@@ -15,23 +15,18 @@ TELEMETRY_PATH = "current_test.json"
 
 st.set_page_config(layout="wide", page_title="Alpha Engine Configuration")
 
-def init_db_config():
-    """Idempotent database and routing initialization layers."""
+def init_db():
     try:
         conn = sqlite3.connect(str(DB_PATH), timeout=60.0)
         cursor = conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL;")
-        cursor.execute("CREATE TABLE IF NOT EXISTS engine_config (key TEXT PRIMARY KEY, value TEXT)")
         cursor.execute("CREATE TABLE IF NOT EXISTS active_workers (id TEXT PRIMARY KEY, pid INTEGER)")
         conn.commit()
         conn.close()
     except Exception as e:
-        st.error(f"🔴 System Storage Initialization Failure: {e}")
+        st.error(f"🔴 Database initialization failure: {e}")
 
-def load_config_from_db():
-    init_db_config()
-    
-    # 🌟 Fallback safe default configuration layout matrix
+def load_config():
     default_config = {
         "version": "v1.2",
         "target_tickers": ["TQQQ", "SQQQ", "SPY"],
@@ -47,56 +42,25 @@ def load_config_from_db():
             "alpha_tolerance": -2.0
         }
     }
-
-    if not os.path.exists(DB_PATH):
-        save_config_to_db(default_config)
+    if not os.path.exists("config.json"):
+        save_config(default_config)
         return default_config
-
     try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=60.0)
-        cursor = conn.cursor()
-        cursor.execute("SELECT key, value FROM engine_config")
-        rows = cursor.fetchall()
-        conn.close()
-    except Exception as e:
-        st.warning(f"Database read bypassed; rolling back to local defaults. Error: {e}")
+        with open("config.json", "r") as f:
+            config = json.load(f)
+        for key in default_config:
+            if key not in config:
+                config[key] = default_config[key]
+        return config
+    except Exception:
         return default_config
-    
-    if not rows:
-        save_config_to_db(default_config)
-        return default_config
-    
-    # Unpack values securely with explicit key checking
-    config = {}
-    for key, value in rows:
-        try:
-            config[key] = json.loads(value)
-        except Exception:
-            pass
-            
-    # Guarantee critical keys exist to prevent downstream UI breaks
-    for key in default_config:
-        if key not in config:
-            config[key] = default_config[key]
-            
-    return config
 
-def save_config_to_db(config_dict):
-    try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=60.0)
-        cursor = conn.cursor()
-        for key, value in config_dict.items():
-            cursor.execute("INSERT OR REPLACE INTO engine_config (key, value) VALUES (?, ?)", (key, json.dumps(value)))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        st.error(f"Failed to commit transaction matrix to local database cache: {e}")
-
+def save_config(config_dict):
     try:
         with open("config.json", "w") as f:
             json.dump(config_dict, f, indent=4)
     except IOError as e:
-        st.error(f"Failed to synchronize config.json local asset mirror: {e}")
+        st.error(f"Failed to save config.json: {e}")
 
 def get_active_worker_pid():
     if not os.path.exists(DB_PATH):
@@ -142,6 +106,7 @@ def clear_worker_pid():
 # --- Interface Layout Presentation Frame ---
 st.title("⚙️ Master Core Optimization Settings")
 
+init_db()
 active_pid = get_active_worker_pid()
 if active_pid:
     st.error(f"⚠️ SYSTEM STATUS: Optimization Suite actively running in background (PID: {active_pid}). Cluster processes fully engaged.")
@@ -150,7 +115,7 @@ else:
 
 st.markdown("Configure global hyperparameters, strategy boundaries, and deploy parallel sweep worker pools across the cluster environment.")
 
-db_config = load_config_from_db()
+db_config = load_config()
 
 # --- Consolidated Configuration Form Entry Block ---
 with st.form(key="global_config_form"):
@@ -169,7 +134,7 @@ with st.form(key="global_config_form"):
         
         # Pull inner nested configuration attributes safely using .get() fallbacks
         exec_settings = db_config.get("execution", {"max_generations": 4, "alpha_tolerance": -2.0})
-        max_gens = st.number_input("Max Search Generations", min_value=1, value=int(exec_settings.get("max_generations", 4)))
+        max_gens = st.number_input("Max Search Generations", min_value=0, value=int(exec_settings.get("max_generations", 4)))
         alpha_tol = st.number_input("Alpha Drop Prune Tolerance (%)", value=float(exec_settings.get("alpha_tolerance", -2.0)), step=0.5)
 
     with col2:
@@ -200,7 +165,7 @@ if submit_button:
                 "alpha_tolerance": float(alpha_tol)
             }
         }
-        save_config_to_db(updated_config)
+        save_config(updated_config)
         st.success("Global configuration successfully written to database and configuration file sync layer!")
         st.rerun()
     except Exception as parse_err:

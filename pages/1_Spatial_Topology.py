@@ -60,11 +60,13 @@ else:
     # --- Universal Scope View Selection Levers ---
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        selected_ticker = st.selectbox("Scope Ticker Target", sorted(df_raw["ticker"].unique()))
-    with col_b:
-        selected_strat = st.selectbox("Scope Strategy Target", sorted(df_raw["strategy"].unique()))
-    with col_c:
         selected_ver = st.selectbox("Scope Execution Version Target", sorted(df_raw["version"].unique(), reverse=True))
+    with col_b:
+        ticker_opts = sorted(df_raw[df_raw["version"] == selected_ver]["ticker"].unique())
+        selected_ticker = st.selectbox("Scope Ticker Target", ticker_opts)
+    with col_c:
+        strat_opts = sorted(df_raw[(df_raw["version"] == selected_ver) & (df_raw["ticker"] == selected_ticker)]["strategy"].unique())
+        selected_strat = st.selectbox("Scope Strategy Target", strat_opts)
 
     df_filtered = df_raw[(df_raw["ticker"] == selected_ticker) & 
                          (df_raw["strategy"] == selected_strat) & 
@@ -139,9 +141,9 @@ else:
 
                 alpha_cutoff = st.slider(
                     "Min Alpha vs SPY (%)",
-                    min_value=float(slider_min-20),
+                    min_value=float(true_min),
                     max_value=float(true_max),
-                    value=float(default_handle_value-20),
+                    value=float(true_min),
                     step=0.5,
                     help="Nodes falling below this threshold will be hidden from the map."
                 )
@@ -292,7 +294,8 @@ else:
         with col_lead:
             st.subheader(f"🏆 Top Performance Frontier — {selected_ticker}")
             if not df_filtered.empty:
-                top_performers = df_filtered.nlargest(5, "alpha_vs_spy")[
+                df_leaderboard = df_plot_base if not df_plot_base.empty else df_filtered
+                top_performers = df_leaderboard.nlargest(5, "alpha_vs_spy")[
                     ["take_profit", "stop_loss", "max_hold_hours", "window", "strategy_return", "win_rate", "trades", "asset_bh", "alpha_vs_spy"]
                 ].reset_index(drop=True)
                 

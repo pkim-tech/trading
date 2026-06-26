@@ -1,15 +1,23 @@
 {
-    "version": "v1.3",
+    "version": "v1.4",
     "target_tickers": [
         "AGQ",
+        "CRMX",
+        "EDC",
+        "KORU",
+        "LABU",
         "SOXL",
-        "KORU"
+        "SQQQ",
+        "SSO",
+        "TQQQ",
+        "VOO"
     ],
     "active_strategies": [
         "ZScore_Original"
     ],
     "hyperparameters": {
         "windows": [
+            10,
             20,
             30,
             40
@@ -102,7 +110,7 @@
         ]
     },
     "execution": {
-        "max_generations": 20,
+        "max_generations": 0,
         "alpha_tolerance": -100.0
     }
 }

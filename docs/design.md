@@ -43,7 +43,7 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - `pages/1_Spatial_Topology.py` — 4D Plotly scatter of parameter space, shows planned nodes in blue and completed nodes colored by alpha
 - `pages/2_Node_Inspector.py` — re-runs backtest for a selected node, shows trade ledger and quarterly breakdown
 - `cache/trading_universe.db` — SQLite cache, nodes never re-evaluated once computed
-- `config.json` — tickers, hyperparameter arrays, max generations, strategy selection
+- `config.json` — single source of truth for runtime config. `app.py` reads/writes directly — DB copy removed.
 
 ### Performance
 - `ProcessPoolExecutor` with up to 10 workers

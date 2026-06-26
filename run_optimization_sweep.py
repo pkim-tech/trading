@@ -157,21 +157,24 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
         total=len(futures_map), 
         desc=f"📊 [{ticker}] {phase_label}", 
         unit="node",
-        mininterval=5.0,     # 🚀 Only refresh screen text once every 5 seconds maximum
-        maxinterval=10.0     # Ensure it updates at least once every 10 seconds if things are slow
+        mininterval=15.0,
+        maxinterval=30.0
     )
     
     node_counter = 0
+    COMMIT_BATCH = 100
+    last_postfix_time = 0.0
     for future in progress_bar:
         tp, sl, hold_hours, w = futures_map[future]
         try:
             res = future.result()
             if res.get("status") == "SUCCESS":
                 alpha, num_trades, wr, comp_ret = res["payload"]
-                progress_bar.set_postfix({"Alpha Peak": f"{alpha:+.1f}%", "Trades": num_trades})
+                now = time.time()
+                if now - last_postfix_time >= 2.0:
+                    progress_bar.set_postfix({"Alpha Peak": f"{alpha:+.1f}%", "Trades": num_trades})
+                    last_postfix_time = now
 
-                # 📊 Throttle Telemetry to protect File System I/O
-                
                 node_counter += 1
                 if node_counter % 50 == 0:
                     try:
@@ -179,7 +182,6 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                             json.dump({"phase": phase_label, "ticker": ticker, "strategy": strategy_name, "version": config_version, "take_profit": int(tp), "stop_loss": int(sl), "max_hold_hours": int(hold_hours)}, tf)
                     except Exception:
                         pass
-
 
                 matrix_results.append({
                     "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
@@ -190,10 +192,14 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
                 cursor.execute("INSERT OR REPLACE INTO backtest_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl), num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp))
-                conn.commit()
+
+                if node_counter % COMMIT_BATCH == 0:
+                    conn.commit()
+
         except Exception as e:
             logger.error(f"Worker process crashed evaluating node TP={tp}, SL={sl}: {e}")
 
+    conn.commit()  # flush remaining
     progress_bar.close()
     conn.close()
     return pd.DataFrame(matrix_results)

@@ -1,82 +1,162 @@
-import pandas as pd
+import numpy as np
+from numba import njit
+
+# Result codes
+WIN   = 0
+LOSS  = 1
+TWIN  = 2
+TLOSS = 3
+OPEN  = 4
+
+_RESULT_NAMES = {WIN: 'WIN', LOSS: 'LOSS', TWIN: 'TWIN', TLOSS: 'TLOSS', OPEN: 'OPEN'}
+
+MAX_TRADES = 5000
+
+
+@njit(cache=True)
+def _simulate(prices, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+              take_profit, stop_loss, max_hours_to_hold, target_h0, target_h1):
+    # Pre-allocated output arrays
+    entry_i   = np.empty(MAX_TRADES, dtype=np.int64)
+    exit_i    = np.empty(MAX_TRADES, dtype=np.int64)
+    entry_p   = np.empty(MAX_TRADES, dtype=np.float64)
+    exit_p    = np.empty(MAX_TRADES, dtype=np.float64)
+    hours_held= np.empty(MAX_TRADES, dtype=np.int64)
+    results   = np.empty(MAX_TRADES, dtype=np.int64)
+    returns   = np.empty(MAX_TRADES, dtype=np.float64)
+    count     = 0
+
+    in_trade     = False
+    entry_price  = 0.0
+    entry_bar    = 0
+    held         = 0
+
+    n = len(prices)
+    for i in range(n):
+        cp = prices[i]
+
+        if in_trade:
+            held += 1
+            pc = (cp - entry_price) / entry_price
+
+            if pc >= take_profit:
+                entry_i[count]    = entry_bar
+                exit_i[count]     = i
+                entry_p[count]    = entry_price
+                exit_p[count]     = cp
+                hours_held[count] = held
+                results[count]    = WIN
+                returns[count]    = pc
+                count += 1
+                in_trade = False
+                continue
+
+            elif pc <= -stop_loss:
+                entry_i[count]    = entry_bar
+                exit_i[count]     = i
+                entry_p[count]    = entry_price
+                exit_p[count]     = cp
+                hours_held[count] = held
+                results[count]    = LOSS
+                returns[count]    = pc
+                count += 1
+                in_trade = False
+                continue
+
+            elif held >= max_hours_to_hold:
+                entry_i[count]    = entry_bar
+                exit_i[count]     = i
+                entry_p[count]    = entry_price
+                exit_p[count]     = cp
+                hours_held[count] = held
+                results[count]    = TWIN if pc > 0 else TLOSS
+                returns[count]    = pc
+                count += 1
+                in_trade = False
+                continue
+
+            continue
+
+        h = hours[i]
+        if h != target_h0 and h != target_h1:
+            continue
+
+        di = daily_idx[i]
+        if di < 0:
+            continue
+
+        sma = sma_arr[di]
+        std = std_arr[di]
+        if std == 0.0:
+            continue
+
+        lower_band = sma - std * 2.0
+
+        if has_trend:
+            trend = trend_arr[di]
+            signal = (cp <= lower_band) and (cp > trend)
+        else:
+            signal = cp <= lower_band
+
+        if signal:
+            in_trade    = True
+            entry_price = cp
+            entry_bar   = i
+            held        = 0
+
+    # Handle open position at end of data
+    if in_trade:
+        cp = prices[n - 1]
+        pc = (cp - entry_price) / entry_price
+        entry_i[count]    = entry_bar
+        exit_i[count]     = n - 1
+        entry_p[count]    = entry_price
+        exit_p[count]     = cp
+        hours_held[count] = held
+        results[count]    = OPEN
+        returns[count]    = pc
+        count += 1
+
+    return entry_i[:count], exit_i[:count], entry_p[:count], exit_p[:count], hours_held[:count], results[:count], returns[:count]
 
 
 def run_backtest(df_hourly, df_daily_indicators, ticker,
-                            mode="BACKTEST", target_hours=(9, 14),
-                            take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28):
+                 mode="BACKTEST", target_hours=(9, 14),
+                 take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28):
+
+    prices = df_hourly['Close'].to_numpy(dtype=np.float64)
+    timestamps = df_hourly.index
+    hours = timestamps.hour.to_numpy(dtype=np.int64)
+    date_strs = timestamps.strftime('%Y-%m-%d')
+
+    daily_date_strs = df_daily_indicators.index.strftime('%Y-%m-%d')
+    daily_lookup = {d: i for i, d in enumerate(daily_date_strs)}
+    daily_idx = np.array([daily_lookup.get(d, -1) for d in date_strs], dtype=np.int64)
+
+    sma_arr = df_daily_indicators['SMA'].to_numpy(dtype=np.float64)
+    std_arr = df_daily_indicators['Std'].to_numpy(dtype=np.float64)
+    has_trend = 'Trend_Filter' in df_daily_indicators.columns
+    trend_arr = df_daily_indicators['Trend_Filter'].to_numpy(dtype=np.float64) if has_trend else np.zeros(1, dtype=np.float64)
+
+    target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
+
+    ei, xi, ep, xp, held, res, ret = _simulate(
+        prices, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+        float(take_profit), float(stop_loss), int(max_hours_to_hold),
+        target_h0, target_h1
+    )
+
     trades = []
-    active_trade = None
-
-    df_hourly = df_hourly.copy()
-    df_hourly['date_str'] = df_hourly.index.strftime('%Y-%m-%d')
-
-    for i in range(len(df_hourly)):
-        current_time = df_hourly.index[i]
-        current_price = df_hourly['Close'].iloc[i]
-        current_date_str = df_hourly['date_str'].iloc[i]
-
-        if active_trade:
-            active_trade['hours_held'] += 1
-            price_change = (current_price - active_trade['Entry Price']) / active_trade['Entry Price']
-
-            if price_change >= take_profit:
-                active_trade.update({'Exit Price': current_price, 'Exit Time': current_time, 'Result': 'WIN', 'Return': price_change})
-                trades.append(active_trade)
-                active_trade = None
-                continue
-
-            elif price_change <= -stop_loss:
-                active_trade.update({'Exit Price': current_price, 'Exit Time': current_time, 'Result': 'LOSS', 'Return': price_change})
-                trades.append(active_trade)
-                active_trade = None
-                continue
-
-            elif active_trade['hours_held'] >= max_hours_to_hold:
-                active_trade.update({
-                    'Exit Price': current_price, 'Exit Time': current_time, 'Return': price_change,
-                    'Result': 'TWIN' if price_change > 0 else 'TLOSS'
-                })
-                trades.append(active_trade)
-                active_trade = None
-                continue
-
-            continue
-
-        if current_time.hour not in target_hours:
-            continue
-
-        if current_date_str not in df_daily_indicators.index.strftime('%Y-%m-%d'):
-            continue
-
-        prior_day_data = df_daily_indicators.loc[df_daily_indicators.index.strftime('%Y-%m-%d') == current_date_str].iloc[0]
-
-        if 'SMA' in prior_day_data and 'Std' in prior_day_data:
-            lower_band = prior_day_data['SMA'] - (prior_day_data['Std'] * 2.0)
-
-            if 'Trend_Filter' in prior_day_data:
-                entry_signal = (current_price <= lower_band) and (current_price > prior_day_data['Trend_Filter'])
-            else:
-                entry_signal = (current_price <= lower_band)
-
-            if entry_signal:
-                active_trade = {
-                    'Ticker': ticker,
-                    'Entry Time': current_time,
-                    'Entry Price': current_price,
-                    'Exit Time': None,
-                    'Exit Price': None,
-                    'hours_held': 0,
-                    'Result': 'OPEN',
-                    'Return': 0.0
-                }
-
-    if active_trade:
-        active_trade.update({
-            'Exit Price': df_hourly['Close'].iloc[-1],
-            'Exit Time': df_hourly.index[-1],
-            'Result': 'OPEN',
-            'Return': (df_hourly['Close'].iloc[-1] - active_trade['Entry Price']) / active_trade['Entry Price']
+    for k in range(len(ei)):
+        trades.append({
+            'Ticker':      ticker,
+            'Entry Time':  timestamps[ei[k]],
+            'Entry Price': ep[k],
+            'Exit Time':   timestamps[xi[k]],
+            'Exit Price':  xp[k],
+            'hours_held':  int(held[k]),
+            'Result':      _RESULT_NAMES[res[k]],
+            'Return':      ret[k]
         })
-        trades.append(active_trade)
 
     return trades
