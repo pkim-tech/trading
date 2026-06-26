@@ -1,0 +1,15 @@
+requests
+pandas
+dotenv
+yfinance
+seaborn
+matplotlib
+numpy  
+scikit-learn
+scipy
+pip-audit  
+streamlit
+seaborn
+matplotlib
+pandas
+plotly

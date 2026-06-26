@@ -1,0 +1,288 @@
+import streamlit as st
+import pandas as pd
+import sqlite3
+import json
+import os
+import plotly.graph_objects as go
+
+DB_PATH = "./cache/trading_universe.db"
+TELEMETRY_PATH = "current_test.json"
+
+st.set_page_config(layout="wide", page_title="Spatial Topology Space")
+
+def load_all_historical_dimensions():
+    if not os.path.exists(DB_PATH):
+        return pd.DataFrame()
+    conn = sqlite3.connect(DB_PATH)
+    query = """
+        SELECT ticker, strategy, version, window, max_hold_hours, take_profit, stop_loss,
+               trades, win_rate, strategy_return, alpha_vs_spy, asset_bh
+        FROM backtest_cache
+    """
+    try:
+        df = pd.read_sql_query(query, conn)
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+    return df
+
+def get_active_telemetry():
+    if os.path.exists(TELEMETRY_PATH):
+        try:
+            with open(TELEMETRY_PATH, "r") as f: return json.load(f)
+        except Exception: return None
+    return None
+
+st.title("📊 4D Spatial Grid Topology Monitor")
+
+df_raw = load_all_historical_dimensions()
+active_node = get_active_telemetry()
+
+if df_raw.empty:
+    st.warning("No completed hyperparameter records found. Initialize optimization runs via the main config view.")
+else:
+    # --- Universal Scope View Selection Levers ---
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        selected_ticker = st.selectbox("Scope Ticker Target", sorted(df_raw["ticker"].unique()))
+    with col_b:
+        selected_strat = st.selectbox("Scope Strategy Target", sorted(df_raw["strategy"].unique()))
+    with col_c:
+        selected_ver = st.selectbox("Scope Execution Version Target", sorted(df_raw["version"].unique(), reverse=True))
+
+    df_filtered = df_raw[(df_raw["ticker"] == selected_ticker) & 
+                         (df_raw["strategy"] == selected_strat) & 
+                         (df_raw["version"] == selected_ver)].copy()
+
+    st.markdown("---")
+    
+    # --- 4D Dynamic Axis Controller Levers ---
+    st.subheader("🕹️ High-Dimensional Projections Slicing Matrix")
+    dimension_options = {
+        "Take Profit %": "take_profit",
+        "Stop Loss %": "stop_loss",
+        "Max Hold Hours": "max_hold_hours",
+        "Lookback Window": "window"
+    }
+    
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        x_axis_label = st.selectbox("X-Axis Spatial Mapping", list(dimension_options.keys()), index=0)
+    with c2:
+        y_axis_label = st.selectbox("Y-Axis Spatial Mapping", list(dimension_options.keys()), index=1)
+    with c3:
+        z_axis_label = st.selectbox("Z-Axis Spatial Mapping", list(dimension_options.keys()), index=2)
+    with c4:
+        slice_label = st.selectbox("4th-Dimension Isolation Filter", list(dimension_options.keys()), index=3)
+
+    if len({x_axis_label, y_axis_label, z_axis_label, slice_label}) < 4:
+        st.error("Invalid state. Each parameter field dimension map option must map uniquely to a single axis or slicing engine filter.")
+    else:
+        x_col = dimension_options[x_axis_label]
+        y_col = dimension_options[y_axis_label]
+        z_col = dimension_options[z_axis_label]
+        s_col = dimension_options[slice_label]
+
+        available_slice_values = sorted([v for v in df_filtered[s_col].unique() if v is not None and pd.notna(v)])
+        
+        if len(available_slice_values) > 1:
+            # Safely render the slider if there is a valid mathematical range
+            selected_slice_val = st.select_slider(
+                f"Isolate Plane Slice Range for {slice_label}", 
+                options=available_slice_values
+            )
+            df_plot_base = df_filtered[df_filtered[s_col] == selected_slice_val].copy()
+            
+        elif len(available_slice_values) == 1:
+            # If only 1 coordinate exists, auto-lock to it without drawing a broken slider component
+            selected_slice_val = available_slice_values[0]
+            st.info(f"Fixed Horizon Layer Locked: {slice_label} = {selected_slice_val}")
+            df_plot_base = df_filtered[df_filtered[s_col] == selected_slice_val].copy()
+            
+        else:
+            # Fallback if the database slice is completely empty
+            df_plot_base = df_filtered.copy()
+
+        # --- Re-architected Filter Workspace Layout ---
+        plot_col, filter_col = st.columns([5, 1])
+        
+        # --- Cleaned Workspace Layout Filter Engine ---
+        with filter_col:
+            st.markdown("### 🎛️ Alpha Filter")
+            
+            # 🛡️ Initialize default fallback to prevent NameErrors down-page
+            lock_axis_scaling = False
+            
+            if not df_plot_base.empty:
+                true_min = float(df_plot_base['alpha_vs_spy'].min())
+                true_max = float(df_plot_base['alpha_vs_spy'].max())
+                
+                # Hard clamp optimization for extreme outliers
+                slider_min = true_min 
+                default_handle_value = 0.0 if true_max > 0 else true_min
+
+                alpha_cutoff = st.slider(
+                    "Min Alpha vs SPY (%)",
+                    min_value=float(slider_min-20),
+                    max_value=float(true_max),
+                    value=float(default_handle_value-20),
+                    step=0.5,
+                    help="Nodes falling below this threshold will be hidden from the map."
+                )
+                
+                df_plot_final = df_plot_base[df_plot_base['alpha_vs_spy'] >= alpha_cutoff].copy()
+                
+                # 💎 RESTORED CRITICAL WIDGET: Kept variable alive inside the data path
+                lock_axis_scaling = st.checkbox(
+                    "Freeze Grid Bounds",
+                    value=False,
+                    help="When checked, grid bounds remain static so nodes vanish in place."
+                )
+                
+                st.metric("Visible Nodes", f"{len(df_plot_final)} / {len(df_plot_base)}")
+                st.caption(f"Absolute Floor: {true_min:+.1f}% | Absolute Ceiling: {true_max:+.1f}%")
+            else:
+                df_plot_final = df_plot_base.copy()
+                lock_axis_scaling = False # Safe fallback
+                st.caption("No points available in current configuration.")
+                
+
+        # --- Calculate Dynamic vs Anchored Viewport Ranges ---
+        if lock_axis_scaling and not df_plot_base.empty:
+            x_range = [float(df_plot_base[x_col].min()), float(df_plot_base[x_col].max())]
+            y_range = [float(df_plot_base[y_col].min()), float(df_plot_base[y_col].max())]
+            z_range = [float(df_plot_base[z_col].min()), float(df_plot_base[z_col].max())]
+            
+            x_range = [x_range[0] - (x_range[1]-x_range[0])*0.05 if x_range[1]!=x_range[0] else x_range[0]-1, x_range[1] + (x_range[1]-x_range[0])*0.05 if x_range[1]!=x_range[0] else x_range[1]+1]
+            y_range = [y_range[0] - (y_range[1]-y_range[0])*0.05 if y_range[1]!=y_range[0] else y_range[0]-1, y_range[1] + (y_range[1]-y_range[0])*0.05 if y_range[1]!=y_range[0] else y_range[1]+1]
+            z_range = [z_range[0] - (z_range[1]-z_range[0])*0.05 if z_range[1]!=z_range[0] else z_range[0]-1, z_range[1] + (z_range[1]-z_range[0])*0.05 if z_range[1]!=z_range[0] else z_range[1]+1]
+        else:
+            x_range, y_range, z_range = None, None, None
+
+        # --- Plotly 3D Canvas Engine ---
+        fig = go.Figure()
+        if not df_plot_final.empty:
+            hover_strings = [
+                f"<b>📍 COORDINATE NODE</b><br>"
+                f"Lookback Window: {w}w<br>"
+                f"Take Profit: {tp}%<br>"
+                f"Stop Loss: {sl}%<br>"
+                f"Max Hold: {h}h<br>"
+                f"--------------------<br>"
+                f"📈 Alpha vs SPY: {alpha:+.2f}%<br>"
+                f"💵 Sim Return: {r:+.2f}%<br>"
+                f"🎯 Win Rate: {wr:.1f}%<br>"
+                f"📊 Total Trades: {t}"
+                for w, tp, sl, h, alpha, r, wr, t in zip(
+                    df_plot_final["window"], df_plot_final["take_profit"], df_plot_final["stop_loss"],
+                    df_plot_final["max_hold_hours"], df_plot_final["alpha_vs_spy"], df_plot_final["strategy_return"],
+                    df_plot_final["win_rate"], df_plot_final["trades"]
+                )
+            ]
+
+            fig.add_trace(go.Scatter3d(
+                x=df_plot_final[x_col], y=df_plot_final[y_col], z=df_plot_final[z_col],
+                mode='markers',
+                marker=dict(
+                    size=6, color=df_plot_final["alpha_vs_spy"], colorscale='RdYlGn', cmid=0.0,
+                    colorbar=dict(title="Alpha vs SPY %", x=1.05), opacity=0.8,
+                    line=dict(color='black', width=0.3)
+                ),
+                text=hover_strings,
+                hoverinfo='text'
+            ))
+
+        fig.update_layout(
+            margin=dict(l=0, r=0, b=0, t=0),
+            scene=dict(
+                xaxis_title=x_axis_label, 
+                yaxis_title=y_axis_label, 
+                zaxis_title=z_axis_label,
+                xaxis=dict(range=x_range) if x_range else dict(),
+                yaxis=dict(range=y_range) if y_range else dict(),
+                zaxis=dict(range=z_range) if z_range else dict()
+            ),
+            height=650,
+            uirevision='constant'
+        )
+        
+        with plot_col:
+            st.plotly_chart(fig, use_container_width=True, key="spatial_3d_cube")
+
+        # --- Unified Real-time Monitor HUD and Top Matrix Leaderboard ---
+        col_hud, col_lead = st.columns([1.2, 1.8])
+        
+        with col_hud:
+            st.subheader("Telemetry Engine Matrix")
+            
+            if not df_filtered.empty:
+                st.markdown("### 🎯 Parametric Vector Query")
+                
+                # Grouped tiny select options targeting individual numerical axes
+                sub_c1, sub_c2 = st.columns(2)
+                with sub_c1:
+                    q_tp = st.selectbox("Query Target TP %", sorted(df_filtered["take_profit"].unique()))
+                    q_win = st.selectbox("Query Lookback Window", sorted(df_filtered["window"].unique()))
+                with sub_c2:
+                    q_sl = st.selectbox("Query Target SL %", sorted(df_filtered["stop_loss"].unique()))
+                    q_hold = st.selectbox("Query Max Hold Hours", sorted(df_filtered["max_hold_hours"].unique()))
+                
+                # Instantly isolate the exact cross-section out of the thousands of points
+                matched_rows = df_filtered[
+                    (df_filtered["take_profit"] == q_tp) & 
+                    (df_filtered["stop_loss"] == q_sl) & 
+                    (df_filtered["window"] == q_win) & 
+                    (df_filtered["max_hold_hours"] == q_hold)
+                ]
+                
+                st.markdown("---")
+                if not matched_rows.empty:
+                    clicked_row = matched_rows.iloc[0]
+                    st.metric("Alpha Performance", f"{clicked_row['alpha_vs_spy']:+.2f}%")
+                    st.markdown(f"**Sim Return:** {clicked_row['strategy_return']:+.2f}% | **Win Rate:** {clicked_row['win_rate']:.1f}%")
+                    st.markdown(f"**Total Trades executed:** {int(clicked_row['trades'])}")
+                    
+                    if st.button("📥 Load Isolated Node into Inspector", use_container_width=True, key="click_transmit"):
+                        st.session_state["target_node"] = {
+                            "ticker": selected_ticker, "strategy": selected_strat, "version": selected_ver,
+                            "window": int(clicked_row["window"]), "take_profit": int(clicked_row["take_profit"]),
+                            "stop_loss": int(clicked_row["stop_loss"]), "max_hold_hours": int(clicked_row["max_hold_hours"])
+                        }
+                        st.switch_page("pages/2_Node_Inspector.py")
+                else:
+                    st.warning("No data row matches this specific vector coordinate layout.")
+            
+            elif active_node and active_node.get("ticker") == selected_ticker:
+                st.metric("📋 Currently Processing", f"{active_node.get('ticker')}")
+                st.metric("🎯 Sub-Routine Focus Zone", f"TP: {active_node.get('take_profit')}% | SL: {active_node.get('stop_loss')}%")
+            else:
+                st.success("⚡ Optimization Process Idle.")
+
+        with col_lead:
+            st.subheader(f"🏆 Top Performance Frontier — {selected_ticker}")
+            if not df_filtered.empty:
+                top_performers = df_filtered.nlargest(5, "alpha_vs_spy")[
+                    ["take_profit", "stop_loss", "max_hold_hours", "window", "strategy_return", "win_rate", "trades", "asset_bh", "alpha_vs_spy"]
+                ].reset_index(drop=True)
+                
+                st.dataframe(top_performers.style.format({
+                    "take_profit": "{:,.0f}%", "stop_loss": "{:,.0f}%", "max_hold_hours": "{:,.0f}h", "window": "{:,.0f}w",
+                    "strategy_return": "{:+.2f}%", "win_rate": "{:.1f}%", "trades": "{:,.0f}", "asset_bh": "{:+.2f}%", "alpha_vs_spy": "{:+.2f}%"
+                }), hide_index=False, use_container_width=True)
+
+                st.markdown("### 🔍 Inspect a Frontier Node")
+                selected_idx = st.selectbox(
+                    "Select a row number from the table above to load into the Node Inspector:",
+                    options=list(top_performers.index),
+                    format_func=lambda x: f"Row {x}: TP={top_performers.loc[x, 'take_profit']}% | SL={top_performers.loc[x, 'stop_loss']}% | Window={top_performers.loc[x, 'window']}w"
+                )
+                
+                if st.button("🔎 Transmit Chosen Node Coordinates to Inspector", use_container_width=True):
+                    clicked_node = top_performers.iloc[selected_idx]
+                    st.session_state["target_node"] = {
+                        "ticker": selected_ticker, "strategy": selected_strat, "version": selected_ver,
+                        "window": int(clicked_node["window"]), "take_profit": int(clicked_node["take_profit"]),
+                        "stop_loss": int(clicked_node["stop_loss"]), "max_hold_hours": int(clicked_node["max_hold_hours"])
+                    }
+                    st.switch_page("pages/2_Node_Inspector.py")
