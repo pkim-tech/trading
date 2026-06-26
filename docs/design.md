@@ -54,7 +54,7 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 ## Layer 3 — Live Trading Engine (Planned)
 
-Not yet implemented. `trading_engine.py` is a legacy placeholder pointing at older files.
+Not yet implemented. `live_trading.py` will be built from scratch.
 
 **Planned design:**
 - Read optimized parameter sets from Layer 2 SQLite results

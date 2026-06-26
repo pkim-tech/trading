@@ -19,7 +19,7 @@ python data_collector.py --once # single fetch and exit
 
 The core of the system. `run_optimization_sweep.py` searches for robust trading parameter sets by brute-forcing the full combination space of take profit %, stop loss %, and max hold time across one or more tickers and strategy variants.
 
-Each combination (a "node") is evaluated by `strategy_optimizer.py`, which runs a full backtest simulation and returns alpha vs SPY. Results are cached in SQLite (`cache/trading_universe.db`) so nodes are never re-evaluated.
+Each combination (a "node") is evaluated by `backtester.py`, which runs a full backtest simulation and returns alpha vs SPY. Results are cached in SQLite (`cache/trading_universe.db`) so nodes are never re-evaluated.
 
 The search evolved through several approaches before settling on full brute force:
 - Early versions tried smart grid search and generational refinement around alpha peaks
@@ -39,7 +39,7 @@ Config is set via `app.py` (Streamlit UI) or by editing `config.json` directly.
 
 ## Layer 3 — Live Trading Engine (Planned)
 
-`trading_engine.py` is a placeholder. The intent is to take optimized parameter sets from Layer 2, apply them to live intraday signals, and track open positions across sessions.
+`live_trading.py` (not yet built). The intent is to take optimized parameter sets from Layer 2, apply them to live intraday signals, and track open positions across sessions.
 
 Manual state updates will be needed (e.g. logging fills when returning home after market hours). This layer is not yet implemented.
 
