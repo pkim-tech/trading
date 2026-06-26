@@ -8,3 +8,4 @@ logs/
 output/
 active_phase_grid.json
 current_test.json
+docs/session_cache.md

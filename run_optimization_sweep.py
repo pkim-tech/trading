@@ -14,7 +14,7 @@ import seaborn as sns
 from tqdm import tqdm
 
 # --- Dynamic Core Strategy Imports ---
-from strategy_optimizer import run_backtest_simulation
+from backtester import run_backtest
 import strategies
 
 # --- Global Workspace Environments ---
@@ -83,11 +83,11 @@ def run_single_backtest_node_isolated(args):
     df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
 
     try:
-        trades = run_backtest_simulation(
+        trades = run_backtest(
             df_hourly_raw, df_daily_processed, ticker, 
             take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0), max_hours_to_hold=int(hold_hours)
         )
-        closed = [t for t in trades if t["Result"] in ["WIN", "LOSS", "TIME_EXIT"]]
+        closed = [t for t in trades if t["Result"] in ["WIN", "LOSS", "TWIN", "TLOSS"]]
     except Exception:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "status": "SIM_ERROR"}
 
@@ -137,7 +137,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
         conn.close()
         return pd.DataFrame(matrix_results)
 
-    planned_nodes = [{"take_profit": int(t[0]), "stop_loss": int(t[1]), "max_hold_days": t[2] / 24.0} for t in unvisited_tasks]
+    planned_nodes = [{"take_profit": int(t[0]), "stop_loss": int(t[1]), "max_hold_hours": int(t[2])} for t in unvisited_tasks]
     try:
         with open("active_phase_grid.json", "w") as gf:
             json.dump({"phase": phase_label, "nodes": planned_nodes}, gf)
@@ -176,7 +176,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                 if node_counter % 50 == 0:
                     try:
                         with open("current_test.json", "w") as tf:
-                            json.dump({"phase": phase_label, "ticker": ticker, "strategy": strategy_name, "version": config_version, "take_profit": int(tp), "stop_loss": int(sl), "max_hold_days": hold_hours / 24.0}, tf)
+                            json.dump({"phase": phase_label, "ticker": ticker, "strategy": strategy_name, "version": config_version, "take_profit": int(tp), "stop_loss": int(sl), "max_hold_hours": int(hold_hours)}, tf)
                     except Exception:
                         pass
 

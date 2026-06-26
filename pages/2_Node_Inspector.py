@@ -3,7 +3,7 @@ import pandas as pd
 import sqlite3
 import os
 from pathlib import Path
-from strategy_optimizer import run_backtest_simulation
+from backtester import run_backtest
 import strategies
 
 DB_PATH = "./cache/trading_universe.db"
@@ -113,7 +113,7 @@ else:
                 strat_instance = strat_class(window=int(target_w))
                 df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
                 
-                trades = run_backtest_simulation(
+                trades = run_backtest(
                     df_hourly_raw, df_daily_processed, selected_ticker,
                     take_profit=float(target_tp / 100.0), stop_loss=float(target_sl / 100.0), max_hours_to_hold=int(target_hold)
                 )

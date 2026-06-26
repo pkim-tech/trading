@@ -161,24 +161,3 @@ def generate_mock_signal_data(target_signal="BUY"):
         df_hourly.loc[target_time, 'Adj Close'] = 150.0
         
     return df_hourly
-    """
-    Generates a deterministic 25-day dataset.
-    The first 24 days are perfectly flat ($100), meaning SMA=100 and Std=0.
-    The final hourly bar intentionally forces a massive shift to guarantee a Z-score trigger.
-    """
-    # Create 25 days of hourly timestamps (9:30 to 15:30)
-    timestamps = pd.date_range(start="2026-01-01", periods=25 * 7, freq="h")
-    
-    # Initialize everything at a flat $100 base
-    df_hourly = pd.DataFrame(index=timestamps)
-    df_hourly['Adj Close'] = 100.0
-    
-    # Manipulate the very last row to force our target signal
-    if target_signal == "BUY":
-        # Force a massive drop on the final hour to trigger oversold (Z <= -2)
-        df_hourly.iloc[-1, df_hourly.columns.get_loc('Adj Close')] = 50.0
-    elif target_signal == "SELL":
-        # Force a massive spike on the final hour to trigger overbought (Z >= 2)
-        df_hourly.iloc[-1, df_hourly.columns.get_loc('Adj Close')] = 150.0
-        
-    return df_hourly

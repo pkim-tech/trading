@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 
 DB_PATH = "./cache/trading_universe.db"
 TELEMETRY_PATH = "current_test.json"
+PHASE_GRID_PATH = "active_phase_grid.json"
 
 st.set_page_config(layout="wide", page_title="Spatial Topology Space")
 
@@ -26,6 +27,20 @@ def load_all_historical_dimensions():
     finally:
         conn.close()
     return df
+
+def load_planned_nodes():
+    if not os.path.exists(PHASE_GRID_PATH):
+        return pd.DataFrame()
+    try:
+        with open(PHASE_GRID_PATH, "r") as f:
+            data = json.load(f)
+        nodes = data.get("nodes", [])
+        if not nodes:
+            return pd.DataFrame()
+        df = pd.DataFrame(nodes)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 def get_active_telemetry():
     if os.path.exists(TELEMETRY_PATH):
@@ -192,6 +207,21 @@ else:
                 text=hover_strings,
                 hoverinfo='text'
             ))
+
+        df_planned = load_planned_nodes()
+        if not df_planned.empty and all(c in df_planned.columns for c in [x_col, y_col, z_col]):
+            completed_keys = set(zip(df_plot_base[x_col], df_plot_base[y_col], df_plot_base[z_col]))
+            df_unrun = df_planned[
+                ~df_planned.apply(lambda r: (r[x_col], r[y_col], r[z_col]) in completed_keys, axis=1)
+            ]
+            if not df_unrun.empty:
+                fig.add_trace(go.Scatter3d(
+                    x=df_unrun[x_col], y=df_unrun[y_col], z=df_unrun[z_col],
+                    mode='markers',
+                    marker=dict(size=3, color='royalblue', opacity=0.4),
+                    name='Planned (unrun)',
+                    hoverinfo='skip'
+                ))
 
         fig.update_layout(
             margin=dict(l=0, r=0, b=0, t=0),
