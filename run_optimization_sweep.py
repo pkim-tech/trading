@@ -163,8 +163,13 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
         tp, sl, hold_hours, w = futures_map[future]
         try:
             res = future.result()
-            if res.get("status") == "SUCCESS":
-                alpha, num_trades, wr, comp_ret = res["payload"]
+            status = res.get("status")
+            if status in ("SUCCESS", "NO_TRADES"):
+                if status == "SUCCESS":
+                    alpha, num_trades, wr, comp_ret = res["payload"]
+                else:
+                    alpha, num_trades, wr, comp_ret = 0.0, 0, 0.0, 0.0
+
                 now = time.time()
                 if now - last_postfix_time >= 2.0:
                     progress_bar.set_postfix({"Alpha Peak": f"{alpha:+.1f}%", "Trades": num_trades})
@@ -178,12 +183,13 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                     except Exception:
                         pass
 
-                matrix_results.append({
-                    "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
-                    "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
-                    "Trades": num_trades, "Win Rate %": wr, "Return %": comp_ret,
-                    "Alpha vs SPY %": alpha, "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
-                })
+                if status == "SUCCESS":
+                    matrix_results.append({
+                        "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
+                        "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
+                        "Trades": num_trades, "Win Rate %": wr, "Return %": comp_ret,
+                        "Alpha vs SPY %": alpha, "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
+                    })
 
                 cursor.execute("INSERT OR REPLACE INTO backtest_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl), num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp))
@@ -221,12 +227,16 @@ def run_master_evolutionary_suite(shared_pool, ticker, strategy_class, strategy_
         return None
         
     df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True).sort_index()
+    if df_hourly_raw.index.tz is not None:
+        df_hourly_raw.index = df_hourly_raw.index.tz_localize(None)
     close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
     asset_bh = ((df_hourly_raw[close_col].iloc[-1] - df_hourly_raw[close_col].iloc[0]) / df_hourly_raw[close_col].iloc[0]) * 100
-    
+
     spy_cache, spy_bh = CACHE_DIR / "SPY_1h.csv", 0.0
     if spy_cache.exists():
         spy_df = pd.read_csv(spy_cache, index_col=0, parse_dates=True).sort_index()
+        if spy_df.index.tz is not None:
+            spy_df.index = spy_df.index.tz_localize(None)
         spy_sliced = spy_df.loc[df_hourly_raw.index.min():df_hourly_raw.index.max()]
         if not spy_sliced.empty:
             spy_col = 'Adj Close' if 'Adj Close' in spy_df.columns else 'Close'
@@ -309,7 +319,7 @@ def run_master_evolutionary_suite(shared_pool, ticker, strategy_class, strategy_
         if len(df_plane) > 1:
             try:
                 plt.figure(figsize=(12, 10))
-                pivot_table = df_plane.pivot(index="Stop Loss %", columns="Take Profit %", values="Alpha vs SPY %")
+                pivot_table = df_plane.groupby(["Stop Loss %", "Take Profit %"])["Alpha vs SPY %"].mean().unstack("Take Profit %")
                 sns.heatmap(pivot_table, annot=False, cmap="RdYlGn", cbar_kws={'label': 'Alpha vs SPY %'}, linewidths=0.5)
                 plt.title(f"Safety Perimeter Matrix ({ticker} - {strategy_name} @ {best_hold}h)")
                 

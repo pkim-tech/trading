@@ -95,10 +95,20 @@ with c5:
 with c6:
     top_n = st.number_input("Top N per ticker", min_value=1, value=5, step=1)
 
-beat_bh = st.toggle("Beat asset B&H", value=True)
+c7, c8, c9 = st.columns(3)
+with c7:
+    min_return = st.number_input("Min return %", value=100.0, step=10.0, format="%.0f")
+with c8:
+    min_bh_mult = st.number_input("Min B&H multiplier", value=2.0, step=0.5, format="%.1f")
+with c9:
+    beat_bh = st.toggle("Beat asset B&H", value=True)
 show_dismissed = st.toggle("Show dismissed", value=False)
 if dismissed and show_dismissed:
     st.caption(f"Dismissed: {', '.join(f'{t}/{s}' for t, s, v in sorted(dismissed) if v == version)}")
+
+df_all['bh_mult'] = df_all.apply(
+    lambda r: r['strategy_return'] / r['asset_bh'] if r['asset_bh'] > 0 else None, axis=1
+)
 
 is_dismissed = df_all.apply(lambda r: (r['ticker'], r['strategy'], version) in dismissed, axis=1)
 df = df_all[
@@ -106,6 +116,8 @@ df = df_all[
     df_all['strategy'].isin(strategy_filter) &
     (df_all['trades'] >= min_trades) &
     (df_all['alpha_vs_spy'] >= min_alpha) &
+    (df_all['strategy_return'] >= min_return) &
+    (df_all['bh_mult'].fillna(0) >= min_bh_mult) &
     (~beat_bh | (df_all['strategy_return'] > df_all['asset_bh'])) &
     (show_dismissed | ~is_dismissed)
 ]
@@ -134,12 +146,13 @@ display['strategy_return'] = display['strategy_return'].map(lambda x: f"{x:.1f}%
 display['alpha_vs_spy']    = display['alpha_vs_spy'].map(lambda x: f"{x:.1f}%")
 display['asset_bh']        = display['asset_bh'].map(lambda x: f"{x:.1f}%")
 display['spy_bh']          = display['spy_bh'].map(lambda x: f"{x:.1f}%")
+display['bh_mult']         = display['bh_mult'].map(lambda x: f"{x:.1f}x" if pd.notna(x) else "")
 display = display.rename(columns={
     'ticker': 'Ticker', 'strategy': 'Strategy', 'window': 'Win',
     'take_profit': 'TP%', 'stop_loss': 'SL%', 'max_hold_hours': 'Hold h',
     'trades': 'Trades', 'win_rate': 'Win%', 'strategy_return': 'Return',
     'alpha_vs_spy': 'Alpha', 'asset_bh': 'Asset B&H', 'spy_bh': 'SPY B&H',
-    'vol': 'Vol (last day)', 'price': 'Last Price',
+    'bh_mult': 'B&H Mult', 'vol': 'Vol (last day)', 'price': 'Last Price',
 })
 
 selection = st.dataframe(

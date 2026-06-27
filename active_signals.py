@@ -113,9 +113,35 @@ def ensure_tables():
                 signal_price   REAL NOT NULL,
                 signal_time    TEXT NOT NULL,
                 entry_price    REAL NOT NULL,
-                entry_time     TEXT NOT NULL
+                entry_time     TEXT NOT NULL,
+                trade_log_id   INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS trade_log (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker              TEXT NOT NULL,
+                strategy            TEXT NOT NULL,
+                version             TEXT NOT NULL,
+                window              INTEGER NOT NULL,
+                take_profit         INTEGER NOT NULL,
+                stop_loss           INTEGER NOT NULL,
+                max_hold_hours      INTEGER NOT NULL,
+                signal_price        REAL NOT NULL,
+                signal_time         TEXT NOT NULL,
+                entry_price         REAL NOT NULL,
+                entry_time          TEXT NOT NULL,
+                entry_drift_pct     REAL NOT NULL,
+                exit_signal_price   REAL,
+                exit_price          REAL,
+                exit_time           TEXT,
+                exit_drift_pct      REAL,
+                pnl_pct             REAL,
+                exit_reason         TEXT
             );
         """)
+        existing_cols = [r[1] for r in c.execute("PRAGMA table_info(open_positions)").fetchall()]
+        if 'trade_log_id' not in existing_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN trade_log_id INTEGER")
         c.commit()
 
 
@@ -175,24 +201,67 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time):
             return
         sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
         entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
+        trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time)
         c.execute("""
             INSERT INTO open_positions
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
-                 signal_price, signal_time, entry_price, entry_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 signal_price, signal_time, entry_price, entry_time, trade_log_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(node['take_profit']), int(node['stop_loss']),
             int(node['max_hold_hours']),
             float(signal_price), sig_time_str,
-            float(entry_price), entry_time_str,
+            float(entry_price), entry_time_str, trade_log_id,
         ))
         c.commit()
 
 
-def close_position(position_id):
+def close_position(position_id, exit_signal_price=None, exit_price=None, exit_time=None, exit_reason=None):
     with _conn() as c:
+        if exit_price is not None:
+            row = c.execute(
+                "SELECT trade_log_id, entry_price FROM open_positions WHERE id = ?", (position_id,)
+            ).fetchone()
+            if row and row[0]:
+                log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1])
         c.execute("DELETE FROM open_positions WHERE id = ?", (position_id,))
+        c.commit()
+
+
+def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time):
+    sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
+    entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
+    entry_drift    = (entry_price - signal_price) / signal_price * 100
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO trade_log
+                (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            node['ticker'], node['strategy'], node['version'],
+            int(node['window']), int(node['take_profit']), int(node['stop_loss']),
+            int(node['max_hold_hours']),
+            float(signal_price), sig_time_str,
+            float(entry_price), entry_time_str, entry_drift,
+        ))
+        c.commit()
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reason, entry_price):
+    exit_time_str = exit_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(exit_time, 'strftime') else exit_time
+    exit_drift    = (exit_price - exit_signal_price) / exit_signal_price * 100
+    pnl           = (exit_price - entry_price) / entry_price * 100
+    with _conn() as c:
+        c.execute("""
+            UPDATE trade_log SET
+                exit_signal_price = ?, exit_price = ?, exit_time = ?,
+                exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?
+            WHERE id = ?
+        """, (float(exit_signal_price), float(exit_price), exit_time_str,
+              exit_drift, pnl, exit_reason, trade_id))
         c.commit()
 
 
@@ -626,7 +695,9 @@ if SOCKET_MODE:
         drift_pct  = (exit_price - signal_price) / signal_price * 100
         actual_pnl = (exit_price - entry_price) / entry_price * 100
 
-        close_position(position_id)
+        close_position(position_id,
+                       exit_signal_price=signal_price, exit_price=exit_price,
+                       exit_time=datetime.now(), exit_reason=data.get('reason'))
 
         note = f"${exit_price:.4f}  (signal drift: {drift_pct:+.2f}%  P&L: {actual_pnl:+.2f}%)"
         print(f"  Position closed via Slack: {ticker} at {note}")
@@ -733,7 +804,8 @@ def notify_sell_signal(pos, reason, current_price, target_price):
             drift_pct  = (exit_price - current_price) / current_price * 100
             actual_pnl = (exit_price - ep) / ep * 100
             note = f"Exited at ${exit_price:.4f}  (signal drift: {drift_pct:+.2f}%  P&L: {actual_pnl:+.2f}%)"
-            close_position(pos['id'])
+            close_position(pos['id'], exit_signal_price=current_price, exit_price=exit_price,
+                           exit_time=datetime.now(), exit_reason='MANUAL')
             print(f"  Position closed. {note}")
             _post_message(f"{ticker} position closed: {note}")
         except ValueError:

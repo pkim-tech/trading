@@ -30,7 +30,7 @@ def load_config():
     default_config = {
         "version": "v1.2",
         "target_tickers": ["TQQQ", "SQQQ", "SPY"],
-        "active_strategies": ["ZScore_Original"],
+        "active_strategies": ["ZScoreBreakout"],
         "hyperparameters": {
             "windows": [20],
             "take_profits": [2, 4, 6, 8],
@@ -127,9 +127,9 @@ with st.form(key="global_config_form"):
         ticker_string = st.text_input("Target Ticker Set (Comma Separated)", ", ".join(db_config.get("target_tickers", ["TQQQ"])))
         
         strategy_choices = st.multiselect(
-            "Active Compute Strategies", 
-            ["ZScore_Original", "ZScore_TrendFiltered"], 
-            default=db_config.get("active_strategies", ["ZScore_Original"])
+            "Active Compute Strategies",
+            ["ZScoreBreakout", "TrendFilteredZScore"],
+            default=db_config.get("active_strategies", ["ZScoreBreakout"])
         )
         
         # Pull inner nested configuration attributes safely using .get() fallbacks

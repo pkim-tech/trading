@@ -77,6 +77,14 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - Open in Node Inspector passes all params (window, TP, SL, hold) via session state — dropdowns auto-select on arrival
 - Watch list table at bottom with inline label editing and remove-by-uncheck
 
+### Sweep Status Page
+
+`pages/5_Sweep_Status.py` — per-ticker sweep progress for a selected version. Shows nodes cached vs expected, SUCCESS vs NO_TRADES counts, last data date, ASCII progress bar. Auto-refreshes every 30s. Useful for monitoring long-running sweeps and diagnosing gaps.
+
+### Strategy Page
+
+`pages/6_Strategy.py` — renders `docs/strategy.md` in the app. Living reference for signal logic, edge cases, and trading rules.
+
 ### Screener Page
 
 `pages/4_Screener.py` — filter the full ticker universe before deciding what to sweep.
