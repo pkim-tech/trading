@@ -15,6 +15,8 @@ Three discrete layers, each independently runnable:
 - `data_collector.py` polls every 5 minutes, calls `data_manager.py` for incremental updates
 - Data stored as `cache/{ticker}_1h.csv`, SPY always included as benchmark
 - Incremental backfill with deduplication — overlapping buffer handles weekends/holidays
+- Ticker universe defined in `tickers.json` — plain JSON array, read at startup
+- Cron job runs `data_collector.py --once` daily at 8 AM via `scripts/run_data_collector.sh`, logs to `logs/data_collector_daily.log`
 
 ---
 
@@ -54,7 +56,7 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 ## Layer 3 — Active Signals
 
-`active_signals.py` — polls cached price data, fires BUY/SELL alerts to console and Slack. Requires `data_collector.py` running simultaneously to keep price cache fresh.
+`active_signals.py` — polls price data, fires BUY/SELL alerts to console and Slack. Fetches fresh data for all watched tickers at the start of each poll cycle — no separate data collector process needed.
 
 - `watch_list` DB table — nodes selected for live monitoring
 - `open_positions` DB table — tracks entries pending exit
@@ -72,7 +74,24 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - Filters: version, ticker, strategy, min trades, min alpha, beat asset B&H toggle, top N per ticker
 - Dismiss per `(ticker, strategy, version)` — persisted to `cache/dismissed_tickers.json`
 - Click row → Watch / Dismiss / Open in Node Inspector actions
+- Open in Node Inspector passes all params (window, TP, SL, hold) via session state — dropdowns auto-select on arrival
 - Watch list table at bottom with inline label editing and remove-by-uncheck
+
+### Screener Page
+
+`pages/4_Screener.py` — filter the full ticker universe before deciding what to sweep.
+
+- Reads from `tickers` table in `cache/trading_universe.db`
+- Filters: symbol/name search, AUM, dollar volume liquidity (investment × multiplier), leverage (2x/3x), inverse toggle, single-stock underlier toggle, has-data toggle, underlying index search, performance
+- Columns: stock_underlier, index_underlier, leverage, inverse, has_data, price, dollar vol, AUM, performance, signals
+- "Add to config.json" button adds selected tickers to `target_tickers` for the next sweep
+
+### Ticker Universe Table
+
+`tickers` table in `cache/trading_universe.db` — populated by `scripts/import_tickers.py` from screener CSV exports.
+
+- Key derived columns: `leverage` (parsed from description), `inverse` (from fund type/description), `has_data` (cache CSV exists), `stock_underlier` / `index_underlier` (classified from underlying index + description)
+- Re-run `python scripts/import_tickers.py <file.csv>` to replace with a new screener export
 
 See `docs/strategy_architecture.md` for the target node/strategy data model (deferred until second strategy is added).
 

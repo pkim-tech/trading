@@ -1,3 +1,4 @@
+import json
 import time
 import argparse
 import logging
@@ -14,8 +15,14 @@ except ImportError:
         df.to_csv(Path("./cache") / f"{ticker}_1h.csv")
 
 # --- GLOBAL CONFIGURATIONS ---
-DEFAULT_TICKERS = ["SOXL", "TQQQ", "KORU", "AGQ", "EDC", "LABU", "CRMX", "VOO","SQQQ", "SSO"]
+TICKERS_FILE  = Path("./tickers.json")
 LOOP_INTERVAL = 300  # 5 minutes in seconds
+
+
+def load_tickers() -> list[str]:
+    if not TICKERS_FILE.exists():
+        raise FileNotFoundError(f"{TICKERS_FILE} not found — create it with a JSON array of ticker symbols")
+    return json.loads(TICKERS_FILE.read_text())
 
 # --- RUNTIME DIRECTORY SETUP ---
 LOG_DIR = Path("./logs")
@@ -53,8 +60,7 @@ def parse_runtime_arguments():
 def start_batch_collector():
     args = parse_runtime_arguments()
     
-    # 🟢 FORCE INCLUSION: Auto-inject SPY benchmark to stay perfectly synced with your basket
-    portfolio_tickers = list(DEFAULT_TICKERS)
+    portfolio_tickers = load_tickers()
     if "SPY" not in portfolio_tickers:
         portfolio_tickers.append("SPY")
         

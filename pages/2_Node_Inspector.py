@@ -101,12 +101,7 @@ else:
         else:
             with st.spinner("Decoding tick ledger streams and compiling backtest profiles..."):
                 df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True).sort_index()
-                strategy_mapping = {
-                    "ZScore_Original": strategies.ZScoreBreakout,
-                    "ZScore_TrendFiltered": strategies.TrendFilteredZScore
-                }
-                
-                strat_class = strategy_mapping.get(selected_strategy)
+                strat_class = getattr(strategies, selected_strategy, None)
                 close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
                 df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
                 

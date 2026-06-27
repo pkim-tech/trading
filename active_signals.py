@@ -20,12 +20,14 @@ Environment (Webhook fallback — fire-and-forget, no buttons):
     SIGNAL_POLL_SECS    — poll interval in seconds (default 300)
 """
 
+import io
 import os
 import sys
 import json
 import time
 import sqlite3
 import threading
+import contextlib
 import requests
 import pandas as pd
 import matplotlib
@@ -36,6 +38,7 @@ from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+from data_manager import fetch_live_data_smart
 import strategies
 
 load_dotenv()
@@ -771,6 +774,17 @@ def run_loop(tickers: set = None):
             buy_alerted.clear()
             last_date = today
 
+        watchlist = get_watchlist()
+        if tickers:
+            watchlist = [n for n in watchlist if n['ticker'] in tickers]
+        refresh_tickers = {p['ticker'] for p in get_open_positions()} | {n['ticker'] for n in watchlist}
+        for t in sorted(refresh_tickers):
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    fetch_live_data_smart(t)
+            except Exception as e:
+                print(f"  [data] {t} refresh failed: {e}")
+
         for pos in get_open_positions():
             if tickers and pos['ticker'] not in tickers:
                 continue
@@ -784,9 +798,6 @@ def run_loop(tickers: set = None):
                 notify_sell_signal(pos, reason, cp, target)
                 sell_alerted.add(pos['id'])
 
-        watchlist = get_watchlist()
-        if tickers:
-            watchlist = [n for n in watchlist if n['ticker'] in tickers]
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
             time.sleep(POLL_SECS)

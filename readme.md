@@ -6,12 +6,16 @@ A z-score mean reversion system for leveraged ETFs, built in three layers: data 
 
 ## Layer 1 — Data Collection
 
-`data_collector.py` runs as a background daemon, polling `data_manager.py` every 5 minutes to fetch and cache hourly OHLCV data for the full ticker universe via yfinance. Data is stored as CSV files in `cache/` (one per ticker). SPY is always included as the benchmark.
+`data_collector.py` fetches and caches hourly OHLCV data for the full ticker universe via yfinance. Data is stored as CSV files in `cache/` (one per ticker). SPY is always appended as the benchmark.
+
+The ticker universe is defined in `tickers.json` — a plain JSON array of symbols. Edit this file to add or remove tickers; both `data_collector.py` and the optimization sweep read from it.
 
 ```bash
-python data_collector.py        # runs continuously
+python data_collector.py        # runs continuously (every 5 min)
 python data_collector.py --once # single fetch and exit
 ```
+
+A cron job runs `--once` daily at 8 AM to keep all tickers fresh. Output is logged to `logs/data_collector_daily.log`.
 
 ---
 
@@ -39,14 +43,11 @@ Config is set via `app.py` (Streamlit UI) or by editing `config.json` directly.
 
 ## Layer 3 — Active Signals
 
-`active_signals.py` monitors the watch list and fires BUY/SELL alerts to console and Slack when entry/exit conditions are met. It reads from the same price cache as Layer 1 — both processes must be running simultaneously for signals to reflect current prices.
+`active_signals.py` monitors the watch list and fires BUY/SELL alerts to Slack (and console) when entry/exit conditions are met. It fetches fresh price data for each watched ticker at the start of every poll cycle — no separate data collector process needed.
 
 ```bash
-# Terminal 1 — keeps price cache fresh
-python data_collector.py
-
-# Terminal 2 — monitors watch list, fires alerts
-python active_signals.py
+python active_signals.py                        # monitor all watched tickers
+python active_signals.py --ticker AGQ,TQQQ      # limit to specific tickers
 ```
 
 **Watch list management:**
@@ -58,9 +59,13 @@ python active_signals.py remove     # remove a node
 python active_signals.py positions  # show open positions
 ```
 
-**Slack notifications:** set `SLACK_WEBHOOK_URL` in `.env`. Console output works without it.
+**Slack — Socket Mode (interactive):** set `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and `SLACK_CHANNEL` in `.env`. BUY/SELL alerts include Executed/Skipped buttons. Clicking opens a modal to enter execution price, which opens or closes a position in the DB. A price chart (30-day price + SMA/bands + signal marker) is uploaded to the channel on each signal.
 
-When a BUY signal fires, the loop blocks and prompts for your execution price. If you enter one, the position is tracked in `open_positions` and monitored for TP, SL, and time-exit conditions. When a SELL condition is met, it fires again and prompts for your exit price.
+**Slack — Webhook fallback:** set `SLACK_WEBHOOK_URL` in `.env`. Fire-and-forget, no interactive buttons.
+
+**Console only:** works without any Slack config — blocks on stdin and prompts for execution price.
+
+Poll interval defaults to 300s and is controlled by `SIGNAL_POLL_SECS` in `.env`.
 
 ---
 

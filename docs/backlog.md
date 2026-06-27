@@ -2,9 +2,9 @@
 
 ## High Priority
 
-- **Data refresh wiring**: Call `fetch_live_data_smart(ticker)` inside `active_signals.py` poll loop before checking signals — currently relies on `data_collector.py` running separately.
 - **Trade log**: New DB table to record each executed trade — signal price, execution price, exit price, drift on entry/exit. Triggered from Socket Mode modal submissions.
-- **Winners → Node Inspector jump**: Clicking a row in Winners should navigate directly to the correct node in Node Inspector (ticker + strategy + version already passed via session state; window/hold/TP/SL dropdowns need auto-selection on arrival).
+- **Screener → sweep**: Re-export leveraged ETF screener with Underlying Index + Total Assets columns, re-import, then use Screener page to select candidates and add to config.json for sweep. Current import (Results 7.csv) is missing those columns so underlier classification is incomplete.
+- **Run sweep on leveraged universe**: ~130 leveraged ETFs with data at 2x/3x. At 20 min/ticker with current grid → ~45 hours. Consider coarsening TP/SL grid to reduce to ~3 days.
 
 ## Visualization Pages (Streamlit)
 

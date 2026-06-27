@@ -197,9 +197,13 @@ if selected_rows:
     with a3:
         if st.button("Open in Node Inspector"):
             st.session_state["target_node"] = {
-                "ticker":   r['ticker'],
-                "strategy": r['strategy'],
-                "version":  version,
+                "ticker":        r['ticker'],
+                "strategy":      r['strategy'],
+                "version":       version,
+                "window":        int(r['window']),
+                "take_profit":   int(r['take_profit']),
+                "stop_loss":     int(r['stop_loss']),
+                "max_hold_hours": int(r['max_hold_hours']),
             }
             st.switch_page("pages/2_Node_Inspector.py")
 
