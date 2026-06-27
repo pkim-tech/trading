@@ -54,13 +54,25 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 ## Layer 3 — Active Signals
 
-`active_signals.py` — polls cached price data, fires BUY/SELL alerts to console and Slack, blocks for execution confirmation. Requires `data_collector.py` running simultaneously to keep price cache fresh.
+`active_signals.py` — polls cached price data, fires BUY/SELL alerts to console and Slack. Requires `data_collector.py` running simultaneously to keep price cache fresh.
 
 - `watch_list` DB table — nodes selected for live monitoring
 - `open_positions` DB table — tracks entries pending exit
 - Entry/exit logic delegated to strategy classes in `strategies.py` — no signal logic in `active_signals.py`
-- Slack notifications via incoming webhook (Block Kit); interactive buttons (Socket Mode) planned
+- **Slack Socket Mode** — bot token + app token; BUY/SELL messages have interactive Executed/Skipped buttons, price entry modal, chart image upload
+- Signal indicators use prior closed day's SMA/Std (not today's intraday close) — matches live trading semantics
+- `--ticker TICKER` flag to filter the poll loop to specific tickers
 - No brokerage integration — manual execution
+- `scripts/live_test.py` — synthetic TEST ticker for end-to-end Socket Mode testing
+
+### Winners Page
+
+`pages/3_Winners.py` — Streamlit leaderboard of top nodes per ticker for a selected version.
+
+- Filters: version, ticker, strategy, min trades, min alpha, beat asset B&H toggle, top N per ticker
+- Dismiss per `(ticker, strategy, version)` — persisted to `cache/dismissed_tickers.json`
+- Click row → Watch / Dismiss / Open in Node Inspector actions
+- Watch list table at bottom with inline label editing and remove-by-uncheck
 
 See `docs/strategy_architecture.md` for the target node/strategy data model (deferred until second strategy is added).
 

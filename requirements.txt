@@ -11,3 +11,4 @@ python-dotenv
 scikit-learn
 scipy
 tqdm
+slack_bolt

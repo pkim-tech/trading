@@ -9,19 +9,32 @@ Usage:
     python active_signals.py remove   # remove a node interactively
     python active_signals.py positions  # show open positions
 
-Environment:
-    SLACK_WEBHOOK_URL   — incoming webhook URL for notifications
+Environment (Socket Mode — interactive buttons):
+    SLACK_BOT_TOKEN     — bot OAuth token (xoxb-...)
+    SLACK_APP_TOKEN     — app-level token (xapp-...) for Socket Mode
+    SLACK_CHANNEL       — channel to post to (e.g. #trading)
+
+Environment (Webhook fallback — fire-and-forget, no buttons):
+    SLACK_WEBHOOK_URL   — incoming webhook URL
+
     SIGNAL_POLL_SECS    — poll interval in seconds (default 300)
 """
 
 import os
 import sys
+import json
 import time
 import sqlite3
+import threading
 import requests
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from io import BytesIO
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 import strategies
 
@@ -31,6 +44,31 @@ DB_PATH    = Path("./cache/trading_universe.db")
 CACHE_DIR  = Path("./cache")
 POLL_SECS  = int(os.environ.get("SIGNAL_POLL_SECS", 300))
 SLACK_HOOK = os.environ.get("SLACK_WEBHOOK_URL", "")
+
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
+SLACK_CHANNEL   = os.environ.get("SLACK_CHANNEL", "")
+SOCKET_MODE     = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNEL)
+
+SLACK_CHANNEL_ID = ""
+
+if SOCKET_MODE:
+    from slack_bolt import App
+    from slack_bolt.adapter.socket_mode import SocketModeHandler
+    bolt_app = App(token=SLACK_BOT_TOKEN)
+else:
+    bolt_app = None
+
+
+def _resolve_channel_id():
+    global SLACK_CHANNEL_ID
+    if SLACK_CHANNEL_ID or not SOCKET_MODE:
+        return
+    try:
+        r = bolt_app.client.chat_postMessage(channel=SLACK_CHANNEL, text="Signal monitor online.")
+        SLACK_CHANNEL_ID = r['channel']
+    except Exception as e:
+        print(f"  [slack] could not resolve channel ID: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +117,7 @@ def ensure_tables():
 
 
 # ---------------------------------------------------------------------------
-# Watch list CRUD (called by Streamlit picker and CLI)
+# Watch list CRUD
 # ---------------------------------------------------------------------------
 
 def get_watchlist():
@@ -132,6 +170,8 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time):
         if existing:
             print(f"  [warn] position already open for {node['ticker']} w={node['window']} — skipping duplicate")
             return
+        sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
+        entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
         c.execute("""
             INSERT INTO open_positions
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
@@ -141,8 +181,8 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time):
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(node['take_profit']), int(node['stop_loss']),
             int(node['max_hold_hours']),
-            float(signal_price), signal_time.strftime('%Y-%m-%d %H:%M:%S'),
-            float(entry_price), entry_time.strftime('%Y-%m-%d %H:%M:%S'),
+            float(signal_price), sig_time_str,
+            float(entry_price), entry_time_str,
         ))
         c.commit()
 
@@ -192,8 +232,9 @@ def compute_buy_signal(node):
     if df_hourly is None or len(df_daily) < window:
         return None
 
-    strat      = strategy_cls(window=window)
-    indicators = strat.generate_daily_indicators(df_daily)
+    strat = strategy_cls(window=window)
+    today = pd.Timestamp.now().normalize()
+    indicators = strat.generate_daily_indicators(df_daily[df_daily.index < today])
     if indicators.empty:
         return None
 
@@ -232,34 +273,371 @@ def check_sell_condition(pos, current_price, now):
 
 
 # ---------------------------------------------------------------------------
-# Notifications
+# Chart generation
 # ---------------------------------------------------------------------------
 
-def _slack(text, blocks=None):
-    if not SLACK_HOOK:
+def _upload_chart(buf: BytesIO, filename: str, title: str):
+    if not SOCKET_MODE or not SLACK_CHANNEL_ID:
         return
-    payload = {'text': text}
-    if blocks:
-        payload['blocks'] = blocks
     try:
-        r = requests.post(SLACK_HOOK, json=payload, timeout=5)
-        if not r.ok:
-            print(f"  [slack error] HTTP {r.status_code}")
+        bolt_app.client.files_upload_v2(
+            channel=SLACK_CHANNEL_ID,
+            file=buf,
+            filename=filename,
+            title=title,
+        )
     except Exception as e:
-        print(f"  [slack error] {e}")
+        print(f"  [chart] upload failed: {e}")
 
 
-def _slack_blocks(header_text, fields, context=None):
+def _chart_buy(node, sig) -> BytesIO | None:
+    ticker = sig['ticker']
+    window = int(node['window'])
+    df_hourly, df_daily = _load_cache(ticker)
+    if df_hourly is None:
+        return None
+
+    today      = pd.Timestamp.now().normalize()
+    cutoff     = df_hourly.index[-1] - pd.Timedelta(days=30)
+    df_plot    = df_hourly[df_hourly.index >= cutoff]['Close'].dropna()
+    strat      = getattr(strategies, node['strategy'])(window=window)
+    indicators = strat.generate_daily_indicators(df_daily[df_daily.index < today])
+
+    sma_h   = indicators['SMA'].reindex(df_plot.index, method='ffill')
+    std_h   = indicators['Std'].reindex(df_plot.index, method='ffill')
+    upper_h = sma_h + 2 * std_h
+    lower_h = sma_h - 2 * std_h
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(df_plot.index, df_plot.values, color='#4c9be8', linewidth=1, label='Price')
+    ax.plot(sma_h.index, sma_h.values, color='#f0a500', linewidth=1, label=f'SMA({window})')
+    ax.fill_between(df_plot.index, lower_h, upper_h, alpha=0.12, color='#f0a500')
+    ax.plot(lower_h.index, lower_h.values, color='#f0a500', linewidth=0.6, linestyle='--')
+    ax.axvline(sig['last_bar'], color='#2ecc71', linewidth=1.5, linestyle='--', alpha=0.8)
+    ax.scatter([sig['last_bar']], [sig['current_price']], color='#2ecc71', s=60, zorder=5)
+    ax.set_title(f"{ticker}  BUY SIGNAL  |  z = {sig['z_score']:.2f}  |  window={window}", fontsize=11)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+
+    buf = BytesIO()
+    fig.savefig(buf, format='png', dpi=120)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _chart_sell(pos, current_price) -> BytesIO | None:
+    ticker = pos['ticker']
+    window = int(pos['window'])
+    df_hourly, df_daily = _load_cache(ticker)
+    if df_hourly is None:
+        return None
+
+    today      = pd.Timestamp.now().normalize()
+    cutoff     = df_hourly.index[-1] - pd.Timedelta(days=30)
+    df_plot    = df_hourly[df_hourly.index >= cutoff]['Close'].dropna()
+    strat      = getattr(strategies, pos['strategy'])(window=window)
+    indicators = strat.generate_daily_indicators(df_daily[df_daily.index < today])
+
+    sma_h   = indicators['SMA'].reindex(df_plot.index, method='ffill')
+    std_h   = indicators['Std'].reindex(df_plot.index, method='ffill')
+    upper_h = sma_h + 2 * std_h
+    lower_h = sma_h - 2 * std_h
+
+    ep         = pos['entry_price']
+    tp_price   = ep * (1 + pos['take_profit'] / 100)
+    sl_price   = ep * (1 - pos['stop_loss'] / 100)
+    entry_time = datetime.strptime(pos['entry_time'], '%Y-%m-%d %H:%M:%S')
+    pct        = (current_price - ep) / ep * 100
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(df_plot.index, df_plot.values, color='#4c9be8', linewidth=1, label='Price')
+    ax.plot(sma_h.index, sma_h.values, color='#f0a500', linewidth=1, label=f'SMA({window})')
+    ax.fill_between(df_plot.index, lower_h, upper_h, alpha=0.12, color='#f0a500')
+    ax.axhline(tp_price, color='#2ecc71', linewidth=1, linestyle='--', label=f'TP ${tp_price:.2f}')
+    ax.axhline(sl_price, color='#e74c3c', linewidth=1, linestyle='--', label=f'SL ${sl_price:.2f}')
+    ax.axhline(ep, color='white', linewidth=0.8, linestyle=':', alpha=0.6, label=f'Entry ${ep:.2f}')
+    if entry_time in df_plot.index or df_plot.index[0] <= entry_time <= df_plot.index[-1]:
+        ax.axvline(entry_time, color='#9b59b6', linewidth=1.2, linestyle='--', alpha=0.7)
+    ax.set_title(f"{ticker}  SELL SIGNAL  |  P&L {pct:+.2f}%  |  window={window}", fontsize=11)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+
+    buf = BytesIO()
+    fig.savefig(buf, format='png', dpi=120)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# ---------------------------------------------------------------------------
+# Slack helpers
+# ---------------------------------------------------------------------------
+
+def _post_message(text, blocks=None):
+    if SOCKET_MODE:
+        try:
+            bolt_app.client.chat_postMessage(channel=SLACK_CHANNEL, text=text, blocks=blocks)
+        except Exception as e:
+            print(f"  [slack error] {e}")
+    elif SLACK_HOOK:
+        payload = {'text': text}
+        if blocks:
+            payload['blocks'] = blocks
+        try:
+            r = requests.post(SLACK_HOOK, json=payload, timeout=5)
+            if not r.ok:
+                print(f"  [slack error] HTTP {r.status_code}")
+        except Exception as e:
+            print(f"  [slack error] {e}")
+
+
+def _fields_block(fields: dict):
+    return {"type": "section", "fields": [
+        {"type": "mrkdwn", "text": f"*{k}:*\n{v}"} for k, v in fields.items()
+    ]}
+
+
+def _price_input_block():
+    return {
+        "type":     "input",
+        "block_id": "price_block",
+        "label":    {"type": "plain_text", "text": "Price"},
+        "element":  {
+            "type":               "number_input",
+            "is_decimal_allowed": True,
+            "action_id":          "price_input",
+            "placeholder":        {"type": "plain_text", "text": "e.g. 123.45"},
+        },
+    }
+
+
+def _build_buy_blocks(node, sig):
+    ticker  = sig['ticker']
+    price   = sig['current_price']
+    z       = sig['z_score']
+    bar_str = sig['last_bar'].strftime('%Y-%m-%d %H:%M')
+
     blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": header_text}},
-        {"type": "section", "fields": [
-            {"type": "mrkdwn", "text": f"*{k}:*\n{v}"} for k, v in fields.items()
-        ]},
+        {"type": "header", "text": {"type": "plain_text", "text": f"BUY SIGNAL — {ticker}"}},
+        _fields_block({
+            "Price":      f"${price:.4f}",
+            "Lower Band": f"${sig['lower_band']:.4f}",
+            "Z-Score":    f"{z:.2f}",
+            "Bar":        bar_str,
+            "Window":     str(node['window']),
+            "TP / SL":    f"{node['take_profit']}% / {node['stop_loss']}%",
+            "Max Hold":   f"{node['max_hold_hours']}h",
+            "SMA":        f"${sig['sma']:.4f}",
+        }),
     ]
-    if context:
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": context}]})
+
+    if SOCKET_MODE:
+        value = json.dumps({
+            "type":         "buy",
+            "node":         {k: node[k] for k in ('ticker', 'strategy', 'version', 'window',
+                                                    'take_profit', 'stop_loss', 'max_hold_hours', 'label')},
+            "signal_price": price,
+            "signal_time":  sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'),
+            "lower_band":   sig['lower_band'],
+            "z_score":      z,
+        })
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Executed"},
+                 "style": "primary", "action_id": "buy_executed", "value": value},
+                {"type": "button", "text": {"type": "plain_text", "text": "Skipped"},
+                 "action_id": "buy_skipped", "value": value},
+            ],
+        })
+    else:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "Reply with execution price when filled."}
+        ]})
+
     return blocks
 
+
+def _build_sell_blocks(pos, reason, current_price, target_price):
+    reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT'}
+    ticker     = pos['ticker']
+    ep         = pos['entry_price']
+    entry_time = pos['entry_time']
+    pct        = (current_price - ep) / ep * 100
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text",
+         "text": f"SELL SIGNAL — {ticker} ({reason_labels[reason]})"}},
+        _fields_block({
+            "Entry Price":   f"${ep:.4f}",
+            "Current Price": f"${current_price:.4f}",
+            "P&L":           f"{pct:+.2f}%",
+            "Target":        f"${target_price:.4f}",
+            "TP / SL":       f"{pos['take_profit']}% / {pos['stop_loss']}%",
+            "Max Hold":      f"{pos['max_hold_hours']}h",
+            "Entered":       entry_time,
+        }),
+    ]
+
+    if SOCKET_MODE:
+        value = json.dumps({
+            "type":          "sell",
+            "position_id":   pos['id'],
+            "ticker":        ticker,
+            "current_price": current_price,
+            "entry_price":   ep,
+            "reason":        reason,
+        })
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Exited"},
+                 "style": "primary", "action_id": "sell_exited", "value": value},
+                {"type": "button", "text": {"type": "plain_text", "text": "Skipped"},
+                 "action_id": "sell_skipped", "value": value},
+            ],
+        })
+    else:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "Reply with exit price when filled."}
+        ]})
+
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# Bolt handlers (Socket Mode only)
+# ---------------------------------------------------------------------------
+
+if SOCKET_MODE:
+
+    @bolt_app.action("buy_executed")
+    def handle_buy_executed(ack, body, client):
+        ack()
+        data    = json.loads(body['actions'][0]['value'])
+        channel = body['channel']['id']
+        ts      = body['message']['ts']
+        client.views_open(
+            trigger_id=body['trigger_id'],
+            view={
+                "type":             "modal",
+                "callback_id":      "entry_price_submit",
+                "private_metadata": json.dumps({"data": data, "channel": channel, "ts": ts}),
+                "title":  {"type": "plain_text", "text": "Entry Price"},
+                "submit": {"type": "plain_text", "text": "Confirm"},
+                "close":  {"type": "plain_text", "text": "Cancel"},
+                "blocks": [_price_input_block()],
+            },
+        )
+
+    @bolt_app.action("buy_skipped")
+    def handle_buy_skipped(ack, body, client):
+        ack()
+        data    = json.loads(body['actions'][0]['value'])
+        channel = body['channel']['id']
+        ts      = body['message']['ts']
+        ticker  = data['node']['ticker']
+        client.chat_update(
+            channel=channel, ts=ts,
+            text=f"BUY {ticker} — Skipped",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"*BUY {ticker}* — Skipped"}}],
+        )
+
+    @bolt_app.view("entry_price_submit")
+    def handle_entry_price(ack, body, client):
+        ack()
+        meta         = json.loads(body['view']['private_metadata'])
+        data         = meta['data']
+        channel      = meta['channel']
+        ts           = meta['ts']
+        node         = data['node']
+        signal_price = data['signal_price']
+        signal_time  = datetime.strptime(data['signal_time'], '%Y-%m-%d %H:%M:%S')
+
+        exec_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
+        drift_pct  = (exec_price - signal_price) / signal_price * 100
+        now        = datetime.now()
+
+        open_position(node, signal_price, signal_time, exec_price, now)
+
+        ticker = node['ticker']
+        note   = f"${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
+        print(f"  Position opened via Slack: {ticker} at {note}")
+        client.chat_update(
+            channel=channel, ts=ts,
+            text=f"BUY {ticker} — Executed at {note}",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"*BUY {ticker}* — Executed at {note}"}}],
+        )
+
+    @bolt_app.action("sell_exited")
+    def handle_sell_exited(ack, body, client):
+        ack()
+        data    = json.loads(body['actions'][0]['value'])
+        channel = body['channel']['id']
+        ts      = body['message']['ts']
+        client.views_open(
+            trigger_id=body['trigger_id'],
+            view={
+                "type":             "modal",
+                "callback_id":      "exit_price_submit",
+                "private_metadata": json.dumps({"data": data, "channel": channel, "ts": ts}),
+                "title":  {"type": "plain_text", "text": "Exit Price"},
+                "submit": {"type": "plain_text", "text": "Confirm"},
+                "close":  {"type": "plain_text", "text": "Cancel"},
+                "blocks": [_price_input_block()],
+            },
+        )
+
+    @bolt_app.action("sell_skipped")
+    def handle_sell_skipped(ack, body, client):
+        ack()
+        data    = json.loads(body['actions'][0]['value'])
+        channel = body['channel']['id']
+        ts      = body['message']['ts']
+        ticker  = data['ticker']
+        client.chat_update(
+            channel=channel, ts=ts,
+            text=f"SELL {ticker} — Skipped (position kept open)",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"*SELL {ticker}* — Skipped (position kept open)"}}],
+        )
+
+    @bolt_app.view("exit_price_submit")
+    def handle_exit_price(ack, body, client):
+        ack()
+        meta         = json.loads(body['view']['private_metadata'])
+        data         = meta['data']
+        channel      = meta['channel']
+        ts           = meta['ts']
+        position_id  = data['position_id']
+        ticker       = data['ticker']
+        entry_price  = data['entry_price']
+        signal_price = data['current_price']
+
+        exit_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
+        drift_pct  = (exit_price - signal_price) / signal_price * 100
+        actual_pnl = (exit_price - entry_price) / entry_price * 100
+
+        close_position(position_id)
+
+        note = f"${exit_price:.4f}  (signal drift: {drift_pct:+.2f}%  P&L: {actual_pnl:+.2f}%)"
+        print(f"  Position closed via Slack: {ticker} at {note}")
+        client.chat_update(
+            channel=channel, ts=ts,
+            text=f"SELL {ticker} — Exited at {note}",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"*SELL {ticker}* — Exited at {note}"}}],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
 
 def notify_buy_signal(node, sig):
     ticker   = sig['ticker']
@@ -279,17 +657,17 @@ def notify_buy_signal(node, sig):
     print(f"  SMA: ${sig['sma']:.4f}   Std: ${sig['std']:.4f}")
     print(sep)
 
-    _slack(
+    _post_message(
         f"BUY SIGNAL — {ticker}  ${price:.4f}  z={z:.2f}  ({bar_str})",
-        _slack_blocks(
-            f"\U0001f514 BUY SIGNAL — {ticker}",
-            {"Price": f"${price:.4f}", "Lower Band": f"${sig['lower_band']:.4f}",
-             "Z-Score": f"{z:.2f}", "Bar": bar_str,
-             "Window": str(node['window']), "TP / SL": f"{tp}% / {sl}%",
-             "Max Hold": f"{hold}h", "SMA": f"${sig['sma']:.4f}"},
-            context="Reply with execution price when filled.",
-        )
+        _build_buy_blocks(node, sig),
     )
+
+    if SOCKET_MODE:
+        chart = _chart_buy(node, sig)
+        if chart:
+            _upload_chart(chart, f"{ticker}_buy.png", f"BUY — {ticker}  z={z:.2f}")
+        print("  Waiting for Slack response (Executed / Skipped).")
+        return
 
     print("\nDid you execute? Enter price (or Enter to skip): ", end='', flush=True)
     try:
@@ -305,7 +683,7 @@ def notify_buy_signal(node, sig):
             open_position(node, price, bar_time, exec_price, now)
             note = f"Entered at ${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
             print(f"  Position opened. {note}")
-            _slack(f"{ticker} position opened: {note}")
+            _post_message(f"{ticker} position opened: {note}")
         except ValueError:
             print("  Invalid price — position not opened.")
     else:
@@ -317,9 +695,6 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     ep         = pos['entry_price']
     entry_time = pos['entry_time']
     pct        = (current_price - ep) / ep * 100
-    tp         = pos['take_profit']
-    sl         = pos['stop_loss']
-    hold       = pos['max_hold_hours']
 
     reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT'}
 
@@ -327,21 +702,21 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     print(f"\n{sep}")
     print(f"  SELL SIGNAL  {ticker}  — {reason_labels[reason]}")
     print(f"  Entry: ${ep:.4f}  →  Current: ${current_price:.4f}  ({pct:+.2f}%)")
-    print(f"  Target: ${target_price:.4f}   Node: TP={tp}%  SL={sl}%  hold={hold}h")
+    print(f"  Target: ${target_price:.4f}   Node: TP={pos['take_profit']}%  SL={pos['stop_loss']}%  hold={pos['max_hold_hours']}h")
     print(f"  Entered: {entry_time}")
     print(sep)
 
-    _slack(
+    _post_message(
         f"SELL SIGNAL — {ticker}  {reason_labels[reason]}  ${current_price:.4f}  ({pct:+.2f}%)",
-        _slack_blocks(
-            f"\U0001f6a8 SELL SIGNAL — {ticker}  ({reason_labels[reason]})",
-            {"Entry Price": f"${ep:.4f}", "Current Price": f"${current_price:.4f}",
-             "P&L": f"{pct:+.2f}%", "Target": f"${target_price:.4f}",
-             "TP / SL": f"{tp}% / {sl}%", "Max Hold": f"{hold}h",
-             "Entered": entry_time},
-            context="Reply with exit price when filled.",
-        )
+        _build_sell_blocks(pos, reason, current_price, target_price),
     )
+
+    if SOCKET_MODE:
+        chart = _chart_sell(pos, current_price)
+        if chart:
+            _upload_chart(chart, f"{ticker}_sell.png", f"SELL — {ticker}  {reason_labels[reason]}  {pct:+.2f}%")
+        print("  Waiting for Slack response (Exited / Skipped).")
+        return
 
     print("\nDid you exit? Enter price (or Enter to skip): ", end='', flush=True)
     try:
@@ -357,7 +732,7 @@ def notify_sell_signal(pos, reason, current_price, target_price):
             note = f"Exited at ${exit_price:.4f}  (signal drift: {drift_pct:+.2f}%  P&L: {actual_pnl:+.2f}%)"
             close_position(pos['id'])
             print(f"  Position closed. {note}")
-            _slack(f"{ticker} position closed: {note}")
+            _post_message(f"{ticker} position closed: {note}")
         except ValueError:
             print("  Invalid price — position kept open.")
     else:
@@ -368,28 +743,37 @@ def notify_sell_signal(pos, reason, current_price, target_price):
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_loop():
+def run_loop(tickers: set = None):
     ensure_tables()
-    print(f"Signal monitor started  |  poll={POLL_SECS}s  |  Ctrl+C to stop")
-    if not SLACK_HOOK:
-        print("  [info] SLACK_WEBHOOK_URL not set — console only")
+    ticker_label = ",".join(sorted(tickers)) if tickers else "all"
+    print(f"Signal monitor started  |  poll={POLL_SECS}s  |  tickers={ticker_label}  |  Ctrl+C to stop")
 
-    # One BUY alert per (ticker, window) per calendar day
-    buy_alerted: set[tuple] = set()
-    # One SELL alert per open position ID per run (until position closed or restarted)
-    sell_alerted: set[int] = set()
+    if SOCKET_MODE:
+        handler = SocketModeHandler(bolt_app, SLACK_APP_TOKEN)
+        t = threading.Thread(target=handler.start, daemon=True)
+        t.start()
+        _resolve_channel_id()
+        print("  [slack] Socket Mode active — interactive buttons enabled")
+    elif SLACK_HOOK:
+        print("  [slack] Webhook mode — no interactive buttons")
+    else:
+        print("  [info] No Slack config — console only")
+
+    buy_alerted:  set[tuple] = set()
+    sell_alerted: set[int]   = set()
     last_date = datetime.now().strftime('%Y-%m-%d')
 
     while True:
-        now      = datetime.now()
-        today    = now.strftime('%Y-%m-%d')
+        now   = datetime.now()
+        today = now.strftime('%Y-%m-%d')
 
         if today != last_date:
             buy_alerted.clear()
             last_date = today
 
-        # --- Check open positions for SELL conditions first ---
         for pos in get_open_positions():
+            if tickers and pos['ticker'] not in tickers:
+                continue
             if pos['id'] in sell_alerted:
                 continue
             cp, _ = _current_price(pos['ticker'])
@@ -400,17 +784,19 @@ def run_loop():
                 notify_sell_signal(pos, reason, cp, target)
                 sell_alerted.add(pos['id'])
 
-        # --- Check watch list for BUY conditions ---
         watchlist = get_watchlist()
+        if tickers:
+            watchlist = [n for n in watchlist if n['ticker'] in tickers]
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
             time.sleep(POLL_SECS)
             continue
 
+        summaries = []
         for node in watchlist:
             sig = compute_buy_signal(node)
             if sig is None:
-                print(f"[{now.strftime('%H:%M:%S')}] {node['ticker']} w={node['window']}: no data")
+                summaries.append(f"{node['ticker']} w={node['window']} NO_DATA")
                 continue
 
             alert_key = (sig['ticker'], node['strategy'], sig['window'])
@@ -419,11 +805,12 @@ def run_loop():
                 buy_alerted.add(alert_key)
                 notify_buy_signal(node, sig)
             else:
-                print(
-                    f"[{now.strftime('%H:%M:%S')}] {sig['ticker']:<6} w={sig['window']:<3} "
-                    f"{sig['signal']:<4}  ${sig['current_price']:.4f}  "
-                    f"z={sig['z_score']:+.2f}  bar={sig['last_bar'].strftime('%m-%d %H:%M')}"
+                summaries.append(
+                    f"{sig['ticker']} z={sig['z_score']:+.2f} {sig['signal']}"
                 )
+
+        if summaries:
+            print(f"[{now.strftime('%H:%M:%S')}] {' | '.join(summaries)}")
 
         time.sleep(POLL_SECS)
 
@@ -472,7 +859,7 @@ def cmd_add():
     ensure_tables()
     print("Add node to watch list (values from backtest_cache):")
     ticker         = input("  ticker: ").strip().upper()
-    strategy       = input("  strategy [ZScore_Original]: ").strip() or "ZScore_Original"
+    strategy       = input("  strategy [ZScoreBreakout]: ").strip() or "ZScoreBreakout"
     version        = input("  version [v1.4]: ").strip() or "v1.4"
     window         = int(input("  window: ").strip())
     take_profit    = int(input("  take_profit: ").strip())
@@ -502,5 +889,14 @@ _CMDS = {
 }
 
 if __name__ == '__main__':
-    cmd = sys.argv[1] if len(sys.argv) > 1 else 'run'
-    _CMDS.get(cmd, run_loop)()
+    args = sys.argv[1:]
+    cmd  = args[0] if args else 'run'
+
+    if cmd in ('run', ) or cmd not in _CMDS:
+        tickers = None
+        if '--ticker' in args:
+            idx     = args.index('--ticker')
+            tickers = {t.strip().upper() for t in args[idx + 1].split(',')}
+        run_loop(tickers=tickers)
+    else:
+        _CMDS[cmd]()
