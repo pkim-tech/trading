@@ -13,7 +13,7 @@
         "VOO"
     ],
     "active_strategies": [
-        "ZScore_Original"
+        "ZScoreBreakout"
     ],
     "hyperparameters": {
         "windows": [

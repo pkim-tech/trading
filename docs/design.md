@@ -6,7 +6,7 @@ Three discrete layers, each independently runnable:
 
 1. **Data Collection** — daemon fetches and caches hourly OHLCV data
 2. **Parameter Optimization** — brute force search for robust alpha islands
-3. **Live Trading Engine** — apply optimized params to live signals (planned)
+3. **Active Signals** — apply optimized params to current market state, surface entries/exits (planned)
 
 ---
 
@@ -52,13 +52,24 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 ---
 
-## Layer 3 — Live Trading Engine (Planned)
+## Layer 3 — Active Signals
 
-Not yet implemented. `live_trading.py` will be built from scratch.
+`active_signals.py` — polls cached price data, fires BUY/SELL alerts to console and Slack, blocks for execution confirmation. Requires `data_collector.py` running simultaneously to keep price cache fresh.
 
-**Planned design:**
-- Read optimized parameter sets from Layer 2 SQLite results
-- Apply to live intraday signals (z-score against cached hourly data)
-- Track open positions across sessions
-- Manual state update workflow for end-of-day fills (user updates on return home)
-- May support multiple tickers simultaneously with different signal profiles
+- `watch_list` DB table — nodes selected for live monitoring
+- `open_positions` DB table — tracks entries pending exit
+- Entry/exit logic delegated to strategy classes in `strategies.py` — no signal logic in `active_signals.py`
+- Slack notifications via incoming webhook (Block Kit); interactive buttons (Socket Mode) planned
+- No brokerage integration — manual execution
+
+See `docs/strategy_architecture.md` for the target node/strategy data model (deferred until second strategy is added).
+
+---
+
+## Future — Live Trading Engine
+
+If a brokerage API key is added (e.g. Alpaca, IBKR), Layer 3 can be extended to:
+- Submit orders automatically on signal trigger
+- Track open positions via broker API (not manual state)
+- Handle fills, partial fills, and slippage reporting
+- End-of-day reconciliation against broker blotter

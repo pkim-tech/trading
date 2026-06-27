@@ -67,12 +67,7 @@ def run_single_backtest_node_isolated(args):
     if df_hourly_raw.empty:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "status": "EMPTY"}
 
-    # 🔄 Dynamically mappings class references to prevent missing strategy errors in processes
-    strategy_mapping = {
-        "ZScore_Original": strategies.ZScoreBreakout,
-        "ZScore_TrendFiltered": strategies.TrendFilteredZScore
-    }
-    strategy_class = strategy_mapping.get(strategy_name)
+    strategy_class = getattr(strategies, strategy_name, None)
     if not strategy_class:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "status": "UNKNOWN_STRAT"}
 
@@ -341,22 +336,17 @@ if __name__ == "__main__":
             config = json.load(f)
         filtered_tickers = config.get("target_tickers", [])
         # 🌟 NEW: Pull configuration target lists straight out of workspace JSON fields
-        configured_strategies = config.get("active_strategies", ["ZScore_Original"])
+        configured_strategies = config.get("active_strategies", ["ZScoreBreakout"])
     except Exception as conf_err:
         logger.critical(f"Failed to extract dynamic runtime inputs from config.json: {conf_err}")
         filtered_tickers = []
-        configured_strategies = ["ZScore_Original"]
-        
-    strategy_class_references = {
-        "ZScore_Original": strategies.ZScoreBreakout,
-        "ZScore_TrendFiltered": strategies.TrendFilteredZScore
-    }
-    
+        configured_strategies = ["ZScoreBreakout"]
+
     if filtered_tickers:
         with ProcessPoolExecutor(max_workers=10) as shared_pool:
             for ticker in filtered_tickers:
                 for name in configured_strategies:
-                    strat_class = strategy_class_references.get(name)
+                    strat_class = getattr(strategies, name, None)
                     if not strat_class:
                         logger.warning(f"Skip request: Strategy key '{name}' lacks structural mapper index.")
                         continue

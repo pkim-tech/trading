@@ -37,11 +37,30 @@ Config is set via `app.py` (Streamlit UI) or by editing `config.json` directly.
 
 ---
 
-## Layer 3 — Live Trading Engine (Planned)
+## Layer 3 — Active Signals
 
-`live_trading.py` (not yet built). The intent is to take optimized parameter sets from Layer 2, apply them to live intraday signals, and track open positions across sessions.
+`active_signals.py` monitors the watch list and fires BUY/SELL alerts to console and Slack when entry/exit conditions are met. It reads from the same price cache as Layer 1 — both processes must be running simultaneously for signals to reflect current prices.
 
-Manual state updates will be needed (e.g. logging fills when returning home after market hours). This layer is not yet implemented.
+```bash
+# Terminal 1 — keeps price cache fresh
+python data_collector.py
+
+# Terminal 2 — monitors watch list, fires alerts
+python active_signals.py
+```
+
+**Watch list management:**
+
+```bash
+python active_signals.py list       # show watched nodes
+python active_signals.py add        # add a node interactively
+python active_signals.py remove     # remove a node
+python active_signals.py positions  # show open positions
+```
+
+**Slack notifications:** set `SLACK_WEBHOOK_URL` in `.env`. Console output works without it.
+
+When a BUY signal fires, the loop blocks and prompts for your execution price. If you enter one, the position is tracked in `open_positions` and monitored for TP, SL, and time-exit conditions. When a SELL condition is met, it fires again and prompts for your exit price.
 
 ---
 
