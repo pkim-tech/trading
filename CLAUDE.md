@@ -1,8 +1,8 @@
 # Trading Alpha Engine
 
 ## Session Commands
-- `go` — session start: read `docs/session_cache.md` and give a brief summary of where we left off and what's next
-- `session close` — session end: append a handover summary to `docs/session_cache.md` covering what was done, current state, and what the next session should pick up. No commits, no tests.
+- `go` — session start: read `docs/handover.md` (compact current state) and give a brief summary of where we left off and what's next. Fall back to `docs/session_cache.md` only if handover.md is missing or unclear.
+- `session close` — session end: append a handover summary to `docs/session_cache.md` AND overwrite `docs/handover.md` with the current compact state. No commits, no tests.
 - `feature wrap` — mid-session feature complete: update relevant docs, run pre-commit checklist (`docs/pre_commit_checklist.md`), and commit. Does not trigger session close.
 - `session wrap` — feature wrap followed by session close.
 
