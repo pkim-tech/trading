@@ -158,12 +158,6 @@ display = df.copy()
 _stats = display['ticker'].map(latest_ticker_stats)
 display['vol']   = _stats.map(lambda s: s.get('vol'))
 display['price'] = _stats.map(lambda s: s.get('price'))
-display['win_rate']        = display['win_rate'].map(lambda x: f"{x:.0f}%")
-display['strategy_return'] = display['strategy_return'].map(lambda x: f"{x:.1f}%")
-display['alpha_vs_spy']    = display['alpha_vs_spy'].map(lambda x: f"{x:.1f}%")
-display['asset_bh']        = display['asset_bh'].map(lambda x: f"{x:.1f}%")
-display['spy_bh']          = display['spy_bh'].map(lambda x: f"{x:.1f}%")
-display['bh_mult']         = display['bh_mult'].map(lambda x: f"{x:.1f}x" if pd.notna(x) else "")
 display = display.rename(columns={
     'ticker': 'Ticker', 'strategy': 'Strategy', 'window': 'Win',
     'take_profit': 'TP%', 'stop_loss': 'SL%', 'max_hold_hours': 'Hold h',
@@ -179,6 +173,14 @@ selection = st.dataframe(
     hide_index=True,
     on_select="rerun",
     selection_mode="single-row",
+    column_config={
+        'Win%':       st.column_config.NumberColumn(format="%.0f%%"),
+        'Return':     st.column_config.NumberColumn(format="%.1f%%"),
+        'Alpha':      st.column_config.NumberColumn(format="%.1f%%"),
+        'Asset B&H':  st.column_config.NumberColumn(format="%.1f%%"),
+        'SPY B&H':    st.column_config.NumberColumn(format="%.1f%%"),
+        'B&H Mult':   st.column_config.NumberColumn(format="%.1fx"),
+    },
 )
 
 selected_rows = selection.selection.rows
@@ -200,7 +202,8 @@ if selected_rows:
         watch_val = st.checkbox("Watch", value=is_watched, key=f"watch_{i}")
         if watch_val and not is_watched:
             add_node(r['ticker'], r['strategy'], version, int(r['window']),
-                     int(r['take_profit']), int(r['stop_loss']), int(r['max_hold_hours']))
+                     int(r['take_profit']), int(r['stop_loss']), int(r['max_hold_hours']),
+                     z_score_threshold=float(r['z_score_threshold']))
             st.cache_data.clear()
             st.rerun()
         elif not watch_val and is_watched:
@@ -260,6 +263,7 @@ if wl:
     with sqlite3.connect(DB_PATH) as c:
         stats = pd.read_sql_query(
             f"""SELECT ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
+                      COALESCE(z_score_threshold, 2.0) as z_score_threshold,
                       trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh
                FROM backtest_cache
                WHERE ticker IN ({placeholders})""",
@@ -267,22 +271,17 @@ if wl:
         )
     wl_df = wl_df.merge(
         stats,
-        on=['ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss', 'max_hold_hours'],
+        on=['ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss', 'max_hold_hours', 'z_score_threshold'],
         how='left',
     )
 
-    wl_df['win_rate']        = wl_df['win_rate'].map(lambda x: f"{x:.0f}%" if pd.notna(x) else "")
-    wl_df['strategy_return'] = wl_df['strategy_return'].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
-    wl_df['alpha_vs_spy']    = wl_df['alpha_vs_spy'].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
-    wl_df['asset_bh']        = wl_df['asset_bh'].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
-    wl_df['spy_bh']          = wl_df['spy_bh'].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
-
     wl_df['watch'] = True
     wl_display = wl_df[['id', 'ticker', 'strategy', 'version', 'window', 'take_profit',
-                          'stop_loss', 'max_hold_hours', 'trades', 'win_rate',
+                          'stop_loss', 'max_hold_hours', 'z_score_threshold', 'trades', 'win_rate',
                           'strategy_return', 'alpha_vs_spy', 'asset_bh', 'spy_bh', 'label', 'watch']].rename(columns={
         'id': 'ID', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
         'window': 'Win', 'take_profit': 'TP%', 'stop_loss': 'SL%', 'max_hold_hours': 'Hold h',
+        'z_score_threshold': 'Z Thresh',
         'trades': 'Trades', 'win_rate': 'Win%', 'strategy_return': 'Return',
         'alpha_vs_spy': 'Alpha', 'asset_bh': 'Asset B&H', 'spy_bh': 'SPY B&H',
         'label': 'Label', 'watch': 'Watch',
@@ -295,6 +294,11 @@ if wl:
         column_config={
             "Label": st.column_config.TextColumn("Label"),
             "Watch": st.column_config.CheckboxColumn("Watch", help="Uncheck to remove"),
+            'Win%':       st.column_config.NumberColumn(format="%.0f%%"),
+            'Return':     st.column_config.NumberColumn(format="%.1f%%"),
+            'Alpha':      st.column_config.NumberColumn(format="%.1f%%"),
+            'Asset B&H':  st.column_config.NumberColumn(format="%.1f%%"),
+            'SPY B&H':    st.column_config.NumberColumn(format="%.1f%%"),
         },
         disabled=[c for c in wl_display.columns if c not in ('Label', 'Watch')],
     )

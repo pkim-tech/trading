@@ -142,6 +142,9 @@ def ensure_tables():
         existing_cols = [r[1] for r in c.execute("PRAGMA table_info(open_positions)").fetchall()]
         if 'trade_log_id' not in existing_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN trade_log_id INTEGER")
+        wl_cols = [r[1] for r in c.execute("PRAGMA table_info(watch_list)").fetchall()]
+        if 'z_score_threshold' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN z_score_threshold REAL NOT NULL DEFAULT 2.0")
         c.commit()
 
 
@@ -156,14 +159,14 @@ def get_watchlist():
         ).fetchall()]
 
 
-def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label=''):
+def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label='', z_score_threshold=2.0):
     with _conn() as c:
         c.execute("""
             INSERT OR IGNORE INTO watch_list
-                (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label, z_score_threshold)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (ticker, strategy, version, int(window), int(take_profit),
-              int(stop_loss), int(max_hold_hours), label))
+              int(stop_loss), int(max_hold_hours), label, float(z_score_threshold)))
         c.commit()
 
 
@@ -947,10 +950,11 @@ def cmd_add():
     window         = int(input("  window: ").strip())
     take_profit    = int(input("  take_profit: ").strip())
     stop_loss      = int(input("  stop_loss: ").strip())
-    max_hold_hours = int(input("  max_hold_hours: ").strip())
-    label          = input("  label (optional): ").strip()
-    add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label)
-    print(f"Added {ticker} (w={window} TP={take_profit} SL={stop_loss} hold={max_hold_hours}h) label='{label}'.")
+    max_hold_hours    = int(input("  max_hold_hours: ").strip())
+    z_score_threshold = float(input("  z_score_threshold [2.0]: ").strip() or "2.0")
+    label             = input("  label (optional): ").strip()
+    add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label, z_score_threshold)
+    print(f"Added {ticker} (w={window} TP={take_profit} SL={stop_loss} hold={max_hold_hours}h Z={z_score_threshold}) label='{label}'.")
 
 
 def cmd_remove():

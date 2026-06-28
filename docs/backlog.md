@@ -6,7 +6,8 @@
 
 - **v1.6 coarse grid sweep**: Re-run full universe with TP/SL at every-3 integers `[3,6,9,...,30]` (6000 nodes/ticker/threshold vs 54k). Goal: validate that islands found at coarse resolution match v1.5 fine-grid islands. If confirmed, adopt coarse grid as default for new thresholds. Discuss grid before implementing.
 
-- **Hurst + ADF screener columns**: Compute Hurst exponent and ADF p-value per ticker (one-time, offline, on daily prices). Add as columns to `tickers` table and surface in Screener page as a quality gate before sweeping. `statsmodels` already installed. Rolling Hurst (6-month window) is separate backlog item.
+- **Hurst + ADF screener columns**: Compute Hurst exponent and ADF p-value per ticker (one-time, offline, on daily prices). Add as columns to `tickers` table and surface in Screener page as a quality gate before sweeping. `statsmodels` already installed. Rolling Hurst (30d window) now live on Node Inspector page.
+- **Portfolio backtest page**: Replay all watchlist nodes simultaneously over the same timeline. Show concurrent positions, capital utilization, max simultaneous positions. Naturally handles same-ticker and cross-ticker comparison — distinct from Node Inspector (single-node deep dive) and Spatial Topology (island finding).
 
 - **Position sizing in Slack BUY signal**: Include suggested max notional in the BUY Slack message (e.g. "Max size: $12k @ 1% of avg daily vol"). `avg_vol_10d` and `last_price` are already in the screener DB — look up by ticker at signal time.
 
@@ -16,7 +17,7 @@
 
 ## Visualization Pages (Streamlit)
 
-- **Trade chart page**: New Streamlit page showing hourly price, SMA/Bollinger bands, buy/sell/exit markers, and alpha scorecard for a selected ticker and parameter set. Should be launchable from Node Inspector. (3D topology and node inspector pages already exist in `pages/`)
+- **Trade chart page**: ✅ Built as Node Inspector (pages/2_Node_Inspector.py) — price + bands at z=2.0/2.5/3.0, trade markers, rolling Hurst, optional ADF, H-filter slider.
 - **Topology page — collapsible controls**: Pickers and dropdowns consume too much vertical space on the Spatial Topology page. Add a collapse/expand toggle so the control panel can be hidden to maximize chart real estate. Also consider renaming the page to something shorter (e.g. "Topology" or "Map"). — Medium
 - **Topology page — node selection rework**: The bottom section for picking and researching nodes is hard to use. Needs a full rework — easier node selection, clearer display of selected node details, and a path to launch the trade chart from a selected node. — Medium
 
