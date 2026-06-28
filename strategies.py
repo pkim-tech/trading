@@ -34,7 +34,8 @@ class ZScoreBreakout(BaseStrategy):
         sma, std = prior_day['SMA'], prior_day['Std']
         if std == 0 or pd.isna(sma) or pd.isna(std):
             return 'HOLD'
-        return 'BUY' if current_price <= sma - std * 2.0 else 'HOLD'
+        threshold = self.params.get('z_score_threshold', 2.0)
+        return 'BUY' if current_price <= sma - std * threshold else 'HOLD'
 
 
 class TrendFilteredZScore(BaseStrategy):
@@ -50,6 +51,7 @@ class TrendFilteredZScore(BaseStrategy):
         sma, std, trend = prior_day['SMA'], prior_day['Std'], prior_day['Trend_Filter']
         if pd.isna(sma) or pd.isna(std) or pd.isna(trend):
             return 'HOLD'
-        return 'BUY' if current_price <= sma - std * 2.0 and current_price > trend else 'HOLD'
+        threshold = self.params.get('z_score_threshold', 2.0)
+        return 'BUY' if current_price <= sma - std * threshold and current_price > trend else 'HOLD'
 
 

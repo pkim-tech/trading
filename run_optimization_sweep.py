@@ -47,47 +47,52 @@ def init_idempotent_db():
             max_hold_hours INTEGER, take_profit INTEGER, stop_loss INTEGER,
             trades INTEGER, win_rate REAL, strategy_return REAL,
             alpha_vs_spy REAL, asset_bh REAL, spy_bh REAL, run_timestamp TEXT,
-            PRIMARY KEY (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss)
+            z_score_threshold REAL DEFAULT 2.0,
+            PRIMARY KEY (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss, z_score_threshold)
         )
     """)
+    try:
+        cursor.execute("ALTER TABLE backtest_cache ADD COLUMN z_score_threshold REAL DEFAULT 2.0")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
 
 def run_single_backtest_node_isolated(args):
     """Pure mathematical worker node running inside the isolated subprocess."""
-    ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh = args
+    ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh = args
 
     try:
         cache_path = CACHE_DIR / f"{ticker}_1h.csv"
         df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True).sort_index()
     except Exception:
-        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "status": "ERROR"}
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR"}
 
     if df_hourly_raw.empty:
-        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "status": "EMPTY"}
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
 
     strategy_class = getattr(strategies, strategy_name, None)
     if not strategy_class:
-        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "status": "UNKNOWN_STRAT"}
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "UNKNOWN_STRAT"}
 
     close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
     df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
-    
-    strat_instance = strategy_class(window=w)
+
+    strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
     df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
 
     try:
         trades = run_backtest(
-            df_hourly_raw, df_daily_processed, ticker, 
+            df_hourly_raw, df_daily_processed, ticker,
             take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0), max_hours_to_hold=int(hold_hours)
         )
         closed = [t for t in trades if t["Result"] in ["WIN", "LOSS", "TWIN", "TLOSS"]]
     except Exception:
-        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "status": "SIM_ERROR"}
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "SIM_ERROR"}
 
     if not closed:
-        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "status": "NO_TRADES"}
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "NO_TRADES"}
 
     df_tr = pd.DataFrame(closed)
     win_rate = float((len(df_tr[df_tr['Result'] == 'WIN']) / len(df_tr)) * 100)
@@ -98,6 +103,7 @@ def run_single_backtest_node_isolated(args):
         "coords": (tp, sl, hold_hours),
         "payload": (alpha_calc, len(df_tr), win_rate, compounded),
         "window": w,
+        "z_thresh": z_thresh,
         "status": "SUCCESS"
     }
 
@@ -110,18 +116,19 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
     unvisited_tasks = []
     for t in tasks:
-        tp, sl, hold_hours, w = t
+        tp, sl, hold_hours, w, z_thresh = t
         cursor.execute("""
-            SELECT trades, win_rate, strategy_return, alpha_vs_spy 
-            FROM backtest_cache 
-            WHERE strategy=? AND version=? AND ticker=? AND window=? AND max_hold_hours=? AND take_profit=? AND stop_loss=?
-        """, (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl)))
+            SELECT trades, win_rate, strategy_return, alpha_vs_spy
+            FROM backtest_cache
+            WHERE strategy=? AND version=? AND ticker=? AND window=? AND max_hold_hours=? AND take_profit=? AND stop_loss=? AND z_score_threshold=?
+        """, (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl), z_thresh))
         cached_row = cursor.fetchone()
-        
+
         if cached_row:
             matrix_results.append({
                 "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
                 "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
+                "Z Threshold": z_thresh,
                 "Trades": cached_row[0], "Win Rate %": cached_row[1], "Return %": cached_row[2],
                 "Alpha vs SPY %": cached_row[3], "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
             })
@@ -141,8 +148,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
     futures_map = {}
     for task in unvisited_tasks:
-        tp, sl, hold_hours, w = task
-        args = (ticker, strategy_name, config_version, int(tp), int(sl), hold_hours, w, spy_bh)
+        tp, sl, hold_hours, w, z_thresh = task
+        args = (ticker, strategy_name, config_version, int(tp), int(sl), hold_hours, w, spy_bh, z_thresh)
         futures_map[shared_pool.submit(run_single_backtest_node_isolated, args)] = task
 
     logger.info(f"🚀 Processing Grid: {len(unvisited_tasks)} unvisited execution nodes sent to worker pool...")
@@ -160,7 +167,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     COMMIT_BATCH = 100
     last_postfix_time = 0.0
     for future in progress_bar:
-        tp, sl, hold_hours, w = futures_map[future]
+        tp, sl, hold_hours, w, z_thresh = futures_map[future]
         try:
             res = future.result()
             status = res.get("status")
@@ -187,12 +194,16 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                     matrix_results.append({
                         "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
                         "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
+                        "Z Threshold": z_thresh,
                         "Trades": num_trades, "Win Rate %": wr, "Return %": comp_ret,
                         "Alpha vs SPY %": alpha, "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
                     })
 
-                cursor.execute("INSERT OR REPLACE INTO backtest_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                               (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl), num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp))
+                cursor.execute(
+                    "INSERT OR REPLACE INTO backtest_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl),
+                     num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh)
+                )
 
                 if node_counter % COMMIT_BATCH == 0:
                     conn.commit()
@@ -242,12 +253,14 @@ def run_master_evolutionary_suite(shared_pool, ticker, strategy_class, strategy_
             spy_col = 'Adj Close' if 'Adj Close' in spy_df.columns else 'Close'
             spy_bh = ((spy_sliced[spy_col].iloc[-1] - spy_sliced[spy_col].iloc[0]) / spy_sliced[spy_col].iloc[0]) * 100
 
+    z_thresholds = hp.get("z_score_thresholds", [2.0])
     macro_tasks = []
-    for w in hp["windows"]:
-        for tp in hp["take_profits"]:
-            for sl in hp["stop_losses"]:
-                for hold in hp["hold_time_caps"]:
-                    macro_tasks.append((int(tp), int(sl), int(hold), int(w)))
+    for z_thresh in z_thresholds:
+        for w in hp["windows"]:
+            for tp in hp["take_profits"]:
+                for sl in hp["stop_losses"]:
+                    for hold in hp["hold_time_caps"]:
+                        macro_tasks.append((int(tp), int(sl), int(hold), int(w), float(z_thresh)))
 
     logger.info(f"Generated {len(macro_tasks)} total structural grid nodes for the brute-force sweep.")
     df_global = dispatch_parallel_grid(shared_pool, macro_tasks, ticker, strategy_name, config_version, "Macro Scan", spy_bh, asset_bh, run_timestamp)
@@ -255,26 +268,26 @@ def run_master_evolutionary_suite(shared_pool, ticker, strategy_class, strategy_
         logger.warning("Initial structural baseline empty. Skipping optimization sequences.")
         return None
         
-    frontier = [{"tp": int(r['Take Profit %']), "sl": int(r['Stop Loss %']), "hold": int(r['Max Hold Hours']), "w": int(r['Window'])} 
+    frontier = [{"tp": int(r['Take Profit %']), "sl": int(r['Stop Loss %']), "hold": int(r['Max Hold Hours']), "w": int(r['Window']), "z": float(r['Z Threshold'])}
                 for _, r in df_global.nlargest(2, "Alpha vs SPY %").iterrows()]
     all_fine_data = []
-    
+
     for generation in range(1, max_generations + 1):
         logger.info(f"🧬 Generation {generation}/{max_generations} | Refining Local Grid Boundaries...")
         generation_tasks = []
-        
+
         for agent in frontier:
             fine_tps = [int(agent["tp"] - 2), int(agent["tp"] - 1), int(agent["tp"]), int(agent["tp"] + 1), int(agent["tp"] + 2)]
             fine_sls = [int(agent["sl"] - 2), int(agent["sl"] - 1), int(agent["sl"]), int(agent["sl"] + 1), int(agent["sl"] + 2)]
-            
+
             fine_tps = sorted(list(set([max(1, tp) for tp in fine_tps])))
             fine_sls = sorted(list(set([max(1, sl) for sl in fine_sls])))
             fine_holds = sorted(list(set([max(24, agent["hold"] - 24), agent["hold"], min(120, agent["hold"] + 24)])))
-                    
+
             for tp_mod in fine_tps:
                 for sl_mod in fine_sls:
                     for hold_mod in fine_holds:
-                        generation_tasks.append((tp_mod, sl_mod, hold_mod, agent["w"]))
+                        generation_tasks.append((tp_mod, sl_mod, hold_mod, agent["w"], agent["z"]))
 
         generation_tasks = list(set(generation_tasks))
         

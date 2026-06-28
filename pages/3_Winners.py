@@ -24,16 +24,36 @@ st.title("Winners")
 
 
 @st.cache_data(ttl=60)
-def load_results(version):
+def load_ticker_strategy_options(version):
+    with sqlite3.connect(DB_PATH) as c:
+        tickers = [r[0] for r in c.execute(
+            "SELECT DISTINCT ticker FROM backtest_cache WHERE version = ? ORDER BY ticker", (version,)
+        ).fetchall()]
+        strats = [r[0] for r in c.execute(
+            "SELECT DISTINCT strategy FROM backtest_cache WHERE version = ? ORDER BY strategy", (version,)
+        ).fetchall()]
+    return tickers, strats
+
+
+@st.cache_data(ttl=60)
+def load_results(version, min_trades, min_return, min_alpha, min_bh_mult, beat_bh):
+    bh_filter = "AND strategy_return > asset_bh" if beat_bh else ""
     with sqlite3.connect(DB_PATH) as c:
         return pd.read_sql_query(
-            """SELECT ticker, strategy, window, take_profit, stop_loss,
+            f"""SELECT ticker, strategy, window, take_profit, stop_loss,
                       max_hold_hours, trades, win_rate, strategy_return, alpha_vs_spy,
-                      asset_bh, spy_bh
+                      asset_bh, spy_bh,
+                      CASE WHEN asset_bh > 0 THEN strategy_return / asset_bh ELSE NULL END as bh_mult
                FROM backtest_cache
                WHERE version = ?
+                 AND trades >= ?
+                 AND strategy_return >= ?
+                 AND alpha_vs_spy >= ?
+                 AND asset_bh > 0
+                 AND strategy_return / asset_bh >= ?
+                 {bh_filter}
                ORDER BY alpha_vs_spy DESC""",
-            c, params=(version,)
+            c, params=(version, min_trades, min_return, min_alpha, min_bh_mult)
         )
 
 
@@ -81,13 +101,6 @@ dismissed = load_dismissed()
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1:
     version = st.selectbox("Version", versions)
-with c2:
-    df_all = load_results(version)
-    tickers_all = sorted(df_all['ticker'].unique())
-    ticker_filter = st.multiselect("Ticker", tickers_all, default=tickers_all)
-with c3:
-    strategy_opts = sorted(df_all['strategy'].unique())
-    strategy_filter = st.multiselect("Strategy", strategy_opts, default=strategy_opts)
 with c4:
     min_trades = st.number_input("Min trades", min_value=0, value=5, step=1)
 with c5:
@@ -103,22 +116,22 @@ with c8:
 with c9:
     beat_bh = st.toggle("Beat asset B&H", value=True)
 show_dismissed = st.toggle("Show dismissed", value=False)
+
+tickers_all, strategy_opts = load_ticker_strategy_options(version)
+with c2:
+    ticker_filter = st.multiselect("Ticker", tickers_all, default=tickers_all)
+with c3:
+    strategy_filter = st.multiselect("Strategy", strategy_opts, default=strategy_opts)
+
 if dismissed and show_dismissed:
     st.caption(f"Dismissed: {', '.join(f'{t}/{s}' for t, s, v in sorted(dismissed) if v == version)}")
 
-df_all['bh_mult'] = df_all.apply(
-    lambda r: r['strategy_return'] / r['asset_bh'] if r['asset_bh'] > 0 else None, axis=1
-)
+df_all = load_results(version, int(min_trades), float(min_return), float(min_alpha), float(min_bh_mult), beat_bh)
 
 is_dismissed = df_all.apply(lambda r: (r['ticker'], r['strategy'], version) in dismissed, axis=1)
 df = df_all[
     df_all['ticker'].isin(ticker_filter) &
     df_all['strategy'].isin(strategy_filter) &
-    (df_all['trades'] >= min_trades) &
-    (df_all['alpha_vs_spy'] >= min_alpha) &
-    (df_all['strategy_return'] >= min_return) &
-    (df_all['bh_mult'].fillna(0) >= min_bh_mult) &
-    (~beat_bh | (df_all['strategy_return'] > df_all['asset_bh'])) &
     (show_dismissed | ~is_dismissed)
 ]
 
@@ -176,7 +189,7 @@ if selected_rows:
         f"**{r['ticker']}**  {r['strategy']}  "
         f"w={r['window']}  TP={r['take_profit']}%  SL={r['stop_loss']}%  hold={r['max_hold_hours']}h"
     )
-    a1, a2, a3 = st.columns(3)
+    a1, a2, a3, a4 = st.columns(4)
 
     with a1:
         watch_val = st.checkbox("Watch", value=is_watched, key=f"watch_{i}")
@@ -220,18 +233,31 @@ if selected_rows:
             }
             st.switch_page("pages/2_Node_Inspector.py")
 
+    with a4:
+        if st.button("View in Topology"):
+            st.session_state["target_topology"] = {
+                "ticker":   r['ticker'],
+                "strategy": r['strategy'],
+                "version":  version,
+            }
+            st.switch_page("pages/1_Spatial_Topology.py")
+
 st.divider()
 st.subheader("Watch list")
 wl = get_watchlist()
 if wl:
     wl_df = pd.DataFrame(wl)
 
-    # Join backtest stats
+    # Join backtest stats — query only tickers on the watchlist
+    wl_tickers = list({w['ticker'] for w in wl})
+    placeholders = ','.join('?' * len(wl_tickers))
     with sqlite3.connect(DB_PATH) as c:
         stats = pd.read_sql_query(
-            """SELECT ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
+            f"""SELECT ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                       trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh
-               FROM backtest_cache""", c
+               FROM backtest_cache
+               WHERE ticker IN ({placeholders})""",
+            c, params=wl_tickers
         )
     wl_df = wl_df.merge(
         stats,

@@ -11,22 +11,42 @@ PHASE_GRID_PATH = "active_phase_grid.json"
 
 st.set_page_config(layout="wide", page_title="Spatial Topology Space")
 
-def load_all_historical_dimensions():
+@st.cache_data(ttl=60)
+def load_dropdown_options():
+    if not os.path.exists(DB_PATH):
+        return [], {}, {}
+    with sqlite3.connect(DB_PATH) as conn:
+        versions = [r[0] for r in conn.execute(
+            "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
+        ).fetchall()]
+        tickers_by_version = {}
+        for v in versions:
+            tickers_by_version[v] = [r[0] for r in conn.execute(
+                "SELECT DISTINCT ticker FROM backtest_cache WHERE version = ? ORDER BY ticker", (v,)
+            ).fetchall()]
+        strats_by_version_ticker = {}
+        rows = conn.execute(
+            "SELECT DISTINCT version, ticker, strategy FROM backtest_cache"
+        ).fetchall()
+        for v, t, s in rows:
+            strats_by_version_ticker.setdefault((v, t), [])
+            if s not in strats_by_version_ticker[(v, t)]:
+                strats_by_version_ticker[(v, t)].append(s)
+    return versions, tickers_by_version, strats_by_version_ticker
+
+
+@st.cache_data(ttl=60)
+def load_slice(version, ticker, strategy):
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()
-    conn = sqlite3.connect(DB_PATH)
-    query = """
-        SELECT ticker, strategy, version, window, max_hold_hours, take_profit, stop_loss,
-               trades, win_rate, strategy_return, alpha_vs_spy, asset_bh
-        FROM backtest_cache
-    """
-    try:
-        df = pd.read_sql_query(query, conn)
-    except Exception:
-        df = pd.DataFrame()
-    finally:
-        conn.close()
-    return df
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query(
+            """SELECT window, max_hold_hours, take_profit, stop_loss,
+                      trades, win_rate, strategy_return, alpha_vs_spy, asset_bh
+               FROM backtest_cache
+               WHERE version = ? AND ticker = ? AND strategy = ?""",
+            conn, params=(version, ticker, strategy)
+        )
 
 def load_planned_nodes():
     if not os.path.exists(PHASE_GRID_PATH):
@@ -49,28 +69,31 @@ def get_active_telemetry():
         except Exception: return None
     return None
 
-st.title("📊 4D Spatial Grid Topology Monitor")
+st.title("Spatial Topology")
 
-df_raw = load_all_historical_dimensions()
+versions, tickers_by_version, strats_by_version_ticker = load_dropdown_options()
 active_node = get_active_telemetry()
 
-if df_raw.empty:
+if not versions:
     st.warning("No completed hyperparameter records found. Initialize optimization runs via the main config view.")
+    st.stop()
 else:
-    # --- Universal Scope View Selection Levers ---
+    t_top = st.session_state.pop("target_topology", {})
+
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        selected_ver = st.selectbox("Scope Execution Version Target", sorted(df_raw["version"].unique(), reverse=True))
+        default_ver = t_top.get("version") if t_top.get("version") in versions else versions[0]
+        selected_ver = st.selectbox("Version", versions, index=versions.index(default_ver))
     with col_b:
-        ticker_opts = sorted(df_raw[df_raw["version"] == selected_ver]["ticker"].unique())
-        selected_ticker = st.selectbox("Scope Ticker Target", ticker_opts)
+        ticker_opts = tickers_by_version.get(selected_ver, [])
+        default_ticker = t_top.get("ticker") if t_top.get("ticker") in ticker_opts else ticker_opts[0]
+        selected_ticker = st.selectbox("Ticker", ticker_opts, index=ticker_opts.index(default_ticker))
     with col_c:
-        strat_opts = sorted(df_raw[(df_raw["version"] == selected_ver) & (df_raw["ticker"] == selected_ticker)]["strategy"].unique())
-        selected_strat = st.selectbox("Scope Strategy Target", strat_opts)
+        strat_opts = sorted(strats_by_version_ticker.get((selected_ver, selected_ticker), []))
+        default_strat = t_top.get("strategy") if t_top.get("strategy") in strat_opts else strat_opts[0]
+        selected_strat = st.selectbox("Strategy", strat_opts, index=strat_opts.index(default_strat))
 
-    df_filtered = df_raw[(df_raw["ticker"] == selected_ticker) & 
-                         (df_raw["strategy"] == selected_strat) & 
-                         (df_raw["version"] == selected_ver)].copy()
+    df_filtered = load_slice(selected_ver, selected_ticker, selected_strat)
 
     st.markdown("---")
     
@@ -134,9 +157,12 @@ else:
             if not df_plot_base.empty:
                 true_min = float(df_plot_base['alpha_vs_spy'].min())
                 true_max = float(df_plot_base['alpha_vs_spy'].max())
-                
+
+                if true_min == true_max:
+                    true_max = true_min + 1.0
+
                 # Hard clamp optimization for extreme outliers
-                slider_min = true_min 
+                slider_min = true_min
                 default_handle_value = 0.0 if true_max > 0 else true_min
 
                 alpha_cutoff = st.slider(
