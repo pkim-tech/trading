@@ -12,7 +12,8 @@ st.title("Sweep Status")
 
 cfg = json.loads(CONFIG_PATH.read_text())
 hp  = cfg["hyperparameters"]
-expected_per_ticker = (
+config_expected_per_ticker = (
+    len(hp.get("z_score_thresholds", [2.0])) *
     len(hp["windows"]) *
     len(hp["take_profits"]) *
     len(hp["stop_losses"]) *
@@ -66,6 +67,11 @@ def get_data_date(ticker):
         return None
 
 df["data_thru"] = df["ticker"].apply(get_data_date)
+
+# Use max cached nodes across tickers for this version as the expected count,
+# falling back to config-derived value if the version is still in progress
+version_max = int(df["cached"].max()) if not df.empty and df["cached"].max() > 0 else 0
+expected_per_ticker = max(version_max, config_expected_per_ticker) if version == cfg.get("version") else version_max or config_expected_per_ticker
 df["expected"] = expected_per_ticker
 df["pct"]      = (df["cached"] / df["expected"] * 100).round(1)
 df["status"]   = df["cached"].apply(

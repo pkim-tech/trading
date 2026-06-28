@@ -41,7 +41,8 @@ def load_results(version, min_trades, min_return, min_alpha, min_bh_mult, beat_b
     with sqlite3.connect(DB_PATH) as c:
         return pd.read_sql_query(
             f"""SELECT ticker, strategy, window, take_profit, stop_loss,
-                      max_hold_hours, trades, win_rate, strategy_return, alpha_vs_spy,
+                      max_hold_hours, COALESCE(z_score_threshold, 2.0) as z_score_threshold,
+                      trades, win_rate, strategy_return, alpha_vs_spy,
                       asset_bh, spy_bh,
                       CASE WHEN asset_bh > 0 THEN strategy_return / asset_bh ELSE NULL END as bh_mult
                FROM backtest_cache
@@ -102,7 +103,7 @@ c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1:
     version = st.selectbox("Version", versions)
 with c4:
-    min_trades = st.number_input("Min trades", min_value=0, value=5, step=1)
+    min_trades = st.number_input("Min trades", min_value=1, value=5, step=1)
 with c5:
     min_alpha = st.number_input("Min alpha %", value=0.0, step=1.0, format="%.1f")
 with c6:
@@ -123,15 +124,18 @@ with c2:
 with c3:
     strategy_filter = st.multiselect("Strategy", strategy_opts, default=strategy_opts)
 
+df_all = load_results(version, int(min_trades), float(min_return), float(min_alpha), float(min_bh_mult), beat_bh)
+threshold_opts = sorted(df_all['z_score_threshold'].unique())
+threshold_filter = st.multiselect("Z Threshold", threshold_opts, default=threshold_opts) if len(threshold_opts) > 1 else threshold_opts
+
 if dismissed and show_dismissed:
     st.caption(f"Dismissed: {', '.join(f'{t}/{s}' for t, s, v in sorted(dismissed) if v == version)}")
-
-df_all = load_results(version, int(min_trades), float(min_return), float(min_alpha), float(min_bh_mult), beat_bh)
 
 is_dismissed = df_all.apply(lambda r: (r['ticker'], r['strategy'], version) in dismissed, axis=1)
 df = df_all[
     df_all['ticker'].isin(ticker_filter) &
     df_all['strategy'].isin(strategy_filter) &
+    df_all['z_score_threshold'].isin(threshold_filter) &
     (show_dismissed | ~is_dismissed)
 ]
 
@@ -163,6 +167,7 @@ display['bh_mult']         = display['bh_mult'].map(lambda x: f"{x:.1f}x" if pd.
 display = display.rename(columns={
     'ticker': 'Ticker', 'strategy': 'Strategy', 'window': 'Win',
     'take_profit': 'TP%', 'stop_loss': 'SL%', 'max_hold_hours': 'Hold h',
+    'z_score_threshold': 'Z Thresh',
     'trades': 'Trades', 'win_rate': 'Win%', 'strategy_return': 'Return',
     'alpha_vs_spy': 'Alpha', 'asset_bh': 'Asset B&H', 'spy_bh': 'SPY B&H',
     'bh_mult': 'B&H Mult', 'vol': 'Vol (last day)', 'price': 'Last Price',
@@ -187,7 +192,7 @@ if selected_rows:
 
     st.caption(
         f"**{r['ticker']}**  {r['strategy']}  "
-        f"w={r['window']}  TP={r['take_profit']}%  SL={r['stop_loss']}%  hold={r['max_hold_hours']}h"
+        f"w={r['window']}  TP={r['take_profit']}%  SL={r['stop_loss']}%  hold={r['max_hold_hours']}h  Z={r['z_score_threshold']}"
     )
     a1, a2, a3, a4 = st.columns(4)
 
@@ -223,13 +228,14 @@ if selected_rows:
     with a3:
         if st.button("Open in Node Inspector"):
             st.session_state["target_node"] = {
-                "ticker":        r['ticker'],
-                "strategy":      r['strategy'],
-                "version":       version,
-                "window":        int(r['window']),
-                "take_profit":   int(r['take_profit']),
-                "stop_loss":     int(r['stop_loss']),
-                "max_hold_hours": int(r['max_hold_hours']),
+                "ticker":           r['ticker'],
+                "strategy":         r['strategy'],
+                "version":          version,
+                "window":           int(r['window']),
+                "take_profit":      int(r['take_profit']),
+                "stop_loss":        int(r['stop_loss']),
+                "max_hold_hours":   int(r['max_hold_hours']),
+                "z_score_threshold": float(r['z_score_threshold']),
             }
             st.switch_page("pages/2_Node_Inspector.py")
 
