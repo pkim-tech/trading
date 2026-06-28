@@ -85,7 +85,8 @@ def run_single_backtest_node_isolated(args):
     try:
         trades = run_backtest(
             df_hourly_raw, df_daily_processed, ticker,
-            take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0), max_hours_to_hold=int(hold_hours)
+            take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0), max_hours_to_hold=int(hold_hours),
+            z_score_threshold=float(z_thresh)
         )
         closed = [t for t in trades if t["Result"] in ["WIN", "LOSS", "TWIN", "TLOSS"]]
     except Exception:

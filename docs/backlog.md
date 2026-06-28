@@ -2,6 +2,12 @@
 
 ## High Priority
 
+- **Remove FAS from watchlist**: Hurst=0.595 (full) / 0.574 (6mo), ADF non-stationary (p=0.36), z=3.0 sweep zero positive alpha across 54k nodes, z=2.5 best node only 1.43× B&H. Structurally momentum, not mean-reverting. The v1.4 559% return node is valid but untrustworthy given the Hurst profile.
+
+- **v1.6 coarse grid sweep**: Re-run full universe with TP/SL at every-3 integers `[3,6,9,...,30]` (6000 nodes/ticker/threshold vs 54k). Goal: validate that islands found at coarse resolution match v1.5 fine-grid islands. If confirmed, adopt coarse grid as default for new thresholds. Discuss grid before implementing.
+
+- **Hurst + ADF screener columns**: Compute Hurst exponent and ADF p-value per ticker (one-time, offline, on daily prices). Add as columns to `tickers` table and surface in Screener page as a quality gate before sweeping. `statsmodels` already installed. Rolling Hurst (6-month window) is separate backlog item.
+
 - **Position sizing in Slack BUY signal**: Include suggested max notional in the BUY Slack message (e.g. "Max size: $12k @ 1% of avg daily vol"). `avg_vol_10d` and `last_price` are already in the screener DB — look up by ticker at signal time.
 
 - **Trade log**: New DB table to record each executed trade — signal price, execution price, exit price, drift on entry/exit. Triggered from Socket Mode modal submissions.

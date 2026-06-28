@@ -141,7 +141,7 @@ df = df_all[
 
 df = (
     df.sort_values('alpha_vs_spy', ascending=False)
-      .groupby('ticker', sort=False)
+      .groupby(['ticker', 'z_score_threshold'], sort=False)
       .head(int(top_n))
       .reset_index(drop=True)
 )

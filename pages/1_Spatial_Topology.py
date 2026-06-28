@@ -42,6 +42,7 @@ def load_slice(version, ticker, strategy):
     with sqlite3.connect(DB_PATH) as conn:
         return pd.read_sql_query(
             """SELECT window, max_hold_hours, take_profit, stop_loss,
+                      COALESCE(z_score_threshold, 2.0) as z_score_threshold,
                       trades, win_rate, strategy_return, alpha_vs_spy, asset_bh
                FROM backtest_cache
                WHERE version = ? AND ticker = ? AND strategy = ?""",
@@ -93,7 +94,16 @@ else:
         default_strat = t_top.get("strategy") if t_top.get("strategy") in strat_opts else strat_opts[0]
         selected_strat = st.selectbox("Strategy", strat_opts, index=strat_opts.index(default_strat))
 
-    df_filtered = load_slice(selected_ver, selected_ticker, selected_strat)
+    df_all = load_slice(selected_ver, selected_ticker, selected_strat)
+
+    zt_opts = sorted(df_all["z_score_threshold"].unique()) if not df_all.empty else [2.0]
+    if len(zt_opts) > 1:
+        default_zt = t_top.get("z_score_threshold", 2.0) if t_top.get("z_score_threshold") in zt_opts else zt_opts[0]
+        selected_zt = st.selectbox("Z-Score Threshold", zt_opts, index=zt_opts.index(default_zt))
+    else:
+        selected_zt = zt_opts[0]
+
+    df_filtered = df_all[df_all["z_score_threshold"] == selected_zt].copy() if not df_all.empty else df_all
 
     st.markdown("---")
     

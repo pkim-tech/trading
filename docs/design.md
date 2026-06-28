@@ -40,8 +40,8 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 ### Key Components
 - `run_optimization_sweep.py` — orchestrates the sweep, manages worker pool, writes progress to `active_phase_grid.json` (planned nodes) and `current_test.json` (live telemetry)
-- `backtester.py` — single node evaluation (`run_backtest`)
-- `strategies.py` — strategy class definitions
+- `backtester.py` — single node evaluation (`run_backtest`). Numba JIT kernel `_simulate` accepts `z_thresh` and uses it for the entry band (`sma - std * z_thresh`). `run_backtest` accepts `z_score_threshold=2.0` and passes it through.
+- `strategies.py` — strategy class definitions. `z_score_threshold` stored in `self.params`, used in `check_signal` for live signal detection. The sweep and Node Inspector both pass it to `run_backtest` explicitly.
 - `pages/1_Spatial_Topology.py` — 4D Plotly scatter of parameter space, shows planned nodes in blue and completed nodes colored by alpha
 - `pages/2_Node_Inspector.py` — re-runs backtest for a selected node, shows trade ledger and quarterly breakdown
 - `cache/trading_universe.db` — SQLite cache, nodes never re-evaluated once computed
@@ -69,12 +69,13 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 ### Winners Page
 
-`pages/3_Winners.py` — Streamlit leaderboard of top nodes per ticker for a selected version.
+`pages/3_Winners.py` — Streamlit leaderboard of top nodes per ticker per z_score_threshold for a selected version.
 
-- Filters: version, ticker, strategy, min trades, min alpha, beat asset B&H toggle, top N per ticker
+- Filters: version, ticker, strategy, z_score_threshold multiselect, min trades, min alpha, beat asset B&H toggle, top N per ticker per threshold
+- Groups by `(ticker, z_score_threshold)` — allows direct comparison of z=2.0 vs z=2.5 vs z=3.0 best nodes side by side
 - Dismiss per `(ticker, strategy, version)` — persisted to `cache/dismissed_tickers.json`
 - Click row → Watch / Dismiss / Open in Node Inspector actions
-- Open in Node Inspector passes all params (window, TP, SL, hold) via session state — dropdowns auto-select on arrival
+- Open in Node Inspector passes all params (window, TP, SL, hold, z_score_threshold) via session state — dropdowns auto-select on arrival
 - Watch list table at bottom with inline label editing and remove-by-uncheck
 
 ### Sweep Status Page

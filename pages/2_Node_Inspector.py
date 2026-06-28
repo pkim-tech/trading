@@ -115,7 +115,8 @@ else:
 
             trades = run_backtest(
                 df_hourly_raw, df_daily_processed, selected_ticker,
-                take_profit=float(target_tp / 100.0), stop_loss=float(target_sl / 100.0), max_hours_to_hold=int(target_hold)
+                take_profit=float(target_tp / 100.0), stop_loss=float(target_sl / 100.0),
+                max_hours_to_hold=int(target_hold), z_score_threshold=float(target_zt)
             )
 
             df_trades = pd.DataFrame(trades)

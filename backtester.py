@@ -15,7 +15,7 @@ MAX_TRADES = 5000
 
 @njit(cache=True)
 def _simulate(prices, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
-              take_profit, stop_loss, max_hours_to_hold, target_h0, target_h1):
+              take_profit, stop_loss, max_hours_to_hold, target_h0, target_h1, z_thresh):
     # Pre-allocated output arrays
     entry_i   = np.empty(MAX_TRADES, dtype=np.int64)
     exit_i    = np.empty(MAX_TRADES, dtype=np.int64)
@@ -90,7 +90,7 @@ def _simulate(prices, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
         if std == 0.0:
             continue
 
-        lower_band = sma - std * 2.0
+        lower_band = sma - std * z_thresh
 
         if has_trend:
             trend = trend_arr[di]
@@ -122,7 +122,7 @@ def _simulate(prices, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
 
 def run_backtest(df_hourly, df_daily_indicators, ticker,
                  mode="BACKTEST", target_hours=(9, 14),
-                 take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28):
+                 take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28, z_score_threshold=2.0):
 
     prices = df_hourly['Close'].to_numpy(dtype=np.float64)
     timestamps = df_hourly.index
@@ -143,7 +143,7 @@ def run_backtest(df_hourly, df_daily_indicators, ticker,
     ei, xi, ep, xp, held, res, ret = _simulate(
         prices, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
         float(take_profit), float(stop_loss), int(max_hours_to_hold),
-        target_h0, target_h1
+        target_h0, target_h1, float(z_score_threshold)
     )
 
     trades = []
