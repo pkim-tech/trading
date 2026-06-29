@@ -6,8 +6,8 @@
 
 - **v1.6 coarse grid sweep**: Re-run full universe with TP/SL at every-3 integers `[3,6,9,...,30]` (6000 nodes/ticker/threshold vs 54k). Goal: validate that islands found at coarse resolution match v1.5 fine-grid islands. If confirmed, adopt coarse grid as default for new thresholds. Discuss grid before implementing.
 
-- **Hurst + ADF screener columns**: Compute Hurst exponent and ADF p-value per ticker (one-time, offline, on daily prices). Add as columns to `tickers` table and surface in Screener page as a quality gate before sweeping. `statsmodels` already installed. Rolling Hurst (30d window) now live on Node Inspector page.
-- **Portfolio backtest page**: Replay all watchlist nodes simultaneously over the same timeline. Show concurrent positions, capital utilization, max simultaneous positions. Naturally handles same-ticker and cross-ticker comparison — distinct from Node Inspector (single-node deep dive) and Spatial Topology (island finding).
+- **Hurst + ADF screener columns**: Hook into data download — compute on download and store in `tickers` table. Not a single scalar (regime-dependent); pending decision on right aggregation. Rolling per-ticker series already computed in Node Inspector; Hurst/ADF at signal time now sent in Slack BUY message.
+- **Portfolio backtest page**: ✅ Built (`pages/4_Portfolio.py`). Gantt timeline + SPY overlay + concurrent positions panel, all shared x-axis. Hurst/ADF sliders filter trades by regime at entry. Summary metrics + per-node table with unfiltered vs filtered return comparison.
 
 - **Position sizing in Slack BUY signal**: Include suggested max notional in the BUY Slack message (e.g. "Max size: $12k @ 1% of avg daily vol"). `avg_vol_10d` and `last_price` are already in the screener DB — look up by ticker at signal time.
 
@@ -16,6 +16,8 @@
 - **Run sweep on leveraged universe**: ~130 leveraged ETFs with data at 2x/3x. At 20 min/ticker with current grid → ~45 hours. Consider coarsening TP/SL grid to reduce to ~3 days.
 
 ## Visualization Pages (Streamlit)
+
+- **Two-phase UX rethink**: The current pages reflect two distinct workflows that aren't made explicit: (1) **Discovery** — sweep → Winners → find candidate tickers/nodes; (2) **Optimization** — Spatial Topology + Node Inspector + Hurst filter → refine a candidate into a tradeable config. Spatial Topology and Node Inspector are ticker-centric views (ticker is the subject, node is a detail) while Winners is node-centric. Navigation feels like peers but they're different phases. Consider: shared "active ticker" context carried across Topology and Node Inspector, clearer phase separation in the sidebar, or restructuring so the two optimization pages feel like sub-views of a single ticker analysis flow.
 
 - **Trade chart page**: ✅ Built as Node Inspector (pages/2_Node_Inspector.py) — price + bands at z=2.0/2.5/3.0, trade markers, rolling Hurst, optional ADF, H-filter slider.
 - **Topology page — collapsible controls**: Pickers and dropdowns consume too much vertical space on the Spatial Topology page. Add a collapse/expand toggle so the control panel can be hidden to maximize chart real estate. Also consider renaming the page to something shorter (e.g. "Topology" or "Map"). — Medium

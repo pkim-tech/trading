@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 from active_signals import add_node, remove_node, get_watchlist, label_node
+from db_cache import get_kv
 
 DB_PATH      = "./cache/trading_universe.db"
 DISMISS_FILE = Path("./cache/dismissed_tickers.json")
@@ -23,16 +24,18 @@ st.set_page_config(layout="wide", page_title="Winners")
 st.title("Winners")
 
 
-@st.cache_data(ttl=60)
 def load_ticker_strategy_options(version):
-    with sqlite3.connect(DB_PATH) as c:
-        tickers = [r[0] for r in c.execute(
-            "SELECT DISTINCT ticker FROM backtest_cache WHERE version = ? ORDER BY ticker", (version,)
-        ).fetchall()]
-        strats = [r[0] for r in c.execute(
-            "SELECT DISTINCT strategy FROM backtest_cache WHERE version = ? ORDER BY strategy", (version,)
-        ).fetchall()]
-    return tickers, strats
+    tickers   = get_kv(f"tickers_{version}")
+    strategies = get_kv(f"strategies_{version}")
+    if tickers is None or strategies is None:
+        with sqlite3.connect(DB_PATH) as c:
+            tickers = [r[0] for r in c.execute(
+                "SELECT DISTINCT ticker FROM backtest_cache WHERE version = ? ORDER BY ticker", (version,)
+            ).fetchall()]
+            strategies = [r[0] for r in c.execute(
+                "SELECT DISTINCT strategy FROM backtest_cache WHERE version = ? ORDER BY strategy", (version,)
+            ).fetchall()]
+    return tickers, strategies
 
 
 @st.cache_data(ttl=60)
@@ -73,13 +76,14 @@ def latest_ticker_stats(ticker: str) -> dict:
     return {'vol': vol, 'price': price}
 
 
-@st.cache_data(ttl=60)
 def load_versions():
-    with sqlite3.connect(DB_PATH) as c:
-        rows = c.execute(
-            "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
-        ).fetchall()
-    return [r[0] for r in rows]
+    versions = get_kv("versions")
+    if versions is None:
+        with sqlite3.connect(DB_PATH) as c:
+            versions = [r[0] for r in c.execute(
+                "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
+            ).fetchall()]
+    return versions
 
 
 def watchlist_keys(version):
@@ -119,8 +123,9 @@ with c9:
 show_dismissed = st.toggle("Show dismissed", value=False)
 
 tickers_all, strategy_opts = load_ticker_strategy_options(version)
+_default_tickers = st.session_state.pop("winners_ticker_filter", tickers_all)
 with c2:
-    ticker_filter = st.multiselect("Ticker", tickers_all, default=tickers_all)
+    ticker_filter = st.multiselect("Ticker", tickers_all, default=_default_tickers)
 with c3:
     strategy_filter = st.multiselect("Strategy", strategy_opts, default=strategy_opts)
 

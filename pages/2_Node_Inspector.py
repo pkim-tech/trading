@@ -12,38 +12,103 @@ from statsmodels.tsa.stattools import adfuller
 
 DB_PATH = "./cache/trading_universe.db"
 CACHE_DIR = Path("./cache")
-ROLLING_WINDOW = 30 * 7  # ~30 trading days in hourly bars
+ROLLING_WINDOW = 60 * 7  # ~60 trading days in hourly bars
 
 st.set_page_config(layout="wide", page_title="Node Inspector")
 
 
-def _hurst(ts):
-    lags = [2, 4, 8, 16, 32]
-    lags = [l for l in lags if l < len(ts) // 2]
-    if len(lags) < 2:
-        return np.nan
-    variances = []
-    for lag in lags:
-        v = np.var(ts[lag:] - ts[:-lag])
-        if v <= 0:
-            return np.nan
-        variances.append(v)
-    m = np.polyfit(np.log(lags[:len(variances)]), np.log(variances), 1)
-    return m[0] / 2.0
+def _hurst_vectorized(log_p, window):
+    from numpy.lib.stride_tricks import sliding_window_view
+    lags = [l for l in [2, 4, 8, 16, 32] if l < window // 2]
+    if len(lags) < 2 or len(log_p) <= window:
+        return np.full(len(log_p), np.nan)
+
+    windows = sliding_window_view(log_p, window)[:-1]  # drop last so len matches result[window:]
+    variances = np.array([
+        np.var(windows[:, lag:] - windows[:, :-lag], axis=1)
+        for lag in lags
+    ])  # (n_lags, n_windows)
+
+    valid = np.all(variances > 0, axis=0)
+    hurst_vals = np.full(len(windows), np.nan)
+    if valid.any():
+        log_lags = np.log(lags)
+        X = np.vstack([log_lags, np.ones(len(lags))]).T
+        coeffs = np.linalg.lstsq(X, np.log(variances[:, valid]), rcond=None)[0]
+        hurst_vals[valid] = coeffs[0] / 2.0
+
+    result = np.full(len(log_p), np.nan)
+    result[window:] = hurst_vals  # first `window` bars have no full lookback
+    return result
 
 
-@st.cache_data(ttl=3600)
-def rolling_hurst(ticker, window=ROLLING_WINDOW, step=12):
+def rolling_hurst(ticker, window=ROLLING_WINDOW):
     prices = load_hourly(ticker)
     if prices is None:
         return pd.Series(dtype=float)
     close_col = 'Adj Close' if 'Adj Close' in prices.columns else 'Close'
     log_p = np.log(prices[close_col].values)
-    result = np.full(len(log_p), np.nan)
-    for i in range(window, len(log_p), step):
-        result[i] = _hurst(log_p[i - window:i])
-    s = pd.Series(result, index=prices.index)
-    return s.interpolate(method='time').where(s.notna() | s.shift().notna())
+    return pd.Series(_hurst_vectorized(log_p, window), index=prices.index)
+
+
+def _load_hurst_db(ticker):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hurst_cache (
+                ticker    TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                hurst     REAL,
+                PRIMARY KEY (ticker, timestamp)
+            )
+        """)
+        rows = conn.execute(
+            "SELECT timestamp, hurst FROM hurst_cache WHERE ticker = ? ORDER BY timestamp",
+            (ticker,)
+        ).fetchall()
+    if not rows:
+        return None
+    return pd.Series(
+        [r[1] for r in rows],
+        index=pd.to_datetime([r[0] for r in rows])
+    )
+
+
+def _save_hurst_db(ticker, series):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hurst_cache (
+                ticker    TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                hurst     REAL,
+                PRIMARY KEY (ticker, timestamp)
+            )
+        """)
+        conn.executemany(
+            "INSERT OR REPLACE INTO hurst_cache (ticker, timestamp, hurst) VALUES (?, ?, ?)",
+            [(ticker, ts.isoformat(), val) for ts, val in series.items()]
+        )
+
+
+def get_hurst(ticker, is_watchlist=False):
+    key = f"hurst_{ticker}"
+    if key in st.session_state:
+        return st.session_state[key]
+
+    h = None
+    if is_watchlist:
+        h = _load_hurst_db(ticker)
+        if h is not None:
+            prices = load_hourly(ticker)
+            if prices is not None and h.index[-1] < prices.index[-1]:
+                h = None  # stale — CSV has newer bars
+
+    if h is None:
+        h = rolling_hurst(ticker)
+        if is_watchlist:
+            _save_hurst_db(ticker, h)
+
+    st.session_state[key] = h
+    return h
 
 
 @st.cache_data(ttl=3600)
@@ -118,6 +183,24 @@ def compute_bands(ticker, strategy_name, window):
 
 
 st.title("Node Inspector")
+
+# ---------------------------------------------------------------------------
+# Pre-warm Hurst (once per session)
+#   - watchlist tickers: load from hurst_cache DB (or compute+save if missing/stale)
+#   - non-watchlist tickers with any node >200% return: session_state only
+# ---------------------------------------------------------------------------
+if "hurst_prewarmed" not in st.session_state:
+    _wl_tickers = set(w["ticker"] for w in (get_watchlist() or []))
+    with sqlite3.connect(DB_PATH) as _c:
+        _high_return = set(r[0] for r in _c.execute(
+            "SELECT DISTINCT ticker FROM backtest_cache WHERE strategy_return > 2.0"
+        ).fetchall())
+    _to_warm = [t for t in (_wl_tickers | _high_return) if f"hurst_{t}" not in st.session_state]
+    if _to_warm:
+        with st.spinner(f"Pre-computing Hurst for {len(_to_warm)} tickers..."):
+            for t in _to_warm:
+                get_hurst(t, is_watchlist=(t in _wl_tickers))
+    st.session_state["hurst_prewarmed"] = True
 
 # ---------------------------------------------------------------------------
 # Watchlist
@@ -219,204 +302,162 @@ closed = df_trades[df_trades["Result"].isin(["WIN", "LOSS", "TWIN", "TLOSS"])] i
 # ---------------------------------------------------------------------------
 # Compute indicators (needed before chart for slider)
 # ---------------------------------------------------------------------------
-with st.spinner("Computing Hurst..."):
-    h_series = rolling_hurst(selected_ticker)
+_wl_set = set(w["ticker"] for w in (get_watchlist() or []))
+h_series = get_hurst(selected_ticker, is_watchlist=(selected_ticker in _wl_set))
 
-show_adf = st.checkbox("Show rolling ADF p-value (slow on first load)")
-adf_series = rolling_adf(selected_ticker) if show_adf else None
-
-# ---------------------------------------------------------------------------
-# Hurst filter slider
-# ---------------------------------------------------------------------------
-st.subheader("Hurst Filter")
-h_cutoff = st.slider("Suppress entries where H ≥", min_value=0.30, max_value=0.70,
-                     value=0.50, step=0.01, format="%.2f")
-
-# Classify trades as allowed / suppressed based on H at entry time
+# Pre-compute H_at_entry here — depends on h_series only, not the slider value
 if not closed.empty:
     closed = closed.copy()
     closed["Entry Time"] = pd.to_datetime(closed["Entry Time"])
     closed["Exit Time"]  = pd.to_datetime(closed["Exit Time"])
     closed["H_at_entry"] = closed["Entry Time"].apply(
-        lambda t: h_series.asof(t) if t >= h_series.index[0] else np.nan
+        lambda t: h_series.asof(t) if not h_series.empty and t >= h_series.index[0] else np.nan
     )
-    closed["allowed"] = closed["H_at_entry"].isna() | (closed["H_at_entry"] < h_cutoff)
-    allowed    = closed[closed["allowed"]]
-    suppressed = closed[~closed["allowed"]]
-else:
-    allowed = suppressed = pd.DataFrame()
 
-# ---------------------------------------------------------------------------
-# Chart
-# ---------------------------------------------------------------------------
-st.subheader("Price + Bands")
 
-n_rows = 3 if show_adf else 2
-row_heights = [0.62, 0.19, 0.19] if show_adf else [0.75, 0.25]
-subplot_titles = ("", "Hurst (30d)", "ADF p-value (30d)") if show_adf else ("", "Hurst (30d)")
+@st.fragment
+def _render_hurst_section(closed, h_series, df_ind, close, ticker):
+    show_adf = st.checkbox("Show rolling ADF p-value (slow on first load)")
+    adf_series = rolling_adf(ticker) if show_adf else None
 
-fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True,
-                    row_heights=row_heights,
-                    vertical_spacing=0.03,
-                    subplot_titles=subplot_titles)
+    st.subheader("Hurst Filter")
+    h_cutoff = st.slider("Suppress entries where H ≥", min_value=0.30, max_value=0.70,
+                         value=0.50, step=0.01, format="%.2f")
 
-# Downsample to 4h for display performance
-close_4h = close.resample('4h').last().dropna()
+    if not closed.empty:
+        cwh = closed.copy()
+        cwh["allowed"] = cwh["H_at_entry"].isna() | (cwh["H_at_entry"] < h_cutoff)
+        allowed    = cwh[cwh["allowed"]]
+        suppressed = cwh[~cwh["allowed"]]
+    else:
+        allowed = suppressed = pd.DataFrame()
 
-# Price
-fig.add_trace(go.Scatter(
-    x=close_4h.index, y=close_4h.values,
-    name="Price", line=dict(color="#aaaaaa", width=1),
-), row=1, col=1)
+    # -----------------------------------------------------------------------
+    # Chart
+    # -----------------------------------------------------------------------
+    st.subheader("Price + Bands")
 
-# Bollinger bands for each z
-if df_ind is not None:
-    sma = df_ind['SMA'].reindex(close.index, method='ffill')
-    std = df_ind['Std'].reindex(close.index, method='ffill')
-    band_styles = {
-        2.0: ("#4a9eff", "dash"),
-        2.5: ("#ff9f4a", "dot"),
-        3.0: ("#cc44ff", "dashdot"),
-    }
-    for z, (color, dash) in band_styles.items():
-        upper = (sma + z * std).resample('4h').last().dropna()
-        lower = (sma - z * std).resample('4h').last().dropna()
-        fig.add_trace(go.Scatter(
-            x=upper.index, y=upper.values,
-            name=f"z={z} upper", line=dict(color=color, width=1, dash=dash), opacity=0.7,
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=lower.index, y=lower.values,
-            name=f"z={z} lower", line=dict(color=color, width=1, dash=dash), opacity=0.7,
-            showlegend=False,
-        ), row=1, col=1)
+    n_rows = 3 if show_adf else 2
+    row_heights = [0.62, 0.19, 0.19] if show_adf else [0.75, 0.25]
+    subplot_titles = ("", "Hurst (30d)", "ADF p-value (30d)") if show_adf else ("", "Hurst (30d)")
 
-# Trade markers — allowed trades (normal colors)
-for subset, color, symbol, label in [
-    (allowed[allowed["Result"].isin(["WIN","TWIN"])],  "#00cc66", "triangle-up",   "Win (allowed)"),
-    (allowed[allowed["Result"].isin(["LOSS","TLOSS"])], "#ff4444", "triangle-down", "Loss (allowed)"),
-]:
-    if not subset.empty:
-        fig.add_trace(go.Scatter(
-            x=subset["Entry Time"], y=subset["Entry Price"],
-            mode="markers", marker=dict(symbol=symbol, size=10, color=color),
-            name=label,
-        ), row=1, col=1)
+    fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True,
+                        row_heights=row_heights, vertical_spacing=0.03,
+                        subplot_titles=subplot_titles)
 
-# Suppressed trades (grey, hollow)
-if not suppressed.empty:
+    close_4h = close.resample('4h').last().dropna()
     fig.add_trace(go.Scatter(
-        x=suppressed["Entry Time"], y=suppressed["Entry Price"],
-        mode="markers",
-        marker=dict(symbol="circle-open", size=10, color="#888888", line=dict(width=2)),
-        name="Suppressed (H≥cutoff)",
+        x=close_4h.index, y=close_4h.values,
+        name="Price", line=dict(color="#aaaaaa", width=1),
     ), row=1, col=1)
 
-# Exit markers
-if not closed.empty:
-    fig.add_trace(go.Scatter(
-        x=allowed["Exit Time"], y=allowed["Exit Price"],
-        mode="markers", marker=dict(symbol="x", size=8, color="#ffffff", opacity=0.7),
-        name="Exit",
-    ), row=1, col=1)
+    if df_ind is not None:
+        sma = df_ind['SMA'].reindex(close.index, method='ffill')
+        std = df_ind['Std'].reindex(close.index, method='ffill')
+        for z, (color, dash) in {2.0: ("#4a9eff","dash"), 2.5: ("#ff9f4a","dot"), 3.0: ("#cc44ff","dashdot")}.items():
+            upper = (sma + z * std).resample('4h').last().dropna()
+            lower = (sma - z * std).resample('4h').last().dropna()
+            fig.add_trace(go.Scatter(x=upper.index, y=upper.values, name=f"z={z} upper",
+                                     line=dict(color=color, width=1, dash=dash), opacity=0.7), row=1, col=1)
+            fig.add_trace(go.Scatter(x=lower.index, y=lower.values, showlegend=False,
+                                     line=dict(color=color, width=1, dash=dash), opacity=0.7), row=1, col=1)
 
-    # Shade allowed trade periods only
-    for _, tr in allowed.iterrows():
-        is_win = tr["Result"] in ["WIN", "TWIN"]
-        fig.add_vrect(
-            x0=tr["Entry Time"], x1=tr["Exit Time"],
-            fillcolor="#00cc66" if is_win else "#ff4444",
-            opacity=0.07, line_width=0, row=1, col=1,
-        )
+    for subset, color, symbol, label in [
+        (allowed[allowed["Result"].isin(["WIN","TWIN"])],   "#00cc66", "triangle-up",   "Win (allowed)"),
+        (allowed[allowed["Result"].isin(["LOSS","TLOSS"])], "#ff4444", "triangle-down", "Loss (allowed)"),
+    ]:
+        if not subset.empty:
+            fig.add_trace(go.Scatter(x=subset["Entry Time"], y=subset["Entry Price"],
+                                     mode="markers", marker=dict(symbol=symbol, size=10, color=color),
+                                     name=label), row=1, col=1)
 
-# Rolling Hurst + threshold line
-fig.add_trace(go.Scatter(
-    x=h_series.index, y=h_series.values,
-    name="Hurst (30d)", line=dict(color="#ffdd44", width=1.5),
-), row=2, col=1)
-fig.add_hline(y=0.5,      line=dict(color="#555555", dash="dash",  width=1), row=2, col=1)
-fig.add_hline(y=h_cutoff, line=dict(color="#ff8800", dash="solid", width=1.5), row=2, col=1)
+    if not suppressed.empty:
+        fig.add_trace(go.Scatter(x=suppressed["Entry Time"], y=suppressed["Entry Price"],
+                                 mode="markers",
+                                 marker=dict(symbol="circle-open", size=10, color="#888888", line=dict(width=2)),
+                                 name="Suppressed (H≥cutoff)"), row=1, col=1)
 
-# Rolling ADF p-value (optional)
-if show_adf and adf_series is not None:
-    fig.add_trace(go.Scatter(
-        x=adf_series.index, y=adf_series.values,
-        name="ADF p-value (30d)", line=dict(color="#44ddff", width=1.5),
-    ), row=3, col=1)
-    fig.add_hline(y=0.05, line=dict(color="#888888", dash="dash", width=1), row=3, col=1)
+    if not closed.empty:
+        fig.add_trace(go.Scatter(x=allowed["Exit Time"], y=allowed["Exit Price"],
+                                 mode="markers", marker=dict(symbol="x", size=8, color="#ffffff", opacity=0.7),
+                                 name="Exit"), row=1, col=1)
+        for _, tr in allowed.iterrows():
+            fig.add_vrect(x0=tr["Entry Time"], x1=tr["Exit Time"],
+                          fillcolor="#00cc66" if tr["Result"] in ["WIN","TWIN"] else "#ff4444",
+                          opacity=0.07, line_width=0, row=1, col=1)
 
-fig.update_layout(
-    height=800,
-    legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-    margin=dict(l=50, r=20, t=30, b=20),
-    hovermode="x unified",
-    xaxis_rangeslider_visible=False,
-)
-fig.update_yaxes(title_text="Price", row=1, col=1)
-fig.update_yaxes(title_text="Hurst", row=2, col=1, range=[0, 1])
-if show_adf:
-    fig.update_yaxes(title_text="ADF p", row=3, col=1, range=[0, 1])
+    fig.add_trace(go.Scatter(x=h_series.index, y=h_series.values,
+                             name="Hurst (30d)", line=dict(color="#ffdd44", width=1.5)), row=2, col=1)
+    fig.add_hline(y=0.5,      line=dict(color="#555555", dash="dash",  width=1), row=2, col=1)
+    fig.add_hline(y=h_cutoff, line=dict(color="#ff8800", dash="solid", width=1.5), row=2, col=1)
 
-st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+    if show_adf and adf_series is not None:
+        fig.add_trace(go.Scatter(x=adf_series.index, y=adf_series.values,
+                                 name="ADF p-value (30d)", line=dict(color="#44ddff", width=1.5)), row=3, col=1)
+        fig.add_hline(y=0.05, line=dict(color="#888888", dash="dash", width=1), row=3, col=1)
 
-# ---------------------------------------------------------------------------
-# Metrics — unfiltered vs H-filtered side by side
-# ---------------------------------------------------------------------------
-def _metrics(df, label):
-    if df.empty:
-        st.caption(f"{label}: no trades")
-        return
-    total = len(df)
-    pw = len(df[df["Result"] == "WIN"])
-    tw = len(df[df["Result"] == "TWIN"])
-    ret = ((df["Return %"] / 100.0 + 1).prod() - 1) * 100 if "Return %" in df.columns else 0.0
-    wr  = (pw + tw) / total * 100
-    st.caption(label)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Trades", total)
-    c2.metric("Win Rate", f"{wr:.1f}%")
-    c3.metric("Compounded Return", f"{ret:+.2f}%")
-    c4.metric("Time Exits", len(df[df["Result"].isin(["TWIN","TLOSS"])]))
+    fig.update_layout(height=800,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+                      margin=dict(l=50, r=20, t=30, b=20),
+                      hovermode="x unified", xaxis_rangeslider_visible=False)
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Hurst", row=2, col=1, range=[0, 1])
+    if show_adf:
+        fig.update_yaxes(title_text="ADF p", row=3, col=1, range=[0, 1])
 
-if not closed.empty:
-    col_all, col_filt = st.columns(2)
-    with col_all:
-        _metrics(closed, "All trades (unfiltered)")
-    with col_filt:
-        _metrics(allowed, f"H-filtered (H < {h_cutoff:.2f})")
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
 
-    # Quarterly breakdown (filtered)
-    if not allowed.empty:
-        st.markdown("#### By Quarter (H-filtered)")
-        allowed = allowed.copy()
-        allowed["Quarter"] = allowed["Entry Time"].dt.to_period("Q").astype(str)
-        rows_q = []
-        for q, g in allowed.groupby("Quarter"):
-            pw = len(g[g["Result"] == "WIN"])
-            tw = len(g[g["Result"] == "TWIN"])
-            ret = ((g["Return %"] / 100.0 + 1).prod() - 1) * 100 if "Return %" in g.columns else 0.0
-            rows_q.append({"Quarter": q, "Trades": len(g), "Win %": (pw+tw)/len(g)*100, "Return %": ret})
-        df_q = pd.DataFrame(rows_q).sort_values("Quarter", ascending=False)
-        st.dataframe(df_q, hide_index=True, use_container_width=True,
-                     column_config={
-                         "Win %":    st.column_config.NumberColumn(format="%.1f%%"),
-                         "Return %": st.column_config.NumberColumn(format="%+.2f%%"),
-                     })
+    # -----------------------------------------------------------------------
+    # Metrics
+    # -----------------------------------------------------------------------
+    def _metrics(df, label):
+        if df.empty:
+            st.caption(f"{label}: no trades")
+            return
+        total = len(df)
+        pw  = len(df[df["Result"] == "WIN"])
+        tw  = len(df[df["Result"] == "TWIN"])
+        ret = ((df["Return %"] / 100.0 + 1).prod() - 1) * 100 if "Return %" in df.columns else 0.0
+        wr  = (pw + tw) / total * 100
+        st.caption(label)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trades", total)
+        c2.metric("Win Rate", f"{wr:.1f}%")
+        c3.metric("Compounded Return", f"{ret:+.2f}%")
+        c4.metric("Time Exits", len(df[df["Result"].isin(["TWIN","TLOSS"])]))
 
-    # Trade log
-    st.markdown("#### Trade Log")
-    log_cols = [c for c in ["Entry Time", "Entry Price", "Exit Time", "Exit Price", "Result", "H_at_entry", "Return %"] if c in closed.columns]
-    log_df = closed[log_cols].copy()
-    st.dataframe(
-        log_df,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Entry Price":  st.column_config.NumberColumn(format="$%.2f"),
-            "Exit Price":   st.column_config.NumberColumn(format="$%.2f"),
-            "H_at_entry":   st.column_config.NumberColumn(format="%.3f"),
-            "Return %":     st.column_config.NumberColumn(format="%+.2f%%"),
-        },
-    )
-else:
-    st.warning("No closed trades for this node.")
+    if not closed.empty:
+        col_all, col_filt = st.columns(2)
+        with col_all:
+            _metrics(closed, "All trades (unfiltered)")
+        with col_filt:
+            _metrics(allowed, f"H-filtered (H < {h_cutoff:.2f})")
+
+        if not allowed.empty:
+            st.markdown("#### By Quarter (H-filtered)")
+            aq = allowed.copy()
+            aq["Quarter"] = aq["Entry Time"].dt.to_period("Q").astype(str)
+            rows_q = []
+            for q, g in aq.groupby("Quarter"):
+                pw  = len(g[g["Result"] == "WIN"])
+                tw  = len(g[g["Result"] == "TWIN"])
+                ret = ((g["Return %"] / 100.0 + 1).prod() - 1) * 100 if "Return %" in g.columns else 0.0
+                rows_q.append({"Quarter": q, "Trades": len(g), "Win %": (pw+tw)/len(g)*100, "Return %": ret})
+            st.dataframe(pd.DataFrame(rows_q).sort_values("Quarter", ascending=False),
+                         hide_index=True, use_container_width=True,
+                         column_config={"Win %": st.column_config.NumberColumn(format="%.1f%%"),
+                                        "Return %": st.column_config.NumberColumn(format="%+.2f%%")})
+
+        st.markdown("#### Trade Log")
+        log_cols = [c for c in ["Entry Time", "Entry Price", "Exit Time", "Exit Price",
+                                 "Result", "H_at_entry", "Return %"] if c in closed.columns]
+        st.dataframe(closed[log_cols].copy(), hide_index=True, use_container_width=True,
+                     column_config={"Entry Price": st.column_config.NumberColumn(format="$%.2f"),
+                                    "Exit Price":  st.column_config.NumberColumn(format="$%.2f"),
+                                    "H_at_entry":  st.column_config.NumberColumn(format="%.3f"),
+                                    "Return %":    st.column_config.NumberColumn(format="%+.2f%%")})
+    else:
+        st.warning("No closed trades for this node.")
+
+
+_render_hurst_section(closed, h_series, df_ind, close, selected_ticker)

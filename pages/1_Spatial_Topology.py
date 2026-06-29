@@ -4,6 +4,7 @@ import sqlite3
 import json
 import os
 import plotly.graph_objects as go
+from db_cache import get_kv, set_kv
 
 DB_PATH = "./cache/trading_universe.db"
 TELEMETRY_PATH = "current_test.json"
@@ -11,31 +12,33 @@ PHASE_GRID_PATH = "active_phase_grid.json"
 
 st.set_page_config(layout="wide", page_title="Spatial Topology Space")
 
-@st.cache_data(ttl=60)
+
 def load_dropdown_options():
     if not os.path.exists(DB_PATH):
         return [], {}, {}
-    with sqlite3.connect(DB_PATH) as conn:
-        versions = [r[0] for r in conn.execute(
-            "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
-        ).fetchall()]
-        tickers_by_version = {}
-        for v in versions:
-            tickers_by_version[v] = [r[0] for r in conn.execute(
-                "SELECT DISTINCT ticker FROM backtest_cache WHERE version = ? ORDER BY ticker", (v,)
+    versions = get_kv("versions")
+    if versions is None:
+        with sqlite3.connect(DB_PATH) as conn:
+            versions = [r[0] for r in conn.execute(
+                "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
             ).fetchall()]
-        strats_by_version_ticker = {}
-        rows = conn.execute(
-            "SELECT DISTINCT version, ticker, strategy FROM backtest_cache"
-        ).fetchall()
-        for v, t, s in rows:
-            strats_by_version_ticker.setdefault((v, t), [])
-            if s not in strats_by_version_ticker[(v, t)]:
-                strats_by_version_ticker[(v, t)].append(s)
+    tickers_by_version = {}
+    strats_by_version_ticker = {}
+    for v in versions:
+        tickers = get_kv(f"tickers_{v}")
+        if tickers is None:
+            with sqlite3.connect(DB_PATH) as conn:
+                tickers = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT ticker FROM backtest_cache WHERE version = ? ORDER BY ticker", (v,)
+                ).fetchall()]
+        tickers_by_version[v] = tickers
+        strats = get_kv(f"strategies_{v}") or ["ZScoreBreakout"]
+        for t in tickers:
+            strats_by_version_ticker[(v, t)] = strats
     return versions, tickers_by_version, strats_by_version_ticker
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=3600)
 def load_slice(version, ticker, strategy):
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()

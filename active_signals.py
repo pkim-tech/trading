@@ -295,6 +295,32 @@ def _current_price(ticker):
 # Signal computation
 # ---------------------------------------------------------------------------
 
+def _hurst_adf(ticker, df_hourly):
+    hurst = None
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            row = c.execute(
+                "SELECT hurst FROM hurst_cache WHERE ticker = ? ORDER BY timestamp DESC LIMIT 1",
+                (ticker,)
+            ).fetchone()
+        if row:
+            hurst = row[0]
+    except Exception:
+        pass
+
+    adf_p = None
+    try:
+        from statsmodels.tsa.stattools import adfuller
+        close = df_hourly['Close'].dropna()
+        n = min(420, len(close))
+        if n >= 20:
+            adf_p = adfuller(close.iloc[-n:], maxlag=1, autolag=None)[1]
+    except Exception:
+        pass
+
+    return hurst, adf_p
+
+
 def compute_buy_signal(node):
     ticker = node['ticker']
     window = int(node['window'])
@@ -307,7 +333,8 @@ def compute_buy_signal(node):
     if df_hourly is None or len(df_daily) < window:
         return None
 
-    strat = strategy_cls(window=window)
+    z_thresh = float(node.get('z_score_threshold', 2.0))
+    strat = strategy_cls(window=window, z_score_threshold=z_thresh)
     today = pd.Timestamp.now().normalize()
     indicators = strat.generate_daily_indicators(df_daily[df_daily.index < today])
     if indicators.empty:
@@ -319,6 +346,7 @@ def compute_buy_signal(node):
     last_bar      = close_series.index[-1]
     sma           = last_row['SMA']
     std           = last_row['Std']
+    hurst, adf_p  = _hurst_adf(ticker, df_hourly)
 
     return {
         'ticker':        ticker,
@@ -326,10 +354,12 @@ def compute_buy_signal(node):
         'current_price': current_price,
         'sma':           sma,
         'std':           std,
-        'lower_band':    sma - 2.0 * std,
+        'lower_band':    sma - z_thresh * std,
         'z_score':       (current_price - sma) / std,
         'signal':        strat.check_signal(current_price, last_row),
         'last_bar':      last_bar,
+        'hurst':         hurst,
+        'adf_p':         adf_p,
     }
 
 
@@ -495,18 +525,24 @@ def _build_buy_blocks(node, sig):
     z       = sig['z_score']
     bar_str = sig['last_bar'].strftime('%Y-%m-%d %H:%M')
 
+    fields = {
+        "Price":      f"${price:.4f}",
+        "Lower Band": f"${sig['lower_band']:.4f}",
+        "Z-Score":    f"{z:.2f}",
+        "Bar":        bar_str,
+        "Window":     str(node['window']),
+        "TP / SL":    f"{node['take_profit']}% / {node['stop_loss']}%",
+        "Max Hold":   f"{node['max_hold_hours']}h",
+        "SMA":        f"${sig['sma']:.4f}",
+    }
+    if sig.get('hurst') is not None:
+        fields["Hurst (60d)"] = f"{sig['hurst']:.3f}"
+    if sig.get('adf_p') is not None:
+        fields["ADF p"] = f"{sig['adf_p']:.3f}"
+
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"BUY SIGNAL — {ticker}"}},
-        _fields_block({
-            "Price":      f"${price:.4f}",
-            "Lower Band": f"${sig['lower_band']:.4f}",
-            "Z-Score":    f"{z:.2f}",
-            "Bar":        bar_str,
-            "Window":     str(node['window']),
-            "TP / SL":    f"{node['take_profit']}% / {node['stop_loss']}%",
-            "Max Hold":   f"{node['max_hold_hours']}h",
-            "SMA":        f"${sig['sma']:.4f}",
-        }),
+        _fields_block(fields),
     ]
 
     if SOCKET_MODE:
@@ -726,12 +762,16 @@ def notify_buy_signal(node, sig):
     sl       = node['stop_loss']
     hold     = node['max_hold_hours']
 
+    hurst_str = f"{sig['hurst']:.3f}" if sig.get('hurst') is not None else "n/a"
+    adf_str   = f"{sig['adf_p']:.3f}" if sig.get('adf_p') is not None else "n/a"
+
     sep = '=' * 62
     print(f"\n{sep}")
     print(f"  BUY SIGNAL  {ticker}  {bar_str}")
     print(f"  Price:  ${price:.4f}   Lower band: ${sig['lower_band']:.4f}   z = {z:.2f}")
     print(f"  Node:   window={node['window']}  TP={tp}%  SL={sl}%  hold={hold}h")
     print(f"  SMA: ${sig['sma']:.4f}   Std: ${sig['std']:.4f}")
+    print(f"  Hurst (60d): {hurst_str}   ADF p: {adf_str}")
     print(sep)
 
     _post_message(
