@@ -109,6 +109,16 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - Columns: stock_underlier, index_underlier, leverage, inverse, has_data, price, dollar vol, AUM, performance, signals
 - "Add to config.json" button adds selected tickers to `target_tickers` for the next sweep
 
+### Open Positions Page
+
+`pages/10_Open_Positions.py` — live view of manually entered positions tracked in `open_positions` DB table.
+
+- Reads from `open_positions` in `cache/trading_universe.db`
+- Fetches current price via `yfinance fast_info.last_price` at page load
+- Shows: entry price, current price, unrealized P&L%, TP price, SL price, hours held, hours remaining until time-exit, entry time
+- TP = entry_price × (1 + tp%), SL = entry_price × (1 - sl%) — display only, Schwab stop is set separately at lower_band × (1 - (sl%+1%))
+- Manual refresh button; no auto-refresh
+
 ### Ticker Universe Table
 
 `tickers` table in `cache/trading_universe.db` — populated by `scripts/import_tickers.py` from screener CSV exports.
