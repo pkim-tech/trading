@@ -312,7 +312,7 @@ def _hurst_adf(ticker, df_hourly):
     try:
         from statsmodels.tsa.stattools import adfuller
         close = df_hourly['Close'].dropna()
-        n = min(420, len(close))
+        n = min(200, len(close))
         if n >= 20:
             adf_p = adfuller(close.iloc[-n:], maxlag=1, autolag=None)[1]
     except Exception:
@@ -536,7 +536,7 @@ def _build_buy_blocks(node, sig):
         "SMA":        f"${sig['sma']:.4f}",
     }
     if sig.get('hurst') is not None:
-        fields["Hurst (60d)"] = f"{sig['hurst']:.3f}"
+        fields["Hurst (100 bars)"] = f"{sig['hurst']:.3f}"
     if sig.get('adf_p') is not None:
         fields["ADF p"] = f"{sig['adf_p']:.3f}"
 
@@ -771,7 +771,7 @@ def notify_buy_signal(node, sig):
     print(f"  Price:  ${price:.4f}   Lower band: ${sig['lower_band']:.4f}   z = {z:.2f}")
     print(f"  Node:   window={node['window']}  TP={tp}%  SL={sl}%  hold={hold}h")
     print(f"  SMA: ${sig['sma']:.4f}   Std: ${sig['std']:.4f}")
-    print(f"  Hurst (60d): {hurst_str}   ADF p: {adf_str}")
+    print(f"  Hurst (100 bars): {hurst_str}   ADF p: {adf_str}")
     print(sep)
 
     _post_message(

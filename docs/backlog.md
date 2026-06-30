@@ -24,6 +24,8 @@
 - **Topology page — node selection rework**: The bottom section for picking and researching nodes is hard to use. Needs a full rework — easier node selection, clearer display of selected node details, and a path to launch the trade chart from a selected node. — Medium
 
 
+- **SPY trend / VIX level as entry filter**: Next research direction after ruling out Hurst/ADF. Hypothesis: avoid entries when SPY is in a downtrend (e.g. price < 200d SMA) or VIX is elevated (e.g. VIX > 25). Both are macro regime signals rather than ticker-level, which may address the lag problem that killed Hurst/ADF.
+
 ## Medium Priority
 
 - **Parameter selection workflow**: After enough sweeps, need a way to review results across tickers and select parameter sets to trade — currently manual via logs/heatmaps
@@ -37,9 +39,9 @@
 - **Portfolio backtest page**: Replay all watched nodes simultaneously over the same time period. Show concurrent open positions over time (chart), max simultaneous positions, average utilization, capital requirements. Answers "how much capital do I actually need?"
 - **Broader ticker universe**: `results.csv` (999 rows, mixed leveraged/non-leveraged) has liquidity data for non-leveraged ETFs. Import and sweep to increase signal frequency. Current universe is leveraged-only.
 - **Half-Life of Reversion**: Fit an Ornstein-Uhlenbeck process per ticker to estimate how many hours prices take to revert to mean. Use to inform `max_hold_hours` sweep range per ticker (sweep around the half-life rather than the same grid for all tickers). One offline computation per ticker, surface in Screener. Complements Hurst and ADF.
-- **ADF test (stationarity filter)**: One-time per-ticker computation. Augmented Dickey-Fuller test confirms whether a price series is stationary (genuinely mean-reverting) vs. random walk. Simple pass/fail screener column. Pair with Hurst for a two-signal quality gate.
+- **ADF test (stationarity filter)**: ✅ Built as `pages/8_ADF_Filter.py`. Verdict: not actionable as entry filter — see `docs/research.md`.
 - **Regime transition stress test (synthetic)**: Generate a single synthetic price series that transitions through Hurst regimes over time (e.g. mean-reverting → trending → random → back). Run backtester against it and visualize equity curve + open/close markers through the transition. Goal: confirm the strategy doesn't get caught entering trades as H spikes, and that the H filter cuts exposure at the right moment. Critical gap — all real data is bull market only.
-- **H threshold slider (real ticker)**: For a selected ticker, compute rolling Hurst on real price history and let user drag an H cutoff threshold. Show how trades, return, and win rate change as the filter tightens/loosens. Practical calibration tool for setting live trading filter. Pair with regime transition stress test.
+- **H threshold slider (real ticker)**: ✅ Built as `pages/7_Hurst_Filter.py`. Verdict: not actionable as entry filter — see `docs/research.md`.
 - **Rolling Hurst Exponent filter**: Compute rolling Hurst (512-bar window ≈ 6 months of trading hours, DFA method) per ticker offline. Surface as a screener column and use as a signal quality gate — H < 0.45 confirms genuine mean-reversion regime, H > 0.55 signals trending (suppress entries). Rolling window intentional: captures recent regime behavior, not a 2-year average that masks recent shifts. Motivated by bear/bull regime risk: leveraged ETFs in sustained sector trends look like dip-buying opportunities but aren't. See session discussion 2026-06-27.
 - **Advanced indicators**: Dataset size allows pre-computing Bollinger Bands, ATR, MACD etc. instantly via TA-Lib or pandas-ta (compiled C under the hood) — no hardware constraints
 - **Basic ML experimentation**: Dataset small enough to train Random Forests or XGBoost on CPU in seconds if we want to explore signal prediction

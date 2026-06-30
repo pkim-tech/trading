@@ -8,38 +8,16 @@ from pathlib import Path
 from backtester import run_backtest
 import strategies
 from active_signals import get_watchlist
+from db_cache import get_kv
 from statsmodels.tsa.stattools import adfuller
 
 DB_PATH = "./cache/trading_universe.db"
 CACHE_DIR = Path("./cache")
-ROLLING_WINDOW = 60 * 7  # ~60 trading days in hourly bars
 
 st.set_page_config(layout="wide", page_title="Node Inspector")
 
 
-def _hurst_vectorized(log_p, window):
-    from numpy.lib.stride_tricks import sliding_window_view
-    lags = [l for l in [2, 4, 8, 16, 32] if l < window // 2]
-    if len(lags) < 2 or len(log_p) <= window:
-        return np.full(len(log_p), np.nan)
-
-    windows = sliding_window_view(log_p, window)[:-1]  # drop last so len matches result[window:]
-    variances = np.array([
-        np.var(windows[:, lag:] - windows[:, :-lag], axis=1)
-        for lag in lags
-    ])  # (n_lags, n_windows)
-
-    valid = np.all(variances > 0, axis=0)
-    hurst_vals = np.full(len(windows), np.nan)
-    if valid.any():
-        log_lags = np.log(lags)
-        X = np.vstack([log_lags, np.ones(len(lags))]).T
-        coeffs = np.linalg.lstsq(X, np.log(variances[:, valid]), rcond=None)[0]
-        hurst_vals[valid] = coeffs[0] / 2.0
-
-    result = np.full(len(log_p), np.nan)
-    result[window:] = hurst_vals  # first `window` bars have no full lookback
-    return result
+from hurst import _hurst_vectorized, ROLLING_WINDOW
 
 
 def rolling_hurst(ticker, window=ROLLING_WINDOW):
@@ -129,6 +107,17 @@ def rolling_adf(ticker, window=ROLLING_WINDOW, step=48):
     return s.interpolate(method='time').where(s.notna() | s.shift().notna())
 
 
+@st.cache_data(ttl=300)
+def _load_dropdown_opts():
+    versions = get_kv("versions")
+    with sqlite3.connect(DB_PATH) as _c:
+        if versions is None:
+            versions = [r[0] for r in _c.execute("SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC").fetchall()]
+        tickers = [r[0] for r in _c.execute("SELECT DISTINCT ticker FROM backtest_cache ORDER BY ticker").fetchall()]
+        strats  = [r[0] for r in _c.execute("SELECT DISTINCT strategy FROM backtest_cache ORDER BY strategy").fetchall()]
+    return tickers, strats, versions
+
+
 @st.cache_data(ttl=60)
 def get_slice(ticker, strategy, version):
     with sqlite3.connect(DB_PATH) as conn:
@@ -151,6 +140,7 @@ def load_hourly(ticker):
 
 
 @st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def run_cached_backtest(ticker, strategy_name, version, window, tp, sl, hold, zt):
     df_h = load_hourly(ticker)
     if df_h is None:
@@ -191,15 +181,11 @@ st.title("Node Inspector")
 # ---------------------------------------------------------------------------
 if "hurst_prewarmed" not in st.session_state:
     _wl_tickers = set(w["ticker"] for w in (get_watchlist() or []))
-    with sqlite3.connect(DB_PATH) as _c:
-        _high_return = set(r[0] for r in _c.execute(
-            "SELECT DISTINCT ticker FROM backtest_cache WHERE strategy_return > 2.0"
-        ).fetchall())
-    _to_warm = [t for t in (_wl_tickers | _high_return) if f"hurst_{t}" not in st.session_state]
+    _to_warm = [t for t in _wl_tickers if f"hurst_{t}" not in st.session_state]
     if _to_warm:
-        with st.spinner(f"Pre-computing Hurst for {len(_to_warm)} tickers..."):
+        with st.spinner(f"Computing Hurst for watchlist..."):
             for t in _to_warm:
-                get_hurst(t, is_watchlist=(t in _wl_tickers))
+                get_hurst(t, is_watchlist=True)
     st.session_state["hurst_prewarmed"] = True
 
 # ---------------------------------------------------------------------------
@@ -236,10 +222,7 @@ if not wl_df.empty:
 # ---------------------------------------------------------------------------
 t_node = st.session_state.pop("target_node", {}) or selected_node
 
-with sqlite3.connect(DB_PATH) as _c:
-    tick_opts = [r[0] for r in _c.execute("SELECT DISTINCT ticker FROM backtest_cache ORDER BY ticker").fetchall()]
-    strat_opts = [r[0] for r in _c.execute("SELECT DISTINCT strategy FROM backtest_cache ORDER BY strategy").fetchall()]
-    ver_opts   = [r[0] for r in _c.execute("SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC").fetchall()]
+tick_opts, strat_opts, ver_opts = _load_dropdown_opts()
 
 if not tick_opts:
     st.info("No backtest data yet.")
@@ -310,9 +293,12 @@ if not closed.empty:
     closed = closed.copy()
     closed["Entry Time"] = pd.to_datetime(closed["Entry Time"])
     closed["Exit Time"]  = pd.to_datetime(closed["Exit Time"])
-    closed["H_at_entry"] = closed["Entry Time"].apply(
-        lambda t: h_series.asof(t) if not h_series.empty and t >= h_series.index[0] else np.nan
-    )
+    if not h_series.empty:
+        closed["H_at_entry"] = closed["Entry Time"].apply(
+            lambda t: h_series.asof(t) if t >= h_series.index[0] else np.nan
+        )
+    else:
+        closed["H_at_entry"] = np.nan
 
 
 @st.fragment
@@ -339,7 +325,7 @@ def _render_hurst_section(closed, h_series, df_ind, close, ticker):
 
     n_rows = 3 if show_adf else 2
     row_heights = [0.62, 0.19, 0.19] if show_adf else [0.75, 0.25]
-    subplot_titles = ("", "Hurst (30d)", "ADF p-value (30d)") if show_adf else ("", "Hurst (30d)")
+    subplot_titles = ("", "Hurst (100 bars)", "ADF p-value (100 bars)") if show_adf else ("", "Hurst (100 bars)")
 
     fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True,
                         row_heights=row_heights, vertical_spacing=0.03,
@@ -385,15 +371,19 @@ def _render_hurst_section(closed, h_series, df_ind, close, ticker):
             fig.add_vrect(x0=tr["Entry Time"], x1=tr["Exit Time"],
                           fillcolor="#00cc66" if tr["Result"] in ["WIN","TWIN"] else "#ff4444",
                           opacity=0.07, line_width=0, row=1, col=1)
+        for _, tr in suppressed.iterrows():
+            fig.add_vrect(x0=tr["Entry Time"], x1=tr["Exit Time"],
+                          fillcolor="#888888", opacity=0.04,
+                          line=dict(color="#888888", width=1, dash="dot"), row=1, col=1)
 
     fig.add_trace(go.Scatter(x=h_series.index, y=h_series.values,
-                             name="Hurst (30d)", line=dict(color="#ffdd44", width=1.5)), row=2, col=1)
+                             name="Hurst (100 bars)", line=dict(color="#ffdd44", width=1.5)), row=2, col=1)
     fig.add_hline(y=0.5,      line=dict(color="#555555", dash="dash",  width=1), row=2, col=1)
     fig.add_hline(y=h_cutoff, line=dict(color="#ff8800", dash="solid", width=1.5), row=2, col=1)
 
     if show_adf and adf_series is not None:
         fig.add_trace(go.Scatter(x=adf_series.index, y=adf_series.values,
-                                 name="ADF p-value (30d)", line=dict(color="#44ddff", width=1.5)), row=3, col=1)
+                                 name="ADF p-value (100 bars)", line=dict(color="#44ddff", width=1.5)), row=3, col=1)
         fig.add_hline(y=0.05, line=dict(color="#888888", dash="dash", width=1), row=3, col=1)
 
     fig.update_layout(height=800,

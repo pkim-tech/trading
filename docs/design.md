@@ -48,9 +48,11 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - `config.json` — single source of truth for runtime config. `app.py` reads/writes directly — DB copy removed.
 
 ### Performance
-- `ProcessPoolExecutor` with up to 10 workers
+- `ProcessPoolExecutor` with up to 6 workers (`max_workers=6`)
 - SQLite WAL mode for concurrent writes
 - L3 cache optimization identified as next performance improvement (suggested by Gemini)
+- Sweep auto-runs `refresh_dropdown_cache()` + `refresh_pivot_cache()` on completion
+- Cron job runs sweep daily at 4:15am
 
 ---
 
@@ -85,6 +87,18 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 ### Strategy Page
 
 `pages/6_Strategy.py` — renders `docs/strategy.md` in the app. Living reference for signal logic, edge cases, and trading rules.
+
+### Hurst Filter Page
+
+`pages/7_Hurst_Filter.py` — sweeps Hurst cutoff across all qualifying watchlist nodes. Compares MR (mean-reverting, H<cutoff) vs MO (momentum, H≥cutoff) entry filters. Result: not actionable — see `docs/research.md`.
+
+### ADF Filter Page
+
+`pages/8_ADF_Filter.py` — same structure for ADF p-value filter. Non-stationary (p≥cutoff) vs stationary entries. See `docs/research.md`.
+
+### Shared Modules
+
+- `hurst.py` — `_hurst_vectorized` + `ROLLING_WINDOW=200`. Imported by Node Inspector and `active_signals.py`.
 
 ### Screener Page
 

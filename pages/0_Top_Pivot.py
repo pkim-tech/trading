@@ -30,6 +30,15 @@ def load_single_stock_tickers():
     return {r[0] for r in rows}
 
 
+@st.cache_data(ttl=3600)
+def load_index_tickers():
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute(
+            "SELECT symbol FROM tickers WHERE index_underlier IS NOT NULL AND index_underlier != ''"
+        ).fetchall()
+    return {r[0] for r in rows}
+
+
 def _build_pivot(df_cells, df_meta, min_trades):
     df_filtered = df_cells[df_cells['trades'] >= min_trades]
     if df_filtered.empty:
@@ -103,6 +112,7 @@ with c5:
     min_bh_mult = st.number_input("Min B&H mult", value=1.0, step=0.5, format="%.1f")
 with c6:
     exclude_single_stock = st.toggle("Exclude single-stock", value=True)
+    exclude_index = st.toggle("Exclude index", value=False)
 
 pivot = load_pivot(version, int(min_trades))
 if pivot.empty:
@@ -110,9 +120,12 @@ if pivot.empty:
     st.stop()
 
 single_stock = load_single_stock_tickers()
+index_tickers = load_index_tickers()
 
 if exclude_single_stock:
     pivot = pivot[~pivot.index.isin(single_stock)]
+if exclude_index:
+    pivot = pivot[~pivot.index.isin(index_tickers)]
 
 pivot = pivot[
     (pivot['max'] >= min_return) &

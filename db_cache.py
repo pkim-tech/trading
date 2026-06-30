@@ -1,8 +1,9 @@
 import json
 import sqlite3
 import pandas as pd
+from pathlib import Path
 
-DB_PATH = "./cache/trading_universe.db"
+DB_PATH = str(Path(__file__).parent / "cache" / "trading_universe.db")
 
 
 def _ensure_table(conn):

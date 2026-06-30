@@ -16,6 +16,7 @@ from tqdm import tqdm
 # --- Dynamic Core Strategy Imports ---
 from backtester import run_backtest
 import strategies
+from db_cache import refresh_dropdown_cache, refresh_pivot_cache
 
 # --- Global Workspace Environments ---
 CACHE_DIR = Path("./cache")
@@ -367,7 +368,7 @@ if __name__ == "__main__":
         configured_strategies = ["ZScoreBreakout"]
 
     if filtered_tickers:
-        with ProcessPoolExecutor(max_workers=10) as shared_pool:
+        with ProcessPoolExecutor(max_workers=6) as shared_pool:
             for ticker in filtered_tickers:
                 for name in configured_strategies:
                     strat_class = getattr(strategies, name, None)
@@ -383,6 +384,10 @@ if __name__ == "__main__":
             try: os.remove(p)
             except Exception: pass
             
+    logger.info("Refreshing DB caches...")
+    refresh_dropdown_cache()
+    refresh_pivot_cache()
+
     logger.info("=============================================")
     logger.info("🏁 PIPELINE OPERATIONS SUCCESSFULLY CLOSED   ")
     logger.info("=============================================")
