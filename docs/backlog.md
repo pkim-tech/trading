@@ -9,7 +9,7 @@
 - **Hurst + ADF screener columns**: Hook into data download — compute on download and store in `tickers` table. Not a single scalar (regime-dependent); pending decision on right aggregation. Rolling per-ticker series already computed in Node Inspector; Hurst/ADF at signal time now sent in Slack BUY message.
 - **Portfolio backtest page**: ✅ Built (`pages/4_Portfolio.py`). Gantt timeline + SPY overlay + concurrent positions panel, all shared x-axis. Hurst/ADF sliders filter trades by regime at entry. Summary metrics + per-node table with unfiltered vs filtered return comparison.
 
-- **Position sizing in Slack BUY signal**: Include suggested max notional in the BUY Slack message (e.g. "Max size: $12k @ 1% of avg daily vol"). `avg_vol_10d` and `last_price` are already in the screener DB — look up by ticker at signal time.
+- **Position sizing in Slack BUY signal**: ✅ BUY message now shows max notional and max shares at 1% of avg daily vol.
 
 - **Trade log**: New DB table to record each executed trade — signal price, execution price, exit price, drift on entry/exit. Triggered from Socket Mode modal submissions.
 - **Screener → sweep**: Re-export leveraged ETF screener with Underlying Index + Total Assets columns, re-import, then use Screener page to select candidates and add to config.json for sweep. Current import (Results 7.csv) is missing those columns so underlier classification is incomplete.

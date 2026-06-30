@@ -16,7 +16,7 @@ Three discrete layers, each independently runnable:
 - Data stored as `cache/{ticker}_1h.csv`, SPY always included as benchmark
 - Incremental backfill with deduplication — overlapping buffer handles weekends/holidays
 - Ticker universe defined in `tickers.json` — plain JSON array, read at startup
-- Cron job runs `data_collector.py --once` daily at 8 AM via `scripts/run_data_collector.sh`, logs to `logs/data_collector_daily.log`
+- Cron job runs `data_collector.py --once` daily at 6:30 AM via `scripts/run_data_collector.sh`, logs to `logs/data_collector_daily.log` (runs before 7 AM morning report so bands are fresh)
 
 ---
 
@@ -64,6 +64,9 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - `open_positions` DB table — tracks entries pending exit
 - Entry/exit logic delegated to strategy classes in `strategies.py` — no signal logic in `active_signals.py`
 - **Slack Socket Mode** — bot token + app token; BUY/SELL messages have interactive Executed/Skipped buttons, price entry modal, chart image upload
+- **BUY message** — shows market price, share count at $50k notional, and max notional / max shares at 1% of avg daily vol (liquidity ceiling from `tickers` table)
+- **Morning report** — fires at startup and daily at 7 AM ET; shows current price (via `yfinance history prepost=True`), overnight change vs last daily close, trigger proximity, TP/SL prices, z-score, and data date (last daily bar used for bands)
+- **Current price** — uses `yfinance history(period='1d', interval='1m', prepost=True)` to capture pre/post-market; falls back to cached hourly close on failure
 - Signal indicators use prior closed day's SMA/Std (not today's intraday close) — matches live trading semantics
 - `--ticker TICKER` flag to filter the poll loop to specific tickers
 - No brokerage integration — manual execution

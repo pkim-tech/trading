@@ -7,7 +7,15 @@
 - `session wrap` — feature wrap followed by session close.
 
 ## Project Overview
-A z-score mean reversion backtesting and optimization system targeting leveraged ETFs (TQQQ, SOXL, AGQ, KORU, etc.). Runs parallel grid sweeps over take profit, stop loss, and hold time parameters to find optimal strategy configurations with positive alpha vs SPY.
+A z-score mean reversion backtesting and optimization system targeting leveraged ETFs. Runs parallel grid sweeps over take profit, stop loss, and hold time parameters to find optimal strategy configurations with positive alpha vs SPY. Now in live trading phase with manual execution via Schwab.
+
+## Live Trading — Current State
+- **Watchlist**: AGQ (w=10 TP=19 SL=8 hold=133h), EDC (w=10 TP=17 SL=17 hold=112h), FAS (w=10 TP=25 SL=10 hold=133h), HIBL (w=10 TP=29 SL=21 hold=126h) — all z=2.0 ZScoreBreakout v1.5
+- **Signal windows**: 10:25–10:40 AM ET and 15:25–15:40 PM ET (matches backtest target_hours=(9,14))
+- **Execution workflow**: Stage limit order pre-market at absurd low price → Slack fires at bar close if price confirmed below lower_band → edit order to market and submit (~5 seconds). 🔶 in morning report = set phone alarm for 10:28 and 15:28.
+- **Stop loss**: Schwab stop order at lower_band × (1 - (SL%+1%)) — 1% buffer over backtest SL for intraday protection. Real exit is triggered by Slack SELL signal at bar close, not the Schwab stop (which is catastrophic insurance only).
+- **Position sizing**: $50k notional per trade. Share count shown in BUY Slack message.
+- **Entry price**: Real-time via `yfinance fast_info.last_price` at signal check time.
 
 ## Key Files
 - `app.py` — Streamlit UI for configuring and launching optimization sweeps

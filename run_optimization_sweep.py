@@ -233,7 +233,19 @@ def run_master_evolutionary_suite(shared_pool, ticker, strategy_class, strategy_
     config_version = config.get("version", "v1.2")
     hp = config["hyperparameters"]
     max_generations = config.get("execution", {}).get("max_generations", 1)
-    
+
+    z_thresholds = hp.get("z_score_thresholds", [2.0])
+    expected = (len(z_thresholds) * len(hp["windows"]) * len(hp["take_profits"])
+                * len(hp["stop_losses"]) * len(hp["hold_time_caps"]))
+    with sqlite3.connect(DB_PATH, timeout=60.0) as _chk:
+        cached = _chk.execute(
+            "SELECT COUNT(*) FROM backtest_cache WHERE strategy=? AND version=? AND ticker=?",
+            (strategy_name, config_version, ticker)
+        ).fetchone()[0]
+    if cached >= expected:
+        logger.info(f"[{ticker}] fully cached ({cached}/{expected} nodes). Skipping.")
+        return None
+
     cache_path = CACHE_DIR / f"{ticker}_1h.csv"
     if not cache_path.exists():
         logger.error(f"Critical Ingestion Error: Base cache token not found at {cache_path}")
@@ -255,7 +267,6 @@ def run_master_evolutionary_suite(shared_pool, ticker, strategy_class, strategy_
             spy_col = 'Adj Close' if 'Adj Close' in spy_df.columns else 'Close'
             spy_bh = ((spy_sliced[spy_col].iloc[-1] - spy_sliced[spy_col].iloc[0]) / spy_sliced[spy_col].iloc[0]) * 100
 
-    z_thresholds = hp.get("z_score_thresholds", [2.0])
     macro_tasks = []
     for z_thresh in z_thresholds:
         for w in hp["windows"]:

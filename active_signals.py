@@ -344,8 +344,11 @@ def compute_buy_signal(node):
     last_row      = indicators.iloc[-1]
     close_series  = df_hourly['Close'].dropna()
     last_bar      = close_series.index[-1]
+    daily_closes = df_daily['Close'].dropna()
+    prev_close = float(daily_closes.iloc[-1]) if not daily_closes.empty else close_series.iloc[-1]
     try:
-        current_price = yf.Ticker(ticker).fast_info.last_price
+        hist = yf.Ticker(ticker).history(period='1d', interval='1m', prepost=True)
+        current_price = float(hist['Close'].iloc[-1]) if not hist.empty else close_series.iloc[-1]
     except Exception:
         current_price = close_series.iloc[-1]
     sma           = last_row['SMA']
@@ -356,12 +359,14 @@ def compute_buy_signal(node):
         'ticker':        ticker,
         'window':        window,
         'current_price': current_price,
+        'prev_close':    prev_close,
         'sma':           sma,
         'std':           std,
         'lower_band':    sma - z_thresh * std,
         'z_score':       (current_price - sma) / std,
         'signal':        strat.check_signal(current_price, last_row),
         'last_bar':      last_bar,
+        'last_daily_bar': indicators.index[-1],
         'hurst':         hurst,
         'adf_p':         adf_p,
     }
@@ -542,9 +547,15 @@ def _build_buy_blocks(node, sig):
     schwab_sl_pct   = node['stop_loss'] + 1
     schwab_sl_price = sig['lower_band'] * (1 - schwab_sl_pct / 100)
 
+    with _conn() as _c:
+        vol_row = _c.execute("SELECT avg_vol_10d FROM tickers WHERE symbol=?", (ticker,)).fetchone()
+    max_notional = vol_row['avg_vol_10d'] * price * 0.01 if vol_row and vol_row['avg_vol_10d'] else None
+    max_shares = int(max_notional // price) if max_notional else None
+    max_notional_str = f"  |  max `${max_notional/1000:.0f}k` / `{max_shares} shares` @ 1% vol" if max_notional else ""
+
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
-            "text": f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k)\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger)"}},
+            "text": f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k){max_notional_str}\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger)"}},
     ]
 
     if SOCKET_MODE:
@@ -917,12 +928,14 @@ def send_startup_report(watchlist):
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}*  NO_DATA"}})
             continue
         emoji = _proximity_emoji(meta['pct'])
+        overnight = (sig['current_price'] - sig['prev_close']) / sig['prev_close'] * 100
+        data_date = pd.Timestamp(sig['last_daily_bar']).strftime('%m/%d')
         text = (
             f"{emoji} *{ticker}*  "
-            f"now `${sig['current_price']:.2f}`  "
+            f"now `${sig['current_price']:.2f}` ({overnight:+.1f}% O/N)  close `${sig['prev_close']:.2f}`  "
             f"trigger `${sig['lower_band']:.2f}` ({meta['pct']:+.1f}%)  "
             f"tp `${meta['tp']:.2f}`  sl `${meta['sl']:.2f}`  "
-            f"z `{sig['z_score']:+.2f}`"
+            f"z `{sig['z_score']:+.2f}`  data `{data_date}`"
         )
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
 
@@ -1016,6 +1029,7 @@ def run_loop(tickers: set = None):
     buy_alerted:  set[tuple] = set()
     sell_alerted: set[int]   = set()
     last_date = datetime.now().strftime('%Y-%m-%d')
+    last_morning_report_date = datetime.now().strftime('%Y-%m-%d') if datetime.now().hour >= 7 else None
 
     while True:
         now   = datetime.now()
@@ -1024,6 +1038,13 @@ def run_loop(tickers: set = None):
         if today != last_date:
             buy_alerted.clear()
             last_date = today
+
+        if now.hour >= 7 and today != last_morning_report_date:
+            wl = get_watchlist()
+            if tickers:
+                wl = [n for n in wl if n['ticker'] in tickers]
+            send_startup_report(wl)
+            last_morning_report_date = today
 
         watchlist = get_watchlist()
         if tickers:
