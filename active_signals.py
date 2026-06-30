@@ -38,6 +38,7 @@ from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+import yfinance as yf
 from data_manager import fetch_live_data_smart
 import strategies
 
@@ -342,8 +343,11 @@ def compute_buy_signal(node):
 
     last_row      = indicators.iloc[-1]
     close_series  = df_hourly['Close'].dropna()
-    current_price = close_series.iloc[-1]
     last_bar      = close_series.index[-1]
+    try:
+        current_price = yf.Ticker(ticker).fast_info.last_price
+    except Exception:
+        current_price = close_series.iloc[-1]
     sma           = last_row['SMA']
     std           = last_row['Std']
     hurst, adf_p  = _hurst_adf(ticker, df_hourly)
@@ -520,29 +524,27 @@ def _price_input_block():
 
 
 def _build_buy_blocks(node, sig):
-    ticker  = sig['ticker']
-    price   = sig['current_price']
-    z       = sig['z_score']
-    bar_str = sig['last_bar'].strftime('%Y-%m-%d %H:%M')
+    ticker    = sig['ticker']
+    price     = sig['current_price']
+    z         = sig['z_score']
+    bar_str   = sig['last_bar'].strftime('%Y-%m-%d %H:%M')
+    tp_price  = price * (1 + node['take_profit'] / 100)
+    sl_price  = price * (1 - node['stop_loss']   / 100)
 
-    fields = {
-        "Price":      f"${price:.4f}",
-        "Lower Band": f"${sig['lower_band']:.4f}",
-        "Z-Score":    f"{z:.2f}",
-        "Bar":        bar_str,
-        "Window":     str(node['window']),
-        "TP / SL":    f"{node['take_profit']}% / {node['stop_loss']}%",
-        "Max Hold":   f"{node['max_hold_hours']}h",
-        "SMA":        f"${sig['sma']:.4f}",
-    }
-    if sig.get('hurst') is not None:
-        fields["Hurst (100 bars)"] = f"{sig['hurst']:.3f}"
-    if sig.get('adf_p') is not None:
-        fields["ADF p"] = f"{sig['adf_p']:.3f}"
+    hurst_str = f"{sig['hurst']:.3f}" if sig.get('hurst') is not None else "n/a"
+    adf_str   = f"{sig['adf_p']:.3f}" if sig.get('adf_p')  is not None else "n/a"
+
+    hold_deadline = _add_trading_hours(sig['last_bar'], node['max_hold_hours'])
+    deadline_str  = hold_deadline.strftime('%a %b %d %H:%M')
+
+    target_notional = 50_000
+    shares = int(target_notional // price)
+    schwab_sl_pct   = node['stop_loss'] + 1
+    schwab_sl_price = sig['lower_band'] * (1 - schwab_sl_pct / 100)
 
     blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": f"BUY SIGNAL — {ticker}"}},
-        _fields_block(fields),
+        {"type": "section", "text": {"type": "mrkdwn",
+            "text": f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k)\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger)"}},
     ]
 
     if SOCKET_MODE:
@@ -573,24 +575,30 @@ def _build_buy_blocks(node, sig):
 
 
 def _build_sell_blocks(pos, reason, current_price, target_price):
-    reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT'}
-    ticker     = pos['ticker']
-    ep         = pos['entry_price']
-    entry_time = pos['entry_time']
-    pct        = (current_price - ep) / ep * 100
+    ticker = pos['ticker']
+    ep     = pos['entry_price']
+    pct    = (current_price - ep) / ep * 100
+
+    if reason == 'TP':
+        emoji   = "🟢"
+        label   = "TAKE PROFIT"
+        action  = f"Cancel Stop Loss order — Sell All (Market) @ `${current_price:.2f}`"
+    elif reason == 'SL':
+        emoji   = "🔴"
+        label   = "STOP LOSS HIT"
+        action  = f"Check account — Stop Loss order should have auto-filled @ `${target_price:.2f}`"
+    else:  # TIME
+        emoji   = "🔶"
+        label   = "TIME EXIT"
+        action  = f"Change Stop Loss → Market Close order (exit by EOD)"
 
     blocks = [
-        {"type": "header", "text": {"type": "plain_text",
-         "text": f"SELL SIGNAL — {ticker} ({reason_labels[reason]})"}},
-        _fields_block({
-            "Entry Price":   f"${ep:.4f}",
-            "Current Price": f"${current_price:.4f}",
-            "P&L":           f"{pct:+.2f}%",
-            "Target":        f"${target_price:.4f}",
-            "TP / SL":       f"{pos['take_profit']}% / {pos['stop_loss']}%",
-            "Max Hold":      f"{pos['max_hold_hours']}h",
-            "Entered":       entry_time,
-        }),
+        {"type": "section", "text": {"type": "mrkdwn",
+            "text": (
+                f"{emoji} *{ticker}* — {label}\n"
+                f"{action}\n"
+                f"entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`"
+            )}},
     ]
 
     if SOCKET_MODE:
@@ -858,8 +866,131 @@ def notify_sell_signal(pos, reason, current_price, target_price):
 
 
 # ---------------------------------------------------------------------------
+# Startup report
+# ---------------------------------------------------------------------------
+
+def _add_trading_hours(start, hours):
+    """Advance `start` by `hours` trading bars (market hours 9-15, Mon-Fri only)."""
+    from datetime import timedelta
+    dt = start
+    remaining = hours
+    while remaining > 0:
+        dt += timedelta(hours=1)
+        if dt.weekday() < 5 and 9 <= dt.hour <= 15:
+            remaining -= 1
+    return dt
+
+
+def _proximity_emoji(pct_away):
+    if pct_away < 5:
+        return "🔶"
+    if pct_away < 15:
+        return "🟡"
+    return "⚪"
+
+
+def send_startup_report(watchlist):
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    # Build buy candidates sorted by proximity
+    rows = []
+    for node in watchlist:
+        sig = compute_buy_signal(node)
+        if sig is None:
+            rows.append((float('inf'), node['ticker'], None, None))
+            continue
+        trigger  = sig['lower_band']
+        tp_price = trigger * (1 + node['take_profit'] / 100)
+        sl_price = trigger * (1 - node['stop_loss']  / 100)
+        pct_away = (sig['current_price'] - trigger) / trigger * 100
+        rows.append((pct_away, node['ticker'], sig, {'tp': tp_price, 'sl': sl_price, 'pct': pct_away}))
+    rows.sort(key=lambda x: x[0])
+
+    # Build blocks
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"Morning Report — {now_str}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*Buy Candidates* — sorted by proximity to trigger"}},
+    ]
+
+    for _, ticker, sig, meta in rows:
+        if sig is None:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}*  NO_DATA"}})
+            continue
+        emoji = _proximity_emoji(meta['pct'])
+        text = (
+            f"{emoji} *{ticker}*  "
+            f"now `${sig['current_price']:.2f}`  "
+            f"trigger `${sig['lower_band']:.2f}` ({meta['pct']:+.1f}%)  "
+            f"tp `${meta['tp']:.2f}`  sl `${meta['sl']:.2f}`  "
+            f"z `{sig['z_score']:+.2f}`"
+        )
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+
+    # Open positions section
+    positions = get_open_positions()
+    if positions:
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Open Positions*"}})
+        for p in positions:
+            entry_time = datetime.fromisoformat(p['entry_time'])
+            hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+            cp, _ = _current_price(p['ticker'])
+            if cp:
+                pnl = (cp - p['entry_price']) / p['entry_price'] * 100
+                pnl_str = f"  P&L `{pnl:+.1f}%`"
+            else:
+                pnl_str = ""
+            text = (
+                f"📊 *{p['ticker']}*  "
+                f"entry `${p['entry_price']:.2f}`  "
+                f"held `{hours_held:.0f}h`  "
+                f"tp `{p['take_profit']}%`  sl `{p['stop_loss']}%`"
+                f"{pnl_str}"
+            )
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    else:
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "No open positions."}]})
+
+    # Reconfirm reminder for hot tickers
+    hot = [r[1] for r in rows if r[0] < 5]
+    if hot:
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+            "text": f"⏰ *Reconfirm limit order:* {', '.join(hot)} — signal window 10:25–10:40 AM and 3:25–3:40 PM ET"}})
+
+    # Console output
+    print(f"Morning Report — {now_str}")
+    for _, ticker, sig, meta in rows:
+        if sig is None:
+            print(f"  {ticker:<6}  NO_DATA")
+        else:
+            emoji = _proximity_emoji(meta['pct'])
+            print(f"  {emoji} {ticker:<6}  now=${sig['current_price']:>7.2f}  trigger=${sig['lower_band']:>7.2f}  ({meta['pct']:+.1f}%)  z={sig['z_score']:>+5.2f}")
+    if positions:
+        print("  Open positions:")
+        for p in positions:
+            entry_time = datetime.fromisoformat(p['entry_time'])
+            hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+            print(f"    {p['ticker']:<6}  entry=${p['entry_price']:.2f}  held={hours_held:.0f}h")
+
+    _post_message(f"Morning Report — {now_str}", blocks=blocks)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+
+# Signal windows in ET: 10:25-10:40 (9:30 bar close) and 15:25-15:40 (14:30 bar close)
+_SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]
+
+def _in_buy_window(now):
+    t = (now.hour, now.minute)
+    for h0, m0, h1, m1 in _SIGNAL_WINDOWS:
+        if (h0, m0) <= t <= (h1, m1):
+            return True
+    return False
+
 
 def run_loop(tickers: set = None):
     ensure_tables()
@@ -876,6 +1007,11 @@ def run_loop(tickers: set = None):
         print("  [slack] Webhook mode — no interactive buttons")
     else:
         print("  [info] No Slack config — console only")
+
+    startup_wl = get_watchlist()
+    if tickers:
+        startup_wl = [n for n in startup_wl if n['ticker'] in tickers]
+    send_startup_report(startup_wl)
 
     buy_alerted:  set[tuple] = set()
     sell_alerted: set[int]   = set()
@@ -900,40 +1036,45 @@ def run_loop(tickers: set = None):
             except Exception as e:
                 print(f"  [data] {t} refresh failed: {e}")
 
-        for pos in get_open_positions():
-            if tickers and pos['ticker'] not in tickers:
-                continue
-            if pos['id'] in sell_alerted:
-                continue
-            cp, _ = _current_price(pos['ticker'])
-            if cp is None:
-                continue
-            reason, target = check_sell_condition(pos, cp, now)
-            if reason:
-                notify_sell_signal(pos, reason, cp, target)
-                sell_alerted.add(pos['id'])
+        if _in_buy_window(now):
+            for pos in get_open_positions():
+                if tickers and pos['ticker'] not in tickers:
+                    continue
+                if pos['id'] in sell_alerted:
+                    continue
+                cp, _ = _current_price(pos['ticker'])
+                if cp is None:
+                    continue
+                reason, target = check_sell_condition(pos, cp, now)
+                if reason:
+                    notify_sell_signal(pos, reason, cp, target)
+                    sell_alerted.add(pos['id'])
 
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
             time.sleep(POLL_SECS)
             continue
 
+        in_window = _in_buy_window(now)
         summaries = []
-        for node in watchlist:
-            sig = compute_buy_signal(node)
-            if sig is None:
-                summaries.append(f"{node['ticker']} w={node['window']} NO_DATA")
-                continue
+        if in_window:
+            for node in watchlist:
+                sig = compute_buy_signal(node)
+                if sig is None:
+                    summaries.append(f"{node['ticker']} w={node['window']} NO_DATA")
+                    continue
 
-            alert_key = (sig['ticker'], node['strategy'], sig['window'])
+                alert_key = (sig['ticker'], node['strategy'], sig['window'])
 
-            if sig['signal'] == 'BUY' and alert_key not in buy_alerted:
-                buy_alerted.add(alert_key)
-                notify_buy_signal(node, sig)
-            else:
-                summaries.append(
-                    f"{sig['ticker']} z={sig['z_score']:+.2f} {sig['signal']}"
-                )
+                if sig['signal'] == 'BUY' and alert_key not in buy_alerted:
+                    buy_alerted.add(alert_key)
+                    notify_buy_signal(node, sig)
+                else:
+                    summaries.append(
+                        f"{sig['ticker']} z={sig['z_score']:+.2f} {sig['signal']}"
+                    )
+        else:
+            summaries.append(f"outside signal window — next: 10:25 or 14:55 ET")
 
         if summaries:
             print(f"[{now.strftime('%H:%M:%S')}] {' | '.join(summaries)}")

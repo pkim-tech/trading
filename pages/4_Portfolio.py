@@ -39,13 +39,17 @@ def load_hourly(ticker):
 
 
 @st.cache_data(ttl=3600)
-def load_spy():
-    p = CACHE_DIR / "SPY_1h.csv"
+def load_price_series(ticker):
+    p = CACHE_DIR / f"{ticker}_1h.csv"
     if not p.exists():
         return None
     df = pd.read_csv(p, index_col=0, parse_dates=True).sort_index()
     close_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
     return df[close_col].dropna()
+
+
+def load_spy():
+    return load_price_series('SPY')
 
 
 @st.cache_data(ttl=300)
@@ -140,33 +144,45 @@ df_all['Entry Time'] = pd.to_datetime(df_all['Entry Time'])
 df_all['Exit Time']  = pd.to_datetime(df_all['Exit Time'])
 df_all['Return %']   = (df_all['Return'] * 100).round(1)
 
-with st.spinner("Computing Hurst / ADF at entry..."):
-    df_all = annotate_trades(df_all)
+# with st.spinner("Computing Hurst / ADF at entry..."):
+#     df_all = annotate_trades(df_all)
+df_all['Hurst'] = np.nan
+df_all['ADF p'] = np.nan
 
 spy   = load_spy()
+tqqq  = load_price_series('TQQQ')
 nodes = sorted(df_all['Node'].unique().tolist())
+
+# ── Watchlist table ───────────────────────────────────────────────────────
+
+with st.expander("Watchlist", expanded=True):
+    wl_df = pd.DataFrame(watchlist)[['ticker', 'strategy', 'version', 'window', 'z_score_threshold', 'take_profit', 'stop_loss', 'max_hold_hours', 'label', 'added_at']]
+    wl_df.columns = ['Ticker', 'Strategy', 'Version', 'Window', 'Z', 'TP%', 'SL%', 'Hold h', 'Label', 'Added']
+    st.dataframe(wl_df, use_container_width=True, hide_index=True)
 
 
 # ── Chart rendering (fragment = sliders only re-run this) ─────────────────
 
 @st.fragment
-def render(df_all, spy, nodes):
+def render(df_all, spy, tqqq, nodes, watchlist):
     h_has_data   = df_all['Hurst'].notna().any()
     adf_has_data = df_all['ADF p'].notna().any()
 
-    c1, c2 = st.columns(2)
-    with c1:
-        max_hurst = st.slider("Max Hurst at entry", 0.3, 0.8, 0.8, 0.01,
-                              disabled=not h_has_data)
-    with c2:
-        max_adf = st.slider("Max ADF p at entry", 0.0, 1.0, 1.0, 0.01,
-                            disabled=not adf_has_data)
+    all_tickers = sorted(df_all['Ticker'].unique().tolist())
+    selected = st.multiselect("Tickers", all_tickers, default=all_tickers)
+    if not selected:
+        st.warning("No tickers selected.")
+        return
 
-    df = df_all.copy()
-    if h_has_data:
-        df = df[df['Hurst'].isna() | (df['Hurst'] <= max_hurst)]
-    if adf_has_data:
-        df = df[df['ADF p'].isna() | (df['ADF p'] <= max_adf)]
+    # c1, c2 = st.columns(2)
+    # with c1:
+    #     max_hurst = st.slider("Max Hurst at entry", 0.3, 0.8, 0.8, 0.01,
+    #                           disabled=not h_has_data)
+    # with c2:
+    #     max_adf = st.slider("Max ADF p at entry", 0.0, 1.0, 1.0, 0.01,
+    #                         disabled=not adf_has_data)
+
+    df = df_all[df_all['Ticker'].isin(selected)].copy()
 
     if df.empty:
         st.warning("No trades pass current filters.")
@@ -189,15 +205,14 @@ def render(df_all, spy, nodes):
     t_min, t_max = df['Entry Time'].min(), df['Exit Time'].max()
     spy_plot = spy[(spy.index >= t_min) & (spy.index <= t_max)] if spy is not None else None
 
-    node_y = {n: i for i, n in enumerate(nodes)}
-    n_nodes = len(nodes)
-
+    active_nodes = sorted(df['Node'].unique().tolist())
+    node_y = {n: i for i, n in enumerate(active_nodes)}
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
         row_heights=[0.55, 0.25, 0.20],
         vertical_spacing=0.03,
-        subplot_titles=("Trades", "SPY", f"Concurrent  (max {max_concurrent})"),
+        subplot_titles=("Trades", "SPY / TQQQ (normalized)", f"Concurrent  (max {max_concurrent})"),
     )
 
     seen = set()
@@ -229,6 +244,7 @@ def render(df_all, spy, nodes):
         ), row=1, col=1)
         seen.add(result)
 
+    n_nodes = len(active_nodes)
     fig.update_yaxes(
         tickmode='array',
         tickvals=list(node_y.values()),
@@ -238,12 +254,22 @@ def render(df_all, spy, nodes):
     )
 
     if spy_plot is not None and not spy_plot.empty:
+        spy_norm = spy_plot / spy_plot.iloc[0] * 100
         fig.add_trace(go.Scatter(
-            x=spy_plot.index, y=spy_plot.values,
+            x=spy_norm.index, y=spy_norm.values,
             mode='lines', name='SPY',
             line=dict(color='#f0a500', width=1),
-            showlegend=False,
         ), row=2, col=1)
+
+    if tqqq is not None:
+        tqqq_plot = tqqq[(tqqq.index >= t_min) & (tqqq.index <= t_max)]
+        if not tqqq_plot.empty:
+            tqqq_norm = tqqq_plot / tqqq_plot.iloc[0] * 100
+            fig.add_trace(go.Scatter(
+                x=tqqq_norm.index, y=tqqq_norm.values,
+                mode='lines', name='TQQQ',
+                line=dict(color='#9b59b6', width=1),
+            ), row=2, col=1)
 
     fig.add_trace(go.Scatter(
         x=conc_times, y=conc_counts,
@@ -305,4 +331,4 @@ def render(df_all, spy, nodes):
     st.dataframe(summary, use_container_width=True)
 
 
-render(df_all, spy, nodes)
+render(df_all, spy, tqqq, nodes, watchlist)

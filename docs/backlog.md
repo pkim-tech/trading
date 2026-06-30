@@ -2,9 +2,9 @@
 
 ## High Priority
 
-- **Remove FAS from watchlist**: Hurst=0.595 (full) / 0.574 (6mo), ADF non-stationary (p=0.36), z=3.0 sweep zero positive alpha across 54k nodes, z=2.5 best node only 1.43× B&H. Structurally momentum, not mean-reverting. The v1.4 559% return node is valid but untrustworthy given the Hurst profile.
-
 - **v1.6 coarse grid sweep**: Re-run full universe with TP/SL at every-3 integers `[3,6,9,...,30]` (6000 nodes/ticker/threshold vs 54k). Goal: validate that islands found at coarse resolution match v1.5 fine-grid islands. If confirmed, adopt coarse grid as default for new thresholds. Discuss grid before implementing.
+
+- **v1.6 limit order entry model**: Add `use_limit_fill` toggle to backtester. Fill condition: `Low <= lower_band` during the target bar (price touched the limit intrabar). Fill price: `lower_band` exactly. Current v1.5 uses `Close <= lower_band` as both signal and entry price. Limit model catches more trades (intrabar touches that close back above lower_band) at a better price. Requires passing lows array to Numba kernel. This matches the real execution approach (limit order staged pre-market, edited at signal time). Return impact unknown — needs full re-sweep.
 
 - **Hurst + ADF screener columns**: Hook into data download — compute on download and store in `tickers` table. Not a single scalar (regime-dependent); pending decision on right aggregation. Rolling per-ticker series already computed in Node Inspector; Hurst/ADF at signal time now sent in Slack BUY message.
 - **Portfolio backtest page**: ✅ Built (`pages/4_Portfolio.py`). Gantt timeline + SPY overlay + concurrent positions panel, all shared x-axis. Hurst/ADF sliders filter trades by regime at entry. Summary metrics + per-node table with unfiltered vs filtered return comparison.
@@ -32,6 +32,8 @@
 - **`trading_engine.py` cleanup**: Either retrofit or replace with Layer 3 implementation; currently points at legacy files
 
 ## Low Priority / Ideas
+
+- **Alternative trading windows**: Backtest currently enters only on the 9:30 bar close (10:30 AM) and 14:30 bar close (3:30 PM). Explore whether other hourly bar closes (e.g. 11:30, 12:30, 1:30) improve signal frequency or return — requires expanding `target_hours` in backtester and re-sweeping affected tickers.
 
 - **Chaos monkey / floor alpha**: For each node, re-run backtest with worst-case execution — entry at highest price in up to N bars after signal, exit at lowest price in up to N bars after exit signal (model: 1-day delay and 2-week delay). Also model missed TIME_EXIT: exit N bars late at worst price in that window. Produces a `floor_alpha` metric. Nodes with positive floor alpha are robust to real-world execution delays (meetings, swimming pool, travel). Store alongside `alpha_vs_spy` in DB and surface in Winners page.
 - **Alpha robustness — drop top N trades**: Re-run backtest dropping the top 3 best-performing trades and recalculate alpha. Tests whether alpha is structural or lucky. Complements floor alpha.

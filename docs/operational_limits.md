@@ -16,6 +16,12 @@ Rules imposed on live trading based on the current phase of the system. These ex
 - **Max notional per trade**: 1% of ticker's avg daily dollar volume (surfaced in Slack BUY message)
 - **One node per ticker**: Only one watch list entry per ticker until portfolio-level behavior is validated
 
+### Entry Execution Approach
+- **Order type**: Limit order staged pre-market at an absurd low price (will not fill accidentally). At 10:30 AM or 3:30 PM ET, if Slack fires a BUY signal, edit the limit price to current market and submit.
+- **Signal check windows**: 10:25–10:40 AM ET (9:30 bar close) and 15:25–15:40 PM ET (14:30 bar close). `active_signals.py` only evaluates buy/sell signals within these windows.
+- **Data source**: Real-time spot price via `yfinance fast_info.last_price` at signal check time. Hourly cached data used only for indicator computation (SMA, Std).
+- **Do not use overnight limit orders at lower_band**: Open-fill analysis showed entering at the 9:30 open (before the intrabar decline) is consistently worse than the 10:30 close. A staged limit order edited at signal time is the correct approach.
+
 ### Execution Limits
 - **Do not enter if you cannot monitor**: If unavailable for the next 2h, skip the signal
 - **Exit within one trading day of exit signal**: If you miss the exit signal, close at next morning's open
