@@ -156,6 +156,26 @@ def run_cached_backtest(ticker, strategy_name, version, window, tp, sl, hold, zt
 
 
 @st.cache_data(ttl=300)
+def load_watchlist_metrics(params_tuple):
+    cols = ['ticker','version','window','take_profit','stop_loss','max_hold_hours','z_score_threshold']
+    rows = []
+    with sqlite3.connect(DB_PATH) as c:
+        for p in params_tuple:
+            row = c.execute(
+                """SELECT ticker, version, window, take_profit, stop_loss, max_hold_hours,
+                          z_score_threshold, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
+                          CASE WHEN asset_bh > 0 THEN strategy_return / asset_bh ELSE NULL END,
+                          trades, win_rate
+                   FROM backtest_cache
+                   WHERE strategy='ZScoreBreakout' AND ticker=? AND version=? AND window=? AND take_profit=?
+                     AND stop_loss=? AND max_hold_hours=? AND z_score_threshold=?
+                   LIMIT 1""", p
+            ).fetchone()
+            rows.append(row)
+    return pd.DataFrame(rows, columns=cols + ['strategy_return','alpha_vs_spy','asset_bh','spy_bh','bh_mult','trades','win_rate'])
+
+
+@st.cache_data(ttl=300)
 def compute_bands(ticker, strategy_name, window):
     df_h = load_hourly(ticker)
     if df_h is None:
@@ -197,11 +217,20 @@ wl_df = pd.DataFrame(wl) if wl else pd.DataFrame()
 selected_node = {}
 if not wl_df.empty:
     st.subheader("Watch List")
-    wl_display = wl_df[['ticker', 'strategy', 'version', 'window', 'take_profit',
-                          'stop_loss', 'max_hold_hours', 'z_score_threshold', 'label']].rename(columns={
-        'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
-        'window': 'Win', 'take_profit': 'TP%', 'stop_loss': 'SL%',
-        'max_hold_hours': 'Hold h', 'z_score_threshold': 'Z', 'label': 'Label',
+    _params = tuple((r['ticker'], r['version'], r['window'], r['take_profit'],
+                     r['stop_loss'], r['max_hold_hours'], r['z_score_threshold']) for r in wl)
+    metrics = load_watchlist_metrics(_params)
+    wl_display = wl_df.merge(
+        metrics,
+        on=['ticker', 'version', 'window', 'take_profit', 'stop_loss', 'max_hold_hours', 'z_score_threshold'],
+        how='left'
+    )[['ticker', 'window', 'take_profit', 'stop_loss', 'max_hold_hours', 'z_score_threshold',
+       'trades', 'win_rate', 'strategy_return', 'alpha_vs_spy', 'asset_bh', 'spy_bh', 'bh_mult', 'label']].rename(columns={
+        'ticker': 'Ticker', 'window': 'Win', 'take_profit': 'TP%', 'stop_loss': 'SL%',
+        'max_hold_hours': 'Hold h', 'z_score_threshold': 'Z',
+        'trades': 'Trades', 'win_rate': 'Win%', 'strategy_return': 'Return',
+        'alpha_vs_spy': 'Alpha', 'asset_bh': 'Asset B&H', 'spy_bh': 'SPY B&H',
+        'bh_mult': 'B&H Mult', 'label': 'Label',
     })
     sel = st.dataframe(
         wl_display,
@@ -209,7 +238,15 @@ if not wl_df.empty:
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        height=200,
+        height=35 * (len(wl_display) + 1) + 10,
+        column_config={
+            'Win%':      st.column_config.NumberColumn(format="%.0f%%"),
+            'Return':    st.column_config.NumberColumn(format="%.1f%%"),
+            'Alpha':     st.column_config.NumberColumn(format="%.1f%%"),
+            'Asset B&H': st.column_config.NumberColumn(format="%.1f%%"),
+            'SPY B&H':   st.column_config.NumberColumn(format="%.1f%%"),
+            'B&H Mult':  st.column_config.NumberColumn(format="%.1fx"),
+        },
     )
     rows = sel.selection.rows
     if rows:
