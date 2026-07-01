@@ -25,12 +25,14 @@ st.set_page_config(layout="wide", page_title="Portfolio")
 st.title("Portfolio")
 
 
+@st.cache_data(ttl=60)
 def load_watchlist():
     with sqlite3.connect(DB_PATH) as c:
         c.row_factory = sqlite3.Row
         return [dict(r) for r in c.execute("SELECT * FROM watch_list ORDER BY ticker").fetchall()]
 
 
+@st.cache_data(ttl=3600)
 def load_hourly(ticker):
     p = CACHE_DIR / f"{ticker}_1h.csv"
     if not p.exists():

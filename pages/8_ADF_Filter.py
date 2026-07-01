@@ -20,7 +20,7 @@ MIN_BH_MULT = c3.number_input("Min B&H mult", value=2.0, step=0.5)
 ADF_WINDOW  = c4.number_input("ADF window (bars)", value=200, min_value=50, step=50)
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)
 def load_qualifying_nodes(min_trades, min_return, min_bh_mult):
     with sqlite3.connect(DB_PATH) as conn:
         single_stock = {r[0] for r in conn.execute(

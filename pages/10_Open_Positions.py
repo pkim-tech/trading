@@ -11,6 +11,7 @@ st.set_page_config(page_title="Open Positions", layout="wide")
 st.title("Open Positions")
 
 
+@st.cache_data(ttl=30)
 def load_positions():
     with sqlite3.connect(DB_PATH) as c:
         rows = c.execute(

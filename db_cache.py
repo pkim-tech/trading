@@ -96,6 +96,35 @@ def refresh_pivot_cache():
     print(f"Pivot cache refreshed for {len(versions)} versions")
 
 
+def refresh_best_nodes_cache():
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_table(conn)
+        versions = [r[0] for r in conn.execute(
+            "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
+        ).fetchall()]
+
+        for v in versions:
+            print(f"  best_nodes cache: {v}...")
+            rows = conn.execute("""
+                WITH best AS (
+                    SELECT ticker, window, COALESCE(z_score_threshold, 2.0) AS z,
+                           take_profit, stop_loss, max_hold_hours,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ticker, window, COALESCE(z_score_threshold, 2.0)
+                               ORDER BY alpha_vs_spy DESC
+                           ) AS rn
+                    FROM backtest_cache WHERE version = ?
+                )
+                SELECT ticker, window, z, take_profit, stop_loss, max_hold_hours
+                FROM best WHERE rn = 1
+            """, (v,)).fetchall()
+            data = {f"{r[0]}|{int(r[1])}|{float(r[2])}": [int(r[3]), int(r[4]), int(r[5])] for r in rows}
+            set_kv(f"best_nodes_{v}", data)
+
+    print(f"Best nodes cache refreshed for {len(versions)} versions")
+
+
 if __name__ == "__main__":
     refresh_dropdown_cache()
     refresh_pivot_cache()
+    refresh_best_nodes_cache()

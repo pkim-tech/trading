@@ -13,6 +13,7 @@ PHASE_GRID_PATH = "active_phase_grid.json"
 st.set_page_config(layout="wide", page_title="Spatial Topology Space")
 
 
+@st.cache_data(ttl=86400)
 def load_dropdown_options():
     if not os.path.exists(DB_PATH):
         return [], {}, {}
@@ -38,7 +39,7 @@ def load_dropdown_options():
     return versions, tickers_by_version, strats_by_version_ticker
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)
 def load_slice(version, ticker, strategy):
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()

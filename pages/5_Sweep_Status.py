@@ -37,10 +37,14 @@ def load_data(version):
     return df
 
 
-with sqlite3.connect(DB_PATH) as conn:
-    versions = [r[0] for r in conn.execute(
-        "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
-    ).fetchall()]
+@st.cache_data(ttl=3600)
+def load_versions():
+    with sqlite3.connect(DB_PATH) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
+        ).fetchall()]
+
+versions = load_versions()
 
 if not versions:
     st.warning("No sweep data in DB yet.")
@@ -56,6 +60,7 @@ all_tickers = pd.DataFrame({"ticker": target})
 df = all_tickers.merge(df, on="ticker", how="left").fillna(0)
 df[["cached", "success", "no_trades"]] = df[["cached", "success", "no_trades"]].astype(int)
 
+@st.cache_data(ttl=3600)
 def get_data_date(ticker):
     p = Path(f"./cache/{ticker}_1h.csv")
     if not p.exists():

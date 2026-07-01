@@ -56,6 +56,9 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE backtest_cache ADD COLUMN z_score_threshold REAL DEFAULT 2.0")
     except Exception:
         pass
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker ON backtest_cache(version, ticker)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_window ON backtest_cache(version, window)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker_strategy ON backtest_cache(version, ticker, strategy)")
     conn.commit()
     conn.close()
 

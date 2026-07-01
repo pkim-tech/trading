@@ -21,7 +21,7 @@ HURST_WINS  = c4.multiselect("Hurst windows", [100, 150, 200], default=[100, 150
 STRATEGY    = "ZScoreBreakout"
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)
 def load_qualifying_nodes(min_trades, min_return, min_bh_mult):
     with sqlite3.connect(DB_PATH) as conn:
         single_stock = {r[0] for r in conn.execute(

@@ -107,7 +107,7 @@ def rolling_adf(ticker, window=ROLLING_WINDOW, step=48):
     return s.interpolate(method='time').where(s.notna() | s.shift().notna())
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400)
 def _load_dropdown_opts():
     versions = get_kv("versions")
     with sqlite3.connect(DB_PATH) as _c:
@@ -118,7 +118,7 @@ def _load_dropdown_opts():
     return tickers, strats, versions
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=86400)
 def get_slice(ticker, strategy, version):
     with sqlite3.connect(DB_PATH) as conn:
         return pd.read_sql_query(
@@ -139,8 +139,7 @@ def load_hourly(ticker):
     return pd.read_csv(p, index_col=0, parse_dates=True).sort_index()
 
 
-@st.cache_data(ttl=300)
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)
 def run_cached_backtest(ticker, strategy_name, version, window, tp, sl, hold, zt):
     df_h = load_hourly(ticker)
     if df_h is None:
@@ -155,7 +154,7 @@ def run_cached_backtest(ticker, strategy_name, version, window, tp, sl, hold, zt
                         max_hours_to_hold=hold, z_score_threshold=float(zt))
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400)
 def load_watchlist_metrics(params_tuple):
     cols = ['ticker','version','window','take_profit','stop_loss','max_hold_hours','z_score_threshold']
     rows = []
@@ -257,7 +256,12 @@ if not wl_df.empty:
 # ---------------------------------------------------------------------------
 # Node params — pre-filled from watchlist selection or session state
 # ---------------------------------------------------------------------------
-t_node = st.session_state.pop("target_node", {}) or selected_node
+_qp = st.query_params
+_qp_node = {k: _qp[k] for k in ("ticker", "version", "strategy") if k in _qp}
+for _k in ("window", "take_profit", "stop_loss", "max_hold_hours"):
+    if _k in _qp:
+        _qp_node[_k] = int(_qp[_k])
+t_node = st.session_state.pop("target_node", {}) or _qp_node or selected_node
 
 tick_opts, strat_opts, ver_opts = _load_dropdown_opts()
 

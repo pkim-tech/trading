@@ -24,6 +24,7 @@ st.set_page_config(layout="wide", page_title="Winners")
 st.title("Winners")
 
 
+@st.cache_data(ttl=86400)
 def load_ticker_strategy_options(version):
     tickers   = get_kv(f"tickers_{version}")
     strategies = get_kv(f"strategies_{version}")
@@ -38,7 +39,7 @@ def load_ticker_strategy_options(version):
     return tickers, strategies
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=86400)
 def load_results(version, min_trades, min_return, min_alpha, min_bh_mult, beat_bh):
     bh_filter = "AND strategy_return > asset_bh" if beat_bh else ""
     with sqlite3.connect(DB_PATH) as c:
@@ -76,6 +77,7 @@ def latest_ticker_stats(ticker: str) -> dict:
     return {'vol': vol, 'price': price}
 
 
+@st.cache_data(ttl=86400)
 def load_versions():
     versions = get_kv("versions")
     if versions is None:
