@@ -241,9 +241,11 @@ def run_master_evolutionary_suite(shared_pool, ticker, strategy_class, strategy_
     expected = (len(z_thresholds) * len(hp["windows"]) * len(hp["take_profits"])
                 * len(hp["stop_losses"]) * len(hp["hold_time_caps"]))
     with sqlite3.connect(DB_PATH, timeout=60.0) as _chk:
+        z_placeholders = ",".join("?" * len(z_thresholds))
+        w_placeholders = ",".join("?" * len(hp["windows"]))
         cached = _chk.execute(
-            "SELECT COUNT(*) FROM backtest_cache WHERE strategy=? AND version=? AND ticker=?",
-            (strategy_name, config_version, ticker)
+            f"SELECT COUNT(*) FROM backtest_cache WHERE strategy=? AND version=? AND ticker=? AND z_score_threshold IN ({z_placeholders}) AND window IN ({w_placeholders})",
+            (strategy_name, config_version, ticker, *z_thresholds, *hp["windows"])
         ).fetchone()[0]
     if cached >= expected:
         logger.info(f"[{ticker}] fully cached ({cached}/{expected} nodes). Skipping.")

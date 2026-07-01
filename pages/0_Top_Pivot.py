@@ -5,7 +5,7 @@ from db_cache import get_kv
 
 DB_PATH = "./cache/trading_universe.db"
 WINDOWS = [10, 20]
-Z_THRESHOLDS = [2.0]
+Z_THRESHOLDS = [1.0, 1.5, 2.0]
 
 st.set_page_config(layout="wide", page_title="Top Pivot")
 st.title("Top Pivot")

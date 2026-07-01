@@ -19,7 +19,6 @@ RESULT_COLORS = {
     'OPEN':  '#95a5a6',
 }
 
-HURST_WINDOW = 420  # 60d × 7 bars/day
 
 st.set_page_config(layout="wide", page_title="Portfolio")
 st.title("Portfolio")
@@ -30,6 +29,29 @@ def load_watchlist():
     with sqlite3.connect(DB_PATH) as c:
         c.row_factory = sqlite3.Row
         return [dict(r) for r in c.execute("SELECT * FROM watch_list ORDER BY ticker").fetchall()]
+
+
+@st.cache_data(ttl=60)
+def load_versions():
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute("SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC").fetchall()
+    return [r[0] for r in rows]
+
+
+@st.cache_data(ttl=60)
+def load_top_nodes(version, min_alpha, min_trades, z_thresholds):
+    placeholders = ",".join("?" * len(z_thresholds))
+    with sqlite3.connect(DB_PATH) as c:
+        return pd.read_sql(f"""
+            SELECT ticker, strategy, '{version}' as version, window, take_profit, stop_loss,
+                   max_hold_hours, z_score_threshold, trades, win_rate,
+                   strategy_return, alpha_vs_spy
+            FROM backtest_cache
+            WHERE version=? AND alpha_vs_spy >= ? AND trades >= ?
+              AND z_score_threshold IN ({placeholders})
+            ORDER BY alpha_vs_spy DESC
+            LIMIT 200
+        """, c, params=(version, min_alpha, min_trades, *z_thresholds))
 
 
 @st.cache_data(ttl=3600)
@@ -68,73 +90,80 @@ def run_node_backtest(ticker, strategy_name, window, tp, sl, hold, zt):
                         max_hours_to_hold=hold, z_score_threshold=float(zt))
 
 
-@st.cache_data(ttl=300)
-def get_hurst_series(ticker):
-    with sqlite3.connect(DB_PATH) as c:
-        rows = c.execute(
-            "SELECT timestamp, hurst FROM hurst_cache WHERE ticker = ? ORDER BY timestamp",
-            (ticker,)
-        ).fetchall()
-    if not rows:
-        return None
-    return pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))
 
-
-@st.cache_data(ttl=300)
-def get_adf_series(ticker):
-    from statsmodels.tsa.stattools import adfuller
-    df_h = load_hourly(ticker)
-    if df_h is None:
-        return None
-    close_col = 'Adj Close' if 'Adj Close' in df_h.columns else 'Close'
-    close = df_h[close_col].dropna()
-    window, step = HURST_WINDOW, 48
-    results = []
-    for i in range(window, len(close), step):
-        p = adfuller(close.iloc[i - window:i], maxlag=1, autolag=None)[1]
-        results.append((close.index[i - 1], p))
-    if not results:
-        return None
-    times, pvals = zip(*results)
-    return pd.Series(list(pvals), index=pd.to_datetime(list(times)))
-
-
-def annotate_trades(df):
-    tickers = df['Ticker'].unique()
-    hurst_map = {t: get_hurst_series(t) for t in tickers}
-    adf_map   = {t: get_adf_series(t)   for t in tickers}
-
-    def lookup(series_map, ticker, ts):
-        s = series_map.get(ticker)
-        if s is None or s.empty:
-            return np.nan
-        val = s.asof(ts)
-        return float(val) if pd.notna(val) else np.nan
-
-    df = df.copy()
-    df['Hurst'] = [lookup(hurst_map, r['Ticker'], r['Entry Time']) for _, r in df.iterrows()]
-    df['ADF p'] = [lookup(adf_map,   r['Ticker'], r['Entry Time']) for _, r in df.iterrows()]
-    return df
-
-
-# ── Load data ────────────────────────────────────────────────────────────────
+# ── Node selection ────────────────────────────────────────────────────────────
 
 watchlist = load_watchlist()
-if not watchlist:
-    st.info("Watch list is empty. Add nodes with: .venv/bin/python3 active_signals.py add")
+versions  = load_versions()
+
+nodes_to_run = []  # list of dicts with keys: ticker, strategy, window, take_profit, stop_loss, max_hold_hours, z_score_threshold, label
+
+with st.expander("Watchlist nodes", expanded=True):
+    include_watchlist = st.toggle("Include watchlist", value=True)
+    if watchlist:
+        wl_df = pd.DataFrame(watchlist)[['ticker', 'strategy', 'version', 'window', 'z_score_threshold', 'take_profit', 'stop_loss', 'max_hold_hours', 'label', 'added_at']]
+        wl_df.columns = ['Ticker', 'Strategy', 'Version', 'Window', 'Z', 'TP%', 'SL%', 'Hold h', 'Label', 'Added']
+        st.dataframe(wl_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Watchlist is empty.")
+    if include_watchlist and watchlist:
+        for node in watchlist:
+            nodes_to_run.append({**node, 'label': f"{node['ticker']} w={node['window']} (WL)"})
+
+with st.expander("Research nodes (from DB)", expanded=False):
+    if versions:
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        r_version    = rc1.selectbox("Version", versions, key="r_version")
+        r_min_alpha  = rc2.number_input("Min alpha %", value=100.0, step=50.0, key="r_alpha")
+        r_min_trades = rc3.number_input("Min trades", value=10, step=5, key="r_trades")
+        r_z_options  = sorted({row[0] for row in sqlite3.connect(DB_PATH).execute(
+            "SELECT DISTINCT z_score_threshold FROM backtest_cache WHERE version=?", (r_version,)
+        ).fetchall()})
+        r_z = rc4.multiselect("Z thresholds", r_z_options, default=r_z_options, key="r_z")
+
+        if r_z:
+            df_top = load_top_nodes(r_version, r_min_alpha, int(r_min_trades), r_z)
+            if not df_top.empty:
+                df_top['label'] = df_top.apply(
+                    lambda r: f"{r['ticker']} w={r['window']} z={r['z_score_threshold']} TP={r['take_profit']} SL={r['stop_loss']}", axis=1
+                )
+                df_display = df_top[['label', 'trades', 'win_rate', 'strategy_return', 'alpha_vs_spy']].copy()
+                df_display.columns = ['Node', 'Trades', 'Win %', 'Return %', 'Alpha %']
+                selected_labels = st.multiselect("Add to portfolio", df_top['label'].tolist(), key="r_nodes")
+                if selected_labels:
+                    sel_rows = df_top[df_top['label'].isin(selected_labels)]
+                    for _, row in sel_rows.iterrows():
+                        nodes_to_run.append({
+                            'ticker': row['ticker'], 'strategy': row['strategy'],
+                            'window': row['window'], 'take_profit': row['take_profit'],
+                            'stop_loss': row['stop_loss'], 'max_hold_hours': row['max_hold_hours'],
+                            'z_score_threshold': row['z_score_threshold'], 'label': row['label'],
+                        })
+                st.dataframe(df_display, use_container_width=True, hide_index=True,
+                             column_config={"Win %":    st.column_config.NumberColumn(format="%.0f%%"),
+                                            "Return %": st.column_config.NumberColumn(format="%.0f%%"),
+                                            "Alpha %":  st.column_config.NumberColumn(format="%.0f%%")})
+            else:
+                st.caption("No nodes match filters.")
+    else:
+        st.caption("No versions in DB.")
+
+if not nodes_to_run:
+    st.info("No nodes selected.")
     st.stop()
+
+# ── Run backtests ─────────────────────────────────────────────────────────────
 
 all_trades = []
 with st.spinner("Running backtests..."):
-    for node in watchlist:
+    for node in nodes_to_run:
         trades = run_node_backtest(
-            node['ticker'], node['strategy'], node['window'],
+            node['ticker'], node.get('strategy', 'ZScoreBreakout'), node['window'],
             node['take_profit'], node['stop_loss'], node['max_hold_hours'],
             node.get('z_score_threshold', 2.0)
         )
-        label = f"{node['ticker']} w={node['window']}"
         for t in trades:
-            t['Node'] = label
+            t['Node'] = node['label']
         all_trades.extend(trades)
 
 if not all_trades:
@@ -146,30 +175,15 @@ df_all['Entry Time'] = pd.to_datetime(df_all['Entry Time'])
 df_all['Exit Time']  = pd.to_datetime(df_all['Exit Time'])
 df_all['Return %']   = (df_all['Return'] * 100).round(1)
 
-# with st.spinner("Computing Hurst / ADF at entry..."):
-#     df_all = annotate_trades(df_all)
-df_all['Hurst'] = np.nan
-df_all['ADF p'] = np.nan
-
 spy   = load_spy()
 tqqq  = load_price_series('TQQQ')
 nodes = sorted(df_all['Node'].unique().tolist())
-
-# ── Watchlist table ───────────────────────────────────────────────────────
-
-with st.expander("Watchlist", expanded=True):
-    wl_df = pd.DataFrame(watchlist)[['ticker', 'strategy', 'version', 'window', 'z_score_threshold', 'take_profit', 'stop_loss', 'max_hold_hours', 'label', 'added_at']]
-    wl_df.columns = ['Ticker', 'Strategy', 'Version', 'Window', 'Z', 'TP%', 'SL%', 'Hold h', 'Label', 'Added']
-    st.dataframe(wl_df, use_container_width=True, hide_index=True)
 
 
 # ── Chart rendering (fragment = sliders only re-run this) ─────────────────
 
 @st.fragment
-def render(df_all, spy, tqqq, nodes, watchlist):
-    h_has_data   = df_all['Hurst'].notna().any()
-    adf_has_data = df_all['ADF p'].notna().any()
-
+def render(df_all, spy, tqqq, nodes, nodes_to_run):
     all_tickers = sorted(df_all['Ticker'].unique().tolist())
     selected = st.multiselect("Tickers", all_tickers, default=all_tickers)
     if not selected:
@@ -220,8 +234,6 @@ def render(df_all, spy, tqqq, nodes, watchlist):
     seen = set()
     for _, row in df.sort_values('Entry Time').iterrows():
         result = row['Result']
-        h_str  = f"{row['Hurst']:.3f}" if pd.notna(row['Hurst']) else "n/a"
-        adf_str = f"{row['ADF p']:.3f}" if pd.notna(row['ADF p']) else "n/a"
         fig.add_trace(go.Scatter(
             x=[row['Entry Time'], row['Exit Time']],
             y=[node_y[row['Node']], node_y[row['Node']]],
@@ -231,16 +243,13 @@ def render(df_all, spy, tqqq, nodes, watchlist):
             showlegend=(result not in seen),
             line=dict(color=RESULT_COLORS[result], width=18),
             customdata=[[row['Return %'], row['hours_held'],
-                         row['Entry Price'], row['Exit Price'],
-                         h_str, adf_str]] * 2,
+                         row['Entry Price'], row['Exit Price']]] * 2,
             hovertemplate=(
                 f"<b>{row['Node']}</b><br>"
                 "Return: %{customdata[0]}%<br>"
                 "Hours: %{customdata[1]}<br>"
                 "Entry: $%{customdata[2]:.4f}<br>"
-                "Exit: $%{customdata[3]:.4f}<br>"
-                "Hurst: %{customdata[4]}<br>"
-                "ADF p: %{customdata[5]}"
+                "Exit: $%{customdata[3]:.4f}"
                 "<extra></extra>"
             ),
         ), row=1, col=1)
@@ -333,4 +342,4 @@ def render(df_all, spy, tqqq, nodes, watchlist):
     st.dataframe(summary, use_container_width=True)
 
 
-render(df_all, spy, tqqq, nodes, watchlist)
+render(df_all, spy, tqqq, nodes, nodes_to_run)

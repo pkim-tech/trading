@@ -43,7 +43,8 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - `backtester.py` — single node evaluation (`run_backtest`). Numba JIT kernel `_simulate` accepts `z_thresh` and uses it for the entry band (`sma - std * z_thresh`). `run_backtest` accepts `z_score_threshold=2.0` and passes it through.
 - `strategies.py` — strategy class definitions. `z_score_threshold` stored in `self.params`, used in `check_signal` for live signal detection. The sweep and Node Inspector both pass it to `run_backtest` explicitly.
 - `pages/1_Spatial_Topology.py` — 4D Plotly scatter of parameter space, shows planned nodes in blue and completed nodes colored by alpha
-- `pages/2_Node_Inspector.py` — re-runs backtest for a selected node, shows trade ledger and quarterly breakdown
+- `pages/2_Node_Inspector.py` — re-runs backtest for a selected node, shows trade ledger and quarterly breakdown; Hurst/ADF analysis is opt-in (checkbox), lazy-loaded on demand
+- `pages/4_Portfolio.py` — portfolio backtester with two node sources: (1) watchlist toggle, (2) DB research nodes (filter by version/alpha/trades/z). Gantt timeline + SPY/TQQQ overlay + concurrent positions panel. Hurst/ADF overlay removed (not actionable).
 - `cache/trading_universe.db` — SQLite cache, nodes never re-evaluated once computed
 - `config.json` — single source of truth for runtime config. `app.py` reads/writes directly — DB copy removed.
 
@@ -118,7 +119,7 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 - Reads from `open_positions` in `cache/trading_universe.db`
 - Fetches current price via `yfinance fast_info.last_price` at page load
-- Shows: entry price, current price, unrealized P&L%, TP price, SL price, hours held, hours remaining until time-exit, entry time
+- Shows: signal price, entry price, drift % (entry vs signal), current price, unrealized P&L%, TP price, SL price, hours held, hours remaining until time-exit, entry time
 - TP = entry_price × (1 + tp%), SL = entry_price × (1 - sl%) — display only, Schwab stop is set separately at lower_band × (1 - (sl%+1%))
 - Manual refresh button; no auto-refresh
 

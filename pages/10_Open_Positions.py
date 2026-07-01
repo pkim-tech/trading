@@ -43,10 +43,13 @@ for pos_id, ticker, window, tp, sl, max_hold, signal_price, entry_price, entry_t
     pnl_pct = (cp - entry_price) / entry_price * 100 if cp else None
     tp_price = entry_price * (1 + tp / 100)
     sl_price = entry_price * (1 - sl / 100)
+    drift_pct = (entry_price - signal_price) / signal_price * 100 if signal_price else None
     rows.append({
         "ID":         pos_id,
         "Ticker":     ticker,
+        "Signal $":   signal_price,
         "Entry $":    entry_price,
+        "Drift %":    drift_pct,
         "Now $":      cp,
         "P&L %":      pnl_pct,
         "TP $":       tp_price,
@@ -65,7 +68,9 @@ st.dataframe(
     hide_index=True,
     height=35 * (len(df) + 1) + 10,
     column_config={
+        "Signal $": st.column_config.NumberColumn(format="$%.2f"),
         "Entry $":  st.column_config.NumberColumn(format="$%.2f"),
+        "Drift %":  st.column_config.NumberColumn(format="%+.2f%%"),
         "Now $":    st.column_config.NumberColumn(format="$%.2f"),
         "P&L %":    st.column_config.NumberColumn(format="%+.2f%%"),
         "TP $":     st.column_config.NumberColumn(format="$%.2f"),

@@ -194,20 +194,6 @@ def compute_bands(ticker, strategy_name, window):
 st.title("Node Inspector")
 
 # ---------------------------------------------------------------------------
-# Pre-warm Hurst (once per session)
-#   - watchlist tickers: load from hurst_cache DB (or compute+save if missing/stale)
-#   - non-watchlist tickers with any node >200% return: session_state only
-# ---------------------------------------------------------------------------
-if "hurst_prewarmed" not in st.session_state:
-    _wl_tickers = set(w["ticker"] for w in (get_watchlist() or []))
-    _to_warm = [t for t in _wl_tickers if f"hurst_{t}" not in st.session_state]
-    if _to_warm:
-        with st.spinner(f"Computing Hurst for watchlist..."):
-            for t in _to_warm:
-                get_hurst(t, is_watchlist=True)
-    st.session_state["hurst_prewarmed"] = True
-
-# ---------------------------------------------------------------------------
 # Watchlist
 # ---------------------------------------------------------------------------
 wl = get_watchlist()
@@ -323,50 +309,60 @@ if not df_trades.empty and "Return" in df_trades.columns and "Return %" not in d
     df_trades["Return %"] = df_trades["Return"] * 100
 closed = df_trades[df_trades["Result"].isin(["WIN", "LOSS", "TWIN", "TLOSS"])] if not df_trades.empty else pd.DataFrame()
 
-# ---------------------------------------------------------------------------
-# Compute indicators (needed before chart for slider)
-# ---------------------------------------------------------------------------
-_wl_set = set(w["ticker"] for w in (get_watchlist() or []))
-h_series = get_hurst(selected_ticker, is_watchlist=(selected_ticker in _wl_set))
-
-# Pre-compute H_at_entry here — depends on h_series only, not the slider value
 if not closed.empty:
     closed = closed.copy()
     closed["Entry Time"] = pd.to_datetime(closed["Entry Time"])
     closed["Exit Time"]  = pd.to_datetime(closed["Exit Time"])
-    if not h_series.empty:
-        closed["H_at_entry"] = closed["Entry Time"].apply(
-            lambda t: h_series.asof(t) if t >= h_series.index[0] else np.nan
-        )
-    else:
-        closed["H_at_entry"] = np.nan
 
 
 @st.fragment
-def _render_hurst_section(closed, h_series, df_ind, close, ticker):
-    show_adf = st.checkbox("Show rolling ADF p-value (slow on first load)")
-    adf_series = rolling_adf(ticker) if show_adf else None
+def _render_hurst_section(closed, df_ind, close, ticker):
+    show_hurst = st.checkbox("Show Hurst analysis")
 
-    st.subheader("Hurst Filter")
-    h_cutoff = st.slider("Suppress entries where H ≥", min_value=0.30, max_value=0.70,
-                         value=0.50, step=0.01, format="%.2f")
+    if show_hurst:
+        _wl_set = set(w["ticker"] for w in (get_watchlist() or []))
+        with st.spinner("Computing Hurst..."):
+            h_series = get_hurst(ticker, is_watchlist=(ticker in _wl_set))
+        show_adf = st.checkbox("Show rolling ADF p-value (slow on first load)")
+        adf_series = rolling_adf(ticker) if show_adf else None
 
-    if not closed.empty:
-        cwh = closed.copy()
-        cwh["allowed"] = cwh["H_at_entry"].isna() | (cwh["H_at_entry"] < h_cutoff)
-        allowed    = cwh[cwh["allowed"]]
-        suppressed = cwh[~cwh["allowed"]]
+        h_cutoff = st.slider("Suppress entries where H ≥", min_value=0.30, max_value=0.70,
+                             value=0.50, step=0.01, format="%.2f")
+        st.caption("Hurst filter")
+
+        if not closed.empty:
+            cwh = closed.copy()
+            if not h_series.empty:
+                cwh["H_at_entry"] = cwh["Entry Time"].apply(
+                    lambda t: h_series.asof(t) if t >= h_series.index[0] else np.nan
+                )
+            else:
+                cwh["H_at_entry"] = np.nan
+            cwh["allowed"] = cwh["H_at_entry"].isna() | (cwh["H_at_entry"] < h_cutoff)
+            allowed    = cwh[cwh["allowed"]]
+            suppressed = cwh[~cwh["allowed"]]
+        else:
+            h_series = pd.Series(dtype=float)
+            allowed = suppressed = pd.DataFrame()
     else:
-        allowed = suppressed = pd.DataFrame()
+        h_series = pd.Series(dtype=float)
+        adf_series = None
+        allowed = closed
+        suppressed = pd.DataFrame()
 
     # -----------------------------------------------------------------------
     # Chart
     # -----------------------------------------------------------------------
     st.subheader("Price + Bands")
 
-    n_rows = 3 if show_adf else 2
-    row_heights = [0.62, 0.19, 0.19] if show_adf else [0.75, 0.25]
-    subplot_titles = ("", "Hurst (100 bars)", "ADF p-value (100 bars)") if show_adf else ("", "Hurst (100 bars)")
+    if show_hurst:
+        n_rows = 3 if adf_series is not None else 2
+        row_heights = [0.62, 0.19, 0.19] if n_rows == 3 else [0.75, 0.25]
+        subplot_titles = ("", "Hurst (100 bars)", "ADF p-value (100 bars)") if n_rows == 3 else ("", "Hurst (100 bars)")
+    else:
+        n_rows = 1
+        row_heights = [1.0]
+        subplot_titles = ("",)
 
     fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True,
                         row_heights=row_heights, vertical_spacing=0.03,
@@ -389,9 +385,11 @@ def _render_hurst_section(closed, h_series, df_ind, close, ticker):
             fig.add_trace(go.Scatter(x=lower.index, y=lower.values, showlegend=False,
                                      line=dict(color=color, width=1, dash=dash), opacity=0.7), row=1, col=1)
 
+    win_label  = "Win (H-filtered)" if show_hurst else "Win"
+    loss_label = "Loss (H-filtered)" if show_hurst else "Loss"
     for subset, color, symbol, label in [
-        (allowed[allowed["Result"].isin(["WIN","TWIN"])],   "#00cc66", "triangle-up",   "Win (allowed)"),
-        (allowed[allowed["Result"].isin(["LOSS","TLOSS"])], "#ff4444", "triangle-down", "Loss (allowed)"),
+        (allowed[allowed["Result"].isin(["WIN","TWIN"])],   "#00cc66", "triangle-up",   win_label),
+        (allowed[allowed["Result"].isin(["LOSS","TLOSS"])], "#ff4444", "triangle-down", loss_label),
     ]:
         if not subset.empty:
             fig.add_trace(go.Scatter(x=subset["Entry Time"], y=subset["Entry Price"],
@@ -417,12 +415,13 @@ def _render_hurst_section(closed, h_series, df_ind, close, ticker):
                           fillcolor="#888888", opacity=0.04,
                           line=dict(color="#888888", width=1, dash="dot"), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=h_series.index, y=h_series.values,
-                             name="Hurst (100 bars)", line=dict(color="#ffdd44", width=1.5)), row=2, col=1)
-    fig.add_hline(y=0.5,      line=dict(color="#555555", dash="dash",  width=1), row=2, col=1)
-    fig.add_hline(y=h_cutoff, line=dict(color="#ff8800", dash="solid", width=1.5), row=2, col=1)
+    if show_hurst and not h_series.empty:
+        fig.add_trace(go.Scatter(x=h_series.index, y=h_series.values,
+                                 name="Hurst (100 bars)", line=dict(color="#ffdd44", width=1.5)), row=2, col=1)
+        fig.add_hline(y=0.5,      line=dict(color="#555555", dash="dash",  width=1), row=2, col=1)
+        fig.add_hline(y=h_cutoff, line=dict(color="#ff8800", dash="solid", width=1.5), row=2, col=1)
 
-    if show_adf and adf_series is not None:
+    if adf_series is not None:
         fig.add_trace(go.Scatter(x=adf_series.index, y=adf_series.values,
                                  name="ADF p-value (100 bars)", line=dict(color="#44ddff", width=1.5)), row=3, col=1)
         fig.add_hline(y=0.05, line=dict(color="#888888", dash="dash", width=1), row=3, col=1)
@@ -432,8 +431,9 @@ def _render_hurst_section(closed, h_series, df_ind, close, ticker):
                       margin=dict(l=50, r=20, t=30, b=20),
                       hovermode="x unified", xaxis_rangeslider_visible=False)
     fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Hurst", row=2, col=1, range=[0, 1])
-    if show_adf:
+    if show_hurst:
+        fig.update_yaxes(title_text="Hurst", row=2, col=1, range=[0, 1])
+    if adf_series is not None:
         fig.update_yaxes(title_text="ADF p", row=3, col=1, range=[0, 1])
 
     st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
@@ -458,14 +458,18 @@ def _render_hurst_section(closed, h_series, df_ind, close, ticker):
         c4.metric("Time Exits", len(df[df["Result"].isin(["TWIN","TLOSS"])]))
 
     if not closed.empty:
-        col_all, col_filt = st.columns(2)
-        with col_all:
-            _metrics(closed, "All trades (unfiltered)")
-        with col_filt:
-            _metrics(allowed, f"H-filtered (H < {h_cutoff:.2f})")
+        if show_hurst:
+            col_all, col_filt = st.columns(2)
+            with col_all:
+                _metrics(closed, "All trades (unfiltered)")
+            with col_filt:
+                _metrics(allowed, f"H-filtered (H < {h_cutoff:.2f})")
+        else:
+            _metrics(closed, "All trades")
 
         if not allowed.empty:
-            st.markdown("#### By Quarter (H-filtered)")
+            quarter_label = "By Quarter (H-filtered)" if show_hurst else "By Quarter"
+            st.markdown(f"#### {quarter_label}")
             aq = allowed.copy()
             aq["Quarter"] = aq["Entry Time"].dt.to_period("Q").astype(str)
             rows_q = []
@@ -491,4 +495,4 @@ def _render_hurst_section(closed, h_series, df_ind, close, ticker):
         st.warning("No closed trades for this node.")
 
 
-_render_hurst_section(closed, h_series, df_ind, close, selected_ticker)
+_render_hurst_section(closed, df_ind, close, selected_ticker)
