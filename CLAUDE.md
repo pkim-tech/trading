@@ -1,8 +1,8 @@
 # Trading Alpha Engine
 
 ## Session Commands
-- `go` — session start: read the last ~60 lines of `docs/session_cache.md` and give a brief summary of where we left off and what's next.
-- `session close` — session end: append a session summary to `docs/session_cache.md`. No commits, no tests.
+- `go` — session start: read the first ~60 lines of `docs/session_cache.md` and give a brief summary of where we left off and what's next.
+- `session close` — session end: prepend a session summary to `docs/session_cache.md` (insert after the header, before existing entries). Keep only the 10 most recent entries; drop older ones. No commits, no tests. If context is low and reading the file first is not feasible, write the summary to a new file `docs/session_cache_new.md` instead.
 - `feature wrap` — mid-session feature complete: update relevant docs, run pre-commit checklist (`docs/pre_commit_checklist.md`), and commit. Does not trigger session close.
 - `session wrap` — feature wrap followed by session close.
 

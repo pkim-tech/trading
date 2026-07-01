@@ -2,6 +2,8 @@
 
 ## High Priority
 
+- **Session cache two-file design**: Work account uses two files — one for session close handover, one (conversation_cache?) for top-10 session history loaded into conversation context. Need to check work account to reconstruct the design and port it here.
+
 - **v1.6 coarse grid sweep**: ✅ Done. Step-3 [3,6,...,30] coarse + 3-island ±4 fine mesh + full mesh for cliff-safe top-10. Three-phase sweep engine built (`run_optimization_sweep.py`). v1.6 completed: 358 tickers coarse, 30 island mesh, 1 full mesh (WULX — only cliff-safe index/other candidate). SMST full mesh running separately.
 
 - **Sweep run registry**: Add `sweep_runs` table to DB — one row per sweep execution with `run_id`, `version`, `timestamp`, `config_json` snapshot, `notes`, `phase_reached`. Lets you record why each version was run and reconstruct config if needed. Wire into sweep engine to auto-insert on start/finish.

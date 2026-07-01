@@ -52,7 +52,7 @@
         ]
     },
     "execution": {
-        "max_workers": 10,
+        "max_workers": 9,
         "max_generations": 0,
         "alpha_tolerance": -100.0
     }

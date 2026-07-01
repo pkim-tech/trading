@@ -352,24 +352,28 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
     with sqlite3.connect(DB_PATH) as conn:
         for ticker in island_tickers:
             row = conn.execute("""
-                SELECT take_profit, stop_loss, alpha_vs_spy FROM backtest_cache
+                SELECT take_profit, stop_loss, max_hold_hours, window, z_score_threshold, alpha_vs_spy FROM backtest_cache
                 WHERE version=? AND ticker=? AND strategy=? AND trades > 0
                 ORDER BY alpha_vs_spy DESC LIMIT 1
             """, (config_version, ticker, strategy_name)).fetchone()
             if not row:
                 continue
 
-            tp_c, sl_c, best_alpha = int(row[0]), int(row[1]), float(row[2])
+            tp_c, sl_c, hold_c, win_c, z_c, best_alpha = int(row[0]), int(row[1]), int(row[2]), int(row[3]), float(row[4]), float(row[5])
 
             worst = conn.execute("""
                 SELECT MIN(alpha_vs_spy) FROM backtest_cache
                 WHERE version=? AND ticker=? AND strategy=?
-                  AND take_profit  BETWEEN ? AND ?
-                  AND stop_loss    BETWEEN ? AND ?
+                  AND window=? AND z_score_threshold=?
+                  AND take_profit    BETWEEN ? AND ?
+                  AND stop_loss      BETWEEN ? AND ?
+                  AND max_hold_hours BETWEEN ? AND ?
                   AND trades > 0
             """, (config_version, ticker, strategy_name,
+                  win_c, z_c,
                   tp_c - CLIFF_RADIUS, tp_c + CLIFF_RADIUS,
-                  sl_c - CLIFF_RADIUS, sl_c + CLIFF_RADIUS)).fetchone()[0]
+                  sl_c - CLIFF_RADIUS, sl_c + CLIFF_RADIUS,
+                  hold_c - 24, hold_c + 24)).fetchone()[0]
 
             worst_neighbor = float(worst) if worst is not None else 0.0
             cliff = worst_neighbor < 0
@@ -383,17 +387,27 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
     safe = df[df['worst_neighbor'] >= 0].sort_values('best_alpha', ascending=False)
 
     with sqlite3.connect(DB_PATH) as conn:
-        t_df = pd.read_sql("SELECT symbol, index_underlier FROM tickers", conn)
+        t_df = pd.read_sql("SELECT symbol, index_underlier, avg_vol_10d, last_price FROM tickers", conn)
     t_df = t_df.rename(columns={'symbol': 'ticker'})
     safe = safe.merge(t_df, on='ticker', how='left')
     safe['is_index'] = safe['index_underlier'].notna() & (safe['index_underlier'].astype(str).str.strip() != '')
+    safe['max_notional'] = safe['avg_vol_10d'] * safe['last_price'] * 0.01
 
-    top_index = safe[safe['is_index']].head(n_index)['ticker'].tolist()
-    top_other  = safe[~safe['is_index']].head(n_stock)['ticker'].tolist()
+    before = len(safe)
+    safe = safe[safe['best_alpha'] >= 200]
+    safe = safe[safe['max_notional'].notna() & (safe['max_notional'] >= 50_000)]
+    logger.info(f"Checkpoint2 — filters: {before} cliff-free → {len(safe)} after alpha>=200% and liq>=$50k")
 
-    logger.info(f"Checkpoint2 — full mesh index ({n_index}): {top_index}")
-    logger.info(f"Checkpoint2 — full mesh other ({n_stock}): {top_other}")
-    return top_index, top_other
+    all_index = safe[safe['is_index']]['ticker'].tolist()
+    all_other  = safe[~safe['is_index']]['ticker'].tolist()
+    top_other  = all_other[:n_stock]
+    rest_other = all_other[n_stock:]
+
+    logger.info(f"Checkpoint2 — Phase3 order: top {n_stock} non-index → all index ({len(all_index)}) → remaining non-index ({len(rest_other)})")
+    logger.info(f"  Top non-index: {top_other}")
+    logger.info(f"  Index: {all_index}")
+    logger.info(f"  Remaining non-index: {rest_other}")
+    return top_other, all_index, rest_other
 
 
 # ── Phase 3: Full mesh ────────────────────────────────────────────────────────
@@ -527,10 +541,11 @@ if __name__ == "__main__":
 
             # ── Checkpoint 2 ─────────────────────────────────────────────
             logger.info(f"\nCheckpoint 2: cliff check on {len(island_tickers)} island tickers...")
-            full_index, full_other = identify_full_mesh_candidates(
+            top_other, all_index, rest_other = identify_full_mesh_candidates(
                 config_version, name, island_tickers, 5, 5
             )
-            full_tickers = full_index + full_other
+            # Order: top 5 non-index → all index → remaining non-index
+            full_tickers = top_other + all_index + rest_other
 
             if not full_tickers:
                 logger.warning("No cliff-free candidates for Phase 3.")
