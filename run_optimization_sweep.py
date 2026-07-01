@@ -13,18 +13,20 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
-# --- Dynamic Core Strategy Imports ---
 from backtester import run_backtest
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache
 
-# --- Global Workspace Environments ---
-CACHE_DIR = Path("./cache")
+CACHE_DIR    = Path("./cache")
 OPTO_LOG_DIR = Path("./logs")
 OPTO_LOG_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = CACHE_DIR / "trading_universe.db"
 
-# --- Structural Log Level Framing Configuration ---
+FINE_RADIUS    = 4
+N_ISLANDS      = 3
+ISLAND_MIN_SEP = 6
+CLIFF_RADIUS   = 2
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -37,7 +39,6 @@ logger = logging.getLogger("MatrixSweepEngine")
 
 
 def init_idempotent_db():
-    """Validates and enforces target SQL relational table architecture schemas."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
@@ -64,7 +65,6 @@ def init_idempotent_db():
 
 
 def run_single_backtest_node_isolated(args):
-    """Pure mathematical worker node running inside the isolated subprocess."""
     ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh = args
 
     try:
@@ -82,7 +82,6 @@ def run_single_backtest_node_isolated(args):
 
     close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
     df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
-
     strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
     df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
 
@@ -100,35 +99,31 @@ def run_single_backtest_node_isolated(args):
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "NO_TRADES"}
 
     df_tr = pd.DataFrame(closed)
-    win_rate = float((len(df_tr[df_tr['Result'] == 'WIN']) / len(df_tr)) * 100)
+    win_rate   = float((len(df_tr[df_tr['Result'] == 'WIN']) / len(df_tr)) * 100)
     compounded = float(((df_tr['Return'] + 1).prod() - 1) * 100)
     alpha_calc = float(compounded - spy_bh)
 
     return {
-        "coords": (tp, sl, hold_hours),
+        "coords":  (tp, sl, hold_hours),
         "payload": (alpha_calc, len(df_tr), win_rate, compounded),
-        "window": w,
-        "z_thresh": z_thresh,
-        "status": "SUCCESS"
+        "window":  w, "z_thresh": z_thresh, "status": "SUCCESS"
     }
 
 
 def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp):
-    """Dispatches processing frames to the warmed up shared pool and gathers metrics securely."""
-    conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    conn   = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
-    matrix_results = []
-
+    matrix_results  = []
     unvisited_tasks = []
+
     for t in tasks:
         tp, sl, hold_hours, w, z_thresh = t
         cursor.execute("""
-            SELECT trades, win_rate, strategy_return, alpha_vs_spy
-            FROM backtest_cache
-            WHERE strategy=? AND version=? AND ticker=? AND window=? AND max_hold_hours=? AND take_profit=? AND stop_loss=? AND z_score_threshold=?
+            SELECT trades, win_rate, strategy_return, alpha_vs_spy FROM backtest_cache
+            WHERE strategy=? AND version=? AND ticker=? AND window=? AND max_hold_hours=?
+              AND take_profit=? AND stop_loss=? AND z_score_threshold=?
         """, (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl), z_thresh))
         cached_row = cursor.fetchone()
-
         if cached_row:
             matrix_results.append({
                 "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
@@ -144,37 +139,34 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
         conn.close()
         return pd.DataFrame(matrix_results)
 
-    planned_nodes = [{"take_profit": int(t[0]), "stop_loss": int(t[1]), "max_hold_hours": int(t[2])} for t in unvisited_tasks]
     try:
         with open("active_phase_grid.json", "w") as gf:
-            json.dump({"phase": phase_label, "nodes": planned_nodes}, gf)
+            json.dump({"phase": phase_label, "nodes": [
+                {"take_profit": int(t[0]), "stop_loss": int(t[1]), "max_hold_hours": int(t[2])}
+                for t in unvisited_tasks
+            ]}, gf)
     except Exception:
         pass
 
-    futures_map = {}
-    for task in unvisited_tasks:
-        tp, sl, hold_hours, w, z_thresh = task
-        args = (ticker, strategy_name, config_version, int(tp), int(sl), hold_hours, w, spy_bh, z_thresh)
-        futures_map[shared_pool.submit(run_single_backtest_node_isolated, args)] = task
-
-    logger.info(f"🚀 Processing Grid: {len(unvisited_tasks)} unvisited execution nodes sent to worker pool...")
+    futures_map = {
+        shared_pool.submit(run_single_backtest_node_isolated,
+                           (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z)): task
+        for task in unvisited_tasks
+        for tp, sl, hold, w, z in [task]
+    }
 
     progress_bar = tqdm(
-        as_completed(futures_map), 
-        total=len(futures_map), 
-        desc=f"📊 [{ticker}] {phase_label}", 
-        unit="node",
-        mininterval=15.0,
-        maxinterval=30.0
+        as_completed(futures_map), total=len(futures_map),
+        desc=f"[{ticker}] {phase_label}", unit="node",
+        mininterval=15.0, maxinterval=30.0
     )
-    
-    node_counter = 0
-    COMMIT_BATCH = 100
+
+    node_counter      = 0
     last_postfix_time = 0.0
     for future in progress_bar:
         tp, sl, hold_hours, w, z_thresh = futures_map[future]
         try:
-            res = future.result()
+            res    = future.result()
             status = res.get("status")
             if status in ("SUCCESS", "NO_TRADES"):
                 if status == "SUCCESS":
@@ -184,14 +176,16 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
                 now = time.time()
                 if now - last_postfix_time >= 2.0:
-                    progress_bar.set_postfix({"Alpha Peak": f"{alpha:+.1f}%", "Trades": num_trades})
+                    progress_bar.set_postfix({"Alpha": f"{alpha:+.1f}%", "Trades": num_trades})
                     last_postfix_time = now
 
                 node_counter += 1
                 if node_counter % 50 == 0:
                     try:
                         with open("current_test.json", "w") as tf:
-                            json.dump({"phase": phase_label, "ticker": ticker, "strategy": strategy_name, "version": config_version, "take_profit": int(tp), "stop_loss": int(sl), "max_hold_hours": int(hold_hours)}, tf)
+                            json.dump({"phase": phase_label, "ticker": ticker, "strategy": strategy_name,
+                                       "version": config_version, "take_profit": int(tp),
+                                       "stop_loss": int(sl), "max_hold_hours": int(hold_hours)}, tf)
                     except Exception:
                         pass
 
@@ -209,201 +203,359 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                     (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl),
                      num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh)
                 )
-
-                if node_counter % COMMIT_BATCH == 0:
+                if node_counter % 100 == 0:
                     conn.commit()
 
         except Exception as e:
-            logger.error(f"Worker process crashed evaluating node TP={tp}, SL={sl}: {e}")
+            logger.error(f"Worker crashed TP={tp} SL={sl}: {e}")
 
-    conn.commit()  # flush remaining
+    conn.commit()
     progress_bar.close()
     conn.close()
     return pd.DataFrame(matrix_results)
 
 
-def run_master_evolutionary_suite(shared_pool, ticker, strategy_class, strategy_name, run_timestamp):
-    """Executes multi-generation mesh scans using the clean shared execution thread context."""
-    init_idempotent_db()
-    
-    try:
-        with open("config.json", "r") as f: 
-            config = json.load(f)
-    except Exception:
-        logger.error("Configuration file missing. Halting execution pipeline.")
-        return None
-        
-    config_version = config.get("version", "v1.2")
-    hp = config["hyperparameters"]
-    max_generations = config.get("execution", {}).get("max_generations", 1)
+# ── B&H helper ────────────────────────────────────────────────────────────────
 
-    z_thresholds = hp.get("z_score_thresholds", [2.0])
-    expected = (len(z_thresholds) * len(hp["windows"]) * len(hp["take_profits"])
-                * len(hp["stop_losses"]) * len(hp["hold_time_caps"]))
-    with sqlite3.connect(DB_PATH, timeout=60.0) as _chk:
-        z_placeholders = ",".join("?" * len(z_thresholds))
-        w_placeholders = ",".join("?" * len(hp["windows"]))
-        cached = _chk.execute(
-            f"SELECT COUNT(*) FROM backtest_cache WHERE strategy=? AND version=? AND ticker=? AND z_score_threshold IN ({z_placeholders}) AND window IN ({w_placeholders})",
-            (strategy_name, config_version, ticker, *z_thresholds, *hp["windows"])
-        ).fetchone()[0]
-    if cached >= expected:
-        logger.info(f"[{ticker}] fully cached ({cached}/{expected} nodes). Skipping.")
-        return None
-
+def compute_bh_returns(ticker):
     cache_path = CACHE_DIR / f"{ticker}_1h.csv"
     if not cache_path.exists():
-        logger.error(f"Critical Ingestion Error: Base cache token not found at {cache_path}")
-        return None
-        
-    df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True).sort_index()
-    if df_hourly_raw.index.tz is not None:
-        df_hourly_raw.index = df_hourly_raw.index.tz_localize(None)
-    close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
-    asset_bh = ((df_hourly_raw[close_col].iloc[-1] - df_hourly_raw[close_col].iloc[0]) / df_hourly_raw[close_col].iloc[0]) * 100
+        return None, None
+    df = pd.read_csv(cache_path, index_col=0, parse_dates=True).sort_index()
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    close_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+    asset_bh  = ((df[close_col].iloc[-1] - df[close_col].iloc[0]) / df[close_col].iloc[0]) * 100
 
-    spy_cache, spy_bh = CACHE_DIR / "SPY_1h.csv", 0.0
+    spy_bh    = 0.0
+    spy_cache = CACHE_DIR / "SPY_1h.csv"
     if spy_cache.exists():
         spy_df = pd.read_csv(spy_cache, index_col=0, parse_dates=True).sort_index()
         if spy_df.index.tz is not None:
             spy_df.index = spy_df.index.tz_localize(None)
-        spy_sliced = spy_df.loc[df_hourly_raw.index.min():df_hourly_raw.index.max()]
-        if not spy_sliced.empty:
+        sliced = spy_df.loc[df.index.min():df.index.max()]
+        if not sliced.empty:
             spy_col = 'Adj Close' if 'Adj Close' in spy_df.columns else 'Close'
-            spy_bh = ((spy_sliced[spy_col].iloc[-1] - spy_sliced[spy_col].iloc[0]) / spy_sliced[spy_col].iloc[0]) * 100
+            spy_bh  = ((sliced[spy_col].iloc[-1] - sliced[spy_col].iloc[0]) / sliced[spy_col].iloc[0]) * 100
+    return asset_bh, spy_bh
 
-    macro_tasks = []
-    for z_thresh in z_thresholds:
-        for w in hp["windows"]:
-            for tp in hp["take_profits"]:
-                for sl in hp["stop_losses"]:
-                    for hold in hp["hold_time_caps"]:
-                        macro_tasks.append((int(tp), int(sl), int(hold), int(w), float(z_thresh)))
 
-    logger.info(f"Generated {len(macro_tasks)} total structural grid nodes for the brute-force sweep.")
-    df_global = dispatch_parallel_grid(shared_pool, macro_tasks, ticker, strategy_name, config_version, "Macro Scan", spy_bh, asset_bh, run_timestamp)
-    if df_global.empty: 
-        logger.warning("Initial structural baseline empty. Skipping optimization sequences.")
-        return None
-        
-    frontier = [{"tp": int(r['Take Profit %']), "sl": int(r['Stop Loss %']), "hold": int(r['Max Hold Hours']), "w": int(r['Window']), "z": float(r['Z Threshold'])}
-                for _, r in df_global.nlargest(2, "Alpha vs SPY %").iterrows()]
-    all_fine_data = []
+# ── Island selection ──────────────────────────────────────────────────────────
 
-    for generation in range(1, max_generations + 1):
-        logger.info(f"🧬 Generation {generation}/{max_generations} | Refining Local Grid Boundaries...")
-        generation_tasks = []
-
-        for agent in frontier:
-            fine_tps = [int(agent["tp"] - 2), int(agent["tp"] - 1), int(agent["tp"]), int(agent["tp"] + 1), int(agent["tp"] + 2)]
-            fine_sls = [int(agent["sl"] - 2), int(agent["sl"] - 1), int(agent["sl"]), int(agent["sl"] + 1), int(agent["sl"] + 2)]
-
-            fine_tps = sorted(list(set([max(1, tp) for tp in fine_tps])))
-            fine_sls = sorted(list(set([max(1, sl) for sl in fine_sls])))
-            fine_holds = sorted(list(set([max(24, agent["hold"] - 24), agent["hold"], min(120, agent["hold"] + 24)])))
-
-            for tp_mod in fine_tps:
-                for sl_mod in fine_sls:
-                    for hold_mod in fine_holds:
-                        generation_tasks.append((tp_mod, sl_mod, hold_mod, agent["w"], agent["z"]))
-
-        generation_tasks = list(set(generation_tasks))
-        
-        df_gen_mesh = dispatch_parallel_grid(shared_pool, generation_tasks, ticker, strategy_name, config_version, f"Gen {generation} Mesh", spy_bh, asset_bh, run_timestamp)
-        if df_gen_mesh.empty:
+def pick_island_centers(df, n=N_ISLANDS, min_sep=ISLAND_MIN_SEP):
+    centers = []
+    for _, row in df.sort_values('alpha_vs_spy', ascending=False).iterrows():
+        tp, sl = int(row['take_profit']), int(row['stop_loss'])
+        if all(abs(tp - c[0]) >= min_sep or abs(sl - c[1]) >= min_sep for c in centers):
+            centers.append((tp, sl))
+        if len(centers) == n:
             break
-        all_fine_data.append(df_gen_mesh)
-            
-        df_current_universe = pd.concat([df_global] + all_fine_data, ignore_index=True).drop_duplicates(subset=["Max Hold Hours", "Take Profit %", "Stop Loss %"])
-        df_current_universe["Safety_Score"] = 0.0
-        
-        for idx, row in df_current_universe.iterrows():
-            tp, sl, h = row["Take Profit %"], row["Stop Loss %"], row["Max Hold Hours"]
-            surrounding = df_current_universe[(df_current_universe["Take Profit %"].between(tp - 1, tp + 1)) & 
-                                              (df_current_universe["Stop Loss %"].between(sl - 1, sl + 1)) & 
-                                              (df_current_universe["Max Hold Hours"].between(h - 24, h + 24))]
-            
-            worst_neighbor = surrounding["Alpha vs SPY %"].min()
-            df_current_universe.at[idx, "Safety_Score"] = worst_neighbor if worst_neighbor <= 0 else surrounding["Alpha vs SPY %"].mean() + 100.0
+    return centers
 
-        top_survivors = df_current_universe.nlargest(2, "Safety_Score")
-        current_alpha_peak = df_current_universe["Alpha vs SPY %"].max()
-        logger.info(f"📊 Gen {generation} Complete | Frontier Alpha Peak: {current_alpha_peak:+.2f}%")
-        
-        if top_survivors["Alpha vs SPY %"].max() <= 0.0:
-            break
-            
-        frontier = [{"tp": int(s["Take Profit %"]), "sl": int(s["Stop Loss %"]), "hold": int(s["Max Hold Hours"]), "w": int(s["Window"])} for _, s in top_survivors.iterrows()]
 
-    df_master = df_global
-    if all_fine_data:
-        valid_dfs = [df for df in all_fine_data if not df.empty]
-        if valid_dfs:
-            df_master = pd.concat([df_global] + valid_dfs, ignore_index=True).drop_duplicates(
-                subset=["Strategy", "Version", "Ticker", "Window", "Max Hold Hours", "Take Profit %", "Stop Loss %"]
-            )
-    
-    if not df_master.empty:
-        best_hold = int(df_master.nlargest(1, "Alpha vs SPY %")["Max Hold Hours"].values[0])
-        df_plane = df_master[df_master["Max Hold Hours"] == best_hold]
-        
-        if len(df_plane) > 1:
-            try:
-                plt.figure(figsize=(12, 10))
-                pivot_table = df_plane.groupby(["Stop Loss %", "Take Profit %"])["Alpha vs SPY %"].mean().unstack("Take Profit %")
-                sns.heatmap(pivot_table, annot=False, cmap="RdYlGn", cbar_kws={'label': 'Alpha vs SPY %'}, linewidths=0.5)
-                plt.title(f"Safety Perimeter Matrix ({ticker} - {strategy_name} @ {best_hold}h)")
-                
-                output_img = OPTO_LOG_DIR / f"safety_perimeter_{ticker}_{strategy_name}.png"
-                plt.savefig(output_img, bbox_inches='tight')
-                plt.close()
-                logger.info(f"🖼️ Successfully exported final topological map asset layer to: {output_img}")
-            except Exception as e:
-                logger.warning(f"Topological heatmap file generation bypassed: {e}")
+# ── Phase 1: Coarse scan ──────────────────────────────────────────────────────
 
-    return df_master
+def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp):
+    z_thresholds = hp['z_score_thresholds']
+    expected = (len(z_thresholds) * len(hp['windows']) * len(hp['take_profits'])
+                * len(hp['stop_losses']) * len(hp['hold_time_caps']))
 
+    with sqlite3.connect(DB_PATH, timeout=60.0) as chk:
+        z_ph = ','.join('?' * len(z_thresholds))
+        w_ph = ','.join('?' * len(hp['windows']))
+        cached = chk.execute(
+            f"SELECT COUNT(*) FROM backtest_cache WHERE strategy=? AND version=? AND ticker=?"
+            f" AND z_score_threshold IN ({z_ph}) AND window IN ({w_ph})",
+            (strategy_name, config_version, ticker, *z_thresholds, *hp['windows'])
+        ).fetchone()[0]
+
+    if cached >= expected:
+        logger.info(f"[{ticker}] Phase1 fully cached ({cached}/{expected}). Skipping.")
+        return
+
+    tasks = [(int(tp), int(sl), int(hold), int(w), float(z))
+             for z    in z_thresholds
+             for w    in hp['windows']
+             for tp   in hp['take_profits']
+             for sl   in hp['stop_losses']
+             for hold in hp['hold_time_caps']]
+
+    dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
+                           "Phase1-Coarse", spy_bh, asset_bh, run_timestamp)
+
+
+# ── Checkpoint 1: rank by coarse alpha, return island candidates ──────────────
+
+def identify_island_candidates(config_version, strategy_name, n_index, n_stock):
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql("""
+            SELECT b.ticker, MAX(b.alpha_vs_spy) as best_alpha,
+                   t.index_underlier, t.stock_underlier
+            FROM backtest_cache b
+            LEFT JOIN tickers t ON t.symbol = b.ticker
+            WHERE b.version=? AND b.strategy=? AND b.trades > 0
+            GROUP BY b.ticker
+            ORDER BY best_alpha DESC
+        """, conn, params=(config_version, strategy_name))
+
+    def utype(row):
+        if pd.notna(row.get('index_underlier')) and row['index_underlier']:
+            return 'index'
+        return 'other'
+
+    df['underlier'] = df.apply(utype, axis=1)
+    top_index = df[df['underlier'] == 'index'].head(n_index)['ticker'].tolist()
+    top_other  = df[df['underlier'] != 'index'].head(n_stock)['ticker'].tolist()
+
+    logger.info(f"Checkpoint1 — top index ({n_index}): {top_index}")
+    logger.info(f"Checkpoint1 — top other ({n_stock}): {top_other}")
+    return top_index, top_other
+
+
+# ── Phase 2: Island mesh ──────────────────────────────────────────────────────
+
+def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp):
+    tasks = set()
+    with sqlite3.connect(DB_PATH) as conn:
+        for z in hp['z_score_thresholds']:
+            for w in hp['windows']:
+                df_wz = pd.read_sql("""
+                    SELECT take_profit, stop_loss, max_hold_hours, alpha_vs_spy
+                    FROM backtest_cache
+                    WHERE version=? AND ticker=? AND strategy=?
+                      AND z_score_threshold=? AND window=? AND trades > 0
+                """, conn, params=(config_version, ticker, strategy_name, float(z), int(w)))
+
+                if df_wz.empty:
+                    continue
+
+                centers = pick_island_centers(df_wz)
+                for (tp_c, sl_c) in centers:
+                    for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
+                        for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
+                            for hold in hp['hold_time_caps']:
+                                tasks.add((tp, sl, int(hold), int(w), float(z)))
+
+    if not tasks:
+        logger.warning(f"[{ticker}] Phase2: no island tasks generated.")
+        return
+
+    logger.info(f"[{ticker}] Phase2 island mesh: {len(tasks)} tasks ({N_ISLANDS} islands ±{FINE_RADIUS})")
+    dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
+                           "Phase2-Island", spy_bh, asset_bh, run_timestamp)
+
+
+# ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
+
+def identify_full_mesh_candidates(config_version, strategy_name, island_tickers, n_index, n_stock):
+    results = []
+    with sqlite3.connect(DB_PATH) as conn:
+        for ticker in island_tickers:
+            row = conn.execute("""
+                SELECT take_profit, stop_loss, alpha_vs_spy FROM backtest_cache
+                WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+                ORDER BY alpha_vs_spy DESC LIMIT 1
+            """, (config_version, ticker, strategy_name)).fetchone()
+            if not row:
+                continue
+
+            tp_c, sl_c, best_alpha = int(row[0]), int(row[1]), float(row[2])
+
+            worst = conn.execute("""
+                SELECT MIN(alpha_vs_spy) FROM backtest_cache
+                WHERE version=? AND ticker=? AND strategy=?
+                  AND take_profit  BETWEEN ? AND ?
+                  AND stop_loss    BETWEEN ? AND ?
+                  AND trades > 0
+            """, (config_version, ticker, strategy_name,
+                  tp_c - CLIFF_RADIUS, tp_c + CLIFF_RADIUS,
+                  sl_c - CLIFF_RADIUS, sl_c + CLIFF_RADIUS)).fetchone()[0]
+
+            worst_neighbor = float(worst) if worst is not None else 0.0
+            cliff = worst_neighbor < 0
+            logger.info(f"  [{ticker}] best={best_alpha:+.1f}%  worst_neighbor={worst_neighbor:+.1f}%  {'CLIFF' if cliff else 'safe'}")
+            results.append({'ticker': ticker, 'best_alpha': best_alpha, 'worst_neighbor': worst_neighbor})
+
+    if not results:
+        return [], []
+
+    df = pd.DataFrame(results)
+    safe = df[df['worst_neighbor'] >= 0].sort_values('best_alpha', ascending=False)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        t_df = pd.read_sql("SELECT symbol, index_underlier FROM tickers", conn)
+    t_df = t_df.rename(columns={'symbol': 'ticker'})
+    safe = safe.merge(t_df, on='ticker', how='left')
+    safe['is_index'] = safe['index_underlier'].notna() & (safe['index_underlier'].astype(str).str.strip() != '')
+
+    top_index = safe[safe['is_index']].head(n_index)['ticker'].tolist()
+    top_other  = safe[~safe['is_index']].head(n_stock)['ticker'].tolist()
+
+    logger.info(f"Checkpoint2 — full mesh index ({n_index}): {top_index}")
+    logger.info(f"Checkpoint2 — full mesh other ({n_stock}): {top_other}")
+    return top_index, top_other
+
+
+# ── Phase 3: Full mesh ────────────────────────────────────────────────────────
+
+def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp):
+    tasks = [(tp, sl, int(hold), int(w), float(z))
+             for z    in hp['z_score_thresholds']
+             for w    in hp['windows']
+             for tp   in range(1, 31)
+             for sl   in range(1, 31)
+             for hold in hp['hold_time_caps']]
+
+    logger.info(f"[{ticker}] Phase3 full mesh: {len(tasks)} tasks (cache skips coarse+island already done)")
+    dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
+                           "Phase3-Full", spy_bh, asset_bh, run_timestamp)
+
+    # Heatmap at best hold
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql("""
+            SELECT take_profit, stop_loss, max_hold_hours, alpha_vs_spy
+            FROM backtest_cache
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+        """, conn, params=(config_version, ticker, strategy_name))
+    if df.empty:
+        return
+    best_hold = int(df.nlargest(1, 'alpha_vs_spy')['max_hold_hours'].iloc[0])
+    df_plane  = df[df['max_hold_hours'] == best_hold]
+    if len(df_plane) < 2:
+        return
+    try:
+        pivot = df_plane.groupby(['stop_loss', 'take_profit'])['alpha_vs_spy'].mean().unstack('take_profit')
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(pivot, annot=False, cmap='RdYlGn', cbar_kws={'label': 'Alpha vs SPY %'}, linewidths=0.5)
+        plt.title(f"{ticker} — {strategy_name} @ {best_hold}h ({config_version})")
+        out = OPTO_LOG_DIR / f"topology_{ticker}_{strategy_name}.png"
+        plt.savefig(out, bbox_inches='tight')
+        plt.close()
+        logger.info(f"[{ticker}] Heatmap saved: {out}")
+    except Exception as e:
+        logger.warning(f"[{ticker}] Heatmap failed: {e}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
     run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    logger.info("============================================")
-    logger.info("🖥️  DEPLOYING AUTONOMOUS PARALLEL SEARCH WRAPPER ")
-    logger.info("============================================")
-    
-    try:
-        with open("config.json", "r") as f: 
-            config = json.load(f)
-        filtered_tickers = config.get("target_tickers", [])
-        # 🌟 NEW: Pull configuration target lists straight out of workspace JSON fields
-        configured_strategies = config.get("active_strategies", ["ZScoreBreakout"])
-    except Exception as conf_err:
-        logger.critical(f"Failed to extract dynamic runtime inputs from config.json: {conf_err}")
-        filtered_tickers = []
-        configured_strategies = ["ZScoreBreakout"]
 
-    if filtered_tickers:
-        with ProcessPoolExecutor(max_workers=6) as shared_pool:
-            for ticker in filtered_tickers:
-                for name in configured_strategies:
-                    strat_class = getattr(strategies, name, None)
-                    if not strat_class:
-                        logger.warning(f"Skip request: Strategy key '{name}' lacks structural mapper index.")
-                        continue
-                        
-                    logger.info(f"Target verification clear. Booting processing pipelines for [{ticker}] - [{name}]")
-                    run_master_evolutionary_suite(shared_pool, ticker, strat_class, name, run_timestamp)
-                        
-    for p in ["current_test.json", "active_phase_grid.json"]:
-        if os.path.exists(p): 
-            try: os.remove(p)
-            except Exception: pass
-            
-    logger.info("Refreshing DB caches...")
+    logger.info("=" * 52)
+    logger.info("  THREE-PHASE SWEEP ENGINE")
+    logger.info("  Phase1: Coarse  |  Phase2: Island  |  Phase3: Full")
+    logger.info("=" * 52)
+
+    try:
+        with open("config.json") as f:
+            config = json.load(f)
+    except Exception as e:
+        logger.critical(f"Failed to load config.json: {e}")
+        sys.exit(1)
+
+    config_version    = config.get("version", "v1.6")
+    hp                = config["hyperparameters"]
+    max_workers       = config.get("execution", {}).get("max_workers", 6)
+    tickers           = config.get("target_tickers", [])
+    strategy_names    = config.get("active_strategies", ["ZScoreBreakout"])
+
+    if not tickers:
+        logger.error("No tickers in config.")
+        sys.exit(1)
+
+    init_idempotent_db()
+
+    logger.info(f"Version: {config_version} | Tickers: {len(tickers)} | Workers: {max_workers}")
+    logger.info(f"Coarse grid: TP/SL {hp['take_profits']} | Hold: {len(hp['hold_time_caps'])} values | Z: {hp['z_score_thresholds']}")
+
+    # Precompute B&H returns once — reused across all phases
+    logger.info("Precomputing B&H returns for all tickers...")
+    bh_cache = {}
+    for ticker in tickers:
+        asset_bh, spy_bh = compute_bh_returns(ticker)
+        if asset_bh is not None:
+            bh_cache[ticker] = (asset_bh, spy_bh)
+    valid_tickers = [t for t in tickers if t in bh_cache]
+    logger.info(f"Valid tickers with cache data: {len(valid_tickers)}/{len(tickers)}")
+
+    with ProcessPoolExecutor(max_workers=max_workers) as shared_pool:
+
+        # ── Phase 1 ───────────────────────────────────────────────────────
+        logger.info(f"\n{'='*52}")
+        logger.info(f"PHASE 1 — COARSE SCAN ({len(valid_tickers)} tickers)")
+        logger.info(f"{'='*52}")
+        for ticker in valid_tickers:
+            for name in strategy_names:
+                if not getattr(strategies, name, None):
+                    logger.warning(f"Unknown strategy: {name}")
+                    continue
+                asset_bh, spy_bh = bh_cache[ticker]
+                run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
+
+        logger.info("Phase 1 complete. Refreshing caches...")
+        refresh_dropdown_cache()
+        refresh_pivot_cache()
+
+        for name in strategy_names:
+            if not getattr(strategies, name, None):
+                continue
+
+            # ── Checkpoint 1 ─────────────────────────────────────────────
+            logger.info(f"\nCheckpoint 1: ranking coarse results for {name}...")
+            top_index, top_other = identify_island_candidates(config_version, name, 25, 5)
+            island_tickers = top_index + top_other
+
+            if not island_tickers:
+                logger.warning("No island candidates. Skipping phases 2 & 3.")
+                continue
+
+            # ── Phase 2 ───────────────────────────────────────────────────
+            logger.info(f"\n{'='*52}")
+            logger.info(f"PHASE 2 — ISLAND MESH ({len(island_tickers)} tickers)")
+            logger.info(f"{'='*52}")
+            for ticker in island_tickers:
+                if ticker not in bh_cache:
+                    logger.warning(f"[{ticker}] No B&H data, skipping Phase 2.")
+                    continue
+                asset_bh, spy_bh = bh_cache[ticker]
+                run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
+
+            logger.info("Phase 2 complete. Refreshing caches...")
+            refresh_dropdown_cache()
+            refresh_pivot_cache()
+
+            # ── Checkpoint 2 ─────────────────────────────────────────────
+            logger.info(f"\nCheckpoint 2: cliff check on {len(island_tickers)} island tickers...")
+            full_index, full_other = identify_full_mesh_candidates(
+                config_version, name, island_tickers, 5, 5
+            )
+            full_tickers = full_index + full_other
+
+            if not full_tickers:
+                logger.warning("No cliff-free candidates for Phase 3.")
+                continue
+
+            # ── Phase 3 ───────────────────────────────────────────────────
+            logger.info(f"\n{'='*52}")
+            logger.info(f"PHASE 3 — FULL MESH ({len(full_tickers)} tickers)")
+            logger.info(f"{'='*52}")
+            for ticker in full_tickers:
+                if ticker not in bh_cache:
+                    logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
+                    continue
+                asset_bh, spy_bh = bh_cache[ticker]
+                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
+
+    logger.info("\nFinal cache refresh...")
     refresh_dropdown_cache()
     refresh_pivot_cache()
 
-    logger.info("=============================================")
-    logger.info("🏁 PIPELINE OPERATIONS SUCCESSFULLY CLOSED   ")
-    logger.info("=============================================")
+    for p in ["current_test.json", "active_phase_grid.json"]:
+        if os.path.exists(p):
+            try: os.remove(p)
+            except Exception: pass
+
+    logger.info("=" * 52)
+    logger.info("  THREE-PHASE SWEEP COMPLETE")
+    logger.info("=" * 52)

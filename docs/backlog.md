@@ -2,7 +2,11 @@
 
 ## High Priority
 
-- **v1.6 coarse grid sweep**: Re-run full universe with TP/SL at every-3 integers `[3,6,9,...,30]` (6000 nodes/ticker/threshold vs 54k). Goal: validate that islands found at coarse resolution match v1.5 fine-grid islands. If confirmed, adopt coarse grid as default for new thresholds. Discuss grid before implementing.
+- **v1.6 coarse grid sweep**: ✅ Done. Step-3 [3,6,...,30] coarse + 3-island ±4 fine mesh + full mesh for cliff-safe top-10. Three-phase sweep engine built (`run_optimization_sweep.py`). v1.6 completed: 358 tickers coarse, 30 island mesh, 1 full mesh (WULX — only cliff-safe index/other candidate). SMST full mesh running separately.
+
+- **Sweep run registry**: Add `sweep_runs` table to DB — one row per sweep execution with `run_id`, `version`, `timestamp`, `config_json` snapshot, `notes`, `phase_reached`. Lets you record why each version was run and reconstruct config if needed. Wire into sweep engine to auto-insert on start/finish.
+
+- **Cliff check improvements**: Current `CLIFF_RADIUS=2`, `AND trades > 0` excludes NO_TRADES nodes. Consider: (1) include NO_TRADES as alpha=0 so cliff detection catches edges where signal disappears; (2) widen radius to 3 for coarse-only data where ±2 may miss real neighbors. v1.5 cliff check: 25/340 tickers safe — VRTL, WULX, CIFG, GEVX, CRDU are top safe candidates.
 
 - **v1.6 limit order entry model**: Add `use_limit_fill` toggle to backtester. Fill condition: `Low <= lower_band` during the target bar (price touched the limit intrabar). Fill price: `lower_band` exactly. Current v1.5 uses `Close <= lower_band` as both signal and entry price. Limit model catches more trades (intrabar touches that close back above lower_band) at a better price. Requires passing lows array to Numba kernel. **Architecture decision**: implement as a separate strategy class (`LimitOrderZScoreBreakout`), not an inherited override. New strategy gets its own sweep version (v1.6).
 
@@ -13,6 +17,8 @@
 ## Visualization Pages (Streamlit)
 
 - **Open Positions page**: ✅ Built (`pages/10_Open_Positions.py`) — entry/signal price, drift %, current price, P&L %, TP/SL prices, hours held/left.
+
+- **Universe Scan page** (`pages/11_Universe_Scan.py`): ✅ Built — coarse alpha ranking, liquidity (max notional), underlier type, TOP_IDX/TOP_STK/LOW_LIQ/REFINE flags, neighborhood safety score. Pending: (1) switch safety score to worst-neighbor min (currently count of positive neighbors); (2) color-code green/yellow/red; (3) fine mesh trigger button for top-25 only.
 
 - **Two-phase UX rethink**: The current pages reflect two distinct workflows that aren't made explicit: (1) **Discovery** — sweep → Winners → find candidate tickers/nodes; (2) **Optimization** — Spatial Topology + Node Inspector → refine a candidate into a tradeable config. Consider shared "active ticker" context across Topology and Node Inspector, or restructuring so the two optimization pages feel like sub-views of a single ticker analysis flow.
 
