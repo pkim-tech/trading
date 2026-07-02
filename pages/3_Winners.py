@@ -315,14 +315,21 @@ if wl:
                WHERE ticker IN ({placeholders})""",
             c, params=wl_tickers
         )
+        underlier = pd.read_sql_query(
+            f"SELECT symbol, stock_underlier, index_underlier FROM tickers WHERE symbol IN ({placeholders})",
+            c, params=wl_tickers
+        )
+    underlier['Type'] = underlier.apply(
+        lambda r: 'STK' if (r['stock_underlier'] and not r['index_underlier']) else 'IDX', axis=1
+    )
     wl_df = wl_df.merge(
         stats,
         on=['ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss', 'max_hold_hours', 'z_score_threshold'],
         how='left',
-    )
+    ).merge(underlier[['symbol', 'Type']], left_on='ticker', right_on='symbol', how='left').drop(columns='symbol')
 
     wl_df['watch'] = True
-    wl_display = wl_df[['id', 'mode', 'ticker', 'strategy', 'version', 'window', 'take_profit',
+    wl_display = wl_df[['id', 'mode', 'ticker', 'Type', 'strategy', 'version', 'window', 'take_profit',
                           'stop_loss', 'max_hold_hours', 'z_score_threshold', 'trades', 'win_rate',
                           'strategy_return', 'alpha_vs_spy', 'asset_bh', 'spy_bh', 'label', 'watch']].rename(columns={
         'id': 'ID', 'mode': 'Mode', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
