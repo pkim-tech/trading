@@ -538,33 +538,41 @@ if __name__ == "__main__":
         refresh_dropdown_cache()
         refresh_pivot_cache()
 
+        max_generations = config.get("execution", {}).get("max_generations", 1)
+        max_generations = max(1, max_generations)
+
         for name in strategy_names:
             if not getattr(strategies, name, None):
                 continue
 
-            # ── Checkpoint 1 ─────────────────────────────────────────────
-            logger.info(f"\nCheckpoint 1: ranking coarse results for {name}...")
-            top_index, top_other = identify_island_candidates(config_version, name, 25, 5)
-            island_tickers = top_index + top_other
+            island_tickers = []
+            for gen in range(max_generations):
+                # ── Checkpoint 1 (re-run each generation) ────────────────
+                logger.info(f"\nCheckpoint 1 (gen {gen+1}/{max_generations}): ranking results for {name}...")
+                top_index, top_other = identify_island_candidates(config_version, name, 25, 5)
+                island_tickers = top_index + top_other
+
+                if not island_tickers:
+                    logger.warning("No island candidates. Skipping phases 2 & 3.")
+                    break
+
+                # ── Phase 2 ───────────────────────────────────────────────
+                logger.info(f"\n{'='*52}")
+                logger.info(f"PHASE 2 — ISLAND MESH gen {gen+1}/{max_generations} ({len(island_tickers)} tickers)")
+                logger.info(f"{'='*52}")
+                for ticker in island_tickers:
+                    if ticker not in bh_cache:
+                        logger.warning(f"[{ticker}] No B&H data, skipping Phase 2.")
+                        continue
+                    asset_bh, spy_bh = bh_cache[ticker]
+                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
+
+                logger.info(f"Phase 2 gen {gen+1} complete. Refreshing caches...")
+                refresh_dropdown_cache()
+                refresh_pivot_cache()
 
             if not island_tickers:
-                logger.warning("No island candidates. Skipping phases 2 & 3.")
                 continue
-
-            # ── Phase 2 ───────────────────────────────────────────────────
-            logger.info(f"\n{'='*52}")
-            logger.info(f"PHASE 2 — ISLAND MESH ({len(island_tickers)} tickers)")
-            logger.info(f"{'='*52}")
-            for ticker in island_tickers:
-                if ticker not in bh_cache:
-                    logger.warning(f"[{ticker}] No B&H data, skipping Phase 2.")
-                    continue
-                asset_bh, spy_bh = bh_cache[ticker]
-                run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
-
-            logger.info("Phase 2 complete. Refreshing caches...")
-            refresh_dropdown_cache()
-            refresh_pivot_cache()
 
             # ── Phase 2.5 ─────────────────────────────────────────────────
             logger.info(f"\n{'='*52}")

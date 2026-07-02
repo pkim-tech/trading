@@ -5,7 +5,7 @@ import sqlite3
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
-from backtester import run_backtest
+from backtester import run_backtest, run_backtest_v17
 import strategies
 from active_signals import get_watchlist
 from db_cache import get_kv
@@ -140,6 +140,7 @@ def load_hourly(ticker):
 
 
 @st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400)
 def run_cached_backtest(ticker, strategy_name, version, window, tp, sl, hold, zt):
     df_h = load_hourly(ticker)
     if df_h is None:
@@ -149,9 +150,10 @@ def run_cached_backtest(ticker, strategy_name, version, window, tp, sl, hold, zt
     strat_class = getattr(strategies, strategy_name)
     strat = strat_class(window=window, z_score_threshold=float(zt))
     df_daily_proc = strat.generate_daily_indicators(df_daily)
-    return run_backtest(df_h, df_daily_proc, ticker,
-                        take_profit=tp / 100.0, stop_loss=sl / 100.0,
-                        max_hours_to_hold=hold, z_score_threshold=float(zt))
+    backtest_fn = run_backtest_v17 if issubclass(strat_class, strategies.LimitOrderZScoreBreakout) else run_backtest
+    return backtest_fn(df_h, df_daily_proc, ticker,
+                       take_profit=tp / 100.0, stop_loss=sl / 100.0,
+                       max_hours_to_hold=hold, z_score_threshold=float(zt))
 
 
 @st.cache_data(ttl=86400)

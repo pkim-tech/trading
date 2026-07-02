@@ -25,9 +25,11 @@ Three discrete layers, each independently runnable:
 ### Strategy
 Z-score mean reversion: buy when price deviates significantly below the rolling SMA, exit at take profit, stop loss, or max hold time.
 
-Two strategy variants:
-- `ZScoreBreakout` — pure z-score entry
-- `TrendFilteredZScore` — z-score with trend filter overlay
+Strategy variants:
+- `ZScoreBreakout` — pure z-score entry, close-based fill (v1.5/v1.6)
+- `TrendFilteredZScore` — z-score with 50d SMA trend filter overlay
+- `LimitOrderZScoreBreakout` — limit entry at `lower_band` (fill on `Low <= lower_band` intrabar); intrabar stop loss checks `Low <= stop_price`; TP checks `Close >= tp_price` at bar close (v1.7)
+- `TrailingExitZScoreBreakout` — close-based entry (v1.5 style); once `Close >= tp_price`, switches to trailing mode: tracks `peak = max(High)`, exits when `Low <= peak × (1 - trail_pct)`. Replaces SL once trailing is active (v1.8, experimental)
 
 ### Optimization Approach
 
@@ -40,7 +42,7 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 ### Key Components
 - `run_optimization_sweep.py` — orchestrates the sweep, manages worker pool, writes progress to `active_phase_grid.json` (planned nodes) and `current_test.json` (live telemetry)
-- `backtester.py` — single node evaluation (`run_backtest`). Numba JIT kernel `_simulate` accepts `z_thresh` and uses it for the entry band (`sma - std * z_thresh`). `run_backtest` accepts `z_score_threshold=2.0` and passes it through.
+- `backtester.py` — single node evaluation. Three kernels: `_simulate` (close-based, v1.5/v1.6), `_simulate_limit` (limit entry + intrabar SL, v1.7), `_simulate_trail` (close entry + trailing exit, v1.8). Corresponding wrappers: `run_backtest`, `run_backtest_v17`, `run_backtest_v18`. Sweep engine and Node Inspector dispatch to the correct wrapper based on strategy class.
 - `strategies.py` — strategy class definitions. `z_score_threshold` stored in `self.params`, used in `check_signal` for live signal detection. The sweep and Node Inspector both pass it to `run_backtest` explicitly.
 - `pages/1_Spatial_Topology.py` — 4D Plotly scatter of parameter space, shows planned nodes in blue and completed nodes colored by alpha
 - `pages/2_Node_Inspector.py` — re-runs backtest for a selected node, shows trade ledger and quarterly breakdown; Hurst/ADF analysis is opt-in (checkbox), lazy-loaded on demand
@@ -49,7 +51,8 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - `config.json` — single source of truth for runtime config. `app.py` reads/writes directly — DB copy removed.
 
 ### Performance
-- `ProcessPoolExecutor` with up to 9 workers (`max_workers=9`, reserving 1 core for active_signals)
+- `ProcessPoolExecutor` with up to 10 workers (configurable via `execution.max_workers`)
+- Phase 2 runs `execution.max_generations` times (default 1), re-centering island mesh on refined peaks each generation
 - SQLite WAL mode for concurrent writes
 - L3 cache optimization identified as next performance improvement (suggested by Gemini)
 - Sweep auto-runs `refresh_dropdown_cache()` + `refresh_pivot_cache()` on completion
