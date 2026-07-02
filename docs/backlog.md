@@ -12,7 +12,9 @@
 
 - **Cliff check improvements**: Current `CLIFF_RADIUS=2`, `AND trades > 0` excludes NO_TRADES nodes. Consider: (1) include NO_TRADES as alpha=0 so cliff detection catches edges where signal disappears; (2) widen radius to 3 for coarse-only data where ±2 may miss real neighbors. v1.5 cliff check: 25/340 tickers safe — VRTL, WULX, CIFG, GEVX, CRDU are top safe candidates.
 
-- **v1.6 limit order entry model**: Add `use_limit_fill` toggle to backtester. Fill condition: `Low <= lower_band` during the target bar (price touched the limit intrabar). Fill price: `lower_band` exactly. Current v1.5 uses `Close <= lower_band` as both signal and entry price. Limit model catches more trades (intrabar touches that close back above lower_band) at a better price. Requires passing lows array to Numba kernel. **Architecture decision**: implement as a separate strategy class (`LimitOrderZScoreBreakout`), not an inherited override. New strategy gets its own sweep version (v1.6).
+- **v1.7 limit order entry model**: ✅ Built. `LimitOrderZScoreBreakout` — fill on `Low <= lower_band` intrabar at `lower_band` price; intrabar stop loss checks `Low <= stop_price`; TP checks `Close >= tp_price` at bar close. New `_simulate_limit` Numba kernel + `run_backtest_v17`. Grid: w=[10,20], z=[1.0,1.5,2.0], TP/SL=[3,6,...,30], Hold=[7,14,...,140].
+
+- **v1.8 trailing exit**: Once price clears TP threshold, switch to trailing sell mode — track `peak = max(High)`, exit when `Low <= peak × (1 - trail_pct)`. Lets winners run past the fixed TP. `trail_pct` is a swept parameter (start at 3%, likely varies per ticker). TP% becomes the activation trigger, not the exit price. Build on top of v1.7 limit entry (or drop limit entry if v1.7 sweep shows it underperforms).
 
 - **Trade log UI**: DB table and schema exist (`trade_log` in `trading_universe.db`). Pending: Socket Mode modal to record entry/exit from Slack interactions.
 

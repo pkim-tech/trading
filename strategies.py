@@ -38,6 +38,23 @@ class ZScoreBreakout(BaseStrategy):
         return 'BUY' if current_price <= sma - std * threshold else 'HOLD'
 
 
+class LimitOrderZScoreBreakout(BaseStrategy):
+    """v1.7: limit order entry at lower_band (fill on Low touch), intrabar stop loss."""
+    def generate_daily_indicators(self, df_daily):
+        w = self.params.get('window', 10)
+        df = df_daily.copy()
+        df['SMA'] = df['Close'].rolling(window=w).mean()
+        df['Std'] = df['Close'].rolling(window=w).std()
+        return df[['SMA', 'Std']].dropna()
+
+    def check_signal(self, current_price, prior_day):
+        sma, std = prior_day['SMA'], prior_day['Std']
+        if std == 0 or pd.isna(sma) or pd.isna(std):
+            return 'HOLD'
+        threshold = self.params.get('z_score_threshold', 2.0)
+        return 'BUY' if current_price <= sma - std * threshold else 'HOLD'
+
+
 class TrendFilteredZScore(BaseStrategy):
     def generate_daily_indicators(self, df_daily):
         w = self.params.get('window', 10)

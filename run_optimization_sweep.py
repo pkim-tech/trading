@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
-from backtester import run_backtest
+from backtester import run_backtest, run_backtest_v17
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache
 
@@ -86,7 +86,8 @@ def run_single_backtest_node_isolated(args):
     df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
 
     try:
-        trades = run_backtest(
+        backtest_fn = run_backtest_v17 if issubclass(strategy_class, strategies.LimitOrderZScoreBreakout) else run_backtest
+        trades = backtest_fn(
             df_hourly_raw, df_daily_processed, ticker,
             take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0), max_hours_to_hold=int(hold_hours),
             z_score_threshold=float(z_thresh)
