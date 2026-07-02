@@ -345,6 +345,32 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
                            "Phase2-Island", spy_bh, asset_bh, run_timestamp)
 
 
+# ── Phase 2.5: targeted cliff-box sweep around true best node ────────────────
+
+def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp):
+    """Sweep ±CLIFF_RADIUS in TP/SL and ±7h in hold around the true best node from Phase 2.
+    Guarantees cliff check has complete neighborhood data regardless of where the peak landed."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("""
+            SELECT take_profit, stop_loss, max_hold_hours, window, z_score_threshold FROM backtest_cache
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+            ORDER BY alpha_vs_spy DESC LIMIT 1
+        """, (config_version, ticker, strategy_name)).fetchone()
+    if not row:
+        return
+    tp_c, sl_c, hold_c, w_c, z_c = int(row[0]), int(row[1]), int(row[2]), int(row[3]), float(row[4])
+
+    tasks = set()
+    for tp in range(max(1, tp_c - CLIFF_RADIUS), min(30, tp_c + CLIFF_RADIUS) + 1):
+        for sl in range(max(1, sl_c - CLIFF_RADIUS), min(30, sl_c + CLIFF_RADIUS) + 1):
+            for hold in [h for h in hp['hold_time_caps'] if abs(h - hold_c) <= 7]:
+                tasks.add((tp, sl, hold, w_c, z_c))
+
+    logger.info(f"[{ticker}] Phase2.5 cliff-box: {len(tasks)} tasks around TP={tp_c} SL={sl_c} hold={hold_c}h")
+    dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
+                           "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp)
+
+
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
 
 def identify_full_mesh_candidates(config_version, strategy_name, island_tickers, n_index, n_stock):
@@ -373,7 +399,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                   win_c, z_c,
                   tp_c - CLIFF_RADIUS, tp_c + CLIFF_RADIUS,
                   sl_c - CLIFF_RADIUS, sl_c + CLIFF_RADIUS,
-                  hold_c - 24, hold_c + 24)).fetchone()[0]
+                  hold_c - 7, hold_c + 7)).fetchone()[0]
 
             worst_neighbor = float(worst) if worst is not None else 0.0
             cliff = worst_neighbor < 0
@@ -538,6 +564,16 @@ if __name__ == "__main__":
             logger.info("Phase 2 complete. Refreshing caches...")
             refresh_dropdown_cache()
             refresh_pivot_cache()
+
+            # ── Phase 2.5 ─────────────────────────────────────────────────
+            logger.info(f"\n{'='*52}")
+            logger.info(f"PHASE 2.5 — CLIFF-BOX SWEEP ({len(island_tickers)} tickers)")
+            logger.info(f"{'='*52}")
+            for ticker in island_tickers:
+                if ticker not in bh_cache:
+                    continue
+                asset_bh, spy_bh = bh_cache[ticker]
+                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
 
             # ── Checkpoint 2 ─────────────────────────────────────────────
             logger.info(f"\nCheckpoint 2: cliff check on {len(island_tickers)} island tickers...")
