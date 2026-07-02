@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import json
+import argparse
 import sqlite3
 import time
 from pathlib import Path
@@ -69,22 +70,26 @@ def run_single_backtest_node_isolated(args):
 
     try:
         cache_path = CACHE_DIR / f"{ticker}_1h.csv"
-        df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True).sort_index()
+        df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        df_hourly_raw.index = pd.to_datetime(df_hourly_raw.index).tz_localize(None)
+        df_hourly_raw = df_hourly_raw.sort_index()
     except Exception:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR"}
 
     if df_hourly_raw.empty:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
 
-
     strategy_class = getattr(strategies, strategy_name, None)
     if not strategy_class:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "UNKNOWN_STRAT"}
 
-    close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
-    df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
-    strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
-    df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
+    try:
+        close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
+        df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
+        strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
+        df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
+    except Exception:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR"}
 
     try:
         if issubclass(strategy_class, strategies.TrailingExitZScoreBreakout):
@@ -494,6 +499,15 @@ def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Three-phase sweep engine")
+    parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=None,
+                        help="Run only this phase (default: all phases)")
+    parser.add_argument("--tickers", nargs="+", default=None,
+                        help="Override tickers to sweep")
+    parser.add_argument("--version", default=None,
+                        help="Override version from config.json")
+    args = parser.parse_args()
+
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
     run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -509,12 +523,13 @@ if __name__ == "__main__":
         logger.critical(f"Failed to load config.json: {e}")
         sys.exit(1)
 
-    config_version    = config.get("version", "v1.6")
+    config_version    = args.version or config.get("version", "v1.6")
     hp                = config["hyperparameters"]
     max_workers       = config.get("execution", {}).get("max_workers", 6)
     fixed_sl          = config.get("execution", {}).get("fixed_stop_loss", 0)
-    tickers           = config.get("target_tickers", [])
+    tickers           = args.tickers or config.get("target_tickers", [])
     strategy_names    = config.get("active_strategies", ["ZScoreBreakout"])
+    phase_only        = args.phase
 
     if not tickers:
         logger.error("No tickers in config.")
@@ -537,27 +552,42 @@ if __name__ == "__main__":
 
     with ProcessPoolExecutor(max_workers=max_workers) as shared_pool:
 
-        # ── Phase 1 ───────────────────────────────────────────────────────
-        logger.info(f"\n{'='*52}")
-        logger.info(f"PHASE 1 — COARSE SCAN ({len(valid_tickers)} tickers)")
-        logger.info(f"{'='*52}")
-        for ticker in valid_tickers:
-            for name in strategy_names:
-                if not getattr(strategies, name, None):
-                    logger.warning(f"Unknown strategy: {name}")
-                    continue
-                asset_bh, spy_bh = bh_cache[ticker]
-                run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
+        if phase_only != 3:
+            # ── Phase 1 ───────────────────────────────────────────────────────
+            logger.info(f"\n{'='*52}")
+            logger.info(f"PHASE 1 — COARSE SCAN ({len(valid_tickers)} tickers)")
+            logger.info(f"{'='*52}")
+            for ticker in valid_tickers:
+                for name in strategy_names:
+                    if not getattr(strategies, name, None):
+                        logger.warning(f"Unknown strategy: {name}")
+                        continue
+                    asset_bh, spy_bh = bh_cache[ticker]
+                    run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
 
-        logger.info("Phase 1 complete. Refreshing caches...")
-        refresh_dropdown_cache()
-        refresh_pivot_cache()
+            logger.info("Phase 1 complete. Refreshing caches...")
+            refresh_dropdown_cache()
+            refresh_pivot_cache()
 
         max_generations = config.get("execution", {}).get("max_generations", 1)
         max_generations = max(1, max_generations)
 
         for name in strategy_names:
             if not getattr(strategies, name, None):
+                continue
+
+            if phase_only == 3:
+                # Skip directly to Phase 3 using provided tickers
+                full_tickers = [t for t in valid_tickers if t in bh_cache]
+                logger.info(f"\n{'='*52}")
+                logger.info(f"PHASE 3 — FULL MESH ({len(full_tickers)} tickers) [direct]")
+                logger.info(f"{'='*52}")
+                for ticker in full_tickers:
+                    if ticker not in bh_cache:
+                        logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
+                        continue
+                    asset_bh, spy_bh = bh_cache[ticker]
+                    run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
                 continue
 
             island_tickers = []
@@ -570,6 +600,9 @@ if __name__ == "__main__":
                 if not island_tickers:
                     logger.warning("No island candidates. Skipping phases 2 & 3.")
                     break
+
+                if phase_only == 1:
+                    continue
 
                 # ── Phase 2 ───────────────────────────────────────────────
                 logger.info(f"\n{'='*52}")
@@ -586,7 +619,7 @@ if __name__ == "__main__":
                 refresh_dropdown_cache()
                 refresh_pivot_cache()
 
-            if not island_tickers:
+            if not island_tickers or phase_only in (1, 2):
                 continue
 
             # ── Phase 2.5 ─────────────────────────────────────────────────

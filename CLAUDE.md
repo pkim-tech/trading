@@ -2,9 +2,9 @@
 
 ## Session Commands
 - `go` — session start: read the first ~60 lines of `docs/session_cache.md` and give a brief summary of where we left off and what's next.
-- `session close` — session end: prepend a session summary to `docs/session_cache.md` (insert after the header, before existing entries). Keep only the 10 most recent entries; drop older ones. No commits, no tests. If context is low and reading the file first is not feasible, write the summary to a new file `docs/session_cache_new.md` instead.
-- `feature wrap` — mid-session feature complete: update relevant docs, run pre-commit checklist (`docs/pre_commit_checklist.md`), and commit. Does not trigger session close.
-- `session wrap` — feature wrap followed by session close.
+- `session close` — session end: prepend a session summary to `docs/session_cache.md` (insert after the header, before existing entries). Keep only the 10 most recent entries; drop older ones. No commits, no tests, no skills. If context is low and reading the file first is not feasible, write the summary to a new file `docs/session_cache_new.md` instead.
+- `feature wrap` — mid-session feature complete: update relevant docs, review pre-commit checklist (`docs/pre_commit_checklist.md`) manually, and commit. Does not trigger session close. **Do not invoke any skills (especially verify) during this command.**
+- `session wrap` — feature wrap followed by session close. **Do not invoke any skills.**
 
 ## Project Overview
 A z-score mean reversion backtesting and optimization system targeting leveraged ETFs. Runs parallel grid sweeps over take profit, stop loss, and hold time parameters to find optimal strategy configurations with positive alpha vs SPY. Now in live trading phase with manual execution via Schwab.

@@ -1,26 +1,12 @@
 {
     "version": "v1.8",
     "target_tickers": [
-        "SOXL",
-        "AGQ",
-        "TQQQ",
-        "HIBL",
-        "GDXU",
-        "NUGT",
-        "GDXD",
-        "NRGU",
-        "YANG",
-        "URAA",
-        "ZSL",
-        "USD",
-        "OILU",
-        "UCO",
-        "DUST",
-        "SCO",
-        "BULZ",
-        "OILD",
-        "TSXU",
-        "ROM"
+        "AGQ", "BULZ", "DGP", "DUST",
+        "FNGD", "FNGU", "GDXD", "GDXU", "HIBL", "NUGT", "OILU",
+        "QID", "QLD", "ROM", "SBIT", "SCO", "SOXL", "SOXS",
+        "SQQQ", "SVXY", "TBT", "TMF", "TMV", "TQQQ", "UCO",
+        "USD", "UVIX", "UVXY", "YANG", "YINN", "ZSL",
+        "EDC", "FAS"
     ],
     "active_strategies": [
         "TrailingExitZScoreBreakout"

@@ -27,6 +27,7 @@ import json
 import time
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import contextlib
 import requests
 import pandas as pd
@@ -456,7 +457,8 @@ def compute_buy_signal(node):
     daily_closes = df_daily['Close'].dropna()
     prev_close = float(daily_closes.iloc[-1]) if not daily_closes.empty else close_series.iloc[-1]
     try:
-        hist = yf.Ticker(ticker).history(period='1d', interval='1m', prepost=True)
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            hist = ex.submit(lambda: yf.Ticker(ticker).history(period='1d', interval='1m', prepost=True)).result(timeout=10)
         current_price = float(hist['Close'].iloc[-1]) if not hist.empty else close_series.iloc[-1]
     except Exception:
         current_price = close_series.iloc[-1]
@@ -1233,13 +1235,19 @@ def run_loop(tickers: set = None):
         watchlist = get_watchlist()
         if tickers:
             watchlist = [n for n in watchlist if n['ticker'] in tickers]
+        def _refresh(ticker):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                fetch_live_data_smart(ticker)
+
         refresh_tickers = {p['ticker'] for p in get_open_positions()} | {n['ticker'] for n in watchlist}
-        for t in sorted(refresh_tickers):
-            try:
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    fetch_live_data_smart(t)
-            except Exception as e:
-                print(f"  [data] {t} refresh failed: {e}")
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            for t in sorted(refresh_tickers):
+                try:
+                    ex.submit(_refresh, t).result(timeout=15)
+                except FuturesTimeoutError:
+                    print(f"  [data] {t} refresh timed out — skipping")
+                except Exception as e:
+                    print(f"  [data] {t} refresh failed: {e}")
 
         # Fire once per window: notify at 10:25 and 15:25 that algo is alive
         for wh, wm, label in [(10, 25, "10:25"), (15, 25, "15:25")]:
