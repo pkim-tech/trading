@@ -87,21 +87,79 @@ def _conn():
 
 def ensure_tables():
     with _conn() as c:
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS watch_list (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker         TEXT NOT NULL,
-                strategy       TEXT NOT NULL,
-                version        TEXT NOT NULL,
-                window         INTEGER NOT NULL,
-                take_profit    INTEGER NOT NULL,
-                stop_loss      INTEGER NOT NULL,
-                max_hold_hours INTEGER NOT NULL,
-                label          TEXT DEFAULT '',
-                added_at       TEXT DEFAULT (datetime('now')),
-                UNIQUE(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours)
-            );
+        # watchlists table — named profiles, one is_active at a time
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS watchlists (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT UNIQUE NOT NULL,
+                is_active  INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        c.execute("INSERT OR IGNORE INTO watchlists (name, is_active) VALUES ('main', 1)")
+        if not c.execute("SELECT 1 FROM watchlists WHERE is_active=1").fetchone():
+            c.execute("UPDATE watchlists SET is_active=1 WHERE name='main'")
+        c.commit()
 
+        main_id = c.execute("SELECT id FROM watchlists WHERE name='main'").fetchone()[0]
+
+        # watch_list: create fresh or migrate from old single-list schema
+        wl_cols = {r[1] for r in c.execute("PRAGMA table_info(watch_list)").fetchall()}
+        if not wl_cols:
+            c.execute(f"""
+                CREATE TABLE watch_list (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    watchlist_id      INTEGER NOT NULL DEFAULT {main_id} REFERENCES watchlists(id),
+                    mode              TEXT NOT NULL DEFAULT 'live',
+                    ticker            TEXT NOT NULL,
+                    strategy          TEXT NOT NULL,
+                    version           TEXT NOT NULL,
+                    window            INTEGER NOT NULL,
+                    take_profit       INTEGER NOT NULL,
+                    stop_loss         INTEGER NOT NULL,
+                    max_hold_hours    INTEGER NOT NULL,
+                    z_score_threshold REAL NOT NULL DEFAULT 2.0,
+                    label             TEXT DEFAULT '',
+                    added_at          TEXT DEFAULT (datetime('now')),
+                    UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours)
+                )
+            """)
+        elif 'watchlist_id' not in wl_cols:
+            # migrate: recreate table with watchlist_id + mode + updated UNIQUE constraint
+            c.executescript(f"""
+                CREATE TABLE watch_list_new (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    watchlist_id      INTEGER NOT NULL DEFAULT {main_id},
+                    mode              TEXT NOT NULL DEFAULT 'live',
+                    ticker            TEXT NOT NULL,
+                    strategy          TEXT NOT NULL,
+                    version           TEXT NOT NULL,
+                    window            INTEGER NOT NULL,
+                    take_profit       INTEGER NOT NULL,
+                    stop_loss         INTEGER NOT NULL,
+                    max_hold_hours    INTEGER NOT NULL,
+                    z_score_threshold REAL NOT NULL DEFAULT 2.0,
+                    label             TEXT DEFAULT '',
+                    added_at          TEXT DEFAULT (datetime('now')),
+                    UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours)
+                );
+                INSERT INTO watch_list_new
+                    (watchlist_id, mode, ticker, strategy, version, window, take_profit, stop_loss,
+                     max_hold_hours, z_score_threshold, label, added_at)
+                SELECT {main_id}, 'live', ticker, strategy, version, window, take_profit, stop_loss,
+                       max_hold_hours, COALESCE(z_score_threshold, 2.0), label, added_at
+                FROM watch_list;
+                DROP TABLE watch_list;
+                ALTER TABLE watch_list_new RENAME TO watch_list;
+            """)
+        else:
+            if 'mode' not in wl_cols:
+                c.execute("ALTER TABLE watch_list ADD COLUMN mode TEXT NOT NULL DEFAULT 'live'")
+            if 'z_score_threshold' not in wl_cols:
+                c.execute("ALTER TABLE watch_list ADD COLUMN z_score_threshold REAL NOT NULL DEFAULT 2.0")
+
+        # open_positions
+        c.execute("""
             CREATE TABLE IF NOT EXISTS open_positions (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker         TEXT NOT NULL,
@@ -116,8 +174,14 @@ def ensure_tables():
                 entry_price    REAL NOT NULL,
                 entry_time     TEXT NOT NULL,
                 trade_log_id   INTEGER
-            );
+            )
+        """)
+        op_cols = {r[1] for r in c.execute("PRAGMA table_info(open_positions)").fetchall()}
+        if 'trade_log_id' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN trade_log_id INTEGER")
 
+        # trade_log
+        c.execute("""
             CREATE TABLE IF NOT EXISTS trade_log (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker              TEXT NOT NULL,
@@ -138,14 +202,8 @@ def ensure_tables():
                 exit_drift_pct      REAL,
                 pnl_pct             REAL,
                 exit_reason         TEXT
-            );
+            )
         """)
-        existing_cols = [r[1] for r in c.execute("PRAGMA table_info(open_positions)").fetchall()]
-        if 'trade_log_id' not in existing_cols:
-            c.execute("ALTER TABLE open_positions ADD COLUMN trade_log_id INTEGER")
-        wl_cols = [r[1] for r in c.execute("PRAGMA table_info(watch_list)").fetchall()]
-        if 'z_score_threshold' not in wl_cols:
-            c.execute("ALTER TABLE watch_list ADD COLUMN z_score_threshold REAL NOT NULL DEFAULT 2.0")
         c.commit()
 
 
@@ -153,20 +211,65 @@ def ensure_tables():
 # Watch list CRUD
 # ---------------------------------------------------------------------------
 
-def get_watchlist():
+def get_watchlists():
     with _conn() as c:
         return [dict(r) for r in c.execute(
-            "SELECT * FROM watch_list ORDER BY ticker, id"
+            "SELECT * FROM watchlists ORDER BY name"
         ).fetchall()]
 
 
-def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label='', z_score_threshold=2.0):
+def get_active_watchlist_id():
+    with _conn() as c:
+        row = c.execute("SELECT id FROM watchlists WHERE is_active=1").fetchone()
+        if row:
+            return row[0]
+        row = c.execute("SELECT id FROM watchlists ORDER BY id LIMIT 1").fetchone()
+        return row[0] if row else None
+
+
+def create_watchlist(name):
+    with _conn() as c:
+        c.execute("INSERT OR IGNORE INTO watchlists (name, is_active) VALUES (?, 0)", (name,))
+        c.commit()
+
+
+def delete_watchlist(watchlist_id):
+    with _conn() as c:
+        c.execute("DELETE FROM watch_list WHERE watchlist_id = ?", (watchlist_id,))
+        c.execute("DELETE FROM watchlists WHERE id = ? AND is_active = 0", (watchlist_id,))
+        c.commit()
+
+
+def set_active_watchlist(watchlist_id):
+    with _conn() as c:
+        c.execute("UPDATE watchlists SET is_active = 0")
+        c.execute("UPDATE watchlists SET is_active = 1 WHERE id = ?", (watchlist_id,))
+        c.commit()
+
+
+def get_watchlist(watchlist_id=None):
+    with _conn() as c:
+        if watchlist_id is None:
+            watchlist_id = get_active_watchlist_id()
+        if watchlist_id is None:
+            return []
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM watch_list WHERE watchlist_id = ? ORDER BY ticker, id",
+            (watchlist_id,)
+        ).fetchall()]
+
+
+def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
+             label='', z_score_threshold=2.0, watchlist_id=None, mode='live'):
+    if watchlist_id is None:
+        watchlist_id = get_active_watchlist_id()
     with _conn() as c:
         c.execute("""
             INSERT OR IGNORE INTO watch_list
-                (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label, z_score_threshold)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (ticker, strategy, version, int(window), int(take_profit),
+                (watchlist_id, mode, ticker, strategy, version, window, take_profit,
+                 stop_loss, max_hold_hours, label, z_score_threshold)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (watchlist_id, mode, ticker, strategy, version, int(window), int(take_profit),
               int(stop_loss), int(max_hold_hours), label, float(z_score_threshold)))
         c.commit()
 
@@ -174,6 +277,12 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
 def remove_node(watch_id):
     with _conn() as c:
         c.execute("DELETE FROM watch_list WHERE id = ?", (watch_id,))
+        c.commit()
+
+
+def set_node_mode(watch_id, mode):
+    with _conn() as c:
+        c.execute("UPDATE watch_list SET mode = ? WHERE id = ?", (mode, watch_id))
         c.commit()
 
 
@@ -900,6 +1009,30 @@ def _proximity_emoji(pct_away):
     return "⚪"
 
 
+def _send_window_alert(label, watchlist):
+    rows = []
+    for node in watchlist:
+        sig = compute_buy_signal(node)
+        if sig is None:
+            rows.append((float('inf'), node['ticker'], None, None))
+            continue
+        pct_away = (sig['current_price'] - sig['lower_band']) / sig['lower_band'] * 100
+        rows.append((pct_away, node['ticker'], sig, pct_away))
+    rows.sort(key=lambda x: x[0])
+
+    hot = [t for pct, t, _, __ in rows if pct < 5]
+    alert_level = "🔶 *HIGH ALERT*" if hot else "✅ algo running"
+    lines = [f"⏱ *Signal window — {label} ET* | {alert_level}"]
+    for pct, ticker, sig, _ in rows:
+        if sig is None:
+            lines.append(f"  ⚫ {ticker}  NO_DATA")
+        else:
+            emoji = _proximity_emoji(pct)
+            lines.append(f"  {emoji} *{ticker}*  now `${sig['current_price']:.2f}`  trigger `${sig['lower_band']:.2f}` ({pct:+.1f}%)")
+
+    _post_message("\n".join(lines))
+
+
 def send_startup_report(watchlist):
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
 
@@ -1028,6 +1161,7 @@ def run_loop(tickers: set = None):
 
     buy_alerted:  set[tuple] = set()
     sell_alerted: set[int]   = set()
+    window_alerted: set[tuple] = set()
     last_date = datetime.now().strftime('%Y-%m-%d')
     last_morning_report_date = datetime.now().strftime('%Y-%m-%d') if datetime.now().hour >= 7 else None
 
@@ -1037,6 +1171,7 @@ def run_loop(tickers: set = None):
 
         if today != last_date:
             buy_alerted.clear()
+            window_alerted.clear()
             last_date = today
 
         if now.hour >= 7 and today != last_morning_report_date:
@@ -1056,6 +1191,13 @@ def run_loop(tickers: set = None):
                     fetch_live_data_smart(t)
             except Exception as e:
                 print(f"  [data] {t} refresh failed: {e}")
+
+        # Fire once per window: notify at 10:25 and 15:25 that algo is alive
+        for wh, wm, label in [(10, 25, "10:25"), (15, 25, "15:25")]:
+            wkey = (today, label)
+            if now.hour == wh and now.minute == wm and wkey not in window_alerted:
+                window_alerted.add(wkey)
+                _send_window_alert(label, watchlist)
 
         if _in_buy_window(now):
             for pos in get_open_positions():
@@ -1089,10 +1231,14 @@ def run_loop(tickers: set = None):
 
                 if sig['signal'] == 'BUY' and alert_key not in buy_alerted:
                     buy_alerted.add(alert_key)
-                    notify_buy_signal(node, sig)
+                    if node.get('mode', 'live') == 'live':
+                        notify_buy_signal(node, sig)
+                    else:
+                        print(f"  [research] BUY: {node['ticker']} z={sig['z_score']:+.2f} (no alert)")
                 else:
+                    mode_tag = ' [R]' if node.get('mode') == 'research' else ''
                     summaries.append(
-                        f"{sig['ticker']} z={sig['z_score']:+.2f} {sig['signal']}"
+                        f"{sig['ticker']}{mode_tag} z={sig['z_score']:+.2f} {sig['signal']}"
                     )
         else:
             summaries.append(f"outside signal window — next: 10:25 or 14:55 ET")

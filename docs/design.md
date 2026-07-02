@@ -49,7 +49,7 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - `config.json` — single source of truth for runtime config. `app.py` reads/writes directly — DB copy removed.
 
 ### Performance
-- `ProcessPoolExecutor` with up to 6 workers (`max_workers=6`)
+- `ProcessPoolExecutor` with up to 9 workers (`max_workers=9`, reserving 1 core for active_signals)
 - SQLite WAL mode for concurrent writes
 - L3 cache optimization identified as next performance improvement (suggested by Gemini)
 - Sweep auto-runs `refresh_dropdown_cache()` + `refresh_pivot_cache()` on completion
@@ -61,7 +61,9 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 `active_signals.py` — polls price data, fires BUY/SELL alerts to console and Slack. Fetches fresh data for all watched tickers at the start of each poll cycle — no separate data collector process needed.
 
-- `watch_list` DB table — nodes selected for live monitoring
+- **Multi-watchlist**: `watchlists` DB table (id, name, is_active). One list is designated active — that's what the signal loop monitors. Same node can exist in multiple lists (UNIQUE constraint is scoped per list).
+- **Node mode**: `watch_list.mode` — `live` fires full Slack BUY alerts; `research` logs signal to console only (no Slack, no position tracking).
+- `watch_list` DB table — nodes selected for monitoring, scoped to a watchlist
 - `open_positions` DB table — tracks entries pending exit
 - Entry/exit logic delegated to strategy classes in `strategies.py` — no signal logic in `active_signals.py`
 - **Slack Socket Mode** — bot token + app token; BUY/SELL messages have interactive Executed/Skipped buttons, price entry modal, chart image upload
@@ -82,7 +84,8 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - Dismiss per `(ticker, strategy, version)` — persisted to `cache/dismissed_tickers.json`
 - Click row → Watch / Dismiss / Open in Node Inspector actions
 - Open in Node Inspector passes all params (window, TP, SL, hold, z_score_threshold) via session state — dropdowns auto-select on arrival
-- Watch list table at bottom with inline label editing and remove-by-uncheck
+- Sidebar watchlist picker — create/delete/set-active named lists; active list drives signal loop
+- Watch list table at bottom with inline label editing, mode toggle (live/research), and remove-by-uncheck
 
 ### Sweep Status Page
 

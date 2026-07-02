@@ -3,7 +3,9 @@ import sqlite3
 import streamlit as st
 import pandas as pd
 from pathlib import Path
-from active_signals import add_node, remove_node, get_watchlist, label_node
+from active_signals import (add_node, remove_node, get_watchlist, label_node,
+                             get_watchlists, create_watchlist, delete_watchlist,
+                             set_active_watchlist, set_node_mode)
 from db_cache import get_kv
 
 DB_PATH      = "./cache/trading_universe.db"
@@ -88,11 +90,11 @@ def load_versions():
     return versions
 
 
-def watchlist_keys(version):
+def watchlist_keys(version, watchlist_id=None):
     return {
         (w['ticker'], w['strategy'], w['version'], w['window'],
          w['take_profit'], w['stop_loss'], w['max_hold_hours'])
-        for w in get_watchlist()
+        for w in get_watchlist(watchlist_id)
         if w['version'] == version
     }
 
@@ -159,7 +161,16 @@ if df.empty:
 
 st.caption(f"{len(df)} nodes  ·  {df['ticker'].nunique()} tickers")
 
-watched = watchlist_keys(version)
+# --- Watchlist picker (used by both the Watch checkbox and the bottom section) ---
+all_wls     = get_watchlists()
+wl_names    = [w['name'] for w in all_wls]
+active_name = next((w['name'] for w in all_wls if w['is_active']), wl_names[0] if wl_names else 'main')
+_wl_idx     = wl_names.index(active_name) if active_name in wl_names else 0
+_picked_wl_name = st.sidebar.selectbox("Watchlist", wl_names, index=_wl_idx, key="wl_picker")
+picked_wl   = next((w for w in all_wls if w['name'] == _picked_wl_name), None)
+picked_wl_id = picked_wl['id'] if picked_wl else None
+
+watched = watchlist_keys(version, picked_wl_id)
 
 display = df.copy()
 _stats = display['ticker'].map(latest_ticker_stats)
@@ -210,14 +221,15 @@ if selected_rows:
         if watch_val and not is_watched:
             add_node(r['ticker'], r['strategy'], version, int(r['window']),
                      int(r['take_profit']), int(r['stop_loss']), int(r['max_hold_hours']),
-                     z_score_threshold=float(r['z_score_threshold']))
+                     z_score_threshold=float(r['z_score_threshold']),
+                     watchlist_id=picked_wl_id)
             st.cache_data.clear()
             st.rerun()
         elif not watch_val and is_watched:
             wl_by_key = {
                 (w['ticker'], w['strategy'], w['version'], w['window'],
                  w['take_profit'], w['stop_loss'], w['max_hold_hours']): w['id']
-                for w in get_watchlist()
+                for w in get_watchlist(picked_wl_id)
             }
             if key in wl_by_key:
                 remove_node(wl_by_key[key])
@@ -259,12 +271,39 @@ if selected_rows:
             st.switch_page("pages/1_Spatial_Topology.py")
 
 st.divider()
-st.subheader("Watch list")
-wl = get_watchlist()
+
+# --- Watchlist management header ---
+st.subheader("Watchlists")
+mc1, mc2, mc3, mc4 = st.columns([3, 2, 1, 1])
+with mc1:
+    if picked_wl:
+        if picked_wl['is_active']:
+            st.caption(f"**{_picked_wl_name}** ⚡ active signals list")
+        else:
+            if st.button(f"Set '{_picked_wl_name}' as active signals list"):
+                set_active_watchlist(picked_wl['id'])
+                st.cache_data.clear()
+                st.rerun()
+with mc2:
+    new_wl_name = st.text_input("New watchlist name", label_visibility="collapsed",
+                                 placeholder="New watchlist name…", key="new_wl_input")
+with mc3:
+    if st.button("Create", use_container_width=True) and new_wl_name.strip():
+        create_watchlist(new_wl_name.strip())
+        st.cache_data.clear()
+        st.rerun()
+with mc4:
+    can_delete = picked_wl and not picked_wl['is_active']
+    if st.button("Delete list", disabled=not can_delete, use_container_width=True):
+        delete_watchlist(picked_wl['id'])
+        st.cache_data.clear()
+        st.rerun()
+
+# --- Nodes in selected watchlist ---
+wl = get_watchlist(picked_wl_id)
 if wl:
     wl_df = pd.DataFrame(wl)
 
-    # Join backtest stats — query only tickers on the watchlist
     wl_tickers = list({w['ticker'] for w in wl})
     placeholders = ','.join('?' * len(wl_tickers))
     with sqlite3.connect(DB_PATH) as c:
@@ -283,10 +322,10 @@ if wl:
     )
 
     wl_df['watch'] = True
-    wl_display = wl_df[['id', 'ticker', 'strategy', 'version', 'window', 'take_profit',
+    wl_display = wl_df[['id', 'mode', 'ticker', 'strategy', 'version', 'window', 'take_profit',
                           'stop_loss', 'max_hold_hours', 'z_score_threshold', 'trades', 'win_rate',
                           'strategy_return', 'alpha_vs_spy', 'asset_bh', 'spy_bh', 'label', 'watch']].rename(columns={
-        'id': 'ID', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
+        'id': 'ID', 'mode': 'Mode', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
         'window': 'Win', 'take_profit': 'TP%', 'stop_loss': 'SL%', 'max_hold_hours': 'Hold h',
         'z_score_threshold': 'Z Thresh',
         'trades': 'Trades', 'win_rate': 'Win%', 'strategy_return': 'Return',
@@ -299,15 +338,16 @@ if wl:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Label": st.column_config.TextColumn("Label"),
-            "Watch": st.column_config.CheckboxColumn("Watch", help="Uncheck to remove"),
+            "Mode":       st.column_config.SelectboxColumn("Mode", options=["live", "research"], required=True),
+            "Label":      st.column_config.TextColumn("Label"),
+            "Watch":      st.column_config.CheckboxColumn("Watch", help="Uncheck to remove"),
             'Win%':       st.column_config.NumberColumn(format="%.0f%%"),
             'Return':     st.column_config.NumberColumn(format="%.1f%%"),
             'Alpha':      st.column_config.NumberColumn(format="%.1f%%"),
             'Asset B&H':  st.column_config.NumberColumn(format="%.1f%%"),
             'SPY B&H':    st.column_config.NumberColumn(format="%.1f%%"),
         },
-        disabled=[c for c in wl_display.columns if c not in ('Label', 'Watch')],
+        disabled=[c for c in wl_display.columns if c not in ('Mode', 'Label', 'Watch')],
     )
 
     # Remove unchecked rows
@@ -316,9 +356,18 @@ if wl:
         st.cache_data.clear()
         st.rerun()
 
+    # Save edited mode
+    mode_changed = wl_display['Mode'] != wl_edited['Mode']
+    for i in wl_display.index[mode_changed]:
+        set_node_mode(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'Mode'])
+
     # Save edited labels
-    changed = wl_display['Label'] != wl_edited['Label']
-    for i in wl_display.index[changed]:
+    label_changed = wl_display['Label'] != wl_edited['Label']
+    for i in wl_display.index[label_changed]:
         label_node(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'Label'])
+
+    if mode_changed.any() or label_changed.any():
+        st.cache_data.clear()
+        st.rerun()
 else:
-    st.caption("Watch list is empty.")
+    st.caption(f"'{_picked_wl_name}' is empty.")

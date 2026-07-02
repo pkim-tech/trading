@@ -1,6 +1,7 @@
 import sqlite3
 import streamlit as st
 import pandas as pd
+from active_signals import get_watchlists
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
@@ -25,10 +26,45 @@ st.title("Portfolio")
 
 
 @st.cache_data(ttl=60)
-def load_watchlist():
+def load_watchlist(watchlist_id=None):
     with sqlite3.connect(DB_PATH) as c:
         c.row_factory = sqlite3.Row
-        return [dict(r) for r in c.execute("SELECT * FROM watch_list ORDER BY ticker").fetchall()]
+        if watchlist_id is None:
+            row = c.execute("SELECT id FROM watchlists WHERE is_active=1").fetchone()
+            watchlist_id = row[0] if row else None
+        if watchlist_id is None:
+            return []
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM watch_list WHERE watchlist_id=? ORDER BY ticker", (watchlist_id,)
+        ).fetchall()]
+
+
+@st.cache_data(ttl=86400)
+def load_watchlist_metrics(params_tuple):
+    rows = []
+    with sqlite3.connect(DB_PATH) as c:
+        for (ticker, version, window, tp, sl, hold, z) in params_tuple:
+            row = c.execute("""
+                SELECT alpha_vs_spy, strategy_return, trades, win_rate, asset_bh, spy_bh
+                FROM backtest_cache
+                WHERE ticker=? AND version=? AND window=? AND take_profit=? AND stop_loss=?
+                  AND max_hold_hours=? AND z_score_threshold=? AND strategy='ZScoreBreakout'
+            """, (ticker, version, window, tp, sl, hold, z)).fetchone()
+            t_row = c.execute(
+                "SELECT avg_vol_10d, last_price FROM tickers WHERE symbol=?", (ticker,)
+            ).fetchone()
+            max_notional = (t_row[0] * t_row[1] * 0.01) if t_row and t_row[0] and t_row[1] else None
+            t_row2 = c.execute("SELECT stock_underlier, index_underlier FROM tickers WHERE symbol=?", (ticker,)).fetchone()
+            if t_row2:
+                ticker_type = "STK 🔴" if (t_row2[0] and not t_row2[1]) else "IDX"
+            else:
+                ticker_type = "?"
+            rows.append({**({'alpha': row[0], 'ret': row[1], 'trades': row[2], 'win_rate': row[3],
+                              'asset_bh': row[4], 'spy_bh': row[5]} if row else
+                             {'alpha': None, 'ret': None, 'trades': None, 'win_rate': None,
+                              'asset_bh': None, 'spy_bh': None}),
+                          'max_notional': max_notional, 'type': ticker_type})
+    return rows
 
 
 @st.cache_data(ttl=60)
@@ -93,7 +129,14 @@ def run_node_backtest(ticker, strategy_name, window, tp, sl, hold, zt):
 
 # ── Node selection ────────────────────────────────────────────────────────────
 
-watchlist = load_watchlist()
+all_wls     = get_watchlists()
+wl_names    = [w['name'] for w in all_wls]
+active_name = next((w['name'] for w in all_wls if w['is_active']), wl_names[0] if wl_names else None)
+_wl_idx     = wl_names.index(active_name) if active_name in wl_names else 0
+_picked_name = st.sidebar.selectbox("Watchlist", wl_names, index=_wl_idx, key="portfolio_wl_picker") if wl_names else None
+picked_wl_id = next((w['id'] for w in all_wls if w['name'] == _picked_name), None) if _picked_name else None
+
+watchlist = load_watchlist(picked_wl_id)
 versions  = load_versions()
 
 nodes_to_run = []  # list of dicts with keys: ticker, strategy, window, take_profit, stop_loss, max_hold_hours, z_score_threshold, label
@@ -101,9 +144,24 @@ nodes_to_run = []  # list of dicts with keys: ticker, strategy, window, take_pro
 with st.expander("Watchlist nodes", expanded=True):
     include_watchlist = st.toggle("Include watchlist", value=True)
     if watchlist:
-        wl_df = pd.DataFrame(watchlist)[['ticker', 'strategy', 'version', 'window', 'z_score_threshold', 'take_profit', 'stop_loss', 'max_hold_hours', 'label', 'added_at']]
-        wl_df.columns = ['Ticker', 'Strategy', 'Version', 'Window', 'Z', 'TP%', 'SL%', 'Hold h', 'Label', 'Added']
-        st.dataframe(wl_df, use_container_width=True, hide_index=True)
+        wl_options = [f"{n['ticker']} {n['version']} w={n['window']} z={n['z_score_threshold']}" for n in watchlist]
+        selected_wl = st.multiselect("Select nodes", wl_options, default=wl_options, key="wl_select")
+        watchlist = [n for n, lbl in zip(watchlist, wl_options) if lbl in selected_wl]
+        wl_df = pd.DataFrame(watchlist)[['ticker', 'strategy', 'version', 'window', 'z_score_threshold', 'take_profit', 'stop_loss', 'max_hold_hours', 'label']]
+        params = tuple((r['ticker'], r['version'], r['window'], r['take_profit'], r['stop_loss'], r['max_hold_hours'], r['z_score_threshold']) for r in watchlist)
+        metrics = load_watchlist_metrics(params)
+        m_df = pd.DataFrame(metrics)
+        wl_df = pd.concat([wl_df.reset_index(drop=True), m_df], axis=1)
+        wl_df.columns = ['Ticker', 'Strategy', 'Version', 'Window', 'Z', 'TP%', 'SL%', 'Hold h', 'Label',
+                         'Alpha%', 'Return%', 'Trades', 'Win%', 'Asset B&H%', 'SPY B&H%', 'Max Notional', 'Type']
+        st.dataframe(wl_df, use_container_width=True, hide_index=True, column_config={
+            'Alpha%':       st.column_config.NumberColumn(format="%.1f%%"),
+            'Return%':      st.column_config.NumberColumn(format="%.1f%%"),
+            'Win%':         st.column_config.NumberColumn(format="%.0f%%"),
+            'Asset B&H%':   st.column_config.NumberColumn(format="%.1f%%"),
+            'SPY B&H%':     st.column_config.NumberColumn(format="%.1f%%"),
+            'Max Notional': st.column_config.NumberColumn(format="$%.0f"),
+        })
     else:
         st.caption("Watchlist is empty.")
     if include_watchlist and watchlist:
