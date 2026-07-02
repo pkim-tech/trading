@@ -50,7 +50,7 @@ def load_watchlist_metrics(params_tuple):
                 SELECT alpha_vs_spy, strategy_return, trades, win_rate, asset_bh, spy_bh
                 FROM backtest_cache
                 WHERE ticker=? AND version=? AND window=? AND take_profit=? AND stop_loss=?
-                  AND max_hold_hours=? AND z_score_threshold=? AND strategy='ZScoreBreakout'
+                  AND max_hold_hours=? AND z_score_threshold=?
             """, (ticker, version, window, tp, sl, hold, z)).fetchone()
             t_row = c.execute(
                 "SELECT avg_vol_10d, last_price FROM tickers WHERE symbol=?", (ticker,)
@@ -405,10 +405,10 @@ nodes = sorted(df_all['Node'].unique().tolist())
 
 @st.fragment
 def render(df_all, spy, tqqq, nodes, nodes_to_run):
-    all_tickers = sorted(df_all['Ticker'].unique().tolist())
-    selected = st.multiselect("Tickers", all_tickers, default=all_tickers)
+    all_nodes = sorted(df_all['Node'].unique().tolist())
+    selected = st.multiselect("Nodes", all_nodes, default=all_nodes)
     if not selected:
-        st.warning("No tickers selected.")
+        st.warning("No nodes selected.")
         return
 
     # c1, c2 = st.columns(2)
@@ -419,7 +419,7 @@ def render(df_all, spy, tqqq, nodes, nodes_to_run):
     #     max_adf = st.slider("Max ADF p at entry", 0.0, 1.0, 1.0, 0.01,
     #                         disabled=not adf_has_data)
 
-    df = df_all[df_all['Ticker'].isin(selected)].copy()
+    df = df_all[df_all['Node'].isin(selected)].copy()
 
     if df.empty:
         st.warning("No trades pass current filters.")

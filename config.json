@@ -1,5 +1,5 @@
 {
-    "version": "v1.7",
+    "version": "v1.8",
     "target_tickers": [
         "SOXL",
         "AGQ",
@@ -23,7 +23,7 @@
         "ROM"
     ],
     "active_strategies": [
-        "LimitOrderZScoreBreakout"
+        "TrailingExitZScoreBreakout"
     ],
     "hyperparameters": {
         "z_score_thresholds": [
@@ -48,16 +48,15 @@
             30
         ],
         "stop_losses": [
+            2,
             3,
+            4,
+            5,
             6,
+            7,
+            8,
             9,
-            12,
-            15,
-            18,
-            21,
-            24,
-            27,
-            30
+            10
         ],
         "hold_time_caps": [
             56,
@@ -78,6 +77,7 @@
     "execution": {
         "max_workers": 10,
         "max_generations": 3,
-        "alpha_tolerance": -100.0
+        "alpha_tolerance": -100.0,
+        "fixed_stop_loss": 15
     }
 }

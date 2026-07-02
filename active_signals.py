@@ -935,6 +935,26 @@ def notify_buy_signal(node, sig):
         print("  Skipped.")
 
 
+def notify_limit_fill(node, current_price, lower_band):
+    ticker        = node['ticker']
+    schwab_sl_pct = node['stop_loss'] + 1
+    schwab_sl_price = lower_band * (1 - schwab_sl_pct / 100)
+    shares = int(50_000 // lower_band)
+    now_str = datetime.now().strftime('%H:%M:%S')
+
+    print(f"\n  [LIMIT FILL] {ticker}  price=${current_price:.2f}  trigger=${lower_band:.2f}  {now_str}")
+    print(f"  Place stop: ${schwab_sl_price:.2f} (-{schwab_sl_pct}% from trigger)")
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"LIMIT FILLED — {ticker}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": (
+            f"✅ *{ticker}* limit filled at `${lower_band:.2f}` — `{shares} shares`\n"
+            f"🔴 Place Schwab stop: `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger)"
+        )}},
+    ]
+    _post_message(f"LIMIT FILLED — {ticker} at ${lower_band:.2f}", blocks=blocks)
+
+
 def notify_sell_signal(pos, reason, current_price, target_price):
     ticker     = pos['ticker']
     ep         = pos['entry_price']
@@ -1033,44 +1053,70 @@ def _send_window_alert(label, watchlist):
     _post_message("\n".join(lines))
 
 
+_STRATEGY_LABELS = {
+    'ZScoreBreakout':             ('BUY (bar-close)', 'At signal close: edit staged limit → market and submit'),
+    'TrendFilteredZScore':        ('BUY (bar-close)', 'At signal close: edit staged limit → market and submit'),
+    'TrailingExitZScoreBreakout': ('BUY (bar-close, trailing exit)', 'At signal close: edit staged limit → market and submit'),
+    'LimitOrderZScoreBreakout':   ('BUY (limit)', 'Pre-market: stage limit order at trigger price (absurdly low); confirm fill intrabar'),
+}
+
+
 def send_startup_report(watchlist):
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
 
-    # Build buy candidates sorted by proximity
+    # Build buy candidates sorted by proximity, carrying node for strategy info
     rows = []
-    for node in watchlist:
+    for node in [n for n in watchlist if n.get('mode') == 'live']:
         sig = compute_buy_signal(node)
         if sig is None:
-            rows.append((float('inf'), node['ticker'], None, None))
+            rows.append((float('inf'), node['ticker'], node['strategy'], node.get('version', ''), None, None))
             continue
         trigger  = sig['lower_band']
         tp_price = trigger * (1 + node['take_profit'] / 100)
         sl_price = trigger * (1 - node['stop_loss']  / 100)
         pct_away = (sig['current_price'] - trigger) / trigger * 100
-        rows.append((pct_away, node['ticker'], sig, {'tp': tp_price, 'sl': sl_price, 'pct': pct_away}))
+        rows.append((pct_away, node['ticker'], node['strategy'], node.get('version', ''), sig, {'tp': tp_price, 'sl': sl_price, 'pct': pct_away}))
     rows.sort(key=lambda x: x[0])
 
-    # Build blocks
+    # Group by strategy
+    from itertools import groupby
+    strategy_order = []
+    seen = set()
+    for r in rows:
+        s = r[2]
+        if s not in seen:
+            strategy_order.append(s)
+            seen.add(s)
+    by_strategy = {s: [r for r in rows if r[2] == s] for s in strategy_order}
+
+
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"Morning Report — {now_str}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": "*Buy Candidates* — sorted by proximity to trigger"}},
     ]
 
-    for _, ticker, sig, meta in rows:
-        if sig is None:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}*  NO_DATA"}})
-            continue
-        emoji = _proximity_emoji(meta['pct'])
-        overnight = (sig['current_price'] - sig['prev_close']) / sig['prev_close'] * 100
-        data_date = pd.Timestamp(sig['last_daily_bar']).strftime('%m/%d')
-        text = (
-            f"{emoji} *{ticker}*  "
-            f"now `${sig['current_price']:.2f}` ({overnight:+.1f}% O/N)  close `${sig['prev_close']:.2f}`  "
-            f"trigger `${sig['lower_band']:.2f}` ({meta['pct']:+.1f}%)  "
-            f"tp `${meta['tp']:.2f}`  sl `${meta['sl']:.2f}`  "
-            f"z `{sig['z_score']:+.2f}`  data `{data_date}`"
-        )
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    for strategy, group in by_strategy.items():
+        label, action = _STRATEGY_LABELS.get(strategy, (strategy, ''))
+        versions = ', '.join(sorted({r[3] for r in group if r[3]}))
+        header_text = f"{label} — {versions}" if versions else label
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "header", "text": {"type": "plain_text", "text": header_text}})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": action}]})
+
+        for _, ticker, _strat, version, sig, meta in group:
+            if sig is None:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}})
+                continue
+            emoji = _proximity_emoji(meta['pct'])
+            overnight = (sig['current_price'] - sig['prev_close']) / sig['prev_close'] * 100
+            data_date = pd.Timestamp(sig['last_daily_bar']).strftime('%m/%d')
+            text = (
+                f"{emoji} *{ticker}* `{version}`  "
+                f"now `${sig['current_price']:.2f}` ({overnight:+.1f}% O/N)  close `${sig['prev_close']:.2f}`  "
+                f"trigger `${sig['lower_band']:.2f}` ({meta['pct']:+.1f}%)  "
+                f"tp `${meta['tp']:.2f}`  sl `${meta['sl']:.2f}`  "
+                f"z `{sig['z_score']:+.2f}`  data `{data_date}`"
+            )
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
 
     # Open positions section
     positions = get_open_positions()
@@ -1099,7 +1145,7 @@ def send_startup_report(watchlist):
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "No open positions."}]})
 
     # Reconfirm reminder for hot tickers
-    hot = [r[1] for r in rows if r[0] < 5]
+    hot = [r[1] for r in rows if isinstance(r[0], float) and r[0] < 5]
     if hot:
         blocks.append({"type": "divider"})
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
@@ -1107,12 +1153,13 @@ def send_startup_report(watchlist):
 
     # Console output
     print(f"Morning Report — {now_str}")
-    for _, ticker, sig, meta in rows:
+    for _, ticker, strategy, version, sig, meta in rows:
         if sig is None:
-            print(f"  {ticker:<6}  NO_DATA")
+            print(f"  {ticker:<6} {version}  NO_DATA  [{strategy}]")
         else:
             emoji = _proximity_emoji(meta['pct'])
-            print(f"  {emoji} {ticker:<6}  now=${sig['current_price']:>7.2f}  trigger=${sig['lower_band']:>7.2f}  ({meta['pct']:+.1f}%)  z={sig['z_score']:>+5.2f}")
+            label = _STRATEGY_LABELS.get(strategy, (strategy,))[0]
+            print(f"  {emoji} {ticker:<6} {version}  now=${sig['current_price']:>7.2f}  trigger=${sig['lower_band']:>7.2f}  ({meta['pct']:+.1f}%)  z={sig['z_score']:>+5.2f}  [{label}]")
     if positions:
         print("  Open positions:")
         for p in positions:
@@ -1159,9 +1206,10 @@ def run_loop(tickers: set = None):
         startup_wl = [n for n in startup_wl if n['ticker'] in tickers]
     send_startup_report(startup_wl)
 
-    buy_alerted:  set[tuple] = set()
-    sell_alerted: set[int]   = set()
-    window_alerted: set[tuple] = set()
+    buy_alerted:        set[tuple] = set()
+    sell_alerted:       set[int]   = set()
+    window_alerted:     set[tuple] = set()
+    limit_fill_alerted: set[tuple] = set()
     last_date = datetime.now().strftime('%Y-%m-%d')
     last_morning_report_date = datetime.now().strftime('%Y-%m-%d') if datetime.now().hour >= 7 else None
 
@@ -1172,6 +1220,7 @@ def run_loop(tickers: set = None):
         if today != last_date:
             buy_alerted.clear()
             window_alerted.clear()
+            limit_fill_alerted.clear()
             last_date = today
 
         if now.hour >= 7 and today != last_morning_report_date:
@@ -1217,6 +1266,25 @@ def run_loop(tickers: set = None):
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
             time.sleep(POLL_SECS)
             continue
+
+        # Intrabar fill detection for limit-entry nodes (all day, not just signal window)
+        for node in watchlist:
+            if node.get('mode') != 'live':
+                continue
+            if node.get('strategy') != 'LimitOrderZScoreBreakout':
+                continue
+            fill_key = (node['ticker'], node['window'], today)
+            if fill_key in limit_fill_alerted:
+                continue
+            cp, _ = _current_price(node['ticker'])
+            if cp is None:
+                continue
+            sig = compute_buy_signal(node)
+            if sig is None:
+                continue
+            if cp <= sig['lower_band']:
+                limit_fill_alerted.add(fill_key)
+                notify_limit_fill(node, cp, sig['lower_band'])
 
         in_window = _in_buy_window(now)
         summaries = []

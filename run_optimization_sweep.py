@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
-from backtester import run_backtest, run_backtest_v17
+from backtester import run_backtest, run_backtest_v17, run_backtest_v18
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache
 
@@ -65,7 +65,7 @@ def init_idempotent_db():
 
 
 def run_single_backtest_node_isolated(args):
-    ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh = args
+    ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl = args
 
     try:
         cache_path = CACHE_DIR / f"{ticker}_1h.csv"
@@ -75,6 +75,7 @@ def run_single_backtest_node_isolated(args):
 
     if df_hourly_raw.empty:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
+
 
     strategy_class = getattr(strategies, strategy_name, None)
     if not strategy_class:
@@ -86,12 +87,25 @@ def run_single_backtest_node_isolated(args):
     df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
 
     try:
-        backtest_fn = run_backtest_v17 if issubclass(strategy_class, strategies.LimitOrderZScoreBreakout) else run_backtest
-        trades = backtest_fn(
-            df_hourly_raw, df_daily_processed, ticker,
-            take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0), max_hours_to_hold=int(hold_hours),
-            z_score_threshold=float(z_thresh)
-        )
+        if issubclass(strategy_class, strategies.TrailingExitZScoreBreakout):
+            trades = run_backtest_v18(
+                df_hourly_raw, df_daily_processed, ticker,
+                take_profit=float(tp / 100.0), stop_loss=float(fixed_sl / 100.0),
+                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh),
+                trail_pct=float(sl / 100.0)
+            )
+        elif issubclass(strategy_class, strategies.LimitOrderZScoreBreakout):
+            trades = run_backtest_v17(
+                df_hourly_raw, df_daily_processed, ticker,
+                take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0),
+                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh)
+            )
+        else:
+            trades = run_backtest(
+                df_hourly_raw, df_daily_processed, ticker,
+                take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0),
+                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh)
+            )
         closed = [t for t in trades if t["Result"] in ["WIN", "LOSS", "TWIN", "TLOSS"]]
     except Exception:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "SIM_ERROR"}
@@ -111,7 +125,7 @@ def run_single_backtest_node_isolated(args):
     }
 
 
-def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp):
+def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
     conn   = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
     matrix_results  = []
@@ -151,7 +165,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
     futures_map = {
         shared_pool.submit(run_single_backtest_node_isolated,
-                           (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z)): task
+                           (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z, fixed_sl)): task
         for task in unvisited_tasks
         for tp, sl, hold, w, z in [task]
     }
@@ -256,7 +270,7 @@ def pick_island_centers(df, n=N_ISLANDS, min_sep=ISLAND_MIN_SEP):
 
 # ── Phase 1: Coarse scan ──────────────────────────────────────────────────────
 
-def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp):
+def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
     z_thresholds = hp['z_score_thresholds']
     expected = (len(z_thresholds) * len(hp['windows']) * len(hp['take_profits'])
                 * len(hp['stop_losses']) * len(hp['hold_time_caps']))
@@ -282,7 +296,7 @@ def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, sp
              for hold in hp['hold_time_caps']]
 
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
-                           "Phase1-Coarse", spy_bh, asset_bh, run_timestamp)
+                           "Phase1-Coarse", spy_bh, asset_bh, run_timestamp, fixed_sl)
 
 
 # ── Checkpoint 1: rank by coarse alpha, return island candidates ──────────────
@@ -315,7 +329,7 @@ def identify_island_candidates(config_version, strategy_name, n_index, n_stock):
 
 # ── Phase 2: Island mesh ──────────────────────────────────────────────────────
 
-def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp):
+def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
     tasks = set()
     with sqlite3.connect(DB_PATH) as conn:
         for z in hp['z_score_thresholds']:
@@ -343,12 +357,12 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
 
     logger.info(f"[{ticker}] Phase2 island mesh: {len(tasks)} tasks ({N_ISLANDS} islands ±{FINE_RADIUS})")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
-                           "Phase2-Island", spy_bh, asset_bh, run_timestamp)
+                           "Phase2-Island", spy_bh, asset_bh, run_timestamp, fixed_sl)
 
 
 # ── Phase 2.5: targeted cliff-box sweep around true best node ────────────────
 
-def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp):
+def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
     """Sweep ±CLIFF_RADIUS in TP/SL and ±7h in hold around the true best node from Phase 2.
     Guarantees cliff check has complete neighborhood data regardless of where the peak landed."""
     with sqlite3.connect(DB_PATH) as conn:
@@ -369,7 +383,7 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
 
     logger.info(f"[{ticker}] Phase2.5 cliff-box: {len(tasks)} tasks around TP={tp_c} SL={sl_c} hold={hold_c}h")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
-                           "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp)
+                           "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp, fixed_sl)
 
 
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
@@ -439,7 +453,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
 
 # ── Phase 3: Full mesh ────────────────────────────────────────────────────────
 
-def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp):
+def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
     tasks = [(tp, sl, int(hold), int(w), float(z))
              for z    in hp['z_score_thresholds']
              for w    in hp['windows']
@@ -449,7 +463,7 @@ def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_
 
     logger.info(f"[{ticker}] Phase3 full mesh: {len(tasks)} tasks (cache skips coarse+island already done)")
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
-                           "Phase3-Full", spy_bh, asset_bh, run_timestamp)
+                           "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl)
 
     # Heatmap at best hold
     with sqlite3.connect(DB_PATH) as conn:
@@ -498,6 +512,7 @@ if __name__ == "__main__":
     config_version    = config.get("version", "v1.6")
     hp                = config["hyperparameters"]
     max_workers       = config.get("execution", {}).get("max_workers", 6)
+    fixed_sl          = config.get("execution", {}).get("fixed_stop_loss", 0)
     tickers           = config.get("target_tickers", [])
     strategy_names    = config.get("active_strategies", ["ZScoreBreakout"])
 
@@ -532,7 +547,7 @@ if __name__ == "__main__":
                     logger.warning(f"Unknown strategy: {name}")
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
+                run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
 
         logger.info("Phase 1 complete. Refreshing caches...")
         refresh_dropdown_cache()
@@ -565,7 +580,7 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 2.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
+                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
 
                 logger.info(f"Phase 2 gen {gen+1} complete. Refreshing caches...")
                 refresh_dropdown_cache()
@@ -582,7 +597,7 @@ if __name__ == "__main__":
                 if ticker not in bh_cache:
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
+                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
 
             # ── Checkpoint 2 ─────────────────────────────────────────────
             logger.info(f"\nCheckpoint 2: cliff check on {len(island_tickers)} island tickers...")
@@ -605,7 +620,7 @@ if __name__ == "__main__":
                     logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp)
+                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
 
     logger.info("\nFinal cache refresh...")
     refresh_dropdown_cache()

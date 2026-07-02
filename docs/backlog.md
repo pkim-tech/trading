@@ -14,7 +14,7 @@
 
 - **v1.7 limit order entry model**: ✅ Built. `LimitOrderZScoreBreakout` — fill on `Low <= lower_band` intrabar at `lower_band` price; intrabar stop loss checks `Low <= stop_price`; TP checks `Close >= tp_price` at bar close. New `_simulate_limit` Numba kernel + `run_backtest_v17`. Grid: w=[10,20], z=[1.0,1.5,2.0], TP/SL=[3,6,...,30], Hold=[7,14,...,140].
 
-- **v1.8 trailing exit**: Once price clears TP threshold, switch to trailing sell mode — track `peak = max(High)`, exit when `Low <= peak × (1 - trail_pct)`. Lets winners run past the fixed TP. `trail_pct` is a swept parameter (start at 3%, likely varies per ticker). TP% becomes the activation trigger, not the exit price. Build on top of v1.7 limit entry (or drop limit entry if v1.7 sweep shows it underperforms).
+- **v1.8 trailing exit**: ✅ Sweep wired. `TrailingExitZScoreBreakout` — close-based entry (v1.5 style), trailing stop once TP% cleared. `trail_pct` replaces `stop_losses` in sweep grid ([2–10%]), `fixed_stop_loss=15` in config execution. `run_backtest_v18` dispatched in sweep engine. Config set to v1.8, ready to run. Pending: run sweep, review results.
 
 - **Trade log UI**: DB table and schema exist (`trade_log` in `trading_universe.db`). Pending: Socket Mode modal to record entry/exit from Slack interactions.
 

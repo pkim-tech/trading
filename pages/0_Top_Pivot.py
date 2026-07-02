@@ -239,6 +239,49 @@ function sortTable(col) {
 
 st.html(build_pivot_html(pivot, best_nodes, version, wz_cols, underlier_map))
 
+st.divider()
+st.subheader("Watchlist — Alpha by Strategy")
+
+
+@st.cache_data(ttl=300)
+def load_watchlist_pivot():
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql('''
+            SELECT w.ticker, w.mode, w.strategy, w.version,
+                   w.window, w.z_score_threshold, w.take_profit, w.stop_loss, w.max_hold_hours,
+                   b.alpha_vs_spy, b.strategy_return, b.trades, b.win_rate
+            FROM watch_list w
+            LEFT JOIN backtest_cache b
+                ON  b.ticker           = w.ticker
+                AND b.version          = w.version
+                AND b.strategy         = w.strategy
+                AND b.window           = w.window
+                AND b.take_profit      = w.take_profit
+                AND b.stop_loss        = w.stop_loss
+                AND b.max_hold_hours   = w.max_hold_hours
+                AND b.z_score_threshold = w.z_score_threshold
+            WHERE w.watchlist_id = 1
+        ''', conn)
+    strat_short = {
+        'ZScoreBreakout':             'ZSB',
+        'LimitOrderZScoreBreakout':   'Limit',
+        'TrailingExitZScoreBreakout': 'Trail',
+    }
+    df['strat_col'] = df['strategy'].map(strat_short).fillna(df['strategy']) + ' ' + df['version']
+    df['row'] = df['ticker'] + ' (' + df['mode'] + ')'
+    pivot = df.pivot_table(index='row', columns='strat_col', values='alpha_vs_spy', aggfunc='max')
+    pivot['best'] = pivot.max(axis=1)
+    return pivot.sort_values('best', ascending=False).round(1)
+
+
+wl_pivot = load_watchlist_pivot()
+if not wl_pivot.empty:
+    strat_cols = [c for c in wl_pivot.columns if c != 'best']
+    col_cfg = {c: st.column_config.NumberColumn(c, format="%.1f%%") for c in strat_cols}
+    col_cfg['best'] = st.column_config.NumberColumn('Best α', format="%.1f%%")
+    st.dataframe(wl_pivot, use_container_width=True, column_config=col_cfg)
+
+
 with st.expander("Edit Underliers"):
     display = pivot.copy()
     display.insert(0, 'Underlier', display.index.map(underlier_map).fillna(''))
