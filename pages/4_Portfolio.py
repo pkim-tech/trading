@@ -1,13 +1,15 @@
 import sqlite3
 import streamlit as st
 import pandas as pd
-from active_signals import get_watchlists
+from active_signals import (get_watchlists, get_watchlist, add_node, remove_node,
+                             label_node, create_watchlist, delete_watchlist,
+                             set_active_watchlist, set_node_mode)
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
 import numpy as np
 import strategies
-from backtester import run_backtest
+from backtester import run_backtest, run_backtest_v17
 
 DB_PATH   = "./cache/trading_universe.db"
 CACHE_DIR = Path("./cache")
@@ -113,17 +115,35 @@ def load_spy():
 
 
 @st.cache_data(ttl=300)
+def compute_bands(ticker, strategy_name, window):
+    df_h = load_hourly(ticker)
+    if df_h is None:
+        return None, None
+    close_col = 'Adj Close' if 'Adj Close' in df_h.columns else 'Close'
+    df_daily = df_h.resample('D').last().dropna(subset=[close_col])
+    strat_class = getattr(strategies, strategy_name, None)
+    if strat_class is None:
+        return None, None
+    strat = strat_class(window=window, z_score_threshold=2.0)
+    df_ind = strat.generate_daily_indicators(df_daily)
+    df_ind = df_ind.reindex(df_h.index, method='ffill')
+    return df_ind, df_h[close_col]
+
+
+@st.cache_data(ttl=300)
 def run_node_backtest(ticker, strategy_name, window, tp, sl, hold, zt):
     df_h = load_hourly(ticker)
     if df_h is None:
         return []
     close_col = 'Adj Close' if 'Adj Close' in df_h.columns else 'Close'
     df_daily = df_h.resample('D').last().dropna(subset=[close_col])
-    strat = getattr(strategies, strategy_name)(window=window, z_score_threshold=float(zt))
+    strat_class = getattr(strategies, strategy_name)
+    strat = strat_class(window=window, z_score_threshold=float(zt))
     df_ind = strat.generate_daily_indicators(df_daily)
-    return run_backtest(df_h, df_ind, ticker,
-                        take_profit=tp / 100.0, stop_loss=sl / 100.0,
-                        max_hours_to_hold=hold, z_score_threshold=float(zt))
+    backtest_fn = run_backtest_v17 if issubclass(strat_class, strategies.LimitOrderZScoreBreakout) else run_backtest
+    return backtest_fn(df_h, df_ind, ticker,
+                       take_profit=tp / 100.0, stop_loss=sl / 100.0,
+                       max_hours_to_hold=hold, z_score_threshold=float(zt))
 
 
 
@@ -134,39 +154,167 @@ wl_names    = [w['name'] for w in all_wls]
 active_name = next((w['name'] for w in all_wls if w['is_active']), wl_names[0] if wl_names else None)
 _wl_idx     = wl_names.index(active_name) if active_name in wl_names else 0
 _picked_name = st.sidebar.selectbox("Watchlist", wl_names, index=_wl_idx, key="portfolio_wl_picker") if wl_names else None
-picked_wl_id = next((w['id'] for w in all_wls if w['name'] == _picked_name), None) if _picked_name else None
+picked_wl   = next((w for w in all_wls if w['name'] == _picked_name), None)
+picked_wl_id = picked_wl['id'] if picked_wl else None
+
+# Sidebar: watchlist create / delete / set-active
+with st.sidebar:
+    st.divider()
+    if picked_wl:
+        if picked_wl['is_active']:
+            st.caption(f"**{_picked_name}** — active signals list")
+        elif st.button("Set as active signals list"):
+            set_active_watchlist(picked_wl['id'])
+            st.cache_data.clear()
+            st.rerun()
+    new_wl_name = st.text_input("New watchlist", placeholder="Name…", label_visibility="collapsed")
+    c_create, c_delete = st.columns(2)
+    if c_create.button("Create", use_container_width=True) and new_wl_name.strip():
+        create_watchlist(new_wl_name.strip())
+        st.cache_data.clear()
+        st.rerun()
+    can_delete = picked_wl and not picked_wl['is_active']
+    if c_delete.button("Delete list", disabled=not can_delete, use_container_width=True):
+        delete_watchlist(picked_wl['id'])
+        st.cache_data.clear()
+        st.rerun()
 
 watchlist = load_watchlist(picked_wl_id)
 versions  = load_versions()
 
 nodes_to_run = []  # list of dicts with keys: ticker, strategy, window, take_profit, stop_loss, max_hold_hours, z_score_threshold, label
 
-with st.expander("Watchlist nodes", expanded=True):
-    include_watchlist = st.toggle("Include watchlist", value=True)
-    if watchlist:
-        wl_options = [f"{n['ticker']} {n['version']} w={n['window']} z={n['z_score_threshold']}" for n in watchlist]
-        selected_wl = st.multiselect("Select nodes", wl_options, default=wl_options, key="wl_select")
-        watchlist = [n for n, lbl in zip(watchlist, wl_options) if lbl in selected_wl]
-        wl_df = pd.DataFrame(watchlist)[['ticker', 'strategy', 'version', 'window', 'z_score_threshold', 'take_profit', 'stop_loss', 'max_hold_hours', 'label']]
-        params = tuple((r['ticker'], r['version'], r['window'], r['take_profit'], r['stop_loss'], r['max_hold_hours'], r['z_score_threshold']) for r in watchlist)
-        metrics = load_watchlist_metrics(params)
-        m_df = pd.DataFrame(metrics)
-        wl_df = pd.concat([wl_df.reset_index(drop=True), m_df], axis=1)
-        wl_df.columns = ['Ticker', 'Strategy', 'Version', 'Window', 'Z', 'TP%', 'SL%', 'Hold h', 'Label',
-                         'Alpha%', 'Return%', 'Trades', 'Win%', 'Asset B&H%', 'SPY B&H%', 'Max Notional', 'Type']
-        st.dataframe(wl_df, use_container_width=True, hide_index=True, column_config={
-            'Alpha%':       st.column_config.NumberColumn(format="%.1f%%"),
-            'Return%':      st.column_config.NumberColumn(format="%.1f%%"),
-            'Win%':         st.column_config.NumberColumn(format="%.0f%%"),
-            'Asset B&H%':   st.column_config.NumberColumn(format="%.1f%%"),
-            'SPY B&H%':     st.column_config.NumberColumn(format="%.1f%%"),
-            'Max Notional': st.column_config.NumberColumn(format="$%.0f"),
-        })
-    else:
-        st.caption("Watchlist is empty.")
-    if include_watchlist and watchlist:
-        for node in watchlist:
-            nodes_to_run.append({**node, 'label': f"{node['ticker']} w={node['window']} (WL)"})
+# ── Watchlist table ───────────────────────────────────────────────────────────
+selected_wl_node = None
+if watchlist:
+    wl_raw = pd.DataFrame(watchlist)
+    params = tuple((r['ticker'], r['version'], r['window'], r['take_profit'], r['stop_loss'], r['max_hold_hours'], r['z_score_threshold']) for r in watchlist)
+    metrics = load_watchlist_metrics(params)
+    m_df = pd.DataFrame(metrics)
+    wl_base = pd.concat([wl_raw[['id', 'mode', 'ticker', 'strategy', 'version', 'window', 'z_score_threshold',
+                                   'take_profit', 'stop_loss', 'max_hold_hours', 'label']].reset_index(drop=True), m_df], axis=1)
+    wl_base['watch'] = True
+
+    wl_display = wl_base.rename(columns={
+        'id': 'ID', 'mode': 'Mode', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
+        'window': 'Window', 'z_score_threshold': 'Z', 'take_profit': 'TP%', 'stop_loss': 'SL%',
+        'max_hold_hours': 'Hold h', 'label': 'Label',
+        'alpha': 'Alpha%', 'ret': 'Return%', 'trades': 'Trades', 'win_rate': 'Win%',
+        'asset_bh': 'Asset B&H%', 'spy_bh': 'SPY B&H%', 'max_notional': 'Max Notional', 'type': 'Type',
+        'watch': 'Watch',
+    })
+
+    wl_edited = st.data_editor(
+        wl_display, use_container_width=True, hide_index=True,
+        height=35 * (len(wl_display) + 1) + 10,
+        column_config={
+            'ID':           st.column_config.NumberColumn('ID', disabled=True),
+            'Mode':         st.column_config.SelectboxColumn('Mode', options=['live', 'research'], required=True),
+            'Label':        st.column_config.TextColumn('Label'),
+            'Watch':        st.column_config.CheckboxColumn('Watch', help='Uncheck to remove'),
+            'Alpha%':       st.column_config.NumberColumn(format='%.1f%%'),
+            'Return%':      st.column_config.NumberColumn(format='%.1f%%'),
+            'Win%':         st.column_config.NumberColumn(format='%.0f%%'),
+            'Asset B&H%':   st.column_config.NumberColumn(format='%.1f%%'),
+            'SPY B&H%':     st.column_config.NumberColumn(format='%.1f%%'),
+            'Max Notional': st.column_config.NumberColumn(format='$%.0f'),
+        },
+        disabled=[c for c in wl_display.columns if c not in ('Mode', 'Label', 'Watch')],
+    )
+
+    # Remove unchecked rows
+    for i in wl_display.index[wl_edited['Watch'] == False]:
+        remove_node(int(wl_display.loc[i, 'ID']))
+        st.cache_data.clear()
+        st.rerun()
+
+    # Save mode / label edits
+    mode_changed  = wl_display['Mode']  != wl_edited['Mode']
+    label_changed = wl_display['Label'] != wl_edited['Label']
+    for i in wl_display.index[mode_changed]:
+        set_node_mode(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'Mode'])
+    for i in wl_display.index[label_changed]:
+        label_node(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'Label'])
+    if mode_changed.any() or label_changed.any():
+        st.cache_data.clear()
+        st.rerun()
+
+    # Row picker for the chart (data_editor doesn't support on_select)
+    node_labels = [f"{n['ticker']}  w={n['window']}  z={n['z_score_threshold']}  TP={n['take_profit']}  SL={n['stop_loss']}" for n in watchlist]
+    chart_pick = st.selectbox("Chart node", ['— none —'] + node_labels, key='wl_chart_pick')
+    if chart_pick != '— none —':
+        selected_wl_node = watchlist[node_labels.index(chart_pick)]
+
+    for node in watchlist:
+        nodes_to_run.append({**node, 'label': f"{node['ticker']} w={node['window']} (WL)"})
+else:
+    st.caption("Watchlist is empty.")
+
+# ── Price + bands chart for selected watchlist node ───────────────────────────
+if selected_wl_node:
+    n = selected_wl_node
+    st.subheader(f"{n['ticker']} — Price + Bands")
+    df_ind, close = compute_bands(n['ticker'], n.get('strategy', 'ZScoreBreakout'), int(n['window']))
+    with st.spinner("Running backtest..."):
+        trades = run_node_backtest(
+            n['ticker'], n.get('strategy', 'ZScoreBreakout'),
+            int(n['window']), int(n['take_profit']), int(n['stop_loss']),
+            int(n['max_hold_hours']), float(n['z_score_threshold']),
+        )
+    df_trades = pd.DataFrame(trades)
+    closed = pd.DataFrame()
+    if not df_trades.empty:
+        if 'Return %' not in df_trades.columns and 'Return' in df_trades.columns:
+            df_trades['Return %'] = df_trades['Return'] * 100
+        closed = df_trades[df_trades['Result'].isin(['WIN', 'LOSS', 'TWIN', 'TLOSS'])].copy()
+        closed['Entry Time'] = pd.to_datetime(closed['Entry Time'])
+        closed['Exit Time']  = pd.to_datetime(closed['Exit Time'])
+
+    fig_bands = go.Figure()
+    if close is not None:
+        close_4h = close.resample('4h').last().dropna()
+        fig_bands.add_trace(go.Scatter(
+            x=close_4h.index, y=close_4h.values,
+            name='Price', line=dict(color='#aaaaaa', width=1),
+        ))
+    if df_ind is not None:
+        sma = df_ind['SMA'].reindex(close.index, method='ffill')
+        std = df_ind['Std'].reindex(close.index, method='ffill')
+        for z_val, (color, dash) in {2.0: ('#4a9eff', 'dash'), 2.5: ('#ff9f4a', 'dot'), 3.0: ('#cc44ff', 'dashdot')}.items():
+            upper = (sma + z_val * std).resample('4h').last().dropna()
+            lower = (sma - z_val * std).resample('4h').last().dropna()
+            fig_bands.add_trace(go.Scatter(x=upper.index, y=upper.values, name=f'z={z_val} upper',
+                                           line=dict(color=color, width=1, dash=dash), opacity=0.7))
+            fig_bands.add_trace(go.Scatter(x=lower.index, y=lower.values, showlegend=False,
+                                           line=dict(color=color, width=1, dash=dash), opacity=0.7))
+    if not closed.empty:
+        wins  = closed[closed['Result'].isin(['WIN', 'TWIN'])]
+        losses = closed[closed['Result'].isin(['LOSS', 'TLOSS'])]
+        if not wins.empty:
+            fig_bands.add_trace(go.Scatter(x=wins['Entry Time'], y=wins['Entry Price'],
+                                           mode='markers', name='Win',
+                                           marker=dict(symbol='triangle-up', size=10, color='#2ecc71')))
+        if not losses.empty:
+            fig_bands.add_trace(go.Scatter(x=losses['Entry Time'], y=losses['Entry Price'],
+                                           mode='markers', name='Loss',
+                                           marker=dict(symbol='triangle-down', size=10, color='#e74c3c')))
+        fig_bands.add_trace(go.Scatter(x=closed['Exit Time'], y=closed['Exit Price'],
+                                       mode='markers', name='Exit',
+                                       marker=dict(symbol='x', size=8, color='#ffffff', opacity=0.7)))
+        for _, tr in closed.iterrows():
+            fig_bands.add_vrect(
+                x0=tr['Entry Time'], x1=tr['Exit Time'],
+                fillcolor='#2ecc71' if tr['Result'] in ['WIN', 'TWIN'] else '#e74c3c',
+                opacity=0.07, line_width=0,
+            )
+    fig_bands.update_layout(
+        height=500, margin=dict(l=0, r=0, t=30, b=0),
+        hovermode='x unified', xaxis_rangeslider_visible=False,
+        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='left', x=0),
+    )
+    st.plotly_chart(fig_bands, use_container_width=True, config={'scrollZoom': True})
+
+st.divider()
 
 with st.expander("Research nodes (from DB)", expanded=False):
     if versions:
@@ -187,20 +335,35 @@ with st.expander("Research nodes (from DB)", expanded=False):
                 )
                 df_display = df_top[['label', 'trades', 'win_rate', 'strategy_return', 'alpha_vs_spy']].copy()
                 df_display.columns = ['Node', 'Trades', 'Win %', 'Return %', 'Alpha %']
-                selected_labels = st.multiselect("Add to portfolio", df_top['label'].tolist(), key="r_nodes")
-                if selected_labels:
-                    sel_rows = df_top[df_top['label'].isin(selected_labels)]
-                    for _, row in sel_rows.iterrows():
-                        nodes_to_run.append({
-                            'ticker': row['ticker'], 'strategy': row['strategy'],
-                            'window': row['window'], 'take_profit': row['take_profit'],
-                            'stop_loss': row['stop_loss'], 'max_hold_hours': row['max_hold_hours'],
-                            'z_score_threshold': row['z_score_threshold'], 'label': row['label'],
-                        })
-                st.dataframe(df_display, use_container_width=True, hide_index=True,
-                             column_config={"Win %":    st.column_config.NumberColumn(format="%.0f%%"),
-                                            "Return %": st.column_config.NumberColumn(format="%.0f%%"),
-                                            "Alpha %":  st.column_config.NumberColumn(format="%.0f%%")})
+                r_sel = st.dataframe(
+                    df_display, use_container_width=True, hide_index=True,
+                    on_select="rerun", selection_mode="single-row",
+                    column_config={"Win %":    st.column_config.NumberColumn(format="%.0f%%"),
+                                   "Return %": st.column_config.NumberColumn(format="%.0f%%"),
+                                   "Alpha %":  st.column_config.NumberColumn(format="%.0f%%")},
+                )
+                if r_sel.selection.rows:
+                    r_idx = r_sel.selection.rows[0]
+                    r_row = df_top.iloc[r_idx]
+                    st.caption(f"**{r_row['ticker']}**  w={r_row['window']}  z={r_row['z_score_threshold']}  TP={r_row['take_profit']}  SL={r_row['stop_loss']}  hold={r_row['max_hold_hours']}h")
+                    ac1, ac2 = st.columns(2)
+                    with ac1:
+                        if picked_wl_id and st.button("Add to watchlist", use_container_width=True):
+                            add_node(r_row['ticker'], r_row['strategy'], r_version,
+                                     int(r_row['window']), int(r_row['take_profit']),
+                                     int(r_row['stop_loss']), int(r_row['max_hold_hours']),
+                                     z_score_threshold=float(r_row['z_score_threshold']),
+                                     watchlist_id=picked_wl_id)
+                            st.cache_data.clear()
+                            st.rerun()
+                    with ac2:
+                        if st.button("Add to portfolio view", use_container_width=True):
+                            nodes_to_run.append({
+                                'ticker': r_row['ticker'], 'strategy': r_row['strategy'],
+                                'window': r_row['window'], 'take_profit': r_row['take_profit'],
+                                'stop_loss': r_row['stop_loss'], 'max_hold_hours': r_row['max_hold_hours'],
+                                'z_score_threshold': r_row['z_score_threshold'], 'label': r_row['label'],
+                            })
             else:
                 st.caption("No nodes match filters.")
     else:
