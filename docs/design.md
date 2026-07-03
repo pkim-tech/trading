@@ -43,7 +43,8 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 ### Key Components
 - `run_optimization_sweep.py` — orchestrates the sweep, manages worker pool, writes progress to `active_phase_grid.json` (planned nodes) and `current_test.json` (live telemetry)
 - `backtester.py` — single node evaluation. Three kernels: `_simulate` (close-based, v1.5/v1.6), `_simulate_limit` (limit entry + intrabar SL, v1.7), `_simulate_trail` (close entry + trailing exit, v1.8). Corresponding wrappers: `run_backtest`, `run_backtest_v17`, `run_backtest_v18`. Sweep engine and Node Inspector dispatch to the correct wrapper based on strategy class.
-- `strategies.py` — strategy class definitions. `z_score_threshold` stored in `self.params`, used in `check_signal` for live signal detection. The sweep and Node Inspector both pass it to `run_backtest` explicitly.
+- `strategies.py` — strategy class definitions. `check_signal(ctx)` and `check_exit(ctx)` take a context dict (not individual args) — per-class implementations that mirror each backtest kernel's exact logic (bar-close vs continuous per exit reason). `z_score_threshold` stored in `self.params`. The sweep and Node Inspector both pass it to `run_backtest` explicitly.
+- `scripts/verify_live_parity.py` — replays live strategy logic bar-by-bar against the Numba backtest kernels for a given ticker/node; diffs trade-by-trade and reports first divergence. Used to validate that `strategies.py` matches `backtester.py` exactly.
 - `pages/1_Spatial_Topology.py` — 4D Plotly scatter of parameter space, shows planned nodes in blue and completed nodes colored by alpha
 - `pages/2_Node_Inspector.py` — re-runs backtest for a selected node, shows trade ledger and quarterly breakdown; Hurst/ADF analysis is opt-in (checkbox), lazy-loaded on demand
 - `pages/4_Portfolio.py` — portfolio backtester with two node sources: (1) watchlist toggle, (2) DB research nodes (filter by version/alpha/trades/z). Gantt timeline + SPY/TQQQ overlay + concurrent positions panel. Hurst/ADF overlay removed (not actionable).
@@ -55,7 +56,9 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - Phase 2 runs `execution.max_generations` times (default 1), re-centering island mesh on refined peaks each generation
 - SQLite WAL mode for concurrent writes
 - L3 cache optimization identified as next performance improvement (suggested by Gemini)
-- Sweep auto-runs `refresh_dropdown_cache()` + `refresh_pivot_cache()` on completion
+- Sweep auto-runs `refresh_dropdown_cache()` + `refresh_pivot_cache()` once on true completion (not between generations)
+- `sweep_runs` DB table — one row per sweep execution: version, timestamps, status, strategies, tickers, phase_reached, config_json snapshot, log_file. `start_sweep_run`/`update_sweep_run` in `run_optimization_sweep.py` wire this automatically.
+- `identify_island_candidates` scoped to `allowed_tickers` (current run's tickers) — prevents silently dropping candidates whose B&H data wasn't cached for the current run
 - Cron job runs sweep daily at 4:15am
 
 ---
@@ -67,11 +70,11 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - **Multi-watchlist**: `watchlists` DB table (id, name, is_active). One list is designated active — that's what the signal loop monitors. Same node can exist in multiple lists (UNIQUE constraint is scoped per list).
 - **Node mode**: `watch_list.mode` — `live` fires full Slack BUY alerts; `research` logs signal to console only (no Slack, no position tracking).
 - `watch_list` DB table — nodes selected for monitoring, scoped to a watchlist
-- `open_positions` DB table — tracks entries pending exit
+- `open_positions` DB table — tracks entries pending exit; `trail_state` TEXT column stores per-position trailing-stop state (peak price, activated flag) as JSON
 - Entry/exit logic delegated to strategy classes in `strategies.py` — no signal logic in `active_signals.py`
 - **Slack Socket Mode** — bot token + app token; BUY/SELL messages have interactive Executed/Skipped buttons, price entry modal, chart image upload
 - **BUY message** — shows market price, share count at $50k notional, and max notional / max shares at 1% of avg daily vol (liquidity ceiling from `tickers` table)
-- **Morning report** — fires at startup and daily at 7 AM ET; shows current price (via `yfinance history prepost=True`), overnight change vs last daily close, trigger proximity, TP/SL prices, z-score, and data date (last daily bar used for bands)
+- **Morning report** — fires at startup and daily at 7 AM ET; dark-theme chart (30 trading days lookback, positional x-axis, right-side y-axis, both ±2σ generic band and node-specific z-threshold trigger line). Leading line: `{emoji} *TICKER* — BUY (bar-close/limit) — version — trigger $X`. Chart attached only when within 5% of trigger.
 - **Current price** — uses `yfinance history(period='1d', interval='1m', prepost=True)` to capture pre/post-market; falls back to cached hourly close on failure
 - Signal indicators use prior closed day's SMA/Std (not today's intraday close) — matches live trading semantics
 - `--ticker TICKER` flag to filter the poll loop to specific tickers

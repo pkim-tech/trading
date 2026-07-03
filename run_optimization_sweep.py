@@ -61,6 +61,47 @@ def init_idempotent_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker ON backtest_cache(version, ticker)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_window ON backtest_cache(version, window)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker_strategy ON backtest_cache(version, ticker, strategy)")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sweep_runs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            version       TEXT NOT NULL,
+            started_at    TEXT NOT NULL,
+            finished_at   TEXT,
+            status        TEXT NOT NULL DEFAULT 'RUNNING',
+            strategies    TEXT NOT NULL,
+            tickers       TEXT NOT NULL,
+            phase_reached TEXT,
+            config_json   TEXT NOT NULL,
+            notes         TEXT,
+            log_file      TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def start_sweep_run(config_version, strategy_names, tickers, config, log_file):
+    conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sweep_runs (version, started_at, status, strategies, tickers, config_json, log_file)
+        VALUES (?, ?, 'RUNNING', ?, ?, ?, ?)
+    """, (config_version, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+          json.dumps(strategy_names), json.dumps(tickers), json.dumps(config), str(log_file)))
+    conn.commit()
+    run_id = cur.lastrowid
+    conn.close()
+    return run_id
+
+
+def update_sweep_run(run_id, **fields):
+    if not fields:
+        return
+    conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    cur = conn.cursor()
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    cur.execute(f"UPDATE sweep_runs SET {set_clause} WHERE id = ?", (*fields.values(), run_id))
     conn.commit()
     conn.close()
 
@@ -306,17 +347,21 @@ def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, sp
 
 # ── Checkpoint 1: rank by coarse alpha, return island candidates ──────────────
 
-def identify_island_candidates(config_version, strategy_name, n_index, n_stock):
+def identify_island_candidates(config_version, strategy_name, n_index, n_stock, allowed_tickers=None):
     with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql("""
+        query = """
             SELECT b.ticker, MAX(b.alpha_vs_spy) as best_alpha,
                    t.index_underlier, t.stock_underlier
             FROM backtest_cache b
             LEFT JOIN tickers t ON t.symbol = b.ticker
             WHERE b.version=? AND b.strategy=? AND b.trades > 0
-            GROUP BY b.ticker
-            ORDER BY best_alpha DESC
-        """, conn, params=(config_version, strategy_name))
+        """
+        params = [config_version, strategy_name]
+        if allowed_tickers:
+            query += f" AND b.ticker IN ({','.join('?' * len(allowed_tickers))})"
+            params += list(allowed_tickers)
+        query += " GROUP BY b.ticker ORDER BY best_alpha DESC"
+        df = pd.read_sql(query, conn, params=params)
 
     def utype(row):
         if pd.notna(row.get('index_underlier')) and row['index_underlier']:
@@ -470,30 +515,31 @@ def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
                            "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl)
 
-    # Heatmap at best hold
-    with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql("""
-            SELECT take_profit, stop_loss, max_hold_hours, alpha_vs_spy
-            FROM backtest_cache
-            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
-        """, conn, params=(config_version, ticker, strategy_name))
-    if df.empty:
-        return
-    best_hold = int(df.nlargest(1, 'alpha_vs_spy')['max_hold_hours'].iloc[0])
-    df_plane  = df[df['max_hold_hours'] == best_hold]
-    if len(df_plane) < 2:
-        return
-    try:
-        pivot = df_plane.groupby(['stop_loss', 'take_profit'])['alpha_vs_spy'].mean().unstack('take_profit')
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(pivot, annot=False, cmap='RdYlGn', cbar_kws={'label': 'Alpha vs SPY %'}, linewidths=0.5)
-        plt.title(f"{ticker} — {strategy_name} @ {best_hold}h ({config_version})")
-        out = OPTO_LOG_DIR / f"topology_{ticker}_{strategy_name}.png"
-        plt.savefig(out, bbox_inches='tight')
-        plt.close()
-        logger.info(f"[{ticker}] Heatmap saved: {out}")
-    except Exception as e:
-        logger.warning(f"[{ticker}] Heatmap failed: {e}")
+    # Static heatmap PNG disabled — superseded by the interactive Spatial Topology page,
+    # nothing read these files back. Left commented instead of deleted in case that changes.
+    # with sqlite3.connect(DB_PATH) as conn:
+    #     df = pd.read_sql("""
+    #         SELECT take_profit, stop_loss, max_hold_hours, alpha_vs_spy
+    #         FROM backtest_cache
+    #         WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+    #     """, conn, params=(config_version, ticker, strategy_name))
+    # if df.empty:
+    #     return
+    # best_hold = int(df.nlargest(1, 'alpha_vs_spy')['max_hold_hours'].iloc[0])
+    # df_plane  = df[df['max_hold_hours'] == best_hold]
+    # if len(df_plane) < 2:
+    #     return
+    # try:
+    #     pivot = df_plane.groupby(['stop_loss', 'take_profit'])['alpha_vs_spy'].mean().unstack('take_profit')
+    #     plt.figure(figsize=(12, 10))
+    #     sns.heatmap(pivot, annot=False, cmap='RdYlGn', cbar_kws={'label': 'Alpha vs SPY %'}, linewidths=0.5)
+    #     plt.title(f"{ticker} — {strategy_name} @ {best_hold}h ({config_version})")
+    #     out = OPTO_LOG_DIR / f"topology_{ticker}_{strategy_name}.png"
+    #     plt.savefig(out, bbox_inches='tight')
+    #     plt.close()
+    #     logger.info(f"[{ticker}] Heatmap saved: {out}")
+    # except Exception as e:
+    #     logger.warning(f"[{ticker}] Heatmap failed: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -537,6 +583,43 @@ if __name__ == "__main__":
 
     init_idempotent_db()
 
+    run_id_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_log_path = OPTO_LOG_DIR / f"sweep_{config_version}_{run_id_tag}.log"
+
+    # tqdm progress bars write directly to stderr, bypassing the logging module —
+    # a logging.FileHandler alone misses all of it. Tee raw stdout/stderr into the
+    # run log file too so it has everything, not just structured logger.info() calls.
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, data):
+            for s in self._streams:
+                s.write(data)
+        def flush(self):
+            for s in self._streams:
+                s.flush()
+
+    run_log_file = open(run_log_path, "a")
+    sys.stdout = _Tee(sys.stdout, run_log_file)
+    sys.stderr = _Tee(sys.stderr, run_log_file)
+
+    # logging.StreamHandler captured the original sys.stdout object at basicConfig()
+    # time (module import) — reassigning sys.stdout above doesn't retarget it, so
+    # logger.info() calls still need their own handler to reach the run log file.
+    run_file_handler = logging.FileHandler(run_log_path)
+    run_file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logging.getLogger().addHandler(run_file_handler)
+
+    run_id = start_sweep_run(config_version, strategy_names, tickers, config, run_log_path)
+
+    def _mark_failed_on_crash(exc_type, exc_value, exc_tb):
+        logger.critical("Sweep crashed", exc_info=(exc_type, exc_value, exc_tb))
+        update_sweep_run(run_id, status='FAILED',
+                          finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                          notes=str(exc_value)[:500])
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _mark_failed_on_crash
+
     logger.info(f"Version: {config_version} | Tickers: {len(tickers)} | Workers: {max_workers}")
     logger.info(f"Coarse grid: TP/SL {hp['take_profits']} | Hold: {len(hp['hold_time_caps'])} values | Z: {hp['z_score_thresholds']}")
 
@@ -565,9 +648,7 @@ if __name__ == "__main__":
                     asset_bh, spy_bh = bh_cache[ticker]
                     run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
 
-            logger.info("Phase 1 complete. Refreshing caches...")
-            refresh_dropdown_cache()
-            refresh_pivot_cache()
+            logger.info("Phase 1 complete.")
 
         max_generations = config.get("execution", {}).get("max_generations", 1)
         max_generations = max(1, max_generations)
@@ -594,7 +675,7 @@ if __name__ == "__main__":
             for gen in range(max_generations):
                 # ── Checkpoint 1 (re-run each generation) ────────────────
                 logger.info(f"\nCheckpoint 1 (gen {gen+1}/{max_generations}): ranking results for {name}...")
-                top_index, top_other = identify_island_candidates(config_version, name, 25, 5)
+                top_index, top_other = identify_island_candidates(config_version, name, 25, 5, allowed_tickers=valid_tickers)
                 island_tickers = top_index + top_other
 
                 if not island_tickers:
@@ -615,9 +696,7 @@ if __name__ == "__main__":
                     asset_bh, spy_bh = bh_cache[ticker]
                     run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
 
-                logger.info(f"Phase 2 gen {gen+1} complete. Refreshing caches...")
-                refresh_dropdown_cache()
-                refresh_pivot_cache()
+                logger.info(f"Phase 2 gen {gen+1} complete.")
 
             if not island_tickers or phase_only in (1, 2):
                 continue
@@ -667,3 +746,7 @@ if __name__ == "__main__":
     logger.info("=" * 52)
     logger.info("  THREE-PHASE SWEEP COMPLETE")
     logger.info("=" * 52)
+
+    update_sweep_run(run_id, status='COMPLETE',
+                      finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                      phase_reached=f"phase{phase_only}" if phase_only else "all")

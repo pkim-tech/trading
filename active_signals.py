@@ -30,11 +30,27 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import contextlib
 import requests
+import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+matplotlib.rcParams.update({
+    'figure.facecolor':  '#1e1f22',
+    'axes.facecolor':    '#1e1f22',
+    'savefig.facecolor': '#1e1f22',
+    'text.color':        '#dbdee1',
+    'axes.labelcolor':   '#dbdee1',
+    'axes.edgecolor':    '#4e5058',
+    'xtick.color':       '#dbdee1',
+    'ytick.color':       '#dbdee1',
+    'grid.color':        '#3f4147',
+    'legend.facecolor':  '#2b2d31',
+    'legend.edgecolor':  '#4e5058',
+    'legend.labelcolor': '#dbdee1',
+})
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
@@ -180,6 +196,8 @@ def ensure_tables():
         op_cols = {r[1] for r in c.execute("PRAGMA table_info(open_positions)").fetchall()}
         if 'trade_log_id' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN trade_log_id INTEGER")
+        if 'trail_state' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN trail_state TEXT")
 
         # trade_log
         c.execute("""
@@ -299,9 +317,18 @@ def label_node(watch_id, label):
 
 def get_open_positions():
     with _conn() as c:
-        return [dict(r) for r in c.execute(
+        rows = [dict(r) for r in c.execute(
             "SELECT * FROM open_positions ORDER BY entry_time"
         ).fetchall()]
+    for r in rows:
+        r['trail_state'] = json.loads(r['trail_state']) if r.get('trail_state') else {}
+    return rows
+
+
+def update_position_trail_state(position_id, state):
+    with _conn() as c:
+        c.execute("UPDATE open_positions SET trail_state = ? WHERE id = ?",
+                  (json.dumps(state), position_id))
 
 
 def open_position(node, signal_price, signal_time, entry_price, entry_time):
@@ -466,6 +493,14 @@ def compute_buy_signal(node):
     std           = last_row['Std']
     hurst, adf_p  = _hurst_adf(ticker, df_hourly)
 
+    signal_ctx = {
+        'current_price': current_price,
+        'low':           current_price,  # no true intrabar low available live; best proxy
+        'sma':           sma,
+        'std':           std,
+        'trend':         last_row['Trend_Filter'] if 'Trend_Filter' in indicators.columns else None,
+    }
+
     return {
         'ticker':        ticker,
         'window':        window,
@@ -475,7 +510,7 @@ def compute_buy_signal(node):
         'std':           std,
         'lower_band':    sma - z_thresh * std,
         'z_score':       (current_price - sma) / std,
-        'signal':        strat.check_signal(current_price, last_row),
+        'signal':        strat.check_signal(signal_ctx),
         'last_bar':      last_bar,
         'last_daily_bar': indicators.index[-1],
         'hurst':         hurst,
@@ -483,18 +518,34 @@ def compute_buy_signal(node):
     }
 
 
-def check_sell_condition(pos, current_price, now):
+def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, high=None):
     strategy_cls = getattr(strategies, pos['strategy'], None)
     if strategy_cls is None:
-        return None, None
+        return None, None, False
     entry_time = datetime.strptime(pos['entry_time'], '%Y-%m-%d %H:%M:%S')
     hours_held = (now - entry_time).total_seconds() / 3600
-    strat      = strategy_cls(window=pos['window'])
-    return strat.check_exit(
-        current_price, pos['entry_price'],
-        pos['take_profit'], pos['stop_loss'],
-        hours_held, pos['max_hold_hours']
-    )
+    strat      = strategy_cls(window=pos['window'], trail_pct=pos.get('trail_pct', 0.03))
+    old_state  = pos.get('trail_state', {})
+    reason, price, new_state = strat.check_exit({
+        'current_price':     current_price,
+        # Real bar Low/High when this call represents an actual closed hourly bar;
+        # otherwise current_price is the best available proxy for a mid-bar poll.
+        'low':               low if low is not None else current_price,
+        'high':              high if high is not None else current_price,
+        'entry_price':       pos['entry_price'],
+        'take_profit':       pos['take_profit'] / 100.0,
+        'stop_loss':         pos['stop_loss'] / 100.0,
+        'max_hours_to_hold': pos['max_hold_hours'],
+        'hours_held':        hours_held,
+        'at_bar_close':      at_bar_close,
+        'state':             old_state,
+    })
+    just_activated_trailing = bool(new_state.get('trailing')) and not old_state.get('trailing')
+    if reason in ('WIN', 'LOSS'):
+        reason = 'TRAIL'
+    if new_state != old_state:
+        update_position_trail_state(pos['id'], new_state)
+    return reason, price, just_activated_trailing
 
 
 # ---------------------------------------------------------------------------
@@ -522,28 +573,67 @@ def _chart_buy(node, sig) -> BytesIO | None:
     if df_hourly is None:
         return None
 
-    today      = pd.Timestamp.now().normalize()
-    cutoff     = df_hourly.index[-1] - pd.Timedelta(days=30)
-    df_plot    = df_hourly[df_hourly.index >= cutoff]['Close'].dropna()
-    strat      = getattr(strategies, node['strategy'])(window=window)
-    indicators = strat.generate_daily_indicators(df_daily[df_daily.index < today])
+    today        = pd.Timestamp.now().normalize()
+    trading_days = pd.Series(df_hourly.index.normalize()).unique()
+    cutoff       = trading_days[-30] if len(trading_days) >= 30 else trading_days[0]
+    df_plot      = df_hourly[df_hourly.index.normalize() >= cutoff]['Close'].dropna()
+    strat        = getattr(strategies, node['strategy'])(window=window)
+    df_daily_in  = df_daily[df_daily.index < today]
+    indicators  = strat.generate_daily_indicators(df_daily_in)
 
-    sma_h   = indicators['SMA'].reindex(df_plot.index, method='ffill')
-    std_h   = indicators['Std'].reindex(df_plot.index, method='ffill')
-    upper_h = sma_h + 2 * std_h
-    lower_h = sma_h - 2 * std_h
+    z_thresh  = float(node.get('z_score_threshold', 2.0))
+    sma_h     = indicators['SMA'].reindex(df_plot.index, method='ffill')
+    std_h     = indicators['Std'].reindex(df_plot.index, method='ffill')
+    upper_h   = sma_h + 2 * std_h
+    lower_h   = sma_h - 2 * std_h
+    trigger_h = sma_h - z_thresh * std_h
+
+    # Positional x-axis (bar index, not calendar time) so weekend/overnight gaps
+    # don't stretch out as flat empty segments.
+    x = np.arange(len(df_plot))
+
+    def _pos(ts):
+        return df_plot.index.get_indexer([ts], method='nearest')[0]
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(df_plot.index, df_plot.values, color='#4c9be8', linewidth=1, label='Price')
-    ax.plot(sma_h.index, sma_h.values, color='#f0a500', linewidth=1, label=f'SMA({window})')
-    ax.fill_between(df_plot.index, lower_h, upper_h, alpha=0.12, color='#f0a500')
-    ax.plot(lower_h.index, lower_h.values, color='#f0a500', linewidth=0.6, linestyle='--')
-    ax.axvline(sig['last_bar'], color='#2ecc71', linewidth=1.5, linestyle='--', alpha=0.8)
-    ax.scatter([sig['last_bar']], [sig['current_price']], color='#2ecc71', s=60, zorder=5)
-    ax.set_title(f"{ticker}  BUY SIGNAL  |  z = {sig['z_score']:.2f}  |  window={window}", fontsize=11)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
-    ax.legend(fontsize=8)
-    fig.tight_layout()
+    ax.plot(x, df_plot.values, color='#4c9be8', linewidth=1, label='Price')
+    ax.plot(x, sma_h.values, color='#f0a500', linewidth=1, label=f'SMA({window})')
+    ax.fill_between(x, lower_h.values, upper_h.values, alpha=0.12, color='#f0a500')
+    ax.plot(x, lower_h.values, color='#f0a500', linewidth=0.6, linestyle='--')
+    ax.plot(x, trigger_h.values, color='#e74c3c', linewidth=1, linestyle='--', label=f'Trigger line (z={z_thresh:g})')
+
+    last_pos = _pos(sig['last_bar'])
+    ax.axvline(last_pos, color='#2ecc71', linewidth=1.5, linestyle='--', alpha=0.8)
+    ax.scatter([last_pos], [sig['current_price']], color='#2ecc71', s=60, zorder=5)
+
+    if len(df_daily_in) >= window and df_daily_in.index[-window] >= df_plot.index[0]:
+        w_pos = _pos(df_daily_in.index[-window])
+        ax.axvline(w_pos, color='white', linewidth=1.3, linestyle=':', alpha=0.9, label=f'w{window} start')
+
+    ax.set_xlim(-2, len(x) + 1)
+
+    ax.axhline(sig['prev_close'], color='#dbdee1', linewidth=1, linestyle=':', alpha=0.7,
+               label=f"Close ${sig['prev_close']:.2f}")
+    ax.axhline(sig['current_price'], color='#2ecc71', linewidth=1, linestyle='--', alpha=0.8,
+               label=f"Current ${sig['current_price']:.2f}")
+    ax.axhline(sig['lower_band'], color='#e74c3c', linewidth=1.2, linestyle='-', alpha=0.9,
+               label=f"Trigger ${sig['lower_band']:.2f}")
+
+    pct_away = (sig['current_price'] - sig['lower_band']) / sig['lower_band'] * 100
+    fig.suptitle(f"{ticker}   trigger ${sig['lower_band']:.2f}  ({pct_away:+.1f}%)",
+                 fontsize=15, fontweight='bold', color='#f0a500', y=0.98)
+    ax.set_title(f"w{window} z{z_thresh:g} tp{node['take_profit']} sl{node['stop_loss']}",
+                 fontsize=9, color='#9aa0a6')
+
+    tick_step = max(len(x) // 10, 1)
+    tick_pos  = x[::tick_step]
+    ax.set_xticks(tick_pos)
+    ax.set_xticklabels([df_plot.index[i].strftime('%m/%d') for i in tick_pos])
+
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position('right')
+    ax.legend(fontsize=8, loc='upper right')
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
 
     buf = BytesIO()
     fig.savefig(buf, format='png', dpi=120)
@@ -709,6 +799,10 @@ def _build_sell_blocks(pos, reason, current_price, target_price):
         emoji   = "🔴"
         label   = "STOP LOSS HIT"
         action  = f"Check account — Stop Loss order should have auto-filled @ `${target_price:.2f}`"
+    elif reason == 'TRAIL':
+        emoji   = "🟢"
+        label   = "TRAILING STOP"
+        action  = f"Cancel Stop Loss order — Sell All (Market), trailing stop triggered @ `${target_price:.2f}`"
     else:  # TIME
         emoji   = "🔶"
         label   = "TIME EXIT"
@@ -963,7 +1057,7 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     entry_time = pos['entry_time']
     pct        = (current_price - ep) / ep * 100
 
-    reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT'}
+    reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT', 'TRAIL': 'TRAILING STOP'}
 
     sep = '=' * 62
     print(f"\n{sep}")
@@ -1005,6 +1099,24 @@ def notify_sell_signal(pos, reason, current_price, target_price):
             print("  Invalid price — position kept open.")
     else:
         print("  Skipped — position kept open.")
+
+
+def notify_trailing_activated(pos, current_price):
+    ticker    = pos['ticker']
+    ep        = pos['entry_price']
+    pct       = (current_price - ep) / ep * 100
+    trail_pct = pos.get('trail_pct', 0.03) * 100
+    print(f"\n  [TRAILING ACTIVATED] {ticker}  entry=${ep:.4f}  now=${current_price:.4f}  ({pct:+.2f}%)")
+    _post_message(
+        f"TRAILING ACTIVATED — {ticker}  ${current_price:.4f}  ({pct:+.2f}%)",
+        [{"type": "section", "text": {"type": "mrkdwn", "text": (
+            f"🎯 *{ticker}* — TRAILING ACTIVATED — action needed\n"
+            f"entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
+            f"Take-profit cleared. Cancel the fixed Schwab stop and place a *trailing stop* order at `{trail_pct:.0f}%` "
+            f"so it auto-adjusts with price at the broker — Slack polling alone won't catch it fast enough. "
+            f"Next alert fires when the trailing stop or max hold triggers."
+        )}}],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1071,13 +1183,13 @@ def send_startup_report(watchlist):
     for node in [n for n in watchlist if n.get('mode') == 'live']:
         sig = compute_buy_signal(node)
         if sig is None:
-            rows.append((float('inf'), node['ticker'], node['strategy'], node.get('version', ''), None, None))
+            rows.append((float('inf'), node['ticker'], node['strategy'], node.get('version', ''), None, None, node))
             continue
         trigger  = sig['lower_band']
         tp_price = trigger * (1 + node['take_profit'] / 100)
         sl_price = trigger * (1 - node['stop_loss']  / 100)
         pct_away = (sig['current_price'] - trigger) / trigger * 100
-        rows.append((pct_away, node['ticker'], node['strategy'], node.get('version', ''), sig, {'tp': tp_price, 'sl': sl_price, 'pct': pct_away}))
+        rows.append((pct_away, node['ticker'], node['strategy'], node.get('version', ''), sig, {'tp': tp_price, 'sl': sl_price, 'pct': pct_away}, node))
     rows.sort(key=lambda x: x[0])
 
     # Group by strategy
@@ -1104,21 +1216,26 @@ def send_startup_report(watchlist):
         blocks.append({"type": "header", "text": {"type": "plain_text", "text": header_text}})
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": action}]})
 
-        for _, ticker, _strat, version, sig, meta in group:
+        for _, ticker, _strat, version, sig, meta, node in group:
             if sig is None:
                 blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}})
                 continue
             emoji = _proximity_emoji(meta['pct'])
             overnight = (sig['current_price'] - sig['prev_close']) / sig['prev_close'] * 100
             data_date = pd.Timestamp(sig['last_daily_bar']).strftime('%m/%d')
+            buy_type, node_action = _STRATEGY_LABELS.get(_strat, (_strat, ''))
             text = (
-                f"{emoji} *{ticker}* `{version}`  "
-                f"now `${sig['current_price']:.2f}` ({overnight:+.1f}% O/N)  close `${sig['prev_close']:.2f}`  "
-                f"trigger `${sig['lower_band']:.2f}` ({meta['pct']:+.1f}%)  "
-                f"tp `${meta['tp']:.2f}`  sl `${meta['sl']:.2f}`  "
-                f"z `{sig['z_score']:+.2f}`  data `{data_date}`"
+                f"{emoji} *{ticker}* — {buy_type} — `{version}` — trigger `${sig['lower_band']:.2f}`\n"
+                f"→ _{node_action}_\n"
+                f"now `${sig['current_price']:.2f}` ({overnight:+.1f}% O/N)  z `{sig['z_score']:+.2f}`\n"
+                f"      trigger `${sig['lower_band']:.2f}` ({meta['pct']:+.1f}%)  tp `${meta['tp']:.2f}`  sl `${meta['sl']:.2f}`  "
+                f"close `${sig['prev_close']:.2f}`  data `{data_date}`"
             )
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+            if meta['pct'] < 5:
+                chart = _chart_buy(node, sig)
+                if chart:
+                    _upload_chart(chart, f"{ticker}_morning.png", f"{ticker} `{version}`  z={sig['z_score']:+.2f}")
 
     # Open positions section
     positions = get_open_positions()
@@ -1155,7 +1272,7 @@ def send_startup_report(watchlist):
 
     # Console output
     print(f"Morning Report — {now_str}")
-    for _, ticker, strategy, version, sig, meta in rows:
+    for _, ticker, strategy, version, sig, meta, _node in rows:
         if sig is None:
             print(f"  {ticker:<6} {version}  NO_DATA  [{strategy}]")
         else:
@@ -1212,6 +1329,7 @@ def run_loop(tickers: set = None):
     sell_alerted:       set[int]   = set()
     window_alerted:     set[tuple] = set()
     limit_fill_alerted: set[tuple] = set()
+    last_seen_bar:      dict       = {}   # ticker -> last hourly bar timestamp checked
     last_date = datetime.now().strftime('%Y-%m-%d')
     last_morning_report_date = datetime.now().strftime('%Y-%m-%d') if datetime.now().hour >= 7 else None
 
@@ -1256,19 +1374,38 @@ def run_loop(tickers: set = None):
                 window_alerted.add(wkey)
                 _send_window_alert(label, watchlist)
 
-        if _in_buy_window(now):
-            for pos in get_open_positions():
-                if tickers and pos['ticker'] not in tickers:
-                    continue
-                if pos['id'] in sell_alerted:
-                    continue
+        # Exit checks run every poll cycle (not gated to the entry signal windows) —
+        # the backtest evaluates TP/SL/TIME on every hourly bar once in a trade, so
+        # live monitoring needs to check at least that often, not just twice a day.
+        # SL/trailing checks are continuous (every poll); TP/TIME only fire when a
+        # genuinely new hourly bar has closed since the last check, using that bar's
+        # real Close/Low/High — not a live mid-bar tick — to match the backtest kernels.
+        for pos in get_open_positions():
+            if tickers and pos['ticker'] not in tickers:
+                continue
+            if pos['id'] in sell_alerted:
+                continue
+            df_hourly, _ = _load_cache(pos['ticker'])
+            if df_hourly is None or df_hourly.empty:
+                continue
+            last_bar_ts = df_hourly.index[-1]
+            at_bar_close = last_seen_bar.get(pos['ticker']) != last_bar_ts
+            if at_bar_close:
+                last_seen_bar[pos['ticker']] = last_bar_ts
+                bar = df_hourly.iloc[-1]
+                cp, low, high = float(bar['Close']), float(bar['Low']), float(bar['High'])
+            else:
                 cp, _ = _current_price(pos['ticker'])
                 if cp is None:
                     continue
-                reason, target = check_sell_condition(pos, cp, now)
-                if reason:
-                    notify_sell_signal(pos, reason, cp, target)
-                    sell_alerted.add(pos['id'])
+                low = high = cp
+            reason, target, just_activated_trailing = check_sell_condition(
+                pos, cp, now, at_bar_close=at_bar_close, low=low, high=high)
+            if just_activated_trailing:
+                notify_trailing_activated(pos, cp)
+            if reason:
+                notify_sell_signal(pos, reason, cp, target)
+                sell_alerted.add(pos['id'])
 
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")

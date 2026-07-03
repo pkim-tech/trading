@@ -16,11 +16,25 @@ Rules imposed on live trading based on the current phase of the system. These ex
 - **Max notional per trade**: 1% of ticker's avg daily dollar volume (surfaced in Slack BUY message)
 - **One node per ticker**: Only one watch list entry per ticker until portfolio-level behavior is validated
 
-### Entry Execution Approach
-- **Order type**: Limit order staged pre-market at an absurd low price (will not fill accidentally). At 10:30 AM or 3:30 PM ET, if Slack fires a BUY signal, edit the limit price to current market and submit.
-- **Signal check windows**: 10:25–10:40 AM ET (9:30 bar close) and 15:25–15:40 PM ET (14:30 bar close). `active_signals.py` only evaluates buy/sell signals within these windows.
+### Entry/Exit Action Table — By Strategy
+
+Each strategy has different execution mechanics. Check the strategy name shown in the Slack message against this table before acting — do not assume all signals work like v1.5/v1.6.
+
+General notes that apply everywhere:
+- **Signal check windows**: 10:25–10:40 AM ET (9:30 bar close) and 15:25–15:40 PM ET (14:30 bar close), for anything marked "bar-close" below.
 - **Data source**: Real-time spot price via `yfinance fast_info.last_price` at signal check time. Hourly cached data used only for indicator computation (SMA, Std).
-- **Do not use overnight limit orders at lower_band**: Open-fill analysis showed entering at the 9:30 open (before the intrabar decline) is consistently worse than the 10:30 close. A staged limit order edited at signal time is the correct approach.
+- **Do not use overnight limit orders at lower_band for bar-close strategies**: Open-fill analysis showed entering at the 9:30 open (before the intrabar decline) is consistently worse than the 10:30 close. A staged limit order edited at signal time is the correct approach.
+
+| # | Strategy | Signal | Timing | Slack message | Required action |
+|---|----------|--------|--------|----------------|------------------|
+| 1 | `ZScoreBreakout` (v1.5/v1.6) | BUY | bar-close (signal window) | 🟢 BUY — Market — price/shares + 🔴 stop-loss price | Edit pre-staged absurd-low limit → market, submit within ~5 sec. Then place the Schwab stop at the shown price. |
+| 2 | `ZScoreBreakout` (v1.5/v1.6) | SELL | bar-close (signal window) | TP: "Cancel Stop Loss — Sell All (Market)". SL: "Check account — stop should have auto-filled". TIME: "Change Stop Loss → Market Close order" | TP → sell now. SL → just verify the resting Schwab stop caught it. TIME → convert to a market-close (EOD) order. |
+| 3 | `TrendFilteredZScore` (v1.4) | BUY | bar-close (signal window) | Same as row 1 | Same as row 1 — mechanically identical to ZScoreBreakout, just gated by the extra 50d trend filter. |
+| 4 | `TrendFilteredZScore` (v1.4) | SELL | bar-close (signal window) | Same as row 2 | Same as row 2. |
+| 5 | `LimitOrderZScoreBreakout` (v1.7) | BUY | all day, continuous (intrabar Low touch) | ✅ "LIMIT FILLED" — price/shares + 🔴 stop price | **No entry action** — this is a real resting limit order at the computed trigger price, not a placeholder; it already filled on its own. Just place the Schwab stop at the shown price. |
+| 6 | `LimitOrderZScoreBreakout` (v1.7) | SELL | SL continuous (intrabar); TP/TIME bar-close (signal window) | Same TP/SL/TIME messages as row 2 | Same actions as row 2. SL is a backup confirmation — the real protection is the resting Schwab stop, which should already have fired. |
+| 7 | `TrailingExitZScoreBreakout` (v1.8) | BUY | bar-close (signal window) | Same as row 1 | Same as row 1. |
+| 8 | `TrailingExitZScoreBreakout` (v1.8) | SELL | SL + trailing-stop continuous (intrabar); TP-activation & TIME bar-close | 🎯 "TRAILING ACTIVATED" (no action, informational) fires once when TP clears. Final exit: 🟢 "TRAILING STOP" or 🔴 "STOP LOSS" or 🔶 "TIME EXIT" | TRAILING ACTIVATED → no action, just confirms state changed. Final exit messages → same actions as row 2 (TRAIL behaves like TP: cancel stop, sell now). |
 
 ### Execution Limits
 - **Do not enter if you cannot monitor**: If unavailable for the next 2h, skip the signal

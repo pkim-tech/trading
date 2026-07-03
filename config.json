@@ -1,5 +1,5 @@
 {
-    "version": "v1.8",
+    "version": "v1.4",
     "target_tickers": [
         "AGQ", "BULZ", "DGP", "DUST",
         "FNGD", "FNGU", "GDXD", "GDXU", "HIBL", "NUGT", "OILU",
@@ -9,7 +9,7 @@
         "EDC", "FAS"
     ],
     "active_strategies": [
-        "TrailingExitZScoreBreakout"
+        "TrendFilteredZScore"
     ],
     "hyperparameters": {
         "z_score_thresholds": [
@@ -34,15 +34,16 @@
             30
         ],
         "stop_losses": [
-            2,
             3,
-            4,
-            5,
             6,
-            7,
-            8,
             9,
-            10
+            12,
+            15,
+            18,
+            21,
+            24,
+            27,
+            30
         ],
         "hold_time_caps": [
             56,
@@ -61,7 +62,7 @@
         ]
     },
     "execution": {
-        "max_workers": 10,
+        "max_workers": 9,
         "max_generations": 3,
         "alpha_tolerance": -100.0,
         "fixed_stop_loss": 15
