@@ -20,7 +20,6 @@ Environment (Webhook fallback — fire-and-forget, no buttons):
     SIGNAL_POLL_SECS    — poll interval in seconds (default 300)
 """
 
-import io
 import os
 import sys
 import json
@@ -66,6 +65,26 @@ CACHE_DIR   = Path("./cache")
 CONFIG_PATH = Path("./config.json")
 POLL_SECS  = int(os.environ.get("SIGNAL_POLL_SECS", 300))
 SLACK_HOOK = os.environ.get("SLACK_WEBHOOK_URL", "")
+
+LOG_DIR = Path("./logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+HUMAN_LOG_PATH   = LOG_DIR / "active_signals.log"
+VERBOSE_LOG_PATH = LOG_DIR / "active_signals_verbose.log"
+
+
+class _Tee:
+    """Mirrors writes to multiple streams — used to log to a file without losing
+    the live console output when running `active_signals.py run` interactively."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
@@ -1362,6 +1381,12 @@ def _in_buy_window(now):
 
 def run_loop(tickers: set = None):
     ensure_tables()
+
+    human_fh = open(HUMAN_LOG_PATH, "a")
+    sys.stdout = _Tee(sys.__stdout__, human_fh)
+    sys.stderr = _Tee(sys.__stderr__, human_fh)
+    verbose_fh = open(VERBOSE_LOG_PATH, "a")
+
     ticker_label = ",".join(sorted(tickers)) if tickers else "all"
     print(f"Signal monitor started  |  poll={POLL_SECS}s  |  tickers={ticker_label}  |  Ctrl+C to stop")
 
@@ -1410,8 +1435,10 @@ def run_loop(tickers: set = None):
         if tickers:
             watchlist = [n for n in watchlist if n['ticker'] in tickers]
         def _refresh(ticker):
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            verbose_fh.write(f"\n--- {datetime.now():%Y-%m-%d %H:%M:%S} {ticker} ---\n")
+            with contextlib.redirect_stdout(verbose_fh), contextlib.redirect_stderr(verbose_fh):
                 fetch_live_data_smart(ticker)
+            verbose_fh.flush()
 
         refresh_tickers = {p['ticker'] for p in get_open_positions()} | {n['ticker'] for n in watchlist}
         with ThreadPoolExecutor(max_workers=1) as ex:

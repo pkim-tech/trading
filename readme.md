@@ -65,7 +65,9 @@ python active_signals.py positions  # show open positions
 
 **Console only:** works without any Slack config — blocks on stdin and prompts for execution price.
 
-Poll interval defaults to 300s and is controlled by `SIGNAL_POLL_SECS` in `.env`.
+Poll interval defaults to 300s and is controlled by `SIGNAL_POLL_SECS` in `.env` (currently set to 30s); override inline for a slower/quieter cadence when watching manually, e.g. `SIGNAL_POLL_SECS=90 python active_signals.py`.
+
+Logs write to `logs/active_signals.log` (human-readable — same lines shown on console) and `logs/active_signals_verbose.log` (per-ticker data-refresh detail, suppressed from console).
 
 ---
 

@@ -61,7 +61,8 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 - `identify_island_candidates` scoped to `allowed_tickers` (current run's tickers) — prevents silently dropping candidates whose B&H data wasn't cached for the current run
 - Cron job runs sweep daily at 4:15am
 - `backtest_cache.fixed_sl` column (v1.8+) — the swept `stop_loss` column holds trail_pct/trail_buy_pct for those strategies, not the real fixed SL; cache-hit lookups key on `fixed_sl` too so re-running with a different `execution.fixed_stop_loss` recomputes instead of silently reusing stale results
-- `dispatch_parallel_grid` batches `backtest_cache` writes via `executemany()` (chunks of 50, flushed at loop end) with an explicit column list instead of one positional `execute()` per node
+- `dispatch_parallel_grid` batches `backtest_cache` writes via `executemany()` (chunks of 50, flushed at loop end) with an explicit column list instead of one positional `execute()` per node — benchmarked 2026-07-03: not a speed win in isolation (28% slower than per-row inserts due to more frequent commits), kept for the correctness fix (silent insert failures). Real bottleneck is compute, not DB/IPC (profiler re-run confirms prior session's "88% result collection overhead" was a parallel-kernel-compute measurement artifact, not real overhead).
+- `ProcessPoolExecutor` initializer (`_warmup_worker`) pays each Numba kernel's one-time JIT compile cost (~600ms cold) at worker startup instead of on a random real grid node mid-sweep — all 5 kernels (`_simulate`, `_simulate_limit`, `_simulate_trail`, `_simulate_trail_buy`, `_simulate_trail_both`) warmed with tiny dummy arrays
 
 ---
 

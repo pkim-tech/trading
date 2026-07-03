@@ -12,7 +12,9 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from backtester import run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110, prep_inputs
+from backtester import (run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110,
+                        prep_inputs, _simulate, _simulate_limit, _simulate_trail, _simulate_trail_buy,
+                        _simulate_trail_both)
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
@@ -139,6 +141,29 @@ def _load_node_inputs(ticker, strategy_class, strategy_name, w, z_thresh):
         _NODE_INPUT_CACHE.clear()
     _NODE_INPUT_CACHE[key] = entry
     return entry
+
+
+def _warmup_worker():
+    """ProcessPoolExecutor initializer: pays each numba kernel's one-time JIT
+    compile cost at worker startup instead of on a random real grid node."""
+    prices    = np.array([100.0, 99.0, 101.0], dtype=np.float64)
+    hilo      = prices
+    hours     = np.array([9, 14, 9], dtype=np.int64)
+    daily_idx = np.array([0, 0, 0], dtype=np.int64)
+    sma_arr   = np.array([100.0], dtype=np.float64)
+    std_arr   = np.array([1.0], dtype=np.float64)
+    trend_arr = np.array([0.0], dtype=np.float64)
+
+    _simulate(prices, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
+              0.05, 0.05, 1, 9, 14, 2.0)
+    _simulate_limit(prices, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
+                     0.05, 0.05, 1, 9, 14, 2.0)
+    _simulate_trail(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
+                     0.05, 0.05, 1, 0.03, 9, 14, 2.0)
+    _simulate_trail_buy(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
+                         0.05, 0.05, 1, 0.03, 9, 14, 2.0)
+    _simulate_trail_both(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
+                          0.05, 0.05, 1, 0.03, 0.03, 9, 14, 2.0)
 
 
 def run_single_backtest_node_isolated(args):
@@ -719,7 +744,7 @@ if __name__ == "__main__":
     valid_tickers = [t for t in tickers if t in bh_cache]
     logger.info(f"Valid tickers with cache data: {len(valid_tickers)}/{len(tickers)}")
 
-    with ProcessPoolExecutor(max_workers=max_workers) as shared_pool:
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_warmup_worker) as shared_pool:
 
         if phase_only != 3:
             # ── Phase 1 ───────────────────────────────────────────────────────
