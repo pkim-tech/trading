@@ -4,6 +4,32 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 
 ---
 
+## 2026-07-03 — P0 fixes reviewed & accepted, numba warmup, log split, ADR 0001 (parity test redesign)
+
+### What we did
+- **Reviewed all 5 P0 live-trading fixes** (6216f59) one at a time with the user — TIME exit bar-counting, fixed_sl/trail_pct round-trip, signal-window alert, sell_alerted dedup, app.py config save. No correctness issues found. Added backlog item: manually test fixed_sl/trail_pct round-trip against a real v1.8 position before promoting it live (current watchlist is all v1.5, never exercises that code path; v1.8 had many sweep winners so it's a near-term promotion candidate).
+- **Perf retest (Haiku background agent)**: re-ran `scripts/profile_dispatch.py` and a new isolated DB-insert benchmark (old per-row `execute()` vs new batched `executemany()`, 12k synthetic rows). Batching is actually 28% *slower* (more frequent commits: every 50 rows vs old every 100) — not a speed win, kept only for the correctness fix (silent insert failures once `fixed_sl` became the 16th column). Confirmed prior session's "88% result collection overhead" was a measurement artifact (kernel time summed across 8 parallel workers, divided by wall-clock — double-counts); real workload is compute-bound, not IPC/DB-bound.
+- **Numba worker warmup**: added `_warmup_worker()` initializer to `run_optimization_sweep.py`'s `ProcessPoolExecutor` — pays each of the 5 kernels' one-time JIT compile cost (~600ms cold, confirmed) at worker startup instead of on a random real grid node mid-sweep.
+- **active_signals.py log split**: `logs/active_signals.log` (human-readable, tees console) + `logs/active_signals_verbose.log` (per-ticker `fetch_live_data_smart` chatter, previously discarded entirely). Verified stdout only shows the concise line, verbose chatter never touches console.
+- **SIGNAL_POLL_SECS** tightened to 30s in `.env` (untracked) — `fetch_live_data_smart` only hits Yahoo once/ticker/hour regardless of poll frequency (guard clause), so no added API load; makes the P0 #4 window-alert land reliably early instead of relying on luck. Inline override (`SIGNAL_POLL_SECS=90 python active_signals.py`) documented in readme for quieter manual/foreground runs.
+- Cleaned up root-dir clutter: `Results (7/8).csv`, `results.csv`, `config.json.bak` (byte-identical to config.json), `.operational_limits.md.swp`, `test_report.py` (throwaway 3-line smoke script).
+- **Feature-wrapped and committed** (74ec60f): numba warmup, log split, backlog item, doc updates (design.md, readme.md).
+- **Design discussion → ADR 0001** (`docs/adr/0001-live-parity-sim-vs-backtest.md`, new `docs/adr/` dir, lightweight Context/Decision/Consequences format): clarified `active_signals.py` is not a third implementation of trading rules — it delegates to `strategies.py`, adding only DB/Slack orchestration and derived-input computation. Audited that derived-input layer for the same drift risk that caused the P0 #1 bug (two independent computations of `hours_held`, one wrong): found `real_sl_pct`/`trail_pct` selection for fixed_sl strategies has **zero** test coverage (`verify_live_parity.py`'s `kernel_trades()` doesn't even branch on v1.9/v1.10), and `compute_buy_signal`'s "today" date-cutoff + intrabar-low proxy + live-price-fallback are all untested buy-side risks. Decided: extend `verify_live_parity.py` (not a new script) so its `replay()` calls `active_signals.py`'s real `compute_buy_signal`/`check_sell_condition` instead of calling `strategies.py` directly — both entry and exit sides together (a buy-side bug means there's nothing to feed the exit side, so partial coverage was explicitly rejected). Also decided `kernel_trades()` must keep recomputing fresh from `backtester.py` rather than reading `backtest_cache` — the DB only stores aggregates (not a real trade-by-trade ledger) and can go stale relative to current kernel code, the same staleness class P0 #2 just fixed elsewhere.
+
+### State at close
+- All P0 fixes accepted; `active_signals.py` still needs a restart to pick up all of this session's changes (never done this session).
+- ADR 0001 written but **not yet implemented** — user explicitly wants implementation done in a fresh context/session, not this one.
+- ADR file (`docs/adr/0001-live-parity-sim-vs-backtest.md`) is new/untracked as of this close — per `session close` semantics only `conversation_summary.md` gets committed, so this file needs a separate commit next session (or as part of implementing ADR 0001).
+
+### Next
+1. Implement ADR 0001: refactor `compute_buy_signal` for injectable `as_of`/`price_override`/`df_hourly_override`/`df_daily_override` (all default `None` = unchanged live behavior); swap `verify_live_parity.py`'s `replay()` to call the real `active_signals.compute_buy_signal`/`check_sell_condition`; add a throwaway SQLite DB per test run (needed for `check_sell_condition`'s internal `update_position_trail_state` write); add v1.8/v1.9/v1.10 test cases to `compare()` and extend `kernel_trades()` with `run_backtest_v19`/`run_backtest_v110` branches (currently absent).
+2. Do NOT re-litigate the ADR 0001 design — it was deliberately deferred to a fresh context specifically to implement cleanly, not to redesign.
+3. Commit `docs/adr/0001-live-parity-sim-vs-backtest.md` (currently untracked).
+4. Restart `active_signals.py` to pick up this session's changes (numba warmup doesn't apply to it, but log split + poll cadence do).
+5. Manually test v1.8 fixed_sl/trail_pct round-trip (backlog item) before promoting it live.
+
+---
+
 ## 2026-07-01 — Multi-watchlist, live/research modes, MULL corporate action investigation
 
 ### What we did
