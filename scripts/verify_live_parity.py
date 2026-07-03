@@ -1,23 +1,51 @@
 """
-Compares the Numba backtest kernels (backtester.py) against a bar-by-bar replay
-using the live-monitoring decision logic (strategies.py check_signal/check_exit).
+Compares the Numba backtest kernels (backtester.py) against active_signals.py's real
+live-orchestration functions (compute_buy_signal/check_sell_condition), replayed bar-by-bar.
 
-Ground truth is the kernel — if they disagree, the live logic has a bug (or vice versa).
-Reports the first divergent trade so the exact bar/rule can be pinpointed.
+Nominally the kernel is ground truth — if they disagree, the live orchestration layer has
+a bug (derived-input drift), not strategies.py itself (both call into the same strategies.py
+check_signal/check_exit). Reports the first divergent trade so the exact bar/rule can be
+pinpointed. See docs/adr/0001-live-parity-sim-vs-backtest.md for why this compares against
+active_signals.py directly instead of reimplementing the replay loop's own decision logic.
+
+KNOWN, EXPECTED mismatches as of 2026-07-03 (see docs/backlog.md "Look-ahead bias..." entry
+for full detail) — every case below currently reports MISMATCH, and that is not a live bug:
+  1. Look-ahead bias in the KERNEL, not live: run_optimization_sweep.py's df_daily includes
+     each day's own close in that day's SMA/std, and backtester.py's daily_idx looks up a
+     bar's own calendar day — so the kernel's entry signal uses same-day information no
+     intraday check could actually have. active_signals.compute_buy_signal's `today` cutoff
+     is the correct, realistic behavior; here the kernel is the one that's wrong. Affects
+     every strategy (all share the same generate_daily_indicators pattern + daily_idx
+     plumbing), so even plain ZScoreBreakout (no other known gaps) mismatches on this alone.
+  2. LimitOrderZScoreBreakout's live signal check uses current_price as a proxy for intrabar
+     low (no true low available live — see compute_buy_signal's 'low' key). The kernel uses
+     the real bar Low. This is a live-data-availability limitation, not a bug — see the ADR's
+     Consequences section.
+Until #1 is fixed (backlog item, needs a sweep rerun, out of scope for a quick patch), this
+script cannot report a clean MATCH — its value right now is catching *new, additional*
+divergence (e.g. via first-mismatch trade index/date moving in a run-to-run diff), not a
+binary pass/fail.
+
+v1.9/v1.10 (TrailingBuyZScoreBreakout/TrailingBothZScoreBreakout) are deliberately absent
+from compare() below: active_signals.py has no live entry implementation for the
+trailing-buy "wait for bounce" state machine yet (tracked as P0 #3), so comparing them here
+would just restate that known gap rather than test derived-input correctness. kernel_trades()
+still supports them so the wiring is ready once P0 #3 lands.
 
 Usage: .venv/bin/python scripts/verify_live_parity.py
 """
 import sys
+import tempfile
+import contextlib
 from pathlib import Path
+from datetime import datetime
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import strategies
-from backtester import run_backtest, run_backtest_v17, run_backtest_v18
+import active_signals
+from backtester import run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
-
-_RESULT_SIGN = {'WIN': 'WIN', 'TWIN': 'WIN', 'LOSS': 'LOSS', 'TLOSS': 'LOSS', 'OPEN': 'OPEN'}
 
 
 def _load(ticker):
@@ -28,93 +56,110 @@ def _load(ticker):
     return df, df_daily
 
 
+@contextlib.contextmanager
+def _throwaway_db():
+    """check_sell_condition persists trail_state via a real DB write — give it a scratch
+    DB per replay so trail-state round-trips correctly without touching the live DB."""
+    with tempfile.TemporaryDirectory() as d:
+        orig = active_signals.DB_PATH
+        active_signals.DB_PATH = Path(d) / "parity_test.db"
+        try:
+            active_signals.ensure_tables()
+            yield
+        finally:
+            active_signals.DB_PATH = orig
+
+
 def replay(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_pct,
            max_hold_hours, target_hours=(9, 14), trail_pct=None):
-    """Bar-by-bar replay using strategies.py check_signal/check_exit — mirrors what
-    active_signals.py would decide live, called every bar (streaming)."""
+    """Bar-by-bar replay that calls active_signals.py's real compute_buy_signal /
+    check_sell_condition — mirrors exactly what active_signals.py would decide live,
+    called every bar (streaming), including its DB-backed trail-state persistence."""
     df_hourly, df_daily = _load(ticker)
-    strat_cls = getattr(strategies, strategy_name)
-    kwargs = {'window': window, 'z_score_threshold': z_thresh}
-    if trail_pct is not None:
-        kwargs['trail_pct'] = trail_pct / 100.0
-    strat = strat_cls(**kwargs)
-    indicators = strat.generate_daily_indicators(df_daily)
 
-    take_profit = take_profit_pct / 100.0
-    stop_loss   = stop_loss_pct / 100.0
+    uses_fixed_sl = active_signals._uses_fixed_sl(strategy_name)
+    node = {
+        'ticker': ticker, 'strategy': strategy_name, 'version': 'test',
+        'window': window, 'z_score_threshold': z_thresh,
+        'take_profit': take_profit_pct, 'stop_loss': stop_loss_pct,
+        'max_hold_hours': max_hold_hours,
+        'trail_pct': trail_pct if uses_fixed_sl else None,
+        'fixed_sl': stop_loss_pct if uses_fixed_sl else None,
+    }
 
     trades = []
     in_trade = False
-    entry_price = entry_time = entry_bar_idx = None
-    state = {}
-    last_bar_seen = None
+    entry_price = entry_time = None
+    position_id = None
 
-    daily_lookup = {d.strftime('%Y-%m-%d'): i for i, d in enumerate(indicators.index)}
+    with _throwaway_db():
+        for i, ts in enumerate(df_hourly.index):
+            row = df_hourly.iloc[i]
+            cp, low, high = row['Close'], row['Low'], row['High']
+            df_slice = df_hourly.iloc[:i + 1]
 
-    for i, ts in enumerate(df_hourly.index):
-        row = df_hourly.iloc[i]
-        cp, low, high = row['Close'], row['Low'], row['High']
-        di = daily_lookup.get(ts.strftime('%Y-%m-%d'))
-        at_bar_close = True  # every hourly row here IS a bar close (historical replay)
+            if in_trade:
+                pos = next(p for p in active_signals.get_open_positions() if p['id'] == position_id)
+                reason, price, _ = active_signals.check_sell_condition(
+                    pos, cp, ts, at_bar_close=True, low=low, high=high, df_hourly=df_slice)
+                if reason:
+                    signal_time = datetime.strptime(pos['signal_time'], '%Y-%m-%d %H:%M:%S')
+                    hours_held = active_signals._bars_held(df_slice, signal_time)
+                    pc = (price - entry_price) / entry_price
+                    result = 'WIN' if reason in ('TP', 'WIN') else 'LOSS' if reason in ('SL', 'LOSS') else ('TWIN' if pc > 0 else 'TLOSS')
+                    trades.append({'Entry Time': entry_time, 'Exit Time': ts, 'Entry Price': entry_price,
+                                    'Exit Price': price, 'hours_held': hours_held, 'Result': result, 'Return': pc})
+                    active_signals.close_position(position_id, exit_signal_price=cp, exit_price=price,
+                                                   exit_time=ts, exit_reason=reason)
+                    in_trade = False
+                    position_id = None
+                continue
+
+            if ts.hour not in target_hours:
+                continue
+
+            sig = active_signals.compute_buy_signal(
+                node, as_of=ts, price_override=cp,
+                df_hourly_override=df_slice, df_daily_override=df_daily[df_daily.index <= ts])
+            if sig is None or sig['signal'] != 'BUY':
+                continue
+
+            entry_price = sig['lower_band'] if strategy_name == 'LimitOrderZScoreBreakout' else cp
+            entry_time = ts
+            active_signals.open_position(node, signal_price=cp, signal_time=ts, entry_price=entry_price, entry_time=ts)
+            position_id = next(p['id'] for p in active_signals.get_open_positions()
+                                if p['ticker'] == ticker and p['window'] == window)
+            in_trade = True
 
         if in_trade:
-            hours_held = i - entry_bar_idx
-            ctx = {
-                'current_price': cp, 'low': low, 'high': high,
-                'entry_price': entry_price,
-                'take_profit': take_profit, 'stop_loss': stop_loss,
-                'max_hours_to_hold': max_hold_hours,
-                'hours_held': hours_held, 'at_bar_close': at_bar_close,
-                'state': state,
-            }
-            reason, price, state = strat.check_exit(ctx)
-            if reason:
-                pc = (price - entry_price) / entry_price
-                result = 'WIN' if reason in ('TP', 'WIN') else 'LOSS' if reason in ('SL', 'LOSS') else ('TWIN' if pc > 0 else 'TLOSS')
-                trades.append({'Entry Time': entry_time, 'Exit Time': ts, 'Entry Price': entry_price,
-                                'Exit Price': price, 'hours_held': hours_held, 'Result': result, 'Return': pc})
-                in_trade = False
-                state = {}
-            continue
-
-        if di is None:
-            continue
-        ind_row = indicators.iloc[di]
-        if ts.hour not in target_hours:
-            continue
-
-        sig_ctx = {
-            'current_price': cp, 'low': low,
-            'sma': ind_row['SMA'], 'std': ind_row['Std'],
-            'trend': ind_row['Trend_Filter'] if 'Trend_Filter' in indicators.columns else None,
-        }
-        signal = strat.check_signal(sig_ctx)
-        if signal == 'BUY':
-            in_trade = True
-            entry_price = low if strategy_name == 'LimitOrderZScoreBreakout' else cp
-            if strategy_name == 'LimitOrderZScoreBreakout':
-                entry_price = ind_row['SMA'] - ind_row['Std'] * z_thresh  # lower_band, matches kernel
-            entry_time = ts
-            entry_bar_idx = i
-            state = {}
-
-    if in_trade:
-        cp = df_hourly['Close'].iloc[-1]
-        pc = (cp - entry_price) / entry_price
-        trades.append({'Entry Time': entry_time, 'Exit Time': df_hourly.index[-1], 'Entry Price': entry_price,
-                        'Exit Price': cp, 'hours_held': len(df_hourly) - 1 - entry_bar_idx, 'Result': 'OPEN', 'Return': pc})
+            cp = df_hourly['Close'].iloc[-1]
+            pc = (cp - entry_price) / entry_price
+            signal_time = datetime.strptime(entry_time.strftime('%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S')
+            hours_held = active_signals._bars_held(df_hourly, signal_time)
+            trades.append({'Entry Time': entry_time, 'Exit Time': df_hourly.index[-1], 'Entry Price': entry_price,
+                            'Exit Price': cp, 'hours_held': hours_held, 'Result': 'OPEN', 'Return': pc})
 
     return trades
 
 
 def kernel_trades(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_pct,
-                   max_hold_hours, target_hours=(9, 14), trail_pct=None):
+                   max_hold_hours, target_hours=(9, 14), trail_pct=None, trail_buy_pct=None):
     df_hourly, df_daily = _load(ticker)
-    strat_cls = getattr(strategies, strategy_name)
+    strat_cls = getattr(active_signals.strategies, strategy_name)
     strat = strat_cls(window=window, z_score_threshold=z_thresh)
     indicators = strat.generate_daily_indicators(df_daily)
 
-    if strategy_name == 'TrailingExitZScoreBreakout':
+    if strategy_name == 'TrailingBothZScoreBreakout':
+        return run_backtest_v110(df_hourly, indicators, ticker, target_hours=target_hours,
+                                  take_profit=take_profit_pct/100.0, stop_loss=stop_loss_pct/100.0,
+                                  max_hours_to_hold=max_hold_hours, z_score_threshold=z_thresh,
+                                  trail_buy_pct=trail_buy_pct/100.0, trail_pct=trail_pct/100.0)
+    elif strategy_name == 'TrailingBuyZScoreBreakout':
+        return run_backtest_v19(df_hourly, indicators, ticker, target_hours=target_hours,
+                                 take_profit=take_profit_pct/100.0, stop_loss=stop_loss_pct/100.0,
+                                 max_hours_to_hold=max_hold_hours, z_score_threshold=z_thresh,
+                                 trail_buy_pct=trail_buy_pct/100.0)
+    elif strategy_name == 'TrailingExitZScoreBreakout':
         return run_backtest_v18(df_hourly, indicators, ticker, target_hours=target_hours,
                                  take_profit=take_profit_pct/100.0, stop_loss=stop_loss_pct/100.0,
                                  max_hours_to_hold=max_hold_hours, z_score_threshold=z_thresh,

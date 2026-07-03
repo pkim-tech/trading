@@ -512,7 +512,7 @@ def _hurst_adf(ticker, df_hourly):
     return hurst, adf_p
 
 
-def compute_buy_signal(node):
+def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override=None, df_daily_override=None):
     ticker = node['ticker']
     window = int(node['window'])
 
@@ -520,13 +520,16 @@ def compute_buy_signal(node):
     if strategy_cls is None:
         return None
 
-    df_hourly, df_daily = _load_cache(ticker)
+    if df_hourly_override is not None:
+        df_hourly, df_daily = df_hourly_override, df_daily_override
+    else:
+        df_hourly, df_daily = _load_cache(ticker)
     if df_hourly is None or len(df_daily) < window:
         return None
 
     z_thresh = float(node.get('z_score_threshold', 2.0))
     strat = strategy_cls(window=window, z_score_threshold=z_thresh)
-    today = pd.Timestamp.now().normalize()
+    today = (as_of if as_of is not None else pd.Timestamp.now()).normalize()
     indicators = strat.generate_daily_indicators(df_daily[df_daily.index < today])
     if indicators.empty:
         return None
@@ -536,12 +539,15 @@ def compute_buy_signal(node):
     last_bar      = close_series.index[-1]
     daily_closes = df_daily['Close'].dropna()
     prev_close = float(daily_closes.iloc[-1]) if not daily_closes.empty else close_series.iloc[-1]
-    try:
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            hist = ex.submit(lambda: yf.Ticker(ticker).history(period='1d', interval='1m', prepost=True)).result(timeout=10)
-        current_price = float(hist['Close'].iloc[-1]) if not hist.empty else close_series.iloc[-1]
-    except Exception:
-        current_price = close_series.iloc[-1]
+    if price_override is not None:
+        current_price = price_override
+    else:
+        try:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                hist = ex.submit(lambda: yf.Ticker(ticker).history(period='1d', interval='1m', prepost=True)).result(timeout=10)
+            current_price = float(hist['Close'].iloc[-1]) if not hist.empty else close_series.iloc[-1]
+        except Exception:
+            current_price = close_series.iloc[-1]
     sma           = last_row['SMA']
     std           = last_row['Std']
     hurst, adf_p  = _hurst_adf(ticker, df_hourly)

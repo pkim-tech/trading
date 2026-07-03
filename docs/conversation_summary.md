@@ -4,6 +4,30 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 
 ---
 
+## 2026-07-03 — ADR 0001 implemented; discovered look-ahead bias in every backtest kernel
+
+### What we did
+- **Implemented ADR 0001** (`docs/adr/0001-live-parity-sim-vs-backtest.md`): `active_signals.compute_buy_signal` now takes optional `as_of`/`price_override`/`df_hourly_override`/`df_daily_override` (all default `None` = unchanged live behavior). `scripts/verify_live_parity.py` rewritten — `replay()` now calls the real `active_signals.compute_buy_signal`/`check_sell_condition` through a throwaway per-run SQLite DB (needed since `check_sell_condition` persists `trail_state` via a real DB write), instead of reimplementing its own decision logic. `check_sell_condition` needed no changes (already injectable). `kernel_trades()` extended with `run_backtest_v19`/`run_backtest_v110` branches for v1.9/v1.10 wiring, but v1.9/v1.10 were **not** added to `compare()` — audit found `active_signals.py` has zero live entry logic for the "wait for bounce" trailing-buy state machine (P0 #3, already known), so comparing them would just restate that gap rather than test derived-input correctness. Test-first: harness is ready for when P0 #3 lands.
+- **Immediately surfaced a major, unplanned finding**: switching the parity test to call real `compute_buy_signal` made every test case mismatch, including plain `ZScoreBreakout` with no other known gaps. Traced to a genuine look-ahead bias in the kernel, confirmed by direct code trace (not inference): `run_optimization_sweep.py:135-137` builds daily SMA/std including that day's own closing price; `backtester.py:16-30` (`prep_inputs`) maps each hourly bar to its own calendar day's indicator row — so a 9:30am/2:30pm intraday check uses a same-day close that doesn't exist yet at that hour. Structural, not strategy-specific — every strategy in `strategies.py` shares the same `generate_daily_indicators`/`daily_idx` plumbing. Exit side (`check_exit`) unaffected (no sma/std references there). Only `active_signals.py`'s three live functions (`compute_buy_signal`, `_chart_buy`, `_chart_sell`) correctly exclude "today."
+- **Mapped full blast radius**: grepped every `generate_daily_indicators`/`resample('D')` call site — one root cause, not several. Every trade-simulating page/script (`pages/2_Node_Inspector.py`, `pages/4_Portfolio.py`, `pages/7_Hurst_Filter.py`, `pages/8_ADF_Filter.py`, `pages/9_Entry_Delay.py`, `hurst_filter_sweep.py`, `open_fill_analysis.py`) reuses `backtester.run_backtest`/`run_backtest_v17` — same kernel, same bug — rather than an independent reimplementation. Other bias categories checked and ruled out: trailing-stop/peak tracking, `_bars_held`, entry/TP/SL fill prices all use only already-realized bar data.
+- **Quantified impact** on the live watchlist (AGQ/EDC/FAS/HIBL, all v1.5 ZScoreBreakout w=10) using the new harness directly: alpha stays positive for all four after removing the bias, but was overstated ~3x (EDC, HIBL) to 7x+ (AGQ, FAS) — kernel alpha 308-665% vs corrected-replay alpha 40-202%. Trade counts also diverge substantially (e.g. AGQ 18→31). Also means the sweep's *relative ranking* across all tickers is suspect, not just these four's magnitude.
+- **Why didn't the earlier full-codebase review catch this?** `docs/code_review_findings.md` scoped itself to inter-implementation consistency (does `active_signals.py` match `strategies.py`/`backtester.py`); its reference tool (the *old* `verify_live_parity.py`) reimplemented the kernel's same-day-inclusive convention rather than calling live's `today` cutoff, so it was structurally blind to this class of bug. The code is also unremarkable in isolation (idiomatic pandas rolling) — the bug is purely in temporal alignment, which only a "what's actually knowable live" comparison (i.e. this session's ADR 0001 rewrite) could reveal.
+- **Backlog additions**: full write-up of the bias (mechanism, blast radius, quantified impact, review-gap explanation) as a new High Priority item in `docs/backlog.md`. Also added a Low-Priority research idea (user's insight): the bias mechanically makes entry *harder* on days with a large move (same-day close pulls SMA down and inflates STD, pushing `lower_band` further away) — matches measured direction (fewer kernel trades, not more). Open question: does a same-day realized-intraday-vol-gated variant (no future info) preserve any of that effect, or does it evaporate once done honestly (mean-reversion caveat: sigma should come back down post-spike if genuinely mean-reverting).
+- Updated `docs/design.md`'s description of `scripts/verify_live_parity.py` to reflect what it actually does now.
+
+### State at close
+- ADR 0001 code changes done, verified via direct runs (both the generic 4-ticker test set and the 4 real watchlist nodes).
+- `active_signals.py` live process deliberately **not** restarted this session — user explicitly said no need, long weekend, no reason to.
+- The look-ahead bias fix itself (excluding same-day close in the sweep path, mirroring `compute_buy_signal`) is **not implemented** — flagged as a substantial rerun requiring its own scoping session, not a quick patch.
+
+### Next
+1. Decide scope/timing for the look-ahead bias fix + sweep rerun (see backlog High Priority item) — this could reshuffle which tickers/nodes are worth trading at all, not just the current watchlist's four.
+2. Consider the same-day realized-vol-gated research idea (backlog, Low Priority/Ideas) as a way to test whether the bias encodes any real signal or is pure noise-selection.
+3. Manually test v1.8 fixed_sl/trail_pct round-trip (carried over from prior session, still open, current watchlist is all v1.5 so never exercises that path).
+4. Restart `active_signals.py` whenever convenient (not urgent — no code changes since last restart affect it beyond what's already been running, aside from ADR 0001's `compute_buy_signal` signature change, which is backward-compatible with no-arg calls).
+
+---
+
 ## 2026-07-03 — P0 fixes reviewed & accepted, numba warmup, log split, ADR 0001 (parity test redesign)
 
 ### What we did
