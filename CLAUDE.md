@@ -2,9 +2,9 @@
 
 ## Session Commands
 - `go` — session start: read the first ~60 lines of `docs/session_cache.md` and give a brief summary of where we left off and what's next.
-- `session close` — session end: prepend a session summary to `docs/session_cache.md` (insert after the header, before existing entries). Keep only the 10 most recent entries; drop older ones. No commits, no tests, no skills. If context is low and reading the file first is not feasible, write the summary to a new file `docs/session_cache_new.md` instead.
+- `session close` — session end: write the session summary to two places: (1) prepend to `docs/session_cache.md` (insert after the header, before existing entries; keep only the 10 most recent entries, drop older ones — this file is gitignored, not committed), and (2) append the same summary to `docs/conversation_summary.md` (permanent, uncapped, committed — this is the durable record, since entries dropped from session_cache.md are not recoverable). Commit only `docs/conversation_summary.md`. No tests, no skills. If context is low and reading the file first is not feasible, write the summary to a new file `docs/session_cache_new.md` instead.
 - `feature wrap` — mid-session feature complete: update relevant docs, review pre-commit checklist (`docs/pre_commit_checklist.md`) manually, and commit. Does not trigger session close. **Do not invoke any skills (especially verify) during this command.**
-- `session wrap` — in order: (1) update relevant docs, (2) review pre-commit checklist manually, (3) commit, (4) prepend session summary to `docs/session_cache.md`. **Do not invoke any skills.**
+- `session wrap` — in order: (1) update relevant docs, (2) review pre-commit checklist manually, (3) write the session summary to both `docs/session_cache.md` (prepend, cap 10) and `docs/conversation_summary.md` (append, uncapped), (4) commit everything including both files. **Do not invoke any skills.**
 
 ## Project Overview
 A z-score mean reversion backtesting and optimization system targeting leveraged ETFs. Runs parallel grid sweeps over take profit, stop loss, and hold time parameters to find optimal strategy configurations with positive alpha vs SPY. Now in live trading phase with manual execution via Schwab.

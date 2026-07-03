@@ -4,6 +4,33 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 
 ---
 
+## 2026-07-01 — Multi-watchlist, live/research modes, MULL corporate action investigation
+
+### What we did
+
+- **Multi-watchlist support** (committed `6d4ab1c`): `watchlists` table with named profiles; one is_active drives signal loop. `watch_list` gains `watchlist_id` + `mode` (live/research). Migration runs automatically on next `ensure_tables()` call — existing 12 nodes moved to 'main'. Active signals suppresses Slack for `mode='research'` nodes (console-only).
+- **Winners page**: sidebar watchlist picker, create/delete/set-active controls, Mode selectbox in data editor.
+- **Portfolio page**: sidebar watchlist picker.
+- **Watchlist backup**: `cache/watchlist_backup_20260701.json` — 12-node snapshot before trimming.
+- **MULL corporate action investigation**: MULL had a 25:1 forward split on 2026-06-26. yfinance daily and cache are correctly split-adjusted (÷25); the "97% drop" on Google Finance is Google showing unadjusted prices. yfinance hourly has a bug where it returns 25x higher prices for pre-split dates vs daily — cache is on the correct scale and internally consistent. Backtesting results valid.
+
+### Current State
+
+- Watchlist: 12 nodes in 'main' (all mode=live). User was trimming to 7 — not yet done.
+- run_optimization_sweep.py has uncommitted changes from prior session (Phase 2.5, island check fix).
+- `docs/session_cache_addendum.md` still untracked — contains prior session notes, can be deleted or committed.
+
+### Next Session
+
+1. Trim watchlist to 7 nodes (use Winners page → uncheck Watch, or sidebar picker)
+2. Decide between AGQ v1.5 (w=10 z=2.0 TP=19 SL=8 hold=133h) vs v1.6 (w=20 z=1.0 TP=28 SL=11 hold=140h)
+3. Mark some nodes as 'research' vs 'live' once list is trimmed
+4. Commit run_optimization_sweep.py (Phase 2.5 + island check fix)
+5. Fix Phase 2.5 to sweep all 3 island centers × all (w,z) combos (backlog item added)
+6. Review MULL/VRTL/NBIZ single-stock nodes before trading
+
+---
+
 ## 2026-07-01 (addendum) — v1.6 Sweep Execution + Cliff Analysis
 
 ### What we did
