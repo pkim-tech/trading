@@ -1,7 +1,7 @@
 #!/bin/bash
-# Sweep all 26 qualified 3x index tickers across v1.4, v1.5, v1.6, v1.7, v1.8.
+# Sweep all 26 qualified 3x index tickers across v1.4–v1.10.
 # Cache dedup skips already-computed nodes automatically.
-# Usage: ./scripts/run_new_tickers_sweep.sh [v1.4|v1.5|v1.6|v1.7|v1.8]
+# Usage: ./scripts/run_new_tickers_sweep.sh [v1.4|v1.5|v1.6|v1.7|v1.8|v1.9|v1.10]
 #   No arg = run all versions in sequence.
 
 set -e
@@ -38,20 +38,33 @@ run_version() {
     echo " $version — $(date)"
     echo "======================================================"
     case "$version" in
-        v1.4) patch_config v1.4 TrendFilteredZScore 7 ;;
-        v1.5) patch_config v1.5 ZScoreBreakout 7 ;;
-        v1.6) patch_config v1.6 ZScoreBreakout 7 ;;
-        v1.7) patch_config v1.7 LimitOrderZScoreBreakout 7 ;;
-        v1.8) patch_config v1.8 TrailingExitZScoreBreakout 7 ;;
+        v1.4)  patch_config v1.4  TrendFilteredZScore          7 ;;
+        v1.5)  patch_config v1.5  ZScoreBreakout               7 ;;
+        v1.6)  patch_config v1.6  ZScoreBreakout               7 ;;
+        v1.7)  patch_config v1.7  LimitOrderZScoreBreakout     7 ;;
+        v1.8)  patch_config v1.8  TrailingExitZScoreBreakout   7 ;;
+        v1.9)  patch_config v1.9  TrailingBuyZScoreBreakout    7 ;;
+        v1.10) patch_config v1.10 TrailingBothZScoreBreakout   7 ;;
         *) echo "Unknown version: $version"; exit 1 ;;
     esac
     $PYTHON run_optimization_sweep.py --version "$version" --tickers $TICKERS
 }
 
-VERSIONS="${1:-v1.4 v1.5 v1.6 v1.7 v1.8}"
-for v in $VERSIONS; do
-    run_version "$v"
-done
+if [ -z "$1" ]; then
+    # v1.9 preview for live watchlist tickers first
+    echo ""
+    echo "======================================================"
+    echo " v1.9 preview (EDC FAS HIBL SOXL) — $(date)"
+    echo "======================================================"
+    patch_config v1.9 TrailingBuyZScoreBreakout 7
+    $PYTHON run_optimization_sweep.py --version v1.9 --tickers EDC FAS HIBL SOXL
+
+    for v in v1.10 v1.4 v1.5 v1.6 v1.7 v1.8 v1.9; do
+        run_version "$v"
+    done
+else
+    run_version "$1"
+fi
 
 echo ""
 echo "All done — $(date)"

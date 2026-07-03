@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
-from backtester import run_backtest, run_backtest_v17, run_backtest_v18
+from backtester import run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache
 
@@ -133,7 +133,21 @@ def run_single_backtest_node_isolated(args):
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR"}
 
     try:
-        if issubclass(strategy_class, strategies.TrailingExitZScoreBreakout):
+        if issubclass(strategy_class, strategies.TrailingBothZScoreBreakout):
+            trades = run_backtest_v110(
+                df_hourly_raw, df_daily_processed, ticker,
+                take_profit=float(tp / 100.0), stop_loss=float(fixed_sl / 100.0),
+                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh),
+                trail_buy_pct=float(sl / 100.0), trail_pct=0.03
+            )
+        elif issubclass(strategy_class, strategies.TrailingBuyZScoreBreakout):
+            trades = run_backtest_v19(
+                df_hourly_raw, df_daily_processed, ticker,
+                take_profit=float(tp / 100.0), stop_loss=float(fixed_sl / 100.0),
+                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh),
+                trail_buy_pct=float(sl / 100.0)
+            )
+        elif issubclass(strategy_class, strategies.TrailingExitZScoreBreakout):
             trades = run_backtest_v18(
                 df_hourly_raw, df_daily_processed, ticker,
                 take_profit=float(tp / 100.0), stop_loss=float(fixed_sl / 100.0),

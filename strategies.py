@@ -145,6 +145,73 @@ class LimitOrderZScoreBreakout(BaseStrategy):
         return None, None, ctx.get('state', {})
 
 
+class TrailingBuyZScoreBreakout(BaseStrategy):
+    """v1.9: after z-score signal, waits for price to bounce trail_buy_pct% above running low before entering.
+    Exit: fixed TP (bar-close) + fixed SL (intrabar) + hold cap. Mirrors backtester._simulate_trail_buy."""
+
+    def generate_daily_indicators(self, df_daily):
+        w = self.params.get('window', 10)
+        df = df_daily.copy()
+        df['SMA'] = df['Close'].rolling(window=w).mean()
+        df['Std'] = df['Close'].rolling(window=w).std()
+        return df[['SMA', 'Std']].dropna()
+
+    def check_signal(self, ctx):
+        sma, std = ctx['sma'], ctx['std']
+        if std == 0 or pd.isna(sma) or pd.isna(std):
+            return 'HOLD'
+        threshold = self.params.get('z_score_threshold', 2.0)
+        return 'BUY' if _entry_price_field(ctx) <= sma - std * threshold else 'HOLD'
+
+    def check_exit(self, ctx):
+        ep = ctx['entry_price']
+        stop_price = ep * (1 - ctx['stop_loss'])
+        tp_price   = ep * (1 + ctx['take_profit'])
+        if ctx['low'] <= stop_price:
+            return 'SL', stop_price, ctx.get('state', {})
+        if not ctx.get('at_bar_close', True):
+            return None, None, ctx.get('state', {})
+        if ctx['current_price'] >= tp_price:
+            return 'TP', ctx['current_price'], ctx.get('state', {})
+        if ctx['hours_held'] >= ctx['max_hours_to_hold']:
+            return 'TIME', ctx['current_price'], ctx.get('state', {})
+        return None, None, ctx.get('state', {})
+
+
+class TrailingBothZScoreBreakout(TrailingBuyZScoreBreakout):
+    """v1.10: trailing entry (bounce above running low) + trailing exit once TP% cleared.
+    Mirrors backtester._simulate_trail_both."""
+
+    def check_exit(self, ctx):
+        ep = ctx['entry_price']
+        state = dict(ctx.get('state', {}))
+        stop_price = ep * (1 - ctx['stop_loss'])
+        tp_price   = ep * (1 + ctx['take_profit'])
+        trail_pct  = self.params.get('trail_pct', 0.03)
+
+        if state.get('trailing'):
+            peak = max(state.get('peak', ep), ctx['high'])
+            state['peak'] = peak
+            trail_stop = peak * (1 - trail_pct)
+            if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
+                exit_px = trail_stop if ctx['low'] <= trail_stop else ctx['current_price']
+                reason = 'WIN' if exit_px > ep else 'LOSS'
+                return reason, exit_px, state
+            return None, None, state
+
+        if ctx['low'] <= stop_price:
+            return 'SL', stop_price, state
+        if not ctx.get('at_bar_close', True):
+            return None, None, state
+        if ctx['current_price'] >= tp_price:
+            state['trailing'] = True
+            state['peak'] = ctx['current_price']
+            return None, None, state
+        if ctx['hours_held'] >= ctx['max_hours_to_hold']:
+            return 'TIME', ctx['current_price'], state
+        return None, None, state
+
+
 class TrendFilteredZScore(BaseStrategy):
     def generate_daily_indicators(self, df_daily):
         w = self.params.get('window', 10)
