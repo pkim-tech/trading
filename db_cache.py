@@ -60,12 +60,13 @@ def refresh_dropdown_cache():
     print(f"Cached {len(versions)} versions: {versions}")
 
 
-def refresh_pivot_cache():
+def refresh_pivot_cache(versions=None):
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_table(conn)
-        versions = [r[0] for r in conn.execute(
-            "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
-        ).fetchall()]
+        if versions is None:
+            versions = [r[0] for r in conn.execute(
+                "SELECT DISTINCT version FROM backtest_cache ORDER BY version DESC"
+            ).fetchall()]
 
         for v in versions:
             print(f"  pivot cache: {v}...")

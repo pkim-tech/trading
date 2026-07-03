@@ -736,7 +736,7 @@ if __name__ == "__main__":
 
     logger.info("\nFinal cache refresh...")
     refresh_dropdown_cache()
-    refresh_pivot_cache()
+    refresh_pivot_cache(versions=[config_version])
 
     for p in ["current_test.json", "active_phase_grid.json"]:
         if os.path.exists(p):

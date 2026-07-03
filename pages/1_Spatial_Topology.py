@@ -175,20 +175,29 @@ else:
                 if true_min == true_max:
                     true_max = true_min + 1.0
 
-                # Hard clamp optimization for extreme outliers
-                slider_min = true_min
-                default_handle_value = 0.0 if true_max > 0 else true_min
+                invert_slider = st.checkbox("Invert slider", value=False,
+                    help="Inverted: slider sets a MAX cutoff — drag left to hide high-alpha nodes.")
 
-                alpha_cutoff = st.slider(
-                    "Min Alpha vs SPY (%)",
-                    min_value=float(true_min),
-                    max_value=float(true_max),
-                    value=float(true_min),
-                    step=0.5,
-                    help="Nodes falling below this threshold will be hidden from the map."
-                )
-                
-                df_plot_final = df_plot_base[df_plot_base['alpha_vs_spy'] >= alpha_cutoff].copy()
+                if invert_slider:
+                    alpha_cutoff = st.slider(
+                        "Max Alpha vs SPY (%)",
+                        min_value=float(true_min),
+                        max_value=float(true_max),
+                        value=float(true_max),
+                        step=0.5,
+                        help="Nodes above this threshold will be hidden from the map."
+                    )
+                    df_plot_final = df_plot_base[df_plot_base['alpha_vs_spy'] <= alpha_cutoff].copy()
+                else:
+                    alpha_cutoff = st.slider(
+                        "Min Alpha vs SPY (%)",
+                        min_value=float(true_min),
+                        max_value=float(true_max),
+                        value=float(true_min),
+                        step=0.5,
+                        help="Nodes falling below this threshold will be hidden from the map."
+                    )
+                    df_plot_final = df_plot_base[df_plot_base['alpha_vs_spy'] >= alpha_cutoff].copy()
                 
                 # 💎 RESTORED CRITICAL WIDGET: Kept variable alive inside the data path
                 lock_axis_scaling = st.checkbox(
@@ -205,15 +214,16 @@ else:
                 st.caption("No points available in current configuration.")
                 
 
-        # --- Calculate Dynamic vs Anchored Viewport Ranges ---
-        if lock_axis_scaling and not df_plot_base.empty:
-            x_range = [float(df_plot_base[x_col].min()), float(df_plot_base[x_col].max())]
-            y_range = [float(df_plot_base[y_col].min()), float(df_plot_base[y_col].max())]
-            z_range = [float(df_plot_base[z_col].min()), float(df_plot_base[z_col].max())]
-            
-            x_range = [x_range[0] - (x_range[1]-x_range[0])*0.05 if x_range[1]!=x_range[0] else x_range[0]-1, x_range[1] + (x_range[1]-x_range[0])*0.05 if x_range[1]!=x_range[0] else x_range[1]+1]
-            y_range = [y_range[0] - (y_range[1]-y_range[0])*0.05 if y_range[1]!=y_range[0] else y_range[0]-1, y_range[1] + (y_range[1]-y_range[0])*0.05 if y_range[1]!=y_range[0] else y_range[1]+1]
-            z_range = [z_range[0] - (z_range[1]-z_range[0])*0.05 if z_range[1]!=z_range[0] else z_range[0]-1, z_range[1] + (z_range[1]-z_range[0])*0.05 if z_range[1]!=z_range[0] else z_range[1]+1]
+        # --- Calculate Anchored Viewport Ranges ---
+        # Always pin axes to the pre-filter (df_plot_base) range so nodes vanish in place
+        # rather than the grid reshaping around the filtered subset.
+        if not df_plot_base.empty:
+            def _padded(lo, hi):
+                pad = (hi - lo) * 0.05 if hi != lo else 1.0
+                return [lo - pad, hi + pad]
+            x_range = _padded(float(df_plot_base[x_col].min()), float(df_plot_base[x_col].max()))
+            y_range = _padded(float(df_plot_base[y_col].min()), float(df_plot_base[y_col].max()))
+            z_range = _padded(float(df_plot_base[z_col].min()), float(df_plot_base[z_col].max()))
         else:
             x_range, y_range, z_range = None, None, None
 
@@ -243,6 +253,8 @@ else:
                 mode='markers',
                 marker=dict(
                     size=6, color=df_plot_final["alpha_vs_spy"], colorscale='RdYlGn', cmid=0.0,
+                    cmin=float(df_plot_base['alpha_vs_spy'].min()),
+                    cmax=float(df_plot_base['alpha_vs_spy'].max()),
                     colorbar=dict(title="Alpha vs SPY %", x=1.05), opacity=0.8,
                     line=dict(color='black', width=0.3)
                 ),

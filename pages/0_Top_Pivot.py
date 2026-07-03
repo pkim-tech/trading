@@ -240,6 +240,52 @@ function sortTable(col) {
 st.html(build_pivot_html(pivot, best_nodes, version, wz_cols, underlier_map))
 
 st.divider()
+st.subheader("Universe — Best Alpha by Strategy")
+
+STRAT_SHORT = {
+    'ZScoreBreakout':             'ZSB',
+    'TrendFilteredZScore':        'TrendF',
+    'LimitOrderZScoreBreakout':   'Limit',
+    'TrailingExitZScoreBreakout': 'Trail',
+}
+
+@st.cache_data(ttl=3600)
+def load_strategy_pivot(min_trades_val):
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql("""
+            SELECT ticker, strategy, MAX(alpha_vs_spy) AS best_alpha
+            FROM backtest_cache
+            WHERE trades >= ?
+            GROUP BY ticker, strategy
+        """, conn, params=(min_trades_val,))
+        bh = pd.read_sql("""
+            SELECT ticker, MAX(asset_bh) AS bh
+            FROM backtest_cache
+            WHERE trades >= ? AND asset_bh IS NOT NULL
+            GROUP BY ticker
+        """, conn, params=(min_trades_val,))
+    df['col'] = df['strategy'].map(STRAT_SHORT).fillna(df['strategy'])
+    piv = df.pivot_table(index='ticker', columns='col', values='best_alpha', aggfunc='max')
+    piv['max'] = piv.max(axis=1)
+    piv = piv.join(bh.set_index('ticker')['bh'], how='left')
+    return piv.sort_values('max', ascending=False).round(1)
+
+strat_piv = load_strategy_pivot(int(min_trades))
+if not strat_piv.empty:
+    _ss = load_single_stock_tickers()
+    _ix = load_index_tickers()
+    if exclude_single_stock:
+        strat_piv = strat_piv[~strat_piv.index.isin(_ss)]
+    if exclude_index:
+        strat_piv = strat_piv[~strat_piv.index.isin(_ix)]
+    strat_piv = strat_piv[strat_piv['max'] >= min_return]
+    scols = [c for c in strat_piv.columns if c not in ('max', 'bh')]
+    col_cfg_s = {c: st.column_config.NumberColumn(c, format="%.1f%%") for c in scols}
+    col_cfg_s['max'] = st.column_config.NumberColumn('Best α', format="%.1f%%")
+    col_cfg_s['bh']  = st.column_config.NumberColumn('B&H %', format="%.1f%%")
+    st.dataframe(strat_piv, use_container_width=True, column_config=col_cfg_s)
+
+st.divider()
 st.subheader("Watchlist — Alpha by Strategy")
 
 
