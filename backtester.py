@@ -13,6 +13,44 @@ _RESULT_NAMES = {WIN: 'WIN', LOSS: 'LOSS', TWIN: 'TWIN', TLOSS: 'TLOSS', OPEN: '
 MAX_TRADES = 5000
 
 
+def prep_inputs(df_hourly, df_daily_indicators):
+    """Kernel input arrays. Depends only on (hourly data, indicators) — cacheable
+    per (ticker, strategy, window) across grid nodes; z/tp/sl/hold are kernel args."""
+    timestamps = df_hourly.index
+    date_strs = timestamps.strftime('%Y-%m-%d')
+    daily_lookup = {d: i for i, d in enumerate(df_daily_indicators.index.strftime('%Y-%m-%d'))}
+    prices = df_hourly['Close'].to_numpy(dtype=np.float64)
+    has_trend = 'Trend_Filter' in df_daily_indicators.columns
+    return {
+        'timestamps': timestamps,
+        'prices':     prices,
+        'highs':      df_hourly['High'].to_numpy(dtype=np.float64) if 'High' in df_hourly.columns else prices,
+        'lows':       df_hourly['Low'].to_numpy(dtype=np.float64) if 'Low' in df_hourly.columns else prices,
+        'hours':      timestamps.hour.to_numpy(dtype=np.int64),
+        'daily_idx':  np.array([daily_lookup.get(d, -1) for d in date_strs], dtype=np.int64),
+        'sma_arr':    df_daily_indicators['SMA'].to_numpy(dtype=np.float64),
+        'std_arr':    df_daily_indicators['Std'].to_numpy(dtype=np.float64),
+        'trend_arr':  df_daily_indicators['Trend_Filter'].to_numpy(dtype=np.float64) if has_trend else np.zeros(1, dtype=np.float64),
+        'has_trend':  has_trend,
+    }
+
+
+def _build_trades(ticker, timestamps, ei, xi, ep, xp, held, res, ret):
+    trades = []
+    for k in range(len(ei)):
+        trades.append({
+            'Ticker':      ticker,
+            'Entry Time':  timestamps[ei[k]],
+            'Entry Price': ep[k],
+            'Exit Time':   timestamps[xi[k]],
+            'Exit Price':  xp[k],
+            'hours_held':  int(held[k]),
+            'Result':      _RESULT_NAMES[res[k]],
+            'Return':      ret[k]
+        })
+    return trades
+
+
 @njit(cache=True)
 def _simulate(prices, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
               take_profit, stop_loss, max_hours_to_hold, target_h0, target_h1, z_thresh):
@@ -235,44 +273,18 @@ def _simulate_limit(prices, lows, hours, daily_idx, sma_arr, std_arr, trend_arr,
 
 def run_backtest_v17(df_hourly, df_daily_indicators, ticker,
                      mode="BACKTEST", target_hours=(9, 14),
-                     take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28, z_score_threshold=2.0):
-    prices = df_hourly['Close'].to_numpy(dtype=np.float64)
-    lows   = df_hourly['Low'].to_numpy(dtype=np.float64)
-    timestamps = df_hourly.index
-    hours = timestamps.hour.to_numpy(dtype=np.int64)
-    date_strs = timestamps.strftime('%Y-%m-%d')
-
-    daily_date_strs = df_daily_indicators.index.strftime('%Y-%m-%d')
-    daily_lookup = {d: i for i, d in enumerate(daily_date_strs)}
-    daily_idx = np.array([daily_lookup.get(d, -1) for d in date_strs], dtype=np.int64)
-
-    sma_arr = df_daily_indicators['SMA'].to_numpy(dtype=np.float64)
-    std_arr = df_daily_indicators['Std'].to_numpy(dtype=np.float64)
-    has_trend = 'Trend_Filter' in df_daily_indicators.columns
-    trend_arr = df_daily_indicators['Trend_Filter'].to_numpy(dtype=np.float64) if has_trend else np.zeros(1, dtype=np.float64)
-
+                     take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28, z_score_threshold=2.0,
+                     prep=None):
+    p = prep if prep is not None else prep_inputs(df_hourly, df_daily_indicators)
     target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
 
     ei, xi, ep, xp, held, res, ret = _simulate_limit(
-        prices, lows, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+        p['prices'], p['lows'], p['hours'], p['daily_idx'],
+        p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
         float(take_profit), float(stop_loss), int(max_hours_to_hold),
         target_h0, target_h1, float(z_score_threshold)
     )
-
-    trades = []
-    for k in range(len(ei)):
-        trades.append({
-            'Ticker':      ticker,
-            'Entry Time':  timestamps[ei[k]],
-            'Entry Price': ep[k],
-            'Exit Time':   timestamps[xi[k]],
-            'Exit Price':  xp[k],
-            'hours_held':  int(held[k]),
-            'Result':      _RESULT_NAMES[res[k]],
-            'Return':      ret[k]
-        })
-
-    return trades
+    return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
 
 
 @njit(cache=True)
@@ -408,45 +420,17 @@ def _simulate_trail(prices, highs, lows, hours, daily_idx, sma_arr, std_arr, tre
 def run_backtest_v18(df_hourly, df_daily_indicators, ticker,
                      mode="BACKTEST", target_hours=(9, 14),
                      take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28,
-                     z_score_threshold=2.0, trail_pct=0.03):
-    prices = df_hourly['Close'].to_numpy(dtype=np.float64)
-    highs  = df_hourly['High'].to_numpy(dtype=np.float64)
-    lows   = df_hourly['Low'].to_numpy(dtype=np.float64)
-    timestamps = df_hourly.index
-    hours = timestamps.hour.to_numpy(dtype=np.int64)
-    date_strs = timestamps.strftime('%Y-%m-%d')
-
-    daily_date_strs = df_daily_indicators.index.strftime('%Y-%m-%d')
-    daily_lookup = {d: i for i, d in enumerate(daily_date_strs)}
-    daily_idx = np.array([daily_lookup.get(d, -1) for d in date_strs], dtype=np.int64)
-
-    sma_arr = df_daily_indicators['SMA'].to_numpy(dtype=np.float64)
-    std_arr = df_daily_indicators['Std'].to_numpy(dtype=np.float64)
-    has_trend = 'Trend_Filter' in df_daily_indicators.columns
-    trend_arr = df_daily_indicators['Trend_Filter'].to_numpy(dtype=np.float64) if has_trend else np.zeros(1, dtype=np.float64)
-
+                     z_score_threshold=2.0, trail_pct=0.03, prep=None):
+    p = prep if prep is not None else prep_inputs(df_hourly, df_daily_indicators)
     target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
 
     ei, xi, ep, xp, held, res, ret = _simulate_trail(
-        prices, highs, lows, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+        p['prices'], p['highs'], p['lows'], p['hours'], p['daily_idx'],
+        p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
         float(take_profit), float(stop_loss), int(max_hours_to_hold), float(trail_pct),
         target_h0, target_h1, float(z_score_threshold)
     )
-
-    trades = []
-    for k in range(len(ei)):
-        trades.append({
-            'Ticker':      ticker,
-            'Entry Time':  timestamps[ei[k]],
-            'Entry Price': ep[k],
-            'Exit Time':   timestamps[xi[k]],
-            'Exit Price':  xp[k],
-            'hours_held':  int(held[k]),
-            'Result':      _RESULT_NAMES[res[k]],
-            'Return':      ret[k]
-        })
-
-    return trades
+    return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
 
 
 @njit(cache=True)
@@ -659,115 +643,47 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
 def run_backtest_v19(df_hourly, df_daily_indicators, ticker,
                      mode="BACKTEST", target_hours=(9, 14),
                      take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28,
-                     z_score_threshold=2.0, trail_buy_pct=0.02):
-    prices = df_hourly['Close'].to_numpy(dtype=np.float64)
-    highs  = df_hourly['High'].to_numpy(dtype=np.float64)
-    lows   = df_hourly['Low'].to_numpy(dtype=np.float64)
-    timestamps = df_hourly.index
-    hours = timestamps.hour.to_numpy(dtype=np.int64)
-    date_strs = timestamps.strftime('%Y-%m-%d')
-
-    daily_date_strs = df_daily_indicators.index.strftime('%Y-%m-%d')
-    daily_lookup = {d: i for i, d in enumerate(daily_date_strs)}
-    daily_idx = np.array([daily_lookup.get(d, -1) for d in date_strs], dtype=np.int64)
-
-    sma_arr = df_daily_indicators['SMA'].to_numpy(dtype=np.float64)
-    std_arr = df_daily_indicators['Std'].to_numpy(dtype=np.float64)
-    has_trend = 'Trend_Filter' in df_daily_indicators.columns
-    trend_arr = df_daily_indicators['Trend_Filter'].to_numpy(dtype=np.float64) if has_trend else np.zeros(1, dtype=np.float64)
+                     z_score_threshold=2.0, trail_buy_pct=0.02, prep=None):
+    p = prep if prep is not None else prep_inputs(df_hourly, df_daily_indicators)
     target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
 
     ei, xi, ep, xp, held, res, ret = _simulate_trail_buy(
-        prices, highs, lows, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+        p['prices'], p['highs'], p['lows'], p['hours'], p['daily_idx'],
+        p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
         float(take_profit), float(stop_loss), int(max_hours_to_hold), float(trail_buy_pct),
         target_h0, target_h1, float(z_score_threshold)
     )
-
-    trades = []
-    for k in range(len(ei)):
-        trades.append({
-            'Ticker': ticker, 'Entry Time': timestamps[ei[k]], 'Entry Price': ep[k],
-            'Exit Time': timestamps[xi[k]], 'Exit Price': xp[k],
-            'hours_held': int(held[k]), 'Result': _RESULT_NAMES[res[k]], 'Return': ret[k]
-        })
-    return trades
+    return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
 
 
 def run_backtest_v110(df_hourly, df_daily_indicators, ticker,
                       mode="BACKTEST", target_hours=(9, 14),
                       take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28,
-                      z_score_threshold=2.0, trail_buy_pct=0.02, trail_pct=0.03):
-    prices = df_hourly['Close'].to_numpy(dtype=np.float64)
-    highs  = df_hourly['High'].to_numpy(dtype=np.float64)
-    lows   = df_hourly['Low'].to_numpy(dtype=np.float64)
-    timestamps = df_hourly.index
-    hours = timestamps.hour.to_numpy(dtype=np.int64)
-    date_strs = timestamps.strftime('%Y-%m-%d')
-
-    daily_date_strs = df_daily_indicators.index.strftime('%Y-%m-%d')
-    daily_lookup = {d: i for i, d in enumerate(daily_date_strs)}
-    daily_idx = np.array([daily_lookup.get(d, -1) for d in date_strs], dtype=np.int64)
-
-    sma_arr = df_daily_indicators['SMA'].to_numpy(dtype=np.float64)
-    std_arr = df_daily_indicators['Std'].to_numpy(dtype=np.float64)
-    has_trend = 'Trend_Filter' in df_daily_indicators.columns
-    trend_arr = df_daily_indicators['Trend_Filter'].to_numpy(dtype=np.float64) if has_trend else np.zeros(1, dtype=np.float64)
+                      z_score_threshold=2.0, trail_buy_pct=0.02, trail_pct=0.03, prep=None):
+    p = prep if prep is not None else prep_inputs(df_hourly, df_daily_indicators)
     target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
 
     ei, xi, ep, xp, held, res, ret = _simulate_trail_both(
-        prices, highs, lows, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+        p['prices'], p['highs'], p['lows'], p['hours'], p['daily_idx'],
+        p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
         float(take_profit), float(stop_loss), int(max_hours_to_hold),
         float(trail_buy_pct), float(trail_pct),
         target_h0, target_h1, float(z_score_threshold)
     )
-
-    trades = []
-    for k in range(len(ei)):
-        trades.append({
-            'Ticker': ticker, 'Entry Time': timestamps[ei[k]], 'Entry Price': ep[k],
-            'Exit Time': timestamps[xi[k]], 'Exit Price': xp[k],
-            'hours_held': int(held[k]), 'Result': _RESULT_NAMES[res[k]], 'Return': ret[k]
-        })
-    return trades
+    return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
 
 
 def run_backtest(df_hourly, df_daily_indicators, ticker,
                  mode="BACKTEST", target_hours=(9, 14),
-                 take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28, z_score_threshold=2.0):
-
-    prices = df_hourly['Close'].to_numpy(dtype=np.float64)
-    timestamps = df_hourly.index
-    hours = timestamps.hour.to_numpy(dtype=np.int64)
-    date_strs = timestamps.strftime('%Y-%m-%d')
-
-    daily_date_strs = df_daily_indicators.index.strftime('%Y-%m-%d')
-    daily_lookup = {d: i for i, d in enumerate(daily_date_strs)}
-    daily_idx = np.array([daily_lookup.get(d, -1) for d in date_strs], dtype=np.int64)
-
-    sma_arr = df_daily_indicators['SMA'].to_numpy(dtype=np.float64)
-    std_arr = df_daily_indicators['Std'].to_numpy(dtype=np.float64)
-    has_trend = 'Trend_Filter' in df_daily_indicators.columns
-    trend_arr = df_daily_indicators['Trend_Filter'].to_numpy(dtype=np.float64) if has_trend else np.zeros(1, dtype=np.float64)
-
+                 take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28, z_score_threshold=2.0,
+                 prep=None):
+    p = prep if prep is not None else prep_inputs(df_hourly, df_daily_indicators)
     target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
 
     ei, xi, ep, xp, held, res, ret = _simulate(
-        prices, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+        p['prices'], p['hours'], p['daily_idx'],
+        p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
         float(take_profit), float(stop_loss), int(max_hours_to_hold),
         target_h0, target_h1, float(z_score_threshold)
     )
-
-    trades = []
-    for k in range(len(ei)):
-        trades.append({
-            'Ticker':      ticker,
-            'Entry Time':  timestamps[ei[k]],
-            'Entry Price': ep[k],
-            'Exit Time':   timestamps[xi[k]],
-            'Exit Price':  xp[k],
-            'hours_held':  int(held[k]),
-            'Result':      _RESULT_NAMES[res[k]],
-            'Return':      ret[k]
-        })
-
-    return trades
+    return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)

@@ -10,13 +10,11 @@ from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 from tqdm import tqdm
 
-from backtester import run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110
+from backtester import run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110, prep_inputs
 import strategies
-from db_cache import refresh_dropdown_cache, refresh_pivot_cache
+from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
 CACHE_DIR    = Path("./cache")
 OPTO_LOG_DIR = Path("./logs")
@@ -106,31 +104,54 @@ def update_sweep_run(run_id, **fields):
     conn.close()
 
 
+# Per-worker-process memo: workers are long-lived across grid nodes, and dispatch
+# is one ticker at a time — without this every node re-parses the CSV and recomputes
+# indicators (~18k times per ticker in Phase 3). Indicators depend only on
+# (ticker, strategy, window): no strategy's generate_daily_indicators uses z.
+_NODE_INPUT_CACHE = {}
+_NODE_INPUT_CACHE_MAX = 6
+
+
+def _load_node_inputs(ticker, strategy_class, strategy_name, w, z_thresh):
+    key = (ticker, strategy_name, int(w))
+    hit = _NODE_INPUT_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    cache_path = CACHE_DIR / f"{ticker}_1h.csv"
+    df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+    df_hourly_raw.index = pd.to_datetime(df_hourly_raw.index).tz_localize(None)
+    df_hourly_raw = df_hourly_raw.sort_index()
+    if df_hourly_raw.empty:
+        entry = None
+    else:
+        close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
+        df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
+        strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
+        df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
+        entry = (df_hourly_raw, df_daily_processed, prep_inputs(df_hourly_raw, df_daily_processed))
+
+    if len(_NODE_INPUT_CACHE) >= _NODE_INPUT_CACHE_MAX:
+        _NODE_INPUT_CACHE.clear()
+    _NODE_INPUT_CACHE[key] = entry
+    return entry
+
+
 def run_single_backtest_node_isolated(args):
     ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl = args
-
-    try:
-        cache_path = CACHE_DIR / f"{ticker}_1h.csv"
-        df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-        df_hourly_raw.index = pd.to_datetime(df_hourly_raw.index).tz_localize(None)
-        df_hourly_raw = df_hourly_raw.sort_index()
-    except Exception:
-        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR"}
-
-    if df_hourly_raw.empty:
-        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
 
     strategy_class = getattr(strategies, strategy_name, None)
     if not strategy_class:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "UNKNOWN_STRAT"}
 
     try:
-        close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
-        df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
-        strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
-        df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
-    except Exception:
-        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR"}
+        inputs = _load_node_inputs(ticker, strategy_class, strategy_name, w, z_thresh)
+    except Exception as e:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR", "error": repr(e)}
+
+    if inputs is None:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
+    df_hourly_raw, df_daily_processed, prep = inputs
 
     try:
         if issubclass(strategy_class, strategies.TrailingBothZScoreBreakout):
@@ -138,37 +159,37 @@ def run_single_backtest_node_isolated(args):
                 df_hourly_raw, df_daily_processed, ticker,
                 take_profit=float(tp / 100.0), stop_loss=float(fixed_sl / 100.0),
                 max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh),
-                trail_buy_pct=float(sl / 100.0), trail_pct=0.03
+                trail_buy_pct=float(sl / 100.0), trail_pct=0.03, prep=prep
             )
         elif issubclass(strategy_class, strategies.TrailingBuyZScoreBreakout):
             trades = run_backtest_v19(
                 df_hourly_raw, df_daily_processed, ticker,
                 take_profit=float(tp / 100.0), stop_loss=float(fixed_sl / 100.0),
                 max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh),
-                trail_buy_pct=float(sl / 100.0)
+                trail_buy_pct=float(sl / 100.0), prep=prep
             )
         elif issubclass(strategy_class, strategies.TrailingExitZScoreBreakout):
             trades = run_backtest_v18(
                 df_hourly_raw, df_daily_processed, ticker,
                 take_profit=float(tp / 100.0), stop_loss=float(fixed_sl / 100.0),
                 max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh),
-                trail_pct=float(sl / 100.0)
+                trail_pct=float(sl / 100.0), prep=prep
             )
         elif issubclass(strategy_class, strategies.LimitOrderZScoreBreakout):
             trades = run_backtest_v17(
                 df_hourly_raw, df_daily_processed, ticker,
                 take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0),
-                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh)
+                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh), prep=prep
             )
         else:
             trades = run_backtest(
                 df_hourly_raw, df_daily_processed, ticker,
                 take_profit=float(tp / 100.0), stop_loss=float(sl / 100.0),
-                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh)
+                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh), prep=prep
             )
         closed = [t for t in trades if t["Result"] in ["WIN", "LOSS", "TWIN", "TLOSS"]]
-    except Exception:
-        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "SIM_ERROR"}
+    except Exception as e:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "SIM_ERROR", "error": repr(e)}
 
     if not closed:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "NO_TRADES"}
@@ -191,14 +212,23 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     matrix_results  = []
     unvisited_tasks = []
 
+    # One query for all cached nodes of this (strategy, version, ticker) instead of
+    # one SELECT per task (Phase 3 = ~18k queries per ticker).
+    cached_map = {}
+    cursor.execute("""
+        SELECT window, max_hold_hours, take_profit, stop_loss, z_score_threshold,
+               trades, win_rate, strategy_return, alpha_vs_spy
+        FROM backtest_cache
+        WHERE strategy=? AND version=? AND ticker=?
+    """, (strategy_name, config_version, ticker))
+    for r in cursor.fetchall():
+        if r[4] is None:
+            continue  # legacy NULL-z rows never matched the old equality check either
+        cached_map[(int(r[2]), int(r[3]), int(r[1]), int(r[0]), float(r[4]))] = (r[5], r[6], r[7], r[8])
+
     for t in tasks:
         tp, sl, hold_hours, w, z_thresh = t
-        cursor.execute("""
-            SELECT trades, win_rate, strategy_return, alpha_vs_spy FROM backtest_cache
-            WHERE strategy=? AND version=? AND ticker=? AND window=? AND max_hold_hours=?
-              AND take_profit=? AND stop_loss=? AND z_score_threshold=?
-        """, (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl), z_thresh))
-        cached_row = cursor.fetchone()
+        cached_row = cached_map.get((int(tp), int(sl), int(hold_hours), int(w), float(z_thresh)))
         if cached_row:
             matrix_results.append({
                 "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
@@ -238,11 +268,17 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
     node_counter      = 0
     last_postfix_time = 0.0
+    fail_counts       = {}
     for future in progress_bar:
         tp, sl, hold_hours, w, z_thresh = futures_map[future]
         try:
             res    = future.result()
             status = res.get("status")
+            if status not in ("SUCCESS", "NO_TRADES"):
+                fail_counts[status] = fail_counts.get(status, 0) + 1
+                if sum(fail_counts.values()) == 1:
+                    logger.warning(f"[{ticker}] {phase_label} first failed node TP={tp} SL={sl}: "
+                                   f"{status} {res.get('error', '')}")
             if status in ("SUCCESS", "NO_TRADES"):
                 if status == "SUCCESS":
                     alpha, num_trades, wr, comp_ret = res["payload"]
@@ -287,6 +323,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     conn.commit()
     progress_bar.close()
     conn.close()
+    if fail_counts:
+        logger.warning(f"[{ticker}] {phase_label}: {sum(fail_counts.values())} nodes failed {fail_counts}")
     return pd.DataFrame(matrix_results)
 
 
@@ -751,6 +789,10 @@ if __name__ == "__main__":
     logger.info("\nFinal cache refresh...")
     refresh_dropdown_cache()
     refresh_pivot_cache(versions=[config_version])
+    try:
+        refresh_cliff_grid_cache()
+    except Exception as e:
+        logger.warning(f"Cliff grid cache refresh failed (page will fall back to live query): {e}")
 
     for p in ["current_test.json", "active_phase_grid.json"]:
         if os.path.exists(p):

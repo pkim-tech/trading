@@ -251,16 +251,8 @@ STRAT_SHORT = {
     'TrailingBothZScoreBreakout':  'TrBoth',
 }
 
-sp_c1, sp_c2, sp_c3 = st.columns(3)
-with sp_c1:
-    max_alpha = st.number_input("Max alpha cap % (0 = no cap)", value=0.0, step=100.0, format="%.0f",
-                                help="Cap to exclude black-swan outliers (e.g. UVIX). 0 = disabled.")
-with sp_c2:
-    cliff_radius = st.number_input("Cliff-safe radius", value=3, step=1, min_value=1,
-                                   help="±N in TP/SL integer values. Use 3 for coarse grid, 2 for fine mesh.")
-with sp_c3:
-    min_cliff_neighbors = st.number_input("Min safe neighbors", value=4, step=1, min_value=1,
-                                          help="How many ±radius neighbors must have alpha > 0.")
+max_alpha = st.number_input("Max alpha cap % (0 = no cap)", value=0.0, step=100.0, format="%.0f",
+                            help="Cap to exclude black-swan outliers (e.g. UVIX). 0 = disabled.")
 
 
 @st.cache_data(ttl=3600)
@@ -285,64 +277,47 @@ def load_strategy_pivot(min_trades_val):
     return piv.sort_values('max', ascending=False).round(1)
 
 
+@st.cache_data(ttl=86400, show_spinner="Loading cliff grid (slow if no sweep-end cache)...")
+def load_cliff_grid_cached(min_trades_val):
+    """One aggregated node per (ticker, strategy, version, window, z, tp, sl) — holds
+    collapsed to best alpha. Served from the sweep-end kv cache when available."""
+    from db_cache import load_cliff_grid
+    return load_cliff_grid(min_trades_val)
+
+
 @st.cache_data(ttl=3600)
-def load_strategy_pivot_safe(min_trades_val, radius, min_neighbors):
-    with sqlite3.connect(DB_PATH) as conn:
-        # Top 100 candidates per (ticker, strategy) — walk best→worst until one is cliff-safe
-        candidates = pd.read_sql("""
-            WITH ranked AS (
-                SELECT ticker, strategy, version, window,
-                       COALESCE(z_score_threshold, 2.0) AS z,
-                       take_profit, stop_loss, alpha_vs_spy,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY ticker, strategy
-                           ORDER BY alpha_vs_spy DESC
-                       ) AS rn
-                FROM backtest_cache WHERE trades >= ?
-            )
-            SELECT * FROM ranked WHERE rn <= 100
-        """, conn, params=(min_trades_val,))
+def load_strategy_pivot_safe(min_trades_val, radius, min_neighbors, max_nodes=100, cliff_threshold=50):
+    grid = load_cliff_grid_cached(min_trades_val)
+    if grid.empty:
+        return pd.DataFrame()
 
-        if candidates.empty:
-            return pd.DataFrame()
+    # (ticker, strategy, version, window, z) → {(tp, sl): best alpha over holds}
+    grids = {}
+    for key, grp in grid.groupby(['ticker', 'strategy', 'version', 'window', 'z'], sort=False):
+        grids[key] = dict(zip(zip(grp['take_profit'].astype(int), grp['stop_loss'].astype(int)),
+                              grp['max_alpha']))
 
-        # Bulk-load all TP/SL grid data for the relevant tickers/strategies in one query
-        tickers_in   = ','.join(f"'{t}'" for t in candidates['ticker'].unique())
-        strategies_in = ','.join(f"'{s}'" for s in candidates['strategy'].unique())
-        grid_df = pd.read_sql(f"""
-            SELECT ticker, strategy, version, window,
-                   COALESCE(z_score_threshold, 2.0) AS z,
-                   take_profit, stop_loss, alpha_vs_spy
-            FROM backtest_cache
-            WHERE ticker IN ({tickers_in}) AND strategy IN ({strategies_in})
-              AND trades >= ?
-        """, conn, params=(min_trades_val,))
-
-        # Build lookup: (ticker, strategy, version, window, z) → {(tp, sl): alpha}
-        grids = {}
-        for key, grp in grid_df.groupby(['ticker','strategy','version','window','z']):
-            grids[key] = {(int(r.take_profit), int(r.stop_loss)): r.alpha_vs_spy
-                          for _, r in grp.iterrows()}
-
-        bh = pd.read_sql("""
-            SELECT ticker, MAX(asset_bh) AS bh FROM backtest_cache
-            WHERE trades >= ? AND asset_bh IS NOT NULL GROUP BY ticker
-        """, conn, params=(min_trades_val,))
-
+    # Walk down the top max_nodes per (ticker, strategy); keep the best one that
+    # has >= min_neighbors positive-alpha neighbors within ±radius TP/SL AND no sharp cliff.
     results = []
-    for (ticker, strategy), grp in candidates.sort_values('alpha_vs_spy', ascending=False).groupby(['ticker','strategy']):
-        for _, c in grp.iterrows():
-            key = (c.ticker, c.strategy, c.version, c.window, c.z)
-            grid = grids.get(key, {})
+    grid_sorted = grid.sort_values('max_alpha', ascending=False)
+    for (ticker, strategy), grp in grid_sorted.groupby(['ticker', 'strategy'], sort=False):
+        for c in grp.head(max_nodes).itertuples():
+            g = grids[(c.ticker, c.strategy, c.version, c.window, c.z)]
             tp0, sl0 = int(c.take_profit), int(c.stop_loss)
-            pos = sum(
-                1 for dtp in range(-radius, radius + 1)
+            neighbors = [
+                g.get((tp0 + dtp, sl0 + dsl), -999)
+                for dtp in range(-radius, radius + 1)
                 for dsl in range(-radius, radius + 1)
-                if (dtp != 0 or dsl != 0) and grid.get((tp0 + dtp, sl0 + dsl), -999) > 0
-            )
+                if (dtp != 0 or dsl != 0)
+            ]
+            pos = sum(1 for a in neighbors if a > 0)
             if pos >= min_neighbors:
-                results.append({'ticker': ticker, 'strategy': strategy, 'best_alpha': c.alpha_vs_spy})
-                break
+                min_neighbor_alpha = min([a for a in neighbors if a > 0], default=0)
+                cliff_drop = c.max_alpha - min_neighbor_alpha
+                if cliff_drop <= cliff_threshold:
+                    results.append({'ticker': ticker, 'strategy': strategy, 'best_alpha': c.max_alpha})
+                    break
 
     if not results:
         return pd.DataFrame()
@@ -351,7 +326,7 @@ def load_strategy_pivot_safe(min_trades_val, radius, min_neighbors):
     best['col'] = best['strategy'].map(STRAT_SHORT).fillna(best['strategy'])
     piv = best.pivot_table(index='ticker', columns='col', values='best_alpha', aggfunc='max')
     piv['max'] = piv.max(axis=1)
-    piv = piv.join(bh.set_index('ticker')['bh'], how='left')
+    piv = piv.join(grid.groupby('ticker')['bh'].max(), how='left')
     return piv.sort_values('max', ascending=False).round(1)
 
 
@@ -387,9 +362,25 @@ _render_strat_pivot(strat_piv)
 
 st.divider()
 st.subheader("Universe — Best Cliff-Safe Alpha by Strategy")
-st.caption(f"Only nodes where ≥{int(min_cliff_neighbors)} neighbors within ±{int(cliff_radius)} TP/SL have alpha > 0")
+_grid = load_cliff_grid_cached(int(min_trades))
+st.caption(f"Searching {len(_grid):,} qualified cliff-grid nodes ({_grid['ticker'].nunique()} tickers)")
+cs_c1, cs_c2, cs_c3, cs_c4 = st.columns(4)
+with cs_c1:
+    cliff_radius = st.number_input("Cliff-safe radius", value=3, step=1, min_value=1,
+                                   help="±N in TP/SL integer values. Use 3 for coarse grid, 2 for fine mesh.")
+with cs_c2:
+    min_cliff_neighbors = st.number_input("Min safe neighbors", value=4, step=1, min_value=1,
+                                          help="How many ±radius neighbors must have alpha > 0.")
+with cs_c3:
+    max_nodes_to_check = st.number_input("Max nodes to check", value=100, step=10, min_value=10,
+                                         help="Top N nodes per (ticker, strategy) to evaluate.")
+with cs_c4:
+    cliff_threshold = st.number_input("Cliff threshold (%)", value=50, step=10, min_value=0,
+                                      help="Max alpha drop to neighbor. Higher = less strict, lower = reject more ridges.")
+st.caption(f"Only nodes where ≥{int(min_cliff_neighbors)} neighbors within ±{int(cliff_radius)} TP/SL have alpha > 0 and drop < {int(cliff_threshold)}%")
 
-safe_piv = load_strategy_pivot_safe(int(min_trades), int(cliff_radius), int(min_cliff_neighbors))
+safe_piv = load_strategy_pivot_safe(int(min_trades), int(cliff_radius), int(min_cliff_neighbors),
+                                     int(max_nodes_to_check), int(cliff_threshold))
 safe_piv = _apply_strat_pivot_filters(safe_piv, exclude_single_stock, exclude_index,
                                        _ss, _ix, max_alpha, min_return)
 _render_strat_pivot(safe_piv)

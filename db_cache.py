@@ -97,6 +97,47 @@ def refresh_pivot_cache(versions=None):
     print(f"Pivot cache refreshed for {len(versions)} versions")
 
 
+# Qualified 3x index tickers, holds collapsed to best alpha per (tp, sl) node.
+# Shared by the Top Pivot cliff-safe section (live fallback) and the sweep-end refresh.
+CLIFF_GRID_SQL = """
+    SELECT b.ticker, b.strategy, b.version, b.window,
+           COALESCE(b.z_score_threshold, 2.0) AS z,
+           b.take_profit, b.stop_loss,
+           MAX(b.alpha_vs_spy) AS max_alpha,
+           MAX(b.asset_bh)     AS bh
+    FROM backtest_cache b
+    JOIN (
+        SELECT symbol FROM tickers
+        WHERE leverage = 3
+          AND (inverse IS NULL OR inverse = 0)
+          AND index_underlier IS NOT NULL AND index_underlier != ''
+          AND (dupe_direxion IS NULL OR dupe_direxion = '')
+          AND avg_vol_10d IS NOT NULL AND last_price IS NOT NULL
+          AND avg_vol_10d * last_price >= 5000000
+    ) q ON q.symbol = b.ticker
+    WHERE b.trades >= ?
+    GROUP BY b.ticker, b.strategy, b.version, b.window,
+             COALESCE(b.z_score_threshold, 2.0), b.take_profit, b.stop_loss
+"""
+
+
+def load_cliff_grid(min_trades=5):
+    """kv-cached at sweep completion; falls back to the heavy live query (~2 min)."""
+    cached = get_kv(f"cliff_grid_mt{min_trades}")
+    if cached is not None:
+        return pd.DataFrame(cached)
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query(CLIFF_GRID_SQL, conn, params=(min_trades,))
+
+
+def refresh_cliff_grid_cache(min_trades=5):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_table(conn)
+        df = pd.read_sql_query(CLIFF_GRID_SQL, conn, params=(min_trades,))
+    set_kv(f"cliff_grid_mt{min_trades}", df.to_dict(orient="records"))
+    print(f"Cliff grid cache refreshed ({len(df):,} nodes, min_trades={min_trades})")
+
+
 def refresh_best_nodes_cache():
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_table(conn)
