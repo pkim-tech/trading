@@ -203,6 +203,75 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 
 ---
 
+## 2026-06-30 (addendum) — Live Execution Design, Slack Redesign, Watchlist Trim
+
+### What we did
+
+- **Open-fill analysis**: Ran across all 17 watchlist tickers. Open-fill (9:30 bar open as entry) is consistently worse than 10:30 close — selection bias (bars only selected when close <= lower_band). Conclusion: market order at 10:30 matches backtest entry best.
+- **Real-time price**: `compute_buy_signal` now uses `yfinance fast_info.last_price` instead of last cached hourly close. Fallback to cache on failure.
+- **Signal time-gating**: Buy and sell signals only evaluated in windows 10:25–10:40 AM and 15:25–15:40 PM ET, matching backtest `target_hours=(9,14)` (9:30 bar close at 10:30, 14:30 bar close at 15:30). Outside windows, loop idles.
+- **Execution workflow documented** (`docs/operational_limits.md`): Stage limit order pre-market at absurd price, edit to market at 10:30/15:30 when Slack fires. No overnight limit orders at lower_band (open-fill analysis showed this is worse).
+- **Startup report redesigned**: Block Kit with 🔶/🟡/⚪ proximity emoji, sorted by % to trigger, open positions section with P&L, reconfirm reminder for hot tickers (< 5% away).
+- **BUY message redesigned**: Two-line action card — `🟢 FAS — BUY — Market — $148.12 — 337 shares (~$50k)` / `🔴 FAS — SELL ALL — Stop Loss — $128.12 (-11% from trigger)`. Stop loss at lower_band × (1 - (SL% + 1%)) — 1% buffer over backtest SL for intraday noise protection. Intrabar false trigger rate confirmed very low (0.0–0.3% of bars).
+- **SELL messages redesigned**: TP → cancel stop loss, sell market. SL → check account, should have auto-filled. TIME → change stop loss to market close order.
+- **Portfolio page**: Ticker multiselect to toggle tickers on/off, full watchlist expander, TQQQ normalized price overlay alongside SPY, Hurst/ADF computation commented out for speed.
+- **pages/9_Entry_Delay.py**: Entry delay analysis across all watchlist tickers.
+- **open_fill_analysis.py**: Standalone open-fill vs backtest return script.
+- **Watchlist trimmed** to AGQ, EDC, FAS, HIBL (top 4 by alpha/island quality). Others remain in DB.
+- **Alternative trading windows** added to backlog.
+
+### Key Findings
+
+- Open-fill is always worse than 10:30 close — not a bug, just selection bias
+- Intrabar SL false trigger rate: 0.0–0.3% across all 4 tickers — tight Schwab stop is fine
+- Portfolio peak concurrent positions: up to 14 (all correlated — same macro event). Trimmed to 4 tickers to manage.
+- 🔶 in morning report = set phone alarm for 10:28 and 15:28
+
+### Current State
+
+- Watchlist: AGQ w=10 TP=19 SL=8, EDC w=10 TP=17 SL=17, FAS w=10 TP=25 SL=10, HIBL w=10 TP=29 SL=21
+- FAS at +2.9% from trigger — 🔶 tomorrow morning
+- No open positions
+
+### Next Session
+
+1. Build Streamlit open positions page
+2. Commit `pages/2_Node_Inspector.py` changes (not staged this session)
+3. Check sweep status
+## 2026-06-29 (addendum 2) — Watchlist Expansion, DB Indexes, Entry Delay Analysis
+
+### What we did
+
+- **docs/research.md**: Created. Captured Hurst/ADF filter findings and sweep parameter conclusions (was left in session_cache by predecessor).
+- **Watchlist expanded to 17 tickers**: Added KORU, HIBL, SOXL, TQQQ, NAIL (top 5 by return), then corrected via Top Pivot download — KORU/SOXL/NAIL don't beat B&H (B&H mult < 1.0x, filtered by Top Pivot). Left them on watchlist anyway (user curious about signals). Added URTY, DUSL, TNA, DRN, OILU, CURE, MIDU from Top Pivot list (user removed TQQQ, GDXU, JNUG from download).
+- **Watchlist versions**: Updated all v1.4 → v1.5.
+- **DB index added**: `idx_bc_version_ticker_z_return` on `(version, ticker, z_score_threshold, strategy_return DESC)`. Took 220s to build on 45M rows.
+- **PK fix in Node Inspector**: Watchlist metrics query now includes `strategy='ZScoreBreakout'` to hit PK instead of falling back to `idx_bc_ticker` scan.
+- **Node Inspector watchlist table**: Now shows Return%, Alpha%, Asset B&H, SPY B&H, B&H Mult, Trades, Win% inline. Height auto-sizes to row count. Metrics cached via `load_watchlist_metrics()`.
+- **active_signals.py startup report**: `send_startup_report()` fires at startup, posts Slack table with current price, buy trigger (lower_band), z-score, TP price, SL price per ticker.
+- **pages/9_Entry_Delay.py**: New page. For each watchlist node, runs backtest then replays each trade with entry delayed 1-4 hours. Shows compounded return and missed trade count per delay. Finding: delayed entry is consistently terrible — strategy selects against fast mean-reversions.
+- **Limit order analysis (AGQ)**: 9 of 18 AGQ trades fire at 9:30 bar. Open fill (using 9:30 open as entry) gives 311% vs 372% backtest — about 62% lower compounded return. Limit order fills between open and close (at lower_band), so real performance is between 311-372%. Interesting stat to run across all tickers.
+- **backlog**: Added v1.6 open-price entry model. Removed FAS watchlist removal item (user decided to keep). SPY/VIX filter added as next research direction.
+- **docs/design.md**: Updated with pages 7/8, shared hurst.py module, max_workers=6, sweep auto-cache, cron.
+
+### Key Findings
+
+- Delayed entry is bad: selecting for trades that didn't bounce fast = selecting losers
+- Earlier entry (limit order at open) is better than waiting for 10:30 close
+- But open fill still ~17% worse than backtested return for AGQ (compounded)
+- Limit order at lower_band placed night before is valid execution approach
+- 9:30 bar open is typically 1-3% above the 10:30 close (entry price in backtest)
+- Most 9:30 trades gap through the limit price — fill at open, not exactly at lower_band
+
+### Next Session
+
+1. Run open-fill analysis across all 17 watchlist tickers (AGQ showed -62% compounded vs backtest — is this typical?)
+2. Commit pending changes (active_signals.py, Node Inspector, pages/9, docs/)
+3. Check sweep status — 30 U-Z tickers remaining
+4. Run db_cache.py after sweep completes
+
+---
+
 ## 2026-06-29 (addendum) — Hurst/ADF Research, Node Inspector Perf, Sweep Config
 
 ### What we did
@@ -237,6 +306,41 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 3. Run remaining 30 tickers: `.venv/bin/python3 run_optimization_sweep.py 2>&1 | tee -a logs/sweep_v15_full.log`
 4. Run `db_cache.py` after sweep
 5. SPY trend / VIX level as entry filter — next research direction
+
+---
+
+## 2026-06-29 — Portfolio Page, Pivot Cache, Signal Improvements
+
+### What we did
+
+- **Portfolio page** (`pages/4_Portfolio.py`): Gantt chart of all watchlist node trades on a shared x-axis with SPY price overlay and concurrent-positions step chart. Hurst + ADF sliders filter trades by regime at entry time — lets you see if regime filtering improves per-trade avg return. Summary metrics bar (trades, win rate, avg return, avg win, avg loss, avg hold, max concurrent) + per-node table with unfiltered vs filtered columns side-by-side.
+- **Pivot cache** (`db_cache.py` `refresh_pivot_cache()`): Pre-aggregates Top Pivot data per (ticker, window, z, trades) into `kv_cache`. Page load now hits a key lookup instead of scanning 49M rows. Fallback to SQL if cache miss. Run `.venv/bin/python3 db_cache.py` after each sweep to refresh both dropdown and pivot caches.
+- **Top Pivot cache integration** (`pages/0_Top_Pivot.py`): `load_pivot()` checks `kv_cache` first; `min_trades` filter applied in pandas on cached cell data.
+- **z_score_threshold bug fixed** (`active_signals.py` line 311): `compute_buy_signal()` was hardcoding `2.0` in strategy constructor and `lower_band` calculation. Now uses `node['z_score_threshold']`.
+- **Hurst + ADF in BUY signal**: At signal time, pulls latest Hurst from `hurst_cache` and computes ADF fresh on last 420 hourly bars. Both shown in console print and Slack `_fields_block`.
+- **Removed `docs/handover.md`**: Was stale and duplicating DB state. `go` now reads last ~60 lines of `session_cache.md`. `session close` appends here only.
+- **venv fix**: All python commands need `.venv/bin/python3`, not bare `python3`.
+
+### Key Decisions
+
+- Portfolio Hurst/ADF sliders show regime filter effect vs baseline — useful for deciding whether to use regime filter in live trading
+- ADF computed fresh at signal time (fast enough for one ticker); no dedicated cache needed yet
+- Hurst/ADF screener columns: will hook into data download pipeline rather than single scalar (regime-dependent); pending design decision on aggregation
+- Pivot cache stores per-(ticker, window, z, trades) granularity so any min_trades value can be filtered in Python
+
+### Current State
+
+- Watch list: AGQ w=10 TP=19 SL=8 hold=133h, DPST w=10 TP=21 SL=12 hold=126h, EDC w=10 TP=17 SL=17 hold=112h, FAS w=10 TP=25 SL=10 hold=133h, LABU w=20 TP=21 SL=18 hold=84h
+- Sweep v1.5: z=2.0 done, z=2.5 done, z=3.0 ~50% (33 tickers missing)
+- No open positions. Ready to go live tomorrow with `active_signals.py`.
+
+### Next Session
+
+1. Start live signal monitoring: `.venv/bin/python3 active_signals.py`
+2. Restart z=3.0 sweep: `.venv/bin/python3 run_optimization_sweep.py 2>&1 | tee -a logs/sweep_v15_full.log`
+3. Run `.venv/bin/python3 db_cache.py` after sweep completes
+4. Hurst/ADF screener column design: hook into data download, decide on aggregation approach
+5. Position sizing in Slack BUY signal (data already in `tickers` table)
 
 ---
 
@@ -588,110 +692,3 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 ### Next Session Should
 - Review `trading_engine.py` and decide whether to retrofit or replace for Layer 3
 - Investigate L3 cache optimization for node evaluation speed
-
----
-
-## 2026-06-29 — Portfolio Page, Pivot Cache, Signal Improvements
-
-### What we did
-
-- **Portfolio page** (`pages/4_Portfolio.py`): Gantt chart of all watchlist node trades on a shared x-axis with SPY price overlay and concurrent-positions step chart. Hurst + ADF sliders filter trades by regime at entry time — lets you see if regime filtering improves per-trade avg return. Summary metrics bar (trades, win rate, avg return, avg win, avg loss, avg hold, max concurrent) + per-node table with unfiltered vs filtered columns side-by-side.
-- **Pivot cache** (`db_cache.py` `refresh_pivot_cache()`): Pre-aggregates Top Pivot data per (ticker, window, z, trades) into `kv_cache`. Page load now hits a key lookup instead of scanning 49M rows. Fallback to SQL if cache miss. Run `.venv/bin/python3 db_cache.py` after each sweep to refresh both dropdown and pivot caches.
-- **Top Pivot cache integration** (`pages/0_Top_Pivot.py`): `load_pivot()` checks `kv_cache` first; `min_trades` filter applied in pandas on cached cell data.
-- **z_score_threshold bug fixed** (`active_signals.py` line 311): `compute_buy_signal()` was hardcoding `2.0` in strategy constructor and `lower_band` calculation. Now uses `node['z_score_threshold']`.
-- **Hurst + ADF in BUY signal**: At signal time, pulls latest Hurst from `hurst_cache` and computes ADF fresh on last 420 hourly bars. Both shown in console print and Slack `_fields_block`.
-- **Removed `docs/handover.md`**: Was stale and duplicating DB state. `go` now reads last ~60 lines of `session_cache.md`. `session close` appends here only.
-- **venv fix**: All python commands need `.venv/bin/python3`, not bare `python3`.
-
-### Key Decisions
-
-- Portfolio Hurst/ADF sliders show regime filter effect vs baseline — useful for deciding whether to use regime filter in live trading
-- ADF computed fresh at signal time (fast enough for one ticker); no dedicated cache needed yet
-- Hurst/ADF screener columns: will hook into data download pipeline rather than single scalar (regime-dependent); pending design decision on aggregation
-- Pivot cache stores per-(ticker, window, z, trades) granularity so any min_trades value can be filtered in Python
-
-### Current State
-
-- Watch list: AGQ w=10 TP=19 SL=8 hold=133h, DPST w=10 TP=21 SL=12 hold=126h, EDC w=10 TP=17 SL=17 hold=112h, FAS w=10 TP=25 SL=10 hold=133h, LABU w=20 TP=21 SL=18 hold=84h
-- Sweep v1.5: z=2.0 done, z=2.5 done, z=3.0 ~50% (33 tickers missing)
-- No open positions. Ready to go live tomorrow with `active_signals.py`.
-
-### Next Session
-
-1. Start live signal monitoring: `.venv/bin/python3 active_signals.py`
-2. Restart z=3.0 sweep: `.venv/bin/python3 run_optimization_sweep.py 2>&1 | tee -a logs/sweep_v15_full.log`
-3. Run `.venv/bin/python3 db_cache.py` after sweep completes
-4. Hurst/ADF screener column design: hook into data download, decide on aggregation approach
-5. Position sizing in Slack BUY signal (data already in `tickers` table)
-
----
-
-## 2026-06-29 (addendum 2) — Watchlist Expansion, DB Indexes, Entry Delay Analysis
-
-### What we did
-
-- **docs/research.md**: Created. Captured Hurst/ADF filter findings and sweep parameter conclusions (was left in session_cache by predecessor).
-- **Watchlist expanded to 17 tickers**: Added KORU, HIBL, SOXL, TQQQ, NAIL (top 5 by return), then corrected via Top Pivot download — KORU/SOXL/NAIL don't beat B&H (B&H mult < 1.0x, filtered by Top Pivot). Left them on watchlist anyway (user curious about signals). Added URTY, DUSL, TNA, DRN, OILU, CURE, MIDU from Top Pivot list (user removed TQQQ, GDXU, JNUG from download).
-- **Watchlist versions**: Updated all v1.4 → v1.5.
-- **DB index added**: `idx_bc_version_ticker_z_return` on `(version, ticker, z_score_threshold, strategy_return DESC)`. Took 220s to build on 45M rows.
-- **PK fix in Node Inspector**: Watchlist metrics query now includes `strategy='ZScoreBreakout'` to hit PK instead of falling back to `idx_bc_ticker` scan.
-- **Node Inspector watchlist table**: Now shows Return%, Alpha%, Asset B&H, SPY B&H, B&H Mult, Trades, Win% inline. Height auto-sizes to row count. Metrics cached via `load_watchlist_metrics()`.
-- **active_signals.py startup report**: `send_startup_report()` fires at startup, posts Slack table with current price, buy trigger (lower_band), z-score, TP price, SL price per ticker.
-- **pages/9_Entry_Delay.py**: New page. For each watchlist node, runs backtest then replays each trade with entry delayed 1-4 hours. Shows compounded return and missed trade count per delay. Finding: delayed entry is consistently terrible — strategy selects against fast mean-reversions.
-- **Limit order analysis (AGQ)**: 9 of 18 AGQ trades fire at 9:30 bar. Open fill (using 9:30 open as entry) gives 311% vs 372% backtest — about 62% lower compounded return. Limit order fills between open and close (at lower_band), so real performance is between 311-372%. Interesting stat to run across all tickers.
-- **backlog**: Added v1.6 open-price entry model. Removed FAS watchlist removal item (user decided to keep). SPY/VIX filter added as next research direction.
-- **docs/design.md**: Updated with pages 7/8, shared hurst.py module, max_workers=6, sweep auto-cache, cron.
-
-### Key Findings
-
-- Delayed entry is bad: selecting for trades that didn't bounce fast = selecting losers
-- Earlier entry (limit order at open) is better than waiting for 10:30 close
-- But open fill still ~17% worse than backtested return for AGQ (compounded)
-- Limit order at lower_band placed night before is valid execution approach
-- 9:30 bar open is typically 1-3% above the 10:30 close (entry price in backtest)
-- Most 9:30 trades gap through the limit price — fill at open, not exactly at lower_band
-
-### Next Session
-
-1. Run open-fill analysis across all 17 watchlist tickers (AGQ showed -62% compounded vs backtest — is this typical?)
-2. Commit pending changes (active_signals.py, Node Inspector, pages/9, docs/)
-3. Check sweep status — 30 U-Z tickers remaining
-4. Run db_cache.py after sweep completes
-
----
-
-## 2026-06-30 (addendum) — Live Execution Design, Slack Redesign, Watchlist Trim
-
-### What we did
-
-- **Open-fill analysis**: Ran across all 17 watchlist tickers. Open-fill (9:30 bar open as entry) is consistently worse than 10:30 close — selection bias (bars only selected when close <= lower_band). Conclusion: market order at 10:30 matches backtest entry best.
-- **Real-time price**: `compute_buy_signal` now uses `yfinance fast_info.last_price` instead of last cached hourly close. Fallback to cache on failure.
-- **Signal time-gating**: Buy and sell signals only evaluated in windows 10:25–10:40 AM and 15:25–15:40 PM ET, matching backtest `target_hours=(9,14)` (9:30 bar close at 10:30, 14:30 bar close at 15:30). Outside windows, loop idles.
-- **Execution workflow documented** (`docs/operational_limits.md`): Stage limit order pre-market at absurd price, edit to market at 10:30/15:30 when Slack fires. No overnight limit orders at lower_band (open-fill analysis showed this is worse).
-- **Startup report redesigned**: Block Kit with 🔶/🟡/⚪ proximity emoji, sorted by % to trigger, open positions section with P&L, reconfirm reminder for hot tickers (< 5% away).
-- **BUY message redesigned**: Two-line action card — `🟢 FAS — BUY — Market — $148.12 — 337 shares (~$50k)` / `🔴 FAS — SELL ALL — Stop Loss — $128.12 (-11% from trigger)`. Stop loss at lower_band × (1 - (SL% + 1%)) — 1% buffer over backtest SL for intraday noise protection. Intrabar false trigger rate confirmed very low (0.0–0.3% of bars).
-- **SELL messages redesigned**: TP → cancel stop loss, sell market. SL → check account, should have auto-filled. TIME → change stop loss to market close order.
-- **Portfolio page**: Ticker multiselect to toggle tickers on/off, full watchlist expander, TQQQ normalized price overlay alongside SPY, Hurst/ADF computation commented out for speed.
-- **pages/9_Entry_Delay.py**: Entry delay analysis across all watchlist tickers.
-- **open_fill_analysis.py**: Standalone open-fill vs backtest return script.
-- **Watchlist trimmed** to AGQ, EDC, FAS, HIBL (top 4 by alpha/island quality). Others remain in DB.
-- **Alternative trading windows** added to backlog.
-
-### Key Findings
-
-- Open-fill is always worse than 10:30 close — not a bug, just selection bias
-- Intrabar SL false trigger rate: 0.0–0.3% across all 4 tickers — tight Schwab stop is fine
-- Portfolio peak concurrent positions: up to 14 (all correlated — same macro event). Trimmed to 4 tickers to manage.
-- 🔶 in morning report = set phone alarm for 10:28 and 15:28
-
-### Current State
-
-- Watchlist: AGQ w=10 TP=19 SL=8, EDC w=10 TP=17 SL=17, FAS w=10 TP=25 SL=10, HIBL w=10 TP=29 SL=21
-- FAS at +2.9% from trigger — 🔶 tomorrow morning
-- No open positions
-
-### Next Session
-
-1. Build Streamlit open positions page
-2. Commit `pages/2_Node_Inspector.py` changes (not staged this session)
-3. Check sweep status
