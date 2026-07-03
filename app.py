@@ -5,7 +5,15 @@ import os
 import subprocess
 import sys
 import signal
+import inspect
 from pathlib import Path
+
+import strategies
+
+STRATEGY_OPTIONS = [
+    name for name, obj in inspect.getmembers(strategies, inspect.isclass)
+    if obj.__module__ == 'strategies' and issubclass(obj, strategies.BaseStrategy) and obj is not strategies.BaseStrategy
+]
 
 # Enforce clean workspace environment paths immediately on boot
 DB_DIR = Path("./cache")
@@ -128,8 +136,8 @@ with st.form(key="global_config_form"):
         
         strategy_choices = st.multiselect(
             "Active Compute Strategies",
-            ["ZScoreBreakout", "TrendFilteredZScore"],
-            default=db_config.get("active_strategies", ["ZScoreBreakout"])
+            STRATEGY_OPTIONS,
+            default=[s for s in db_config.get("active_strategies", ["ZScoreBreakout"]) if s in STRATEGY_OPTIONS]
         )
         
         # Pull inner nested configuration attributes safely using .get() fallbacks
@@ -145,25 +153,31 @@ with st.form(key="global_config_form"):
         tp_input = st.text_input("Take Profits Baseline (%)", ", ".join(map(str, hp_settings.get("take_profits", [2, 4, 6, 8]))))
         sl_input = st.text_input("Stop Losses Baseline (%)", ", ".join(map(str, hp_settings.get("stop_losses", [1, 2, 3, 4]))))
         hold_input = st.text_input("Max Hold Horizons (Hours)", ", ".join(map(str, hp_settings.get("hold_time_caps", [24, 48, 72, 96, 120]))))
+        zthresh_input = st.text_input("Z-Score Thresholds", ", ".join(map(str, hp_settings.get("z_score_thresholds", [2.0]))))
 
     submit_button = st.form_submit_button(label="💾 Lock Configuration Parameters & Update Workspace File", use_container_width=True)
 
 if submit_button:
     try:
-        updated_config = {
-            "version": version_string.strip(),
-            "target_tickers": [t.strip().upper() for t in ticker_string.split(",") if t.strip()],
-            "active_strategies": strategy_choices,
-            "hyperparameters": {
-                "windows": [int(x.strip()) for x in windows_input.split(",") if x.strip()],
-                "take_profits": [int(x.strip()) for x in tp_input.split(",") if x.strip()],
-                "stop_losses": [int(x.strip()) for x in sl_input.split(",") if x.strip()],
-                "hold_time_caps": [int(x.strip()) for x in hold_input.split(",") if x.strip()]
-            },
-            "execution": {
-                "max_generations": int(max_gens),
-                "alpha_tolerance": float(alpha_tol)
-            }
+        # Merge into the loaded config rather than rebuilding from scratch — otherwise
+        # fields this form doesn't manage (max_workers, fixed_stop_loss, any future key)
+        # get silently dropped on every save.
+        updated_config = dict(db_config)
+        updated_config["version"] = version_string.strip()
+        updated_config["target_tickers"] = [t.strip().upper() for t in ticker_string.split(",") if t.strip()]
+        updated_config["active_strategies"] = strategy_choices
+        updated_config["hyperparameters"] = {
+            **db_config.get("hyperparameters", {}),
+            "z_score_thresholds": [float(x.strip()) for x in zthresh_input.split(",") if x.strip()],
+            "windows": [int(x.strip()) for x in windows_input.split(",") if x.strip()],
+            "take_profits": [int(x.strip()) for x in tp_input.split(",") if x.strip()],
+            "stop_losses": [int(x.strip()) for x in sl_input.split(",") if x.strip()],
+            "hold_time_caps": [int(x.strip()) for x in hold_input.split(",") if x.strip()]
+        }
+        updated_config["execution"] = {
+            **db_config.get("execution", {}),
+            "max_generations": int(max_gens),
+            "alpha_tolerance": float(alpha_tol)
         }
         save_config(updated_config)
         st.success("Global configuration successfully written to database and configuration file sync layer!")

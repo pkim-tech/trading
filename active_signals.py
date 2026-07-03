@@ -61,8 +61,9 @@ import strategies
 
 load_dotenv()
 
-DB_PATH    = Path("./cache/trading_universe.db")
-CACHE_DIR  = Path("./cache")
+DB_PATH     = Path("./cache/trading_universe.db")
+CACHE_DIR   = Path("./cache")
+CONFIG_PATH = Path("./config.json")
 POLL_SECS  = int(os.environ.get("SIGNAL_POLL_SECS", 300))
 SLACK_HOOK = os.environ.get("SLACK_WEBHOOK_URL", "")
 
@@ -175,6 +176,12 @@ def ensure_tables():
             if 'z_score_threshold' not in wl_cols:
                 c.execute("ALTER TABLE watch_list ADD COLUMN z_score_threshold REAL NOT NULL DEFAULT 2.0")
 
+        wl_cols = {r[1] for r in c.execute("PRAGMA table_info(watch_list)").fetchall()}
+        if 'trail_pct' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN trail_pct REAL")
+        if 'fixed_sl' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN fixed_sl REAL")
+
         # open_positions
         c.execute("""
             CREATE TABLE IF NOT EXISTS open_positions (
@@ -198,6 +205,10 @@ def ensure_tables():
             c.execute("ALTER TABLE open_positions ADD COLUMN trade_log_id INTEGER")
         if 'trail_state' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN trail_state TEXT")
+        if 'trail_pct' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN trail_pct REAL")
+        if 'fixed_sl' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN fixed_sl REAL")
 
         # trade_log
         c.execute("""
@@ -278,18 +289,39 @@ def get_watchlist(watchlist_id=None):
         ).fetchall()]
 
 
+def _uses_fixed_sl(strategy_name):
+    """v1.8/v1.9/v1.10: the swept 'stop_loss' column actually holds trail_pct/trail_buy_pct;
+    the real fixed SL comes from config.execution.fixed_stop_loss, not the node's stop_loss field."""
+    strategy_cls = getattr(strategies, strategy_name, None)
+    return strategy_cls is not None and issubclass(
+        strategy_cls, (strategies.TrailingExitZScoreBreakout, strategies.TrailingBuyZScoreBreakout))
+
+
+def _config_fixed_stop_loss():
+    try:
+        with open(CONFIG_PATH) as f:
+            return float(json.load(f).get("execution", {}).get("fixed_stop_loss", 0))
+    except Exception:
+        return 0.0
+
+
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
              label='', z_score_threshold=2.0, watchlist_id=None, mode='live'):
     if watchlist_id is None:
         watchlist_id = get_active_watchlist_id()
+    if _uses_fixed_sl(strategy):
+        trail_pct, fixed_sl = float(stop_loss), _config_fixed_stop_loss()
+    else:
+        trail_pct, fixed_sl = None, None
     with _conn() as c:
         c.execute("""
             INSERT OR IGNORE INTO watch_list
                 (watchlist_id, mode, ticker, strategy, version, window, take_profit,
-                 stop_loss, max_hold_hours, label, z_score_threshold)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 stop_loss, max_hold_hours, label, z_score_threshold, trail_pct, fixed_sl)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (watchlist_id, mode, ticker, strategy, version, int(window), int(take_profit),
-              int(stop_loss), int(max_hold_hours), label, float(z_score_threshold)))
+              int(stop_loss), int(max_hold_hours), label, float(z_score_threshold),
+              trail_pct, fixed_sl))
         c.commit()
 
 
@@ -346,14 +378,16 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time):
         c.execute("""
             INSERT INTO open_positions
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
-                 signal_price, signal_time, entry_price, entry_time, trade_log_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 signal_price, signal_time, entry_price, entry_time, trade_log_id,
+                 trail_pct, fixed_sl)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(node['take_profit']), int(node['stop_loss']),
             int(node['max_hold_hours']),
             float(signal_price), sig_time_str,
             float(entry_price), entry_time_str, trade_log_id,
+            node.get('trail_pct'), node.get('fixed_sl'),
         ))
         c.commit()
 
@@ -518,13 +552,32 @@ def compute_buy_signal(node):
     }
 
 
-def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, high=None):
+def _bars_held(df_hourly, signal_time):
+    """Trading-hour bars elapsed since the signal bar — mirrors the kernels'
+    `held += 1` per hourly row (cached data is market-hours-only), unlike
+    wall-clock hours which run ~3.5x faster than trading hours."""
+    if df_hourly is None or df_hourly.empty:
+        return 0
+    return int((df_hourly.index > signal_time).sum())
+
+
+def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, high=None, df_hourly=None):
     strategy_cls = getattr(strategies, pos['strategy'], None)
     if strategy_cls is None:
         return None, None, False
-    entry_time = datetime.strptime(pos['entry_time'], '%Y-%m-%d %H:%M:%S')
-    hours_held = (now - entry_time).total_seconds() / 3600
-    strat      = strategy_cls(window=pos['window'], trail_pct=pos.get('trail_pct', 0.03))
+    signal_time = datetime.strptime(pos['signal_time'], '%Y-%m-%d %H:%M:%S')
+    if df_hourly is None:
+        df_hourly, _ = _load_cache(pos['ticker'])
+    hours_held = _bars_held(df_hourly, signal_time)
+    # For v1.8/v1.9/v1.10 the swept 'stop_loss' column holds trail_pct/trail_buy_pct,
+    # not the real fixed SL — that comes from the node's fixed_sl column instead.
+    if _uses_fixed_sl(pos['strategy']):
+        real_sl_pct = pos.get('fixed_sl') or 0.0
+        trail_pct   = (pos.get('trail_pct') or 3.0) / 100.0
+    else:
+        real_sl_pct = pos['stop_loss']
+        trail_pct   = 0.03
+    strat      = strategy_cls(window=pos['window'], trail_pct=trail_pct)
     old_state  = pos.get('trail_state', {})
     reason, price, new_state = strat.check_exit({
         'current_price':     current_price,
@@ -534,7 +587,7 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
         'high':              high if high is not None else current_price,
         'entry_price':       pos['entry_price'],
         'take_profit':       pos['take_profit'] / 100.0,
-        'stop_loss':         pos['stop_loss'] / 100.0,
+        'stop_loss':         real_sl_pct / 100.0,
         'max_hours_to_hold': pos['max_hold_hours'],
         'hours_held':        hours_held,
         'at_bar_close':      at_bar_close,
@@ -762,8 +815,9 @@ def _build_buy_blocks(node, sig):
     if SOCKET_MODE:
         value = json.dumps({
             "type":         "buy",
-            "node":         {k: node[k] for k in ('ticker', 'strategy', 'version', 'window',
-                                                    'take_profit', 'stop_loss', 'max_hold_hours', 'label')},
+            "node":         {k: node.get(k) for k in ('ticker', 'strategy', 'version', 'window',
+                                                        'take_profit', 'stop_loss', 'max_hold_hours', 'label',
+                                                        'trail_pct', 'fixed_sl')},
             "signal_price": price,
             "signal_time":  sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'),
             "lower_band":   sig['lower_band'],
@@ -1243,8 +1297,9 @@ def send_startup_report(watchlist):
         blocks.append({"type": "divider"})
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Open Positions*"}})
         for p in positions:
-            entry_time = datetime.fromisoformat(p['entry_time'])
-            hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+            signal_time = datetime.fromisoformat(p['signal_time'])
+            df_hourly_p, _ = _load_cache(p['ticker'])
+            hours_held = _bars_held(df_hourly_p, signal_time)
             cp, _ = _current_price(p['ticker'])
             if cp:
                 pnl = (cp - p['entry_price']) / p['entry_price'] * 100
@@ -1282,8 +1337,9 @@ def send_startup_report(watchlist):
     if positions:
         print("  Open positions:")
         for p in positions:
-            entry_time = datetime.fromisoformat(p['entry_time'])
-            hours_held = (datetime.now() - entry_time).total_seconds() / 3600
+            signal_time = datetime.fromisoformat(p['signal_time'])
+            df_hourly_p, _ = _load_cache(p['ticker'])
+            hours_held = _bars_held(df_hourly_p, signal_time)
             print(f"    {p['ticker']:<6}  entry=${p['entry_price']:.2f}  held={hours_held:.0f}h")
 
     _post_message(f"Morning Report — {now_str}", blocks=blocks)
@@ -1326,7 +1382,7 @@ def run_loop(tickers: set = None):
     send_startup_report(startup_wl)
 
     buy_alerted:        set[tuple] = set()
-    sell_alerted:       set[int]   = set()
+    sell_alerted:       set[tuple] = set()  # (position_id, bar_ts) — dedups within a bar, not across bars
     window_alerted:     set[tuple] = set()
     limit_fill_alerted: set[tuple] = set()
     last_seen_bar:      dict       = {}   # ticker -> last hourly bar timestamp checked
@@ -1367,10 +1423,12 @@ def run_loop(tickers: set = None):
                 except Exception as e:
                     print(f"  [data] {t} refresh failed: {e}")
 
-        # Fire once per window: notify at 10:25 and 15:25 that algo is alive
-        for wh, wm, label in [(10, 25, "10:25"), (15, 25, "15:25")]:
+        # Fire once per window: notify that algo is alive anywhere inside the window
+        # (POLL_SECS=300 means we rarely land on the exact opening minute).
+        for wh, wm, wh1, wm1 in _SIGNAL_WINDOWS:
+            label = f"{wh:02d}:{wm:02d}"
             wkey = (today, label)
-            if now.hour == wh and now.minute == wm and wkey not in window_alerted:
+            if (wh, wm) <= (now.hour, now.minute) <= (wh1, wm1) and wkey not in window_alerted:
                 window_alerted.add(wkey)
                 _send_window_alert(label, watchlist)
 
@@ -1383,12 +1441,12 @@ def run_loop(tickers: set = None):
         for pos in get_open_positions():
             if tickers and pos['ticker'] not in tickers:
                 continue
-            if pos['id'] in sell_alerted:
-                continue
             df_hourly, _ = _load_cache(pos['ticker'])
             if df_hourly is None or df_hourly.empty:
                 continue
             last_bar_ts = df_hourly.index[-1]
+            if (pos['id'], last_bar_ts) in sell_alerted:
+                continue
             at_bar_close = last_seen_bar.get(pos['ticker']) != last_bar_ts
             if at_bar_close:
                 last_seen_bar[pos['ticker']] = last_bar_ts
@@ -1400,12 +1458,12 @@ def run_loop(tickers: set = None):
                     continue
                 low = high = cp
             reason, target, just_activated_trailing = check_sell_condition(
-                pos, cp, now, at_bar_close=at_bar_close, low=low, high=high)
+                pos, cp, now, at_bar_close=at_bar_close, low=low, high=high, df_hourly=df_hourly)
             if just_activated_trailing:
                 notify_trailing_activated(pos, cp)
             if reason:
                 notify_sell_signal(pos, reason, cp, target)
-                sell_alerted.add(pos['id'])
+                sell_alerted.add((pos['id'], last_bar_ts))
 
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
@@ -1488,16 +1546,16 @@ def cmd_positions():
     if not positions:
         print("No open positions.")
         return
-    now = datetime.now()
-    hdr = f"{'ID':<4} {'Ticker':<7} {'Entry Price':<13} {'Entry Time':<22} {'Hours':<7} {'TP%':<5} {'SL%':<5} {'Hold'}"
+    hdr = f"{'ID':<4} {'Ticker':<7} {'Entry Price':<13} {'Entry Time':<22} {'Bars Held':<9} {'TP%':<5} {'SL%':<5} {'Hold'}"
     print(hdr)
     print('-' * len(hdr))
     for p in positions:
-        et    = datetime.strptime(p['entry_time'], '%Y-%m-%d %H:%M:%S')
-        hours = (now - et).total_seconds() / 3600
+        signal_time = datetime.strptime(p['signal_time'], '%Y-%m-%d %H:%M:%S')
+        df_hourly_p, _ = _load_cache(p['ticker'])
+        hours = _bars_held(df_hourly_p, signal_time)
         print(
             f"{p['id']:<4} {p['ticker']:<7} ${p['entry_price']:<12.4f} "
-            f"{p['entry_time']:<22} {hours:<7.1f} {p['take_profit']:<5} "
+            f"{p['entry_time']:<22} {hours:<9} {p['take_profit']:<5} "
             f"{p['stop_loss']:<5} {p['max_hold_hours']}"
         )
 

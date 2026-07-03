@@ -56,6 +56,10 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE backtest_cache ADD COLUMN z_score_threshold REAL DEFAULT 2.0")
     except Exception:
         pass
+    try:
+        cursor.execute("ALTER TABLE backtest_cache ADD COLUMN fixed_sl REAL DEFAULT 0")
+    except Exception:
+        pass
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker ON backtest_cache(version, ticker)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_window ON backtest_cache(version, window)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker_strategy ON backtest_cache(version, ticker, strategy)")
@@ -212,11 +216,20 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     matrix_results  = []
     unvisited_tasks = []
 
+    # v1.8/v1.9/v1.10 use fixed_sl as the real stop loss (the swept 'stop_loss' column
+    # holds trail_pct/trail_buy_pct for these) — a cache row is only valid for the
+    # fixed_sl it was computed with, else re-running with a different fixed_stop_loss
+    # would silently serve stale results under the same (tp, sl, hold, w, z) key.
+    strategy_cls_fsl = getattr(strategies, strategy_name, None)
+    uses_fixed_sl = strategy_cls_fsl is not None and issubclass(
+        strategy_cls_fsl, (strategies.TrailingExitZScoreBreakout, strategies.TrailingBuyZScoreBreakout))
+    stored_fsl = float(fixed_sl) if uses_fixed_sl else 0.0
+
     # One query for all cached nodes of this (strategy, version, ticker) instead of
     # one SELECT per task (Phase 3 = ~18k queries per ticker).
     cached_map = {}
     cursor.execute("""
-        SELECT window, max_hold_hours, take_profit, stop_loss, z_score_threshold,
+        SELECT window, max_hold_hours, take_profit, stop_loss, z_score_threshold, fixed_sl,
                trades, win_rate, strategy_return, alpha_vs_spy
         FROM backtest_cache
         WHERE strategy=? AND version=? AND ticker=?
@@ -224,11 +237,12 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     for r in cursor.fetchall():
         if r[4] is None:
             continue  # legacy NULL-z rows never matched the old equality check either
-        cached_map[(int(r[2]), int(r[3]), int(r[1]), int(r[0]), float(r[4]))] = (r[5], r[6], r[7], r[8])
+        row_fsl = float(r[5]) if (uses_fixed_sl and r[5] is not None) else 0.0
+        cached_map[(int(r[2]), int(r[3]), int(r[1]), int(r[0]), float(r[4]), row_fsl)] = (r[6], r[7], r[8], r[9])
 
     for t in tasks:
         tp, sl, hold_hours, w, z_thresh = t
-        cached_row = cached_map.get((int(tp), int(sl), int(hold_hours), int(w), float(z_thresh)))
+        cached_row = cached_map.get((int(tp), int(sl), int(hold_hours), int(w), float(z_thresh), stored_fsl))
         if cached_row:
             matrix_results.append({
                 "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
@@ -269,6 +283,9 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     node_counter      = 0
     last_postfix_time = 0.0
     fail_counts       = {}
+    buffer            = []
+    batch_size        = 50
+
     for future in progress_bar:
         tp, sl, hold_hours, w, z_thresh = futures_map[future]
         try:
@@ -309,17 +326,34 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                         "Alpha vs SPY %": alpha, "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
                     })
 
-                cursor.execute(
-                    "INSERT OR REPLACE INTO backtest_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl),
-                     num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh)
-                )
-                if node_counter % 100 == 0:
+                buffer.append((strategy_name, config_version, ticker, w, hold_hours, int(tp), int(sl),
+                               num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
+                               stored_fsl))
+
+                if len(buffer) >= batch_size:
+                    cursor.executemany(
+                        """INSERT OR REPLACE INTO backtest_cache
+                           (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
+                            trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
+                            run_timestamp, z_score_threshold, fixed_sl)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        buffer
+                    )
+                    buffer = []
                     conn.commit()
 
         except Exception as e:
             logger.error(f"Worker crashed TP={tp} SL={sl}: {e}")
 
+    if buffer:
+        cursor.executemany(
+            """INSERT OR REPLACE INTO backtest_cache
+               (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
+                trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
+                run_timestamp, z_score_threshold, fixed_sl)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            buffer
+        )
     conn.commit()
     progress_bar.close()
     conn.close()
