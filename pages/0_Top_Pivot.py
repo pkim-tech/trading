@@ -243,11 +243,25 @@ st.divider()
 st.subheader("Universe — Best Alpha by Strategy")
 
 STRAT_SHORT = {
-    'ZScoreBreakout':             'ZSB',
-    'TrendFilteredZScore':        'TrendF',
-    'LimitOrderZScoreBreakout':   'Limit',
-    'TrailingExitZScoreBreakout': 'Trail',
+    'ZScoreBreakout':              'ZSB',
+    'TrendFilteredZScore':         'TrendF',
+    'LimitOrderZScoreBreakout':    'Limit',
+    'TrailingExitZScoreBreakout':  'Trail',
+    'TrailingBuyZScoreBreakout':   'TrBuy',
+    'TrailingBothZScoreBreakout':  'TrBoth',
 }
+
+sp_c1, sp_c2, sp_c3 = st.columns(3)
+with sp_c1:
+    max_alpha = st.number_input("Max alpha cap % (0 = no cap)", value=0.0, step=100.0, format="%.0f",
+                                help="Cap to exclude black-swan outliers (e.g. UVIX). 0 = disabled.")
+with sp_c2:
+    cliff_radius = st.number_input("Cliff-safe radius", value=3, step=1, min_value=1,
+                                   help="±N in TP/SL integer values. Use 3 for coarse grid, 2 for fine mesh.")
+with sp_c3:
+    min_cliff_neighbors = st.number_input("Min safe neighbors", value=4, step=1, min_value=1,
+                                          help="How many ±radius neighbors must have alpha > 0.")
+
 
 @st.cache_data(ttl=3600)
 def load_strategy_pivot(min_trades_val):
@@ -270,20 +284,115 @@ def load_strategy_pivot(min_trades_val):
     piv = piv.join(bh.set_index('ticker')['bh'], how='left')
     return piv.sort_values('max', ascending=False).round(1)
 
+
+@st.cache_data(ttl=3600)
+def load_strategy_pivot_safe(min_trades_val, radius, min_neighbors):
+    with sqlite3.connect(DB_PATH) as conn:
+        # Top 100 candidates per (ticker, strategy) — walk best→worst until one is cliff-safe
+        candidates = pd.read_sql("""
+            WITH ranked AS (
+                SELECT ticker, strategy, version, window,
+                       COALESCE(z_score_threshold, 2.0) AS z,
+                       take_profit, stop_loss, alpha_vs_spy,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY ticker, strategy
+                           ORDER BY alpha_vs_spy DESC
+                       ) AS rn
+                FROM backtest_cache WHERE trades >= ?
+            )
+            SELECT * FROM ranked WHERE rn <= 100
+        """, conn, params=(min_trades_val,))
+
+        if candidates.empty:
+            return pd.DataFrame()
+
+        # Bulk-load all TP/SL grid data for the relevant tickers/strategies in one query
+        tickers_in   = ','.join(f"'{t}'" for t in candidates['ticker'].unique())
+        strategies_in = ','.join(f"'{s}'" for s in candidates['strategy'].unique())
+        grid_df = pd.read_sql(f"""
+            SELECT ticker, strategy, version, window,
+                   COALESCE(z_score_threshold, 2.0) AS z,
+                   take_profit, stop_loss, alpha_vs_spy
+            FROM backtest_cache
+            WHERE ticker IN ({tickers_in}) AND strategy IN ({strategies_in})
+              AND trades >= ?
+        """, conn, params=(min_trades_val,))
+
+        # Build lookup: (ticker, strategy, version, window, z) → {(tp, sl): alpha}
+        grids = {}
+        for key, grp in grid_df.groupby(['ticker','strategy','version','window','z']):
+            grids[key] = {(int(r.take_profit), int(r.stop_loss)): r.alpha_vs_spy
+                          for _, r in grp.iterrows()}
+
+        bh = pd.read_sql("""
+            SELECT ticker, MAX(asset_bh) AS bh FROM backtest_cache
+            WHERE trades >= ? AND asset_bh IS NOT NULL GROUP BY ticker
+        """, conn, params=(min_trades_val,))
+
+    results = []
+    for (ticker, strategy), grp in candidates.sort_values('alpha_vs_spy', ascending=False).groupby(['ticker','strategy']):
+        for _, c in grp.iterrows():
+            key = (c.ticker, c.strategy, c.version, c.window, c.z)
+            grid = grids.get(key, {})
+            tp0, sl0 = int(c.take_profit), int(c.stop_loss)
+            pos = sum(
+                1 for dtp in range(-radius, radius + 1)
+                for dsl in range(-radius, radius + 1)
+                if (dtp != 0 or dsl != 0) and grid.get((tp0 + dtp, sl0 + dsl), -999) > 0
+            )
+            if pos >= min_neighbors:
+                results.append({'ticker': ticker, 'strategy': strategy, 'best_alpha': c.alpha_vs_spy})
+                break
+
+    if not results:
+        return pd.DataFrame()
+
+    best = pd.DataFrame(results)
+    best['col'] = best['strategy'].map(STRAT_SHORT).fillna(best['strategy'])
+    piv = best.pivot_table(index='ticker', columns='col', values='best_alpha', aggfunc='max')
+    piv['max'] = piv.max(axis=1)
+    piv = piv.join(bh.set_index('ticker')['bh'], how='left')
+    return piv.sort_values('max', ascending=False).round(1)
+
+
+def _apply_strat_pivot_filters(piv, exclude_ss, exclude_ix, ss_set, ix_set, max_alpha_cap, min_ret):
+    if exclude_ss:
+        piv = piv[~piv.index.isin(ss_set)]
+    if exclude_ix:
+        piv = piv[~piv.index.isin(ix_set)]
+    piv = piv[piv['max'] >= min_ret]
+    if max_alpha_cap > 0:
+        piv = piv[piv['max'] <= max_alpha_cap]
+    return piv
+
+
+def _render_strat_pivot(piv):
+    if piv.empty:
+        st.info("No results.")
+        return
+    scols = [c for c in piv.columns if c not in ('max', 'bh')]
+    col_cfg = {c: st.column_config.NumberColumn(c, format="%.1f%%") for c in scols}
+    col_cfg['max'] = st.column_config.NumberColumn('Best α', format="%.1f%%")
+    col_cfg['bh']  = st.column_config.NumberColumn('B&H %', format="%.1f%%")
+    st.dataframe(piv, use_container_width=True, column_config=col_cfg)
+
+
+_ss = load_single_stock_tickers()
+_ix = load_index_tickers()
+
 strat_piv = load_strategy_pivot(int(min_trades))
-if not strat_piv.empty:
-    _ss = load_single_stock_tickers()
-    _ix = load_index_tickers()
-    if exclude_single_stock:
-        strat_piv = strat_piv[~strat_piv.index.isin(_ss)]
-    if exclude_index:
-        strat_piv = strat_piv[~strat_piv.index.isin(_ix)]
-    strat_piv = strat_piv[strat_piv['max'] >= min_return]
-    scols = [c for c in strat_piv.columns if c not in ('max', 'bh')]
-    col_cfg_s = {c: st.column_config.NumberColumn(c, format="%.1f%%") for c in scols}
-    col_cfg_s['max'] = st.column_config.NumberColumn('Best α', format="%.1f%%")
-    col_cfg_s['bh']  = st.column_config.NumberColumn('B&H %', format="%.1f%%")
-    st.dataframe(strat_piv, use_container_width=True, column_config=col_cfg_s)
+strat_piv = _apply_strat_pivot_filters(strat_piv, exclude_single_stock, exclude_index,
+                                        _ss, _ix, max_alpha, min_return)
+_render_strat_pivot(strat_piv)
+
+st.divider()
+st.subheader("Universe — Best Cliff-Safe Alpha by Strategy")
+st.caption(f"Only nodes where ≥{int(min_cliff_neighbors)} neighbors within ±{int(cliff_radius)} TP/SL have alpha > 0")
+
+safe_piv = load_strategy_pivot_safe(int(min_trades), int(cliff_radius), int(min_cliff_neighbors))
+safe_piv = _apply_strat_pivot_filters(safe_piv, exclude_single_stock, exclude_index,
+                                       _ss, _ix, max_alpha, min_return)
+_render_strat_pivot(safe_piv)
 
 st.divider()
 st.subheader("Watchlist — Alpha by Strategy")
