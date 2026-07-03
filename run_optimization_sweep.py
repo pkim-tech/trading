@@ -62,9 +62,12 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE backtest_cache ADD COLUMN fixed_sl REAL DEFAULT 0")
     except Exception:
         pass
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker ON backtest_cache(version, ticker)")
+    cursor.execute("DROP INDEX IF EXISTS idx_bc_version_ticker")
+    cursor.execute("DROP INDEX IF EXISTS idx_bc_version_ticker_z_return")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_window ON backtest_cache(version, window)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker_strategy ON backtest_cache(version, ticker, strategy)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_return ON backtest_cache(version, strategy_return)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_ticker ON backtest_cache(ticker)")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sweep_runs (
@@ -309,7 +312,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     last_postfix_time = 0.0
     fail_counts       = {}
     buffer            = []
-    batch_size        = 50
+    batch_size        = 5000
 
     for future in progress_bar:
         tp, sl, hold_hours, w, z_thresh = futures_map[future]

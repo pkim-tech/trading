@@ -18,7 +18,10 @@ def prep_inputs(df_hourly, df_daily_indicators):
     per (ticker, strategy, window) across grid nodes; z/tp/sl/hold are kernel args."""
     timestamps = df_hourly.index
     date_strs = timestamps.strftime('%Y-%m-%d')
-    daily_lookup = {d: i for i, d in enumerate(df_daily_indicators.index.strftime('%Y-%m-%d'))}
+    # Map each hourly bar to the most recently *completed* day's row (i-1, not i) —
+    # day D's own row is built from D's close, which isn't known during D's intraday
+    # bars. Mirrors active_signals.compute_buy_signal's `df_daily.index < today` cutoff.
+    daily_lookup = {d: i - 1 for i, d in enumerate(df_daily_indicators.index.strftime('%Y-%m-%d'))}
     prices = df_hourly['Close'].to_numpy(dtype=np.float64)
     has_trend = 'Trend_Filter' in df_daily_indicators.columns
     return {
