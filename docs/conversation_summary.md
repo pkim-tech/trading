@@ -4,6 +4,29 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 
 ---
 
+## 2026-07-03 (evening) — v2.x backfill launched, live-parity spot-checks on AGQ, cache-refresh deferred
+
+### What we did
+- **Launched the v2.x bias-corrected backfill** (`scripts/run_v2_backfill_sweep.sh`, no-arg full run) — in progress at session end, ~9hr estimated (measured ~84s/ticker × 53 tickers × 7 strategies), safe to run unattended offline (no network calls, confirmed last session).
+- **Clarified the version↔z-threshold mapping is incidental, not designed**: `patch_config` in `run_v2_backfill_sweep.sh` never touches `z_score_thresholds` — every version just inherits whatever's in `config.json` at run time. v1.5 being z=2.0-only was because `config.json` happened to have a single z value when that sweep ran, not a per-version rule the script enforces. v2.5/v2.6 will end up identical (both all-z) once both complete.
+- **Live-parity spot-checked AGQ mid-run** using `scripts/verify_live_parity.py`'s `compare()`/`kernel_trades()` called ad hoc (no need to hardcode every node into the script's `__main__` block):
+  - Live watchlist node (w=10 z=2.0 tp=19 sl=8 hold=133h): v1.5 (pre-fix, cached) 372.8% return/18 trades vs. v2.5 (post-fix) 106.1% return/31 trades — confirms the bias-fix magnitude at the individual-node level, matching last session's aggregate estimate. Live-parity MATCH (31/31 trades) on the corrected kernel.
+  - Established that **grid-max (best-of-sweep) comparisons across versions are not apples-to-apples** — each version re-maximizes over ~10k+ combos, so a different node can win each time (e.g. v1.6's best-of-grid alpha 871%→668% same-node-family comparison looked like a modest drop, but the *same exact node* run through the fixed kernel actually dropped 934%→365%, a much bigger haircut — the grid-max shift was partly just re-optimization noise, not the true bias-removal effect). Only same-node comparisons cleanly isolate what the fix actually did.
+  - Best AGQ v2.5 candidate found so far (z unrestricted, since the sweep doesn't restrict it): w=10 z=1.0 tp=19 sl=11 hold=140h — 668% alpha, 42 trades, 45.2% win rate, live-parity MATCH (42/42). Materially different from the current live watchlist entry (z=1.0 vs 2.0, SL=11 vs 8, hold=140 vs 133h) — a real candidate for watchlist review once the full sweep confirms it's not a single-ticker fluke.
+- **Added `--skip-cache-refresh` to `run_optimization_sweep.py`** — `refresh_dropdown_cache`/`refresh_pivot_cache`/`refresh_cliff_grid_cache` take 2-4 min each; `run_v2_backfill_sweep.sh`'s no-arg path was paying that once per version (7x, ~15-30 min total) for a Streamlit page nobody's watching mid-sweep. Now deferred to one combined refresh after all 7 versions finish. Single-version/ticker-override invocations (sanity checks) still refresh normally — the skip flag is only set for the full 7-version loop (`DEFER_CACHE_REFRESH=1`).
+- **Added `scripts/post_sweep_report.py`** — run manually after the backfill completes (no polling; user will run it themselves when the sweep's done). Reports live-parity + fresh-kernel stats for every `watch_list` node (16 nodes across `ZScoreBreakout`/`LimitOrderZScoreBreakout`, not just the 4-ticker live watchlist) plus each one's best-alpha v2.x replacement candidate, written to `docs/post_sweep_report.md`. Not yet run against a completed backfill.
+
+### Key decisions
+- Same-node comparison is the only valid way to measure the bias fix's effect; best-of-grid comparisons are confounded by re-optimization over a large combo space and should not be used to judge whether the fix "helped" or "hurt" a given z-threshold or strategy.
+- Cache-refresh timing doesn't matter functionally (Top Pivot page falls back to a live query if the cache is stale/missing) — deferring it is a pure time-savings, no correctness tradeoff.
+
+### Next Session
+1. Run `.venv/bin/python scripts/post_sweep_report.py` once the v2.x backfill finishes — generates `docs/post_sweep_report.md`.
+2. Review the AGQ w=10 z=1.0 tp=19 sl=11 hold=140h candidate (and equivalents for EDC/FAS/HIBL once their v2.x data lands) as potential watchlist swaps — confirm not overfit to a narrow window before promoting.
+3. `config.json.bak` is a live runtime artifact from the in-progress sweep (created/restored by its `trap`) — leave it alone until the sweep exits.
+
+---
+
 ## 2026-07-03 (later still) — Look-ahead bias fixed, v2.x backfill prepared for offline run
 
 ### What we did

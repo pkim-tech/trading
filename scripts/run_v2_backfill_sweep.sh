@@ -56,13 +56,24 @@ run_version() {
         v2.10) patch_config v2.10 TrailingBothZScoreBreakout   7 ;;
         *) echo "Unknown version: $version"; exit 1 ;;
     esac
-    $PYTHON run_optimization_sweep.py --version "$version" --tickers $tickers
+    local refresh_flag=""
+    [ "$DEFER_CACHE_REFRESH" = "1" ] && refresh_flag="--skip-cache-refresh"
+    $PYTHON run_optimization_sweep.py --version "$version" --tickers $tickers $refresh_flag
 }
 
 if [ -z "$1" ]; then
+    DEFER_CACHE_REFRESH=1
     for v in v2.4 v2.5 v2.6 v2.7 v2.8 v2.9 v2.10; do
         run_version "$v"
     done
+    echo ""
+    echo "Final cache refresh (all versions)..."
+    $PYTHON -c "
+from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
+refresh_dropdown_cache()
+refresh_pivot_cache(versions=['v2.4','v2.5','v2.6','v2.7','v2.8','v2.9','v2.10'])
+refresh_cliff_grid_cache()
+"
 else
     run_version "$@"
 fi

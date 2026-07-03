@@ -666,6 +666,9 @@ if __name__ == "__main__":
                         help="Override tickers to sweep")
     parser.add_argument("--version", default=None,
                         help="Override version from config.json")
+    parser.add_argument("--skip-cache-refresh", action="store_true",
+                        help="Skip dropdown/pivot/cliff-grid cache refresh at end of run "
+                             "(useful when chaining multiple versions and refreshing once at the end)")
     args = parser.parse_args()
 
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
@@ -848,13 +851,16 @@ if __name__ == "__main__":
                 asset_bh, spy_bh = bh_cache[ticker]
                 run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
 
-    logger.info("\nFinal cache refresh...")
-    refresh_dropdown_cache()
-    refresh_pivot_cache(versions=[config_version])
-    try:
-        refresh_cliff_grid_cache()
-    except Exception as e:
-        logger.warning(f"Cliff grid cache refresh failed (page will fall back to live query): {e}")
+    if args.skip_cache_refresh:
+        logger.info("\nSkipping cache refresh (--skip-cache-refresh).")
+    else:
+        logger.info("\nFinal cache refresh...")
+        refresh_dropdown_cache()
+        refresh_pivot_cache(versions=[config_version])
+        try:
+            refresh_cliff_grid_cache()
+        except Exception as e:
+            logger.warning(f"Cliff grid cache refresh failed (page will fall back to live query): {e}")
 
     for p in ["current_test.json", "active_phase_grid.json"]:
         if os.path.exists(p):
