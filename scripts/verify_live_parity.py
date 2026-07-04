@@ -106,7 +106,18 @@ def replay(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_p
                     signal_time = datetime.strptime(pos['signal_time'], '%Y-%m-%d %H:%M:%S')
                     hours_held = active_signals._bars_held(df_slice, signal_time)
                     pc = (price - entry_price) / entry_price
-                    result = 'WIN' if reason in ('TP', 'WIN') else 'LOSS' if reason in ('SL', 'LOSS') else ('TWIN' if pc > 0 else 'TLOSS')
+                    # check_sell_condition collapses the strategy's WIN/LOSS (trailing-stop
+                    # triggered) into a generic 'TRAIL' reason for Slack messaging — recover
+                    # the kernel's WIN/LOSS-by-sign labeling here instead of falling through
+                    # to TWIN/TLOSS, which is only correct for a pre-activation 'TIME' exit.
+                    if reason in ('TP', 'WIN'):
+                        result = 'WIN'
+                    elif reason in ('SL', 'LOSS'):
+                        result = 'LOSS'
+                    elif reason == 'TRAIL':
+                        result = 'WIN' if pc > 0 else 'LOSS'
+                    else:
+                        result = 'TWIN' if pc > 0 else 'TLOSS'
                     trades.append({'Entry Time': entry_time, 'Exit Time': ts, 'Entry Price': entry_price,
                                     'Exit Price': price, 'hours_held': hours_held, 'Result': result, 'Return': pc})
                     active_signals.close_position(position_id, exit_signal_price=cp, exit_price=price,

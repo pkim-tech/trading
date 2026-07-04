@@ -24,6 +24,7 @@ General notes that apply everywhere:
 - **Signal check windows**: 10:25–10:40 AM ET (9:30 bar close) and 15:25–15:40 PM ET (14:30 bar close), for anything marked "bar-close" below.
 - **Data source**: Real-time spot price via `yfinance fast_info.last_price` at signal check time. Hourly cached data used only for indicator computation (SMA, Std).
 - **Do not use overnight limit orders at lower_band for bar-close strategies**: Open-fill analysis showed entering at the 9:30 open (before the intrabar decline) is consistently worse than the 10:30 close. A staged limit order edited at signal time is the correct approach.
+- **No use for stop-limit orders anywhere in this workflow**: all exits (fixed floor stop, armed trailing stop) must guarantee a fill — a stop-limit risks no fill at all during a fast/gappy move on a leveraged ETF, which defeats the point of a stop at exactly the moment it's needed. The one place a stop-limit could plausibly help (capping slippage on a v1.9/v1.10 trailing-buy entry) isn't offered as a combo order at Schwab (confirmed: no trailing-stop-limit-to-buy). Use plain stop (market) throughout.
 
 | # | Strategy | Signal | Timing | Slack message | Required action |
 |---|----------|--------|--------|----------------|------------------|

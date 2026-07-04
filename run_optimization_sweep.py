@@ -254,13 +254,14 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     matrix_results  = []
     unvisited_tasks = []
 
-    # v1.8/v1.9/v1.10 use fixed_sl as the real stop loss (the swept 'stop_loss' column
-    # holds trail_pct/trail_buy_pct for these) — a cache row is only valid for the
-    # fixed_sl it was computed with, else re-running with a different fixed_stop_loss
+    # v1.8/v1.9/v1.10/v2.11 use fixed_sl as the real stop loss (the swept 'stop_loss'
+    # column holds trail_pct/trail_buy_pct for these) — a cache row is only valid for
+    # the fixed_sl it was computed with, else re-running with a different fixed_stop_loss
     # would silently serve stale results under the same (tp, sl, hold, w, z) key.
     strategy_cls_fsl = getattr(strategies, strategy_name, None)
     uses_fixed_sl = strategy_cls_fsl is not None and issubclass(
-        strategy_cls_fsl, (strategies.TrailingExitZScoreBreakout, strategies.TrailingBuyZScoreBreakout))
+        strategy_cls_fsl, (strategies.TrailingExitZScoreBreakout, strategies.TrailingBuyZScoreBreakout,
+                            strategies.LimitOrderTrailingExit))
     stored_fsl = float(fixed_sl) if uses_fixed_sl else 0.0
 
     # One query for all cached nodes of this (strategy, version, ticker) instead of
