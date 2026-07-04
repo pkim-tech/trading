@@ -13,8 +13,9 @@ import pandas as pd
 from tqdm import tqdm
 
 from backtester import (run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110,
+                        run_backtest_v211,
                         prep_inputs, _simulate, _simulate_limit, _simulate_trail, _simulate_trail_buy,
-                        _simulate_trail_both)
+                        _simulate_trail_both, _simulate_limit_trail)
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
@@ -167,6 +168,8 @@ def _warmup_worker():
                          0.05, 0.05, 1, 0.03, 9, 14, 2.0)
     _simulate_trail_both(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
                           0.05, 0.05, 1, 0.03, 0.03, 9, 14, 2.0)
+    _simulate_limit_trail(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
+                           0.05, 0.05, 1, 0.03, 9, 14, 2.0)
 
 
 def run_single_backtest_node_isolated(args):
@@ -202,6 +205,13 @@ def run_single_backtest_node_isolated(args):
             )
         elif issubclass(strategy_class, strategies.TrailingExitZScoreBreakout):
             trades = run_backtest_v18(
+                df_hourly_raw, df_daily_processed, ticker,
+                take_profit=float(tp / 100.0), stop_loss=float(fixed_sl / 100.0),
+                max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh),
+                trail_pct=float(sl / 100.0), prep=prep
+            )
+        elif issubclass(strategy_class, strategies.LimitOrderTrailingExit):
+            trades = run_backtest_v211(
                 df_hourly_raw, df_daily_processed, ticker,
                 take_profit=float(tp / 100.0), stop_loss=float(fixed_sl / 100.0),
                 max_hours_to_hold=int(hold_hours), z_score_threshold=float(z_thresh),

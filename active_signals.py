@@ -309,11 +309,12 @@ def get_watchlist(watchlist_id=None):
 
 
 def _uses_fixed_sl(strategy_name):
-    """v1.8/v1.9/v1.10: the swept 'stop_loss' column actually holds trail_pct/trail_buy_pct;
+    """v1.8/v1.9/v1.10/v2.11: the swept 'stop_loss' column actually holds trail_pct/trail_buy_pct;
     the real fixed SL comes from config.execution.fixed_stop_loss, not the node's stop_loss field."""
     strategy_cls = getattr(strategies, strategy_name, None)
     return strategy_cls is not None and issubclass(
-        strategy_cls, (strategies.TrailingExitZScoreBreakout, strategies.TrailingBuyZScoreBreakout))
+        strategy_cls, (strategies.TrailingExitZScoreBreakout, strategies.TrailingBuyZScoreBreakout,
+                        strategies.LimitOrderTrailingExit))
 
 
 def _config_fixed_stop_loss():

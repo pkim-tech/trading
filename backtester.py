@@ -676,6 +676,151 @@ def run_backtest_v110(df_hourly, df_daily_indicators, ticker,
     return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
 
 
+@njit(cache=True)
+def _simulate_limit_trail(prices, highs, lows, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+                          take_profit, stop_loss, max_hours_to_hold, trail_pct, target_h0, target_h1, z_thresh):
+    entry_i    = np.empty(MAX_TRADES, dtype=np.int64)
+    exit_i     = np.empty(MAX_TRADES, dtype=np.int64)
+    entry_p    = np.empty(MAX_TRADES, dtype=np.float64)
+    exit_p     = np.empty(MAX_TRADES, dtype=np.float64)
+    hours_held = np.empty(MAX_TRADES, dtype=np.int64)
+    results    = np.empty(MAX_TRADES, dtype=np.int64)
+    returns    = np.empty(MAX_TRADES, dtype=np.float64)
+    count      = 0
+
+    in_trade    = False
+    trailing    = False
+    entry_price = 0.0
+    stop_price  = 0.0
+    tp_price    = 0.0
+    peak        = 0.0
+    entry_bar   = 0
+    held        = 0
+
+    n = len(prices)
+    for i in range(n):
+        cp   = prices[i]
+        high = highs[i]
+        low  = lows[i]
+
+        if in_trade:
+            held += 1
+
+            if trailing:
+                if high > peak:
+                    peak = high
+                trail_stop = peak * (1.0 - trail_pct)
+                if low <= trail_stop or held >= max_hours_to_hold:
+                    exit_px = trail_stop if low <= trail_stop else cp
+                    pc = (exit_px - entry_price) / entry_price
+                    entry_i[count]    = entry_bar
+                    exit_i[count]     = i
+                    entry_p[count]    = entry_price
+                    exit_p[count]     = exit_px
+                    hours_held[count] = held
+                    results[count]    = WIN if pc > 0 else LOSS
+                    returns[count]    = pc
+                    count += 1
+                    in_trade = False
+                    trailing = False
+                continue
+
+            # SL first: stop order triggers intrabar (band-anchored, like _simulate_limit)
+            if low <= stop_price:
+                pc = (stop_price - entry_price) / entry_price
+                entry_i[count]    = entry_bar
+                exit_i[count]     = i
+                entry_p[count]    = entry_price
+                exit_p[count]     = stop_price
+                hours_held[count] = held
+                results[count]    = LOSS
+                returns[count]    = pc
+                count += 1
+                in_trade = False
+                continue
+
+            # TP activation — switch to trailing mode
+            if cp >= tp_price:
+                trailing = True
+                peak     = cp
+                continue
+
+            if held >= max_hours_to_hold:
+                pc = (cp - entry_price) / entry_price
+                entry_i[count]    = entry_bar
+                exit_i[count]     = i
+                entry_p[count]    = entry_price
+                exit_p[count]     = cp
+                hours_held[count] = held
+                results[count]    = TWIN if pc > 0 else TLOSS
+                returns[count]    = pc
+                count += 1
+                in_trade = False
+                continue
+
+            continue
+
+        h = hours[i]
+        if h != target_h0 and h != target_h1:
+            continue
+
+        di = daily_idx[i]
+        if di < 0:
+            continue
+
+        sma = sma_arr[di]
+        std = std_arr[di]
+        if std == 0.0:
+            continue
+
+        lower_band = sma - std * z_thresh
+
+        if has_trend:
+            trend = trend_arr[di]
+            signal = (low <= lower_band) and (cp > trend)
+        else:
+            signal = low <= lower_band
+
+        if signal:
+            in_trade    = True
+            trailing    = False
+            entry_price = lower_band
+            tp_price    = lower_band * (1.0 + take_profit)
+            stop_price  = lower_band * (1.0 - stop_loss)
+            entry_bar   = i
+            held        = 0
+
+    if in_trade:
+        cp = prices[n - 1]
+        pc = (cp - entry_price) / entry_price
+        entry_i[count]    = entry_bar
+        exit_i[count]     = n - 1
+        entry_p[count]    = entry_price
+        exit_p[count]     = cp
+        hours_held[count] = held
+        results[count]    = OPEN
+        returns[count]    = pc
+        count += 1
+
+    return entry_i[:count], exit_i[:count], entry_p[:count], exit_p[:count], hours_held[:count], results[:count], returns[:count]
+
+
+def run_backtest_v211(df_hourly, df_daily_indicators, ticker,
+                      mode="BACKTEST", target_hours=(9, 14),
+                      take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28,
+                      z_score_threshold=2.0, trail_pct=0.03, prep=None):
+    p = prep if prep is not None else prep_inputs(df_hourly, df_daily_indicators)
+    target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
+
+    ei, xi, ep, xp, held, res, ret = _simulate_limit_trail(
+        p['prices'], p['highs'], p['lows'], p['hours'], p['daily_idx'],
+        p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
+        float(take_profit), float(stop_loss), int(max_hours_to_hold), float(trail_pct),
+        target_h0, target_h1, float(z_score_threshold)
+    )
+    return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
+
+
 def run_backtest(df_hourly, df_daily_indicators, ticker,
                  mode="BACKTEST", target_hours=(9, 14),
                  take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28, z_score_threshold=2.0,

@@ -6,7 +6,7 @@
 # index-underlier-only (excludes single-stock leveraged ETPs), non-dupe
 # (excludes dupe_direxion copycats) — 53 tickers as of 2026-07-03.
 # v1.x data is left untouched for before/after comparison.
-# Usage: ./scripts/run_v2_backfill_sweep.sh [v2.4|v2.5|v2.6|v2.7|v2.8|v2.9|v2.10] [TICKER ...]
+# Usage: ./scripts/run_v2_backfill_sweep.sh [v2.4|v2.5|v2.6|v2.7|v2.8|v2.9|v2.10|v2.11] [TICKER ...]
 #   No version arg = run all versions in sequence (full ticker list).
 #   Extra args after version = ticker override (e.g. a single-ticker sanity check),
 #   still goes through the version->strategy patch_config guard below.
@@ -54,6 +54,7 @@ run_version() {
         v2.8)  patch_config v2.8  TrailingExitZScoreBreakout   7 ;;
         v2.9)  patch_config v2.9  TrailingBuyZScoreBreakout    7 ;;
         v2.10) patch_config v2.10 TrailingBothZScoreBreakout   7 ;;
+        v2.11) patch_config v2.11 LimitOrderTrailingExit       7 ;;
         *) echo "Unknown version: $version"; exit 1 ;;
     esac
     local refresh_flag=""
@@ -63,7 +64,7 @@ run_version() {
 
 if [ -z "$1" ]; then
     DEFER_CACHE_REFRESH=1
-    for v in v2.4 v2.5 v2.6 v2.7 v2.8 v2.9 v2.10; do
+    for v in v2.4 v2.5 v2.6 v2.7 v2.8 v2.9 v2.10 v2.11; do
         run_version "$v"
     done
     echo ""
@@ -71,7 +72,7 @@ if [ -z "$1" ]; then
     $PYTHON -c "
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 refresh_dropdown_cache()
-refresh_pivot_cache(versions=['v2.4','v2.5','v2.6','v2.7','v2.8','v2.9','v2.10'])
+refresh_pivot_cache(versions=['v2.4','v2.5','v2.6','v2.7','v2.8','v2.9','v2.10','v2.11'])
 refresh_cliff_grid_cache()
 "
 else

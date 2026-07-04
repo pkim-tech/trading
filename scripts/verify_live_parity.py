@@ -43,7 +43,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import active_signals
-from backtester import run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110
+from backtester import run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110, run_backtest_v211
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 
@@ -118,13 +118,20 @@ def replay(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_p
             if ts.hour not in target_hours:
                 continue
 
+            # Limit-entry strategies: production polls all day (5-min cadence,
+            # active_signals.py's intrabar fill-detection loop) and would catch a wick
+            # through the band even if the bar's close recovers — mirror the kernel's
+            # own Low-based check (backtester.py's _simulate_limit/_simulate_limit_trail)
+            # rather than Close.
+            is_limit_entry = strategy_name in ('LimitOrderZScoreBreakout', 'LimitOrderTrailingExit')
+            entry_check_price = low if is_limit_entry else cp
             sig = active_signals.compute_buy_signal(
-                node, as_of=ts, price_override=cp,
+                node, as_of=ts, price_override=entry_check_price,
                 df_hourly_override=df_slice, df_daily_override=df_daily[df_daily.index <= ts])
             if sig is None or sig['signal'] != 'BUY':
                 continue
 
-            entry_price = sig['lower_band'] if strategy_name == 'LimitOrderZScoreBreakout' else cp
+            entry_price = sig['lower_band'] if is_limit_entry else cp
             entry_time = ts
             active_signals.open_position(node, signal_price=cp, signal_time=ts, entry_price=entry_price, entry_time=ts)
             position_id = next(p['id'] for p in active_signals.get_open_positions()
@@ -164,6 +171,11 @@ def kernel_trades(ticker, strategy_name, window, z_thresh, take_profit_pct, stop
                                  take_profit=take_profit_pct/100.0, stop_loss=stop_loss_pct/100.0,
                                  max_hours_to_hold=max_hold_hours, z_score_threshold=z_thresh,
                                  trail_pct=trail_pct/100.0)
+    elif strategy_name == 'LimitOrderTrailingExit':
+        return run_backtest_v211(df_hourly, indicators, ticker, target_hours=target_hours,
+                                  take_profit=take_profit_pct/100.0, stop_loss=stop_loss_pct/100.0,
+                                  max_hours_to_hold=max_hold_hours, z_score_threshold=z_thresh,
+                                  trail_pct=trail_pct/100.0)
     elif strategy_name == 'LimitOrderZScoreBreakout':
         return run_backtest_v17(df_hourly, indicators, ticker, target_hours=target_hours,
                                  take_profit=take_profit_pct/100.0, stop_loss=stop_loss_pct/100.0,
