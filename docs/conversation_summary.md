@@ -4,6 +4,34 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 
 ---
 
+## 2026-07-05 (later still) — Fixed Portfolio page alpha bug + a real check_sell_condition crash regression; promoted Sweep 3 (v3.x) to live watchlist; fixed trailing-buy Slack messaging
+
+### What we did
+- **Fixed `pages/4_Portfolio.py`'s `load_watchlist_metrics`**: it matched `backtest_cache` only on `(ticker, version, window, take_profit, stop_loss, max_hold_hours, z_score_threshold)` — missing `strategy`/`fixed_sl`/`trail_buy_pct`/`trail_pct`. For v3.x trailing strategies, `trail_pct` is a real swept axis with many rows sharing that same tuple (e.g. SOXL v3.18 has 30 rows, one per trail_pct 1-30), so `.fetchone()` grabbed an arbitrary row — surfaced as SOXL showing -15.7% alpha in the "Sweep 3 (v3.x)" watchlist view instead of its real +2829.9%. Fixed by matching on the full axis set.
+- **Round-trip tested `active_signals.py`'s fixed_sl/trail_pct flow** (`add_node` → `open_position` → `check_sell_condition`) against SOXL's real v3.18 node, and found a real crash bug: `check_sell_condition` (line 632) called a deleted local `_uses_fixed_sl` instead of `strategies.uses_fixed_sl` — leftover from the axis-schema consolidation, same regression class as the `dispatch_parallel_grid` `NameError` fixed last session, just a different call site that was missed. Would have crashed on every sell-check for any trailing-strategy position. Fixed and reverified working.
+- **Found and fixed the identical stale reference in `scripts/verify_live_parity.py:80`** (`active_signals._uses_fixed_sl` → `strategies.uses_fixed_sl`), plus a missing `strategies` import. Ran the script end-to-end afterward — all 4 comparison cases (SOXL ZScoreBreakout, TQQQ/HIBL LimitOrderZScoreBreakout, AGQ TrailingExitZScoreBreakout) report MATCH.
+- **Promoted Sweep 3 (v3.x) (`watchlist_id=7`) to the active, all-live watchlist**, replacing the old v1.x `main` watchlist (7 tickers) — no open positions at the time, clean cutover. 10 tickers now live: `TrailingExitZScoreBreakout` v3.18 (NUGT/SOXL/TQQQ, bar-close entry) and `TrailingBothZScoreBreakout` v3.21-27 (AGQ/DPST/EDC/GDXU/HIBL/KORU/YANG, trailing entry+exit).
+- **Worked through a real design question on `TrailingBothZScoreBreakout` live entries**: its `check_signal` (inherited from `TrailingBuyZScoreBreakout`) is a plain z-score breach check, not the "wait for bounce above running low" state machine described in its docstring (that logic only exists in the backtest kernel). Flagged this as a possible correctness gap; user clarified it's by design — the bar-close z-score breach is the signal to place a **broker-side trailing buy order at `trail_buy_pct`%**, and the broker (not the software) handles the bounce-timing. No order-state-tracking feature needed.
+- **Fixed two real Slack-messaging gaps this surfaced**: `_build_buy_blocks` always said "BUY — Market" regardless of strategy (now says "BUY — Trailing Buy {trail_buy_pct}%" for `TrailingBuyZScoreBreakout`/`TrailingBothZScoreBreakout`); `_STRATEGY_LABELS` had no entries for those two strategies (morning report fell back to the raw class name with no action reminder — now has proper labels/action text).
+- **Manually tested entry/exit/morning-report Slack messages** for the two (now four) live strategies — discovered along the way that `SOCKET_MODE` is driven by real `.env` Slack credentials (`#trading` channel), so any ad-hoc script calling a `notify_*` function posts to the real live channel, indistinguishable from a real signal (including live Executed/Skipped buttons). User was fine treating today's test posts as test-mode noise, but backlogged a proper `TEST_MODE` marker for future manual testing.
+- **Confirmed live BUY/HOLD signal status** on request: KORU BUY (z=-1.58 vs -1.0 threshold), EDC HOLD (z=-1.11 vs -1.5), SOXL BUY (z=-1.67 vs -1.0), TQQQ HOLD (z=-0.76 vs -1.0).
+- **Killed a stray running Streamlit process** (PID 141083) so the Portfolio page fix takes effect on next launch.
+- **Updated `CLAUDE.md`'s "Live Trading — Current State"** section to reflect the new Sweep 3 (v3.x) watchlist, per-strategy execution workflow (market vs trailing-buy order placement), and the two live entry mechanics.
+
+### Key decisions
+- No order-state-tracking feature built for trailing-buy entries — user confirmed the existing bar-close Slack alert (telling them to place a trailing buy order at `trail_buy_pct`%) is sufficient; the broker's own order type handles fill timing, deliberately "out of my hands."
+- `config.json`/`config.json.bak` left uncommitted again — a `v3.32` `TrailingBothZScoreBreakout` sweep (`sweep_runs.id=92`) was still `RUNNING` as of session end; same precedent as prior sessions, do not touch until confirmed done/stopped.
+- Test Slack messages posted to the real `#trading` channel during manual testing were left as-is (not corrected/deleted) per user's explicit "I'm ok with you posting — we're in test mode — I'm going to ignore it."
+
+### Next Session
+1. **First live trade cycle under the new watchlist** — especially the `TrailingBothZScoreBreakout` tickers' trailing-buy order placement workflow, which has never been used live before (only bar-close/limit-order strategies were live previously). Watch closely.
+2. Two questions raised but not resolved this session, worth explicitly closing out: (a) user asked about "some holds in the backfill" (interrupted mid-investigation, never clarified what this referred to — possibly `sweep_runs` status or something in the Streamlit UI, not confirmed); (b) `sweep_runs` currently shows 7 `FAILED` rows — 3 of those (v3.5/v3.6/v3.9) were the now-fixed `uses_fixed_sl` `NameError` regression and were successfully re-run to `COMPLETE`; the other 4 (v2.5, v2.12 ×2, v3.0) are older/unexplained but likely stale — user flagged "shouldn't be 7" and this was never followed up on.
+3. Backlog items added this session, not yet built: automated pytest round-trip test for `active_signals.py`'s DB layer (no coverage exists at all right now); Slack `TEST_MODE` marker for manual `notify_*` testing.
+4. Check whether the `v3.32` backfill (and the earlier-queued 53-ticker × 34-version v3.x run) has finished — `config.json`/`config.json.bak` still uncommitted pending that.
+5. KORU 6%-vs-5% `trail_pct` pick decision (carried over from two sessions ago) still open.
+
+---
+
 ## 2026-07-05 (late night) — Solved KORU win-rate mystery (metric artifact, not two edges); dropped UVIX from v3.x watchlist; repicked 4 tickers at wider trail_pct; built sparse-then-fill trail_pct extension + win_twin_rate metric; fixed a real regression bug
 
 ### What we did

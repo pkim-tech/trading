@@ -45,13 +45,15 @@ def load_watchlist(watchlist_id=None):
 def load_watchlist_metrics(params_tuple):
     rows = []
     with sqlite3.connect(DB_PATH) as c:
-        for (ticker, version, window, tp, sl, hold, z) in params_tuple:
+        for (ticker, strategy, version, window, tp, sl, hold, z, fixed_sl, trail_buy_pct, trail_pct) in params_tuple:
             row = c.execute("""
                 SELECT alpha_vs_spy, strategy_return, trades, win_rate, asset_bh, spy_bh
                 FROM backtest_cache
-                WHERE ticker=? AND version=? AND window=? AND take_profit=? AND stop_loss=?
+                WHERE ticker=? AND strategy=? AND version=? AND window=? AND take_profit=? AND stop_loss=?
                   AND max_hold_hours=? AND z_score_threshold=?
-            """, (ticker, version, window, tp, sl, hold, z)).fetchone()
+                  AND COALESCE(fixed_sl,0)=? AND COALESCE(trail_buy_pct,0)=? AND COALESCE(trail_pct,0)=?
+            """, (ticker, strategy, version, window, tp, sl, hold, z,
+                  fixed_sl or 0.0, trail_buy_pct or 0.0, trail_pct or 0.0)).fetchone()
             t_row = c.execute(
                 "SELECT avg_vol_10d, last_price FROM tickers WHERE symbol=?", (ticker,)
             ).fetchone()
@@ -212,7 +214,8 @@ nodes_to_run = []  # list of dicts with keys: ticker, strategy, window, take_pro
 selected_wl_node = None
 if watchlist:
     wl_raw = pd.DataFrame(watchlist)
-    params = tuple((r['ticker'], r['version'], r['window'], r['take_profit'], r['stop_loss'], r['max_hold_hours'], r['z_score_threshold']) for r in watchlist)
+    params = tuple((r['ticker'], r['strategy'], r['version'], r['window'], r['take_profit'], r['stop_loss'], r['max_hold_hours'], r['z_score_threshold'],
+                    r.get('fixed_sl'), r.get('trail_buy_pct'), r.get('trail_pct')) for r in watchlist)
     metrics = load_watchlist_metrics(params)
     m_df = pd.DataFrame(metrics)
     wl_base = pd.concat([wl_raw[['id', 'mode', 'ticker', 'strategy', 'version', 'window', 'z_score_threshold',

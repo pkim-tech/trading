@@ -43,6 +43,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import active_signals
+import strategies
 from backtester import run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110, run_backtest_v211
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
@@ -77,7 +78,7 @@ def replay(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_p
     called every bar (streaming), including its DB-backed trail-state persistence."""
     df_hourly, df_daily = _load(ticker)
 
-    uses_fixed_sl = active_signals._uses_fixed_sl(strategy_name)
+    uses_fixed_sl = strategies.uses_fixed_sl(strategy_name)
     node = {
         'ticker': ticker, 'strategy': strategy_name, 'version': 'test',
         'window': window, 'z_score_threshold': z_thresh,

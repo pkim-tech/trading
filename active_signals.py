@@ -629,7 +629,7 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
     hours_held = _bars_held(df_hourly, signal_time)
     # For v1.8/v1.9/v1.10 the swept 'stop_loss' column holds trail_pct/trail_buy_pct,
     # not the real fixed SL — that comes from the node's fixed_sl column instead.
-    if _uses_fixed_sl(pos['strategy']):
+    if strategies.uses_fixed_sl(pos['strategy']):
         real_sl_pct = pos.get('fixed_sl') or 0.0
         trail_pct   = (pos.get('trail_pct') or 3.0) / 100.0
     else:
@@ -865,9 +865,16 @@ def _build_buy_blocks(node, sig):
     max_shares = int(max_notional // price) if max_notional else None
     max_notional_str = f"  |  max `${max_notional/1000:.0f}k` / `{max_shares} shares` @ 1% vol" if max_notional else ""
 
+    sl_axis_col, _ = strategies.resolve_axis_columns(node['strategy'])
+    if sl_axis_col == 'trail_buy_pct':
+        trail_buy_pct = node.get('trail_buy_pct') or 0.0
+        entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k){max_notional_str}"
+    else:
+        entry_line = f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k){max_notional_str}"
+
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
-            "text": f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k){max_notional_str}\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger)"}},
+            "text": f"{entry_line}\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger)"}},
     ]
 
     if SOCKET_MODE:
@@ -1284,6 +1291,8 @@ _STRATEGY_LABELS = {
     'TrendFilteredZScore':        ('BUY (bar-close)', 'At signal close: edit staged limit → market and submit'),
     'TrailingExitZScoreBreakout': ('BUY (bar-close, trailing exit)', 'At signal close: edit staged limit → market and submit'),
     'LimitOrderZScoreBreakout':   ('BUY (limit)', 'Pre-market: stage limit order at trigger price (absurdly low); confirm fill intrabar'),
+    'TrailingBuyZScoreBreakout':  ('BUY (bar-close, trailing entry)', 'At signal close: place a trailing buy order at trail_buy_pct% — broker handles fill timing'),
+    'TrailingBothZScoreBreakout': ('BUY (bar-close, trailing entry+exit)', 'At signal close: place a trailing buy order at trail_buy_pct% — broker handles fill timing'),
 }
 
 
