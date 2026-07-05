@@ -329,6 +329,29 @@ def _config_fixed_stop_loss():
         return 0.0
 
 
+# TrailingBothZScoreBreakout's static per-run exit trail % for legacy v1.10/v2.10/v2.13-17
+# nodes — this constant lived in config.execution.trail_pct at backfill time, not in any
+# swept column, so it can't be recovered from the node's own row; hardcode the known mapping
+# (see docs/design.md "Version Changelog"). v1.10/v2.10 ran at the default 3%.
+_LEGACY_TRAILING_BOTH_TRAIL_PCT = {'v2.13': 1.0, 'v2.14': 2.0, 'v2.15': 3.0, 'v2.16': 4.0, 'v2.17': 5.0}
+
+
+def _resolve_axis_columns(strategy_name):
+    """Which real column the legacy overloaded 'stop_loss' value maps to for this
+    strategy — mirrors run_optimization_sweep.py::_resolve_axis_columns. Returns
+    (sl_axis_column, fourth_axis_column_or_None)."""
+    cls = getattr(strategies, strategy_name, None)
+    if cls is None:
+        return 'stop_loss', None
+    if issubclass(cls, strategies.TrailingBothZScoreBreakout):
+        return 'trail_buy_pct', 'trail_pct'
+    if issubclass(cls, strategies.TrailingBuyZScoreBreakout):
+        return 'trail_buy_pct', None
+    if issubclass(cls, (strategies.TrailingExitZScoreBreakout, strategies.LimitOrderTrailingExit)):
+        return 'trail_pct', None
+    return 'stop_loss', None
+
+
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
              label='', z_score_threshold=2.0, watchlist_id=None, mode='live',
              trail_buy_pct=None, trail_pct=None):
@@ -341,10 +364,17 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
     if _uses_fixed_sl(strategy):
         fixed_sl = _config_fixed_stop_loss()
         if trail_buy_pct is None and trail_pct is None:
-            stored_trail_pct = float(stop_loss)
+            sl_axis_col, fourth_axis_col = _resolve_axis_columns(strategy)
+            if sl_axis_col == 'trail_buy_pct':
+                stored_trail_buy_pct = float(stop_loss)
+                stored_trail_pct = (_LEGACY_TRAILING_BOTH_TRAIL_PCT.get(version, 3.0)
+                                     if fourth_axis_col == 'trail_pct' else 0.0)
+            else:
+                stored_trail_buy_pct = 0.0
+                stored_trail_pct = float(stop_loss)
         else:
             stored_trail_pct = trail_pct if trail_pct is not None else 0.0
-        stored_trail_buy_pct = trail_buy_pct if trail_buy_pct is not None else 0.0
+            stored_trail_buy_pct = trail_buy_pct if trail_buy_pct is not None else 0.0
     else:
         fixed_sl = None
         stored_trail_pct = None

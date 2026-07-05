@@ -83,8 +83,46 @@ silently wrong for all 4 trailing strategies before this fix).
 both falls back to the old stop_loss-reinterpretation logic for legacy v1.x/v2.x nodes.
 
 Full design/rationale: `/home/pkim/.claude/plans/ancient-giggling-kettle.md`.
-Backfill script: `scripts/run_v3_backfill_sweep.sh` (`v3.0`, or `v3.0 --validate` for a
-5-ticker sanity check first).
+Backfill script: `scripts/run_v3_backfill_sweep.sh`, one version per run
+(`./scripts/run_v3_backfill_sweep.sh v3.21`), or no arg to run every included version in
+sequence. `--validate` runs a 4-ticker sanity check first.
+
+### Version Changelog
+
+Canonical version→strategy→grid record. Update this table whenever a new version is
+added to a backfill script — the version number alone doesn't tell you what ran.
+
+| Version | Strategy | Tickers | tp/sl grid | trail_pct | Notes |
+|---|---|---|---|---|---|
+| v1.5/v1.6 | `ZScoreBreakout` | watchlist ad hoc | coarse 3-30 | — | Original, pre-bias-fix |
+| v1.7 | `LimitOrderZScoreBreakout` | watchlist ad hoc | coarse 3-30 | — | Pre-bias-fix |
+| v1.8 | `TrailingExitZScoreBreakout` | watchlist ad hoc | coarse 3-30 | static, `config.execution.trail_pct` | Pre-bias-fix, experimental |
+| v1.9 | `TrailingBuyZScoreBreakout` | watchlist ad hoc | coarse 3-30 | — | Pre-bias-fix |
+| v1.10 | `TrailingBothZScoreBreakout` | watchlist ad hoc | coarse 3-30 | static 3% | Pre-bias-fix |
+| v2.4 | `TrendFilteredZScore` | 53-ticker universe | coarse 3-30 | — | Bias-fix reindex; weak results, closed out |
+| v2.5/v2.6 | `ZScoreBreakout` | 53-ticker universe | coarse 3-30 | — | Bias-fix reindex |
+| v2.7 | `LimitOrderZScoreBreakout` | 53-ticker universe | coarse 3-30 | — | Bias-fix reindex |
+| v2.8 | `TrailingExitZScoreBreakout` | 53-ticker universe | coarse 3-30 | static, `config.execution.trail_pct` | Bias-fix reindex |
+| v2.9 | `TrailingBuyZScoreBreakout` | 53-ticker universe | coarse 3-30 | — | Bias-fix reindex |
+| v2.10 | `TrailingBothZScoreBreakout` | 53-ticker universe | coarse 3-30 | static 3% | Bias-fix reindex, original untouched run |
+| v2.11 | `LimitOrderTrailingExit` | 53-ticker universe | coarse 3-30 | static, `config.execution.trail_pct` | New in v2.x, no v1.x precursor |
+| v2.12 | `LimitExitZScoreBreakout` | 53-ticker universe | coarse 3-30 | — | New in v2.x, backfill-only |
+| v2.13-17 | `TrailingBothZScoreBreakout` | 53-ticker universe | combined (adds 1,2,4,5) | static, one full run per value: 1%/2%/3%/4%/5% | Superseded by v3.21-27 |
+| v2.18 | `TrailingExitZScoreBreakout` | 53-ticker universe | combined (adds 1,2,4,5) | static 3% | Superseded by v3.18 |
+| v3.5/v3.6 | `ZScoreBreakout` | Sweep 3 (11 tickers) | combined (adds 1,2,4,5) | — | Real trail_buy_pct/trail_pct columns (n/a here) |
+| v3.9 | `TrailingBuyZScoreBreakout` | Sweep 3 (11 tickers) | combined | — | |
+| v3.18 | `TrailingExitZScoreBreakout` | Sweep 3 (11 tickers) | combined | real `trail_pct` column (swept via sl axis) | Replaces v2.18 |
+| v3.21-27 | `TrailingBothZScoreBreakout` | Sweep 3 (11 tickers) | combined | real `trail_pct` column, one value per version: 1-7% | Replaces v2.10 + v2.13-17; `trail_pct` still not a free grid axis (sl slot taken by `trail_buy_pct`), so still one run per value — see "Grid axis meaning" above |
+
+v3.4/v3.7/v3.8/v3.10/v3.11/v3.12/v3.13-17/v3.19-20 are deliberately skipped (TrendFiltered
+and limit-order-family strategies not carried into v3.x; v3.8 coarse-grid TrailingExit was
+redundant with v3.18's combined grid; v3.10 was a dropped "all trail_pct values in one
+run" design, see `scripts/run_v3_backfill_sweep.sh` header). v3.28+ reserved for future
+trailing-stop strategy variants (none defined yet).
+
+Switched to the combined grid everywhere in v3.x (rather than coarse-by-default) after
+confirming multiple current watchlist winners sit at the 1/2/4/5 low-end points — see
+git history 2026-07-05 for the query.
 
 ### Optimization Approach
 

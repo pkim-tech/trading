@@ -2,6 +2,7 @@ import sqlite3
 import streamlit as st
 import pandas as pd
 from db_cache import get_kv
+import strategies
 
 DB_PATH = "./cache/trading_universe.db"
 WINDOWS = [10, 20]
@@ -391,6 +392,44 @@ _render_strat_pivot(safe_piv)
 st.divider()
 st.subheader("Cliff Safety — Best vs Worst Neighbor")
 
+# Legacy v1.x/v2.x TrailingBothZScoreBreakout's static per-run exit trail % — lived in
+# config.execution.trail_pct at backfill time, not any swept column. v1.10/v2.10 ran at
+# the default 3%. See docs/design.md "Version Changelog" / active_signals.py::add_node.
+_LEGACY_TRAILING_BOTH_TRAIL_PCT = {'v2.13': 1.0, 'v2.14': 2.0, 'v2.15': 3.0, 'v2.16': 4.0, 'v2.17': 5.0}
+
+
+def _resolve_axis_columns(strategy_name):
+    """Which real column the swept 'sl' grid axis populates for this strategy, and
+    (for TrailingBothZScoreBreakout only) its real 4th axis column. Mirrors
+    run_optimization_sweep.py::_resolve_axis_columns. Returns (sl_axis_col, fourth_axis_col)."""
+    cls = getattr(strategies, strategy_name, None)
+    if cls is None:
+        return 'stop_loss', None
+    if issubclass(cls, strategies.TrailingBothZScoreBreakout):
+        return 'trail_buy_pct', 'trail_pct'
+    if issubclass(cls, strategies.TrailingBuyZScoreBreakout):
+        return 'trail_buy_pct', None
+    if issubclass(cls, (strategies.TrailingExitZScoreBreakout, strategies.LimitOrderTrailingExit)):
+        return 'trail_pct', None
+    return 'stop_loss', None
+
+
+def _resolve_sl_display(version, strategy, stop_loss, trail_buy_pct, trail_pct):
+    """What the swept SL axis actually represents for this row, un-overloaded.
+    v3.x rows have real trail_buy_pct/trail_pct columns populated directly; v1.x/v2.x
+    rows still have the swept value sitting in the overloaded 'stop_loss' column.
+    Returns (label, display_value, raw_axis_value_for_neighbor_query)."""
+    sl_axis_col, fourth_axis_col = _resolve_axis_columns(strategy)
+    if sl_axis_col == 'stop_loss':
+        return 'SL %', f"{stop_loss:g}", stop_loss
+    is_v3 = version.startswith('v3.')
+    real_sl_axis_val = (trail_buy_pct if sl_axis_col == 'trail_buy_pct' else trail_pct) if is_v3 else stop_loss
+    if sl_axis_col == 'trail_buy_pct' and fourth_axis_col == 'trail_pct':
+        real_trail_pct = trail_pct if is_v3 else _LEGACY_TRAILING_BOTH_TRAIL_PCT.get(version, 3.0)
+        return 'Bounce % / Trail %', f"{real_sl_axis_val:g} / {real_trail_pct:g}", real_sl_axis_val
+    label = 'Bounce %' if sl_axis_col == 'trail_buy_pct' else 'Trail %'
+    return label, f"{real_sl_axis_val:g}", real_sl_axis_val
+
 
 @st.cache_data(ttl=3600)
 def load_version_strategy_pairs():
@@ -407,6 +446,8 @@ def load_cliff_safety(version_strategy_pairs):
     results = []
     with sqlite3.connect(DB_PATH) as conn:
         for version, strategy in version_strategy_pairs:
+            sl_axis_col, _ = _resolve_axis_columns(strategy)
+            neighbor_axis_col = sl_axis_col if version.startswith('v3.') else 'stop_loss'
             tickers = [r[0] for r in conn.execute(
                 "SELECT DISTINCT ticker FROM backtest_cache WHERE version=? AND strategy=? AND trades > 0",
                 (version, strategy)
@@ -414,33 +455,38 @@ def load_cliff_safety(version_strategy_pairs):
             for ticker in tickers:
                 row = conn.execute("""
                     SELECT take_profit, stop_loss, max_hold_hours, window, z_score_threshold,
-                           alpha_vs_spy, strategy_return, trades, win_rate
+                           alpha_vs_spy, strategy_return, trades, win_rate, trail_buy_pct, trail_pct
                     FROM backtest_cache
                     WHERE version=? AND ticker=? AND strategy=? AND trades > 0
                     ORDER BY alpha_vs_spy DESC LIMIT 1
                 """, (version, ticker, strategy)).fetchone()
                 if not row:
                     continue
-                tp, sl, hold, window, z, alpha, ret, trades, win_rate = row
+                (tp, sl, hold, window, z, alpha, ret, trades, win_rate,
+                 trail_buy_pct, trail_pct) = row
                 tp, sl, hold, window = int(tp), int(sl), int(hold), int(window)
-                worst = conn.execute("""
+                trail_buy_pct, trail_pct = float(trail_buy_pct or 0), float(trail_pct or 0)
+                sl_label, sl_display, neighbor_center = _resolve_sl_display(
+                    version, strategy, sl, trail_buy_pct, trail_pct)
+                worst = conn.execute(f"""
                     SELECT MIN(alpha_vs_spy) FROM backtest_cache
                     WHERE version=? AND ticker=? AND strategy=?
                       AND window=? AND z_score_threshold=?
-                      AND take_profit    BETWEEN ? AND ?
-                      AND stop_loss      BETWEEN ? AND ?
+                      AND take_profit BETWEEN ? AND ?
+                      AND {neighbor_axis_col} BETWEEN ? AND ?
                       AND max_hold_hours BETWEEN ? AND ?
                       AND trades > 0
                 """, (version, ticker, strategy, window, z,
                       tp - CLIFF_SAFETY_RADIUS, tp + CLIFF_SAFETY_RADIUS,
-                      sl - CLIFF_SAFETY_RADIUS, sl + CLIFF_SAFETY_RADIUS,
+                      neighbor_center - CLIFF_SAFETY_RADIUS, neighbor_center + CLIFF_SAFETY_RADIUS,
                       hold - 7, hold + 7)).fetchone()[0]
                 worst_neighbor = float(worst) if worst is not None else float(alpha)
                 results.append({
                     'ticker': ticker, 'version': version, 'strategy': strategy,
                     'best_alpha': float(alpha), 'worst_neighbor': worst_neighbor,
                     'safe': worst_neighbor >= 0,
-                    'take_profit': tp, 'stop_loss': sl, 'max_hold_hours': hold,
+                    'take_profit': tp, 'sl_label': sl_label, 'sl_display': sl_display,
+                    'max_hold_hours': hold,
                     'window': window, 'z': float(z),
                     'strategy_return': float(ret), 'trades': int(trades), 'win_rate': float(win_rate),
                 })
@@ -467,10 +513,12 @@ else:
             'strategy_return': st.column_config.NumberColumn('Return', format="%.1f%%"),
             'win_rate':        st.column_config.NumberColumn('Win %', format="%.1f%%"),
             'safe':            st.column_config.CheckboxColumn('Safe'),
+            'sl_label':        st.column_config.TextColumn('SL Axis'),
+            'sl_display':      st.column_config.TextColumn('SL Value'),
         }
         st.dataframe(
             safety_df[['ticker', 'version', 'strategy', 'best_alpha', 'worst_neighbor', 'safe',
-                       'take_profit', 'stop_loss', 'max_hold_hours', 'window', 'z',
+                       'take_profit', 'sl_label', 'sl_display', 'max_hold_hours', 'window', 'z',
                        'strategy_return', 'trades', 'win_rate']].sort_values('worst_neighbor'),
             use_container_width=True, hide_index=True, column_config=table_col_cfg,
         )
