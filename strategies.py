@@ -246,6 +246,45 @@ class TrailingBothZScoreBreakout(TrailingBuyZScoreBreakout):
         return None, None, state
 
 
+class LimitExitZScoreBreakout(BaseStrategy):
+    """v2.12: bar-close confirmed entry (like ZScoreBreakout). SL is a fixed intrabar floor.
+    TP is a resting limit order — fills intrabar the moment High touches tp_price, at tp_price
+    (guaranteed, no waiting for bar-close). Mirrors backtester._simulate_close_limitexit."""
+
+    def generate_daily_indicators(self, df_daily):
+        w = self.params.get('window', 10)
+        df = df_daily.copy()
+        df['SMA'] = df['Close'].rolling(window=w).mean()
+        df['Std'] = df['Close'].rolling(window=w).std()
+        return df[['SMA', 'Std']].dropna()
+
+    def check_signal(self, ctx):
+        sma, std = ctx['sma'], ctx['std']
+        if std == 0 or pd.isna(sma) or pd.isna(std):
+            return 'HOLD'
+        threshold = self.params.get('z_score_threshold', 2.0)
+        return 'BUY' if _entry_price_field(ctx) <= sma - std * threshold else 'HOLD'
+
+    def check_exit(self, ctx):
+        ep = ctx['entry_price']
+        stop_price = ep * (1 - ctx['stop_loss'])
+        tp_price   = ep * (1 + ctx['take_profit'])
+
+        if ctx['low'] <= stop_price:
+            return 'SL', stop_price, ctx.get('state', {})
+
+        if ctx['high'] >= tp_price:
+            return 'TP', tp_price, ctx.get('state', {})
+
+        if not ctx.get('at_bar_close', True):
+            return None, None, ctx.get('state', {})
+
+        if ctx['hours_held'] >= ctx['max_hours_to_hold']:
+            return 'TIME', ctx['current_price'], ctx.get('state', {})
+
+        return None, None, ctx.get('state', {})
+
+
 class TrendFilteredZScore(BaseStrategy):
     def generate_daily_indicators(self, df_daily):
         w = self.params.get('window', 10)

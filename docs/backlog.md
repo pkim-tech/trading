@@ -1,5 +1,38 @@
 # Backlog
 
+## `backtest_cache` schema migration — real named columns per strategy (not urgent, do when not mid-sweep)
+
+The swept `stop_loss` ("sl") grid column means different things per strategy — real stop-loss for some, `trail_buy_pct` (entry bounce %) or `trail_pct` (exit trailing %) for others — see `docs/design.md`'s "Grid axis meaning by strategy" table (added 2026-07-04) for the full mapping. This has caused real confusion in conversation more than once (2026-07-04 session). Two options discussed:
+1. **Real named columns**: split `stop_loss` into proper `stop_loss`/`trail_buy_pct`/`trail_pct` columns (nullable per strategy) in `backtest_cache`. Correct long-term fix, but wide blast radius — touches the composite PK, every query in `run_optimization_sweep.py`/`db_cache.py`/`pages/*.py` (Spatial Topology, Node Inspector, Portfolio, Winners)/`verify_live_parity.py`/`active_signals.py`, and needs a data migration (existing rows' `stop_loss` value *is* the trail param for those strategies — can't just rename the column, values need to move).
+2. **Generic `param1`/`param2`/`param3`**: smaller blast radius, but doesn't fix the confusion — still needs the same lookup table to know what a given param means per strategy, just trades "a name that lies" for "a name that tells you nothing."
+Leaning toward option 1 (real names) as the actual fix, but it's a real project — do it when not simultaneously trying to launch overnight backfills. Don't start mid-sweep.
+
+## Watchlist Repick (2026-07-04, do tomorrow)
+
+Reviewing v2.x sweep results to repick the live watchlist (AGQ/EDC/FAS/HIBL). Entry/exit shorthand: **Close** = bar-close confirmed entry, **Limit** = intrabar touch entry, **Trail** = trailing-buy bounce entry; **Fixed** = market exit at TP/SL, **Trail** = trailing-stop exit, **Limit** = limit-order exit (not yet built). Existing versions: Close/Fixed=v1.5/2.5, Close/Trail=v1.8/2.8, Limit/Fixed=v1.7/2.7, Limit/Trail=v2.11 (done, confirmed bad — entry noise not offset by trailing exit), Trail/Fixed=v1.9/2.9, Trail/Trail=v1.10/2.10.
+
+Todo:
+- v2.4 (`TrendFilteredZScore`, 50-day SMA trend filter) didn't return much — probably close this out, no further work.
+- Limit/Limit (limit entry + limit exit, not built) — probably not worth building.
+- Close/Limit (close entry + limit exit) — ✅ built 2026-07-04: `LimitExitZScoreBreakout` (`strategies.py`), kernel `_simulate_close_limitexit` + wrapper `run_backtest_v212` (`backtester.py`), dispatch wired in `run_optimization_sweep.py`, version case added to `scripts/run_v2_backfill_sweep.sh` (v2.12, not added to the no-arg full loop — run standalone). TP modeled as a resting limit order (fills intrabar at `tp_price` the moment High touches it, no bar-close wait); SL stays a fixed intrabar floor. **Live-parity wiring deferred** (`active_signals.py` `_STRATEGY_LABELS`/`_uses_fixed_sl`, `verify_live_parity.py` replay dispatch) — backfill-only for now, do before ever considering this live.
+- Trail/Limit (trailing-buy entry + limit exit, not built) — probably not worth it.
+- Limit/Trail = v2.11 — done, confirmed not good (see High Priority entry-noise finding above).
+- Redo charts using the 9:30am bar? Would require recalculating max-hold-hours bar counts.
+- Try varying the trailing-buy-entry % or trailing-sell-exit % (currently fixed defaults, e.g. `trail_buy_pct=0.02`, `trail_pct=0.03`).
+- Revisit the design review list (`docs/code_review_findings.md`).
+
+Research:
+- Ways to avoid big losses, or strings of consecutive losses.
+- Gap risk (overnight/weekend gaps through stop levels).
+- Seasonal trade patterns.
+- Tickers unrelated to a given ticker but highly correlated to its down-signals (cross-ticker signal).
+- Split analysis into two halves — look for candidates whose edge holds in both halves (out-of-sample consistency) rather than just aggregate alpha.
+- 3-month rolling window analysis — walk-forward validation instead of one static backtest window.
+- Does higher liquidity correlate with the pattern holding up better?
+- Why are some 3x leverage funds consistently more profitable (better alpha/win rate) than others across strategies/versions? Look for a common factor (underlying volatility/beta, decay from daily rebalancing, sector, liquidity, borrow cost) that predicts which leveraged ETFs are good candidates before running a full sweep on them.
+
+- **Liquidity threshold (1% of 10-day avg $ volume) may not be conservative enough given lump-sum entry**: the v2.x scope filter (`docs/backlog.md`'s ticker-scoping note, `scripts/run_v2_backfill_sweep.sh`) requires ≥$50k max notional at 1% of 10-day avg $ volume — but that 1% assumes participation spread over the day, not a single ~$50k market order placed all at once at signal time (current execution: edit staged limit → market and submit in ~5 seconds). Worth checking whether 1% is still safe for a lump-sum fill, or whether the threshold should be lowered (e.g. to 0.5%) to reduce slippage/market-impact risk on the live watchlist tickers.
+
 ## High Priority
 
 - **Look-ahead bias in every backtest's entry signal — affects all strategies, all sweep results, current live watchlist**: Discovered 2026-07-03 while implementing ADR 0001 (`docs/adr/0001-live-parity-sim-vs-backtest.md`) — switching `verify_live_parity.py` to call the real `active_signals.compute_buy_signal` instead of reimplementing its own replay loop immediately surfaced a systematic entry-timing mismatch, confirmed by direct code trace (not inference):
