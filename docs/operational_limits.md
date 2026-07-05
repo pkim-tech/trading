@@ -51,6 +51,18 @@ General notes that apply everywhere:
 
 ---
 
+## Account Type — IRA / Roth IRA (Planned Live Test)
+
+Plan is to test strategies live in IRA/Roth IRA accounts first, not a taxable brokerage account.
+
+- **No margin**: IRAs are cash accounts. Not a constraint on strategy design — the 3x leverage in AGQ/SOXL/TQQQ/etc. is embedded in the fund itself, not achieved via account margin. Shares are bought outright.
+- **T+1 settlement — cannot sell and buy same day with the same cash**: a cash account cannot reuse unsettled sale proceeds for a new purchase same-day; doing so risks a good-faith violation. This only matters when *different tickers* compete for the same account's cash on the same day (e.g. one position's exit funding a different position's entry). Ask Schwab whether the IRA has "limited margin" enabled — it doesn't allow borrowing/leverage, just removes the settlement-violation risk for same-day reuse of proceeds.
+- **Mitigation — 3 separate IRA-type accounts, 1 position each**: removes the cross-ticker cash-contention problem entirely, since no account's cash is ever competing between two different tickers' signals. (A single account's own position exiting and its *same* ticker re-signaling later the same day would still hit the settlement wait, but that's a narrow edge case.)
+- **Wash sale rule is moot inside an IRA/Roth**: neither account type reports per-trade gains/losses for tax purposes, so there's nothing to disallow. The one real trap — a taxable-account loss permanently disallowed because the same security is repurchased in an IRA within 30 days — only applies if a ticker is traded in *both* a taxable account and an IRA. **Rule: do not trade any ticker in a taxable brokerage account that is also live in one of the 3 IRA accounts** (or vice versa).
+- **UBTI/K-1 risk — check before funding**: AGQ (ProShares Ultra Silver) is commodity-futures-based; funds structured this way can generate Unrelated Business Taxable Income, which can trigger tax even inside an IRA, and may issue a K-1 instead of a 1099. Verify with Schwab/fund prospectus before trading AGQ in an IRA. The other watchlist tickers (SOXL, TQQQ, FAS, EDC, HIBL, GDXU) are standard equity-index '40 Act funds and don't have this issue.
+
+---
+
 ## Phase 2 — Automated Exits (Planned)
 
 Exits (TP/SL/TIME) submitted automatically via brokerage API. Entries remain manual.
