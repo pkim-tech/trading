@@ -71,16 +71,29 @@ table above, with `trail_buy_pct`/`trail_pct` = 0 (not populated) on those rows.
 `trail_pct` is now a genuine 4th swept grid axis for `TrailingBothZScoreBreakout`
 (`hyperparameters.trail_pcts` in config.json, e.g. `[1,2,3,4,5]`) — this replaces the old
 v2.13-v2.17 pattern of one full 53-ticker backfill per trail_pct value with a single v3.x
-run. `_resolve_axis_columns()` (`run_optimization_sweep.py`) is the single source of truth
-for which strategy sweeps which column; `run_backtest_dispatch()` (`backtester.py`) is the
-matching single source of truth for kernel dispatch, shared by the sweep engine, Node
-Inspector, and Portfolio (previously each had their own, out-of-sync `issubclass` chain —
-Node Inspector/Portfolio only ever dispatched to `run_backtest_v17`-or-`run_backtest`,
-silently wrong for all 4 trailing strategies before this fix).
+run. `run_backtest_dispatch()` (`backtester.py`) is the single source of truth
+for kernel dispatch, shared by the sweep engine, Node Inspector, and Portfolio (previously
+each had their own, out-of-sync `issubclass` chain — Node Inspector/Portfolio only ever
+dispatched to `run_backtest_v17`-or-`run_backtest`, silently wrong for all 4 trailing
+strategies before this fix).
 
 `watch_list`/`open_positions` also gained a real `trail_buy_pct` column (`active_signals.py`).
 `add_node()` accepts optional `trail_buy_pct`/`trail_pct` kwargs for v3.x callers; omitting
 both falls back to the old stop_loss-reinterpretation logic for legacy v1.x/v2.x nodes.
+
+**Axis schema consolidation (2026-07-05)**: `sl_axis`/`fourth_axis`/`uses_fixed_sl` are now
+class attributes on each strategy in `strategies.py` (on `BaseStrategy`, overridden per
+subclass) — the single source of truth, replacing 3 independently-maintained
+`_resolve_axis_columns()` copies (`active_signals.py`, `run_optimization_sweep.py`,
+`pages/0_Top_Pivot.py`) and 2 separate `uses_fixed_sl` `issubclass` chains. Module-level
+helpers `strategies.resolve_axis_columns(name)`/`strategies.uses_fixed_sl(name)` wrap the
+class attributes for callers that only have the strategy name string. New
+`strategies.validate_axis_values(strategy, trail_buy_pct, trail_pct)` warns (doesn't raise)
+when a caller passes a value for an axis the strategy doesn't use (e.g. `trail_buy_pct` on a
+bar-close `ZScoreBreakout` node), or omits one it requires — wired into `add_node()`'s
+explicit v3.x-value path. Built after finding this exact duplication was the root cause of
+the `trail_buy_pct`/`trail_pct` mis-mapping bug fixed earlier the same day (see
+`docs/backlog.md`).
 
 Full design/rationale: `/home/pkim/.claude/plans/ancient-giggling-kettle.md`.
 Backfill script: `scripts/run_v3_backfill_sweep.sh`, one version per run

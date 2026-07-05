@@ -398,28 +398,12 @@ st.subheader("Cliff Safety — Best vs Worst Neighbor")
 _LEGACY_TRAILING_BOTH_TRAIL_PCT = {'v2.13': 1.0, 'v2.14': 2.0, 'v2.15': 3.0, 'v2.16': 4.0, 'v2.17': 5.0}
 
 
-def _resolve_axis_columns(strategy_name):
-    """Which real column the swept 'sl' grid axis populates for this strategy, and
-    (for TrailingBothZScoreBreakout only) its real 4th axis column. Mirrors
-    run_optimization_sweep.py::_resolve_axis_columns. Returns (sl_axis_col, fourth_axis_col)."""
-    cls = getattr(strategies, strategy_name, None)
-    if cls is None:
-        return 'stop_loss', None
-    if issubclass(cls, strategies.TrailingBothZScoreBreakout):
-        return 'trail_buy_pct', 'trail_pct'
-    if issubclass(cls, strategies.TrailingBuyZScoreBreakout):
-        return 'trail_buy_pct', None
-    if issubclass(cls, (strategies.TrailingExitZScoreBreakout, strategies.LimitOrderTrailingExit)):
-        return 'trail_pct', None
-    return 'stop_loss', None
-
-
 def _resolve_sl_display(version, strategy, stop_loss, trail_buy_pct, trail_pct):
     """What the swept SL axis actually represents for this row, un-overloaded.
     v3.x rows have real trail_buy_pct/trail_pct columns populated directly; v1.x/v2.x
     rows still have the swept value sitting in the overloaded 'stop_loss' column.
     Returns (label, display_value, raw_axis_value_for_neighbor_query)."""
-    sl_axis_col, fourth_axis_col = _resolve_axis_columns(strategy)
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy)
     if sl_axis_col == 'stop_loss':
         return 'SL %', f"{stop_loss:g}", stop_loss
     is_v3 = version.startswith('v3.')
@@ -446,7 +430,7 @@ def load_cliff_safety(version_strategy_pairs):
     results = []
     with sqlite3.connect(DB_PATH) as conn:
         for version, strategy in version_strategy_pairs:
-            sl_axis_col, _ = _resolve_axis_columns(strategy)
+            sl_axis_col, _ = strategies.resolve_axis_columns(strategy)
             neighbor_axis_col = sl_axis_col if version.startswith('v3.') else 'stop_loss'
             tickers = [r[0] for r in conn.execute(
                 "SELECT DISTINCT ticker FROM backtest_cache WHERE version=? AND strategy=? AND trades > 0",

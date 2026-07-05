@@ -2,6 +2,14 @@ import pandas as pd
 
 
 class BaseStrategy:
+    """sl_axis/fourth_axis/uses_fixed_sl: single source of truth for what the swept
+    grid columns actually mean per strategy (see docs/design.md 'Grid axis meaning
+    by strategy'). Consulted by resolve_axis_columns()/uses_fixed_sl() below instead
+    of each caller keeping its own issubclass chain in sync."""
+    sl_axis = 'stop_loss'   # real backtest_cache column the swept 'sl' grid value populates
+    fourth_axis = None      # extra swept axis name, or None if the strategy doesn't have one
+    uses_fixed_sl = False   # real SL comes from config.execution.fixed_stop_loss, not a grid axis
+
     def __init__(self, **kwargs):
         self.params = kwargs
 
@@ -18,6 +26,45 @@ class BaseStrategy:
 def _entry_price_field(ctx):
     """Close for bar-close entry strategies, Low for intrabar-touch entry strategies."""
     return ctx['current_price']
+
+
+def resolve_axis_columns(strategy_name):
+    """(sl_axis_column, fourth_axis_column_or_None) for this strategy — single source
+    of truth, see BaseStrategy.sl_axis/fourth_axis."""
+    cls = globals().get(strategy_name)
+    if cls is None or not issubclass(cls, BaseStrategy):
+        return 'stop_loss', None
+    return cls.sl_axis, cls.fourth_axis
+
+
+def uses_fixed_sl(strategy_name):
+    """Whether this strategy's real SL comes from config.execution.fixed_stop_loss
+    rather than a swept grid axis — see BaseStrategy.uses_fixed_sl."""
+    cls = globals().get(strategy_name)
+    return cls is not None and issubclass(cls, BaseStrategy) and cls.uses_fixed_sl
+
+
+def validate_axis_values(strategy_name, trail_buy_pct=None, trail_pct=None):
+    """Warn (not raise) if trail_buy_pct/trail_pct are being set for a strategy that
+    doesn't use that axis, or left unset for one that does — catches the class of bug
+    that put wrong values in watch_list silently for days (see docs/backlog.md,
+    2026-07-05 add_node() trail_buy_pct/trail_pct mis-mapping)."""
+    sl_axis, fourth_axis = resolve_axis_columns(strategy_name)
+    uses_trail_buy_pct = sl_axis == 'trail_buy_pct'
+    uses_trail_pct = sl_axis == 'trail_pct' or fourth_axis == 'trail_pct'
+
+    warnings = []
+    if not uses_trail_buy_pct and trail_buy_pct:
+        warnings.append(f"{strategy_name} doesn't use trail_buy_pct (bar-close/fixed-SL "
+                         f"entry) — value {trail_buy_pct} will have no effect")
+    if uses_trail_buy_pct and not trail_buy_pct:
+        warnings.append(f"{strategy_name} requires trail_buy_pct but none/zero was given")
+    if not uses_trail_pct and trail_pct:
+        warnings.append(f"{strategy_name} doesn't use trail_pct — value {trail_pct} "
+                         f"will have no effect")
+    if uses_trail_pct and not trail_pct:
+        warnings.append(f"{strategy_name} requires trail_pct but none/zero was given")
+    return warnings
 
 
 class ZScoreBreakout(BaseStrategy):
@@ -55,6 +102,8 @@ class ZScoreBreakout(BaseStrategy):
 class TrailingExitZScoreBreakout(BaseStrategy):
     """v1.8: bar-close entry. SL + trailing-stop are intrabar (continuous);
     TP-activation and TIME (pre-activation) are bar-close. Mirrors backtester._simulate_trail."""
+    sl_axis = 'trail_pct'
+    uses_fixed_sl = True
 
     def generate_daily_indicators(self, df_daily):
         w = self.params.get('window', 10)
@@ -148,6 +197,8 @@ class LimitOrderZScoreBreakout(BaseStrategy):
 class LimitOrderTrailingExit(LimitOrderZScoreBreakout):
     """v2.11: v1.7's intrabar-touch entry (Low vs band, fill at band price) combined with
     v1.8's trailing-stop exit instead of fixed TP/SL. Mirrors backtester._simulate_limit_trail."""
+    sl_axis = 'trail_pct'
+    uses_fixed_sl = True
 
     def check_exit(self, ctx):
         ep = ctx['entry_price']
@@ -182,6 +233,8 @@ class LimitOrderTrailingExit(LimitOrderZScoreBreakout):
 class TrailingBuyZScoreBreakout(BaseStrategy):
     """v1.9: after z-score signal, waits for price to bounce trail_buy_pct% above running low before entering.
     Exit: fixed TP (bar-close) + fixed SL (intrabar) + hold cap. Mirrors backtester._simulate_trail_buy."""
+    sl_axis = 'trail_buy_pct'
+    uses_fixed_sl = True
 
     def generate_daily_indicators(self, df_daily):
         w = self.params.get('window', 10)
@@ -215,6 +268,7 @@ class TrailingBuyZScoreBreakout(BaseStrategy):
 class TrailingBothZScoreBreakout(TrailingBuyZScoreBreakout):
     """v1.10: trailing entry (bounce above running low) + trailing exit once TP% cleared.
     Mirrors backtester._simulate_trail_both."""
+    fourth_axis = 'trail_pct'
 
     def check_exit(self, ctx):
         ep = ctx['entry_price']

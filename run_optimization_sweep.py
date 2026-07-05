@@ -224,27 +224,10 @@ def _config_trail_pct():
         return 0.03
 
 
-def _resolve_axis_columns(strategy_name):
-    """Which real backtest_cache column the swept 'sl' grid axis populates for this
-    strategy, and (for TrailingBothZScoreBreakout only) which column its real 4th
-    axis populates. See docs/design.md 'Grid axis meaning by strategy'.
-    Returns (sl_axis_column, fourth_axis_column_or_None)."""
-    cls = getattr(strategies, strategy_name, None)
-    if cls is None:
-        return 'stop_loss', None
-    if issubclass(cls, strategies.TrailingBothZScoreBreakout):
-        return 'trail_buy_pct', 'trail_pct'
-    if issubclass(cls, strategies.TrailingBuyZScoreBreakout):
-        return 'trail_buy_pct', None
-    if issubclass(cls, (strategies.TrailingExitZScoreBreakout, strategies.LimitOrderTrailingExit)):
-        return 'trail_pct', None
-    return 'stop_loss', None
-
-
 def _trail_pcts_for_strategy(strategy_name, hp):
     """TrailingBothZScoreBreakout is the only strategy with a real, swept 4th axis
     (trail_pct). Everything else doesn't use this axis (single dummy value)."""
-    _, fourth_axis_col = _resolve_axis_columns(strategy_name)
+    _, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     if fourth_axis_col != 'trail_pct':
         return [0.0]
     return [float(v) for v in hp.get('trail_pcts', [_config_trail_pct() * 100])]
@@ -301,15 +284,11 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     # column holds trail_pct/trail_buy_pct for these) — a cache row is only valid for
     # the fixed_sl it was computed with, else re-running with a different fixed_stop_loss
     # would silently serve stale results under the same (tp, sl, hold, w, z) key.
-    strategy_cls_fsl = getattr(strategies, strategy_name, None)
-    uses_fixed_sl = strategy_cls_fsl is not None and issubclass(
-        strategy_cls_fsl, (strategies.TrailingExitZScoreBreakout, strategies.TrailingBuyZScoreBreakout,
-                            strategies.LimitOrderTrailingExit))
-    stored_fsl = float(fixed_sl) if uses_fixed_sl else 0.0
+    stored_fsl = float(fixed_sl) if strategies.uses_fixed_sl(strategy_name) else 0.0
 
     # Which real column a task's raw sl/tpct grid values land in for this strategy —
     # see docs/design.md "Grid axis meaning by strategy".
-    sl_axis_col, fourth_axis_col = _resolve_axis_columns(strategy_name)
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
 
     # One query for all cached nodes of this (strategy, version, ticker) instead of
     # one SELECT per task (Phase 3 = ~18k queries per ticker).
@@ -573,7 +552,7 @@ def identify_island_candidates(config_version, strategy_name, n_index, n_stock, 
 # ── Phase 2: Island mesh ──────────────────────────────────────────────────────
 
 def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
-    sl_axis_col, fourth_axis_col = _resolve_axis_columns(strategy_name)
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     tasks = set()
     with sqlite3.connect(DB_PATH) as conn:
@@ -618,7 +597,7 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
     Guarantees cliff check has complete neighborhood data regardless of where the peak landed.
     For TrailingBothZScoreBreakout, also sweeps the trail_pct axis's immediate neighbors
     (±1 in the configured trail_pcts list) so Checkpoint 2's cliff check has data there too."""
-    sl_axis_col, fourth_axis_col = _resolve_axis_columns(strategy_name)
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(f"""
@@ -653,7 +632,7 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
 
 def identify_full_mesh_candidates(config_version, strategy_name, island_tickers, n_index, n_stock):
-    sl_axis_col, fourth_axis_col = _resolve_axis_columns(strategy_name)
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     results = []
     with sqlite3.connect(DB_PATH) as conn:
         for ticker in island_tickers:

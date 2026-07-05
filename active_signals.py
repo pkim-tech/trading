@@ -284,6 +284,7 @@ def create_watchlist(name):
     with _conn() as c:
         c.execute("INSERT OR IGNORE INTO watchlists (name, is_active) VALUES (?, 0)", (name,))
         c.commit()
+        return c.execute("SELECT id FROM watchlists WHERE name = ?", (name,)).fetchone()[0]
 
 
 def delete_watchlist(watchlist_id):
@@ -312,15 +313,6 @@ def get_watchlist(watchlist_id=None):
         ).fetchall()]
 
 
-def _uses_fixed_sl(strategy_name):
-    """v1.8/v1.9/v1.10/v2.11: the swept 'stop_loss' column actually holds trail_pct/trail_buy_pct;
-    the real fixed SL comes from config.execution.fixed_stop_loss, not the node's stop_loss field."""
-    strategy_cls = getattr(strategies, strategy_name, None)
-    return strategy_cls is not None and issubclass(
-        strategy_cls, (strategies.TrailingExitZScoreBreakout, strategies.TrailingBuyZScoreBreakout,
-                        strategies.LimitOrderTrailingExit))
-
-
 def _config_fixed_stop_loss():
     try:
         with open(CONFIG_PATH) as f:
@@ -336,35 +328,22 @@ def _config_fixed_stop_loss():
 _LEGACY_TRAILING_BOTH_TRAIL_PCT = {'v2.13': 1.0, 'v2.14': 2.0, 'v2.15': 3.0, 'v2.16': 4.0, 'v2.17': 5.0}
 
 
-def _resolve_axis_columns(strategy_name):
-    """Which real column the legacy overloaded 'stop_loss' value maps to for this
-    strategy — mirrors run_optimization_sweep.py::_resolve_axis_columns. Returns
-    (sl_axis_column, fourth_axis_column_or_None)."""
-    cls = getattr(strategies, strategy_name, None)
-    if cls is None:
-        return 'stop_loss', None
-    if issubclass(cls, strategies.TrailingBothZScoreBreakout):
-        return 'trail_buy_pct', 'trail_pct'
-    if issubclass(cls, strategies.TrailingBuyZScoreBreakout):
-        return 'trail_buy_pct', None
-    if issubclass(cls, (strategies.TrailingExitZScoreBreakout, strategies.LimitOrderTrailingExit)):
-        return 'trail_pct', None
-    return 'stop_loss', None
-
-
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
              label='', z_score_threshold=2.0, watchlist_id=None, mode='live',
              trail_buy_pct=None, trail_pct=None):
     """trail_buy_pct/trail_pct: pass the real values directly for v3.x nodes (where
     backtest_cache has real named columns). Omit both for legacy v1.x/v2.x nodes —
     falls back to reinterpreting stop_loss the way it's always meant for the 4
-    trailing strategies (see docs/design.md 'Grid axis meaning by strategy')."""
+    trailing strategies (see docs/design.md 'Grid axis meaning by strategy').
+    For v3.x trailing-both/trailing-exit nodes, the stop_loss arg is not a real
+    swept value (backtest_cache stores config.execution.fixed_stop_loss there,
+    a constant) — pass whatever backtest_cache's stop_loss column shows, it's vestigial."""
     if watchlist_id is None:
         watchlist_id = get_active_watchlist_id()
-    if _uses_fixed_sl(strategy):
+    if strategies.uses_fixed_sl(strategy):
         fixed_sl = _config_fixed_stop_loss()
         if trail_buy_pct is None and trail_pct is None:
-            sl_axis_col, fourth_axis_col = _resolve_axis_columns(strategy)
+            sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy)
             if sl_axis_col == 'trail_buy_pct':
                 stored_trail_buy_pct = float(stop_loss)
                 stored_trail_pct = (_LEGACY_TRAILING_BOTH_TRAIL_PCT.get(version, 3.0)
@@ -373,9 +352,16 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
                 stored_trail_buy_pct = 0.0
                 stored_trail_pct = float(stop_loss)
         else:
+            # v3.x explicit pass — real values, validate against the strategy's schema.
+            for w in strategies.validate_axis_values(strategy, trail_buy_pct, trail_pct):
+                print(f"WARNING add_node({ticker}, {strategy}, {version}): {w}")
             stored_trail_pct = trail_pct if trail_pct is not None else 0.0
             stored_trail_buy_pct = trail_buy_pct if trail_buy_pct is not None else 0.0
     else:
+        # Strategy doesn't use trailing axes at all (e.g. bar-close ZScoreBreakout) —
+        # flag if the caller passed either anyway, since it'll silently do nothing.
+        for w in strategies.validate_axis_values(strategy, trail_buy_pct, trail_pct):
+            print(f"WARNING add_node({ticker}, {strategy}, {version}): {w}")
         fixed_sl = None
         stored_trail_pct = None
         stored_trail_buy_pct = None
