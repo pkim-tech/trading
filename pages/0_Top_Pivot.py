@@ -439,7 +439,8 @@ def load_cliff_safety(version_strategy_pairs):
             for ticker in tickers:
                 row = conn.execute("""
                     SELECT take_profit, stop_loss, max_hold_hours, window, z_score_threshold,
-                           alpha_vs_spy, strategy_return, trades, win_rate, trail_buy_pct, trail_pct
+                           alpha_vs_spy, strategy_return, trades, win_rate, trail_buy_pct, trail_pct,
+                           win_twin_rate
                     FROM backtest_cache
                     WHERE version=? AND ticker=? AND strategy=? AND trades > 0
                     ORDER BY alpha_vs_spy DESC LIMIT 1
@@ -447,7 +448,7 @@ def load_cliff_safety(version_strategy_pairs):
                 if not row:
                     continue
                 (tp, sl, hold, window, z, alpha, ret, trades, win_rate,
-                 trail_buy_pct, trail_pct) = row
+                 trail_buy_pct, trail_pct, win_twin_rate) = row
                 tp, sl, hold, window = int(tp), int(sl), int(hold), int(window)
                 trail_buy_pct, trail_pct = float(trail_buy_pct or 0), float(trail_pct or 0)
                 sl_label, sl_display, neighbor_center = _resolve_sl_display(
@@ -473,6 +474,7 @@ def load_cliff_safety(version_strategy_pairs):
                     'max_hold_hours': hold,
                     'window': window, 'z': float(z),
                     'strategy_return': float(ret), 'trades': int(trades), 'win_rate': float(win_rate),
+                    'win_twin_rate': float(win_twin_rate or 0),
                 })
     return pd.DataFrame(results)
 
@@ -495,7 +497,10 @@ else:
             'best_alpha':      st.column_config.NumberColumn('Best α', format="%.1f%%"),
             'worst_neighbor':  st.column_config.NumberColumn('Worst Neighbor', format="%.1f%%"),
             'strategy_return': st.column_config.NumberColumn('Return', format="%.1f%%"),
-            'win_rate':        st.column_config.NumberColumn('Win %', format="%.1f%%"),
+            'win_rate':        st.column_config.NumberColumn('Win %', format="%.1f%%",
+                                                              help="Clean WIN exits only — excludes profitable TIME-exit trades (TWIN). See Win+TWin %."),
+            'win_twin_rate':   st.column_config.NumberColumn('Win+TWin %', format="%.1f%%",
+                                                              help="True profitable-trade rate: (WIN + TWIN) / trades. 0 for rows run before 2026-07-05 (not recomputed retroactively)."),
             'safe':            st.column_config.CheckboxColumn('Safe'),
             'sl_label':        st.column_config.TextColumn('SL Axis'),
             'sl_display':      st.column_config.TextColumn('SL Value'),
@@ -503,7 +508,7 @@ else:
         st.dataframe(
             safety_df[['ticker', 'version', 'strategy', 'best_alpha', 'worst_neighbor', 'safe',
                        'take_profit', 'sl_label', 'sl_display', 'max_hold_hours', 'window', 'z',
-                       'strategy_return', 'trades', 'win_rate']].sort_values('worst_neighbor'),
+                       'strategy_return', 'trades', 'win_rate', 'win_twin_rate']].sort_values('worst_neighbor'),
             use_container_width=True, hide_index=True, column_config=table_col_cfg,
         )
 

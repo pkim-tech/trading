@@ -62,6 +62,16 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE backtest_cache ADD COLUMN fixed_sl REAL DEFAULT 0")
     except Exception:
         pass
+    try:
+        # win_rate only counts Result=='WIN' (excludes profitable TIME-exit 'TWIN'
+        # trades) — win_twin_rate = (WIN+TWIN)/trades is the real "did this trade
+        # make money" rate. Added 2026-07-05 after finding a KORU node whose 21%
+        # win_rate was misleading (71% of its trades were actually profitable, just
+        # via TWIN). Old rows keep win_twin_rate=0 (not recomputed retroactively —
+        # would require re-simulating all historical trades).
+        cursor.execute("ALTER TABLE backtest_cache ADD COLUMN win_twin_rate REAL DEFAULT 0")
+    except Exception:
+        pass
 
     # v3.x reparameterization (2026-07-05): stop_loss now always means real SL;
     # trail_buy_pct/trail_pct get real columns instead of overloading stop_loss.
@@ -263,13 +273,14 @@ def run_single_backtest_node_isolated(args):
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "NO_TRADES"}
 
     df_tr = pd.DataFrame(closed)
-    win_rate   = float((len(df_tr[df_tr['Result'] == 'WIN']) / len(df_tr)) * 100)
+    win_rate      = float((len(df_tr[df_tr['Result'] == 'WIN']) / len(df_tr)) * 100)
+    win_twin_rate = float((len(df_tr[df_tr['Result'].isin(['WIN', 'TWIN'])]) / len(df_tr)) * 100)
     compounded = float(((df_tr['Return'] + 1).prod() - 1) * 100)
     alpha_calc = float(compounded - spy_bh)
 
     return {
         "coords":  (tp, sl, hold_hours),
-        "payload": (alpha_calc, len(df_tr), win_rate, compounded),
+        "payload": (alpha_calc, len(df_tr), win_rate, compounded, win_twin_rate),
         "window":  w, "z_thresh": z_thresh, "status": "SUCCESS"
     }
 
@@ -284,7 +295,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     # column holds trail_pct/trail_buy_pct for these) — a cache row is only valid for
     # the fixed_sl it was computed with, else re-running with a different fixed_stop_loss
     # would silently serve stale results under the same (tp, sl, hold, w, z) key.
-    stored_fsl = float(fixed_sl) if strategies.uses_fixed_sl(strategy_name) else 0.0
+    uses_fixed_sl = strategies.uses_fixed_sl(strategy_name)
+    stored_fsl = float(fixed_sl) if uses_fixed_sl else 0.0
 
     # Which real column a task's raw sl/tpct grid values land in for this strategy —
     # see docs/design.md "Grid axis meaning by strategy".
@@ -295,7 +307,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     cached_map = {}
     cursor.execute("""
         SELECT window, max_hold_hours, take_profit, stop_loss, z_score_threshold, fixed_sl,
-               trail_buy_pct, trail_pct, trades, win_rate, strategy_return, alpha_vs_spy
+               trail_buy_pct, trail_pct, trades, win_rate, strategy_return, alpha_vs_spy, win_twin_rate
         FROM backtest_cache
         WHERE strategy=? AND version=? AND ticker=?
     """, (strategy_name, config_version, ticker))
@@ -313,7 +325,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
             row_sl_raw = float(r[3])
         row_tpct_raw = float(r[7]) if fourth_axis_col == 'trail_pct' else 0.0
         cached_map[(int(r[2]), row_sl_raw, int(r[1]), int(r[0]), float(r[4]), row_fsl, row_tpct_raw)] = \
-            (r[8], r[9], r[10], r[11])
+            (r[8], r[9], r[10], r[11], r[12] if r[12] is not None else 0.0)
 
     for t in tasks:
         tp, sl, hold_hours, w, z_thresh, tpct = t
@@ -324,7 +336,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                 "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
                 "Z Threshold": z_thresh,
                 "Trades": cached_row[0], "Win Rate %": cached_row[1], "Return %": cached_row[2],
-                "Alpha vs SPY %": cached_row[3], "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
+                "Alpha vs SPY %": cached_row[3], "Win+TWin Rate %": cached_row[4],
+                "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
             })
         else:
             unvisited_tasks.append(t)
@@ -373,9 +386,9 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                                    f"{status} {res.get('error', '')}")
             if status in ("SUCCESS", "NO_TRADES"):
                 if status == "SUCCESS":
-                    alpha, num_trades, wr, comp_ret = res["payload"]
+                    alpha, num_trades, wr, comp_ret, wtw = res["payload"]
                 else:
-                    alpha, num_trades, wr, comp_ret = 0.0, 0, 0.0, 0.0
+                    alpha, num_trades, wr, comp_ret, wtw = 0.0, 0, 0.0, 0.0, 0.0
 
                 now = time.time()
                 if now - last_postfix_time >= 2.0:
@@ -398,7 +411,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                         "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
                         "Z Threshold": z_thresh,
                         "Trades": num_trades, "Win Rate %": wr, "Return %": comp_ret,
-                        "Alpha vs SPY %": alpha, "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
+                        "Alpha vs SPY %": alpha, "Win+TWin Rate %": wtw,
+                        "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
                     })
 
                 # Map this task's raw sl/tpct grid values onto the real named columns.
@@ -412,15 +426,15 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
                 buffer.append((strategy_name, config_version, ticker, w, hold_hours, int(tp), row_stop_loss,
                                num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
-                               stored_fsl, row_trail_buy_pct, row_trail_pct))
+                               stored_fsl, row_trail_buy_pct, row_trail_pct, wtw))
 
                 if len(buffer) >= batch_size:
                     cursor.executemany(
                         """INSERT OR REPLACE INTO backtest_cache
                            (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
                             trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
-                            run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_pct)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_pct, win_twin_rate)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         buffer
                     )
                     buffer = []
@@ -434,8 +448,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
             """INSERT OR REPLACE INTO backtest_cache
                (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
                 trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
-                run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_pct)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_pct, win_twin_rate)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             buffer
         )
     conn.commit()
