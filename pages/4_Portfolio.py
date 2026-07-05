@@ -9,7 +9,7 @@ from plotly.subplots import make_subplots
 from pathlib import Path
 import numpy as np
 import strategies
-from backtester import run_backtest, run_backtest_v17
+from backtester import run_backtest_dispatch
 
 DB_PATH   = "./cache/trading_universe.db"
 CACHE_DIR = Path("./cache")
@@ -83,7 +83,10 @@ def load_top_nodes(version, min_alpha, min_trades, z_thresholds):
         return pd.read_sql(f"""
             SELECT ticker, strategy, '{version}' as version, window, take_profit, stop_loss,
                    max_hold_hours, z_score_threshold, trades, win_rate,
-                   strategy_return, alpha_vs_spy
+                   strategy_return, alpha_vs_spy,
+                   COALESCE(fixed_sl, 0) as fixed_sl,
+                   COALESCE(trail_buy_pct, 0) as trail_buy_pct,
+                   COALESCE(trail_pct, 0) as trail_pct
             FROM backtest_cache
             WHERE version=? AND alpha_vs_spy >= ? AND trades >= ?
               AND z_score_threshold IN ({placeholders})
@@ -130,8 +133,26 @@ def compute_bands(ticker, strategy_name, window):
     return df_ind, df_h[close_col]
 
 
+def _resolve_sl_and_trailpct(strategy_class, stop_loss, trail_buy_pct, trail_pct, fixed_sl):
+    """Best-effort across v3.x (real named columns) and legacy v1.x/v2.x (overloaded
+    stop_loss, trail_buy_pct not tracked pre-v3.x) watch_list/backtest_cache rows —
+    see docs/design.md 'Grid axis meaning by strategy'. Legacy TrailingBoth rows have
+    no per-row trail_pct (it was a config constant, not stored) — 3.0% is the
+    historical default (v2.10)."""
+    if issubclass(strategy_class, strategies.TrailingBothZScoreBreakout):
+        sl_raw = trail_buy_pct if trail_buy_pct else stop_loss
+        tpct   = trail_pct if trail_pct else 3.0
+        return sl_raw, fixed_sl, tpct
+    if issubclass(strategy_class, strategies.TrailingBuyZScoreBreakout):
+        return (trail_buy_pct if trail_buy_pct else stop_loss), fixed_sl, 0.0
+    if issubclass(strategy_class, (strategies.TrailingExitZScoreBreakout, strategies.LimitOrderTrailingExit)):
+        return (trail_pct if trail_pct else stop_loss), fixed_sl, 0.0
+    return stop_loss, 0.0, 0.0
+
+
 @st.cache_data(ttl=300)
-def run_node_backtest(ticker, strategy_name, window, tp, sl, hold, zt):
+def run_node_backtest(ticker, strategy_name, window, tp, sl, hold, zt,
+                      fixed_sl=0.0, trail_buy_pct=0.0, trail_pct=0.0):
     df_h = load_hourly(ticker)
     if df_h is None:
         return []
@@ -140,10 +161,13 @@ def run_node_backtest(ticker, strategy_name, window, tp, sl, hold, zt):
     strat_class = getattr(strategies, strategy_name)
     strat = strat_class(window=window, z_score_threshold=float(zt))
     df_ind = strat.generate_daily_indicators(df_daily)
-    backtest_fn = run_backtest_v17 if issubclass(strat_class, strategies.LimitOrderZScoreBreakout) else run_backtest
-    return backtest_fn(df_h, df_ind, ticker,
-                       take_profit=tp / 100.0, stop_loss=sl / 100.0,
-                       max_hours_to_hold=hold, z_score_threshold=float(zt))
+    sl_raw, resolved_fixed_sl, tpct = _resolve_sl_and_trailpct(
+        strat_class, sl, trail_buy_pct, trail_pct, fixed_sl)
+    return run_backtest_dispatch(
+        strat_class, df_h, df_ind, ticker,
+        take_profit=tp, sl_raw=sl_raw, max_hours_to_hold=hold, z_score_threshold=float(zt),
+        fixed_sl=resolved_fixed_sl, trail_pct_pct=tpct
+    )
 
 
 
@@ -260,6 +284,8 @@ if selected_wl_node:
             n['ticker'], n.get('strategy', 'ZScoreBreakout'),
             int(n['window']), int(n['take_profit']), int(n['stop_loss']),
             int(n['max_hold_hours']), float(n['z_score_threshold']),
+            fixed_sl=float(n.get('fixed_sl') or 0), trail_buy_pct=float(n.get('trail_buy_pct') or 0),
+            trail_pct=float(n.get('trail_pct') or 0),
         )
     df_trades = pd.DataFrame(trades)
     closed = pd.DataFrame()
@@ -349,11 +375,17 @@ with st.expander("Research nodes (from DB)", expanded=False):
                     ac1, ac2 = st.columns(2)
                     with ac1:
                         if picked_wl_id and st.button("Add to watchlist", use_container_width=True):
+                            # trail_buy_pct/trail_pct are 0 (not populated) for legacy
+                            # v1.x/v2.x rows — only pass real values for v3.x rows;
+                            # None lets add_node fall back to its legacy path.
+                            _has_new_cols = bool(r_row['trail_buy_pct']) or bool(r_row['trail_pct'])
                             add_node(r_row['ticker'], r_row['strategy'], r_version,
                                      int(r_row['window']), int(r_row['take_profit']),
                                      int(r_row['stop_loss']), int(r_row['max_hold_hours']),
                                      z_score_threshold=float(r_row['z_score_threshold']),
-                                     watchlist_id=picked_wl_id)
+                                     watchlist_id=picked_wl_id,
+                                     trail_buy_pct=float(r_row['trail_buy_pct']) if _has_new_cols else None,
+                                     trail_pct=float(r_row['trail_pct']) if _has_new_cols else None)
                             st.cache_data.clear()
                             st.rerun()
                     with ac2:
@@ -363,6 +395,8 @@ with st.expander("Research nodes (from DB)", expanded=False):
                                 'window': r_row['window'], 'take_profit': r_row['take_profit'],
                                 'stop_loss': r_row['stop_loss'], 'max_hold_hours': r_row['max_hold_hours'],
                                 'z_score_threshold': r_row['z_score_threshold'], 'label': r_row['label'],
+                                'fixed_sl': r_row['fixed_sl'], 'trail_buy_pct': r_row['trail_buy_pct'],
+                                'trail_pct': r_row['trail_pct'],
                             })
             else:
                 st.caption("No nodes match filters.")
@@ -381,7 +415,9 @@ with st.spinner("Running backtests..."):
         trades = run_node_backtest(
             node['ticker'], node.get('strategy', 'ZScoreBreakout'), node['window'],
             node['take_profit'], node['stop_loss'], node['max_hold_hours'],
-            node.get('z_score_threshold', 2.0)
+            node.get('z_score_threshold', 2.0),
+            fixed_sl=float(node.get('fixed_sl') or 0), trail_buy_pct=float(node.get('trail_buy_pct') or 0),
+            trail_pct=float(node.get('trail_pct') or 0),
         )
         for t in trades:
             t['Node'] = node['label']

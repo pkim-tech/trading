@@ -969,3 +969,48 @@ def run_backtest(df_hourly, df_daily_indicators, ticker,
         target_h0, target_h1, float(z_score_threshold)
     )
     return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
+
+
+def run_backtest_dispatch(strategy_class, df_hourly, df_daily_indicators, ticker,
+                          take_profit, sl_raw, max_hours_to_hold, z_score_threshold,
+                          fixed_sl=0.0, trail_pct_pct=0.0, prep=None):
+    """Strategy-aware dispatch to the correct kernel wrapper — single source of truth
+    for what a raw swept 'sl_raw' grid value (plus the fixed_sl/trail_pct_pct config
+    values) actually mean for a given strategy. Mirrors
+    run_optimization_sweep.py::run_single_backtest_node_isolated's branches so the
+    sweep engine and any UI page replaying a node can't drift apart again — see
+    docs/design.md 'Grid axis meaning by strategy'.
+    take_profit/sl_raw/fixed_sl/trail_pct_pct are percent-scale (e.g. 15, not 0.15)."""
+    import strategies as _strategies
+    tp   = float(take_profit) / 100.0
+    hold = int(max_hours_to_hold)
+    z    = float(z_score_threshold)
+
+    if issubclass(strategy_class, _strategies.TrailingBothZScoreBreakout):
+        return run_backtest_v110(df_hourly, df_daily_indicators, ticker,
+            take_profit=tp, stop_loss=float(fixed_sl) / 100.0, max_hours_to_hold=hold,
+            z_score_threshold=z, trail_buy_pct=float(sl_raw) / 100.0,
+            trail_pct=float(trail_pct_pct) / 100.0, prep=prep)
+    if issubclass(strategy_class, _strategies.TrailingBuyZScoreBreakout):
+        return run_backtest_v19(df_hourly, df_daily_indicators, ticker,
+            take_profit=tp, stop_loss=float(fixed_sl) / 100.0, max_hours_to_hold=hold,
+            z_score_threshold=z, trail_buy_pct=float(sl_raw) / 100.0, prep=prep)
+    if issubclass(strategy_class, _strategies.TrailingExitZScoreBreakout):
+        return run_backtest_v18(df_hourly, df_daily_indicators, ticker,
+            take_profit=tp, stop_loss=float(fixed_sl) / 100.0, max_hours_to_hold=hold,
+            z_score_threshold=z, trail_pct=float(sl_raw) / 100.0, prep=prep)
+    if issubclass(strategy_class, _strategies.LimitOrderTrailingExit):
+        return run_backtest_v211(df_hourly, df_daily_indicators, ticker,
+            take_profit=tp, stop_loss=float(fixed_sl) / 100.0, max_hours_to_hold=hold,
+            z_score_threshold=z, trail_pct=float(sl_raw) / 100.0, prep=prep)
+    if issubclass(strategy_class, _strategies.LimitOrderZScoreBreakout):
+        return run_backtest_v17(df_hourly, df_daily_indicators, ticker,
+            take_profit=tp, stop_loss=float(sl_raw) / 100.0, max_hours_to_hold=hold,
+            z_score_threshold=z, prep=prep)
+    if issubclass(strategy_class, _strategies.LimitExitZScoreBreakout):
+        return run_backtest_v212(df_hourly, df_daily_indicators, ticker,
+            take_profit=tp, stop_loss=float(sl_raw) / 100.0, max_hours_to_hold=hold,
+            z_score_threshold=z, prep=prep)
+    return run_backtest(df_hourly, df_daily_indicators, ticker,
+        take_profit=tp, stop_loss=float(sl_raw) / 100.0, max_hours_to_hold=hold,
+        z_score_threshold=z, prep=prep)

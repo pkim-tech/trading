@@ -200,6 +200,8 @@ def ensure_tables():
             c.execute("ALTER TABLE watch_list ADD COLUMN trail_pct REAL")
         if 'fixed_sl' not in wl_cols:
             c.execute("ALTER TABLE watch_list ADD COLUMN fixed_sl REAL")
+        if 'trail_buy_pct' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN trail_buy_pct REAL")
 
         # open_positions
         c.execute("""
@@ -228,6 +230,8 @@ def ensure_tables():
             c.execute("ALTER TABLE open_positions ADD COLUMN trail_pct REAL")
         if 'fixed_sl' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN fixed_sl REAL")
+        if 'trail_buy_pct' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN trail_buy_pct REAL")
 
         # trade_log
         c.execute("""
@@ -326,22 +330,34 @@ def _config_fixed_stop_loss():
 
 
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
-             label='', z_score_threshold=2.0, watchlist_id=None, mode='live'):
+             label='', z_score_threshold=2.0, watchlist_id=None, mode='live',
+             trail_buy_pct=None, trail_pct=None):
+    """trail_buy_pct/trail_pct: pass the real values directly for v3.x nodes (where
+    backtest_cache has real named columns). Omit both for legacy v1.x/v2.x nodes —
+    falls back to reinterpreting stop_loss the way it's always meant for the 4
+    trailing strategies (see docs/design.md 'Grid axis meaning by strategy')."""
     if watchlist_id is None:
         watchlist_id = get_active_watchlist_id()
     if _uses_fixed_sl(strategy):
-        trail_pct, fixed_sl = float(stop_loss), _config_fixed_stop_loss()
+        fixed_sl = _config_fixed_stop_loss()
+        if trail_buy_pct is None and trail_pct is None:
+            stored_trail_pct = float(stop_loss)
+        else:
+            stored_trail_pct = trail_pct if trail_pct is not None else 0.0
+        stored_trail_buy_pct = trail_buy_pct if trail_buy_pct is not None else 0.0
     else:
-        trail_pct, fixed_sl = None, None
+        fixed_sl = None
+        stored_trail_pct = None
+        stored_trail_buy_pct = None
     with _conn() as c:
         c.execute("""
             INSERT OR IGNORE INTO watch_list
                 (watchlist_id, mode, ticker, strategy, version, window, take_profit,
-                 stop_loss, max_hold_hours, label, z_score_threshold, trail_pct, fixed_sl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 stop_loss, max_hold_hours, label, z_score_threshold, trail_pct, fixed_sl, trail_buy_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (watchlist_id, mode, ticker, strategy, version, int(window), int(take_profit),
               int(stop_loss), int(max_hold_hours), label, float(z_score_threshold),
-              trail_pct, fixed_sl))
+              stored_trail_pct, fixed_sl, stored_trail_buy_pct))
         c.commit()
 
 
@@ -399,15 +415,15 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time):
             INSERT INTO open_positions
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, trade_log_id,
-                 trail_pct, fixed_sl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_pct, fixed_sl, trail_buy_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(node['take_profit']), int(node['stop_loss']),
             int(node['max_hold_hours']),
             float(signal_price), sig_time_str,
             float(entry_price), entry_time_str, trade_log_id,
-            node.get('trail_pct'), node.get('fixed_sl'),
+            node.get('trail_pct'), node.get('fixed_sl'), node.get('trail_buy_pct'),
         ))
         c.commit()
 

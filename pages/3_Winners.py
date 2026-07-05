@@ -50,7 +50,9 @@ def load_results(version, min_trades, min_return, min_alpha, min_bh_mult, beat_b
                       max_hold_hours, COALESCE(z_score_threshold, 2.0) as z_score_threshold,
                       trades, win_rate, strategy_return, alpha_vs_spy,
                       asset_bh, spy_bh,
-                      CASE WHEN asset_bh > 0 THEN strategy_return / asset_bh ELSE NULL END as bh_mult
+                      CASE WHEN asset_bh > 0 THEN strategy_return / asset_bh ELSE NULL END as bh_mult,
+                      COALESCE(fixed_sl, 0) as fixed_sl, COALESCE(trail_buy_pct, 0) as trail_buy_pct,
+                      COALESCE(trail_pct, 0) as trail_pct
                FROM backtest_cache
                WHERE version = ?
                  AND trades >= ?
@@ -219,10 +221,16 @@ if selected_rows:
     with a1:
         watch_val = st.checkbox("Watch", value=is_watched, key=f"watch_{i}")
         if watch_val and not is_watched:
+            # trail_buy_pct/trail_pct are 0 (not populated) for legacy v1.x/v2.x rows —
+            # only pass real values through for v3.x rows; None lets add_node fall
+            # back to its legacy stop_loss-reinterpretation path.
+            _has_new_cols = bool(r['trail_buy_pct']) or bool(r['trail_pct'])
             add_node(r['ticker'], r['strategy'], version, int(r['window']),
                      int(r['take_profit']), int(r['stop_loss']), int(r['max_hold_hours']),
                      z_score_threshold=float(r['z_score_threshold']),
-                     watchlist_id=picked_wl_id)
+                     watchlist_id=picked_wl_id,
+                     trail_buy_pct=float(r['trail_buy_pct']) if _has_new_cols else None,
+                     trail_pct=float(r['trail_pct']) if _has_new_cols else None)
             st.cache_data.clear()
             st.rerun()
         elif not watch_val and is_watched:

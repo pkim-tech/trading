@@ -33,7 +33,13 @@ Strategy variants:
 - `LimitOrderTrailingExit` — subclasses `LimitOrderZScoreBreakout`, keeps its intrabar `Low <= lower_band` entry (fill at `lower_band`), swaps the fixed TP/SL exit for `TrailingExitZScoreBreakout`'s trailing-stop exit. Built 2026-07-04 to test whether v1.7/v2.7's weak returns (see `docs/backlog.md`) come from the entry or the fixed-TP exit — the entry noise (any wick counts, not just a confirmed close) is unfixable without becoming a different strategy (would collapse into `TrailingBuyZScoreBreakout`'s bounce-confirmation or `TrendFilteredZScore`'s regime filter), so this isolates the exit side only (v2.11)
 - `LimitExitZScoreBreakout` — bar-close confirmed entry (like `ZScoreBreakout`); SL is a fixed intrabar floor, but TP is modeled as a resting limit order — fills intrabar the moment `High >= tp_price`, at `tp_price`, instead of waiting for bar-close confirmation. Built 2026-07-04 as the "Close entry + Limit exit" combo from the watchlist-repick shorthand (see `docs/backlog.md`); live-parity wiring intentionally deferred, backfill-only for now (v2.12)
 
-### Grid axis meaning by strategy (read this before touching `sl`/`tp` on any Trailing* strategy)
+### Grid axis meaning by strategy — v1.x/v2.x only, see "v3.x reparameterization" below for the fix
+
+**This table describes v1.x/v2.x data only.** As of 2026-07-05, v3.x fixes the overload
+described here: `backtest_cache.stop_loss` always means real stop-loss, and
+`trail_buy_pct`/`trail_pct` are real named columns — see the "v3.x reparameterization"
+section below. v1.x/v2.x rows are untouched and still follow the table below exactly as
+written; this section stays for interpreting that historical data.
 
 The sweep grid always has exactly 3 free axes — `take_profit`, `stop_loss`, `hold_time` — plus `z_score_threshold`/`window` as separate loop dimensions. For strategies that need an extra parameter, that parameter is stuffed into the `stop_loss` ("sl") column instead of getting real grid space — the column's *name* stays `stop_loss` everywhere (DB schema, CLI, dispatch code) but its *meaning* changes per strategy. This has caused real confusion in conversation more than once — check this table before assuming what a strategy's `sl` value represents:
 
@@ -51,6 +57,34 @@ Key gotchas:
 - `TrailingBothZScoreBreakout` needs *two* extra parameters (`trail_buy_pct` for entry, `trail_pct` for exit) but only has *one* free slot (`sl`). `trail_buy_pct` wins that slot; `trail_pct` is hardcoded per backfill run via `config.execution.trail_pct` (default 3%, read by `run_optimization_sweep.py`'s `_config_trail_pct()`). Testing trail_pct at other values means running the *entire 53-ticker backfill again* with a different constant — v2.13=1%, v2.14=2%, v2.15=3%, v2.16=4%, v2.17=5% (v2.10 stays as-is, the original untouched run at trail_pct=3% with the plain coarse sl-grid) — it can never be a real grid axis without a schema change + rewriting the phase1/2/3 mesh generation to handle a 4th dimension. v2.13-17 all use a `sl` grid extended to include 1,2,4,5 alongside the normal coarse 3-30% points (`scripts/run_v2_backfill_sweep.sh`'s `COMBINED` list), so `trail_buy_pct` gets guaranteed low-end coverage on every ticker too, not just the ones whose coarse=3% point happened to earn island/full-mesh refinement in v2.10.
 - Only tickers that pass **Checkpoint 2** (cliff-free AND alpha≥200% AND liquidity≥$50k) get Phase 2 island refinement + Phase 3 full mesh (which tests `sl` 1-30 completely). Everything else only has the 10 coarse grid points. So "we already have sl=1-5 data for some tickers" only reflects which tickers looked good on the coarse pass, not a deliberate test of that range — a ticker whose true edge sits at sl=2 but whose sl=3 coarse point looked mediocre would never get refined down to sl=2 at all.
 - Confirmed real (non-fluke) example: SOXL's best v2.10 node sits at `trail_buy_pct`=13-14% (30+ trades, 36-48% win rate) — nowhere near the 1-5% range, and found via full mesh since SOXL passed Checkpoint 2. Don't assume the 1-5% range is "where the edge is" without ticker-specific evidence; UVIX's apparent 1-5% cliff patterns are contaminated by many `trades=1` fluke rows in the cache and shouldn't be used as supporting evidence for anything.
+
+### v3.x reparameterization (2026-07-05) — real named columns, trail_pct is now a real swept axis
+
+`backtest_cache` was migrated (schema rebuilt in place, `run_optimization_sweep.py::init_idempotent_db`,
+verified 60,364,303 rows carried over unchanged) to add real `trail_buy_pct`/`trail_pct` columns.
+Going forward (v3.x onward): `stop_loss` **always** means real stop-loss; `trail_buy_pct`
+(entry bounce %) and `trail_pct` (exit trailing %) are their own columns, populated only
+for the strategies that use them (0 otherwise). The PK now includes both new columns.
+v1.x/v2.x rows are untouched — they keep the old overloaded meaning described in the
+table above, with `trail_buy_pct`/`trail_pct` = 0 (not populated) on those rows.
+
+`trail_pct` is now a genuine 4th swept grid axis for `TrailingBothZScoreBreakout`
+(`hyperparameters.trail_pcts` in config.json, e.g. `[1,2,3,4,5]`) — this replaces the old
+v2.13-v2.17 pattern of one full 53-ticker backfill per trail_pct value with a single v3.x
+run. `_resolve_axis_columns()` (`run_optimization_sweep.py`) is the single source of truth
+for which strategy sweeps which column; `run_backtest_dispatch()` (`backtester.py`) is the
+matching single source of truth for kernel dispatch, shared by the sweep engine, Node
+Inspector, and Portfolio (previously each had their own, out-of-sync `issubclass` chain —
+Node Inspector/Portfolio only ever dispatched to `run_backtest_v17`-or-`run_backtest`,
+silently wrong for all 4 trailing strategies before this fix).
+
+`watch_list`/`open_positions` also gained a real `trail_buy_pct` column (`active_signals.py`).
+`add_node()` accepts optional `trail_buy_pct`/`trail_pct` kwargs for v3.x callers; omitting
+both falls back to the old stop_loss-reinterpretation logic for legacy v1.x/v2.x nodes.
+
+Full design/rationale: `/home/pkim/.claude/plans/ancient-giggling-kettle.md`.
+Backfill script: `scripts/run_v3_backfill_sweep.sh` (`v3.0`, or `v3.0 --validate` for a
+5-ticker sanity check first).
 
 ### Optimization Approach
 

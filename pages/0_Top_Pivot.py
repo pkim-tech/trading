@@ -249,7 +249,10 @@ STRAT_SHORT = {
     'TrailingExitZScoreBreakout':  'Trail',
     'TrailingBuyZScoreBreakout':   'TrBuy',
     'TrailingBothZScoreBreakout':  'TrBoth',
+    'LimitOrderTrailingExit':      'LimTr',
+    'LimitExitZScoreBreakout':     'LimExit',
 }
+CLIFF_SAFETY_RADIUS = 3
 
 max_alpha = st.number_input("Max alpha cap % (0 = no cap)", value=0.0, step=100.0, format="%.0f",
                             help="Cap to exclude black-swan outliers (e.g. UVIX). 0 = disabled.")
@@ -384,6 +387,109 @@ safe_piv = load_strategy_pivot_safe(int(min_trades), int(cliff_radius), int(min_
 safe_piv = _apply_strat_pivot_filters(safe_piv, exclude_single_stock, exclude_index,
                                        _ss, _ix, max_alpha, min_return)
 _render_strat_pivot(safe_piv)
+
+st.divider()
+st.subheader("Cliff Safety — Best vs Worst Neighbor")
+
+
+@st.cache_data(ttl=3600)
+def load_version_strategy_pairs():
+    with sqlite3.connect(DB_PATH) as c:
+        return c.execute(
+            "SELECT DISTINCT version, strategy FROM backtest_cache ORDER BY version DESC"
+        ).fetchall()
+
+
+@st.cache_data(ttl=3600, show_spinner="Running cliff-box lookups...")
+def load_cliff_safety(version_strategy_pairs):
+    """Per (ticker, version, strategy): best node + worst alpha in its ±radius TP/SL,
+    ±7h hold neighborhood. Same math as Checkpoint2 in run_optimization_sweep.py."""
+    results = []
+    with sqlite3.connect(DB_PATH) as conn:
+        for version, strategy in version_strategy_pairs:
+            tickers = [r[0] for r in conn.execute(
+                "SELECT DISTINCT ticker FROM backtest_cache WHERE version=? AND strategy=? AND trades > 0",
+                (version, strategy)
+            ).fetchall()]
+            for ticker in tickers:
+                row = conn.execute("""
+                    SELECT take_profit, stop_loss, max_hold_hours, window, z_score_threshold,
+                           alpha_vs_spy, strategy_return, trades, win_rate
+                    FROM backtest_cache
+                    WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+                    ORDER BY alpha_vs_spy DESC LIMIT 1
+                """, (version, ticker, strategy)).fetchone()
+                if not row:
+                    continue
+                tp, sl, hold, window, z, alpha, ret, trades, win_rate = row
+                tp, sl, hold, window = int(tp), int(sl), int(hold), int(window)
+                worst = conn.execute("""
+                    SELECT MIN(alpha_vs_spy) FROM backtest_cache
+                    WHERE version=? AND ticker=? AND strategy=?
+                      AND window=? AND z_score_threshold=?
+                      AND take_profit    BETWEEN ? AND ?
+                      AND stop_loss      BETWEEN ? AND ?
+                      AND max_hold_hours BETWEEN ? AND ?
+                      AND trades > 0
+                """, (version, ticker, strategy, window, z,
+                      tp - CLIFF_SAFETY_RADIUS, tp + CLIFF_SAFETY_RADIUS,
+                      sl - CLIFF_SAFETY_RADIUS, sl + CLIFF_SAFETY_RADIUS,
+                      hold - 7, hold + 7)).fetchone()[0]
+                worst_neighbor = float(worst) if worst is not None else float(alpha)
+                results.append({
+                    'ticker': ticker, 'version': version, 'strategy': strategy,
+                    'best_alpha': float(alpha), 'worst_neighbor': worst_neighbor,
+                    'safe': worst_neighbor >= 0,
+                    'take_profit': tp, 'stop_loss': sl, 'max_hold_hours': hold,
+                    'window': window, 'z': float(z),
+                    'strategy_return': float(ret), 'trades': int(trades), 'win_rate': float(win_rate),
+                })
+    return pd.DataFrame(results)
+
+
+vs_pairs_all = [(v, s) for v, s in load_version_strategy_pairs() if not v.startswith('v1.')]
+vs_labels_all = [f"{v} / {s}" for v, s in vs_pairs_all]
+chosen_labels = st.multiselect("Versions / strategies", vs_labels_all, default=vs_labels_all)
+chosen_pairs = tuple(vs_pairs_all[vs_labels_all.index(lbl)] for lbl in chosen_labels)
+
+if not chosen_pairs:
+    st.info("Select at least one version/strategy.")
+else:
+    safety_df = load_cliff_safety(chosen_pairs)
+    if safety_df.empty:
+        st.info("No data for the selected version/strategy pairs.")
+    else:
+        st.caption(f"{len(safety_df)} ticker × version/strategy rows")
+
+        table_col_cfg = {
+            'best_alpha':      st.column_config.NumberColumn('Best α', format="%.1f%%"),
+            'worst_neighbor':  st.column_config.NumberColumn('Worst Neighbor', format="%.1f%%"),
+            'strategy_return': st.column_config.NumberColumn('Return', format="%.1f%%"),
+            'win_rate':        st.column_config.NumberColumn('Win %', format="%.1f%%"),
+            'safe':            st.column_config.CheckboxColumn('Safe'),
+        }
+        st.dataframe(
+            safety_df[['ticker', 'version', 'strategy', 'best_alpha', 'worst_neighbor', 'safe',
+                       'take_profit', 'stop_loss', 'max_hold_hours', 'window', 'z',
+                       'strategy_return', 'trades', 'win_rate']].sort_values('worst_neighbor'),
+            use_container_width=True, hide_index=True, column_config=table_col_cfg,
+        )
+
+        st.markdown("**Pivot — worst neighbor (of each ticker's best node) vs. best α by version/strategy**")
+        safety_df['col'] = safety_df['strategy'].map(STRAT_SHORT).fillna(safety_df['strategy']) + ' ' + safety_df['version']
+        best_idx = safety_df.groupby('ticker')['best_alpha'].idxmax()
+        per_ticker = safety_df.loc[best_idx, ['ticker', 'worst_neighbor', 'safe']].set_index('ticker')
+        vs_piv = safety_df.pivot_table(index='ticker', columns='col', values='best_alpha', aggfunc='max')
+        vs_cols = list(vs_piv.columns)
+        vs_piv = per_ticker.join(vs_piv, how='right')
+        vs_piv['max'] = vs_piv[vs_cols].max(axis=1)
+        vs_piv = vs_piv.sort_values('worst_neighbor')
+
+        piv_col_cfg = {c: st.column_config.NumberColumn(c, format="%.1f%%") for c in vs_cols}
+        piv_col_cfg['worst_neighbor'] = st.column_config.NumberColumn('Worst Neighbor', format="%.1f%%")
+        piv_col_cfg['max']  = st.column_config.NumberColumn('Best α', format="%.1f%%")
+        piv_col_cfg['safe'] = st.column_config.CheckboxColumn('Safe')
+        st.dataframe(vs_piv, use_container_width=True, column_config=piv_col_cfg)
 
 st.divider()
 st.subheader("Watchlist — Alpha by Strategy")
