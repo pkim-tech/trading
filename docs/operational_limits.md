@@ -49,6 +49,10 @@ General notes that apply everywhere:
 - **No new entries when 3+ positions are open**: Until portfolio backtest validates stacked position behavior
 - **Close all positions and pause watch list before travel**: If connectivity is uncertain (vacation, cruise, international travel), close open positions and remove tickers from watch list before leaving. Do not rely on Slack being reachable.
 
+### Data Integrity Limits
+- **Stock splits can silently corrupt cached price data**: `data_manager.py::fetch_live_data_smart`'s incremental fetch only re-adjusts *overlapping* rows on each update (full split-adjusted history is only pulled fresh on initial bootstrap). If a split lands after a ticker's initial bootstrap, older cached rows can stay at the pre-split price scale while newer rows come in post-split-adjusted — producing a fake single-bar price jump that can dominate a compounded backtest return. Found and fixed for **UVIX** (1-for-20 reverse split, 2026-07-01 — fake +1889% trade inflated one node's alpha to +4400%) and **NBIZ** (2026-06-03 split, but the bad tick turned out to be baked into yfinance's own historical data — a full cache rebuild did not fix it, so NBIZ was blacklisted: removed from `tickers.json` and `watch_list` instead).
+- **Not yet built — split-hold safeguard**: run `scripts/check_stock_splits.py` (queries yfinance's authoritative `Ticker.splits`, flags any split landing inside a ticker's cached date range) at the start of each trading day, scoped to watchlist/`open_positions` tickers. Any ticker flagged should be pulled from live signal checks until its cache is rebuilt and verified clean. **If a position is open across a split date**, the entry price/share count must be manually reconciled against the actual broker position (which auto-adjusts on the split) before trusting any Slack exit signal — the cached-data math and the real brokerage position can silently diverge.
+
 ---
 
 ## Account Type — IRA / Roth IRA (Planned Live Test)

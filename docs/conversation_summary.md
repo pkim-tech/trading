@@ -942,3 +942,33 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 5. User flagged wanting to work on making the Slack-posting manual-review safety net more robust at some point (not scoped yet) — noted as a live-trading-adjacent research item, not started.
 
 ---
+
+## 2026-07-05 (evening) — UVIX/NBIZ unadjusted-split data bugs found & fixed; NBIZ blacklisted; new split-check tool; TQQQ/HIBL/YANG cliff investigations closed
+
+### What we did
+- **Investigated the 4 tickers flagged for a closer look** (UVIX's suspicious 88% win rate, HIBL/YANG "feels like an island", TQQQ's prior-session v1.7-beats-v2.18 exception):
+  - **UVIX**: traced the +4400% alpha / 88.9% win rate to a real bug — UVIX did a 1-for-20 reverse split effective 2026-07-01, but `data_manager.py::fetch_live_data_smart`'s incremental fetch only re-adjusts *overlapping* rows on update (full split-adjusted history only pulled fresh on initial bootstrap). `cache/UVIX_1h.csv` had pre-split prices (~$3-4) through 2026-06-24 and post-split prices (~$70) from 2026-06-25 on, producing one fake +1889% trade that dominated the compounded return via multiplication. The other 8 real trades were reasonable (10-28% each); excluding the bad trade gives a much more believable +127.8% return / +106.7% alpha on 8 trades (95% CI on the 87.5% win rate is ~53-98% — small sample, don't oversize on it).
+  - **HIBL & YANG**: neither is actually an "island" — replicated Top Pivot's Cliff Safety math (best-alpha node per version, ±3 tp/sl and ±7h hold neighbor radius) and found both tickers' *currently-watchlisted* version (HIBL v2.17, YANG v2.16) has the best (most positive) worst-neighbor alpha of all their trail_pct versions (v2.13-17) — i.e. the most stable pick, not a cliff.
+  - **TQQQ**: not a bug — the "v1.7 beats v2.18" comparison from the prior session wasn't apples-to-apples (each version's watchlist node sits at a different z-score threshold: v1.7 at z=2.0, v2.18 at z=1.0; each collapses badly at the other's z). Decided to skip further reconciliation since v1.7 is two generations behind v3.x anyway.
+- **Fixed UVIX's cache**: backed up (`cache/UVIX_1h_backup_20260705.csv`), deleted and rebootstrapped `cache/UVIX_1h.csv`, confirmed clean. Deleted 204,200 `backtest_cache` rows for UVIX/v3.5, v3.6, v3.9 (all ran before the fix, 11:15-11:42) — v3.18 ran after the fix (11:57) and is fine. User will rerun those 3 versions once the primary v3.x backfill (still running) finishes — explicitly held off touching UVIX in the meantime to avoid contending with the live run.
+- **Built `scripts/check_stock_splits.py`**: queries yfinance's authoritative `Ticker.splits` per cached ticker, flags any split landing inside that ticker's cached date range — deterministic, no price-jump threshold to tune (an earlier day-over-day/week-over-week % threshold approach was tried first and rejected by the user as unreliable — "it would also miss a reverse split"). Full-universe run (1442 tickers) found 211 splits.
+- **Found and handled a second real casualty: NBIZ** (active in the main watchlist, `mode='research'`, v1.6). Its cache has a single garbled bar right at its 2026-06-03 split (spikes to $91 for one bar, reverts to ~$9 the next day) — but unlike UVIX, a full cache rebuild did **not** fix it, meaning the bad tick is baked into yfinance's own historical data, not a caching artifact. Since it was never live and there are plenty of other candidates, blacklisted NBIZ: removed from `tickers.json` (1515-ticker collector list) and deleted its `watch_list` row, rather than hand-patching the bad tick.
+- **Confirmed no live position was ever at risk**: `open_positions` was empty throughout.
+- **Added `[{config_version}]` to every phase/checkpoint log header** in `run_optimization_sweep.py` (Phase 1/2/2.5/3, Checkpoint 1/2) per user request, so multi-version backfill logs are easy to scan by version. Takes effect on the next sweep process launch (doesn't retroactively affect the currently-running backfill).
+- **Documented in `docs/operational_limits.md`** (new "Data Integrity Limits" subsection under Phase 1) rather than `docs/backlog.md` (user explicitly redirected away from backlog for this write-up): the split-corruption mechanism, the UVIX/NBIZ findings, and the not-yet-built "start of day, hold ticker if split detected" safeguard (run `check_stock_splits.py` scoped to watchlist/open_positions each morning; any open position spanning a split date needs manual entry-price/share-count reconciliation against the broker before trusting an exit signal, since cached-data math and the real brokerage position can silently diverge).
+- Also spot-checked MULL/VRTL/KORU/YANG/TQQQ (other watchlist tickers with splits in their history per the full scan) — all came back clean, no discontinuity.
+
+### Key decisions
+- UVIX rerun deliberately deferred until the primary v3.x backfill finishes, to avoid resource contention with the live run — user was explicit about not wanting to "slam it."
+- NBIZ blacklisted outright rather than trying to patch/interpolate the one bad tick, since it was never live and the fix-cost/benefit didn't justify it with "many other tickers" available.
+- Split-detection approach changed mid-session from a price-jump % threshold (day-over-day or week-over-week) to querying yfinance's actual `Ticker.splits` data directly, per user pushback that a threshold-based heuristic would still miss real splits — this is strictly better (deterministic, no tuning, no false negatives from a small-ratio split hiding under threshold).
+- Write-up location for the bug findings was deliberately placed in `docs/operational_limits.md`, not `docs/backlog.md` — user redirected mid-session ("no not backlog - somewhere else").
+
+### Next Session
+1. Once the primary v3.x backfill finishes: rerun UVIX for v3.5, v3.6, v3.9 (rows already deleted, clean cache in place) — command: `./scripts/run_v3_backfill_sweep.sh v3.5 UVIX` (and v3.6/v3.9 same pattern), or fold into the next full run.
+2. Build the split-hold safeguard described in `docs/operational_limits.md`'s new "Data Integrity Limits" section — not started, just documented as a plan.
+3. `check_stock_splits.py`'s full 211-split list has only been spot-checked for the watchlist tickers — worth a fuller pass across the other ~200 flagged tickers if any of them become sweep candidates later.
+4. KORU's trail_pct=6-7% backfill (v3.26/v3.27) still pending as part of the primary run — watch for it to confirm/deny the v2.17 (trail_pct=5%) win-rate jump hypothesis.
+5. v1.9/v1.10 Schwab live-execution wiring still pending, still not urgent.
+
+---
