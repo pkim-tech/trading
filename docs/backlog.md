@@ -1,5 +1,34 @@
 # Backlog
 
+## Rename trail_pct → trail_sell_pct; split buy/sell display columns (2026-07-06)
+
+`trail_pct` (exit-side trailing %) and `trail_buy_pct` (entry-side bounce %) are asymmetrically named — the sell-side one kept its original name from `TrailingExitZScoreBreakout` (v1.8, back when there was only one trailing mechanism), while the buy-side one got a distinct name when `TrailingBothZScoreBreakout` added a second trailing axis. User wants `trail_pct` renamed to `trail_sell_pct` for symmetry/clarity, so buy-side and sell-side code/display never need to be parsed apart from a combined string.
+
+Scope (real column in 3 DB tables — **`open_positions` currently holds live KORU/SOXL positions**, so this must not be done carelessly mid-trade):
+- DB: `ALTER TABLE ... RENAME COLUMN trail_pct TO trail_sell_pct` on `backtest_cache`, `watch_list`, `open_positions` (SQLite supports this natively, no full rebuild). **Back up the DB file first**, per established practice ([[feedback_backup_before_schema_migration]]).
+- Code: rename the `trail_pct` param/column references across `strategies.py`, `backtester.py`, `run_optimization_sweep.py`, `active_signals.py`, `pages/0_Top_Pivot.py`, `pages/2_Node_Inspector.py`, `pages/3_Winners.py`, `pages/4_Portfolio.py`, `scripts/export_cliff_safety.py`, `scripts/fill_trail_pct_gaps.py`, `scripts/verify_live_parity.py`, `tests/test_TrailingBuyZScoreBreakout.py` — do NOT touch `trail_buy_pct` (no substring collision, but double check regex/replace scope).
+- Also fix `scripts/export_cliff_safety.py`'s/`pages/0_Top_Pivot.py`'s combined `sl_display` ("Bounce % / Trail %" as one string) to output separate `trail_buy_pct`/`trail_sell_pct` numeric columns instead — this was the immediate trigger (Excel-facing CSV was mixing buy and sell values into one field).
+- Verify KORU/SOXL still read back correctly from `open_positions` after the rename before considering it done.
+
+Deferred until after live positions are settled or clearly off-hours — not done same-session as opening those two positions.
+
+## Split trading_universe.db into separate live/research DB files (2026-07-06)
+
+Found while a `REINDEX backtest_cache` (146.5M rows, no row-count trim ever done across v1.x-v3.x) ran for 2.5+ hours and left a 25GB WAL that blocked even simple reads afterward — the single `cache/trading_universe.db` file conflates the tiny, hot live-trading tables (`watch_list`, `open_positions`, `trade_log`, `kv_cache`) with the enormous `backtest_cache`/`hurst_cache` research tables, so any heavy sweep/maintenance operation on the research side risks locking out the live daemon (`active_signals.py run`) that needs continuous access during market hours. Plan: split into two DB files — e.g. `trading_live.db` (watchlists, open_positions, trade_log, kv_cache) and `trading_research.db` (backtest_cache, hurst_cache) — so research-side maintenance can never contend with live trading reads/writes. Needs a design pass: how `active_signals.py`/`run_optimization_sweep.py`/Streamlit pages attach to both, whether any query joins across the two (if so, `ATTACH DATABASE` or keep a thin cross-reference).
+
+## Slack slash-command interaction for the live trading app (2026-07-06)
+
+User wants to interact with the app via Slack `/` slash commands (e.g. check positions, watchlist status) — reasonable since `SOCKET_MODE` is already wired up for Slack Executed/Skipped buttons (`active_signals.py`), so the app already has a live Slack Bolt connection. Needs a design pass: which commands (e.g. `/positions`, `/watchlist`, `/status`), whether they read live from DB or reuse existing `cmd_list`/`cmd_positions` CLI logic, and Slack app manifest changes needed to register slash commands.
+
+## Split active_signals.py into modules (2026-07-06)
+
+`active_signals.py` (1680+ lines) has grown to hold everything: DB connection/schema, watchlist CRUD, positions CRUD, signal computation, chart generation, Slack messaging, and the `run_loop` daemon + CLI, all in one file. Split in two passes, lowest-risk first:
+
+1. **Pass 1 — watchlist + positions**: pull `get_watchlists`/`get_active_watchlist_id`/`create_watchlist`/`delete_watchlist`/`set_active_watchlist`/`get_watchlist`/`add_node`/`remove_node`/`set_node_mode`/`label_node` into `watchlist.py`, and `get_open_positions`/`update_position_trail_state`/`open_position`/`close_position`/`log_trade_entry`/`log_trade_exit` into `positions.py`. Both are pure DB CRUD, no coupling to signal logic — safest to extract first.
+2. **Pass 2 — db + notify**: pull `_conn`/`ensure_tables` into `db.py` (shared base everything else imports), and the Slack/chart layer (`_post_message`, `_build_buy_blocks`, `_build_sell_blocks`, `notify_buy_signal`/`notify_sell_signal`/`notify_trailing_activated`/`notify_limit_fill`, `_chart_buy`/`_chart_sell`/`_upload_chart`) into `notify.py`.
+
+Leaves `compute_buy_signal`/`check_sell_condition`/`run_loop`/CLI in `active_signals.py` (or a renamed daemon module) as the actual trading-logic core. Not started — deferred, live trading week takes priority.
+
 ## Next Session Priority — Live-test the watchlist
 
 Nothing else in the backlog matters as much as this right now. Full session to be spent testing live trading of the watchlist end to end (see detailed item under High Priority: "Manually test fixed_sl/trail_pct round-trip before promoting Sweep 3 (v3.18/v3.21-27) live").

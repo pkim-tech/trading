@@ -10,11 +10,12 @@
 A z-score mean reversion backtesting and optimization system targeting leveraged ETFs. Runs parallel grid sweeps over take profit, stop loss, and hold time parameters to find optimal strategy configurations with positive alpha vs SPY. Now in live trading phase with manual execution via Schwab.
 
 ## Live Trading — Current State
-- **Watchlist**: Sweep 3 (v3.x) (`watchlist_id=7`), promoted to active/live 2026-07-05, replacing the old v1.x `main` watchlist. 10 tickers:
-  - `TrailingExitZScoreBreakout` v3.18 (bar-close entry, trailing exit): NUGT, SOXL, TQQQ
-  - `TrailingBothZScoreBreakout` v3.21-27 (trailing entry — place a broker trailing-buy order at `trail_buy_pct`%, broker handles fill timing — + trailing exit): AGQ, DPST, EDC, GDXU, HIBL, KORU, YANG
+- **Watchlist**: Sweep 3 (v3.x) (`watchlist_id=7`), promoted to active/live 2026-07-05, replacing the old v1.x `main` watchlist. 10 tickers total, 8 currently `live` mode (GDXU and TQQQ moved to `research` mode 2026-07-06 — still in the DB for backtest reference, excluded from live signals/Slack alerts):
+  - `TrailingExitZScoreBreakout` v3.18 (bar-close entry, trailing exit): NUGT, SOXL (TQQQ → research)
+  - `TrailingBothZScoreBreakout` v3.21-27 (trailing entry — place a broker trailing-buy order at `trail_buy_pct`%, broker handles fill timing — + trailing exit): AGQ, DPST, EDC, HIBL, KORU, YANG (GDXU → research)
   - All use `fixed_sl=15%` (real stop loss, config-driven constant, not swept) and z-score thresholds 1.0-1.5 per ticker — see `watch_list` table for exact per-ticker window/take_profit/hold/trail_buy_pct/trail_pct.
-- **Signal windows**: 10:25–10:40 AM ET and 15:25–15:40 PM ET (matches backtest target_hours=(9,14))
+- **Signal windows**: 10:25–10:40 AM ET and 15:25–15:40 PM ET (matches backtest target_hours=(9,14)). Hourly bars are labeled by **start** time (e.g. the "14:30" bar spans 14:30–15:30) — the bar-close signal actually being checked in the 15:25–15:40 window is the **14:30** bar (last one fully closed by then), not the 15:30 bar. `target_hours=(9,14)` reflects this: only hours 9-14 (9:30-14:30 anchors) are in the backtested grid: the 15:30 partial bar is excluded entirely.
+- **Open positions (as of 2026-07-06)**: KORU and SOXL, both entered off a signal that fired the prior trading day (Thursday 2026-07-02 14:30 bar close) but was missed live (engine wasn't running that day/the intervening holiday). Logged with `signal_time` backdated to the real Thursday signal bar so `max_hold_hours` counts from the actual dislocation, not from the late entry — `open_position()`'s `signal_time`/`entry_time` split already supported this without any code change.
 - **Execution workflow**:
   - `TrailingExitZScoreBreakout`: Stage limit order pre-market at absurd low price → Slack fires at bar close if price confirmed below lower_band → edit order to market and submit (~5 seconds).
   - `TrailingBothZScoreBreakout`: same bar-close signal fires the alert, but place a **trailing buy order at `trail_buy_pct`%** instead of a market order — the broker tracks the bounce-above-running-low entry itself (live code does not simulate this state machine).

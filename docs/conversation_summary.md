@@ -1054,3 +1054,30 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 5. v1.9/v1.10 Schwab live-execution wiring still pending, still not urgent.
 
 ---
+
+## 2026-07-06 — Logged live KORU/SOXL late entries off a missed Thursday signal; moved GDXU/TQQQ to research; survived a runaway REINDEX; built Cliff Safety CSV export
+
+### What we did
+- **User manually bought KORU and SOXL** off a signal that genuinely fired the prior trading day (Thursday 2026-07-02) but was missed live — engine wasn't running, and Friday 2026-07-03/the weekend meant no chance to catch it sooner. Recomputed the real signal bar for both using `compute_buy_signal(as_of=..., price_override=...)`: confirmed SOXL (z=-1.94, thresh -1.0) and KORU (z=-1.78, thresh -1.0) both genuinely breached at the **14:30 bar close**, not 15:30 as first assumed.
+- **Corrected a live signal-timing misunderstanding along the way**: hourly bars in the cache are labeled by **start** time (the "14:30" bar spans 14:30–15:30), so the last bar fully closed during the 15:25–15:40 PM signal window is the 14:30 bar, not 15:30. This also matches `target_hours=(9,14)` in the backtest — the 15:30 partial bar was never part of the backtested grid at all. Worth remembering for any future live-vs-signal-bar reconciliation.
+- **Logged both positions in `open_positions`** via `active_signals.open_position()`, backdating `signal_time` to the real Thursday 14:30 bar (KORU signal $510.78, SOXL signal $173.585007) while `entry_time`/`entry_price` reflect the actual late fills (KORU ~$624.65, SOXL $195.00 exact per user). This was already fully supported by the existing schema (`signal_time` vs `entry_time` are separate columns) — no code change needed. Confirmed `check_sell_condition`'s `hours_held` clock reads `signal_time`, not `entry_time`, so `max_hold_hours` (119h for both) correctly counts from the real dislocation, not the late fill — meaning no hold-budget was lost by missing Thursday.
+- **Moved GDXU and TQQQ to `research` mode** in the live watchlist (`set_node_mode`) — excluded from live signals/Slack alerts going forward, still in the DB for backtest reference. Live Sweep 3 watchlist is now 8 tickers, not 10.
+- **Confirmed the v3.50 backfill (53 tickers) completed successfully** — 2 completed `sweep_runs` (evening of 7/5, morning of 7/6), 2,478,900 rows in `backtest_cache` for v3.50 across all 53 tickers.
+- **REINDEX incident**: attempted a precautionary `REINDEX backtest_cache` after user worried they'd "messed up the copy paste for index build." Verified first that the actual index definitions in `sqlite_master` matched the code's `CREATE INDEX IF NOT EXISTS` statements exactly — no real corruption found. Ran the REINDEX anyway to be safe; it ran for 2.5+ hours (confirmed via `/proc/<pid>/io`: 636GB read, 152GB written — genuinely working, not hung) because `backtest_cache` has **146.5 million total rows** (all versions ever run, not just v3.50's 2.48M slice) and `cache_size` was at SQLite's default 2MB, forcing disk-based sort spills. Killed it (safe — uncommitted transaction, WAL-rollback-safe), which left a 25GB WAL file; cleared it via `PRAGMA wal_checkpoint(TRUNCATE)` (WAL was already mostly empty — checkpoint confirmed only 10 live frames, rest was unclaimed disk allocation).
+- **User restarted their PC mid-session** (heat/battery concern, plausibly linked to the REINDEX's sustained ~50% CPU + heavy I/O for hours) — Streamlit came back up on its own/was restarted; `active_signals.py run` (the live daemon) was deliberately left off for the night since market closed at 4pm ET.
+- **Built `scripts/export_cliff_safety.py`**, replicating `pages/0_Top_Pivot.py`'s `load_cliff_safety` best-alpha-vs-worst-neighbor math standalone (no Streamlit needed), filtered to v3.x-only version/strategy pairs. Exported `logs/cliff_safety_v3x.csv` (1816 rows). Fixed an Excel gotcha along the way: `sl_display` values like "27 / 22" were being misparsed as dates — prefixed with a leading `'` (Excel's force-text convention).
+
+### Key decisions
+- Treating the KORU/SOXL late entries as legitimate fills of a real, already-confirmed signal (recomputed from actual historical data, not just a stale carried-over reading) rather than a "late entry" edge case requiring new backtest research — justified because zero trading hours had elapsed against the hold-time budget over the weekend/holiday gap, so nothing about the strategy's tested shape was violated.
+- Deferred the `trail_pct` → `trail_sell_pct` rename (see backlog) rather than doing it same-session, specifically because `open_positions` currently holds live KORU/SOXL data depending on that column — wait for positions to settle or clearly off-hours.
+- REINDEX itself was judged unnecessary in hindsight (no real index corruption existed) but was reasonable as a precaution given the initial ambiguity; the real fix worth doing is the DB split (see backlog), not a periodic REINDEX habit.
+
+### Next Session
+1. **Split `trading_universe.db` into live/research DB files** (backlogged) — root-cause fix for today's incident class: a single DB file lets heavy research-side maintenance (146M-row `backtest_cache`) lock out the live daemon's hot tables.
+2. **Rename `trail_pct` → `trail_sell_pct`** + split the Cliff Safety CSV/UI's combined "Bounce % / Trail %" string into separate real columns (backlogged, deferred until KORU/SOXL are off or it's clearly off-hours) — back up the DB first per established practice.
+3. Restart `active_signals.py run` before tomorrow's 10:25–10:40 AM ET signal window — deliberately left off tonight.
+4. Split `active_signals.py` into modules (watchlist.py/positions.py first pass, db.py/notify.py second) — backlogged, not started.
+5. Review `logs/cliff_safety_v3x.csv` with user for any watchlist repick decisions (not yet reviewed together this session — export just finished before restart).
+6. Slack slash-command interaction for the live app — backlogged, needs a design pass (which commands, Slack manifest changes).
+
+---
