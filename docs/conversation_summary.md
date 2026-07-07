@@ -1200,3 +1200,24 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 7. KORU (held through a stop-loss breach) and HIBL (9% trailing-sell armed) still open — no daemon monitoring until restart.
 
 ---
+
+## 2026-07-07 (late afternoon, addendum) — axis_tp migration killed mid-script, recovered cleanly; discovered host-disk crisis (WSL vhdx vs. Windows C: drive)
+
+- User asked to bump SQLite `cache_size` to 12GB to speed up the still-running axis_tp migration. Flagged as too aggressive for the 15GB-RAM box and wrong as a *permanent* default (would multiply across `ProcessPoolExecutor` workers in `dispatch_parallel_grid`). Killed the migration instead of tuning it.
+- `kill -9` landed mid-script: `cursor.executescript()` doesn't wrap `CREATE`/`INSERT`/`DROP`/`RENAME` in one transaction, each auto-commits separately. `DROP TABLE backtest_cache` had already committed, leaving only `backtest_cache_new` (missing the final `RENAME`). A stray leftover process from an earlier ad hoc DB check was also still holding the file open — killed.
+- **Found a serious host-level disk issue**: `df -h` inside WSL reported 742GB free, but the actual Windows `C:` drive had only ~1.95GB free — the WSL `ext4.vhdx` (324.8GB on the host) is a sparse file, and WSL's own free-space number doesn't reflect whether the host can actually let it grow. Same failure class as an earlier WSL crash this session. User is restarting Windows/WSL after this session closes to reclaim real host space.
+- Wrote `scripts/recover_migration_wal.py` to checkpoint the ~32GB (stale, already-empty) WAL and verify `backtest_cache_new` before acting — confirmed complete: 86,213,203 rows, exactly matching the pre-migration backup, all `TrailingBothZScoreBreakout`/`axis_tp` invariants correct.
+- Ran `scripts/finish_axis_tp_rename.py` (rename + rebuild 4 indexes on 86M rows) — still running as of this wrap, confirm completion next session.
+- New scripts this leg (uncommitted as of this wrap): `scripts/check_migration_pragmas.py`, `scripts/check_migration_kill_state.py`, `scripts/recover_migration_wal.py`, `scripts/finish_axis_tp_rename.py`.
+
+### Next Session
+1. Confirm `scripts/finish_axis_tp_rename.py` completed; commit the 4 new recovery scripts.
+2. Confirm the host disk crisis is resolved post-restart before trusting any large DB operation again.
+3. Run the planned AGQ fresh-backfill comparison test.
+4. Propagate the rename to the 5 Streamlit pages and 3 remaining scripts.
+5. Drop the 4 stale duplicate tables from `trading_universe.db`.
+6. Restart `active_signals.py`.
+7. TQQQ pending trailing-buy fill — log once confirmed.
+8. KORU/HIBL still open, no daemon monitoring until restart.
+
+---
