@@ -1171,3 +1171,32 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 7. AGQ $307 legacy brokerage lot — still parked, user's call.
 
 ---
+
+## 2026-07-07 (late afternoon) — Fixed run_optimization_sweep.py (was fully broken post-rename); added axis_tp PK column; avg_vol_10d crash-safety fallback; TQQQ flipped live with pending trailing-buy order
+
+### What we did
+- **`.gitignore`**: scoped fix, `config.json.bak` only (not a blanket `*.bak` — user explicitly corrected an overly broad first attempt).
+- **TQQQ flipped to `live`** on watchlist 9 (`TrailingBothZScoreBreakout` v3.29, `trail_buy_pct=1.0`, matches a real trailing-buy order the user placed for 700 shares). **Order is still pending (not filled)** — not logged into `open_positions`/`trade_log` yet; log it once a fill price/time is confirmed. Backlogged an idea: daemon could compute per-bar whether a pending trailing-buy would have triggered and Slack a confirmation instead of relying on manual tracking.
+- **Found `run_optimization_sweep.py` was fully broken**, not just stale — the DB-side `trail_pct`→`trail_sell_pct` rename from the previous session's commit had already landed on the live `backtest_cache` (75.6M rows), but this file's SQL still referenced the old `trail_pct` column name (`no such column` on any real run). Also found the file never split `take_profit`/`arm_sell_pct` for `TrailingBothZScoreBreakout` the way `active_signals.py` does — it just wrote the grid's tp value straight into `take_profit`.
+- **Worked through the fix's design with the user** before implementing: NULLing `take_profit` for `TrailingBothZScoreBreakout` breaks the table's composite PK (SQLite never treats `NULL = NULL`, so `INSERT OR REPLACE` stops deduping and duplicates pile up). Considered and rejected: sentinel `-1` (still doesn't discriminate rows), defaulting both columns to `0.0` (reintroduces the exact zero/NULL ambiguity the rename was for), a SQL `CHECK` constraint enforcing mutual exclusivity (would break a hypothetical future strategy needing both `take_profit` and `arm_sell_pct` as independent real values in the same row). Landed on: a new `axis_tp` column, computed in Python at write time (`take_profit if strategy != 'TrailingBothZScoreBreakout' else arm_sell_pct`, same idea as `COALESCE` but computed in application code to match the existing pattern) — always non-NULL, used in the PK and every internal island/cliff-box/candidate query instead of raw `take_profit`.
+- **Implemented the full fix**: renamed `trail_pct`→`trail_sell_pct` throughout, added `arm_sell_pct`/`axis_tp` columns + a new PK, updated `dispatch_parallel_grid`'s cache-read/write, and updated `run_phase2_island`/`run_phase25_cliff_box`/`identify_full_mesh_candidates` (previously all read `take_profit` directly as a real grid value — would have silently produced zero cliff-check/island data for `TrailingBothZScoreBreakout` once that column went NULL, on top of the outright crash). Backed up `trading_universe.db` first (`cache/trading_universe_pre_axis_tp.db.bak`, 42GB) before running the rebuild migration.
+- **Migration (`cache/axis_tp_migration.log`) was still running as of session end** — full table rebuild of 75.6M rows, detached via `setsid`/`disown`. **Check it next session before trusting any fresh sweep run.**
+- **Real crash risk found mid-migration**: `active_signals.py` was running unattended (started 15:38, not by me) while the migration held brief exclusive locks on the same DB file — its `RESEARCH_DB_PATH` connections (`hurst_cache`, `tickers` lookups) have no busy-timeout. `hurst_cache` is wrapped in try/except (safe); the `tickers` lookup in `_build_buy_blocks` (position-sizing cap) was not. User killed the daemon for the day before this became a real collision (market closed, after 4pm).
+- **Fixed the `tickers` lookup crash risk properly** rather than just noting it: added `watch_list.cached_avg_vol_10d`, wrapped the research-DB lookup in try/except, caches the value on success and falls back to it on failure (scoped to just the ~11 active watchlist tickers per the user's call, not a full `tickers`-table sync — `avg_vol_10d` only changes via a manual, non-cron `scripts/import_tickers.py` run anyway, so a cached fallback is barely staler than the live lookup). Verified both paths (success caches, forced failure falls back without crashing) via a new committed script, `scripts/test_avg_vol_fallback.py`.
+- **New standing preference from the user**: write real committed test scripts (like `scripts/live_test.py`'s pattern) instead of throwaway inline `python3 -c "..."` one-liners for verification.
+
+### Key decisions
+- `axis_tp` computed in Python at write time, not a SQL `GENERATED` column — matches the file's existing pattern of hand-computing derived columns before INSERT, avoids per-row SQL formula evaluation.
+- No `CHECK` constraint enforcing take_profit/arm_sell_pct mutual exclusivity — would be wrong for a possible future strategy needing both as independent real axes.
+- `cached_avg_vol_10d` lives on `watch_list` (per-ticker, populated opportunistically), not a full sync of the `tickers` table.
+
+### Next Session
+1. **Check `cache/axis_tp_migration.log`** — confirm the table-rebuild finished; verify row count (75,658,063 expected) and spot-check a few `TrailingBothZScoreBreakout` rows (`take_profit` NULL, `arm_sell_pct` populated, `axis_tp` non-NULL matching `arm_sell_pct`).
+2. Run the planned test: fresh `TrailingBothZScoreBreakout` backfill for an existing AGQ node, compare final numbers against the pre-migration cached row.
+3. Propagate the rename to the 5 Streamlit pages (`Top_Pivot`, `Node_Inspector`, `Winners`, `Portfolio`, `Open_Positions`) and 3 scripts (`export_cliff_safety.py`, `verify_live_parity.py`, `fill_trail_pct_gaps.py`).
+4. Drop the 4 stale duplicate tables from `trading_universe.db` once the migration is confirmed done.
+5. **Restart `active_signals.py`** — picks up the `avg_vol_10d` fallback and everything from prior sessions' pending restarts. Confirm `cached_avg_vol_10d` column gets created via `ensure_tables()` on startup.
+6. TQQQ: check on the pending trailing-buy fill; log it via `open_position()`/`log_trade_entry()` once confirmed.
+7. KORU (held through a stop-loss breach) and HIBL (9% trailing-sell armed) still open — no daemon monitoring until restart.
+
+---

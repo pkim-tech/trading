@@ -205,6 +205,8 @@ def ensure_tables():
             c.execute("ALTER TABLE watch_list ADD COLUMN trail_buy_pct REAL")
         if 'arm_sell_pct' not in wl_cols:
             c.execute("ALTER TABLE watch_list ADD COLUMN arm_sell_pct REAL")
+        if 'cached_avg_vol_10d' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN cached_avg_vol_10d REAL")
 
         # open_positions
         c.execute("""
@@ -893,10 +895,24 @@ def _build_buy_blocks(node, sig):
     schwab_sl_pct   = node['stop_loss'] + 1
     schwab_sl_price = sig['lower_band'] * (1 - schwab_sl_pct / 100)
 
-    with sqlite3.connect(RESEARCH_DB_PATH) as _c:
-        _c.row_factory = sqlite3.Row
-        vol_row = _c.execute("SELECT avg_vol_10d FROM tickers WHERE symbol=?", (ticker,)).fetchone()
-    max_notional = vol_row['avg_vol_10d'] * price * 0.01 if vol_row and vol_row['avg_vol_10d'] else None
+    # avg_vol_10d only changes when someone re-runs scripts/import_tickers.py (manual,
+    # not on a cron) — a locked research DB (e.g. mid-migration) is worth falling back
+    # on the last-cached value for rather than crashing the daemon over a stale-by-a-day
+    # sizing number.
+    avg_vol_10d = None
+    try:
+        with sqlite3.connect(RESEARCH_DB_PATH) as _c:
+            _c.row_factory = sqlite3.Row
+            vol_row = _c.execute("SELECT avg_vol_10d FROM tickers WHERE symbol=?", (ticker,)).fetchone()
+        avg_vol_10d = vol_row['avg_vol_10d'] if vol_row else None
+        if avg_vol_10d and node.get('id') is not None:
+            with _conn() as _c:
+                _c.execute("UPDATE watch_list SET cached_avg_vol_10d=? WHERE id=?", (avg_vol_10d, node['id']))
+                _c.commit()
+    except Exception as e:
+        print(f"WARNING _build_buy_blocks({ticker}): tickers lookup failed ({e}), using cached avg_vol_10d")
+        avg_vol_10d = node.get('cached_avg_vol_10d')
+    max_notional = avg_vol_10d * price * 0.01 if avg_vol_10d else None
     max_shares = int(max_notional // price) if max_notional else None
     max_notional_str = f"  |  max `${max_notional/1000:.0f}k` / `{max_shares} shares` @ 1% vol" if max_notional else ""
 
