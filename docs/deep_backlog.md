@@ -1,5 +1,27 @@
 # Backlog
 
+## Default rule: Slack-notify on every action-requiring state change (2026-07-07)
+
+Established as a standing convention, not a one-off feature: any state transition in `active_signals.py` that requires the user to do something (place/cancel an order, confirm a fill, etc.) must have a corresponding Slack notification. Prompted by HIBL's arm-sell threshold crossing without an alert — but on investigation, the notification already exists (`notify_trailing_activated()`, fires on `just_activated_trailing` at `active_signals.py:1582-1583`) and today's miss was purely because the daemon was down the whole time since HIBL's buy signal (same root cause as the heartbeat/watchdog gap below), not a missing notification path.
+
+Current coverage, for reference: buy signal (`notify_buy_signal`), sell signal/SL/TP/TIME/TRAIL (`notify_sell_signal`), trailing armed (`notify_trailing_activated`), limit fill (`notify_limit_filled`) all exist and are wired into `run_loop`. Action item going forward: any new state/strategy added to `active_signals.py` must include a matching Slack notification before being considered done — audit this against the rule at that time, don't assume coverage.
+
+## Out-of-band heartbeat/watchdog for active_signals.py (2026-07-07)
+
+Daemon crashed today mid-session (the `tickers`-table bug during the DB split) and there was no independent alert — Slack itself is posted *by* the daemon, so it can't reliably alert on its own death. Needs a separate standalone process: a lightweight watchdog (own process, cron or sleep-loop) that checks a heartbeat (daemon touches a file/DB row every poll cycle) and posts to Slack via its own independent webhook call if the heartbeat goes stale during market hours — so a bug in the main daemon can't take down its own alerting. Not started.
+
+## "What's close" script — buy trigger proximity for the whole watchlist, exposed via Slack command (2026-07-07)
+
+There's no persisted/queryable "current signal state" anywhere — `active_signals.py`'s `run_loop` recomputes everything fresh each poll and only acts (fires `notify_buy_signal`) when a threshold is actually crossed; nothing is written for "how close is X to triggering." Found this gap when asked to check all watchlist tickers' buy trigger vs current price — had to call `compute_buy_signal()` per ticker by hand, no shortcut existed.
+
+Scope: a standalone script (mirrors the ad-hoc check done this session: loop live watch_list nodes, call `compute_buy_signal()`, compare `current_price` vs `lower_band`, sort by proximity) plus a Slack slash-command/interactive-message hook so it can be triggered on demand instead of only via a Claude session. Not started.
+
+## Add account tracking (Brokerage/SEP/IRA/Roth) for portfolio performance (2026-07-07)
+
+User has 4 accounts (Brokerage, SEP, IRA, Roth) and positions are opened across all of them (e.g. HIBL entered in IRA same session), but nothing in the DB tracks which account a position/trade belongs to — currently just verbal/memory. User explicitly wants this tracked in the DB (not a spreadsheet) so account-level portfolio performance can be computed, not just aggregate.
+
+Scope: add an `account` column to `open_positions` and `trade_log` (both in `trading_live.db`), thread it through `open_position()`/`log_trade_entry()`/`close_position()` call sites, surface it in the Slack entry-price-confirmation flow (need to capture which account at execution time — currently nothing prompts for this) and in `pages/4_Portfolio.py`/`pages/10_Open_Positions.py` displays/filters. Not started.
+
 ## ✅ Done 2026-07-07 (evening, while user away) — Split trading_universe.db into live/research files; folded Watchlist Trade Pivot into Top Pivot; trail_pct rename still deferred
 
 **DB split**: Built `cache/trading_live.db` as a **copy** of `watchlists`/`watch_list`/`open_positions`/`trade_log` (4/47/2/3 rows) — `cache/trading_universe.db` untouched, still holds `backtest_cache`/`hurst_cache`/`tickers` plus the original (now-redundant) copies of the live tables. Repointed `active_signals.py`'s `DB_PATH` to `trading_live.db`, added `RESEARCH_DB_PATH` for the one `hurst_cache` lookup it makes. Repointed `pages/10_Open_Positions.py`, and split `pages/4_Portfolio.py`/`pages/0_Top_Pivot.py`/`scripts/post_sweep_report.py` into dual-path (live table queries → `trading_live.db`, `backtest_cache` queries → `trading_universe.db`); `pages/0_Top_Pivot.py`'s watch_list/backtest_cache join now uses `ATTACH DATABASE` across the two files (verified working). `scripts/verify_live_parity.py` and `scripts/live_test.py` needed no changes (already DB-path-agnostic via monkeypatch / re-import).
@@ -26,12 +48,9 @@ Built `pages/12_Watchlist_Trade_Pivot.py` as a **test page** against this sandbo
 
 **Open question**: should this sandbox pattern (scoped snapshot + trade_cache) become the permanent shape of the "watchlist" tier in the live/research split below, or stay a one-off testing tool? Not decided.
 
-## SOXL/KORU live exit-strategy decision — still open (2026-07-07)
+## ✅ Closed 2026-07-07 — SOXL/KORU live exit-strategy decision (overtaken by events)
 
-Both are open positions running exit configs that are *not* the current best-known backtest pick for their ticker:
-- **SOXL**: running v3.18 (`TrailingExitZScoreBreakout`, arm=1%, trail_sell=24%) — real per-trade breakdown (via `trade_cache`): 48 closed trades, 23 WIN / 24 LOSS / 0 TWIN / 0 TLOSS (47.9% win rate). Candidate v3.35 (`TrailingBothZScoreBreakout`, arm=17%, trail_buy=1%, trail_sell=15%): 56 trades, 32 WIN / 19 LOSS / 2 TWIN / 2 TLOSS (60.7% win+twin) — a real edge, not just the one-outlier-trade effect that inflated v3.35's headline alpha (see the `take_profit`→`trail_arm_pct` rename item above for that investigation).
-- **KORU**: running v3.25 (arm=10%, trail_buy=5%, trail_sell=5%, hold=119h) — 39 trades, 27 WIN / 9 LOSS / 2 TWIN / 0 TLOSS (74.4% win+twin). Candidate v3.34 (arm=23%, trail_buy=12%, trail_sell=14%, hold=77h): 30 trades, 10 WIN / 5 LOSS / 11 TWIN / 3 TLOSS (70.0% win+twin) — current config is actually slightly *better* on win rate; v3.34's bigger backtest alpha comes from letting winners run further, not winning more often. Also checked: extending KORU's hold time past 77h (up to the already-swept max of 140h/~21.5 trading days) makes alpha and win rate *worse*, not better — the 77h pick isn't leaving easy gains on the table by capping early.
-- No decision made yet on whether to switch either open position's live exit params to the candidate configs. Blocked on user judgment call, not on missing data anymore.
+Was an open question about whether to switch SOXL/KORU's live exit params to better-backtesting candidate configs (SOXL v3.35, KORU v3.34) — see prior analysis in git history if ever needed. Overtaken by the 2026-07-07 market swing: SOXL hit its real stop-loss and was closed out (-15.38%, logged in `trade_log`); KORU also breached its stop but the user chose to hold through it manually, working the position directly rather than via a config swap. No longer an open decision.
 
 ## Rename trail_pct → trail_sell_pct; also take_profit → trail_arm_pct for TrailingBoth; split buy/sell display columns (2026-07-06, updated 2026-07-06)
 
@@ -49,9 +68,9 @@ Scope (real column in 3 DB tables — **`open_positions` currently holds live KO
 
 Deferred until after live positions are settled or clearly off-hours — not done same-session as opening those two positions.
 
-## Split trading_universe.db into separate live/research DB files (2026-07-06)
+## ✅ Done (mostly) — Split trading_universe.db into separate live/research DB files (2026-07-06, cutover verified 2026-07-07)
 
-Found while a `REINDEX backtest_cache` (146.5M rows, no row-count trim ever done across v1.x-v3.x) ran for 2.5+ hours and left a 25GB WAL that blocked even simple reads afterward — the single `cache/trading_universe.db` file conflates the tiny, hot live-trading tables (`watch_list`, `open_positions`, `trade_log`, `kv_cache`) with the enormous `backtest_cache`/`hurst_cache` research tables, so any heavy sweep/maintenance operation on the research side risks locking out the live daemon (`active_signals.py run`) that needs continuous access during market hours. Plan: split into two DB files — e.g. `trading_live.db` (watchlists, open_positions, trade_log, kv_cache) and `trading_research.db` (backtest_cache, hurst_cache) — so research-side maintenance can never contend with live trading reads/writes. Needs a design pass: how `active_signals.py`/`run_optimization_sweep.py`/Streamlit pages attach to both, whether any query joins across the two (if so, `ATTACH DATABASE` or keep a thin cross-reference).
+`cache/trading_live.db` (watchlists, watch_list, open_positions, trade_log) and `cache/trading_universe.db` (backtest_cache, hurst_cache, tickers, kv_cache) now fully split, `active_signals.py` repointed and verified reading/writing the live file exclusively (confirmed via `ensure_tables()` + live position exit-check exercise). **Not yet done**: the 4 stale duplicate live tables (`watch_list`/`watchlists`/`open_positions`/`trade_log`) are still physically present in `trading_universe.db`, unused — a backup exists (`cache/trading_universe.db.bak_pre_table_drop_20260707`) but the actual `DROP TABLE` never ran. Safe to do once the `arm_sell_pct` migration (see rename item) finishes — don't run concurrent writes against the same file. Also cosmetic: the research file is still literally named `trading_universe.db`, not renamed to `trading_research.db`.
 
 ## Slack slash-command interaction for the live trading app (2026-07-06)
 
@@ -66,9 +85,9 @@ User wants to interact with the app via Slack `/` slash commands (e.g. check pos
 
 Leaves `compute_buy_signal`/`check_sell_condition`/`run_loop`/CLI in `active_signals.py` (or a renamed daemon module) as the actual trading-logic core. Not started — deferred, live trading week takes priority.
 
-## Next Session Priority — Live-test the watchlist
+## ✅ Done — Live-test the watchlist (2026-07-07)
 
-Nothing else in the backlog matters as much as this right now. Full session to be spent testing live trading of the watchlist end to end (see detailed item under High Priority: "Manually test fixed_sl/trail_pct round-trip before promoting Sweep 3 (v3.18/v3.21-27) live").
+Sweep 3 / "Sweep v3 - Full" watchlist is live and has been traded through a real market swing (SOXL stopped out, KORU held through a breach, HIBL entered and armed its trailing sell) — the priority this note flagged is complete.
 
 **Milestone marker**: once the axis-schema cleanup (2026-07-05 — `strategies.py` class attributes + `validate_axis_values`, consolidating the 5 duplicated `_resolve_axis_columns`/`uses_fixed_sl` copies) and this live-test session both land, that's the end of `docs/operational_limits.md`'s Phase 1 (Manual Execution). Revisit then whether to relabel/split phases (e.g. current work retroactively "Phase 0" bootstrapping vs. a "Phase 1" that starts once Sweep 3 is the confirmed live watchlist) and define what Phase 2 actually covers (automation — see [[project_execution_automation_plan]]).
 
@@ -97,9 +116,9 @@ Found while asking "do any current watchlist winners sit in the 1/2/4/5 sl range
 
 **Follow-up not done this session**: `pages/0_Top_Pivot.py`'s "Watchlist — Alpha by Strategy" section only queries `watchlist_id=1` and joins `backtest_cache`/`watch_list` on raw `b.stop_loss = w.stop_loss` — fine for that watchlist's real-SL strategies, but would break if it's ever extended to Sweep 3 (`watchlist_id=5`) or any future v3.x trailing-strategy node without the same axis-aware join fix.
 
-## Watchlist Repick (2026-07-04, do tomorrow)
+## ✅ Done — Watchlist Repick (2026-07-04 → concluded 2026-07-07, Sweep 3/"Sweep v3 - Full" is live)
 
-Reviewing v2.x sweep results to repick the live watchlist (AGQ/EDC/FAS/HIBL). Entry/exit shorthand: **Close** = bar-close confirmed entry, **Limit** = intrabar touch entry, **Trail** = trailing-buy bounce entry; **Fixed** = market exit at TP/SL, **Trail** = trailing-stop exit, **Limit** = limit-order exit. Existing versions: Close/Fixed=v1.5/2.5, Close/Trail=v1.8/2.8, Limit/Fixed=v1.7/2.7, Close/Limit=v2.12, Trail/Fixed=v1.9/2.9, Trail/Trail=v1.10/2.10.
+Was reviewing v2.x sweep results to repick the live watchlist (AGQ/EDC/FAS/HIBL). Entry/exit shorthand for reference: **Close** = bar-close confirmed entry, **Limit** = intrabar touch entry, **Trail** = trailing-buy bounce entry; **Fixed** = market exit at TP/SL, **Trail** = trailing-stop exit, **Limit** = limit-order exit. Existing versions: Close/Fixed=v1.5/2.5, Close/Trail=v1.8/2.8, Limit/Fixed=v1.7/2.7, Close/Limit=v2.12, Trail/Fixed=v1.9/2.9, Trail/Trail=v1.10/2.10. Concluded with the current v3.x, 10-ticker Sweep 3 watchlist now live. The "Research:" ideas below this point (post-loss cooldown, gap risk, seasonal patterns, etc.) are separate standalone research questions, still open.
 
 Todo:
 - **✅ Resolved 2026-07-05 — giving up on v2.4 (`TrendFilteredZScore`, 50-day SMA trend filter) for now**: didn't produce substantive signals. Not pursuing further.
