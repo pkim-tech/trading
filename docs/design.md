@@ -68,6 +68,8 @@ for the strategies that use them (0 otherwise). The PK now includes both new col
 v1.x/v2.x rows are untouched — they keep the old overloaded meaning described in the
 table above, with `trail_buy_pct`/`trail_pct` = 0 (not populated) on those rows.
 
+**Addendum (2026-07-07)**: `trail_pct` renamed to `trail_sell_pct` for symmetry with `trail_buy_pct`. For `TrailingBothZScoreBreakout` specifically, `take_profit` was also split out — it never actually took profit for this strategy, it armed the trailing-sell mechanism, so that value now lives in a new `arm_sell_pct` column instead (`take_profit` is `NULL` on `TrailingBothZScoreBreakout` rows, real take-profit % everywhere else it's used). Done DB-side + `active_signals.py` this session; `run_optimization_sweep.py`/Streamlit pages/scripts still read the old names — see `docs/backlog_cache.md`.
+
 `trail_pct` is now a genuine 4th swept grid axis for `TrailingBothZScoreBreakout`
 (`hyperparameters.trail_pcts` in config.json, e.g. `[1,2,3,4,5]`) — this replaces the old
 v2.13-v2.17 pattern of one full 53-ticker backfill per trail_pct value with a single v3.x

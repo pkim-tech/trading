@@ -153,7 +153,7 @@ def ensure_tables():
                     strategy          TEXT NOT NULL,
                     version           TEXT NOT NULL,
                     window            INTEGER NOT NULL,
-                    take_profit       INTEGER NOT NULL,
+                    take_profit       INTEGER,
                     stop_loss         INTEGER NOT NULL,
                     max_hold_hours    INTEGER NOT NULL,
                     z_score_threshold REAL NOT NULL DEFAULT 2.0,
@@ -173,7 +173,7 @@ def ensure_tables():
                     strategy          TEXT NOT NULL,
                     version           TEXT NOT NULL,
                     window            INTEGER NOT NULL,
-                    take_profit       INTEGER NOT NULL,
+                    take_profit       INTEGER,
                     stop_loss         INTEGER NOT NULL,
                     max_hold_hours    INTEGER NOT NULL,
                     z_score_threshold REAL NOT NULL DEFAULT 2.0,
@@ -197,12 +197,14 @@ def ensure_tables():
                 c.execute("ALTER TABLE watch_list ADD COLUMN z_score_threshold REAL NOT NULL DEFAULT 2.0")
 
         wl_cols = {r[1] for r in c.execute("PRAGMA table_info(watch_list)").fetchall()}
-        if 'trail_pct' not in wl_cols:
-            c.execute("ALTER TABLE watch_list ADD COLUMN trail_pct REAL")
+        if 'trail_sell_pct' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN trail_sell_pct REAL")
         if 'fixed_sl' not in wl_cols:
             c.execute("ALTER TABLE watch_list ADD COLUMN fixed_sl REAL")
         if 'trail_buy_pct' not in wl_cols:
             c.execute("ALTER TABLE watch_list ADD COLUMN trail_buy_pct REAL")
+        if 'arm_sell_pct' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN arm_sell_pct REAL")
 
         # open_positions
         c.execute("""
@@ -212,7 +214,7 @@ def ensure_tables():
                 strategy       TEXT NOT NULL,
                 version        TEXT NOT NULL,
                 window         INTEGER NOT NULL,
-                take_profit    INTEGER NOT NULL,
+                take_profit    INTEGER,
                 stop_loss      INTEGER NOT NULL,
                 max_hold_hours INTEGER NOT NULL,
                 signal_price   REAL NOT NULL,
@@ -227,12 +229,14 @@ def ensure_tables():
             c.execute("ALTER TABLE open_positions ADD COLUMN trade_log_id INTEGER")
         if 'trail_state' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN trail_state TEXT")
-        if 'trail_pct' not in op_cols:
-            c.execute("ALTER TABLE open_positions ADD COLUMN trail_pct REAL")
+        if 'trail_sell_pct' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN trail_sell_pct REAL")
         if 'fixed_sl' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN fixed_sl REAL")
         if 'trail_buy_pct' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN trail_buy_pct REAL")
+        if 'arm_sell_pct' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN arm_sell_pct REAL")
 
         # trade_log
         c.execute("""
@@ -242,7 +246,7 @@ def ensure_tables():
                 strategy            TEXT NOT NULL,
                 version             TEXT NOT NULL,
                 window              INTEGER NOT NULL,
-                take_profit         INTEGER NOT NULL,
+                take_profit         INTEGER,
                 stop_loss           INTEGER NOT NULL,
                 max_hold_hours      INTEGER NOT NULL,
                 signal_price        REAL NOT NULL,
@@ -255,9 +259,13 @@ def ensure_tables():
                 exit_time           TEXT,
                 exit_drift_pct      REAL,
                 pnl_pct             REAL,
-                exit_reason         TEXT
+                exit_reason         TEXT,
+                arm_sell_pct        REAL
             )
         """)
+        tl_cols = {r[1] for r in c.execute("PRAGMA table_info(trade_log)").fetchall()}
+        if 'arm_sell_pct' not in tl_cols:
+            c.execute("ALTER TABLE trade_log ADD COLUMN arm_sell_pct REAL")
         c.commit()
 
 
@@ -329,6 +337,15 @@ def _config_fixed_stop_loss():
 _LEGACY_TRAILING_BOTH_TRAIL_PCT = {'v2.13': 1.0, 'v2.14': 2.0, 'v2.15': 3.0, 'v2.16': 4.0, 'v2.17': 5.0}
 
 
+def _tp_or_arm_pct(row):
+    """take_profit is a real take-profit % for most strategies, but for
+    TrailingBothZScoreBreakout it's the arm-sell threshold, stored in arm_sell_pct
+    instead (take_profit is NULL on those rows)."""
+    if row['strategy'] == 'TrailingBothZScoreBreakout':
+        return row['arm_sell_pct']
+    return row['take_profit']
+
+
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
              label='', z_score_threshold=2.0, watchlist_id=None, mode='live',
              trail_buy_pct=None, trail_pct=None):
@@ -347,16 +364,16 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
             sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy)
             if sl_axis_col == 'trail_buy_pct':
                 stored_trail_buy_pct = float(stop_loss)
-                stored_trail_pct = (_LEGACY_TRAILING_BOTH_TRAIL_PCT.get(version, 3.0)
-                                     if fourth_axis_col == 'trail_pct' else 0.0)
+                stored_trail_sell_pct = (_LEGACY_TRAILING_BOTH_TRAIL_PCT.get(version, 3.0)
+                                          if fourth_axis_col == 'trail_pct' else 0.0)
             else:
                 stored_trail_buy_pct = 0.0
-                stored_trail_pct = float(stop_loss)
+                stored_trail_sell_pct = float(stop_loss)
         else:
             # v3.x explicit pass — real values, validate against the strategy's schema.
             for w in strategies.validate_axis_values(strategy, trail_buy_pct, trail_pct):
                 print(f"WARNING add_node({ticker}, {strategy}, {version}): {w}")
-            stored_trail_pct = trail_pct if trail_pct is not None else 0.0
+            stored_trail_sell_pct = trail_pct if trail_pct is not None else 0.0
             stored_trail_buy_pct = trail_buy_pct if trail_buy_pct is not None else 0.0
     else:
         # Strategy doesn't use trailing axes at all (e.g. bar-close ZScoreBreakout) —
@@ -364,17 +381,29 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
         for w in strategies.validate_axis_values(strategy, trail_buy_pct, trail_pct):
             print(f"WARNING add_node({ticker}, {strategy}, {version}): {w}")
         fixed_sl = None
-        stored_trail_pct = None
+        stored_trail_sell_pct = None
         stored_trail_buy_pct = None
+
+    # take_profit is a real take-profit exit for most strategies, but for
+    # TrailingBothZScoreBreakout it's actually the arm-sell threshold — store it
+    # in arm_sell_pct instead so take_profit never means two different things.
+    if strategy == 'TrailingBothZScoreBreakout':
+        stored_take_profit = None
+        stored_arm_sell_pct = float(take_profit)
+    else:
+        stored_take_profit = int(take_profit)
+        stored_arm_sell_pct = None
+
     with _conn() as c:
         c.execute("""
             INSERT OR IGNORE INTO watch_list
                 (watchlist_id, mode, ticker, strategy, version, window, take_profit,
-                 stop_loss, max_hold_hours, label, z_score_threshold, trail_pct, fixed_sl, trail_buy_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (watchlist_id, mode, ticker, strategy, version, int(window), int(take_profit),
+                 stop_loss, max_hold_hours, label, z_score_threshold, trail_sell_pct, fixed_sl,
+                 trail_buy_pct, arm_sell_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (watchlist_id, mode, ticker, strategy, version, int(window), stored_take_profit,
               int(stop_loss), int(max_hold_hours), label, float(z_score_threshold),
-              stored_trail_pct, fixed_sl, stored_trail_buy_pct))
+              stored_trail_sell_pct, fixed_sl, stored_trail_buy_pct, stored_arm_sell_pct))
         c.commit()
 
 
@@ -428,19 +457,21 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time):
         sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
         entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
         trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time)
+        tp = node.get('take_profit')
         c.execute("""
             INSERT INTO open_positions
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, trade_log_id,
-                 trail_pct, fixed_sl, trail_buy_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
-            int(node['window']), int(node['take_profit']), int(node['stop_loss']),
+            int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
             int(node['max_hold_hours']),
             float(signal_price), sig_time_str,
             float(entry_price), entry_time_str, trade_log_id,
-            node.get('trail_pct'), node.get('fixed_sl'), node.get('trail_buy_pct'),
+            node.get('trail_sell_pct'), node.get('fixed_sl'), node.get('trail_buy_pct'),
+            node.get('arm_sell_pct'),
         ))
         c.commit()
 
@@ -461,18 +492,19 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time):
     sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
     entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
     entry_drift    = (entry_price - signal_price) / signal_price * 100
+    tp = node.get('take_profit')
     with _conn() as c:
         c.execute("""
             INSERT INTO trade_log
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
-                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
-            int(node['window']), int(node['take_profit']), int(node['stop_loss']),
+            int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
             int(node['max_hold_hours']),
             float(signal_price), sig_time_str,
-            float(entry_price), entry_time_str, entry_drift,
+            float(entry_price), entry_time_str, entry_drift, node.get('arm_sell_pct'),
         ))
         c.commit()
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -632,10 +664,11 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
     # not the real fixed SL — that comes from the node's fixed_sl column instead.
     if strategies.uses_fixed_sl(pos['strategy']):
         real_sl_pct = pos.get('fixed_sl') or 0.0
-        trail_pct   = (pos.get('trail_pct') or 3.0) / 100.0
+        trail_pct   = (pos.get('trail_sell_pct') or 3.0) / 100.0
     else:
         real_sl_pct = pos['stop_loss']
         trail_pct   = 0.03
+    tp_pct     = _tp_or_arm_pct(pos)
     strat      = strategy_cls(window=pos['window'], trail_pct=trail_pct)
     old_state  = pos.get('trail_state', {})
     reason, price, new_state = strat.check_exit({
@@ -645,7 +678,7 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
         'low':               low if low is not None else current_price,
         'high':              high if high is not None else current_price,
         'entry_price':       pos['entry_price'],
-        'take_profit':       pos['take_profit'] / 100.0,
+        'take_profit':       tp_pct / 100.0,
         'stop_loss':         real_sl_pct / 100.0,
         'max_hours_to_hold': pos['max_hold_hours'],
         'hours_held':        hours_held,
@@ -734,7 +767,7 @@ def _chart_buy(node, sig) -> BytesIO | None:
     pct_away = (sig['current_price'] - sig['lower_band']) / sig['lower_band'] * 100
     fig.suptitle(f"{ticker}   trigger ${sig['lower_band']:.2f}  ({pct_away:+.1f}%)",
                  fontsize=15, fontweight='bold', color='#f0a500', y=0.98)
-    ax.set_title(f"w{window} z{z_thresh:g} tp{node['take_profit']} sl{node['stop_loss']}",
+    ax.set_title(f"w{window} z{z_thresh:g} tp{_tp_or_arm_pct(node)} sl{node['stop_loss']}",
                  fontsize=9, color='#9aa0a6')
 
     tick_step = max(len(x) // 10, 1)
@@ -773,7 +806,7 @@ def _chart_sell(pos, current_price) -> BytesIO | None:
     lower_h = sma_h - 2 * std_h
 
     ep         = pos['entry_price']
-    tp_price   = ep * (1 + pos['take_profit'] / 100)
+    tp_price   = ep * (1 + _tp_or_arm_pct(pos) / 100)
     sl_price   = ep * (1 - pos['stop_loss'] / 100)
     entry_time = datetime.strptime(pos['entry_time'], '%Y-%m-%d %H:%M:%S')
     pct        = (current_price - ep) / ep * 100
@@ -846,7 +879,7 @@ def _build_buy_blocks(node, sig):
     price     = sig['current_price']
     z         = sig['z_score']
     bar_str   = sig['last_bar'].strftime('%Y-%m-%d %H:%M')
-    tp_price  = price * (1 + node['take_profit'] / 100)
+    tp_price  = price * (1 + _tp_or_arm_pct(node) / 100)
     sl_price  = price * (1 - node['stop_loss']   / 100)
 
     hurst_str = f"{sig['hurst']:.3f}" if sig.get('hurst') is not None else "n/a"
@@ -860,7 +893,8 @@ def _build_buy_blocks(node, sig):
     schwab_sl_pct   = node['stop_loss'] + 1
     schwab_sl_price = sig['lower_band'] * (1 - schwab_sl_pct / 100)
 
-    with _conn() as _c:
+    with sqlite3.connect(RESEARCH_DB_PATH) as _c:
+        _c.row_factory = sqlite3.Row
         vol_row = _c.execute("SELECT avg_vol_10d FROM tickers WHERE symbol=?", (ticker,)).fetchone()
     max_notional = vol_row['avg_vol_10d'] * price * 0.01 if vol_row and vol_row['avg_vol_10d'] else None
     max_shares = int(max_notional // price) if max_notional else None
@@ -883,7 +917,7 @@ def _build_buy_blocks(node, sig):
             "type":         "buy",
             "node":         {k: node.get(k) for k in ('ticker', 'strategy', 'version', 'window',
                                                         'take_profit', 'stop_loss', 'max_hold_hours', 'label',
-                                                        'trail_pct', 'fixed_sl')},
+                                                        'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct')},
             "signal_price": price,
             "signal_time":  sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'),
             "lower_band":   sig['lower_band'],
@@ -1102,7 +1136,7 @@ def notify_buy_signal(node, sig):
     z        = sig['z_score']
     bar_time = sig['last_bar']
     bar_str  = bar_time.strftime('%Y-%m-%d %H:%M')
-    tp       = node['take_profit']
+    tp       = _tp_or_arm_pct(node)
     sl       = node['stop_loss']
     hold     = node['max_hold_hours']
 
@@ -1183,7 +1217,7 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     print(f"\n{sep}")
     print(f"  SELL SIGNAL  {ticker}  — {reason_labels[reason]}")
     print(f"  Entry: ${ep:.4f}  →  Current: ${current_price:.4f}  ({pct:+.2f}%)")
-    print(f"  Target: ${target_price:.4f}   Node: TP={pos['take_profit']}%  SL={pos['stop_loss']}%  hold={pos['max_hold_hours']}h")
+    print(f"  Target: ${target_price:.4f}   Node: TP={_tp_or_arm_pct(pos)}%  SL={pos['stop_loss']}%  hold={pos['max_hold_hours']}h")
     print(f"  Entered: {entry_time}")
     print(sep)
 
@@ -1225,7 +1259,7 @@ def notify_trailing_activated(pos, current_price):
     ticker    = pos['ticker']
     ep        = pos['entry_price']
     pct       = (current_price - ep) / ep * 100
-    trail_pct = pos.get('trail_pct', 0.03) * 100
+    trail_pct = pos.get('trail_sell_pct') or 3.0
     print(f"\n  [TRAILING ACTIVATED] {ticker}  entry=${ep:.4f}  now=${current_price:.4f}  ({pct:+.2f}%)")
     _post_message(
         f"TRAILING ACTIVATED — {ticker}  ${current_price:.4f}  ({pct:+.2f}%)",
@@ -1308,7 +1342,7 @@ def send_startup_report(watchlist):
             rows.append((float('inf'), node['ticker'], node['strategy'], node.get('version', ''), None, None, node))
             continue
         trigger  = sig['lower_band']
-        tp_price = trigger * (1 + node['take_profit'] / 100)
+        tp_price = trigger * (1 + _tp_or_arm_pct(node) / 100)
         sl_price = trigger * (1 - node['stop_loss']  / 100)
         pct_away = (sig['current_price'] - trigger) / trigger * 100
         rows.append((pct_away, node['ticker'], node['strategy'], node.get('version', ''), sig, {'tp': tp_price, 'sl': sl_price, 'pct': pct_away}, node))
@@ -1377,17 +1411,17 @@ def send_startup_report(watchlist):
             trail_state = p.get('trail_state') or {}
             if trail_state.get('trailing'):
                 peak = trail_state.get('peak', p['entry_price'])
-                trail_pct = (p.get('trail_pct') or 3.0) / 100.0
+                trail_pct = (p.get('trail_sell_pct') or 3.0) / 100.0
                 trigger_price = peak * (1 - trail_pct)
                 trigger_str = f"trailing active, peak `${peak:.2f}`  sell trigger `${trigger_price:.2f}`"
             else:
-                tp_price = p['entry_price'] * (1 + p['take_profit'] / 100.0)
+                tp_price = p['entry_price'] * (1 + _tp_or_arm_pct(p) / 100.0)
                 trigger_str = f"arm trigger `${tp_price:.2f}`"
             text = (
                 f"📊 *{p['ticker']}*  "
                 f"entry `${p['entry_price']:.2f}`  "
                 f"held `{hours_held:.0f}h/{p['max_hold_hours']}h`  "
-                f"tp `{p['take_profit']}%`  sl `{p['stop_loss']}%`  "
+                f"tp `{_tp_or_arm_pct(p)}%`  sl `{p['stop_loss']}%`  "
                 f"{trigger_str}"
                 f"{pnl_str}"
             )
@@ -1621,7 +1655,7 @@ def cmd_list():
     print('-' * len(hdr))
     for n in wl:
         print(
-            f"{n['id']:<4} {n['ticker']:<7} {n['window']:<4} {n['take_profit']:<4} "
+            f"{n['id']:<4} {n['ticker']:<7} {n['window']:<4} {_tp_or_arm_pct(n)!s:<4} "
             f"{n['stop_loss']:<4} {n['max_hold_hours']:<6} {(n.get('label') or ''):<20} {n['added_at']}"
         )
 
@@ -1641,7 +1675,7 @@ def cmd_positions():
         hours = _bars_held(df_hourly_p, signal_time)
         print(
             f"{p['id']:<4} {p['ticker']:<7} ${p['entry_price']:<12.4f} "
-            f"{p['entry_time']:<22} {hours:<9} {p['take_profit']:<5} "
+            f"{p['entry_time']:<22} {hours:<9} {_tp_or_arm_pct(p)!s:<5} "
             f"{p['stop_loss']:<5} {p['max_hold_hours']}"
         )
 

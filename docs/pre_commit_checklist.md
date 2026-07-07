@@ -7,7 +7,7 @@ Used by `feature wrap` and `session wrap` before committing.
 - [ ] No secrets or API keys in staged files (check `.env` is gitignored)
 - [ ] No runtime artifacts staged (`cache/`, `logs/`, `output/`, `active_phase_grid.json`, `current_test.json`)
 - [ ] `docs/design.md` reflects any architectural changes made this session
-- [ ] `docs/backlog.md` updated if new issues or ideas surfaced
+- [ ] `docs/backlog_cache.md`/`docs/deep_backlog.md` updated if new issues or ideas surfaced
 - [ ] `readme.md` updated if layer behavior changed
 - [ ] Staged files reviewed — nothing unexpected included
 
