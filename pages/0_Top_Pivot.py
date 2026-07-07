@@ -5,8 +5,17 @@ from db_cache import get_kv
 import strategies
 
 DB_PATH = "./cache/trading_universe.db"
+WATCHLIST_SWEEP_DB_PATH = "./cache/watchlist_sweep.db"
 WINDOWS = [10, 20]
 Z_THRESHOLDS = [1.0, 1.5, 2.0]
+
+TRADE_RESULT_COLORS = {
+    'WIN':   '#2ecc71',
+    'TWIN':  '#4c9be8',
+    'LOSS':  '#e74c3c',
+    'TLOSS': '#f0a500',
+    'OPEN':  '#95a5a6',
+}
 
 st.set_page_config(layout="wide", page_title="Top Pivot")
 st.title("Top Pivot")
@@ -535,11 +544,12 @@ st.subheader("Watchlist — Alpha by Strategy")
 @st.cache_data(ttl=300)
 def load_watchlist_pivot():
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("ATTACH DATABASE ? AS live_db", ("./cache/trading_live.db",))
         df = pd.read_sql('''
             SELECT w.ticker, w.mode, w.strategy, w.version,
                    w.window, w.z_score_threshold, w.take_profit, w.stop_loss, w.max_hold_hours,
                    b.alpha_vs_spy, b.strategy_return, b.trades, b.win_rate
-            FROM watch_list w
+            FROM live_db.watch_list w
             LEFT JOIN backtest_cache b
                 ON  b.ticker           = w.ticker
                 AND b.version          = w.version
@@ -592,3 +602,92 @@ with st.expander("Edit Underliers"):
         load_single_stock_tickers.clear()
         load_underlier_map.clear()
         st.rerun()
+
+
+st.divider()
+st.subheader("Watchlist Trade Pivot")
+st.caption("Reads a scoped snapshot (cache/watchlist_sweep.db), not the production DB. "
+           "Trade-level results are computed once via the real kernel and cached in trade_cache, "
+           "not read from backtest_cache's (sometimes stale) aggregate win_rate columns.")
+
+
+@st.cache_data(ttl=300)
+def load_trade_pivot_nodes():
+    with sqlite3.connect(WATCHLIST_SWEEP_DB_PATH) as c:
+        c.row_factory = sqlite3.Row
+        return [dict(r) for r in c.execute("SELECT * FROM watch_list ORDER BY ticker").fetchall()]
+
+
+@st.cache_data(ttl=300)
+def load_trade_pivot_trades(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
+                            z_score_threshold, fixed_sl, trail_buy_pct, trail_pct):
+    with sqlite3.connect(WATCHLIST_SWEEP_DB_PATH) as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute("""
+            SELECT entry_time, entry_price, exit_time, exit_price, hours_held, result, return_pct
+            FROM trade_cache
+            WHERE ticker=? AND strategy=? AND version=? AND window=? AND take_profit=? AND stop_loss=?
+              AND max_hold_hours=? AND z_score_threshold=?
+              AND COALESCE(fixed_sl,0)=? AND COALESCE(trail_buy_pct,0)=? AND COALESCE(trail_pct,0)=?
+            ORDER BY entry_time
+        """, (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
+              z_score_threshold, fixed_sl or 0.0, trail_buy_pct or 0.0, trail_pct or 0.0)).fetchall()
+        return [dict(r) for r in rows]
+
+
+trade_pivot_nodes = load_trade_pivot_nodes()
+if not trade_pivot_nodes:
+    st.warning("No nodes found in watchlist_sweep.db's watch_list table.")
+else:
+    trade_pivot_summary = []
+    trade_pivot_by_node = {}
+    for node in trade_pivot_nodes:
+        trades = load_trade_pivot_trades(
+            node['ticker'], node['strategy'], node['version'], node['window'],
+            node['take_profit'], node['stop_loss'], node['max_hold_hours'],
+            node['z_score_threshold'], node['fixed_sl'], node['trail_buy_pct'], node['trail_pct'])
+        trade_pivot_by_node[node['id']] = trades
+        counts = {k: 0 for k in TRADE_RESULT_COLORS}
+        for t in trades:
+            counts[t['result']] = counts.get(t['result'], 0) + 1
+        closed = sum(v for k, v in counts.items() if k != 'OPEN')
+        win_twin = counts['WIN'] + counts['TWIN']
+        compounded = 1.0
+        for t in trades:
+            if t['result'] != 'OPEN':
+                compounded *= (1 + t['return_pct'])
+        trade_pivot_summary.append({
+            'Ticker': node['ticker'], 'Mode': node['mode'], 'Version': node['version'],
+            'Trades': closed, 'WIN': counts['WIN'], 'LOSS': counts['LOSS'],
+            'TWIN': counts['TWIN'], 'TLOSS': counts['TLOSS'], 'OPEN': counts['OPEN'],
+            'Win+TWin %': round(100 * win_twin / closed, 1) if closed else None,
+            'Compounded Return %': round((compounded - 1) * 100, 1),
+        })
+
+    st.write("**Watchlist summary**")
+    st.dataframe(pd.DataFrame(trade_pivot_summary), use_container_width=True, hide_index=True)
+
+    st.write("**Drill into a node**")
+    trade_pivot_labels = {n['id']: f"{n['ticker']} ({n['version']}, {n['mode']})" for n in trade_pivot_nodes}
+    trade_pivot_selected_id = st.selectbox(
+        "Node", options=list(trade_pivot_labels.keys()), format_func=lambda i: trade_pivot_labels[i],
+        key="trade_pivot_node_select")
+    trade_pivot_node = next(n for n in trade_pivot_nodes if n['id'] == trade_pivot_selected_id)
+    trade_pivot_trades = trade_pivot_by_node[trade_pivot_selected_id]
+
+    st.write(f"**{trade_pivot_node['ticker']}** — {trade_pivot_node['strategy']} {trade_pivot_node['version']} — "
+             f"window={trade_pivot_node['window']} arm/tp={trade_pivot_node['take_profit']}% "
+             f"trail_buy={trade_pivot_node['trail_buy_pct']}% trail_sell={trade_pivot_node['trail_pct']}% "
+             f"max_hold={trade_pivot_node['max_hold_hours']}h z={trade_pivot_node['z_score_threshold']}")
+
+    trade_pivot_df = pd.DataFrame(trade_pivot_trades)
+    if not trade_pivot_df.empty:
+        trade_pivot_df['return_pct'] = (trade_pivot_df['return_pct'] * 100).round(2)
+        st.dataframe(
+            trade_pivot_df.style.apply(
+                lambda row: [f"background-color: {TRADE_RESULT_COLORS.get(row['result'], '')}22"] * len(row),
+                axis=1),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("No cached trades for this node.")

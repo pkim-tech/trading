@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.verify_live_parity import compare, kernel_trades
 
 DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "trading_universe.db"
+LIVE_DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "trading_live.db"
 OUT_PATH = Path(__file__).resolve().parent.parent / "docs" / "post_sweep_report.md"
 
 STRATEGY_TO_V2 = {
@@ -27,7 +28,7 @@ STRATEGY_TO_V2 = {
 
 
 def get_watch_list():
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(LIVE_DB_PATH) as conn:
         return conn.execute("""
             SELECT ticker, strategy, version, window, z_score_threshold,
                    take_profit, stop_loss, max_hold_hours

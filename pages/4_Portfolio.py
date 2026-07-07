@@ -12,6 +12,7 @@ import strategies
 from backtester import run_backtest_dispatch
 
 DB_PATH   = "./cache/trading_universe.db"
+LIVE_DB_PATH = "./cache/trading_live.db"
 CACHE_DIR = Path("./cache")
 
 RESULT_COLORS = {
@@ -29,7 +30,7 @@ st.title("Portfolio")
 
 @st.cache_data(ttl=60)
 def load_watchlist(watchlist_id=None):
-    with sqlite3.connect(DB_PATH) as c:
+    with sqlite3.connect(LIVE_DB_PATH) as c:
         c.row_factory = sqlite3.Row
         if watchlist_id is None:
             row = c.execute("SELECT id FROM watchlists WHERE is_active=1").fetchone()

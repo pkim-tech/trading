@@ -187,6 +187,8 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 `active_signals.py` — polls price data, fires BUY/SELL alerts to console and Slack. Fetches fresh data for all watched tickers at the start of each poll cycle — no separate data collector process needed.
 
+- **DB split (2026-07-07)**: `watchlists`/`watch_list`/`open_positions`/`trade_log` now live in `cache/trading_live.db` (small, hot tables the daemon reads/writes every poll), separate from `cache/trading_universe.db` (`backtest_cache`/`hurst_cache`/`tickers`/`kv_cache` — the large research-side tables, including the sweep engine's own cache-of-`backtest_cache`-queries). Reason: heavy research maintenance (REINDEX/VACUUM/sweeps) on the 146M+-row `backtest_cache` was locking out live daemon reads. `active_signals.py`'s `DB_PATH` points at `trading_live.db`; `RESEARCH_DB_PATH` covers the one `hurst_cache` lookup it still makes. Any code that joins live + research data (e.g. `pages/0_Top_Pivot.py`'s Watchlist pivot) uses `ATTACH DATABASE` across the two files.
+
 - **Multi-watchlist**: `watchlists` DB table (id, name, is_active). One list is designated active — that's what the signal loop monitors. Same node can exist in multiple lists (UNIQUE constraint is scoped per list).
 - **Node mode**: `watch_list.mode` — `live` fires full Slack BUY alerts; `research` logs signal to console only (no Slack, no position tracking).
 - `watch_list` DB table — nodes selected for monitoring, scoped to a watchlist
@@ -246,7 +248,7 @@ The optimizer searches for **winning islands** — regions of the (take profit, 
 
 `pages/10_Open_Positions.py` — live view of manually entered positions tracked in `open_positions` DB table.
 
-- Reads from `open_positions` in `cache/trading_universe.db`
+- Reads from `open_positions` in `cache/trading_live.db` (moved from `trading_universe.db` in the 2026-07-07 DB split, see Layer 3 above)
 - Fetches current price via `yfinance fast_info.last_price` at page load
 - Shows: signal price, entry price, drift % (entry vs signal), current price, unrealized P&L%, TP price, SL price, hours held, hours remaining until time-exit, entry time
 - TP = entry_price × (1 + tp%), SL = entry_price × (1 - sl%) — display only, Schwab stop is set separately at lower_band × (1 - (sl%+1%))

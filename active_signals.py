@@ -60,7 +60,8 @@ import strategies
 
 load_dotenv()
 
-DB_PATH     = Path("./cache/trading_universe.db")
+DB_PATH          = Path("./cache/trading_live.db")
+RESEARCH_DB_PATH = Path("./cache/trading_universe.db")
 CACHE_DIR   = Path("./cache")
 CONFIG_PATH = Path("./config.json")
 POLL_SECS  = int(os.environ.get("SIGNAL_POLL_SECS", 300))
@@ -522,7 +523,7 @@ def _current_price(ticker):
 def _hurst_adf(ticker, df_hourly):
     hurst = None
     try:
-        with sqlite3.connect(DB_PATH) as c:
+        with sqlite3.connect(RESEARCH_DB_PATH) as c:
             row = c.execute(
                 "SELECT hurst FROM hurst_cache WHERE ticker = ? ORDER BY timestamp DESC LIMIT 1",
                 (ticker,)
@@ -1373,11 +1374,21 @@ def send_startup_report(watchlist):
                 pnl_str = f"  P&L `{pnl:+.1f}%`"
             else:
                 pnl_str = ""
+            trail_state = p.get('trail_state') or {}
+            if trail_state.get('trailing'):
+                peak = trail_state.get('peak', p['entry_price'])
+                trail_pct = (p.get('trail_pct') or 3.0) / 100.0
+                trigger_price = peak * (1 - trail_pct)
+                trigger_str = f"trailing active, peak `${peak:.2f}`  sell trigger `${trigger_price:.2f}`"
+            else:
+                tp_price = p['entry_price'] * (1 + p['take_profit'] / 100.0)
+                trigger_str = f"arm trigger `${tp_price:.2f}`"
             text = (
                 f"📊 *{p['ticker']}*  "
                 f"entry `${p['entry_price']:.2f}`  "
-                f"held `{hours_held:.0f}h`  "
-                f"tp `{p['take_profit']}%`  sl `{p['stop_loss']}%`"
+                f"held `{hours_held:.0f}h/{p['max_hold_hours']}h`  "
+                f"tp `{p['take_profit']}%`  sl `{p['stop_loss']}%`  "
+                f"{trigger_str}"
                 f"{pnl_str}"
             )
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
