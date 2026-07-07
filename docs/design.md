@@ -100,6 +100,13 @@ Backfill script: `scripts/run_v3_backfill_sweep.sh`, one version per run
 (`./scripts/run_v3_backfill_sweep.sh v3.21`), or no arg to run every included version in
 sequence. `--validate` runs a 4-ticker sanity check first.
 
+**Index added 2026-07-07**: `idx_bc_ticker_strategy_version ON backtest_cache(ticker, strategy, version)` —
+none of the pre-existing indexes had `ticker` paired with `strategy`/`version`, so any
+`ticker IN (...) AND strategy=? AND version LIKE '...'` filter (a common shape for
+watchlist-scoped exploration) fell back to scanning most of the table. Added to both
+`cache/trading_universe.db` and the `cache/watchlist_sweep.db` sandbox (see `docs/backlog.md`
+"Watchlist-scoped trade-cache sandbox").
+
 ### Version Changelog
 
 Canonical version→strategy→grid record. Update this table whenever a new version is
