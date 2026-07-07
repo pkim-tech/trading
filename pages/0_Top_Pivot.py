@@ -166,14 +166,14 @@ def load_best_nodes(version):
         rows = c.execute("""
             WITH best AS (
                 SELECT ticker, window, COALESCE(z_score_threshold, 2.0) AS z,
-                       take_profit, stop_loss, max_hold_hours,
+                       axis_tp, stop_loss, max_hold_hours,
                        ROW_NUMBER() OVER (
                            PARTITION BY ticker, window, COALESCE(z_score_threshold, 2.0)
                            ORDER BY alpha_vs_spy DESC
                        ) AS rn
                 FROM backtest_cache WHERE version = ?
             )
-            SELECT ticker, window, z, take_profit, stop_loss, max_hold_hours
+            SELECT ticker, window, z, axis_tp, stop_loss, max_hold_hours
             FROM best WHERE rn = 1
         """, (version,)).fetchall()
     return {(r[0], int(r[1]), float(r[2])): (int(r[3]), int(r[4]), int(r[5])) for r in rows}
@@ -447,8 +447,8 @@ def load_cliff_safety(version_strategy_pairs):
             ).fetchall()]
             for ticker in tickers:
                 row = conn.execute("""
-                    SELECT take_profit, stop_loss, max_hold_hours, window, z_score_threshold,
-                           alpha_vs_spy, strategy_return, trades, win_rate, trail_buy_pct, trail_pct,
+                    SELECT axis_tp, stop_loss, max_hold_hours, window, z_score_threshold,
+                           alpha_vs_spy, strategy_return, trades, win_rate, trail_buy_pct, trail_sell_pct,
                            win_twin_rate
                     FROM backtest_cache
                     WHERE version=? AND ticker=? AND strategy=? AND trades > 0
@@ -466,7 +466,7 @@ def load_cliff_safety(version_strategy_pairs):
                     SELECT MIN(alpha_vs_spy) FROM backtest_cache
                     WHERE version=? AND ticker=? AND strategy=?
                       AND window=? AND z_score_threshold=?
-                      AND take_profit BETWEEN ? AND ?
+                      AND axis_tp BETWEEN ? AND ?
                       AND {neighbor_axis_col} BETWEEN ? AND ?
                       AND max_hold_hours BETWEEN ? AND ?
                       AND trades > 0
@@ -555,7 +555,7 @@ def load_watchlist_pivot():
                 AND b.version          = w.version
                 AND b.strategy         = w.strategy
                 AND b.window           = w.window
-                AND b.take_profit      = w.take_profit
+                AND b.axis_tp          = COALESCE(w.take_profit, w.arm_sell_pct)
                 AND b.stop_loss        = w.stop_loss
                 AND b.max_hold_hours   = w.max_hold_hours
                 AND b.z_score_threshold = w.z_score_threshold

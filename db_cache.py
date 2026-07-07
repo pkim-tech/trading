@@ -102,7 +102,7 @@ def refresh_pivot_cache(versions=None):
 CLIFF_GRID_SQL = """
     SELECT b.ticker, b.strategy, b.version, b.window,
            COALESCE(b.z_score_threshold, 2.0) AS z,
-           b.take_profit, b.stop_loss,
+           b.axis_tp AS take_profit, b.stop_loss,
            MAX(b.alpha_vs_spy) AS max_alpha,
            MAX(b.asset_bh)     AS bh
     FROM backtest_cache b
@@ -117,7 +117,7 @@ CLIFF_GRID_SQL = """
     ) q ON q.symbol = b.ticker
     WHERE b.trades >= ?
     GROUP BY b.ticker, b.strategy, b.version, b.window,
-             COALESCE(b.z_score_threshold, 2.0), b.take_profit, b.stop_loss
+             COALESCE(b.z_score_threshold, 2.0), b.axis_tp, b.stop_loss
 """
 
 
@@ -150,14 +150,14 @@ def refresh_best_nodes_cache():
             rows = conn.execute("""
                 WITH best AS (
                     SELECT ticker, window, COALESCE(z_score_threshold, 2.0) AS z,
-                           take_profit, stop_loss, max_hold_hours,
+                           axis_tp, stop_loss, max_hold_hours,
                            ROW_NUMBER() OVER (
                                PARTITION BY ticker, window, COALESCE(z_score_threshold, 2.0)
                                ORDER BY alpha_vs_spy DESC
                            ) AS rn
                     FROM backtest_cache WHERE version = ?
                 )
-                SELECT ticker, window, z, take_profit, stop_loss, max_hold_hours
+                SELECT ticker, window, z, axis_tp, stop_loss, max_hold_hours
                 FROM best WHERE rn = 1
             """, (v,)).fetchall()
             data = {f"{r[0]}|{int(r[1])}|{float(r[2])}": [int(r[3]), int(r[4]), int(r[5])] for r in rows}
