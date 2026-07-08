@@ -71,6 +71,7 @@ LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 HUMAN_LOG_PATH   = LOG_DIR / "active_signals.log"
 VERBOSE_LOG_PATH = LOG_DIR / "active_signals_verbose.log"
+HEARTBEAT_PATH   = CACHE_DIR / "active_signals_heartbeat.txt"
 
 
 class _Tee:
@@ -239,6 +240,8 @@ def ensure_tables():
             c.execute("ALTER TABLE open_positions ADD COLUMN trail_buy_pct REAL")
         if 'arm_sell_pct' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN arm_sell_pct REAL")
+        if 'shares' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN shares REAL")
 
         # trade_log
         c.execute("""
@@ -268,6 +271,8 @@ def ensure_tables():
         tl_cols = {r[1] for r in c.execute("PRAGMA table_info(trade_log)").fetchall()}
         if 'arm_sell_pct' not in tl_cols:
             c.execute("ALTER TABLE trade_log ADD COLUMN arm_sell_pct REAL")
+        if 'shares' not in tl_cols:
+            c.execute("ALTER TABLE trade_log ADD COLUMN shares REAL")
         c.commit()
 
 
@@ -447,7 +452,7 @@ def update_position_trail_state(position_id, state):
                   (json.dumps(state), position_id))
 
 
-def open_position(node, signal_price, signal_time, entry_price, entry_time):
+def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None):
     with _conn() as c:
         existing = c.execute(
             "SELECT id FROM open_positions WHERE ticker=? AND window=?",
@@ -458,14 +463,14 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time):
             return
         sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
         entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
-        trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time)
+        trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares)
         tp = node.get('take_profit')
         c.execute("""
             INSERT INTO open_positions
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, trade_log_id,
-                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
@@ -473,7 +478,7 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time):
             float(signal_price), sig_time_str,
             float(entry_price), entry_time_str, trade_log_id,
             node.get('trail_sell_pct'), node.get('fixed_sl'), node.get('trail_buy_pct'),
-            node.get('arm_sell_pct'),
+            node.get('arm_sell_pct'), float(shares) if shares is not None else None,
         ))
         c.commit()
 
@@ -490,7 +495,7 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
         c.commit()
 
 
-def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time):
+def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares=None):
     sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
     entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
     entry_drift    = (entry_price - signal_price) / signal_price * 100
@@ -499,14 +504,15 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time):
         c.execute("""
             INSERT INTO trade_log
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
-                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct, shares)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
             int(node['max_hold_hours']),
             float(signal_price), sig_time_str,
             float(entry_price), entry_time_str, entry_drift, node.get('arm_sell_pct'),
+            float(shares) if shares is not None else None,
         ))
         c.commit()
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -1066,8 +1072,9 @@ if SOCKET_MODE:
         exec_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
         drift_pct  = (exec_price - signal_price) / signal_price * 100
         now        = datetime.now()
+        shares     = int(50_000 // exec_price)
 
-        open_position(node, signal_price, signal_time, exec_price, now)
+        open_position(node, signal_price, signal_time, exec_price, now, shares=shares)
 
         ticker = node['ticker']
         note   = f"${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
@@ -1526,6 +1533,7 @@ def run_loop(tickers: set = None):
     while True:
         now   = datetime.now()
         today = now.strftime('%Y-%m-%d')
+        HEARTBEAT_PATH.write_text(now.strftime('%Y-%m-%d %H:%M:%S'))
 
         if today != last_date:
             buy_alerted.clear()
@@ -1574,7 +1582,9 @@ def run_loop(tickers: set = None):
         # SL/trailing checks are continuous (every poll); TP/TIME only fire when a
         # genuinely new hourly bar has closed since the last check, using that bar's
         # real Close/Low/High — not a live mid-bar tick — to match the backtest kernels.
-        for pos in get_open_positions():
+        open_positions = get_open_positions()
+        open_position_keys = {(p['ticker'], p['window']) for p in open_positions}
+        for pos in open_positions:
             if tickers and pos['ticker'] not in tickers:
                 continue
             df_hourly, _ = _load_cache(pos['ticker'])
@@ -1638,7 +1648,9 @@ def run_loop(tickers: set = None):
 
                 if sig['signal'] == 'BUY' and alert_key not in buy_alerted:
                     buy_alerted.add(alert_key)
-                    if node.get('mode', 'live') == 'live':
+                    if (sig['ticker'], sig['window']) in open_position_keys:
+                        print(f"  [skip] BUY {sig['ticker']} z={sig['z_score']:+.2f} — position already open, no alert")
+                    elif node.get('mode', 'live') == 'live':
                         notify_buy_signal(node, sig)
                     else:
                         print(f"  [research] BUY: {node['ticker']} z={sig['z_score']:+.2f} (no alert)")

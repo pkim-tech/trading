@@ -1244,3 +1244,30 @@ Handover notes between Claude sessions. Append a new entry on session close. Mos
 8. Slack messaging redesign for trailing-buy→arm→trailing-sell flow.
 
 ---
+
+## 2026-07-08 — Found & fixed a real BUY-alert-while-holding bug; root-caused a 5h14m WSL sleep freeze that missed the whole 10:25 AM window; corrected watchlist_id 7→9 drift; added shares tracking; heartbeat mechanism started but incomplete
+
+### What we did
+- **Diagnosed "messages not complete"**: `active_signals.py` was frozen 07:54:22–13:08:17 (5h14m) — confirmed via Windows event log (Modern Standby entered 07:54:41 on idle/battery, exited 13:08:05 via lid open), not a code bug. This missed the entire 10:25 AM signal window. Verified via `scripts/watchlist_status.py history EDC 7` (replays the real `compute_buy_signal()` per historical bar, no reimplementation) that EDC's trigger was genuinely active during the freeze (z=-2.36 at 10:30) — user's manual EDC entry (~14:55, 400sh @ $77.79) was a valid late catch, not a guess.
+- **Found & fixed a real, separate live-only bug**: the buy-check loop never checked `get_open_positions()` before alerting — existed since the loop was first written 2026-06-30, never exercised until today's selloff pushed already-held KORU/HIBL/SOXL back below trigger, firing spurious re-BUY alerts for all three. Fixed: loop now builds `open_position_keys` and skips the alert (prints `[skip]`) for anything already held. Not yet live-tested — needs a daemon restart to verify.
+- **Confirmed the backtest kernel itself is not affected** — `_simulate_trail_both` (`backtester.py:562-600`) already correctly blocks re-entry via `in_trade`; the bug was purely in the live orchestration layer.
+- **Found a bigger, pre-existing gap**: `scripts/verify_live_parity.py` deliberately excludes `TrailingBothZScoreBreakout` from its comparison (own docstring) — live has no implementation of the trailing-buy entry state machine, hands off to a broker trailing-buy order instead. Since 100% of watchlist 9's live tickers use this strategy, there's no verified live/backtest parity for actual entry behavior — open since 2026-07-03 ("P0 #3"), never closed.
+- **Corrected a real drift**: `CLAUDE.md`/backlog said `watchlist_id=7` was active; it's actually `9` (superseded 7 on 2026-07-07 06:26, before the prior session's `account` column work mistakenly targeted 7). Fixed `CLAUDE.md`, copied `account` values onto watchlist 9. Also found LABU (flagged "not backtested" in backlog) actually has 108k real `backtest_cache` rows and is live on watchlist 9 — backlog note was stale.
+- User explicitly re-split watchlist 9 modes: live = AGQ/EDC/HIBL/KORU/LABU/SOXL; research = DPST/GDXU/NUGT/TQQQ/YANG, via new `scripts/set_watchlist_mode.py`.
+- Added `shares` column to `open_positions`/`trade_log` (was completely missing). Backfilled EDC (400sh) and SOXL (300sh); KORU/HIBL still NULL.
+- Logged EDC and SOXL into `open_positions` (both manually traded during the freeze, had no DB record), via new `scripts/log_manual_position.py`.
+- Started a heartbeat mechanism (`cache/active_signals_heartbeat.txt` + `scripts/check_heartbeat.py`) — incomplete, nothing currently invokes the checker; needs a Windows Task Scheduler job (host-level, survives WSL suspend) since a WSL-internal cron would freeze along with the daemon during the exact failure this is meant to catch.
+- New script `scripts/watchlist_status.py` — live trigger-distance table plus a `history TICKER [num_bars]` mode for retroactive per-bar signal checks.
+- **Real process mistake**: changed Windows power settings without asking first after the user twice said "we REALLY need to stop wsl from falling asleep." User's reaction was sharp — left as-is per explicit instruction, but no further OS-level changes without asking first, ever.
+
+### Next Session
+1. Verify the BUY-alert-while-holding fix live (restart daemon, confirm `[skip]` prints).
+2. Build the Task Scheduler piece of the heartbeat — without it, `check_heartbeat.py` never runs.
+3. User's real ask, not yet built: a start-of-day report with entry AND exit triggers per ticker in advance.
+4. SMA/Std caching in `compute_buy_signal` — recomputes from scratch every poll despite only depending on prior days; backtest kernel already does this efficiently via precomputed arrays.
+5. Get KORU/HIBL real share counts to complete the `shares` backfill.
+6. IRA settlement-delay check — still not started.
+7. Continue rename propagation: `Node_Inspector.py`, `Winners.py`, `Portfolio.py`, `Open_Positions.py`, `export_cliff_safety.py`, `verify_live_parity.py`, `fill_trail_pct_gaps.py`.
+8. Confirm LABU's account assignment (unmapped after the watchlist 7→9 account copy).
+
+---
