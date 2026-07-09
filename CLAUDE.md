@@ -34,6 +34,7 @@ A z-score mean reversion backtesting and optimization system targeting leveraged
 - `data_manager.py` — data fetching and cache management
 - `config.json` — runtime config: tickers, hyperparameters, strategy selection
 - `pages/` — Streamlit multipage app views (Spatial Topology, Node Inspector)
+- `scripts/live_sim.py` — manual-step live-sim REPL: drives the real `compute_buy_signal`/`check_sell_condition`/`notify_*` functions against an isolated `cache/trading_sim.db` (via `TRADING_DB_PATH` env override) so the full BUY→arm→trailing-sell Slack sequence can be exercised bar-by-bar without touching the live daemon or `trading_live.db`. `SIM_MODE=1` forces plain-text/typed-input Slack messages (prefixed `🧪 SIM`) instead of interactive buttons — the sim never opens its own Socket Mode connection, so real buttons would risk being delivered to the live daemon's connection instead. Not yet tested end-to-end interactively by the user — planned for next session.
 
 ## Runtime Artifacts (not committed)
 - `cache/` — hourly CSV data per ticker + SQLite results DB (`trading_universe.db`)

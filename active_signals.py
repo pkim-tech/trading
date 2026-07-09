@@ -60,7 +60,7 @@ import strategies
 
 load_dotenv()
 
-DB_PATH          = Path("./cache/trading_live.db")
+DB_PATH          = Path(os.environ.get("TRADING_DB_PATH", "./cache/trading_live.db"))
 RESEARCH_DB_PATH = Path("./cache/trading_universe.db")
 CACHE_DIR   = Path("./cache")
 CONFIG_PATH = Path("./config.json")
@@ -94,6 +94,13 @@ SLACK_CHANNEL   = os.environ.get("SLACK_CHANNEL", "")
 SOCKET_MODE     = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNEL)
 
 SLACK_CHANNEL_ID = ""
+SIM_MODE         = os.environ.get("SIM_MODE") == "1"
+# Interactive buttons/reminders require the process's own Socket Mode connection to be
+# the one Slack delivers the click to. The sim never starts a SocketModeHandler (only
+# run_loop() does), so if it rendered real buttons, a click would be delivered to
+# whichever *other* process (the live daemon) happens to be connected — using sim data
+# against the live DB. SIM_MODE forces the plain-text/typed-input fallback instead.
+INTERACTIVE      = SOCKET_MODE and not SIM_MODE
 
 if SOCKET_MODE:
     from slack_bolt import App
@@ -874,6 +881,14 @@ def _chart_sell(pos, current_price) -> BytesIO | None:
 # ---------------------------------------------------------------------------
 
 def _post_message(text, blocks=None):
+    if SIM_MODE:
+        text = f"🧪 SIM — {text}"
+        if blocks:
+            blocks = [
+                {**b, "text": {**b["text"], "text": f"🧪 SIM — {b['text']['text']}"}}
+                if b.get("type") == "header" else b
+                for b in blocks
+            ]
     if SOCKET_MODE:
         try:
             bolt_app.client.chat_postMessage(channel=SLACK_CHANNEL, text=text, blocks=blocks)
@@ -969,7 +984,7 @@ def _build_buy_blocks(node, sig):
             "text": f"{entry_line}\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger){warning_line}"}},
     ]
 
-    if SOCKET_MODE:
+    if INTERACTIVE:
         value = json.dumps({
             "type":         "buy",
             "node":         {k: node.get(k) for k in ('ticker', 'strategy', 'version', 'window',
@@ -1028,7 +1043,7 @@ def _build_sell_blocks(pos, reason, current_price, target_price):
             )}},
     ]
 
-    if SOCKET_MODE:
+    if INTERACTIVE:
         value = json.dumps({
             "type":          "sell",
             "position_id":   pos['id'],
@@ -1240,7 +1255,7 @@ def notify_buy_signal(node, sig):
         _build_buy_blocks(node, sig),
     )
 
-    if SOCKET_MODE:
+    if INTERACTIVE:
         chart = _chart_buy(node, sig)
         if chart:
             _upload_chart(chart, f"{ticker}_buy.png", f"BUY — {ticker}  z={z:.2f}")
@@ -1311,7 +1326,7 @@ def notify_sell_signal(pos, reason, current_price, target_price):
         _build_sell_blocks(pos, reason, current_price, target_price),
     )
 
-    if SOCKET_MODE:
+    if INTERACTIVE:
         chart = _chart_sell(pos, current_price)
         if chart:
             _upload_chart(chart, f"{ticker}_sell.png", f"SELL — {ticker}  {reason_labels[reason]}  {pct:+.2f}%")
@@ -1357,7 +1372,7 @@ def _trailing_order_blocks(pos, current_price, reminder_num=0):
             f"so it auto-adjusts with price at the broker — Slack polling alone won't catch it fast enough."
         )}},
     ]
-    if SOCKET_MODE:
+    if INTERACTIVE:
         value = json.dumps({"position_id": pos['id'], "ticker": ticker})
         blocks.append({
             "type": "actions",
@@ -1391,7 +1406,7 @@ def notify_trailing_activated(pos, current_price):
 
     blocks = _trailing_order_blocks(pos, current_price, reminder_num=0)
     channel = ts = None
-    if SOCKET_MODE:
+    if INTERACTIVE:
         try:
             resp = bolt_app.client.chat_postMessage(
                 channel=SLACK_CHANNEL, text=f"TRAILING ACTIVATED — {ticker}  ${current_price:.4f}  ({pct:+.2f}%)",
@@ -1402,7 +1417,13 @@ def notify_trailing_activated(pos, current_price):
     else:
         _post_message(f"TRAILING ACTIVATED — {ticker}  ${current_price:.4f}  ({pct:+.2f}%)", blocks=blocks)
 
-    state = dict(pos.get('trail_state') or {})
+    # Re-read trail_state from the DB rather than trusting `pos` -- check_sell_condition
+    # already committed the fresh state (trailing=True, peak=...) just before this was
+    # called, but `pos` here is the caller's pre-update copy. Merging onto the stale
+    # copy would silently erase 'trailing'/'peak', breaking the trailing-stop entirely.
+    with _conn() as c:
+        row = c.execute("SELECT trail_state FROM open_positions WHERE id = ?", (pos['id'],)).fetchone()
+    state = json.loads(row['trail_state']) if row and row['trail_state'] else {}
     state['order_placed']    = False
     state['reminder_channel'] = channel
     state['reminder_ts']      = ts
@@ -1415,7 +1436,7 @@ def check_trailing_reminders(open_positions):
     """Nags every TRAIL_REMINDER_MINUTES until the trailing-stop order is confirmed
     placed -- a single one-time alert is too easy to miss, and an unplaced trailing
     stop between polls is a real risk if price moves fast."""
-    if not SOCKET_MODE:
+    if not INTERACTIVE:
         return
     now = datetime.now()
     for pos in open_positions:
