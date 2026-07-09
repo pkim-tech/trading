@@ -2,6 +2,9 @@
 
 Curated, current subset of `docs/deep_backlog.md` — read in full at session start (`go`). Full detail for every item lives in `deep_backlog.md`; this is just the active/relevant pointer list. Periodically re-triage.
 
+## Open question, 2026-07-09 — is the Schwab catastrophic-stop +1% buffer the right size?
+The initial broker stop-loss order is placed at `(stop_loss + 1)%` below trigger (flat +1% buffer, hardcoded, `active_signals.py` `schwab_sl_pct = node['stop_loss'] + 1`) so ordinary intraday noise doesn't trip it before the real Slack SELL signal fires. User flagged 2026-07-09 that a flat +1% (e.g. 15%→16%) doesn't feel empirically grounded — if the goal is genuinely avoiding noise-driven stop-outs, the buffer should be backtested/varied (like the fixed_sl 15% vs 30% sensitivity sim run earlier that session) rather than assumed. Separate from that day's other fixes — explicitly deferred as its own backlog item.
+
 ## Open question, 2026-07-09 — trailing-buy re-entry timing after a same-day exit
 If a same-day re-entry trigger hits (ticker sold, then dislocates again same day), does the live trailing-buy order actually need to be placed relative to the **9:30 open** or the **10:30 normal bar time**? Not tested yet — flagged by the user mid-session, explicitly deferred ("test that next time"). Relevant given today's same-day-buy-warning work; worth checking against `active_signals.py`'s actual signal-window/bar-labeling logic (`docs` note: hourly bars are labeled by start time) before assuming either answer.
 

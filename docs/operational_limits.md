@@ -37,6 +37,26 @@ General notes that apply everywhere:
 | 7 | `TrailingExitZScoreBreakout` (v1.8) | BUY | bar-close (signal window) | Same as row 1 | Same as row 1. |
 | 8 | `TrailingExitZScoreBreakout` (v1.8) | SELL | SL + trailing-stop continuous (intrabar); TP-activation & TIME bar-close | 🎯 "TRAILING ACTIVATED" (no action, informational) fires once when TP clears. Final exit: 🟢 "TRAILING STOP" or 🔴 "STOP LOSS" or 🔶 "TIME EXIT" | TRAILING ACTIVATED → no action, just confirms state changed. Final exit messages → same actions as row 2 (TRAIL behaves like TP: cancel stop, sell now). |
 
+**Table above predates `TrailingBothZScoreBreakout` (v1.10) going live** — see the dedicated lifecycle table below; it's the strategy 100% of the current live watchlist actually uses (trailing buy *and* trailing sell), not covered by rows 1-8.
+
+### `TrailingBothZScoreBreakout` (v1.10) Full Lifecycle — 100% of live watchlist (2026-07-09)
+
+Reviewed end-to-end 2026-07-09 after the TP/SL-label and signal-window-alert fixes. Reconciles the code's actual behavior against the manual Schwab workflow, state by state.
+
+| # | State | What fires | Frequency | Code | Status |
+|---|---|---|---|---|---|
+| 1 | Above z trigger — holding | Reference table shown in startup report + signal-window pings | Startup, 7am, each window | `build_reference_table` (`active_signals.py:1503`) | OK |
+| 2 | Below z trigger, in window → BUY trailing order alert | `notify_buy_signal` → `_build_buy_blocks`: trigger price, shares, notional (~$50k), max-vol cap | Bar-close, in-window only | `active_signals.py:1213`, `:914` | **Gap: no account shown** unless the same-day-buy-warning branch happens to fire — otherwise the alert never states which account (brokerage/ira/sep) to place the order in |
+| 3 | Trailing buy pending → "should have filled by now" reminder | Doesn't exist. "Executed" button lets you self-report a fill any time, but nothing nags like the sell-side reminder does | — | — | **Gap** — matches the open backlog item "Trailing-buy fill confirmation" (2026-07-07), never built |
+| 4 | Holding, waiting for arm/profit level | Silent, shown only in periodic table | — | — | OK by design |
+| 5a | Profit level reached → notify to place trailing sell | `notify_trailing_activated` fires once, detected | **Bar-close only**, not continuous | `strategies.py:294` (gated behind `at_bar_close`) | Not literally "any time" — up to ~1 poll-cycle-after-bar-close lag (bars close hourly) |
+| 6a | Trailing sell pending, order not yet placed | Reminder every 15 min until "Order Placed" clicked; goes silent once placed | Every 15 min while unplaced | `check_trailing_reminders` (`active_signals.py:1411`) | OK — matches "no new notifications once placed" |
+| 7a | Trailing sell hit → notify expected sell | `notify_sell_signal(..., 'TRAIL', ...)` | Continuous, every poll (currently 30s), using polled price as proxy for intrabar low/high | `strategies.py:280-288`, `active_signals.py:691` | Fires promptly, but timing is bounded by poll interval, not true tick data — some drift vs. the broker's own continuous trailing engine is inherent, not fully fixable without a streaming feed |
+| 5b | SL hit | `notify_sell_signal(..., 'SL', ...)` | Continuous, every poll — no bar-close gate | `strategies.py:290` | OK — any time, as expected |
+| 5c | Max hold hours hit | `notify_sell_signal(..., 'TIME', ...)` | **Bar-close only** | `strategies.py:298` (same `at_bar_close` gate as 5a) | Not "any time" — up to ~1h lag past the actual max-hold crossing, intentional (mirrors backtest kernel's hourly-bar-based max-hold check; changing to continuous would break backtest parity) |
+
+**Open items from this review**: (1) add account to the BUY alert — small fix, not yet done; (2) trailing-buy fill reminder — real feature, not yet scoped/built.
+
 ### Execution Limits
 - **Do not enter if you cannot monitor**: If unavailable for the next 2h, skip the signal
 - **Exit within one trading day of exit signal**: If you miss the exit signal, close at next morning's open

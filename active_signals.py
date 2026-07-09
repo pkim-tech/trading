@@ -803,7 +803,7 @@ def _chart_buy(node, sig) -> BytesIO | None:
     pct_away = (sig['current_price'] - sig['lower_band']) / sig['lower_band'] * 100
     fig.suptitle(f"{ticker}   trigger ${sig['lower_band']:.2f}  ({pct_away:+.1f}%)",
                  fontsize=15, fontweight='bold', color='#f0a500', y=0.98)
-    ax.set_title(f"w{window} z{z_thresh:g} tp{_tp_or_arm_pct(node)} sl{node['stop_loss']}",
+    ax.set_title(f"w{window} z{z_thresh:g} arm{_tp_or_arm_pct(node)} sl{node['stop_loss'] + 1}",
                  fontsize=9, color='#9aa0a6')
 
     tick_step = max(len(x) // 10, 1)
@@ -841,9 +841,10 @@ def _chart_sell(pos, current_price) -> BytesIO | None:
     upper_h = sma_h + 2 * std_h
     lower_h = sma_h - 2 * std_h
 
-    ep         = pos['entry_price']
-    tp_price   = ep * (1 + _tp_or_arm_pct(pos) / 100)
-    sl_price   = ep * (1 - pos['stop_loss'] / 100)
+    ep            = pos['entry_price']
+    arm_price     = ep * (1 + _tp_or_arm_pct(pos) / 100)
+    schwab_sl_pct = pos['stop_loss'] + 1
+    sl_price      = ep * (1 - schwab_sl_pct / 100)
     entry_time = datetime.strptime(pos['entry_time'], '%Y-%m-%d %H:%M:%S')
     pct        = (current_price - ep) / ep * 100
 
@@ -851,7 +852,7 @@ def _chart_sell(pos, current_price) -> BytesIO | None:
     ax.plot(df_plot.index, df_plot.values, color='#4c9be8', linewidth=1, label='Price')
     ax.plot(sma_h.index, sma_h.values, color='#f0a500', linewidth=1, label=f'SMA({window})')
     ax.fill_between(df_plot.index, lower_h, upper_h, alpha=0.12, color='#f0a500')
-    ax.axhline(tp_price, color='#2ecc71', linewidth=1, linestyle='--', label=f'TP ${tp_price:.2f}')
+    ax.axhline(arm_price, color='#2ecc71', linewidth=1, linestyle='--', label=f'Arm ${arm_price:.2f}')
     ax.axhline(sl_price, color='#e74c3c', linewidth=1, linestyle='--', label=f'SL ${sl_price:.2f}')
     ax.axhline(ep, color='white', linewidth=0.8, linestyle=':', alpha=0.6, label=f'Entry ${ep:.2f}')
     if entry_time in df_plot.index or df_plot.index[0] <= entry_time <= df_plot.index[-1]:
@@ -915,8 +916,6 @@ def _build_buy_blocks(node, sig):
     price     = sig['current_price']
     z         = sig['z_score']
     bar_str   = sig['last_bar'].strftime('%Y-%m-%d %H:%M')
-    tp_price  = price * (1 + _tp_or_arm_pct(node) / 100)
-    sl_price  = price * (1 - node['stop_loss']   / 100)
 
     hurst_str = f"{sig['hurst']:.3f}" if sig.get('hurst') is not None else "n/a"
     adf_str   = f"{sig['adf_p']:.3f}" if sig.get('adf_p')  is not None else "n/a"
@@ -924,7 +923,7 @@ def _build_buy_blocks(node, sig):
     hold_deadline = _add_trading_hours(sig['last_bar'], node['max_hold_hours'])
     deadline_str  = hold_deadline.strftime('%a %b %d %H:%M')
 
-    target_notional = 50_000
+    target_notional = _last_sale_recovery(ticker)
     shares = int(target_notional // price)
     schwab_sl_pct   = node['stop_loss'] + 1
     schwab_sl_price = sig['lower_band'] * (1 - schwab_sl_pct / 100)
@@ -950,12 +949,13 @@ def _build_buy_blocks(node, sig):
     max_shares = int(max_notional // price) if max_notional else None
     max_notional_str = f"  |  max `${max_notional/1000:.0f}k` / `{max_shares} shares` @ 1% vol" if max_notional else ""
 
+    account = node.get('account') or 'unmapped'
     sl_axis_col, _ = strategies.resolve_axis_columns(node['strategy'])
     if sl_axis_col == 'trail_buy_pct':
         trail_buy_pct = node.get('trail_buy_pct') or 0.0
-        entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k){max_notional_str}"
+        entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}"
     else:
-        entry_line = f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k){max_notional_str}"
+        entry_line = f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}"
 
     warning_line = ""
     if (node.get('account') or '').lower() != 'brokerage' and closed_today(ticker):
@@ -1217,8 +1217,8 @@ def notify_buy_signal(node, sig):
     z        = sig['z_score']
     bar_time = sig['last_bar']
     bar_str  = bar_time.strftime('%Y-%m-%d %H:%M')
-    tp       = _tp_or_arm_pct(node)
-    sl       = node['stop_loss']
+    arm      = _tp_or_arm_pct(node)
+    sl       = node['stop_loss'] + 1
     hold     = node['max_hold_hours']
 
     hurst_str = f"{sig['hurst']:.3f}" if sig.get('hurst') is not None else "n/a"
@@ -1228,7 +1228,7 @@ def notify_buy_signal(node, sig):
     print(f"\n{sep}")
     print(f"  BUY SIGNAL  {ticker}  {bar_str}")
     print(f"  Price:  ${price:.4f}   Lower band: ${sig['lower_band']:.4f}   z = {z:.2f}")
-    print(f"  Node:   window={node['window']}  TP={tp}%  SL={sl}%  hold={hold}h")
+    print(f"  Node:   window={node['window']}  Arm={arm}%  SL={sl}%  hold={hold}h")
     print(f"  SMA: ${sig['sma']:.4f}   Std: ${sig['std']:.4f}")
     print(f"  Hurst (100 bars): {hurst_str}   ADF p: {adf_str}")
     if (node.get('account') or '').lower() != 'brokerage' and closed_today(ticker):
@@ -1269,19 +1269,21 @@ def notify_buy_signal(node, sig):
 
 
 def notify_limit_fill(node, current_price, lower_band):
-    ticker        = node['ticker']
-    schwab_sl_pct = node['stop_loss'] + 1
+    ticker          = node['ticker']
+    schwab_sl_pct   = node['stop_loss'] + 1
     schwab_sl_price = lower_band * (1 - schwab_sl_pct / 100)
-    shares = int(50_000 // lower_band)
+    target_notional = _last_sale_recovery(ticker)
+    shares          = int(target_notional // lower_band)
     now_str = datetime.now().strftime('%H:%M:%S')
 
     print(f"\n  [LIMIT FILL] {ticker}  price=${current_price:.2f}  trigger=${lower_band:.2f}  {now_str}")
     print(f"  Place stop: ${schwab_sl_price:.2f} (-{schwab_sl_pct}% from trigger)")
 
+    account = node.get('account') or 'unmapped'
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"LIMIT FILLED — {ticker}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text": (
-            f"✅ *{ticker}* limit filled at `${lower_band:.2f}` — `{shares} shares`\n"
+            f"✅ *{ticker}* limit filled at `${lower_band:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`\n"
             f"🔴 Place Schwab stop: `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger)"
         )}},
     ]
@@ -1300,7 +1302,7 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     print(f"\n{sep}")
     print(f"  SELL SIGNAL  {ticker}  — {reason_labels[reason]}")
     print(f"  Entry: ${ep:.4f}  →  Current: ${current_price:.4f}  ({pct:+.2f}%)")
-    print(f"  Target: ${target_price:.4f}   Node: TP={_tp_or_arm_pct(pos)}%  SL={pos['stop_loss']}%  hold={pos['max_hold_hours']}h")
+    print(f"  Target: ${target_price:.4f}   Node: Arm={_tp_or_arm_pct(pos)}%  SL={pos['stop_loss'] + 1}%  hold={pos['max_hold_hours']}h")
     print(f"  Entered: {entry_time}")
     print(sep)
 
@@ -1471,33 +1473,38 @@ def _proximity_emoji(pct_away):
 
 
 def _send_window_alert(label, watchlist):
-    rows = []
-    for node in watchlist:
-        sig = compute_buy_signal(node)
-        if sig is None:
-            rows.append((float('inf'), node['ticker'], None, None))
-            continue
-        pct_away = (sig['current_price'] - sig['lower_band']) / sig['lower_band'] * 100
-        rows.append((pct_away, node['ticker'], sig, pct_away))
-    rows.sort(key=lambda x: x[0])
-
-    hot = [t for pct, t, _, __ in rows if pct < 5]
+    """Reuses build_reference_table so this alert shares one source of truth with
+    the morning report -- correct per-position trigger (buy/arm/trailing-sell,
+    not always the buy-side lower_band), live-mode-only, with Account shown."""
+    ref_rows = build_reference_table(watchlist)
+    hot = [r['Ticker'] for r in ref_rows if isinstance(r.get('Proximity'), (int, float)) and r['Proximity'] < 5]
     alert_level = "🔶 *HIGH ALERT*" if hot else "✅ algo running"
-    lines = [f"⏱ *Signal window — {label} ET* | {alert_level}"]
-    for pct, ticker, sig, _ in rows:
-        if sig is None:
-            lines.append(f"  ⚫ {ticker}  NO_DATA")
-        else:
-            emoji = _proximity_emoji(pct)
-            lines.append(f"  {emoji} *{ticker}*  now `${sig['current_price']:.2f}`  trigger `${sig['lower_band']:.2f}` ({pct:+.1f}%)")
-
-    _post_message("\n".join(lines))
+    header = f"⏱ *Signal window — {label} ET* | {alert_level}"
+    table = format_reference_table(ref_rows)
+    _post_message(f"{header}\n```{table}```")
 
 
 _REF_TABLE_COLS = [
     'Ticker', 'Hold', 'Next Trigger $', 'Now', 'Proximity', 'Next Action',
-    'Version', 'Alpha', 'Z', 'Z Trigger', 'TrailBuy%', 'Arm%', 'TrailSell%', 'Account',
+    'Version', 'Alpha', 'Z', 'Z Trigger', 'TrailBuy%', 'Arm%', 'TrailSell%', 'Account', 'Last Sale $',
 ]
+
+
+def _last_sale_recovery(ticker):
+    """Estimated next-buy notional: proceeds (exit_price * shares) from this ticker's
+    most recent closed trade, so sizing roughly compounds off the last recycle instead
+    of always assuming a flat $50k. Falls back to $50k if no closed trade has shares
+    logged yet. A rough estimate, not a live capital feed -- doesn't know about other
+    trades competing for the same account's cash in between."""
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT exit_price, shares FROM trade_log WHERE ticker=? AND exit_price IS NOT NULL "
+            "AND shares IS NOT NULL ORDER BY exit_time DESC LIMIT 1", (ticker,)
+        ).fetchone()
+    if row and row['exit_price'] and row['shares']:
+        return row['exit_price'] * row['shares']
+    return 50_000
 
 
 def build_reference_table(watchlist):
@@ -1513,6 +1520,7 @@ def build_reference_table(watchlist):
         sig = compute_buy_signal(node)
         account = node.get('account') or ''
         alpha = node.get('alpha')
+        last_sale = _last_sale_recovery(ticker)
 
         if sig is None:
             rows.append({
@@ -1520,7 +1528,7 @@ def build_reference_table(watchlist):
                 'Now': None, 'Proximity': None, 'Version': node.get('version'), 'Alpha': alpha,
                 'Z': None, 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': node.get('trail_buy_pct'), 'Arm%': node.get('arm_sell_pct'),
-                'TrailSell%': node.get('trail_sell_pct'), 'Account': account,
+                'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
             })
             continue
 
@@ -1537,7 +1545,7 @@ def build_reference_table(watchlist):
                 'Version': node.get('version'), 'Alpha': alpha, 'Z': sig['z_score'],
                 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': trail_buy_pct, 'Arm%': node.get('arm_sell_pct'),
-                'TrailSell%': node.get('trail_sell_pct'), 'Account': account,
+                'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
             })
         else:
             df_hourly_p, _ = _load_cache(ticker)
@@ -1568,7 +1576,7 @@ def build_reference_table(watchlist):
                 'Version': pos.get('version'), 'Alpha': alpha, 'Z': sig['z_score'],
                 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': pos.get('trail_buy_pct'), 'Arm%': arm_pct,
-                'TrailSell%': trail_sell_pct, 'Account': account,
+                'TrailSell%': trail_sell_pct, 'Account': account, 'Last Sale $': last_sale,
             })
     return rows
 
@@ -1591,6 +1599,8 @@ def format_reference_table(rows):
             return f"{v:g}"
         if col in ('TrailBuy%', 'Arm%', 'TrailSell%'):
             return f"{v:g}"
+        if col == 'Last Sale $':
+            return f"${v/1000:.0f}k"
         return str(v)
 
     cells = [[fmt(c, r.get(c)) for c in _REF_TABLE_COLS] for r in rows]
@@ -1624,11 +1634,12 @@ def send_startup_report(watchlist):
         if sig is None:
             rows.append((float('inf'), node['ticker'], node['strategy'], node.get('version', ''), None, None, node))
             continue
-        trigger  = sig['lower_band']
-        tp_price = trigger * (1 + _tp_or_arm_pct(node) / 100)
-        sl_price = trigger * (1 - node['stop_loss']  / 100)
-        pct_away = (sig['current_price'] - trigger) / trigger * 100
-        rows.append((pct_away, node['ticker'], node['strategy'], node.get('version', ''), sig, {'tp': tp_price, 'sl': sl_price, 'pct': pct_away}, node))
+        trigger       = sig['lower_band']
+        arm_price     = trigger * (1 + _tp_or_arm_pct(node) / 100)
+        schwab_sl_pct = node['stop_loss'] + 1
+        sl_price      = trigger * (1 - schwab_sl_pct / 100)
+        pct_away      = (sig['current_price'] - trigger) / trigger * 100
+        rows.append((pct_away, node['ticker'], node['strategy'], node.get('version', ''), sig, {'arm': arm_price, 'sl': sl_price, 'pct': pct_away}, node))
     rows.sort(key=lambda x: x[0])
 
     # Group by strategy
@@ -1673,7 +1684,7 @@ def send_startup_report(watchlist):
                 f"{emoji} *{ticker}* — {buy_type} — `{version}` — trigger `${sig['lower_band']:.2f}`\n"
                 f"→ _{node_action}_\n"
                 f"now `${sig['current_price']:.2f}` ({overnight:+.1f}% O/N)  z `{sig['z_score']:+.2f}`\n"
-                f"      trigger `${sig['lower_band']:.2f}` ({meta['pct']:+.1f}%)  tp `${meta['tp']:.2f}`  sl `${meta['sl']:.2f}`  "
+                f"      trigger `${sig['lower_band']:.2f}` ({meta['pct']:+.1f}%)  arm `${meta['arm']:.2f}`  sl `${meta['sl']:.2f}`  "
                 f"close `${sig['prev_close']:.2f}`  data `{data_date}`"
             )
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
@@ -1705,13 +1716,14 @@ def send_startup_report(watchlist):
                 placed_str = "order placed" if trail_state.get('order_placed') else "⚠️ order NOT placed"
                 trigger_str = f"trailing active ({placed_str}), peak `${peak:.2f}`  sell trigger `${trigger_price:.2f}`"
             else:
-                tp_price = p['entry_price'] * (1 + _tp_or_arm_pct(p) / 100.0)
-                trigger_str = f"arm trigger `${tp_price:.2f}`"
+                arm_price = p['entry_price'] * (1 + _tp_or_arm_pct(p) / 100.0)
+                trigger_str = f"arm trigger `${arm_price:.2f}`"
+            schwab_sl_pct = p['stop_loss'] + 1
             text = (
                 f"📊 *{p['ticker']}*  "
                 f"entry `${p['entry_price']:.2f}`  "
                 f"held `{hours_held:.0f}h/{p['max_hold_hours']}h`  "
-                f"tp `{_tp_or_arm_pct(p)}%`  sl `{p['stop_loss']}%`  "
+                f"arm `{_tp_or_arm_pct(p)}%`  sl `{schwab_sl_pct}%`  "
                 f"{trigger_str}"
                 f"{pnl_str}"
             )
