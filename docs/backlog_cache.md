@@ -2,6 +2,9 @@
 
 Curated, current subset of `docs/deep_backlog.md` — read in full at session start (`go`). Full detail for every item lives in `deep_backlog.md`; this is just the active/relevant pointer list. Periodically re-triage.
 
+## Open question, 2026-07-09 — trailing-buy re-entry timing after a same-day exit
+If a same-day re-entry trigger hits (ticker sold, then dislocates again same day), does the live trailing-buy order actually need to be placed relative to the **9:30 open** or the **10:30 normal bar time**? Not tested yet — flagged by the user mid-session, explicitly deferred ("test that next time"). Relevant given today's same-day-buy-warning work; worth checking against `active_signals.py`'s actual signal-window/bar-labeling logic (`docs` note: hourly bars are labeled by start time) before assuming either answer.
+
 ## In progress
 - **`trail_pct`→`trail_sell_pct` + `take_profit`→`arm_sell_pct` rename**: DB-side + `active_signals.py` + `run_optimization_sweep.py` done. `axis_tp` migration on `backtest_cache` (86.2M rows) confirmed complete and verified 2026-07-07 (row-for-row match vs. pre-migration backup, fresh AGQ backfill test passed once data-drift was accounted for). 4 stale duplicate tables (`open_positions`/`trade_log`/`watch_list`/`watchlists` in `trading_universe.db`, orphaned by the live/research DB split) dropped 2026-07-07, backed up first to `cache/stale_tables_backup_20260707.sql`.
   **Streamlit/script propagation — partial, still broken in places:**

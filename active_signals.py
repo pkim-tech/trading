@@ -468,6 +468,18 @@ def update_position_trail_state(position_id, state):
                   (json.dumps(state), position_id))
 
 
+def closed_today(ticker):
+    """True if this ticker had a trade_log exit today -- IRA/SEP cash accounts can't
+    reuse that capital until T+1 settlement, so a same-day re-buy needs a warning."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM trade_log WHERE ticker = ? AND exit_time LIKE ? LIMIT 1",
+            (ticker, f"{today}%"),
+        ).fetchone()
+    return row is not None
+
+
 def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None):
     with _conn() as c:
         existing = c.execute(
@@ -945,9 +957,16 @@ def _build_buy_blocks(node, sig):
     else:
         entry_line = f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k){max_notional_str}"
 
+    warning_line = ""
+    if (node.get('account') or '').lower() != 'brokerage' and closed_today(ticker):
+        warning_line = (
+            f"\n⚠️🔁 *SAME DAY BUY WARNING:* {ticker} already sold today in a "
+            f"{node.get('account', 'non-brokerage')} account — cash may not be settled (T+1). Confirm funds are available before entering."
+        )
+
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
-            "text": f"{entry_line}\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger)"}},
+            "text": f"{entry_line}\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger){warning_line}"}},
     ]
 
     if SOCKET_MODE:
@@ -1135,6 +1154,29 @@ if SOCKET_MODE:
                      "text": f"*SELL {ticker}* — Skipped (position kept open)"}}],
         )
 
+    @bolt_app.action("trail_order_placed")
+    def handle_trail_order_placed(ack, body, client):
+        ack()
+        data        = json.loads(body['actions'][0]['value'])
+        channel     = body['channel']['id']
+        ts          = body['message']['ts']
+        position_id = data['position_id']
+        ticker      = data['ticker']
+
+        positions = {p['id']: p for p in get_open_positions()}
+        pos = positions.get(position_id)
+        if pos:
+            state = dict(pos.get('trail_state') or {})
+            state['order_placed'] = True
+            update_position_trail_state(position_id, state)
+
+        client.chat_update(
+            channel=channel, ts=ts,
+            text=f"{ticker} — trailing order placed",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"✅ *{ticker}* — trailing stop order placed"}}],
+        )
+
     @bolt_app.view("exit_price_submit")
     def handle_exit_price(ack, body, client):
         ack()
@@ -1189,6 +1231,8 @@ def notify_buy_signal(node, sig):
     print(f"  Node:   window={node['window']}  TP={tp}%  SL={sl}%  hold={hold}h")
     print(f"  SMA: ${sig['sma']:.4f}   Std: ${sig['std']:.4f}")
     print(f"  Hurst (100 bars): {hurst_str}   ADF p: {adf_str}")
+    if (node.get('account') or '').lower() != 'brokerage' and closed_today(ticker):
+        print(f"  ⚠️🔁 SAME DAY BUY WARNING: {ticker} already sold today — cash may not be settled (T+1)")
     print(sep)
 
     _post_message(
@@ -1294,22 +1338,112 @@ def notify_sell_signal(pos, reason, current_price, target_price):
         print("  Skipped — position kept open.")
 
 
-def notify_trailing_activated(pos, current_price):
+TRAIL_REMINDER_MINUTES = 15
+
+
+def _trailing_order_blocks(pos, current_price, reminder_num=0):
     ticker    = pos['ticker']
     ep        = pos['entry_price']
     pct       = (current_price - ep) / ep * 100
     trail_pct = pos.get('trail_sell_pct') or 3.0
-    print(f"\n  [TRAILING ACTIVATED] {ticker}  entry=${ep:.4f}  now=${current_price:.4f}  ({pct:+.2f}%)")
-    _post_message(
-        f"TRAILING ACTIVATED — {ticker}  ${current_price:.4f}  ({pct:+.2f}%)",
-        [{"type": "section", "text": {"type": "mrkdwn", "text": (
-            f"🎯 *{ticker}* — TRAILING ACTIVATED — action needed\n"
+    header    = f"⚠️ *{ticker}* — STILL PENDING (reminder #{reminder_num})" if reminder_num else f"🎯 *{ticker}* — TRAILING ACTIVATED — action needed"
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": (
+            f"{header}\n"
             f"entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
             f"Take-profit cleared. Cancel the fixed Schwab stop and place a *trailing stop* order at `{trail_pct:.0f}%` "
-            f"so it auto-adjusts with price at the broker — Slack polling alone won't catch it fast enough. "
-            f"Next alert fires when the trailing stop or max hold triggers."
-        )}}],
-    )
+            f"so it auto-adjusts with price at the broker — Slack polling alone won't catch it fast enough."
+        )}},
+    ]
+    if SOCKET_MODE:
+        value = json.dumps({"position_id": pos['id'], "ticker": ticker})
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Order Placed"},
+                 "style": "primary", "action_id": "trail_order_placed", "value": value},
+            ],
+        })
+    return blocks
+
+
+def _supersede_message(channel, ts, ticker):
+    if not (SOCKET_MODE and channel and ts):
+        return
+    try:
+        bolt_app.client.chat_update(
+            channel=channel, ts=ts,
+            text=f"{ticker} trailing order reminder — superseded",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"~_{ticker} trailing order reminder — superseded, see newer message below_~"}}],
+        )
+    except Exception as e:
+        print(f"  [slack error] supersede failed: {e}")
+
+
+def notify_trailing_activated(pos, current_price):
+    ticker = pos['ticker']
+    ep     = pos['entry_price']
+    pct    = (current_price - ep) / ep * 100
+    print(f"\n  [TRAILING ACTIVATED] {ticker}  entry=${ep:.4f}  now=${current_price:.4f}  ({pct:+.2f}%)")
+
+    blocks = _trailing_order_blocks(pos, current_price, reminder_num=0)
+    channel = ts = None
+    if SOCKET_MODE:
+        try:
+            resp = bolt_app.client.chat_postMessage(
+                channel=SLACK_CHANNEL, text=f"TRAILING ACTIVATED — {ticker}  ${current_price:.4f}  ({pct:+.2f}%)",
+                blocks=blocks)
+            channel, ts = resp['channel'], resp['ts']
+        except Exception as e:
+            print(f"  [slack error] {e}")
+    else:
+        _post_message(f"TRAILING ACTIVATED — {ticker}  ${current_price:.4f}  ({pct:+.2f}%)", blocks=blocks)
+
+    state = dict(pos.get('trail_state') or {})
+    state['order_placed']    = False
+    state['reminder_channel'] = channel
+    state['reminder_ts']      = ts
+    state['reminder_count']   = 0
+    state['last_reminder_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    update_position_trail_state(pos['id'], state)
+
+
+def check_trailing_reminders(open_positions):
+    """Nags every TRAIL_REMINDER_MINUTES until the trailing-stop order is confirmed
+    placed -- a single one-time alert is too easy to miss, and an unplaced trailing
+    stop between polls is a real risk if price moves fast."""
+    if not SOCKET_MODE:
+        return
+    now = datetime.now()
+    for pos in open_positions:
+        state = pos.get('trail_state') or {}
+        if not state.get('trailing') or state.get('order_placed'):
+            continue
+        last_at_str = state.get('last_reminder_at')
+        if not last_at_str:
+            continue
+        last_at = datetime.strptime(last_at_str, '%Y-%m-%d %H:%M:%S')
+        if (now - last_at).total_seconds() < TRAIL_REMINDER_MINUTES * 60:
+            continue
+        cp, _ = _current_price(pos['ticker'])
+        if cp is None:
+            continue
+        _supersede_message(state.get('reminder_channel'), state.get('reminder_ts'), pos['ticker'])
+        reminder_num = state.get('reminder_count', 0) + 1
+        blocks = _trailing_order_blocks(pos, cp, reminder_num=reminder_num)
+        try:
+            resp = bolt_app.client.chat_postMessage(
+                channel=SLACK_CHANNEL, text=f"{pos['ticker']} trailing order — still pending (reminder #{reminder_num})",
+                blocks=blocks)
+            new_state = dict(state)
+            new_state['reminder_channel'] = resp['channel']
+            new_state['reminder_ts']      = resp['ts']
+            new_state['reminder_count']   = reminder_num
+            new_state['last_reminder_at'] = now.strftime('%Y-%m-%d %H:%M:%S')
+            update_position_trail_state(pos['id'], new_state)
+        except Exception as e:
+            print(f"  [slack error] {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1418,7 +1552,10 @@ def build_reference_table(watchlist):
                 peak = trail_state.get('peak', pos['entry_price'])
                 trail_pct = (trail_sell_pct or 3.0) / 100.0
                 trigger = peak * (1 - trail_pct)
-                next_action = f"Waiting Sell {trail_sell_pct:g}% Fill" if trail_sell_pct else 'Waiting Sell Fill'
+                if trail_state.get('order_placed'):
+                    next_action = f"Waiting Sell {trail_sell_pct:g}% Fill" if trail_sell_pct else 'Waiting Sell Fill'
+                else:
+                    next_action = f"Pending Sell {trail_sell_pct:g}%" if trail_sell_pct else 'Pending Sell'
                 proximity = (now_price - trigger) / trigger * 100
             else:
                 trigger = pos['entry_price'] * (1 + _tp_or_arm_pct(pos) / 100.0)
@@ -1565,7 +1702,8 @@ def send_startup_report(watchlist):
                 peak = trail_state.get('peak', p['entry_price'])
                 trail_pct = (p.get('trail_sell_pct') or 3.0) / 100.0
                 trigger_price = peak * (1 - trail_pct)
-                trigger_str = f"trailing active, peak `${peak:.2f}`  sell trigger `${trigger_price:.2f}`"
+                placed_str = "order placed" if trail_state.get('order_placed') else "⚠️ order NOT placed"
+                trigger_str = f"trailing active ({placed_str}), peak `${peak:.2f}`  sell trigger `${trigger_price:.2f}`"
             else:
                 tp_price = p['entry_price'] * (1 + _tp_or_arm_pct(p) / 100.0)
                 trigger_str = f"arm trigger `${tp_price:.2f}`"
@@ -1739,6 +1877,8 @@ def run_loop(tickers: set = None):
             if reason:
                 notify_sell_signal(pos, reason, cp, target)
                 sell_alerted.add((pos['id'], last_bar_ts))
+
+        check_trailing_reminders(open_positions)
 
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
