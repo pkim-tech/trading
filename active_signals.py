@@ -208,6 +208,13 @@ def ensure_tables():
             c.execute("ALTER TABLE watch_list ADD COLUMN arm_sell_pct REAL")
         if 'cached_avg_vol_10d' not in wl_cols:
             c.execute("ALTER TABLE watch_list ADD COLUMN cached_avg_vol_10d REAL")
+        if 'account' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN account TEXT")
+        if 'alpha' not in wl_cols:
+            # snapshot of backtest_cache.alpha_vs_spy at add_node/backfill time, not live-joined
+            # (that DB is trading_universe.db, a separate file from this live DB) -- see
+            # scripts/backfill_watch_list_alpha.py to (re)populate after adding/changing nodes.
+            c.execute("ALTER TABLE watch_list ADD COLUMN alpha REAL")
 
         # open_positions
         c.execute("""
@@ -444,6 +451,15 @@ def get_open_positions():
     for r in rows:
         r['trail_state'] = json.loads(r['trail_state']) if r.get('trail_state') else {}
     return rows
+
+
+def get_held_tickers():
+    """Single source of truth for 'is this ticker already held' -- use this instead of
+    re-deriving a ticker set from get_open_positions() at each call site. A prior version
+    of this exact gap (one code path filtered on it, another didn't) caused a real
+    spurious-BUY-alert bug on 2026-07-08; a second, separate instance of the same gap
+    (send_startup_report never filtered at all) was found 2026-07-09."""
+    return {p['ticker'] for p in get_open_positions()}
 
 
 def update_position_trail_state(position_id, state):
@@ -1344,6 +1360,111 @@ def _send_window_alert(label, watchlist):
     _post_message("\n".join(lines))
 
 
+_REF_TABLE_COLS = [
+    'Ticker', 'Hold', 'Next Trigger $', 'Now', 'Proximity', 'Next Action',
+    'Version', 'Alpha', 'Z', 'Z Trigger', 'TrailBuy%', 'Arm%', 'TrailSell%', 'Account',
+]
+
+
+def build_reference_table(watchlist):
+    """One row per live-mode ticker: buy-trigger info if flat, arm/sell-trigger
+    info if held. `Proximity` is signed so negative always means the trigger has
+    already been crossed (price fell through a buy/sell-trail trigger, or rose
+    through an arm trigger) -- sign convention, not raw distance."""
+    positions = {p['ticker']: p for p in get_open_positions()}
+    rows = []
+    for node in [n for n in watchlist if n.get('mode') == 'live']:
+        ticker = node['ticker']
+        pos = positions.get(ticker)
+        sig = compute_buy_signal(node)
+        account = node.get('account') or ''
+        alpha = node.get('alpha')
+
+        if sig is None:
+            rows.append({
+                'Ticker': ticker, 'Hold': '', 'Next Action': 'NO_DATA', 'Next Trigger $': None,
+                'Now': None, 'Proximity': None, 'Version': node.get('version'), 'Alpha': alpha,
+                'Z': None, 'Z Trigger': node.get('z_score_threshold'),
+                'TrailBuy%': node.get('trail_buy_pct'), 'Arm%': node.get('arm_sell_pct'),
+                'TrailSell%': node.get('trail_sell_pct'), 'Account': account,
+            })
+            continue
+
+        now_price = sig['current_price']
+
+        if pos is None:
+            trigger = sig['lower_band']
+            trail_buy_pct = node.get('trail_buy_pct')
+            rows.append({
+                'Ticker': ticker, 'Hold': '',
+                'Next Action': 'Waiting Trigger Event',
+                'Next Trigger $': trigger, 'Now': now_price,
+                'Proximity': (now_price - trigger) / trigger * 100,
+                'Version': node.get('version'), 'Alpha': alpha, 'Z': sig['z_score'],
+                'Z Trigger': node.get('z_score_threshold'),
+                'TrailBuy%': trail_buy_pct, 'Arm%': node.get('arm_sell_pct'),
+                'TrailSell%': node.get('trail_sell_pct'), 'Account': account,
+            })
+        else:
+            df_hourly_p, _ = _load_cache(ticker)
+            signal_time = datetime.fromisoformat(pos['signal_time'])
+            hours_held = _bars_held(df_hourly_p, signal_time)
+            hold = f"{hours_held:.0f}h/{pos['max_hold_hours']}h"
+            trail_state = pos.get('trail_state') or {}
+            arm_pct = pos.get('arm_sell_pct')
+            trail_sell_pct = pos.get('trail_sell_pct')
+
+            if trail_state.get('trailing'):
+                peak = trail_state.get('peak', pos['entry_price'])
+                trail_pct = (trail_sell_pct or 3.0) / 100.0
+                trigger = peak * (1 - trail_pct)
+                next_action = f"Waiting Sell {trail_sell_pct:g}% Fill" if trail_sell_pct else 'Waiting Sell Fill'
+                proximity = (now_price - trigger) / trigger * 100
+            else:
+                trigger = pos['entry_price'] * (1 + _tp_or_arm_pct(pos) / 100.0)
+                next_action = f"Arm {arm_pct:g}%" if arm_pct else 'Arm'
+                proximity = (trigger - now_price) / trigger * 100
+
+            rows.append({
+                'Ticker': ticker, 'Hold': hold, 'Next Action': next_action,
+                'Next Trigger $': trigger, 'Now': now_price, 'Proximity': proximity,
+                'Version': pos.get('version'), 'Alpha': alpha, 'Z': sig['z_score'],
+                'Z Trigger': node.get('z_score_threshold'),
+                'TrailBuy%': pos.get('trail_buy_pct'), 'Arm%': arm_pct,
+                'TrailSell%': trail_sell_pct, 'Account': account,
+            })
+    return rows
+
+
+def format_reference_table(rows):
+    def fmt(col, v):
+        if v is None:
+            return ''
+        if col == 'Next Trigger $':
+            return f"${v:.2f}"
+        if col == 'Now':
+            return f"${v:.2f}"
+        if col == 'Proximity':
+            return f"{v:+.1f}%"
+        if col == 'Alpha':
+            return f"{v:+.0f}"
+        if col == 'Z':
+            return f"{v:+.2f}"
+        if col == 'Z Trigger':
+            return f"{v:g}"
+        if col in ('TrailBuy%', 'Arm%', 'TrailSell%'):
+            return f"{v:g}"
+        return str(v)
+
+    cells = [[fmt(c, r.get(c)) for c in _REF_TABLE_COLS] for r in rows]
+    widths = [max(len(col), *(len(row[i]) for row in cells)) if cells else len(col)
+              for i, col in enumerate(_REF_TABLE_COLS)]
+    lines = [' '.join(col.ljust(widths[i]) for i, col in enumerate(_REF_TABLE_COLS))]
+    for row in cells:
+        lines.append(' '.join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+    return '\n'.join(lines)
+
+
 _STRATEGY_LABELS = {
     'ZScoreBreakout':             ('BUY (bar-close)', 'At signal close: edit staged limit → market and submit'),
     'TrendFilteredZScore':        ('BUY (bar-close)', 'At signal close: edit staged limit → market and submit'),
@@ -1358,8 +1479,10 @@ def send_startup_report(watchlist):
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
 
     # Build buy candidates sorted by proximity, carrying node for strategy info
+    # (skip tickers already held -- they're covered in the Open Positions section below)
+    held_tickers = get_held_tickers()
     rows = []
-    for node in [n for n in watchlist if n.get('mode') == 'live']:
+    for node in [n for n in watchlist if n.get('mode') == 'live' and n['ticker'] not in held_tickers]:
         sig = compute_buy_signal(node)
         if sig is None:
             rows.append((float('inf'), node['ticker'], node['strategy'], node.get('version', ''), None, None, node))
@@ -1386,6 +1509,12 @@ def send_startup_report(watchlist):
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"Morning Report — {now_str}"}},
     ]
+
+    ref_rows = build_reference_table(watchlist)
+    if ref_rows:
+        ref_table = format_reference_table(ref_rows)
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"```{ref_table}```"}})
+        blocks.append({"type": "divider"})
 
     for strategy, group in by_strategy.items():
         label, action = _STRATEGY_LABELS.get(strategy, (strategy, ''))
