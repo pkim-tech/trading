@@ -287,6 +287,24 @@ def ensure_tables():
             c.execute("ALTER TABLE trade_log ADD COLUMN arm_sell_pct REAL")
         if 'shares' not in tl_cols:
             c.execute("ALTER TABLE trade_log ADD COLUMN shares REAL")
+
+        # pending_buys -- tracks a trailing-buy order from BUY alert until Executed/Skipped
+        # is confirmed, so a stalled broker-side fill can be reminded on (mirrors trail_state
+        # on open_positions for the sell side, which has no equivalent pre-fill row to hang state off).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pending_buys (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker            TEXT NOT NULL,
+                node_json         TEXT NOT NULL,
+                signal_price      REAL NOT NULL,
+                signal_time       TEXT NOT NULL,
+                reminder_channel  TEXT,
+                reminder_ts       TEXT,
+                reminder_count    INTEGER NOT NULL DEFAULT 0,
+                last_reminder_at  TEXT NOT NULL,
+                created_at        TEXT NOT NULL
+            )
+        """)
         c.commit()
 
 
@@ -365,6 +383,11 @@ def _tp_or_arm_pct(row):
     if row['strategy'] == 'TrailingBothZScoreBreakout':
         return row['arm_sell_pct']
     return row['take_profit']
+
+
+def _is_trailing_buy(node):
+    buy_axis_col, _ = strategies.resolve_axis_columns(node['strategy'])
+    return buy_axis_col == 'trail_buy_pct'
 
 
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
@@ -465,8 +488,53 @@ def get_held_tickers():
     re-deriving a ticker set from get_open_positions() at each call site. A prior version
     of this exact gap (one code path filtered on it, another didn't) caused a real
     spurious-BUY-alert bug on 2026-07-08; a second, separate instance of the same gap
-    (send_startup_report never filtered at all) was found 2026-07-09."""
+    (send_reference_report never filtered at all) was found 2026-07-09."""
     return {p['ticker'] for p in get_open_positions()}
+
+
+_PENDING_BUY_NODE_KEYS = ('ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
+                          'max_hold_hours', 'label', 'trail_sell_pct', 'fixed_sl', 'trail_buy_pct',
+                          'arm_sell_pct', 'account')
+
+
+def add_pending_buy(node, sig, channel, ts):
+    node_subset = {k: node.get(k) for k in _PENDING_BUY_NODE_KEYS}
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO pending_buys (ticker, node_json, signal_price, signal_time, "
+            "reminder_channel, reminder_ts, reminder_count, last_reminder_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            (node['ticker'], json.dumps(node_subset), sig['current_price'],
+             sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), channel, ts, now_str, now_str),
+        )
+        c.commit()
+
+
+def get_pending_buys():
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        rows = [dict(r) for r in c.execute("SELECT * FROM pending_buys").fetchall()]
+    for r in rows:
+        r['node'] = json.loads(r['node_json'])
+    return rows
+
+
+def clear_pending_buy(ticker):
+    with _conn() as c:
+        c.execute("DELETE FROM pending_buys WHERE ticker = ?", (ticker,))
+        c.commit()
+
+
+def update_pending_buy_reminder(pending_id, channel, ts, reminder_count):
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with _conn() as c:
+        c.execute(
+            "UPDATE pending_buys SET reminder_channel=?, reminder_ts=?, reminder_count=?, last_reminder_at=? "
+            "WHERE id=?",
+            (channel, ts, reminder_count, now_str, pending_id),
+        )
+        c.commit()
 
 
 def update_position_trail_state(position_id, state):
@@ -881,6 +949,8 @@ def _chart_sell(pos, current_price) -> BytesIO | None:
 # ---------------------------------------------------------------------------
 
 def _post_message(text, blocks=None):
+    """Returns (channel, ts) when posted via the Socket Mode client (None, None
+    otherwise) so callers can track a message for later reminder/supersede."""
     if SIM_MODE:
         text = f"🧪 SIM — {text}"
         if blocks:
@@ -891,9 +961,11 @@ def _post_message(text, blocks=None):
             ]
     if SOCKET_MODE:
         try:
-            bolt_app.client.chat_postMessage(channel=SLACK_CHANNEL, text=text, blocks=blocks)
+            resp = bolt_app.client.chat_postMessage(channel=SLACK_CHANNEL, text=text, blocks=blocks)
+            return resp['channel'], resp['ts']
         except Exception as e:
             print(f"  [slack error] {e}")
+            return None, None
     elif SLACK_HOOK:
         payload = {'text': text}
         if blocks:
@@ -904,6 +976,7 @@ def _post_message(text, blocks=None):
                 print(f"  [slack error] HTTP {r.status_code}")
         except Exception as e:
             print(f"  [slack error] {e}")
+    return None, None
 
 
 def _fields_block(fields: dict):
@@ -1101,6 +1174,7 @@ if SOCKET_MODE:
         channel = body['channel']['id']
         ts      = body['message']['ts']
         ticker  = data['node']['ticker']
+        clear_pending_buy(ticker)
         client.chat_update(
             channel=channel, ts=ts,
             text=f"BUY {ticker} — Skipped",
@@ -1127,6 +1201,7 @@ if SOCKET_MODE:
         open_position(node, signal_price, signal_time, exec_price, now, shares=shares)
 
         ticker = node['ticker']
+        clear_pending_buy(ticker)
         note   = f"${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
         print(f"  Position opened via Slack: {ticker} at {note}")
         client.chat_update(
@@ -1250,12 +1325,14 @@ def notify_buy_signal(node, sig):
         print(f"  ⚠️🔁 SAME DAY BUY WARNING: {ticker} already sold today — cash may not be settled (T+1)")
     print(sep)
 
-    _post_message(
+    channel, ts = _post_message(
         f"BUY SIGNAL — {ticker}  ${price:.4f}  z={z:.2f}  ({bar_str})",
         _build_buy_blocks(node, sig),
     )
 
     if INTERACTIVE:
+        if _is_trailing_buy(node):
+            add_pending_buy(node, sig, channel, ts)
         chart = _chart_buy(node, sig)
         if chart:
             _upload_chart(chart, f"{ticker}_buy.png", f"BUY — {ticker}  z={z:.2f}")
@@ -1364,12 +1441,22 @@ def _trailing_order_blocks(pos, current_price, reminder_num=0):
     pct       = (current_price - ep) / ep * 100
     trail_pct = pos.get('trail_sell_pct') or 3.0
     header    = f"⚠️ *{ticker}* — STILL PENDING (reminder #{reminder_num})" if reminder_num else f"🎯 *{ticker}* — TRAILING ACTIVATED — action needed"
+    if reminder_num:
+        body = (
+            f"Order still not confirmed placed. If it should have filled by now, check Schwab — "
+            f"if the trailing stop didn't take, cancel it and submit a *market* order instead to "
+            f"match the strategy's expected exit, rather than leaving it unprotected."
+        )
+    else:
+        body = (
+            f"Take-profit cleared. Cancel the fixed Schwab stop and place a *trailing stop* order at `{trail_pct:.0f}%` "
+            f"so it auto-adjusts with price at the broker — Slack polling alone won't catch it fast enough."
+        )
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": (
             f"{header}\n"
             f"entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
-            f"Take-profit cleared. Cancel the fixed Schwab stop and place a *trailing stop* order at `{trail_pct:.0f}%` "
-            f"so it auto-adjusts with price at the broker — Slack polling alone won't catch it fast enough."
+            f"{body}"
         )}},
     ]
     if INTERACTIVE:
@@ -1469,6 +1556,65 @@ def check_trailing_reminders(open_positions):
             print(f"  [slack error] {e}")
 
 
+BUY_REMINDER_MINUTES = 15
+
+
+def _pending_buy_blocks(pending, reminder_num):
+    """Mirrors _trailing_order_blocks for the buy side -- a trailing-buy order
+    placed at the broker has no live fill confirmation, so this nags the same
+    way the sell-side trailing-stop reminder does, escalating to a market-order
+    suggestion instead of leaving a stalled entry silently unconfirmed."""
+    node    = pending['node']
+    ticker  = pending['ticker']
+    account = node.get('account') or 'unmapped'
+    text = (
+        f"⚠️ *{ticker}* — BUY STILL PENDING (reminder #{reminder_num})\n"
+        f"trigger `${pending['signal_price']:.2f}`  |  `{account}`\n"
+        f"Trailing buy order not confirmed filled. Check Schwab — if it hasn't taken, "
+        f"consider canceling and submitting a *market* order instead to match the strategy's "
+        f"expected entry timing, or Skip if the setup no longer applies."
+    )
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+    if INTERACTIVE:
+        value = json.dumps({
+            "node": node, "signal_price": pending['signal_price'], "signal_time": pending['signal_time'],
+        })
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Executed"},
+                 "style": "primary", "action_id": "buy_executed", "value": value},
+                {"type": "button", "text": {"type": "plain_text", "text": "Skipped"},
+                 "action_id": "buy_skipped", "value": value},
+            ],
+        })
+    return blocks
+
+
+def check_buy_reminders():
+    """Nags every BUY_REMINDER_MINUTES until a pending trailing-buy order is
+    confirmed Executed or Skipped -- without this, a stalled trailing-buy at the
+    broker is invisible until the user happens to remember to check (the gap
+    flagged in docs/operational_limits.md's TrailingBoth lifecycle table, row 3)."""
+    if not INTERACTIVE:
+        return
+    now = datetime.now()
+    for pending in get_pending_buys():
+        last_at = datetime.strptime(pending['last_reminder_at'], '%Y-%m-%d %H:%M:%S')
+        if (now - last_at).total_seconds() < BUY_REMINDER_MINUTES * 60:
+            continue
+        _supersede_message(pending['reminder_channel'], pending['reminder_ts'], pending['ticker'])
+        reminder_num = pending['reminder_count'] + 1
+        blocks = _pending_buy_blocks(pending, reminder_num)
+        try:
+            resp = bolt_app.client.chat_postMessage(
+                channel=SLACK_CHANNEL, text=f"{pending['ticker']} trailing buy — still pending (reminder #{reminder_num})",
+                blocks=blocks)
+            update_pending_buy_reminder(pending['id'], resp['channel'], resp['ts'], reminder_num)
+        except Exception as e:
+            print(f"  [slack error] {e}")
+
+
 # ---------------------------------------------------------------------------
 # Startup report
 # ---------------------------------------------------------------------------
@@ -1493,16 +1639,55 @@ def _proximity_emoji(pct_away):
     return "⚪"
 
 
+def _ticker_block(row):
+    """Renders one row from build_reference_table as mrkdwn prose (wraps naturally
+    on mobile) instead of a fixed-width table column (unreadable on iPhone)."""
+    ticker, version, account = row['Ticker'], row.get('Version') or '', row.get('Account') or ''
+    proximity = row.get('Proximity')
+
+    if row['Next Action'] == 'NO_DATA':
+        return {"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}}
+
+    emoji = _proximity_emoji(proximity) if isinstance(proximity, (int, float)) else '⚪'
+    now = row['Now']
+    trigger = row['Next Trigger $']
+
+    if row['Held']:
+        pnl = row.get('PnL %')
+        text = (
+            f"{emoji} *{ticker}* `{version}` — HELD {row['Hold']} — `{account}`\n"
+            f"now `${now:.2f}` (P&L {pnl:+.1f}%)  trigger `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"→ _{row['Next Action']}_  sl `${row['SL $']:.2f}`"
+        )
+    else:
+        overnight = row.get('Overnight %')
+        data_date = row.get('Data Date')
+        data_str = pd.Timestamp(data_date).strftime('%m/%d') if data_date is not None else '?'
+        _, action_desc = _STRATEGY_LABELS.get(row['Strategy'], (row['Strategy'], ''))
+        text = (
+            f"{emoji} *{ticker}* `{version}` — `{account}`\n"
+            f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  trigger `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"→ _{action_desc}_  arm `${row['Arm $']:.2f}`  sl `${row['SL $']:.2f}`  data `{data_str}`"
+        )
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+
 def _send_window_alert(label, watchlist):
     """Reuses build_reference_table so this alert shares one source of truth with
     the morning report -- correct per-position trigger (buy/arm/trailing-sell,
-    not always the buy-side lower_band), live-mode-only, with Account shown."""
+    not always the buy-side lower_band). Minimal by design: only tickers within
+    5% of their next trigger, rendered as mobile-readable prose, not the full
+    watchlist table."""
     ref_rows = build_reference_table(watchlist)
-    hot = [r['Ticker'] for r in ref_rows if isinstance(r.get('Proximity'), (int, float)) and r['Proximity'] < 5]
-    alert_level = "🔶 *HIGH ALERT*" if hot else "✅ algo running"
+    hot = [r for r in ref_rows if isinstance(r.get('Proximity'), (int, float)) and r['Proximity'] < 5]
+    alert_level = "🔶 *HIGH ALERT*" if hot else "✅ algo running, nothing within range"
     header = f"⏱ *Signal window — {label} ET* | {alert_level}"
-    table = format_reference_table(ref_rows)
-    _post_message(f"{header}\n```{table}```")
+    if not hot:
+        _post_message(header)
+        return
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": header}}, {"type": "divider"}]
+    blocks += [_ticker_block(r) for r in hot]
+    _post_message(header, blocks=blocks)
 
 
 _REF_TABLE_COLS = [
@@ -1550,10 +1735,13 @@ def build_reference_table(watchlist):
                 'Z': None, 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': node.get('trail_buy_pct'), 'Arm%': node.get('arm_sell_pct'),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
+                'Strategy': node['strategy'], 'Held': False,
+                '_node': node, '_pos': None, '_sig': None,
             })
             continue
 
         now_price = sig['current_price']
+        schwab_sl_pct = node['stop_loss'] + 1
 
         if pos is None:
             trigger = sig['lower_band']
@@ -1567,6 +1755,11 @@ def build_reference_table(watchlist):
                 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': trail_buy_pct, 'Arm%': node.get('arm_sell_pct'),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
+                'Strategy': node['strategy'], 'Held': False,
+                'SL $': trigger * (1 - schwab_sl_pct / 100), 'Arm $': trigger * (1 + _tp_or_arm_pct(node) / 100),
+                'Overnight %': (now_price - sig['prev_close']) / sig['prev_close'] * 100,
+                'Prev Close': sig['prev_close'], 'Data Date': sig['last_daily_bar'],
+                '_node': node, '_pos': None, '_sig': sig,
             })
         else:
             df_hourly_p, _ = _load_cache(ticker)
@@ -1576,6 +1769,8 @@ def build_reference_table(watchlist):
             trail_state = pos.get('trail_state') or {}
             arm_pct = pos.get('arm_sell_pct')
             trail_sell_pct = pos.get('trail_sell_pct')
+            pos_schwab_sl_pct = pos['stop_loss'] + 1
+            sl_price = pos['entry_price'] * (1 - pos_schwab_sl_pct / 100)
 
             if trail_state.get('trailing'):
                 peak = trail_state.get('peak', pos['entry_price'])
@@ -1598,6 +1793,9 @@ def build_reference_table(watchlist):
                 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': pos.get('trail_buy_pct'), 'Arm%': arm_pct,
                 'TrailSell%': trail_sell_pct, 'Account': account, 'Last Sale $': last_sale,
+                'Strategy': pos.get('strategy', node['strategy']), 'Held': True,
+                'SL $': sl_price, 'PnL %': (now_price - pos['entry_price']) / pos['entry_price'] * 100,
+                '_node': node, '_pos': pos, '_sig': sig,
             })
     return rows
 
@@ -1643,118 +1841,42 @@ _STRATEGY_LABELS = {
 }
 
 
-def send_startup_report(watchlist):
+def send_reference_report(watchlist):
+    """One source of truth (build_reference_table) rendered as mobile-readable
+    prose per ticker -- flat and held both shown with their real next trigger,
+    grouped: held positions first, then buy candidates sorted by proximity."""
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+    rows = build_reference_table(watchlist)
 
-    # Build buy candidates sorted by proximity, carrying node for strategy info
-    # (skip tickers already held -- they're covered in the Open Positions section below)
-    held_tickers = get_held_tickers()
-    rows = []
-    for node in [n for n in watchlist if n.get('mode') == 'live' and n['ticker'] not in held_tickers]:
-        sig = compute_buy_signal(node)
-        if sig is None:
-            rows.append((float('inf'), node['ticker'], node['strategy'], node.get('version', ''), None, None, node))
-            continue
-        trigger       = sig['lower_band']
-        arm_price     = trigger * (1 + _tp_or_arm_pct(node) / 100)
-        schwab_sl_pct = node['stop_loss'] + 1
-        sl_price      = trigger * (1 - schwab_sl_pct / 100)
-        pct_away      = (sig['current_price'] - trigger) / trigger * 100
-        rows.append((pct_away, node['ticker'], node['strategy'], node.get('version', ''), sig, {'arm': arm_price, 'sl': sl_price, 'pct': pct_away}, node))
-    rows.sort(key=lambda x: x[0])
+    def sort_key(r):
+        p = r.get('Proximity')
+        return p if isinstance(p, (int, float)) else float('inf')
 
-    # Group by strategy
-    from itertools import groupby
-    strategy_order = []
-    seen = set()
-    for r in rows:
-        s = r[2]
-        if s not in seen:
-            strategy_order.append(s)
-            seen.add(s)
-    by_strategy = {s: [r for r in rows if r[2] == s] for s in strategy_order}
-
+    held_rows = sorted([r for r in rows if r['Held']], key=sort_key)
+    flat_rows = sorted([r for r in rows if not r['Held']], key=sort_key)
 
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"Morning Report — {now_str}"}},
     ]
 
-    ref_rows = build_reference_table(watchlist)
-    if ref_rows:
-        ref_table = format_reference_table(ref_rows)
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"```{ref_table}```"}})
-        blocks.append({"type": "divider"})
-
-    for strategy, group in by_strategy.items():
-        label, action = _STRATEGY_LABELS.get(strategy, (strategy, ''))
-        versions = ', '.join(sorted({r[3] for r in group if r[3]}))
-        header_text = f"{label} — {versions}" if versions else label
-        blocks.append({"type": "divider"})
-        blocks.append({"type": "header", "text": {"type": "plain_text", "text": header_text}})
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": action}]})
-
-        for _, ticker, _strat, version, sig, meta, node in group:
-            if sig is None:
-                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}})
-                continue
-            emoji = _proximity_emoji(meta['pct'])
-            overnight = (sig['current_price'] - sig['prev_close']) / sig['prev_close'] * 100
-            data_date = pd.Timestamp(sig['last_daily_bar']).strftime('%m/%d')
-            buy_type, node_action = _STRATEGY_LABELS.get(_strat, (_strat, ''))
-            text = (
-                f"{emoji} *{ticker}* — {buy_type} — `{version}` — trigger `${sig['lower_band']:.2f}`\n"
-                f"→ _{node_action}_\n"
-                f"now `${sig['current_price']:.2f}` ({overnight:+.1f}% O/N)  z `{sig['z_score']:+.2f}`\n"
-                f"      trigger `${sig['lower_band']:.2f}` ({meta['pct']:+.1f}%)  arm `${meta['arm']:.2f}`  sl `${meta['sl']:.2f}`  "
-                f"close `${sig['prev_close']:.2f}`  data `{data_date}`"
-            )
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
-            if meta['pct'] < 5:
-                chart = _chart_buy(node, sig)
-                if chart:
-                    _upload_chart(chart, f"{ticker}_morning.png", f"{ticker} `{version}`  z={sig['z_score']:+.2f}")
-
-    # Open positions section
-    positions = get_open_positions()
-    if positions:
-        blocks.append({"type": "divider"})
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Open Positions*"}})
-        for p in positions:
-            signal_time = datetime.fromisoformat(p['signal_time'])
-            df_hourly_p, _ = _load_cache(p['ticker'])
-            hours_held = _bars_held(df_hourly_p, signal_time)
-            cp, _ = _current_price(p['ticker'])
-            if cp:
-                pnl = (cp - p['entry_price']) / p['entry_price'] * 100
-                pnl_str = f"  P&L `{pnl:+.1f}%`"
-            else:
-                pnl_str = ""
-            trail_state = p.get('trail_state') or {}
-            if trail_state.get('trailing'):
-                peak = trail_state.get('peak', p['entry_price'])
-                trail_pct = (p.get('trail_sell_pct') or 3.0) / 100.0
-                trigger_price = peak * (1 - trail_pct)
-                placed_str = "order placed" if trail_state.get('order_placed') else "⚠️ order NOT placed"
-                trigger_str = f"trailing active ({placed_str}), peak `${peak:.2f}`  sell trigger `${trigger_price:.2f}`"
-            else:
-                arm_price = p['entry_price'] * (1 + _tp_or_arm_pct(p) / 100.0)
-                trigger_str = f"arm trigger `${arm_price:.2f}`"
-            schwab_sl_pct = p['stop_loss'] + 1
-            text = (
-                f"📊 *{p['ticker']}*  "
-                f"entry `${p['entry_price']:.2f}`  "
-                f"held `{hours_held:.0f}h/{p['max_hold_hours']}h`  "
-                f"arm `{_tp_or_arm_pct(p)}%`  sl `{schwab_sl_pct}%`  "
-                f"{trigger_str}"
-                f"{pnl_str}"
-            )
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    if held_rows:
+        blocks.append({"type": "header", "text": {"type": "plain_text", "text": "Open Positions"}})
+        blocks += [_ticker_block(r) for r in held_rows]
     else:
-        blocks.append({"type": "divider"})
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "No open positions."}]})
 
-    # Reconfirm reminder for hot tickers
-    hot = [r[1] for r in rows if isinstance(r[0], float) and r[0] < 5]
+    blocks.append({"type": "divider"})
+    blocks.append({"type": "header", "text": {"type": "plain_text", "text": "Buy Candidates"}})
+    for r in flat_rows:
+        blocks.append(_ticker_block(r))
+        proximity = r.get('Proximity')
+        if isinstance(proximity, (int, float)) and proximity < 5:
+            chart = _chart_buy(r['_node'], r['_sig'])
+            if chart:
+                _upload_chart(chart, f"{r['Ticker']}_morning.png", f"{r['Ticker']} `{r['Version']}`  z={r['Z']:+.2f}")
+
+    # Reconfirm reminder for hot buy candidates
+    hot = [r['Ticker'] for r in flat_rows if isinstance(r.get('Proximity'), (int, float)) and r['Proximity'] < 5]
     if hot:
         blocks.append({"type": "divider"})
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
@@ -1762,20 +1884,16 @@ def send_startup_report(watchlist):
 
     # Console output
     print(f"Morning Report — {now_str}")
-    for _, ticker, strategy, version, sig, meta, _node in rows:
-        if sig is None:
-            print(f"  {ticker:<6} {version}  NO_DATA  [{strategy}]")
-        else:
-            emoji = _proximity_emoji(meta['pct'])
-            label = _STRATEGY_LABELS.get(strategy, (strategy,))[0]
-            print(f"  {emoji} {ticker:<6} {version}  now=${sig['current_price']:>7.2f}  trigger=${sig['lower_band']:>7.2f}  ({meta['pct']:+.1f}%)  z={sig['z_score']:>+5.2f}  [{label}]")
-    if positions:
+    if held_rows:
         print("  Open positions:")
-        for p in positions:
-            signal_time = datetime.fromisoformat(p['signal_time'])
-            df_hourly_p, _ = _load_cache(p['ticker'])
-            hours_held = _bars_held(df_hourly_p, signal_time)
-            print(f"    {p['ticker']:<6}  entry=${p['entry_price']:.2f}  held={hours_held:.0f}h")
+        for r in held_rows:
+            print(f"    {r['Ticker']:<6} {r['Version']}  hold={r['Hold']}  now=${r['Now']:.2f}  {r['Next Action']}")
+    for r in flat_rows:
+        if r['Next Action'] == 'NO_DATA':
+            print(f"  {r['Ticker']:<6} {r['Version']}  NO_DATA  [{r['Strategy']}]")
+        else:
+            emoji = _proximity_emoji(r['Proximity'])
+            print(f"  {emoji} {r['Ticker']:<6} {r['Version']}  now=${r['Now']:>7.2f}  trigger=${r['Next Trigger $']:>7.2f}  ({r['Proximity']:+.1f}%)  z={r['Z']:>+5.2f}  [{r['Strategy']}]")
 
     _post_message(f"Morning Report — {now_str}", blocks=blocks)
 
@@ -1786,6 +1904,11 @@ def send_startup_report(watchlist):
 
 # Signal windows in ET: 10:25-10:40 (9:30 bar close) and 15:25-15:40 (14:30 bar close)
 _SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]
+
+# Reference report fires once at each of these times daily -- before the open and
+# before the afternoon signal window, so a fresh full-watchlist view lands ahead
+# of the two moments an action is most likely to be required.
+_REFERENCE_TIMES = [(9, 20), (15, 20)]
 
 def _in_buy_window(now):
     t = (now.hour, now.minute)
@@ -1820,7 +1943,7 @@ def run_loop(tickers: set = None):
     startup_wl = get_watchlist()
     if tickers:
         startup_wl = [n for n in startup_wl if n['ticker'] in tickers]
-    send_startup_report(startup_wl)
+    send_reference_report(startup_wl)
 
     buy_alerted:        set[tuple] = set()
     sell_alerted:       set[tuple] = set()  # (position_id, bar_ts) — dedups within a bar, not across bars
@@ -1828,7 +1951,13 @@ def run_loop(tickers: set = None):
     limit_fill_alerted: set[tuple] = set()
     last_seen_bar:      dict       = {}   # ticker -> last hourly bar timestamp checked
     last_date = datetime.now().strftime('%Y-%m-%d')
-    last_morning_report_date = datetime.now().strftime('%Y-%m-%d') if datetime.now().hour >= 7 else None
+    # Slots already past today are pre-marked "done" since the unconditional
+    # send_reference_report() above just covered them -- only upcoming slots fire.
+    _now0 = datetime.now()
+    reference_alerted: set[tuple] = {
+        (last_date, f"{rh:02d}:{rm:02d}") for rh, rm in _REFERENCE_TIMES
+        if (_now0.hour, _now0.minute) >= (rh, rm)
+    }
 
     while True:
         now   = datetime.now()
@@ -1839,14 +1968,18 @@ def run_loop(tickers: set = None):
             buy_alerted.clear()
             window_alerted.clear()
             limit_fill_alerted.clear()
+            reference_alerted.clear()
             last_date = today
 
-        if now.hour >= 7 and today != last_morning_report_date:
-            wl = get_watchlist()
-            if tickers:
-                wl = [n for n in wl if n['ticker'] in tickers]
-            send_startup_report(wl)
-            last_morning_report_date = today
+        for rh, rm in _REFERENCE_TIMES:
+            rlabel = f"{rh:02d}:{rm:02d}"
+            rkey = (today, rlabel)
+            if (now.hour, now.minute) >= (rh, rm) and rkey not in reference_alerted:
+                reference_alerted.add(rkey)
+                wl = get_watchlist()
+                if tickers:
+                    wl = [n for n in wl if n['ticker'] in tickers]
+                send_reference_report(wl)
 
         watchlist = get_watchlist()
         if tickers:
@@ -1912,6 +2045,7 @@ def run_loop(tickers: set = None):
                 sell_alerted.add((pos['id'], last_bar_ts))
 
         check_trailing_reminders(open_positions)
+        check_buy_reminders()
 
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
