@@ -2,6 +2,9 @@
 
 Curated, current subset of `docs/deep_backlog.md` — read in full at session start (`go`). Full detail for every item lives in `deep_backlog.md`; this is just the active/relevant pointer list. Periodically re-triage.
 
+## New, 2026-07-10 — get user's reaction to the phase-emoji prototype, iterate or finalize
+Built `_phase_emoji()` (blank/🟡/🟢 single lifecycle ball per ticker) in `build_reference_table`, wired into both the CLI table's new `Phase` column and `_ticker_block`'s leading position. Unit-tested (`scripts/test_phase_emoji.py`, all 7 states) and sent as a real sample to `#trading`, but the user had to run before giving feedback on the look/placement — next session, ask whether it stays as-is, needs repositioning (e.g. merged with or replacing the existing `_proximity_emoji`), or needs the reminder/stale (red) state added back after all.
+
 ## High priority, 2026-07-10 — rerun trailing-buy backtest kernels with corrected (non-optimistic) intrabar fill logic
 `_simulate_trail_buy`/`_simulate_trail_both` (backs all 11 live watchlist tickers) always assumes a bar's Low happens before its High during the trailing-buy "waiting" phase — best case for the strategy, unproven from OHLC data. Built a side analysis (`scripts/export_trades.py::simulate_trail_both_ohlc_aware`, live kernel untouched) that resolves fills as CERTAIN wherever provable (High clears prior-bar trigger, or Close — always bar-last — confirms it) and only guesses (Open/Close-direction heuristic) for genuinely ambiguous wicks — just 1/61 entries on SOXL. Result: SOXL 57-trade final equity dropped from $3.55M (7007%) to $1.85M (3591%) under the corrected logic — every live ticker's on-file alpha/return is inflated by an unquantified amount until the real kernels are patched and the full sweep is rerun. Full detail: `docs/deep_backlog.md` "High Priority" section. Not started.
 

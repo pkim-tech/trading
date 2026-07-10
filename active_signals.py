@@ -1899,6 +1899,8 @@ def _ticker_block(row):
         return {"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}}
 
     emoji = _proximity_emoji(proximity) if isinstance(proximity, (int, float)) else '⚪'
+    phase = row.get('Phase') or ''
+    phase_str = f"{phase} " if phase else ''
     now = row['Now']
     trigger = row['Next Trigger $']
 
@@ -1913,7 +1915,7 @@ def _ticker_block(row):
         last_sale = row.get('Last Sale $')
         last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
         text = (
-            f"{emoji} *{ticker}* `{version}` — {row['Hold']}{account_str}{last_sale_str}\n"
+            f"{phase_str}{emoji} *{ticker}* `{version}` — {row['Hold']}{account_str}{last_sale_str}\n"
             f"now `${now:.2f}` {pnl:+.1f}%  trig `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_{sl_str}\n"
             f"z `{z_str}`  tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
@@ -1927,7 +1929,7 @@ def _ticker_block(row):
         z_trig = row.get('Z Trigger')
         z_trig_str = f"  z-trig `{z_trig:g}`" if z_trig is not None else ''
         text = (
-            f"{emoji} *{ticker}* `{version}`{account_str}{last_sale_str}\n"
+            f"{phase_str}{emoji} *{ticker}* `{version}`{account_str}{last_sale_str}\n"
             f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  trig `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_  arm `${row['Arm $']:.2f}`  sl `${row['SL $']:.2f}`\n"
             f"tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`{z_trig_str}"
@@ -1954,7 +1956,7 @@ def _send_window_alert(label, watchlist):
 
 
 _REF_TABLE_COLS = [
-    'Ticker', 'Hold', 'Next Trigger $', 'Now', 'Proximity', 'Next Action',
+    'Phase', 'Ticker', 'Hold', 'Next Trigger $', 'Now', 'Proximity', 'Next Action',
     'Version', 'Alpha', 'Z', 'Z Trigger', 'TrailBuy%', 'Arm%', 'TrailSell%', 'Account', 'Last Sale $',
 ]
 
@@ -1976,12 +1978,25 @@ def _last_sale_recovery(ticker):
     return 50_000
 
 
+def _phase_emoji(pos, pending_buy):
+    """Single glance-able lifecycle ball: yellow = an order/confirmation is
+    outstanding (placed-but-unfilled, or armed-but-not-yet-sold), green = filled
+    and resting with nothing outstanding, gray = idle, nothing in flight."""
+    if pos is None:
+        return '🟡' if pending_buy is not None else ''
+    trail_state = pos.get('trail_state') or {}
+    if trail_state.get('exit_pending') or trail_state.get('trailing'):
+        return '🟡'
+    return '🟢'
+
+
 def build_reference_table(watchlist):
     """One row per live-mode ticker: buy-trigger info if flat, arm/sell-trigger
     info if held. `Proximity` is signed so negative always means the trigger has
     already been crossed (price fell through a buy/sell-trail trigger, or rose
     through an arm trigger) -- sign convention, not raw distance."""
     positions = {p['ticker']: p for p in get_open_positions()}
+    pending_buys = {p['ticker']: p for p in get_pending_buys()}
     rows = []
     for node in [n for n in watchlist if n.get('mode') == 'live']:
         ticker = node['ticker']
@@ -1990,6 +2005,7 @@ def build_reference_table(watchlist):
         account = node.get('account') or ''
         alpha = node.get('alpha')
         last_sale = _last_sale_recovery(ticker)
+        phase = _phase_emoji(pos, pending_buys.get(ticker))
 
         if sig is None:
             rows.append({
@@ -1998,7 +2014,7 @@ def build_reference_table(watchlist):
                 'Z': None, 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': node.get('trail_buy_pct'), 'Arm%': node.get('arm_sell_pct'),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
-                'Strategy': node['strategy'], 'Held': False,
+                'Strategy': node['strategy'], 'Held': False, 'Phase': phase,
                 '_node': node, '_pos': None, '_sig': None,
             })
             continue
@@ -2018,7 +2034,7 @@ def build_reference_table(watchlist):
                 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': trail_buy_pct, 'Arm%': node.get('arm_sell_pct'),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
-                'Strategy': node['strategy'], 'Held': False,
+                'Strategy': node['strategy'], 'Held': False, 'Phase': phase,
                 'SL $': trigger * (1 - schwab_sl_pct / 100), 'Arm $': trigger * (1 + _tp_or_arm_pct(node) / 100),
                 'Overnight %': (now_price - sig['prev_close']) / sig['prev_close'] * 100,
                 'Prev Close': sig['prev_close'], 'Data Date': sig['last_daily_bar'],
@@ -2060,7 +2076,7 @@ def build_reference_table(watchlist):
                 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': pos.get('trail_buy_pct'), 'Arm%': arm_pct,
                 'TrailSell%': trail_sell_pct, 'Account': account, 'Last Sale $': last_sale,
-                'Strategy': pos.get('strategy', node['strategy']), 'Held': True,
+                'Strategy': pos.get('strategy', node['strategy']), 'Held': True, 'Phase': phase,
                 'SL $': sl_price, 'PnL %': (now_price - pos['entry_price']) / pos['entry_price'] * 100,
                 '_node': node, '_pos': pos, '_sig': sig,
             })
