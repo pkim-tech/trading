@@ -42,7 +42,7 @@ import argparse
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--sim-db", default="./cache/trading_sim.db")
@@ -216,6 +216,58 @@ class SimShell(cmd.Cmd):
             print(f"  [research] {ticker} would BUY but mode={node.get('mode')} -- no alert")
             return
         A.notify_buy_signal(node, sig)
+
+    def do_pending(self, arg):
+        "pending -- show pending_buys rows (ticker, order_placed, reminder_count)"
+        rows = A.get_pending_buys()
+        if not rows:
+            print("  (none)")
+            return
+        for p in rows:
+            print(f"  {p['ticker']:6s} order_placed={bool(p['order_placed'])}  "
+                  f"reminder_count={p['reminder_count']}  signal_price=${p['signal_price']:.4f}")
+
+    def do_placed(self, arg):
+        "placed TICKER -- mark a pending trailing-buy order as placed (no position yet)"
+        ticker = arg.strip().upper()
+        if not ticker:
+            print("usage: placed TICKER")
+            return
+        if not any(p['ticker'] == ticker for p in A.get_pending_buys()):
+            print(f"  no pending buy for {ticker}")
+            return
+        A.mark_pending_buy_placed(ticker)
+        print(f"  {ticker}: order marked placed, waiting for fill (no position yet)")
+
+    def do_fill(self, arg):
+        "fill TICKER PRICE -- confirm the real fill price, opens the position"
+        parts = arg.split()
+        if len(parts) < 2:
+            print("usage: fill TICKER PRICE")
+            return
+        ticker, price = parts[0].upper(), float(parts[1])
+        pending = next((p for p in A.get_pending_buys() if p['ticker'] == ticker), None)
+        if pending is None:
+            print(f"  no pending buy for {ticker}")
+            return
+        node = pending['node']
+        signal_price = pending['signal_price']
+        signal_time = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
+        drift_pct = (price - signal_price) / signal_price * 100
+        shares = int(A._last_sale_recovery(ticker) // price)
+        A.open_position(node, signal_price, signal_time, price, datetime.now(), shares=shares)
+        A.clear_pending_buy(ticker)
+        print(f"  {ticker}: filled at ${price:.4f}  (drift: {drift_pct:+.2f}%)  {shares} shares")
+
+    def do_remind_buy(self, arg):
+        "remind_buy [--stale] -- run check_buy_reminders; --stale backdates all timers 20min first"
+        if arg.strip() == '--stale':
+            with A._conn() as c:
+                stale = (datetime.now() - timedelta(minutes=20)).strftime('%Y-%m-%d %H:%M:%S')
+                c.execute("UPDATE pending_buys SET last_reminder_at=?", (stale,))
+                c.commit()
+        A.check_buy_reminders()
+        self.do_pending('')
 
     def do_sell(self, arg):
         "sell TICKER [PRICE] [--poll] -- run the real sell-condition check for TICKER's open position"

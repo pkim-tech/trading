@@ -95,6 +95,7 @@ SOCKET_MODE     = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNEL)
 
 SLACK_CHANNEL_ID = ""
 SIM_MODE         = os.environ.get("SIM_MODE") == "1"
+SIM_SCENARIO     = os.environ.get("SIM_SCENARIO", "")
 # Interactive buttons/reminders require the process's own Socket Mode connection to be
 # the one Slack delivers the click to. The sim never starts a SocketModeHandler (only
 # run_loop() does), so if it rendered real buttons, a click would be delivered to
@@ -298,6 +299,7 @@ def ensure_tables():
                 node_json         TEXT NOT NULL,
                 signal_price      REAL NOT NULL,
                 signal_time       TEXT NOT NULL,
+                order_placed      INTEGER NOT NULL DEFAULT 0,
                 reminder_channel  TEXT,
                 reminder_ts       TEXT,
                 reminder_count    INTEGER NOT NULL DEFAULT 0,
@@ -305,6 +307,9 @@ def ensure_tables():
                 created_at        TEXT NOT NULL
             )
         """)
+        pb_cols = [r[1] for r in c.execute("PRAGMA table_info(pending_buys)")]
+        if 'order_placed' not in pb_cols:
+            c.execute("ALTER TABLE pending_buys ADD COLUMN order_placed INTEGER NOT NULL DEFAULT 0")
         c.commit()
 
 
@@ -523,6 +528,15 @@ def get_pending_buys():
 def clear_pending_buy(ticker):
     with _conn() as c:
         c.execute("DELETE FROM pending_buys WHERE ticker = ?", (ticker,))
+        c.commit()
+
+
+def mark_pending_buy_placed(ticker):
+    """Order confirmed resting at the broker -- stops the 'is it placed' nag, but
+    doesn't open a position (mirrors trail_state.order_placed on the sell side: a
+    placed order still needs a real fill before anything is actually held)."""
+    with _conn() as c:
+        c.execute("UPDATE pending_buys SET order_placed=1 WHERE ticker = ?", (ticker,))
         c.commit()
 
 
@@ -952,13 +966,17 @@ def _post_message(text, blocks=None):
     """Returns (channel, ts) when posted via the Socket Mode client (None, None
     otherwise) so callers can track a message for later reminder/supersede."""
     if SIM_MODE:
-        text = f"🧪 SIM — {text}"
+        scenario_suffix = f" ({SIM_SCENARIO})" if SIM_SCENARIO else ""
+        text = f"🧪 SIM{scenario_suffix} — {text}"
         if blocks:
-            blocks = [
-                {**b, "text": {**b["text"], "text": f"🧪 SIM — {b['text']['text']}"}}
-                if b.get("type") == "header" else b
-                for b in blocks
-            ]
+            # A dedicated marker block, not a rewrite of the first block's text --
+            # the prior approach only patched "header"-type blocks, so any message
+            # built from "section" blocks (most of them) silently shipped with no
+            # visible SIM tag at all, regardless of block composition.
+            scenario_str = f": {SIM_SCENARIO}" if SIM_SCENARIO else ""
+            header_marker = {"type": "context", "elements": [{"type": "mrkdwn", "text": f"🧪 *SIM MODE{scenario_str}*"}]}
+            footer_marker = {"type": "context", "elements": [{"type": "mrkdwn", "text": "🧪 *SIM MODE END*"}]}
+            blocks = [header_marker] + blocks + [footer_marker]
     if SOCKET_MODE:
         try:
             resp = bolt_app.client.chat_postMessage(channel=SLACK_CHANNEL, text=text, blocks=blocks)
@@ -1057,6 +1075,8 @@ def _build_buy_blocks(node, sig):
             "text": f"{entry_line}\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger){warning_line}"}},
     ]
 
+    trailing_buy = _is_trailing_buy(node)
+
     if INTERACTIVE:
         value = json.dumps({
             "type":         "buy",
@@ -1068,18 +1088,38 @@ def _build_buy_blocks(node, sig):
             "lower_band":   sig['lower_band'],
             "z_score":      z,
         })
-        blocks.append({
-            "type": "actions",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "Executed"},
-                 "style": "primary", "action_id": "buy_executed", "value": value},
-                {"type": "button", "text": {"type": "plain_text", "text": "Skipped"},
-                 "action_id": "buy_skipped", "value": value},
-            ],
-        })
+        if trailing_buy:
+            # No price ask -- the trailing-buy fill price isn't known at alert time
+            # (broker tracks the bounce-above-running-low entry itself). Opens the
+            # position immediately at the signal price so arm/SL/trail triggers are
+            # live right away; the real fill price (when known) only feeds a
+            # separate drag/drift stat later, it doesn't retroactively move triggers.
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "Trailing Buy Order Placed"},
+                     "style": "primary", "action_id": "trail_buy_order_placed", "value": value},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Skipped"},
+                     "action_id": "buy_skipped", "value": value},
+                ],
+            })
+        else:
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "Executed"},
+                     "style": "primary", "action_id": "buy_executed", "value": value},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Skipped"},
+                     "action_id": "buy_skipped", "value": value},
+                ],
+            })
+    elif trailing_buy:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "No interactive buttons — confirm the trailing buy order is placed in the terminal running the daemon (fill price isn't known yet)."}
+        ]})
     else:
         blocks.append({"type": "context", "elements": [
-            {"type": "mrkdwn", "text": "Reply with execution price when filled."}
+            {"type": "mrkdwn", "text": "No interactive buttons — type the execution price into the terminal running the daemon when filled."}
         ]})
 
     return blocks
@@ -1136,7 +1176,7 @@ def _build_sell_blocks(pos, reason, current_price, target_price):
         })
     else:
         blocks.append({"type": "context", "elements": [
-            {"type": "mrkdwn", "text": "Reply with exit price when filled."}
+            {"type": "mrkdwn", "text": "No interactive buttons — type the exit price into the terminal running the daemon when filled."}
         ]})
 
     return blocks
@@ -1165,6 +1205,96 @@ if SOCKET_MODE:
                 "close":  {"type": "plain_text", "text": "Cancel"},
                 "blocks": [_price_input_block()],
             },
+        )
+
+    @bolt_app.action("trail_buy_order_placed")
+    def handle_trail_buy_order_placed(ack, body, client):
+        """Order resting at the broker -- no position yet (broker tracks the
+        bounce-above-running-low entry itself, still no live state machine for
+        it). Just flips pending_buys.order_placed=True (stops the 'is it placed'
+        nag) and swaps to Filled/Cancelled buttons; open_position() only runs
+        once a real fill is separately confirmed via handle_trail_buy_filled."""
+        ack()
+        data    = json.loads(body['actions'][0]['value'])
+        channel = body['channel']['id']
+        ts      = body['message']['ts']
+        ticker  = data['node']['ticker']
+        mark_pending_buy_placed(ticker)
+        client.chat_update(
+            channel=channel, ts=ts,
+            text=f"BUY {ticker} — order placed, waiting for fill",
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn",
+                 "text": f"*{ticker}* — trailing buy order placed, waiting for fill"}},
+                {"type": "actions", "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "Filled"},
+                     "style": "primary", "action_id": "trail_buy_filled", "value": json.dumps(data)},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Cancelled"},
+                     "action_id": "trail_buy_cancelled", "value": json.dumps(data)},
+                ]},
+            ],
+        )
+
+    @bolt_app.action("trail_buy_filled")
+    def handle_trail_buy_filled(ack, body, client):
+        ack()
+        data    = json.loads(body['actions'][0]['value'])
+        channel = body['channel']['id']
+        ts      = body['message']['ts']
+        client.views_open(
+            trigger_id=body['trigger_id'],
+            view={
+                "type":             "modal",
+                "callback_id":      "trail_buy_fill_price_submit",
+                "private_metadata": json.dumps({"data": data, "channel": channel, "ts": ts}),
+                "title":  {"type": "plain_text", "text": "Fill Price"},
+                "submit": {"type": "plain_text", "text": "Confirm"},
+                "close":  {"type": "plain_text", "text": "Cancel"},
+                "blocks": [_price_input_block()],
+            },
+        )
+
+    @bolt_app.action("trail_buy_cancelled")
+    def handle_trail_buy_cancelled(ack, body, client):
+        ack()
+        data    = json.loads(body['actions'][0]['value'])
+        channel = body['channel']['id']
+        ts      = body['message']['ts']
+        ticker  = data['node']['ticker']
+        clear_pending_buy(ticker)
+        client.chat_update(
+            channel=channel, ts=ts,
+            text=f"BUY {ticker} — order cancelled",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"*BUY {ticker}* — trailing buy order cancelled, no position"}}],
+        )
+
+    @bolt_app.view("trail_buy_fill_price_submit")
+    def handle_trail_buy_fill_price(ack, body, client):
+        ack()
+        meta         = json.loads(body['view']['private_metadata'])
+        data         = meta['data']
+        channel      = meta['channel']
+        ts           = meta['ts']
+        node         = data['node']
+        signal_price = data['signal_price']
+        signal_time  = datetime.strptime(data['signal_time'], '%Y-%m-%d %H:%M:%S')
+        ticker       = node['ticker']
+
+        fill_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
+        drift_pct  = (fill_price - signal_price) / signal_price * 100
+        shares     = int(_last_sale_recovery(ticker) // fill_price)
+
+        open_position(node, signal_price, signal_time, fill_price, datetime.now(), shares=shares)
+        clear_pending_buy(ticker)
+
+        note = f"${fill_price:.4f}  (drift: {drift_pct:+.2f}%)  {shares} shares"
+        print(f"  Trailing buy filled via Slack: {ticker} at {note}")
+        client.chat_update(
+            channel=channel, ts=ts,
+            text=f"BUY {ticker} — Filled at {note}",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"*BUY {ticker}* — Filled at {note}"}}],
         )
 
     @bolt_app.action("buy_skipped")
@@ -1237,6 +1367,12 @@ if SOCKET_MODE:
         channel = body['channel']['id']
         ts      = body['message']['ts']
         ticker  = data['ticker']
+        position_id = data.get('position_id')
+        pos = next((p for p in get_open_positions() if p['id'] == position_id), None)
+        if pos:
+            state = dict(pos.get('trail_state') or {})
+            state.pop('exit_pending', None)
+            update_position_trail_state(pos['id'], state)
         client.chat_update(
             channel=channel, ts=ts,
             text=f"SELL {ticker} — Skipped (position kept open)",
@@ -1330,13 +1466,33 @@ def notify_buy_signal(node, sig):
         _build_buy_blocks(node, sig),
     )
 
+    # Tracked regardless of INTERACTIVE -- a trailing-buy order is still pending
+    # fill confirmation even in SIM_MODE or webhook-only (non-socket) runs, where
+    # there's no button to click but the reminder loop should still nag.
+    if _is_trailing_buy(node):
+        add_pending_buy(node, sig, channel, ts)
+
     if INTERACTIVE:
-        if _is_trailing_buy(node):
-            add_pending_buy(node, sig, channel, ts)
         chart = _chart_buy(node, sig)
         if chart:
             _upload_chart(chart, f"{ticker}_buy.png", f"BUY — {ticker}  z={z:.2f}")
         print("  Waiting for Slack response (Executed / Skipped).")
+        return
+
+    if _is_trailing_buy(node):
+        print("\nTrailing buy order placed at the broker? No position opens yet -- "
+              "report the real fill separately once it happens. (y/n): ", end='', flush=True)
+        try:
+            resp = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            resp = ''
+        if resp == 'y':
+            mark_pending_buy_placed(ticker)
+            print(f"  {ticker} order marked placed — no position yet, waiting for fill.")
+            _post_message(f"{ticker} trailing buy order placed, waiting for fill.")
+        else:
+            clear_pending_buy(ticker)
+            print("  Skipped.")
         return
 
     print("\nDid you execute? Enter price (or Enter to skip): ", end='', flush=True)
@@ -1351,12 +1507,14 @@ def notify_buy_signal(node, sig):
             drift_pct  = (exec_price - price) / price * 100
             now        = datetime.now()
             open_position(node, price, bar_time, exec_price, now)
+            clear_pending_buy(ticker)
             note = f"Entered at ${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
             print(f"  Position opened. {note}")
             _post_message(f"{ticker} position opened: {note}")
         except ValueError:
             print("  Invalid price — position not opened.")
     else:
+        clear_pending_buy(ticker)
         print("  Skipped.")
 
 
@@ -1398,10 +1556,22 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     print(f"  Entered: {entry_time}")
     print(sep)
 
-    _post_message(
+    channel, ts = _post_message(
         f"SELL SIGNAL — {ticker}  {reason_labels[reason]}  ${current_price:.4f}  ({pct:+.2f}%)",
         _build_sell_blocks(pos, reason, current_price, target_price),
     )
+
+    # Tracks the exit as unresolved until Exited/Skipped -- unlike a placed trailing-buy
+    # (waiting on a broker fill we can't detect), a stalled SELL confirmation means an
+    # already-open position with real capital sitting unmanaged, arguably more urgent to
+    # nag about than the buy side.
+    state = dict(pos.get('trail_state') or {})
+    state['exit_pending'] = {
+        'reason': reason, 'current_price': current_price, 'target_price': target_price,
+        'reminder_channel': channel, 'reminder_ts': ts, 'reminder_count': 0,
+        'last_reminder_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    update_position_trail_state(pos['id'], state)
 
     if INTERACTIVE:
         chart = _chart_sell(pos, current_price)
@@ -1429,6 +1599,9 @@ def notify_sell_signal(pos, reason, current_price, target_price):
         except ValueError:
             print("  Invalid price — position kept open.")
     else:
+        state = dict(pos.get('trail_state') or {})
+        state.pop('exit_pending', None)
+        update_position_trail_state(pos['id'], state)
         print("  Skipped — position kept open.")
 
 
@@ -1523,8 +1696,6 @@ def check_trailing_reminders(open_positions):
     """Nags every TRAIL_REMINDER_MINUTES until the trailing-stop order is confirmed
     placed -- a single one-time alert is too easy to miss, and an unplaced trailing
     stop between polls is a real risk if price moves fast."""
-    if not INTERACTIVE:
-        return
     now = datetime.now()
     for pos in open_positions:
         state = pos.get('trail_state') or {}
@@ -1542,37 +1713,115 @@ def check_trailing_reminders(open_positions):
         _supersede_message(state.get('reminder_channel'), state.get('reminder_ts'), pos['ticker'])
         reminder_num = state.get('reminder_count', 0) + 1
         blocks = _trailing_order_blocks(pos, cp, reminder_num=reminder_num)
-        try:
-            resp = bolt_app.client.chat_postMessage(
-                channel=SLACK_CHANNEL, text=f"{pos['ticker']} trailing order — still pending (reminder #{reminder_num})",
-                blocks=blocks)
-            new_state = dict(state)
-            new_state['reminder_channel'] = resp['channel']
-            new_state['reminder_ts']      = resp['ts']
-            new_state['reminder_count']   = reminder_num
-            new_state['last_reminder_at'] = now.strftime('%Y-%m-%d %H:%M:%S')
-            update_position_trail_state(pos['id'], new_state)
-        except Exception as e:
-            print(f"  [slack error] {e}")
+        channel, ts = _post_message(
+            f"{pos['ticker']} trailing order — still pending (reminder #{reminder_num})", blocks=blocks)
+        new_state = dict(state)
+        new_state['reminder_channel'] = channel
+        new_state['reminder_ts']      = ts
+        new_state['reminder_count']   = reminder_num
+        new_state['last_reminder_at'] = now.strftime('%Y-%m-%d %H:%M:%S')
+        update_position_trail_state(pos['id'], new_state)
 
 
 BUY_REMINDER_MINUTES = 15
 
 
+def _trailing_buy_status(pending):
+    """Best-effort live approximation of the backtest's waiting-state bounce check
+    (_simulate_trail_both's running_low/buy_trigger) -- tracks the running low across
+    hourly bars since the signal fired and checks whether price has already bounced
+    back up by trail_buy_pct%. Only as accurate as the hourly cache (no true intrabar
+    low live, same caveat as compute_buy_signal) -- a reasonable signal for reminder
+    wording, not a substitute for the real live state machine (still unimplemented,
+    tracked in docs/backlog_cache.md)."""
+    node = pending['node']
+    trail_buy_pct = (node.get('trail_buy_pct') or 0) / 100.0
+    df_hourly, _ = _load_cache(pending['ticker'])
+    if df_hourly is None or not trail_buy_pct:
+        return None, None
+    signal_time = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
+    bars = df_hourly[df_hourly.index >= signal_time]
+    if bars.empty:
+        return False, None
+    running_low = float(bars['Low'].iloc[0])
+    trigger = running_low * (1 + trail_buy_pct)
+    met = False
+    for _, bar in bars.iterrows():
+        if bar['Low'] < running_low:
+            running_low = float(bar['Low'])
+            trigger = running_low * (1 + trail_buy_pct)
+        if bar['High'] >= trigger:
+            met = True
+            break
+    return met, trigger
+
+
 def _pending_buy_blocks(pending, reminder_num):
-    """Mirrors _trailing_order_blocks for the buy side -- a trailing-buy order
-    placed at the broker has no live fill confirmation, so this nags the same
-    way the sell-side trailing-stop reminder does, escalating to a market-order
-    suggestion instead of leaving a stalled entry silently unconfirmed."""
+    """Mirrors _trailing_order_blocks for the buy side. Two distinct nag phases,
+    since order_placed alone isn't resolution -- unlike the sell side (where a
+    placed trailing-stop needs no further confirmation), a placed trailing-buy
+    still needs a real Filled/Skip confirmation, because there's no way to detect
+    a fill live -- we can only estimate whether it *should* have filled by now
+    (_trailing_buy_status) and prompt, never assume it silently."""
     node    = pending['node']
     ticker  = pending['ticker']
     account = node.get('account') or 'unmapped'
+    met, trigger = _trailing_buy_status(pending)
+
+    if pending['order_placed']:
+        header = f"⚠️ *{ticker}* — FILL NOT CONFIRMED (reminder #{reminder_num})"
+        if met:
+            action_text = (
+                f"Trailing buy trigger (bounce off low, `${trigger:.2f}`) already met — this should "
+                f"have filled by now. Please confirm: Filled, or Skip if it never took and you're "
+                f"converting to a market order instead."
+            )
+        else:
+            action_text = (
+                f"Trailing buy trigger not yet met (needs a `{node.get('trail_buy_pct', 0):g}%` bounce "
+                f"off the running low) — likely still resting, no urgency yet. Confirm Filled once it "
+                f"executes, or Skip to cancel."
+            )
+        text = f"{header}\ntrigger `${pending['signal_price']:.2f}`  |  `{account}`\n{action_text}"
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+        if INTERACTIVE:
+            value = json.dumps({
+                "node": node, "signal_price": pending['signal_price'], "signal_time": pending['signal_time'],
+            })
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "Filled"},
+                     "style": "primary", "action_id": "trail_buy_filled", "value": value},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Skipped"},
+                     "action_id": "buy_skipped", "value": value},
+                ],
+            })
+        return blocks
+
+    if met:
+        action_text = (
+            f"Trailing buy trigger (bounce off low, `${trigger:.2f}`) already met — order likely "
+            f"should have filled. Check Schwab — if it hasn't taken, cancel and submit a *market* "
+            f"order instead, or Skip if the setup no longer applies."
+        )
+    elif met is False:
+        action_text = (
+            f"Trailing buy trigger not yet met (needs a `{node.get('trail_buy_pct', 0):g}%` bounce "
+            f"off the running low, currently `${trigger:.2f}`) — wider trail% naturally takes longer, "
+            f"no urgency yet. Confirm the trailing buy order is resting at the broker, or Skip if the "
+            f"setup no longer applies."
+        )
+    else:
+        action_text = (
+            f"Trailing buy order not confirmed filled. Check Schwab — if it hasn't taken, "
+            f"consider canceling and submitting a *market* order instead to match the strategy's "
+            f"expected entry timing, or Skip if the setup no longer applies."
+        )
     text = (
         f"⚠️ *{ticker}* — BUY STILL PENDING (reminder #{reminder_num})\n"
         f"trigger `${pending['signal_price']:.2f}`  |  `{account}`\n"
-        f"Trailing buy order not confirmed filled. Check Schwab — if it hasn't taken, "
-        f"consider canceling and submitting a *market* order instead to match the strategy's "
-        f"expected entry timing, or Skip if the setup no longer applies."
+        f"{action_text}"
     )
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
     if INTERACTIVE:
@@ -1582,8 +1831,8 @@ def _pending_buy_blocks(pending, reminder_num):
         blocks.append({
             "type": "actions",
             "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "Executed"},
-                 "style": "primary", "action_id": "buy_executed", "value": value},
+                {"type": "button", "text": {"type": "plain_text", "text": "Trailing Buy Order Placed"},
+                 "style": "primary", "action_id": "trail_buy_order_placed", "value": value},
                 {"type": "button", "text": {"type": "plain_text", "text": "Skipped"},
                  "action_id": "buy_skipped", "value": value},
             ],
@@ -1592,12 +1841,15 @@ def _pending_buy_blocks(pending, reminder_num):
 
 
 def check_buy_reminders():
-    """Nags every BUY_REMINDER_MINUTES until a pending trailing-buy order is
-    confirmed Executed or Skipped -- without this, a stalled trailing-buy at the
-    broker is invisible until the user happens to remember to check (the gap
-    flagged in docs/operational_limits.md's TrailingBoth lifecycle table, row 3)."""
-    if not INTERACTIVE:
-        return
+    """Nags every BUY_REMINDER_MINUTES until a trailing-buy is fully resolved
+    (Filled or Skipped) -- without this, a stalled trailing-buy at the broker is
+    invisible until the user happens to remember to check (the gap flagged in
+    docs/operational_limits.md's TrailingBoth lifecycle table, row 3). Unlike the
+    sell side's order_placed (which needs no further confirmation once placed),
+    the buy side keeps nagging after order_placed=True too -- there's no way to
+    detect a live fill, so a placed-but-unconfirmed order still needs a real
+    Filled/Skip answer, never silently assumed (_pending_buy_blocks switches
+    wording/buttons for this phase)."""
     now = datetime.now()
     for pending in get_pending_buys():
         last_at = datetime.strptime(pending['last_reminder_at'], '%Y-%m-%d %H:%M:%S')
@@ -1606,13 +1858,9 @@ def check_buy_reminders():
         _supersede_message(pending['reminder_channel'], pending['reminder_ts'], pending['ticker'])
         reminder_num = pending['reminder_count'] + 1
         blocks = _pending_buy_blocks(pending, reminder_num)
-        try:
-            resp = bolt_app.client.chat_postMessage(
-                channel=SLACK_CHANNEL, text=f"{pending['ticker']} trailing buy — still pending (reminder #{reminder_num})",
-                blocks=blocks)
-            update_pending_buy_reminder(pending['id'], resp['channel'], resp['ts'], reminder_num)
-        except Exception as e:
-            print(f"  [slack error] {e}")
+        channel, ts = _post_message(
+            f"{pending['ticker']} trailing buy — still pending (reminder #{reminder_num})", blocks=blocks)
+        update_pending_buy_reminder(pending['id'], channel, ts, reminder_num)
 
 
 # ---------------------------------------------------------------------------
@@ -1642,7 +1890,9 @@ def _proximity_emoji(pct_away):
 def _ticker_block(row):
     """Renders one row from build_reference_table as mrkdwn prose (wraps naturally
     on mobile) instead of a fixed-width table column (unreadable on iPhone)."""
-    ticker, version, account = row['Ticker'], row.get('Version') or '', row.get('Account') or ''
+    ticker, version = row['Ticker'], row.get('Version') or ''
+    account = 'bro' if (row.get('Account') or '').lower() == 'brokerage' else (row.get('Account') or '')
+    account_str = f" — `{account}`" if account else ''
     proximity = row.get('Proximity')
 
     if row['Next Action'] == 'NO_DATA':
@@ -1654,20 +1904,33 @@ def _ticker_block(row):
 
     if row['Held']:
         pnl = row.get('PnL %')
+        sl = row.get('SL $')
+        sl_str = f"  sl `${sl:.2f}`" if sl is not None else "  sl `cancelled (trail order live)`"
+        z = row.get('Z')
+        z_str = f"{z:+.2f}" if z is not None else '?'
+        tb, arm, ts = row.get('TrailBuy%'), row.get('Arm%'), row.get('TrailSell%')
+        pct_str = lambda v: f"{v:g}%" if v is not None else '?'
+        last_sale = row.get('Last Sale $')
+        last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
         text = (
-            f"{emoji} *{ticker}* `{version}` — HELD {row['Hold']} — `{account}`\n"
-            f"now `${now:.2f}` (P&L {pnl:+.1f}%)  trigger `${trigger:.2f}` ({proximity:+.1f}%)\n"
-            f"→ _{row['Next Action']}_  sl `${row['SL $']:.2f}`"
+            f"{emoji} *{ticker}* `{version}` — {row['Hold']}{account_str}{last_sale_str}\n"
+            f"now `${now:.2f}` {pnl:+.1f}%  trig `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"→ _{row['Next Action']}_{sl_str}\n"
+            f"z `{z_str}`  tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
         )
     else:
         overnight = row.get('Overnight %')
-        data_date = row.get('Data Date')
-        data_str = pd.Timestamp(data_date).strftime('%m/%d') if data_date is not None else '?'
-        _, action_desc = _STRATEGY_LABELS.get(row['Strategy'], (row['Strategy'], ''))
+        tb, arm, ts = row.get('TrailBuy%'), row.get('Arm%'), row.get('TrailSell%')
+        pct_str = lambda v: f"{v:g}%" if v is not None else '?'
+        last_sale = row.get('Last Sale $')
+        last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
+        z_trig = row.get('Z Trigger')
+        z_trig_str = f"  z-trig `{z_trig:g}`" if z_trig is not None else ''
         text = (
-            f"{emoji} *{ticker}* `{version}` — `{account}`\n"
-            f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  trigger `${trigger:.2f}` ({proximity:+.1f}%)\n"
-            f"→ _{action_desc}_  arm `${row['Arm $']:.2f}`  sl `${row['SL $']:.2f}`  data `{data_str}`"
+            f"{emoji} *{ticker}* `{version}`{account_str}{last_sale_str}\n"
+            f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  trig `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"→ _{row['Next Action']}_  arm `${row['Arm $']:.2f}`  sl `${row['SL $']:.2f}`\n"
+            f"tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`{z_trig_str}"
         )
     return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
 
@@ -1748,7 +2011,7 @@ def build_reference_table(watchlist):
             trail_buy_pct = node.get('trail_buy_pct')
             rows.append({
                 'Ticker': ticker, 'Hold': '',
-                'Next Action': 'Waiting Trigger Event',
+                'Next Action': 'Waiting Buy Trigger',
                 'Next Trigger $': trigger, 'Now': now_price,
                 'Proximity': (now_price - trigger) / trigger * 100,
                 'Version': node.get('version'), 'Alpha': alpha, 'Z': sig['z_score'],
@@ -1770,7 +2033,11 @@ def build_reference_table(watchlist):
             arm_pct = pos.get('arm_sell_pct')
             trail_sell_pct = pos.get('trail_sell_pct')
             pos_schwab_sl_pct = pos['stop_loss'] + 1
-            sl_price = pos['entry_price'] * (1 - pos_schwab_sl_pct / 100)
+            # Broker only allows one resting sell-all order per position -- once the
+            # trailing-sell order is actually placed (order_placed=True), it replaces
+            # the catastrophic stop, so the entry-based SL price is no longer live.
+            sl_price = None if trail_state.get('order_placed') else \
+                pos['entry_price'] * (1 - pos_schwab_sl_pct / 100)
 
             if trail_state.get('trailing'):
                 peak = trail_state.get('peak', pos['entry_price'])
@@ -1905,10 +2172,12 @@ def send_reference_report(watchlist):
 # Signal windows in ET: 10:25-10:40 (9:30 bar close) and 15:25-15:40 (14:30 bar close)
 _SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]
 
-# Reference report fires once at each of these times daily -- before the open and
-# before the afternoon signal window, so a fresh full-watchlist view lands ahead
-# of the two moments an action is most likely to be required.
-_REFERENCE_TIMES = [(9, 20), (15, 20)]
+# Reference report fires once at each of these times daily -- early (7am) so
+# there's a report before the day even starts, before the open, and before the
+# afternoon signal window, so a fresh full-watchlist view lands ahead of the
+# moments an action is most likely to be required. Also fires unconditionally
+# on daemon startup/restart, independent of this schedule.
+_REFERENCE_TIMES = [(7, 0), (9, 20), (15, 20)]
 
 def _in_buy_window(now):
     t = (now.hour, now.minute)
