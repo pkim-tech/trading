@@ -534,9 +534,18 @@ def clear_pending_buy(ticker):
 def mark_pending_buy_placed(ticker):
     """Order confirmed resting at the broker -- stops the 'is it placed' nag, but
     doesn't open a position (mirrors trail_state.order_placed on the sell side: a
-    placed order still needs a real fill before anything is actually held)."""
+    placed order still needs a real fill before anything is actually held).
+    Resets reminder_count/last_reminder_at so the fill-confirmation phase gets
+    its own reminder numbering (#1, #2, ...) instead of continuing the placement
+    phase's count -- the two are different questions ('is it placed?' vs 'did it
+    fill?') and sharing one counter across them reads as a lie about how many
+    times you've actually been asked about the fill."""
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with _conn() as c:
-        c.execute("UPDATE pending_buys SET order_placed=1 WHERE ticker = ?", (ticker,))
+        c.execute(
+            "UPDATE pending_buys SET order_placed=1, reminder_count=0, last_reminder_at=? WHERE ticker = ?",
+            (now_str, ticker),
+        )
         c.commit()
 
 
@@ -1593,7 +1602,7 @@ def notify_sell_signal(pos, reason, current_price, target_price):
             actual_pnl = (exit_price - ep) / ep * 100
             note = f"Exited at ${exit_price:.4f}  (signal drift: {drift_pct:+.2f}%  P&L: {actual_pnl:+.2f}%)"
             close_position(pos['id'], exit_signal_price=current_price, exit_price=exit_price,
-                           exit_time=datetime.now(), exit_reason='MANUAL')
+                           exit_time=datetime.now(), exit_reason=reason)
             print(f"  Position closed. {note}")
             _post_message(f"{ticker} position closed: {note}")
         except ValueError:
@@ -1723,6 +1732,82 @@ def check_trailing_reminders(open_positions):
         update_position_trail_state(pos['id'], new_state)
 
 
+EXIT_REMINDER_MINUTES = 15
+
+
+def _exit_pending_blocks(pos, exit_pending, reminder_num):
+    """Mirrors _trailing_order_blocks for the sell side. A stalled SELL
+    confirmation means an already-open position with real capital sitting
+    unmanaged -- arguably more urgent than a stalled BUY, so this reuses the
+    same 'Exited'/'Skipped' buttons (sell_exited/sell_skipped) as the original
+    alert rather than inventing new action_ids."""
+    ticker        = pos['ticker']
+    ep            = pos['entry_price']
+    reason        = exit_pending['reason']
+    current_price = exit_pending['current_price']
+    target_price  = exit_pending['target_price']
+    pct           = (current_price - ep) / ep * 100
+    reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT', 'TRAIL': 'TRAILING STOP'}
+
+    text = (
+        f"⚠️ *{ticker}* — EXIT NOT CONFIRMED (reminder #{reminder_num})\n"
+        f"{reason_labels[reason]}  |  entry `${ep:.2f}`  |  signal `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
+        f"Position may still be open and unmanaged at the broker. Confirm Exited with the real fill "
+        f"price, or Skip if it turns out the exit condition no longer applies."
+    )
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+    if INTERACTIVE:
+        value = json.dumps({
+            "type": "sell", "position_id": pos['id'], "ticker": ticker,
+            "current_price": current_price, "entry_price": ep, "reason": reason,
+        })
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Exited"},
+                 "style": "primary", "action_id": "sell_exited", "value": value},
+                {"type": "button", "text": {"type": "plain_text", "text": "Skipped"},
+                 "action_id": "sell_skipped", "value": value},
+            ],
+        })
+    else:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "No interactive buttons — type the exit price into the terminal running the daemon when filled."}
+        ]})
+    return blocks
+
+
+def check_exit_reminders(open_positions):
+    """Nags every EXIT_REMINDER_MINUTES until a fired SELL signal is confirmed
+    Exited or Skipped ('4r' in the buy/sell lifecycle numbering) -- mirrors
+    check_trailing_reminders' supersede-not-edit-in-place pattern. Without this,
+    trail_state.exit_pending is written by notify_sell_signal and cleared on
+    Exited/Skipped, but nothing polls it -- a missed SELL alert would sit
+    silently forever, unlike every other stage's yellow state."""
+    now = datetime.now()
+    for pos in open_positions:
+        state = pos.get('trail_state') or {}
+        exit_pending = state.get('exit_pending')
+        if not exit_pending:
+            continue
+        last_at = datetime.strptime(exit_pending['last_reminder_at'], '%Y-%m-%d %H:%M:%S')
+        if (now - last_at).total_seconds() < EXIT_REMINDER_MINUTES * 60:
+            continue
+        _supersede_message(exit_pending.get('reminder_channel'), exit_pending.get('reminder_ts'), pos['ticker'])
+        reminder_num = exit_pending.get('reminder_count', 0) + 1
+        blocks = _exit_pending_blocks(pos, exit_pending, reminder_num)
+        channel, ts = _post_message(
+            f"{pos['ticker']} exit — still unconfirmed (reminder #{reminder_num})", blocks=blocks)
+        new_state = dict(state)
+        new_exit_pending = dict(exit_pending)
+        new_exit_pending['reminder_channel'] = channel
+        new_exit_pending['reminder_ts']      = ts
+        new_exit_pending['reminder_count']   = reminder_num
+        new_exit_pending['last_reminder_at'] = now.strftime('%Y-%m-%d %H:%M:%S')
+        new_state['exit_pending'] = new_exit_pending
+        update_position_trail_state(pos['id'], new_state)
+
+
 BUY_REMINDER_MINUTES = 15
 
 
@@ -1742,7 +1827,7 @@ def _trailing_buy_status(pending):
     signal_time = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
     bars = df_hourly[df_hourly.index >= signal_time]
     if bars.empty:
-        return False, None
+        return None, None
     running_low = float(bars['Low'].iloc[0])
     trigger = running_low * (1 + trail_buy_pct)
     met = False
@@ -1855,6 +1940,15 @@ def check_buy_reminders():
         last_at = datetime.strptime(pending['last_reminder_at'], '%Y-%m-%d %H:%M:%S')
         if (now - last_at).total_seconds() < BUY_REMINDER_MINUTES * 60:
             continue
+        if pending['order_placed']:
+            # Fill-confirmation phase: nagging every 15min regardless of whether a fill
+            # is even plausible yet is noisy (e.g. KORU's wide 12% trail_buy_pct can
+            # genuinely take a while). Only start nagging once the bounce trigger has
+            # plausibly been hit; met=None (unknown -- e.g. stale/missing cache) still
+            # nags, erring toward not silently dropping a real stalled fill.
+            met, _ = _trailing_buy_status(pending)
+            if met is False:
+                continue
         _supersede_message(pending['reminder_channel'], pending['reminder_ts'], pending['ticker'])
         reminder_num = pending['reminder_count'] + 1
         blocks = _pending_buy_blocks(pending, reminder_num)
@@ -1898,7 +1992,6 @@ def _ticker_block(row):
     if row['Next Action'] == 'NO_DATA':
         return {"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}}
 
-    emoji = _proximity_emoji(proximity) if isinstance(proximity, (int, float)) else '⚪'
     phase = row.get('Phase') or ''
     phase_str = f"{phase} " if phase else ''
     now = row['Now']
@@ -1915,7 +2008,7 @@ def _ticker_block(row):
         last_sale = row.get('Last Sale $')
         last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
         text = (
-            f"{phase_str}{emoji} *{ticker}* `{version}` — {row['Hold']}{account_str}{last_sale_str}\n"
+            f"{phase_str}*{ticker}* `{version}` — {row['Hold']}{account_str}{last_sale_str}\n"
             f"now `${now:.2f}` {pnl:+.1f}%  trig `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_{sl_str}\n"
             f"z `{z_str}`  tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
@@ -1929,7 +2022,7 @@ def _ticker_block(row):
         z_trig = row.get('Z Trigger')
         z_trig_str = f"  z-trig `{z_trig:g}`" if z_trig is not None else ''
         text = (
-            f"{phase_str}{emoji} *{ticker}* `{version}`{account_str}{last_sale_str}\n"
+            f"{phase_str}*{ticker}* `{version}`{account_str}{last_sale_str}\n"
             f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  trig `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_  arm `${row['Arm $']:.2f}`  sl `${row['SL $']:.2f}`\n"
             f"tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`{z_trig_str}"
@@ -1978,16 +2071,29 @@ def _last_sale_recovery(ticker):
     return 50_000
 
 
+_PHASE_GREY, _PHASE_YELLOW, _PHASE_GREEN = '⚪', '🟡', '🟢'
+
+
 def _phase_emoji(pos, pending_buy):
-    """Single glance-able lifecycle ball: yellow = an order/confirmation is
-    outstanding (placed-but-unfilled, or armed-but-not-yet-sold), green = filled
-    and resting with nothing outstanding, gray = idle, nothing in flight."""
+    """Four-bubble lifecycle strip, left to right: Signal / Filled / Armed / Sold.
+    Each bubble is gray (not reached), yellow (in progress, awaiting confirmation),
+    or green (confirmed complete) -- a position can be filled without being armed,
+    so those get separate bubbles rather than one combined ball."""
     if pos is None:
-        return '🟡' if pending_buy is not None else ''
+        if pending_buy is None:
+            return _PHASE_GREY * 4
+        order_placed = pending_buy.get('order_placed')
+        signal = _PHASE_GREEN if order_placed else _PHASE_YELLOW
+        fill = _PHASE_YELLOW if order_placed else _PHASE_GREY
+        return f"{signal}{fill}{_PHASE_GREY}{_PHASE_GREY}"
+
     trail_state = pos.get('trail_state') or {}
-    if trail_state.get('exit_pending') or trail_state.get('trailing'):
-        return '🟡'
-    return '🟢'
+    if trail_state.get('trailing'):
+        armed = _PHASE_GREEN if trail_state.get('order_placed') else _PHASE_YELLOW
+    else:
+        armed = _PHASE_GREY
+    sold = _PHASE_YELLOW if trail_state.get('exit_pending') else _PHASE_GREY
+    return f"{_PHASE_GREEN}{_PHASE_GREEN}{armed}{sold}"
 
 
 def build_reference_table(watchlist):
@@ -2330,6 +2436,7 @@ def run_loop(tickers: set = None):
                 sell_alerted.add((pos['id'], last_bar_ts))
 
         check_trailing_reminders(open_positions)
+        check_exit_reminders(open_positions)
         check_buy_reminders()
 
         if not watchlist:
