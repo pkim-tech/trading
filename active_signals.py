@@ -2264,13 +2264,6 @@ def send_reference_report(watchlist):
             if chart:
                 _upload_chart(chart, f"{r['Ticker']}_morning.png", f"{r['Ticker']} `{r['Version']}`  z={r['Z']:+.2f}")
 
-    # Reconfirm reminder for hot buy candidates
-    hot = [r['Ticker'] for r in flat_rows if isinstance(r.get('Proximity'), (int, float)) and r['Proximity'] < 5]
-    if hot:
-        blocks.append({"type": "divider"})
-        blocks.append({"type": "section", "text": {"type": "mrkdwn",
-            "text": f"⏰ *Reconfirm limit order:* {', '.join(hot)} — signal window 10:25–10:40 AM and 3:25–3:40 PM ET"}})
-
     # Console output
     print(f"Morning Report — {now_str}")
     if held_rows:
