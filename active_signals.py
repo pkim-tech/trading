@@ -1026,6 +1026,23 @@ def _price_input_block():
     }
 
 
+def _shares_input_block(initial=None):
+    element = {
+        "type":               "number_input",
+        "is_decimal_allowed": False,
+        "action_id":          "shares_input",
+        "placeholder":        {"type": "plain_text", "text": "e.g. 300"},
+    }
+    if initial is not None:
+        element["initial_value"] = str(int(initial))
+    return {
+        "type":     "input",
+        "block_id": "shares_block",
+        "label":    {"type": "plain_text", "text": "Shares"},
+        "element":  element,
+    }
+
+
 def _build_buy_blocks(node, sig):
     ticker    = sig['ticker']
     price     = sig['current_price']
@@ -1440,6 +1457,96 @@ if SOCKET_MODE:
             blocks=[{"type": "section", "text": {"type": "mrkdwn",
                      "text": f"*SELL {ticker}* — Exited at {note}"}}],
         )
+
+    @bolt_app.action("manual_open")
+    def handle_manual_open(ack, body, client):
+        """Correction path for a misclick (e.g. hit Skipped after a real fill) --
+        opens a position directly from the reference report, price-entry modal
+        doubling as the confirmation step."""
+        ack()
+        data   = json.loads(body['actions'][0]['value'])
+        ticker = data['node']['ticker']
+        current_price, _ = _current_price(ticker)
+        suggested_shares = int(_last_sale_recovery(ticker) // current_price) if current_price else None
+        client.views_open(
+            trigger_id=body['trigger_id'],
+            view={
+                "type":             "modal",
+                "callback_id":      "manual_open_price_submit",
+                "private_metadata": json.dumps(data),
+                "title":  {"type": "plain_text", "text": "Manual Open"},
+                "submit": {"type": "plain_text", "text": "Confirm"},
+                "close":  {"type": "plain_text", "text": "Cancel"},
+                "blocks": [_price_input_block(), _shares_input_block(suggested_shares)],
+            },
+        )
+
+    @bolt_app.view("manual_open_price_submit")
+    def handle_manual_open_price(ack, body, client):
+        ack()
+        data   = json.loads(body['view']['private_metadata'])
+        node   = data['node']
+        ticker = node['ticker']
+
+        price  = float(body['view']['state']['values']['price_block']['price_input']['value'])
+        shares = int(body['view']['state']['values']['shares_block']['shares_input']['value'])
+        now    = datetime.now()
+
+        open_position(node, price, now, price, now, shares=shares)
+
+        note = f"${price:.4f}  {shares} shares"
+        print(f"  Position manually opened via Slack: {ticker} at {note}")
+        _post_message(f"MANUAL OPEN {ticker} — {note}", blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                      "text": f"*MANUAL OPEN {ticker}* — {note}"}}])
+
+    @bolt_app.action("manual_close")
+    def handle_manual_close(ack, body, client):
+        """Correction path for a misclick (e.g. hit Skipped after a real exit) --
+        closes a position directly from the reference report, price-entry modal
+        doubling as the confirmation step."""
+        ack()
+        data = json.loads(body['actions'][0]['value'])
+        client.views_open(
+            trigger_id=body['trigger_id'],
+            view={
+                "type":             "modal",
+                "callback_id":      "manual_close_price_submit",
+                "private_metadata": json.dumps(data),
+                "title":  {"type": "plain_text", "text": "Manual Close"},
+                "submit": {"type": "plain_text", "text": "Confirm"},
+                "close":  {"type": "plain_text", "text": "Cancel"},
+                "blocks": [_price_input_block()],
+            },
+        )
+
+    @bolt_app.view("manual_close_price_submit")
+    def handle_manual_close_price(ack, body, client):
+        ack()
+        data        = json.loads(body['view']['private_metadata'])
+        position_id = data['position_id']
+        ticker      = data['ticker']
+        entry_price = data['entry_price']
+
+        exit_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
+        actual_pnl = (exit_price - entry_price) / entry_price * 100
+        now        = datetime.now()
+
+        close_position(position_id,
+                       exit_signal_price=exit_price, exit_price=exit_price,
+                       exit_time=now, exit_reason='MANUAL')
+
+        note = f"${exit_price:.4f}  (P&L: {actual_pnl:+.2f}%)"
+        print(f"  Position manually closed via Slack: {ticker} at {note}")
+        _post_message(f"MANUAL CLOSE {ticker} — {note}", blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                      "text": f"*MANUAL CLOSE {ticker}* — {note}"}}])
+
+    @bolt_app.action("resend_ref_table")
+    def handle_resend_ref_table(ack, body, client):
+        """On-demand refresh -- posts a brand new reference report rather than
+        editing the clicked one in place, so the old report (and its now-stale
+        manual-open/close buttons) stays as a historical record."""
+        ack()
+        send_reference_report(get_watchlist())
 
 
 # ---------------------------------------------------------------------------
@@ -1983,14 +2090,15 @@ def _proximity_emoji(pct_away):
 
 def _ticker_block(row):
     """Renders one row from build_reference_table as mrkdwn prose (wraps naturally
-    on mobile) instead of a fixed-width table column (unreadable on iPhone)."""
+    on mobile) instead of a fixed-width table column (unreadable on iPhone).
+    Returns a list of blocks (section + optional manual-correction actions)."""
     ticker, version = row['Ticker'], row.get('Version') or ''
     account = 'bro' if (row.get('Account') or '').lower() == 'brokerage' else (row.get('Account') or '')
     account_str = f" — `{account}`" if account else ''
     proximity = row.get('Proximity')
 
     if row['Next Action'] == 'NO_DATA':
-        return {"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}}
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}}]
 
     phase = row.get('Phase') or ''
     phase_str = f"{phase} " if phase else ''
@@ -2027,7 +2135,29 @@ def _ticker_block(row):
             f"→ _{row['Next Action']}_  arm `${row['Arm $']:.2f}`  sl `${row['SL $']:.2f}`\n"
             f"tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`{z_trig_str}"
         )
-    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+    if INTERACTIVE:
+        node = row.get('_node')
+        if row['Held']:
+            pos = row.get('_pos')
+            if pos:
+                value = json.dumps({"position_id": pos['id'], "ticker": ticker, "entry_price": pos['entry_price']})
+                blocks.append({"type": "actions", "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": f"Manually Close {ticker}"},
+                     "action_id": "manual_close", "value": value},
+                ]})
+        elif node:
+            node_fields = {k: node.get(k) for k in ('ticker', 'strategy', 'version', 'window',
+                                                      'take_profit', 'stop_loss', 'max_hold_hours',
+                                                      'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct')}
+            value = json.dumps({"node": node_fields})
+            blocks.append({"type": "actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": f"Manually Open {ticker}"},
+                 "action_id": "manual_open", "value": value},
+            ]})
+
+    return blocks
 
 
 def _send_window_alert(label, watchlist):
@@ -2044,7 +2174,8 @@ def _send_window_alert(label, watchlist):
         _post_message(header)
         return
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": header}}, {"type": "divider"}]
-    blocks += [_ticker_block(r) for r in hot]
+    for r in hot:
+        blocks += _ticker_block(r)
     _post_message(header, blocks=blocks)
 
 
@@ -2247,17 +2378,22 @@ def send_reference_report(watchlist):
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"Morning Report — {now_str}"}},
     ]
+    if INTERACTIVE:
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "🔄 Resend Report"}, "action_id": "resend_ref_table"},
+        ]})
 
     if held_rows:
         blocks.append({"type": "header", "text": {"type": "plain_text", "text": "Open Positions"}})
-        blocks += [_ticker_block(r) for r in held_rows]
+        for r in held_rows:
+            blocks += _ticker_block(r)
     else:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "No open positions."}]})
 
     blocks.append({"type": "divider"})
     blocks.append({"type": "header", "text": {"type": "plain_text", "text": "Buy Candidates"}})
     for r in flat_rows:
-        blocks.append(_ticker_block(r))
+        blocks += _ticker_block(r)
         proximity = r.get('Proximity')
         if isinstance(proximity, (int, float)) and proximity < 5:
             chart = _chart_buy(r['_node'], r['_sig'])
