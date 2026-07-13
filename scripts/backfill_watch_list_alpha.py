@@ -35,6 +35,8 @@ def main():
                 AND b.stop_loss         = w.stop_loss
                 AND b.max_hold_hours    = w.max_hold_hours
                 AND b.z_score_threshold = w.z_score_threshold
+                AND b.trail_buy_pct     = w.trail_buy_pct
+                AND b.trail_sell_pct    = w.trail_sell_pct
             WHERE w.watchlist_id = ?
         """, (watchlist_id,)).fetchall()
 
