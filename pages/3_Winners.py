@@ -46,13 +46,13 @@ def load_results(version, min_trades, min_return, min_alpha, min_bh_mult, beat_b
     bh_filter = "AND strategy_return > asset_bh" if beat_bh else ""
     with sqlite3.connect(DB_PATH) as c:
         return pd.read_sql_query(
-            f"""SELECT ticker, strategy, window, take_profit, stop_loss,
+            f"""SELECT ticker, strategy, window, axis_tp as take_profit, stop_loss,
                       max_hold_hours, COALESCE(z_score_threshold, 2.0) as z_score_threshold,
                       trades, win_rate, strategy_return, alpha_vs_spy,
                       asset_bh, spy_bh,
                       CASE WHEN asset_bh > 0 THEN strategy_return / asset_bh ELSE NULL END as bh_mult,
                       COALESCE(fixed_sl, 0) as fixed_sl, COALESCE(trail_buy_pct, 0) as trail_buy_pct,
-                      COALESCE(trail_pct, 0) as trail_pct
+                      COALESCE(trail_sell_pct, 0) as trail_pct
                FROM backtest_cache
                WHERE version = ?
                  AND trades >= ?
@@ -95,7 +95,8 @@ def load_versions():
 def watchlist_keys(version, watchlist_id=None):
     return {
         (w['ticker'], w['strategy'], w['version'], w['window'],
-         w['take_profit'], w['stop_loss'], w['max_hold_hours'])
+         w['take_profit'] if w['take_profit'] is not None else w['arm_sell_pct'],
+         w['stop_loss'], w['max_hold_hours'])
         for w in get_watchlist(watchlist_id)
         if w['version'] == version
     }
@@ -236,7 +237,8 @@ if selected_rows:
         elif not watch_val and is_watched:
             wl_by_key = {
                 (w['ticker'], w['strategy'], w['version'], w['window'],
-                 w['take_profit'], w['stop_loss'], w['max_hold_hours']): w['id']
+                 w['take_profit'] if w['take_profit'] is not None else w['arm_sell_pct'],
+                 w['stop_loss'], w['max_hold_hours']): w['id']
                 for w in get_watchlist(picked_wl_id)
             }
             if key in wl_by_key:
@@ -311,12 +313,13 @@ with mc4:
 wl = get_watchlist(picked_wl_id)
 if wl:
     wl_df = pd.DataFrame(wl)
+    wl_df['take_profit'] = wl_df['take_profit'].fillna(wl_df['arm_sell_pct'])
 
     wl_tickers = list({w['ticker'] for w in wl})
     placeholders = ','.join('?' * len(wl_tickers))
     with sqlite3.connect(DB_PATH) as c:
         stats = pd.read_sql_query(
-            f"""SELECT ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
+            f"""SELECT ticker, strategy, version, window, axis_tp as take_profit, stop_loss, max_hold_hours,
                       COALESCE(z_score_threshold, 2.0) as z_score_threshold,
                       trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh
                FROM backtest_cache

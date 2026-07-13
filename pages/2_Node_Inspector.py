@@ -122,12 +122,12 @@ def _load_dropdown_opts():
 def get_slice(ticker, strategy, version):
     with sqlite3.connect(DB_PATH) as conn:
         return pd.read_sql_query(
-            """SELECT window, max_hold_hours, take_profit, stop_loss,
+            """SELECT window, max_hold_hours, axis_tp as take_profit, stop_loss,
                       COALESCE(z_score_threshold, 2.0) as z_score_threshold,
                       trades, win_rate, strategy_return, alpha_vs_spy, asset_bh,
                       COALESCE(fixed_sl, 0) as fixed_sl,
                       COALESCE(trail_buy_pct, 0) as trail_buy_pct,
-                      COALESCE(trail_pct, 0) as trail_pct
+                      COALESCE(trail_sell_pct, 0) as trail_pct
                FROM backtest_cache
                WHERE ticker = ? AND strategy = ? AND version = ?""",
             conn, params=(ticker, strategy, version)

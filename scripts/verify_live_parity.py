@@ -84,7 +84,7 @@ def replay(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_p
         'window': window, 'z_score_threshold': z_thresh,
         'take_profit': take_profit_pct, 'stop_loss': stop_loss_pct,
         'max_hold_hours': max_hold_hours,
-        'trail_pct': trail_pct if uses_fixed_sl else None,
+        'trail_sell_pct': trail_pct if uses_fixed_sl else None,
         'fixed_sl': stop_loss_pct if uses_fixed_sl else None,
     }
 

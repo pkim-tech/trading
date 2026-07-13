@@ -36,8 +36,8 @@ def load_cliff_safety(conn, version_strategy_pairs):
         ).fetchall()]
         for ticker in tickers:
             row = conn.execute("""
-                SELECT take_profit, stop_loss, max_hold_hours, window, z_score_threshold,
-                       alpha_vs_spy, strategy_return, trades, win_rate, trail_buy_pct, trail_pct,
+                SELECT axis_tp, stop_loss, max_hold_hours, window, z_score_threshold,
+                       alpha_vs_spy, strategy_return, trades, win_rate, trail_buy_pct, trail_sell_pct,
                        win_twin_rate
                 FROM backtest_cache
                 WHERE version=? AND ticker=? AND strategy=? AND trades > 0
@@ -49,13 +49,13 @@ def load_cliff_safety(conn, version_strategy_pairs):
              trail_buy_pct, trail_pct, win_twin_rate) = row
             tp, sl, hold, window = int(tp), int(sl), int(hold), int(window)
             trail_buy_pct, trail_pct = float(trail_buy_pct or 0), float(trail_pct or 0)
-            _, _, neighbor_center = _resolve_sl_display(
+            sl_label, sl_display, neighbor_center = _resolve_sl_display(
                 version, strategy, sl, trail_buy_pct, trail_pct)
             worst = conn.execute(f"""
                 SELECT MIN(alpha_vs_spy) FROM backtest_cache
                 WHERE version=? AND ticker=? AND strategy=?
                   AND window=? AND z_score_threshold=?
-                  AND take_profit BETWEEN ? AND ?
+                  AND axis_tp BETWEEN ? AND ?
                   AND {neighbor_axis_col} BETWEEN ? AND ?
                   AND max_hold_hours BETWEEN ? AND ?
                   AND trades > 0

@@ -50,9 +50,9 @@ def load_watchlist_metrics(params_tuple):
             row = c.execute("""
                 SELECT alpha_vs_spy, strategy_return, trades, win_rate, asset_bh, spy_bh
                 FROM backtest_cache
-                WHERE ticker=? AND strategy=? AND version=? AND window=? AND take_profit=? AND stop_loss=?
+                WHERE ticker=? AND strategy=? AND version=? AND window=? AND axis_tp=? AND stop_loss=?
                   AND max_hold_hours=? AND z_score_threshold=?
-                  AND COALESCE(fixed_sl,0)=? AND COALESCE(trail_buy_pct,0)=? AND COALESCE(trail_pct,0)=?
+                  AND COALESCE(fixed_sl,0)=? AND COALESCE(trail_buy_pct,0)=? AND COALESCE(trail_sell_pct,0)=?
             """, (ticker, strategy, version, window, tp, sl, hold, z,
                   fixed_sl or 0.0, trail_buy_pct or 0.0, trail_pct or 0.0)).fetchone()
             t_row = c.execute(
@@ -84,12 +84,12 @@ def load_top_nodes(version, min_alpha, min_trades, z_thresholds):
     placeholders = ",".join("?" * len(z_thresholds))
     with sqlite3.connect(DB_PATH) as c:
         return pd.read_sql(f"""
-            SELECT ticker, strategy, '{version}' as version, window, take_profit, stop_loss,
+            SELECT ticker, strategy, '{version}' as version, window, axis_tp as take_profit, stop_loss,
                    max_hold_hours, z_score_threshold, trades, win_rate,
                    strategy_return, alpha_vs_spy,
                    COALESCE(fixed_sl, 0) as fixed_sl,
                    COALESCE(trail_buy_pct, 0) as trail_buy_pct,
-                   COALESCE(trail_pct, 0) as trail_pct
+                   COALESCE(trail_sell_pct, 0) as trail_pct
             FROM backtest_cache
             WHERE version=? AND alpha_vs_spy >= ? AND trades >= ?
               AND z_score_threshold IN ({placeholders})
@@ -207,6 +207,11 @@ with st.sidebar:
         st.rerun()
 
 watchlist = load_watchlist(picked_wl_id)
+for _w in watchlist:
+    if _w.get('take_profit') is None:
+        _w['take_profit'] = _w.get('arm_sell_pct')
+    if _w.get('trail_pct') is None:
+        _w['trail_pct'] = _w.get('trail_sell_pct')
 versions  = load_versions()
 
 nodes_to_run = []  # list of dicts with keys: ticker, strategy, window, take_profit, stop_loss, max_hold_hours, z_score_threshold, label

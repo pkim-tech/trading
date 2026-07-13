@@ -15,7 +15,7 @@ st.title("Open Positions")
 def load_positions():
     with sqlite3.connect(DB_PATH) as c:
         rows = c.execute(
-            "SELECT id, ticker, window, take_profit, stop_loss, max_hold_hours, "
+            "SELECT id, ticker, window, COALESCE(take_profit, arm_sell_pct) as take_profit, stop_loss, max_hold_hours, "
             "signal_price, entry_price, entry_time FROM open_positions ORDER BY entry_time"
         ).fetchall()
     return rows
