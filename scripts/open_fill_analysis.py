@@ -5,9 +5,12 @@ trigger bar, simulating a limit order placed the night before).
 
 Exit price is held constant — we're measuring the entry slippage only.
 """
+import sys
 import pandas as pd
 import numpy as np
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from backtester import run_backtest
 import strategies
 from active_signals import get_watchlist

@@ -13,7 +13,7 @@ Verifies every state transition:
   exit_pending set (sell signal fired)      -> Signal+Filled+Armed green, Sold yellow
 
 Usage:
-    python scripts/test_phase_emoji.py
+    python tests/test_phase_emoji.py
 """
 
 import sys

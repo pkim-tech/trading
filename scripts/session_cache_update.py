@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Mechanically prepend a session entry to docs/session_cache.md (cap 10, drop oldest)
+Mechanically prepend a session entry to docs/session_cache.md (cap 5, drop oldest)
 and append the same entry to docs/conversation_summary.md (uncapped).
 
 Usage:
@@ -15,7 +15,7 @@ from pathlib import Path
 DOCS = Path(__file__).resolve().parent.parent / "docs"
 SESSION_CACHE = DOCS / "session_cache.md"
 CONVERSATION_SUMMARY = DOCS / "conversation_summary.md"
-MAX_ENTRIES = 10
+MAX_ENTRIES = 5
 SEP = "\n---\n\n"
 
 

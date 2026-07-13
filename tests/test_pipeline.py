@@ -1,8 +1,10 @@
+import sys
 import time
 import pandas as pd
 from pathlib import Path
-# Assuming your original code is in a file named market_data.py
-from data_manager import fetch_live_data_smart, CACHE_DIR  
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from data_manager import fetch_live_data_smart, CACHE_DIR
 
 def run_pipeline_tests():
     ticker = "SOXL"

@@ -6,7 +6,7 @@ Verifies: (1) a normal research-DB lookup caches the value onto watch_list,
 (2) a research-DB failure falls back to the cached value instead of crashing.
 
 Usage:
-    python scripts/test_avg_vol_fallback.py <ticker>   # defaults to TQQQ, watchlist 9
+    python tests/test_avg_vol_fallback.py <ticker>   # defaults to TQQQ, watchlist 9
 """
 
 import sys
