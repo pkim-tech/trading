@@ -28,15 +28,18 @@ def alert(text):
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL:
         print(f"[no slack config] {text}")
         return
-    requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        json={"channel": SLACK_CHANNEL, "text": text},
-        timeout=10,
-    )
+    try:
+        requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": SLACK_CHANNEL, "text": text},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        print(f"[alert failed: {e}] {text}")
 
 
-def main():
+def check():
     max_age = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_MAX_AGE
 
     if not HEARTBEAT_PATH.exists():
@@ -53,6 +56,14 @@ def main():
         )
     else:
         print(f"heartbeat OK — {age:.0f}s old")
+
+
+def main():
+    try:
+        check()
+    except Exception as e:
+        alert(f"⚠️ check_heartbeat.py itself crashed: {e!r} — heartbeat status unknown, check manually.")
+        raise
 
 
 if __name__ == '__main__':

@@ -717,6 +717,10 @@ def _hurst_adf(ticker, df_hourly):
     return hurst, adf_p
 
 
+_indicator_cache = {}  # (ticker, strategy, window) -> (cache_key, indicators df); avoids
+                       # recomputing the full rolling SMA/Std history on every 5-min poll
+
+
 def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override=None, df_daily_override=None):
     ticker = node['ticker']
     window = int(node['window'])
@@ -735,7 +739,16 @@ def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override
     z_thresh = float(node.get('z_score_threshold', 2.0))
     strat = strategy_cls(window=window, z_score_threshold=z_thresh)
     today = (as_of if as_of is not None else pd.Timestamp.now()).normalize()
-    indicators = strat.generate_daily_indicators(df_daily[df_daily.index < today])
+    df_daily_prior = df_daily[df_daily.index < today]
+
+    cache_id = (ticker, node['strategy'], window)
+    cache_key = (len(df_daily_prior), df_daily_prior.index[-1] if not df_daily_prior.empty else None)
+    cached = _indicator_cache.get(cache_id)
+    if cached is not None and cached[0] == cache_key:
+        indicators = cached[1]
+    else:
+        indicators = strat.generate_daily_indicators(df_daily_prior)
+        _indicator_cache[cache_id] = (cache_key, indicators)
     if indicators.empty:
         return None
 

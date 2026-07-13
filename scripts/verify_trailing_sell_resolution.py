@@ -6,8 +6,9 @@ Re-detects every recent live-watchlist trailing-sell exit using 5-min bars (yfin
 ~60 days back) and compares exit price/time against what the hourly kernel predicts for
 the same trade.
 
-Usage: .venv/bin/python scripts/verify_trailing_sell_resolution.py
+Usage: .venv/bin/python scripts/verify_trailing_sell_resolution.py [--tickers AGQ,SOXL]
 """
+import argparse
 import sqlite3
 import sys
 from pathlib import Path
@@ -99,6 +100,12 @@ def replay_five_min(df_5m, arm_time, peak_at_arm, trail_sell_pct, cutoff_time):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tickers', help="comma-separated ticker subset, e.g. AGQ,SOXL "
+                         "(default: full active watchlist)")
+    args = parser.parse_args()
+    ticker_filter = {t.strip().upper() for t in args.tickers.split(',')} if args.tickers else None
+
     conn = sqlite3.connect(LIVE_DB)
     conn.row_factory = sqlite3.Row
     active_wl = conn.execute(
@@ -110,6 +117,8 @@ def main():
         "FROM watch_list WHERE strategy='TrailingBothZScoreBreakout' AND watchlist_id=?",
         (active_wl,)
     ).fetchall()
+    if ticker_filter:
+        nodes = [n for n in nodes if n['ticker'] in ticker_filter]
 
     cutoff = pd.Timestamp.now().normalize() - timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
     all_rows = []

@@ -5,8 +5,9 @@ broker trailing-buy order would actually do -- without needing real broker fills
 same bounce using 5-min bars (yfinance, ~60 days back) for every recent live-watchlist signal and
 compares entry price/time against what the hourly kernel predicts for the same signal.
 
-Usage: .venv/bin/python scripts/verify_trailing_buy_resolution.py
+Usage: .venv/bin/python scripts/verify_trailing_buy_resolution.py [--tickers AGQ,SOXL]
 """
+import argparse
 import sqlite3
 import sys
 from pathlib import Path
@@ -117,6 +118,12 @@ def replay_five_min(ticker, df_5m, signal_time, signal_close, trail_buy_pct, cut
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tickers', help="comma-separated ticker subset, e.g. AGQ,SOXL "
+                         "(default: full active watchlist)")
+    args = parser.parse_args()
+    ticker_filter = {t.strip().upper() for t in args.tickers.split(',')} if args.tickers else None
+
     conn = sqlite3.connect(LIVE_DB)
     conn.row_factory = sqlite3.Row
     active_wl = conn.execute(
@@ -127,6 +134,8 @@ def main():
         "FROM watch_list WHERE strategy='TrailingBothZScoreBreakout' AND watchlist_id=?",
         (active_wl,)
     ).fetchall()
+    if ticker_filter:
+        nodes = [n for n in nodes if n['ticker'] in ticker_filter]
 
     cutoff = pd.Timestamp.now().normalize() - timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
     all_rows = []
