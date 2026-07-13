@@ -86,6 +86,8 @@ Propagated the `take_profit`→`axis_tp` / `trail_pct`→`trail_sell_pct` fix to
 
 Added a nullable `account` column to `watch_list` (`trading_live.db`) and populated it for watchlist 7 per the user's stated real-money allocations (brokerage: AGQ/TQQQ/GDXU; sep: EDC; ira: SOXL/KORU/HIBL/YANG/DPST/NUGT). Chosen as the lower-risk additive option over a separate `accounts` table — user said they might still switch to a table later once P&L tracking needs grow. See `docs/backlog_cache.md` "Live trading behaviors" for the larger unstarted P&L/compounding/Slack-redesign scope this connects to.
 
+**Addendum (2026-07-13)**: extended `account` to `open_positions`/`trade_log` (migration in `ensure_tables()`, backed up first). `open_position()`/`log_trade_entry()` now capture `node.get('account')` at execution time rather than relying on `watch_list.account`'s current value — needed because that value can change later (e.g. LABU ira→roth) and would otherwise mis-attribute historical trades. `pages/4_Portfolio.py` gained an "Account Performance (live)" section (realized win-rate/compounded-return from `trade_log`, unrealized $ P&L from `open_positions`, both grouped by account); `pages/10_Open_Positions.py` shows the column. Pre-migration open positions (AGQ/HIBL/EDC/SOXL) show as `unknown` — no historical backfill possible.
+
 `trail_pct` is now a genuine 4th swept grid axis for `TrailingBothZScoreBreakout`
 (`hyperparameters.trail_pcts` in config.json, e.g. `[1,2,3,4,5]`) — this replaces the old
 v2.13-v2.17 pattern of one full 53-ticker backfill per trail_pct value with a single v3.x

@@ -257,6 +257,8 @@ def ensure_tables():
             c.execute("ALTER TABLE open_positions ADD COLUMN arm_sell_pct REAL")
         if 'shares' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN shares REAL")
+        if 'account' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN account TEXT")
 
         # trade_log
         c.execute("""
@@ -288,6 +290,8 @@ def ensure_tables():
             c.execute("ALTER TABLE trade_log ADD COLUMN arm_sell_pct REAL")
         if 'shares' not in tl_cols:
             c.execute("ALTER TABLE trade_log ADD COLUMN shares REAL")
+        if 'account' not in tl_cols:
+            c.execute("ALTER TABLE trade_log ADD COLUMN account TEXT")
 
         # pending_buys -- tracks a trailing-buy order from BUY alert until Executed/Skipped
         # is confirmed, so a stalled broker-side fill can be reminded on (mirrors trail_state
@@ -595,8 +599,8 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             INSERT INTO open_positions
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, trade_log_id,
-                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares, account)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
@@ -605,6 +609,7 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             float(entry_price), entry_time_str, trade_log_id,
             node.get('trail_sell_pct'), node.get('fixed_sl'), node.get('trail_buy_pct'),
             node.get('arm_sell_pct'), float(shares) if shares is not None else None,
+            node.get('account'),
         ))
         c.commit()
 
@@ -630,15 +635,15 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, sh
         c.execute("""
             INSERT INTO trade_log
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
-                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct, shares)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct, shares, account)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
             int(node['max_hold_hours']),
             float(signal_price), sig_time_str,
             float(entry_price), entry_time_str, entry_drift, node.get('arm_sell_pct'),
-            float(shares) if shares is not None else None,
+            float(shares) if shares is not None else None, node.get('account'),
         ))
         c.commit()
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]

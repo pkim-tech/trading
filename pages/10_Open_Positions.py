@@ -16,7 +16,7 @@ def load_positions():
     with sqlite3.connect(DB_PATH) as c:
         rows = c.execute(
             "SELECT id, ticker, window, COALESCE(take_profit, arm_sell_pct) as take_profit, stop_loss, max_hold_hours, "
-            "signal_price, entry_price, entry_time FROM open_positions ORDER BY entry_time"
+            "signal_price, entry_price, entry_time, account FROM open_positions ORDER BY entry_time"
         ).fetchall()
     return rows
 
@@ -35,7 +35,7 @@ if not positions:
     st.stop()
 
 rows = []
-for pos_id, ticker, window, tp, sl, max_hold, signal_price, entry_price, entry_time_str in positions:
+for pos_id, ticker, window, tp, sl, max_hold, signal_price, entry_price, entry_time_str, account in positions:
     entry_time = datetime.fromisoformat(entry_time_str)
     hours_held = (datetime.now() - entry_time).total_seconds() / 3600
     hours_left = max_hold - hours_held
@@ -47,6 +47,7 @@ for pos_id, ticker, window, tp, sl, max_hold, signal_price, entry_price, entry_t
     rows.append({
         "ID":         pos_id,
         "Ticker":     ticker,
+        "Account":    account or "",
         "Signal $":   signal_price,
         "Entry $":    entry_price,
         "Drift %":    drift_pct,

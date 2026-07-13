@@ -44,7 +44,33 @@ Read the per-ticker summary at the bottom:
 If a candidate's ratio is high, either accept the known drift, or consider whether its
 `trail_buy_pct` should be widened to better match its actual volatility.
 
-## 3. Win-rate stability check (train/live split)
+## 3. Trailing-sell resolution check (`TrailingBothZScoreBreakout` only)
+`scripts/verify_trailing_sell_resolution.py` — same idea as check 2, but for the exit
+side: once the trailing-sell arms (price clears `arm_sell_pct`), re-detects the
+peak/trail_stop crossing using 5-min bars and compares against what the hourly-bar
+kernel's trailing branch (`_simulate_trail_both`) would have caught. Also run across the
+whole active watchlist in one shot:
+```
+.venv/bin/python scripts/verify_trailing_sell_resolution.py
+```
+Same reading as check 2 (`mean` price diff, `median_intrahour_range_pct_of_trigger` —
+here measured against `trail_sell_pct` instead of `trail_buy_pct`). Sign convention
+differs from the buy check: negative mean diff means the 5-min exit fills *lower* (worse)
+than the hourly kernel assumed. (Built 2026-07-13: all 11 watchlist tickers at parity,
+mean diff -0.17% across 21 matched exits — unlike the buy side, live trailing-sell is
+already monitored continuously by `active_signals.py` itself rather than handed off blind
+to a broker order, so this check mainly validates the *backtest's* hourly-bar exit
+modeling, not a live-execution gap. LABU showed -4.6% on a single sample — not enough
+data yet to call it a real outlier, worth re-checking as more trades accumulate.)
+
+**Note on both trailing-buy/sell resolution scripts**: `max_hold_hours` counts hourly
+*bars*, not calendar hours (bars only exist ~7/trading day), so any cutoff-time math for
+the 5-min replay must look up the real bar timestamp (`timestamps[entry_i + max_hold_hours]`)
+rather than adding `timedelta(hours=max_hold_hours)` — the latter cuts the replay off
+days early for longer holds and produces fabricated "ran out of data" results. Both
+scripts had this bug until fixed 2026-07-13.
+
+## 4. Win-rate stability check (train/live split)
 Is the backtested win rate real, or an artifact of the older (training) portion of the
 history — i.e., would a strategy that stopped working recently still show a good
 full-history win rate? Replay the node's trades (same params as the live watchlist entry,
@@ -62,7 +88,7 @@ at the end is a real warning sign even if the aggregate late-window win rate sti
 fine (found for AGQ, 2026-07-12: 84% early vs. 81.8% late overall, but 2 of the last 4
 trades were full -15% SL hits, both landing in the same recent downtrend window).
 
-## 4. Live position hold-% / P&L check
+## 5. Live position hold-% / P&L check
 For anything currently open, not just candidates: `python scripts/open_positions_status.py`
 for entry price/time/shares, cross-referenced against the reference report's current
 price and `hold=Xh/Yh` (hours held vs. `max_hold_hours`) and arm-% distance. Gives real
@@ -71,14 +97,14 @@ before deciding whether a "this looks bad" worry is about one ticker or the whol
 (found 2026-07-12: AGQ was the only red position out of four open; HIBL/EDC/SOXL were all
 solidly positive).
 
-## 5. Data-integrity check (stock splits)
+## 6. Data-integrity check (stock splits)
 `scripts/check_stock_splits.py` — queries yfinance's authoritative split history and flags
 any split landing inside the ticker's cached date range. A missed split silently corrupts
 the cached price series (huge fake gap/spike), producing phantom outlier trades and
 inflated alpha. Caught real cases historically (UVIX, NBIZ). Cheap, run before trusting
 any candidate's backtest numbers, not just at promotion time.
 
-## 6. Fill-logic optimism check (`TrailingBothZScoreBreakout`/`TrailingBuyZScoreBreakout`)
+## 7. Fill-logic optimism check (`TrailingBothZScoreBreakout`/`TrailingBuyZScoreBreakout`)
 `scripts/export_trades.py`'s `simulate_trail_both_ohlc_aware` — re-simulates entries
 without assuming the best-case Low-before-High ordering within each hourly bar (the
 standard kernel can't know which came first within an hour and picks the favorable
@@ -87,7 +113,7 @@ Found historically to matter a lot for some tickers (SOXL's on-file return was ~
 overstated, 7007%→3591%) — worth a spot-check on any candidate with an unusually strong
 number before trusting it at face value.
 
-## 7. Trade-count fluke check
+## 8. Trade-count fluke check
 Before trusting a "best alpha" node, check whether it's actually driven by a single
 outlier trade (`trades` column at or near 1 for the winning grid cell) rather than a
 real repeatable edge. Recurring failure mode in sweep results (e.g. UVIX had thousands of

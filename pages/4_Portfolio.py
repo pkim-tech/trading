@@ -1,6 +1,7 @@
 import sqlite3
 import streamlit as st
 import pandas as pd
+import yfinance as yf
 from active_signals import (get_watchlists, get_watchlist, add_node, remove_node,
                              label_node, create_watchlist, delete_watchlist,
                              set_active_watchlist, set_node_mode)
@@ -70,6 +71,28 @@ def load_watchlist_metrics(params_tuple):
                               'asset_bh': None, 'spy_bh': None}),
                           'max_notional': max_notional, 'type': ticker_type})
     return rows
+
+
+@st.cache_data(ttl=60)
+def load_account_performance():
+    """Realized (trade_log) + unrealized (open_positions) P&L grouped by account.
+    account is only populated for trades placed 2026-07-13 onward -- older closed
+    trades show up under 'unknown'."""
+    with sqlite3.connect(LIVE_DB_PATH) as c:
+        closed = pd.read_sql(
+            "SELECT COALESCE(account, 'unknown') as account, pnl_pct "
+            "FROM trade_log WHERE pnl_pct IS NOT NULL", c)
+        open_rows = pd.read_sql(
+            "SELECT COALESCE(account, 'unknown') as account, ticker, entry_price, shares "
+            "FROM open_positions", c)
+    return closed, open_rows
+
+
+def current_price(ticker):
+    try:
+        return yf.Ticker(ticker).fast_info.last_price
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=60)
@@ -172,6 +195,54 @@ def run_node_backtest(ticker, strategy_name, window, tp, sl, hold, zt,
         fixed_sl=resolved_fixed_sl, trail_pct_pct=tpct
     )
 
+
+# ── Account performance (real trades, not backtest) ───────────────────────────
+
+with st.expander("Account Performance (live)", expanded=True):
+    closed_df, open_df = load_account_performance()
+
+    if closed_df.empty and open_df.empty:
+        st.caption("No trade history or open positions yet.")
+    else:
+        rows = []
+        accounts = sorted(set(closed_df['account']).union(open_df['account']))
+        for acct in accounts:
+            c_acct = closed_df[closed_df['account'] == acct]
+            realized_trades = len(c_acct)
+            win_rate = (c_acct['pnl_pct'] > 0).mean() * 100 if realized_trades else None
+            compounded = ((1 + c_acct['pnl_pct'] / 100).prod() - 1) * 100 if realized_trades else None
+
+            o_acct = open_df[open_df['account'] == acct]
+            open_count = len(o_acct)
+            unrealized_pnl = 0.0
+            for _, pos in o_acct.iterrows():
+                cp = current_price(pos['ticker'])
+                if cp and pos['entry_price'] and pos['shares']:
+                    unrealized_pnl += (cp - pos['entry_price']) * pos['shares']
+
+            rows.append({
+                'Account': acct,
+                'Realized Trades': realized_trades,
+                'Win %': win_rate,
+                'Compounded Return %': compounded,
+                'Open Positions': open_count,
+                'Unrealized P&L $': unrealized_pnl if open_count else None,
+            })
+
+        acct_df = pd.DataFrame(rows)
+        st.dataframe(
+            acct_df, use_container_width=True, hide_index=True,
+            column_config={
+                'Win %':                st.column_config.NumberColumn(format="%.0f%%"),
+                'Compounded Return %':  st.column_config.NumberColumn(format="%+.1f%%"),
+                'Unrealized P&L $':     st.column_config.NumberColumn(format="$%+.0f"),
+            },
+        )
+        if (closed_df['account'] == 'unknown').any():
+            st.caption(
+                "'unknown' = trades closed before 2026-07-13 account tracking was added "
+                "to trade_log/open_positions; no historical account attribution exists for them."
+            )
 
 
 # ── Node selection ────────────────────────────────────────────────────────────

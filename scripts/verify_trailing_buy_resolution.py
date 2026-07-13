@@ -48,6 +48,7 @@ def find_hourly_signals(ticker, window, z_thresh, trail_buy_pct, max_hold_hours,
     waiting = False
     running_low = 0.0
     wait_bars = 0
+    signal_bar_i = 0
     signals = []
 
     for i in range(len(prices)):
@@ -59,8 +60,14 @@ def find_hourly_signals(ticker, window, z_thresh, trail_buy_pct, max_hold_hours,
                 running_low = low
             buy_trigger = running_low * (1.0 + trail_buy_pct)
             if high >= buy_trigger:
+                # max_hold_hours counts hourly *bars* (only ~7/day exist during the
+                # trading session), not calendar hours -- look up the real bar
+                # timestamp at wait_bars==max_hold_hours rather than adding
+                # timedelta(hours=max_hold_hours).
+                cutoff_i = min(signal_bar_i + max_hold_hours, len(timestamps) - 1)
                 signals.append({
                     'signal_time': signal_ts, 'signal_close': signal_cp,
+                    'cutoff_time': timestamps[cutoff_i],
                     'hourly_entry_time': timestamps[i], 'hourly_entry_price': buy_trigger,
                 })
                 waiting = False
@@ -83,24 +90,24 @@ def find_hourly_signals(ticker, window, z_thresh, trail_buy_pct, max_hold_hours,
             waiting = True
             running_low = cp
             wait_bars = 0
+            signal_bar_i = i
             signal_ts, signal_cp = timestamps[i], cp
 
     return [s for s in signals if s['signal_time'] >= cutoff]
 
 
-def replay_five_min(ticker, df_5m, signal_time, signal_close, trail_buy_pct, max_hold_hours):
+def replay_five_min(ticker, df_5m, signal_time, signal_close, trail_buy_pct, cutoff_time):
     """From the bar immediately after the signal hour's close, walk 5-min bars tracking the
-    same running_low/buy_trigger logic as the hourly kernel."""
+    same running_low/buy_trigger logic as the hourly kernel. Returns None if the trade
+    needs more 5-min history than yfinance's 60-day window actually has (rather than
+    silently reporting the last available bar as a fabricated result)."""
     start = signal_time + timedelta(hours=1)
-    window = df_5m[df_5m.index >= start]
+    window = df_5m[(df_5m.index >= start) & (df_5m.index <= cutoff_time)]
     if window.empty:
         return None
-    cutoff_time = start + timedelta(hours=max_hold_hours)
     running_low = signal_close
     buy_trigger = running_low * (1.0 + trail_buy_pct)
     for ts, row in window.iterrows():
-        if ts > cutoff_time:
-            return None
         if row['Low'] < running_low:
             running_low = row['Low']
             buy_trigger = running_low * (1.0 + trail_buy_pct)
@@ -145,7 +152,7 @@ def main():
 
         for s in signals:
             r = replay_five_min(ticker, df_5m, s['signal_time'], s['signal_close'],
-                                 trail_buy_pct, n['max_hold_hours'])
+                                 trail_buy_pct, s['cutoff_time'])
             row = {'ticker': ticker, **s}
             if r is None:
                 row['five_min_entry_time'] = None
