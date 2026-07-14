@@ -378,6 +378,17 @@ def get_open_positions():
     return rows
 
 
+def get_open_position(ticker):
+    """Single-ticker lookup -- used to report what's actually live when a
+    duplicate-position attempt is rejected (see open_position())."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM open_positions WHERE ticker=? ORDER BY entry_time DESC LIMIT 1",
+            (ticker,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def get_held_tickers():
     """Single source of truth for 'is this ticker already held' -- use this instead of
     re-deriving a ticker set from get_open_positions() at each call site. A prior version
@@ -469,6 +480,9 @@ def closed_today(ticker):
 
 
 def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None):
+    """Returns True if a position was opened, False if skipped because one was
+    already open for this ticker/window — callers that report success to Slack
+    must check this, since a silent skip must not be reported as a fill."""
     with _conn() as c:
         existing = c.execute(
             "SELECT id FROM open_positions WHERE ticker=? AND window=?",
@@ -476,7 +490,7 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
         ).fetchone()
         if existing:
             print(f"  [warn] position already open for {node['ticker']} w={node['window']} — skipping duplicate")
-            return
+            return False
         sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
         entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
         trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares)
@@ -498,6 +512,7 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             node.get('account'),
         ))
         c.commit()
+        return True
 
 
 def set_broker_stop_price(ticker, broker_stop_price):

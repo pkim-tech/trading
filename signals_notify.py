@@ -469,6 +469,8 @@ if cfg.SOCKET_MODE:
                 {"type": "actions", "elements": [
                     {"type": "button", "text": {"type": "plain_text", "text": "Filled"},
                      "style": "primary", "action_id": "trail_buy_filled", "value": json.dumps(data)},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Missed It"},
+                     "action_id": "trail_buy_missed", "value": json.dumps(data)},
                     {"type": "button", "text": {"type": "plain_text", "text": "Cancelled"},
                      "action_id": "trail_buy_cancelled", "value": json.dumps(data)},
                 ]},
@@ -492,6 +494,28 @@ if cfg.SOCKET_MODE:
                 "close":  {"type": "plain_text", "text": "Cancel"},
                 "blocks": [_price_input_block()],
             },
+        )
+
+    @cfg.bolt_app.action("trail_buy_missed")
+    def handle_trail_buy_missed(ack, body, client):
+        """For when the bounce trigger fired (per _trailing_buy_status) before the
+        real broker order was resting -- distinct from Cancelled, which implies the
+        order itself was pulled. Here the order may still be live at the broker;
+        this just stops the app from nagging about a bounce that already passed it
+        by. If it fills later, record it via Manual Open from the reference report."""
+        ack()
+        data    = json.loads(body['actions'][0]['value'])
+        channel = body['channel']['id']
+        ts      = body['message']['ts']
+        ticker  = data['node']['ticker']
+        db.clear_pending_buy(ticker)
+        client.chat_update(
+            channel=channel, ts=ts,
+            text=f"BUY {ticker} — missed it",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"*BUY {ticker}* — missed it (bounce already passed before the order was live). "
+                             f"No longer tracking/reminding. Order may still be resting at the broker — if it "
+                             f"fills later, record it via Manual Open from the reference report."}}],
         )
 
     @cfg.bolt_app.action("trail_buy_cancelled")
@@ -525,8 +549,19 @@ if cfg.SOCKET_MODE:
         drift_pct  = (fill_price - signal_price) / signal_price * 100
         shares     = int(_last_sale_recovery(ticker) // fill_price)
 
-        db.open_position(node, signal_price, signal_time, fill_price, datetime.now(), shares=shares)
+        opened = db.open_position(node, signal_price, signal_time, fill_price, datetime.now(), shares=shares)
         db.clear_pending_buy(ticker)
+
+        if not opened:
+            print(f"  [warn] {ticker} already has an open position — ignored duplicate Filled confirmation")
+            client.chat_update(
+                channel=channel, ts=ts,
+                text=f"{ticker} — ALREADY OPEN, this fill was ignored",
+                blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                         "text": f"⚠️ *{ticker}* — a position was already open, this Filled confirmation "
+                                 f"was *not* recorded (no duplicate created). {_existing_position_note(ticker)}"}}],
+            )
+            return
 
         note = f"${fill_price:.4f}  (drift: {drift_pct:+.2f}%)  {shares} shares"
         print(f"  Trailing buy filled via Slack: {ticker} at {note}")
@@ -568,10 +603,22 @@ if cfg.SOCKET_MODE:
         now        = datetime.now()
         shares     = int(50_000 // exec_price)
 
-        db.open_position(node, signal_price, signal_time, exec_price, now, shares=shares)
+        opened = db.open_position(node, signal_price, signal_time, exec_price, now, shares=shares)
 
         ticker = node['ticker']
         db.clear_pending_buy(ticker)
+
+        if not opened:
+            print(f"  [warn] {ticker} already has an open position — ignored duplicate Executed confirmation")
+            client.chat_update(
+                channel=channel, ts=ts,
+                text=f"{ticker} — ALREADY OPEN, this fill was ignored",
+                blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                         "text": f"⚠️ *{ticker}* — a position was already open, this Executed confirmation "
+                                 f"was *not* recorded (no duplicate created). {_existing_position_note(ticker)}"}}],
+            )
+            return
+
         note   = f"${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
         print(f"  Position opened via Slack: {ticker} at {note}")
         client.chat_update(
@@ -706,7 +753,16 @@ if cfg.SOCKET_MODE:
         shares = int(body['view']['state']['values']['shares_block']['shares_input']['value'])
         now    = datetime.now()
 
-        db.open_position(node, price, now, price, now, shares=shares)
+        opened = db.open_position(node, price, now, price, now, shares=shares)
+        db.clear_pending_buy(ticker)
+
+        if not opened:
+            print(f"  [warn] {ticker} already has an open position — ignored duplicate Manual Open")
+            _post_message(f"{ticker} — ALREADY OPEN, this Manual Open was ignored",
+                          blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                          "text": f"⚠️ *{ticker}* — a position was already open, this Manual Open "
+                                  f"was *not* recorded (no duplicate created). {_existing_position_note(ticker)}"}}])
+            return
 
         note = f"${price:.4f}  {shares} shares"
         print(f"  Position manually opened via Slack: {ticker} at {note}")
@@ -836,11 +892,15 @@ def notify_buy_signal(node, sig):
             exec_price = float(resp)
             drift_pct  = (exec_price - price) / price * 100
             now        = datetime.now()
-            db.open_position(node, price, bar_time, exec_price, now)
+            opened     = db.open_position(node, price, bar_time, exec_price, now)
             db.clear_pending_buy(ticker)
-            note = f"Entered at ${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
-            print(f"  Position opened. {note}")
-            _post_message(f"{ticker} position opened: {note}")
+            if not opened:
+                print(f"  [warn] {ticker} already has an open position — ignored duplicate")
+                _post_message(f"{ticker} — ALREADY OPEN, this fill was ignored. {_existing_position_note(ticker)}")
+            else:
+                note = f"Entered at ${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
+                print(f"  Position opened. {note}")
+                _post_message(f"{ticker} position opened: {note}")
         except ValueError:
             print("  Invalid price — position not opened.")
     else:
@@ -1162,7 +1222,8 @@ def _pending_buy_blocks(pending, reminder_num):
         text = (
             f"{header}\n"
             f"Trailing buy order placed at the broker but not yet confirmed filled{trigger_str}.\n"
-            f"Confirm Filled with the real fill price, or Cancelled if the order didn't go through."
+            f"Confirm Filled with the real fill price, Missed It if the bounce already passed before the "
+            f"order was live, or Cancelled if the order didn't go through."
         )
     else:
         header = f"⚠️ *{ticker}* — ORDER NOT CONFIRMED PLACED (reminder #{reminder_num})"
@@ -1182,6 +1243,8 @@ def _pending_buy_blocks(pending, reminder_num):
                 "elements": [
                     {"type": "button", "text": {"type": "plain_text", "text": "Filled"},
                      "style": "primary", "action_id": "trail_buy_filled", "value": value},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Missed It"},
+                     "action_id": "trail_buy_missed", "value": value},
                     {"type": "button", "text": {"type": "plain_text", "text": "Cancelled"},
                      "action_id": "trail_buy_cancelled", "value": value},
                 ],
@@ -1280,18 +1343,21 @@ def _ticker_block(row):
         pnl = row.get('PnL %')
         sl = row.get('SL $')
         sl_str = f"  sl `${sl:.2f}`" if sl is not None else "  sl `cancelled (trail order live)`"
-        z = row.get('Z')
-        z_str = f"{z:+.2f}" if z is not None else '?'
-        tb, arm, ts = row.get('TrailBuy%'), row.get('Arm%'), row.get('TrailSell%')
         pct_str = lambda v: f"{v:g}%" if v is not None else '?'
-        last_sale = row.get('Last Sale $')
-        last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
         trig_label = row.get('Trigger Label', 'trig')
+        pos = row.get('_pos')
+        shares_str = f" x `{pos['shares']:g}`" if pos and pos.get('shares') is not None else ''
+        entry_str = f"  `${pos['entry_price']:.2f}`{shares_str}" if pos else ''
+        armed = bool((pos or {}).get('trail_state', {}).get('trailing'))
+        if armed:
+            arm_ts_line = ''
+        else:
+            arm, ts = row.get('Arm%'), row.get('TrailSell%')
+            arm_ts_line = f"\narm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
         text = (
-            f"{phase_str}*{ticker}* `{version}` — {row['Hold']}{account_str}{last_sale_str}\n"
+            f"{phase_str}*{ticker}* `{version}` — {row['Hold']}{account_str}{entry_str}\n"
             f"now `${now:.2f}` {pnl:+.1f}%  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
-            f"→ _{row['Next Action']}_{sl_str}\n"
-            f"z `{z_str}`  tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
+            f"→ _{row['Next Action']}_{sl_str}{arm_ts_line}"
         )
     else:
         overnight = row.get('Overnight %')
@@ -1300,13 +1366,13 @@ def _ticker_block(row):
         last_sale = row.get('Last Sale $')
         last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
         z_trig = row.get('Z Trigger')
-        z_trig_str = f"  z-trig `{z_trig:g}`" if z_trig is not None else ''
+        z_trig_str = f"z1 `{z_trig:g}`  " if z_trig is not None else ''
         trig_label = row.get('Trigger Label', 'trig')
         text = (
             f"{phase_str}*{ticker}* `{version}`{account_str}{last_sale_str}\n"
             f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_\n"
-            f"tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`{z_trig_str}"
+            f"{z_trig_str}tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
         )
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
 
@@ -1356,6 +1422,16 @@ _REF_TABLE_COLS = [
     'Phase', 'Ticker', 'Hold', 'Next Trigger $', 'Now', 'Proximity', 'Next Action',
     'Version', 'Alpha', 'Z', 'Z Trigger', 'TrailBuy%', 'Arm%', 'TrailSell%', 'Account', 'Last Sale $',
 ]
+
+
+def _existing_position_note(ticker):
+    """Formats the already-open position for a duplicate-attempt warning, so the
+    user doesn't have to go run scripts/open_positions_status.py separately."""
+    pos = db.get_open_position(ticker)
+    if not pos:
+        return "check `open_positions` if unsure what's live."
+    return (f"currently open: `${pos['entry_price']:.4f}` x `{pos['shares']}` shares, "
+            f"entered `{pos['entry_time']}` ({pos['account']}).")
 
 
 def _last_sale_recovery(ticker):
