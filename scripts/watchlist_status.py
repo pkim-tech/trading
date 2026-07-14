@@ -35,22 +35,33 @@ def _in_live_window(ts):
 def print_status(watchlist_id=None):
     watchlist_id = watchlist_id or a.get_active_watchlist_id()
     wl = a.get_watchlist(watchlist_id)
+    pending_by_ticker = {p['ticker']: p for p in a.get_pending_buys()}
 
     rows = []
     for n in wl:
         sig = a.compute_buy_signal(n)
         if sig is None:
             continue
-        trigger = sig['lower_band']
         cur = sig['current_price']
+        pending = pending_by_ticker.get(n['ticker'])
+        if pending is not None:
+            # z-score already crossed and a trailing-buy order is active/pending --
+            # the number worth watching now is the bounce-above-running-low trigger,
+            # not the (already-cleared, often much farther away) initial z trigger.
+            _, tb_trigger = a._trailing_buy_status(pending)
+            trigger = tb_trigger if tb_trigger is not None else sig['lower_band']
+            phase = 'trail-buy'
+        else:
+            trigger = sig['lower_band']
+            phase = 'z-cross'
         pct = (cur - trigger) / trigger * 100
-        rows.append((n['ticker'], trigger, cur, pct, n.get('trail_buy_pct'), n.get('account'), n.get('mode')))
-    rows.sort(key=lambda r: r[3])
+        rows.append((n['ticker'], phase, trigger, cur, pct, n.get('trail_buy_pct'), n.get('account'), n.get('mode')))
+    rows.sort(key=lambda r: r[4])
 
     print(f"watchlist_id={watchlist_id}\n")
-    print(f"{'Ticker':<6} {'Trigger':>10} {'Current':>10} {'%':>8} {'TrailBuy%':>10} {'Account':>10} {'Mode':>10}")
-    for t, trig, cur, pct, tb, acc, mode in rows:
-        print(f"{t:<6} {trig:>10.2f} {cur:>10.2f} {pct:>7.2f}% {str(tb):>10} {str(acc):>10} {str(mode):>10}")
+    print(f"{'Ticker':<6} {'Phase':>9} {'Trigger':>10} {'Current':>10} {'%':>8} {'TrailBuy%':>10} {'Account':>10} {'Mode':>10}")
+    for t, phase, trig, cur, pct, tb, acc, mode in rows:
+        print(f"{t:<6} {phase:>9} {trig:>10.2f} {cur:>10.2f} {pct:>7.2f}% {str(tb):>10} {str(acc):>10} {str(mode):>10}")
 
 
 def print_history(ticker, num_bars=7, watchlist_id=None):

@@ -143,6 +143,8 @@ def ensure_tables():
             c.execute("ALTER TABLE open_positions ADD COLUMN shares REAL")
         if 'account' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN account TEXT")
+        if 'broker_stop_price' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN broker_stop_price REAL")
 
         # trade_log
         c.execute("""
@@ -495,6 +497,15 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             node.get('arm_sell_pct'), float(shares) if shares is not None else None,
             node.get('account'),
         ))
+        c.commit()
+
+
+def set_broker_stop_price(ticker, broker_stop_price):
+    with _conn() as c:
+        c.execute(
+            "UPDATE open_positions SET broker_stop_price = ? WHERE ticker = ?",
+            (float(broker_stop_price), ticker)
+        )
         c.commit()
 
 

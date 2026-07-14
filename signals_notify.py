@@ -373,7 +373,11 @@ def _build_sell_blocks(pos, reason, current_price, target_price):
     elif reason == 'SL':
         emoji   = "🔴"
         label   = "STOP LOSS HIT"
-        action  = f"Check account — Stop Loss order should have auto-filled @ `${target_price:.2f}`"
+        bsp = pos.get('broker_stop_price')
+        if bsp:
+            action = f"Broker stop-loss on file @ `${bsp:.2f}` — should auto-fill there, no action needed. Confirm once you see the fill in your account."
+        else:
+            action = f"Check account — Stop Loss order should have auto-filled @ `${target_price:.2f}`"
     elif reason == 'TRAIL':
         emoji   = "🟢"
         label   = "TRAILING STOP"
@@ -1042,12 +1046,22 @@ def _exit_pending_blocks(pos, exit_pending, reminder_num):
     target_price  = exit_pending['target_price']
     pct           = (current_price - ep) / ep * 100
     reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT', 'TRAIL': 'TRAILING STOP'}
+    bsp = pos.get('broker_stop_price')
 
+    if reason == 'SL' and bsp:
+        status_line = (
+            f"Protected by broker stop-loss on file @ `${bsp:.2f}` — should auto-fill there without "
+            f"action from you. Confirm here once you see the fill in your account."
+        )
+    else:
+        status_line = (
+            f"Position may still be open and unmanaged at the broker. Confirm Exited with the real fill "
+            f"price, or Skip if it turns out the exit condition no longer applies."
+        )
     text = (
         f"⚠️ *{ticker}* — EXIT NOT CONFIRMED (reminder #{reminder_num})\n"
         f"{reason_labels[reason]}  |  entry `${ep:.2f}`  |  signal `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
-        f"Position may still be open and unmanaged at the broker. Confirm Exited with the real fill "
-        f"price, or Skip if it turns out the exit condition no longer applies."
+        f"{status_line}"
     )
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
     if cfg.INTERACTIVE:
@@ -1272,9 +1286,10 @@ def _ticker_block(row):
         pct_str = lambda v: f"{v:g}%" if v is not None else '?'
         last_sale = row.get('Last Sale $')
         last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
+        trig_label = row.get('Trigger Label', 'trig')
         text = (
             f"{phase_str}*{ticker}* `{version}` — {row['Hold']}{account_str}{last_sale_str}\n"
-            f"now `${now:.2f}` {pnl:+.1f}%  trig `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"now `${now:.2f}` {pnl:+.1f}%  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_{sl_str}\n"
             f"z `{z_str}`  tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
         )
@@ -1286,10 +1301,11 @@ def _ticker_block(row):
         last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
         z_trig = row.get('Z Trigger')
         z_trig_str = f"  z-trig `{z_trig:g}`" if z_trig is not None else ''
+        trig_label = row.get('Trigger Label', 'trig')
         text = (
             f"{phase_str}*{ticker}* `{version}`{account_str}{last_sale_str}\n"
-            f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  trig `${trigger:.2f}` ({proximity:+.1f}%)\n"
-            f"→ _{row['Next Action']}_  arm `${row['Arm $']:.2f}`  sl `${row['SL $']:.2f}`\n"
+            f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"→ _{row['Next Action']}_\n"
             f"tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`{z_trig_str}"
         )
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
@@ -1417,11 +1433,23 @@ def build_reference_table(watchlist):
         schwab_sl_pct = node['stop_loss'] + 1
 
         if pos is None:
-            trigger = sig['lower_band']
+            pending = pending_buys.get(ticker)
             trail_buy_pct = node.get('trail_buy_pct')
+            if pending is not None:
+                # z already crossed, trailing-buy order active -- the bounce-above-
+                # running-low trigger is the number that actually matters now, not
+                # the (already-cleared, often much farther away) initial z trigger.
+                _, tb_trigger = _trailing_buy_status(pending)
+                trigger = tb_trigger if tb_trigger is not None else sig['lower_band']
+                next_action = 'Waiting Trail-Buy Bounce'
+                trigger_label = 'tb-bounce'
+            else:
+                trigger = sig['lower_band']
+                next_action = 'Waiting Buy Trigger'
+                trigger_label = 'z-cross'
             rows.append({
                 'Ticker': ticker, 'Hold': '',
-                'Next Action': 'Waiting Buy Trigger',
+                'Next Action': next_action, 'Trigger Label': trigger_label,
                 'Next Trigger $': trigger, 'Now': now_price,
                 'Proximity': (now_price - trigger) / trigger * 100,
                 'Version': node.get('version'), 'Alpha': alpha, 'Z': sig['z_score'],
@@ -1458,13 +1486,17 @@ def build_reference_table(watchlist):
                 else:
                     next_action = f"Pending Sell {trail_sell_pct:g}%" if trail_sell_pct else 'Pending Sell'
                 proximity = (now_price - trigger) / trigger * 100
+                trigger_label = 'trail-sell'
             else:
+                # Two triggers are simultaneously live here: SL protects right now,
+                # Arm is the next threshold that swaps SL for the trailing sell.
                 trigger = pos['entry_price'] * (1 + db._tp_or_arm_pct(pos) / 100.0)
                 next_action = f"Arm {arm_pct:g}%" if arm_pct else 'Arm'
                 proximity = (trigger - now_price) / trigger * 100
+                trigger_label = 'arm'
 
             rows.append({
-                'Ticker': ticker, 'Hold': hold, 'Next Action': next_action,
+                'Ticker': ticker, 'Hold': hold, 'Next Action': next_action, 'Trigger Label': trigger_label,
                 'Next Trigger $': trigger, 'Now': now_price, 'Proximity': proximity,
                 'Version': pos.get('version'), 'Alpha': alpha, 'Z': sig['z_score'],
                 'Z Trigger': node.get('z_score_threshold'),
