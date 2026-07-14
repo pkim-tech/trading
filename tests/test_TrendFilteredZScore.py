@@ -15,7 +15,7 @@ from tests.conftest import cleanup_csv, fake_node
 
 TICKER    = 'TEST_TFZS'
 STRATEGY  = 'TrendFilteredZScore'
-CACHE_DIR = Path("./cache")
+CACHE_DIR = Path("./cache/research")
 
 
 def node(**kw): return fake_node(TICKER, STRATEGY, **kw)

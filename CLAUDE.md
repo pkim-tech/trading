@@ -37,9 +37,10 @@ A z-score mean reversion backtesting and optimization system targeting leveraged
 - `scripts/live_sim.py` — manual-step live-sim REPL: drives the real `compute_buy_signal`/`check_sell_condition`/`notify_*` functions against an isolated `cache/trading_sim.db` (via `TRADING_DB_PATH` env override) so the full BUY→placed→filled→arm→trailing-sell Slack sequence can be exercised bar-by-bar without touching the live daemon or `trading_live.db`. `SIM_MODE=1` forces plain-text/typed-input Slack messages (prefixed with a `🧪 SIM MODE`/`🧪 SIM MODE END` header/footer context block, optionally labeled via `SIM_SCENARIO` env var) instead of interactive buttons — the sim never opens its own Socket Mode connection, so real buttons would risk being delivered to the live daemon's connection instead. Real interactive buttons genuinely cannot be tested this way (Slack routes all clicks to whichever process holds the socket, i.e. the live daemon, not the sim) — button *layout* can still be previewed by manually appending a dummy-`action_id` actions block (safe no-op if tapped). `buy`/`sell` REPL commands drive signal checks directly; `pending`/`placed TICKER`/`fill TICKER PRICE`/`remind_buy [--stale]` drive the three-state buy lifecycle (signal → order placed → filled) added 2026-07-10. Interactively tested end-to-end with the user 2026-07-09/10 — found and fixed several real bugs in the process (see `docs/conversation_summary.md`).
 
 ## Runtime Artifacts (not committed)
-- `cache/` — hourly CSV data per ticker + SQLite results DB (`trading_universe.db`)
+- `cache/live/` — the real trade record: `trading_live.db` plus pre-migration `.bak` snapshots, `trading_sim.db` (live-sim testing), `active_signals_heartbeat.txt`
+- `cache/research/` — regenerable research data: hourly CSV per ticker, `trading_universe.db` (+ daily/weekly `.bak` rotations), `watchlist_sweep.db`, `dismissed_tickers.json`
 - `logs/` — optimization output PNGs, CSVs, text reports
-- `output/` — archived/legacy files
+- `output/` — script outputs/exports/reports (not cache): `*_trades.xlsx`, `live_backups/` (hourly `trading_live.db` snapshots), archived/legacy files
 - `active_phase_grid.json` — live progress state written during sweep runs
 - `current_test.json` — temp telemetry file, deleted on sweep exit
 

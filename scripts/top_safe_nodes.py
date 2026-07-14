@@ -13,7 +13,7 @@ import time
 import pandas as pd
 from pathlib import Path
 
-DB_PATH      = Path("./cache/trading_universe.db")
+DB_PATH      = Path("./cache/research/trading_universe.db")
 CLIFF_RADIUS = 3
 
 

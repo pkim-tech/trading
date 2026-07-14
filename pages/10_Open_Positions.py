@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-DB_PATH = "./cache/trading_live.db"
+DB_PATH = "./cache/live/trading_live.db"
 
 st.set_page_config(page_title="Open Positions", layout="wide")
 st.title("Open Positions")

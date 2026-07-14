@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import sqlite3
 import pandas as pd
 
-CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
 NOTIONAL = 50_000
 
 

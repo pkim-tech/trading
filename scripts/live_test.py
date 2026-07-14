@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from active_signals import add_node, remove_node, get_watchlist, get_open_positions, close_position, DB_PATH
 
-CACHE_DIR  = Path("./cache")
+CACHE_DIR  = Path("./cache/research")
 TEST_CSV   = CACHE_DIR / "TEST_1h.csv"
 
 # Node params

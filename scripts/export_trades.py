@@ -9,7 +9,9 @@ import pandas as pd
 import strategies
 from backtester import prep_inputs, WIN, LOSS, TWIN, TLOSS, OPEN, _RESULT_NAMES
 
-CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
+LIVE_DIR = Path(__file__).resolve().parent.parent / "cache" / "live"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 START_CAPITAL = 50_000  # matches $50k notional per trade in live sizing
 
 
@@ -260,7 +262,7 @@ def load_hourly(ticker):
 
 
 def get_node(ticker, watchlist_id=9):
-    conn = sqlite3.connect(CACHE_DIR / "trading_live.db")
+    conn = sqlite3.connect(LIVE_DIR / "trading_live.db")
     c = conn.cursor()
     c.execute(
         "SELECT window, arm_sell_pct, trail_buy_pct, trail_sell_pct, fixed_sl, "
@@ -463,7 +465,7 @@ def main(ticker):
         strat_ws.append([name, val])
     strat_ws.column_dimensions["A"].width = 34
 
-    out_path = CACHE_DIR / f"{ticker}_trades.xlsx"
+    out_path = OUTPUT_DIR / f"{ticker}_trades.xlsx"
     wb.save(out_path)
     print(f"Wrote {len(out)} trades (with in-between bars) to {out_path} (starting equity ${START_CAPITAL:,})")
     n_compared = min(len(raw_trades), len(ohlc_trades))

@@ -14,9 +14,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DB_PATH          = Path(os.environ.get("TRADING_DB_PATH", "./cache/trading_live.db"))
-RESEARCH_DB_PATH = Path("./cache/trading_universe.db")
+DB_PATH          = Path(os.environ.get("TRADING_DB_PATH", "./cache/live/trading_live.db"))
+RESEARCH_DB_PATH = Path("./cache/research/trading_universe.db")
 CACHE_DIR        = Path("./cache")
+LIVE_DIR         = CACHE_DIR / "live"
+RESEARCH_DIR     = CACHE_DIR / "research"
 CONFIG_PATH      = Path("./config.json")
 POLL_SECS        = int(os.environ.get("SIGNAL_POLL_SECS", 300))
 SLACK_HOOK       = os.environ.get("SLACK_WEBHOOK_URL", "")
@@ -25,7 +27,7 @@ LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 HUMAN_LOG_PATH   = LOG_DIR / "active_signals.log"
 VERBOSE_LOG_PATH = LOG_DIR / "active_signals_verbose.log"
-HEARTBEAT_PATH   = CACHE_DIR / "active_signals_heartbeat.txt"
+HEARTBEAT_PATH   = LIVE_DIR / "active_signals_heartbeat.txt"
 
 
 class _Tee:

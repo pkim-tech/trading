@@ -6,9 +6,11 @@ streamlit
 plotly
 seaborn
 matplotlib
+pillow>=12.3.0  # CVE fix (PYSEC-2026-2253/2254/2255/2256/2257) -- pinned floor since it's normally a transitive dep
 requests
 python-dotenv
 scikit-learn
 scipy
 tqdm
 slack_bolt
+schwab-py

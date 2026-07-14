@@ -13,8 +13,8 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.verify_live_parity import compare, kernel_trades
 
-DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "trading_universe.db"
-LIVE_DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "trading_live.db"
+DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "research" / "trading_universe.db"
+LIVE_DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "live" / "trading_live.db"
 OUT_PATH = Path(__file__).resolve().parent.parent / "docs" / "post_sweep_report.md"
 
 STRATEGY_TO_V2 = {

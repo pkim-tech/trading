@@ -20,7 +20,7 @@ STRATEGY = "ZScoreBreakout"
 all_results = []
 
 for TICKER, WINDOW, TP, SL, HOLD, Z in WATCHLIST:
-    df_h = pd.read_csv(f"cache/{TICKER}_1h.csv", index_col=0, parse_dates=True)
+    df_h = pd.read_csv(f"cache/research/{TICKER}_1h.csv", index_col=0, parse_dates=True)
     close_col = "Adj Close" if "Adj Close" in df_h.columns else "Close"
     df_daily = df_h.resample("D").last().dropna(subset=[close_col])
 

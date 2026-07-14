@@ -6,7 +6,7 @@ import os
 import plotly.graph_objects as go
 from db_cache import get_kv, set_kv
 
-DB_PATH = "./cache/trading_universe.db"
+DB_PATH = "./cache/research/trading_universe.db"
 TELEMETRY_PATH = "current_test.json"
 PHASE_GRID_PATH = "active_phase_grid.json"
 

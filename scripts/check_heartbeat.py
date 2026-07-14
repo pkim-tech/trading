@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-HEARTBEAT_PATH = Path(__file__).resolve().parent.parent / "cache" / "active_signals_heartbeat.txt"
+HEARTBEAT_PATH = Path(__file__).resolve().parent.parent / "cache" / "live" / "active_signals_heartbeat.txt"
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL   = os.environ.get("SLACK_CHANNEL", "")
 

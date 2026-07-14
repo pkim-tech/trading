@@ -13,10 +13,12 @@ Three discrete layers, each independently runnable:
 ## Layer 1 — Data Collection
 
 - `data_collector.py` polls every 5 minutes, calls `data_manager.py` for incremental updates
-- Data stored as `cache/{ticker}_1h.csv`, SPY always included as benchmark
+- Data stored as `cache/research/{ticker}_1h.csv`, SPY always included as benchmark
 - Incremental backfill with deduplication — overlapping buffer handles weekends/holidays
 - Ticker universe defined in `tickers.json` — plain JSON array, read at startup
 - Cron job runs `data_collector.py --once` daily at 6:30 AM via `scripts/run_data_collector.sh`, logs to `logs/data_collector_daily.log` (runs before 7 AM morning report so bands are fresh)
+
+**Addendum (2026-07-14)**: `cache/` split into three buckets that were previously all flat in one folder: `cache/live/` (`trading_live.db` + backups, `trading_sim.db`, the daemon heartbeat — the real trade record), `cache/research/` (`trading_universe.db` + backups, all ticker `_1h.csv`, `watchlist_sweep.db` — regenerable), and `output/` (`*_trades.xlsx`, `live_backups/` hourly DB snapshots, one-off migration artifacts — not cache at all). See `CLAUDE.md`'s Runtime Artifacts section for the current layout. Crontab backup jobs updated to match.
 
 ---
 
@@ -307,3 +309,13 @@ If a brokerage API key is added (e.g. Alpaca, IBKR), Layer 3 can be extended to:
 - Track open positions via broker API (not manual state)
 - Handle fills, partial fills, and slippage reporting
 - End-of-day reconciliation against broker blotter
+
+**Addendum (2026-07-14)**: Schwab module skeleton added — `schwab_auth.py` (OAuth via the
+`schwab-py` library's `easy_client`, token cached at `cache/live/schwab_token.json`; the 7-day
+refresh-token expiry means unattended operation still needs a human to redo browser login
+roughly weekly, no way around this today), `schwab_client.py` (account-nickname→hash resolution
+from env vars, `place_equity_buy`/`place_equity_sell`), `schwab_safety.py` (the gate every order
+must pass through first: per-account allowlist/notional-cap/daily-order-cap/dry-run flag, a hard
+global order ceiling, and a global kill switch). All accounts start `dry_run=True` with
+placeholder caps — real numbers and the first interactive OAuth login are still pending. No
+order has been placed against a real account yet.

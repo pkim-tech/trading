@@ -16,7 +16,7 @@ Prints commands only — does not execute anything.
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "trading_universe.db"
+DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "research" / "trading_universe.db"
 STRATEGY = "TrailingBothZScoreBreakout"
 SPARSE_VALUES = [1, 2, 3, 4, 5, 6, 7, 9, 12, 15, 18, 21, 24, 27, 30]
 

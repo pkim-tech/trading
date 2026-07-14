@@ -6,7 +6,7 @@ A z-score mean reversion system for leveraged ETFs, built in three layers: data 
 
 ## Layer 1 — Data Collection
 
-`data_collector.py` fetches and caches hourly OHLCV data for the full ticker universe via yfinance. Data is stored as CSV files in `cache/` (one per ticker). SPY is always appended as the benchmark.
+`data_collector.py` fetches and caches hourly OHLCV data for the full ticker universe via yfinance. Data is stored as CSV files in `cache/research/` (one per ticker). SPY is always appended as the benchmark.
 
 The ticker universe is defined in `tickers.json` — a plain JSON array of symbols. Edit this file to add or remove tickers; both `data_collector.py` and the optimization sweep read from it.
 
@@ -23,7 +23,7 @@ A cron job runs `--once` daily at 8 AM to keep all tickers fresh. Output is logg
 
 The core of the system. `run_optimization_sweep.py` searches for robust trading parameter sets by brute-forcing the full combination space of take profit %, stop loss %, and max hold time across one or more tickers and strategy variants.
 
-Each combination (a "node") is evaluated by `backtester.py`, which runs a full backtest simulation and returns alpha vs SPY. Results are cached in SQLite (`cache/trading_universe.db`) so nodes are never re-evaluated.
+Each combination (a "node") is evaluated by `backtester.py`, which runs a full backtest simulation and returns alpha vs SPY. Results are cached in SQLite (`cache/research/trading_universe.db`) so nodes are never re-evaluated.
 
 The search evolved through several approaches before settling on full brute force:
 - Early versions tried smart grid search and generational refinement around alpha peaks

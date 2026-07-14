@@ -12,7 +12,8 @@ import strategies
 from backtester import prep_inputs
 from scripts.export_trades import load_hourly, simulate_trail_both_annotated
 
-CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+LIVE_DIR = Path(__file__).resolve().parent.parent / "cache" / "live"
+RESEARCH_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
 
 # (ticker, watch_list version) -- pulled from watchlist_id=9, matched exactly against
 # their backtest_cache row (including axis_tp/max_hold_hours) in the 2026-07-13 session.
@@ -20,7 +21,7 @@ TARGETS = ["AGQ", "EDC", "YANG"]
 
 
 def recalc(ticker):
-    conn = sqlite3.connect(CACHE_DIR / "trading_live.db")
+    conn = sqlite3.connect(LIVE_DIR / "trading_live.db")
     row = conn.execute(
         "SELECT window, arm_sell_pct, trail_buy_pct, trail_sell_pct, fixed_sl, "
         "max_hold_hours, z_score_threshold, version FROM watch_list "
@@ -50,7 +51,7 @@ def recalc(ticker):
     win_rate = float((df_tr["result"] == WIN).sum() / len(df_tr) * 100)
     win_twin_rate = float(df_tr["result"].isin([WIN, TWIN]).sum() / len(df_tr) * 100)
 
-    uconn = sqlite3.connect(CACHE_DIR / "trading_universe.db")
+    uconn = sqlite3.connect(RESEARCH_DIR / "trading_universe.db")
     ucur = uconn.execute(
         "SELECT win_rate, win_twin_rate, trades FROM backtest_cache WHERE ticker=? AND "
         "strategy='TrailingBothZScoreBreakout' AND version=? AND window=? AND z_score_threshold=? "

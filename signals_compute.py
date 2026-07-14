@@ -19,7 +19,7 @@ import signals_db as db
 # ---------------------------------------------------------------------------
 
 def _load_cache(ticker):
-    path = cfg.CACHE_DIR / f"{ticker}_1h.csv"
+    path = cfg.RESEARCH_DIR / f"{ticker}_1h.csv"
     if not path.exists():
         return None, None
     df = pd.read_csv(path, index_col=0, parse_dates=True)

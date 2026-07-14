@@ -12,9 +12,9 @@ import numpy as np
 import strategies
 from backtester import run_backtest_dispatch
 
-DB_PATH   = "./cache/trading_universe.db"
-LIVE_DB_PATH = "./cache/trading_live.db"
-CACHE_DIR = Path("./cache")
+DB_PATH   = "./cache/research/trading_universe.db"
+LIVE_DB_PATH = "./cache/live/trading_live.db"
+CACHE_DIR = Path("./cache/research")
 
 RESULT_COLORS = {
     'WIN':   '#2ecc71',

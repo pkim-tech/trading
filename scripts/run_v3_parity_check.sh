@@ -67,7 +67,7 @@ echo " Parity check — v2.x vs v3.x best node for $TICKER"
 echo "======================================================"
 $PYTHON -c "
 import sqlite3
-c = sqlite3.connect('cache/trading_universe.db')
+c = sqlite3.connect('cache/research/trading_universe.db')
 pairs = [('v2.5','v3.5','ZScoreBreakout'), ('v2.10','v3.10','TrailingBothZScoreBreakout'),
          ('v2.17','v3.17','TrailingBothZScoreBreakout')]
 for old, new, strat in pairs:

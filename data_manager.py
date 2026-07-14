@@ -6,8 +6,8 @@ from pathlib import Path
 from datetime import datetime
 
 # Create a local directory named 'cache' to store data files
-CACHE_DIR = Path("./cache")
-CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR = Path("./cache/research")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def generate_synthetic_data(days=60, points_per_day=7, base_price=150.0):
     """

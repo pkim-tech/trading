@@ -7,7 +7,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime, timedelta
 
-CACHE_DIR = Path("./cache")
+CACHE_DIR = Path("./cache/research")
 
 
 def _synthetic_timestamps(days=90):
@@ -26,7 +26,7 @@ def _synthetic_timestamps(days=90):
 
 def make_synthetic_csv(ticker, last_close, days=90):
     """
-    Writes a synthetic hourly CSV to cache/{ticker}_1h.csv.
+    Writes a synthetic hourly CSV to cache/research/{ticker}_1h.csv.
     Prices are ~100 with low variance; last bar is set to last_close.
     days=90 ensures enough history for window=20 + 50-day trend filter.
     Call cleanup_csv() after the test.

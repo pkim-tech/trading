@@ -7,7 +7,7 @@ how the UVIX unadjusted-reverse-split bug (2026-07-01) was actually confirmed.
 data_manager.py's incremental fetch only re-adjusts overlapping rows on update
 (see fetch_live_data_smart), so any split landing after a ticker's initial 730-day
 bootstrap can leave older cached rows stuck at the pre-split scale. Any ticker
-flagged here should have its cache/{ticker}_1h.csv deleted and rebuilt.
+flagged here should have its cache/research/{ticker}_1h.csv deleted and rebuilt.
 """
 import argparse
 import sys
@@ -17,7 +17,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
 
 
 def check_ticker(csv_path: Path) -> list[dict]:

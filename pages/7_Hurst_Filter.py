@@ -11,7 +11,7 @@ from db_cache import get_kv
 st.set_page_config(layout="wide", page_title="Hurst Filter")
 st.title("Hurst Filter Sweep")
 
-DB_PATH = "./cache/trading_universe.db"
+DB_PATH = "./cache/research/trading_universe.db"
 
 c1, c2, c3, c4 = st.columns(4)
 MIN_TRADES  = c1.number_input("Min trades", value=5, min_value=1)
@@ -49,7 +49,7 @@ def load_qualifying_nodes(min_trades, min_return, min_bh_mult):
 def run_hurst_sweep(nodes, hurst_windows):
     results = []
     for ticker, window, z, tp, sl, hold, base_ret, n_trades, bh_mult in nodes:
-        csv = Path(f"cache/{ticker}_1h.csv")
+        csv = Path(f"cache/research/{ticker}_1h.csv")
         if not csv.exists():
             continue
         df_h = pd.read_csv(csv, index_col=0, parse_dates=True)

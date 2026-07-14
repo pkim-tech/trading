@@ -12,7 +12,7 @@ except ImportError:
     def fetch_live_data_smart(ticker):
         import yfinance as yf
         df = yf.download(ticker, period="1y", interval="1h", multi_level_index=False)
-        df.to_csv(Path("./cache") / f"{ticker}_1h.csv")
+        df.to_csv(Path("./cache/research") / f"{ticker}_1h.csv")
 
 # --- GLOBAL CONFIGURATIONS ---
 TICKERS_FILE  = Path("./tickers.json")
@@ -27,8 +27,8 @@ def load_tickers() -> list[str]:
 # --- RUNTIME DIRECTORY SETUP ---
 LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(exist_ok=True)
-CACHE_DIR = Path("./cache")
-CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR = Path("./cache/research")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # FORCE RESET: Clear out any conflicting configurations from imports to ensure file writing works
 for handler in logging.root.handlers[:]:

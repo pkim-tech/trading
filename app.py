@@ -16,7 +16,7 @@ STRATEGY_OPTIONS = [
 ]
 
 # Enforce clean workspace environment paths immediately on boot
-DB_DIR = Path("./cache")
+DB_DIR = Path("./cache/research")
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "trading_universe.db"
 TELEMETRY_PATH = "current_test.json"

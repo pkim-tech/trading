@@ -49,7 +49,7 @@ def make_dip_bounce_csv(ticker, signal_close=85.0, dip_low=82.0, bounce=0.05, da
 
     df = pd.DataFrame({'Close': prices, 'High': highs, 'Low': lows}, index=timestamps)
     df.index.name = 'Datetime'
-    df.to_csv(Path('./cache') / f"{ticker}_1h.csv")
+    df.to_csv(Path('./cache/research') / f"{ticker}_1h.csv")
 
 
 def test_trailingbuy_buy_signal_price_below_lower_band():
@@ -103,7 +103,7 @@ def test_trailingbuy_exit_time():
 def dip_bounce_df():
     ticker = '_v19_test'
     make_dip_bounce_csv(ticker)
-    df = pd.read_csv(f'cache/{ticker}_1h.csv', index_col=0, parse_dates=True)
+    df = pd.read_csv(f'cache/research/{ticker}_1h.csv', index_col=0, parse_dates=True)
     df.index = pd.to_datetime(df.index).tz_localize(None)
     yield df
     cleanup_csv(ticker)
@@ -133,7 +133,7 @@ def test_v110_kernel_fires_trades_on_dip_bounce_data(dip_bounce_df):
 
 @pytest.mark.parametrize("ticker", ['AGQ', 'SOXL'])
 def test_v19_real_data_has_closed_trades(ticker):
-    cache = Path(f'cache/{ticker}_1h.csv')
+    cache = Path(f'cache/research/{ticker}_1h.csv')
     if not cache.exists():
         pytest.skip(f"no cached data for {ticker}")
     df_r = pd.read_csv(cache, index_col=0, parse_dates=True)

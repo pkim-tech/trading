@@ -4,7 +4,7 @@ Manual-step live-trading simulator.
 
 Drives the *real* active_signals.py functions (compute_buy_signal,
 check_sell_condition, notify_buy_signal, notify_sell_signal, open_position,
-close_position, ...) against an isolated sim DB (cache/trading_sim.db by
+close_position, ...) against an isolated sim DB (cache/live/trading_sim.db by
 default), so the full BUY -> trailing-buy -> arm -> trailing-sell Slack
 message sequence can be exercised bar-by-bar without touching the live
 daemon or trading_live.db.
@@ -45,7 +45,7 @@ import sys
 from datetime import datetime, timedelta
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--sim-db", default="./cache/trading_sim.db")
+parser.add_argument("--sim-db", default="./cache/live/trading_sim.db")
 parser.add_argument("--source-watchlist-id", type=int, default=9)
 args, _ = parser.parse_known_args()
 
@@ -59,7 +59,7 @@ import pandas as pd  # noqa: E402
 
 import active_signals as A  # noqa: E402  (must import after env vars are set)
 
-LIVE_DB_PATH = "./cache/trading_live.db"
+LIVE_DB_PATH = "./cache/live/trading_live.db"
 
 NODE_COLS = [
     'ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',

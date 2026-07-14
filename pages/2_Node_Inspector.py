@@ -11,8 +11,8 @@ from active_signals import get_watchlist
 from db_cache import get_kv
 from statsmodels.tsa.stattools import adfuller
 
-DB_PATH = "./cache/trading_universe.db"
-CACHE_DIR = Path("./cache")
+DB_PATH = "./cache/research/trading_universe.db"
+CACHE_DIR = Path("./cache/research")
 
 st.set_page_config(layout="wide", page_title="Node Inspector")
 

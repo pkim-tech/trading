@@ -10,7 +10,7 @@ from statsmodels.tsa.stattools import adfuller
 st.set_page_config(layout="wide", page_title="ADF Filter")
 st.title("ADF Filter Sweep")
 
-DB_PATH  = "./cache/trading_universe.db"
+DB_PATH  = "./cache/research/trading_universe.db"
 STRATEGY = "ZScoreBreakout"
 
 c1, c2, c3, c4 = st.columns(4)
@@ -45,7 +45,7 @@ def load_qualifying_nodes(min_trades, min_return, min_bh_mult):
 def run_adf_sweep(nodes, adf_window):
     results = []
     for ticker, window, z, tp, sl, hold, base_ret_db, n_trades, bh_mult in nodes:
-        csv = Path(f"cache/{ticker}_1h.csv")
+        csv = Path(f"cache/research/{ticker}_1h.csv")
         if not csv.exists():
             continue
         df_h = pd.read_csv(csv, index_col=0, parse_dates=True)

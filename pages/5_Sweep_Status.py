@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 
-DB_PATH    = "./cache/trading_universe.db"
+DB_PATH    = "./cache/research/trading_universe.db"
 CONFIG_PATH = Path("./config.json")
 
 st.set_page_config(layout="wide", page_title="Sweep Status")
@@ -62,7 +62,7 @@ df[["cached", "success", "no_trades"]] = df[["cached", "success", "no_trades"]].
 
 @st.cache_data(ttl=3600)
 def get_data_date(ticker):
-    p = Path(f"./cache/{ticker}_1h.csv")
+    p = Path(f"./cache/research/{ticker}_1h.csv")
     if not p.exists():
         return None
     try:

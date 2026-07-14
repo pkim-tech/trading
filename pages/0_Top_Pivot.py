@@ -4,8 +4,8 @@ import pandas as pd
 from db_cache import get_kv
 import strategies
 
-DB_PATH = "./cache/trading_universe.db"
-WATCHLIST_SWEEP_DB_PATH = "./cache/watchlist_sweep.db"
+DB_PATH = "./cache/research/trading_universe.db"
+WATCHLIST_SWEEP_DB_PATH = "./cache/research/watchlist_sweep.db"
 WINDOWS = [10, 20]
 Z_THRESHOLDS = [1.0, 1.5, 2.0]
 
@@ -544,7 +544,7 @@ st.subheader("Watchlist — Alpha by Strategy")
 @st.cache_data(ttl=300)
 def load_watchlist_pivot():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("ATTACH DATABASE ? AS live_db", ("./cache/trading_live.db",))
+        conn.execute("ATTACH DATABASE ? AS live_db", ("./cache/live/trading_live.db",))
         df = pd.read_sql('''
             SELECT w.ticker, w.mode, w.strategy, w.version,
                    w.window, w.z_score_threshold, w.take_profit, w.stop_loss, w.max_hold_hours,
@@ -606,7 +606,7 @@ with st.expander("Edit Underliers"):
 
 st.divider()
 st.subheader("Watchlist Trade Pivot")
-st.caption("Reads a scoped snapshot (cache/watchlist_sweep.db), not the production DB. "
+st.caption("Reads a scoped snapshot (cache/research/watchlist_sweep.db), not the production DB. "
            "Trade-level results are computed once via the real kernel and cached in trade_cache, "
            "not read from backtest_cache's (sometimes stale) aggregate win_rate columns.")
 

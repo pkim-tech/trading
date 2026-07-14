@@ -73,8 +73,8 @@ def classify_underlier(underlying_index: str, description: str = "") -> tuple[st
     return None, None
 
 
-DB_PATH   = Path("./cache/trading_universe.db")
-CACHE_DIR = Path("./cache")
+DB_PATH   = Path("./cache/research/trading_universe.db")
+CACHE_DIR = Path("./cache/research")
 CSV_PATH  = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./results.csv")
 
 

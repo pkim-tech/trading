@@ -46,7 +46,7 @@ import active_signals
 import strategies
 from backtester import run_backtest, run_backtest_v17, run_backtest_v18, run_backtest_v19, run_backtest_v110, run_backtest_v211
 
-CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
 
 
 def _load(ticker):

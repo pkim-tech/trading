@@ -2,7 +2,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 
-DB_PATH = "./cache/trading_universe.db"
+DB_PATH = "./cache/research/trading_universe.db"
 COARSE_VALS = list(range(3, 31, 3))  # [3,6,9,...,30]
 MIN_NOTIONAL = 50_000                 # default liquidity floor ($)
 TOP_N_INDEX  = 20

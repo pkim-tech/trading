@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 
-DB_PATH     = "./cache/trading_universe.db"
+DB_PATH     = "./cache/research/trading_universe.db"
 CONFIG_PATH = Path("./config.json")
 
 st.set_page_config(layout="wide", page_title="Screener")

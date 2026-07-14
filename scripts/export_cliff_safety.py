@@ -6,7 +6,7 @@ import pandas as pd
 
 import strategies
 
-DB_PATH = "./cache/trading_universe.db"
+DB_PATH = "./cache/research/trading_universe.db"
 CLIFF_SAFETY_RADIUS = 3
 
 _LEGACY_TRAILING_BOTH_TRAIL_PCT = {'v2.13': 1.0, 'v2.14': 2.0, 'v2.15': 3.0, 'v2.16': 4.0, 'v2.17': 5.0}

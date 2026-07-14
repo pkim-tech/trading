@@ -8,8 +8,8 @@ from active_signals import (add_node, remove_node, get_watchlist, label_node,
                              set_active_watchlist, set_node_mode)
 from db_cache import get_kv
 
-DB_PATH      = "./cache/trading_universe.db"
-DISMISS_FILE = Path("./cache/dismissed_tickers.json")
+DB_PATH      = "./cache/research/trading_universe.db"
+DISMISS_FILE = Path("./cache/research/dismissed_tickers.json")
 
 
 def load_dismissed() -> set:
@@ -68,7 +68,7 @@ def load_results(version, min_trades, min_return, min_alpha, min_bh_mult, beat_b
 
 @st.cache_data(ttl=300)
 def latest_ticker_stats(ticker: str) -> dict:
-    path = Path(f"./cache/{ticker}_1h.csv")
+    path = Path(f"./cache/research/{ticker}_1h.csv")
     if not path.exists():
         return {}
     df = pd.read_csv(path, index_col=0, parse_dates=True)

@@ -15,7 +15,7 @@ from backtester import run_backtest
 import strategies
 from active_signals import get_watchlist
 
-CACHE_DIR = Path("./cache")
+CACHE_DIR = Path("./cache/research")
 
 
 def load_hourly(ticker):

@@ -21,8 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from backtester import prep_inputs
 import strategies
 
-CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
-LIVE_DB = CACHE_DIR / "trading_live.db"
+CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
+LIVE_DB = Path(__file__).resolve().parent.parent / "cache" / "live" / "trading_live.db"
 FIVE_MIN_LOOKBACK_DAYS = 58  # yfinance caps 5m history at 60d; leave margin
 
 

@@ -8,7 +8,8 @@ import sqlite3
 import pandas as pd
 import strategies
 
-CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
 
 def load_hourly(ticker):
@@ -20,7 +21,7 @@ def load_hourly(ticker):
 
 
 def get_node(ticker, watchlist_id=9):
-    conn = sqlite3.connect(Path(__file__).resolve().parent.parent / "cache" / "trading_live.db")
+    conn = sqlite3.connect(Path(__file__).resolve().parent.parent / "cache" / "live" / "trading_live.db")
     c = conn.cursor()
     c.execute(
         "SELECT window, arm_sell_pct, trail_buy_pct, trail_sell_pct, fixed_sl, "
@@ -66,7 +67,7 @@ def main(ticker):
         })
 
     out = pd.DataFrame(out_rows)
-    out_path = CACHE_DIR / f"{ticker}_signal_bars.csv"
+    out_path = OUTPUT_DIR / f"{ticker}_signal_bars.csv"
     out.to_csv(out_path, index=False)
     print(f"Wrote {len(out)} bars to {out_path}")
 

@@ -18,7 +18,7 @@ from backtester import (run_backtest_dispatch,
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
-CACHE_DIR    = Path("./cache")
+CACHE_DIR    = Path("./cache/research")
 OPTO_LOG_DIR = Path("./logs")
 OPTO_LOG_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = CACHE_DIR / "trading_universe.db"

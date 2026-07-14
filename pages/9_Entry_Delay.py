@@ -9,7 +9,7 @@ from active_signals import get_watchlist
 st.set_page_config(layout="wide", page_title="Entry Delay")
 st.title("Entry Delay Analysis")
 
-CACHE_DIR = Path("./cache")
+CACHE_DIR = Path("./cache/research")
 MAX_DELAY  = 4
 
 

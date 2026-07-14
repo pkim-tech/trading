@@ -160,7 +160,7 @@ def _write_low_high_csv(ticker, lows, highs, start='2025-06-01 10:30:00'):
     idx = pd.date_range(start, periods=len(lows), freq='h')
     df = pd.DataFrame({'Close': lows, 'Low': lows, 'High': highs}, index=idx)
     df.index.name = 'Datetime'
-    df.to_csv(Path('./cache') / f"{ticker}_1h.csv")
+    df.to_csv(Path('./cache/research') / f"{ticker}_1h.csv")
     return idx
 
 
