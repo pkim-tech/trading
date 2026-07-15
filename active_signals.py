@@ -20,10 +20,13 @@ Environment (Webhook fallback — fire-and-forget, no buttons):
     SIGNAL_POLL_SECS    — poll interval in seconds (default 300)
 
 Module layout: DB layer is signals_db.py, signal computation (SMA/Std
-indicator cache, buy/sell evaluation) is signals_compute.py, Slack-facing
-code (charts, message blocks, notify_*, reminders, Bolt handlers, reference
-report) is signals_notify.py, and shared config/tokens/the Bolt app singleton
-is signals_config.py. This file re-exports their public names for backward
+indicator cache, buy/sell evaluation) is signals_compute.py, chart PNG
+generation is signals_charts.py, Slack message posting/block builders is
+signals_blocks.py, small shared helpers (used by both blocks and notify) is
+signals_helpers.py, Bolt interactive button/modal handlers is
+signals_handlers.py, notify_*/reminder loops/reference-table/report is
+signals_notify.py, and shared config/tokens/the Bolt app singleton is
+signals_config.py. This file re-exports their public names for backward
 compatibility with existing `from active_signals import X` / `import
 active_signals as a; a.X` callers (scripts/, pages/, tests/) and keeps only
 the daemon main loop and CLI dispatch.
@@ -42,7 +45,6 @@ import strategies
 import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
-import signals_notify as notify
 
 # --- Backward-compatible re-exports -----------------------------------------
 
@@ -66,18 +68,25 @@ from signals_compute import (
     _load_cache, _current_price, _hurst_adf, compute_buy_signal, _bars_held,
     check_sell_condition, _indicator_cache,
 )
+from signals_charts import _upload_chart, _chart_buy, _chart_sell
+from signals_blocks import (
+    _post_message, _fields_block, _price_input_block, _shares_input_block,
+    _build_buy_blocks, _build_sell_blocks,
+)
+from signals_helpers import (
+    _add_trading_hours, _proximity_emoji, _last_sale_recovery, _phase_emoji,
+)
 from signals_notify import (
-    _upload_chart, _chart_buy, _chart_sell, _post_message, _fields_block,
-    _price_input_block, _shares_input_block, _build_buy_blocks, _build_sell_blocks,
     notify_buy_signal, notify_limit_fill, notify_sell_signal,
     TRAIL_REMINDER_MINUTES, _trailing_order_blocks, _supersede_message,
     notify_trailing_activated, check_trailing_reminders,
     EXIT_REMINDER_MINUTES, _exit_pending_blocks, check_exit_reminders,
     BUY_REMINDER_MINUTES, _trailing_buy_status, _pending_buy_blocks, check_buy_reminders,
-    _add_trading_hours, _proximity_emoji, _ticker_block, _send_window_alert,
-    _REF_TABLE_COLS, _last_sale_recovery, _phase_emoji,
-    build_reference_table, format_reference_table, _STRATEGY_LABELS, send_reference_report,
+    _ticker_block, _send_window_alert,
+    _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
+    send_reference_report,
 )
+import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
 
 # ---------------------------------------------------------------------------

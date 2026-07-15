@@ -29,7 +29,7 @@ A z-score mean reversion backtesting and optimization system targeting leveraged
 - `run_optimization_sweep.py` — main parallel optimization engine (brute force + generational refinement)
 - `backtester.py` — core backtest simulation logic (`run_backtest`)
 - `strategies.py` — strategy classes: `ZScoreBreakout`, `TrailingExitZScoreBreakout`, `LimitOrderZScoreBreakout`, `LimitOrderTrailingExit`, `TrailingBuyZScoreBreakout`, `TrailingBothZScoreBreakout` (live default), `LimitExitZScoreBreakout`, `TrendFilteredZScore`
-- `active_signals.py` — live trading daemon: polls signal windows, manages `open_positions`/`watch_list`, fires Slack alerts
+- `active_signals.py` — live trading daemon: polls signal windows, manages `open_positions`/`watch_list`, fires Slack alerts. Delegates to (and re-exports, for backward compat): `signals_config.py` (config/tokens/Bolt app singleton), `signals_db.py` (DB layer), `signals_compute.py` (signal computation), `signals_charts.py` (chart PNGs), `signals_blocks.py` (Slack message posting/block builders), `signals_helpers.py` (small shared helpers), `signals_handlers.py` (Bolt interactive button/modal handlers), `signals_notify.py` (notify_*/reminder loops/reference-table/report — the core, formerly the whole Slack-facing layer, split out 2026-07-14 for length).
 - `data_collector.py` — fetches and caches hourly price data
 - `data_manager.py` — data fetching and cache management
 - `config.json` — runtime config: tickers, hyperparameters, strategy selection
