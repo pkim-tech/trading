@@ -415,10 +415,10 @@ def _resolve_sl_display(version, strategy, stop_loss, trail_buy_pct, trail_pct):
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy)
     if sl_axis_col == 'stop_loss':
         return 'SL %', f"{stop_loss:g}", stop_loss
-    is_v3 = version.startswith('v3.')
-    real_sl_axis_val = (trail_buy_pct if sl_axis_col == 'trail_buy_pct' else trail_pct) if is_v3 else stop_loss
+    is_v3_plus = not version.startswith(('v1.', 'v2.'))
+    real_sl_axis_val = (trail_buy_pct if sl_axis_col == 'trail_buy_pct' else trail_pct) if is_v3_plus else stop_loss
     if sl_axis_col == 'trail_buy_pct' and fourth_axis_col == 'trail_pct':
-        real_trail_pct = trail_pct if is_v3 else _LEGACY_TRAILING_BOTH_TRAIL_PCT.get(version, 3.0)
+        real_trail_pct = trail_pct if is_v3_plus else _LEGACY_TRAILING_BOTH_TRAIL_PCT.get(version, 3.0)
         return 'Bounce % / Trail %', f"{real_sl_axis_val:g} / {real_trail_pct:g}", real_sl_axis_val
     label = 'Bounce %' if sl_axis_col == 'trail_buy_pct' else 'Trail %'
     return label, f"{real_sl_axis_val:g}", real_sl_axis_val
@@ -440,7 +440,7 @@ def load_cliff_safety(version_strategy_pairs):
     with sqlite3.connect(DB_PATH) as conn:
         for version, strategy in version_strategy_pairs:
             sl_axis_col, _ = strategies.resolve_axis_columns(strategy)
-            neighbor_axis_col = sl_axis_col if version.startswith('v3.') else 'stop_loss'
+            neighbor_axis_col = sl_axis_col if not version.startswith(('v1.', 'v2.')) else 'stop_loss'
             tickers = [r[0] for r in conn.execute(
                 "SELECT DISTINCT ticker FROM backtest_cache WHERE version=? AND strategy=? AND trades > 0",
                 (version, strategy)
@@ -449,7 +449,7 @@ def load_cliff_safety(version_strategy_pairs):
                 row = conn.execute("""
                     SELECT axis_tp, stop_loss, max_hold_hours, window, z_score_threshold,
                            alpha_vs_spy, strategy_return, trades, win_rate, trail_buy_pct, trail_sell_pct,
-                           win_twin_rate
+                           win_twin_rate, entry_timing
                     FROM backtest_cache
                     WHERE version=? AND ticker=? AND strategy=? AND trades > 0
                     ORDER BY alpha_vs_spy DESC LIMIT 1
@@ -457,11 +457,18 @@ def load_cliff_safety(version_strategy_pairs):
                 if not row:
                     continue
                 (tp, sl, hold, window, z, alpha, ret, trades, win_rate,
-                 trail_buy_pct, trail_pct, win_twin_rate) = row
+                 trail_buy_pct, trail_pct, win_twin_rate, entry_timing) = row
                 tp, sl, hold, window = int(tp), int(sl), int(hold), int(window)
                 trail_buy_pct, trail_pct = float(trail_buy_pct or 0), float(trail_pct or 0)
                 sl_label, sl_display, neighbor_center = _resolve_sl_display(
                     version, strategy, sl, trail_buy_pct, trail_pct)
+                # Multiple stop_loss/entry_timing campaigns can share one version
+                # string (v4+) — keep the neighbor box inside the same campaign as
+                # the best row, or a cliff-safety check would mix SL regimes.
+                campaign_sql, campaign_params = ("", [])
+                if strategies.uses_fixed_sl(strategy):
+                    campaign_sql = " AND stop_loss=? AND entry_timing=?"
+                    campaign_params = [sl, entry_timing]
                 worst = conn.execute(f"""
                     SELECT MIN(alpha_vs_spy) FROM backtest_cache
                     WHERE version=? AND ticker=? AND strategy=?
@@ -469,11 +476,11 @@ def load_cliff_safety(version_strategy_pairs):
                       AND axis_tp BETWEEN ? AND ?
                       AND {neighbor_axis_col} BETWEEN ? AND ?
                       AND max_hold_hours BETWEEN ? AND ?
-                      AND trades > 0
+                      AND trades > 0 {campaign_sql}
                 """, (version, ticker, strategy, window, z,
                       tp - CLIFF_SAFETY_RADIUS, tp + CLIFF_SAFETY_RADIUS,
                       neighbor_center - CLIFF_SAFETY_RADIUS, neighbor_center + CLIFF_SAFETY_RADIUS,
-                      hold - 7, hold + 7)).fetchone()[0]
+                      hold - 7, hold + 7, *campaign_params)).fetchone()[0]
                 worst_neighbor = float(worst) if worst is not None else float(alpha)
                 results.append({
                     'ticker': ticker, 'version': version, 'strategy': strategy,

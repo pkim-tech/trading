@@ -167,6 +167,43 @@ Switched to the combined grid everywhere in v3.x (rather than coarse-by-default)
 confirming multiple current watchlist winners sit at the 1/2/4/5 low-end points — see
 git history 2026-07-05 for the query.
 
+### v4 (2026-07-14/15) — fill-optimism resolution bounds + entry_timing + phase tagging
+
+`_simulate_trail_both` now computes three parallel trailing-buy bounce-fill
+resolutions per node instead of one, since none of hourly OHLC proves the true
+intrabar path: **possible** (existing/unchanged, Low-before-High assumption),
+**pessimistic** (new, mirror-image High-before-Low assumption), **certain** (new,
+only resolves a fill when provable regardless of ordering). Verified via
+`scripts/verify_v4_fill_bounds.py`: `possible` is byte-for-byte unchanged from
+pre-v4 (exact match against historical v3.x rows once re-run against the
+same-dated truncated price history). **Important correction (found 2026-07-15,
+KORU)**: `pessimistic` is *not* a rigorous aggregate lower bound on `possible`
+despite being provably same-bar-or-later/same-or-worse-price *per fill event* —
+once it defers past the bar where `possible` already fired, the two trade
+sequences diverge independently, and continued deferral can let `pessimistic`'s
+running_low fall further before its own eventual fill, occasionally producing a
+*better* aggregate result (same mechanism that lets `certain` beat `possible`).
+None of the three is a mathematically guaranteed bound on the others in
+aggregate — only per-fill-event trigger-price comparisons have proven orderings.
+`ROBUST_ALPHA_SQL` = `MIN(possible, pessimistic, certain)` is still used for
+island/cliff-safety ranking as the best available conservative heuristic, just
+not a provable floor.
+
+`entry_timing` (`close`/`open_check`) and `stop_loss` (for `uses_fixed_sl`
+strategies) are campaign-level constants — like the pre-2026-07-05 `trail_pct`
+pattern, not real grid axes (3-axis island cap, see below) — but unlike that
+pattern, every v4 campaign shares one version string (`v4`); the real
+`stop_loss`/`entry_timing` columns disambiguate campaigns instead
+(`run_optimization_sweep.py::_campaign_scope_sql`). New `phase` column
+(plain data, in-place `ALTER TABLE ADD COLUMN`, no PK rebuild) tags each row
+with whichever phase (`Phase1-Coarse`/`Phase2-Island`/`Phase2.5-CliffBox`/
+`Phase3-Full`) first computed it — the caching layer means a node keeps the
+label of the *first* phase that reached it even if a later phase's mesh would
+have also covered it, which is exactly what's needed to measure whether Phase 3
+(originally meant as a fallback for when island search can't find a good node,
+not a routine step) ever actually finds something the cheaper phases missed.
+New `sl_sweep_summary` rollup table, one row per completed campaign.
+
 ### Optimization Approach
 
 The optimizer searches for **winning islands** — regions of the (take profit, stop loss, hold time) parameter space where many neighboring nodes all produce positive alpha vs SPY. A single isolated peak is fragile; a broad plateau is robust.

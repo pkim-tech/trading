@@ -159,6 +159,71 @@ def init_idempotent_db():
         if after_count != before_count:
             raise RuntimeError(f"backtest_cache axis_tp migration row count mismatch: {before_count} -> {after_count}")
         logger.info(f"Migration complete: {after_count:,} rows carried over, axis_tp backfilled from take_profit.")
+        bc_cols = {r[1] for r in cursor.execute("PRAGMA table_info(backtest_cache)").fetchall()}
+
+    # v4 (2026-07-14): fill-optimism resolution bounds + entry_timing axis — see
+    # docs/backlog_cache.md fill-optimism item, plan at
+    # /home/pkim/.claude/plans/rustling-bubbling-hennessy.md. entry_timing is a
+    # campaign-level constant (like fixed_sl/stop_loss, not swept within a run) so
+    # it goes in the PK. 'possible' is the existing alpha_vs_spy/strategy_return
+    # (Low-before-High assumption, unchanged) — 'pessimistic' (High-before-Low
+    # assumption) and 'certain' (no-guessing, only provable fills) are new,
+    # plain data columns riding alongside, not PK members. None of the three is a
+    # rigorous bound on the others (see _simulate_trail_both docstring) — island
+    # search ranks by MIN across all three, not 'possible' alone, so a node only
+    # gets picked when it's robust under every resolution, not just the
+    # optimistic default.
+    if 'entry_timing' not in bc_cols:
+        logger.info("Migrating backtest_cache schema: adding entry_timing/pessimistic+certain bound columns, rebuilding PK...")
+        before_count = cursor.execute("SELECT COUNT(*) FROM backtest_cache").fetchone()[0]
+        cursor.executescript("""
+            CREATE TABLE backtest_cache_new (
+                strategy TEXT, version TEXT, ticker TEXT, window INTEGER,
+                max_hold_hours INTEGER, take_profit INTEGER, stop_loss INTEGER,
+                trades INTEGER, win_rate REAL, strategy_return REAL,
+                alpha_vs_spy REAL, asset_bh REAL, spy_bh REAL, run_timestamp TEXT,
+                z_score_threshold REAL DEFAULT 2.0, fixed_sl REAL DEFAULT 0,
+                trail_buy_pct REAL DEFAULT 0, trail_sell_pct REAL DEFAULT 0,
+                win_twin_rate REAL DEFAULT 0, arm_sell_pct REAL, axis_tp REAL NOT NULL DEFAULT 0,
+                entry_timing TEXT NOT NULL DEFAULT 'close',
+                strategy_return_pessimistic REAL, alpha_vs_spy_pessimistic REAL,
+                strategy_return_certain REAL, alpha_vs_spy_certain REAL,
+                PRIMARY KEY (strategy, version, ticker, window, max_hold_hours,
+                             axis_tp, stop_loss, z_score_threshold,
+                             trail_buy_pct, trail_sell_pct, entry_timing)
+            );
+            INSERT INTO backtest_cache_new
+                (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
+                 trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
+                 run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
+                 win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
+                 strategy_return_pessimistic, alpha_vs_spy_pessimistic,
+                 strategy_return_certain, alpha_vs_spy_certain)
+            SELECT strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
+                   trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
+                   run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
+                   win_twin_rate, arm_sell_pct, axis_tp, 'close', NULL, NULL, NULL, NULL
+            FROM backtest_cache;
+            DROP TABLE backtest_cache;
+            ALTER TABLE backtest_cache_new RENAME TO backtest_cache;
+        """)
+        after_count = cursor.execute("SELECT COUNT(*) FROM backtest_cache").fetchone()[0]
+        if after_count != before_count:
+            raise RuntimeError(f"backtest_cache v4 migration row count mismatch: {before_count} -> {after_count}")
+        logger.info(f"Migration complete: {after_count:,} rows carried over, entry_timing backfilled to 'close'.")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sl_sweep_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL, strategy TEXT NOT NULL, version TEXT NOT NULL,
+            stop_loss REAL NOT NULL, trail_sell_pct REAL NOT NULL, entry_timing TEXT NOT NULL,
+            best_alpha REAL, best_alpha_pessimistic REAL, best_alpha_certain REAL,
+            worst_neighbor_alpha REAL,
+            best_node_tp REAL, best_node_hold INTEGER, best_node_trail_buy_pct REAL,
+            n_islands INTEGER, any_cliff_safe INTEGER, run_timestamp TEXT NOT NULL,
+            UNIQUE(ticker, strategy, version, stop_loss, trail_sell_pct, entry_timing, run_timestamp)
+        )
+    """)
 
     cursor.execute("DROP INDEX IF EXISTS idx_bc_version_ticker")
     cursor.execute("DROP INDEX IF EXISTS idx_bc_version_ticker_z_return")
@@ -264,7 +329,7 @@ def _warmup_worker():
     _simulate_trail_buy(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
                          0.05, 0.05, 1, 0.03, 9, 14, 2.0)
     _simulate_trail_both(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
-                          0.05, 0.05, 1, 0.03, 0.03, 9, 14, 2.0)
+                          0.05, 0.05, 1, 0.03, 0.03, 9, 14, 2.0, prices, False)
     _simulate_limit_trail(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
                            0.05, 0.05, 1, 0.03, 9, 14, 2.0)
     _simulate_close_limitexit(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
@@ -291,8 +356,18 @@ def _trail_pcts_for_strategy(strategy_name, hp):
     return [float(v) for v in hp.get('trail_pcts', [_config_trail_pct() * 100])]
 
 
+def _summarize_trades(closed, spy_bh):
+    """(alpha, n_trades, win_rate, compounded, win_twin_rate) for a closed-trade list."""
+    df_tr = pd.DataFrame(closed)
+    win_rate      = float((len(df_tr[df_tr['Result'] == 'WIN']) / len(df_tr)) * 100)
+    win_twin_rate = float((len(df_tr[df_tr['Result'].isin(['WIN', 'TWIN'])]) / len(df_tr)) * 100)
+    compounded = float(((df_tr['Return'] + 1).prod() - 1) * 100)
+    alpha_calc = float(compounded - spy_bh)
+    return alpha_calc, len(df_tr), win_rate, compounded, win_twin_rate
+
+
 def run_single_backtest_node_isolated(args):
-    ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl, trail_pct_pct = args
+    ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl, trail_pct_pct, entry_timing = args
 
     strategy_class = getattr(strategies, strategy_name, None)
     if not strategy_class:
@@ -308,32 +383,48 @@ def run_single_backtest_node_isolated(args):
     df_hourly_raw, df_daily_processed, prep = inputs
 
     try:
-        trades = run_backtest_dispatch(
+        result = run_backtest_dispatch(
             strategy_class, df_hourly_raw, df_daily_processed, ticker,
             take_profit=tp, sl_raw=sl, max_hours_to_hold=hold_hours, z_score_threshold=z_thresh,
-            fixed_sl=fixed_sl, trail_pct_pct=trail_pct_pct, prep=prep
+            fixed_sl=fixed_sl, trail_pct_pct=trail_pct_pct, entry_timing=entry_timing,
+            return_bounds=True, prep=prep
         )
-        closed = [t for t in trades if t["Result"] in ["WIN", "LOSS", "TWIN", "TLOSS"]]
+        # pessimistic/certain bounds only exist for TrailingBothZScoreBreakout —
+        # every other strategy's dispatch branch ignores return_bounds and returns
+        # a plain list.
+        if isinstance(result, tuple):
+            trades, trades_pess, trades_cert = result
+        else:
+            trades, trades_pess, trades_cert = result, None, None
+        closed_codes = ["WIN", "LOSS", "TWIN", "TLOSS"]
+        closed = [t for t in trades if t["Result"] in closed_codes]
+        closed_pess = [t for t in trades_pess if t["Result"] in closed_codes] if trades_pess is not None else None
+        closed_cert = [t for t in trades_cert if t["Result"] in closed_codes] if trades_cert is not None else None
     except Exception as e:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "SIM_ERROR", "error": repr(e)}
 
     if not closed:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "NO_TRADES"}
 
-    df_tr = pd.DataFrame(closed)
-    win_rate      = float((len(df_tr[df_tr['Result'] == 'WIN']) / len(df_tr)) * 100)
-    win_twin_rate = float((len(df_tr[df_tr['Result'].isin(['WIN', 'TWIN'])]) / len(df_tr)) * 100)
-    compounded = float(((df_tr['Return'] + 1).prod() - 1) * 100)
-    alpha_calc = float(compounded - spy_bh)
+    alpha_calc, n_trades, win_rate, compounded, win_twin_rate = _summarize_trades(closed, spy_bh)
+    if closed_pess:
+        alpha_pess, _, _, compounded_pess, _ = _summarize_trades(closed_pess, spy_bh)
+    else:
+        alpha_pess, compounded_pess = None, None
+    if closed_cert:
+        alpha_cert, _, _, compounded_cert, _ = _summarize_trades(closed_cert, spy_bh)
+    else:
+        alpha_cert, compounded_cert = None, None
 
     return {
         "coords":  (tp, sl, hold_hours),
-        "payload": (alpha_calc, len(df_tr), win_rate, compounded, win_twin_rate),
+        "payload": (alpha_calc, n_trades, win_rate, compounded, win_twin_rate,
+                    alpha_pess, compounded_pess, alpha_cert, compounded_cert),
         "window":  w, "z_thresh": z_thresh, "status": "SUCCESS"
     }
 
 
-def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
+def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
     conn   = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
     matrix_results  = []
@@ -357,8 +448,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
         SELECT window, max_hold_hours, axis_tp, stop_loss, z_score_threshold, fixed_sl,
                trail_buy_pct, trail_sell_pct, trades, win_rate, strategy_return, alpha_vs_spy, win_twin_rate
         FROM backtest_cache
-        WHERE strategy=? AND version=? AND ticker=?
-    """, (strategy_name, config_version, ticker))
+        WHERE strategy=? AND version=? AND ticker=? AND entry_timing=?
+    """, (strategy_name, config_version, ticker, entry_timing))
     for r in cursor.fetchall():
         if r[4] is None:
             continue  # legacy NULL-z rows never matched the old equality check either
@@ -407,7 +498,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
     futures_map = {
         shared_pool.submit(run_single_backtest_node_isolated,
-                           (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z, fixed_sl, tpct)): task
+                           (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z, fixed_sl, tpct, entry_timing)): task
         for task in unvisited_tasks
         for tp, sl, hold, w, z, tpct in [task]
     }
@@ -436,9 +527,11 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                                    f"{status} {res.get('error', '')}")
             if status in ("SUCCESS", "NO_TRADES"):
                 if status == "SUCCESS":
-                    alpha, num_trades, wr, comp_ret, wtw = res["payload"]
+                    (alpha, num_trades, wr, comp_ret, wtw,
+                     alpha_pess, comp_ret_pess, alpha_cert, comp_ret_cert) = res["payload"]
                 else:
                     alpha, num_trades, wr, comp_ret, wtw = 0.0, 0, 0.0, 0.0, 0.0
+                    alpha_pess, comp_ret_pess, alpha_cert, comp_ret_cert = None, None, None, None
 
                 now = time.time()
                 if now - last_postfix_time >= 2.0:
@@ -485,7 +578,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
                 buffer.append((strategy_name, config_version, ticker, w, hold_hours, row_take_profit, row_stop_loss,
                                num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
-                               stored_fsl, row_trail_buy_pct, row_trail_pct, wtw, row_arm_sell_pct, float(tp)))
+                               stored_fsl, row_trail_buy_pct, row_trail_pct, wtw, row_arm_sell_pct, float(tp),
+                               entry_timing, comp_ret_pess, alpha_pess, comp_ret_cert, alpha_cert, phase_label))
 
                 if len(buffer) >= batch_size:
                     cursor.executemany(
@@ -493,8 +587,10 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                            (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
                             trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
                             run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
-                            win_twin_rate, arm_sell_pct, axis_tp)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
+                            strategy_return_pessimistic, alpha_vs_spy_pessimistic,
+                            strategy_return_certain, alpha_vs_spy_certain, phase)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         buffer
                     )
                     buffer = []
@@ -509,8 +605,10 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
                 trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
                 run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
-                win_twin_rate, arm_sell_pct, axis_tp)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
+                strategy_return_pessimistic, alpha_vs_spy_pessimistic,
+                strategy_return_certain, alpha_vs_spy_certain, phase)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             buffer
         )
     conn.commit()
@@ -548,9 +646,20 @@ def compute_bh_returns(ticker):
 
 # ── Island selection ──────────────────────────────────────────────────────────
 
+# A node's "robust" alpha is the worst of its three fill-optimism resolutions
+# (possible/pessimistic/certain — see backtester._simulate_trail_both), not just
+# the optimistic 'possible' number — island search and cliff-safety rank/filter
+# on this everywhere so a node is only ever selected when it holds up under all
+# three, not just the default optimistic one. COALESCE falls back to alpha_vs_spy
+# itself for strategies that don't produce pessimistic/certain bounds (NULL).
+ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_vs_spy), "
+                     "COALESCE(alpha_vs_spy_certain, alpha_vs_spy))")
+
+
 def pick_island_centers(df, n=N_ISLANDS, min_sep=ISLAND_MIN_SEP):
+    rank_col = 'robust_alpha' if 'robust_alpha' in df.columns else 'alpha_vs_spy'
     centers = []
-    for _, row in df.sort_values('alpha_vs_spy', ascending=False).iterrows():
+    for _, row in df.sort_values(rank_col, ascending=False).iterrows():
         tp, sl = int(row['take_profit']), int(row['stop_loss'])
         if all(abs(tp - c[0]) >= min_sep or abs(sl - c[1]) >= min_sep for c in centers):
             centers.append((tp, sl))
@@ -561,7 +670,19 @@ def pick_island_centers(df, n=N_ISLANDS, min_sep=ISLAND_MIN_SEP):
 
 # ── Phase 1: Coarse scan ──────────────────────────────────────────────────────
 
-def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
+def _campaign_scope_sql(strategy_name, fixed_sl, entry_timing):
+    """Extra WHERE-clause fragment + params to keep a phase2/2.5/checkpoint query
+    scoped to one (stop_loss, entry_timing) campaign when multiple v4-style
+    campaigns share a single version string — see docs/design.md's 3-axis island
+    cap and the v4 plan's separate-campaign-per-(stop_loss,entry_timing) design.
+    For strategies whose real 'stop_loss' column IS the swept grid axis (not
+    fixed_sl), only entry_timing needs scoping."""
+    if strategies.uses_fixed_sl(strategy_name):
+        return " AND stop_loss=? AND entry_timing=?", [int(round(float(fixed_sl))), entry_timing]
+    return " AND entry_timing=?", [entry_timing]
+
+
+def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
     z_thresholds = hp['z_score_thresholds']
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     expected = (len(z_thresholds) * len(hp['windows']) * len(hp['take_profits'])
@@ -570,10 +691,11 @@ def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, sp
     with sqlite3.connect(DB_PATH, timeout=60.0) as chk:
         z_ph = ','.join('?' * len(z_thresholds))
         w_ph = ','.join('?' * len(hp['windows']))
+        scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
         cached = chk.execute(
             f"SELECT COUNT(*) FROM backtest_cache WHERE strategy=? AND version=? AND ticker=?"
-            f" AND z_score_threshold IN ({z_ph}) AND window IN ({w_ph})",
-            (strategy_name, config_version, ticker, *z_thresholds, *hp['windows'])
+            f" AND z_score_threshold IN ({z_ph}) AND window IN ({w_ph}) {scope_sql}",
+            (strategy_name, config_version, ticker, *z_thresholds, *hp['windows'], *scope_params)
         ).fetchone()[0]
 
     if cached >= expected:
@@ -589,21 +711,22 @@ def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, sp
              for tpct in trail_pcts]
 
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
-                           "Phase1-Coarse", spy_bh, asset_bh, run_timestamp, fixed_sl)
+                           "Phase1-Coarse", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
 
 # ── Checkpoint 1: rank by coarse alpha, return island candidates ──────────────
 
-def identify_island_candidates(config_version, strategy_name, n_index, n_stock, allowed_tickers=None):
+def identify_island_candidates(config_version, strategy_name, n_index, n_stock, allowed_tickers=None, fixed_sl=0, entry_timing='close'):
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     with sqlite3.connect(DB_PATH) as conn:
-        query = """
-            SELECT b.ticker, MAX(b.alpha_vs_spy) as best_alpha,
+        query = f"""
+            SELECT b.ticker, MAX({ROBUST_ALPHA_SQL}) as best_alpha,
                    t.index_underlier, t.stock_underlier
             FROM backtest_cache b
             LEFT JOIN tickers t ON t.symbol = b.ticker
-            WHERE b.version=? AND b.strategy=? AND b.trades > 0
+            WHERE b.version=? AND b.strategy=? AND b.trades > 0 {scope_sql}
         """
-        params = [config_version, strategy_name]
+        params = [config_version, strategy_name, *scope_params]
         if allowed_tickers:
             query += f" AND b.ticker IN ({','.join('?' * len(allowed_tickers))})"
             params += list(allowed_tickers)
@@ -626,24 +749,26 @@ def identify_island_candidates(config_version, strategy_name, n_index, n_stock, 
 
 # ── Phase 2: Island mesh ──────────────────────────────────────────────────────
 
-def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
+def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     tasks = set()
     with sqlite3.connect(DB_PATH) as conn:
         for z in hp['z_score_thresholds']:
             for w in hp['windows']:
                 for tpct in trail_pcts:
-                    params = [config_version, ticker, strategy_name, float(z), int(w)]
+                    params = [config_version, ticker, strategy_name, float(z), int(w), *scope_params]
                     tpct_filter = ""
                     if fourth_axis_col == 'trail_pct':
                         tpct_filter = "AND trail_sell_pct=?"
                         params.append(float(tpct))
                     df_wz = pd.read_sql(f"""
-                        SELECT axis_tp AS take_profit, {sl_axis_col} AS stop_loss, max_hold_hours, alpha_vs_spy
+                        SELECT axis_tp AS take_profit, {sl_axis_col} AS stop_loss, max_hold_hours, alpha_vs_spy,
+                               {ROBUST_ALPHA_SQL} AS robust_alpha
                         FROM backtest_cache
                         WHERE version=? AND ticker=? AND strategy=?
-                          AND z_score_threshold=? AND window=? AND trades > 0 {tpct_filter}
+                          AND z_score_threshold=? AND window=? AND trades > 0 {scope_sql} {tpct_filter}
                     """, conn, params=params)
 
                     if df_wz.empty:
@@ -662,26 +787,27 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
 
     logger.info(f"[{ticker}] Phase2 island mesh: {len(tasks)} tasks ({N_ISLANDS} islands ±{FINE_RADIUS})")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
-                           "Phase2-Island", spy_bh, asset_bh, run_timestamp, fixed_sl)
+                           "Phase2-Island", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
 
 # ── Phase 2.5: targeted cliff-box sweep around true best node ────────────────
 
-def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
+def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
     """Sweep ±CLIFF_RADIUS in TP/SL and ±7h in hold around the true best node from Phase 2.
     Guarantees cliff check has complete neighborhood data regardless of where the peak landed.
     For TrailingBothZScoreBreakout, also sweeps the trail_pct axis's immediate neighbors
     (±1 in the configured trail_pcts list) so Checkpoint 2's cliff check has data there too."""
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(f"""
             SELECT axis_tp, {sl_axis_col} AS stop_loss, max_hold_hours, window, z_score_threshold,
                    {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct
             FROM backtest_cache
-            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
-            ORDER BY alpha_vs_spy DESC LIMIT 1
-        """, (config_version, ticker, strategy_name)).fetchone()
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0 {scope_sql}
+            ORDER BY {ROBUST_ALPHA_SQL} DESC LIMIT 1
+        """, (config_version, ticker, strategy_name, *scope_params)).fetchone()
     if not row:
         return
     tp_c, sl_c, hold_c, w_c, z_c, tpct_c = int(row[0]), int(row[1]), int(row[2]), int(row[3]), float(row[4]), float(row[5])
@@ -701,23 +827,25 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
 
     logger.info(f"[{ticker}] Phase2.5 cliff-box: {len(tasks)} tasks around TP={tp_c} SL={sl_c} hold={hold_c}h")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
-                           "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp, fixed_sl)
+                           "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
 
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
 
-def identify_full_mesh_candidates(config_version, strategy_name, island_tickers, n_index, n_stock):
+def identify_full_mesh_candidates(config_version, strategy_name, island_tickers, n_index, n_stock, fixed_sl=0, entry_timing='close'):
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     results = []
     with sqlite3.connect(DB_PATH) as conn:
         for ticker in island_tickers:
             row = conn.execute(f"""
-                SELECT axis_tp, {sl_axis_col} AS stop_loss, max_hold_hours, window, z_score_threshold, alpha_vs_spy,
+                SELECT axis_tp, {sl_axis_col} AS stop_loss, max_hold_hours, window, z_score_threshold,
+                       {ROBUST_ALPHA_SQL} AS robust_alpha,
                        {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct
                 FROM backtest_cache
-                WHERE version=? AND ticker=? AND strategy=? AND trades > 0
-                ORDER BY alpha_vs_spy DESC LIMIT 1
-            """, (config_version, ticker, strategy_name)).fetchone()
+                WHERE version=? AND ticker=? AND strategy=? AND trades > 0 {scope_sql}
+                ORDER BY robust_alpha DESC LIMIT 1
+            """, (config_version, ticker, strategy_name, *scope_params)).fetchone()
             if not row:
                 continue
 
@@ -731,20 +859,20 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                 tpct_params = [tpct_c - 1, tpct_c + 1]
 
             worst = conn.execute(f"""
-                SELECT MIN(alpha_vs_spy) FROM backtest_cache
+                SELECT MIN({ROBUST_ALPHA_SQL}) FROM backtest_cache
                 WHERE version=? AND ticker=? AND strategy=?
                   AND window=? AND z_score_threshold=?
                   AND axis_tp        BETWEEN ? AND ?
                   AND {sl_axis_col}  BETWEEN ? AND ?
                   AND max_hold_hours BETWEEN ? AND ?
-                  {tpct_filter}
+                  {scope_sql} {tpct_filter}
                   AND trades > 0
             """, (config_version, ticker, strategy_name,
                   win_c, z_c,
                   tp_c - CLIFF_RADIUS, tp_c + CLIFF_RADIUS,
                   sl_c - CLIFF_RADIUS, sl_c + CLIFF_RADIUS,
                   hold_c - 7, hold_c + 7,
-                  *tpct_params)).fetchone()[0]
+                  *scope_params, *tpct_params)).fetchone()[0]
 
             worst_neighbor = float(worst) if worst is not None else 0.0
             cliff = worst_neighbor < 0
@@ -783,7 +911,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
 
 # ── Phase 3: Full mesh ────────────────────────────────────────────────────────
 
-def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0):
+def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     tasks = [(tp, sl, int(hold), int(w), float(z), float(tpct))
              for z    in hp['z_score_thresholds']
@@ -795,7 +923,7 @@ def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_
 
     logger.info(f"[{ticker}] Phase3 full mesh: {len(tasks)} tasks (cache skips coarse+island already done)")
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
-                           "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl)
+                           "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
     # Static heatmap PNG disabled — superseded by the interactive Spatial Topology page,
     # nothing read these files back. Left commented instead of deleted in case that changes.
@@ -834,6 +962,9 @@ if __name__ == "__main__":
                         help="Override tickers to sweep")
     parser.add_argument("--version", default=None,
                         help="Override version from config.json")
+    parser.add_argument("--entry-timing", dest="entry_timing", default=None, choices=["close", "open_check"],
+                        help="Override entry_timing from config.json (close=bar-close only, "
+                             "open_check=also check bar Open before falling through to Close)")
     parser.add_argument("--skip-cache-refresh", action="store_true",
                         help="Skip dropdown/pivot/cliff-grid cache refresh at end of run "
                              "(useful when chaining multiple versions and refreshing once at the end)")
@@ -858,6 +989,7 @@ if __name__ == "__main__":
     hp                = config["hyperparameters"]
     max_workers       = config.get("execution", {}).get("max_workers", 6)
     fixed_sl          = config.get("execution", {}).get("fixed_stop_loss", 0)
+    entry_timing      = args.entry_timing or config.get("execution", {}).get("entry_timing", "close")
     tickers           = args.tickers or config.get("target_tickers", [])
     strategy_names    = config.get("active_strategies", ["ZScoreBreakout"])
     phase_only        = args.phase
@@ -931,7 +1063,7 @@ if __name__ == "__main__":
                         logger.warning(f"Unknown strategy: {name}")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
+                    run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
             logger.info("Phase 1 complete.")
 
@@ -953,14 +1085,14 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
+                    run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
                 continue
 
             island_tickers = []
             for gen in range(max_generations):
                 # ── Checkpoint 1 (re-run each generation) ────────────────
                 logger.info(f"\nCheckpoint 1 (gen {gen+1}/{max_generations}): ranking results for {name} [{config_version}]...")
-                top_index, top_other = identify_island_candidates(config_version, name, 25, 5, allowed_tickers=valid_tickers)
+                top_index, top_other = identify_island_candidates(config_version, name, 25, 5, allowed_tickers=valid_tickers, fixed_sl=fixed_sl, entry_timing=entry_timing)
                 island_tickers = top_index + top_other
 
                 if not island_tickers:
@@ -979,7 +1111,7 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 2.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
+                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
                 logger.info(f"Phase 2 gen {gen+1} complete.")
 
@@ -994,12 +1126,12 @@ if __name__ == "__main__":
                 if ticker not in bh_cache:
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
+                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
             # ── Checkpoint 2 ─────────────────────────────────────────────
             logger.info(f"\nCheckpoint 2: cliff check on {len(island_tickers)} island tickers [{config_version}]...")
             top_other, all_index, rest_other = identify_full_mesh_candidates(
-                config_version, name, island_tickers, 5, 5
+                config_version, name, island_tickers, 5, 5, fixed_sl=fixed_sl, entry_timing=entry_timing
             )
             # Order: top 5 non-index → all index → remaining non-index
             full_tickers = top_other + all_index + rest_other
@@ -1017,7 +1149,7 @@ if __name__ == "__main__":
                     logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl)
+                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
     if args.skip_cache_refresh:
         logger.info("\nSkipping cache refresh (--skip-cache-refresh).")

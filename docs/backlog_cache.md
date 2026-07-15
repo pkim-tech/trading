@@ -41,4 +41,4 @@ Original question: if a same-day re-entry trigger hits (ticker sold, then disloc
 - `trading_universe.db` (research, regenerable): daily + weekly rotating single-file backups, 2 copies total, no accumulation.
 
 ## Deferred, lower priority
-(none currently)
+- **Train/test (e.g. 70/30) split for backtest date range** — 2026-07-14: raised during v4 kernel-correctness work as a third, distinct robustness axis alongside island/cliff-safety (parameter-neighborhood robustness) and possible/pessimistic/certain (fill-timing-assumption robustness) — a train/test split protects against overfitting to the specific historical period's regime/noise, which neither of the other two addresses. **Not implemented at all currently** — the whole system runs one pass over the full historical range for both parameter selection and reporting; every "best node" on file is in-sample by construction. Deliberately deferred out of the v4 pass (already large: kernel rewrite + robust ranking) to its own focused session — would need island search re-run on a 70% training slice, then a separate out-of-sample validation pass on the remaining 30%.
