@@ -65,9 +65,12 @@ if cfg.SOCKET_MODE:
     @cfg.bolt_app.action("trail_buy_filled")
     def handle_trail_buy_filled(ack, body, client):
         ack()
-        data    = json.loads(body['actions'][0]['value'])
-        channel = body['channel']['id']
-        ts      = body['message']['ts']
+        data              = json.loads(body['actions'][0]['value'])
+        channel           = body['channel']['id']
+        ts                = body['message']['ts']
+        ticker            = data['node']['ticker']
+        signal_price      = data['signal_price']
+        suggested_shares  = int(_last_sale_recovery(ticker) // signal_price) if signal_price else None
         client.views_open(
             trigger_id=body['trigger_id'],
             view={
@@ -77,7 +80,7 @@ if cfg.SOCKET_MODE:
                 "title":  {"type": "plain_text", "text": "Fill Price"},
                 "submit": {"type": "plain_text", "text": "Confirm"},
                 "close":  {"type": "plain_text", "text": "Cancel"},
-                "blocks": [_price_input_block()],
+                "blocks": [_price_input_block(), _shares_input_block(suggested_shares)],
             },
         )
 
@@ -132,7 +135,7 @@ if cfg.SOCKET_MODE:
 
         fill_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
         drift_pct  = (fill_price - signal_price) / signal_price * 100
-        shares     = int(_last_sale_recovery(ticker) // fill_price)
+        shares     = int(body['view']['state']['values']['shares_block']['shares_input']['value'])
 
         opened = db.open_position(node, signal_price, signal_time, fill_price, datetime.now(), shares=shares)
         db.clear_pending_buy(ticker)

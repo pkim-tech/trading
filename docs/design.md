@@ -204,6 +204,30 @@ have also covered it, which is exactly what's needed to measure whether Phase 3
 not a routine step) ever actually finds something the cheaper phases missed.
 New `sl_sweep_summary` rollup table, one row per completed campaign.
 
+**Phase-3 value-add answered (2026-07-15)**: across all 30 tagged SOXL+KORU SL-sweep
+campaigns, Phase 3 (full mesh) never held the best `MIN(possible,pessimistic,certain)`
+alpha node — Phase1 (coarse) or Phase2 (island) always did, Phase2.5 (cliff-box) won a
+few. Island/cliff-safety selection (Checkpoint 2) was independently confirmed to only
+ever read Phase1+2+2.5 data — Phase 3 was never part of that calculation to begin with.
+Added `--max-phase {1,2,2.5,3}` (default `3`, unchanged pipeline behavior) to
+`run_optimization_sweep.py` so future campaigns can skip Phase 3 outright
+(`run_phase3_full` also now logs a `Phase3 best=... (pre-Phase3 best=...,
+IMPROVED/no improvement)` line for live confirmation on any run that does still include
+it). New `generation` column (nullable, `Phase2-Island` rows only) records which
+island-search generation (1-indexed, `config.execution.max_generations`) first computed
+a row, to similarly test whether the generation loop's extra passes earn their cost —
+not yet analyzed. Also found and fixed: `phase` was never created by
+`init_idempotent_db()` (only existed because it was added by hand against the live DB
+in session 10) — a fresh DB would have failed on `INSERT ... phase`; now a proper
+`ALTER TABLE ADD COLUMN`, alongside `generation`.
+
+**Emerging finding, not yet conclusive (2026-07-15)**: across both tickers tested,
+`entry_timing='open_check'` won every single tested campaign (17/17, SOXL 10/10 + KORU
+7/7), and `robust_alpha` showed a real declining trend as `stop_loss` loosened (SOXL
+3% ≈ 2.5x better than 30%). Directly contradicts the current live config (15% flat SL,
+close-only entry) — worth confirming across the rest of the watchlist before acting on
+it (see `docs/backlog_cache.md`).
+
 ### Optimization Approach
 
 The optimizer searches for **winning islands** — regions of the (take profit, stop loss, hold time) parameter space where many neighboring nodes all produce positive alpha vs SPY. A single isolated peak is fragile; a broad plateau is robust.

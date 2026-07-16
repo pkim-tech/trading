@@ -39,7 +39,7 @@ cd "$(dirname "$0")/.."
 PYTHON=".venv/bin/python"
 TICKERS="AGQ DPST EDC GDXU HIBL KORU LABU NUGT SOXL TQQQ YANG"
 VALIDATE_TICKERS="SOXL"
-STOP_LOSSES="3 6 9 12 15 18 21 24 27 30"
+STOP_LOSSES="1 2 3 4 5 6 9 12 15 18 21 24 27 30"
 ENTRY_TIMINGS="close open_check"
 COMBINED="[1,2,3,4,5,6,9,12,15,18,21,24,27,30]"
 TRAIL_PCTS="[1,2,3,4,5,6,7]"
@@ -77,7 +77,9 @@ run_campaign() {
     patch_config "$stop_loss"
     local refresh_flag=""
     [ "$DEFER_CACHE_REFRESH" = "1" ] && refresh_flag="--skip-cache-refresh"
-    $PYTHON run_optimization_sweep.py --version v4 --entry-timing "$entry_timing" \
+    local max_phase_flag=""
+    [ -n "$MAX_PHASE" ] && max_phase_flag="--max-phase $MAX_PHASE"
+    $PYTHON run_optimization_sweep.py --version v4 --entry-timing "$entry_timing" $max_phase_flag \
         --tickers $tickers $refresh_flag
 }
 

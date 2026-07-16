@@ -212,6 +212,24 @@ def init_idempotent_db():
             raise RuntimeError(f"backtest_cache v4 migration row count mismatch: {before_count} -> {after_count}")
         logger.info(f"Migration complete: {after_count:,} rows carried over, entry_timing backfilled to 'close'.")
 
+    # phase (2026-07-15): tags each row with whichever phase (Phase1-Coarse/
+    # Phase2-Island/Phase2.5-CliffBox/Phase3-Full) first computed it, so a
+    # "does a later phase ever actually improve on an earlier one" analysis is a
+    # simple query. Plain data column, no PK rebuild. Originally added by hand
+    # against the live DB — codified here so a fresh DB doesn't fail on INSERT.
+    try:
+        cursor.execute("ALTER TABLE backtest_cache ADD COLUMN phase TEXT")
+    except Exception:
+        pass
+    # generation (2026-07-15): for Phase2-Island rows only, which island-search
+    # generation (1-indexed, config.execution.max_generations) produced this row —
+    # lets the same "does it earn its cost" question be asked of the generation
+    # loop, not just the phase pipeline. NULL for all other phases (single-pass).
+    try:
+        cursor.execute("ALTER TABLE backtest_cache ADD COLUMN generation INTEGER")
+    except Exception:
+        pass
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sl_sweep_summary (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -424,7 +442,7 @@ def run_single_backtest_node_isolated(args):
     }
 
 
-def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
+def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None):
     conn   = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
     matrix_results  = []
@@ -579,7 +597,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                 buffer.append((strategy_name, config_version, ticker, w, hold_hours, row_take_profit, row_stop_loss,
                                num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
                                stored_fsl, row_trail_buy_pct, row_trail_pct, wtw, row_arm_sell_pct, float(tp),
-                               entry_timing, comp_ret_pess, alpha_pess, comp_ret_cert, alpha_cert, phase_label))
+                               entry_timing, comp_ret_pess, alpha_pess, comp_ret_cert, alpha_cert, phase_label,
+                               generation))
 
                 if len(buffer) >= batch_size:
                     cursor.executemany(
@@ -589,8 +608,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                             run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
                             win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                             strategy_return_pessimistic, alpha_vs_spy_pessimistic,
-                            strategy_return_certain, alpha_vs_spy_certain, phase)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            strategy_return_certain, alpha_vs_spy_certain, phase, generation)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         buffer
                     )
                     buffer = []
@@ -607,8 +626,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                 run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
                 win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                 strategy_return_pessimistic, alpha_vs_spy_pessimistic,
-                strategy_return_certain, alpha_vs_spy_certain, phase)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                strategy_return_certain, alpha_vs_spy_certain, phase, generation)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             buffer
         )
     conn.commit()
@@ -749,7 +768,7 @@ def identify_island_candidates(config_version, strategy_name, n_index, n_stock, 
 
 # ── Phase 2: Island mesh ──────────────────────────────────────────────────────
 
-def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
+def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None):
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
@@ -787,7 +806,8 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
 
     logger.info(f"[{ticker}] Phase2 island mesh: {len(tasks)} tasks ({N_ISLANDS} islands ±{FINE_RADIUS})")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
-                           "Phase2-Island", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
+                           "Phase2-Island", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing,
+                           generation=generation)
 
 
 # ── Phase 2.5: targeted cliff-box sweep around true best node ────────────────
@@ -925,6 +945,27 @@ def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
                            "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    with sqlite3.connect(DB_PATH) as conn:
+        pre_phase3 = conn.execute(f"""
+            SELECT MAX({ROBUST_ALPHA_SQL}) FROM backtest_cache
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+              AND phase IN ('Phase1-Coarse','Phase2-Island','Phase2.5-CliffBox') {scope_sql}
+        """, (config_version, ticker, strategy_name, *scope_params)).fetchone()[0]
+        overall = conn.execute(f"""
+            SELECT MAX({ROBUST_ALPHA_SQL}) FROM backtest_cache
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0 {scope_sql}
+        """, (config_version, ticker, strategy_name, *scope_params)).fetchone()[0]
+    pre_phase3 = float(pre_phase3) if pre_phase3 is not None else None
+    overall    = float(overall) if overall is not None else None
+    if overall is not None:
+        if pre_phase3 is not None:
+            improved = overall > pre_phase3
+            logger.info(f"  [{ticker}] Phase3 best={overall:+.1f}%  (pre-Phase3 best={pre_phase3:+.1f}%)  "
+                        f"{'IMPROVED' if improved else 'no improvement'}")
+        else:
+            logger.info(f"  [{ticker}] Phase3 best={overall:+.1f}%  (no pre-Phase3 data to compare)")
+
     # Static heatmap PNG disabled — superseded by the interactive Spatial Topology page,
     # nothing read these files back. Left commented instead of deleted in case that changes.
     # with sqlite3.connect(DB_PATH) as conn:
@@ -958,6 +999,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Three-phase sweep engine")
     parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=None,
                         help="Run only this phase (default: all phases)")
+    parser.add_argument("--max-phase", dest="max_phase", default="3", choices=["1", "2", "2.5", "3"],
+                        help="Run phases up through this one, then stop (default: 3, full pipeline). "
+                             "Island/cliff-safety selection only needs data through Phase 2.5 -- "
+                             "'--max-phase 2.5' skips the expensive full-mesh Phase 3 pass entirely.")
     parser.add_argument("--tickers", nargs="+", default=None,
                         help="Override tickers to sweep")
     parser.add_argument("--version", default=None,
@@ -993,6 +1038,7 @@ if __name__ == "__main__":
     tickers           = args.tickers or config.get("target_tickers", [])
     strategy_names    = config.get("active_strategies", ["ZScoreBreakout"])
     phase_only        = args.phase
+    max_phase         = args.max_phase
 
     if not tickers:
         logger.error("No tickers in config.")
@@ -1099,7 +1145,7 @@ if __name__ == "__main__":
                     logger.warning("No island candidates. Skipping phases 2 & 3.")
                     break
 
-                if phase_only == 1:
+                if phase_only == 1 or max_phase == "1":
                     continue
 
                 # ── Phase 2 ───────────────────────────────────────────────
@@ -1111,11 +1157,11 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 2.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
+                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, generation=gen + 1)
 
                 logger.info(f"Phase 2 gen {gen+1} complete.")
 
-            if not island_tickers or phase_only in (1, 2):
+            if not island_tickers or phase_only in (1, 2) or max_phase in ("1", "2"):
                 continue
 
             # ── Phase 2.5 ─────────────────────────────────────────────────
@@ -1138,6 +1184,10 @@ if __name__ == "__main__":
 
             if not full_tickers:
                 logger.warning("No cliff-free candidates for Phase 3.")
+                continue
+
+            if max_phase in ("1", "2", "2.5"):
+                logger.info(f"--max-phase {max_phase}: skipping Phase 3 for {name}.")
                 continue
 
             # ── Phase 3 ───────────────────────────────────────────────────
