@@ -524,6 +524,18 @@ def set_broker_stop_price(ticker, broker_stop_price):
         c.commit()
 
 
+def correct_entry_price(ticker, entry_price):
+    """Applies a corporate-action correction to a held position's entry_price
+    -- fixing the underlying data is what clears a corporate-action freeze
+    (signals_compute.check_sell_condition), not a separate unfreeze step."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE open_positions SET entry_price = ? WHERE ticker = ?",
+            (float(entry_price), ticker)
+        )
+        c.commit()
+
+
 def close_position(position_id, exit_signal_price=None, exit_price=None, exit_time=None, exit_reason=None):
     with _conn() as c:
         if exit_price is not None:

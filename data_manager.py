@@ -5,6 +5,8 @@ import yfinance as yf
 from pathlib import Path
 from datetime import datetime
 
+from signals_helpers import detect_price_discontinuity
+
 # Create a local directory named 'cache' to store data files
 CACHE_DIR = Path("./cache/research")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -107,6 +109,29 @@ def fetch_live_data_smart(ticker):
 
         # 3. Force delta index to match the clean string-parsed format from the CSV file
         df_delta.index = pd.to_datetime(df_delta.index).tz_localize(None)
+
+        # 3b. Corporate-action guard: yfinance's hourly interval does NOT retroactively
+        # split-adjust historical bars (only daily+ intervals get that treatment), so a
+        # split shows up as every overlapping-date local row being an near-identical
+        # multiple of the fresh delta row for the same timestamp -- ordinary price
+        # volatility doesn't produce a *consistent* ratio across every overlap bar, and
+        # magnitude alone can't tell a real crash from a split (a 3x leveraged ETF can
+        # plausibly fall >66% in one real extreme day) -- match against known round-number
+        # split factors instead, same logic as signals_compute.py's live-price check.
+        # Rescale the whole local cache before merging so history stays on the same scale
+        # as fresh data, instead of leaving a silent price cliff (found live 2026-07-15,
+        # KORU's ~20:1 split -- see docs/backlog_cache.md).
+        overlap = df_local.index.intersection(df_delta.index)
+        if len(overlap) >= 1:
+            ratios = df_local.loc[overlap, "Close"] / df_delta.loc[overlap, "Close"]
+            consistent = len(overlap) == 1 or (ratios.std() / ratios.mean()) < 0.05
+            split_ratio = detect_price_discontinuity(current_price=1.0, reference_price=ratios.mean())
+            if consistent and split_ratio is not None:
+                factor = ratios.mean()
+                print(f"⚠️ Detected likely stock split for {ticker} (ratio={factor:.2f}) -- rescaling cached history.")
+                df_local[["Open", "High", "Low", "Close"]] = df_local[["Open", "High", "Low", "Close"]] / factor
+                if "Volume" in df_local.columns:
+                    df_local["Volume"] = df_local["Volume"] * factor
 
         # 4. Splice datasets together
         df_combined = pd.concat([df_local, df_delta], axis=0)

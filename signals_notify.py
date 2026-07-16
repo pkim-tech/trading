@@ -11,6 +11,7 @@ from datetime import datetime
 import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
+import schwab_safety
 from signals_charts import _chart_buy, _chart_sell, _upload_chart
 from signals_blocks import _post_message, _build_buy_blocks, _build_sell_blocks
 from signals_helpers import (
@@ -774,6 +775,16 @@ def send_reference_report(watchlist):
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"Morning Report — {now_str}"}},
     ]
+    stopped = schwab_safety.kill_switch_engaged()
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+        "text": f"{'🛑 Automated engine STOPPED' if stopped else '▶️ Automated engine running'}"}]})
+    if cfg.INTERACTIVE:
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "▶️ Start Engine"}, "style": "primary",
+             "action_id": "start_engine"} if stopped else
+            {"type": "button", "text": {"type": "plain_text", "text": "🛑 Stop Engine"}, "style": "danger",
+             "action_id": "stop_engine"},
+        ]})
     if cfg.INTERACTIVE:
         blocks.append({"type": "actions", "elements": [
             {"type": "button", "text": {"type": "plain_text", "text": "🔄 Resend Report"}, "action_id": "resend_ref_table"},

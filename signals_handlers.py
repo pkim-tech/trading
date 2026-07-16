@@ -7,8 +7,9 @@ from datetime import datetime
 import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
+import schwab_safety
 from signals_blocks import _post_message, _price_input_block, _shares_input_block
-from signals_helpers import _existing_position_note, _last_sale_recovery
+from signals_helpers import _existing_position_note, _last_sale_recovery, clear_corp_action_alert
 from signals_notify import send_reference_report
 
 if cfg.SOCKET_MODE:
@@ -405,3 +406,32 @@ if cfg.SOCKET_MODE:
         manual-open/close buttons) stays as a historical record."""
         ack()
         send_reference_report(db.get_watchlist())
+
+    @cfg.bolt_app.action("stop_engine")
+    def handle_stop_engine(ack, body, client):
+        ack()
+        user = body.get('user', {}).get('username', 'someone')
+        schwab_safety.engage_kill_switch(reason=f"Stop Engine button by {user}")
+        _post_message(f"\U0001F6D1 Automated engine STOPPED by {user}")
+        send_reference_report(db.get_watchlist())
+
+    @cfg.bolt_app.action("start_engine")
+    def handle_start_engine(ack, body, client):
+        ack()
+        user = body.get('user', {}).get('username', 'someone')
+        schwab_safety.disengage_kill_switch()
+        _post_message(f"▶️ Automated engine STARTED by {user}")
+        send_reference_report(db.get_watchlist())
+
+    @cfg.bolt_app.action("apply_corp_action_correction")
+    def handle_apply_corp_action_correction(ack, body, client):
+        """Fixing entry_price is what clears the freeze -- check_sell_condition's
+        discontinuity check naturally stops triggering once the data matches,
+        no separate unfreeze step needed."""
+        ack()
+        data = json.loads(body['actions'][0]['value'])
+        ticker = data['ticker']
+        proposed = data['proposed_entry_price']
+        db.correct_entry_price(ticker, proposed)
+        clear_corp_action_alert(ticker)
+        _post_message(f"✅ {ticker} entry_price corrected to ${proposed:.4f} -- SL/arm checks resume")

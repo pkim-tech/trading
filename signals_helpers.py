@@ -1,8 +1,43 @@
 """Small shared helpers with no cross-dependency on blocks/charts/handlers."""
+import json
 import sqlite3
 from datetime import timedelta
+from pathlib import Path
 
 import signals_db as db
+
+_CORP_ACTION_ALERT_PATH = Path(__file__).parent / "cache" / "live" / "corporate_action_alerts.json"
+
+
+def _load_corp_action_alerts():
+    if not _CORP_ACTION_ALERT_PATH.exists():
+        return {}
+    try:
+        return json.loads(_CORP_ACTION_ALERT_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def already_alerted_corp_action(ticker) -> bool:
+    """Prevents re-alerting every ~30s poll while a held position's entry_price
+    stays stale -- one alert per detected discontinuity, not one per check."""
+    return ticker in _load_corp_action_alerts()
+
+
+def mark_corp_action_alerted(ticker):
+    state = _load_corp_action_alerts()
+    state[ticker] = True
+    _CORP_ACTION_ALERT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _CORP_ACTION_ALERT_PATH.write_text(json.dumps(state))
+
+
+def clear_corp_action_alert(ticker):
+    """Called once the correction is applied -- lets a genuinely new,
+    separate discontinuity for the same ticker alert again later."""
+    state = _load_corp_action_alerts()
+    state.pop(ticker, None)
+    _CORP_ACTION_ALERT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _CORP_ACTION_ALERT_PATH.write_text(json.dumps(state))
 
 
 def _add_trading_hours(start, hours):
@@ -14,6 +49,42 @@ def _add_trading_hours(start, hours):
         if dt.weekday() < 5 and 9 <= dt.hour <= 15:
             remaining -= 1
     return dt
+
+
+# Known corporate-action ratios to match against, not an arbitrary magnitude
+# cutoff -- a 3x leveraged ETF can plausibly crash >66% in one real extreme
+# day (ratio > 3), so magnitude alone can't tell a real crash from a split.
+# A split ratio is always a clean, round number; a real market move landing
+# within tolerance of one by coincidence is vanishingly unlikely regardless
+# of how large the move is.
+_SPLIT_RATIOS = (1.5, 2, 2.5, 3, 4, 5, 10, 15, 20, 25, 30, 40, 50)
+
+
+def detect_price_discontinuity(current_price, reference_price, tolerance=0.03):
+    """Returns the reference/current ratio if it closely matches a known
+    split-like factor (or its inverse, for a reverse split), None otherwise.
+    Detection only -- callers decide what to do with a hit; this doesn't
+    freeze/block/notify on its own. (Found live 2026-07-15: KORU's ~20:1
+    split silently passed every SL/arm check since nothing compared current
+    price against the stale reference price.)"""
+    if not current_price or not reference_price:
+        return None
+    ratio = reference_price / current_price
+    for r in _SPLIT_RATIOS:
+        if abs(ratio - r) / r < tolerance or abs(ratio - 1 / r) / (1 / r) < tolerance:
+            return ratio
+    return None
+
+
+def nearest_split_factor(ratio):
+    """Given a raw ratio that already matched in detect_price_discontinuity,
+    returns the clean round-number factor it matched (e.g. 20.0, not the
+    noisy 20.34 an actual fill price would produce) -- used for the proposed
+    correction, since guessing off the clean factor is more sensible than the
+    raw ratio. Returns None if ratio doesn't match any known factor (shouldn't
+    happen if only ever called after a positive detect_price_discontinuity)."""
+    candidates = list(_SPLIT_RATIOS) + [1 / r for r in _SPLIT_RATIOS]
+    return min(candidates, key=lambda r: abs(ratio - r))
 
 
 def _proximity_emoji(pct_away):

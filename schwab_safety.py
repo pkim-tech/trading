@@ -12,15 +12,37 @@ turned off per account.
 import fcntl
 import json
 import os
+import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+import signals_db
+
 load_dotenv()
 
 STATE_PATH = Path(__file__).parent / "cache" / "live" / "schwab_order_counts.json"
+
+# Separate file (not just SCHWAB_KILL_SWITCH env var) so a Slack "Stop Engine"
+# button click survives a daemon restart -- an env var set in-process would
+# silently reset to "running" on the next restart, the wrong default for a
+# safety-critical switch (2026-07-15).
+KILL_SWITCH_PATH = Path(__file__).parent / "cache" / "live" / "schwab_kill_switch.json"
+
+# Mirrors active_signals._SIGNAL_WINDOWS -- kept as a separate constant here
+# (not imported) to avoid a real circular import (active_signals -> signals_notify
+# -> schwab_safety). Only gates BUY orders: check_sell_condition runs every poll
+# cycle all market hours, not just these two windows (active_signals.py:214),
+# so a SELL restricted to this window would incorrectly block a legitimate exit.
+_SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]
+
+# Duplicate-submit guard: a second order for the same account+ticker+side
+# within this window is almost certainly a retry/double-call bug, not a real
+# distinct signal (signal windows are 15 min wide; genuine re-entries happen
+# on a completely different bar, not seconds/minutes later).
+DUPLICATE_ORDER_WINDOW_SECS = 60
 
 
 class SafetyViolation(Exception):
@@ -45,13 +67,74 @@ ACCOUNTS = {
     "ira":       AccountLimits(enabled=True, notional_cap=75_000, daily_order_cap=10, dry_run=True),
 }
 
+# Initial live-automation scope (2026-07-15): KORU only. SOXL was considered
+# first but ruled out -- it has an open position entered through the manual
+# workflow, and automation shouldn't grab control mid-position. KORU is flat
+# (closed at a loss earlier today) and its stock-split data problem is now
+# fixed (cache/research/KORU_1h.csv rescaled, data_manager.py's merge guard
+# added so future refreshes can't silently re-corrupt it). Every other live
+# watchlist ticker still goes through the existing manual Slack workflow --
+# this is a restriction *on top of* the ticker-allowlist/mode check, not a
+# replacement for it. Widen deliberately once KORU automation is proven out.
+AUTOMATION_ENABLED_TICKERS = {"KORU"}
+
+def _now():
+    """Seam for tests to monkeypatch -- the real signal windows only make
+    sense at actual current wall-clock time, but tests need to simulate being
+    inside/outside a window regardless of when they happen to run."""
+    return datetime.now()
+
+
 # Absolute backstop regardless of account config -- catches a misconfigured
 # per-account cap before it reaches the API.
 HARD_ORDER_CEILING = 100_000
 
+# Global (all-accounts) burst cap, separate from each account's daily cap --
+# catches a runaway loop spamming orders within a single signal-check minute
+# before the daily cap would ever trip. Sized at 2x the 6-ticker live watchlist
+# (buy+sell per ticker in the same minute), not Schwab's own 120/min platform limit.
+GLOBAL_ORDERS_PER_MINUTE = 12
+
 
 def kill_switch_engaged() -> bool:
-    return os.environ.get("SCHWAB_KILL_SWITCH") == "1"
+    if os.environ.get("SCHWAB_KILL_SWITCH") == "1":
+        return True
+    if KILL_SWITCH_PATH.exists():
+        try:
+            return bool(json.loads(KILL_SWITCH_PATH.read_text()).get("engaged", False))
+        except (json.JSONDecodeError, OSError):
+            return False
+    return False
+
+
+def kill_switch_reason() -> str:
+    """Human-readable source for why kill_switch_engaged() is True -- used in
+    the SafetyViolation message so it doesn't misleadingly cite the env var
+    when the persistent Stop-Engine flag is the actual trigger."""
+    if os.environ.get("SCHWAB_KILL_SWITCH") == "1":
+        return "SCHWAB_KILL_SWITCH=1 env var"
+    if KILL_SWITCH_PATH.exists():
+        try:
+            state = json.loads(KILL_SWITCH_PATH.read_text())
+            return state.get("reason") or "Stop Engine"
+        except (json.JSONDecodeError, OSError):
+            pass
+    return "unknown"
+
+
+def engage_kill_switch(reason: str = ""):
+    """Persists the stopped state so it survives a daemon restart. Called by
+    the Slack 'Stop Engine' button handler (signals_handlers.py)."""
+    KILL_SWITCH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    KILL_SWITCH_PATH.write_text(json.dumps({
+        "engaged": True, "reason": reason, "at": datetime.now().isoformat(),
+    }))
+
+
+def disengage_kill_switch():
+    """Called by the Slack 'Start Engine' button handler."""
+    KILL_SWITCH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    KILL_SWITCH_PATH.write_text(json.dumps({"engaged": False, "at": datetime.now().isoformat()}))
 
 
 def _open_locked():
@@ -64,19 +147,63 @@ def _open_locked():
     return f
 
 
-def check_order(account: str, ticker: str, quantity: int, price: float, counts: dict | None = None) -> None:
+def _live_ticker_accounts() -> dict:
+    """ticker -> assigned account nickname, for watchlist rows currently in
+    'live' mode -- queried fresh (not cached) since mode/account assignment
+    can change during a running day (e.g. AGQ moved to research mid-session
+    2026-07-13)."""
+    return {row["ticker"]: row["account"] for row in signals_db.get_watchlist() if row["mode"] == "live"}
+
+
+def check_order(
+    account: str, ticker: str, quantity: int, price: float, side: str, counts: dict | None = None
+) -> None:
     """Raises SafetyViolation if the order should not proceed. `counts`, if
-    given, is used for the daily-cap check instead of re-reading the state
-    file -- lets approve_and_record() validate against the exact snapshot
-    it's about to increment, under one lock, instead of a separate read."""
+    given, is used for the daily-cap/burst-cap/duplicate checks instead of
+    re-reading the state file -- lets approve_and_record() validate against
+    the exact snapshot it's about to increment, under one lock, instead of a
+    separate read."""
     if kill_switch_engaged():
-        raise SafetyViolation("global kill switch engaged (SCHWAB_KILL_SWITCH=1)")
+        raise SafetyViolation(f"global kill switch engaged ({kill_switch_reason()})")
 
     limits = ACCOUNTS.get(account)
     if limits is None:
         raise SafetyViolation(f"unknown account '{account}' -- not in the allowlist")
     if not limits.enabled:
         raise SafetyViolation(f"account '{account}' is disabled in the allowlist")
+
+    ticker_accounts = _live_ticker_accounts()
+    if ticker not in ticker_accounts:
+        raise SafetyViolation(f"'{ticker}' is not a live-mode ticker on the active watchlist")
+    if ticker_accounts[ticker] != account:
+        raise SafetyViolation(
+            f"'{ticker}' is assigned to account '{ticker_accounts[ticker]}', not '{account}'"
+        )
+    if ticker not in AUTOMATION_ENABLED_TICKERS:
+        raise SafetyViolation(
+            f"'{ticker}' is not in the automation pilot scope {AUTOMATION_ENABLED_TICKERS} "
+            f"-- still manual-only"
+        )
+
+    # Same-day re-buy guardrail (2026-07-15): a same-day re-buy risks a real
+    # Schwab good-faith violation (reusing unsettled sale proceeds in a cash
+    # account) -- a hard broker-enforced constraint, unlike the same-day-sell
+    # direction (a soft employer recommendation, not enforced, deliberately
+    # left out).
+    if side == "BUY" and signals_db.closed_today(ticker):
+        raise SafetyViolation(
+            f"'{ticker}' was sold today -- same-day re-buy risks a cash-account good-faith violation"
+        )
+
+    # Signal-window time gate, BUY only (see _SIGNAL_WINDOWS comment above).
+    if side == "BUY":
+        now = _now()
+        t = (now.hour, now.minute)
+        in_window = any((h0, m0) <= t <= (h1, m1) for h0, m0, h1, m1 in _SIGNAL_WINDOWS)
+        if not in_window:
+            raise SafetyViolation(
+                f"BUY outside signal windows {_SIGNAL_WINDOWS} (current time {t[0]:02d}:{t[1]:02d})"
+            )
 
     notional = quantity * price
     if notional > HARD_ORDER_CEILING:
@@ -96,19 +223,46 @@ def check_order(account: str, ticker: str, quantity: int, price: float, counts: 
     if count >= limits.daily_order_cap:
         raise SafetyViolation(f"account '{account}' has hit its daily order cap ({limits.daily_order_cap})")
 
+    recent = [t for t in counts.get("recent_order_timestamps", []) if time.time() - t < 60]
+    if len(recent) >= GLOBAL_ORDERS_PER_MINUTE:
+        raise SafetyViolation(
+            f"global burst cap hit ({len(recent)} orders across all accounts in the last minute, "
+            f"max {GLOBAL_ORDERS_PER_MINUTE})"
+        )
 
-def approve_and_record(account: str, ticker: str, quantity: int, price: float) -> bool:
+    for o in counts.get("recent_orders", []):
+        if (
+            o["account"] == account and o["ticker"] == ticker and o["side"] == side
+            and time.time() - o["ts"] < DUPLICATE_ORDER_WINDOW_SECS
+        ):
+            raise SafetyViolation(
+                f"duplicate order: {side} {ticker} in {account} already submitted "
+                f"{time.time() - o['ts']:.0f}s ago (within {DUPLICATE_ORDER_WINDOW_SECS}s window)"
+            )
+
+
+def approve_and_record(account: str, ticker: str, quantity: int, price: float, side: str) -> bool:
     """Call immediately before placing a real order. Raises SafetyViolation if
-    blocked; otherwise records the order against the daily cap and returns
-    whether the account is in dry_run mode (caller must skip the real API
-    call if so). The daily-cap check and the increment happen under the same
-    file lock so two concurrent callers can't both slip past the cap."""
+    blocked; otherwise records the order against the daily cap, the global
+    per-minute burst cap, and the duplicate-order window, and returns whether
+    the account is in dry_run mode (caller must skip the real API call if so).
+    Checks and increments happen under the same file lock so two concurrent
+    callers can't both slip past a cap."""
     with _open_locked() as f:
         counts = json.loads(f.read() or "{}")
-        check_order(account, ticker, quantity, price, counts=counts)
+        check_order(account, ticker, quantity, price, side, counts=counts)
         key = str(date.today())
         today = counts.setdefault(key, {})
         today[account] = today.get(account, 0) + 1
+        recent = [t for t in counts.get("recent_order_timestamps", []) if time.time() - t < 60]
+        recent.append(time.time())
+        counts["recent_order_timestamps"] = recent
+        recent_orders = [
+            o for o in counts.get("recent_orders", [])
+            if time.time() - o["ts"] < DUPLICATE_ORDER_WINDOW_SECS
+        ]
+        recent_orders.append({"account": account, "ticker": ticker, "side": side, "ts": time.time()})
+        counts["recent_orders"] = recent_orders
         f.seek(0)
         f.truncate()
         f.write(json.dumps(counts))

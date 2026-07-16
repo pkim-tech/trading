@@ -2,6 +2,7 @@
 Signal computation: cached price loading, buy-signal evaluation (with the
 SMA/Std indicator cache), and sell-condition checking.
 """
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -12,6 +13,11 @@ import yfinance as yf
 import strategies
 import signals_config as cfg
 import signals_db as db
+from signals_helpers import (
+    detect_price_discontinuity, nearest_split_factor,
+    already_alerted_corp_action, mark_corp_action_alerted,
+)
+from signals_blocks import _post_message
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +122,14 @@ def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override
             current_price = float(hist['Close'].iloc[-1]) if not hist.empty else close_series.iloc[-1]
         except Exception:
             current_price = close_series.iloc[-1]
+    discontinuity = detect_price_discontinuity(current_price, prev_close)
+    if discontinuity:
+        print(f"⚠️ Possible corporate action for {ticker}: prev_close={prev_close:.4f} "
+              f"current={current_price:.4f} ratio={discontinuity:.2f} -- freezing new signals")
+        # prev_close/SMA/Std are all computed against pre-event history, so any
+        # signal here would be comparing today's real price to a stale baseline
+        # (exactly what let KORU's split slip through undetected 2026-07-15).
+        return None
     sma           = last_row['SMA']
     std           = last_row['Std']
     hurst, adf_p  = _hurst_adf(ticker, df_hourly)
@@ -157,6 +171,37 @@ def _bars_held(df_hourly, signal_time):
 def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, high=None, df_hourly=None):
     strategy_cls = getattr(strategies, pos['strategy'], None)
     if strategy_cls is None:
+        return None, None, False
+    discontinuity = detect_price_discontinuity(current_price, pos['entry_price'])
+    if discontinuity:
+        ticker = pos['ticker']
+        print(f"⚠️ Possible corporate action for {ticker}: entry_price={pos['entry_price']:.4f} "
+              f"current={current_price:.4f} ratio={discontinuity:.2f} -- freezing SL/arm checks")
+        if not already_alerted_corp_action(ticker):
+            factor = nearest_split_factor(discontinuity)
+            proposed_entry = pos['entry_price'] / factor
+            value = json.dumps({"position_id": pos['id'], "ticker": ticker, "proposed_entry_price": proposed_entry})
+            _post_message(
+                f"⚠️ Possible corporate action — {ticker}",
+                blocks=[
+                    {"type": "section", "text": {"type": "mrkdwn", "text": (
+                        f"⚠️ *{ticker}* — possible corporate action (ratio≈{discontinuity:.2f}, "
+                        f"nearest factor {factor}).\n"
+                        f"Recorded entry: `${pos['entry_price']:.4f}`  |  Current: `${current_price:.4f}`\n"
+                        f"Proposed corrected entry: `${proposed_entry:.4f}`\n"
+                        f"SL/arm checks are frozen for this ticker until corrected."
+                    )}},
+                    {"type": "actions", "elements": [
+                        {"type": "button", "text": {"type": "plain_text", "text": "Apply Correction"},
+                         "style": "primary", "action_id": "apply_corp_action_correction", "value": value},
+                    ]},
+                ],
+            )
+            mark_corp_action_alerted(ticker)
+        # entry_price is untrustworthy against an unadjusted corporate action --
+        # a real SL check here would be mechanically true regardless of actual
+        # performance (exactly the false-SL scenario found live with KORU
+        # 2026-07-15). No exit signal until a human confirms/re-bases the position.
         return None, None, False
     signal_time = datetime.strptime(pos['signal_time'], '%Y-%m-%d %H:%M:%S')
     if df_hourly is None:

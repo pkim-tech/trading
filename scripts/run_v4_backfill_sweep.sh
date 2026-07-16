@@ -39,7 +39,11 @@ cd "$(dirname "$0")/.."
 PYTHON=".venv/bin/python"
 TICKERS="AGQ DPST EDC GDXU HIBL KORU LABU NUGT SOXL TQQQ YANG"
 VALIDATE_TICKERS="SOXL"
-STOP_LOSSES="1 2 3 4 5 6 9 12 15 18 21 24 27 30"
+STOP_LOSSES="1 2 3 4 5 6 9"
+# Capped at 9% (2026-07-16) -- robust_alpha showed a consistent decline as SL
+# loosened across the full 1-30 grid on SOXL/KORU/EDC/GDXU, with no value above
+# 9% ever coming close to the low-SL region. Not worth the compute above this
+# point; see docs/backlog_cache.md fixed_sl sweep item.
 ENTRY_TIMINGS="close open_check"
 COMBINED="[1,2,3,4,5,6,9,12,15,18,21,24,27,30]"
 TRAIL_PCTS="[1,2,3,4,5,6,7]"

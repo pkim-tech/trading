@@ -382,3 +382,38 @@ must pass through first: per-account allowlist/notional-cap/daily-order-cap/dry-
 global order ceiling, and a global kill switch). All accounts start `dry_run=True` with
 placeholder caps — real numbers and the first interactive OAuth login are still pending. No
 order has been placed against a real account yet.
+
+**Addendum (2026-07-15)**: First real OAuth login completed (IRA account only, matched to
+`SCHWAB_ACCOUNT_IRA` by masked suffix, never a full account number in `.env`) — connectivity,
+account-hash resolution, and dry-run order calls verified end-to-end against the real API.
+`schwab_client.py` gained `place_trailing_buy`/`place_trailing_sell` (real `TRAILING_STOP`
+broker orders via the generic `OrderBuilder`, since `equity_orders` has no convenience wrapper
+for it) — mirrors the manual workflow's actual entry/exit mechanics (`docs/CLAUDE.md`'s
+`TrailingBothZScoreBreakout` notes) rather than polling for the bounce/pullback ourselves.
+`schwab_safety.py` gained real guardrails beyond the 2026-07-14 skeleton: a ticker allowlist +
+account-consistency check (both sourced live from `watch_list`, not cached), a duplicate-order
+window, a same-day-re-buy block (real cash-account good-faith-violation risk — same-day-*sell*
+is deliberately not blocked, a soft employer preference not a broker rule), a BUY-only
+signal-window time gate (mirrors `active_signals._in_buy_window`; SELL isn't gated since
+`check_sell_condition` runs continuously, not just in the two windows), and
+`AUTOMATION_ENABLED_TICKERS = {"KORU"}` — automation is scoped to one ticker for now (SOXL was
+considered but has an open manually-entered position; automation shouldn't grab control
+mid-position). The kill switch now persists to `cache/live/schwab_kill_switch.json` (survives a
+daemon restart, unlike a bare env var) with Slack "Stop Engine"/"Start Engine" buttons wired into
+the reference report. Still not wired into `active_signals.py` at all — every call this session
+was direct/manual, dry-run only.
+
+**Addendum (2026-07-15b) — corporate-action detection**: `signals_helpers.detect_price_discontinuity`
+matches the reference/current price ratio against known round-number split factors (2, 3, 5,
+10, 20, ... and inverses) within a tolerance, rather than a bare magnitude threshold — a 3x
+leveraged ETF can plausibly crash >66% in one real extreme day, so magnitude alone can't
+distinguish a real crash from a split; a real move landing within tolerance of a clean ratio by
+coincidence is vanishingly unlikely. Wired into both `compute_buy_signal` (freezes new-signal
+generation on a stale `prev_close`) and `check_sell_condition` (freezes SL/arm checks on a stale
+`entry_price` — the exact false-SL mechanism KORU's split exposed live). The buy-side freeze
+self-heals via `data_manager.py`'s matching merge-guard (same round-number match, rescales the
+whole local CSV cache before merging in fresh data). The sell-side freeze needs a human: one
+Slack alert per detection (not one per poll — tracked in `cache/live/corporate_action_alerts.json`)
+with a proposed correction and an "Apply Correction" button; applying it directly fixes
+`entry_price`, which is what clears the freeze (there's no separate frozen-flag to toggle —
+the discontinuity check just stops matching once the data's back in scale).
