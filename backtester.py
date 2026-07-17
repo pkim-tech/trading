@@ -544,7 +544,7 @@ def _simulate_trail_buy(prices, highs, lows, hours, daily_idx, sma_arr, std_arr,
 @njit(cache=True)
 def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
                          take_profit, stop_loss, max_hours_to_hold, trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh,
-                         opens, open_check_entry_timing):
+                         opens, open_check_entry_timing, same_day_block=False):
     """Three parallel trailing-buy bounce-fill resolutions, run in one pass over the
     same bars — see docs/backlog_cache.md fill-optimism item. None of OHLC's Open/
     High/Low/Close proves the true intrabar path, so none of these is a rigorous
@@ -574,7 +574,16 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
     not an ordering ambiguity, see backlog. open_check_entry_timing: if True,
     also check the bar's Open against the entry threshold before falling through
     to the normal Close check (same bar/iteration, no synthetic bar) — shared by
-    all three since entry-signal timing is a behavior choice, not an ambiguity."""
+    all three since entry-signal timing is a behavior choice, not an ambiguity.
+    same_day_block: if True, mirrors schwab_safety's real cash-account same-day-
+    re-buy rule — a fresh signal is ignored (not just delayed one bar) on any day
+    that matches this same resolution's own most recent exit day. Because the
+    signal-detection block runs again on the next eligible target-hour bar
+    regardless, a blocked day naturally keeps re-checking on subsequent days
+    rather than the entry being discarded outright (see docs/backlog_cache.md's
+    same-day-re-buy delayed-vs-dropped item — this is the 'delayed' behavior,
+    not the naive drop). Tracked independently per resolution (possible/
+    pessimistic/certain) since they can produce different exit days."""
     entry_i    = np.empty(MAX_TRADES, dtype=np.int64)
     exit_i     = np.empty(MAX_TRADES, dtype=np.int64)
     entry_p    = np.empty(MAX_TRADES, dtype=np.float64)
@@ -602,17 +611,18 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
     returns_c    = np.empty(MAX_TRADES, dtype=np.float64)
     count_c      = 0
 
-    in_trade    = False
-    waiting     = False
-    trailing    = False
-    entry_price = 0.0
-    stop_price  = 0.0
-    tp_price    = 0.0
-    peak        = 0.0
-    entry_bar   = 0
-    held        = 0
-    running_low = 0.0
-    wait_bars   = 0
+    in_trade     = False
+    waiting      = False
+    trailing     = False
+    entry_price  = 0.0
+    stop_price   = 0.0
+    tp_price     = 0.0
+    peak         = 0.0
+    entry_bar    = 0
+    held         = 0
+    running_low  = 0.0
+    wait_bars    = 0
+    last_exit_day = -1
 
     in_trade_p    = False
     waiting_p     = False
@@ -625,6 +635,7 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
     held_p        = 0
     running_low_p = 0.0
     wait_bars_p   = 0
+    last_exit_day_p = -1
 
     in_trade_c    = False
     waiting_c     = False
@@ -637,6 +648,7 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
     held_c        = 0
     running_low_c = 0.0
     wait_bars_c   = 0
+    last_exit_day_c = -1
 
     n = len(prices)
     for i in range(n):
@@ -660,12 +672,14 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                     hours_held[count] = held
                     results[count] = WIN if pc > 0 else LOSS; returns[count] = pc
                     count += 1; in_trade = False; trailing = False
+                    last_exit_day = daily_idx[i]
             elif low <= stop_price:
                 pc = (stop_price - entry_price) / entry_price
                 entry_i[count] = entry_bar; exit_i[count] = i
                 entry_p[count] = entry_price; exit_p[count] = stop_price
                 hours_held[count] = held; results[count] = LOSS; returns[count] = pc
                 count += 1; in_trade = False
+                last_exit_day = daily_idx[i]
             elif cp >= tp_price:
                 trailing = True; peak = cp
             elif held >= max_hours_to_hold:
@@ -675,6 +689,7 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                 hours_held[count] = held
                 results[count] = TWIN if pc > 0 else TLOSS; returns[count] = pc
                 count += 1; in_trade = False
+                last_exit_day = daily_idx[i]
         elif waiting:
             wait_bars += 1
             if low < running_low:
@@ -696,22 +711,24 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                     sma = sma_arr[di]; std = std_arr[di]
                     if std != 0.0:
                         lower_band = sma - std * z_thresh
+                        blocked = same_day_block and di == last_exit_day
                         fired = False
-                        if open_check_entry_timing:
-                            if has_trend:
-                                signal_open = (op <= lower_band) and (op > trend_arr[di])
-                            else:
-                                signal_open = op <= lower_band
-                            if signal_open:
-                                waiting = True; running_low = op; wait_bars = 0
-                                fired = True
-                        if not fired:
-                            if has_trend:
-                                signal = (cp <= lower_band) and (cp > trend_arr[di])
-                            else:
-                                signal = cp <= lower_band
-                            if signal:
-                                waiting = True; running_low = cp; wait_bars = 0
+                        if not blocked:
+                            if open_check_entry_timing:
+                                if has_trend:
+                                    signal_open = (op <= lower_band) and (op > trend_arr[di])
+                                else:
+                                    signal_open = op <= lower_band
+                                if signal_open:
+                                    waiting = True; running_low = op; wait_bars = 0
+                                    fired = True
+                            if not fired:
+                                if has_trend:
+                                    signal = (cp <= lower_band) and (cp > trend_arr[di])
+                                else:
+                                    signal = cp <= lower_band
+                                if signal:
+                                    waiting = True; running_low = cp; wait_bars = 0
 
         # ── pessimistic: High-before-Low assumption (mirror of 'possible') ──
         if in_trade_p:
@@ -728,12 +745,14 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                     hours_held_p[count_p] = held_p
                     results_p[count_p] = WIN if pc > 0 else LOSS; returns_p[count_p] = pc
                     count_p += 1; in_trade_p = False; trailing_p = False
+                    last_exit_day_p = daily_idx[i]
             elif low <= stop_price_p:
                 pc = (stop_price_p - entry_price_p) / entry_price_p
                 entry_i_p[count_p] = entry_bar_p; exit_i_p[count_p] = i
                 entry_p_p[count_p] = entry_price_p; exit_p_p[count_p] = stop_price_p
                 hours_held_p[count_p] = held_p; results_p[count_p] = LOSS; returns_p[count_p] = pc
                 count_p += 1; in_trade_p = False
+                last_exit_day_p = daily_idx[i]
             elif cp >= tp_price_p:
                 trailing_p = True; peak_p = cp
             elif held_p >= max_hours_to_hold:
@@ -743,6 +762,7 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                 hours_held_p[count_p] = held_p
                 results_p[count_p] = TWIN if pc > 0 else TLOSS; returns_p[count_p] = pc
                 count_p += 1; in_trade_p = False
+                last_exit_day_p = daily_idx[i]
         elif waiting_p:
             wait_bars_p += 1
             # High checked against the trigger from running_low as of the PRIOR
@@ -767,22 +787,24 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                     sma = sma_arr[di]; std = std_arr[di]
                     if std != 0.0:
                         lower_band = sma - std * z_thresh
+                        blocked_p = same_day_block and di == last_exit_day_p
                         fired_p = False
-                        if open_check_entry_timing:
-                            if has_trend:
-                                signal_open_p = (op <= lower_band) and (op > trend_arr[di])
-                            else:
-                                signal_open_p = op <= lower_band
-                            if signal_open_p:
-                                waiting_p = True; running_low_p = op; wait_bars_p = 0
-                                fired_p = True
-                        if not fired_p:
-                            if has_trend:
-                                signal_p = (cp <= lower_band) and (cp > trend_arr[di])
-                            else:
-                                signal_p = cp <= lower_band
-                            if signal_p:
-                                waiting_p = True; running_low_p = cp; wait_bars_p = 0
+                        if not blocked_p:
+                            if open_check_entry_timing:
+                                if has_trend:
+                                    signal_open_p = (op <= lower_band) and (op > trend_arr[di])
+                                else:
+                                    signal_open_p = op <= lower_band
+                                if signal_open_p:
+                                    waiting_p = True; running_low_p = op; wait_bars_p = 0
+                                    fired_p = True
+                            if not fired_p:
+                                if has_trend:
+                                    signal_p = (cp <= lower_band) and (cp > trend_arr[di])
+                                else:
+                                    signal_p = cp <= lower_band
+                                if signal_p:
+                                    waiting_p = True; running_low_p = cp; wait_bars_p = 0
 
         # ── certain: only resolve a fill when provable regardless of ordering ──
         if in_trade_c:
@@ -799,12 +821,14 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                     hours_held_c[count_c] = held_c
                     results_c[count_c] = WIN if pc > 0 else LOSS; returns_c[count_c] = pc
                     count_c += 1; in_trade_c = False; trailing_c = False
+                    last_exit_day_c = daily_idx[i]
             elif low <= stop_price_c:
                 pc = (stop_price_c - entry_price_c) / entry_price_c
                 entry_i_c[count_c] = entry_bar_c; exit_i_c[count_c] = i
                 entry_p_c[count_c] = entry_price_c; exit_p_c[count_c] = stop_price_c
                 hours_held_c[count_c] = held_c; results_c[count_c] = LOSS; returns_c[count_c] = pc
                 count_c += 1; in_trade_c = False
+                last_exit_day_c = daily_idx[i]
             elif cp >= tp_price_c:
                 trailing_c = True; peak_c = cp
             elif held_c >= max_hours_to_hold:
@@ -814,6 +838,7 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                 hours_held_c[count_c] = held_c
                 results_c[count_c] = TWIN if pc > 0 else TLOSS; returns_c[count_c] = pc
                 count_c += 1; in_trade_c = False
+                last_exit_day_c = daily_idx[i]
         elif waiting_c:
             wait_bars_c += 1
             buy_trigger_prior = running_low_c * (1.0 + trail_buy_pct)
@@ -844,22 +869,24 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                     sma = sma_arr[di]; std = std_arr[di]
                     if std != 0.0:
                         lower_band = sma - std * z_thresh
+                        blocked_c = same_day_block and di == last_exit_day_c
                         fired_c = False
-                        if open_check_entry_timing:
-                            if has_trend:
-                                signal_open_c = (op <= lower_band) and (op > trend_arr[di])
-                            else:
-                                signal_open_c = op <= lower_band
-                            if signal_open_c:
-                                waiting_c = True; running_low_c = op; wait_bars_c = 0
-                                fired_c = True
-                        if not fired_c:
-                            if has_trend:
-                                signal_c = (cp <= lower_band) and (cp > trend_arr[di])
-                            else:
-                                signal_c = cp <= lower_band
-                            if signal_c:
-                                waiting_c = True; running_low_c = cp; wait_bars_c = 0
+                        if not blocked_c:
+                            if open_check_entry_timing:
+                                if has_trend:
+                                    signal_open_c = (op <= lower_band) and (op > trend_arr[di])
+                                else:
+                                    signal_open_c = op <= lower_band
+                                if signal_open_c:
+                                    waiting_c = True; running_low_c = op; wait_bars_c = 0
+                                    fired_c = True
+                            if not fired_c:
+                                if has_trend:
+                                    signal_c = (cp <= lower_band) and (cp > trend_arr[di])
+                                else:
+                                    signal_c = cp <= lower_band
+                                if signal_c:
+                                    waiting_c = True; running_low_c = cp; wait_bars_c = 0
 
     if in_trade:
         cp = prices[n - 1]
@@ -913,7 +940,8 @@ def run_backtest_v110(df_hourly, df_daily_indicators, ticker,
                       mode="BACKTEST", target_hours=(9, 14),
                       take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28,
                       z_score_threshold=2.0, trail_buy_pct=0.02, trail_pct=0.03,
-                      entry_timing='close', return_bounds=False, prep=None):
+                      entry_timing='close', return_bounds=False, prep=None,
+                      same_day_block=False):
     p = prep if prep is not None else prep_inputs(df_hourly, df_daily_indicators)
     target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
 
@@ -925,7 +953,7 @@ def run_backtest_v110(df_hourly, df_daily_indicators, ticker,
         float(take_profit), float(stop_loss), int(max_hours_to_hold),
         float(trail_buy_pct), float(trail_pct),
         target_h0, target_h1, float(z_score_threshold),
-        p['opens'], entry_timing == 'open_check'
+        p['opens'], entry_timing == 'open_check', bool(same_day_block)
     )
     trades = _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
     if return_bounds:

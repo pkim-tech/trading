@@ -221,6 +221,32 @@ not yet analyzed. Also found and fixed: `phase` was never created by
 in session 10) — a fresh DB would have failed on `INSERT ... phase`; now a proper
 `ALTER TABLE ADD COLUMN`, alongside `generation`.
 
+**New `same_day_block` kernel param (2026-07-16)**: `_simulate_trail_both` gained an
+optional `same_day_block=False` argument (threaded through `run_backtest_v110`) that
+mirrors `schwab_safety`'s real cash-account same-day-re-buy rule — a fresh signal is
+ignored (not dropped forever, naturally re-checked on the next eligible target-hour bar)
+on any day matching that resolution's own most recent exit day, tracked independently
+per possible/pessimistic/certain. Default-off, fully backward compatible. Single-ticker
+testing (not yet a real campaign axis/schema column) showed this materially reshapes
+which nodes look best once same-day contention is priced in — some tickers (HIBL, DPST,
+LABU) are structurally robust to it, others (YANG, GDXD, GDXU, KORU) lose most of their
+unconstrained-baseline alpha. See `docs/backlog_cache.md` for the full writeup and
+next-step plan (formalizing it as a real per-campaign axis is still undecided).
+
+**Live/backtest sizing-formula gap found (2026-07-16)**: the live trailing-buy sizing
+formula (`signals_blocks.py` — `shares = target_notional // price`, using the
+*signal-time* price) and the backtest's compounding formula
+(`run_optimization_sweep.py::_summarize_trades` — `((Return+1).prod()-1)`) both assume
+an exact dollar notional can be deployed on every trade. Neither can, in different ways:
+live because a trailing buy's real fill price isn't known until after the order is
+sized, backtest because it never models share-count rounding or a sizing-price/fill-
+price mismatch at all. Real KORU/AGQ trade reconstruction showed the practical impact is
+smaller than the theoretical worst case (a few percent divergence over 31/37 trades, not
+runaway compounding), because overshoot and undershoot trades roughly offset in
+practice — but this is unverified for the rest of the watchlist. See
+`docs/backlog_cache.md` for the full mechanism, real numbers, and the agreed fix plan
+(conservative live sizing formula + backtest compounding rewrite, both still unimplemented).
+
 **Emerging finding, not yet conclusive (2026-07-15)**: across both tickers tested,
 `entry_timing='open_check'` won every single tested campaign (17/17, SOXL 10/10 + KORU
 7/7), and `robust_alpha` showed a real declining trend as `stop_loss` loosened (SOXL

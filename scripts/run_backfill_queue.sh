@@ -82,9 +82,13 @@ run_if_needed() {
     done
   done
 
-  # ── Step 4: non-watchlist tickers with best v3.x alpha >= 500 ─────────────
+  # ── Step 4: non-watchlist tickers with best v3.x alpha >= 300 ─────────────
+  # Lowered from 500 (2026-07-16) -- only GDXD cleared 500, and GDXD's data
+  # turned out to be corrupted (uncleaned historical reverse-split drift,
+  # $9990->$51 over 3 years, same failure mode as the KORU incident but
+  # gradual instead of a single jump -- its v4 numbers should not be trusted).
   echo ""
-  echo "### STEP 4: screening non-watchlist tickers for v3 alpha >= 500 ###"
+  echo "### STEP 4: screening non-watchlist tickers for v3 alpha >= 300 ###"
   EXTRA_TICKERS_LIST=$(.venv/bin/python -c "
 import sqlite3, sys
 conn = sqlite3.connect('cache/research/trading_universe.db')
@@ -95,7 +99,7 @@ c.execute('''
     FROM backtest_cache
     WHERE version LIKE 'v3.%' AND strategy = 'TrailingBothZScoreBreakout' AND trades > 0
     GROUP BY ticker
-    HAVING best_alpha >= 500
+    HAVING best_alpha >= 300
     ORDER BY best_alpha DESC
 ''')
 rows = [r for r in c.fetchall() if r[0] not in watchlist]
@@ -105,7 +109,7 @@ print(' '.join(r[0] for r in rows))
 ")
 
   if [ -z "$EXTRA_TICKERS_LIST" ]; then
-    echo "No non-watchlist tickers cleared the 500% v3 alpha bar -- skipping Step 4."
+    echo "No non-watchlist tickers cleared the 300% v3 alpha bar -- skipping Step 4."
   else
     echo "Step 4 tickers: $EXTRA_TICKERS_LIST"
     for ticker in $EXTRA_TICKERS_LIST; do
