@@ -236,6 +236,155 @@ def simulate_trail_both_deferred_sell(p, take_profit, stop_loss, max_hours_to_ho
     return trades
 
 
+def _resolve_miss(rng, mode, miss_rate, streak, max_delay_checks):
+    """One coin flip for a currently-true entry/exit condition. Returns True if
+    the action fires now, False if this check is missed. `drop` mode has no
+    memory -- a miss is unbounded, the opportunity can vanish for good if the
+    underlying condition stops holding before it's ever caught. `delay` mode
+    tracks consecutive misses of the SAME still-true condition and forces
+    action once `streak` reaches `max_delay_checks - 1` (i.e. bounds the worst
+    -case delay at max_delay_checks consecutive misses)."""
+    if rng.random() >= miss_rate:
+        return True
+    if mode == 'drop':
+        return False
+    return streak >= max_delay_checks - 1
+
+
+def simulate_trail_both_chaos(p, take_profit, stop_loss, max_hours_to_hold,
+                               trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh,
+                               rng, entry_miss_mode, entry_miss_rate,
+                               exit_miss_mode, exit_miss_rate, max_delay_checks=3):
+    """Execution-adherence ("chaos monkey") mirror of simulate_trail_both_annotated:
+    same real bar-by-bar entry/exit logic, but every entry-signal window and every
+    exit trigger (SL / trailing-stop breach / TIME) is subject to a random miss
+    per `_resolve_miss` before it's acted on -- models a human failing to notice
+    or act on a Slack alert in time, the real risk during manual-execution
+    trading (distinct from island/robust-alpha, which both assume perfect
+    adherence to every signal). TP->trailing-arm is never missable -- it's an
+    internal state change (switching into trailing-sell tracking), not a
+    discrete action a human has to click. Entry checks only happen at the two
+    daily signal windows (target_h0/target_h1), matching the real Slack cadence;
+    exit checks happen every bar while in a trade, matching the live daemon's
+    continuous position monitoring. See docs/backlog_cache.md's 2026-07-16
+    "chaos monkey" item and scripts/sim_chaos_monkey.py."""
+    prices, highs, lows, hours = p['prices'], p['highs'], p['lows'], p['hours']
+    daily_idx, sma_arr, std_arr = p['daily_idx'], p['sma_arr'], p['std_arr']
+    trend_arr, has_trend = p['trend_arr'], p['has_trend']
+
+    trades = []
+    in_trade = waiting = trailing = False
+    entry_price = stop_price = tp_price = peak = 0.0
+    entry_bar = held = 0
+    running_low = 0.0
+    wait_bars = 0
+    signal_bar = None
+    signal_z = None
+    arm_bar = None
+    entry_streak = 0
+    exit_streak = 0
+
+    n = len(prices)
+    for i in range(n):
+        cp, high, low = prices[i], highs[i], lows[i]
+
+        if in_trade:
+            held += 1
+            if trailing:
+                if high > peak:
+                    peak = high
+                trail_stop = peak * (1.0 - trail_pct)
+                sl_hit = low <= trail_stop
+                time_hit = held >= max_hours_to_hold
+                if sl_hit or time_hit:
+                    if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
+                        exit_streak = 0
+                        exit_px = trail_stop if sl_hit else cp
+                        pc = (exit_px - entry_price) / entry_price
+                        trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                            arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=exit_px,
+                                            held=held, result=WIN if pc > 0 else LOSS, ret=pc))
+                        in_trade = trailing = False
+                    else:
+                        exit_streak += 1
+                    continue
+                exit_streak = 0
+                continue
+            if low <= stop_price:
+                if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
+                    exit_streak = 0
+                    pc = (stop_price - entry_price) / entry_price
+                    trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                        arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=stop_price,
+                                        held=held, result=LOSS, ret=pc))
+                    in_trade = False
+                else:
+                    exit_streak += 1
+                continue
+            if cp >= tp_price:
+                trailing = True; peak = cp; arm_bar = i
+                continue
+            if held >= max_hours_to_hold:
+                if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
+                    exit_streak = 0
+                    pc = (cp - entry_price) / entry_price
+                    trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                        arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=cp,
+                                        held=held, result=TWIN if pc > 0 else TLOSS, ret=pc))
+                    in_trade = False
+                else:
+                    exit_streak += 1
+                continue
+            exit_streak = 0
+            continue
+
+        if waiting:
+            wait_bars += 1
+            if low < running_low:
+                running_low = low
+            buy_trigger = running_low * (1.0 + trail_buy_pct)
+            if high >= buy_trigger:
+                entry_price = buy_trigger
+                tp_price = entry_price * (1.0 + take_profit)
+                stop_price = entry_price * (1.0 - stop_loss)
+                entry_bar = i; held = 0; arm_bar = None
+                in_trade = True; waiting = trailing = False
+                continue
+            if wait_bars >= max_hours_to_hold:
+                waiting = False
+            continue
+
+        h = hours[i]
+        if h != target_h0 and h != target_h1:
+            continue
+        di = daily_idx[i]
+        if di < 0:
+            continue
+        sma, std = sma_arr[di], std_arr[di]
+        if std == 0.0:
+            continue
+        lower_band = sma - std * z_thresh
+        signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
+        if signal:
+            if _resolve_miss(rng, entry_miss_mode, entry_miss_rate, entry_streak, max_delay_checks):
+                entry_streak = 0
+                waiting = True; running_low = cp; wait_bars = 0
+                signal_bar = i; signal_z = (cp - sma) / std
+            else:
+                entry_streak += 1
+        else:
+            entry_streak = 0
+
+    if in_trade:
+        cp = prices[n - 1]
+        pc = (cp - entry_price) / entry_price
+        trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                            arm_i=arm_bar, exit_i=n - 1, entry_p=entry_price, exit_p=cp,
+                            held=held, result=OPEN, ret=pc))
+
+    return trades
+
+
 def simulate_trail_both_ohlc_aware(p, opens, take_profit, stop_loss, max_hours_to_hold,
                                     trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh):
     """Side analysis only — not used by the live kernel. Same state machine as

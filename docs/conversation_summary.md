@@ -2088,3 +2088,27 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 2. Both new backlog items (trailing-buy re-sizing, dividend crediting) need actual design sessions before any code changes — neither is scoped yet.
 3. Carried over: watch GDXD's next real signal window in dry-run, confirm the `[DRY RUN]` Slack flow looks right before ever considering `dry_run=False`.
 4. Carried over: `schwab_client.get_filled_order`'s field parsing still needs confirming against one real fill before the opt-in auto-fill-detection toggle is trusted.
+
+---
+
+## 2026-07-17 (session 18) — API-proxy idea logged, chaos-monkey execution-adherence simulator built and run
+
+### What we did
+- **Logged a new backlog idea** (not built): moving Schwab order-placement/mutating calls behind a separate API-proxy this session can't write to, mirroring a pattern from the user's work architecture — safety boundary + credential isolation, roughly equal weight. Scoped to write/mutating calls only (reads stay local). Not designed at all yet (no contract, no auth model, no decision on how `schwab_safety.py`'s guardrails split across the boundary). Logged per explicit "backlog only, no code" instruction for that part of the session.
+- **Confirmed the trailing-buy re-sizing backlog item stays open** — user explicitly wants to look at the real numbers again before deciding whether worst-case sizing is good enough, since a fixed 1% (or whatever `trail_buy_pct`) worst-case gap compounding over hundreds of trades could be real drift. Not resolved, not touched.
+- **Confirmed via `logs/backfill_queue_20260716_074059.log`** (not a live DB query — avoided repeatedly hitting the 45GB `trading_universe.db` directly) that the full v4 SL-sweep backfill queue completed 2026-07-16 14:25:03: all 11 original live-watchlist tickers covered at `stop_loss` 1-9%/`open_check`, plus GDXD (Step 4 non-watchlist screen, only ticker to clear the alpha bar) — result CLIFF (not cliff-safe), consistent with its small-pilot framing.
+- **Built and ran the "chaos monkey" execution-adherence simulator** (`docs/backlog_cache.md`'s 2026-07-16 high-priority item, previously not started). New `export_trades.simulate_trail_both_chaos`/`_resolve_miss` — pure-Python mirror of `simulate_trail_both_annotated`, verified byte-identical to baseline at `miss_rate=0`. New CLI `scripts/sim_chaos_monkey.py`. Design, worked out with the user via AskUserQuestion before building: both entry and exit signals missable; entry only at the two daily signal windows (matching real Slack cadence), exit every bar (matching continuous live monitoring); TP-arming never missable; two modes — `drop` (unbounded per-check miss) and `delay` (same coin flip but capped at 3 consecutive misses before forced action); miss rates {1,5,10,20}%; 1000 Monte Carlo trials per (ticker, mode, rate); all 12 `watchlist_id=9` nodes. Ran in 225s wall time (~2.5ms/trial).
+- **Real finding**: at a 20% miss rate, 9/12 tickers lose ~15-31% of mean compounded return vs. perfect adherence (KORU worst, ratio 0.69). **SOXL and DPST are outliers** — SOXL stays flat-to-slightly-positive even at 20% miss, and DPST's mean return actually *increases* with higher miss rates (ratio up to 1.08) — unexplained direction, not yet investigated (possibly a real edge that benefits from occasional misses, or a small-trade-count artifact). `drop` vs `delay` modes track each other closely on every ticker — the 3-check delay cap rarely binds. Tail risk (p10) degrades faster than the mean on most tickers even where the mean holds up. Results in `output/chaos_monkey_summary.csv`/`chart.png` (gitignored, sent to user directly) and written up in `docs/backlog_cache.md`.
+- Confirmed no git worktree was needed for this work (new standalone script, no `config.json`/live-trading-code touch, no in-flight sweep to race with).
+
+### Key decisions
+- Trailing-buy re-sizing backlog item stays open pending a real numbers review — explicitly not resolved this session.
+- Chaos-monkey model applies the same miss_rate to both entry and exit checks simultaneously per run (not independently varied) — kept the parameter grid tractable for a first pass.
+- DPST/SOXL divergence flagged as a real open question in the backlog, not swept under the "some tickers tolerate misses fine" framing without investigation.
+
+### Next Session
+1. Investigate why DPST/SOXL diverge from the rest of the watchlist in the chaos-monkey results (real edge vs. small-sample artifact) before treating it as a trustworthy result.
+2. Trailing-buy re-sizing: user wants to re-review the real numbers (compounding drift from a fixed worst-case gap over hundreds of trades) before deciding whether to resolve or actually build re-sizing.
+3. API-proxy idea (`docs/backlog_cache.md`) needs a real design session before any client stubs, whenever picked back up.
+4. Uncommitted from last session, still pending: `scripts/analyze_capital_utilization_drift.py` (capital utilization drift analysis) — fold into a commit alongside this session's work.
+5. Carried over: watch GDXD's next real signal window in dry-run; confirm `schwab_client.get_filled_order` field parsing against a real fill before enabling auto-fill-detection.
