@@ -127,6 +127,28 @@ def _last_sale_recovery(ticker, starting_notional):
     return starting_notional
 
 
+def buy_order_sizing(node, sig):
+    """Worst-case trailing-buy sizing: a real trailing-buy order fills once price
+    bounces trail_buy_pct% off a running low that can fall further before that, so
+    the fill price is unbounded relative to the signal-time price. Sizing off the
+    worst case (no further drop, fill right at the bounce trigger) guarantees the
+    order never costs more than target_notional. Shared by _build_buy_blocks and
+    the automated-placement path so there's one sizing formula, not two."""
+    ticker = sig['ticker']
+    price = sig['current_price']
+    target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
+    trailing_buy = db._is_trailing_buy(node)
+    trail_buy_pct = node.get('trail_buy_pct') or 0.0
+    if trailing_buy:
+        shares = int(target_notional // (price * (1 + trail_buy_pct / 100)))
+    else:
+        shares = int(target_notional // price)
+    return {
+        'shares': shares, 'target_notional': target_notional,
+        'trailing_buy': trailing_buy, 'trail_buy_pct': trail_buy_pct, 'price': price,
+    }
+
+
 _PHASE_GREY, _PHASE_YELLOW, _PHASE_GREEN = '⚪', '🟡', '🟢'
 
 

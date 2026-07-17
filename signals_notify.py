@@ -12,11 +12,59 @@ import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
 import schwab_safety
+import schwab_client
 from signals_charts import _chart_buy, _chart_sell, _upload_chart
 from signals_blocks import _post_message, _build_buy_blocks, _build_sell_blocks
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
+    buy_order_sizing,
 )
+
+
+def _attempt_automated_buy(node, sizing):
+    """Places a real (or dry_run) trailing-buy order via schwab_client for a
+    pilot-scope ticker instead of waiting on a human to click 'Trailing Buy
+    Order Placed'. Returns False (falls back to the existing manual flow) if
+    the ticker isn't in scope, or if schwab_safety blocks the order for any
+    reason (paused, outside signal window, kill switch, etc.) -- schwab_client
+    already Slack-posts the BLOCKED/DRY RUN message either way, this function
+    just decides which button set the caller should render."""
+    ticker = node['ticker']
+    if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        return False
+    account = node.get('account')
+    try:
+        schwab_client.place_trailing_buy(
+            account, ticker, sizing['shares'], sizing['price'], sizing['trail_buy_pct'])
+    except schwab_safety.SafetyViolation:
+        return False
+    except Exception as e:
+        _post_message(f"⚠️ {ticker} automated order placement failed unexpectedly: {e} — falling back to manual")
+        return False
+    return True
+
+
+def _attempt_automated_sell(pos, current_price):
+    """Sell-side mirror of _attempt_automated_buy -- places the trailing-sell
+    order via schwab_client for a pilot-scope ticker instead of waiting on the
+    'Order Placed' button. Returns False on any block/failure (falls back to
+    the manual flow)."""
+    ticker = pos['ticker']
+    if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        return False
+    account = pos.get('account')
+    shares = pos.get('shares')
+    trail_sell_pct = pos.get('trail_sell_pct')
+    if not shares or not trail_sell_pct:
+        return False
+    try:
+        schwab_client.place_trailing_sell(account, ticker, shares, current_price, trail_sell_pct)
+    except schwab_safety.SafetyViolation:
+        return False
+    except Exception as e:
+        _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual")
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -47,16 +95,24 @@ def notify_buy_signal(node, sig):
         print(f"  ⚠️🔁 SAME DAY BUY WARNING: {ticker} already sold today — cash may not be settled (T+1)")
     print(sep)
 
+    trailing_buy = db._is_trailing_buy(node)
+    auto_placed = False
+    if trailing_buy:
+        sizing = buy_order_sizing(node, sig)
+        auto_placed = _attempt_automated_buy(node, sizing)
+
     channel, ts = _post_message(
         f"BUY SIGNAL — {ticker}  ${price:.4f}  z={z:.2f}  ({bar_str})",
-        _build_buy_blocks(node, sig),
+        _build_buy_blocks(node, sig, auto_placed=auto_placed),
     )
 
     # Tracked regardless of INTERACTIVE -- a trailing-buy order is still pending
     # fill confirmation even in SIM_MODE or webhook-only (non-socket) runs, where
     # there's no button to click but the reminder loop should still nag.
-    if db._is_trailing_buy(node):
+    if trailing_buy:
         db.add_pending_buy(node, sig, channel, ts)
+        if auto_placed:
+            db.mark_pending_buy_placed(ticker)
 
     if cfg.INTERACTIVE:
         chart = _chart_buy(node, sig)
@@ -65,7 +121,11 @@ def notify_buy_signal(node, sig):
         print("  Waiting for Slack response (Executed / Skipped).")
         return
 
-    if db._is_trailing_buy(node):
+    if trailing_buy and auto_placed:
+        print(f"  {ticker} trailing buy order auto-placed at the broker — waiting for fill.")
+        return
+
+    if trailing_buy:
         print("\nTrailing buy order placed at the broker? No position opens yet -- "
               "report the real fill separately once it happens. (y/n): ", end='', flush=True)
         try:
@@ -248,14 +308,24 @@ def _supersede_message(channel, ts, ticker):
 
 def notify_trailing_activated(pos, current_price):
     ticker = pos['ticker']
-    blocks = _trailing_order_blocks(pos, current_price, reminder_num=0)
-    channel, ts = _post_message(
-        f"{ticker} trailing stop activated — place order", blocks=blocks)
+    auto_placed = _attempt_automated_sell(pos, current_price)
+    if auto_placed:
+        channel, ts = _post_message(
+            f"🤖 {ticker} trailing stop activated — order auto-placed at the broker",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                     "text": f"🎯 *{ticker}* — TRAILING ACTIVATED — order auto-placed at the broker"}}],
+        )
+    else:
+        blocks = _trailing_order_blocks(pos, current_price, reminder_num=0)
+        channel, ts = _post_message(
+            f"{ticker} trailing stop activated — place order", blocks=blocks)
     state = dict(pos.get('trail_state') or {})
     state['reminder_channel'] = channel
     state['reminder_ts']      = ts
     state['reminder_count']   = 0
     state['last_reminder_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if auto_placed:
+        state['order_placed'] = True
     db.update_position_trail_state(pos['id'], state)
 
 
@@ -498,6 +568,62 @@ def check_buy_reminders():
         db.update_pending_buy_reminder(pending['id'], channel, ts, reminder_num)
 
 
+def check_auto_fills(open_positions):
+    """Polls Schwab's order book for pilot-scope tickers with auto-fill-detection
+    enabled (schwab_safety.auto_fill_detection_enabled, off by default) and
+    auto-records a fill instead of waiting for the human Filled/Exited click.
+    Buy side: any pending_buys row with order_placed=True. Sell side: any open
+    position with an armed trailing-sell order (trail_state.order_placed) and an
+    unresolved exit_pending. Clearing the pending_buys row / exit_pending on a
+    hit is itself the dedup marker -- no separate 'already processed' state needed."""
+    for pending in db.get_pending_buys():
+        ticker = pending['ticker']
+        if not pending['order_placed']:
+            continue
+        if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            continue
+        if not schwab_safety.auto_fill_detection_enabled(ticker):
+            continue
+        node = pending['node']
+        account = node.get('account')
+        if not account:
+            continue
+        fill = schwab_client.get_filled_order(account, ticker, 'BUY')
+        if fill is None:
+            continue
+        signal_price = pending['signal_price']
+        signal_time = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
+        opened = db.open_position(node, signal_price, signal_time, fill['price'], datetime.now(),
+                                   shares=fill['quantity'])
+        db.clear_pending_buy(ticker)
+        if opened:
+            drift_pct = (fill['price'] - signal_price) / signal_price * 100
+            _post_message(f"🤖 {ticker} — auto-detected fill at ${fill['price']:.4f}  "
+                          f"(drift: {drift_pct:+.2f}%)  {fill['quantity']:g} shares")
+
+    for pos in open_positions:
+        ticker = pos['ticker']
+        if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            continue
+        if not schwab_safety.auto_fill_detection_enabled(ticker):
+            continue
+        state = pos.get('trail_state') or {}
+        exit_pending = state.get('exit_pending')
+        if not (state.get('order_placed') and exit_pending):
+            continue
+        account = pos.get('account')
+        if not account:
+            continue
+        fill = schwab_client.get_filled_order(account, ticker, 'SELL')
+        if fill is None:
+            continue
+        actual_pnl = (fill['price'] - pos['entry_price']) / pos['entry_price'] * 100
+        db.close_position(pos['id'], exit_signal_price=exit_pending['current_price'],
+                           exit_price=fill['price'], exit_time=datetime.now(),
+                           exit_reason=exit_pending['reason'])
+        _post_message(f"🤖 {ticker} — auto-detected exit fill at ${fill['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
+
+
 # ---------------------------------------------------------------------------
 # Startup report
 # ---------------------------------------------------------------------------
@@ -588,6 +714,19 @@ def _ticker_block(row):
                 if automation_on else
                 {"type": "button", "text": {"type": "plain_text", "text": f"▶️ Resume {ticker} Automation"},
                  "style": "primary", "action_id": "resume_ticker_automation", "value": ticker},
+            ]})
+
+            # Auto-fill-detection toggle -- separate from the placement toggle above and
+            # defaults off (see schwab_safety.AUTO_FILL_DETECTION_PATH comment): placement
+            # automation is proven via this session's dry-run testing, fill detection isn't
+            # exercised against a real fill yet.
+            fill_detection_on = schwab_safety.auto_fill_detection_enabled(ticker)
+            blocks.append({"type": "actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Disable {ticker} Auto-Fill Detection"},
+                 "style": "danger", "action_id": "disable_auto_fill_detection", "value": ticker}
+                if fill_detection_on else
+                {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Enable {ticker} Auto-Fill Detection"},
+                 "action_id": "enable_auto_fill_detection", "value": ticker},
             ]})
 
     return blocks

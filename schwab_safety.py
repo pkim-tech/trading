@@ -38,6 +38,15 @@ KILL_SWITCH_PATH = Path(__file__).parent / "cache" / "live" / "schwab_kill_switc
 # Same persisted-file pattern so a pause survives a daemon restart.
 TICKER_AUTOMATION_PATH = Path(__file__).parent / "cache" / "live" / "schwab_ticker_automation.json"
 
+# Auto-fill-detection toggle (2026-07-17) -- separate from ticker_automation_enabled
+# above (which gates order *placement*) and opposite default: placement automation
+# is on-by-default within AUTOMATION_ENABLED_TICKERS scope, but polling Schwab's
+# order book to auto-record a fill (skipping the human Filled/Exited click) is a
+# distinct, newer capability that stays off until explicitly enabled per ticker,
+# since schwab_client.get_filled_order's field parsing hasn't been confirmed
+# against a real fill response yet.
+AUTO_FILL_DETECTION_PATH = Path(__file__).parent / "cache" / "live" / "schwab_auto_fill_detection.json"
+
 # Mirrors active_signals._SIGNAL_WINDOWS + _OPEN_CHECK_WINDOWS -- kept as separate
 # constants here (not imported) to avoid a real circular import (active_signals ->
 # signals_notify -> schwab_safety). Only gates BUY orders: check_sell_condition runs
@@ -203,6 +212,46 @@ def resume_ticker_automation(ticker: str):
     state[ticker] = True
     state.pop(f"{ticker}_reason", None)
     TICKER_AUTOMATION_PATH.write_text(json.dumps(state))
+
+
+def auto_fill_detection_enabled(ticker: str) -> bool:
+    """False unless a persisted per-ticker override has explicitly enabled it --
+    opposite default from ticker_automation_enabled (see AUTO_FILL_DETECTION_PATH
+    comment above)."""
+    if AUTO_FILL_DETECTION_PATH.exists():
+        try:
+            state = json.loads(AUTO_FILL_DETECTION_PATH.read_text())
+            if ticker in state:
+                return bool(state[ticker])
+        except (json.JSONDecodeError, OSError):
+            pass
+    return False
+
+
+def enable_auto_fill_detection(ticker: str):
+    """Called by the Slack per-ticker 'Enable Auto-Fill Detection' button handler."""
+    AUTO_FILL_DETECTION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {}
+    if AUTO_FILL_DETECTION_PATH.exists():
+        try:
+            state = json.loads(AUTO_FILL_DETECTION_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    state[ticker] = True
+    AUTO_FILL_DETECTION_PATH.write_text(json.dumps(state))
+
+
+def disable_auto_fill_detection(ticker: str):
+    """Called by the Slack per-ticker 'Disable Auto-Fill Detection' button handler."""
+    AUTO_FILL_DETECTION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {}
+    if AUTO_FILL_DETECTION_PATH.exists():
+        try:
+            state = json.loads(AUTO_FILL_DETECTION_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    state[ticker] = False
+    AUTO_FILL_DETECTION_PATH.write_text(json.dumps(state))
 
 
 def _open_locked():

@@ -6,7 +6,7 @@ import requests
 
 import signals_config as cfg
 import signals_db as db
-from signals_helpers import _add_trading_hours, _last_sale_recovery
+from signals_helpers import _add_trading_hours, _last_sale_recovery, buy_order_sizing
 
 
 def _post_message(text, blocks=None):
@@ -81,7 +81,7 @@ def _shares_input_block(initial=None):
     }
 
 
-def _build_buy_blocks(node, sig):
+def _build_buy_blocks(node, sig, auto_placed=False):
     ticker    = sig['ticker']
     price     = sig['current_price']
     z         = sig['z_score']
@@ -93,18 +93,11 @@ def _build_buy_blocks(node, sig):
     hold_deadline = _add_trading_hours(sig['last_bar'], node['max_hold_hours'])
     deadline_str  = hold_deadline.strftime('%a %b %d %H:%M')
 
-    target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
-    trailing_buy = db._is_trailing_buy(node)
-    if trailing_buy:
-        # Conservative worst-case sizing: a real trailing-buy order fills once price
-        # bounces trail_buy_pct% off a running low that can fall further before that,
-        # so the fill price is unbounded relative to the signal-time price. Sizing off
-        # the worst case (no further drop, fill right at the bounce trigger) guarantees
-        # the order never costs more than target_notional.
-        trail_buy_pct = node.get('trail_buy_pct') or 0.0
-        shares = int(target_notional // (price * (1 + trail_buy_pct / 100)))
-    else:
-        shares = int(target_notional // price)
+    sizing = buy_order_sizing(node, sig)
+    target_notional = sizing['target_notional']
+    trailing_buy     = sizing['trailing_buy']
+    trail_buy_pct    = sizing['trail_buy_pct']
+    shares           = sizing['shares']
     schwab_sl_pct   = node['stop_loss']
     schwab_sl_price = sig['lower_band'] * (1 - schwab_sl_pct / 100)
 
@@ -131,7 +124,8 @@ def _build_buy_blocks(node, sig):
 
     account = node.get('account') or 'unmapped'
     if trailing_buy:
-        entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}"
+        auto_str = "  🤖 *auto-placed at broker*" if auto_placed else ""
+        entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}{auto_str}"
     else:
         entry_line = f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}"
 
@@ -159,7 +153,22 @@ def _build_buy_blocks(node, sig):
             "lower_band":   sig['lower_band'],
             "z_score":      z,
         })
-        if trailing_buy:
+        if trailing_buy and auto_placed:
+            # Order is already resting at the broker (schwab_client placed it) --
+            # skip straight to the Filled/Missed/Cancelled set, mirroring what
+            # handle_trail_buy_order_placed transitions to for the manual path.
+            blocks.append({
+                "type": "actions",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "Filled"},
+                     "style": "primary", "action_id": "trail_buy_filled", "value": value},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Missed It"},
+                     "action_id": "trail_buy_missed", "value": value},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Cancelled"},
+                     "action_id": "trail_buy_cancelled", "value": value},
+                ],
+            })
+        elif trailing_buy:
             # No price ask -- the trailing-buy fill price isn't known at alert time
             # (broker tracks the bounce-above-running-low entry itself). Opens the
             # position immediately at the signal price so arm/SL/trail triggers are

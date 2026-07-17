@@ -82,6 +82,7 @@ from signals_notify import (
     notify_trailing_activated, check_trailing_reminders,
     EXIT_REMINDER_MINUTES, _exit_pending_blocks, check_exit_reminders,
     BUY_REMINDER_MINUTES, _trailing_buy_status, _pending_buy_blocks, check_buy_reminders,
+    check_auto_fills,
     _ticker_block, _send_window_alert,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report,
@@ -292,6 +293,11 @@ def run_loop(tickers: set = None):
             check_trailing_reminders(open_positions)
             check_exit_reminders(open_positions)
             check_buy_reminders()
+
+        # Not gated to market hours -- a GTC trailing order can fill any time it's
+        # resting at the broker, and auto-fill-detection is opt-in per ticker anyway
+        # (schwab_safety.auto_fill_detection_enabled, off by default).
+        check_auto_fills(open_positions)
 
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")

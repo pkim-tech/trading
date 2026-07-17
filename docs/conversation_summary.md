@@ -2042,3 +2042,28 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 4. Re-run the corrected time-varying liquidity cap across the rest of the watchlist (only GDXD was checked, 2026-07-16).
 5. `same_day_block` kernel feature still unused in the real sweep pipeline — decide whether to formalize as a real `backtest_cache` campaign axis.
 6. Carried over: wire `schwab_client`/`schwab_safety` into `active_signals.py` (see #1 above — same item, now the clear top priority).
+
+---
+
+## 2026-07-17 (session 16) — schwab_client wired into active_signals.py's real BUY/SELL loop
+
+### What we did
+- **Closed the long-standing "schwab_client is fully built but never called" gap.** Scope: only the trailing-buy/trailing-sell path (`TrailingBothZScoreBreakout`, the only strategy any `AUTOMATION_ENABLED_TICKERS` ticker uses).
+- **Automated placement**: `signals_notify.notify_buy_signal`/`notify_trailing_activated` now call `schwab_client.place_trailing_buy`/`place_trailing_sell` directly for GDXD instead of waiting on the "Trailing Buy Order Placed"/"Order Placed" Slack buttons. Any `SafetyViolation` (paused, outside signal window, kill switch) or unexpected exception falls back to the existing manual button flow unchanged — `schwab_client` already Slack-posts the BLOCKED/`[DRY RUN]` message either way. `signals_blocks._build_buy_blocks` gained an `auto_placed` flag: when true it skips straight to the Filled/Missed It/Cancelled button set. Sizing logic extracted into `signals_helpers.buy_order_sizing` so blocks and the automated path share one formula instead of two.
+- **Fill detection built as a separate, opt-in capability** (user's explicit ask: build both placement and fill-detection automation, but gate fill-detection behind a toggle defaulting off). New `signals_notify.check_auto_fills`, polled every `run_loop` iteration (not gated to market hours — a GTC order can fill any time). New `schwab_client.get_filled_order(account, ticker, side)` polls Schwab's live order book for the most recent `FILLED` order and returns price/qty (field parsing against `orderActivityCollection`/`executionLegs` is best-effort, not yet confirmed against a real fill — flagged in code comments). New per-ticker toggle `schwab_safety.auto_fill_detection_enabled` (persisted to `cache/live/schwab_auto_fill_detection.json`, **defaults off**, opposite polarity from the placement-automation toggle which defaults on within pilot scope), with Slack enable/disable buttons on the reference report next to the existing pause/resume-automation button.
+- Every account is still `dry_run=True`, so automated placement is exercisable for real right now with zero live-order risk — this is the sanity-test mechanism the user asked for before ever flipping `dry_run=False`.
+- 9 new tests (`tests/test_schwab_automation.py`): automated placement happy path, three fallback scenarios (outside pilot scope, outside signal window, ticker paused), fill-detection toggle default-off no-op, and both buy-fill/sell-fill auto-recording paths with `get_filled_order` monkeypatched. Full suite: 86/86 passing.
+- Ran the pre-commit checklist's live-vs-backtest regression scripts (`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`, required since `active_signals.py` changed) — both clean, no unexpected mismatches, numbers consistent with prior sessions' findings.
+
+### Key decisions
+- User explicitly chose "build both placement and fill-detection automation, but fill-detection stays a toggle" over the initially-recommended placement-only-for-now scope — captured in `docs/design.md`'s 2026-07-17b addendum.
+- `dry_run` stays `True` for every account and auto-fill-detection stays off for GDXD — both deliberately deferred, not part of this change.
+- Plain market-order automation (`buy_executed`/`entry_price_submit` flow) left untouched — no live ticker needs it, would have been scope creep.
+
+### Next Session
+0. **New backlog item raised by the user post-wiring (2026-07-17)**: the trailing-buy order's fixed share count (sized off the worst-case trigger price) under-deploys budgeted capital whenever the real fill lands below that worst case — needs a design decision (cancel/replace resting order vs. a top-up order once the real fill is known). Not scoped. See `docs/backlog_cache.md`'s new top entry.
+1. Watch GDXD's next real signal window in dry-run and confirm Slack shows `[DRY RUN] would place TRAILING BUY ...` followed directly by Filled/Missed/Cancelled buttons (no separate "order placed" click) — the real sanity check before considering `dry_run=False`.
+2. If that looks right, decide when/whether to flip `dry_run=False` for the `ira` account (GDXD only) — a separate, deliberate decision, not automatic follow-on.
+3. Once a few real GDXD fills have happened, confirm `schwab_client.get_filled_order`'s field parsing against a real fill response before ever turning the auto-fill-detection toggle on.
+4. Real (non-placeholder) notional/daily cap review in `schwab_safety.py:52-55` still outstanding.
+5. Aggregate-across-tickers cash exposure (Schwab doesn't reserve buying power for resting orders, confirmed 2026-07-17) still unguarded — relevant once `AUTOMATION_ENABLED_TICKERS` widens beyond GDXD.

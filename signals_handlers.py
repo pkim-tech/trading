@@ -441,6 +441,24 @@ if cfg.SOCKET_MODE:
         _post_message(f"▶️ {ticker} automation RESUMED by {user}")
         send_reference_report(db.get_watchlist())
 
+    @cfg.bolt_app.action("enable_auto_fill_detection")
+    def handle_enable_auto_fill_detection(ack, body, client):
+        ack()
+        ticker = body['actions'][0]['value']
+        user = body.get('user', {}).get('username', 'someone')
+        schwab_safety.enable_auto_fill_detection(ticker)
+        _post_message(f"🤖 {ticker} auto-fill detection ENABLED by {user} — fills will be auto-recorded, no Filled/Exited click needed")
+        send_reference_report(db.get_watchlist())
+
+    @cfg.bolt_app.action("disable_auto_fill_detection")
+    def handle_disable_auto_fill_detection(ack, body, client):
+        ack()
+        ticker = body['actions'][0]['value']
+        user = body.get('user', {}).get('username', 'someone')
+        schwab_safety.disable_auto_fill_detection(ticker)
+        _post_message(f"🤖 {ticker} auto-fill detection DISABLED by {user} — back to manual Filled/Exited confirmation")
+        send_reference_report(db.get_watchlist())
+
     @cfg.bolt_app.action("apply_corp_action_correction")
     def handle_apply_corp_action_correction(ack, body, client):
         """Fixing entry_price is what clears the freeze -- check_sell_condition's

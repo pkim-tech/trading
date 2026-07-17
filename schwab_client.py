@@ -145,6 +145,49 @@ def place_trailing_buy(account: str, ticker: str, quantity: int, price: float, t
     return _place_trailing_order("BUY", StopPriceLinkBasis.ASK, account, ticker, quantity, price, trail_pct)
 
 
+def get_filled_order(account: str, ticker: str, side: str):
+    """Best-effort poll of Schwab's live order book for the most recent FILLED
+    order matching ticker+side -- used by signals_notify.check_auto_fills to
+    auto-record a fill without a human clicking Filled/Exited. Field names
+    (orderActivityCollection/executionLegs) follow Schwab's documented order
+    schema but are unverified against a real fill response -- confirm against
+    one real (dry_run=False) fill before trusting this for anything beyond the
+    opt-in auto-fill-detection toggle, which defaults off. Returns
+    {'price': float, 'quantity': float} or None if no matching fill is found."""
+    account_hash = _resolve_account_hashes()[account]
+    r = _get_client().get_orders_for_account(account_hash)
+    r.raise_for_status()
+    instruction = EquityInstruction.BUY if side == "BUY" else EquityInstruction.SELL
+    candidates = []
+    for o in r.json():
+        if o.get("status") != "FILLED":
+            continue
+        legs = o.get("orderLegCollection", [])
+        matches = any(
+            leg.get("instrument", {}).get("symbol") == ticker
+            and leg.get("instruction") == instruction.value
+            for leg in legs
+        )
+        if not matches:
+            continue
+        exec_legs = [
+            el for activity in o.get("orderActivityCollection", [])
+            for el in activity.get("executionLegs", [])
+        ]
+        if not exec_legs:
+            continue
+        total_qty = sum(el.get("quantity", 0) for el in exec_legs)
+        if not total_qty:
+            continue
+        vwap = sum(el.get("price", 0) * el.get("quantity", 0) for el in exec_legs) / total_qty
+        candidates.append((o.get("closeTime") or o.get("enteredTime") or "", vwap, total_qty))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    _, price, qty = candidates[-1]
+    return {"price": price, "quantity": qty}
+
+
 def place_trailing_sell(account: str, ticker: str, quantity: int, price: float, trail_pct: float):
     """trail_pct is the pullback-below-running-high trigger (matches the
     position's trail_sell_pct). BID-linked, since a sell naturally references
