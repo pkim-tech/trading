@@ -71,7 +71,7 @@ if cfg.SOCKET_MODE:
         ts                = body['message']['ts']
         ticker            = data['node']['ticker']
         signal_price      = data['signal_price']
-        suggested_shares  = int(_last_sale_recovery(ticker) // signal_price) if signal_price else None
+        suggested_shares  = int(_last_sale_recovery(ticker, data['node'].get('starting_notional')) // signal_price) if signal_price else None
         client.views_open(
             trigger_id=body['trigger_id'],
             view={
@@ -317,7 +317,7 @@ if cfg.SOCKET_MODE:
         data   = json.loads(body['actions'][0]['value'])
         ticker = data['node']['ticker']
         current_price, _ = compute._current_price(ticker)
-        suggested_shares = int(_last_sale_recovery(ticker) // current_price) if current_price else None
+        suggested_shares = int(_last_sale_recovery(ticker, data['node'].get('starting_notional')) // current_price) if current_price else None
         client.views_open(
             trigger_id=body['trigger_id'],
             view={
@@ -421,6 +421,24 @@ if cfg.SOCKET_MODE:
         user = body.get('user', {}).get('username', 'someone')
         schwab_safety.disengage_kill_switch()
         _post_message(f"▶️ Automated engine STARTED by {user}")
+        send_reference_report(db.get_watchlist())
+
+    @cfg.bolt_app.action("pause_ticker_automation")
+    def handle_pause_ticker_automation(ack, body, client):
+        ack()
+        ticker = body['actions'][0]['value']
+        user = body.get('user', {}).get('username', 'someone')
+        schwab_safety.pause_ticker_automation(ticker, reason=f"Pause button by {user}")
+        _post_message(f"⏸️ {ticker} automation PAUSED by {user} — still alerts normally, just won't place real orders")
+        send_reference_report(db.get_watchlist())
+
+    @cfg.bolt_app.action("resume_ticker_automation")
+    def handle_resume_ticker_automation(ack, body, client):
+        ack()
+        ticker = body['actions'][0]['value']
+        user = body.get('user', {}).get('username', 'someone')
+        schwab_safety.resume_ticker_automation(ticker)
+        _post_message(f"▶️ {ticker} automation RESUMED by {user}")
         send_reference_report(db.get_watchlist())
 
     @cfg.bolt_app.action("apply_corp_action_correction")

@@ -96,6 +96,15 @@ import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a sid
 # Signal windows in ET: 10:25-10:40 (9:30 bar close) and 15:25-15:40 (14:30 bar close)
 _SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]
 
+# entry_timing='open_check' nodes also get an earlier poll right after each relevant
+# bar opens (9:30/14:30), mirroring the backtest kernel's Open-then-fall-through-to-Close
+# order: sma/std come from df_daily_prior (strictly prior days), so they're already valid
+# this early. Nodes not marked open_check are skipped here and only checked at the normal
+# close-window time. If an open-check poll fires a BUY, the shared buy_alerted dedup (keyed
+# without a window/time component) naturally suppresses the same node re-firing ~55 minutes
+# later at the regular close-window check.
+_OPEN_CHECK_WINDOWS = [(9, 31, 9, 40), (14, 31, 14, 40)]
+
 # Reference report fires once at each of these times daily -- early (7am) so
 # there's a report before the day even starts, before the open, and before the
 # afternoon signal window, so a fresh full-watchlist view lands ahead of the
@@ -111,12 +120,45 @@ def _reminders_active(now):
     return (9, 0) <= (now.hour, now.minute) <= (16, 0)
 
 
-def _in_buy_window(now):
+def _in_window(now, windows):
     t = (now.hour, now.minute)
-    for h0, m0, h1, m1 in _SIGNAL_WINDOWS:
+    for h0, m0, h1, m1 in windows:
         if (h0, m0) <= t <= (h1, m1):
             return True
     return False
+
+
+def _in_buy_window(now):
+    return _in_window(now, _SIGNAL_WINDOWS)
+
+
+def _scan_buy_signals(nodes, buy_alerted, open_position_keys):
+    """Runs compute_buy_signal over `nodes` and fires notify_buy_signal on new BUYs.
+    Shared by both the open-check and regular close-window polls (see
+    _OPEN_CHECK_WINDOWS) so a node checked in either window gets identical handling."""
+    summaries = []
+    for node in nodes:
+        sig = compute_buy_signal(node)
+        if sig is None:
+            summaries.append(f"{node['ticker']} w={node['window']} NO_DATA")
+            continue
+
+        alert_key = (sig['ticker'], node['strategy'], sig['window'])
+
+        if sig['signal'] == 'BUY' and alert_key not in buy_alerted:
+            buy_alerted.add(alert_key)
+            if (sig['ticker'], sig['window']) in open_position_keys:
+                print(f"  [skip] BUY {sig['ticker']} z={sig['z_score']:+.2f} — position already open, no alert")
+            elif node.get('mode', 'live') == 'live':
+                notify_buy_signal(node, sig)
+            else:
+                print(f"  [research] BUY: {node['ticker']} z={sig['z_score']:+.2f} (no alert)")
+        else:
+            mode_tag = ' [R]' if node.get('mode') == 'research' else ''
+            summaries.append(
+                f"{sig['ticker']}{mode_tag} z={sig['z_score']:+.2f} {sig['signal']}"
+            )
+    return summaries
 
 
 def run_loop(tickers: set = None):
@@ -276,30 +318,15 @@ def run_loop(tickers: set = None):
                 notify_limit_fill(node, cp, sig['lower_band'])
 
         in_window = _in_buy_window(now)
+        in_open_check_window = _in_window(now, _OPEN_CHECK_WINDOWS)
         summaries = []
+        if in_open_check_window:
+            open_check_nodes = [n for n in watchlist if n.get('entry_timing') == 'open_check']
+            if open_check_nodes:
+                summaries += _scan_buy_signals(open_check_nodes, buy_alerted, open_position_keys)
         if in_window:
-            for node in watchlist:
-                sig = compute_buy_signal(node)
-                if sig is None:
-                    summaries.append(f"{node['ticker']} w={node['window']} NO_DATA")
-                    continue
-
-                alert_key = (sig['ticker'], node['strategy'], sig['window'])
-
-                if sig['signal'] == 'BUY' and alert_key not in buy_alerted:
-                    buy_alerted.add(alert_key)
-                    if (sig['ticker'], sig['window']) in open_position_keys:
-                        print(f"  [skip] BUY {sig['ticker']} z={sig['z_score']:+.2f} — position already open, no alert")
-                    elif node.get('mode', 'live') == 'live':
-                        notify_buy_signal(node, sig)
-                    else:
-                        print(f"  [research] BUY: {node['ticker']} z={sig['z_score']:+.2f} (no alert)")
-                else:
-                    mode_tag = ' [R]' if node.get('mode') == 'research' else ''
-                    summaries.append(
-                        f"{sig['ticker']}{mode_tag} z={sig['z_score']:+.2f} {sig['signal']}"
-                    )
-        else:
+            summaries += _scan_buy_signals(watchlist, buy_alerted, open_position_keys)
+        elif not in_open_check_window:
             summaries.append(f"outside signal window — next: 10:25 or 14:55 ET")
 
         if summaries:

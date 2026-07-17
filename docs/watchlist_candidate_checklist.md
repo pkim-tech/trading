@@ -119,6 +119,28 @@ outlier trade (`trades` column at or near 1 for the winning grid cell) rather th
 real repeatable edge. Recurring failure mode in sweep results (e.g. UVIX had thousands of
 `trades=1` rows driving misleadingly high headline alpha).
 
+## 9. Same-day-block sensitivity check
+How much of a node's edge depends on capital that the real cash-account same-day-re-buy
+rule (`schwab_safety.py`'s same-day-block, enforced live) would actually block — i.e. a
+fresh signal on the same calendar day as that node's own prior exit? Run
+`backtester.run_backtest_v110` with `same_day_block=True` vs `False` on the same node
+and compare both **trade count** and **robust alpha** (`MIN(possible,pessimistic,certain)`),
+not just one or the other — the two can diverge sharply (a small trade-count hit can
+still gut alpha if the blocked trades happen to be the strongest ones). See
+`scripts/run_v4_backfill_sweep.sh`'s `same_day_block` kernel note for the underlying
+feature. Found 2026-07-16: GDXD's best SL=1% node lost only ~18% of trades (308→251)
+under blocking but **retained only 7.2% of robust alpha** — most of the edge lived in
+exactly the trades the real same-day rule would block.
+
+## 10. Same-day-collision stability check (70/30 split)
+A same-day-block sensitivity number (check 9) is a single aggregate ratio — this checks
+whether that vulnerability itself is stable over time or concentrated in one window.
+Chronologically split the node's trades 70/30 (same method as check 4) and compare each
+half's *own* same-day-block retention independently, not just the full-history number.
+A node that's fine early but collapses late (or vice versa) means the aggregate ratio
+from check 9 is hiding a regime-dependent effect, not a stable structural property of
+the ticker.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds

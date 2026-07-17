@@ -112,7 +112,7 @@ def notify_limit_fill(node, current_price, lower_band):
     ticker          = node['ticker']
     schwab_sl_pct   = node['stop_loss']
     schwab_sl_price = lower_band * (1 - schwab_sl_pct / 100)
-    target_notional = _last_sale_recovery(ticker)
+    target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
     shares          = int(target_notional // lower_band)
     now_str = datetime.now().strftime('%H:%M:%S')
 
@@ -569,11 +569,25 @@ def _ticker_block(row):
         elif node:
             node_fields = {k: node.get(k) for k in ('ticker', 'strategy', 'version', 'window',
                                                       'take_profit', 'stop_loss', 'max_hold_hours',
-                                                      'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct')}
+                                                      'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct',
+                                                      'starting_notional')}
             value = json.dumps({"node": node_fields})
             blocks.append({"type": "actions", "elements": [
                 {"type": "button", "text": {"type": "plain_text", "text": f"Manually Open {ticker}"},
                  "action_id": "manual_open", "value": value},
+            ]})
+
+        # Per-ticker automation pause/resume -- only shown for tickers actually in
+        # the automation pilot scope (see schwab_safety.AUTOMATION_ENABLED_TICKERS),
+        # so the other manual-only tickers don't show a button that does nothing.
+        if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            automation_on = schwab_safety.ticker_automation_enabled(ticker)
+            blocks.append({"type": "actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": f"⏸️ Pause {ticker} Automation"},
+                 "style": "danger", "action_id": "pause_ticker_automation", "value": ticker}
+                if automation_on else
+                {"type": "button", "text": {"type": "plain_text", "text": f"▶️ Resume {ticker} Automation"},
+                 "style": "primary", "action_id": "resume_ticker_automation", "value": ticker},
             ]})
 
     return blocks
@@ -618,7 +632,7 @@ def build_reference_table(watchlist):
         sig = compute.compute_buy_signal(node)
         account = node.get('account') or ''
         alpha = node.get('alpha')
-        last_sale = _last_sale_recovery(ticker)
+        last_sale = _last_sale_recovery(ticker, node.get('starting_notional'))
         phase = _phase_emoji(pos, pending_buys.get(ticker))
 
         if sig is None:

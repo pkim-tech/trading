@@ -105,11 +105,14 @@ def _existing_position_note(ticker):
             f"entered `{pos['entry_time']}` ({pos['account']}).")
 
 
-def _last_sale_recovery(ticker):
+def _last_sale_recovery(ticker, starting_notional):
     """Estimated next-buy notional: proceeds (exit_price * shares) from this ticker's
-    most recent closed trade, so sizing roughly compounds off the last recycle instead
-    of always assuming a flat $50k. Falls back to $50k if no closed trade has shares
-    logged yet. A rough estimate, not a live capital feed -- doesn't know about other
+    most recent closed trade, so sizing roughly compounds off the last recycle. Falls
+    back to `starting_notional` (the node's own watch_list.starting_notional column)
+    only if no closed trade has shares logged yet -- callers must supply this
+    explicitly (no hidden flat-$50k default here) so a new pilot with a different
+    real book size (e.g. GDXD's $5k) can't silently get sized like everyone else's
+    $50k. A rough estimate, not a live capital feed -- doesn't know about other
     trades competing for the same account's cash in between."""
     with db._conn() as c:
         c.row_factory = sqlite3.Row
@@ -119,7 +122,9 @@ def _last_sale_recovery(ticker):
         ).fetchone()
     if row and row['exit_price'] and row['shares']:
         return row['exit_price'] * row['shares']
-    return 50_000
+    if starting_notional is None:
+        raise ValueError(f"_last_sale_recovery({ticker}): no trade history and no starting_notional configured")
+    return starting_notional
 
 
 _PHASE_GREY, _PHASE_YELLOW, _PHASE_GREEN = '⚪', '🟡', '🟢'

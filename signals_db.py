@@ -107,6 +107,18 @@ def ensure_tables():
             # (that DB is trading_universe.db, a separate file from this live DB) -- see
             # scripts/backfill_watch_list_alpha.py to (re)populate after adding/changing nodes.
             c.execute("ALTER TABLE watch_list ADD COLUMN alpha REAL")
+        if 'entry_timing' not in wl_cols:
+            # 'close' (default) checks at the existing bar-close signal windows only;
+            # 'open_check' also gets an earlier poll near the bar's Open (see
+            # active_signals._OPEN_CHECK_WINDOWS) -- mirrors backtest_cache.entry_timing.
+            c.execute("ALTER TABLE watch_list ADD COLUMN entry_timing TEXT NOT NULL DEFAULT 'close'")
+        if 'starting_notional' not in wl_cols:
+            # Explicit per-ticker sizing floor, used by _last_sale_recovery only when
+            # there's no closed-trade history yet -- backfilled to 50000 for every
+            # existing row (the number every ticker was implicitly getting from the
+            # old hardcoded fallback), now a real per-node value instead of a hidden
+            # default so a new pilot (e.g. GDXD's $5k book) can be sized deliberately.
+            c.execute("ALTER TABLE watch_list ADD COLUMN starting_notional REAL NOT NULL DEFAULT 50000")
 
         # open_positions
         c.execute("""
@@ -287,7 +299,7 @@ def _is_trailing_buy(node):
 
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
              label='', z_score_threshold=2.0, watchlist_id=None, mode='live',
-             trail_buy_pct=None, trail_pct=None):
+             trail_buy_pct=None, trail_pct=None, entry_timing='close', starting_notional=50000):
     """trail_buy_pct/trail_pct: pass the real values directly for v3.x nodes (where
     backtest_cache has real named columns). Omit both for legacy v1.x/v2.x nodes —
     falls back to reinterpreting stop_loss the way it's always meant for the 4
@@ -338,11 +350,12 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
             INSERT OR IGNORE INTO watch_list
                 (watchlist_id, mode, ticker, strategy, version, window, take_profit,
                  stop_loss, max_hold_hours, label, z_score_threshold, trail_sell_pct, fixed_sl,
-                 trail_buy_pct, arm_sell_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_buy_pct, arm_sell_pct, entry_timing, starting_notional)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (watchlist_id, mode, ticker, strategy, version, int(window), stored_take_profit,
               int(stop_loss), int(max_hold_hours), label, float(z_score_threshold),
-              stored_trail_sell_pct, fixed_sl, stored_trail_buy_pct, stored_arm_sell_pct))
+              stored_trail_sell_pct, fixed_sl, stored_trail_buy_pct, stored_arm_sell_pct,
+              entry_timing, float(starting_notional)))
         c.commit()
 
 

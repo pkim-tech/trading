@@ -113,6 +113,129 @@ def simulate_trail_both_annotated(p, take_profit, stop_loss, max_hours_to_hold,
     return trades
 
 
+def simulate_trail_both_deferred_sell(p, take_profit, stop_loss, max_hours_to_hold,
+                                       trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh):
+    """Same real bar-by-bar logic as simulate_trail_both_annotated (entry side is
+    byte-identical), but any exit trigger (SL / trailing-stop breach / TIME) that
+    would fire on the SAME calendar day as entry is deferred: the position keeps
+    being tracked exactly as normal (peak still updates, stop/tp levels unchanged,
+    held keeps counting) but the exit only finalizes at the first trigger that
+    occurs on a LATER calendar day -- quantifies the cost of intentionally avoiding
+    a same-day buy-then-sell round trip. TP->trailing-arm is never deferred (that's
+    not an exit, just arming the trailing-sell -- a separate, already-investigated
+    concern, see docs/backlog_cache.md's entry-bar-arm-timing item). Distinct from
+    the existing same_day_block kernel feature, which defers the ENTRY side after a
+    same-day exit -- this defers the EXIT side of a same-day entry instead.
+    `deferred` in each trade dict is True if that trade's real exit was pushed to a
+    later day than its first-triggered (same-day) exit condition."""
+    prices, highs, lows = p['prices'], p['highs'], p['lows']
+    daily_idx, sma_arr, std_arr = p['daily_idx'], p['sma_arr'], p['std_arr']
+    trend_arr, has_trend = p['trend_arr'], p['has_trend']
+    timestamps = p['timestamps']
+
+    trades = []
+    in_trade = waiting = trailing = False
+    entry_price = stop_price = tp_price = peak = 0.0
+    entry_bar = held = 0
+    running_low = 0.0
+    wait_bars = 0
+    signal_bar = None
+    signal_z = None
+    arm_bar = None
+    entry_date = None
+    deferred = False
+
+    n = len(prices)
+    for i in range(n):
+        cp, high, low = prices[i], highs[i], lows[i]
+
+        if in_trade:
+            held += 1
+            same_day = timestamps[i].date() == entry_date
+            if trailing:
+                if high > peak:
+                    peak = high
+                trail_stop = peak * (1.0 - trail_pct)
+                triggered = low <= trail_stop or held >= max_hours_to_hold
+                if triggered:
+                    if same_day:
+                        deferred = True
+                        continue
+                    exit_px = trail_stop if low <= trail_stop else cp
+                    pc = (exit_px - entry_price) / entry_price
+                    trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                        arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=exit_px,
+                                        held=held, result=WIN if pc > 0 else LOSS, ret=pc, deferred=deferred))
+                    in_trade = trailing = False
+                continue
+            if low <= stop_price:
+                if same_day:
+                    deferred = True
+                    continue
+                pc = (stop_price - entry_price) / entry_price
+                trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                    arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=stop_price,
+                                    held=held, result=LOSS, ret=pc, deferred=deferred))
+                in_trade = False
+                continue
+            if cp >= tp_price:
+                trailing = True; peak = cp; arm_bar = i
+                continue
+            if held >= max_hours_to_hold:
+                if same_day:
+                    deferred = True
+                    continue
+                pc = (cp - entry_price) / entry_price
+                trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                    arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=cp,
+                                    held=held, result=TWIN if pc > 0 else TLOSS, ret=pc, deferred=deferred))
+                in_trade = False
+                continue
+            continue
+
+        if waiting:
+            wait_bars += 1
+            if low < running_low:
+                running_low = low
+            buy_trigger = running_low * (1.0 + trail_buy_pct)
+            if high >= buy_trigger:
+                entry_price = buy_trigger
+                tp_price = entry_price * (1.0 + take_profit)
+                stop_price = entry_price * (1.0 - stop_loss)
+                entry_bar = i; held = 0; arm_bar = None
+                entry_date = timestamps[i].date()
+                deferred = False
+                in_trade = True; waiting = trailing = False
+                continue
+            if wait_bars >= max_hours_to_hold:
+                waiting = False
+            continue
+
+        h = p['hours'][i]
+        if h != target_h0 and h != target_h1:
+            continue
+        di = daily_idx[i]
+        if di < 0:
+            continue
+        sma, std = sma_arr[di], std_arr[di]
+        if std == 0.0:
+            continue
+        lower_band = sma - std * z_thresh
+        signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
+        if signal:
+            waiting = True; running_low = cp; wait_bars = 0
+            signal_bar = i; signal_z = (cp - sma) / std
+
+    if in_trade:
+        cp = prices[n - 1]
+        pc = (cp - entry_price) / entry_price
+        trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                            arm_i=arm_bar, exit_i=n - 1, entry_p=entry_price, exit_p=cp,
+                            held=held, result=OPEN, ret=pc, deferred=deferred))
+
+    return trades
+
+
 def simulate_trail_both_ohlc_aware(p, opens, take_profit, stop_loss, max_hours_to_hold,
                                     trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh):
     """Side analysis only — not used by the live kernel. Same state machine as

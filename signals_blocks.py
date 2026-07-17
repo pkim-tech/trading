@@ -4,7 +4,6 @@ import sqlite3
 
 import requests
 
-import strategies
 import signals_config as cfg
 import signals_db as db
 from signals_helpers import _add_trading_hours, _last_sale_recovery
@@ -94,8 +93,18 @@ def _build_buy_blocks(node, sig):
     hold_deadline = _add_trading_hours(sig['last_bar'], node['max_hold_hours'])
     deadline_str  = hold_deadline.strftime('%a %b %d %H:%M')
 
-    target_notional = _last_sale_recovery(ticker)
-    shares = int(target_notional // price)
+    target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
+    trailing_buy = db._is_trailing_buy(node)
+    if trailing_buy:
+        # Conservative worst-case sizing: a real trailing-buy order fills once price
+        # bounces trail_buy_pct% off a running low that can fall further before that,
+        # so the fill price is unbounded relative to the signal-time price. Sizing off
+        # the worst case (no further drop, fill right at the bounce trigger) guarantees
+        # the order never costs more than target_notional.
+        trail_buy_pct = node.get('trail_buy_pct') or 0.0
+        shares = int(target_notional // (price * (1 + trail_buy_pct / 100)))
+    else:
+        shares = int(target_notional // price)
     schwab_sl_pct   = node['stop_loss']
     schwab_sl_price = sig['lower_band'] * (1 - schwab_sl_pct / 100)
 
@@ -121,9 +130,7 @@ def _build_buy_blocks(node, sig):
     max_notional_str = f"  |  max `${max_notional/1000:.0f}k` / `{max_shares} shares` @ 1% vol" if max_notional else ""
 
     account = node.get('account') or 'unmapped'
-    sl_axis_col, _ = strategies.resolve_axis_columns(node['strategy'])
-    if sl_axis_col == 'trail_buy_pct':
-        trail_buy_pct = node.get('trail_buy_pct') or 0.0
+    if trailing_buy:
         entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}"
     else:
         entry_line = f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}"
@@ -140,14 +147,13 @@ def _build_buy_blocks(node, sig):
             "text": f"{entry_line}\n🔴 *{ticker}* — SELL ALL — Stop Loss — `${schwab_sl_price:.2f}` (-{schwab_sl_pct}% from trigger){warning_line}"}},
     ]
 
-    trailing_buy = db._is_trailing_buy(node)
-
     if cfg.INTERACTIVE:
         value = json.dumps({
             "type":         "buy",
             "node":         {k: node.get(k) for k in ('ticker', 'strategy', 'version', 'window',
                                                         'take_profit', 'stop_loss', 'max_hold_hours', 'label',
-                                                        'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct')},
+                                                        'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct',
+                                                        'starting_notional')},
             "signal_price": price,
             "signal_time":  sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'),
             "lower_band":   sig['lower_band'],
