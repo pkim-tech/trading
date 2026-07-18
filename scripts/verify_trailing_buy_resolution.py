@@ -6,6 +6,10 @@ same bounce using 5-min bars (yfinance, ~60 days back) for every recent live-wat
 compares entry price/time against what the hourly kernel predicts for the same signal.
 
 Usage: .venv/bin/python scripts/verify_trailing_buy_resolution.py [--tickers AGQ,SOXL]
+       .venv/bin/python scripts/verify_trailing_buy_resolution.py --adhoc "ZSL:20:1.0:1.0:70,NAIL:10:1.0:1.0:63"
+         (--adhoc entries are ticker:window:z_score_threshold:trail_buy_pct:max_hold_hours -- for
+         candidates not yet in watch_list, e.g. watchlist-candidate-checklist research. Bypasses the
+         live DB entirely -- read-only against cache/research/*.csv.)
 """
 import argparse
 import sqlite3
@@ -121,21 +125,32 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--tickers', help="comma-separated ticker subset, e.g. AGQ,SOXL "
                          "(default: full active watchlist)")
+    parser.add_argument('--adhoc', help="comma-separated ticker:window:z_score_threshold:"
+                         "trail_buy_pct:max_hold_hours entries for candidates not in watch_list "
+                         "(e.g. 'ZSL:20:1.0:1.0:70'). Bypasses the live DB entirely.")
     args = parser.parse_args()
     ticker_filter = {t.strip().upper() for t in args.tickers.split(',')} if args.tickers else None
 
-    conn = sqlite3.connect(LIVE_DB)
-    conn.row_factory = sqlite3.Row
-    active_wl = conn.execute(
-        "SELECT id FROM watchlists WHERE is_active=1"
-    ).fetchone()[0]
-    nodes = conn.execute(
-        "SELECT DISTINCT ticker, version, window, z_score_threshold, trail_buy_pct, max_hold_hours "
-        "FROM watch_list WHERE strategy='TrailingBothZScoreBreakout' AND watchlist_id=?",
-        (active_wl,)
-    ).fetchall()
-    if ticker_filter:
-        nodes = [n for n in nodes if n['ticker'] in ticker_filter]
+    if args.adhoc:
+        nodes = []
+        for spec in args.adhoc.split(','):
+            ticker, window, z, tb, hold = spec.strip().split(':')
+            nodes.append({'ticker': ticker.upper(), 'window': int(window),
+                           'z_score_threshold': float(z), 'trail_buy_pct': float(tb),
+                           'max_hold_hours': int(hold)})
+    else:
+        conn = sqlite3.connect(LIVE_DB)
+        conn.row_factory = sqlite3.Row
+        active_wl = conn.execute(
+            "SELECT id FROM watchlists WHERE is_active=1"
+        ).fetchone()[0]
+        nodes = conn.execute(
+            "SELECT DISTINCT ticker, version, window, z_score_threshold, trail_buy_pct, max_hold_hours "
+            "FROM watch_list WHERE strategy='TrailingBothZScoreBreakout' AND watchlist_id=?",
+            (active_wl,)
+        ).fetchall()
+        if ticker_filter:
+            nodes = [n for n in nodes if n['ticker'] in ticker_filter]
 
     cutoff = pd.Timestamp.now().normalize() - timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
     all_rows = []

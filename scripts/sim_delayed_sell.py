@@ -11,14 +11,14 @@ mirrors of backtester._simulate_trail_both, not reimplementations of the exit
 logic from scratch. Entry-side logic between the two is byte-identical, so any
 divergence in the results is purely from deferring same-day exits.
 
-Caveat: these pure-Python mirrors only support entry_timing='close' (no
-open_check branch) -- fine for most nodes, but GDXD's real live node uses
-open_check, so results for GDXD here are indicative only, not its exact
-production behavior.
+Pass --open-check for nodes (e.g. GDXD) whose real live entry_timing is
+'open_check' rather than 'close' -- both the baseline and deferred-sell mirrors
+support it (checks the bar's Open against the entry threshold before falling
+through to Close, same as backtester._simulate_trail_both).
 
 Usage:
     .venv/bin/python scripts/sim_delayed_sell.py TICKER --window 20 --z 1.0 \\
-        --tb 1.0 --arm 7.0 --sl 1.0 --ts 1.0 --max-hours 7
+        --tb 1.0 --arm 7.0 --sl 1.0 --ts 1.0 --max-hours 7 [--open-check]
 """
 import argparse
 import sys
@@ -50,7 +50,7 @@ def _compounded(trades):
     return (ret - 1.0) * 100.0
 
 
-def run(ticker, window, z, tb, arm, sl, ts, max_hours, target_hours=(9, 14)):
+def run(ticker, window, z, tb, arm, sl, ts, max_hours, target_hours=(9, 14), open_check=False):
     df_hourly, df_daily = _load(ticker)
     strat = strategies.TrailingBothZScoreBreakout(window=window, z_score_threshold=z)
     df_daily_ind = strat.generate_daily_indicators(df_daily)
@@ -58,7 +58,8 @@ def run(ticker, window, z, tb, arm, sl, ts, max_hours, target_hours=(9, 14)):
 
     kwargs = dict(take_profit=arm / 100, stop_loss=sl / 100, max_hours_to_hold=max_hours,
                   trail_buy_pct=tb / 100, trail_pct=ts / 100,
-                  target_h0=target_hours[0], target_h1=target_hours[1], z_thresh=z)
+                  target_h0=target_hours[0], target_h1=target_hours[1], z_thresh=z,
+                  open_check=open_check)
 
     baseline = simulate_trail_both_annotated(p, **kwargs)
     deferred = simulate_trail_both_deferred_sell(p, **kwargs)
@@ -112,5 +113,8 @@ if __name__ == '__main__':
     parser.add_argument('--sl', type=float, required=True, help='stop_loss, %%')
     parser.add_argument('--ts', type=float, required=True, help='trail_sell_pct, %%')
     parser.add_argument('--max-hours', type=int, required=True, dest='max_hours')
+    parser.add_argument('--open-check', action='store_true', dest='open_check',
+                         help="mirror entry_timing='open_check' (checks bar Open before Close)")
     args = parser.parse_args()
-    run(args.ticker, args.window, args.z, args.tb, args.arm, args.sl, args.ts, args.max_hours)
+    run(args.ticker, args.window, args.z, args.tb, args.arm, args.sl, args.ts, args.max_hours,
+        open_check=args.open_check)

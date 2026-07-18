@@ -16,12 +16,14 @@ START_CAPITAL = 50_000  # matches $50k notional per trade in live sizing
 
 
 def simulate_trail_both_annotated(p, take_profit, stop_loss, max_hours_to_hold,
-                                   trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh):
+                                   trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh,
+                                   open_check=False):
     """Pure-Python mirror of backtester._simulate_trail_both, kept as a separate read-only
     copy (not imported from the live numba kernel) so this reporting script can record
     the extra bar indices (signal/arm) the live kernel doesn't return, without touching
-    the kernel powering the live sweep engine."""
-    prices, highs, lows, hours = p['prices'], p['highs'], p['lows'], p['hours']
+    the kernel powering the live sweep engine. open_check: see
+    simulate_trail_both_deferred_sell's docstring -- same open_check_entry_timing mirror."""
+    prices, highs, lows, hours, opens = p['prices'], p['highs'], p['lows'], p['hours'], p['opens']
     daily_idx, sma_arr, std_arr = p['daily_idx'], p['sma_arr'], p['std_arr']
     trend_arr, has_trend = p['trend_arr'], p['has_trend']
 
@@ -98,10 +100,19 @@ def simulate_trail_both_annotated(p, take_profit, stop_loss, max_hours_to_hold,
         if std == 0.0:
             continue
         lower_band = sma - std * z_thresh
-        signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
-        if signal:
-            waiting = True; running_low = cp; wait_bars = 0
-            signal_bar = i; signal_z = (cp - sma) / std
+        fired = False
+        if open_check:
+            op = opens[i]
+            signal_open = (op <= lower_band) and (op > trend_arr[di]) if has_trend else op <= lower_band
+            if signal_open:
+                waiting = True; running_low = op; wait_bars = 0
+                signal_bar = i; signal_z = (op - sma) / std
+                fired = True
+        if not fired:
+            signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
+            if signal:
+                waiting = True; running_low = cp; wait_bars = 0
+                signal_bar = i; signal_z = (cp - sma) / std
 
     if in_trade:
         cp = prices[n - 1]
@@ -114,7 +125,8 @@ def simulate_trail_both_annotated(p, take_profit, stop_loss, max_hours_to_hold,
 
 
 def simulate_trail_both_deferred_sell(p, take_profit, stop_loss, max_hours_to_hold,
-                                       trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh):
+                                       trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh,
+                                       open_check=False):
     """Same real bar-by-bar logic as simulate_trail_both_annotated (entry side is
     byte-identical), but any exit trigger (SL / trailing-stop breach / TIME) that
     would fire on the SAME calendar day as entry is deferred: the position keeps
@@ -127,8 +139,15 @@ def simulate_trail_both_deferred_sell(p, take_profit, stop_loss, max_hours_to_ho
     the existing same_day_block kernel feature, which defers the ENTRY side after a
     same-day exit -- this defers the EXIT side of a same-day entry instead.
     `deferred` in each trade dict is True if that trade's real exit was pushed to a
-    later day than its first-triggered (same-day) exit condition."""
-    prices, highs, lows = p['prices'], p['highs'], p['lows']
+    later day than its first-triggered (same-day) exit condition.
+    open_check: mirrors backtester._simulate_trail_both's open_check_entry_timing --
+    checks the bar's Open against the entry threshold before falling through to the
+    normal Close check (same bar, no synthetic bar). Needed for nodes like GDXD whose
+    real live entry_timing is 'open_check', not 'close' -- an open-timed entry lands
+    near market-open, leaving much less same-day room before max_hold_hours forces an
+    exit than a close-timed entry does, so the deferred-vs-baseline delta can differ
+    meaningfully from the close-only version."""
+    prices, highs, lows, opens = p['prices'], p['highs'], p['lows'], p['opens']
     daily_idx, sma_arr, std_arr = p['daily_idx'], p['sma_arr'], p['std_arr']
     trend_arr, has_trend = p['trend_arr'], p['has_trend']
     timestamps = p['timestamps']
@@ -172,9 +191,17 @@ def simulate_trail_both_deferred_sell(p, take_profit, stop_loss, max_hours_to_ho
                 if same_day:
                     deferred = True
                     continue
-                pc = (stop_price - entry_price) / entry_price
+                # A deferred SL resolves on a later day, when the position was
+                # left unprotected overnight -- if it gapped down through
+                # stop_price by the open, a real stop order fills at that worse
+                # gap price, not the nominal stop level. A same-day (never
+                # deferred) SL still fills flat at stop_price, matching the
+                # baseline/live convention -- only the added overnight-gap risk
+                # that deferring itself creates is modeled here.
+                exit_px = min(stop_price, opens[i]) if deferred else stop_price
+                pc = (exit_px - entry_price) / entry_price
                 trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
-                                    arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=stop_price,
+                                    arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=exit_px,
                                     held=held, result=LOSS, ret=pc, deferred=deferred))
                 in_trade = False
                 continue
@@ -221,10 +248,19 @@ def simulate_trail_both_deferred_sell(p, take_profit, stop_loss, max_hours_to_ho
         if std == 0.0:
             continue
         lower_band = sma - std * z_thresh
-        signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
-        if signal:
-            waiting = True; running_low = cp; wait_bars = 0
-            signal_bar = i; signal_z = (cp - sma) / std
+        fired = False
+        if open_check:
+            op = opens[i]
+            signal_open = (op <= lower_band) and (op > trend_arr[di]) if has_trend else op <= lower_band
+            if signal_open:
+                waiting = True; running_low = op; wait_bars = 0
+                signal_bar = i; signal_z = (op - sma) / std
+                fired = True
+        if not fired:
+            signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
+            if signal:
+                waiting = True; running_low = cp; wait_bars = 0
+                signal_bar = i; signal_z = (cp - sma) / std
 
     if in_trade:
         cp = prices[n - 1]
