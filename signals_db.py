@@ -34,6 +34,22 @@ def ensure_tables():
 
         main_id = c.execute("SELECT id FROM watchlists WHERE name='main'").fetchone()[0]
 
+        # watch_list_audit: append-only log of watchlist/node mutations (create/delete/
+        # activate a watchlist, add/remove/mode/label a node) — no audit trail existed
+        # before 2026-07-18, discovered while trying to explain 47 deleted watchlists.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS watch_list_audit (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts           TEXT NOT NULL DEFAULT (datetime('now')),
+                action       TEXT NOT NULL,
+                watchlist_id INTEGER,
+                watch_id     INTEGER,
+                ticker       TEXT,
+                detail       TEXT
+            )
+        """)
+        c.commit()
+
         # watch_list: create fresh or migrate from old single-list schema
         wl_cols = {r[1] for r in c.execute("PRAGMA table_info(watch_list)").fetchall()}
         if not wl_cols:
@@ -119,6 +135,12 @@ def ensure_tables():
             # old hardcoded fallback), now a real per-node value instead of a hidden
             # default so a new pilot (e.g. GDXD's $5k book) can be sized deliberately.
             c.execute("ALTER TABLE watch_list ADD COLUMN starting_notional REAL NOT NULL DEFAULT 50000")
+        if 'annotation' not in wl_cols:
+            # Freeform human note on why a node is in its current state (e.g. "walk-forward
+            # clean, promoted 2026-07-18" / "excluded, negative fold, see backlog") -- distinct
+            # from `label` (short display tag) and from watch_list_audit (mechanical mutation
+            # log) -- this is the human-readable "why", not just the "what changed".
+            c.execute("ALTER TABLE watch_list ADD COLUMN annotation TEXT")
 
         # open_positions
         c.execute("""
@@ -219,6 +241,20 @@ def ensure_tables():
 # Watch list CRUD
 # ---------------------------------------------------------------------------
 
+def _log_audit(c, action, watchlist_id=None, watch_id=None, ticker=None, detail=None):
+    c.execute("""
+        INSERT INTO watch_list_audit (action, watchlist_id, watch_id, ticker, detail)
+        VALUES (?, ?, ?, ?, ?)
+    """, (action, watchlist_id, watch_id, ticker, detail))
+
+
+def get_watchlist_audit(limit=200):
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM watch_list_audit ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()]
+
+
 def get_watchlists():
     with _conn() as c:
         return [dict(r) for r in c.execute(
@@ -238,21 +274,32 @@ def get_active_watchlist_id():
 def create_watchlist(name):
     with _conn() as c:
         c.execute("INSERT OR IGNORE INTO watchlists (name, is_active) VALUES (?, 0)", (name,))
+        wl_id = c.execute("SELECT id FROM watchlists WHERE name = ?", (name,)).fetchone()[0]
+        _log_audit(c, 'create_watchlist', watchlist_id=wl_id, detail=name)
         c.commit()
-        return c.execute("SELECT id FROM watchlists WHERE name = ?", (name,)).fetchone()[0]
+        return wl_id
 
 
 def delete_watchlist(watchlist_id):
     with _conn() as c:
+        name_row = c.execute("SELECT name FROM watchlists WHERE id = ?", (watchlist_id,)).fetchone()
+        node_count = c.execute(
+            "SELECT COUNT(*) FROM watch_list WHERE watchlist_id = ?", (watchlist_id,)
+        ).fetchone()[0]
         c.execute("DELETE FROM watch_list WHERE watchlist_id = ?", (watchlist_id,))
         c.execute("DELETE FROM watchlists WHERE id = ? AND is_active = 0", (watchlist_id,))
+        _log_audit(c, 'delete_watchlist', watchlist_id=watchlist_id,
+                   detail=f"name={name_row[0] if name_row else '?'} nodes_removed={node_count}")
         c.commit()
 
 
 def set_active_watchlist(watchlist_id):
     with _conn() as c:
+        prev = c.execute("SELECT id FROM watchlists WHERE is_active=1").fetchone()
         c.execute("UPDATE watchlists SET is_active = 0")
         c.execute("UPDATE watchlists SET is_active = 1 WHERE id = ?", (watchlist_id,))
+        _log_audit(c, 'set_active_watchlist', watchlist_id=watchlist_id,
+                   detail=f"prev_active={prev[0] if prev else None}")
         c.commit()
 
 
@@ -346,7 +393,7 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
         stored_arm_sell_pct = None
 
     with _conn() as c:
-        c.execute("""
+        cur = c.execute("""
             INSERT OR IGNORE INTO watch_list
                 (watchlist_id, mode, ticker, strategy, version, window, take_profit,
                  stop_loss, max_hold_hours, label, z_score_threshold, trail_sell_pct, fixed_sl,
@@ -356,24 +403,57 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
               int(stop_loss), int(max_hold_hours), label, float(z_score_threshold),
               stored_trail_sell_pct, fixed_sl, stored_trail_buy_pct, stored_arm_sell_pct,
               entry_timing, float(starting_notional)))
+        _log_audit(c, 'add_node', watchlist_id=watchlist_id, watch_id=cur.lastrowid,
+                   ticker=ticker, detail=f"strategy={strategy} version={version} mode={mode}")
         c.commit()
 
 
 def remove_node(watch_id):
     with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, strategy, version FROM watch_list WHERE id = ?",
+            (watch_id,)
+        ).fetchone()
         c.execute("DELETE FROM watch_list WHERE id = ?", (watch_id,))
+        if row:
+            _log_audit(c, 'remove_node', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                       ticker=row['ticker'], detail=f"strategy={row['strategy']} version={row['version']}")
         c.commit()
 
 
 def set_node_mode(watch_id, mode):
     with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, mode FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
         c.execute("UPDATE watch_list SET mode = ? WHERE id = ?", (mode, watch_id))
+        if row:
+            _log_audit(c, 'set_node_mode', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                       ticker=row['ticker'], detail=f"{row['mode']} -> {mode}")
         c.commit()
 
 
 def label_node(watch_id, label):
     with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
         c.execute("UPDATE watch_list SET label = ? WHERE id = ?", (label, watch_id))
+        if row:
+            _log_audit(c, 'label_node', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                       ticker=row['ticker'], detail=label)
+        c.commit()
+
+
+def annotate_node(watch_id, annotation):
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
+        c.execute("UPDATE watch_list SET annotation = ? WHERE id = ?", (annotation, watch_id))
+        if row:
+            _log_audit(c, 'annotate_node', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                       ticker=row['ticker'], detail=annotation)
         c.commit()
 
 

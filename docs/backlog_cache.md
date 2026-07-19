@@ -2,6 +2,25 @@
 
 Curated, current subset of `docs/deep_backlog.md` — read in full at session start (`go`). Full detail for every item lives in `deep_backlog.md`; this is just the active/relevant pointer list. Periodically re-triage. Resolved/dead items are pruned here once closed out — see git history or `docs/conversation_summary.md` if the old writeup is ever needed.
 
+## [live-trading] Active, 2026-07-18 — GDXD automation + paper trading build prioritized ahead of trailing-buy capital-sizing fix
+User weighed building GDXD's paper-trading layer now vs. fixing the trailing-buy sizing
+formula (idle-capital-under-worst-case-assumption item, above) first. **Decision: paper
+trading first.** Reasoning: the sizing gap only matters once real orders place
+(`dry_run=False`), nothing is live yet; scoring is done in % return terms so the sizing bug
+doesn't corrupt edge measurement, only dollar-capital efficiency; and paper trading will
+produce real fill data useful for later designing the sizing fix. **User will hedge the
+capital-exposure risk with an extra cash buffer** ("should buy us a few weeks") rather than
+fixing sizing first. Income-replacement/LLC-incorporation tax-structure question also raised
+and explicitly deferred to backlog (not scoped) — separate thread, needs real CPA input on
+entity structure; the capital-needed-for-target-income math itself can be modeled later.
+**Building now**: (A) let `schwab_safety.AUTOMATION_ENABLED_TICKERS` tickers (currently just
+GDXD) act through `_attempt_automated_buy`/`_attempt_automated_sell` even in `research` mode
+(currently gated out entirely since `active_signals._scan_buy_signals` only calls
+`notify_buy_signal` for `mode=='live'` nodes). (B) new `paper_positions`/`paper_trade_log`
+tables + a continuous (every-poll, not just signal-window) running-low/high tracker to
+simulate realistic trailing-buy/sell fills under `dry_run`, since dry_run today only logs
+"[DRY RUN] would place..." and produces no simulated fill or trackable P&L at all.
+
 ## [live-trading][backtest] High priority, 2026-07-18 — promote watchlist tickers' v4 nodes (SL=1%) into live `watch_list`, replacing old v3.x SL=15% params
 Every original watchlist ticker except GDXD still runs old v3.x params (`fixed_sl=15%`,
 close-timing) in the real live `watch_list` — the entire v4 SL-sweep's findings
@@ -42,22 +61,18 @@ checklist check 13.
 **Action needed**: decide whether to promote the 14 clean tickers now, or wait on the
 5-ticker follow-up review too. Not started — no `watch_list` rows changed yet.
 
-## [backtest] Medium priority, 2026-07-18 — review the 5 tickers with a negative walk-forward fold (DPST, NUGT, RETL, UDOW, UVIX)
-Follow-up from the walk-forward check above (`docs/research_log.md` 2026-07-18 entry,
-`logs/walk_forward_check.csv`). Each had exactly one negative-alpha fold out of 5:
-DPST (-11.9%, fold 1, earliest window 2023-07→2024-03), NUGT (-7.2%, fold 4, but NUGT
-only has ~1 year of cached history total so this fold is thin/short), UDOW (-3.6%,
-fold 1, earliest window), UVIX (-4.0%, fold 4), RETL (-8.4%, fold 5, most recent window).
-All mild (single digits to -12%), not collapses, but each needs a closer look at what's
-actually happening in that specific window before being treated as validated.
-**DPST specifically was the user's leading candidate for the first ticker promoted into
-the taxable brokerage account** (see the wash-sale/tax deep-backlog item) — this walk-forward
-flag, plus DPST's already-known thin/small-sample trade count (flagged 2026-07-17 in the
-chaos-monkey item: "DPST's baseline is only a handful of trades relative to KORU/HIBL",
-still unexplained) means DPST may need more searching/scrutiny before committing to it as
-the brokerage-account pick, not just proceeding on the earlier assumption.
-**Action needed**: per-ticker investigation of each negative fold (what trades, what regime,
-outlier-driven or structural) — not started.
+## [backtest] Resolved 2026-07-18 — 5 tickers with a negative walk-forward fold (DPST, NUGT, RETL, UDOW, UVIX) sent to research, no per-ticker investigation
+Follow-up from the walk-forward check (`docs/research_log.md` 2026-07-18 entry,
+`logs/walk_forward_check.csv`). Each had exactly one mild negative-alpha fold out of 5
+(DPST -11.9%, NUGT -7.2%, UDOW -3.6%, UVIX -4.0%, RETL -8.4%). **User decision: skip the
+per-ticker regime investigation and just keep all 5 in research mode** rather than promoting
+any of them further. NUGT/AGQ/GDXU/TQQQ/YANG were already `research`; RETL/UDOW/UVIX were
+never in the live `watch_list` to begin with (screened candidates only). **DPST flipped
+`live`→`research` this session** (`signals_db.set_node_mode(53, 'research')`, watchlist_id=9)
+— it had been the leading candidate for the first taxable-brokerage-account ticker, but this
+walk-forward flag plus its already-known thin trade count (chaos-monkey item, 2026-07-17)
+was enough to deprioritize it without further digging. No live capital was at risk (DPST had
+no open position at the time of the mode change).
 
 ## [live-trading][security] Phase 4 (deferred to cloud-infrastructure planning), 2026-07-18 — move order-placement/mutating Schwab calls behind a separate proxy this session can't write to
 Full detail in `docs/deep_backlog.md`. Short version: API-proxy pattern for safety
@@ -65,10 +80,94 @@ boundary + credential isolation on Schwab order-placement calls, not scoped. Def
 until cloud infrastructure is actually being considered (proxy is naturally a
 separately-hosted service).
 
-## [live-trading][security] Phase 4 (deferred to cloud-infrastructure planning), 2026-07-18 — one brokerage account per live ticker, for blast-radius containment against a rogue algorithm
+## [live-trading] Active, 2026-07-18 — new active watchlist (id=57, "Live v4") holds only GDXD+EDC; 10 v3.x tickers archived in watchlist 9, not polled
+User decided v4's `trail_buy_pct` (much tighter than v3.x) is too tight to catch manually —
+manual live trading is paused until the Schwab automation engine actually drives entries.
+Correction mid-session: initially just flipped all 12 nodes to `research` mode within
+watchlist 9, but the real ask was to stop the daemon polling the 10 stale v3.x tickers
+entirely (AGQ, DPST, GDXU, HIBL, KORU, LABU, NUGT, SOXL, TQQQ, YANG — user tracks these in
+a separate v3 spreadsheet, so no risk of losing track). **Resolved via watchlist versioning**
+(same pattern as the earlier watchlist 7→9 supersession), not row deletion: cloned GDXD (v4)
+and EDC (v3.27, has the one open position) into a new watchlist (`signals_db.create_watchlist`
+→ id=57, "Live v4"), set it active (`set_active_watchlist`). Watchlist 9 ("Sweep v3 - Full")
+is untouched and inactive — all 10 archived nodes' full config is still there, not deleted,
+just not polled (`active_signals.py` re-queries `get_watchlist()` — the active one — fresh
+every loop iteration, so this took effect without a daemon restart). Can be re-cloned into
+the active watchlist later once v4 versions exist for them.
+**EDC has one open live position** (423 shares @ $73.57, opened 2026-07-16, v3.27) — stays
+open, user will monitor manually. Confirmed `check_sell_condition`/`notify_sell_signal`
+(`active_signals.py:263-289`) key off `open_positions`, not `watch_list`/`watchlist_id` at
+all, so EDC's SELL alert still fires normally regardless of which watchlist is active.
+**"Research" now doubles as "paper trading"**: both GDXD and EDC are `research` mode within
+watchlist 57. The plan is to wire `schwab_client`/`schwab_safety` into the daemon's real loop
+(still disconnected) and run it `dry_run=True` on these research-mode nodes to validate the
+engine catches v4 signals reliably, before flipping any ticker back to real execution —
+likely paired with the one-account-per-ticker rollout below so each ticker gets its own
+account as it's proven out.
+**New: `watch_list_audit` table added** (`signals_db.py`, `ensure_tables`) — append-only log
+of every `create_watchlist`/`delete_watchlist`/`set_active_watchlist`/`add_node`/
+`remove_node`/`set_node_mode`/`label_node` call, going forward. Built after discovering
+`watchlists.id` jumped straight to 57 with zero explanation available (47 prior watchlists
+created-then-deleted via the Streamlit UI's Create/Delete buttons, `pages/3_Winners.py`/
+`pages/4_Portfolio.py` — legitimate manual usage, not a bug, but genuinely unreconstructable
+after the fact since `AUTOINCREMENT` never reuses ids and nothing was logging the *why*).
+`signals_db.get_watchlist_audit(limit=200)` reads it back, newest first. Verified via
+`pytest tests/ -k watch` (2 passed) plus a live round-trip test.
+**New: `watch_list.annotation` column added** (freeform human-readable "why", distinct from
+`label` — a short display tag — and from `watch_list_audit` — the mechanical what-changed
+log). `signals_db.annotate_node(watch_id, text)` setter, also writes to `watch_list_audit`.
+Backfilled on both current watchlist-57 rows: EDC ("carried into Live v4 to keep it
+monitored, not yet promoted to v4 params"), GDXD ("v4 pilot... dry_run automation target").
+**Done, 2026-07-18**: all 19 tickers from the full walk-forward screen added to watchlist 57
+as `research`, not just the 12-ticker watchlist. Each ticker's v4 winning node pulled directly
+from `backtest_cache` (`WHERE version='v4' AND stop_loss=1`, ranked by robust alpha —
+`MIN(alpha_vs_spy, pessimistic, certain)`, same selection logic as `run_optimization_sweep.
+ROBUST_ALPHA_SQL`) and inserted via **direct SQL, not `signals_db.add_node`** — found and
+worked around a real bug: `add_node`'s `fixed_sl` computation reads `config.json`'s global
+`execution.fixed_stop_loss` (15%) for any `uses_fixed_sl` strategy, ignoring the real
+per-node SL value entirely, so the first insertion attempt silently wrote `fixed_sl=15.0`
+onto every new row instead of the intended `1.0`. Caught by inspecting the rows after
+insert, not by any test — **`add_node` still has this bug for any future v4/SL-swept
+promotion**, logged as a new follow-up below. Deleted the 10 wrong rows and re-inserted
+correctly via raw SQL (same pattern used earlier for the GDXD/EDC clone).
+14 tickers (AGQ, DUST, EDC*, GDXD, GDXU, HIBL, KORU, LABU, NAIL, SOXL, TQQQ, USD, YANG, ZSL —
+*EDC kept its existing v3.27 node, not re-promoted to v4) annotated "walk-forward clean, zero
+negative folds." 5 tickers (DPST, NUGT, RETL, UDOW, UVIX) annotated with their specific
+negative-fold detail, added anyway per user decision but flagged for closer look. All in
+`research` mode — no live signals fire, this is the automation-engine dry-run staging set.
+Verified: `pytest tests/` full suite (86 passed).
+
+## [backtest] New, 2026-07-18 — `signals_db.add_node`'s `fixed_sl` computation ignores the real per-node value for uses_fixed_sl strategies
+`add_node` (`signals_db.py`) always computes `fixed_sl = _config_fixed_stop_loss()` (reads
+`config.json`'s global `execution.fixed_stop_loss`) whenever `strategies.uses_fixed_sl(strategy)`
+is true, regardless of what real per-node SL value the caller actually wants — there's no
+parameter to override it. Found 2026-07-18 promoting 19 tickers' v4 (SL=1%) nodes: every row
+came out with `fixed_sl=15.0` (the stale global default) instead of the real `1.0`, silently
+wrong, no error. Worked around by inserting via direct SQL instead of `add_node` for this
+promotion, but the underlying function is still broken for any future SL-swept (v4-style)
+promotion through the normal path. **Action needed**: add a `fixed_sl` override parameter to
+`add_node` (default `None` → falls back to current config-read behavior for legacy v3.x
+callers), or reject the mismatch instead of silently overwriting.
+
+## [live-trading][security] High priority, active focus as of 2026-07-18 — one brokerage account per live ticker, for blast-radius containment against a rogue algorithm
 Full detail in `docs/deep_backlog.md`. Short version: split into one brokerage account
-per ticker so a rogue order on one ticker structurally can't reach another's capital.
-Grouped with the API-proxy item above under the same cloud-infra-planning deferral.
+per ticker so a rogue order on one ticker structurally can't reach another's capital —
+each account's own balance becomes a hard ceiling by construction, making the previously-
+flagged "aggregate resting-order cash exposure" gap structurally unnecessary rather than
+something to build. **User declared this the next thread of work, 2026-07-18** (after
+sending the 5 negative-walk-forward-fold tickers to research instead of investigating
+further). `schwab_client.py`'s `NICKNAMES`/`SCHWAB_ACCOUNT_<NAME>` pattern already supports
+scaling from 4 accounts to a dozen-plus with just more entries (single shared OAuth login).
+**Naming, 2026-07-18**: account nicknames will just be the ticker symbol itself (e.g.
+`SOXL`, `KORU`) as a placeholder — not worth bikeshedding before the real design session.
+**Also reframed same session**: the account-per-ticker rollout is now tied to the
+automation-engine/paper-trading plan (v4's `trail_buy_pct` is too tight to trade manually —
+"research" mode tickers are meant to run through the Schwab automation engine in
+`dry_run=True` as the paper-trading validation phase, then flip to real execution once
+proven, likely per-ticker-account by account as each is set up).
+**Action needed**: design session on scope — how many accounts, which tickers first,
+mapping changes, and how this sequences with wiring `schwab_client`/`schwab_safety` into
+`active_signals.py`'s main loop (still not connected). Not started, no code changes yet.
 
 ## [live-trading][tax] Deprioritized 2026-07-18, 2026-07-17 — wash-sale/tax analysis needed before promoting any ticker into the taxable brokerage account
 Full detail moved to `docs/deep_backlog.md` ("Deprioritized 2026-07-18" entry). Short version:
