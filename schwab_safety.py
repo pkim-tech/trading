@@ -99,19 +99,38 @@ ACCOUNTS = {
     "ira":       AccountLimits(enabled=True, notional_cap=75_000, daily_order_cap=10, dry_run=True),
 }
 
-# Live-automation scope, swapped 2026-07-17: GDXD replaces KORU as the sole pilot
-# ticker (not additive). KORU was flat (no open position) at swap time, so no
-# mid-position handoff risk either way -- GDXD was chosen instead because it's a
-# small, never-traded ($5k) book, isolating the pilot's real-money exposure while
-# still exercising the full automated path (including the new entry_timing=
-# 'open_check' node type -- see active_signals._OPEN_CHECK_WINDOWS). GDXD's
-# candidate-checklist review flagged real risk (only ~7% of robust alpha survives
-# the same-day-block constraint; win rate declines in the late 30% of history) --
-# accepted given the small $5k size, per user 2026-07-17. Every other live
-# watchlist ticker (including KORU, still live/manual) still goes through the
-# existing manual Slack workflow -- this is a restriction *on top of* the
-# ticker-allowlist/mode check, not a replacement for it.
-AUTOMATION_ENABLED_TICKERS = {"GDXD"}
+# Live-automation scope -- moved from a hardcoded Python literal to SCHWAB_AUTOMATION_TICKERS
+# in .env (2026-07-19). Reasoning: this set is deployment-specific (which tickers *this*
+# person's automation is trusted with), not something that belongs in shared/committed code --
+# same rationale as SCHWAB_ACCOUNT_<NAME>/NICKNAMES already living in .env. Membership no
+# longer shows up in `git log`, so every change is instead logged via
+# signals_db.log_automation_scope_change (see sync_automation_scope() below) -- call that once
+# at daemon startup, not here at import time, so a bare `import schwab_safety` (tests, scripts)
+# never writes to the live DB as a side effect.
+AUTOMATION_ENABLED_TICKERS = {
+    t.strip() for t in os.environ.get("SCHWAB_AUTOMATION_TICKERS", "").split(",") if t.strip()
+}
+
+AUTOMATION_SCOPE_STATE_PATH = Path(__file__).parent / "cache" / "live" / "schwab_automation_scope.json"
+
+
+def sync_automation_scope():
+    """Compares the current AUTOMATION_ENABLED_TICKERS (read from .env at import
+    time) against the last-known set persisted in AUTOMATION_SCOPE_STATE_PATH; if
+    it changed, logs the old->new diff via signals_db (the only audit trail now
+    that this set isn't in git) and updates the persisted state. Call once at
+    daemon startup -- not on every poll loop, and not at module import time (see
+    comment above AUTOMATION_ENABLED_TICKERS)."""
+    old_tickers = set()
+    if AUTOMATION_SCOPE_STATE_PATH.exists():
+        try:
+            old_tickers = set(json.loads(AUTOMATION_SCOPE_STATE_PATH.read_text()).get("tickers", []))
+        except (json.JSONDecodeError, OSError):
+            pass
+    if old_tickers != AUTOMATION_ENABLED_TICKERS:
+        signals_db.log_automation_scope_change(old_tickers, AUTOMATION_ENABLED_TICKERS)
+        AUTOMATION_SCOPE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AUTOMATION_SCOPE_STATE_PATH.write_text(json.dumps({"tickers": sorted(AUTOMATION_ENABLED_TICKERS)}))
 
 def _now():
     """Seam for tests to monkeypatch -- the real signal windows only make

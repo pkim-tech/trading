@@ -1,5 +1,51 @@
 # Backlog Cache
 
+## [live-trading] Resolved 2026-07-19 — `AUTOMATION_ENABLED_TICKERS` moved to `.env`, widened to all 18 v4 tickers; EDC's v3.27 node removed
+Full writeup in `docs/design.md` (Layer 3). Short version: `AUTOMATION_ENABLED_TICKERS`
+moved from a hardcoded Python set in `schwab_safety.py` to `SCHWAB_AUTOMATION_TICKERS` in
+`.env` (gitignored, deployment-specific — same reasoning as `SCHWAB_ACCOUNT_<NAME>`), with
+`schwab_safety.sync_automation_scope()` (called once at `run_loop` startup) logging any
+scope change to `watch_list_audit` as the replacement for the git-history audit trail that
+move gave up. Widened from GDXD-only to all 18 v4 research-mode tickers (paper-trading
+only, no accounts/dry_run/live involved), each set to `starting_notional=5000`. EDC's
+v3.27 node was removed from `watch_list` entirely (not just excluded from the widened
+scope) — its real open position (423sh @ $73.57) is unaffected (SELL alerts key off
+`open_positions`, not `watch_list`), user is tracking its unwind manually going forward.
+Verified: full `pytest tests/` (92 passed), `verify_trailing_buy_resolution.py`/
+`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` (required since `active_signals.py`
+changed) — both clean, only already-documented drift.
+**Two real gaps found while doing this, not yet fixed** (their own item below):
+paper-trading's dedup is ticker-only (not `(ticker, window)`-aware like the real
+`open_position()`), and SELL-side automation (`_attempt_automated_sell`) is gated by
+ticker membership only, not by the position's node `mode` — unlike the BUY side.
+
+## [live-trading][security] Medium priority, 2026-07-19 — SELL-side automated-order attempt isn't mode-gated, only ticker-gated
+Found while reviewing whether EDC (real open position, `research`-mode node) could safely
+join the widened automation scope. `notify_trailing_activated` (`signals_notify.py:309-321`)
+is called unconditionally from the real `open_positions` exit-check loop in `run_loop` and
+calls `_attempt_automated_sell(pos, current_price)` with no check on the position's node
+`mode` — only `_attempt_automated_sell`'s own `ticker not in AUTOMATION_ENABLED_TICKERS`
+gate stands between a `research`-mode ticker's real open position and a real/dry-run
+automated sell attempt. The BUY side doesn't have this gap: `_scan_buy_signals` only
+reaches `_attempt_automated_buy` when `node.get('mode')=='live'`. This is why EDC's node
+was removed from `watch_list` rather than folded into the widened automation scope —
+adding its ticker to `AUTOMATION_ENABLED_TICKERS` while its real position's node was still
+`research` would have exposed that position's exit to the automated-sell path. **Action
+needed**: gate `_attempt_automated_sell` (or its call site) on the position's mode too,
+not just ticker membership, so this can't bite a future ticker with both a real manual
+position and an unrelated reason to be in the automation set. Not started.
+
+## [live-trading] Low priority, 2026-07-19 — paper-trading dedup is ticker-only, not `(ticker, window)`-aware
+`paper_trading.start_paper_buy`'s dedup guard (`db.get_paper_pending_buy(ticker)` /
+`db.get_open_position(ticker, paper=True)`) is a single-ticker lookup — unlike the real
+`open_position()`, which dedups on `(ticker, window)` (`signals_db.py:737-738`, itself not
+`node.id`-based, so two nodes sharing a `window` value would still collide there too). Fine
+today since every automation-enabled ticker has exactly one node. Would need to become
+`(ticker, window)`-aware before a ticker could ever run two nodes (e.g. a legacy v3.x node
+alongside a new v4 node) through paper trading simultaneously — the second node's BUY
+signal would otherwise be silently dropped as a false "already open" duplicate. Not
+scoped, no ticker needs this today.
+
 Curated, current subset of `docs/deep_backlog.md` — read in full at session start (`go`). Full detail for every item lives in `deep_backlog.md`; this is just the active/relevant pointer list. Periodically re-triage. Resolved/dead items are pruned here once closed out — see git history or `docs/conversation_summary.md` if the old writeup is ever needed.
 
 ## [live-trading] Resolved 2026-07-18 — GDXD paper-trading layer built, `add_node` fixed_sl bug fixed

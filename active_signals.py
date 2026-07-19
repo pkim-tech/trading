@@ -169,6 +169,7 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys):
 
 def run_loop(tickers: set = None):
     ensure_tables()
+    schwab_safety.sync_automation_scope()
 
     human_fh = open(HUMAN_LOG_PATH, "a")
     sys.stdout = _Tee(sys.__stdout__, human_fh)

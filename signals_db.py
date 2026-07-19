@@ -530,6 +530,30 @@ def annotate_node(watch_id, annotation):
         c.commit()
 
 
+def set_starting_notional(watch_id, starting_notional):
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, starting_notional FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
+        c.execute("UPDATE watch_list SET starting_notional = ? WHERE id = ?",
+                   (float(starting_notional), watch_id))
+        if row:
+            _log_audit(c, 'set_starting_notional', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                       ticker=row['ticker'], detail=f"{row['starting_notional']} -> {starting_notional}")
+        c.commit()
+
+
+def log_automation_scope_change(old_tickers, new_tickers):
+    """Records a change to schwab_safety.AUTOMATION_ENABLED_TICKERS in the same
+    append-only audit log used for watchlist/node mutations. Needed because that
+    set moved from a hardcoded Python literal (git-tracked, self-documenting) to
+    an .env var (gitignored, no history) -- this is now the only record of when
+    the automation pilot scope changed and to what."""
+    with _conn() as c:
+        _log_audit(c, 'automation_scope_change', detail=f"{sorted(old_tickers)} -> {sorted(new_tickers)}")
+        c.commit()
+
+
 # ---------------------------------------------------------------------------
 # Open positions CRUD
 # ---------------------------------------------------------------------------
