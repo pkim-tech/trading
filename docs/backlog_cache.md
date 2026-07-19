@@ -20,39 +20,62 @@ beyond GDXD's small $5k pilot. Case for promoting, built up over several session
   `scripts/v4_max_drawdown.py`/`scripts/chart_v4_vs_tqqq.py` (reusable).
 - Every ticker's v4 worst-case historical drawdown (-5.9% to -23.8%) sits well under a
   stated ~50% risk tolerance, with real headroom.
-**Real caveat found 2026-07-18, not yet resolved**: v3 and v4 aren't the same trades with
-a different stop — v4's `trail_buy_pct` is typically much tighter than v3's, so v4 trades
-3-5x more often (only 10-33% of v4's trades correspond to a real v3 trade around the same
-time, checked on SOXL/AGQ/KORU). Promoting isn't just "make the stop tighter," it's
-switching to a busier, lower-per-trade-win-rate strategy that happens to also have a much
-tighter stop — worth being explicit about before cutover.
-**The real blocker**: every number above is still in-sample — the train/test split
-backlog item (see "Deferred, lower priority" below) has never been built, so none of this
-has been checked against data the grid search didn't see. Promoting 11 tickers' real
-capital onto in-sample-optimized parameters without that check is the main open risk, not
-the mechanics of promotion itself (which are straightforward `watch_list` UPDATE
-statements).
-**Action needed**: decide whether to promote now (given the live-selloff validation) or
-wait for a train/test split check first. Not started — no `watch_list` rows changed yet.
+**Real caveat found 2026-07-18, user-agreed framing**: v3 and v4 aren't the same trades
+with a different stop — v4's `trail_buy_pct` is typically much tighter than v3's, so v4
+trades 3-5x more often on smaller dislocations (only 10-33% of v4's trades correspond to a
+real v3 trade around the same time, checked on SOXL/AGQ/KORU), with a lower per-trade win
+rate. **User confirmed 2026-07-18: this should be treated and communicated as adopting a
+new strategy, not tightening a parameter on the existing one** — "promotion" language
+undersells the actual scope of the change. Frame any future promotion decision/rollout
+this way (e.g. sizing, rollout pace, and expectations-setting should match "new strategy
+launch" caution, not "parameter tweak").
+**Train/test-split blocker substantially resolved, 2026-07-18** (see `docs/research_log.md`
+2026-07-18 entry, "train/test split + walk-forward out-of-sample validation"): built
+`scripts/train_test_split_check.py` (single 70/30 split) and `scripts/walk_forward_check.py`
+(5-fold out-of-time, more trustworthy — the single split gave a misleading, outlier-driven
+result on KORU). Walk-forward result across all 19 candidates: **14/19 had zero negative-
+alpha folds across all 5 out-of-time windows** (AGQ, DUST, EDC, GDXD, GDXU, HIBL, KORU,
+LABU, NAIL, SOXL, TQQQ, USD, YANG, ZSL) — real, broadly consistent out-of-sample edge, not
+just in-sample curve-fitting. 5 tickers (DPST, NUGT, RETL, UDOW, UVIX) had exactly one
+negative fold each — see the new follow-up item below, not yet resolved. Added as
+checklist check 13.
+**Action needed**: decide whether to promote the 14 clean tickers now, or wait on the
+5-ticker follow-up review too. Not started — no `watch_list` rows changed yet.
 
-## [live-trading][security] Idea, not scoped, 2026-07-17 — move order-placement/mutating Schwab calls behind a separate proxy this session can't write to
-Raised by the user: their work architecture uses an API-proxy pattern (a separate service/codebase that holds real credentials and does the actual outbound call, so the calling app only ever sends intent) — nothing Schwab-specific exists yet, would need to be rebuilt from scratch in a separate folder/codebase here. Goal is two-fold, roughly equal weight: (1) safety boundary — a bug or bad edit made in *this* repo/session can never itself place/cancel/modify a real order, since the code with real trading authority would live somewhere this session doesn't write to; (2) credential isolation — the Schwab OAuth token/secrets would live only with the proxy, not on this machine/repo at all.
-**Scope discussed**: only the write/mutating calls move (`place_trailing_buy`, `place_trailing_sell`, and any future cancel/modify-order calls) — read-only calls (`get_account`, `get_filled_order`, quotes) stay local in `schwab_client.py` since they can't themselves cause a trade. This server would call out to the proxy for anything that changes broker state; the proxy is the only thing holding a live, order-capable Schwab session.
-**Not scoped at all yet**: what the proxy-side code actually looks like (that part is deliberately meant to live outside what an agent session writes), the request/response contract between this repo and the proxy, how the proxy would authenticate/hold the Schwab token, and how `schwab_safety.py`'s existing guardrails (allowlist, dry_run, kill switch, signal-window gate, duplicate-order window) would split across the local/proxy boundary — plausibly some checks stay local (fast pre-flight rejection) and some get re-validated proxy-side (defense in depth) but not decided.
-**Action needed**: design session, not started. Logged as backlog only per explicit 2026-07-17 instruction — no code changes, no client stubs, nothing wired, given the "we're not trading today, don't introduce bugs" constraint for this session.
+## [backtest] Medium priority, 2026-07-18 — review the 5 tickers with a negative walk-forward fold (DPST, NUGT, RETL, UDOW, UVIX)
+Follow-up from the walk-forward check above (`docs/research_log.md` 2026-07-18 entry,
+`logs/walk_forward_check.csv`). Each had exactly one negative-alpha fold out of 5:
+DPST (-11.9%, fold 1, earliest window 2023-07→2024-03), NUGT (-7.2%, fold 4, but NUGT
+only has ~1 year of cached history total so this fold is thin/short), UDOW (-3.6%,
+fold 1, earliest window), UVIX (-4.0%, fold 4), RETL (-8.4%, fold 5, most recent window).
+All mild (single digits to -12%), not collapses, but each needs a closer look at what's
+actually happening in that specific window before being treated as validated.
+**DPST specifically was the user's leading candidate for the first ticker promoted into
+the taxable brokerage account** (see the wash-sale/tax deep-backlog item) — this walk-forward
+flag, plus DPST's already-known thin/small-sample trade count (flagged 2026-07-17 in the
+chaos-monkey item: "DPST's baseline is only a handful of trades relative to KORU/HIBL",
+still unexplained) means DPST may need more searching/scrutiny before committing to it as
+the brokerage-account pick, not just proceeding on the earlier assumption.
+**Action needed**: per-ticker investigation of each negative fold (what trades, what regime,
+outlier-driven or structural) — not started.
 
-## [live-trading][security] Idea, not scoped, 2026-07-17 — one brokerage account per live ticker, for blast-radius containment against a rogue algorithm
-User plans to split into **one brokerage account per ticker** on the live watchlist. Originally raised as a PDT-avoidance idea (see the now-resolved same-day-block backlog item — that rationale turned out moot since the PDT rule itself was eliminated 2026-06-04). **Restated with a real, independent rationale**: capping how much capital a bug or malfunctioning algorithm on one ticker can ever touch. With separate accounts, a rogue order on ticker A structurally cannot reach ticker B's capital — no code enforcement needed, the account boundary itself is the guarantee.
-**Directly relevant to an existing known gap**: the 2026-07-16 GDXD-promotion finding that Schwab does not reserve/check buying power against a resting order at placement time, combined with the 2026-07-17 finding that the new FINRA intraday-margin framework (replacing the old PDT rules, effective 2026-06-04) is a deficit-and-cure model, not a hard fill-time block — i.e. there's real reason to believe multiple simultaneously-resting orders across tickers *could* collectively commit more than available capital before anything stops them. That gap was previously flagged as needing an "aggregate-across-tickers cash exposure" guard (unbuilt). **One-account-per-ticker makes that guard structurally unnecessary** rather than something to build — each account's own balance is a hard ceiling on that ticker's exposure by construction.
-**Complements, doesn't replace, the API-proxy idea above**: the proxy limits *what code can act* (safety boundary + credential isolation); account-splitting limits *how much money any single ticker's logic can ever reach* (blast-radius containment). Different layers of the same defense-in-depth goal.
-**Real operational cost is small, confirmed by reading the code (2026-07-17)**: these are all IRA accounts, so there's no per-trade taxable event or capital-gains paperwork to multiply (just N annual 5498/1099-R-type forms, minor). And `schwab_client.py:29-59` already uses a single `schwab_auth.get_client()` OAuth session for the whole Schwab login, resolving every nickname (`brokerage`/`sep`/`roth`/`ira` today) to an account hash via one `get_account_numbers()` call plus a `SCHWAB_ACCOUNT_<NAME>` env-var suffix match — since all these accounts are linked under one login, scaling `NICKNAMES` from 4 to a dozen-plus needs zero new logins/tokens, just more list entries and env vars, plus updating whatever mapping decides which nickname a given ticker's trades route through.
-**Action needed**: design session, not started. No code changes.
+## [live-trading][security] Phase 4 (deferred to cloud-infrastructure planning), 2026-07-18 — move order-placement/mutating Schwab calls behind a separate proxy this session can't write to
+Full detail in `docs/deep_backlog.md`. Short version: API-proxy pattern for safety
+boundary + credential isolation on Schwab order-placement calls, not scoped. Deferred
+until cloud infrastructure is actually being considered (proxy is naturally a
+separately-hosted service).
 
-## [live-trading][tax] Idea, not scoped, 2026-07-17 — wash-sale/tax analysis needed before promoting any ticker into the taxable brokerage account
-Distinct from the resolved cross-account (taxable-loss → IRA-repurchase) wash-sale item — this strategy re-enters losing tickers within 30 days as completely normal, routine behavior (not a one-time event), so any ticker live-traded in the taxable brokerage account will generate wash sales continuously, indefinitely. User's explicit call: **fine with this** — a wash sale only defers the loss into replacement-share cost basis, doesn't destroy it, and repeatedly sitting out 30 days after every loss to avoid it would likely cost more in missed re-entries than the deferral costs (matches the general "missed signals aren't free but aren't catastrophic either" theme from the chaos-monkey findings). Also discussed: splitting the brokerage account's capital, with part parked as a static buy-and-hold SPY sleeve alongside the actively-traded portion — orthogonal, low-risk, no design work needed.
-**LABU floated as a candidate** for the first ticker promoted into the brokerage account, not decided.
-**Year-end wrinkle flagged by user, not yet verified**: a wash sale is "just a deferral" in general, but if the 30-day window straddles the calendar year boundary (loss sold in December, replacement bought in the following January), the disallowed loss can't be claimed on that tax year's return at all — it rolls into the replacement shares' basis and isn't usable until eventually sold clean, effectively pushing the deduction a full tax year later rather than just 30 days. Relevant to year-end tax planning (offsetting current-year gains with current-year losses) specifically. Recalled from memory, not independently verified against current IRS rules yet — worth confirming precisely (which side of Dec 31 triggers it, exact mechanics) as part of the real analysis below rather than trusting an offhand recollection.
-**Action needed**: user wants a real wash-sale/tax analysis done before promoting anything into the brokerage account (not scoped yet — e.g. quantifying deferred-vs-recognized loss timing impact across a tax year, and specifically verifying the year-end-straddle mechanic above). Not started.
+## [live-trading][security] Phase 4 (deferred to cloud-infrastructure planning), 2026-07-18 — one brokerage account per live ticker, for blast-radius containment against a rogue algorithm
+Full detail in `docs/deep_backlog.md`. Short version: split into one brokerage account
+per ticker so a rogue order on one ticker structurally can't reach another's capital.
+Grouped with the API-proxy item above under the same cloud-infra-planning deferral.
+
+## [live-trading][tax] Deprioritized 2026-07-18, 2026-07-17 — wash-sale/tax analysis needed before promoting any ticker into the taxable brokerage account
+Full detail moved to `docs/deep_backlog.md` ("Deprioritized 2026-07-18" entry). Short version:
+strategy will generate continuous wash sales in a taxable account, user is fine with the
+deferral mechanic in principle (LABU floated as first candidate) but wants a real analysis
+(incl. year-end 30-day-straddle mechanic, unverified) before promoting. Pushed behind the
+train/test split and v4-promotion work — not blocking anything active right now.
 
 ## [live-trading][security] Resolved 2026-07-17 — same-day buy→sell block explored and deliberately NOT built
 Full writeup moved to `docs/research_log.md` (2026-07-17 entry). Short version: PDT rule
@@ -61,14 +84,16 @@ of blocking anyway is high (GDXD retains only ~47% of edge if same-day exits are
 Decision: proceed without a block. `schwab_safety.py`'s existing `same_day_block` (blocks
 same-day *re-buy*, unrelated direction) is untouched, still enforced live.
 
-## [live-trading][backtest] Medium priority, 2026-07-17 — dividend cash isn't credited into P&L/SL/arm tracking; material for DPST specifically
+## [live-trading][backtest] High priority (raised 2026-07-18) — dividend cash isn't credited into P&L/SL/arm tracking; material for DPST specifically
+**2026-07-18: user confirmed this needs to happen** (along with the trailing-buy re-sizing item below) — no longer just a medium-priority idea.
 Raised while investigating trailing-buy capital utilization. Checked real dividend history via `yfinance`: SOXL, DPST, EDC, HIBL, KORU, LABU, TQQQ, NUGT, YANG all pay small quarterly distributions (largest recent: HIBL $1.41/share, DPST $0.671/share — all well under ~2% of share price); AGQ, GDXD, GDXU pay none (commodity-linked structure, no dividend history on file).
 **Confirmed via a real fetch (`auto_adjust=False` vs `auto_adjust=True` around DPST's 2026-06-23 ex-div date)**: `data_manager.py`'s `yf.download(auto_adjust=True)` (already relied on for the KORU split fix, session 15) only retroactively rescales *cached historical bars from before* an ex-div date (DPST 6/18 close: $122.94 raw → $122.29 once fetched after 6/23) — it does **not** touch live current price or a position's recorded `entry_price` in `open_positions`, which is correct: unlike a split, a dividend doesn't change what you actually paid, so `entry_price` should stay exactly as recorded. **No data-corruption bug found** — grepped the whole codebase for "dividend": zero hits, confirming there's also no dividend-crediting logic anywhere.
 **The real gap**: the underlying market price genuinely drops by ~the dividend amount on the ex-date (true price action) — but the strategy only tracks price return (`current_price` vs `entry_price`), never adding back the real dividend cash actually received. So a position held across an ex-div date shows a P&L understated by roughly the dividend %, even though the account is economically whole (cash landed in settled cash). Same gap applies to SL/arm comparisons (`check_sell_condition`), which use the same unadjusted `entry_price` vs. live-price comparison.
 **Material for DPST specifically**: last dividend was 0.51% of share price against `arm_sell_pct=1.0%` (over half its entire arm threshold) — a position near its arm trigger right around an ex-div date could show materially less gain than its true total return, delaying (or in a rare edge case, falsely triggering) arm/SL timing by a meaningful fraction of the threshold. HIBL/LABU (bigger $ dividends but wider 2%/21% arm thresholds) are less exposed proportionally; AGQ/GDXD/GDXU unaffected (no dividends).
 **Action needed**: not scoped. Possible shape: track ex-div dates/amounts per held ticker (`yf.Ticker(t).dividends`) and add the per-share amount back into the live P&L/SL/arm comparison for any position that was open through the ex-date — needs design discussion on where this plugs into `check_sell_condition` without disturbing the existing corporate-action (split) freeze logic it sits next to.
 
-## [live-trading] High priority, 2026-07-17 — trailing-buy order needs re-sizing as the trigger price moves, to actually use all budgeted capital
+## [live-trading] High priority, confirmed 2026-07-18 — trailing-buy order needs re-sizing as the trigger price moves, to actually use all budgeted capital
+**2026-07-18: user confirmed this needs to happen** (along with the dividend-tracking item above).
 Raised by the user, separate from today's schwab_client wiring work. `signals_blocks._build_buy_blocks`/`signals_helpers.buy_order_sizing` size a trailing-buy order's *quantity* once, at signal time, off the worst-case bounce-trigger price (`price × (1 + trail_buy_pct/100)`, fixed 2026-07-17 to guarantee the order never costs more than `target_notional`). But a real Schwab `TRAILING_STOP` order's linked trigger price keeps moving as the broker's own running-low updates after the order is placed — if the real running low falls further before the bounce (the common case, same asymmetry already documented in the sizing-formula item below), the order fills at a lower price than the quantity was sized for, and the fixed share count now under-deploys the budgeted capital (real dollars left idle) rather than the over-deploy risk the worst-case formula was built to prevent.
 **Confirmed real order type, 2026-07-17**: `schwab_client.place_trailing_buy`/`place_trailing_sell` build a real `TRAILING_STOP` order (`OrderType.TRAILING_STOP`, `schwab_client.py:124`) — not a market order. `place_equity_buy`/`place_equity_sell` (market) exist in the same file but nothing calls them for GDXD (`TrailingBothZScoreBreakout` always routes through the trailing functions), so the under-deployment gap described here is specifically about the trailing order's fixed quantity vs. its live-moving broker-side trigger.
 **Second, smaller contributor, same direction**: `signals_helpers.buy_order_sizing` truncates to a whole share via `int(target_notional // (price * (1 + trail_buy_pct/100)))` — even at the exact worst-case fill price, integer rounding alone leaves up to ~1 share's worth of budgeted cash unused every trade. Worth folding into whichever fix below is chosen (e.g. a top-up order could also mop up the rounding remainder, not just the trigger-price gap).
@@ -146,6 +171,7 @@ KORU did an unannounced ~1-for-20 stock split effective pre-market 2026-07-15 (e
 First real OAuth login completed against the IRA account (masked-suffix matching in `.env`, never a full account number). Real guardrails built into `schwab_safety.py` beyond the 2026-07-14 skeleton: ticker allowlist + account-consistency (sourced live from `watch_list`), duplicate-order window, same-day-re-buy block (real cash-account good-faith-violation risk — same-day-*sell* deliberately left unblocked, a soft employer preference not a broker rule), a BUY-only signal-window time gate (mirrors `active_signals._in_buy_window`; SELL isn't gated since exit checks run continuously), and `AUTOMATION_ENABLED_TICKERS = {"GDXD"}` (swapped from KORU 2026-07-17, see the GDXD-promotion item above). `schwab_client.py` gained `place_trailing_buy`/`place_trailing_sell` (real broker-native `TRAILING_STOP` orders) and, this session, `get_filled_order` (polls the order book for a real fill). Kill switch persists across daemon restarts with Slack "Stop Engine"/"Start Engine" buttons.
 **Done 2026-07-17**: `schwab_client` is now actually wired into `active_signals.py`'s real BUY/SELL loop (`signals_notify.py`) — see `docs/design.md`'s 2026-07-17b addendum for the full breakdown. Automated placement (`notify_buy_signal`/`notify_trailing_activated` call `schwab_client.place_trailing_buy`/`place_trailing_sell` directly for GDXD, falling back to the manual button flow on any `SafetyViolation`) is live and exercisable today since every account is still `dry_run=True`. A separate, opt-in fill-detection capability (`check_auto_fills`, per-ticker toggle `schwab_safety.auto_fill_detection_enabled`, defaults **off**) auto-records a real fill instead of waiting for the Filled/Exited click, once turned on — held back by default since `get_filled_order`'s field parsing hasn't been confirmed against a real fill response yet. 9 new tests in `tests/test_schwab_automation.py`.
 **Not done**: real (non-placeholder) notional/daily cap values in `schwab_safety.py:52-55` still need review. Dry-run cutover (flipping `dry_run=False` for `ira`) not started — next step is watching GDXD's automated placement through a real live signal window in dry-run first. Auto-fill-detection not yet enabled for GDXD. Aggregate-across-tickers cash exposure (flagged 2026-07-17, see the GDXD-promotion item above) still unguarded, relevant whenever `AUTOMATION_ENABLED_TICKERS` widens beyond one ticker.
+**Blocked 2026-07-18**: dry-run cutover is on hold waiting on a limited margin account (not yet in place) — external dependency, not a code/design gap. Revisit once that account is available.
 
 ## [backtest] Medium priority, 2026-07-10 — same-bar arm/take-profit trigger not checked at entry
 `simulate_trail_both_annotated`/`_simulate_trail_both` skip arm/TP/SL checks on the entry bar itself (fill sets `in_trade=True` then `continue`s, so trailing-arm logic starts evaluating the *next* bar). Checked across the 6 live tickers whether the entry bar's own High already cleared the arm threshold: SOXL 0/57, EDC 0/32, KORU 0/30, AGQ 2/36, LABU 1/38, but **HIBL 20/54 (37%)** — over a third of HIBL trades could arm the trailing-sell an hour earlier than the backtest credits. Direction of the return bias not yet determined — unprovable from hourly OHLC (same intrabar-order problem as the fill-timing item). Explicit user call: leave the kernel as-is since live trading has the same delayed-until-next-bar behavior — fixing backtest without fixing live would create a live/backtest divergence. Not started.
@@ -181,9 +207,26 @@ Raised as a forward-looking research question, not tied to a current incident. A
 - **Default rule**: every action-requiring state change in `active_signals.py` must have a Slack notification — audit this against any new strategy/state added going forward.
 - **Race condition: cache CSV reads vs. the daemon's own background refresh** — found 2026-07-13 when "🔄 Resend Report" silently did nothing. Root cause confirmed in `logs/active_signals_verbose.log`: the daemon's main loop refreshes every watchlist/open-position ticker's `cache/{ticker}_1h.csv` roughly every 30s via `fetch_live_data_smart` (non-atomic write-in-place, no lock), and a concurrent Slack button handler's `_load_cache()` read landed mid-write on GDXU's file at the exact same second, hitting it truncated/empty → `pandas.errors.EmptyDataError` → handler crashed, logged, no error surfaced to Slack. Same click again worked (pure timing fluke). Any button click has a small window to hit whichever ticker happens to be mid-refresh. **Fix**: make `data_manager.py`'s cache write atomic (write to temp file, then rename) so readers never see a truncated file. Not started.
 
-## Reference — backup/storage policy (2026-07-07, current; weekly disabled 2026-07-15)
+## Reference — backup/storage policy (2026-07-07, current; weekly removed 2026-07-18)
 - `trading_live.db`: hourly cron backup, keep 30 days (`cache/live_backups/`).
-- `trading_universe.db` (research, regenerable): daily + weekly rotating single-file backups, 2 copies total, no accumulation. **Weekly cron commented out 2026-07-15** to free disk headroom for the SL sweep (`trading_universe_weekly.db.bak`, 46GB, deleted) — daily backup still active. Re-enable (`crontab -e`, uncomment `0 3 * * 0 ...`) once disk pressure isn't a concern.
+- `trading_universe.db` (research, regenerable): daily rotating single-file backup only (`trading_universe_daily.db.bak`). **Weekly backup permanently removed from crontab 2026-07-18** (had been commented out since 2026-07-15 to free disk headroom for the SL sweep, `trading_universe_weekly.db.bak` 46GB deleted at the time) — user decided not to bring it back rather than just leaving it disabled.
 
 ## Deferred, lower priority
-- **Train/test (e.g. 70/30) split for backtest date range** — 2026-07-14: raised during v4 kernel-correctness work as a third, distinct robustness axis alongside island/cliff-safety (parameter-neighborhood robustness) and possible/pessimistic/certain (fill-timing-assumption robustness) — a train/test split protects against overfitting to the specific historical period's regime/noise, which neither of the other two addresses. **Not implemented at all currently** — the whole system runs one pass over the full historical range for both parameter selection and reporting; every "best node" on file is in-sample by construction. Deliberately deferred out of the v4 pass (already large: kernel rewrite + robust ranking) to its own focused session — would need island search re-run on a 70% training slice, then a separate out-of-sample validation pass on the remaining 30%.
+- **Train/test (e.g. 70/30) split for backtest date range** — ✅ Resolved 2026-07-18, see the walk-forward item near the top of this file and `docs/research_log.md`'s 2026-07-18 entry.
+
+## [backtest] Idea, not scoped, 2026-07-18 — daily-bar strategy variant, for much longer backtest history / real bear-market regime coverage
+Raised while discussing today's walk-forward results: the current strategy's cached
+hourly data only goes back ~3 years (2023-07, or ~1 year for GDXU/NUGT/USD) — no real
+adverse-regime coverage (no 2020 COVID crash, no 2022 bear market) — which is the deeper
+issue behind any overfitting/thin-sample concern, not just something a train/test split on
+the existing window can fully address. `yfinance` **daily** bars have no such limit:
+SOXL back to 2010-03-11 (inception), AGQ back to 2008-12-04 (inception), SPY back to
+1993-01-29 — 10x+ more history and real regime diversity if usable.
+**Real constraint, not a quick extension of the existing strategy**: the live strategy's
+trailing-buy/trailing-sell mechanics (running-low tracking, arm-then-trail state,
+intrabar Low/High checks) genuinely need hourly granularity — a daily-bar version would be
+a different strategy variant (new strategy class, new backtest kernel path), not a
+longer-history version of the same `TrailingBothZScoreBreakout` node. Wouldn't directly
+validate what's currently live; would need its own design/build/validation cycle.
+**Action needed**: not scoped, not started — logged as a real idea worth a future focused
+session, not urgent.

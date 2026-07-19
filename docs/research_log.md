@@ -189,3 +189,64 @@ decision: v4 isn't a strict safety upgrade to the same strategy, it's a differen
 **Follow-up:** Added checks 11 (max drawdown) and 12 (current-drawdown-vs-worst-case
 calibration) to `docs/watchlist_candidate_checklist.md`. Feeds directly into the still-open
 v4-promotion backlog decision.
+
+---
+
+## 2026-07-18 — 19 tickers (watchlist + screened candidates) — train/test split + walk-forward out-of-sample validation, resolving the "Train/test split" deferred backlog item
+**Hypothesis/question:** Every v4 node on file (island search, cliff-safety, robust-alpha
+ranking) is selected against the full historical range with no held-out data — is any of
+it overfit to the in-sample period? This was the stated real blocker on the
+watchlist-wide v4-promotion decision (see backlog).
+**Method:** Two scripts built, both reusing the existing backtest kernel/trade-list rather
+than reimplementing anything, and both avoiding a costly re-sweep by exploiting that the
+strategy's SMA/std indicators are already backward-looking (no lookahead) — running the
+backtest once over full history and slicing the resulting trade list chronologically is
+numerically equivalent to running separate backtests on split date ranges:
+1. `scripts/train_test_split_check.py` — single 70/30 chronological split per ticker
+   (per-ticker 70th-percentile entry-time cutoff), robust-alpha (`MIN` of
+   possible/pessimistic/certain) computed separately for each half, each against SPY's
+   *own* return over that half's specific date range (`period_spy_bh`) — not one blended
+   full-history SPY number, which was a real bug caught and fixed mid-session (the first
+   version used `compute_bh_returns()`'s single full-history SPY return for both halves,
+   which understated test-period alpha and even showed spurious negative retention for
+   RETL/UVIX before the fix).
+2. `scripts/walk_forward_check.py` — generalizes the single split into N=5 equal
+   chronological calendar windows, each independently evaluated (not cumulative
+   compounding across windows) against its own SPY benchmark. Built specifically because
+   the single-split method showed a real interpretability weakness on KORU (see below).
+Run across all 19 tickers cleared by the 2026-07-18 checklist screen (12 live watchlist +
+UDOW/USD/UVIX/ZSL/NAIL/DUST/RETL).
+**Result:** Single 70/30 split: median out-of-sample retention well under 50% (e.g. AGQ
+28.5%, HIBL 23.1%, YANG 7.7%, TQQQ 4.9%), with only LABU/DPST/ZSL/DUST/KORU holding up
+strongly. GDXD and SOXL landed at a near-exact tie on absolute out-of-sample numbers
+(test robust-alpha 818.9 vs 815.1, test compounded 832.1% vs 844.9%) despite very
+different retention ratios (43.0% vs 29.5%) — the ratio difference was mostly an artifact
+of SOXL's training number starting higher, not a real difference in OOS quality. KORU's
+70/30 result (test retention 518%, an apparent *improvement*) was traced to a single
+outlier trade (+91.7% over a ~28-calendar-day hold, legitimately within the node's own
+`max_hold_hours=126` trading-hour cap, not a bug) that alone accounted for roughly half
+the entire test-period compounded return — a red flag that a single split's result can be
+dominated by one trade and isn't trustworthy in isolation, in either direction.
+Walk-forward (5 folds) gave a materially more useful picture: **14/19 tickers had zero
+negative-alpha folds across all 5 windows** (AGQ, DUST, EDC, GDXD, GDXU, HIBL, KORU, LABU,
+NAIL, SOXL, TQQQ, USD, YANG, ZSL); 5 had exactly one negative fold (DPST, NUGT, RETL,
+UDOW, UVIX). Critically, KORU's walk-forward folds showed positive, real alpha (51-238%)
+across all four windows *before* the standout recent-selloff window (900%) — the edge
+isn't purely a fluke confined to one lucky test period, contrary to what the single split
+alone suggested. In one fold (fold 3, 2024-10 to 2025-05) SPY itself returned -1.3% while
+KORU/GDXD/SOXL all still posted large positive absolute returns (50-430%), real evidence
+these aren't just riding a rising SPY tide.
+**Verdict:** Confirmed with a real caveat — a single 70/30 split is not reliable enough to
+trust alone (demonstrated concretely by KORU's outlier-driven, direction-ambiguous
+result); the walk-forward version is the more trustworthy check going forward. Most
+watchlist tickers show real, broadly consistent out-of-sample edge (14/19 zero-negative-
+fold), though absolute out-of-sample magnitude is much smaller than the in-sample
+headline numbers suggest across the board — none of this should be read as "the in-sample
+numbers are right," only as "the edge is real, just smaller and noisier than in-sample
+suggested."
+**Follow-up:** Added as checklist check 13 (`docs/watchlist_candidate_checklist.md`).
+DPST/NUGT/RETL/UDOW/UVIX's single negative fold each needs a closer look (which window,
+how large) before treating them as validated. Directly informs, but does not fully
+resolve, the still-open watchlist-wide v4-promotion decision (see backlog) — this
+resolves the "is any of this in-sample-only" concern with real evidence, but the
+promotion decision itself is still open.

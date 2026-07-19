@@ -166,6 +166,32 @@ v3.x node (SL=15%) was at -33.8% (and GDXU's live v3.x node was at -55.7%, its a
 worst point, at that exact moment) — the same real-world price action producing wildly
 different strategy-level pain depending on stop width.
 
+## 13. Walk-forward (N-fold out-of-time) consistency check
+Generalizes check 4's single 70/30 split into N (default 5) equal chronological calendar
+windows across the ticker's full cached history (`scripts/walk_forward_check.py`), and
+reports robust-alpha (`MIN(possible,pessimistic,certain)`) independently per window, each
+against SPY's *own* return over that specific window (not one blended full-history
+benchmark). Exists because a single train/test split can't distinguish "real robust edge"
+from "got lucky on whichever window landed after the cut" — found 2026-07-18: KORU's v4
+node showed a >5x out-of-sample *improvement* on a single 70/30 split, traced to one
+outlier trade plus a favorable recent-selloff test window; a single split has no way to
+flag that as fragile. Splitting into 5 windows instead showed the fuller picture: KORU's
+alpha was positive and real (51-238%) across every one of the four earlier windows too,
+with the 900%-alpha recent window as a genuine standout rather than the *only* good one —
+stronger, more legible evidence than the single split gave either way.
+Run: `.venv/bin/python scripts/walk_forward_check.py TICKER [TICKER ...] [--folds N]`.
+**What to look for**: any negative-alpha fold at all (a real regime where the node lost to
+SPY, not just underperformed its own average), and how much the min/max fold alpha spread
+(dispersion) — a node with all-positive, low-dispersion folds is real evidence of a
+repeatable edge; a node with high dispersion or any negative fold needs more scrutiny
+before promotion. First full 19-ticker run (2026-07-18, all watchlist + screened
+candidates, all against v4 SL=1%/open_check nodes): **14/19 had zero negative folds**
+(AGQ, DUST, EDC, GDXD, GDXU, HIBL, KORU, LABU, NAIL, SOXL, TQQQ, USD, YANG, ZSL); 5 had
+exactly one negative fold (DPST, NUGT, RETL, UDOW, UVIX) — worth a closer look at which
+specific window went negative for those five before treating them as validated.
+No re-sweep, no `backtest_cache` schema change — same "run the backtest once, slice the
+already-computed trade list" approach as check 4/10, just generalized from 2 windows to N.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds

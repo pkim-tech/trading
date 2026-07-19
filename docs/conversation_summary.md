@@ -2172,3 +2172,35 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 3. UDOW/UVIX candidate-checklist continuation carried over from session 19, not touched this session.
 4. Wash-sale/tax analysis for brokerage-account promotion (LABU floated) — still not started.
 5. `deep_backlog.md`/`research_log.md` maintenance convention is new — watch that it actually gets followed next time a backlog item resolves, not just documented.
+
+---
+
+## 2026-07-18 (session 21) — Train/test split + walk-forward out-of-sample validation resolves the deferred overfitting-check backlog item; backlog triage (wash-sale/API-proxy/one-account deprioritized to phase 3/4, dividend/trailing-buy-resize confirmed high priority, Schwab dry-run cutover blocked on limited margin account); weekly research DB backup permanently removed
+
+### What we did
+- **Built and ran `scripts/train_test_split_check.py`**: single 70/30 chronological split (per-ticker 70th-percentile entry-time cutoff) of each ticker's already-computed v4 trade list, robust-alpha (`MIN` of possible/pessimistic/certain) computed separately per half. Found and fixed a real bug mid-build: the first version reused `compute_bh_returns()`'s single full-history SPY benchmark for both halves instead of a period-specific one, which understated test-period alpha and produced spurious negative retention for RETL/UVIX — added `period_spy_bh(start, end)` to slice SPY's own cached CSV to the actual split date range.
+- **Built and ran `scripts/walk_forward_check.py`**: generalizes the single split into N=5 equal chronological calendar windows, each evaluated independently against its own SPY benchmark. Built specifically because the single-split method gave a misleading result on KORU (apparent 518% out-of-sample *improvement*, traced under questioning to one outlier trade — a +91.7% trade over a ~28-calendar-day hold, confirmed legitimate against the node's own `max_hold_hours=126` trading-hour cap, not a bug — that alone accounted for roughly half the entire test-period compounded return).
+- **Full 19-ticker run** (12 live watchlist + 7 screened candidates: UDOW/USD/UVIX/ZSL/NAIL/DUST/RETL), all against v4 SL=1%/open_check nodes. Walk-forward result: **14/19 tickers had zero negative-alpha folds across all 5 out-of-time windows** (AGQ, DUST, EDC, GDXD, GDXU, HIBL, KORU, LABU, NAIL, SOXL, TQQQ, USD, YANG, ZSL) — real, broadly consistent out-of-sample edge, including in a fold where SPY itself returned -1.3% and every checked ticker still posted large positive absolute returns. 5 tickers (DPST, NUGT, RETL, UDOW, UVIX) had exactly one mild negative fold each (-3.6% to -11.9%), logged as a new medium-priority follow-up backlog item.
+- **Direct GDXD-vs-SOXL comparison** (both flagged earlier from the live semiconductor selloff): essentially tied on absolute out-of-sample numbers (test robust-alpha 818.9 vs 815.1) despite different retention ratios (43.0% vs 29.5%) — the ratio gap was mostly an artifact of SOXL's higher training-period number, not a real OOS-quality difference.
+- **User-confirmed framing decision**: v4 vs v3.x should be communicated and planned around as adopting a **new strategy**, not tightening a stop-loss parameter — v4's much tighter `trail_buy_pct` means only 10-33% of its trades correspond to a real v3 trade at the same time, so it trades 3-5x more often on smaller dislocations at a lower per-trade win rate. Logged into the v4-promotion backlog item as an explicit framing note for future rollout/sizing decisions.
+- **Added checklist check 13** (walk-forward/N-fold consistency) to `docs/watchlist_candidate_checklist.md`, matching the existing check-writeup style; added a `docs/design.md` addendum and a `docs/research_log.md` entry (hypothesis/method/result/verdict/follow-up) per the project's logging convention.
+- **Backlog triage** (all via `docs/backlog_cache.md`/`docs/deep_backlog.md`):
+  - Train/test split backlog item marked ✅ resolved, pointing to the research log entry.
+  - Wash-sale/tax-analysis item deprioritized to "phase 3" (pushed behind train/test split + v4-promotion work) — full detail moved to `deep_backlog.md`.
+  - API-proxy and one-brokerage-account-per-ticker items both tagged "phase 4" — deferred until cloud infrastructure is actually being considered, since the proxy is naturally a separately-hosted service. Full detail moved to `deep_backlog.md`.
+  - Dividend-cash-tracking and trailing-buy-resizing items both confirmed by the user as "needs to happen" — raised from medium/unconfirmed to explicitly-confirmed high priority.
+  - Schwab automation dry-run cutover flagged as **blocked** on a limited margin account not yet in place (external dependency, not a code/design gap).
+  - New follow-up item: review the 5 tickers with a single negative walk-forward fold (DPST, NUGT, RETL, UDOW, UVIX) — DPST specifically was the user's leading candidate for the first ticker promoted into the taxable brokerage account (wash-sale item), so this finding plus DPST's already-known thin trade count (unexplained chaos-monkey divergence, flagged 2026-07-17) means it may need more searching before committing to that pick.
+  - New idea logged: a daily-bar strategy variant, for 10x+ longer backtest history and real bear-market regime coverage (SOXL back to 2010, AGQ to 2008, SPY to 1993 — no such limit on daily bars, unlike the ~2-year `yfinance` hourly-interval cap this whole system currently runs on). Explicitly scoped as a different strategy variant requiring its own design/build cycle, not a quick extension — not started.
+- **Removed the weekly `trading_universe.db` backup cron job entirely** (had been commented out/disabled since 2026-07-15 for disk pressure; user decided not to bring it back). Updated the backup-policy reference note in `docs/backlog_cache.md` to match — daily backup is now the only research-DB backup.
+
+### Current state
+- `docs/backlog_cache.md`'s v4-promotion item (top of file) is the live thread: train/test-split blocker substantially resolved (14/19 clean), but promotion still not started — no `watch_list` rows changed. Decision needed: promote the 14 clean tickers now, or wait on the 5-ticker follow-up review too.
+- Two new committed, rerunnable scripts: `scripts/train_test_split_check.py`, `scripts/walk_forward_check.py` — both write CSVs to `logs/` (gitignored).
+- No live-trading code (`active_signals.py`/`strategies.py`/`backtester.py`/`schwab_*.py`) touched this session — pure backtest-analysis tooling + docs/backlog work.
+
+### Next session
+- Decide on v4-promotion scope (14 clean tickers vs. full 11-ticker watchlist vs. wait).
+- Investigate the 5 tickers with a negative walk-forward fold, especially DPST (brokerage-account implications).
+- Dividend-cash-tracking and trailing-buy-resizing are both now confirmed "needs to happen" — pick one to scope/design next.
+- Schwab dry-run cutover stays blocked until the limited margin account is in place — no action until then.
