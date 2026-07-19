@@ -32,6 +32,48 @@ Built as originally scoped: `account` column added to both `open_positions` and 
 
 **trail_pct → trail_sell_pct rename**: still deferred, now for a sharper reason than "wait for off-hours" — traced through `active_signals.py`'s `run_loop` and found `check_sell_condition` is called with no try/except around it (`active_signals.py:1522-1541`), so renaming the column out from under the running daemon would cause an uncaught `KeyError` on the very next poll cycle and kill the entire process (no monitoring on any open position until manually restarted). Do this only immediately before a planned restart, not mid-session.
 
+## ✅ Resolved 2026-07-12 — `trail_pct`/`take_profit` rename propagation
+
+All previously-listed files done: `pages/2_Node_Inspector.py`, `pages/3_Winners.py`, `pages/4_Portfolio.py`, `pages/10_Open_Positions.py` (`take_profit`→`axis_tp`, `trail_pct`→`trail_sell_pct` in SQL), `scripts/export_cliff_safety.py` (same rename, plus fixed a pre-existing `sl_label`/`sl_display` NameError left over from the original commit), `scripts/verify_live_parity.py` (node dict key `trail_pct`→`trail_sell_pct` to match `active_signals.py`'s expected key). `scripts/fill_trail_pct_gaps.py` needed no change — doesn't touch those columns. **Note**: other pages (`8_ADF_Filter.py`, `11_Universe_Scan.py`, `1_Spatial_Topology.py`, `7_Hurst_Filter.py`, `scripts/profile_dispatch.py`, `scripts/post_sweep_report.py`, `scripts/top_safe_nodes.py`) still query raw `take_profit` but were never in scope — they only look at non-v3.x strategies where the column is still populated; revisit only if they ever need to show `TrailingBothZScoreBreakout` rows. **Exception unchanged**: `cache/watchlist_sweep.db` is a separate, never-migrated snapshot DB.
+
+## ✅ Mostly resolved 2026-07-13 — Live/backtest parity gap (trailing-buy/sell fill-timing)
+
+`TrailingBothZScoreBreakout`'s trailing-buy "wait for bounce" entry has no live-orchestration implementation (hands off to a broker-side trailing-buy order) — `scripts/verify_live_parity.py` deliberately can't compare it. Instead of waiting on real broker fill data, built `scripts/verify_trailing_buy_resolution.py`: re-detects every recent signal's bounce-entry using yfinance 5-min bars (real intra-hour tracking) and diffs against what the hourly-bar kernel (`_simulate_trail_both`) would catch for the same signal. After fixing a cutoff-time bug 2026-07-13 (see below), result across all 11 watchlist-9 tickers (130/130 signals matched, last ~58d): mean price diff +0.19%. **SOXL is still the real outlier**: +1.81% mean fill-price penalty (individual signals up to +15.5%), driven by its `trail_buy_pct=1%` being far tighter than its own ~3.65% median intra-hour swing (ratio 3.65) — volatile enough to cross/re-cross the trigger within an hour, so 5-min tracking locks in an earlier/worse fill than the hourly kernel models. TQQQ shows smaller +0.84% drift; everything else is at/near parity (AGQ actually skewed favorable, -2.01%). Formalized as a repeatable procedure in `docs/watchlist_candidate_checklist.md` (checks 2/3).
+
+Built the mirror-image check for the **exit** side 2026-07-13, `scripts/verify_trailing_sell_resolution.py`: same idea, but re-detects the peak/trail_stop crossing once trailing arms, using 5-min bars vs. the hourly kernel's trailing branch. Result: 21/21 exits matched, mean diff -0.17% — trailing-sell is already at parity across the whole watchlist (unlike entries, live trailing-sell is monitored continuously by `active_signals.py` itself, not handed off blind to a broker order, so this check mainly validates the *backtest's* hourly-bar exit modeling rather than a live-execution gap). LABU showed -4.6% on a single sample — not enough data to call a real outlier yet.
+
+**Real bug found and fixed while building the sell-side script**: `max_hold_hours` counts hourly *bars* (~7/trading day), not calendar hours — the original buy-side script's cutoff-time math (`signal_time + timedelta(hours=max_hold_hours)`) was computing a cutoff days too early for any trade near its actual max-hold window, silently reporting fabricated "ran out of data" exits instead of real ones. Fixed in both scripts (now look up the real bar timestamp via `timestamps[entry_i + max_hold_hours]`). Rerunning the buy-side script after the fix confirmed the original SOXL finding wasn't an artifact of this bug — numbers moved only slightly (130/130 matched vs. 134/138 with the shorter truncated dataset before the fix).
+
+**Still not fully closed** (residual, carried forward, no dedicated tracking item since — fold in if this area comes up again): both checks validate the *price* assumption is broadly sound (except SOXL entries); they don't validate the broker's trailing-buy order mechanics themselves (whether Schwab's own `TRAILING_STOP` trigger/fill logic matches the running-low model at all) — that piece still has no real-fill-time-vs-signal-time verification against actual Schwab fills.
+
+## ✅ Resolved (db round-trip coverage built) / Dead (Task Scheduler piece dropped) 2026-07-13/14 — Test coverage & heartbeat watchdog
+
+**Automated round-trip DB test** (`add_node`→`open_position`→`check_sell_condition`, no coverage existed as of 2026-07-13): built — `tests/test_db_roundtrip.py` and `tests/test_signal_and_notifications.py` now cover this path. Resolved.
+
+**Heartbeat/Task Scheduler watchdog** (`scripts/check_heartbeat.py`, posts a Slack alert if `active_signals.py`'s heartbeat file goes stale — meant to catch the daemon going silent, e.g. host sleep/suspend, without relying on the daemon itself to notice its own death): scoped in full (Task Scheduler setup walkthrough, "run only when logged on" vs. password-store tradeoff, retry/missed-start behavior) then **deliberately dropped 2026-07-13** — for the failure modes it would catch (sleep/network/power), the user has no way to act on the alert remotely while at work, so the alert would be pure unactionable stress. Root cause (WSL sleep during market hours) fixed directly via a Windows power-plan change instead. `check_heartbeat.py` itself was left ~80% built and still works standalone if ever revisited — same-session fix wrapped `main()` so an unhandled crash in the check itself also posts a Slack alert, not just the two originally-expected stale/missing paths. See `docs/design.md`'s Heartbeat section for the current authoritative note.
+
+## ✅ Resolved 2026-07-14 — trailing-buy re-entry timing after a same-day exit
+
+No bug — same-day re-entry uses the exact same two daily signal windows as any other entry
+(`_simulate_trail_both`'s new-signal detection has no calendar-day reset or first-entry-of-
+day special-casing). Full experiment writeup in `docs/research_log.md` (2026-07-14 entry).
+
+## ✅ Resolved 2026-07-15 — Phase 3 (full parameter mesh) adds no value over Phase 1/2/2.5
+
+Phase 3 won 0/30 tagged SOXL+KORU v4 SL-sweep campaigns — Phase 1 or Phase 2 always held
+the best robust-alpha node. `--max-phase` cap added to `run_optimization_sweep.py` (default
+3, unchanged behavior) so future runs can skip it. Full experiment writeup in
+`docs/research_log.md` (2026-07-15 entry).
+
+## ✅ Resolved 2026-07-17 — same-day buy→sell block explored and deliberately not built
+
+PDT rule eliminated by FINRA effective 2026-06-04 (Regulatory Notice 26-10); no broker or
+regulatory reason for a same-day round-trip block remains. Real cost of blocking anyway is
+high (GDXD retains only ~47% of edge if same-day exits are deferred to the next day).
+Decision: proceed without a block. `schwab_safety.py`'s existing `same_day_block` (blocks
+same-day *re-buy*, a different, unrelated direction) is untouched, still enforced live.
+Full experiment writeup in `docs/research_log.md` (2026-07-17 entry).
+
 ## ✅ Done 2026-07-07 — Composite index `idx_bc_ticker_strategy_version` on `backtest_cache`
 
 Added `CREATE INDEX idx_bc_ticker_strategy_version ON backtest_cache(ticker, strategy, version)` to both `cache/trading_universe.db` (86.2M rows, 430s to build) and the new `cache/watchlist_sweep.db` sandbox (34.7M rows, 49s). Found while an ad-hoc `ticker IN (...) AND strategy=? AND version LIKE 'v3.%'` query was scanning most of the table — `EXPLAIN QUERY PLAN` showed it falling back to the PK's autoindex (`strategy` is the PK's only usable leading column for that filter shape); none of the 4 existing secondary indexes had `ticker` paired with `strategy`/`version`. This index makes that exact filter shape (ticker-set + strategy + version-prefix) a pure index scan going forward.

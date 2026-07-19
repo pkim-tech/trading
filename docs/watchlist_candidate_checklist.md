@@ -141,6 +141,31 @@ A node that's fine early but collapses late (or vice versa) means the aggregate 
 from check 9 is hiding a regime-dependent effect, not a stable structural property of
 the ticker.
 
+## 11. Max drawdown check
+True peak-to-trough max drawdown across the node's full compounded equity curve
+(`scripts/v4_max_drawdown.py`) — not just the longest consecutive-loss streak, since a
+drawdown can also build from a mix of wins-that-don't-recover-the-prior-peak and losses.
+Exists to put a real, calibratable number on "can I actually stomach this" — a gut-check
+against your own known risk tolerance (e.g. a real portfolio drawdown you've lived
+through), not just an abstract backtest stat. Found 2026-07-18: every watchlist ticker's
+v4 (SL=1%, open_check) node has a worst-case historical drawdown between -5.9% (YANG) and
+-23.8% (SOXL) — all comfortably under a stated -50% tolerance, with SOXL/DPST/HIBL sharing
+the same real Aug-Oct 2023 drawdown window (a shared macro event, not independent bad luck
+per ticker — worth remembering these aren't fully diversified from each other).
+
+## 12. Current-drawdown-vs-worst-case calibration check
+Where does the node sit *right now* relative to its own worst-case history
+(`scripts/v4_max_drawdown.py`'s equity-curve-peak tracking, evaluated at the latest trade
+instead of just the historical max)? Cheap real-time gut-check, especially valuable during
+a live stressful stretch (e.g. a real sector selloff) when it's easy to conflate "this
+feels bad" with "this is actually bad by the numbers." Also useful to run the same
+calculation against the *currently live* node (whatever `watch_list` is actually running,
+e.g. old v3.x params) for direct comparison — found 2026-07-18, mid semiconductor selloff:
+SOXL's v4 (SL=1%) node was sitting at only -3.0% current drawdown while the actual live
+v3.x node (SL=15%) was at -33.8% (and GDXU's live v3.x node was at -55.7%, its all-time
+worst point, at that exact moment) — the same real-world price action producing wildly
+different strategy-level pain depending on stop width.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds

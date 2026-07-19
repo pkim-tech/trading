@@ -2,6 +2,39 @@
 
 Curated, current subset of `docs/deep_backlog.md` — read in full at session start (`go`). Full detail for every item lives in `deep_backlog.md`; this is just the active/relevant pointer list. Periodically re-triage. Resolved/dead items are pruned here once closed out — see git history or `docs/conversation_summary.md` if the old writeup is ever needed.
 
+## [live-trading][backtest] High priority, 2026-07-18 — promote watchlist tickers' v4 nodes (SL=1%) into live `watch_list`, replacing old v3.x SL=15% params
+Every original watchlist ticker except GDXD still runs old v3.x params (`fixed_sl=15%`,
+close-timing) in the real live `watch_list` — the entire v4 SL-sweep's findings
+(`stop_loss=1%` best everywhere, sometimes by 10-40x on robust alpha) were never promoted
+beyond GDXD's small $5k pilot. Case for promoting, built up over several sessions:
+- SL sweep confirmed `stop_loss=1%` dominates on robust alpha for every ticker checked
+  (2026-07-16, see `docs/research_log.md`-adjacent fixed_sl backlog note above).
+- Checklist checks 4/9/10 run for 19 candidates 2026-07-18 (`logs/checklist_deep_checks.csv`):
+  real win-rate decay flags on GDXU/RETL; same-day-block sensitivity ranges from severe
+  (ZSL/YANG/GDXD/UDOW) to fine (DPST/UVIX/LABU).
+- **2026-07-18, live-validated during a real semiconductor selloff**: v4's current
+  drawdown stayed minor everywhere (SOXL -3.0%, KORU -2.0%, worst GDXU -6.8%) while the
+  actual live v3.x params on the same tickers were taking much larger real hits at the same
+  moment (SOXL -33.8%, KORU -38.6%, GDXU -55.7% — its all-time-worst point). See
+  `docs/research_log.md` 2026-07-18 entry for the full breakdown, plus
+  `scripts/v4_max_drawdown.py`/`scripts/chart_v4_vs_tqqq.py` (reusable).
+- Every ticker's v4 worst-case historical drawdown (-5.9% to -23.8%) sits well under a
+  stated ~50% risk tolerance, with real headroom.
+**Real caveat found 2026-07-18, not yet resolved**: v3 and v4 aren't the same trades with
+a different stop — v4's `trail_buy_pct` is typically much tighter than v3's, so v4 trades
+3-5x more often (only 10-33% of v4's trades correspond to a real v3 trade around the same
+time, checked on SOXL/AGQ/KORU). Promoting isn't just "make the stop tighter," it's
+switching to a busier, lower-per-trade-win-rate strategy that happens to also have a much
+tighter stop — worth being explicit about before cutover.
+**The real blocker**: every number above is still in-sample — the train/test split
+backlog item (see "Deferred, lower priority" below) has never been built, so none of this
+has been checked against data the grid search didn't see. Promoting 11 tickers' real
+capital onto in-sample-optimized parameters without that check is the main open risk, not
+the mechanics of promotion itself (which are straightforward `watch_list` UPDATE
+statements).
+**Action needed**: decide whether to promote now (given the live-selloff validation) or
+wait for a train/test split check first. Not started — no `watch_list` rows changed yet.
+
 ## [live-trading][security] Idea, not scoped, 2026-07-17 — move order-placement/mutating Schwab calls behind a separate proxy this session can't write to
 Raised by the user: their work architecture uses an API-proxy pattern (a separate service/codebase that holds real credentials and does the actual outbound call, so the calling app only ever sends intent) — nothing Schwab-specific exists yet, would need to be rebuilt from scratch in a separate folder/codebase here. Goal is two-fold, roughly equal weight: (1) safety boundary — a bug or bad edit made in *this* repo/session can never itself place/cancel/modify a real order, since the code with real trading authority would live somewhere this session doesn't write to; (2) credential isolation — the Schwab OAuth token/secrets would live only with the proxy, not on this machine/repo at all.
 **Scope discussed**: only the write/mutating calls move (`place_trailing_buy`, `place_trailing_sell`, and any future cancel/modify-order calls) — read-only calls (`get_account`, `get_filled_order`, quotes) stay local in `schwab_client.py` since they can't themselves cause a trade. This server would call out to the proxy for anything that changes broker state; the proxy is the only thing holding a live, order-capable Schwab session.
@@ -21,14 +54,12 @@ Distinct from the resolved cross-account (taxable-loss → IRA-repurchase) wash-
 **Year-end wrinkle flagged by user, not yet verified**: a wash sale is "just a deferral" in general, but if the 30-day window straddles the calendar year boundary (loss sold in December, replacement bought in the following January), the disallowed loss can't be claimed on that tax year's return at all — it rolls into the replacement shares' basis and isn't usable until eventually sold clean, effectively pushing the deduction a full tax year later rather than just 30 days. Relevant to year-end tax planning (offsetting current-year gains with current-year losses) specifically. Recalled from memory, not independently verified against current IRS rules yet — worth confirming precisely (which side of Dec 31 triggers it, exact mechanics) as part of the real analysis below rather than trusting an offhand recollection.
 **Action needed**: user wants a real wash-sale/tax analysis done before promoting anything into the brokerage account (not scoped yet — e.g. quantifying deferred-vs-recognized loss timing impact across a tax year, and specifically verifying the year-end-straddle mechanic above). Not started.
 
-## [live-trading][security] Resolved 2026-07-17 — same-day buy→sell block explored and deliberately NOT built; no remaining constraint requires it
-Originally raised same day: user confirmed the live account is a **limited margin account**, not a cash account (unlimited day trades, no PDT-style broker-side count limit) — this removed the cash-account good-faith-violation premise behind `schwab_safety.py`'s existing `same_day_block` (which blocks same-day *re-buy* after an exit). The concern then reframed to "avoid being classified/flagged as a day trader" — i.e. avoid a same-day buy-then-sell round trip on the same security, for optics/compliance reasons independent of any broker-side count limit.
-**Investigated the real cost of avoiding it**: built `open_check` support and a gap-aware fill fix into `scripts/sim_delayed_sell.py`/`export_trades.simulate_trail_both_deferred_sell` (both real, committed-worthy code changes — kept, not reverted, since they're generically useful for any future same-day-exit-deferral question). For GDXD's real production node: naive/buggy version showed deferring same-day exits *improving* returns (+22,402%→+25,793%), which turned out to be an artifact of pinning deferred stop-loss fills to the original nominal stop price regardless of overnight gap risk. Fixed to charge the worse of `stop_price` or the resolving day's `Open` — corrected result: **+22,402% → +10,473%, ~47% of edge retained if forced to defer same-day exits.**
-**Then resolved as unnecessary, in order**:
-1. Considered splitting into one brokerage account per ticker to isolate day-trade-count budgets — concluded **zero benefit** before building anything, since (per a live FINRA lookup) the classic PDT $25k-minimum-equity/4-trades-in-5-days framework was **eliminated by FINRA effective 2026-06-04** (Regulatory Notice 26-10), replaced by an intraday-margin-deficit framework that doesn't restrict day trading by count at all. Splitting into smaller accounts under the old $25k threshold would have actively hurt, not helped, under the old rule anyway — moot now regardless.
-2. Employer-side: no official written rule found, only an unstated soft preference — and "the onus is on them," they never explicitly said this specific pattern (semi-automated, low-frequency signal-driven trading, not manual active day-trading) was disallowed.
-3. **Decision**: proceed without a same-day buy→sell block. Worst case if compliance ever objects is being told to stop — a reversible, low-cost outcome, not worth preemptively giving up ~53% of edge on nodes where it matters (like GDXD) for a rule that may not even apply. User may independently re-verify the actual employer compliance docs.
-**Net code state**: `schwab_safety.py`'s existing `same_day_block` (blocks same-day re-buy after an exit, the original cash-account-era behavior) is untouched — left as-is since it's harmless/conservative, not because it's still required. No new exit-side block was added. Revisit only if compliance actually raises it.
+## [live-trading][security] Resolved 2026-07-17 — same-day buy→sell block explored and deliberately NOT built
+Full writeup moved to `docs/research_log.md` (2026-07-17 entry). Short version: PDT rule
+eliminated by FINRA 2026-06-04, no broker/regulatory reason for a block remains; real cost
+of blocking anyway is high (GDXD retains only ~47% of edge if same-day exits are deferred).
+Decision: proceed without a block. `schwab_safety.py`'s existing `same_day_block` (blocks
+same-day *re-buy*, unrelated direction) is untouched, still enforced live.
 
 ## [live-trading][backtest] Medium priority, 2026-07-17 — dividend cash isn't credited into P&L/SL/arm tracking; material for DPST specifically
 Raised while investigating trailing-buy capital utilization. Checked real dividend history via `yfinance`: SOXL, DPST, EDC, HIBL, KORU, LABU, TQQQ, NUGT, YANG all pay small quarterly distributions (largest recent: HIBL $1.41/share, DPST $0.671/share — all well under ~2% of share price); AGQ, GDXD, GDXU pay none (commodity-linked structure, no dividend history on file).
@@ -81,7 +112,10 @@ Floated as a future disk-relief idea, explicitly not something to act on yet. Re
 Real disk constraint found this session: WSL's own `df` free-space number (874GB) is misleading — it's against the vhdx's *nominal* max, not real disk. The vhdx is a dynamically-growing file on the Windows C: drive, which has only ~114GB actually free. Added `--max-phase` (see below) cuts each ticker's `backtest_cache` footprint to ~2.1GB (Phase1+2+2.5 only, no Phase3) × 20 campaigns. At that rate: **11-ticker live watchlist ≈ 23GB total — comfortably affordable.** **Full 53-ticker research universe ≈ 112GB — would consume essentially all remaining Windows-side headroom**, confirmed "tight" by the user. Decision: stay scoped to the 11-ticker live watchlist for this v4 SL-sweep (matches `run_v4_backfill_sweep.sh`'s existing documented scope). Extending to the full 53-ticker universe is a real future decision, not a default — would need either more disk (external drive, vhdx relocation — discussed 2026-07-15, not started) or further data reduction (downsample/summarize into `sl_sweep_summary`, drop raw rows post-summary) before attempting it.
 
 ## [backtest] Resolved 2026-07-15 — Phase 3 (full mesh) adds no value in every campaign tested so far
-Added `phase`/`generation`-level tracking and a `--max-phase` CLI cap (`run_optimization_sweep.py`) to test the "does Phase 3 ever actually improve on Phase 2/2.5's best node" question from the v4 plan. Result across all 30 tagged SOXL+KORU SL-sweep campaigns so far: **Phase 3 won 0/30** — Phase1 (coarse) or Phase2 (island) always held the best `MIN(possible,pessimistic,certain)` alpha node; Phase2.5 (cliff-box) won a few. Confirmed separately that island/cliff-safety selection (Checkpoint 2) already only depends on Phase1+2+2.5 data — Phase 3 was never part of that calculation. `--max-phase {1,2,2.5,3}` added (default 3, unchanged pipeline behavior); `run_phase3_full` now also logs a `Phase3 best=... (pre-Phase3 best=..., IMPROVED/no improvement)` line for live confirmation on future runs. `generation` column added (nullable, Phase2-Island rows only) to similarly test whether `max_generations=3`'s extra island-search passes earn their cost — not yet analyzed, no data collected with it live yet (added this session, only applies to rows computed after the change). Also fixed a latent gap found while touching this: the `phase` column was never created by `init_idempotent_db()` (only existed because it was added by hand against the live DB last session) — a fresh DB would have failed on `INSERT ... phase`. Now codified as a proper `ALTER TABLE ADD COLUMN`, alongside the new `generation` column.
+Full writeup moved to `docs/research_log.md` (2026-07-15 entry). Short version: Phase 3
+won 0/30 tagged SOXL+KORU campaigns; `--max-phase` cap added (default 3, unchanged
+behavior) so future runs can skip it. `generation` column added for a similar
+not-yet-analyzed question about island-search generation count.
 
 ## [backtest] High priority, 2026-07-10 (plan finalized 2026-07-14) — trailing-buy fill logic is provably optimistic, real numba kernels never fixed
 `backtester.py`'s trailing-buy "waiting" loop (`_simulate_trail_both`/`_simulate_trail_buy`) always updates `running_low` from the current bar's Low *before* checking whether that same bar's High clears the bounce trigger — silently assuming Low happens before High within every hourly bar, the best-case ordering for this strategy (lower running_low = easier/lower trigger to clear), unknowable from OHLC alone. A read-only side analysis (`scripts/export_trades.py::simulate_trail_both_ohlc_aware`) resolves each fill as CERTAIN wherever possible instead of guessing (chains of prior-bar-confirmed lows, or the bar's own Close clearing the trigger — Close is always chronologically last). Rerunning SOXL under certain-tiered logic: compounded equity on $50k dropped from **$3.55M (7007%) under the current kernel to $1.85M (3591%)** — the backtest overstates SOXL's on-file return by ~2x. This strategy family (`TrailingBuyZScoreBreakout`/`TrailingBothZScoreBreakout`) covers **all 11 tickers on the live watchlist** — every live alpha/return number on file is inflated by an unquantified amount until this is fixed.
@@ -132,7 +166,9 @@ While reviewing SOXL SL=1%, tried a quick same-day-re-buy-blocked simulation (mi
 **Fixed** (commit `cf96c56`, "Drop stale +1% SL buffer..."): the `+ 1` padding removed from all `schwab_sl_pct` call sites in `signals_notify.py`; `pos.get('broker_stop_price')` now checked first for held positions where a real tracked value exists.
 
 ## [backtest] Resolved 2026-07-14 — trailing-buy re-entry timing after a same-day exit
-Original question: if a same-day re-entry trigger hits (ticker sold, then dislocates again same day), does the live trailing-buy order need to be placed relative to the **9:30 open** or the **10:30 normal bar time**? **Resolved, no bug**: checked `_simulate_trail_both`'s actual loop (`backtester.py:538-643`) — new-signal detection is already restricted to the same two configured hours every day (`target_h0`/`target_h1`, matching the two live Slack windows), with no calendar-day reset or first-entry-of-day special-casing. A same-day re-entry is scanned for using the exact same two windows as any other entry, walk-forward, nothing to fix. The "10:30" framing in the original question was itself a misunderstanding — 10:30 was never a signal-check hour, backtest or live.
+Full writeup moved to `docs/research_log.md` (2026-07-14 entry). Short version: no bug —
+same-day re-entry uses the exact same two daily signal windows as any other entry, no
+special-casing needed.
 
 ## [execution] Research question, 2026-07-15 — when would TWAP/VWAP order execution become worth considering
 Raised as a forward-looking research question, not tied to a current incident. All live sizing is currently a single-shot market/trailing order at $50k-ish notional per trade (see [[project_execution_automation_plan]] — full API automation is planned but not yet built). Worth scoping once real API automation is underway: at what position size / ticker liquidity / order-notional-vs-avg-volume ratio does slicing an entry or exit via TWAP or VWAP start to reduce market-impact or slippage cost meaningfully vs. the current single fill? Relevant existing context: `run_optimization_sweep.py:893`/`pages/11_Universe_Scan.py:99` already compute a `max_notional = avg_vol_10d * last_price * 0.01` liquidity cap per ticker (1% of daily dollar volume) for candidate screening — the same ratio is probably the right starting lens for a TWAP/VWAP threshold. Not scoped, no design started — likely blocked on the API automation work landing first, since TWAP/VWAP only matters once orders are placed programmatically rather than manually through Schwab's UI.
