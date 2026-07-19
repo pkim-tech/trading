@@ -2,24 +2,29 @@
 
 Curated, current subset of `docs/deep_backlog.md` — read in full at session start (`go`). Full detail for every item lives in `deep_backlog.md`; this is just the active/relevant pointer list. Periodically re-triage. Resolved/dead items are pruned here once closed out — see git history or `docs/conversation_summary.md` if the old writeup is ever needed.
 
-## [live-trading] Active, 2026-07-18 — GDXD automation + paper trading build prioritized ahead of trailing-buy capital-sizing fix
-User weighed building GDXD's paper-trading layer now vs. fixing the trailing-buy sizing
-formula (idle-capital-under-worst-case-assumption item, above) first. **Decision: paper
-trading first.** Reasoning: the sizing gap only matters once real orders place
-(`dry_run=False`), nothing is live yet; scoring is done in % return terms so the sizing bug
-doesn't corrupt edge measurement, only dollar-capital efficiency; and paper trading will
-produce real fill data useful for later designing the sizing fix. **User will hedge the
-capital-exposure risk with an extra cash buffer** ("should buy us a few weeks") rather than
-fixing sizing first. Income-replacement/LLC-incorporation tax-structure question also raised
-and explicitly deferred to backlog (not scoped) — separate thread, needs real CPA input on
-entity structure; the capital-needed-for-target-income math itself can be modeled later.
-**Building now**: (A) let `schwab_safety.AUTOMATION_ENABLED_TICKERS` tickers (currently just
-GDXD) act through `_attempt_automated_buy`/`_attempt_automated_sell` even in `research` mode
-(currently gated out entirely since `active_signals._scan_buy_signals` only calls
-`notify_buy_signal` for `mode=='live'` nodes). (B) new `paper_positions`/`paper_trade_log`
-tables + a continuous (every-poll, not just signal-window) running-low/high tracker to
-simulate realistic trailing-buy/sell fills under `dry_run`, since dry_run today only logs
-"[DRY RUN] would place..." and produces no simulated fill or trackable P&L at all.
+## [live-trading] Resolved 2026-07-18 — GDXD paper-trading layer built, `add_node` fixed_sl bug fixed
+Full writeup in `docs/deep_backlog.md`. Short version: `paper_trading.py` (new module) gives
+`schwab_safety.AUTOMATION_ENABLED_TICKERS` tickers (currently `{"GDXD"}`) a real paper-trading
+simulation while they stay `research` mode — `active_signals._scan_buy_signals` routes their
+BUY signals to `paper_trading.start_paper_buy` instead of the silent research print;
+`update_paper_buys()` (every poll, unconditional) tracks a continuous running-low and
+simulates the trailing-buy bounce-fill; `check_paper_sells()` runs the real
+`signals_compute.check_sell_condition` exit state machine against the simulated position.
+Writes to new `paper_positions`/`paper_trade_log`/`paper_pending_buys` tables — never the real
+`open_positions`/`trade_log`/`pending_buys` — and never calls `schwab_client`/`schwab_safety`
+at all (pure simulation, independent of `dry_run`, which alone still produces zero fill/P&L).
+**Deliberate deviation from the original framing** (routing through the real
+`_attempt_automated_buy`/`_attempt_automated_sell` path): investigating that path found it
+would write real `pending_buys` rows nothing ever marks Filled, causing indefinite
+`check_buy_reminders` nagging for a ticker that was never actually live — the fully separate
+simulation avoids that. `scripts/paper_trading_status.py` shows current state. **Known
+limitation**: fills sampled at `POLL_SECS` cadence, not tick-perfect against a real broker's
+continuously-live `TRAILING_STOP`. Verified: full `pytest tests/` suite (92 passed, was 86 —
+6 new tests in `tests/test_paper_trading.py`), confirmed real `open_positions`/`trade_log`/
+`pending_buys` row counts unchanged after running the new code path.
+Separately, `signals_db.add_node` gained a `fixed_sl_override=None` param (falls back to old
+config-read behavior when omitted) — fixes the bug where it silently pulled `config.json`'s
+stale global default instead of the real per-node SL for any future SL-swept promotion.
 
 ## [live-trading][backtest] High priority, 2026-07-18 — promote watchlist tickers' v4 nodes (SL=1%) into live `watch_list`, replacing old v3.x SL=15% params
 Every original watchlist ticker except GDXD still runs old v3.x params (`fixed_sl=15%`,
@@ -137,17 +142,16 @@ negative-fold detail, added anyway per user decision but flagged for closer look
 `research` mode — no live signals fire, this is the automation-engine dry-run staging set.
 Verified: `pytest tests/` full suite (86 passed).
 
-## [backtest] New, 2026-07-18 — `signals_db.add_node`'s `fixed_sl` computation ignores the real per-node value for uses_fixed_sl strategies
-`add_node` (`signals_db.py`) always computes `fixed_sl = _config_fixed_stop_loss()` (reads
-`config.json`'s global `execution.fixed_stop_loss`) whenever `strategies.uses_fixed_sl(strategy)`
-is true, regardless of what real per-node SL value the caller actually wants — there's no
-parameter to override it. Found 2026-07-18 promoting 19 tickers' v4 (SL=1%) nodes: every row
-came out with `fixed_sl=15.0` (the stale global default) instead of the real `1.0`, silently
-wrong, no error. Worked around by inserting via direct SQL instead of `add_node` for this
-promotion, but the underlying function is still broken for any future SL-swept (v4-style)
-promotion through the normal path. **Action needed**: add a `fixed_sl` override parameter to
-`add_node` (default `None` → falls back to current config-read behavior for legacy v3.x
-callers), or reject the mismatch instead of silently overwriting.
+## [backtest] Resolved 2026-07-18 — `signals_db.add_node`'s `fixed_sl` computation ignored the real per-node value for uses_fixed_sl strategies
+`add_node` (`signals_db.py`) used to always compute `fixed_sl = _config_fixed_stop_loss()`
+(reads `config.json`'s global `execution.fixed_stop_loss`) whenever
+`strategies.uses_fixed_sl(strategy)` was true, regardless of what real per-node SL value the
+caller actually wanted — no parameter existed to override it. Found 2026-07-18 promoting 19
+tickers' v4 (SL=1%) nodes: every row came out with `fixed_sl=15.0` (the stale global default)
+instead of the real `1.0`, silently wrong, no error; worked around that session by inserting
+via direct SQL instead of `add_node`. **Fixed**: `add_node` gained a
+`fixed_sl_override=None` parameter — when set, used instead of `_config_fixed_stop_loss()`.
+`None` (the default) preserves old behavior for legacy v3.x callers.
 
 ## [live-trading][security] High priority, active focus as of 2026-07-18 — one brokerage account per live ticker, for blast-radius containment against a rogue algorithm
 Full detail in `docs/deep_backlog.md`. Short version: split into one brokerage account

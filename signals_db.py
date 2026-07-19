@@ -234,6 +234,75 @@ def ensure_tables():
         pb_cols = [r[1] for r in c.execute("PRAGMA table_info(pending_buys)")]
         if 'order_placed' not in pb_cols:
             c.execute("ALTER TABLE pending_buys ADD COLUMN order_placed INTEGER NOT NULL DEFAULT 0")
+
+        # paper_positions/paper_trade_log -- schema-identical mirrors of open_positions/
+        # trade_log for schwab_safety.AUTOMATION_ENABLED_TICKERS tickers running in research
+        # mode (see paper_trading.py). Never read/written by real order-placement code.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker         TEXT NOT NULL,
+                strategy       TEXT NOT NULL,
+                version        TEXT NOT NULL,
+                window         INTEGER NOT NULL,
+                take_profit    INTEGER,
+                stop_loss      INTEGER NOT NULL,
+                max_hold_hours INTEGER NOT NULL,
+                signal_price   REAL NOT NULL,
+                signal_time    TEXT NOT NULL,
+                entry_price    REAL NOT NULL,
+                entry_time     TEXT NOT NULL,
+                trade_log_id   INTEGER,
+                trail_state    TEXT,
+                trail_sell_pct REAL,
+                fixed_sl       REAL,
+                trail_buy_pct  REAL,
+                arm_sell_pct   REAL,
+                shares         REAL,
+                account        TEXT,
+                broker_stop_price REAL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS paper_trade_log (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker              TEXT NOT NULL,
+                strategy            TEXT NOT NULL,
+                version             TEXT NOT NULL,
+                window              INTEGER NOT NULL,
+                take_profit         INTEGER,
+                stop_loss           INTEGER NOT NULL,
+                max_hold_hours      INTEGER NOT NULL,
+                signal_price        REAL NOT NULL,
+                signal_time         TEXT NOT NULL,
+                entry_price         REAL NOT NULL,
+                entry_time          TEXT NOT NULL,
+                entry_drift_pct     REAL NOT NULL,
+                exit_signal_price   REAL,
+                exit_price          REAL,
+                exit_time           TEXT,
+                exit_drift_pct      REAL,
+                pnl_pct             REAL,
+                exit_reason         TEXT,
+                arm_sell_pct        REAL,
+                shares              REAL,
+                account             TEXT
+            )
+        """)
+        # paper_pending_buys -- lighter than pending_buys: no reminder machinery, since a
+        # simulated fill is auto-detected every poll (paper_trading.update_paper_buys),
+        # never confirmed by a human clicking a button.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS paper_pending_buys (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker        TEXT NOT NULL,
+                node_json     TEXT NOT NULL,
+                signal_price  REAL NOT NULL,
+                signal_time   TEXT NOT NULL,
+                running_low   REAL NOT NULL,
+                created_at    TEXT NOT NULL
+            )
+        """)
         c.commit()
 
 
@@ -346,18 +415,22 @@ def _is_trailing_buy(node):
 
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
              label='', z_score_threshold=2.0, watchlist_id=None, mode='live',
-             trail_buy_pct=None, trail_pct=None, entry_timing='close', starting_notional=50000):
+             trail_buy_pct=None, trail_pct=None, entry_timing='close', starting_notional=50000,
+             fixed_sl_override=None):
     """trail_buy_pct/trail_pct: pass the real values directly for v3.x nodes (where
     backtest_cache has real named columns). Omit both for legacy v1.x/v2.x nodes —
     falls back to reinterpreting stop_loss the way it's always meant for the 4
     trailing strategies (see docs/design.md 'Grid axis meaning by strategy').
     For v3.x trailing-both/trailing-exit nodes, the stop_loss arg is not a real
     swept value (backtest_cache stores config.execution.fixed_stop_loss there,
-    a constant) — pass whatever backtest_cache's stop_loss column shows, it's vestigial."""
+    a constant) — pass whatever backtest_cache's stop_loss column shows, it's vestigial.
+    fixed_sl_override: pass the real per-node SL (e.g. a v4 SL-sweep value) directly —
+    without it, uses_fixed_sl strategies always fall back to config.json's stale global
+    default, which is wrong for any node whose real SL differs from that default."""
     if watchlist_id is None:
         watchlist_id = get_active_watchlist_id()
     if strategies.uses_fixed_sl(strategy):
-        fixed_sl = _config_fixed_stop_loss()
+        fixed_sl = fixed_sl_override if fixed_sl_override is not None else _config_fixed_stop_loss()
         if trail_buy_pct is None and trail_pct is None:
             sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy)
             if sl_axis_col == 'trail_buy_pct':
@@ -461,22 +534,31 @@ def annotate_node(watch_id, annotation):
 # Open positions CRUD
 # ---------------------------------------------------------------------------
 
-def get_open_positions():
+def _pos_tables(paper):
+    """paper_positions/paper_trade_log are schema-identical mirrors of
+    open_positions/trade_log -- this picks which pair the caller means instead
+    of duplicating every CRUD function below."""
+    return ('paper_positions', 'paper_trade_log') if paper else ('open_positions', 'trade_log')
+
+
+def get_open_positions(paper=False):
+    positions_table, _ = _pos_tables(paper)
     with _conn() as c:
         rows = [dict(r) for r in c.execute(
-            "SELECT * FROM open_positions ORDER BY entry_time"
+            f"SELECT * FROM {positions_table} ORDER BY entry_time"
         ).fetchall()]
     for r in rows:
         r['trail_state'] = json.loads(r['trail_state']) if r.get('trail_state') else {}
     return rows
 
 
-def get_open_position(ticker):
+def get_open_position(ticker, paper=False):
     """Single-ticker lookup -- used to report what's actually live when a
     duplicate-position attempt is rejected (see open_position())."""
+    positions_table, _ = _pos_tables(paper)
     with _conn() as c:
         row = c.execute(
-            "SELECT * FROM open_positions WHERE ticker=? ORDER BY entry_time DESC LIMIT 1",
+            f"SELECT * FROM {positions_table} WHERE ticker=? ORDER BY entry_time DESC LIMIT 1",
             (ticker,)
         ).fetchone()
     return dict(row) if row else None
@@ -554,9 +636,59 @@ def update_pending_buy_reminder(pending_id, channel, ts, reminder_count):
         c.commit()
 
 
-def update_position_trail_state(position_id, state):
+_PAPER_PENDING_BUY_NODE_KEYS = _PENDING_BUY_NODE_KEYS + ('starting_notional',)
+
+
+def add_paper_pending_buy(node, sig):
+    """No reminder machinery, unlike add_pending_buy -- a paper fill is
+    auto-detected every poll (paper_trading.update_paper_buys), never confirmed
+    by a human click. Keeps starting_notional (unlike the real pending_buys node
+    subset) since update_paper_buys sizes the simulated fill directly off it,
+    with no live watch_list node to fall back on the way the real Filled-button
+    flow does."""
+    node_subset = {k: node.get(k) for k in _PAPER_PENDING_BUY_NODE_KEYS}
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with _conn() as c:
-        c.execute("UPDATE open_positions SET trail_state = ? WHERE id = ?",
+        c.execute(
+            "INSERT INTO paper_pending_buys (ticker, node_json, signal_price, signal_time, "
+            "running_low, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (node['ticker'], json.dumps(node_subset), sig['current_price'],
+             sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), sig['current_price'], now_str),
+        )
+        c.commit()
+
+
+def get_paper_pending_buys():
+    with _conn() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM paper_pending_buys").fetchall()]
+    for r in rows:
+        r['node'] = json.loads(r['node_json'])
+    return rows
+
+
+def get_paper_pending_buy(ticker):
+    with _conn() as c:
+        row = c.execute("SELECT * FROM paper_pending_buys WHERE ticker = ?", (ticker,)).fetchone()
+    return dict(row) if row else None
+
+
+def clear_paper_pending_buy(ticker):
+    with _conn() as c:
+        c.execute("DELETE FROM paper_pending_buys WHERE ticker = ?", (ticker,))
+        c.commit()
+
+
+def update_paper_pending_buy_running_low(pending_id, running_low):
+    with _conn() as c:
+        c.execute("UPDATE paper_pending_buys SET running_low = ? WHERE id = ?",
+                  (float(running_low), pending_id))
+        c.commit()
+
+
+def update_position_trail_state(position_id, state, paper=False):
+    positions_table, _ = _pos_tables(paper)
+    with _conn() as c:
+        c.execute(f"UPDATE {positions_table} SET trail_state = ? WHERE id = ?",
                   (json.dumps(state), position_id))
 
 
@@ -572,24 +704,25 @@ def closed_today(ticker):
     return row is not None
 
 
-def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None):
+def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False):
     """Returns True if a position was opened, False if skipped because one was
     already open for this ticker/window — callers that report success to Slack
     must check this, since a silent skip must not be reported as a fill."""
+    positions_table, _ = _pos_tables(paper)
     with _conn() as c:
         existing = c.execute(
-            "SELECT id FROM open_positions WHERE ticker=? AND window=?",
+            f"SELECT id FROM {positions_table} WHERE ticker=? AND window=?",
             (node['ticker'], int(node['window']))
         ).fetchone()
         if existing:
-            print(f"  [warn] position already open for {node['ticker']} w={node['window']} — skipping duplicate")
+            print(f"  [warn] {'paper ' if paper else ''}position already open for {node['ticker']} w={node['window']} — skipping duplicate")
             return False
         sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
         entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
-        trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares)
+        trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares, paper=paper)
         tp = node.get('take_profit')
-        c.execute("""
-            INSERT INTO open_positions
+        c.execute(f"""
+            INSERT INTO {positions_table}
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, trade_log_id,
                  trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares, account)
@@ -629,26 +762,28 @@ def correct_entry_price(ticker, entry_price):
         c.commit()
 
 
-def close_position(position_id, exit_signal_price=None, exit_price=None, exit_time=None, exit_reason=None):
+def close_position(position_id, exit_signal_price=None, exit_price=None, exit_time=None, exit_reason=None, paper=False):
+    positions_table, _ = _pos_tables(paper)
     with _conn() as c:
         if exit_price is not None:
             row = c.execute(
-                "SELECT trade_log_id, entry_price FROM open_positions WHERE id = ?", (position_id,)
+                f"SELECT trade_log_id, entry_price FROM {positions_table} WHERE id = ?", (position_id,)
             ).fetchone()
             if row and row[0]:
-                log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1])
-        c.execute("DELETE FROM open_positions WHERE id = ?", (position_id,))
+                log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper)
+        c.execute(f"DELETE FROM {positions_table} WHERE id = ?", (position_id,))
         c.commit()
 
 
-def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares=None):
+def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False):
+    _, trade_log_table = _pos_tables(paper)
     sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
     entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
     entry_drift    = (entry_price - signal_price) / signal_price * 100
     tp = node.get('take_profit')
     with _conn() as c:
-        c.execute("""
-            INSERT INTO trade_log
+        c.execute(f"""
+            INSERT INTO {trade_log_table}
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct, shares, account)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -664,13 +799,14 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, sh
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reason, entry_price):
+def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reason, entry_price, paper=False):
+    _, trade_log_table = _pos_tables(paper)
     exit_time_str = exit_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(exit_time, 'strftime') else exit_time
     exit_drift    = (exit_price - exit_signal_price) / exit_signal_price * 100
     pnl           = (exit_price - entry_price) / entry_price * 100
     with _conn() as c:
-        c.execute("""
-            UPDATE trade_log SET
+        c.execute(f"""
+            UPDATE {trade_log_table} SET
                 exit_signal_price = ?, exit_price = ?, exit_time = ?,
                 exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?
             WHERE id = ?

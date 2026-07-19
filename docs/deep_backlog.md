@@ -298,3 +298,71 @@ User plans to split into **one brokerage account per ticker** on the live watchl
 **Real operational cost is small, confirmed by reading the code (2026-07-17)**: these are all IRA accounts, so there's no per-trade taxable event or capital-gains paperwork to multiply (just N annual 5498/1099-R-type forms, minor). And `schwab_client.py:29-59` already uses a single `schwab_auth.get_client()` OAuth session for the whole Schwab login, resolving every nickname (`brokerage`/`sep`/`roth`/`ira` today) to an account hash via one `get_account_numbers()` call plus a `SCHWAB_ACCOUNT_<NAME>` env-var suffix match — since all these accounts are linked under one login, scaling `NICKNAMES` from 4 to a dozen-plus needs zero new logins/tokens, just more list entries and env vars, plus updating whatever mapping decides which nickname a given ticker's trades route through.
 **Deferred 2026-07-18, un-deferred same day**: briefly tagged "phase 4" alongside the API-proxy item, but the user reprioritized it as the active focus later the same session (after resolving the walk-forward negative-fold follow-up by sending DPST/NUGT/RETL/UDOW/UVIX to research instead of investigating further) — account-per-ticker setup is now the next real thread of work, not deferred infra planning. API-proxy item stays deferred on its own.
 **Action needed**: design session on account-splitting scope (how many accounts, which nicknames, `NICKNAMES`/`SCHWAB_ACCOUNT_<NAME>` mapping, which tickers get their own account first). Not started. No code changes yet.
+
+## ✅ [live-trading] Resolved 2026-07-18 — GDXD paper-trading layer built
+`dry_run=True` (the state of every real Schwab account today) only posts a Slack "[DRY RUN]
+would place..." message and produces zero simulated fill/P&L — no way to see whether the
+automation engine (`schwab_client`/`schwab_safety`, wired 2026-07-17) actually catches signals
+reliably before any ticker is flipped back to real execution. Built `paper_trading.py`
+(new module) to close that gap for `schwab_safety.AUTOMATION_ENABLED_TICKERS` tickers
+(currently `{"GDXD"}`) while they stay `research` mode:
+- `start_paper_buy(node, sig)` — called from `active_signals._scan_buy_signals` on a BUY
+  signal for a research-mode, automation-enabled ticker running a trailing-buy strategy
+  (`db._is_trailing_buy(node)`). Inserts a `paper_pending_buys` row (`running_low` seeded at
+  signal price); deduped against an existing paper position or pending row.
+- `update_paper_buys()` — called every poll, unconditionally, same "not gated to a window"
+  reasoning as `check_auto_fills` (a real trailing buy can fill any time after the signal).
+  Tracks `running_low = min(running_low, current_price)`; once
+  `current_price >= running_low * (1 + trail_buy_pct/100)`, sizes
+  `shares = int(starting_notional // current_price)` — fully deployed at the real discovered
+  fill price, the "correct" sizing approach identified in the trailing-buy capital-sizing
+  backlog item (paper trading learns the true fill price directly instead of needing the
+  live worst-case-conservative formula) — and opens a `paper_positions` row.
+- `check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache)` — mirrors the real
+  `open_positions` exit-check block in `active_signals.run_loop` exactly (same `at_bar_close`
+  detection, shares the `last_seen_bar` dict — safe since a ticker is never simultaneously
+  `live` and `research`), calling `signals_compute.check_sell_condition(..., paper=True)`, the
+  same exit state machine real positions use, writing to `paper_positions`/`paper_trade_log`
+  instead. Uses its own dedup set (`paper_sell_alerted`) since paper position ids are
+  independent of real `open_positions` ids.
+- `signals_db.py`: new `paper_positions`/`paper_trade_log` tables, schema-identical mirrors of
+  `open_positions`/`trade_log`. Existing CRUD (`get_open_positions`, `open_position`,
+  `close_position`, `log_trade_entry`, `log_trade_exit`, `update_position_trail_state`) took a
+  `paper=False` param rather than being duplicated (`_pos_tables(paper)` picks the table pair).
+  New `paper_pending_buys` table — lighter than real `pending_buys` (no reminder machinery,
+  since a paper fill is auto-detected every poll, never confirmed by a human click).
+- `signals_compute.check_sell_condition` gained a `paper=False` param: threads to
+  `db.update_position_trail_state(..., paper=paper)`, and skips the interactive
+  "Apply Correction" corp-action Slack block when `paper=True` (that button's handler assumes
+  a real `open_positions` id) — falls back to a plain freeze/print warning. Accepted gap since
+  this is scoring infrastructure, not real capital.
+**Deliberate deviation from the original framing** ("let `AUTOMATION_ENABLED_TICKERS` act
+through the existing `_attempt_automated_buy`/`_attempt_automated_sell` path"): investigating
+that path (`signals_notify.py`) found it would write real `pending_buys` rows that nothing
+ever marks Filled (no human clicks the button for a research ticker, and auto-fill-detection
+is opt-in/off) — those rows would sit forever and `check_buy_reminders` would nag every 15
+minutes about a ticker that was never actually live. Built a fully separate simulation instead
+— never calls `schwab_client`/`schwab_safety` at all, independent of `dry_run`, keeps real
+live-trading state (reminders, `open_positions`, `_attempt_automated_sell`) completely
+untouched by research-mode paper activity.
+**Known limitation**: fills are sampled at `POLL_SECS` cadence, not tick-perfect against a
+real broker's continuously-live `TRAILING_STOP` price — close enough to score signal-catching
+reliability and get directionally-real fill data, not a tick-perfect replay.
+`scripts/paper_trading_status.py` added (prints pending/open/closed paper state, matching
+`scripts/open_positions_status.py`'s convention).
+**Verified**: full `pytest tests/` suite, 92 passed (was 86 — 6 new tests in
+`tests/test_paper_trading.py` covering pending-buy dedup, running-low tracking, bounce-fill
+sizing, SL exit + `paper_trade_log` write, and that the real `open_positions`/`pending_buys`
+tables are untouched by the paper flow). Confirmed against the real `trading_live.db`: real
+`open_positions`(1)/`trade_log`(11) row counts unchanged after creating the new empty paper
+tables via `scripts/paper_trading_status.py`.
+
+## ✅ [backtest] Resolved 2026-07-18 — `signals_db.add_node`'s `fixed_sl` computation ignored the real per-node value for uses_fixed_sl strategies
+`add_node` used to always compute `fixed_sl = _config_fixed_stop_loss()` (reads
+`config.json`'s global `execution.fixed_stop_loss`) whenever `strategies.uses_fixed_sl(strategy)`
+was true, regardless of what real per-node SL value the caller actually wanted. Found
+2026-07-18 promoting 19 tickers' v4 (SL=1%) nodes: every row came out with `fixed_sl=15.0`
+instead of the real `1.0`, silently wrong, no error — worked around that session via direct
+SQL inserts. **Fixed**: `add_node` gained a `fixed_sl_override=None` parameter — when set,
+used instead of `_config_fixed_stop_loss()`; `None` (the default) preserves the old
+config-read behavior for legacy v3.x callers, so no existing call site needed to change.

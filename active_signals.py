@@ -45,6 +45,8 @@ import strategies
 import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
+import schwab_safety
+import paper_trading
 
 # --- Backward-compatible re-exports -----------------------------------------
 
@@ -152,6 +154,9 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys):
                 print(f"  [skip] BUY {sig['ticker']} z={sig['z_score']:+.2f} — position already open, no alert")
             elif node.get('mode', 'live') == 'live':
                 notify_buy_signal(node, sig)
+            elif sig['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+                paper_trading.start_paper_buy(node, sig)
+                print(f"  [paper] BUY: {node['ticker']} z={sig['z_score']:+.2f} (paper-trading)")
             else:
                 print(f"  [research] BUY: {node['ticker']} z={sig['z_score']:+.2f} (no alert)")
         else:
@@ -192,6 +197,7 @@ def run_loop(tickers: set = None):
 
     buy_alerted:        set[tuple] = set()
     sell_alerted:       set[tuple] = set()  # (position_id, bar_ts) — dedups within a bar, not across bars
+    paper_sell_alerted: set[tuple] = set()  # same shape, separate set — paper position ids aren't real ones
     window_alerted:     set[tuple] = set()
     limit_fill_alerted: set[tuple] = set()
     last_seen_bar:      dict       = {}   # ticker -> last hourly bar timestamp checked
@@ -261,7 +267,9 @@ def run_loop(tickers: set = None):
         # genuinely new hourly bar has closed since the last check, using that bar's
         # real Close/Low/High — not a live mid-bar tick — to match the backtest kernels.
         open_positions = get_open_positions()
-        open_position_keys = {(p['ticker'], p['window']) for p in open_positions}
+        paper_positions = get_open_positions(paper=True)
+        open_position_keys = ({(p['ticker'], p['window']) for p in open_positions}
+                               | {(p['ticker'], p['window']) for p in paper_positions})
         for pos in open_positions:
             if tickers and pos['ticker'] not in tickers:
                 continue
@@ -289,6 +297,8 @@ def run_loop(tickers: set = None):
                 notify_sell_signal(pos, reason, cp, target)
                 sell_alerted.add((pos['id'], last_bar_ts))
 
+        paper_trading.check_paper_sells(last_seen_bar, paper_sell_alerted, _load_cache)
+
         if _reminders_active(now):
             check_trailing_reminders(open_positions)
             check_exit_reminders(open_positions)
@@ -298,6 +308,10 @@ def run_loop(tickers: set = None):
         # resting at the broker, and auto-fill-detection is opt-in per ticker anyway
         # (schwab_safety.auto_fill_detection_enabled, off by default).
         check_auto_fills(open_positions)
+
+        # Same "not gated to a window" reasoning as check_auto_fills above -- a
+        # simulated trailing buy can bounce-fill any time after the signal fires.
+        paper_trading.update_paper_buys()
 
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")

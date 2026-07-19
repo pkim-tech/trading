@@ -168,7 +168,7 @@ def _bars_held(df_hourly, signal_time):
     return int((df_hourly.index > signal_time).sum())
 
 
-def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, high=None, df_hourly=None):
+def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, high=None, df_hourly=None, paper=False):
     strategy_cls = getattr(strategies, pos['strategy'], None)
     if strategy_cls is None:
         return None, None, False
@@ -177,7 +177,10 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
         ticker = pos['ticker']
         print(f"⚠️ Possible corporate action for {ticker}: entry_price={pos['entry_price']:.4f} "
               f"current={current_price:.4f} ratio={discontinuity:.2f} -- freezing SL/arm checks")
-        if not already_alerted_corp_action(ticker):
+        # Paper positions skip the interactive alert -- "Apply Correction"'s handler
+        # assumes a real open_positions id, and this is scoring infrastructure, not
+        # real capital, so a plain freeze (no self-heal button) is an acceptable gap.
+        if not paper and not already_alerted_corp_action(ticker):
             factor = nearest_split_factor(discontinuity)
             proposed_entry = pos['entry_price'] / factor
             value = json.dumps({"position_id": pos['id'], "ticker": ticker, "proposed_entry_price": proposed_entry})
@@ -236,5 +239,5 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
     if reason in ('WIN', 'LOSS'):
         reason = 'TRAIL'
     if new_state != old_state:
-        db.update_position_trail_state(pos['id'], new_state)
+        db.update_position_trail_state(pos['id'], new_state, paper=paper)
     return reason, price, just_activated_trailing
