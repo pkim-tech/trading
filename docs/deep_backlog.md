@@ -1,5 +1,42 @@
 # Backlog
 
+## ✅ Resolved 2026-07-20 — full 18-ticker v5 resweep completed; immediate-entry vs trailing-buy comparison; "Live v5" watchlist built
+
+The interrupted resweep (started 2026-07-20, see prior entry below) was completed the same
+day using the new per-ticker resumable queue tooling (`scripts/run_sweep_queue.sh` +
+`scripts/campaign_config.py`) instead of the old batch `run_v4_full18_resweep.sh`/
+`run_v5_full18_test.sh` scripts. Full writeup, including the immediate-entry
+(`TrailingExitZScoreBreakout`) vs trailing-buy (`TrailingBothZScoreBreakout`) cliff-safety
+comparison and two rounds of self-caught errors in that comparison (unfiltered-alpha
+mistake, then a summary-sentence contradicting the very table it was drawn from), is in
+`docs/research_log.md` ("2026-07-20 — Immediate-entry (TrailingExit) vs trailing-buy
+(TrailingBoth) full 18-ticker v5 comparison").
+
+New standing tool: `scripts/campaign_comparison_table.py` — prints the side-by-side
+TB-vs-TE comparison table (best alpha, worst_neighbor/cliff status, full node params,
+trades, win rate, liquidity) directly from `backtest_cache`, with a `--min-best` filter.
+Built because this exact table got hand-rebuilt piece by piece several times in
+conversation before being made a real script — use this going forward instead of
+re-deriving it ad hoc.
+
+**Outcome**: 10 tickers selected for a new "Live v5" watchlist (`watchlist_id=65`,
+created+activated this session, superseding `watchlist_id=57` "Live v4"): AGQ, DPST,
+GDXU, HIBL, KORU, NUGT, SOXL, UDOW, USD, YANG — split 4 `TrailingBothZScoreBreakout`
+(GDXU/HIBL/SOXL/USD) and 6 `TrailingExitZScoreBreakout` (AGQ/DPST/KORU/NUGT/UDOW/YANG),
+picked per-ticker by whichever strategy had the higher cliff-safe robust alpha at
+`fixed_sl∈{1,2,3}`. TQQQ and LABU had a viable (cliff-safe) TE node but were dropped by
+user call anyway. DUST/GDXD/NAIL/RETL/UVIX/ZSL excluded entirely — no cliff-safe node in
+either strategy at this SL range. All 10 new nodes inserted via
+`scripts/build_v5_watchlist.py` in `mode='research'` (not live, not automation-enabled) —
+see the still-open candidate-testing item in `docs/backlog_cache.md` for what's needed
+before any of these go further.
+
+Also fixed while building the comparison table: `TrailingBothZScoreBreakout`'s swept
+"stop_loss" grid axis is actually `trail_buy_pct` (real `stop_loss` column holds the
+constant `fixed_sl`) — an ad hoc query that used the literal `stop_loss` column for the
+cliff-neighborhood check produced numbers that disagreed with the real
+`identify_full_mesh_candidates` log output until this was caught and fixed.
+
 ## [live-trading][security] Medium priority, 2026-07-19 — SELL-side automated-order attempt isn't mode-gated, only ticker-gated
 
 Found while reviewing whether EDC (real open position, `research`-mode node) could safely
