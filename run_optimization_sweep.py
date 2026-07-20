@@ -243,13 +243,6 @@ def init_idempotent_db():
         )
     """)
 
-    cursor.execute("DROP INDEX IF EXISTS idx_bc_version_ticker")
-    cursor.execute("DROP INDEX IF EXISTS idx_bc_version_ticker_z_return")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_window ON backtest_cache(version, window)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker_strategy ON backtest_cache(version, ticker, strategy)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_return ON backtest_cache(version, strategy_return)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_ticker ON backtest_cache(ticker)")
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sweep_runs (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -265,6 +258,23 @@ def init_idempotent_db():
             log_file      TEXT
         )
     """)
+    conn.commit()
+    conn.close()
+
+
+def rebuild_indexes():
+    """Index maintenance costs every insert during the sweep -- deferred out of
+    init_idempotent_db (which used to run this at the start of every
+    invocation) to here, called once at the very end of a run/queue, so bulk
+    inserts across Phase1-3 aren't paying index-update overhead throughout."""
+    conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    cursor = conn.cursor()
+    cursor.execute("DROP INDEX IF EXISTS idx_bc_version_ticker")
+    cursor.execute("DROP INDEX IF EXISTS idx_bc_version_ticker_z_return")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_window ON backtest_cache(version, window)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker_strategy ON backtest_cache(version, ticker, strategy)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_return ON backtest_cache(version, strategy_return)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_ticker ON backtest_cache(ticker)")
     conn.commit()
     conn.close()
 
@@ -342,7 +352,7 @@ def _warmup_worker():
               0.05, 0.05, 1, 9, 14, 2.0)
     _simulate_limit(prices, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
                      0.05, 0.05, 1, 9, 14, 2.0)
-    _simulate_trail(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
+    _simulate_trail(prices, hilo, hilo, prices, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
                      0.05, 0.05, 1, 0.03, 9, 14, 2.0)
     _simulate_trail_buy(prices, hilo, hilo, prices, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
                          0.05, 0.05, 1, 0.03, 9, 14, 2.0)
@@ -363,6 +373,13 @@ def _config_trail_pct():
             return float(json.load(f).get("execution", {}).get("trail_pct", 3)) / 100.0
     except Exception:
         return 0.03
+
+
+def _sl_axis_real_column(sl_axis_col):
+    """Real backtest_cache column for a strategy's conceptual sl_axis (see
+    strategies.resolve_axis_columns) -- trail_pct's real column is trail_sell_pct,
+    everything else (stop_loss, trail_buy_pct) already matches its conceptual name."""
+    return 'trail_sell_pct' if sl_axis_col == 'trail_pct' else sl_axis_col
 
 
 def _trail_pcts_for_strategy(strategy_name, hp):
@@ -717,9 +734,14 @@ def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, sp
             (strategy_name, config_version, ticker, *z_thresholds, *hp['windows'], *scope_params)
         ).fetchone()[0]
 
-    if cached >= expected:
-        logger.info(f"[{ticker}] Phase1 fully cached ({cached}/{expected}). Skipping.")
-        return
+    # Disabled 2026-07-20: this was a row-count comparison, not a verification
+    # that the cached rows were computed with current code -- it silently
+    # skipped Phase 1 (and let a kernel fix go unexercised) after the
+    # backtester.py gap-fix. dispatch_parallel_grid's own per-task cache
+    # lookup below still avoids recomputing genuinely-unchanged nodes.
+    # if cached >= expected:
+    #     logger.info(f"[{ticker}] Phase1 fully cached ({cached}/{expected}). Skipping.")
+    #     return
 
     tasks = [(int(tp), int(sl), int(hold), int(w), float(z), float(tpct))
              for z    in z_thresholds
@@ -783,7 +805,7 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
                         tpct_filter = "AND trail_sell_pct=?"
                         params.append(float(tpct))
                     df_wz = pd.read_sql(f"""
-                        SELECT axis_tp AS take_profit, {sl_axis_col} AS stop_loss, max_hold_hours, alpha_vs_spy,
+                        SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, alpha_vs_spy,
                                {ROBUST_ALPHA_SQL} AS robust_alpha
                         FROM backtest_cache
                         WHERE version=? AND ticker=? AND strategy=?
@@ -822,7 +844,7 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(f"""
-            SELECT axis_tp, {sl_axis_col} AS stop_loss, max_hold_hours, window, z_score_threshold,
+            SELECT axis_tp, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, window, z_score_threshold,
                    {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct
             FROM backtest_cache
             WHERE version=? AND ticker=? AND strategy=? AND trades > 0 {scope_sql}
@@ -859,7 +881,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
     with sqlite3.connect(DB_PATH) as conn:
         for ticker in island_tickers:
             row = conn.execute(f"""
-                SELECT axis_tp, {sl_axis_col} AS stop_loss, max_hold_hours, window, z_score_threshold,
+                SELECT axis_tp, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, window, z_score_threshold,
                        {ROBUST_ALPHA_SQL} AS robust_alpha,
                        {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct
                 FROM backtest_cache
@@ -883,7 +905,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                 WHERE version=? AND ticker=? AND strategy=?
                   AND window=? AND z_score_threshold=?
                   AND axis_tp        BETWEEN ? AND ?
-                  AND {sl_axis_col}  BETWEEN ? AND ?
+                  AND {_sl_axis_real_column(sl_axis_col)}  BETWEEN ? AND ?
                   AND max_hold_hours BETWEEN ? AND ?
                   {scope_sql} {tpct_filter}
                   AND trades > 0
@@ -1202,8 +1224,10 @@ if __name__ == "__main__":
                 run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
 
     if args.skip_cache_refresh:
-        logger.info("\nSkipping cache refresh (--skip-cache-refresh).")
+        logger.info("\nSkipping cache refresh and index rebuild (--skip-cache-refresh).")
     else:
+        logger.info("\nRebuilding indexes...")
+        rebuild_indexes()
         logger.info("\nFinal cache refresh...")
         refresh_dropdown_cache()
         refresh_pivot_cache(versions=[config_version])

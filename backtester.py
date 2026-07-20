@@ -295,7 +295,7 @@ def run_backtest_v17(df_hourly, df_daily_indicators, ticker,
 
 
 @njit(cache=True)
-def _simulate_trail(prices, highs, lows, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+def _simulate_trail(prices, highs, lows, opens, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
                     take_profit, stop_loss, max_hours_to_hold, trail_pct, target_h0, target_h1, z_thresh):
     entry_i    = np.empty(MAX_TRADES, dtype=np.int64)
     exit_i     = np.empty(MAX_TRADES, dtype=np.int64)
@@ -318,6 +318,7 @@ def _simulate_trail(prices, highs, lows, hours, daily_idx, sma_arr, std_arr, tre
     n = len(prices)
     for i in range(n):
         cp   = prices[i]
+        op   = opens[i]
         high = highs[i]
         low  = lows[i]
 
@@ -325,6 +326,26 @@ def _simulate_trail(prices, highs, lows, hours, daily_idx, sma_arr, std_arr, tre
             held += 1
 
             if trailing:
+                # Open is chronologically first -- if it already gapped past the
+                # trailing-stop confirmed through the prior bar (peak not yet
+                # updated with this bar's high), that's the honest fill, not the
+                # theoretical trail_stop (mirrors the entry-side gap-through-
+                # trigger fix, see docs/backlog_cache.md).
+                trail_stop_gap = peak * (1.0 - trail_pct)
+                if op <= trail_stop_gap:
+                    exit_px = op
+                    pc = (exit_px - entry_price) / entry_price
+                    entry_i[count]    = entry_bar
+                    exit_i[count]     = i
+                    entry_p[count]    = entry_price
+                    exit_p[count]     = exit_px
+                    hours_held[count] = held
+                    results[count]    = WIN if pc > 0 else LOSS
+                    returns[count]    = pc
+                    count += 1
+                    in_trade = False
+                    trailing = False
+                    continue
                 if high > peak:
                     peak = high
                 trail_stop = peak * (1.0 - trail_pct)
@@ -343,7 +364,20 @@ def _simulate_trail(prices, highs, lows, hours, daily_idx, sma_arr, std_arr, tre
                     trailing = False
                 continue
 
-            # SL check
+            # SL check -- Open-first gap check before falling to the intrabar
+            # Low check (mirrors the entry-side gap-through-trigger fix).
+            if op <= stop_price:
+                pc = (op - entry_price) / entry_price
+                entry_i[count]    = entry_bar
+                exit_i[count]     = i
+                entry_p[count]    = entry_price
+                exit_p[count]     = op
+                hours_held[count] = held
+                results[count]    = LOSS
+                returns[count]    = pc
+                count += 1
+                in_trade = False
+                continue
             if low <= stop_price:
                 pc = (stop_price - entry_price) / entry_price
                 entry_i[count]    = entry_bar
@@ -432,7 +466,7 @@ def run_backtest_v18(df_hourly, df_daily_indicators, ticker,
     target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
 
     ei, xi, ep, xp, held, res, ret = _simulate_trail(
-        p['prices'], p['highs'], p['lows'], p['hours'], p['daily_idx'],
+        p['prices'], p['highs'], p['lows'], p['opens'], p['hours'], p['daily_idx'],
         p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
         float(take_profit), float(stop_loss), int(max_hours_to_hold), float(trail_pct),
         target_h0, target_h1, float(z_score_threshold)
@@ -582,7 +616,12 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
         in, 'certain' can end up *better* than 'possible' on a given trade —
         it is not a pessimistic-price bound, just a no-guessing one.
     Exit-side logic (SL/TP/trailing/TIME) is identical/shared across all three —
-    not an ordering ambiguity, see backlog. open_check_entry_timing: if True,
+    not an ordering ambiguity, see backlog. Both intrabar-continuous exit
+    triggers (SL, trailing-stop) check the bar's Open against the level
+    confirmed through the prior bar before falling to the Low check, same
+    gap-through-trigger treatment as the entry side (2026-07-20 fix — the
+    original fix only covered entry; exit had the identical latent bug).
+    open_check_entry_timing: if True,
     also check the bar's Open against the entry threshold before falling through
     to the normal Close check (same bar/iteration, no synthetic bar) — shared by
     all three since entry-signal timing is a behavior choice, not an ambiguity.
@@ -672,11 +711,11 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
         if in_trade:
             held += 1
             if trailing:
-                if high > peak:
-                    peak = high
-                trail_stop = peak * (1.0 - trail_pct)
-                if low <= trail_stop or held >= max_hours_to_hold:
-                    exit_px = trail_stop if low <= trail_stop else cp
+                # Open-first gap check on the trailing-stop, mirrors the entry-
+                # side gap-through-trigger fix (see docs/backlog_cache.md).
+                trail_stop_gap = peak * (1.0 - trail_pct)
+                if op <= trail_stop_gap:
+                    exit_px = op
                     pc = (exit_px - entry_price) / entry_price
                     entry_i[count] = entry_bar; exit_i[count] = i
                     entry_p[count] = entry_price; exit_p[count] = exit_px
@@ -684,6 +723,26 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                     results[count] = WIN if pc > 0 else LOSS; returns[count] = pc
                     count += 1; in_trade = False; trailing = False
                     last_exit_day = daily_idx[i]
+                else:
+                    if high > peak:
+                        peak = high
+                    trail_stop = peak * (1.0 - trail_pct)
+                    if low <= trail_stop or held >= max_hours_to_hold:
+                        exit_px = trail_stop if low <= trail_stop else cp
+                        pc = (exit_px - entry_price) / entry_price
+                        entry_i[count] = entry_bar; exit_i[count] = i
+                        entry_p[count] = entry_price; exit_p[count] = exit_px
+                        hours_held[count] = held
+                        results[count] = WIN if pc > 0 else LOSS; returns[count] = pc
+                        count += 1; in_trade = False; trailing = False
+                        last_exit_day = daily_idx[i]
+            elif op <= stop_price:
+                pc = (op - entry_price) / entry_price
+                entry_i[count] = entry_bar; exit_i[count] = i
+                entry_p[count] = entry_price; exit_p[count] = op
+                hours_held[count] = held; results[count] = LOSS; returns[count] = pc
+                count += 1; in_trade = False
+                last_exit_day = daily_idx[i]
             elif low <= stop_price:
                 pc = (stop_price - entry_price) / entry_price
                 entry_i[count] = entry_bar; exit_i[count] = i
@@ -757,11 +816,9 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
         if in_trade_p:
             held_p += 1
             if trailing_p:
-                if high > peak_p:
-                    peak_p = high
-                trail_stop_p = peak_p * (1.0 - trail_pct)
-                if low <= trail_stop_p or held_p >= max_hours_to_hold:
-                    exit_px = trail_stop_p if low <= trail_stop_p else cp
+                trail_stop_p_gap = peak_p * (1.0 - trail_pct)
+                if op <= trail_stop_p_gap:
+                    exit_px = op
                     pc = (exit_px - entry_price_p) / entry_price_p
                     entry_i_p[count_p] = entry_bar_p; exit_i_p[count_p] = i
                     entry_p_p[count_p] = entry_price_p; exit_p_p[count_p] = exit_px
@@ -769,6 +826,26 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                     results_p[count_p] = WIN if pc > 0 else LOSS; returns_p[count_p] = pc
                     count_p += 1; in_trade_p = False; trailing_p = False
                     last_exit_day_p = daily_idx[i]
+                else:
+                    if high > peak_p:
+                        peak_p = high
+                    trail_stop_p = peak_p * (1.0 - trail_pct)
+                    if low <= trail_stop_p or held_p >= max_hours_to_hold:
+                        exit_px = trail_stop_p if low <= trail_stop_p else cp
+                        pc = (exit_px - entry_price_p) / entry_price_p
+                        entry_i_p[count_p] = entry_bar_p; exit_i_p[count_p] = i
+                        entry_p_p[count_p] = entry_price_p; exit_p_p[count_p] = exit_px
+                        hours_held_p[count_p] = held_p
+                        results_p[count_p] = WIN if pc > 0 else LOSS; returns_p[count_p] = pc
+                        count_p += 1; in_trade_p = False; trailing_p = False
+                        last_exit_day_p = daily_idx[i]
+            elif op <= stop_price_p:
+                pc = (op - entry_price_p) / entry_price_p
+                entry_i_p[count_p] = entry_bar_p; exit_i_p[count_p] = i
+                entry_p_p[count_p] = entry_price_p; exit_p_p[count_p] = op
+                hours_held_p[count_p] = held_p; results_p[count_p] = LOSS; returns_p[count_p] = pc
+                count_p += 1; in_trade_p = False
+                last_exit_day_p = daily_idx[i]
             elif low <= stop_price_p:
                 pc = (stop_price_p - entry_price_p) / entry_price_p
                 entry_i_p[count_p] = entry_bar_p; exit_i_p[count_p] = i
@@ -839,11 +916,9 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
         if in_trade_c:
             held_c += 1
             if trailing_c:
-                if high > peak_c:
-                    peak_c = high
-                trail_stop_c = peak_c * (1.0 - trail_pct)
-                if low <= trail_stop_c or held_c >= max_hours_to_hold:
-                    exit_px = trail_stop_c if low <= trail_stop_c else cp
+                trail_stop_c_gap = peak_c * (1.0 - trail_pct)
+                if op <= trail_stop_c_gap:
+                    exit_px = op
                     pc = (exit_px - entry_price_c) / entry_price_c
                     entry_i_c[count_c] = entry_bar_c; exit_i_c[count_c] = i
                     entry_p_c[count_c] = entry_price_c; exit_p_c[count_c] = exit_px
@@ -851,6 +926,26 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                     results_c[count_c] = WIN if pc > 0 else LOSS; returns_c[count_c] = pc
                     count_c += 1; in_trade_c = False; trailing_c = False
                     last_exit_day_c = daily_idx[i]
+                else:
+                    if high > peak_c:
+                        peak_c = high
+                    trail_stop_c = peak_c * (1.0 - trail_pct)
+                    if low <= trail_stop_c or held_c >= max_hours_to_hold:
+                        exit_px = trail_stop_c if low <= trail_stop_c else cp
+                        pc = (exit_px - entry_price_c) / entry_price_c
+                        entry_i_c[count_c] = entry_bar_c; exit_i_c[count_c] = i
+                        entry_p_c[count_c] = entry_price_c; exit_p_c[count_c] = exit_px
+                        hours_held_c[count_c] = held_c
+                        results_c[count_c] = WIN if pc > 0 else LOSS; returns_c[count_c] = pc
+                        count_c += 1; in_trade_c = False; trailing_c = False
+                        last_exit_day_c = daily_idx[i]
+            elif op <= stop_price_c:
+                pc = (op - entry_price_c) / entry_price_c
+                entry_i_c[count_c] = entry_bar_c; exit_i_c[count_c] = i
+                entry_p_c[count_c] = entry_price_c; exit_p_c[count_c] = op
+                hours_held_c[count_c] = held_c; results_c[count_c] = LOSS; returns_c[count_c] = pc
+                count_c += 1; in_trade_c = False
+                last_exit_day_c = daily_idx[i]
             elif low <= stop_price_c:
                 pc = (stop_price_c - entry_price_c) / entry_price_c
                 entry_i_c[count_c] = entry_bar_c; exit_i_c[count_c] = i

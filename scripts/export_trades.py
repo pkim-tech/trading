@@ -44,6 +44,17 @@ def simulate_trail_both_annotated(p, take_profit, stop_loss, max_hours_to_hold,
         if in_trade:
             held += 1
             if trailing:
+                # Open-first gap check on the trailing-stop, mirrors the entry-
+                # side gap-through-trigger fix (docs/backlog_cache.md).
+                trail_stop_gap = peak * (1.0 - trail_pct)
+                if op <= trail_stop_gap:
+                    exit_px = op
+                    pc = (exit_px - entry_price) / entry_price
+                    trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                        arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=exit_px,
+                                        held=held, result=WIN if pc > 0 else LOSS, ret=pc))
+                    in_trade = trailing = False
+                    continue
                 if high > peak:
                     peak = high
                 trail_stop = peak * (1.0 - trail_pct)
@@ -54,6 +65,13 @@ def simulate_trail_both_annotated(p, take_profit, stop_loss, max_hours_to_hold,
                                         arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=exit_px,
                                         held=held, result=WIN if pc > 0 else LOSS, ret=pc))
                     in_trade = trailing = False
+                continue
+            if op <= stop_price:
+                pc = (op - entry_price) / entry_price
+                trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                    arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=op,
+                                    held=held, result=LOSS, ret=pc))
+                in_trade = False
                 continue
             if low <= stop_price:
                 pc = (stop_price - entry_price) / entry_price

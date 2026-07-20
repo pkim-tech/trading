@@ -2287,3 +2287,30 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 - **Resweep v4 campaigns** with the fixed kernel via `scripts/run_v4_backfill_sweep.sh`/`run_backfill_queue.sh` — every current v4 number is contaminated by the gap-through-trigger optimism until this runs.
 - Once Part 3 is built and the resweep is done, the trailing-buy re-sizing backlog item (top-up order, entry-price averaging) can proceed using the same cancel/order-id infra.
 - Still carried from prior sessions: one-account-per-ticker design session (now explicitly gated on paper-trading results, per 2026-07-19 discussion), dividend cash tracking, v4-promotion decision for the 19 tickers into real live `watch_list` (still blocking further live-trading rollout), daemon restart to pick up session 23's widened automation scope.
+
+---
+
+## 2026-07-20 — Exit-side gap-through-trigger fix; sweep-engine bugs found; immediate-entry-vs-trailing-buy comparison started but interrupted
+
+### What we did
+- **Raised a hypothesis**: does GDXD's (and other tickers') `trail_buy_pct` (the trailing-buy bounce-wait entry) actually earn its cost, given the newly-discovered overnight-gap frequency (2026-07-19 finding)? Started a same-kernel comparison between `TrailingBothZScoreBreakout` (trailing entry) and `TrailingExitZScoreBreakout` (immediate bar-close entry, same trailing exit).
+- **Found and fixed a second, symmetric fill-optimism bug**: the 2026-07-19 gap-through-trigger fix only covered the entry-side trailing-buy trigger. SL and trailing-stop exits (also intrabar-continuous) had the identical bug — filled at the theoretical `stop_price`/`trail_stop` even when the bar's Open had already gapped past it. Fixed in `_simulate_trail` (v1.8) and all three resolutions of `_simulate_trail_both` (v1.10), plus the parity-verified `export_trades.py::simulate_trail_both_annotated` mirror. Added `tests/test_trailing_exit_gap.py` (3 new tests, synthetic-gap pattern mirroring the entry-side tests) — full suite now 97 passed.
+- **Found and fixed two real sweep-engine bugs while trying to resweep with the corrected kernel**:
+  1. A literal-SQL-column-name bug (`_sl_axis_col` used directly in an f-string) broke for any strategy whose conceptual `trail_pct` axis is actually stored in the real `trail_sell_pct` column — never exercised before since `TrailingExitZScoreBreakout` apparently never went through Phase2+. Fixed via new `_sl_axis_real_column()` helper, 4 call sites.
+  2. `run_phase1_coarse`'s `if cached >= expected: skip` was a row-count comparison, not a correctness check — it silently served stale pre-kernel-fix numbers back out of `backtest_cache` (confirmed empirically: a resweep reproduced the exact same stale alpha). Commented out per user's call; `dispatch_parallel_grid`'s own per-task lookup still avoids recomputing genuinely-unchanged nodes.
+  3. Also moved `CREATE INDEX`/`DROP INDEX` out of `init_idempotent_db()` (ran on every invocation, maintaining indexes through every bulk insert) into a new `rebuild_indexes()`, called once at the end, gated by `--skip-cache-refresh` so a chained sequence of sweeps only pays for it on the true last call.
+- **Landed on a cleaner versioning convention** after the user questioned why TrailingBoth/TrailingExit were being split across `v4`/`v5` labels at all: `backtest_cache`'s PK already includes `strategy`, so there's no collision risk splitting by version. New convention: `v5` = everything reswept with today's corrected kernel (both strategies); `v4` stays the untouched historical pre-fix baseline. (GDXD's old `v4`/TrailingBoth rows were already deleted earlier in the session, before landing on this convention — not restorable, but the numbers are preserved in this file.)
+- **New scripts** (all follow the config.json-patch-then-restore-via-trap pattern, `--max-phase 2.5` throughout): `scripts/run_v5_gdxd_test.sh`, `scripts/run_v4_gdxd_resweep_compare.sh` (writes `v5` despite the name), `scripts/run_v4_full18_resweep.sh`/`scripts/run_v5_full18_test.sh` (18-ticker versions, tickers pulled live from `watch_list` `watchlist_id=57`).
+- **Result so far, incomplete**: GDXD's own number flipped from a stale +1442.2% alpha (pre-fix) to -37.8%/CLIFF (post-fix, corrected kernel) — a dramatic, real swing. But the full 18-ticker resweep chain was interrupted mid-run by a WSL restart (host was CPU-pegged from something else running alongside it) before any cross-ticker conclusion was reached. `config.json` was left mid-patch by the interrupted trap; restored to the committed state this session.
+- **Open, unresolved**: observed sweep throughput during the interrupted run (~125-335 nodes/sec on 9 workers/12 cores) looked lower than expected — real regression from the exit-gap kernel edit, or something else (JIT cache invalidation from `_simulate_trail`'s changed signature, worker-scaling, or the external CPU contention that prompted the restart)? Not benchmarked before the interruption.
+- Also did a manual security pass earlier in the session (grepped for SQL-injection-shaped f-string queries, ran `pip-audit` — clean) and answered a few IRA-transfer questions via web search (rollover vs. traditional IRA, internal same-firm transfers) — no code changes from that thread.
+
+### Verified
+- Full `pytest tests/` (97 passed, was 94 — 3 new in `tests/test_trailing_exit_gap.py`).
+- `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` (required since `backtester.py` changed) — both clean, only already-documented drift.
+- `pip-audit -r requirements.txt` — no known vulnerabilities.
+
+### Next session
+- Rerun `./scripts/run_v4_full18_resweep.sh --skip-cache-refresh && ./scripts/run_v5_full18_test.sh` to get the real cross-ticker comparison.
+- Benchmark raw single-core kernel throughput before assuming the observed slow sweep rate is a real kernel regression.
+- Once the full comparison exists, decide whether "immediate entry, no trailing-buy wait" is worth adopting anywhere, or was a GDXD-specific result.
