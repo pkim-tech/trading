@@ -296,7 +296,8 @@ def run_backtest_v17(df_hourly, df_daily_indicators, ticker,
 
 @njit(cache=True)
 def _simulate_trail(prices, highs, lows, opens, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
-                    take_profit, stop_loss, max_hours_to_hold, trail_pct, target_h0, target_h1, z_thresh):
+                    take_profit, stop_loss, max_hours_to_hold, trail_pct, target_h0, target_h1, z_thresh,
+                    open_check_entry_timing=False):
     entry_i    = np.empty(MAX_TRADES, dtype=np.int64)
     exit_i     = np.empty(MAX_TRADES, dtype=np.int64)
     entry_p    = np.empty(MAX_TRADES, dtype=np.float64)
@@ -428,20 +429,37 @@ def _simulate_trail(prices, highs, lows, opens, hours, daily_idx, sma_arr, std_a
 
         lower_band = sma - std * z_thresh
 
-        if has_trend:
-            trend = trend_arr[di]
-            signal = (cp <= lower_band) and (cp > trend)
-        else:
-            signal = cp <= lower_band
+        fired = False
+        if open_check_entry_timing:
+            if has_trend:
+                signal_open = (op <= lower_band) and (op > trend_arr[di])
+            else:
+                signal_open = op <= lower_band
+            if signal_open:
+                in_trade    = True
+                trailing    = False
+                entry_price = op
+                tp_price    = op * (1.0 + take_profit)
+                stop_price  = op * (1.0 - stop_loss)
+                entry_bar   = i
+                held        = 0
+                fired = True
 
-        if signal:
-            in_trade    = True
-            trailing    = False
-            entry_price = cp
-            tp_price    = cp * (1.0 + take_profit)
-            stop_price  = cp * (1.0 - stop_loss)
-            entry_bar   = i
-            held        = 0
+        if not fired:
+            if has_trend:
+                trend = trend_arr[di]
+                signal = (cp <= lower_band) and (cp > trend)
+            else:
+                signal = cp <= lower_band
+
+            if signal:
+                in_trade    = True
+                trailing    = False
+                entry_price = cp
+                tp_price    = cp * (1.0 + take_profit)
+                stop_price  = cp * (1.0 - stop_loss)
+                entry_bar   = i
+                held        = 0
 
     if in_trade:
         cp = prices[n - 1]
@@ -461,7 +479,7 @@ def _simulate_trail(prices, highs, lows, opens, hours, daily_idx, sma_arr, std_a
 def run_backtest_v18(df_hourly, df_daily_indicators, ticker,
                      mode="BACKTEST", target_hours=(9, 14),
                      take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28,
-                     z_score_threshold=2.0, trail_pct=0.03, prep=None):
+                     z_score_threshold=2.0, trail_pct=0.03, entry_timing='close', prep=None):
     p = prep if prep is not None else prep_inputs(df_hourly, df_daily_indicators)
     target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
 
@@ -469,7 +487,7 @@ def run_backtest_v18(df_hourly, df_daily_indicators, ticker,
         p['prices'], p['highs'], p['lows'], p['opens'], p['hours'], p['daily_idx'],
         p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
         float(take_profit), float(stop_loss), int(max_hours_to_hold), float(trail_pct),
-        target_h0, target_h1, float(z_score_threshold)
+        target_h0, target_h1, float(z_score_threshold), entry_timing == 'open_check'
     )
     return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
 
@@ -1411,7 +1429,7 @@ def run_backtest_dispatch(strategy_class, df_hourly, df_daily_indicators, ticker
     if issubclass(strategy_class, _strategies.TrailingExitZScoreBreakout):
         return run_backtest_v18(df_hourly, df_daily_indicators, ticker,
             take_profit=tp, stop_loss=float(fixed_sl) / 100.0, max_hours_to_hold=hold,
-            z_score_threshold=z, trail_pct=float(sl_raw) / 100.0, prep=prep)
+            z_score_threshold=z, trail_pct=float(sl_raw) / 100.0, entry_timing=entry_timing, prep=prep)
     if issubclass(strategy_class, _strategies.LimitOrderTrailingExit):
         return run_backtest_v211(df_hourly, df_daily_indicators, ticker,
             take_profit=tp, stop_loss=float(fixed_sl) / 100.0, max_hours_to_hold=hold,

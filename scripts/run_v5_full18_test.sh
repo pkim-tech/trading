@@ -14,9 +14,12 @@
 # run_v4_full18_resweep.sh's close-entry_timing campaign for the fair half of
 # the comparison.
 #
-# IMPORTANT: deletes existing version='v5' AND strategy='TrailingExitZScoreBreakout'
-# rows for these 18 tickers before sweeping, for the same reason as
-# run_v4_full18_resweep.sh (stale-cache reuse, confirmed 2026-07-20).
+# No delete: dispatch_parallel_grid's own per-node cache lookup (keyed on the
+# full param tuple) already skips any node that's genuinely been computed with
+# the current (corrected) kernel and picks up wherever a prior run left off --
+# same reasoning as run_v4_full18_resweep.sh. A blanket DELETE here would
+# throw away real, already-correct v5 rows for no reason (don't delete data;
+# versioning/per-node dedup exists so this isn't needed).
 #
 # Usage: ./scripts/run_v5_full18_test.sh [--skip-cache-refresh]
 
@@ -30,20 +33,6 @@ TRAIL_PCTS_GRID="[1,2,3,4,5,6,7]"
 
 cp config.json config.json.bak
 trap 'cp config.json.bak config.json; echo "config restored"' EXIT
-
-echo "Deleting stale v5/TrailingExitZScoreBreakout rows for: $TICKERS"
-$PYTHON - <<EOF
-import sqlite3
-tickers = "$TICKERS".split()
-conn = sqlite3.connect('cache/research/trading_universe.db')
-c = conn.cursor()
-placeholders = ",".join("?" * len(tickers))
-c.execute(f"""DELETE FROM backtest_cache WHERE version='v5'
-              AND strategy='TrailingExitZScoreBreakout'
-              AND ticker IN ({placeholders})""", tickers)
-print("deleted:", c.rowcount)
-conn.commit()
-EOF
 
 $PYTHON - <<EOF
 import json

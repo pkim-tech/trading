@@ -1,5 +1,30 @@
 # Backlog Cache
 
+## [backtest] Research idea, not started, 2026-07-20 — for a signal firing at the last (3:30) bar, market-on-close instead of trailing-buy?
+Raised by the user while discussing the overnight-gap-through-trigger fix: for
+a signal that fires right at the last close of the day (no more bars left to
+catch a bounce before the overnight gap), does waiting for a `trail_buy_pct`
+bounce (TB) actually help, or would a plain market-on-close entry do just as
+well or better? Proposed quick sanity check: for real historical last-bar
+signals, compare the entry that TB actually got vs. what a market-on-close
+fill would have gotten, and tally how often the overnight gap ends up in our
+favor vs. against. Framed as research/backlog by the user, not scheduled.
+
+## [backtest] Research idea, not started, 2026-07-20 — is overnight gap frequency/magnitude asymmetric (up-gap vs down-gap)?
+Raised while confirming the gap-through-trigger fix is symmetric across the
+trailing-buy trigger (adverse = up-gap) and the trailing-stop/SL trigger
+(adverse = down-gap) -- it is (both fixed, 2026-07-19 entry-side / 2026-07-20
+exit-side). Open question, not yet checked: do these leveraged/inverse ETFs
+actually gap up vs. down with different frequency or magnitude? If so, the
+trailing-buy side and trailing-stop side wouldn't be equally exposed to the
+fill-optimism risk in practice even though the kernel treats them
+symmetrically. **User: this should be checked across all three fill
+resolutions (possible/pessimistic/certain), not just `possible` alone** --
+same robust-alpha convention as everywhere else in the sweep engine, since
+possible/pessimistic/certain can genuinely differ on when trailing activates
+and where the peak sits, not just on the final number. Framed as
+research/backlog, not scheduled.
+
 ## [backtest] High priority, active, 2026-07-20 — full 18-ticker v5 resweep (both strategies) interrupted, needs rerun; throughput regression unresolved
 Full detail in `CLAUDE.md` Key Files (backtester.py/run_optimization_sweep.py entries) and `docs/research_log.md`. Short version: found+fixed an exit-side gap-through-trigger bug (SL/trailing-stop, mirrors the 2026-07-19 entry-side fix) plus two sweep-engine bugs (a literal-column-name SQL bug for `trail_pct`-axis strategies, and a row-count-only Phase1 skip-check that silently served stale pre-fix numbers). Landed on a cleaner versioning convention (`v5` = corrected-kernel resweep for both `TrailingBothZScoreBreakout` and `TrailingExitZScoreBreakout`; `v4` stays the untouched historical baseline) after realizing `backtest_cache`'s PK already includes `strategy`, so there was never a real reason to split the two strategies across version labels.
 **Not yet done**: the full 18-ticker resweep chain (`run_v4_full18_resweep.sh` → `run_v5_full18_test.sh`) was interrupted by a WSL restart (host was CPU-pegged) partway through — `config.json` was left mid-patch (restored to committed state this session) and no full cross-ticker comparison exists yet. GDXD's own single-ticker result flipped from a stale +1442.2% (pre-fix) to -37.8%/CLIFF (post-fix, corrected kernel) — a real, large swing, but only one ticker's worth of data.

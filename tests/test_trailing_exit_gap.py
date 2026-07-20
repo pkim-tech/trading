@@ -173,3 +173,69 @@ def test_v110_sl_exit_fills_at_open_on_gap_through_trigger_all_resolutions():
             assert exit_px < 80.655, f"{label}: fill should not be the stale stop_price (~80.655)"
     finally:
         cleanup_csv(ticker)
+
+
+def make_v110_trailing_gap_csv(ticker, entry_low=84.9, gap_open=85.0):
+    """trail_buy_pct=0.0 keeps entry fully deterministic (identical across all
+    three resolutions, same reasoning as make_v110_sl_gap_csv), isolating this
+    to the trailing-stop exit-side gap fix. Bar -14 (hour9, day D-1): signal
+    bar. Bar -13 (hour10): running_low dips to entry_low, High clears the
+    (0%-trail) trigger same bar -- entry fills at exactly entry_low (84.9).
+    Bar -12 (hour11): Close clears tp_price (93.39) -- arms trailing,
+    peak=93.5. Bars -11/-10 (hour12/13): build peak to 96 then 99 via High,
+    no exit. Bar -9 (hour14): gap bar -- Open (85.0) blows straight through
+    the trail_stop confirmed from peak=99 (94.05), but this bar's own High
+    (85.5) never comes close to 94.05 either -- pre-fix, the kernel would
+    still exit this same bar (Low 83.5 <= 94.05) but at the stale 94.05, a
+    price that never actually traded; post-fix it exits at the real Open
+    (85.0). Bar -8 (hour15) and everything before -14 is left as background
+    noise -- hour15 never checks for a new signal (target_hours=(9,14)), and
+    in_trade gates out the signal-check branch entirely while a trade is
+    open, so neither can spuriously re-trigger."""
+    timestamps, opens, highs, lows, closes = _base_frame()
+    opens[-14] = 85.0; closes[-14] = 85.0
+    highs[-14] = 85.1; lows[-14] = 85.0
+
+    opens[-13] = entry_low; closes[-13] = entry_low + 0.1
+    highs[-13] = entry_low + 0.15; lows[-13] = entry_low
+
+    opens[-12] = 85.0; closes[-12] = 93.5
+    highs[-12] = 93.6; lows[-12] = 84.8
+
+    opens[-11] = 94.0; closes[-11] = 95.5
+    highs[-11] = 96.0; lows[-11] = 95.0
+
+    opens[-10] = 96.5; closes[-10] = 98.0
+    highs[-10] = 99.0; lows[-10] = 97.5
+
+    opens[-9] = gap_open; closes[-9] = gap_open - 0.5
+    highs[-9] = gap_open + 0.5; lows[-9] = gap_open - 1.5
+
+    opens[-8] = gap_open; closes[-8] = gap_open
+    highs[-8] = gap_open + 0.2; lows[-8] = gap_open - 0.2
+
+    _write(ticker, timestamps, opens, highs, lows, closes)
+
+
+def test_v110_trailing_stop_exit_fills_at_open_on_gap_through_trigger_all_resolutions():
+    ticker = '_v110_trail_gap_test'
+    make_v110_trailing_gap_csv(ticker)
+    try:
+        df = _load(ticker)
+        strat = TrailingExitZScoreBreakout(window=10, z_score_threshold=2.0)
+        df_daily = df.resample('D').last().dropna(subset=['Close'])
+        df_ind = strat.generate_daily_indicators(df_daily)
+        # peak builds to 99 before the gap bar -> trail_stop = 99*0.95 = 94.05
+        possible, pessimistic, certain = run_backtest_v110(
+            df, df_ind, ticker,
+            take_profit=0.10, stop_loss=0.05, max_hours_to_hold=56,
+            z_score_threshold=2.0, trail_buy_pct=0.0, trail_pct=0.05,
+            return_bounds=True,
+        )
+        for label, trades in [('possible', possible), ('pessimistic', pessimistic), ('certain', certain)]:
+            assert len(trades) > 0, f"{label} produced no trades"
+            exit_px = trades[-1]['Exit Price']
+            assert exit_px == pytest.approx(85.0, abs=0.01), f"{label}: expected exit at gap Open (85.0), got {exit_px}"
+            assert exit_px < 94.05, f"{label}: fill should not be the stale trail_stop (~94.05), which never traded"
+    finally:
+        cleanup_csv(ticker)
