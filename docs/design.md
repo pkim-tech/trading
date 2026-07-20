@@ -254,6 +254,48 @@ practice — but this is unverified for the rest of the watchlist. See
 close-only entry) — worth confirming across the rest of the watchlist before acting on
 it (see `docs/backlog_cache.md`).
 
+**Gap-through-trigger fix (2026-07-19)**: found while scoping the trailing-buy
+idle-capital re-sizing item — real overnight/intraday gaps exceed a node's
+`trail_buy_pct` on **19-44% of trading days** across the active v4 watchlist
+(mean upward gap 1.6-4.4% vs. a typical 1% trigger). `_simulate_trail_both`
+(all three resolutions) and `_simulate_trail_buy` always filled a trailing-buy
+entry at the theoretical `running_low × (1 + trail_buy_pct)` trigger price,
+even when the bar's own `Open` had already proven the trigger was blown
+through (`certain`'s `op >= buy_trigger_prior` branch detected this and then
+still used the stale price) — a distinct fill-optimism source from the
+already-fixed Low/High-ordering one, closer in spirit to the deferred-SL gap
+bug found and fixed 2026-07-17 (see the `simulate_trail_both_deferred_sell`
+entry above) but on the entry side instead of the exit side. **Fixed**: all
+three resolutions in `_simulate_trail_both`, plus `_simulate_trail_buy` (which
+gained a new `opens` parameter it didn't previously take), now fill at the
+real `Open` whenever it has already crossed the trigger confirmed through the
+prior bar, before falling through to the existing Low/High logic. Verified via
+a new synthetic-gap unit test (`tests/test_TrailingBuyZScoreBreakout.py`,
+confirmed to fail pre-fix at the stale price and pass post-fix at the real
+Open) and byte-identical parity between the fixed numba kernel and the fixed
+`export_trades.simulate_trail_both_annotated` mirror on real SOXL/KORU/AGQ
+data. **Not yet backfilled**: this changes `possible`/`pessimistic`/
+`certain`/robust-alpha for every trailing-buy/-both node on file — needs the
+same resweep treatment as the original fill-optimism fix, not yet run.
+
+**Gap policy simulation (2026-07-19)**: new `export_trades.simulate_trail_both_gap_policy`
+(configurable `skip_threshold` — `None` reproduces the fixed kernel's default
+"always resize and enter at the real Open"; a float skips the entry attempt
+entirely when the gap overshoots the trigger by more than that fraction) and
+driver `scripts/sim_gap_policy.py` (sweeps `{None, 3%, 5%, 10%, 15%}` per
+ticker, `output/gap_policy_summary.csv`), built to decide the live-side policy
+empirically rather than by guessing (matches the `sim_chaos_monkey.py`/
+`sim_delayed_sell.py` pattern). **Result across the full 18-ticker v4
+watchlist**: gap-through trades have consistently low win rates (8.5%-41.8%,
+most 10-30%) confirming they're genuinely worse setups, but skipping them
+moves total compounded return only modestly and the direction is
+ticker-specific/inconsistent — no universal threshold shows a clear
+consistent edge, and no ticker shows a dramatic blowup avoided by skipping.
+Leaning toward shipping "always resize and enter" (simplest, matches the
+corrected kernel default) for the live-side fix (Part 3, not yet built:
+`schwab_client.cancel_order`, `pending_buys.order_id`, a daily pre-open
+`check_gap_risk()` — see `docs/backlog_cache.md`), pending final confirmation.
+
 ### Optimization Approach
 
 The optimizer searches for **winning islands** — regions of the (take profit, stop loss, hold time) parameter space where many neighboring nodes all produce positive alpha vs SPY. A single isolated peak is fragile; a broad plateau is robust.

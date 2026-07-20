@@ -444,7 +444,7 @@ def run_backtest_v18(df_hourly, df_daily_indicators, ticker,
 # TrailingBothZScoreBreakout / _simulate_trail_both) — not in scope for the v4
 # fill-optimism/worst-case-bound pass. See docs/backlog_cache.md.
 @njit(cache=True)
-def _simulate_trail_buy(prices, highs, lows, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+def _simulate_trail_buy(prices, highs, lows, opens, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
                         take_profit, stop_loss, max_hours_to_hold, trail_buy_pct, target_h0, target_h1, z_thresh):
     entry_i    = np.empty(MAX_TRADES, dtype=np.int64)
     exit_i     = np.empty(MAX_TRADES, dtype=np.int64)
@@ -468,6 +468,7 @@ def _simulate_trail_buy(prices, highs, lows, hours, daily_idx, sma_arr, std_arr,
     n = len(prices)
     for i in range(n):
         cp   = prices[i]
+        op   = opens[i]
         high = highs[i]
         low  = lows[i]
 
@@ -499,6 +500,16 @@ def _simulate_trail_buy(prices, highs, lows, hours, daily_idx, sma_arr, std_arr,
 
         if waiting:
             wait_bars += 1
+            # Open is chronologically first -- an overnight/intraday gap past
+            # the trigger confirmed through the prior bar is the honest fill.
+            buy_trigger_gap = running_low * (1.0 + trail_buy_pct)
+            if op >= buy_trigger_gap:
+                entry_price = op
+                tp_price    = entry_price * (1.0 + take_profit)
+                stop_price  = entry_price * (1.0 - stop_loss)
+                entry_bar   = i; held = 0
+                in_trade = True; waiting = False
+                continue
             if low < running_low:
                 running_low = low
             buy_trigger = running_low * (1.0 + trail_buy_pct)
@@ -692,17 +703,29 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                 last_exit_day = daily_idx[i]
         elif waiting:
             wait_bars += 1
-            if low < running_low:
-                running_low = low
-            buy_trigger = running_low * (1.0 + trail_buy_pct)
-            if high >= buy_trigger:
-                entry_price = buy_trigger
+            # Open is chronologically first -- if it already gapped past the
+            # trigger confirmed through the prior bar, that's the honest fill,
+            # not the theoretical trigger price (see gap-through-trigger item,
+            # docs/backlog_cache.md).
+            buy_trigger_gap = running_low * (1.0 + trail_buy_pct)
+            if op >= buy_trigger_gap:
+                entry_price = op
                 tp_price    = entry_price * (1.0 + take_profit)
                 stop_price  = entry_price * (1.0 - stop_loss)
                 entry_bar   = i; held = 0
                 in_trade = True; waiting = False; trailing = False
-            elif wait_bars >= max_hours_to_hold:
-                waiting = False
+            else:
+                if low < running_low:
+                    running_low = low
+                buy_trigger = running_low * (1.0 + trail_buy_pct)
+                if high >= buy_trigger:
+                    entry_price = buy_trigger
+                    tp_price    = entry_price * (1.0 + take_profit)
+                    stop_price  = entry_price * (1.0 - stop_loss)
+                    entry_bar   = i; held = 0
+                    in_trade = True; waiting = False; trailing = False
+                elif wait_bars >= max_hours_to_hold:
+                    waiting = False
         else:
             h = hours[i]
             if h == target_h0 or h == target_h1:
@@ -768,7 +791,13 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
             # High checked against the trigger from running_low as of the PRIOR
             # bar only — never folds in this bar's own dip, unlike 'possible'.
             buy_trigger_p = running_low_p * (1.0 + trail_buy_pct)
-            if high >= buy_trigger_p:
+            if op >= buy_trigger_p:
+                entry_price_p = op
+                tp_price_p    = entry_price_p * (1.0 + take_profit)
+                stop_price_p  = entry_price_p * (1.0 - stop_loss)
+                entry_bar_p   = i; held_p = 0
+                in_trade_p = True; waiting_p = False; trailing_p = False
+            elif high >= buy_trigger_p:
                 entry_price_p = buy_trigger_p
                 tp_price_p    = entry_price_p * (1.0 + take_profit)
                 stop_price_p  = entry_price_p * (1.0 - stop_loss)
@@ -843,7 +872,7 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
             wait_bars_c += 1
             buy_trigger_prior = running_low_c * (1.0 + trail_buy_pct)
             if op >= buy_trigger_prior:
-                entry_price_c = buy_trigger_prior
+                entry_price_c = op
                 tp_price_c    = entry_price_c * (1.0 + take_profit)
                 stop_price_c  = entry_price_c * (1.0 - stop_loss)
                 entry_bar_c   = i; held_c = 0
@@ -928,7 +957,7 @@ def run_backtest_v19(df_hourly, df_daily_indicators, ticker,
     target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
 
     ei, xi, ep, xp, held, res, ret = _simulate_trail_buy(
-        p['prices'], p['highs'], p['lows'], p['hours'], p['daily_idx'],
+        p['prices'], p['highs'], p['lows'], p['opens'], p['hours'], p['daily_idx'],
         p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
         float(take_profit), float(stop_loss), int(max_hours_to_hold), float(trail_buy_pct),
         target_h0, target_h1, float(z_score_threshold)

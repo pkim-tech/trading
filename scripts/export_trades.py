@@ -39,7 +39,7 @@ def simulate_trail_both_annotated(p, take_profit, stop_loss, max_hours_to_hold,
 
     n = len(prices)
     for i in range(n):
-        cp, high, low = prices[i], highs[i], lows[i]
+        cp, high, low, op = prices[i], highs[i], lows[i], opens[i]
 
         if in_trade:
             held += 1
@@ -76,6 +76,17 @@ def simulate_trail_both_annotated(p, take_profit, stop_loss, max_hours_to_hold,
 
         if waiting:
             wait_bars += 1
+            # Open is chronologically first -- an overnight/intraday gap past
+            # the trigger confirmed through the prior bar is the honest fill
+            # (gap-through-trigger fix, docs/backlog_cache.md).
+            buy_trigger_gap = running_low * (1.0 + trail_buy_pct)
+            if op >= buy_trigger_gap:
+                entry_price = op
+                tp_price = entry_price * (1.0 + take_profit)
+                stop_price = entry_price * (1.0 - stop_loss)
+                entry_bar = i; held = 0; arm_bar = None
+                in_trade = True; waiting = trailing = False
+                continue
             if low < running_low:
                 running_low = low
             buy_trigger = running_low * (1.0 + trail_buy_pct)
@@ -122,6 +133,144 @@ def simulate_trail_both_annotated(p, take_profit, stop_loss, max_hours_to_hold,
                             held=held, result=OPEN, ret=pc))
 
     return trades
+
+
+def simulate_trail_both_gap_policy(p, take_profit, stop_loss, max_hours_to_hold,
+                                    trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh,
+                                    skip_threshold=None, open_check=False):
+    """Same real bar-by-bar entry/exit logic as simulate_trail_both_annotated
+    (including the gap-through-trigger fix -- a bar whose Open already clears
+    the trigger fills at the real Open), but with a configurable policy for
+    what to do when that gap-through event happens (see docs/backlog_cache.md's
+    trailing-buy re-sizing item and scripts/sim_gap_policy.py):
+
+    skip_threshold=None -- always take the entry at the real (gapped) Open,
+        no matter how far past the trigger it landed. Matches the corrected
+        kernel's default behavior.
+    skip_threshold=X (e.g. 0.05) -- if the Open overshoots the theoretical
+        trigger by more than X (relative -- 0.05 = 5% beyond the trigger
+        price, not 5% in absolute terms), skip this entry attempt entirely
+        instead of chasing it. `waiting` resets exactly as it would on a
+        wait_bars timeout, so the next eligible signal window can still fire
+        fresh -- the gapped setup is abandoned, not queued.
+
+    Returns (trades, gap_events). gap_events has one dict per gap-through
+    occurrence (whether entered or skipped): {bar_i, overshoot_pct, entered}.
+    A gap_event with entered=True can be matched back to its trade via
+    trade['entry_i'] == gap_event['bar_i'] to see its eventual return."""
+    prices, highs, lows, hours, opens = p['prices'], p['highs'], p['lows'], p['hours'], p['opens']
+    daily_idx, sma_arr, std_arr = p['daily_idx'], p['sma_arr'], p['std_arr']
+    trend_arr, has_trend = p['trend_arr'], p['has_trend']
+
+    trades = []
+    gap_events = []
+    in_trade = waiting = trailing = False
+    entry_price = stop_price = tp_price = peak = 0.0
+    entry_bar = held = 0
+    running_low = 0.0
+    wait_bars = 0
+    signal_bar = None
+    signal_z = None
+    arm_bar = None
+
+    n = len(prices)
+    for i in range(n):
+        cp, high, low, op = prices[i], highs[i], lows[i], opens[i]
+
+        if in_trade:
+            held += 1
+            if trailing:
+                if high > peak:
+                    peak = high
+                trail_stop = peak * (1.0 - trail_pct)
+                if low <= trail_stop or held >= max_hours_to_hold:
+                    exit_px = trail_stop if low <= trail_stop else cp
+                    pc = (exit_px - entry_price) / entry_price
+                    trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                        arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=exit_px,
+                                        held=held, result=WIN if pc > 0 else LOSS, ret=pc))
+                    in_trade = trailing = False
+                continue
+            if low <= stop_price:
+                pc = (stop_price - entry_price) / entry_price
+                trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                    arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=stop_price,
+                                    held=held, result=LOSS, ret=pc))
+                in_trade = False
+                continue
+            if cp >= tp_price:
+                trailing = True; peak = cp; arm_bar = i
+                continue
+            if held >= max_hours_to_hold:
+                pc = (cp - entry_price) / entry_price
+                trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                    arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=cp,
+                                    held=held, result=TWIN if pc > 0 else TLOSS, ret=pc))
+                in_trade = False
+                continue
+            continue
+
+        if waiting:
+            wait_bars += 1
+            buy_trigger_gap = running_low * (1.0 + trail_buy_pct)
+            if op >= buy_trigger_gap:
+                overshoot_pct = (op / buy_trigger_gap) - 1.0
+                if skip_threshold is not None and overshoot_pct > skip_threshold:
+                    gap_events.append(dict(bar_i=i, overshoot_pct=overshoot_pct, entered=False))
+                    waiting = False
+                    continue
+                gap_events.append(dict(bar_i=i, overshoot_pct=overshoot_pct, entered=True))
+                entry_price = op
+                tp_price = entry_price * (1.0 + take_profit)
+                stop_price = entry_price * (1.0 - stop_loss)
+                entry_bar = i; held = 0; arm_bar = None
+                in_trade = True; waiting = trailing = False
+                continue
+            if low < running_low:
+                running_low = low
+            buy_trigger = running_low * (1.0 + trail_buy_pct)
+            if high >= buy_trigger:
+                entry_price = buy_trigger
+                tp_price = entry_price * (1.0 + take_profit)
+                stop_price = entry_price * (1.0 - stop_loss)
+                entry_bar = i; held = 0; arm_bar = None
+                in_trade = True; waiting = trailing = False
+                continue
+            if wait_bars >= max_hours_to_hold:
+                waiting = False
+            continue
+
+        h = hours[i]
+        if h != target_h0 and h != target_h1:
+            continue
+        di = daily_idx[i]
+        if di < 0:
+            continue
+        sma, std = sma_arr[di], std_arr[di]
+        if std == 0.0:
+            continue
+        lower_band = sma - std * z_thresh
+        fired = False
+        if open_check:
+            signal_open = (op <= lower_band) and (op > trend_arr[di]) if has_trend else op <= lower_band
+            if signal_open:
+                waiting = True; running_low = op; wait_bars = 0
+                signal_bar = i; signal_z = (op - sma) / std
+                fired = True
+        if not fired:
+            signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
+            if signal:
+                waiting = True; running_low = cp; wait_bars = 0
+                signal_bar = i; signal_z = (cp - sma) / std
+
+    if in_trade:
+        cp = prices[n - 1]
+        pc = (cp - entry_price) / entry_price
+        trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                            arm_i=arm_bar, exit_i=n - 1, entry_p=entry_price, exit_p=cp,
+                            held=held, result=OPEN, ret=pc))
+
+    return trades, gap_events
 
 
 def simulate_trail_both_deferred_sell(p, take_profit, stop_loss, max_hours_to_hold,

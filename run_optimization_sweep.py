@@ -344,7 +344,7 @@ def _warmup_worker():
                      0.05, 0.05, 1, 9, 14, 2.0)
     _simulate_trail(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
                      0.05, 0.05, 1, 0.03, 9, 14, 2.0)
-    _simulate_trail_buy(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
+    _simulate_trail_buy(prices, hilo, hilo, prices, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
                          0.05, 0.05, 1, 0.03, 9, 14, 2.0)
     _simulate_trail_both(prices, hilo, hilo, hours, daily_idx, sma_arr, std_arr, trend_arr, False,
                           0.05, 0.05, 1, 0.03, 0.03, 9, 14, 2.0, prices, False)

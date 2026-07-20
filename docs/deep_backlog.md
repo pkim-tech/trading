@@ -1,5 +1,34 @@
 # Backlog
 
+## [live-trading][security] Medium priority, 2026-07-19 — SELL-side automated-order attempt isn't mode-gated, only ticker-gated
+
+Found while reviewing whether EDC (real open position, `research`-mode node) could safely
+join the widened automation scope. `notify_trailing_activated` (`signals_notify.py:309-321`)
+is called unconditionally from the real `open_positions` exit-check loop in `run_loop` and
+calls `_attempt_automated_sell(pos, current_price)` with no check on the position's node
+`mode` — only `_attempt_automated_sell`'s own `ticker not in AUTOMATION_ENABLED_TICKERS`
+gate stands between a `research`-mode ticker's real open position and a real/dry-run
+automated sell attempt. The BUY side doesn't have this gap: `_scan_buy_signals` only
+reaches `_attempt_automated_buy` when `node.get('mode')=='live'`. This is why EDC's node
+was removed from `watch_list` rather than folded into the widened automation scope —
+adding its ticker to `AUTOMATION_ENABLED_TICKERS` while its real position's node was still
+`research` would have exposed that position's exit to the automated-sell path. **Action
+needed**: gate `_attempt_automated_sell` (or its call site) on the position's mode too,
+not just ticker membership, so this can't bite a future ticker with both a real manual
+position and an unrelated reason to be in the automation set. Not started.
+
+## [live-trading] Low priority, 2026-07-19 — paper-trading dedup is ticker-only, not `(ticker, window)`-aware
+
+`paper_trading.start_paper_buy`'s dedup guard (`db.get_paper_pending_buy(ticker)` /
+`db.get_open_position(ticker, paper=True)`) is a single-ticker lookup — unlike the real
+`open_position()`, which dedups on `(ticker, window)` (`signals_db.py:737-738`, itself not
+`node.id`-based, so two nodes sharing a `window` value would still collide there too). Fine
+today since every automation-enabled ticker has exactly one node. Would need to become
+`(ticker, window)`-aware before a ticker could ever run two nodes (e.g. a legacy v3.x node
+alongside a new v4 node) through paper trading simultaneously — the second node's BUY
+signal would otherwise be silently dropped as a false "already open" duplicate. Not
+scoped, no ticker needs this today.
+
 ## Default rule: Slack-notify on every action-requiring state change (2026-07-07)
 
 Established as a standing convention, not a one-off feature: any state transition in `active_signals.py` that requires the user to do something (place/cancel an order, confirm a fill, etc.) must have a corresponding Slack notification. Prompted by HIBL's arm-sell threshold crossing without an alert — but on investigation, the notification already exists (`notify_trailing_activated()`, fires on `just_activated_trailing` at `active_signals.py:1582-1583`) and today's miss was purely because the daemon was down the whole time since HIBL's buy signal (same root cause as the heartbeat/watchdog gap below), not a missing notification path.
