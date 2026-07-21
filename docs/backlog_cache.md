@@ -1,5 +1,52 @@
 # Backlog Cache
 
+## [live-trading] Designed 2026-07-21, not started — Entry Trigger/Fill/SL-Placement/Arm-latency automation for TrailingExitZScoreBreakout (Part 4)
+Full plan at `/home/pkim/.claude/plans/replicated-gliding-quasar.md` (not
+git-tracked) — user wants to review it in detail before coding starts, so no
+implementation this session. Short version: automates the 6 `TrailingExitZScoreBreakout`
+watchlist-65 tickers' (AGQ, DPST, KORU, NUGT, UDOW, YANG) currently-fully-manual
+BUY flow. Four real gaps found and designed for, each backed by evidence pulled
+this session, not assumed:
+1. **Entry Trigger precision**: ambient 5-min polling samples price up to
+   ~10 min after the true bar Open/Close (measured real drift: 1.78% avg at
+   the 9:30 open, worse for choppier tickers). Fix: 4 pinned single-shot
+   checks/day (9:30:02, 10:30:02, 14:30:02, 15:30:02), using Schwab's real
+   `quote.openPrice` field (confirmed present in a live API call) for the two
+   open-check times — exactly matches the backtest kernel's literal bar
+   `Open`, eliminating detection drift entirely for those two windows.
+2. **Entry Fill sizing**: reuses Part 3's existing padded-sizing/top-up
+   machinery, generalized from trailing-buy orders to plain market orders.
+3. **SL Placement — real gap, not previously automated for any ticker**:
+   `schwab_client.py` has no fixed-price STOP order function at all; a
+   pre-arm SL breach has zero automated order path today. Designed a new
+   `place_stop_loss` (buildable with the already-installed `schwab-py`
+   library's `OrderType.STOP`), placed via a **synchronous fast-confirm**
+   step (~10s budget) immediately after the buy fills — deliberately
+   decoupled from the async top-up reconciliation pipeline, since routing SL
+   placement through that pipeline's slow fallback (5-min poll if the
+   websocket is down) would leave a freshly-entered position completely
+   unprotected for up to 5 minutes. Real priority given ~70-80% of this
+   strategy's trades exit via SL — this is the primary defense mechanism, not
+   an edge case. Resized (cancel+replace) once the top-up resolves, and
+   handed off (canceled, replaced by the trailing-sell order) on TP arm.
+4. **Arm/TP detection latency**: the arm *decision* already correctly uses
+   the bar's real historical Close (no drift), but detecting a newly-closed
+   bar still rides the ambient 5-min poll — and since `place_trailing_sell`'s
+   real starting reference is live price at *submission* time (not anything
+   passed in code), a late detection can mean the live trailing order starts
+   from a materially drifted (lower) peak than the backtest assumed. Fix:
+   extend the pinned-check infra to all 7 hourly bar boundaries for open
+   positions on automation-enabled tickers, collapsing detection latency to
+   ~2s.
+
+Verification designed as three deliverables before any real order placement:
+(1) offline backtest-replay validation script, (2) live Schwab-quote/yfinance
+data-quality logging over real trading days (can't be backfilled), (3) wiring
+the new logic into the existing `paper_trading.py` simulation layer so it
+exercises real market-hours data before any `dry_run=False` flip. Full test
+plan included in the plan file. **Action needed**: user reviews the plan in
+detail, then implementation begins in a future session.
+
 ## [live-trading] Implemented 2026-07-21, not yet live-tested — trailing-buy budget adherence (Part 3: padded sizing + overnight gap guard + post-fill top-up)
 Full writeup in `docs/design.md` (Layer 3, "Part 3" entry) and `docs/research_log.md`'s
 2026-07-21 design entry. Resolves both the "trailing-buy needs re-sizing" and

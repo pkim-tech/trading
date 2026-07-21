@@ -2494,3 +2494,32 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 - First real (still dry_run) exercise of the daemon with `schwab_stream` running, to see the account-activity payload shape for real and confirm `_parse_activity_message` actually matches it.
 - Backlog same-day-block account-type awareness item still open (separately flagged, not part of Part 3).
 - Everything else still carried from prior sessions: wash-sale holds (GDXU/AGQ, clears 2026-08-05/06), one-account-per-ticker design (user is leaning toward doing this), dividend cash tracking, sweep-throughput benchmark, kernel-versioning idea.
+
+---
+
+## 2026-07-21 — Real intraday drift measured, then designed Part 4 (Entry Trigger/Fill/SL-Placement/Arm-latency automation) via a full plan-mode session
+
+### What we did
+- **Real intraday drift research**: built `scripts/sim_open_window_volatility.py` (new, committed) to measure real price drift across the live daemon's four signal-reaction windows (morning-open 9:30-9:40, midday-open 14:30-14:40, morning-close 10:25-10:40, afternoon-close 15:25-15:40) for all 10 watchlist-65 tickers, plus a minute-by-minute drift-accumulation profile for the morning open specifically. Findings written up in full in `docs/research_log.md`'s 2026-07-21 entry: the 9:30 open is 3-4x more volatile than the midday/afternoon windows (avg 1.78% vs 0.44-0.51% mean deviation); 90.6% of `TrailingExitZScoreBreakout` entries resolve via the open-check branch, 72% of those at the (calmer) afternoon open-check; drift builds up roughly linearly through the 10-minute window rather than being purely an instantaneous opening-print artifact.
+- **Confirmed a real mechanism fact along the way**: the live daemon's `entry_timing='open_check'` doesn't read a literal exchange Open tick — it polls earlier using whatever the live price is at that moment, an approximation of the backtest kernel's literal Open-column check. Confirmed the two live open_check windows (9:31-9:40, 14:31-14:40) correctly mirror the backtest, which evaluates `open_check_entry_timing` at both `target_h0=9` and `target_h1=14`. Also found the ~10-minute window width isn't arbitrary — it exists because `POLL_SECS=300` (5-min default cadence) isn't phase-aligned to the market clock.
+- **Full plan-mode design session for Part 4** (automating the `TrailingExitZScoreBreakout` bar-close/open-check BUY flow for the 6 watchlist-65 tickers currently fully manual: AGQ, DPST, KORU, NUGT, UDOW, YANG). Plan written to `/home/pkim/.claude/plans/replicated-gliding-quasar.md` (not git-tracked), covering:
+  - **Entry Trigger**: 4 pinned single-shot checks/day (9:30:02, 10:30:02, 14:30:02, 15:30:02) instead of ambient polling, using Schwab's real `quote.openPrice` field (confirmed present in a live API call this session) for the two open-check times — exactly matches the backtest kernel's literal bar Open, eliminating detection drift for those two windows.
+  - **Entry Fill**: generalizes Part 3's existing padded-sizing/top-up machinery from trailing-buy orders to plain market orders.
+  - **SL Placement — real gap found**: `schwab_client.py` has no fixed-price STOP order function at all; a pre-arm SL breach has zero automated order path today, for any ticker. Designed a new `place_stop_loss` (buildable with the already-installed `schwab-py` library's `OrderType.STOP`/`set_stop_price`), placed via a synchronous fast-confirm step (~10s budget) immediately after the buy fills — deliberately decoupled from the async top-up reconciliation pipeline after realizing that pipeline's slow fallback (5-min poll if the websocket is down) would leave a freshly-entered position completely unprotected for up to 5 minutes. Real priority given ~70-80% of this strategy's trades exit via SL. Resized once the top-up resolves; handed off (canceled, replaced by the trailing-sell order) on TP arm.
+  - **Arm/TP detection latency — real gap found**: the arm decision already correctly uses the bar's real historical Close, but detecting a newly-closed bar still rides the ambient 5-min poll, and `place_trailing_sell`'s real starting reference is live price at submission time (not anything passed in code) — a late detection means the live trailing order can start from a materially drifted peak vs. what the backtest assumed. Fix: extend the pinned-check infra to all 7 hourly bar boundaries for open positions on automation-enabled tickers.
+  - Verification designed as three deliverables before any real order placement: offline backtest-replay validation, live Schwab-quote/yfinance data-quality logging over real trading days, and wiring into the existing `paper_trading.py` simulation layer (found it currently no-ops for non-trailing-buy nodes — a real gap this closes).
+- **Docs updated**: `docs/research_log.md` gained the volatility-research entry; `docs/backlog_cache.md` gained a full Part 4 pointer entry.
+
+### Verified
+- Real Schwab `get_quote` API call confirmed `quote.openPrice` field exists and is distinct from `lastPrice`.
+- Real `schwab-py` library confirmed `OrderType.STOP`/`OrderBuilder.set_stop_price()` exist, usable for the new stop-loss placement function.
+- Real historical trade data (via `run_backtest_dispatch`) confirmed entry-hour distribution and open-check-vs-close-fallback resolution mix for all 6 `TrailingExitZScoreBreakout` tickers.
+
+### Current state
+- No implementation code changed this session — Part 4 is fully designed but not started. User wants to review the plan file in detail with fresh eyes before any coding begins.
+- `scripts/sim_open_window_volatility.py` is the only new committed code artifact this session (a research/measurement tool, not part of the live daemon).
+
+### Next session
+- User reviews `/home/pkim/.claude/plans/replicated-gliding-quasar.md` in detail.
+- Once approved, implement Part 4 in the sequence the plan specifies: backtest-replay validation first (fast, offline) → land all code sections together → run paper trading + live data-quality logging concurrently over several real trading days → only then consider any `dry_run=False` flip.
+- Carried forward from prior sessions: wash-sale holds (GDXU/AGQ, clears 2026-08-05/06), one-account-per-ticker design, dividend cash tracking, sweep-throughput benchmark, kernel-versioning idea, `same_day_block` account-type-awareness gap.
