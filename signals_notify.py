@@ -9,6 +9,7 @@ import json
 import time
 from datetime import datetime
 
+import strategies
 import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
@@ -51,7 +52,10 @@ def _attempt_automated_sell(pos, current_price):
     """Sell-side mirror of _attempt_automated_buy -- places the trailing-sell
     order via schwab_client for a pilot-scope ticker instead of waiting on the
     'Order Placed' button. Returns False on any block/failure (falls back to
-    the manual flow)."""
+    the manual flow). If a STOP order is already resting from entry
+    (pos['sl_order_id'], Part 4 Section 6), cancels it first -- otherwise both
+    orders would be live simultaneously for the same shares (oversell attempt
+    or rejected order)."""
     ticker = pos['ticker']
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         return False
@@ -60,6 +64,14 @@ def _attempt_automated_sell(pos, current_price):
     trail_sell_pct = pos.get('trail_sell_pct')
     if not shares or not trail_sell_pct:
         return False
+    sl_order_id = pos.get('sl_order_id')
+    if sl_order_id:
+        try:
+            schwab_client.cancel_order(account, ticker, sl_order_id)
+        except Exception as e:
+            _post_message(f"⚠️ {ticker} failed to cancel resting stop-loss {sl_order_id} before "
+                          f"arming trailing-sell: {e} — falling back to manual")
+            return False
     try:
         schwab_client.place_trailing_sell(account, ticker, shares, current_price, trail_sell_pct)
     except schwab_safety.SafetyViolation:
@@ -68,6 +80,85 @@ def _attempt_automated_sell(pos, current_price):
         _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual")
         return False
     return True
+
+
+def _attempt_automated_market_buy(node, sizing):
+    """Market-buy mirror of _attempt_automated_buy (Part 4, Section 4) --
+    places a real (or dry_run) plain market order via schwab_client.place_equity_buy
+    for a pilot-scope, non-trailing-buy node (e.g. TrailingExitZScoreBreakout)
+    instead of waiting on the manual price-entry flow. Returns (False, None) if
+    the ticker isn't in automation scope or schwab_safety blocks the order."""
+    ticker = node['ticker']
+    if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        return False, None
+    account = node.get('account')
+    try:
+        _, order_id = schwab_client.place_equity_buy(account, ticker, sizing['shares'], sizing['price'])
+    except schwab_safety.SafetyViolation:
+        return False, None
+    except Exception as e:
+        _post_message(f"⚠️ {ticker} automated market-buy placement failed unexpectedly: {e} — falling back to manual")
+        return False, None
+    return True, order_id
+
+
+_SL_FAST_CONFIRM_ATTEMPTS = 5
+_SL_FAST_CONFIRM_INTERVAL_SECS = 2
+
+
+def _place_stop_loss_for_position(node, ticker, fill_price):
+    """Places the real resting STOP order for a freshly-opened automated
+    market-buy position (Part 4, Section 6) -- reads the final share count
+    back off open_positions (post any top-up _reconcile_fill already applied)
+    so the stop covers the whole position, not just a provisional quantity."""
+    pos = db.get_open_position(ticker)
+    if not pos or not pos.get('shares'):
+        return
+    account = node.get('account')
+    sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos['stop_loss']
+    if not sl_pct:
+        return
+    stop_price = fill_price * (1 - sl_pct / 100)
+    try:
+        _, sl_order_id = schwab_client.place_stop_loss(account, ticker, int(pos['shares']), stop_price)
+    except schwab_safety.SafetyViolation as e:
+        _post_message(f"\U0001F6A8 {ticker} — stop-loss placement blocked: {e} — position UNPROTECTED")
+        return
+    except Exception as e:
+        _post_message(f"\U0001F6A8 {ticker} — stop-loss placement failed unexpectedly: {e} — position UNPROTECTED")
+        return
+    if sl_order_id is not None:
+        db.set_sl_order_id(ticker, sl_order_id)
+
+
+def _sync_confirm_and_protect(ticker, node):
+    """Synchronous fast-confirm step (Part 4, Section 6), run immediately after
+    an automated market buy is placed -- ~70-80% of this strategy's trades exit
+    via SL, the primary defense mechanism, so a freshly-opened position needs a
+    resting stop within seconds, not whenever the async fill pipeline
+    (schwab_stream websocket + check_auto_fills 5-min poll fallback) happens to
+    notice. A market order fills in seconds, so this short budget covers the
+    normal case. On a hit, reuses _reconcile_buy_fill directly (idempotent/
+    dedup-safe via clearing pending_buys first, same as the poll/websocket
+    paths) so the position opens, tops up, and gets protected in one place.
+    On timeout (rare -- API/exchange hiccup), fires an urgent Slack alert
+    instead of silently deferring -- the position will still get protected
+    once the async pipeline eventually confirms the fill and re-triggers this,
+    but a human should know about the gap in the meantime."""
+    account = node.get('account')
+    ticker_label = ticker
+    for _ in range(_SL_FAST_CONFIRM_ATTEMPTS):
+        fill = schwab_client.get_filled_order(account, ticker, 'BUY')
+        if fill is not None:
+            break
+        time.sleep(_SL_FAST_CONFIRM_INTERVAL_SECS)
+    else:
+        _post_message(f"\U0001F6A8 {ticker_label} — market buy placed but fill not confirmed after "
+                      f"{_SL_FAST_CONFIRM_ATTEMPTS * _SL_FAST_CONFIRM_INTERVAL_SECS}s — position may be "
+                      f"temporarily UNPROTECTED (no stop-loss resting). Will be placed once the fill is "
+                      f"confirmed by the auto-fill poll or account-activity stream.")
+        return
+    _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], place_sl=True)
 
 
 # ---------------------------------------------------------------------------
@@ -99,24 +190,43 @@ def notify_buy_signal(node, sig):
     print(sep)
 
     trailing_buy = db._is_trailing_buy(node)
+    market_buy_eligible = (not trailing_buy) and (ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS)
     auto_placed = False
     order_id = None
     if trailing_buy:
         sizing = buy_order_sizing(node, sig)
         auto_placed, order_id = _attempt_automated_buy(node, sizing)
+    elif market_buy_eligible:
+        sizing = buy_order_sizing(node, sig)
+        auto_placed, order_id = _attempt_automated_market_buy(node, sizing)
 
     channel, ts = _post_message(
         f"BUY SIGNAL — {ticker}  ${price:.4f}  z={z:.2f}  ({bar_str})",
         _build_buy_blocks(node, sig, auto_placed=auto_placed),
     )
 
-    # Tracked regardless of INTERACTIVE -- a trailing-buy order is still pending
-    # fill confirmation even in SIM_MODE or webhook-only (non-socket) runs, where
-    # there's no button to click but the reminder loop should still nag.
-    if trailing_buy:
+    # Tracked regardless of INTERACTIVE -- a trailing-buy or automated-market-buy
+    # order is still pending fill confirmation even in SIM_MODE or webhook-only
+    # (non-socket) runs, where there's no button to click but the reminder loop
+    # should still nag. Not gated on auto_placed -- a failed/blocked automated
+    # placement must still fall back to the existing manual reminder flow
+    # instead of silently dropping the signal.
+    if trailing_buy or market_buy_eligible:
         db.add_pending_buy(node, sig, channel, ts, order_id=order_id)
         if auto_placed:
-            db.mark_pending_buy_placed(ticker)
+            if trailing_buy:
+                db.mark_pending_buy_placed(ticker)
+            else:
+                # Market-buy sync-confirm (Part 4, Section 6) -- runs the
+                # synchronous fast-confirm poll and, on a hit, opens/tops-up/
+                # protects the position directly (via _reconcile_buy_fill),
+                # rather than waiting on the async pending_buys reminder flow.
+                _sync_confirm_and_protect(ticker, node)
+
+    if market_buy_eligible and auto_placed:
+        print(f"  {ticker} market buy order auto-placed — fill confirmation and SL placement "
+              f"handled synchronously above.")
+        return
 
     if cfg.INTERACTIVE:
         chart = _chart_buy(node, sig)
@@ -595,12 +705,15 @@ def _reconcile_fill(node, fill_price, filled_shares):
                       f"(no corrective sell placed)")
 
 
-def _reconcile_buy_fill(ticker, fill_price, filled_shares):
+def _reconcile_buy_fill(ticker, fill_price, filled_shares, place_sl=False):
     """Single entry point for a detected BUY fill -- shared by check_auto_fills
-    (slow poll path) and drain_fill_queue (fast websocket path, Part 3). Clears
+    (slow poll path), drain_fill_queue (fast websocket path, Part 3), and
+    _sync_confirm_and_protect (synchronous fast-confirm path, Part 4). Clears
     the pending_buys row before acting (the existing dedup marker: whichever
     path notices the fill first wins, the other finds nothing to do), opens the
-    real position, then tops it up via _reconcile_fill."""
+    real position, then tops it up via _reconcile_fill. place_sl=True (only
+    passed by the market-buy sync-confirm path) places the resting STOP order
+    once the position is open/topped-up."""
     pendings = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
     if not pendings:
         return
@@ -617,6 +730,8 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares):
     _post_message(f"🤖 {ticker} — auto-detected fill at ${fill_price:.4f}  "
                   f"(drift: {drift_pct:+.2f}%)  {filled_shares:g} shares")
     _reconcile_fill(node, fill_price, filled_shares)
+    if place_sl:
+        _place_stop_loss_for_position(node, ticker, fill_price)
 
 
 _GAP_RESIZE_PAD_PCT = 5.0

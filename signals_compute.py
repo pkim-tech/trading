@@ -111,7 +111,14 @@ def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override
     last_row      = indicators.iloc[-1]
     close_series  = df_hourly['Close'].dropna()
     last_bar      = close_series.index[-1]
-    daily_closes = df_daily['Close'].dropna()
+    # df_daily_prior (already sliced to < today, same frame the indicators are
+    # computed from), not the unsliced df_daily -- the latter's last row can be
+    # today's own partial/in-progress bar (live) or a day at/after `as_of` (replay),
+    # either way not what "previous close" means. Found 2026-07-21 via Part 4's
+    # backtest-replay verification script, which replays historical as_of dates and
+    # was getting today's real (years-later) close back as "prev_close", spuriously
+    # tripping the corporate-action discontinuity guard on every replayed signal.
+    daily_closes = df_daily_prior['Close'].dropna()
     prev_close = float(daily_closes.iloc[-1]) if not daily_closes.empty else close_series.iloc[-1]
     if price_override is not None:
         current_price = price_override

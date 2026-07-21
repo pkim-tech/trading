@@ -37,7 +37,7 @@ import time
 import threading
 import contextlib
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from data_manager import fetch_live_data_smart
 import strategies
@@ -46,6 +46,7 @@ import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
 import schwab_safety
+import schwab_client
 import schwab_stream
 import paper_trading
 
@@ -114,6 +115,18 @@ _OPEN_CHECK_WINDOWS = [(9, 31, 9, 40), (14, 31, 14, 40)]
 # has happened. Fires once daily, same pattern as _REFERENCE_TIMES/reference_alerted.
 _GAP_CHECK_WINDOW = (9, 15, 9, 29)
 
+# Pinned single-shot checks (Part 4) -- one per hourly bar boundary during market
+# hours (+2s buffer for the print to have landed), instead of relying on ambient
+# POLL_SECS-cadence polling to notice a bar closed/opened. Two purposes, one
+# scheduling mechanism: entry-signal detection at the 4 real signal-reaction
+# moments (_PINNED_ENTRY_TIMES, Section 1a) and exit-arm-latency reduction at all
+# 7 (Section 1b, open positions only).
+_PINNED_BAR_TIMES = [(9, 30, 2), (10, 30, 2), (11, 30, 2), (12, 30, 2), (13, 30, 2), (14, 30, 2), (15, 30, 2)]
+_PINNED_ENTRY_TIMES = {(9, 30), (10, 30), (14, 30), (15, 30)}
+# The two moments where the backtest's literal bar Open is what's being matched
+# (vs. 10:30/15:30, which approximate the just-closed bar's Close).
+_PINNED_OPEN_TIMES = {(9, 30), (14, 30)}
+
 # Reference report fires once at each of these times daily -- early (7am) so
 # there's a report before the day even starts, before the open, and before the
 # afternoon signal window, so a fresh full-watchlist view lands ahead of the
@@ -141,13 +154,38 @@ def _in_buy_window(now):
     return _in_window(now, _SIGNAL_WINDOWS)
 
 
-def _scan_buy_signals(nodes, buy_alerted, open_position_keys):
+def _seconds_until_next_pinned_target(now):
+    """Seconds until the next _PINNED_BAR_TIMES moment (today or, if today's are
+    all past, tomorrow's first) -- lets the main loop wake early right before a
+    pinned target instead of free-running past it on POLL_SECS cadence."""
+    todays = [now.replace(hour=h, minute=m, second=s, microsecond=0) for h, m, s in _PINNED_BAR_TIMES]
+    upcoming = [t for t in todays if t > now]
+    if upcoming:
+        target = min(upcoming)
+    else:
+        h, m, s = _PINNED_BAR_TIMES[0]
+        target = (now + timedelta(days=1)).replace(hour=h, minute=m, second=s, microsecond=0)
+    return (target - now).total_seconds()
+
+
+def _sleep_until_next_cycle(now):
+    """Wakes early right before the next pinned bar-time target instead of
+    free-running the full POLL_SECS past it, while otherwise behaving exactly
+    like the old flat time.sleep(POLL_SECS)."""
+    time.sleep(min(POLL_SECS, max(1, _seconds_until_next_pinned_target(now))))
+
+
+def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=None):
     """Runs compute_buy_signal over `nodes` and fires notify_buy_signal on new BUYs.
-    Shared by both the open-check and regular close-window polls (see
-    _OPEN_CHECK_WINDOWS) so a node checked in either window gets identical handling."""
+    Shared by the open-check/close-window ambient polls and the pinned single-shot
+    checks (_scan_pinned_entry) so a node checked from any of them gets identical
+    handling -- price_overrides (ticker -> price) lets the pinned path substitute a
+    precise fetched price for the default ambient yfinance lookup inside
+    compute_buy_signal."""
+    price_overrides = price_overrides or {}
     summaries = []
     for node in nodes:
-        sig = compute_buy_signal(node)
+        sig = compute_buy_signal(node, price_override=price_overrides.get(node['ticker']))
         if sig is None:
             summaries.append(f"{node['ticker']} w={node['window']} NO_DATA")
             continue
@@ -171,6 +209,70 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys):
                 f"{sig['ticker']}{mode_tag} z={sig['z_score']:+.2f} {sig['signal']}"
             )
     return summaries
+
+
+def _scan_pinned_entry(target_h, target_m, watchlist, buy_alerted, open_position_keys):
+    """Pinned single-shot entry check (Part 4, Section 1a) -- fetches a precise
+    price (Schwab's true session Open at 9:30/14:30, matching the backtest
+    kernel's literal bar Open exactly; a live quote at 10:30/15:30) instead of
+    relying on ambient POLL_SECS-cadence polling, for automation-enabled
+    open_check nodes only. Delegates to _scan_buy_signals via price_overrides so
+    there's one alert code path for both ambient and pinned checks."""
+    nodes = [n for n in watchlist
+             if n.get('entry_timing') == 'open_check' and n['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS]
+    if not nodes:
+        return []
+    is_open_check = (target_h, target_m) in _PINNED_OPEN_TIMES
+    price_overrides = {}
+    for node in nodes:
+        ticker = node['ticker']
+        if ticker in price_overrides:
+            continue
+        try:
+            if is_open_check:
+                price, is_true_open = schwab_client.get_session_open_price(ticker)
+            else:
+                price, is_true_open = schwab_client.get_current_price(ticker), False
+        except Exception as e:
+            print(f"  [pinned] {ticker} price fetch failed at {target_h:02d}:{target_m:02d}: {e}")
+            continue
+        price_overrides[ticker] = price
+        db.log_open_price_quality(ticker, target_h, target_m, price, is_true_open)
+    return _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=price_overrides)
+
+
+def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
+    """Pinned bar-boundary exit-arm check (Part 4, Section 1b) -- collapses the
+    up-to-5-minute ambient-poll detection gap on a newly-closed bar to ~2s for
+    open positions on automation-enabled tickers, since place_trailing_sell's
+    real starting reference is live price at order-submission time, not
+    anything computed here -- a late detection means the real trailing order
+    can start from a materially drifted (lower) peak than the backtest
+    assumed. Decision logic is unchanged (check_sell_condition); this only
+    changes *when* it runs. Shares sell_alerted/last_seen_bar with the ambient
+    exit-check loop, so whichever notices a bar-close first suppresses the
+    other -- call this before that loop each iteration."""
+    for pos in open_positions:
+        if pos['ticker'] not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            continue
+        df_hourly, _ = _load_cache(pos['ticker'])
+        if df_hourly is None or df_hourly.empty:
+            continue
+        last_bar_ts = df_hourly.index[-1]
+        if (pos['id'], last_bar_ts) in sell_alerted:
+            continue
+        if last_seen_bar.get(pos['ticker']) == last_bar_ts:
+            continue  # no new bar since the last check -- nothing to react to early
+        last_seen_bar[pos['ticker']] = last_bar_ts
+        bar = df_hourly.iloc[-1]
+        cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
+        reason, target, just_activated_trailing = check_sell_condition(
+            pos, cp, datetime.now(), at_bar_close=True, low=low, high=high, open_price=op, df_hourly=df_hourly)
+        if just_activated_trailing:
+            notify_trailing_activated(pos, cp)
+        if reason:
+            notify_sell_signal(pos, reason, cp, target)
+            sell_alerted.add((pos['id'], last_bar_ts))
 
 
 def run_loop(tickers: set = None):
@@ -223,6 +325,10 @@ def run_loop(tickers: set = None):
     }
     _gap_h1, _gap_m1 = _GAP_CHECK_WINDOW[2], _GAP_CHECK_WINDOW[3]
     gap_check_alerted: set[str] = {last_date} if (_now0.hour, _now0.minute) >= (_gap_h1, _gap_m1) else set()
+    pinned_bar_alerted: set[tuple] = {
+        (last_date, h, m) for h, m, s in _PINNED_BAR_TIMES
+        if (_now0.hour, _now0.minute) >= (h, m)
+    }
 
     while True:
         now   = datetime.now()
@@ -235,6 +341,7 @@ def run_loop(tickers: set = None):
             limit_fill_alerted.clear()
             reference_alerted.clear()
             gap_check_alerted.clear()
+            pinned_bar_alerted.clear()
             last_date = today
 
         for rh, rm in _REFERENCE_TIMES:
@@ -255,6 +362,8 @@ def run_loop(tickers: set = None):
         watchlist = get_watchlist()
         if tickers:
             watchlist = [n for n in watchlist if n['ticker'] in tickers]
+        summaries = []
+
         def _refresh(ticker):
             verbose_fh.write(f"\n--- {datetime.now():%Y-%m-%d %H:%M:%S} {ticker} ---\n")
             with contextlib.redirect_stdout(verbose_fh), contextlib.redirect_stderr(verbose_fh):
@@ -290,6 +399,17 @@ def run_loop(tickers: set = None):
         paper_positions = get_open_positions(paper=True)
         open_position_keys = ({(p['ticker'], p['window']) for p in open_positions}
                                | {(p['ticker'], p['window']) for p in paper_positions})
+
+        # Pinned single-shot checks (Part 4) -- fire once per hourly bar boundary,
+        # ahead of/instead of relying purely on ambient POLL_SECS-cadence detection.
+        for ph, pm, ps in _PINNED_BAR_TIMES:
+            pkey = (today, ph, pm)
+            if (now.hour, now.minute) >= (ph, pm) and pkey not in pinned_bar_alerted:
+                pinned_bar_alerted.add(pkey)
+                _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar)
+                if (ph, pm) in _PINNED_ENTRY_TIMES:
+                    summaries += _scan_pinned_entry(ph, pm, watchlist, buy_alerted, open_position_keys)
+
         for pos in open_positions:
             if tickers and pos['ticker'] not in tickers:
                 continue
@@ -341,7 +461,7 @@ def run_loop(tickers: set = None):
 
         if not watchlist:
             print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
-            time.sleep(POLL_SECS)
+            _sleep_until_next_cycle(now)
             continue
 
         # Intrabar fill detection for limit-entry nodes (all day, not just signal window)
@@ -365,7 +485,6 @@ def run_loop(tickers: set = None):
 
         in_window = _in_buy_window(now)
         in_open_check_window = _in_window(now, _OPEN_CHECK_WINDOWS)
-        summaries = []
         if in_open_check_window:
             open_check_nodes = [n for n in watchlist if n.get('entry_timing') == 'open_check']
             if open_check_nodes:
@@ -378,7 +497,7 @@ def run_loop(tickers: set = None):
         if summaries:
             print(f"[{now.strftime('%H:%M:%S')}] {' | '.join(summaries)}")
 
-        time.sleep(POLL_SECS)
+        _sleep_until_next_cycle(now)
 
 
 # ---------------------------------------------------------------------------

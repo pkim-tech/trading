@@ -2523,3 +2523,37 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 - User reviews `/home/pkim/.claude/plans/replicated-gliding-quasar.md` in detail.
 - Once approved, implement Part 4 in the sequence the plan specifies: backtest-replay validation first (fast, offline) → land all code sections together → run paper trading + live data-quality logging concurrently over several real trading days → only then consider any `dry_run=False` flip.
 - Carried forward from prior sessions: wash-sale holds (GDXU/AGQ, clears 2026-08-05/06), one-account-per-ticker design, dividend cash tracking, sweep-throughput benchmark, kernel-versioning idea, `same_day_block` account-type-awareness gap.
+
+---
+
+## 2026-07-21 — Part 4 implemented: automated Entry Trigger/Fill/SL-Placement/Arm-latency for TrailingExitZScoreBreakout
+
+### What we did
+- **Implemented Part 4 in full** (the plan reviewed and approved this session, `/home/pkim/.claude/plans/replicated-gliding-quasar.md`), automating the 6 `TrailingExitZScoreBreakout` watchlist-65 tickers' (AGQ, DPST, KORU, NUGT, UDOW, YANG) previously fully-manual BUY flow:
+  1. `active_signals.py` — `_PINNED_BAR_TIMES` (one pinned check per hourly bar boundary, `:30:02`, +2s buffer) replaces ambient 5-min polling for both entry detection (`_scan_pinned_entry`, the 4 real signal-reaction moments) and exit-arm latency (`_scan_pinned_exit_arm`, all 7, open positions on automation-enabled tickers). `_sleep_until_next_cycle`/`_seconds_until_next_pinned_target` wake the main loop early right before the next target. `_scan_buy_signals` gained `price_overrides` so ambient and pinned checks share one alert code path.
+  2. `schwab_client.get_session_open_price()` — reads Schwab's real `quote.openPrice` (confirmed live), matching the backtest kernel's literal bar Open exactly; retries 3x/2s, falls back to `get_current_price()`.
+  3. `signals_helpers.buy_order_sizing` gained `market_pad_pct` (default 1.0, provisional placeholder) for the non-trailing sizing branch.
+  4. `signals_notify._attempt_automated_market_buy`/`notify_buy_signal`'s new `market_buy_eligible` branch places a real (or dry_run) market order; `add_pending_buy` fires regardless of `auto_placed` so a blocked placement still falls back to the manual reminder flow.
+  5. **SL Placement (real gap, not previously automated for any ticker)**: `schwab_client.place_stop_loss()` (new `OrderType.STOP` order) + `signals_notify._sync_confirm_and_protect` (synchronous fast-confirm poll, 5x2s, immediately after a market buy) + new `open_positions.sl_order_id` column. `_attempt_automated_sell` now cancels the resting SL before placing the trailing-sell order on arm.
+  6. `paper_trading.start_paper_market_buy` — fixes a real gap: `start_paper_buy` previously no-op'd for any non-trailing-buy node, so `TrailingExitZScoreBreakout` produced zero paper-trading activity.
+  7. `signals_handlers.py:193` drive-by fix — hardcoded $50k sizing replaced with `_last_sale_recovery`.
+- **Two real bugs found and fixed while implementing, not part of the original design doc**:
+  - `schwab_safety._OPEN_CHECK_WINDOWS` started at :31, one minute after the new pinned checks fire at :30:02 — would have wrongly blocked every pinned-check automated order. Widened to :30.
+  - `signals_compute.compute_buy_signal`'s `prev_close` read the unsliced `df_daily['Close'].iloc[-1]` instead of `df_daily_prior` (correctly sliced to < as_of/today) — found via the new backtest-replay verification script (every replayed historical entry was spuriously tripping the corporate-action guard, comparing a historical entry price against today's real, years-later close). Also a real latent live-mode bug: today's own partial resampled bar could leak in as "prev_close" in live use too. Fixed to use `df_daily_prior['Close']`; also silently affects `scripts/verify_live_parity.py`/`scripts/live_sim.py`'s `as_of` usage (not touched this session, flagged).
+- **Deliverable 1 (backtest-replay validation)**: new `scripts/verify_pinned_entry_vs_backtest.py` — for each of the 6 tickers, runs the real backtest kernel, replays `compute_buy_signal` at each real trade's historical entry date/price, asserts it reproduces the same BUY decision. First real run (post-fix): 5/6 tickers 100% clean (DPST 126/126, KORU 77/77, NUGT 34/34, UDOW 72/72, YANG 60/60); AGQ 128/129, the one mismatch a real ~2:1 stock-split day correctly caught by the corporate-action guard — expected divergence, not a defect (the backtest kernel has no such guard).
+- **Deliverable 2 infra built, not yet populated**: new `open_price_quality_log` table (logs every pinned-check `get_session_open_price` fetch) + `scripts/verify_open_price_quality.py` follow-up script — needs real trading-day data, can't be backfilled.
+- **Docs updated**: `docs/design.md` (Layer 3) gained a full Part 4 entry; `docs/research_log.md` gained the `prev_close` bug-finding writeup; `docs/backlog_cache.md`'s Part 4 item moved from "designed, not started" to "implemented, not yet live-tested."
+
+### Verified
+- Full `pytest tests/`: 131 passed (107 before this session, 24 new in `tests/test_part4_entry_trigger.py`).
+- `scripts/verify_pinned_entry_vs_backtest.py` (Deliverable 1): 5/6 tickers clean, AGQ's one mismatch explained above.
+- `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` — clean, consistent with prior drift (pre-commit checklist requirement since `active_signals.py` changed).
+
+### Current state
+- All accounts still `dry_run=True` — no real order has been tested end-to-end.
+- Deliverable 2 needs the daemon to actually run live through pinned-check windows to populate `open_price_quality_log` — not yet done.
+
+### Next session
+- Run the daemon live (still `dry_run=True`) for at least one real trading day to populate Deliverable 2 data, then run `scripts/verify_open_price_quality.py`.
+- Review Deliverable 2's report before considering any `dry_run=False` flip for the 6 Part 4 tickers.
+- Carried forward from prior sessions: wash-sale holds (GDXU/AGQ, clears 2026-08-05/06), one-account-per-ticker design, `same_day_block` account-type-awareness gap, sweep-throughput benchmark, kernel-versioning idea, `verify_live_parity.py`/`live_sim.py`'s exposure to the (now-fixed elsewhere) `prev_close` bug not yet re-checked.

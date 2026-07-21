@@ -16,14 +16,17 @@ from datetime import datetime
 import signals_db as db
 from signals_compute import _current_price, check_sell_condition
 from signals_blocks import _post_message
+from signals_helpers import buy_order_sizing
 
 
 def start_paper_buy(node, sig):
     """Called from active_signals._scan_buy_signals on a BUY for a research-mode,
-    automation-enabled ticker. No-op if a paper position or pending buy already
-    exists for this ticker (dedup, mirrors the real open_position_keys check)."""
+    automation-enabled ticker. Dispatches to start_paper_market_buy for a
+    non-trailing-buy node (Part 4, Section 7) -- a market order fills near-
+    immediately, no bounce-fill phase to simulate, unlike a trailing buy."""
     ticker = sig['ticker']
     if not db._is_trailing_buy(node):
+        start_paper_market_buy(node, sig)
         return
     if db.get_paper_pending_buy(ticker) or db.get_open_position(ticker, paper=True):
         return
@@ -31,6 +34,24 @@ def start_paper_buy(node, sig):
     _post_message(
         f"🧪 PAPER BUY SIGNAL — {ticker}  ${sig['current_price']:.4f}  z={sig['z_score']:+.2f}"
     )
+
+
+def start_paper_market_buy(node, sig):
+    """Market-buy mirror of the trailing-buy pending/running-low tracking above
+    (Part 4, Section 7) -- a market order fills essentially at placement, so
+    there's no bounce-fill phase to simulate. Sizes via the same
+    buy_order_sizing real code path (market_pad_pct branch) so paper trading
+    faithfully dry-runs the real sizing/pad, not a simplified stand-in, and
+    opens the paper position directly."""
+    ticker = sig['ticker']
+    if db.get_open_position(ticker, paper=True):
+        return
+    sizing = buy_order_sizing(node, sig)
+    if sizing['shares'] < 1:
+        return
+    db.open_position(node, sig['current_price'], sig['last_bar'], sig['current_price'], datetime.now(),
+                      shares=sizing['shares'], paper=True)
+    _post_message(f"🧪 PAPER MARKET BUY — {ticker}  {sizing['shares']}sh @ ${sig['current_price']:.4f}")
 
 
 def update_paper_buys():

@@ -55,9 +55,11 @@ AUTO_FILL_DETECTION_PATH = Path(__file__).parent / "cache" / "live" / "schwab_au
 # Both window sets are allowed since an entry_timing='open_check' node's real BUY can
 # fire in the earlier window (see active_signals._scan_buy_signals) -- narrowing this
 # gate to only the close windows would reject every legitimate open_check automated
-# order.
+# order. Starts at :30 (not active_signals._OPEN_CHECK_WINDOWS' :31) to also admit
+# Part 4's pinned single-shot entry checks, which fire at :30:02 -- one minute ahead
+# of the ambient open-check poll window this mirrors.
 _SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]
-_OPEN_CHECK_WINDOWS = [(9, 31, 9, 40), (14, 31, 14, 40)]
+_OPEN_CHECK_WINDOWS = [(9, 30, 9, 40), (14, 30, 14, 40)]
 
 # Duplicate-submit guard: a second order for the same account+ticker+side
 # within this window is almost certainly a retry/double-call bug, not a real

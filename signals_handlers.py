@@ -186,15 +186,15 @@ if cfg.SOCKET_MODE:
         node         = data['node']
         signal_price = data['signal_price']
         signal_time  = datetime.strptime(data['signal_time'], '%Y-%m-%d %H:%M:%S')
+        ticker       = node['ticker']
 
         exec_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
         drift_pct  = (exec_price - signal_price) / signal_price * 100
         now        = datetime.now()
-        shares     = int(50_000 // exec_price)
+        shares     = int(_last_sale_recovery(ticker, node.get('starting_notional')) // exec_price)
 
         opened = db.open_position(node, signal_price, signal_time, exec_price, now, shares=shares)
 
-        ticker = node['ticker']
         db.clear_pending_buy(ticker)
 
         if not opened:

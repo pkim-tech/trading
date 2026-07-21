@@ -179,6 +179,12 @@ def ensure_tables():
             c.execute("ALTER TABLE open_positions ADD COLUMN account TEXT")
         if 'broker_stop_price' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN broker_stop_price REAL")
+        if 'sl_order_id' not in op_cols:
+            # Real broker order id for the resting STOP order placed on entry (Part 4,
+            # Section 6) -- nullable since non-automated positions and legacy rows never
+            # have one. Cancelled (and this cleared implicitly, the row goes away with the
+            # arm transition) once the trailing-sell order takes over on TP arm.
+            c.execute("ALTER TABLE open_positions ADD COLUMN sl_order_id INTEGER")
 
         # trade_log
         c.execute("""
@@ -307,6 +313,22 @@ def ensure_tables():
                 signal_time   TEXT NOT NULL,
                 running_low   REAL NOT NULL,
                 created_at    TEXT NOT NULL
+            )
+        """)
+        # open_price_quality_log -- Part 4 Deliverable 2: logs every pinned-check
+        # get_session_open_price fetch (timestamp, ticker, target time, price,
+        # is_true_open) so scripts/verify_open_price_quality.py can join it against
+        # the real cached Open/Close the next day and confirm openPrice was populated
+        # promptly, before flipping any ticker from paper to real order placement.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS open_price_quality_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts           TEXT NOT NULL DEFAULT (datetime('now')),
+                ticker       TEXT NOT NULL,
+                target_h     INTEGER NOT NULL,
+                target_m     INTEGER NOT NULL,
+                price        REAL NOT NULL,
+                is_true_open INTEGER NOT NULL
             )
         """)
         c.commit()
@@ -821,6 +843,37 @@ def set_broker_stop_price(ticker, broker_stop_price):
             (float(broker_stop_price), ticker)
         )
         c.commit()
+
+
+def set_sl_order_id(ticker, sl_order_id):
+    """Records the resting STOP order's broker order id (Part 4, Section 6) --
+    read back by _attempt_automated_sell to cancel it before placing the
+    trailing-sell order on arm, avoiding two live sell orders for the same
+    shares."""
+    with _conn() as c:
+        c.execute("UPDATE open_positions SET sl_order_id = ? WHERE ticker = ?", (sl_order_id, ticker))
+        c.commit()
+
+
+def log_open_price_quality(ticker, target_h, target_m, price, is_true_open):
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO open_price_quality_log (ticker, target_h, target_m, price, is_true_open) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ticker, target_h, target_m, float(price), 1 if is_true_open else 0),
+        )
+        c.commit()
+
+
+def get_open_price_quality_log(since=None):
+    with _conn() as c:
+        if since:
+            rows = c.execute(
+                "SELECT * FROM open_price_quality_log WHERE ts >= ? ORDER BY ts", (since,)
+            ).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM open_price_quality_log ORDER BY ts").fetchall()
+        return [dict(r) for r in rows]
 
 
 def correct_entry_price(ticker, entry_price):

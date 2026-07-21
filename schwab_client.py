@@ -10,6 +10,7 @@ env vars (SCHWAB_ACCOUNT_BROKERAGE, etc.) -- never hardcode account numbers
 in source.
 """
 import os
+import time
 
 import schwab.orders.equities as equity_orders
 from schwab.orders.generic import OrderBuilder
@@ -216,6 +217,67 @@ def cancel_order(account: str, ticker: str, order_id: int):
     r.raise_for_status()
     _post_message(f"\U0001F5D1️ cancelled resting order {order_id} ({ticker} in {account})")
     return r
+
+
+_OPEN_PRICE_RETRY_ATTEMPTS = 3
+_OPEN_PRICE_RETRY_INTERVAL_SECS = 2
+
+
+def get_session_open_price(ticker: str) -> tuple[float, bool]:
+    """Reads quote.openPrice (confirmed present in a real Schwab get_quote
+    response, 2026-07-21) -- the session's fixed opening print, matching the
+    backtest kernel's literal bar Open exactly, unlike a live tick sampled
+    seconds later. openPrice is 0.0 until the session's open print lands, not
+    an error -- retries briefly, then falls back to get_current_price()
+    (lastPrice). Returns (price, is_true_open) so callers can distinguish and
+    log which path fired."""
+    for attempt in range(_OPEN_PRICE_RETRY_ATTEMPTS):
+        try:
+            r = _get_client().get_quote(ticker)
+            r.raise_for_status()
+            open_price = r.json()[ticker]["quote"]["openPrice"]
+            if open_price:
+                return float(open_price), True
+        except Exception:
+            pass
+        if attempt < _OPEN_PRICE_RETRY_ATTEMPTS - 1:
+            time.sleep(_OPEN_PRICE_RETRY_INTERVAL_SECS)
+    return get_current_price(ticker), False
+
+
+def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float):
+    """Resting fixed-price STOP order -- the broker executes on breach without
+    depending on our poll cadence (Part 4, Section 6), same mechanism already
+    relied on for the trailing-sell order. Same OrderBuilder pattern as
+    _place_trailing_order, just OrderType.STOP + set_stop_price instead of
+    TRAILING_STOP + link-basis/offset. Returns (response, order_id); dry_run
+    returns (None, None)."""
+    try:
+        dry_run = schwab_safety.approve_and_record(account, ticker, quantity, stop_price, "SELL")
+    except schwab_safety.SafetyViolation as e:
+        _post_message(f"\U0001F6AB BLOCKED STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.4f}: {e}")
+        raise
+
+    if dry_run:
+        msg = f"[DRY RUN] would place STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.4f}"
+        _post_message(msg)
+        print(msg)
+        return None, None
+
+    account_hash = _resolve_account_hashes()[account]
+    order = OrderBuilder()
+    order.set_order_type(OrderType.STOP)
+    order.set_session(Session.NORMAL)
+    order.set_duration(Duration.GOOD_TILL_CANCEL)
+    order.set_order_strategy_type(OrderStrategyType.SINGLE)
+    order.set_stop_price(stop_price)
+    order.add_equity_leg(EquityInstruction.SELL, ticker, quantity)
+
+    r = _get_client().place_order(account_hash, order)
+    r.raise_for_status()
+    order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+    _post_message(f"✅ STOP LOSS {quantity} {ticker} in {account} submitted to Schwab @ ${stop_price:.4f}")
+    return r, order_id
 
 
 def get_current_price(ticker: str) -> float:
