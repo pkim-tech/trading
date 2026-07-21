@@ -1,10 +1,11 @@
 """Execution-adherence robustness ("chaos monkey") simulation — quantifies how
 much of a node's backtested compounded return depends on catching every single
 entry/exit signal exactly on time, the real risk during manual-execution
-trading. See docs/backlog_cache.md's 2026-07-16 "chaos monkey" item.
+trading. See docs/backlog_cache.md's 2026-07-16 "chaos monkey" item and the
+2026-07-20 "candidate testing needed on Live v5 watchlist" item.
 
-Model (see export_trades.simulate_trail_both_chaos / _resolve_miss for the
-exact mechanics):
+Model (see export_trades.simulate_trail_both_chaos/simulate_trail_exit_chaos /
+_resolve_miss for the exact mechanics):
 - Entry signals are only checkable at the two daily signal windows
   (target_h0/target_h1, matching the real Slack alert cadence); exit triggers
   (SL / trailing-stop breach / TIME) are checked continuously, every hourly
@@ -24,17 +25,20 @@ exact mechanics):
              coin flip. Models "I'm bad about it but I always catch it within
              N checks" rather than an unbounded miss.
 - miss_rate in {1%, 5%, 10%, 20%}, max_delay_checks=3, 1000 Monte Carlo trials
-  per (ticker, mode, miss_rate), using each ticker's real current live
-  watch_list node (watchlist_id=9).
-- Baseline ("perfect adherence") is simulate_trail_both_annotated's normal
-  compounded return -- matches every other number already on file.
-
-Caveat: this pure-Python mirror only supports entry_timing='close' (same
-limitation as sim_delayed_sell.py) -- GDXD's real live node uses open_check,
-so its numbers here are indicative only, not its exact production behavior.
+  per (ticker, mode, miss_rate), using each ticker's real live watch_list node
+  (default watchlist_id=65, "Live v5").
+- Routes per node's real `strategy` column: TrailingBothZScoreBreakout ->
+  simulate_trail_both_chaos, TrailingExitZScoreBreakout ->
+  simulate_trail_exit_chaos (added 2026-07-20 -- previously only TB was
+  supported, silently excluding 6/10 of the current watchlist).
+- Baseline ("perfect adherence") is computed from the real production kernel
+  (backtester.run_backtest_v110 for TB / run_backtest_v18 for TE), not a
+  mirror -- matches `entry_timing` exactly (open_check now supported by both
+  chaos mirrors too, added 2026-07-20 -- every node in the current watchlist
+  runs open_check live).
 
 Usage:
-    .venv/bin/python scripts/sim_chaos_monkey.py                    # all watchlist_id=9 tickers
+    .venv/bin/python scripts/sim_chaos_monkey.py                    # all watchlist_id=65 tickers
     .venv/bin/python scripts/sim_chaos_monkey.py --tickers SOXL KORU
     .venv/bin/python scripts/sim_chaos_monkey.py --trials 200        # faster, coarser
 """
@@ -51,8 +55,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import strategies
-from backtester import prep_inputs
-from export_trades import simulate_trail_both_annotated, simulate_trail_both_chaos
+from backtester import run_backtest_v18, run_backtest_v110, prep_inputs
+from export_trades import simulate_trail_both_chaos, simulate_trail_exit_chaos
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = REPO_ROOT / "cache" / "research"
@@ -80,36 +84,75 @@ def _compounded(trades):
     return (ret - 1.0) * 100.0
 
 
-def get_watchlist_nodes(watchlist_id=9):
+def _compounded_kernel(trades):
+    """Same math as _compounded, but for trade dicts from the real production
+    kernel (backtester._build_trades), which uses key 'Return' not 'ret'."""
+    ret = 1.0
+    for t in trades:
+        ret *= (1.0 + t['Return'])
+    return (ret - 1.0) * 100.0
+
+
+def get_watchlist_nodes(watchlist_id=65):
     conn = sqlite3.connect(LIVE_DIR / "trading_live.db")
     c = conn.cursor()
     c.execute(
-        "SELECT ticker, window, z_score_threshold, trail_buy_pct, arm_sell_pct, "
-        "trail_sell_pct, fixed_sl, max_hold_hours, entry_timing "
+        "SELECT ticker, strategy, window, z_score_threshold, trail_buy_pct, arm_sell_pct, "
+        "take_profit, trail_sell_pct, fixed_sl, max_hold_hours, entry_timing "
         "FROM watch_list WHERE watchlist_id=? ORDER BY ticker",
         (watchlist_id,),
     )
     rows = c.fetchall()
     conn.close()
-    cols = ["ticker", "window", "z", "trail_buy_pct", "arm_sell_pct",
+    cols = ["ticker", "strategy", "window", "z", "trail_buy_pct", "arm_sell_pct", "take_profit",
             "trail_sell_pct", "fixed_sl", "max_hold_hours", "entry_timing"]
     return [dict(zip(cols, r)) for r in rows]
 
 
 def run_ticker(node, trials, seed):
     ticker = node["ticker"]
+    is_tb = node["strategy"] == "TrailingBothZScoreBreakout"
     df_hourly, df_daily = _load(ticker)
-    strat = strategies.TrailingBothZScoreBreakout(window=node["window"],
-                                                    z_score_threshold=node["z"])
+    strat_cls = strategies.TrailingBothZScoreBreakout if is_tb else strategies.TrailingExitZScoreBreakout
+    strat = strat_cls(window=node["window"], z_score_threshold=node["z"])
     df_daily_ind = strat.generate_daily_indicators(df_daily)
+
+    open_check = node["entry_timing"] == "open_check"
+    # arm_sell_pct is TB's real take-profit/arm column; TE stores the same
+    # concept in the plain take_profit column instead (signals_db.add_node
+    # strategy-conditional split -- see docs/deep_backlog.md's fixed_sl item
+    # for the analogous pattern on the SL side).
+    take_profit = (node["arm_sell_pct"] if is_tb else node["take_profit"]) / 100
+    stop_loss = node["fixed_sl"] / 100
+    trail_pct = node["trail_sell_pct"] / 100
+
+    if is_tb:
+        baseline_trades = run_backtest_v110(
+            df_hourly, df_daily_ind, ticker, take_profit=take_profit, stop_loss=stop_loss,
+            max_hours_to_hold=node["max_hold_hours"], z_score_threshold=node["z"],
+            trail_buy_pct=node["trail_buy_pct"] / 100, trail_pct=trail_pct,
+            entry_timing=node["entry_timing"])
+    else:
+        baseline_trades = run_backtest_v18(
+            df_hourly, df_daily_ind, ticker, take_profit=take_profit, stop_loss=stop_loss,
+            max_hours_to_hold=node["max_hold_hours"], z_score_threshold=node["z"],
+            trail_pct=trail_pct, entry_timing=node["entry_timing"])
+    baseline = _compounded_kernel(baseline_trades)
+
     p = prep_inputs(df_hourly, df_daily_ind)
 
-    kwargs = dict(take_profit=node["arm_sell_pct"] / 100, stop_loss=node["fixed_sl"] / 100,
-                  max_hours_to_hold=node["max_hold_hours"], trail_buy_pct=node["trail_buy_pct"] / 100,
-                  trail_pct=node["trail_sell_pct"] / 100, target_h0=9, target_h1=14, z_thresh=node["z"])
-
-    baseline_trades = simulate_trail_both_annotated(p, **kwargs)
-    baseline = _compounded(baseline_trades)
+    if is_tb:
+        kwargs = dict(take_profit=take_profit, stop_loss=stop_loss,
+                      max_hours_to_hold=node["max_hold_hours"], trail_buy_pct=node["trail_buy_pct"] / 100,
+                      trail_pct=trail_pct, target_h0=9, target_h1=14, z_thresh=node["z"],
+                      open_check=open_check)
+        sim_fn = simulate_trail_both_chaos
+    else:
+        kwargs = dict(take_profit=take_profit, stop_loss=stop_loss,
+                      max_hours_to_hold=node["max_hold_hours"],
+                      trail_pct=trail_pct, target_h0=9, target_h1=14, z_thresh=node["z"],
+                      open_check=open_check)
+        sim_fn = simulate_trail_exit_chaos
 
     rows = []
     rng = random.Random(seed)
@@ -117,13 +160,13 @@ def run_ticker(node, trials, seed):
         for miss_rate in MISS_RATES:
             returns = np.empty(trials)
             for t in range(trials):
-                trades = simulate_trail_both_chaos(
+                trades = sim_fn(
                     p, rng=rng, entry_miss_mode=mode, entry_miss_rate=miss_rate,
                     exit_miss_mode=mode, exit_miss_rate=miss_rate,
                     max_delay_checks=MAX_DELAY_CHECKS, **kwargs)
                 returns[t] = _compounded(trades)
             rows.append({
-                "ticker": ticker, "mode": mode, "miss_rate": miss_rate,
+                "ticker": ticker, "strategy": node["strategy"], "mode": mode, "miss_rate": miss_rate,
                 "baseline_pct": baseline,
                 "mean_pct": returns.mean(), "median_pct": np.median(returns),
                 "p10_pct": np.percentile(returns, 10), "p90_pct": np.percentile(returns, 90),
@@ -138,7 +181,7 @@ def main():
     parser.add_argument("--tickers", nargs="+", default=None)
     parser.add_argument("--trials", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--watchlist-id", type=int, default=9)
+    parser.add_argument("--watchlist-id", type=int, default=65)
     args = parser.parse_args()
 
     nodes = get_watchlist_nodes(args.watchlist_id)
@@ -158,9 +201,8 @@ def main():
             continue
         all_rows.extend(rows)
         elapsed = time.time() - t0
-        caveat = " (entry_timing=open_check -- indicative only, mirror is close-only)" if node["entry_timing"] != "close" else ""
-        print(f"{ticker}: baseline={rows[0]['baseline_pct']:+.1f}%  "
-              f"({len(baseline_trades)} trades, {elapsed:.1f}s){caveat}")
+        print(f"{ticker} ({node['strategy']}): baseline={rows[0]['baseline_pct']:+.1f}%  "
+              f"({len(baseline_trades)} trades, {elapsed:.1f}s)")
         for r in rows:
             print(f"    {r['mode']:5s} miss={r['miss_rate']*100:4.0f}%  "
                   f"mean={r['mean_pct']:+9.1f}%  median={r['median_pct']:+9.1f}%  "

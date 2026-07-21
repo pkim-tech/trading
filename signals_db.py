@@ -341,9 +341,19 @@ def get_active_watchlist_id():
 
 
 def create_watchlist(name):
+    """Idempotent by name -- returns the existing id if `name` is already taken,
+    without attempting an insert. The prior implementation used INSERT OR IGNORE
+    keyed on the UNIQUE name column: on a name conflict, SQLite still burns an
+    AUTOINCREMENT id even though no row is written (confirmed 2026-07-20 -- the
+    real watchlists.id gap from 57 to 65, 6 ids silently consumed with zero
+    audit-log trace, was caused by exactly this). Checking existence first
+    avoids the wasted-insert path entirely for the common case."""
     with _conn() as c:
-        c.execute("INSERT OR IGNORE INTO watchlists (name, is_active) VALUES (?, 0)", (name,))
-        wl_id = c.execute("SELECT id FROM watchlists WHERE name = ?", (name,)).fetchone()[0]
+        existing = c.execute("SELECT id FROM watchlists WHERE name = ?", (name,)).fetchone()
+        if existing:
+            return existing[0]
+        cur = c.execute("INSERT INTO watchlists (name, is_active) VALUES (?, 0)", (name,))
+        wl_id = cur.lastrowid
         _log_audit(c, 'create_watchlist', watchlist_id=wl_id, detail=name)
         c.commit()
         return wl_id

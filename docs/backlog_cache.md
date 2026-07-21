@@ -1,14 +1,36 @@
 # Backlog Cache
 
-## [backtest] Research idea, not started, 2026-07-20 — for a signal firing at the last (3:30) bar, market-on-close instead of trailing-buy?
-Raised by the user while discussing the overnight-gap-through-trigger fix: for
-a signal that fires right at the last close of the day (no more bars left to
-catch a bounce before the overnight gap), does waiting for a `trail_buy_pct`
-bounce (TB) actually help, or would a plain market-on-close entry do just as
-well or better? Proposed quick sanity check: for real historical last-bar
-signals, compare the entry that TB actually got vs. what a market-on-close
-fill would have gotten, and tally how often the overnight gap ends up in our
-favor vs. against. Framed as research/backlog by the user, not scheduled.
+## [live-trading][tax] Active hold, set 2026-07-20 — don't buy GDXU/AGQ in any IRA-type account before their wash-sale clearance dates
+Real taxable-brokerage-account losses found while discussing account mapping for
+watchlist 65: GDXU lost in brokerage on 2026-07-06 (clears **2026-08-05**), AGQ lost
+in brokerage on 2026-07-07 (clears **2026-08-06**). Per IRS Rev. Rul. 2008-5 (the
+same mechanic resolved 2026-07-07 — see `project_wash_sale_holds.md`), buying either
+ticker in any IRA-type account (ira/sep/roth, or the new limited-margin IRA) before
+its clearance date permanently disallows that brokerage loss. Not the same situation
+as the 2026-07-07 resolution (that was an IRA-internal loss, a non-issue) — this is a
+real taxable-account loss, the actually-dangerous direction. Both tickers are fine to
+trade in the brokerage account itself, or in IRA accounts after clearance. **Action
+needed**: don't execute or recommend a GDXU/AGQ buy into any IRA-type account until
+the respective date above.
+
+## [live-trading][security] Medium priority, not started, 2026-07-20 — `schwab_safety.py`'s `same_day_block` isn't account-type-aware; would incorrectly block legitimate margin-account trades
+Found while reinterpreting the watchlist-65 checklist's check 9 (same-day-block
+sensitivity). The guardrail (`signals_db.closed_today`, enforced in
+`schwab_safety.py`'s BUY-side safety check) refuses a same-day re-buy on any
+ticker unconditionally — but its own docstring frames the risk as cash-account
+settlement-specific ("IRA/SEP cash accounts can't reuse that capital until T+1
+settlement"). User confirmed 2026-07-20: watchlist 65's tickers will trade in
+**limited margin accounts**, not IRA/SEP/Roth — limited margin doesn't have this
+same-day-reuse settlement restriction, so the block as currently written would
+reject valid, safe trades once live. Not urgent — `schwab_client`/`schwab_safety`
+aren't wired into `active_signals.py`'s real loop yet, so nothing is actually
+enforced live right now. **Action needed**: make `same_day_block` conditional on
+account type (skip the check for margin accounts, keep it for any real cash/IRA
+account) before this guardrail is ever wired into live order placement. Depends
+loosely on the still-undecided one-account-per-ticker plan (`docs/deep_backlog.md`)
+for how account type gets tracked per ticker.
+
+## [backtest] Resolved 2026-07-20 — last-window MOC vs trailing-buy; MOC does not win, see `docs/deep_backlog.md`/`docs/research_log.md`
 
 ## [backtest] Research idea, not started, 2026-07-20 — is overnight gap frequency/magnitude asymmetric (up-gap vs down-gap)?
 Raised while confirming the gap-through-trigger fix is symmetric across the
@@ -28,8 +50,7 @@ research/backlog, not scheduled.
 ## [backtest] Resolved 2026-07-20 — full 18-ticker v5 resweep completed; see `docs/deep_backlog.md` and `docs/research_log.md`
 One open sub-item carried forward, not yet done: the observed sweep-throughput question (~125-335 nodes/sec, unclear if a real regression from the exit-gap kernel edit or something else) was never benchmarked before the original interruption and still isn't — low priority, revisit if throughput looks slow again.
 
-## [live-trading][backtest] High priority, active, 2026-07-20 — candidate testing needed on the new "Live v5" watchlist (id=65) before any node goes live/automation-enabled
-10 nodes (AGQ, DPST, GDXU, HIBL, KORU, NUGT, SOXL, UDOW, USD, YANG) added this session in `mode='research'`, watchlist active but nothing changes for real trading yet (see `docs/deep_backlog.md` for the selection writeup). Explicitly deferred to next session by the user ("we'll do the rest of candidate testing next session"). Planned checks: (1) chaos-monkey execution-adherence Monte Carlo (`scripts/sim_chaos_monkey.py`, currently scoped to the old `watchlist_id=9` nodes — needs pointing at watchlist 65's actual params) to see how much of each node's alpha survives realistic missed-signal rates, given several of these nodes have very low win rates (7-13%) riding on a handful of large winners; (2) Stage 5 of `.claude/skills/backtest-change-rollout/SKILL.md` (reconfirm `signals_compute.py`/`paper_trading.py` don't independently reimplement anything the v5 kernel fixes touched). USD's node is worth a specific look — only 10-11 trades total, thin sample for a cliff-safety call.
+## [live-trading][backtest] Resolved 2026-07-20 — watchlist 65 candidate testing complete, found+fixed 2 real bugs, see `docs/deep_backlog.md`/`docs/research_log.md`
 
 ## [live-trading] Resolved 2026-07-19 — `AUTOMATION_ENABLED_TICKERS` moved to `.env`, widened to all 18 v4 tickers; EDC's v3.27 node removed
 Full writeup in `docs/design.md` (Layer 3). Short version: `AUTOMATION_ENABLED_TICKERS`

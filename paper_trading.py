@@ -77,14 +77,14 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
         if at_bar_close:
             last_seen_bar[ticker] = last_bar_ts
             bar = df_hourly.iloc[-1]
-            cp, low, high = float(bar['Close']), float(bar['Low']), float(bar['High'])
+            cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
         else:
             cp, _ = _current_price(ticker)
             if cp is None:
                 continue
-            low = high = cp
+            low = high = op = cp
         reason, target, just_activated_trailing = check_sell_condition(
-            pos, cp, datetime.now(), at_bar_close=at_bar_close, low=low, high=high,
+            pos, cp, datetime.now(), at_bar_close=at_bar_close, low=low, high=high, open_price=op,
             df_hourly=df_hourly, paper=True)
         if just_activated_trailing:
             _post_message(f"🧪 PAPER trailing-sell armed — {ticker}")

@@ -284,14 +284,14 @@ def run_loop(tickers: set = None):
             if at_bar_close:
                 last_seen_bar[pos['ticker']] = last_bar_ts
                 bar = df_hourly.iloc[-1]
-                cp, low, high = float(bar['Close']), float(bar['Low']), float(bar['High'])
+                cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
             else:
                 cp, _ = _current_price(pos['ticker'])
                 if cp is None:
                     continue
-                low = high = cp
+                low = high = op = cp
             reason, target, just_activated_trailing = check_sell_condition(
-                pos, cp, now, at_bar_close=at_bar_close, low=low, high=high, df_hourly=df_hourly)
+                pos, cp, now, at_bar_close=at_bar_close, low=low, high=high, open_price=op, df_hourly=df_hourly)
             if just_activated_trailing:
                 notify_trailing_activated(pos, cp)
             if reason:

@@ -1,5 +1,37 @@
 # Backlog
 
+## ✅ [live-trading][backtest] Resolved 2026-07-20 — watchlist 65 candidate testing complete; found+fixed a live/paper compliance gap and a `create_watchlist` id-burning bug
+Full writeup in `docs/research_log.md` ("2026-07-20 (cont.) — Watchlist 65 candidate
+testing: chaos-monkey, Stage 5 compliance gap found+fixed, watchlists.id gap
+root-caused+fixed"). Short version: chaos-monkey execution-adherence extended to cover
+`TrailingExitZScoreBreakout` and `open_check` (previously TB/close-only), repointed at
+watchlist 65 — no node collapses even at 20% miss rate, USD's thin sample cleared. Stage
+5 compliance recheck found `strategies.py::check_exit` (used by both real live positions
+and paper trading) never received the 2026-07-20 exit-side gap-through-trigger kernel
+fix — fixed by threading a real `open_price` through `check_sell_condition` from both
+call sites and adding the Open-first gap check to `check_exit`. Verified via full
+bar-by-bar parity against real historical trades (280 total across SOXL/AGQ, effectively
+zero mismatches). Also found+fixed, while investigating the unexplained watchlist id
+57->65 jump: `signals_db.create_watchlist`'s `INSERT OR IGNORE` silently burns an
+AUTOINCREMENT id on any duplicate-name call even though no row is written (reproduced
+directly) — fixed to check existence first. No node params changed; watchlist 65 is
+candidate-tested and clear of blockers.
+
+## ✅ [backtest] Resolved 2026-07-20 — last-window market-on-close vs trailing-buy comparison, MOC does not win
+Full writeup in `docs/research_log.md` ("2026-07-20 — Last-window market-on-close vs
+trailing-buy comparison"). Short version: for signals firing in the last daily window
+(the 14:30 bar, no time left before the overnight gap), compared TB's real bounce-fill
+against an MOC counterfactual entry at the same signal bar's Close, across all 4
+`TrailingBothZScoreBreakout` tickers in the Live v5 watchlist (GDXU, HIBL, SOXL, USD) and
+all 3 fill resolutions (possible/pessimistic/certain). TB won every ticker/resolution,
+often by 5-20x on compounded return, driven by a fat right tail of large winners MOC's
+earlier entry misses. Hand-verified 2 SOXL trades entry-to-exit against real OHLC bars —
+every fill price traced exactly to a real Open/High/Low/Close. No 18-ticker backfill
+run — the result was decisive enough on the current watchlist alone; treated as closed.
+New tooling: `scripts/sim_close_vs_trail_buy.py` + `export_trades.
+collect_last_window_comparisons`/`simulate_trail_both_signal_tracked`/
+`_simulate_exit_from_entry`.
+
 ## ✅ Resolved 2026-07-20 — full 18-ticker v5 resweep completed; immediate-entry vs trailing-buy comparison; "Live v5" watchlist built
 
 The interrupted resweep (started 2026-07-20, see prior entry below) was completed the same

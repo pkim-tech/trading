@@ -168,7 +168,7 @@ def _bars_held(df_hourly, signal_time):
     return int((df_hourly.index > signal_time).sum())
 
 
-def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, high=None, df_hourly=None, paper=False):
+def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, high=None, open_price=None, df_hourly=None, paper=False):
     strategy_cls = getattr(strategies, pos['strategy'], None)
     if strategy_cls is None:
         return None, None, False
@@ -223,8 +223,14 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
     old_state  = pos.get('trail_state', {})
     reason, price, new_state = strat.check_exit({
         'current_price':     current_price,
-        # Real bar Low/High when this call represents an actual closed hourly bar;
-        # otherwise current_price is the best available proxy for a mid-bar poll.
+        # Real bar Open/Low/High when this call represents an actual closed hourly
+        # bar; otherwise current_price is the best available proxy for a mid-bar
+        # poll. 'open' lets check_exit apply the same gap-through-trigger fill
+        # check the backtest kernel uses on SL/trailing-stop (2026-07-20 kernel
+        # fix, see docs/backlog_cache.md) -- without it, a live/paper exit that
+        # gapped past its trigger overnight would report the stale theoretical
+        # stop/trail price instead of the real, worse fill.
+        'open':              open_price if open_price is not None else current_price,
         'low':               low if low is not None else current_price,
         'high':              high if high is not None else current_price,
         'entry_price':       pos['entry_price'],

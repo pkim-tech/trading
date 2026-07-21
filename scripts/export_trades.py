@@ -439,6 +439,257 @@ def simulate_trail_both_deferred_sell(p, take_profit, stop_loss, max_hours_to_ho
     return trades
 
 
+def simulate_trail_both_signal_tracked(p, take_profit, stop_loss, max_hours_to_hold,
+                                        trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh,
+                                        open_check=False):
+    """Pure-Python mirror of backtester._simulate_trail_both's three parallel
+    trailing-buy bounce-fill resolutions (possible/pessimistic/certain -- see that
+    function's docstring for the exact reasoning behind each), extended to also
+    record signal_i per trade (the real kernel doesn't track this). Needed to
+    identify which trades' entry signal fired in the LAST daily window
+    (hour==target_h1) for the market-on-close comparison below -- exit-side logic
+    (SL/TP/trailing/TIME) is identical across all three resolutions per the
+    production kernel's docstring, so this only duplicates the entry-side
+    (waiting-phase) logic three ways."""
+    prices, highs, lows, opens = p['prices'], p['highs'], p['lows'], p['opens']
+    hours, daily_idx, sma_arr, std_arr = p['hours'], p['daily_idx'], p['sma_arr'], p['std_arr']
+    trend_arr, has_trend = p['trend_arr'], p['has_trend']
+
+    def make_state():
+        return dict(in_trade=False, waiting=False, trailing=False, entry_price=0.0,
+                    stop_price=0.0, tp_price=0.0, peak=0.0, entry_bar=0, held=0,
+                    running_low=0.0, wait_bars=0, signal_bar=None, signal_z=None,
+                    arm_bar=None, trades=[])
+
+    states = {'possible': make_state(), 'pessimistic': make_state(), 'certain': make_state()}
+
+    n = len(prices)
+    for i in range(n):
+        cp, high, low, op = prices[i], highs[i], lows[i], opens[i]
+
+        for name, s in states.items():
+            if s['in_trade']:
+                s['held'] += 1
+                if s['trailing']:
+                    trail_stop_gap = s['peak'] * (1.0 - trail_pct)
+                    if op <= trail_stop_gap:
+                        exit_px = op
+                        pc = (exit_px - s['entry_price']) / s['entry_price']
+                        s['trades'].append(dict(signal_i=s['signal_bar'], signal_z=s['signal_z'],
+                                                 entry_i=s['entry_bar'], arm_i=s['arm_bar'], exit_i=i,
+                                                 entry_p=s['entry_price'], exit_p=exit_px, held=s['held'],
+                                                 result=WIN if pc > 0 else LOSS, ret=pc))
+                        s['in_trade'] = s['trailing'] = False
+                        continue
+                    if high > s['peak']:
+                        s['peak'] = high
+                    trail_stop = s['peak'] * (1.0 - trail_pct)
+                    if low <= trail_stop or s['held'] >= max_hours_to_hold:
+                        exit_px = trail_stop if low <= trail_stop else cp
+                        pc = (exit_px - s['entry_price']) / s['entry_price']
+                        s['trades'].append(dict(signal_i=s['signal_bar'], signal_z=s['signal_z'],
+                                                 entry_i=s['entry_bar'], arm_i=s['arm_bar'], exit_i=i,
+                                                 entry_p=s['entry_price'], exit_p=exit_px, held=s['held'],
+                                                 result=WIN if pc > 0 else LOSS, ret=pc))
+                        s['in_trade'] = s['trailing'] = False
+                    continue
+                if op <= s['stop_price']:
+                    pc = (op - s['entry_price']) / s['entry_price']
+                    s['trades'].append(dict(signal_i=s['signal_bar'], signal_z=s['signal_z'],
+                                             entry_i=s['entry_bar'], arm_i=s['arm_bar'], exit_i=i,
+                                             entry_p=s['entry_price'], exit_p=op, held=s['held'],
+                                             result=LOSS, ret=pc))
+                    s['in_trade'] = False
+                    continue
+                if low <= s['stop_price']:
+                    pc = (s['stop_price'] - s['entry_price']) / s['entry_price']
+                    s['trades'].append(dict(signal_i=s['signal_bar'], signal_z=s['signal_z'],
+                                             entry_i=s['entry_bar'], arm_i=s['arm_bar'], exit_i=i,
+                                             entry_p=s['entry_price'], exit_p=s['stop_price'], held=s['held'],
+                                             result=LOSS, ret=pc))
+                    s['in_trade'] = False
+                    continue
+                if cp >= s['tp_price']:
+                    s['trailing'] = True; s['peak'] = cp; s['arm_bar'] = i
+                    continue
+                if s['held'] >= max_hours_to_hold:
+                    pc = (cp - s['entry_price']) / s['entry_price']
+                    s['trades'].append(dict(signal_i=s['signal_bar'], signal_z=s['signal_z'],
+                                             entry_i=s['entry_bar'], arm_i=s['arm_bar'], exit_i=i,
+                                             entry_p=s['entry_price'], exit_p=cp, held=s['held'],
+                                             result=TWIN if pc > 0 else TLOSS, ret=pc))
+                    s['in_trade'] = False
+                continue
+
+            if s['waiting']:
+                s['wait_bars'] += 1
+                if name == 'possible':
+                    buy_trigger_gap = s['running_low'] * (1.0 + trail_buy_pct)
+                    if op >= buy_trigger_gap:
+                        entry_price = op
+                    else:
+                        if low < s['running_low']:
+                            s['running_low'] = low
+                        buy_trigger = s['running_low'] * (1.0 + trail_buy_pct)
+                        entry_price = buy_trigger if high >= buy_trigger else None
+                elif name == 'pessimistic':
+                    buy_trigger_p = s['running_low'] * (1.0 + trail_buy_pct)
+                    if op >= buy_trigger_p:
+                        entry_price = op
+                    elif high >= buy_trigger_p:
+                        entry_price = buy_trigger_p
+                    else:
+                        if low < s['running_low']:
+                            s['running_low'] = low
+                        entry_price = None
+                else:  # certain
+                    buy_trigger_prior = s['running_low'] * (1.0 + trail_buy_pct)
+                    if op >= buy_trigger_prior:
+                        entry_price = op
+                    else:
+                        updated_low = low if low < s['running_low'] else s['running_low']
+                        buy_trigger_updated = updated_low * (1.0 + trail_buy_pct)
+                        if cp >= buy_trigger_updated:
+                            entry_price = buy_trigger_updated
+                            s['running_low'] = updated_low
+                        else:
+                            s['running_low'] = updated_low
+                            entry_price = None
+
+                if entry_price is not None:
+                    s['entry_price'] = entry_price
+                    s['tp_price'] = entry_price * (1.0 + take_profit)
+                    s['stop_price'] = entry_price * (1.0 - stop_loss)
+                    s['entry_bar'] = i; s['held'] = 0; s['arm_bar'] = None
+                    s['in_trade'] = True; s['waiting'] = s['trailing'] = False
+                    continue
+                if s['wait_bars'] >= max_hours_to_hold:
+                    s['waiting'] = False
+                continue
+
+            h = hours[i]
+            if h != target_h0 and h != target_h1:
+                continue
+            di = daily_idx[i]
+            if di < 0:
+                continue
+            sma, std = sma_arr[di], std_arr[di]
+            if std == 0.0:
+                continue
+            lower_band = sma - std * z_thresh
+            fired = False
+            if open_check:
+                signal_open = (op <= lower_band) and (op > trend_arr[di]) if has_trend else op <= lower_band
+                if signal_open:
+                    s['waiting'] = True; s['running_low'] = op; s['wait_bars'] = 0
+                    s['signal_bar'] = i; s['signal_z'] = (op - sma) / std
+                    fired = True
+            if not fired:
+                signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
+                if signal:
+                    s['waiting'] = True; s['running_low'] = cp; s['wait_bars'] = 0
+                    s['signal_bar'] = i; s['signal_z'] = (cp - sma) / std
+
+    for s in states.values():
+        if s['in_trade']:
+            cp = prices[n - 1]
+            pc = (cp - s['entry_price']) / s['entry_price']
+            s['trades'].append(dict(signal_i=s['signal_bar'], signal_z=s['signal_z'],
+                                     entry_i=s['entry_bar'], arm_i=s['arm_bar'], exit_i=n - 1,
+                                     entry_p=s['entry_price'], exit_p=cp, held=s['held'],
+                                     result=OPEN, ret=pc))
+
+    return {name: s['trades'] for name, s in states.items()}
+
+
+def _simulate_exit_from_entry(prices, highs, lows, opens, entry_bar, entry_price,
+                               take_profit, stop_loss, trail_pct, max_hours_to_hold):
+    """Shared SL/TP/trailing/TIME exit state machine, run forward from an already-
+    known entry (bar, price) -- exit-side logic identical across all three
+    trailing-buy resolutions (see simulate_trail_both_signal_tracked), so this is
+    the one exit simulation both the real trailing-buy fill and the
+    market-on-close counterfactual entry can share."""
+    tp_price = entry_price * (1.0 + take_profit)
+    stop_price = entry_price * (1.0 - stop_loss)
+    trailing = False
+    peak = 0.0
+    held = 0
+
+    n = len(prices)
+    for i in range(entry_bar + 1, n):
+        cp, high, low, op = prices[i], highs[i], lows[i], opens[i]
+        held += 1
+        if trailing:
+            trail_stop_gap = peak * (1.0 - trail_pct)
+            if op <= trail_stop_gap:
+                pc = (op - entry_price) / entry_price
+                return dict(exit_i=i, exit_p=op, held=held, result=WIN if pc > 0 else LOSS, ret=pc)
+            if high > peak:
+                peak = high
+            trail_stop = peak * (1.0 - trail_pct)
+            if low <= trail_stop or held >= max_hours_to_hold:
+                exit_px = trail_stop if low <= trail_stop else cp
+                pc = (exit_px - entry_price) / entry_price
+                return dict(exit_i=i, exit_p=exit_px, held=held, result=WIN if pc > 0 else LOSS, ret=pc)
+            continue
+        if op <= stop_price:
+            pc = (op - entry_price) / entry_price
+            return dict(exit_i=i, exit_p=op, held=held, result=LOSS, ret=pc)
+        if low <= stop_price:
+            pc = (stop_price - entry_price) / entry_price
+            return dict(exit_i=i, exit_p=stop_price, held=held, result=LOSS, ret=pc)
+        if cp >= tp_price:
+            trailing = True; peak = cp
+            continue
+        if held >= max_hours_to_hold:
+            pc = (cp - entry_price) / entry_price
+            return dict(exit_i=i, exit_p=cp, held=held, result=TWIN if pc > 0 else TLOSS, ret=pc)
+
+    cp = prices[n - 1]
+    pc = (cp - entry_price) / entry_price
+    return dict(exit_i=n - 1, exit_p=cp, held=held, result=OPEN, ret=pc)
+
+
+def collect_last_window_comparisons(p, take_profit, stop_loss, max_hours_to_hold,
+                                     trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh,
+                                     open_check=False):
+    """For every real historical signal that fires in the LAST daily window
+    (hour==target_h1 -- no bars left same-day to catch a trailing-buy bounce
+    before the overnight gap), compares two counterfactual entries from that
+    same signal bar, both forward-simulated with the identical exit logic:
+      - TB: the real trailing-buy bounce-fill, computed 3 ways (possible/
+        pessimistic/certain).
+      - MOC: entering immediately at the signal bar's own Close, no bounce wait.
+    See docs/backlog_cache.md's 'last-bar market-on-close vs trailing-buy'
+    research item. One row per (resolution, last-window signal)."""
+    prices, highs, lows, opens = p['prices'], p['highs'], p['lows'], p['opens']
+    hours, timestamps = p['hours'], p['timestamps']
+
+    by_res = simulate_trail_both_signal_tracked(
+        p, take_profit, stop_loss, max_hours_to_hold, trail_buy_pct, trail_pct,
+        target_h0, target_h1, z_thresh, open_check=open_check)
+
+    rows = []
+    for res_name, trades in by_res.items():
+        for t in trades:
+            if t['signal_i'] is None or hours[t['signal_i']] != target_h1:
+                continue
+            moc_entry_bar = t['signal_i']
+            moc_entry_price = prices[moc_entry_bar]
+            moc = _simulate_exit_from_entry(prices, highs, lows, opens, moc_entry_bar,
+                                             moc_entry_price, take_profit, stop_loss,
+                                             trail_pct, max_hours_to_hold)
+            rows.append(dict(
+                resolution=res_name,
+                signal_i=t['signal_i'], signal_time=timestamps[t['signal_i']],
+                tb_entry_i=t['entry_i'], tb_entry_p=t['entry_p'], tb_exit_p=t['exit_p'],
+                tb_held=t['held'], tb_result=_RESULT_NAMES[t['result']], tb_ret=t['ret'],
+                moc_entry_p=moc_entry_price, moc_exit_p=moc['exit_p'], moc_held=moc['held'],
+                moc_result=_RESULT_NAMES[moc['result']], moc_ret=moc['ret'],
+            ))
+    return rows
+
+
 def _resolve_miss(rng, mode, miss_rate, streak, max_delay_checks):
     """One coin flip for a currently-true entry/exit condition. Returns True if
     the action fires now, False if this check is missed. `drop` mode has no
@@ -457,21 +708,29 @@ def _resolve_miss(rng, mode, miss_rate, streak, max_delay_checks):
 def simulate_trail_both_chaos(p, take_profit, stop_loss, max_hours_to_hold,
                                trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh,
                                rng, entry_miss_mode, entry_miss_rate,
-                               exit_miss_mode, exit_miss_rate, max_delay_checks=3):
+                               exit_miss_mode, exit_miss_rate, max_delay_checks=3,
+                               open_check=False):
     """Execution-adherence ("chaos monkey") mirror of simulate_trail_both_annotated:
-    same real bar-by-bar entry/exit logic, but every entry-signal window and every
-    exit trigger (SL / trailing-stop breach / TIME) is subject to a random miss
-    per `_resolve_miss` before it's acted on -- models a human failing to notice
-    or act on a Slack alert in time, the real risk during manual-execution
-    trading (distinct from island/robust-alpha, which both assume perfect
-    adherence to every signal). TP->trailing-arm is never missable -- it's an
-    internal state change (switching into trailing-sell tracking), not a
-    discrete action a human has to click. Entry checks only happen at the two
-    daily signal windows (target_h0/target_h1), matching the real Slack cadence;
-    exit checks happen every bar while in a trade, matching the live daemon's
-    continuous position monitoring. See docs/backlog_cache.md's 2026-07-16
-    "chaos monkey" item and scripts/sim_chaos_monkey.py."""
-    prices, highs, lows, hours = p['prices'], p['highs'], p['lows'], p['hours']
+    same real bar-by-bar entry/exit logic (including the gap-through-trigger fix on
+    both the trailing-buy entry and the SL/trailing-stop exits), but every
+    entry-signal window and every exit trigger (SL / trailing-stop breach / TIME) is
+    subject to a random miss per `_resolve_miss` before it's acted on -- models a
+    human failing to notice or act on a Slack alert in time, the real risk during
+    manual-execution trading (distinct from island/robust-alpha, which both assume
+    perfect adherence to every signal). A gap-through-trigger fill itself is not a
+    missable event (it's a broker-side fill mechanic, not a discrete human action) --
+    only whether the human notices/acts on the underlying signal is missable; once
+    acted on, the fill price reflects the real gap. TP->trailing-arm is never
+    missable -- it's an internal state change (switching into trailing-sell
+    tracking), not a discrete action a human has to click. Entry checks only happen
+    at the two daily signal windows (target_h0/target_h1), matching the real Slack
+    cadence; exit checks happen every bar while in a trade, matching the live
+    daemon's continuous position monitoring. open_check: mirrors
+    backtester._simulate_trail_both's open_check_entry_timing -- needed since every
+    real live TrailingBoth node runs entry_timing='open_check', not 'close'. See
+    docs/backlog_cache.md's 2026-07-16 "chaos monkey" item and
+    scripts/sim_chaos_monkey.py."""
+    prices, highs, lows, opens, hours = p['prices'], p['highs'], p['lows'], p['opens'], p['hours']
     daily_idx, sma_arr, std_arr = p['daily_idx'], p['sma_arr'], p['std_arr']
     trend_arr, has_trend = p['trend_arr'], p['has_trend']
 
@@ -489,11 +748,24 @@ def simulate_trail_both_chaos(p, take_profit, stop_loss, max_hours_to_hold,
 
     n = len(prices)
     for i in range(n):
-        cp, high, low = prices[i], highs[i], lows[i]
+        cp, high, low, op = prices[i], highs[i], lows[i], opens[i]
 
         if in_trade:
             held += 1
             if trailing:
+                trail_stop_gap = peak * (1.0 - trail_pct)
+                gap_hit = op <= trail_stop_gap
+                if gap_hit:
+                    if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
+                        exit_streak = 0
+                        pc = (op - entry_price) / entry_price
+                        trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
+                                            arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=op,
+                                            held=held, result=WIN if pc > 0 else LOSS, ret=pc))
+                        in_trade = trailing = False
+                    else:
+                        exit_streak += 1
+                    continue
                 if high > peak:
                     peak = high
                 trail_stop = peak * (1.0 - trail_pct)
@@ -513,12 +785,15 @@ def simulate_trail_both_chaos(p, take_profit, stop_loss, max_hours_to_hold,
                     continue
                 exit_streak = 0
                 continue
-            if low <= stop_price:
+            sl_gap_hit = op <= stop_price
+            sl_hit = low <= stop_price
+            if sl_gap_hit or sl_hit:
                 if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
                     exit_streak = 0
-                    pc = (stop_price - entry_price) / entry_price
+                    exit_px = op if sl_gap_hit else stop_price
+                    pc = (exit_px - entry_price) / entry_price
                     trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
-                                        arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=stop_price,
+                                        arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=exit_px,
                                         held=held, result=LOSS, ret=pc))
                     in_trade = False
                 else:
@@ -543,6 +818,14 @@ def simulate_trail_both_chaos(p, take_profit, stop_loss, max_hours_to_hold,
 
         if waiting:
             wait_bars += 1
+            buy_trigger_gap = running_low * (1.0 + trail_buy_pct)
+            if op >= buy_trigger_gap:
+                entry_price = op
+                tp_price = entry_price * (1.0 + take_profit)
+                stop_price = entry_price * (1.0 - stop_loss)
+                entry_bar = i; held = 0; arm_bar = None
+                in_trade = True; waiting = trailing = False
+                continue
             if low < running_low:
                 running_low = low
             buy_trigger = running_low * (1.0 + trail_buy_pct)
@@ -567,12 +850,25 @@ def simulate_trail_both_chaos(p, take_profit, stop_loss, max_hours_to_hold,
         if std == 0.0:
             continue
         lower_band = sma - std * z_thresh
-        signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
-        if signal:
+        fired_signal = False
+        fired_z = None
+        if open_check:
+            signal_open = (op <= lower_band) and (op > trend_arr[di]) if has_trend else op <= lower_band
+            if signal_open:
+                fired_signal = True
+                fired_price = op
+                fired_z = (op - sma) / std
+        if not fired_signal:
+            signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
+            if signal:
+                fired_signal = True
+                fired_price = cp
+                fired_z = (cp - sma) / std
+        if fired_signal:
             if _resolve_miss(rng, entry_miss_mode, entry_miss_rate, entry_streak, max_delay_checks):
                 entry_streak = 0
-                waiting = True; running_low = cp; wait_bars = 0
-                signal_bar = i; signal_z = (cp - sma) / std
+                waiting = True; running_low = fired_price; wait_bars = 0
+                signal_bar = i; signal_z = fired_z
             else:
                 entry_streak += 1
         else:
@@ -583,6 +879,152 @@ def simulate_trail_both_chaos(p, take_profit, stop_loss, max_hours_to_hold,
         pc = (cp - entry_price) / entry_price
         trades.append(dict(signal_i=signal_bar, signal_z=signal_z, entry_i=entry_bar,
                             arm_i=arm_bar, exit_i=n - 1, entry_p=entry_price, exit_p=cp,
+                            held=held, result=OPEN, ret=pc))
+
+    return trades
+
+
+def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
+                               trail_pct, target_h0, target_h1, z_thresh,
+                               rng, entry_miss_mode, entry_miss_rate,
+                               exit_miss_mode, exit_miss_rate, max_delay_checks=3,
+                               open_check=False):
+    """Execution-adherence ("chaos monkey") mirror of backtester._simulate_trail
+    (TrailingExitZScoreBreakout -- immediate market entry at the signal bar, no
+    trailing-buy wait phase), same chaos-miss framework as
+    simulate_trail_both_chaos: the entry signal is missable at the two daily
+    windows (matches the real live workflow -- stage a limit order pre-market,
+    confirm+submit within ~5 seconds of the Slack alert, a genuinely missable
+    manual action), exit triggers (SL / trailing-stop breach / TIME) are missable
+    every bar while in a trade. Includes the same gap-through-trigger exit-side
+    fix as the production kernel (Open-first check before the intrabar Low
+    check on both SL and trailing-stop) -- the gap fill itself isn't missable,
+    only whether the underlying trigger is noticed/acted on. open_check: mirrors
+    backtester._simulate_trail's open_check_entry_timing."""
+    prices, highs, lows, opens, hours = p['prices'], p['highs'], p['lows'], p['opens'], p['hours']
+    daily_idx, sma_arr, std_arr = p['daily_idx'], p['sma_arr'], p['std_arr']
+    trend_arr, has_trend = p['trend_arr'], p['has_trend']
+
+    trades = []
+    in_trade = trailing = False
+    entry_price = stop_price = tp_price = peak = 0.0
+    entry_bar = held = 0
+    signal_z = None
+    entry_streak = 0
+    exit_streak = 0
+
+    n = len(prices)
+    for i in range(n):
+        cp, high, low, op = prices[i], highs[i], lows[i], opens[i]
+
+        if in_trade:
+            held += 1
+            if trailing:
+                trail_stop_gap = peak * (1.0 - trail_pct)
+                gap_hit = op <= trail_stop_gap
+                if gap_hit:
+                    if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
+                        exit_streak = 0
+                        pc = (op - entry_price) / entry_price
+                        trades.append(dict(signal_i=entry_bar, signal_z=signal_z, entry_i=entry_bar,
+                                            arm_i=None, exit_i=i, entry_p=entry_price, exit_p=op,
+                                            held=held, result=WIN if pc > 0 else LOSS, ret=pc))
+                        in_trade = trailing = False
+                    else:
+                        exit_streak += 1
+                    continue
+                if high > peak:
+                    peak = high
+                trail_stop = peak * (1.0 - trail_pct)
+                sl_hit = low <= trail_stop
+                time_hit = held >= max_hours_to_hold
+                if sl_hit or time_hit:
+                    if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
+                        exit_streak = 0
+                        exit_px = trail_stop if sl_hit else cp
+                        pc = (exit_px - entry_price) / entry_price
+                        trades.append(dict(signal_i=entry_bar, signal_z=signal_z, entry_i=entry_bar,
+                                            arm_i=None, exit_i=i, entry_p=entry_price, exit_p=exit_px,
+                                            held=held, result=WIN if pc > 0 else LOSS, ret=pc))
+                        in_trade = trailing = False
+                    else:
+                        exit_streak += 1
+                    continue
+                exit_streak = 0
+                continue
+            sl_gap_hit = op <= stop_price
+            sl_hit = low <= stop_price
+            if sl_gap_hit or sl_hit:
+                if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
+                    exit_streak = 0
+                    exit_px = op if sl_gap_hit else stop_price
+                    pc = (exit_px - entry_price) / entry_price
+                    trades.append(dict(signal_i=entry_bar, signal_z=signal_z, entry_i=entry_bar,
+                                        arm_i=None, exit_i=i, entry_p=entry_price, exit_p=exit_px,
+                                        held=held, result=LOSS, ret=pc))
+                    in_trade = False
+                else:
+                    exit_streak += 1
+                continue
+            if cp >= tp_price:
+                trailing = True; peak = cp
+                continue
+            if held >= max_hours_to_hold:
+                if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
+                    exit_streak = 0
+                    pc = (cp - entry_price) / entry_price
+                    trades.append(dict(signal_i=entry_bar, signal_z=signal_z, entry_i=entry_bar,
+                                        arm_i=None, exit_i=i, entry_p=entry_price, exit_p=cp,
+                                        held=held, result=TWIN if pc > 0 else TLOSS, ret=pc))
+                    in_trade = False
+                else:
+                    exit_streak += 1
+                continue
+            exit_streak = 0
+            continue
+
+        h = hours[i]
+        if h != target_h0 and h != target_h1:
+            continue
+        di = daily_idx[i]
+        if di < 0:
+            continue
+        sma, std = sma_arr[di], std_arr[di]
+        if std == 0.0:
+            continue
+        lower_band = sma - std * z_thresh
+        fired_signal = False
+        if open_check:
+            signal_open = (op <= lower_band) and (op > trend_arr[di]) if has_trend else op <= lower_band
+            if signal_open:
+                fired_signal = True
+                fired_price = op
+                fired_z = (op - sma) / std
+        if not fired_signal:
+            signal = (cp <= lower_band) and (cp > trend_arr[di]) if has_trend else cp <= lower_band
+            if signal:
+                fired_signal = True
+                fired_price = cp
+                fired_z = (cp - sma) / std
+        if fired_signal:
+            if _resolve_miss(rng, entry_miss_mode, entry_miss_rate, entry_streak, max_delay_checks):
+                entry_streak = 0
+                entry_price = fired_price
+                tp_price = entry_price * (1.0 + take_profit)
+                stop_price = entry_price * (1.0 - stop_loss)
+                entry_bar = i; held = 0
+                signal_z = fired_z
+                in_trade = True; trailing = False
+            else:
+                entry_streak += 1
+        else:
+            entry_streak = 0
+
+    if in_trade:
+        cp = prices[n - 1]
+        pc = (cp - entry_price) / entry_price
+        trades.append(dict(signal_i=entry_bar, signal_z=signal_z, entry_i=entry_bar,
+                            arm_i=None, exit_i=n - 1, entry_p=entry_price, exit_p=cp,
                             held=held, result=OPEN, ret=pc))
 
     return trades

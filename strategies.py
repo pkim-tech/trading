@@ -125,9 +125,20 @@ class TrailingExitZScoreBreakout(BaseStrategy):
         stop_price = ep * (1 - ctx['stop_loss'])
         tp_price   = ep * (1 + ctx['take_profit'])
         trail_pct  = self.params.get('trail_pct', 0.03)
+        op = ctx.get('open', ctx['current_price'])
 
         if state.get('trailing'):
-            peak = max(state.get('peak', ep), ctx['high'])
+            prior_peak = state.get('peak', ep)
+            trail_stop_gap = prior_peak * (1 - trail_pct)
+            # Open-first gap check -- mirrors the exit-side gap-through-trigger fix
+            # in backtester.py (2026-07-20): if the bar's Open already cleared the
+            # trailing-stop confirmed through the prior bar, that's the honest fill,
+            # not the theoretical trail_stop level (which the position never
+            # actually traded at).
+            if op <= trail_stop_gap:
+                reason = 'WIN' if op > ep else 'LOSS'
+                return reason, op, state
+            peak = max(prior_peak, ctx['high'])
             state['peak'] = peak
             trail_stop = peak * (1 - trail_pct)
             if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
@@ -136,6 +147,9 @@ class TrailingExitZScoreBreakout(BaseStrategy):
                 return reason, exit_px, state
             return None, None, state
 
+        # Same Open-first gap check on the fixed SL.
+        if op <= stop_price:
+            return 'SL', op, state
         if ctx['low'] <= stop_price:
             return 'SL', stop_price, state
 
@@ -206,9 +220,20 @@ class LimitOrderTrailingExit(LimitOrderZScoreBreakout):
         stop_price = ep * (1 - ctx['stop_loss'])
         tp_price   = ep * (1 + ctx['take_profit'])
         trail_pct  = self.params.get('trail_pct', 0.03)
+        op = ctx.get('open', ctx['current_price'])
 
         if state.get('trailing'):
-            peak = max(state.get('peak', ep), ctx['high'])
+            prior_peak = state.get('peak', ep)
+            trail_stop_gap = prior_peak * (1 - trail_pct)
+            # Open-first gap check -- mirrors the exit-side gap-through-trigger fix
+            # in backtester.py (2026-07-20): if the bar's Open already cleared the
+            # trailing-stop confirmed through the prior bar, that's the honest fill,
+            # not the theoretical trail_stop level (which the position never
+            # actually traded at).
+            if op <= trail_stop_gap:
+                reason = 'WIN' if op > ep else 'LOSS'
+                return reason, op, state
+            peak = max(prior_peak, ctx['high'])
             state['peak'] = peak
             trail_stop = peak * (1 - trail_pct)
             if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
@@ -217,6 +242,9 @@ class LimitOrderTrailingExit(LimitOrderZScoreBreakout):
                 return reason, exit_px, state
             return None, None, state
 
+        # Same Open-first gap check on the fixed SL.
+        if op <= stop_price:
+            return 'SL', op, state
         if ctx['low'] <= stop_price:
             return 'SL', stop_price, state
         if not ctx.get('at_bar_close', True):
@@ -276,9 +304,20 @@ class TrailingBothZScoreBreakout(TrailingBuyZScoreBreakout):
         stop_price = ep * (1 - ctx['stop_loss'])
         tp_price   = ep * (1 + ctx['take_profit'])
         trail_pct  = self.params.get('trail_pct', 0.03)
+        op = ctx.get('open', ctx['current_price'])
 
         if state.get('trailing'):
-            peak = max(state.get('peak', ep), ctx['high'])
+            prior_peak = state.get('peak', ep)
+            trail_stop_gap = prior_peak * (1 - trail_pct)
+            # Open-first gap check -- mirrors the exit-side gap-through-trigger fix
+            # in backtester.py (2026-07-20): if the bar's Open already cleared the
+            # trailing-stop confirmed through the prior bar, that's the honest fill,
+            # not the theoretical trail_stop level (which the position never
+            # actually traded at).
+            if op <= trail_stop_gap:
+                reason = 'WIN' if op > ep else 'LOSS'
+                return reason, op, state
+            peak = max(prior_peak, ctx['high'])
             state['peak'] = peak
             trail_stop = peak * (1 - trail_pct)
             if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
@@ -287,6 +326,9 @@ class TrailingBothZScoreBreakout(TrailingBuyZScoreBreakout):
                 return reason, exit_px, state
             return None, None, state
 
+        # Same Open-first gap check on the fixed SL.
+        if op <= stop_price:
+            return 'SL', op, state
         if ctx['low'] <= stop_price:
             return 'SL', stop_price, state
         if not ctx.get('at_bar_close', True):
