@@ -160,7 +160,10 @@ def test_check_auto_fills_records_buy_fill_when_enabled(env, monkeypatch):
     pos = signals_db.get_open_position(TICKER)
     assert pos is not None
     assert pos['entry_price'] == 51.0
-    assert pos['shares'] == 100
+    # 100-share fill ($5,100) is well under the node's $50k target_notional, so
+    # Part 3's post-fill top-up (_reconcile_fill) buys the remaining shares --
+    # entry_price stays 51.0 since the top-up fills at the same price.
+    assert pos['shares'] == 980
     assert [p for p in signals_db.get_pending_buys() if p['ticker'] == TICKER] == []
 
 

@@ -127,20 +127,24 @@ def _last_sale_recovery(ticker, starting_notional):
     return starting_notional
 
 
-def buy_order_sizing(node, sig):
+def buy_order_sizing(node, sig, pad_pct=1.0):
     """Worst-case trailing-buy sizing: a real trailing-buy order fills once price
     bounces trail_buy_pct% off a running low that can fall further before that, so
-    the fill price is unbounded relative to the signal-time price. Sizing off the
-    worst case (no further drop, fill right at the bounce trigger) guarantees the
-    order never costs more than target_notional. Shared by _build_buy_blocks and
-    the automated-placement path so there's one sizing formula, not two."""
+    the fill price is unbounded relative to the signal-time price. Sizing off
+    trail_buy_pct + pad_pct (not trail_buy_pct alone) covers ordinary same-day
+    slippage between signal detection and the order actually going live at the
+    broker (Part 3, 2026-07-21) -- pad_pct=1.0 is the default same-day pad.
+    The overnight gap-correction path (signals_notify.check_gap_resize, branch B)
+    is a plain MARKET order, sized separately (flat pad on a live quote, not this
+    trailing-bounce formula). Shared by _build_buy_blocks and the
+    automated-placement path so there's one sizing formula, not two."""
     ticker = sig['ticker']
     price = sig['current_price']
     target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
     trailing_buy = db._is_trailing_buy(node)
     trail_buy_pct = node.get('trail_buy_pct') or 0.0
     if trailing_buy:
-        shares = int(target_notional // (price * (1 + trail_buy_pct / 100)))
+        shares = int(target_notional // (price * (1 + (trail_buy_pct + pad_pct) / 100)))
     else:
         shares = int(target_notional // price)
     return {

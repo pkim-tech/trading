@@ -1,53 +1,36 @@
 # Backlog Cache
 
-## [live-trading] High priority, design finalized 2026-07-21, implementation not started — trailing-buy budget adherence (Part 3: padded sizing + overnight gap guard + post-fill top-up)
-Full design at `/home/pkim/.claude/plans/prancy-petting-stallman.md` (not git-tracked —
-local plan file, path only, carry forward if it's ever cleaned up) and summarized in
-`docs/research_log.md`'s 2026-07-21 entry. Resolves both the "trailing-buy needs
-re-sizing" and "gap-through-trigger fill optimism" backlog items below (Part 3 of
-`/home/pkim/.claude/plans/imperative-noodling-dream.md`) with one unified design:
-- **Same-day sizing pad**: `buy_order_sizing` sizes off `trail_buy_pct+1` (was
-  `trail_buy_pct` alone) — covers ordinary same-day slippage, the majority case
-  (real same-day fill rate 40.6-100% across watchlist-65's 4 TB tickers, checked
-  empirically, not assumed).
-- **Pre-open gap guard** (new `_GAP_CHECK_WINDOW=(9,15,9,29)`): only acts when a
-  still-pending order's trigger has *already* cleared overnight — cancels and
-  replaces with a plain `MARKET` order (mirrors the kernel's own `entry_price=op`
-  gap-fill behavior) sized off a live Schwab quote (`schwab_client.get_current_price`,
-  primary Schwab `get_quote`, yfinance fallback) with a flat 5% pad. If the trigger
-  hasn't cleared, no action — the resting order's original sizing is still a valid
-  bound (running_low is non-increasing).
-- **Post-fill top-up**: shared idempotent `_reconcile_fill` helper, fed by two
-  independent paths — a new account-activity websocket (`schwab_stream.py`,
-  `schwab.streaming.StreamClient`, confirmed real, with reconnect+backoff+Slack-alert
-  on disconnect) for fast reconciliation, and the existing `check_auto_fills` poll as
-  an always-on fallback so the websocket is a latency improvement, not a new
-  dependency.
-Real course-corrections during design (each backed by data pulled mid-conversation,
-not assumed) are detailed in the research log entry — worth reading before touching
-this, since several plausible-sounding simpler designs were tried and rejected for
-specific measured reasons (e.g. a flat pad alone doesn't close overnight gap risk;
-yfinance's pre-market feed is real-stale for HIBL specifically).
-**Action needed**: implement per the plan file — `schwab_client.py` (order-id capture,
-`cancel_order`, `get_current_price`), `signals_db.py` (`pending_buys.order_id`),
-`schwab_safety.py` (`is_gap_correction` bypass), `schwab_stream.py` (new),
-`signals_notify.py` (`check_gap_resize`, `_reconcile_fill`, `drain_fill_queue`),
-`active_signals.py` (gap-check window + stream startup + queue drain). Not started
-beyond one prep import added to `schwab_client.py`.
+## [live-trading] Implemented 2026-07-21, not yet live-tested — trailing-buy budget adherence (Part 3: padded sizing + overnight gap guard + post-fill top-up)
+Full writeup in `docs/design.md` (Layer 3, "Part 3" entry) and `docs/research_log.md`'s
+2026-07-21 design entry. Resolves both the "trailing-buy needs re-sizing" and
+"gap-through-trigger fill optimism" backlog items with one unified design:
+same-day sizing pad (`buy_order_sizing(node, sig, pad_pct=1.0)`), a pre-open gap
+guard (`signals_notify.check_gap_resize`, fired once daily from `active_signals.
+run_loop` at `_GAP_CHECK_WINDOW=(9,15,9,29)` — cancels+replaces a resting trailing
+buy with a plain MARKET order only if the overnight gap already cleared the
+trigger), and a post-fill top-up (`_reconcile_buy_fill`/`_reconcile_fill`, fed by
+both the existing `check_auto_fills` poll and a new account-activity websocket,
+`schwab_stream.py`). All 8 implementation tasks done; full `pytest tests/` green
+(107 passed, 9 new), `verify_trailing_buy_resolution.py`/
+`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` clean, `pending_buys.order_id`
+migration confirmed additive-only against a `trading_live.db` backup.
+**Not yet done**: no real order has been tested end-to-end (every account is still
+`dry_run=True`); `schwab_stream.py`'s account-activity payload parsing is unverified
+against a real fill event — confirm both before trusting this beyond dry-run.
+Also open: confirm with Schwab whether the limited-margin IRA falls under FINRA
+Rule 4210's new intraday-margin cure mechanism (user will confirm directly, or a
+test run can help — Schwab typically emails a notification for this); once
+confirmed, rerun the pre-market-to-open drift check against Schwab's own quote
+feed (not yfinance) to make sure the flat 5% gap-guard pad is still well-calibrated.
 
-## [live-trading][backtest] Open question, raised 2026-07-21, not decided — should SOXL's watchlist-65 node switch from TrailingBoth to TrailingExit?
-Raised while discussing execution difficulty. Real comparison pulled (v5, `open_check`,
-robust alpha): TB (sl2 tp30 trail_buy3.0 h70 w10 z1.0) 1212.1% best alpha, worst_neighbor
-153.9; TE (sl2 tp26 trail_sell8.0 h119 w10 z1.0) 947.0% best alpha, worst_neighbor 28.0.
-TE gives up ~22% of alpha and has a much thinner cliff-safety margin, but wins on trade
-count (178 vs 151) and win rate (13.5% vs 9.9%), and is operationally easier to execute
-manually (no trailing-buy order to catch) — same trade-off already resolved for AGQ/NUGT/
-UDOW/YANG/DPST/KORU when the v5 watchlist was built (`docs/deep_backlog.md`, 2026-07-20).
-Conversation pivoted to the Part 3 infra design above before this was decided either way.
-**Action needed**: decide whether to swap SOXL's watchlist-65 node (`signals_db`: remove
-the TB node, add/annotate the TE node) or keep TB now that Part 3 will make TB's execution
-fully automated anyway (which may resolve the "hard to execute manually" motivation
-without needing to give up the extra alpha).
+## [live-trading][backtest] Resolved 2026-07-21 — SOXL's watchlist-65 node stays TrailingBoth
+Real comparison (v5, `open_check`, robust alpha): TB (sl2 tp30 trail_buy3.0 h70 w10 z1.0)
+1212.1% best alpha, worst_neighbor 153.9; TE (sl2 tp26 trail_sell8.0 h119 w10 z1.0) 947.0%
+best alpha, worst_neighbor 28.0. TE's edge was operational ease (no trailing-buy order to
+catch manually) at the cost of ~22% alpha and a much thinner cliff margin. **User decision:
+keep TB** — that operational-ease motivation is exactly what Part 3 (trailing-buy budget
+adherence automation, above) resolves directly, so there's no reason to give up the extra
+alpha. No watchlist/`signals_db` change made.
 
 ## [live-trading][tax] Active hold, set 2026-07-20 — don't buy GDXU/AGQ in any IRA-type account before their wash-sale clearance dates
 Real taxable-brokerage-account losses found while discussing account mapping for

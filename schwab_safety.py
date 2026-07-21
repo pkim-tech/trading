@@ -310,7 +310,8 @@ def _has_open_order(account: str, ticker: str) -> bool:
 
 
 def check_order(
-    account: str, ticker: str, quantity: int, price: float, side: str, counts: dict | None = None
+    account: str, ticker: str, quantity: int, price: float, side: str, counts: dict | None = None,
+    is_gap_correction: bool = False,
 ) -> None:
     """Raises SafetyViolation if the order should not proceed. `counts`, if
     given, is used for the daily-cap/burst-cap/duplicate checks instead of
@@ -359,7 +360,11 @@ def check_order(
         )
 
     # Signal-window time gate, BUY only (see _SIGNAL_WINDOWS comment above).
-    if side == "BUY":
+    # Skipped for a gap-correction replacement order (Part 3, branch B) -- that
+    # order is a cancel+replace of an already-approved pending buy, running in
+    # the pre-open _GAP_CHECK_WINDOW deliberately outside the normal signal
+    # windows; every other guard below still applies.
+    if side == "BUY" and not is_gap_correction:
         now = _now()
         t = (now.hour, now.minute)
         all_windows = _SIGNAL_WINDOWS + _OPEN_CHECK_WINDOWS
@@ -405,16 +410,19 @@ def check_order(
             )
 
 
-def approve_and_record(account: str, ticker: str, quantity: int, price: float, side: str) -> bool:
+def approve_and_record(
+    account: str, ticker: str, quantity: int, price: float, side: str, is_gap_correction: bool = False
+) -> bool:
     """Call immediately before placing a real order. Raises SafetyViolation if
     blocked; otherwise records the order against the daily cap, the global
     per-minute burst cap, and the duplicate-order window, and returns whether
     the account is in dry_run mode (caller must skip the real API call if so).
     Checks and increments happen under the same file lock so two concurrent
-    callers can't both slip past a cap."""
+    callers can't both slip past a cap. is_gap_correction bypasses only the
+    signal-window time gate (see check_order) -- Part 3, branch B."""
     with _open_locked() as f:
         counts = json.loads(f.read() or "{}")
-        check_order(account, ticker, quantity, price, side, counts=counts)
+        check_order(account, ticker, quantity, price, side, counts=counts, is_gap_correction=is_gap_correction)
         key = str(date.today())
         today = counts.setdefault(key, {})
         today[account] = today.get(account, 0) + 1

@@ -6,6 +6,7 @@ Chart generation lives in signals_charts.py, Slack block/message builders
 in signals_blocks.py, Bolt interactive handlers in signals_handlers.py.
 """
 import json
+import time
 from datetime import datetime
 
 import signals_config as cfg
@@ -13,6 +14,7 @@ import signals_db as db
 import signals_compute as compute
 import schwab_safety
 import schwab_client
+import schwab_stream
 from signals_charts import _chart_buy, _chart_sell, _upload_chart
 from signals_blocks import _post_message, _build_buy_blocks, _build_sell_blocks
 from signals_helpers import (
@@ -24,24 +26,25 @@ from signals_helpers import (
 def _attempt_automated_buy(node, sizing):
     """Places a real (or dry_run) trailing-buy order via schwab_client for a
     pilot-scope ticker instead of waiting on a human to click 'Trailing Buy
-    Order Placed'. Returns False (falls back to the existing manual flow) if
-    the ticker isn't in scope, or if schwab_safety blocks the order for any
-    reason (paused, outside signal window, kill switch, etc.) -- schwab_client
-    already Slack-posts the BLOCKED/DRY RUN message either way, this function
-    just decides which button set the caller should render."""
+    Order Placed'. Returns (False, None) (falls back to the existing manual
+    flow) if the ticker isn't in scope, or if schwab_safety blocks the order
+    for any reason (paused, outside signal window, kill switch, etc.) --
+    schwab_client already Slack-posts the BLOCKED/DRY RUN message either way,
+    this function just decides which button set the caller should render.
+    Returns (True, order_id) on success -- order_id is None in dry_run."""
     ticker = node['ticker']
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
-        return False
+        return False, None
     account = node.get('account')
     try:
-        schwab_client.place_trailing_buy(
+        _, order_id = schwab_client.place_trailing_buy(
             account, ticker, sizing['shares'], sizing['price'], sizing['trail_buy_pct'])
     except schwab_safety.SafetyViolation:
-        return False
+        return False, None
     except Exception as e:
         _post_message(f"⚠️ {ticker} automated order placement failed unexpectedly: {e} — falling back to manual")
-        return False
-    return True
+        return False, None
+    return True, order_id
 
 
 def _attempt_automated_sell(pos, current_price):
@@ -97,9 +100,10 @@ def notify_buy_signal(node, sig):
 
     trailing_buy = db._is_trailing_buy(node)
     auto_placed = False
+    order_id = None
     if trailing_buy:
         sizing = buy_order_sizing(node, sig)
-        auto_placed = _attempt_automated_buy(node, sizing)
+        auto_placed, order_id = _attempt_automated_buy(node, sizing)
 
     channel, ts = _post_message(
         f"BUY SIGNAL — {ticker}  ${price:.4f}  z={z:.2f}  ({bar_str})",
@@ -110,7 +114,7 @@ def notify_buy_signal(node, sig):
     # fill confirmation even in SIM_MODE or webhook-only (non-socket) runs, where
     # there's no button to click but the reminder loop should still nag.
     if trailing_buy:
-        db.add_pending_buy(node, sig, channel, ts)
+        db.add_pending_buy(node, sig, channel, ts, order_id=order_id)
         if auto_placed:
             db.mark_pending_buy_placed(ticker)
 
@@ -568,6 +572,144 @@ def check_buy_reminders():
         db.update_pending_buy_reminder(pending['id'], channel, ts, reminder_num)
 
 
+def _reconcile_fill(node, fill_price, filled_shares):
+    """Post-fill top-up (Part 3, branch C) -- compares the real fill notional
+    against target_notional (the conservative worst-case sizing pads in
+    buy_order_sizing/check_gap_resize mean a real fill usually comes in under
+    budget) and tops up the position with a market buy for the difference. A
+    meaningful overspend (rare -- the large-gap case is already prevented by
+    check_gap_resize) gets a notify-only, no corrective sell, per Part 3 design.
+    Called only from _reconcile_buy_fill, which clears the pending_buys row
+    first -- that's the dedup marker preventing a double top-up if both the
+    poll and the websocket path notice the same fill."""
+    ticker = node['ticker']
+    target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
+    delta = target_notional - (fill_price * filled_shares)
+    if delta > fill_price:
+        top_up_shares = int(delta // fill_price)
+        if top_up_shares > 0 and db.top_up_position(ticker, top_up_shares, fill_price):
+            _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${fill_price:.4f} "
+                          f"(fill was under target notional by ${delta:,.0f})")
+    elif delta < -fill_price:
+        _post_message(f"⚠️ {ticker} — fill exceeded target notional by ${-delta:,.0f} "
+                      f"(no corrective sell placed)")
+
+
+def _reconcile_buy_fill(ticker, fill_price, filled_shares):
+    """Single entry point for a detected BUY fill -- shared by check_auto_fills
+    (slow poll path) and drain_fill_queue (fast websocket path, Part 3). Clears
+    the pending_buys row before acting (the existing dedup marker: whichever
+    path notices the fill first wins, the other finds nothing to do), opens the
+    real position, then tops it up via _reconcile_fill."""
+    pendings = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
+    if not pendings:
+        return
+    pending = pendings[0]
+    node = pending['node']
+    signal_price = pending['signal_price']
+    signal_time = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
+    db.clear_pending_buy(ticker)
+    opened = db.open_position(node, signal_price, signal_time, fill_price, datetime.now(),
+                               shares=filled_shares)
+    if not opened:
+        return
+    drift_pct = (fill_price - signal_price) / signal_price * 100
+    _post_message(f"🤖 {ticker} — auto-detected fill at ${fill_price:.4f}  "
+                  f"(drift: {drift_pct:+.2f}%)  {filled_shares:g} shares")
+    _reconcile_fill(node, fill_price, filled_shares)
+
+
+_GAP_RESIZE_PAD_PCT = 5.0
+_GAP_FILL_POLL_ATTEMPTS = 5
+_GAP_FILL_POLL_INTERVAL_SECS = 3
+
+
+def check_gap_resize():
+    """Pre-open overnight-gap check (Part 3, branch B) -- for each still-pending,
+    order_placed trailing-buy whose trigger has already cleared overnight (a real
+    gap-through, not rare: 19-44% of trading days per the 2026-07-19 policy sim),
+    cancels the resting order and replaces it with a plain MARKET order (mirrors
+    the backtest kernel's own entry_price=op gap-fill behavior) sized off a live
+    quote with a flat 5% pad. If the trigger hasn't cleared, no action -- the
+    resting order's original sizing is still a valid bound (running_low is
+    non-increasing). Self-contained: polls for the replacement's own fill and
+    reconciles it immediately rather than deferring to the next check_auto_fills
+    cycle. Call once per day (active_signals._GAP_CHECK_WINDOW's once-daily-fire
+    pattern) -- not idempotent against being called mid-flight twice for the same
+    order (it would attempt to cancel an already-cancelled order)."""
+    for pending in db.get_pending_buys():
+        if not pending['order_placed']:
+            continue
+        ticker = pending['ticker']
+        node = pending['node']
+        account = node.get('account')
+        if not account:
+            continue
+        trail_buy_pct = node.get('trail_buy_pct') or 0.0
+        running_low = pending['signal_price']
+        buy_trigger = running_low * (1 + trail_buy_pct / 100)
+        try:
+            current_price = schwab_client.get_current_price(ticker)
+        except Exception as e:
+            _post_message(f"⚠️ {ticker} gap-check price lookup failed: {e}")
+            continue
+        if current_price < buy_trigger:
+            continue
+
+        order_id = pending.get('order_id')
+        if order_id:
+            try:
+                schwab_client.cancel_order(account, ticker, order_id)
+            except Exception as e:
+                _post_message(f"⚠️ {ticker} gap-correction cancel failed: {e} — leaving resting order in place")
+                continue
+
+        target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
+        padded_price = current_price * (1 + _GAP_RESIZE_PAD_PCT / 100)
+        shares = int(target_notional // padded_price)
+        _post_message(f"🌅 {ticker} — overnight gap cleared trigger (${current_price:.4f} vs "
+                      f"${buy_trigger:.4f}); replacing with a MARKET order for {shares} shares")
+        try:
+            _, new_order_id = schwab_client.place_equity_buy(
+                account, ticker, shares, current_price, is_gap_correction=True)
+        except schwab_safety.SafetyViolation as e:
+            _post_message(f"🚫 {ticker} gap-correction MARKET order blocked: {e}")
+            continue
+        db.set_pending_buy_order_id(ticker, new_order_id)
+
+        if new_order_id is None:
+            # dry_run -- no real fill will ever appear on Schwab's order book
+            continue
+
+        for _ in range(_GAP_FILL_POLL_ATTEMPTS):
+            fill = schwab_client.get_filled_order(account, ticker, 'BUY')
+            if fill is not None:
+                break
+            time.sleep(_GAP_FILL_POLL_INTERVAL_SECS)
+        else:
+            _post_message(f"⚠️ {ticker} gap-correction order placed but fill not confirmed after "
+                          f"{_GAP_FILL_POLL_ATTEMPTS * _GAP_FILL_POLL_INTERVAL_SECS}s — "
+                          f"will be caught by the next check_auto_fills poll")
+            continue
+
+        _reconcile_buy_fill(ticker, fill['price'], fill['quantity'])
+
+
+def drain_fill_queue():
+    """Fast-path fill detection (Part 3, branch C) -- pops all pending events off
+    schwab_stream's account-activity queue and reconciles each. A no-op if
+    schwab_stream was never started or has no events (the slow check_auto_fills
+    poll is the always-on fallback, not gated on this)."""
+    while True:
+        try:
+            account, ticker, side, fill_price, filled_shares = schwab_stream.FILL_QUEUE.get_nowait()
+        except Exception:
+            break
+        if side != 'BUY':
+            continue
+        _reconcile_buy_fill(ticker, fill_price, filled_shares)
+
+
 def check_auto_fills(open_positions):
     """Polls Schwab's order book for pilot-scope tickers with auto-fill-detection
     enabled (schwab_safety.auto_fill_detection_enabled, off by default) and
@@ -591,15 +733,7 @@ def check_auto_fills(open_positions):
         fill = schwab_client.get_filled_order(account, ticker, 'BUY')
         if fill is None:
             continue
-        signal_price = pending['signal_price']
-        signal_time = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
-        opened = db.open_position(node, signal_price, signal_time, fill['price'], datetime.now(),
-                                   shares=fill['quantity'])
-        db.clear_pending_buy(ticker)
-        if opened:
-            drift_pct = (fill['price'] - signal_price) / signal_price * 100
-            _post_message(f"🤖 {ticker} — auto-detected fill at ${fill['price']:.4f}  "
-                          f"(drift: {drift_pct:+.2f}%)  {fill['quantity']:g} shares")
+        _reconcile_buy_fill(ticker, fill['price'], fill['quantity'])
 
     for pos in open_positions:
         ticker = pos['ticker']

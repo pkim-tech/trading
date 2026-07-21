@@ -2456,3 +2456,41 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 - Confirm with Schwab directly whether the limited-margin IRA is in scope for the new Rule 4210 intraday-margin cure mechanism.
 - Once `get_current_price` is live, rerun the pre-market-to-open drift check against Schwab's own quote feed (not yfinance) to confirm the flat 5% pad is still well-calibrated.
 - Everything else still carried from prior sessions: wash-sale holds (GDXU/AGQ, clears 2026-08-05/06), `same_day_block` account-type awareness, dividend cash tracking, one-account-per-ticker design, sweep-throughput benchmark, kernel-versioning idea.
+
+---
+
+## 2026-07-21 — Part 3 (trailing-buy budget adherence) implemented end-to-end; SOXL stays TrailingBoth
+
+### What we did
+- **Decided the SOXL TE-vs-TB open question**: keep `TrailingBothZScoreBreakout` on watchlist 65 — the operational-ease motivation for switching to `TrailingExitZScoreBreakout` (avoiding a hard-to-catch-manually trailing-buy order) is exactly what Part 3's automation resolves directly, so there's no reason to give up TB's extra alpha (1212.1% vs TE's 947.0% best alpha). No `signals_db`/watchlist change made.
+- **Implemented Part 3 in full** (all 8 tasks from the design finalized last session, `/home/pkim/.claude/plans/prancy-petting-stallman.md`):
+  1. `schwab_client.py` — `_place_equity_order`/`_place_trailing_order` now capture the real broker order id (`schwab.utils.Utils.extract_order_id`) and return `(response, order_id)` (dry_run: `(None, None)`); new `cancel_order`/`get_current_price` (Schwab `get_quote` extended-session price primary, yfinance fallback).
+  2. `signals_helpers.buy_order_sizing(node, sig, pad_pct=1.0)` — sizes off `trail_buy_pct + pad_pct` instead of `trail_buy_pct` alone, covering ordinary same-day slippage.
+  3. `signals_db.py` — new nullable `pending_buys.order_id` column, `set_pending_buy_order_id`, and `top_up_position` (blends `entry_price` by share-weighted average). Also added `starting_notional` to `_PENDING_BUY_NODE_KEYS` — a real gap found mid-implementation (see below).
+  4. `schwab_safety.check_order`/`approve_and_record` gained `is_gap_correction=False`, bypassing only the BUY signal-window time gate.
+  5. New `schwab_stream.py` — wraps `schwab.streaming.StreamClient` for account-activity fill events, `run_stream_forever()` with capped exponential backoff + Slack alert on disconnect, pushes parsed fills onto a `queue.Queue`.
+  6. `signals_notify.py` — new `_reconcile_buy_fill`/`_reconcile_fill` (shared, dedup'd via clearing `pending_buys` first), `check_gap_resize` (branch B: cancels+replaces a resting trailing buy with a MARKET order, flat 5% pad, only if the trigger already cleared overnight), `drain_fill_queue` (fast path).
+  7. `active_signals.py` — new `_GAP_CHECK_WINDOW=(9,15,9,29)` fired once daily, `schwab_stream.run_stream_forever` launched as a daemon thread at startup, `drain_fill_queue()` called every loop iteration.
+  8. Verification: full `pytest tests/` green (107 passed, was 98 — added `tests/test_part3_gap_resize.py` (7 tests: no-action/replace/dry-run branches of `check_gap_resize`, idempotency and overspend-notify of `_reconcile_fill`, `drain_fill_queue`) and `tests/test_schwab_stream.py` (2 tests: backoff increases and caps, resets after a clean run)). `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` clean. `pending_buys.order_id` migration run against the real `trading_live.db` (backed up first to `cache/live/trading_live.db.bak_pre_part3_order_id_migration`) — confirmed additive-only (row count unchanged, new column present).
+- **Two real bugs found and fixed while wiring this up, not part of the original design doc**:
+  - `_PENDING_BUY_NODE_KEYS` (the subset of a node persisted into `pending_buys.node_json`) never included `starting_notional` — harmless before Part 3 (sizing only happened once, at signal time, off the live node), but `_reconcile_fill`'s post-fill top-up needs `target_notional` again after the fact, and the persisted subset silently had `None`, throwing `_last_sale_recovery`'s "no trade history and no starting_notional configured" `ValueError`. Fixed by adding it to the tuple (also let `_PAPER_PENDING_BUY_NODE_KEYS`, which had `starting_notional` bolted on separately, collapse back to the same base tuple).
+  - `tests/test_schwab_safety.py`'s dry-run assertions (`assert result is None`) needed updating to `assert result == (None, None)` for the new tuple-return signature — 6 call sites.
+- **One test needed a behavior-change update, not a bug fix**: `test_check_auto_fills_records_buy_fill_when_enabled` asserted `pos['shares'] == 100` (the raw fill quantity) — now genuinely `980` after Part 3's top-up correctly buys the remaining shares to reach the $50k target notional (100 shares @ $51 was only $5,100, far under budget). Updated the assertion and added a comment explaining why.
+- **Docs updated**: `docs/design.md` (Layer 3) gained a full Part 3 entry; `docs/backlog_cache.md`'s Part 3 item moved from "not started" to "implemented, not yet live-tested," and the SOXL TE-vs-TB item resolved.
+
+### Verified
+- Full `pytest tests/`: 107 passed (98 before this session, 9 new).
+- `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` — clean, consistent with prior drift.
+- `pending_buys.order_id` migration: backed up `trading_live.db` first, confirmed additive-only (0 rows before/after, new column present).
+- All new modules (`schwab_stream.py`) and edited modules import cleanly; no circular imports.
+
+### Current state
+- Part 3 is fully implemented and unit-tested but **not live-tested**: every Schwab account is still `dry_run=True`, so no real order/cancel/fill has exercised this path end-to-end, and `schwab_stream.py`'s account-activity payload parsing is unverified against a real fill event (same caveat `schwab_client.get_filled_order` carried before its own first real fill).
+- SOXL's watchlist-65 node is unchanged (`TrailingBothZScoreBreakout`).
+
+### Next session
+- Confirm with Schwab (user will do this directly, or a live test may help — Schwab typically emails a notification) whether the limited-margin IRA falls under FINRA Rule 4210's new intraday-margin cure mechanism.
+- Once `get_current_price` has been exercised live, rerun the pre-market-to-open drift check against Schwab's own quote feed (not yfinance) to confirm the flat 5% gap-guard pad is still well-calibrated.
+- First real (still dry_run) exercise of the daemon with `schwab_stream` running, to see the account-activity payload shape for real and confirm `_parse_activity_message` actually matches it.
+- Backlog same-day-block account-type awareness item still open (separately flagged, not part of Part 3).
+- Everything else still carried from prior sessions: wash-sale holds (GDXU/AGQ, clears 2026-08-05/06), one-account-per-ticker design (user is leaning toward doing this), dividend cash tracking, sweep-throughput benchmark, kernel-versioning idea.

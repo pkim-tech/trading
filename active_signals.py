@@ -46,6 +46,7 @@ import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
 import schwab_safety
+import schwab_stream
 import paper_trading
 
 # --- Backward-compatible re-exports -----------------------------------------
@@ -84,7 +85,7 @@ from signals_notify import (
     notify_trailing_activated, check_trailing_reminders,
     EXIT_REMINDER_MINUTES, _exit_pending_blocks, check_exit_reminders,
     BUY_REMINDER_MINUTES, _trailing_buy_status, _pending_buy_blocks, check_buy_reminders,
-    check_auto_fills,
+    check_auto_fills, check_gap_resize, drain_fill_queue,
     _ticker_block, _send_window_alert,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report,
@@ -107,6 +108,11 @@ _SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]
 # without a window/time component) naturally suppresses the same node re-firing ~55 minutes
 # later at the regular close-window check.
 _OPEN_CHECK_WINDOWS = [(9, 31, 9, 40), (14, 31, 14, 40)]
+
+# Pre-open overnight-gap check (Part 3, branch B) -- must run before Session.NORMAL
+# orders start executing at 9:30, and after most real pre-market price discovery
+# has happened. Fires once daily, same pattern as _REFERENCE_TIMES/reference_alerted.
+_GAP_CHECK_WINDOW = (9, 15, 9, 29)
 
 # Reference report fires once at each of these times daily -- early (7am) so
 # there's a report before the day even starts, before the open, and before the
@@ -191,6 +197,11 @@ def run_loop(tickers: set = None):
     else:
         print("  [info] No Slack config — console only")
 
+    # Account-activity websocket (Part 3, branch C fast path) -- latency
+    # improvement only, check_auto_fills keeps polling unconditionally as the
+    # always-on fallback if this thread degrades or never comes up.
+    threading.Thread(target=schwab_stream.run_stream_forever, daemon=True).start()
+
     startup_wl = get_watchlist()
     if tickers:
         startup_wl = [n for n in startup_wl if n['ticker'] in tickers]
@@ -210,6 +221,8 @@ def run_loop(tickers: set = None):
         (last_date, f"{rh:02d}:{rm:02d}") for rh, rm in _REFERENCE_TIMES
         if (_now0.hour, _now0.minute) >= (rh, rm)
     }
+    _gap_h1, _gap_m1 = _GAP_CHECK_WINDOW[2], _GAP_CHECK_WINDOW[3]
+    gap_check_alerted: set[str] = {last_date} if (_now0.hour, _now0.minute) >= (_gap_h1, _gap_m1) else set()
 
     while True:
         now   = datetime.now()
@@ -221,6 +234,7 @@ def run_loop(tickers: set = None):
             window_alerted.clear()
             limit_fill_alerted.clear()
             reference_alerted.clear()
+            gap_check_alerted.clear()
             last_date = today
 
         for rh, rm in _REFERENCE_TIMES:
@@ -232,6 +246,11 @@ def run_loop(tickers: set = None):
                 if tickers:
                     wl = [n for n in wl if n['ticker'] in tickers]
                 send_reference_report(wl)
+
+        gap_h0, gap_m0, gap_h1, gap_m1 = _GAP_CHECK_WINDOW
+        if (gap_h0, gap_m0) <= (now.hour, now.minute) <= (gap_h1, gap_m1) and today not in gap_check_alerted:
+            gap_check_alerted.add(today)
+            check_gap_resize()
 
         watchlist = get_watchlist()
         if tickers:
@@ -309,6 +328,12 @@ def run_loop(tickers: set = None):
         # resting at the broker, and auto-fill-detection is opt-in per ticker anyway
         # (schwab_safety.auto_fill_detection_enabled, off by default).
         check_auto_fills(open_positions)
+
+        # Fast-path fill reconciliation (Part 3, branch C) -- cheap, non-blocking
+        # drain of whatever schwab_stream's account-activity websocket has queued
+        # since the last iteration. check_auto_fills above is the always-on
+        # fallback, so this is a latency improvement, not a new dependency.
+        drain_fill_queue()
 
         # Same "not gated to a window" reasoning as check_auto_fills above -- a
         # simulated trailing buy can bounce-fill any time after the signal fires.

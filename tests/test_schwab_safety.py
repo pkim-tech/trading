@@ -50,7 +50,7 @@ def env(monkeypatch, tmp_path):
 
 def test_dry_run_blocks_real_api_call(env):
     result = schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
-    assert result is None
+    assert result == (None, None)
 
 
 def test_buy_outside_signal_window_blocked(env, monkeypatch):
@@ -62,12 +62,12 @@ def test_buy_outside_signal_window_blocked(env, monkeypatch):
 def test_sell_outside_signal_window_not_blocked(env, monkeypatch):
     monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 7, 15, 12, 0))
     result = schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
-    assert result is None  # dry_run -- not blocked by the time gate
+    assert result == (None, None)  # dry_run -- not blocked by the time gate
 
 
 def test_trailing_buy_dry_run_blocks_real_api_call(env):
     result = schwab_client.place_trailing_buy('ira', TICKER, 5, 50.0, trail_pct=1.0)
-    assert result is None
+    assert result == (None, None)
 
 
 def test_trailing_buy_goes_through_same_safety_checks(env):
@@ -77,7 +77,7 @@ def test_trailing_buy_goes_through_same_safety_checks(env):
 
 def test_trailing_sell_dry_run_blocks_real_api_call(env):
     result = schwab_client.place_trailing_sell('ira', TICKER, 5, 50.0, trail_pct=15.0)
-    assert result is None
+    assert result == (None, None)
 
 
 def test_trailing_sell_goes_through_same_safety_checks(env):
@@ -115,7 +115,7 @@ def test_same_day_sell_after_buy_not_blocked(env):
         c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
         c.commit()
     result = schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
-    assert result is None  # dry_run -- reaches the normal dry_run path, not blocked
+    assert result == (None, None)  # dry_run -- reaches the normal dry_run path, not blocked
 
 
 def test_trailing_buy_shares_duplicate_window_with_market_buy(env):
@@ -210,7 +210,7 @@ def test_kill_switch_persists_across_calls(env):
     schwab_safety.disengage_kill_switch()
     assert schwab_safety.kill_switch_engaged() is False
     result = schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
-    assert result is None  # dry_run -- no longer blocked
+    assert result == (None, None)  # dry_run -- no longer blocked
 
 
 def test_disabled_account_blocked(env, monkeypatch):

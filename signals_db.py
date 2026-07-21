@@ -234,6 +234,12 @@ def ensure_tables():
         pb_cols = [r[1] for r in c.execute("PRAGMA table_info(pending_buys)")]
         if 'order_placed' not in pb_cols:
             c.execute("ALTER TABLE pending_buys ADD COLUMN order_placed INTEGER NOT NULL DEFAULT 0")
+        if 'order_id' not in pb_cols:
+            # Real broker order id (schwab.utils.Utils.extract_order_id), needed by
+            # Part 3's overnight gap-correction check (signals_notify.check_gap_resize)
+            # to cancel a still-resting automated trailing-buy order before replacing
+            # it -- nullable since manual (non-automated) pending buys never have one.
+            c.execute("ALTER TABLE pending_buys ADD COLUMN order_id INTEGER")
 
         # paper_positions/paper_trade_log -- schema-identical mirrors of open_positions/
         # trade_log for schwab_safety.AUTOMATION_ENABLED_TICKERS tickers running in research
@@ -609,20 +615,29 @@ def get_held_tickers():
 
 _PENDING_BUY_NODE_KEYS = ('ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
                           'max_hold_hours', 'label', 'trail_sell_pct', 'fixed_sl', 'trail_buy_pct',
-                          'arm_sell_pct', 'account')
+                          'arm_sell_pct', 'account', 'starting_notional')
 
 
-def add_pending_buy(node, sig, channel, ts):
+def add_pending_buy(node, sig, channel, ts, order_id=None):
     node_subset = {k: node.get(k) for k in _PENDING_BUY_NODE_KEYS}
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with _conn() as c:
         c.execute(
             "INSERT INTO pending_buys (ticker, node_json, signal_price, signal_time, "
-            "reminder_channel, reminder_ts, reminder_count, last_reminder_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            "reminder_channel, reminder_ts, reminder_count, last_reminder_at, created_at, order_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
             (node['ticker'], json.dumps(node_subset), sig['current_price'],
-             sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), channel, ts, now_str, now_str),
+             sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), channel, ts, now_str, now_str, order_id),
         )
+        c.commit()
+
+
+def set_pending_buy_order_id(ticker, order_id):
+    """Mirrors mark_pending_buy_placed's shape -- called once the broker order id
+    is known (e.g. after check_gap_resize replaces a resting order with a market
+    order, or if a future automated-buy path captures it post-hoc)."""
+    with _conn() as c:
+        c.execute("UPDATE pending_buys SET order_id=? WHERE ticker=?", (order_id, ticker))
         c.commit()
 
 
@@ -670,7 +685,7 @@ def update_pending_buy_reminder(pending_id, channel, ts, reminder_count):
         c.commit()
 
 
-_PAPER_PENDING_BUY_NODE_KEYS = _PENDING_BUY_NODE_KEYS + ('starting_notional',)
+_PAPER_PENDING_BUY_NODE_KEYS = _PENDING_BUY_NODE_KEYS  # starting_notional now included in the base tuple
 
 
 def add_paper_pending_buy(node, sig):
@@ -773,6 +788,30 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
         ))
         c.commit()
         return True
+
+
+def top_up_position(ticker, additional_shares, fill_price, paper=False):
+    """Adds top-up shares to an already-open position, blending entry_price by
+    share-weighted average -- used by signals_notify._reconcile_fill (Part 3,
+    branch C) when a real fill under-spent target_notional relative to the
+    conservative worst-case sizing pads (branch A/B). Returns False if no open
+    position exists for the ticker (nothing to top up)."""
+    positions_table, _ = _pos_tables(paper)
+    with _conn() as c:
+        row = c.execute(
+            f"SELECT shares, entry_price FROM {positions_table} WHERE ticker=?", (ticker,)
+        ).fetchone()
+        if not row or not row['shares']:
+            return False
+        old_shares, old_entry = row['shares'], row['entry_price']
+        new_shares = old_shares + additional_shares
+        blended_entry = (old_shares * old_entry + additional_shares * fill_price) / new_shares
+        c.execute(
+            f"UPDATE {positions_table} SET shares=?, entry_price=? WHERE ticker=?",
+            (new_shares, blended_entry, ticker),
+        )
+        c.commit()
+    return True
 
 
 def set_broker_stop_price(ticker, broker_stop_price):

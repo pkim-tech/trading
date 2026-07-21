@@ -64,11 +64,15 @@ def _resolve_account_hashes() -> dict:
     return _account_hashes
 
 
-def _place_equity_order(side: str, account: str, ticker: str, quantity: int, price: float):
+def _place_equity_order(
+    side: str, account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
+):
     """side is 'BUY' or 'SELL'. price is only used for the safety-cap notional
-    check, not sent to the API -- this places a market order."""
+    check, not sent to the API -- this places a market order. Returns
+    (response, order_id); dry_run returns (None, None)."""
     try:
-        dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, side)
+        dry_run = schwab_safety.approve_and_record(
+            account, ticker, quantity, price, side, is_gap_correction=is_gap_correction)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED {side} {quantity} {ticker} in {account}: {e}")
         raise
@@ -76,19 +80,20 @@ def _place_equity_order(side: str, account: str, ticker: str, quantity: int, pri
     if dry_run:
         _post_message(f"[DRY RUN] would {side} {quantity} {ticker} in {account} (~${quantity * price:,.0f})")
         print(f"[DRY RUN] would {side} {quantity} {ticker} in {account} (~${quantity * price:,.0f})")
-        return None
+        return None, None
 
     account_hash = _resolve_account_hashes()[account]
     order_fn = equity_orders.equity_buy_market if side == "BUY" else equity_orders.equity_sell_market
     order = order_fn(ticker, quantity)
     r = _get_client().place_order(account_hash, order)
     r.raise_for_status()
+    order_id = Utils(_get_client(), account_hash).extract_order_id(r)
     _post_message(f"✅ {side} {quantity} {ticker} in {account} submitted to Schwab (~${quantity * price:,.0f})")
-    return r
+    return r, order_id
 
 
-def place_equity_buy(account: str, ticker: str, quantity: int, price: float):
-    return _place_equity_order("BUY", account, ticker, quantity, price)
+def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False):
+    return _place_equity_order("BUY", account, ticker, quantity, price, is_gap_correction=is_gap_correction)
 
 
 def place_equity_sell(account: str, ticker: str, quantity: int, price: float):
@@ -118,7 +123,7 @@ def _place_trailing_order(
                f"(trail={trail_pct}%, ~${quantity * price:,.0f})")
         _post_message(msg)
         print(msg)
-        return None
+        return None, None
 
     account_hash = _resolve_account_hashes()[account]
     order = OrderBuilder()
@@ -135,9 +140,10 @@ def _place_trailing_order(
 
     r = _get_client().place_order(account_hash, order)
     r.raise_for_status()
+    order_id = Utils(_get_client(), account_hash).extract_order_id(r)
     _post_message(f"✅ {label} {quantity} {ticker} in {account} submitted to Schwab "
                   f"(trail={trail_pct}%, ~${quantity * price:,.0f})")
-    return r
+    return r, order_id
 
 
 def place_trailing_buy(account: str, ticker: str, quantity: int, price: float, trail_pct: float):
@@ -197,3 +203,35 @@ def place_trailing_sell(account: str, ticker: str, quantity: int, price: float, 
     state['trailing'] -- see signals_notify.notify_trailing_activated), same
     as the manual workflow's 'place the trailing stop order now' step."""
     return _place_trailing_order("SELL", StopPriceLinkBasis.BID, account, ticker, quantity, price, trail_pct)
+
+
+def cancel_order(account: str, ticker: str, order_id: int):
+    """Cancels a still-resting order -- used by signals_notify.check_gap_resize
+    (Part 3, branch B) to pull a stale trailing-buy order once an overnight
+    gap has already cleared its trigger, before replacing it with a plain
+    MARKET order. No approve_and_record gate -- this isn't a new placement,
+    just withdrawing one already approved."""
+    account_hash = _resolve_account_hashes()[account]
+    r = _get_client().cancel_order(order_id, account_hash)
+    r.raise_for_status()
+    _post_message(f"\U0001F5D1️ cancelled resting order {order_id} ({ticker} in {account})")
+    return r
+
+
+def get_current_price(ticker: str) -> float:
+    """Primary: Schwab's own get_quote, extended.lastPrice -- confirmed
+    real-time (realtime: true, live quoteTime) unlike yfinance's pre-market
+    feed, which can run tens of minutes stale (Part 3 design, docs/research_log.md
+    2026-07-21). Falls back to yfinance's fast_info.last_price (the existing
+    live-price path used elsewhere, e.g. pages/10_Open_Positions.py) on any
+    Schwab-side error -- standard primary/fallback resilience, not a signal
+    Schwab's feed is untrusted."""
+    try:
+        r = _get_client().get_quote(ticker)
+        r.raise_for_status()
+        quote = r.json()[ticker]
+        price = quote.get("extended", {}).get("lastPrice") or quote["quote"]["lastPrice"]
+        return float(price)
+    except Exception:
+        import yfinance as yf
+        return float(yf.Ticker(ticker).fast_info.last_price)
