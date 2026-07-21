@@ -2421,3 +2421,38 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 - `schwab_safety.py`'s `same_day_block` account-type-awareness fix — not urgent (daemon not wired to Schwab yet) but should land before it is.
 - GDXU/AGQ wash-sale clearance dates (2026-08-05/2026-08-06) — don't execute or recommend an IRA-account buy on either before then.
 - Everything else still carried: the up/down gap-asymmetry research item (still open), kernel-versioning idea (low priority), dividend cash tracking, one-account-per-ticker design (now explicitly in progress but "not sure that's absolutely necessary anymore" per user), sweep-throughput benchmark (low priority).
+
+---
+
+## 2026-07-21 — Part 3 (trailing-buy budget adherence) design finalized through heavy iteration; SOXL TE-vs-TB question raised, not resolved
+
+### What we did
+- **SOXL TrailingBoth-vs-TrailingExit tradeoff raised, not decided**: real comparison pulled (v5, `open_check`, robust alpha) — TB 1212.1% best alpha/153.9 worst_neighbor vs TE 947.0%/28.0, TE giving up ~22% alpha for a much thinner cliff margin but better trade count/win rate and easier manual execution. Conversation pivoted to the Part 3 infra design (which may resolve the "hard to execute manually" motivation directly) before a decision was made. Logged as an open backlog item.
+- **Part 3 ("trailing-buy needs re-sizing" + "gap-through-trigger" live infra) fully designed, through multiple real corrections, each backed by empirical checks pulled mid-conversation rather than assumed**:
+  - Checked real same-day-vs-next-day trailing-buy fill delay across watchlist-65's 4 TB tickers: same-day fill rate 40.6-100% (majority, not exception) — killed an early "defer all placement to next morning" simplification.
+  - Checked real overnight upward-gap distribution vs. each node's `trail_buy_pct`: p99 gaps 8-19%, max 20.6% — even a +5-point flat pad still misses 4-15% of gap days, so a flat-pad-only design was rejected in favor of an active pre-open cancel/resize checkpoint.
+  - Corrected the pre-open resize logic twice: first to recognize the kernel's own gap-fill behavior (`entry_price=op`, no unmodeled second bounce-wait) means the "trigger already cleared" case should replace with a plain `MARKET` order, not a new trailing order; second to recognize the "trigger not yet cleared" case needs *no* action at all (original sizing is already a valid bound, since running_low is non-increasing) — collapsing what was a two-branch design into one.
+  - Checked real 1-minute price data: confirmed a `MARKET` order queued pre-open fills at the actual opening auction print (no dedicated `MARKET_ON_OPEN` type in `schwab-py`, but a plain `MARKET`+`Session.NORMAL` achieves the same). Separately found yfinance's pre-market feed is realistically stale (HIBL's last print averaging 41 minutes before the open, up to 13.4% drift in a small real sample) — live-tested Schwab's own `get_quote` endpoint instead and confirmed it's genuinely real-time (`realtime: true`, populated `extended.lastPrice`/`quoteTime`); adopted as primary price source, yfinance kept as fallback only.
+  - Settled on a shared, idempotent `_reconcile_fill` top-up helper fed by two independent paths: a new account-activity websocket (`schwab.streaming.StreamClient`, confirmed real via `account_activity_sub`/`add_account_activity_handler`) for fast reconciliation with reconnect+backoff+Slack-alert on disconnect, and the existing `check_auto_fills` poll left unconditionally running as an always-on fallback — explicit user framing: "since it's only top off, not a huge risk, we can top off the next day if we need to."
+  - Widened the overnight-replacement sizing pad from an initial 2% guess to a flat 5%, reasoning that overshooting costs almost nothing (the fast top-up reconciles it in seconds) while undershooting risks a real overspend.
+- **Regulatory research on limited-margin-account overspend consequences**: first pass (good-faith-violation/90-day-restriction) was the wrong mechanism — that governs selling before settlement, not a single oversized buy. Found the actually-relevant, very recent one: FINRA Regulatory Notice 26-10 (Rule 4210 amendments, effective 2026-06-04, replacing PDT) — an "intraday margin deficit" has a 5-business-day cure window before repeated-failure risk accrues, 90-day freeze only after a pattern of failures. Whether this framework covers a limited-margin IRA (no real debit capability) specifically is **not resolved** — FINRA's own notice says interpretive guidance was still forthcoming. Recommended staying conservative regardless; user separately noted they keep a cash buffer beyond `target_notional` as an additional account-level safeguard.
+- **Design finalized and written to a plan file** (`/home/pkim/.claude/plans/prancy-petting-stallman.md`, not git-tracked) with 8 tracked implementation tasks. Only one line of actual code changed this session: an unused-for-now `from schwab.utils import Utils` import added to `schwab_client.py`, prep for next session's implementation.
+- **Docs updated**: `docs/backlog_cache.md` gained a consolidated Part 3 entry (pointing at the plan file) plus the SOXL TE-vs-TB open question, with pointer notes added to the two superseded source items. `docs/research_log.md` gained a full entry documenting the four empirical checks and the regulatory research.
+
+### Verified
+- No code implementation happened this session (design/research only) — nothing to run beyond confirming the single import doesn't break anything (`git diff` reviewed, trivial).
+- Live-tested Schwab's `get_quote` endpoint directly (real OAuth call, read-only) — confirmed `realtime: true` with populated extended-session fields.
+- Live-tested `schwab.streaming.StreamClient`'s API surface (`account_activity_sub`, `add_account_activity_handler` confirmed to exist) and `schwab.utils.Utils.extract_order_id` (confirmed present, read its source).
+- FINRA Regulatory Notice 26-10 fetched directly for its actual cure-period text (5 business days / 90-day pattern-based freeze), not inferred from secondary summaries alone.
+
+### Current state
+- Part 3 design is complete and detailed enough to implement directly next session — 8 tasks tracked (schwab_client.py order-id capture/cancel_order/get_current_price, signals_helpers.py pad_pct, signals_db.py pending_buys.order_id, schwab_safety.py is_gap_correction bypass, schwab_stream.py new websocket module, signals_notify.py wiring, active_signals.py gap-check window + stream startup, verification pass).
+- SOXL's watchlist-65 node is still `TrailingBothZScoreBreakout` (v5, unchanged) — the TE-swap question was raised but not decided.
+- No functional code changes this session; only doc updates and one prep import.
+
+### Next session
+- Implement Part 3 per the plan file, starting with task #1 (`schwab_client.py`).
+- Decide the SOXL TE-vs-TB swap — may be informed by how good Part 3's automation ends up being (if trailing-buy becomes fully hands-off, the "hard to execute manually" motivation for switching to TE weakens).
+- Confirm with Schwab directly whether the limited-margin IRA is in scope for the new Rule 4210 intraday-margin cure mechanism.
+- Once `get_current_price` is live, rerun the pre-market-to-open drift check against Schwab's own quote feed (not yfinance) to confirm the flat 5% pad is still well-calibrated.
+- Everything else still carried from prior sessions: wash-sale holds (GDXU/AGQ, clears 2026-08-05/06), `same_day_block` account-type awareness, dividend cash tracking, one-account-per-ticker design, sweep-throughput benchmark, kernel-versioning idea.

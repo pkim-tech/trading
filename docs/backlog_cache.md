@@ -1,5 +1,54 @@
 # Backlog Cache
 
+## [live-trading] High priority, design finalized 2026-07-21, implementation not started — trailing-buy budget adherence (Part 3: padded sizing + overnight gap guard + post-fill top-up)
+Full design at `/home/pkim/.claude/plans/prancy-petting-stallman.md` (not git-tracked —
+local plan file, path only, carry forward if it's ever cleaned up) and summarized in
+`docs/research_log.md`'s 2026-07-21 entry. Resolves both the "trailing-buy needs
+re-sizing" and "gap-through-trigger fill optimism" backlog items below (Part 3 of
+`/home/pkim/.claude/plans/imperative-noodling-dream.md`) with one unified design:
+- **Same-day sizing pad**: `buy_order_sizing` sizes off `trail_buy_pct+1` (was
+  `trail_buy_pct` alone) — covers ordinary same-day slippage, the majority case
+  (real same-day fill rate 40.6-100% across watchlist-65's 4 TB tickers, checked
+  empirically, not assumed).
+- **Pre-open gap guard** (new `_GAP_CHECK_WINDOW=(9,15,9,29)`): only acts when a
+  still-pending order's trigger has *already* cleared overnight — cancels and
+  replaces with a plain `MARKET` order (mirrors the kernel's own `entry_price=op`
+  gap-fill behavior) sized off a live Schwab quote (`schwab_client.get_current_price`,
+  primary Schwab `get_quote`, yfinance fallback) with a flat 5% pad. If the trigger
+  hasn't cleared, no action — the resting order's original sizing is still a valid
+  bound (running_low is non-increasing).
+- **Post-fill top-up**: shared idempotent `_reconcile_fill` helper, fed by two
+  independent paths — a new account-activity websocket (`schwab_stream.py`,
+  `schwab.streaming.StreamClient`, confirmed real, with reconnect+backoff+Slack-alert
+  on disconnect) for fast reconciliation, and the existing `check_auto_fills` poll as
+  an always-on fallback so the websocket is a latency improvement, not a new
+  dependency.
+Real course-corrections during design (each backed by data pulled mid-conversation,
+not assumed) are detailed in the research log entry — worth reading before touching
+this, since several plausible-sounding simpler designs were tried and rejected for
+specific measured reasons (e.g. a flat pad alone doesn't close overnight gap risk;
+yfinance's pre-market feed is real-stale for HIBL specifically).
+**Action needed**: implement per the plan file — `schwab_client.py` (order-id capture,
+`cancel_order`, `get_current_price`), `signals_db.py` (`pending_buys.order_id`),
+`schwab_safety.py` (`is_gap_correction` bypass), `schwab_stream.py` (new),
+`signals_notify.py` (`check_gap_resize`, `_reconcile_fill`, `drain_fill_queue`),
+`active_signals.py` (gap-check window + stream startup + queue drain). Not started
+beyond one prep import added to `schwab_client.py`.
+
+## [live-trading][backtest] Open question, raised 2026-07-21, not decided — should SOXL's watchlist-65 node switch from TrailingBoth to TrailingExit?
+Raised while discussing execution difficulty. Real comparison pulled (v5, `open_check`,
+robust alpha): TB (sl2 tp30 trail_buy3.0 h70 w10 z1.0) 1212.1% best alpha, worst_neighbor
+153.9; TE (sl2 tp26 trail_sell8.0 h119 w10 z1.0) 947.0% best alpha, worst_neighbor 28.0.
+TE gives up ~22% of alpha and has a much thinner cliff-safety margin, but wins on trade
+count (178 vs 151) and win rate (13.5% vs 9.9%), and is operationally easier to execute
+manually (no trailing-buy order to catch) — same trade-off already resolved for AGQ/NUGT/
+UDOW/YANG/DPST/KORU when the v5 watchlist was built (`docs/deep_backlog.md`, 2026-07-20).
+Conversation pivoted to the Part 3 infra design above before this was decided either way.
+**Action needed**: decide whether to swap SOXL's watchlist-65 node (`signals_db`: remove
+the TB node, add/annotate the TE node) or keep TB now that Part 3 will make TB's execution
+fully automated anyway (which may resolve the "hard to execute manually" motivation
+without needing to give up the extra alpha).
+
 ## [live-trading][tax] Active hold, set 2026-07-20 — don't buy GDXU/AGQ in any IRA-type account before their wash-sale clearance dates
 Real taxable-brokerage-account losses found while discussing account mapping for
 watchlist 65: GDXU lost in brokerage on 2026-07-06 (clears **2026-08-05**), AGQ lost
@@ -281,6 +330,9 @@ Raised while investigating trailing-buy capital utilization. Checked real divide
 **Action needed**: not scoped. Possible shape: track ex-div dates/amounts per held ticker (`yf.Ticker(t).dividends`) and add the per-share amount back into the live P&L/SL/arm comparison for any position that was open through the ex-date — needs design discussion on where this plugs into `check_sell_condition` without disturbing the existing corporate-action (split) freeze logic it sits next to.
 
 ## [backtest][live-trading] High priority, found+partially fixed 2026-07-19 — gap-through-trigger fill optimism: neither the backtest kernel nor live sizing ever modeled overnight gaps past trail_buy_pct
+**Live-side design finalized 2026-07-21**: the Part 3 live infra referenced at the
+bottom of this item is now fully designed — see the consolidated Part 3 entry at the
+top of this file. Kernel fix (Part 1, below) remains resolved/unaffected.
 Found while scoping the trailing-buy re-sizing item below. Empirically checked overnight-gap frequency (`.venv/bin/python scripts/sim_gap_policy.py` output, or the one-off `overnight_gap_check.py` scratch script) against every active v4 watchlist ticker's real `trail_buy_pct`: **a next-day gap exceeding the trigger happens on 19-44% of all trading days**, most tickers 30-40% — not a rare tail event, routine. Two independent places assumed this never happens:
 1. **Backtest kernel** (`backtester.py::_simulate_trail_both`/`_simulate_trail_buy`): every trailing-buy fill used the theoretical `running_low × (1 + trail_buy_pct)` trigger price even when the bar's own `Open` had already proven it was blown through — silently overstating every v4 node's on-file return, a distinct fill-optimism source from the already-fixed Low/High-ordering one (closer in spirit to the deferred-SL gap bug fixed 2026-07-17, but on the entry side). **Fixed 2026-07-19**: all three resolutions now fill at the real `Open` once it's proven to have crossed the trigger, before falling through to the existing Low/High logic; `_simulate_trail_buy` gained a new `opens` parameter it previously lacked. Verified via a new synthetic-gap unit test (confirmed to fail pre-fix at the stale price, pass post-fix at the real Open) and byte-identical parity between the fixed kernel and the fixed `export_trades.simulate_trail_both_annotated` mirror on real SOXL/KORU/AGQ data. Full `pytest tests/` (94 passed) + required regression scripts (`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`) both clean, only already-documented drift.
 2. **Live worst-case sizing** (`signals_blocks.py`, 2026-07-17 fix): sizes off `signal_price × (1 + trail_buy_pct)`, which only bounds the fill under continuous intraday movement — a real `TRAILING_STOP` order left resting overnight becomes a market order the instant it triggers, so a gap can blow past that ceiling. No `TRAILING_STOP_LIMIT` order type exists at Schwab to cap this at the broker level (confirmed). **Not yet fixed** — this is Part 3 of the plan below, not yet built.
@@ -289,6 +341,9 @@ Found while scoping the trailing-buy re-sizing item below. Empirically checked o
 **Action needed**: (1) resweep v4 campaigns with the fixed kernel; (2) build Part 3 (live infra: `schwab_client.cancel_order`, order-id capture, `pending_buys.order_id`, `signals_notify.check_gap_risk()`, a daily pre-open scheduled window in `active_signals.py`) — folds together with the trailing-buy re-sizing item's top-up design below, since both need the same cancel/resize plumbing. Full plan: `/home/pkim/.claude/plans/imperative-noodling-dream.md`.
 
 ## [live-trading] High priority, confirmed 2026-07-18 — trailing-buy order needs re-sizing as the trigger price moves, to actually use all budgeted capital
+**Superseded 2026-07-21**: design finalized, folded into the consolidated Part 3 entry
+at the top of this file (padded sizing + overnight gap guard + post-fill top-up) —
+see that entry for the current plan, this one kept for historical context only.
 **2026-07-18: user confirmed this needs to happen** (along with the dividend-tracking item above).
 Raised by the user, separate from today's schwab_client wiring work. `signals_blocks._build_buy_blocks`/`signals_helpers.buy_order_sizing` size a trailing-buy order's *quantity* once, at signal time, off the worst-case bounce-trigger price (`price × (1 + trail_buy_pct/100)`, fixed 2026-07-17 to guarantee the order never costs more than `target_notional`). But a real Schwab `TRAILING_STOP` order's linked trigger price keeps moving as the broker's own running-low updates after the order is placed — if the real running low falls further before the bounce (the common case, same asymmetry already documented in the sizing-formula item below), the order fills at a lower price than the quantity was sized for, and the fixed share count now under-deploys the budgeted capital (real dollars left idle) rather than the over-deploy risk the worst-case formula was built to prevent.
 **Confirmed real order type, 2026-07-17**: `schwab_client.place_trailing_buy`/`place_trailing_sell` build a real `TRAILING_STOP` order (`OrderType.TRAILING_STOP`, `schwab_client.py:124`) — not a market order. `place_equity_buy`/`place_equity_sell` (market) exist in the same file but nothing calls them for GDXD (`TrailingBothZScoreBreakout` always routes through the trailing functions), so the under-deployment gap described here is specifically about the trailing order's fixed quantity vs. its live-moving broker-side trigger.

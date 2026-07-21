@@ -17,6 +17,7 @@ from schwab.orders.common import (
     OrderType, Session, Duration, OrderStrategyType,
     StopPriceLinkBasis, StopPriceLinkType, EquityInstruction,
 )
+from schwab.utils import Utils
 
 import schwab_auth
 import schwab_safety
