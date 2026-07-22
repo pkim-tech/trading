@@ -89,6 +89,14 @@ DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT = 5.0
 # same asymmetry as the same-day-re-buy guardrail above.
 _OPEN_ORDER_STATUSES_EXCLUDED = {"CANCELED", "EXPIRED", "FILLED", "REJECTED", "REPLACED"}
 
+# Statuses meaning the broker never actually accepted or executed the order --
+# used by the duplicate-order guard's broker-truth check below. A local
+# 'recent_orders' record with an outcome in one of these buckets must NOT
+# block a retry as a duplicate: nothing dangerous is actually resting or
+# filled at the broker, so re-submitting the same order is the correct thing
+# to do, not a double-order risk.
+_DUPLICATE_NOT_CONFIRMED_STATUSES = {"CANCELED", "EXPIRED", "REJECTED", "REPLACED"}
+
 
 class SafetyViolation(Exception):
     pass
@@ -319,18 +327,25 @@ def _live_ticker_accounts() -> dict:
     return {row["ticker"]: row["account"] for row in signals_db.get_watchlist() if row["mode"] == "live"}
 
 
-def _open_orders(account: str) -> list:
-    """Schwab's own live order book for the account, non-terminal orders only
-    -- a real API call, not local state, since local tracking could drift or
-    miss an order placed outside our own code (e.g. directly in Schwab's UI,
-    as happened during today's settlement test). Shared by _has_open_order
-    and _has_open_buy_order_in_account below so both checks cost one API call,
-    not two."""
+def _all_orders(account: str) -> list:
+    """Schwab's full live order book for the account, every status -- a real
+    API call, not local state, since local tracking could drift or miss an
+    order placed outside our own code (e.g. directly in Schwab's UI, as
+    happened during today's settlement test). Unlike _open_orders below, this
+    includes terminal statuses (FILLED/CANCELED/REJECTED/etc) -- needed by the
+    duplicate-order guard's broker-truth check, which must see a rejected/
+    canceled prior attempt too, not just resting ones."""
     import schwab_client  # local import: schwab_client imports this module at load time
     account_hash = schwab_client._resolve_account_hashes()[account]
     r = schwab_client._get_client().get_orders_for_account(account_hash)
     r.raise_for_status()
-    return [o for o in r.json() if o.get("status") not in _OPEN_ORDER_STATUSES_EXCLUDED]
+    return r.json()
+
+
+def _open_orders(account: str) -> list:
+    """Non-terminal orders only, for the concurrent-resting-order guards
+    below (_has_open_order / _has_open_buy_order_in_account)."""
+    return [o for o in _all_orders(account) if o.get("status") not in _OPEN_ORDER_STATUSES_EXCLUDED]
 
 
 def _has_open_order(orders: list, ticker: str) -> bool:
@@ -358,6 +373,41 @@ def _has_open_buy_order_in_account(orders: list, ticker: str) -> str | None:
             if leg.get("instruction") == "BUY" and leg.get("instrument", {}).get("symbol") != ticker:
                 return leg.get("instrument", {}).get("symbol")
     return None
+
+
+def _has_open_sell_order(orders: list, ticker: str) -> bool:
+    """True if any resting SELL order for this exact ticker already exists.
+    Unlike _has_open_order (any side blocks a second BUY), this only matches
+    same-side (SELL) orders -- an unrelated resting BUY for this ticker must
+    not block closing a position, same asymmetry the module already applies
+    elsewhere (same-day-block, notional-cap exemption) for SELL."""
+    for o in orders:
+        for leg in o.get("orderLegCollection", []):
+            if leg.get("instruction") == "SELL" and leg.get("instrument", {}).get("symbol") == ticker:
+                return True
+    return False
+
+
+def _broker_confirms_order(orders: list, ticker: str, side: str, quantity: int) -> bool:
+    """True if the real order book (all statuses, see _all_orders) has an
+    order for this exact (ticker, side, quantity within tolerance) that the
+    broker genuinely accepted -- i.e. not CANCELED/EXPIRED/REJECTED/REPLACED.
+    Used to confirm a local 'recent_orders' duplicate candidate against ground
+    truth before blocking a retry (automation_principles.md #1):
+    approve_and_record() writes the local record before the real place_order
+    call happens, so a failed/rejected broker call still looks like a
+    submitted duplicate to the old purely-local check -- this lets a
+    legitimate retry through when nothing actually reached the broker."""
+    for o in orders:
+        if o.get("status") in _DUPLICATE_NOT_CONFIRMED_STATUSES:
+            continue
+        for leg in o.get("orderLegCollection", []):
+            if leg.get("instruction") != side or leg.get("instrument", {}).get("symbol") != ticker:
+                continue
+            qty = leg.get("quantity", 0)
+            if abs(qty - quantity) <= DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT / 100 * max(qty, quantity, 1):
+                return True
+    return False
 
 
 def check_order(
@@ -418,6 +468,21 @@ def check_order(
                 f"a second concurrent BUY into the same account (Schwab doesn't reserve buying power "
                 f"for a resting order, so two BUYs in one account can both pass a cash check against "
                 f"the same undecremented balance -- automation_principles.md #1)"
+            )
+
+    # Resting-SELL guard (2026-07-22, symmetric to the BUY-side guard above):
+    # found via Opus review that SELL had no such check at all, which is what
+    # let a real bug (a stale trail_state overwrite re-arming the trailing
+    # exit on the next bar) place a second live trailing-sell order for the
+    # same shares -- an oversell risk if both then fill. Same-ticker only,
+    # not account-wide like the BUY guard: an unrelated resting BUY for this
+    # ticker must not block closing a position.
+    if side == "SELL":
+        orders = _open_orders(account)
+        if _has_open_sell_order(orders, ticker):
+            raise SafetyViolation(
+                f"'{ticker}' already has a resting SELL order in '{account}' -- refusing a second "
+                f"concurrent SELL (prevents two live exit orders stacking for the same shares)"
             )
 
     # Signal-window time gate, BUY only (see _SIGNAL_WINDOWS comment above).
@@ -500,16 +565,26 @@ def check_order(
             prior_qty is not None
             and abs(prior_qty - quantity) <= DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT / 100 * max(prior_qty, quantity)
         )
-        if (
+        if not (
             o["account"] == account and o["ticker"] == ticker and o["side"] == side
             and qty_matches
             and time.time() - o["ts"] < DUPLICATE_ORDER_WINDOW_SECS
         ):
-            raise SafetyViolation(
-                f"duplicate order: {side} {quantity} {ticker} in {account} already submitted "
-                f"{prior_qty:g} shares {time.time() - o['ts']:.0f}s ago "
-                f"(within {DUPLICATE_ORDER_WINDOW_SECS}s window, {DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT}% tolerance)"
-            )
+            continue
+        # approve_and_record() writes this local record *before* the real
+        # place_order call happens, so it can't tell a genuine resubmission
+        # from a retry after a failed/rejected broker call. For a real
+        # (non-dry_run) account, confirm against Schwab's real order book
+        # before blocking -- ground truth, not a local heuristic
+        # (automation_principles.md #1). Dry-run accounts have no broker book
+        # to check against, so keep the pure local-record behavior.
+        if not limits.dry_run and not _broker_confirms_order(_all_orders(account), ticker, side, quantity):
+            continue
+        raise SafetyViolation(
+            f"duplicate order: {side} {quantity} {ticker} in {account} already submitted "
+            f"{prior_qty:g} shares {time.time() - o['ts']:.0f}s ago "
+            f"(within {DUPLICATE_ORDER_WINDOW_SECS}s window, {DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT}% tolerance)"
+        )
 
 
 def approve_and_record(

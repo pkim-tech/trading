@@ -69,9 +69,21 @@ def test_open_position_writes_open_positions_and_trade_log(db):
 def test_open_position_skips_duplicate_ticker_window(db):
     A = db
     node, signal_time = _add_node_and_open_position(A)
-    A.open_position(node, signal_price=100.0, signal_time=signal_time,
-                     entry_price=102.0, entry_time=signal_time, shares=50)
+    result = A.open_position(node, signal_price=100.0, signal_time=signal_time,
+                              entry_price=102.0, entry_time=signal_time, shares=50)
+    assert result is False
     assert len([p for p in A.get_open_positions() if p['ticker'] == TICKER]) == 1
+
+
+def test_open_position_returns_true_on_real_open(db):
+    A = db
+    A.add_node(TICKER, 'ZScoreBreakout', 'test', window=20, take_profit=10, stop_loss=5,
+               max_hold_hours=56)
+    node = [n for n in A.get_watchlist() if n['ticker'] == TICKER][0]
+    signal_time = datetime.now() - timedelta(hours=10)
+    result = A.open_position(node, signal_price=100.0, signal_time=signal_time,
+                              entry_price=101.0, entry_time=signal_time, shares=50)
+    assert result is True
 
 
 def test_check_sell_condition_sl_hit_on_db_backed_position(db):
@@ -97,8 +109,9 @@ def test_close_position_removes_open_positions_row_and_logs_exit(db):
     A = db
     _add_node_and_open_position(A)
     pos = [p for p in A.get_open_positions() if p['ticker'] == TICKER][0]
-    A.close_position(pos['id'], exit_signal_price=95.0, exit_price=95.0,
-                      exit_time=datetime.now(), exit_reason='SL')
+    result = A.close_position(pos['id'], exit_signal_price=95.0, exit_price=95.0,
+                               exit_time=datetime.now(), exit_reason='SL')
+    assert result is True
     assert len([p for p in A.get_open_positions() if p['ticker'] == TICKER]) == 0
 
     with A._conn() as c:
@@ -109,3 +122,28 @@ def test_close_position_removes_open_positions_row_and_logs_exit(db):
     assert trade_row['exit_price'] == 95.0
     assert trade_row['exit_reason'] == 'SL'
     assert trade_row['pnl_pct'] < 0
+
+
+def test_close_position_is_idempotent_against_a_second_racing_call(db):
+    # Regression test for the poll-loop-vs-Slack-handler race (Opus review,
+    # 2026-07-22): a second close_position() call for a position already
+    # closed (e.g. the poll loop and a button click both noticed the same
+    # exit) must be a safe no-op, not a duplicate trade_log overwrite/error.
+    A = db
+    _add_node_and_open_position(A)
+    pos = [p for p in A.get_open_positions() if p['ticker'] == TICKER][0]
+    A.close_position(pos['id'], exit_signal_price=95.0, exit_price=95.0,
+                      exit_time=datetime.now(), exit_reason='SL')
+    second_result = A.close_position(pos['id'], exit_signal_price=90.0, exit_price=90.0,
+                                      exit_time=datetime.now(), exit_reason='TIME')
+    assert second_result is False
+
+    with A._conn() as c:
+        trade_row = c.execute(
+            "SELECT exit_price, exit_reason FROM trade_log WHERE id = ?",
+            (pos['trade_log_id'],)
+        ).fetchone()
+    # The first (real) close's values must survive, not get overwritten by
+    # the second racing call's different price/reason.
+    assert trade_row['exit_price'] == 95.0
+    assert trade_row['exit_reason'] == 'SL'

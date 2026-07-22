@@ -6,6 +6,7 @@ _post_message is stubbed out)."""
 import os
 import sys
 import tempfile
+import time
 import pytest
 from pathlib import Path
 
@@ -191,6 +192,61 @@ def test_duplicate_guard_tolerance_does_not_catch_top_up_sized_order(env):
     # sits well outside the 5% tolerance and must not be blocked.
     schwab_client.place_equity_buy('ira', TICKER, 980, 50.0)
     schwab_client.place_equity_buy('ira', TICKER, 100, 50.0)  # should not raise
+
+
+def test_second_sell_order_for_same_ticker_blocked(env, monkeypatch):
+    # Symmetric to the BUY-side resting-order guard, added 2026-07-22 after
+    # Opus review found SELL had no such check at all -- the gap that let a
+    # real trail_state clobber bug place two live trailing-sell orders for
+    # the same shares.
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
+        {"status": "WORKING", "orderLegCollection": [
+            {"instruction": "SELL", "instrument": {"symbol": TICKER}}
+        ]}
+    ])
+    with pytest.raises(schwab_safety.SafetyViolation, match="resting SELL order"):
+        schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
+
+
+def test_resting_buy_for_same_ticker_does_not_block_sell(env, monkeypatch):
+    # An unrelated resting BUY for this ticker must not block closing a
+    # position -- only a same-side (SELL) match should.
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
+        {"status": "WORKING", "orderLegCollection": [
+            {"instruction": "BUY", "instrument": {"symbol": TICKER}}
+        ]}
+    ])
+    result = schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
+    assert result == (None, None)
+
+
+def test_duplicate_guard_allows_retry_when_broker_never_confirms_prior_attempt(env, monkeypatch):
+    # Real (non-dry_run) account: approve_and_record() writes the local
+    # 'recent_orders' record before the real place_order call happens, so a
+    # failed/rejected/errored broker call still looks like a submitted
+    # duplicate to the old purely-local check. The fix (2026-07-22) cross-
+    # checks the broker's real order book before blocking a retry -- if
+    # nothing genuinely reached the broker, the retry must go through.
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'dry_run', False)
+    monkeypatch.setattr(schwab_safety, '_all_orders', lambda account: [])
+    counts = {"recent_orders": [
+        {"account": "ira", "ticker": TICKER, "side": "BUY", "quantity": 5, "ts": time.time()}
+    ]}
+    schwab_safety.check_order('ira', TICKER, 5, 50.0, 'BUY', counts=counts)  # should not raise
+
+
+def test_duplicate_guard_blocks_when_broker_confirms_prior_attempt(env, monkeypatch):
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'dry_run', False)
+    monkeypatch.setattr(schwab_safety, '_all_orders', lambda account: [
+        {"status": "WORKING", "orderLegCollection": [
+            {"instruction": "BUY", "instrument": {"symbol": TICKER}, "quantity": 5}
+        ]}
+    ])
+    counts = {"recent_orders": [
+        {"account": "ira", "ticker": TICKER, "side": "BUY", "quantity": 5, "ts": time.time()}
+    ]}
+    with pytest.raises(schwab_safety.SafetyViolation, match="duplicate order"):
+        schwab_safety.check_order('ira', TICKER, 5, 50.0, 'BUY', counts=counts)
 
 
 def test_notional_cap_blocked(env):

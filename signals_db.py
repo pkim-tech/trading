@@ -4,6 +4,7 @@ pending_buys (trailing-buy lifecycle), and trade_log.
 """
 import json
 import sqlite3
+import threading
 from datetime import datetime
 
 import strategies
@@ -14,6 +15,19 @@ def _conn():
     c = sqlite3.connect(cfg.DB_PATH)
     c.row_factory = sqlite3.Row
     return c
+
+
+# Guards the check-then-act sections of open_position()/close_position()
+# against a real intra-process race: the poll loop thread and the Slack
+# Socket Mode handler thread (active_signals.py starts both) can both notice
+# the same fill/exit and each pass their own SELECT-sees-nothing-yet check
+# before either commits its INSERT/DELETE -- each connection's SELECT is a
+# separate read that doesn't see the other's uncommitted write. A plain
+# threading.Lock is enough (found via Opus review, 2026-07-22): this is a
+# single-process, multi-thread daemon, not multiple processes, so this isn't
+# the same cross-process concern schwab_safety._open_locked's file lock
+# guards.
+_position_lock = threading.Lock()
 
 
 def ensure_tables():
@@ -626,6 +640,21 @@ def get_open_position(ticker, paper=False):
     return dict(row) if row else None
 
 
+def get_position_by_id(position_id, paper=False):
+    """Fresh single-row lookup by primary key -- used where a caller holds a
+    possibly-stale in-memory position dict (e.g. notify_trailing_activated
+    re-reading trail_state after check_sell_condition already wrote the
+    armed state to the DB) and must not merge onto stale fields."""
+    positions_table, _ = _pos_tables(paper)
+    with _conn() as c:
+        row = c.execute(f"SELECT * FROM {positions_table} WHERE id = ?", (position_id,)).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d['trail_state'] = json.loads(d['trail_state']) if d.get('trail_state') else {}
+    return d
+
+
 def get_held_tickers():
     """Single source of truth for 'is this ticker already held' -- use this instead of
     re-deriving a ticker set from get_open_positions() at each call site. A prior version
@@ -780,7 +809,7 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
     already open for this ticker/window — callers that report success to Slack
     must check this, since a silent skip must not be reported as a fill."""
     positions_table, _ = _pos_tables(paper)
-    with _conn() as c:
+    with _position_lock, _conn() as c:
         existing = c.execute(
             f"SELECT id FROM {positions_table} WHERE ticker=? AND window=?",
             (node['ticker'], int(node['window']))
@@ -889,16 +918,25 @@ def correct_entry_price(ticker, entry_price):
 
 
 def close_position(position_id, exit_signal_price=None, exit_price=None, exit_time=None, exit_reason=None, paper=False):
+    """Returns True if this call actually closed the position, False if it was
+    already gone -- callers that report a close to Slack must check this,
+    same shape as open_position()'s duplicate-skip return. Guarded by the
+    same _position_lock as open_position() -- without it, the poll loop and
+    the Slack handler could both see the row still present, both write a
+    trade_log exit (last write silently wins, possibly with the wrong
+    price/reason), and only then race on the DELETE."""
     positions_table, _ = _pos_tables(paper)
-    with _conn() as c:
-        if exit_price is not None:
-            row = c.execute(
-                f"SELECT trade_log_id, entry_price FROM {positions_table} WHERE id = ?", (position_id,)
-            ).fetchone()
-            if row and row[0]:
-                log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper)
+    with _position_lock, _conn() as c:
+        row = c.execute(
+            f"SELECT trade_log_id, entry_price FROM {positions_table} WHERE id = ?", (position_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if exit_price is not None and row[0]:
+            log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper)
         c.execute(f"DELETE FROM {positions_table} WHERE id = ?", (position_id,))
         c.commit()
+        return True
 
 
 def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False):

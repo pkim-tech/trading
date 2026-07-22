@@ -148,6 +148,66 @@ def test_automated_sell_falls_back_when_node_mode_not_live(env):
     assert not updated['trail_state'].get('order_placed')
 
 
+def test_notify_trailing_activated_preserves_armed_state_written_by_check_sell_condition(env):
+    """Regression test for the trail_state clobber bug (Opus review,
+    2026-07-22): check_sell_condition persists the newly-armed state
+    (trailing=True, peak=P) to the DB *before* notify_trailing_activated
+    runs, but the `pos` dict callers pass in is still the pre-arm in-memory
+    copy. notify_trailing_activated must merge its reminder fields onto the
+    fresh DB state, not the stale pos['trail_state'] -- otherwise the arm is
+    silently lost, check_exit re-arms on the next bar, and
+    _attempt_automated_sell places a second live trailing-sell order for the
+    same shares."""
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    pos = signals_db.get_open_position(TICKER)  # stale: trail_state == {}
+    signals_db.update_position_trail_state(pos['id'], {'trailing': True, 'peak': 55.0})
+    signals_notify.notify_trailing_activated(pos, current_price=52.0)
+    updated = [p for p in signals_db.get_open_positions() if p['ticker'] == TICKER][0]
+    assert updated['trail_state'].get('trailing') is True
+    assert updated['trail_state'].get('peak') == 55.0
+
+
+def test_automated_sell_notifies_sl_price_when_trailing_sell_fails_after_sl_cancel(env, monkeypatch):
+    """Regression test for finding #2 (Opus review, 2026-07-22): if a resting
+    stop-loss is cancelled to make way for the trailing-sell and the
+    trailing-sell placement then fails, the position is genuinely
+    unprotected -- there's no safe automatic recovery, so the user must be
+    told the SL price to manually re-place at the broker."""
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+
+    posted = []
+
+    def _capture(msg, **kw):
+        posted.append(msg)
+        return (None, None)
+
+    monkeypatch.setattr(signals_notify, '_post_message', _capture)
+    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: None)
+    monkeypatch.setattr(
+        schwab_client, 'place_trailing_sell',
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("order rejected")),
+    )
+    signals_notify.notify_trailing_activated(pos, current_price=52.0)
+
+    unprotected_msgs = [m for m in posted if "UNPROTECTED" in m]
+    assert len(unprotected_msgs) == 1
+    assert "manually re-place a stop-loss SELL" in unprotected_msgs[0]
+    # TrailingBothZScoreBreakout uses_fixed_sl -- real SL % comes from
+    # pos['fixed_sl'] (config.json's fixed_stop_loss), not node['stop_loss'].
+    expected_sl_price = 50.0 * (1 - pos['fixed_sl'] / 100)
+    assert f"${expected_sl_price:.2f}" in unprotected_msgs[0]
+
+
 def test_automated_sell_falls_back_when_no_matching_node(env):
     """If the position's (ticker, window) has no corresponding watch_list row
     at all (e.g. the node was later removed, mirroring EDC's 2026-07-19

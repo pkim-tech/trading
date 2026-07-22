@@ -2660,3 +2660,31 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 - Consider the user's proposed $100 real-order empirical test (fund a margin account, flip `dry_run=False`, place one order via a minimal standalone script) — would exercise several of this session's and last session's builds at once (cash check, timeout bound, reconciliation check) for the first time against a real account.
 - If a clickable-approve-button version of the live-state reconciliation remediation is ever wanted, it needs its own dedicated safety review before being built (explicitly deferred, not just unscoped).
 - Carried forward, all still open: duplicate-order guard should query Schwab's real order book instead of a local heuristic (scoped as its own session — bigger structural change); `same_day_block` account-type awareness (blocked on an undecided account-type-tracking design, don't guess); one-account-per-ticker rollout; dividend cash tracking; wash-sale holds on GDXU/AGQ in IRA-type accounts (clears 2026-08-05/06).
+
+---
+
+## 2026-07-22 — Full-stack Opus review finds and fixes a critical duplicate-sell bug; duplicate-order guard, SELL-side resting-order guard, and poll-loop/handler race all closed out
+
+### What we did
+- **Ran a scoped independent Opus review of the whole automation surface** (`schwab_client.py`, `schwab_safety.py`, `active_signals.py`, `signals_notify.py`, `signals_compute.py`, `signals_db.py`, `paper_trading.py`), asked to focus on seams between features each already individually reviewed in prior sessions rather than re-litigating any one in isolation.
+- **Fixed the duplicate-order guard's known structural gap** (flagged 2026-07-21, "bigger structural change, scoped as its own session"): `check_order`'s duplicate check now cross-checks a real (non-`dry_run`) account's actual order book (new `_broker_confirms_order`/`_all_orders`) before blocking a retry — a failed/rejected/errored prior attempt no longer wrongly blocks a legitimate resubmission. Dry-run accounts keep the old local-heuristic-only behavior. 2 new tests.
+- **Fixed a CRITICAL bug found by the review**: `notify_trailing_activated` was overwriting the just-armed `trail_state` (written by `check_sell_condition`) with a stale pre-arm copy, silently losing `trailing`/`peak` right after arming — the next bar re-armed the position and placed a **second live trailing-sell order for the same shares** (oversell risk if both filled). Fixed via new `signals_db.get_position_by_id` (fresh re-read before merging). 1 new regression test.
+- **Fixed the structural gap that let the bug above actually stack two live orders**: SELL-side order placement had no resting-order duplicate guard at all (only BUY did). New `schwab_safety._has_open_sell_order`, same-ticker-only (not account-wide like the BUY guard). 2 new tests.
+- **Added a manual-fix alert, per explicit user direction** (no auto-recovery — "we might not have much choice... for now notify me of the sl sell price i can manually fix"): if `_attempt_automated_sell` cancels a resting SL and the trailing-sell placement then fails, posts a 🚨 UNPROTECTED alert with the SL price. 1 new test.
+- **Fixed the poll-loop/Slack-handler double-open/close race** (user: "yeah i think loop poll double open/close needs a fix"): `open_position`/`close_position` (`signals_db.py`) now share a `threading.Lock()` around their check-then-act sections — this is a single-process/multi-thread daemon (poll loop + Socket Mode handler thread), not the cross-process concern `schwab_safety`'s file lock guards. `close_position` now returns `True`/`False` and is a safe no-op on a second racing call. 3 new tests.
+- **Left as-is, explicit user call**: kill switch / per-ticker pause also blocking protective sell orders, not just new entries — understood/accepted behavior, not a bug.
+- Raised but deferred (external blocker, unchanged this session): account-type tracking (cash/limited_margin/full_margin) for `same_day_block` — user is waiting to open a new limited-margin IRA account before this can be scoped with real facts; also noted the user's intent to potentially trade one ticker (e.g. SOXL) across multiple accounts in the future, which would break `schwab_safety._live_ticker_accounts()`'s current one-account-per-ticker assumption — logged as a real gap to address if that plan moves forward.
+- Updated `CLAUDE.md`, `docs/design.md` (Layer 3), `docs/backlog_cache.md`, `docs/live_test_coverage.md` to reflect all of the above.
+
+### Verified
+- Full `pytest tests/`: 172 passed (was 164 at session start).
+- `scripts/verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` — both clean, consistent with prior documented drift.
+
+### Current state
+- Still every account `dry_run=True` — none of this session's fixes has been observed live. All logged in `docs/live_test_coverage.md`.
+- No commit yet as of this entry — see below.
+
+### Next session
+- If the user moves forward with opening the limited-margin IRA, resolve the `same_day_block` account-type-awareness backlog item with real facts (see `CLAUDE.md`).
+- If the user pursues trading one ticker across multiple accounts (e.g. SOXL across ira/brokerage), `schwab_safety._live_ticker_accounts()` needs to become `(ticker, window)`-aware instead of ticker-only — currently would silently misvalidate one of the two accounts.
+- Carried forward, all still open: `same_day_block` account-type awareness (now additionally blocked on the new IRA account existing); one-account-per-ticker rollout; dividend cash tracking; wash-sale holds on GDXU/AGQ in IRA-type accounts (clears 2026-08-05/06); consider the user's proposed $100 real-order empirical test now that several more safety layers exist.

@@ -87,10 +87,23 @@ def _attempt_automated_sell(pos, current_price):
             return False
     try:
         schwab_client.place_trailing_sell(account, ticker, shares, current_price, trail_sell_pct)
-    except schwab_safety.SafetyViolation:
-        return False
     except Exception as e:
-        _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual")
+        # If a resting SL was already cancelled above, the position is now
+        # genuinely unprotected -- there's no safe automatic recovery here
+        # (re-placing the same SL could itself hit the same block/failure),
+        # so surface the SL price the user would need to manually re-enter at
+        # the broker rather than leaving them to recompute it (found via
+        # Opus review, 2026-07-22).
+        if sl_order_id:
+            sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos.get('stop_loss')
+            sl_price = pos['signal_price'] * (1 - sl_pct / 100) if sl_pct else None
+            price_note = f" — manually re-place a stop-loss SELL at ~${sl_price:.2f}" if sl_price else ""
+            _post_message(
+                f"🚨 {ticker} — trailing-sell placement failed after cancelling the resting stop-loss "
+                f"{sl_order_id}: {e} — position UNPROTECTED{price_note}"
+            )
+        elif not isinstance(e, schwab_safety.SafetyViolation):
+            _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual")
         return False
     return True
 
@@ -541,7 +554,16 @@ def notify_trailing_activated(pos, current_price):
         blocks = _trailing_order_blocks(pos, current_price, reminder_num=0)
         channel, ts = _post_message(
             f"{ticker} trailing stop activated — place order", blocks=blocks)
-    state = dict(pos.get('trail_state') or {})
+    # check_sell_condition already persisted the newly-armed state (trailing,
+    # peak) to the DB before calling this function -- pos['trail_state'] here
+    # is still the pre-arm in-memory copy the caller passed in. Merging the
+    # reminder fields onto that stale dict would silently clobber trailing/
+    # peak right after arming, causing check_exit to re-arm on the next bar
+    # and _attempt_automated_sell to place a second live trailing-sell order
+    # for the same shares (found via Opus review, 2026-07-22). Re-read the
+    # position fresh so the merge starts from the real just-armed state.
+    fresh = db.get_position_by_id(pos['id']) or pos
+    state = dict(fresh.get('trail_state') or {})
     state['reminder_channel'] = channel
     state['reminder_ts']      = ts
     state['reminder_count']   = 0

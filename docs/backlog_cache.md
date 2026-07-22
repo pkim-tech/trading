@@ -165,21 +165,86 @@ unexpected exception anywhere would propagate all the way up and kill the
 entire daemon process, stopping monitoring/protection for every open
 position on every ticker, not just skipping the one thing that failed.
 
-## [live-trading][security] Medium priority, not started, 2026-07-21 — `schwab_safety`'s duplicate-order guard trusts a local pre-flight record, not Schwab's real order book
-Found while fixing Part 3's top-up to place a real broker order (see the
-resolved Part 4 review item below). `approve_and_record` writes the order
-into its local `recent_orders` dedup list *before* the real `place_order`
-call happens (`schwab_client._place_equity_order`) — if that broker call
-then fails/times out/is rejected, the guard still believes it succeeded, so
-a legitimate retry within `DUPLICATE_ORDER_WINDOW_SECS` (60s) is wrongly
-blocked as a duplicate. The more correct design (discussed, not built):
-query Schwab's real order book (`schwab_client.get_orders_for_account`,
-already used internally by `get_filled_order`) for a genuine WORKING/FILLED
-match instead of trusting a local heuristic — reflects ground truth,
-naturally handles the retry-after-rejection case with no tolerance-window
-guessing. Bigger structural change to the safety layer than a quick fix;
-scoped as its own session. Not urgent — no real order has been placed yet
-(`dry_run=True` everywhere).
+## [live-trading][security] Resolved 2026-07-22 — `schwab_safety`'s duplicate-order guard now confirms against Schwab's real order book, not just a local pre-flight record
+Full original context preserved below the line. `approve_and_record` still
+writes the order into its local `recent_orders` dedup list before the real
+`place_order` call happens, but `check_order`'s duplicate check now only
+blocks a matching retry for a **real (non-dry_run) account** if a new
+`_broker_confirms_order` cross-check finds a genuinely-accepted (WORKING/
+QUEUED/FILLED, not CANCELED/EXPIRED/REJECTED/REPLACED) order for that exact
+ticker/side/quantity in Schwab's real order book (`_all_orders`, a new
+unfiltered sibling of `_open_orders`) — so a failed/rejected/errored prior
+attempt no longer wrongly blocks a legitimate retry. Dry-run accounts keep
+the old pure-local-heuristic behavior unchanged (nothing real to verify
+against). 2 new tests in `test_schwab_safety.py`. Full suite after this fix
+and the critical trail_state fix below: 172 passed (was 164).
+Original framing (2026-07-21): found while fixing Part 3's top-up to place a
+real broker order. `approve_and_record` writes the order into its local
+`recent_orders` dedup list *before* the real `place_order` call happens
+(`schwab_client._place_equity_order`) — if that broker call then fails/times
+out/is rejected, the guard still believes it succeeded, so a legitimate
+retry within `DUPLICATE_ORDER_WINDOW_SECS` (60s) was wrongly blocked as a
+duplicate. Not urgent at the time — no real order had been placed yet
+(`dry_run=True` everywhere, still true).
+
+## [live-trading][security] Resolved 2026-07-22 — CRITICAL: trailing-arm state clobber caused re-arming and duplicate live trailing-sell orders (oversell risk); found by a full-stack Opus review
+Found via a scoped independent Opus review of the whole automation stack
+(`schwab_client.py`, `schwab_safety.py`, `active_signals.py`,
+`signals_notify.py`, `signals_compute.py`, `signals_db.py`,
+`paper_trading.py`), requested to look at seams between features each
+already individually reviewed in prior sessions. `check_sell_condition`
+(`signals_compute.py`) persists the newly-armed state (`trailing=True,
+peak=P`) to the DB correctly, but `notify_trailing_activated`
+(`signals_notify.py`) then merged its reminder fields onto the **stale**
+in-memory `pos['trail_state']` (the pre-arm copy the caller passed in) and
+overwrote the DB with it — silently losing `trailing`/`peak` right after
+arming. On the next bar close the position looked unarmed again, `check_exit`
+re-armed it, and (since a TrailingBoth position entered via trailing-buy has
+no `sl_order_id` to cancel) `_attempt_automated_sell` placed a **second**
+live trailing-sell order for the same shares — an oversell risk if both
+filled. **Fixed**: new `signals_db.get_position_by_id(position_id)` (fresh
+single-row lookup by primary key); `notify_trailing_activated` now re-reads
+the position before merging, so it starts from the real just-armed state,
+not the stale one. 1 new regression test.
+
+**Two more findings from the same review, fixed alongside it, per explicit
+user direction on scope**:
+- SELL-side order placement had **no resting-order duplicate guard at all**
+  (only BUY did) — this is what let the state-clobber bug above actually
+  stack two live orders. Fixed: new `schwab_safety._has_open_sell_order`,
+  wired into `check_order` as a same-ticker (not account-wide, unlike the
+  BUY guard — an unrelated resting BUY must not block closing a position)
+  SELL-side check. 2 new tests.
+- `_attempt_automated_sell` cancels a resting stop-loss *before* confirming
+  the trailing-sell placed; if placement then fails, the position is left
+  with zero protection and no automated way to recover it. **User's explicit
+  call**: don't restructure the cancel/place ordering (no real alternative
+  that avoids some window of risk) — instead just make sure the user is
+  told what to do. Now posts a 🚨 UNPROTECTED Slack alert with the SL price
+  to manually re-place. 1 new test.
+
+Also fixed as its own item (poll-loop/Slack-handler race, user: "yeah i
+think loop poll double open/close needs a fix"): `open_position`/
+`close_position` (`signals_db.py`) each did a SELECT-then-act with no lock
+spanning both statements — the poll loop thread and the Socket Mode Slack
+handler thread (same process, `active_signals.py` starts both) could each
+pass their own existence check before either committed, risking a duplicate
+open or a racing double-close silently overwriting `trade_log`'s exit
+fields with the losing thread's values. Fixed with a plain
+`threading.Lock()` (`signals_db._position_lock`) — single-process/
+multi-thread daemon, not the cross-process concern `schwab_safety`'s file
+lock guards. `close_position` now also returns `True`/`False` (was
+implicit `None`) and is a safe no-op if the row is already gone. 3 new
+tests.
+
+**Not fixed, explicit user call**: kill switch / per-ticker pause also
+blocks *protective* sell orders, not just new entries (found by the same
+review) — this is existing, understood behavior (turning the algo off means
+accepting the exposure), not a bug to patch.
+
+Full suite: 172 passed (was 164). `verify_trailing_buy_resolution.py`/
+`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` clean post-fixes.
+Nothing here has been observed live — every account still `dry_run=True`.
 ## [live-trading][security] Resolved 2026-07-22 — live-state reconciliation check built: detection + text-only proposed remediation, never auto-executes
 Related idea from the item above, split out once actually built. Originally
 scoped as: does `open_positions.shares` match the broker's real position
