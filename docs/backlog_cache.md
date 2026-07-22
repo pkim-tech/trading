@@ -25,9 +25,14 @@ must stay detection/alert-only (Slack notify on mismatch) — an auto-correcting
 version would be a new automated-trading decision layer on top of the ones
 this session found real bugs in, and a false-positive mismatch (legitimate
 slippage, a deliberate manual override, a timing lag) would trigger a real,
-wrong, automated trade to "fix" something that wasn't actually broken. Any
-future auto-correction (if ever) should be narrowly scoped and human-gated
-via Slack, not silent. Not started.
+wrong, automated trade to "fix" something that wasn't actually broken.
+**Refined same session**: a hybrid middle ground — on a detected mismatch,
+compute and post a *proposed* remediation (e.g. "top up N shares" / "place
+missing SL at $X") to Slack for explicit human approval before anything
+executes, rather than either silent auto-correction or a bare alert with no
+suggested fix. Still human-gated, but saves the manual diagnosis step. Any
+auto-correction (silent, no approval step) stays out of scope regardless.
+Not started.
 
 ## [live-trading] Implemented 2026-07-21, not yet live-tested — Entry Trigger/Fill/SL-Placement/Arm-latency automation for TrailingExitZScoreBreakout (Part 4)
 Full design at `/home/pkim/.claude/plans/replicated-gliding-quasar.md` (not
