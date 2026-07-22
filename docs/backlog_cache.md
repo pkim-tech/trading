@@ -1,5 +1,82 @@
 # Backlog Cache
 
+## [live-trading][security] High priority, not started, 2026-07-21 — no account cash/buying-power check anywhere; a BUY order could silently draw on margin
+Raised while discussing what happens if `open_positions.shares` (or any
+order sizing) drifts above what an account can actually afford in cash.
+Checked: `schwab_client.py` has **no function at all** to read an account's
+real cash balance, and `schwab_safety.check_order`/`approve_and_record` only
+enforce a fixed per-account `notional_cap` (a static dollar ceiling), never
+the account's actual available cash. So today, any BUY order — including
+Part 3's top-up, now that it places a real order (see the resolved Part 4
+review item below) — that exceeds real available cash will either get
+rejected outright (accounts with no margin enabled, e.g. most of the
+IRA-type watchlist-65 accounts) or **silently execute on margin** (any
+margin-enabled account) with zero check or intent on our side.
+**Scoped fix, design agreed, not yet built** (started, interrupted for
+session wrap): add `schwab_client.get_account_balance(account)` (read-only,
+`Client.get_account`, parses `securitiesAccount.currentBalances.
+cashAvailableForTrading` — field names follow Schwab's documented schema but
+are unverified against a real account response, same caveat pattern as
+`get_filled_order`). Wire a check into `schwab_safety.check_order` for BUY
+orders — **at the same single chokepoint every buy-related order already
+funnels through** (initial trailing buy, market buy, top-up, `check_gap_resize`'s
+market replacement), so one check covers all of them. Per discussion: NOT
+bypassed by `is_gap_correction` (that bypass is for the signal-window timing
+gate specifically, this is a hard financial constraint); should **fail-closed**
+(block the order) if the balance fetch itself fails/times out, not fail-open —
+placing an order un-checked is exactly the risk being prevented. Needs
+existing BUY-side tests across `test_schwab_safety.py`/`test_schwab_automation.py`/
+`test_part3_gap_resize.py`/`test_part4_entry_trigger.py` updated to
+monkeypatch the new balance check (large default) so they don't start hitting
+a real API / failing on missing credentials.
+**User's proposed empirical validation, not built**: fund a real (margin-enabled)
+account with a small amount (~$100), flip that one account's `dry_run` to
+`False`, and place a single ~$100.50 order via a minimal standalone script
+(bypassing `active_signals.py`/`signals_notify.py`/`schwab_safety` entirely,
+calling `schwab_client.place_equity_buy` directly) to observe Schwab's real
+behavior (reject vs. silently margin-fund) — this would be the first real
+(non-dry_run) order this system has ever placed, so treat deliberately. Not
+scripted yet.
+Related but distinct real-world note (not actionable code, confirm with
+Schwab directly rather than assume): a short position from an oversell is
+likely self-limiting in no-margin (IRA-type) accounts (order rejected, not
+executed as a short), but could actually execute in the margin-enabled
+account; unsure of Schwab's specific margin-call/PDT-flag policy for a brief
+accidental short — don't assume benign without confirming.
+
+## [live-trading][security] Medium priority, not started, 2026-07-21 — `active_signals.run_loop` has no top-level fault tolerance; most of the loop body can crash the whole daemon on a single exception
+Found while discussing how to chaos-test resilience to real-world failures
+(bar/data timeouts, real-time price request timeouts, position/order-book
+request timeouts). Two spots already isolate failures correctly: `_refresh`
+(hourly data fetch, wrapped in a `ThreadPoolExecutor` + 15s timeout, catches
+`FuturesTimeoutError`/`Exception` and just skips that ticker) and
+`_scan_pinned_entry` (Part 4's pinned price fetch, per-ticker
+try/except around `get_session_open_price`/`get_current_price`, skips just
+that ticker on failure). But everything else in `run_loop`'s `while True:`
+body has **no exception handling at all**, and there is no top-level
+try/except around the loop body either: `_scan_pinned_exit_arm` (Part 4's
+exit-arm latency scan — `_load_cache`/`check_sell_condition`/
+`notify_sell_signal`, all unguarded), the pre-existing ambient exit-check
+loop (same functions, also unguarded), `check_auto_fills`, `drain_fill_queue`,
+`check_gap_resize`, `send_reference_report`, etc. A single unexpected
+exception anywhere in any of these (e.g. `_load_cache` hitting a corrupted
+cache file, a Schwab API call timing out inside `check_auto_fills`) would
+propagate all the way up and **kill the entire daemon process** — stopping
+monitoring/protection for every open position on every ticker, not just
+skipping the one thing that failed. This is a materially worse failure mode
+than anything found/fixed elsewhere this session (those were wrong-state
+bugs; this is a total-outage risk with zero recovery until a human notices
+the daemon died and restarts it — `scripts/daemon_status.py` can detect a
+stale/dead daemon but nothing auto-restarts it).
+**Not fixed, not fully scoped** — needs a decision on granularity (wrap each
+major loop-body section individually, like `_refresh` already does, vs. one
+broad outer try/except around the whole loop body as a last-resort net) and
+on what "recovery" means (log + continue to next iteration is probably right
+for most of these, but should not silently swallow — needs a visible Slack
+alert so a human knows a section degraded). Chaos-testing this (simulating a
+timeout/exception at each of these points) was the original ask that
+surfaced this gap; no fault-injection tests exist yet for any of it.
+
 ## [live-trading][security] Medium priority, not started, 2026-07-21 — `schwab_safety`'s duplicate-order guard trusts a local pre-flight record, not Schwab's real order book
 Found while fixing Part 3's top-up to place a real broker order (see the
 resolved Part 4 review item below). `approve_and_record` writes the order

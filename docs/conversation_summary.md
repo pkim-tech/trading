@@ -2583,3 +2583,29 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 - Consider the "query Schwab's real order book instead of a local duplicate-order heuristic" and "detection-only live-state reconciliation" backlog items above — both bigger scope, own session.
 - Same carryover as last session: run the daemon live (`dry_run=True`) for at least one real trading day to populate Deliverable 2 data, then run `scripts/verify_open_price_quality.py`; review before any `dry_run=False` flip.
 - User flagged mid-session that logic/protection-layer complexity is growing — agreed to consolidate rather than keep building; worth periodically re-asking this question rather than only reacting when it's raised.
+
+---
+
+## 2026-07-21 — Resilience/chaos-testing discussion surfaces two more real gaps: no cash-balance check, no daemon fault tolerance
+
+### What we did
+- **Discussed chaos-testing the live-trading order-placement logic** (order timeouts, order rejections, data/price/position-request timeouts) as a follow-up to the phase-by-phase review earlier this session.
+- **Confirmed existing fault isolation is real but partial**: `_refresh` (hourly bar data fetch) already has a per-ticker 15s timeout + broad exception catch (skip that ticker only); `_scan_pinned_entry` (Part 4's pinned price fetch) already has a per-ticker try/except around `get_session_open_price`/`get_current_price`. Both match the original plan's stated design.
+- **Found a real gap — `run_loop` has no top-level fault tolerance**: `_scan_pinned_exit_arm`, the ambient exit-check loop, `check_auto_fills`, `drain_fill_queue`, `check_gap_resize`, `send_reference_report`, etc. all run completely unguarded inside the main `while True:` loop, with no outer try/except either. A single unexpected exception anywhere in any of these would crash the entire daemon process, not just skip one ticker — a total-outage risk (stops monitoring every open position on every ticker) worse than any of the wrong-state bugs fixed earlier this session. Logged to backlog, not fixed — needs a design decision on granularity/recovery semantics first.
+- **Side discussion on accidental-short/margin risk** (prompted by the earlier phantom-top-up-shares bug): concluded an oversell is likely self-limiting in no-margin (IRA-type) accounts (order rejected, not shorted) but could actually execute in the margin-enabled account; margin-call/PDT-flag specifics need confirming with Schwab directly, not assumed.
+- **Found the actual bigger gap while discussing that**: `schwab_client.py` has **no function at all** to read an account's real cash balance — every order-placement check only compares against a fixed per-account `notional_cap`, never actual available cash. So a BUY order (including the newly-real top-up from earlier this session) could exceed real cash and either get rejected (no-margin accounts) or **silently draw on margin** (margin-enabled accounts) with zero check on our side.
+- **Scoped (not built) a fix**: `schwab_client.get_account_balance(account)` (read-only, `Client.get_account`, parses `currentBalances.cashAvailableForTrading`, unverified against a real response) wired into `schwab_safety.check_order`'s single BUY chokepoint — covers every buy-related order type for free (trailing buy, market buy, top-up, gap-correction replacement) since they already all funnel through it. Per discussion: not bypassed by `is_gap_correction` (hard financial constraint, not a timing gate); fail-closed if the balance fetch itself fails. Needs 4 existing test files' BUY-side tests updated to mock it. User proposed a real empirical validation (fund a margin account with ~$100, flip that account's `dry_run=False`, place a single ~$100.50 order via a minimal standalone script bypassing the daemon entirely) — would be this system's first-ever real order, not yet scripted.
+- Interrupted mid-implementation (had read `schwab_client.py`'s account-hash-resolution code, hadn't written any new code yet) for session wrap — both items logged to backlog in full detail rather than left half-built.
+- **Docs updated**: `docs/backlog_cache.md` gained two new high/medium-priority entries with full scoping detail (cash-balance check, daemon fault tolerance).
+
+### Verified
+- N/A — investigation/discussion only this stretch, no code changed.
+
+### Current state
+- No code changes since the last commit (`ee7803f`) — this stretch was pure investigation + backlog scoping.
+
+### Next session
+- Build the cash-balance check (`get_account_balance` + `check_order` wiring + test-fixture updates) — design is agreed, just needs implementation.
+- Consider the daemon fault-tolerance gap — needs a design decision on wrapping granularity before building.
+- Consider the user's $100 real-order empirical test once the balance check exists (would validate both at once).
+- Carried forward: the two structural ideas from the Part 4 review (real-order-book-based duplicate check, detection+propose-remediation live-state reconciliation), Deliverable 2 data collection, wash-sale holds, one-account-per-ticker design.
