@@ -107,6 +107,27 @@ def test_same_day_rebuy_blocked_after_earlier_sale(env):
         schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
 
 
+def test_same_day_rebuy_not_blocked_in_margin_account(env):
+    """Margin accounts (regular or IRA limited margin) don't have the cash-
+    account T+1 settlement restriction same_day_block exists for -- brokerage
+    is account_type='margin' in schwab_safety.ACCOUNTS, unlike 'ira' (cash)."""
+    from datetime import datetime, timedelta
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET account = 'brokerage' WHERE ticker = ?", (TICKER,))
+        c.commit()
+    node = _get_node()
+    signal_time = datetime.now() - timedelta(hours=10)
+    trade_id = signals_db.log_trade_entry(
+        node, signal_price=100.0, signal_time=signal_time, entry_price=101.0, entry_time=signal_time
+    )
+    signals_db.log_trade_exit(
+        trade_id, exit_signal_price=95.0, exit_price=95.0, exit_time=datetime.now(),
+        exit_reason='SL', entry_price=101.0,
+    )
+    result = schwab_client.place_equity_buy('brokerage', TICKER, 5, 50.0)
+    assert result == (None, None)  # dry_run -- not blocked by same_day_block
+
+
 def test_same_day_sell_after_buy_not_blocked(env):
     # deliberately not a guardrail (2026-07-15): a soft employer recommendation,
     # not a hard broker rule like the same-day-rebuy GFV check above

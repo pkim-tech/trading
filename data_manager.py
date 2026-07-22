@@ -110,17 +110,21 @@ def fetch_live_data_smart(ticker):
         # 3. Force delta index to match the clean string-parsed format from the CSV file
         df_delta.index = pd.to_datetime(df_delta.index).tz_localize(None)
 
-        # 3b. Corporate-action guard: yfinance's hourly interval does NOT retroactively
-        # split-adjust historical bars (only daily+ intervals get that treatment), so a
-        # split shows up as every overlapping-date local row being an near-identical
-        # multiple of the fresh delta row for the same timestamp -- ordinary price
-        # volatility doesn't produce a *consistent* ratio across every overlap bar, and
+        # 3b. Corporate-action guard: yf.download() actually defaults to auto_adjust=True
+        # (confirmed 2026-07-16/22 -- this comment previously claimed the opposite), but
+        # that only adjusts the window being fetched *right now* for corporate actions known
+        # as of today -- it doesn't reach back and re-adjust rows already sitting in the
+        # local cache from a prior fetch. So a new split still shows up as every overlapping-
+        # date local row being a near-identical multiple of the fresh delta row for the same
+        # timestamp (the old cache is stale-scale, the new fetch is new-scale) -- ordinary
+        # price volatility doesn't produce a *consistent* ratio across every overlap bar, and
         # magnitude alone can't tell a real crash from a split (a 3x leveraged ETF can
         # plausibly fall >66% in one real extreme day) -- match against known round-number
         # split factors instead, same logic as signals_compute.py's live-price check.
         # Rescale the whole local cache before merging so history stays on the same scale
         # as fresh data, instead of leaving a silent price cliff (found live 2026-07-15,
-        # KORU's ~20:1 split -- see docs/backlog_cache.md).
+        # KORU's ~20:1 split -- see docs/research_log.md's 2026-07-22 entry for the full
+        # auto_adjust/split-guard reconciliation).
         overlap = df_local.index.intersection(df_delta.index)
         if len(overlap) >= 1:
             ratios = df_local.loc[overlap, "Close"] / df_delta.loc[overlap, "Close"]

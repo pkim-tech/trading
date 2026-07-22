@@ -108,16 +108,29 @@ class AccountLimits:
     notional_cap: float    # max $ per single order
     daily_order_cap: int   # max orders per calendar day
     dry_run: bool          # True: log what would happen, never call place_order
+    account_type: str      # 'cash' or 'margin' (regular or IRA limited margin, same_day_block treats both the same)
 
 
 # Placeholder per-account config -- tune before going live. Account-risk framing
 # from the 2026-07-13 research session: Brokerage/SEP are large and need tight
 # controls, Roth ($50k) is deliberate play money, IRA is fine/not small.
+# account_type (2026-07-22): brokerage already has margin (ordinary taxable
+# brokerage accounts do by default); sep/roth/ira are plain cash, confirmed by
+# the user. The new (5th) limited-margin IRA funded this session isn't listed
+# here yet -- not wired into .env/NICKNAMES (schwab_client.py) until its API
+# token scope + compliance trading permission both clear, see the
+# project_new_ira_account_status memory. Used only by same_day_block below,
+# not a gate on whether an account can trade live at all -- the user's model
+# is one account per ticker, growing over time as capital/liquidity needs it
+# (fund a new trade in a new account rather than liquidating an existing
+# one), so a blanket "cash accounts can never go live" rule was considered
+# and explicitly rejected -- it would've locked automation out of every
+# existing cash account.
 ACCOUNTS = {
-    "brokerage": AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  dry_run=True),
-    "sep":       AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  dry_run=True),
-    "roth":      AccountLimits(enabled=True, notional_cap=50_000, daily_order_cap=10, dry_run=True),
-    "ira":       AccountLimits(enabled=True, notional_cap=75_000, daily_order_cap=10, dry_run=True),
+    "brokerage": AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  dry_run=True, account_type="margin"),
+    "sep":       AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  dry_run=True, account_type="cash"),
+    "roth":      AccountLimits(enabled=True, notional_cap=50_000, daily_order_cap=10, dry_run=True, account_type="cash"),
+    "ira":       AccountLimits(enabled=True, notional_cap=75_000, daily_order_cap=10, dry_run=True, account_type="cash"),
 }
 
 # Live-automation scope -- moved from a hardcoded Python literal to SCHWAB_AUTOMATION_TICKERS
@@ -447,8 +460,10 @@ def check_order(
     # Schwab good-faith violation (reusing unsettled sale proceeds in a cash
     # account) -- a hard broker-enforced constraint, unlike the same-day-sell
     # direction (a soft employer recommendation, not enforced, deliberately
-    # left out).
-    if side == "BUY" and signals_db.closed_today(ticker):
+    # left out). Margin accounts (regular or IRA limited margin) don't have
+    # this settlement restriction (2026-07-20 finding, resolved 2026-07-22)
+    # -- skip for them.
+    if side == "BUY" and limits.account_type == "cash" and signals_db.closed_today(ticker):
         raise SafetyViolation(
             f"'{ticker}' was sold today -- same-day re-buy risks a cash-account good-faith violation"
         )

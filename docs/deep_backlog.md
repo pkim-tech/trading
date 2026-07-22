@@ -1,5 +1,41 @@
 # Backlog
 
+## ✅ [live-trading][security] Resolved 2026-07-22 — `same_day_block` account-type-awareness
+`schwab_safety.AccountLimits` gained `account_type` (`'cash'` or `'margin'` — regular and IRA
+limited margin treated identically, since both lack the T+1 cash-settlement restriction the
+same-day-rebuy check exists for). `ACCOUNTS`: brokerage is `'margin'`; sep/roth/ira are `'cash'`,
+confirmed by the user. `check_order`'s same-day-rebuy check now only fires for `'cash'` accounts.
+A blanket "real orders only in a confirmed margin account" gate was considered and explicitly
+rejected mid-build (caused 2 real test failures before being reverted) — the user's account model
+is one account per ticker, capital-capped and expanded by funding a new account rather than
+liquidating an existing one (see `project_account_segregation_model` memory), so a hard
+margin-only gate would've locked automation out of every existing account. 1 new test
+(`test_same_day_rebuy_not_blocked_in_margin_account`). The new (5th) limited-margin IRA funded
+2026-07-22 isn't in `ACCOUNTS` yet — blocked on Schwab API token scope + compliance trading
+permission. Full suite: 177 passed.
+
+## ✅ [backtest] Resolved 2026-07-22 — `auto_adjust`/split-guard reconciliation closed; data traceability (not full immutability) chosen as the design direction
+Reconciled the open 2026-07-16 question (why did `data_manager.py`'s split-guard rescue still
+fire for KORU if `yf.download()` already defaults to `auto_adjust=True`?): `auto_adjust=True`
+only adjusts the window being fetched *right now* for corporate actions known as of today, not
+rows already sitting in the local cache from a prior fetch — a new split therefore still produces
+a scale cliff between stale-scale cached rows and new-scale freshly-fetched rows, which is exactly
+what the split-guard detects and rescales the whole file to fix. Guard is real work, not dead
+code. Since the rescale is one multiplicative factor across the whole series, downstream
+%-based signals (z-score, SL/TP/arm, returns) are scale-invariant to it, so past `backtest_cache`
+numbers should stay reproducible by re-running the same code. Corrected the stale in-code comment
+at `data_manager.py:113-124` that had claimed the opposite (that yfinance's hourly interval isn't
+retroactively split-adjusted at all). Full writeup: `docs/research_log.md`'s 2026-07-22 entry.
+**Real, distinct gap raised in the same discussion, backlogged (medium priority, doesn't block
+trading) rather than built**: no archived record of the exact cache-file data that fed any past
+backtest — mutated in place on every split-guard rescale. User's explicit call: traceability (know
+when/why/how data changed) over full immutable/versioned data linked to each `backtest_cache` row
+— the latter would be real reproducibility but a much bigger lift (schema change across the whole
+sweep engine, real storage growth), and isn't needed if the scale-invariance argument above holds.
+Design agreed for later: a `data_mutation_log` table in `trading_universe.db` (via `db_cache.py`),
+one row per split-guard rescale event with a `pre_mutation_snapshot` of the actual old data (not
+just metadata about the change) — cheap since these events are rare. Not yet built.
+
 ## ✅ [live-trading][backtest] Resolved 2026-07-20 — watchlist 65 candidate testing complete; found+fixed a live/paper compliance gap and a `create_watchlist` id-burning bug
 Full writeup in `docs/research_log.md` ("2026-07-20 (cont.) — Watchlist 65 candidate
 testing: chaos-monkey, Stage 5 compliance gap found+fixed, watchlists.id gap

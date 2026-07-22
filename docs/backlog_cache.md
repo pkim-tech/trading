@@ -410,7 +410,24 @@ trade in the brokerage account itself, or in IRA accounts after clearance. **Act
 needed**: don't execute or recommend a GDXU/AGQ buy into any IRA-type account until
 the respective date above.
 
-## [live-trading][security] Medium priority, not started, 2026-07-20 — `schwab_safety.py`'s `same_day_block` isn't account-type-aware; would incorrectly block legitimate margin-account trades
+## [live-trading][security] Resolved 2026-07-22 — `same_day_block` is now account-type-aware
+Full original framing preserved below the line. Built this session: `schwab_safety.AccountLimits`
+gained an `account_type` field (`'cash'` or `'margin'` — covers both regular margin and IRA
+limited margin identically, since both lack the T+1 cash-settlement restriction). `ACCOUNTS`:
+brokerage is `'margin'` (ordinary taxable brokerage accounts have it by default); sep/roth/ira are
+`'cash'`, confirmed by the user. `check_order`'s same-day-rebuy check now only fires when
+`limits.account_type == 'cash'`. 1 new test (`test_same_day_rebuy_not_blocked_in_margin_account`).
+**Deliberately NOT built, considered and rejected**: a blanket "real orders only allowed in a
+confirmed margin account" gate — the user's actual account model is one account per ticker,
+growing over time as capital/liquidity needs it (fund a new trade in a new account rather than
+liquidating an existing one), so a hard margin-only gate would have locked automation out of
+every existing cash account (brokerage/sep/roth/ira all already hold real, non-algorithmic
+positions). `account_type` is metadata for `same_day_block` specifically, not a live/no-live gate.
+The new (5th) limited-margin IRA funded 2026-07-22 isn't in `ACCOUNTS` yet — still blocked on API
+token scope + compliance trading permission, see the `project_new_ira_account_status` memory.
+Full suite: 177 passed.
+
+### Original framing (2026-07-20), before resolution
 Found while reinterpreting the watchlist-65 checklist's check 9 (same-day-block
 sensitivity). The guardrail (`signals_db.closed_today`, enforced in
 `schwab_safety.py`'s BUY-side safety check) refuses a same-day re-buy on any
@@ -421,11 +438,8 @@ settlement"). User confirmed 2026-07-20: watchlist 65's tickers will trade in
 same-day-reuse settlement restriction, so the block as currently written would
 reject valid, safe trades once live. Not urgent — `schwab_client`/`schwab_safety`
 aren't wired into `active_signals.py`'s real loop yet, so nothing is actually
-enforced live right now. **Action needed**: make `same_day_block` conditional on
-account type (skip the check for margin accounts, keep it for any real cash/IRA
-account) before this guardrail is ever wired into live order placement. Depends
-loosely on the still-undecided one-account-per-ticker plan (`docs/deep_backlog.md`)
-for how account type gets tracked per ticker.
+enforced live right now. Depends loosely on the still-undecided one-account-per-ticker
+plan (`docs/deep_backlog.md`) for how account type gets tracked per ticker.
 
 ## [backtest] Resolved 2026-07-20 — last-window MOC vs trailing-buy; MOC does not win, see `docs/deep_backlog.md`/`docs/research_log.md`
 
@@ -720,9 +734,49 @@ Found while manually reconstructing KORU's real live trailing-buy fills: `signal
 4. **Done.** `_last_sale_recovery(ticker, starting_notional)` now requires the caller to pass `starting_notional` explicitly (raises `ValueError` if both trade history and `starting_notional` are missing) — no more hidden flat-$50k fallback. New `watch_list.starting_notional` column (`REAL NOT NULL DEFAULT 50000`, backfilled to 50000 for every existing row to preserve current behavior); GDXD's row set to `5000`. All 6 call sites (`signals_blocks.py`, `signals_notify.py` x2, `signals_handlers.py` x2) updated to pass `node.get('starting_notional')`; the two Slack-value round-tripped `node_fields` tuples (`signals_blocks.py`, `signals_notify.py`) extended to include it so it survives the button-click round trip.
 5. **Done, with a real and more serious finding than the original hypothesis.** Live-tested directly against the real IRA account (real settled cash $271,662.09, confirmed via `client.get_account()` before testing — already well above both `HARD_ORDER_CEILING=$100k` and the IRA's own `$75k` cap, so no order within our own limits could ever test "beyond available cash" on its own). User placed a real $200k `TRAILING_STOP` buy order directly in Schwab's UI: **buying power was unaffected** — not reduced at all by the resting order. Re-tested with a limit order instead of a trailing-stop: **same result, buying power unaffected**. **Conclusion: Schwab does not reserve/check buying power against either order type at placement time** — whatever check exists (if any) only happens at actual fill/execution, not when a resting order is accepted. This is the opposite of the original hypothesis ("a cash account may already provide a hard backstop") — **no such backstop exists at placement time**. Both test orders were cancelled by the user afterward. **Real implication**: `schwab_safety`'s own per-order notional caps are the *only* protection that exists today — nothing on Schwab's side stops multiple legitimate-looking resting orders (e.g. several tickers' trailing buys, each individually under cap) from collectively committing far more than real available cash. Not an immediate risk at the current single-ticker $5k GDXD scope, but a real gap to close (e.g. an aggregate-resting-orders check, not just a per-order one) before meaningfully widening `AUTOMATION_ENABLED_TICKERS`. What happens when an order actually fires past available cash is still unknown — deliberately not tested (would require an uncontrolled real execution, not a placement-time check).
 
-## [backtest] High priority, 2026-07-16 — split-guard in `data_manager.py` built on a false premise; GDXD's absurd v4 numbers need trade-level verification
+## [backtest] Resolved 2026-07-22 — split-guard/`auto_adjust` reconciliation closed; GDXD numbers verified clean
+Full original writeup preserved below the line. **Reconciled 2026-07-22**: `auto_adjust=True`
+only adjusts the window being fetched *right now* for corporate actions known as of today — it
+doesn't reach back and re-adjust rows already sitting in the local cache from a prior fetch. A
+new split therefore makes the next incremental delta fetch land on the new scale while old cached
+rows stay on the prior scale, which is exactly the discontinuity the split-guard detects and
+rescales the whole file to fix. Guard is real work, not dead code; auto_adjust and the guard are
+two different layers (per-fetch adjustment vs. cross-fetch reconciliation). Since the guard's
+rescale is one multiplicative factor across the whole series, downstream %-based signals (z-score,
+SL/TP/arm, returns) are scale-invariant to it, so past `backtest_cache` numbers should stay
+reproducible by re-running the same code. Full writeup: `docs/research_log.md`'s 2026-07-22 entry.
+**Real, distinct gap surfaced in the same discussion, backlogged separately below (not resolved)**:
+no archived/immutable snapshot of the exact cache-file bytes used for any past backtest exists —
+literal byte-for-byte forensic reproducibility isn't possible, only "same code produces the same
+number." See the new data-traceability item below.
+
+### Original framing (2026-07-16), before reconciliation
 While reviewing a v4 sweep summary CSV, GDXD (non-watchlist, cleared the Step 4 >=300%-v3.x-alpha screen) showed implausible numbers (best_certain up to ~91,000% alpha on some campaigns). Its local `cache/research/GDXD_1h.csv` price fell ~200x over 2.5 years ($9990 in 2023 -> ~$51 now), and `yf.Ticker('GDXD').splits` confirms 3 real reverse splits in that window (2024-04-29 0.10, 2025-10-22 0.05, 2026-02-09 0.10 — cumulative ~1-for-2000). First hypothesis was the KORU-style bug (splits never retroactively applied to local cache, corrupting any trade whose entry/exit straddles a split date) — **checked and disproven**: local Close prices flow smoothly through all 3 split dates with no discontinuity (e.g. 2024-04-29: $4862->$4842->$5345, no ~10x jump). Root cause of the smooth data: `yf.download()` defaults to `auto_adjust=True` (confirmed via `inspect.signature`), and neither call site in `data_manager.py:47,94` overrides it — so every fetch (initial 730-day pull and every incremental delta) already comes back split-adjusted and continuous. **This means the comment at `data_manager.py:113-115` ("yfinance's hourly interval does NOT retroactively split-adjust historical bars") is wrong or stale**, and the whole `detect_price_discontinuity` split-guard machinery (`signals_helpers.py`, wired into `data_manager.py`'s merge step, `compute_buy_signal`, and `check_sell_condition`) may be solving a problem that doesn't actually exist under current yfinance behavior — yet it was empirically triggered for real during the KORU incident (2026-07-15). Needs reconciling: was KORU's raw discontinuity coming from some other path (e.g. `fast_info`/live 1-min tick fetch, which is a separate code path from this `yf.download()` history call), not this one? If so the guard may be correctly placed for that path but the comment/reasoning documenting *why* is wrong. **Action needed**: audit why `auto_adjust=True` didn't prevent the KORU incident, and whether the split-guard is still doing real work or is now dead code for the `data_manager.py` merge path specifically.
-**GDXD trade-level check done, 2026-07-16 — verified clean, no bug.** Called `backtester.run_backtest_v110` directly (not a reimplementation) on GDXD's winning node (window=10, z=1.0, tb=1%, arm=7%, fixed_sl=2%, ts=1%, max_hold=7h, open_check). All three resolutions show sane per-trade numbers: 247-279 trades, win rate 37-47%, avg win ~+7.5%, avg loss capped exactly at the -2% stop, max single trade only +35%, no outliers. Expected per-trade log-return compounded over ~250-280 trades works out to almost exactly the reported ~40-400x multiple — the huge alpha is real multiplicative compounding of a genuinely favorable per-trade edge repeated hundreds of times, not corrupted data or a stray outlier trade. Caveat (not GDXD-specific, applies to every ticker's on-file number): this assumes full reinvestment every trade, which is how `strategy_return`/`alpha_vs_spy` are always computed — not how live trading actually works yet ($50k fixed notional, no compounding). Only the `auto_adjust`/split-guard reconciliation question above remains open for GDXD.
+**GDXD trade-level check done, 2026-07-16 — verified clean, no bug.** Called `backtester.run_backtest_v110` directly (not a reimplementation) on GDXD's winning node (window=10, z=1.0, tb=1%, arm=7%, fixed_sl=2%, ts=1%, max_hold=7h, open_check). All three resolutions show sane per-trade numbers: 247-279 trades, win rate 37-47%, avg win ~+7.5%, avg loss capped exactly at the -2% stop, max single trade only +35%, no outliers. Expected per-trade log-return compounded over ~250-280 trades works out to almost exactly the reported ~40-400x multiple — the huge alpha is real multiplicative compounding of a genuinely favorable per-trade edge repeated hundreds of times, not corrupted data or a stray outlier trade. Caveat (not GDXD-specific, applies to every ticker's on-file number): this assumes full reinvestment every trade, which is how `strategy_return`/`alpha_vs_spy` are always computed — not how live trading actually works yet ($50k fixed notional, no compounding).
+
+## [backtest] Medium priority, designed-not-built 2026-07-22 — data mutation log (traceability, not full immutability/versioning) for historical price cache rescales
+Raised while discussing the split-guard/`auto_adjust` reconciliation above. Real gap: no
+archived record of the exact `cache/research/*_1h.csv` data that fed any given past
+`backtest_cache` row — the file is mutated in place on every split-guard rescale (ordinary
+incremental fetches only append new rows, never mutate old ones). Two shapes discussed: (a) full
+immutable/versioned data with each `backtest_cache` row linked to a specific data version — real
+byte-for-byte reproducibility, but a meaningfully bigger lift (schema change touching the whole
+sweep engine, real storage growth); (b) a lightweight mutation-event log — cheap, no
+reproducibility guarantee on its own. **User's decision**: (b) over (a) — traceability (know
+when/why/how data changed) matters more than full immutability, since the split-guard's rescale
+is scale-invariant to the %-based signals every strategy actually trades on, so re-running the
+same code against today's cache *should* reproduce a past alpha number without needing the exact
+old bytes.
+**Design agreed, not yet built**: new `data_mutation_log` table in `trading_universe.db` (via
+`db_cache.py`, the existing shared research DB) — one row per split-guard rescale event:
+`ticker`, `factor`, `detected_at`, `overlap_bar_time`, `price_before`/`price_after`, `notes`, plus
+a `pre_mutation_snapshot` column holding the full pre-rescale `df_local` (CSV-serialized) so the
+actual old data is recoverable, not just the fact that it changed. Cheap since rescale events are
+rare (a handful of real splits a year across the whole watchlist), captured only at the moment
+`data_manager.py`'s existing rescale branch fires, not on every routine fetch.
+**User's priority call**: medium — doesn't block getting trades out, no live urgency, but worth
+doing before it's needed rather than after an incident. Full discussion: `docs/research_log.md`'s
+2026-07-22 entry.
 
 ## [backtest] High priority, 2026-07-16 — execution-adherence robustness ("chaos monkey"), distinct from island/robust-alpha
 Raised in discussion: island search (parameter-neighborhood robustness) and the possible/pessimistic/certain robust-alpha ranking (intrabar fill-timing robustness) both assume perfect adherence to the strategy over the full trade sequence. Neither models a human missing, mistiming, or skipping a real signal — the actual live-trading risk right now, since execution is fully manual. Because these are single-position-per-ticker, sequentially compounding strategies, a single missed/late/early trade doesn't just cost that trade's return: it can leave the position flat/in when the backtest assumes the opposite for every subsequent signal, so the divergence propagates forward through the rest of the compounding run rather than averaging out. Not the same axis as the existing train/test split item (regime/noise overfitting) — this is about tolerance to *deviation from the assumed execution path*, not about the historical sample.

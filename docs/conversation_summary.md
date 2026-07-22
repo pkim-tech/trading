@@ -2714,3 +2714,32 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 ### Next session
 - If the user has a number in mind for the max-BUY-per-ticker-per-day cap, build it per the design already worked out in `docs/backlog_cache.md` (1.1x starting_notional normally, ~1.0-1.05x most-recent-same-day-sell-notional if applicable).
 - Carried forward, all still open: `same_day_block` account-type awareness (blocked on the new limited-margin IRA account not yet existing); one-account-per-ticker rollout, and note `schwab_safety._live_ticker_accounts()` would need to become `(ticker, window)`-aware if the user ever splits one ticker (e.g. SOXL) across multiple accounts; dividend cash tracking; wash-sale holds on GDXU/AGQ in IRA-type accounts (clears 2026-08-05/06); the user's proposed $100 real-order empirical test.
+
+---
+
+## 2026-07-22 — Fixed test-suite Slack leak, hardened fast-path fill reconciliation against partial fills, made same_day_block account-type-aware; new limited-margin IRA funded
+
+### What we did
+- **Found and fixed a real test-suite bug**: `pytest` was posting real messages to the live Slack channel on every run (including at every `session wrap`'s pre-commit checklist) — `SOCKET_MODE` is true whenever real Slack creds are in `.env`, regardless of `pytest`, and `SIM_MODE` only prefixes message text rather than suppressing the send. Fixed with an autouse `tests/conftest.py` fixture patching `_post_message` on all seven modules that import it directly by name (patching `signals_blocks._post_message` alone doesn't reach any of them, since each holds its own bound reference).
+- **Hardened `signals_notify.drain_fill_queue`** (the account-activity-stream fast fill-detection path) against a real partial-fill risk raised by the user: it previously trusted the stream message's own price/quantity, which may represent one partial execution of a still-filling order (unverified whether Schwab's `filledQuantity` is cumulative or per-execution) — locking in a partial would under-record real share count and let `_reconcile_fill`'s top-up logic place a real second buy for the "shortfall" while the original order kept filling (a genuine double-buy risk). Now uses the stream event only as a wake-up signal, reconfirming via the same `get_filled_order` poll (terminal `FILLED` status, aggregated across every execution leg) the poll and sync-confirm paths already trust. New/updated tests in `test_part3_gap_resize.py`.
+- **New limited-margin IRA account funded** ($5,000) — margin confirmed via account disclosure after some initial confusion. Still blocked on Schwab API token scope and compliance trading permission before it can place any real order; not yet wired into `schwab_safety.ACCOUNTS`/`.env`.
+- **Made `same_day_block` account-type-aware** (closing the 2026-07-20 backlog item): `schwab_safety.AccountLimits` gained `account_type` (`'cash'` or `'margin'`); brokerage is `'margin'`, sep/roth/ira are `'cash'`. The same-day-rebuy check now only fires for cash accounts. Along the way, built and then explicitly reverted (per the user's correction) a blanket "real orders only in a confirmed margin account" gate — it conflicted with the user's actual account model (one account per ticker, cap usage and fund a *new* account rather than liquidating an existing one), and would have locked automation out of every existing account. Saved as a new memory (`project_account_segregation_model`).
+- **Reconciled an open 2026-07-16 backtest question**: why did `data_manager.py`'s split-guard rescue still fire for KORU if `yf.download()` already defaults to `auto_adjust=True`? Answer: `auto_adjust` only adjusts the window being fetched *right now*, not rows already cached from a prior fetch, so a new split still produces a scale cliff the guard correctly detects and fixes. Corrected the stale in-code comment that claimed the opposite. Full writeup in `docs/research_log.md`.
+- **Discussed and designed (not built) a data-traceability mechanism**, raised by the user's concern about historical price data changing under past backtests: decided on traceability (a `data_mutation_log` table in `trading_universe.db`, one row per split-guard rescale with a snapshot of the old data) over full immutable/versioned data linked to `backtest_cache` rows — the latter is a much bigger lift and isn't needed since the guard's rescale is scale-invariant to %-based signals. Backlogged at medium priority — doesn't block trading.
+- Reviewed the current backlog with the user; corrected a summary mistake (`same_day_block` itself was already built and active — only its account-type-awareness was missing, not the whole guardrail) and flagged several other backlog headings that look stale/already resolved by prior sessions but were never marked so.
+- Updated `CLAUDE.md`, `docs/backlog_cache.md`, `docs/deep_backlog.md`, `docs/research_log.md`, `docs/live_test_coverage.md` to reflect all of the above.
+
+### Verified
+- Full `pytest tests/`: 177 passed (was 176 at the top of this continuation).
+- `scripts/verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` — both clean, consistent with prior documented drift.
+- Confirmed via manual run that the test suite no longer posts to the real Slack channel.
+
+### Current state
+- Still every account `dry_run=True` — none of this session's fixes has been observed live.
+- New IRA account funded but not yet usable for any real order (API scope + compliance both pending).
+
+### Next session
+- If the new IRA account's API token scope and compliance approval both clear, wire it into `schwab_safety.ACCOUNTS`/`.env` with `account_type='margin'`.
+- If the user decides to build the data-mutation-log traceability design, it's fully specified in `docs/research_log.md`'s 2026-07-22 entry and `docs/deep_backlog.md`.
+- Consider a dedicated backlog-hygiene pass — several old "High priority" headings (trailing-buy re-sizing, `open_check` live-analog, v4→`watch_list` promotion) look superseded by later work already described in `CLAUDE.md` but were never marked resolved.
+- Carried forward, all still open: BUY-notional-per-ticker-per-day cap (needs a multiplier from the user), dividend cash tracking, chaos-monkey SOXL/DPST anomaly, wash-sale holds on GDXU/AGQ in IRA-type accounts (clears 2026-08-05/06), paper-trading Slack-channel-noise separation (deferred until paper trading is actually turned back on).
