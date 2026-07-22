@@ -4,10 +4,34 @@ Shared test utilities for strategy signal tests.
 
 import numpy as np
 import pandas as pd
+import pytest
 from pathlib import Path
 from datetime import datetime, timedelta
 
 CACHE_DIR = Path("./cache/research")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_slack_posts(monkeypatch):
+    """SOCKET_MODE is True whenever real Slack credentials are configured in
+    .env, regardless of pytest -- and SIM_MODE only prefixes message text, it
+    doesn't stop the real API call. Without this, any test exercising a code
+    path that calls _post_message without its own explicit mock leaks a real
+    message to the real Slack channel. Every module below did `from
+    signals_blocks import _post_message` (a direct name import), so each
+    holds its own reference -- patching signals_blocks._post_message alone
+    does not affect any of them; each must be patched individually."""
+    noop = lambda text, blocks=None: (None, None)
+    import signals_blocks
+    monkeypatch.setattr(signals_blocks, '_post_message', noop)
+    for modname in (
+        'paper_trading', 'schwab_client', 'schwab_stream',
+        'signals_notify', 'signals_compute', 'signals_handlers',
+        'active_signals',
+    ):
+        mod = __import__(modname)
+        if hasattr(mod, '_post_message'):
+            monkeypatch.setattr(mod, '_post_message', noop)
 
 
 def _synthetic_timestamps(days=90):

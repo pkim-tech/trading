@@ -982,15 +982,40 @@ def drain_fill_queue():
     """Fast-path fill detection (Part 3, branch C) -- pops all pending events off
     schwab_stream's account-activity queue and reconciles each. A no-op if
     schwab_stream was never started or has no events (the slow check_auto_fills
-    poll is the always-on fallback, not gated on this)."""
+    poll is the always-on fallback, not gated on this).
+    Deliberately does NOT trust the stream message's own fill_price/filled_shares
+    (found 2026-07-22: an ExecutionActivity message can represent one partial
+    execution of a still-filling order -- unverified whether Schwab's
+    filledQuantity field is cumulative or per-execution, and multiple partial
+    fills can arrive within the same second for a liquid ticker. Locking in
+    whichever partial quantity happens to be parsed first would permanently
+    under-record real share count, and _reconcile_fill's top-up logic would then
+    place a real *second* buy order to "correct" a fill that was never actually
+    final -- a genuine double-buy risk, not just a bookkeeping one). The stream
+    event is used only as a wake-up signal for *which* ticker to check; the
+    actual price/quantity is re-confirmed via the same get_filled_order poll
+    check_auto_fills already trusts (status=='FILLED' only, aggregated across
+    every executionLeg), giving the order a few seconds to fully settle first
+    (automation_principles.md #1 -- reconfirm real state, don't trust a local/
+    cached record)."""
     while True:
         try:
-            account, ticker, side, fill_price, filled_shares = schwab_stream.FILL_QUEUE.get_nowait()
+            account, ticker, side, _stream_price, _stream_shares = schwab_stream.FILL_QUEUE.get_nowait()
         except Exception:
             break
         if side != 'BUY':
             continue
-        _reconcile_buy_fill(ticker, fill_price, filled_shares)
+        fill = None
+        for _ in range(_GAP_FILL_POLL_ATTEMPTS):
+            fill = schwab_client.get_filled_order(account, ticker, 'BUY')
+            if fill is not None:
+                break
+            time.sleep(_GAP_FILL_POLL_INTERVAL_SECS)
+        if fill is None:
+            # Order not yet FILLED at the broker -- leave it for the slow
+            # check_auto_fills poll rather than acting on an unconfirmed partial.
+            continue
+        _reconcile_buy_fill(ticker, fill['price'], fill['quantity'])
 
 
 def check_auto_fills(open_positions):

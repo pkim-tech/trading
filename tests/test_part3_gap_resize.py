@@ -223,14 +223,19 @@ def test_reconcile_fill_topup_passes_through_gap_correction(env, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_drain_fill_queue_reconciles_queued_fill(env, monkeypatch):
+    """The stream event is only a wake-up signal -- the real price/quantity
+    must come from get_filled_order's aggregated poll, not the queued values
+    (which a message like this deliberately mismatches, to prove it's ignored)."""
     _seed_pending_order(monkeypatch)
+    monkeypatch.setattr(schwab_client, 'get_filled_order',
+                         lambda account, ticker, side: {'price': 52.0, 'quantity': 150})
     schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100))
 
     signals_notify.drain_fill_queue()
 
     pos = signals_db.get_open_position(TICKER)
     assert pos is not None
-    assert pos['entry_price'] == 51.0
+    assert pos['entry_price'] == 52.0  # from get_filled_order, not the queued (mismatched) 51.0
 
 
 def test_drain_fill_queue_ignores_sell_events(env, monkeypatch):
@@ -240,5 +245,21 @@ def test_drain_fill_queue_ignores_sell_events(env, monkeypatch):
     signals_notify.drain_fill_queue()
 
     # pending buy untouched by a SELL event
+    assert _pending()['order_placed'] == 1
+    assert signals_db.get_open_position(TICKER) is None
+
+
+def test_drain_fill_queue_no_op_when_order_not_yet_settled(env, monkeypatch):
+    """A partial/in-flight execution shouldn't be locked in -- if
+    get_filled_order never reports the order as FILLED within the poll
+    window, drain_fill_queue must leave the pending buy alone for the slow
+    check_auto_fills poll to catch later, not act on an unconfirmed fill."""
+    _seed_pending_order(monkeypatch)
+    monkeypatch.setattr(schwab_client, 'get_filled_order', lambda account, ticker, side: None)
+    monkeypatch.setattr(signals_notify.time, 'sleep', lambda secs: None)
+    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100))
+
+    signals_notify.drain_fill_queue()
+
     assert _pending()['order_placed'] == 1
     assert signals_db.get_open_position(TICKER) is None
