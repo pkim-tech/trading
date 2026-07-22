@@ -11,6 +11,17 @@ Status values: **Not started** (no live observation, may not even be built) / **
 (built, `dry_run=True`, waiting for a live window to exercise it) / **Verified** (observed
 live, date + note).
 
+**2026-07-22: most rows below now also have a queryable backing** — `signals_db.coverage_events`
+(new table) is logged at ~18 real control sites across `schwab_safety.check_order`,
+`signals_notify.py`, and `paper_trading.py` (`scenario_key`, `mode` ∈ paper/dry_run/live, ticker,
+result, detail, timestamp). `scripts/coverage_matrix.py` pivots it (rows=scenario_key,
+columns=paper/dry_run/live) so "has X actually fired, when, with what result" is answerable by
+query instead of by re-reading this file's prose. This doesn't replace the table below (which
+also tracks scenarios that aren't logging-instrumented yet, e.g. open-price-quality) — treat
+`coverage_matrix.py` as the live/authoritative answer for any row it does cover, and update this
+file's Status column to Verified once a query confirms a real (non-paper, ideally non-dry_run)
+observation, same as before.
+
 | Scenario | Code path | Offline coverage | Status | Notes |
 |---|---|---|---|---|
 | Pinned entry trigger fires at the right bar/price | `active_signals._scan_pinned_entry` | `scripts/verify_pinned_entry_vs_backtest.py` (5/6 tickers clean, AGQ's 1 mismatch explained) | Pending | Needs a live trading day with the daemon actually running this code |

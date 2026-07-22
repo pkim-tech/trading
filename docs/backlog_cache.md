@@ -1,5 +1,113 @@
 # Backlog Cache
 
+## [backtest] Open, paused 2026-07-22 — "v6" idle-capital parking idea; inconclusive, downturn-specific follow-up queued
+Full detail in `docs/research_log.md`'s 2026-07-22 entry. Short version, in the order the
+analysis actually evolved this session:
+1. **First pass (restricted to EOD-exit gaps only, 62 windows across all 10 watchlist-65
+   tickers)**: no vehicle showed a robust edge. SPY itself lost money (-5.4% compounded);
+   the "top 30" leaderboard (TSLQ, SARK, WEBS, BERZ, SQQQ, ...) reversed sign completely in an
+   out-of-sample 50/50 split check — clean overfitting, not a real effect.
+2. **Broadened to every exit→next-entry gap, not just EOD ones** (776 windows) — the EOD-only
+   restriction was itself the flaw (idle capital exists between any two trades, not just
+   overnight ones). Re-scanned; had to exclude the 10 source tickers from the candidate pool
+   (scoring e.g. KORU against KORU's own gap windows measures "should we not have exited," a
+   different question, not the parking one — this had been silently inflating the first
+   broadened run's top result to a nonsensical +68,113%).
+3. **Corrected broadened result**: SPY-long is now sign-consistent positive across a 50/50
+   split (+65.9%/+123.2%, both halves positive) — better than the first pass, but still ~50%
+   win rate, so the compounded number is carried by a few big windows, not a consistent
+   per-window edge. Short/inverse SPY (SH/SDS/SPXU/SPXS) all lost consistently in both
+   halves — the mirror image, as expected.
+4. **Not yet run**: check whether SPY-long's apparent edge is really just "the market went up
+   most of this period" by scoring separately during real identified SPY drawdown episodes
+   (`>=5%` from trailing peak) vs. everywhere else — 11 episodes identified in the 2023-08 to
+   2026-07 window, notably 2023-09-21→2023-10-11 (-7.9%), 2023-10-18→2023-11-06 (-10.3%),
+   2024-08-02→2024-08-13 (-8.4%), 2025-03-06→2025-05-12 (-19.0%, the big one), 2026-03-19→
+   2026-04-08 (-9.1%). If the "hedge" thesis (our exits cluster around bad market days) is
+   real, SPY-long should do *worse* and inverse should do *better* specifically inside these
+   windows than outside them — not yet checked.
+**Action needed**: run the downturn-episode-specific scoring (candidates already narrowed to
+SPY/QQQ/SH/SDS/SPXU/SPXS/SQQQ/QID/BIL from this session's discussion) before drawing any
+further conclusion. Scripts ready: `scripts/sim_v6_parking_vehicle_sweep.py` (windows already
+cached in `output/v6_gap_windows.csv` with the broadened 776-window definition),
+`scripts/sim_v6_split_check.py --split 50-50`/`70-30`/`5fold` (supports arbitrary fold configs).
+
+## [live-trading] In progress, 2026-07-22 — coverage_events matrix: transaction-phase/control coverage tracking across paper/dry_run/live
+Built this session (uncommitted): new `signals_db.coverage_events` table + `log_coverage_event()`/
+`get_coverage_events()`, `scripts/coverage_matrix.py` (pivot: rows=scenario_key, columns=paper/
+dry_run/live, cell=count+most-recent-date+result; `--detail` drills into raw rows). Answers
+`automation_principles.md` #10's ledger by query instead of hand-maintained status text in
+`docs/live_test_coverage.md`. Wired into 7 real control sites so far: `cash_check`, `same_day_block`
+(both branches), `dup_order_blocked`/`dup_sell_order_blocked`/`second_ticker_buy_blocked`/
+`dup_order_window_blocked`/`dup_order_retry_after_failure` (all in `schwab_safety.check_order`),
+`gap_resize` (all 3 failure/success branches in `signals_notify.check_gap_resize`),
+`reconciliation_mismatch`/`reconciliation_fetch_failed` (`check_live_state_reconciliation`), and
+paper-trading's `entry_fill`/`exit_fill` (`paper_trading.py`, both trailing-bounce and market-buy
+paths, plus sell). Verified against a scratch DB (`TRADING_DB_PATH` override) — real
+`trading_live.db` untouched. Full suite still 177 passed after wiring.
+**Not yet done**: remaining ~13 scenarios from `docs/live_test_coverage.md` not yet wired (SL
+placement sync/async, top-up/`_reconcile_fill`, trailing-arm re-read in
+`notify_trailing_activated`, `drain_fill_queue` fast-path, daemon-survives-exception,
+open-price-quality, second-live-ticker-BUY-blocked already covered above actually — double check
+overlap before wiring more). **Action needed**: decide whether to wire the rest now or let this
+set run for a while first and see how useful it is. Not yet committed.
+
+## [live-trading][security] Planned for Friday (2026-07-24 WFH day) — real-account sanity tests: oversized BUY + naked SELL across several tickers, on the new limited-margin IRA only
+Built this session (uncommitted): `scripts/live_sanity_check.py` — standalone, bypasses
+`active_signals.py`/`signals_notify.py`/`schwab_safety` entirely (calls the schwab-py client
+directly via account-suffix resolution, not nickname, since the new IRA isn't in
+`schwab_safety.ACCOUNTS`/`NICKNAMES` yet) — same pattern as the manual $200k buying-power test
+(2026-07-17). Two tests: `oversized_buy` (BUY 50x+ more shares than real cash affords, expect
+Schwab rejection at placement) and `naked_sell` (SELL 1 share of a ticker held at 0, expect
+rejection, not an accidental short — script hard-aborts if real shares are actually held).
+Requires per-ticker typed confirmation (type the ticker again), never loops/retries, logs every
+outcome to `coverage_events` (`scenario_key=sanity_oversized_buy`/`sanity_naked_sell`, `mode='live'`).
+**User confirmed 2026-07-22**: only the new limited-margin IRA is going live (not
+brokerage/sep/roth/ira yet) — but multiple tickers can be sanity-tested in sequence against it
+since each test's notional/quantity is small/rejected by design. **Scope decision, same day**: only
+run the two guaranteed-safe rejection tests for now; hold off on the deeper small-real-fill test
+menu (tiny real BUY + SL placement + trailing-stop + `get_real_position` field check + sell, ~5
+more tests, each closing a specific "unverified against a real account response" gap in
+`docs/live_test_coverage.md`) until after seeing how the rejection tests land.
+**Blocker**: user needs a WFH day to be present for this (can't run during market hours while at
+work) — **planned for Friday 2026-07-24**. Also still needs: the new IRA's real account-number
+suffix, and confirmation that its API token scope + compliance trading permission have actually
+cleared (last known status 2026-07-22: still blocked on both) — check before Friday, not after
+showing up to run the script.
+
+## [live-trading] Idea, raised 2026-07-22, not designed — small (10-share) real EDC pilot position, held ~1 month to shake out issues before scaling
+Distinct from the sanity-check tests above (those are one-shot, expect-rejection tests; this
+would be a real, sustained, small live position). Not yet scoped: which account (the new limited-
+margin IRA, presumably, matching "only going live on 1" above, but not confirmed for this
+specifically), which node/strategy config (EDC's `watch_list` row was removed entirely 2026-07-19 —
+would need a fresh node, not a revival of the old v3.27 one, since that's tied to the existing
+manual 423-share position being unwound separately), and whether it runs through the real
+automation path (`mode='live'`, in `AUTOMATION_ENABLED_TICKERS`, real Slack BUY/SL/trailing flow)
+or is a one-off manually-placed position just monitored for drift. **Action needed**: design
+session before building anything — account, node config, sizing override (10 shares fixed, not
+the usual `starting_notional`-driven formula), and automation scope.
+
+## [live-trading][tax] Open question, raised 2026-07-22 — which ticker (SOXL vs AGQ) goes to the taxable brokerage account first; wash-sale cross-account mechanic needs one more confirmation
+Real comparison pulled this session (v5, `open_check`, `scripts/campaign_comparison_table.py
+--tickers AGQ SOXL`): AGQ's winner is TE (`TrailingExitZScoreBreakout`, best alpha 1114.9%,
+worst_neighbor 285.2, win rate 31.2%, 128 trades, no trailing-buy order to catch manually,
+no dividends — cleaner tax treatment); SOXL's winner is TB (`TrailingBothZScoreBreakout`, best
+alpha 1212.1%, worst_neighbor 153.9, win rate 9.9%, 151 trades, pays small dividends). **Real,
+practical gap**: AGQ's liquidity (1% ADV ≈ $2.0M/day) is drastically thinner than SOXL's (≈
+$136.0M/day) — a $50k AGQ order is a much bigger fraction of daily volume, closer to the
+HIBL/EDC thin-liquidity fragmentation case than to SOXL. Leaning AGQ for the tax/win-rate/cliff-
+safety reasons, capped by how large it can scale; not a final decision.
+**Wash-sale mechanic reconfirmed this session, not fully resolved**: an IRA/SEP/Roth-realized loss
+never triggers a wash sale at all (no recognized loss to disallow — resolved 2026-07-07). Only a
+loss realized in a real taxable account matters, and it's direction-specific: rebuying in the
+*same or another taxable account* just defers the loss (recoverable via basis); rebuying in an
+*IRA-type account* within 30 days permanently disallows it (Rev. Rul. 2008-5). The one AGQ loss on
+file (2026-07-07, in brokerage, clears 2026-08-06) is the safe/deferred case if AGQ is bought back
+in brokerage itself — **not yet confirmed**: whether there's an AGQ loss in some *other taxable*
+account (not sep/roth/ira, which don't count) that isn't in this file. **Action needed**: user to
+confirm whether any such other-taxable-account AGQ loss exists before finalizing the brokerage
+ticker decision.
+
 ## [live-trading][security] Not started, discussed at length 2026-07-22 — max cumulative BUY notional per ticker per day (backstop against a repeat-buy/runaway bug)
 Raised while reviewing this session's order-submission retry mechanism: none
 of the existing guards actually bound total same-day BUY exposure to a
@@ -525,45 +633,7 @@ Separately, `signals_db.add_node` gained a `fixed_sl_override=None` param (falls
 config-read behavior when omitted) — fixes the bug where it silently pulled `config.json`'s
 stale global default instead of the real per-node SL for any future SL-swept promotion.
 
-## [live-trading][backtest] High priority, 2026-07-18 — promote watchlist tickers' v4 nodes (SL=1%) into live `watch_list`, replacing old v3.x SL=15% params
-Every original watchlist ticker except GDXD still runs old v3.x params (`fixed_sl=15%`,
-close-timing) in the real live `watch_list` — the entire v4 SL-sweep's findings
-(`stop_loss=1%` best everywhere, sometimes by 10-40x on robust alpha) were never promoted
-beyond GDXD's small $5k pilot. Case for promoting, built up over several sessions:
-- SL sweep confirmed `stop_loss=1%` dominates on robust alpha for every ticker checked
-  (2026-07-16, see `docs/research_log.md`-adjacent fixed_sl backlog note above).
-- Checklist checks 4/9/10 run for 19 candidates 2026-07-18 (`logs/checklist_deep_checks.csv`):
-  real win-rate decay flags on GDXU/RETL; same-day-block sensitivity ranges from severe
-  (ZSL/YANG/GDXD/UDOW) to fine (DPST/UVIX/LABU).
-- **2026-07-18, live-validated during a real semiconductor selloff**: v4's current
-  drawdown stayed minor everywhere (SOXL -3.0%, KORU -2.0%, worst GDXU -6.8%) while the
-  actual live v3.x params on the same tickers were taking much larger real hits at the same
-  moment (SOXL -33.8%, KORU -38.6%, GDXU -55.7% — its all-time-worst point). See
-  `docs/research_log.md` 2026-07-18 entry for the full breakdown, plus
-  `scripts/v4_max_drawdown.py`/`scripts/chart_v4_vs_tqqq.py` (reusable).
-- Every ticker's v4 worst-case historical drawdown (-5.9% to -23.8%) sits well under a
-  stated ~50% risk tolerance, with real headroom.
-**Real caveat found 2026-07-18, user-agreed framing**: v3 and v4 aren't the same trades
-with a different stop — v4's `trail_buy_pct` is typically much tighter than v3's, so v4
-trades 3-5x more often on smaller dislocations (only 10-33% of v4's trades correspond to a
-real v3 trade around the same time, checked on SOXL/AGQ/KORU), with a lower per-trade win
-rate. **User confirmed 2026-07-18: this should be treated and communicated as adopting a
-new strategy, not tightening a parameter on the existing one** — "promotion" language
-undersells the actual scope of the change. Frame any future promotion decision/rollout
-this way (e.g. sizing, rollout pace, and expectations-setting should match "new strategy
-launch" caution, not "parameter tweak").
-**Train/test-split blocker substantially resolved, 2026-07-18** (see `docs/research_log.md`
-2026-07-18 entry, "train/test split + walk-forward out-of-sample validation"): built
-`scripts/train_test_split_check.py` (single 70/30 split) and `scripts/walk_forward_check.py`
-(5-fold out-of-time, more trustworthy — the single split gave a misleading, outlier-driven
-result on KORU). Walk-forward result across all 19 candidates: **14/19 had zero negative-
-alpha folds across all 5 out-of-time windows** (AGQ, DUST, EDC, GDXD, GDXU, HIBL, KORU,
-LABU, NAIL, SOXL, TQQQ, USD, YANG, ZSL) — real, broadly consistent out-of-sample edge, not
-just in-sample curve-fitting. 5 tickers (DPST, NUGT, RETL, UDOW, UVIX) had exactly one
-negative fold each — see the new follow-up item below, not yet resolved. Added as
-checklist check 13.
-**Action needed**: decide whether to promote the 14 clean tickers now, or wait on the
-5-ticker follow-up review too. Not started — no `watch_list` rows changed yet.
+## ✅ Resolved 2026-07-18 — v4 nodes (SL=1%) promoted into the real `watch_list`, replacing v3.x SL=15% params; see `docs/deep_backlog.md`
 
 ## [backtest] Resolved 2026-07-18 — 5 tickers with a negative walk-forward fold (DPST, NUGT, RETL, UDOW, UVIX) sent to research, no per-ticker investigation
 Follow-up from the walk-forward check (`docs/research_log.md` 2026-07-18 entry,
@@ -584,7 +654,10 @@ boundary + credential isolation on Schwab order-placement calls, not scoped. Def
 until cloud infrastructure is actually being considered (proxy is naturally a
 separately-hosted service).
 
-## [live-trading] Active, 2026-07-18 — new active watchlist (id=57, "Live v4") holds only GDXD+EDC; 10 v3.x tickers archived in watchlist 9, not polled
+## ✅ Superseded 2026-07-20 — watchlist 65 ("Live v5") is now active, not watchlist 57; see `docs/deep_backlog.md`
+
+### Original entry (2026-07-18), preserved for the watchlist-57-build history below
+new active watchlist (id=57, "Live v4") holds only GDXD+EDC; 10 v3.x tickers archived in watchlist 9, not polled
 User decided v4's `trail_buy_pct` (much tighter than v3.x) is too tight to catch manually —
 manual live trading is paused until the Schwab automation engine actually drives entries.
 Correction mid-session: initially just flipped all 12 nodes to `research` mode within
@@ -668,9 +741,14 @@ automation-engine/paper-trading plan (v4's `trail_buy_pct` is too tight to trade
 "research" mode tickers are meant to run through the Schwab automation engine in
 `dry_run=True` as the paper-trading validation phase, then flip to real execution once
 proven, likely per-ticker-account by account as each is set up).
-**Action needed**: design session on scope — how many accounts, which tickers first,
-mapping changes, and how this sequences with wiring `schwab_client`/`schwab_safety` into
-`active_signals.py`'s main loop (still not connected). Not started, no code changes yet.
+**Status corrected 2026-07-22 (was stale — see `docs/deep_backlog.md`)**: infra is built, not
+"not started" — `schwab_safety.ACCOUNTS` holds 4 account slots (brokerage/sep/roth/ira), each
+with its own `AccountLimits` (`notional_cap`/`daily_order_cap`/`account_type`);
+`watch_list.account` is a real per-node column; `_live_ticker_accounts()` derives the live
+ticker→account mapping fresh (currently empty — no ticker is `mode='live'` yet). Rollout is
+incremental (a 5th limited-margin IRA funded 2026-07-22, still blocked on API scope +
+compliance) — this item stays open for tracking new-account onboarding, not because the
+mechanism itself is unbuilt.
 **Sequencing confirmed 2026-07-19**: ticker selection for first-funded-account isn't picked
 up front — wait for real paper-trading results (once the daemon exercises the widened
 `AUTOMATION_ENABLED_TICKERS` set through a live signal window) to inform which tickers earn
@@ -785,11 +863,7 @@ Raised in discussion: island search (parameter-neighborhood robustness) and the 
 **Real finding**: at a 20% miss rate (not an extreme assumption for manual execution), 9/12 tickers lose roughly 15–31% of mean compounded return vs. perfect adherence — worst is **KORU (ratio 0.69, i.e. -31%)**, also EDC/TQQQ/YANG/HIBL/LABU/GDXU/NUGT/GDXD (GDXD is `entry_timing=open_check`, indicative only — mirror is close-only) in the -21% to -24% range at 20% miss. **Two notable exceptions**: SOXL stays flat-to-slightly-positive even at 20% miss (ratio ~1.01–1.05), and **DPST actually improves with higher miss rates** (ratio 1.07–1.08 at 20% miss) — unexplained direction, worth a closer look before trusting it as "safe to miss DPST signals." `drop` vs `delay` modes track each other closely across every ticker — the 3-check delay cap barely changes outcomes vs. unbounded drop, suggesting persistent multi-window setups (where the cap would bind) are rare. Percentile spread (p10-p90) widens sharply with miss rate on most tickers even where the mean holds up (e.g. KORU p10 falls from +1566% at 1% miss to +669% at 20% miss) — tail risk degrades faster than the mean.
 **Not yet investigated**: why DPST/SOXL diverge from the rest of the watchlist (real edge that benefits from occasional misses, or a small-sample/trade-count artifact — DPST's baseline is only a handful of trades relative to KORU/HIBL). **Action needed**: dig into the DPST/SOXL divergence before treating "some tickers tolerate misses fine" as a real result rather than noise.
 
-## [backtest] High priority, 2026-07-16 — entry_timing=open_check has no live-actionable analog yet
-Session-12 finding (never previously promoted from session notes to this backlog): across all 17 tested SL-sweep campaigns so far, `entry_timing='open_check'` beat `'close'` 17/17. Directly contradicts the current live config, which is close-only. Not yet acted on.
-**Real gap surfaced 2026-07-16, SOXL SL=1% review**: `open_check` in the backtest means "check the bar's Open against the entry threshold before falling through to Close" (`backtester._simulate_trail_both`) — the backtest gets this for free since it replays fully-known historical bars. Live has no equivalent. `signals_compute.compute_buy_signal` doesn't replay a stored bar's Open/Close at all — it compares the **live real-time tick price** at poll time against the daily SMA/Std (`signals_compute.py:80-159`), and the existing signal windows (`active_signals.py:97` — 10:25–10:40 / 15:25–15:40) exist purely so that poll lands near each hourly bar's *close* (9:30 bar closes 10:30, 14:30 bar closes 15:30). Naively flipping live `entry_timing` to `open_check` would mean checking a threshold crossing against a bar-Open price that's already up to ~55–70 minutes stale by the time the daemon polls — real, unmodeled drift, structurally different from the close case where the live tick and the backtested price are nearly contemporaneous.
-**Proposed fix, agreed in discussion, not yet built**: not a new bar/data granularity — just a second poll window per signal time, right after each relevant bar opens (e.g. ~9:31–9:40 alongside the existing 10:25–10:40 close-check; ~14:31–14:40 alongside 15:25–15:40), reusing the same `compute_buy_signal` logic slightly earlier. Clean to add because `sma`/`std` are computed from `df_daily_prior` (strictly prior days only), so they're already fully valid at bar-open time with no same-day dependency. Needs one new piece of state: if the open-check poll fires, mark that bar's signal resolved so the existing close-check window doesn't double-fire on it ~55 minutes later (mirrors the backtest's Open-then-fall-through-to-Close order exactly).
-**Action needed**: implement the open-check poll window + resolved-state tracking before ever switching any live ticker's `entry_timing` to `open_check`. Not started, not scoped beyond the shape above.
+## ✅ Resolved 2026-07-17 — `entry_timing=open_check` live-actionable analog built; see `docs/deep_backlog.md`
 
 ## [backtest] Idea, not scoped, 2026-07-15 — eventually delete v3.x once v4 is a confirmed superset
 Floated as a future disk-relief idea, explicitly not something to act on yet. Real prerequisites before it's safe, raised and agreed in discussion: (1) v4 needs to actually be run for all 11 live-watchlist tickers, not just SOXL/KORU — the other 9 tickers' live `watch_list` config is currently backed entirely by v3.x data, so deleting v3 broadly now would leave them unsupported; (2) needs an explicit per-ticker check that each ticker's *currently live* winning node (the exact window/arm_sell_pct/trail_buy_pct/trail_sell_pct combo in `watch_list`) actually exists in v4's grid — v4's island search runs independently and isn't guaranteed to land on the identical node v3.x did, so "v4 covers v3" is a plausible but unverified claim, not a confirmed one. `possible`-value byte-matching was only spot-checked on one node per ticker last session (see v4 verification note), not proof of full grid coverage. Don't treat this as decided — revisit once both prerequisites are actually met.
@@ -803,20 +877,7 @@ won 0/30 tagged SOXL+KORU campaigns; `--max-phase` cap added (default 3, unchang
 behavior) so future runs can skip it. `generation` column added for a similar
 not-yet-analyzed question about island-search generation count.
 
-## [backtest] High priority, 2026-07-10 (plan finalized 2026-07-14) — trailing-buy fill logic is provably optimistic, real numba kernels never fixed
-`backtester.py`'s trailing-buy "waiting" loop (`_simulate_trail_both`/`_simulate_trail_buy`) always updates `running_low` from the current bar's Low *before* checking whether that same bar's High clears the bounce trigger — silently assuming Low happens before High within every hourly bar, the best-case ordering for this strategy (lower running_low = easier/lower trigger to clear), unknowable from OHLC alone. A read-only side analysis (`scripts/export_trades.py::simulate_trail_both_ohlc_aware`) resolves each fill as CERTAIN wherever possible instead of guessing (chains of prior-bar-confirmed lows, or the bar's own Close clearing the trigger — Close is always chronologically last). Rerunning SOXL under certain-tiered logic: compounded equity on $50k dropped from **$3.55M (7007%) under the current kernel to $1.85M (3591%)** — the backtest overstates SOXL's on-file return by ~2x. This strategy family (`TrailingBuyZScoreBreakout`/`TrailingBothZScoreBreakout`) covers **all 11 tickers on the live watchlist** — every live alpha/return number on file is inflated by an unquantified amount until this is fixed.
-**Not the same as already-done work**: `docs/watchlist_candidate_checklist.md`'s check #7 ("fill-logic optimism check") only covers *detecting* this on a per-candidate spot-check basis using the same read-only `simulate_trail_both_ohlc_aware` function — it was never ported into the real kernels, and the full sweep was never rerun with corrected logic. The checklist item is a symptom-detector, not the fix.
-**Full implementation plan written 2026-07-14** (design-only session, no code changed): `/home/pkim/.claude/plans/rustling-bubbling-hennessy.md`. Scope grew during design beyond the original fix — bundled together because they'd each force a separate full rerun if done later:
-- **Dual best-case/worst-case bounds** in `_simulate_trail_both` (not the single `simulate_trail_both_ohlc_aware` heuristic — that function's bullish/bearish guess for unprovable bars was deliberately not ported; best/worst bounds are a cleaner, honestly-labeled replacement), including a new third certain-case (bar's own `Open` clears the trigger, chronologically first, mirrors the existing Close case).
-- **`fixed_sl` sweep** (backlog item below) folded in — `stop_loss` becomes a real per-campaign swept value instead of one flat constant per run.
-- **New Open-based early-action entry-timing variant** — checks the 9:30 bar's `Open` against the entry threshold before falling through to `Close`, backtestable with existing hourly data (no minute data needed, no synthetic bar inserted).
-- **`entry_timing`/`stop_loss` run as separate phase1→2→2.5 campaigns** (like the pre-2026-07-05 `trail_pct` pattern) rather than genuine N-dimension island axes — `docs/design.md:46,59` documents why a real 4th+ island axis needs a mesh-generation rewrite; this sidesteps it. `trail_sell_pct` does NOT need this treatment — already fixed to a real in-run swept axis 2026-07-05 (`docs/design.md:93-96`).
-- **New `sl_sweep_summary` rollup table** for slice/trend queries (by SL value, trail_sell_pct, entry_timing, ticker, time) — also the intended foundation for the regime-change/rotation analysis and nightly rolling re-sim ideas below.
-- Confirmed **not** in scope: exit-side same-bar Close-as-signal-and-fill (investigated, ruled not a bias — exit signal is genuinely bar-close-gated live, matches backtest); same-day re-entry timing (confirmed already correct, no fix needed — see re-entry backlog item below).
-**Action needed**: implement per the plan file. Not started.
-**Progress 2026-07-15**: kernel implemented (`backtester._simulate_trail_both` now computes possible/pessimistic/certain per node), island/cliff-safety rank on `MIN` of the three. Verified via `scripts/verify_v4_fill_bounds.py` across all 11 live nodes: `possible` unchanged (byte-for-byte or data-drift-only) vs. matching v3.x rows on all 11; `possible >= pessimistic` holds for only 5/11 (LABU, NUGT, SOXL, TQQQ, YANG) — **6/11 (AGQ, DPST, EDC, GDXU, HIBL, KORU) violate the bound**, confirming this is the common case, not a rare edge case as session 10's KORU finding first suggested. `docs/design.md`'s framing should be updated accordingly.
-**`phase` column backfill needed**: the SL-sweep campaigns run before phase tagging landed mid-session-10 (SOXL/KORU `stop_loss=3` both entry_timings, plus partial `stop_loss=6`/close) have `phase IS NULL`. `scripts/backfill_v4_phase.py` written 2026-07-15 to deterministically replay phase1→2→2.5→3 grid generation and backfill the column (UPDATE only, no recompute, no data risk) — written but **not yet run**, queued for whenever convenient (no disk cost).
-**SL sweep in progress 2026-07-15**: running `stop_loss` × `entry_timing` campaigns for SOXL then KORU sequentially (not interleaved, so one ticker finishes fully even if interrupted) — user running it themselves in foreground. Full Phase1-3 estimate ~8-8.5h/ticker (~16-17h both), no `--max-phase` cap exists yet to skip Phase 3.
+## ✅ Resolved 2026-07-15/19/20 — trailing-buy fill logic kernel-correctness fix, executed in full; see `docs/deep_backlog.md`
 
 ## [live-trading] Mostly resolved 2026-07-15 — corporate-action (stock split) defense
 KORU did an unannounced ~1-for-20 stock split effective pre-market 2026-07-15 (entry $460.976 → live price ~$23.44). Discovered because the daemon's live 1-min price fetch (`signals_compute.py:115`) picked it up immediately while `yfinance`'s slower endpoints (`fast_info`, hourly `history()`) and the `.splits`/`.actions` metadata all lagged and still showed the pre-split ~$481 level.

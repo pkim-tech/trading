@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime
 
 from signals_helpers import detect_price_discontinuity
+import db_cache
 
 # Create a local directory named 'cache' to store data files
 CACHE_DIR = Path("./cache/research")
@@ -133,6 +134,17 @@ def fetch_live_data_smart(ticker):
             if consistent and split_ratio is not None:
                 factor = ratios.mean()
                 print(f"⚠️ Detected likely stock split for {ticker} (ratio={factor:.2f}) -- rescaling cached history.")
+                overlap_bar_time = overlap[0]
+                price_before = float(df_local.loc[overlap_bar_time, "Close"])
+                try:
+                    db_cache.log_data_mutation(
+                        ticker, float(factor), str(overlap_bar_time), price_before,
+                        price_before / factor,
+                        f"split-guard rescale, {len(overlap)} overlap bar(s), consistent={consistent}",
+                        df_local,
+                    )
+                except Exception as e:
+                    print(f"⚠️ Failed to log data mutation for {ticker} (proceeding with rescale anyway): {e}")
                 df_local[["Open", "High", "Low", "Close"]] = df_local[["Open", "High", "Low", "Close"]] / factor
                 if "Volume" in df_local.columns:
                     df_local["Volume"] = df_local["Volume"] * factor

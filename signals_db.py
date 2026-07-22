@@ -347,6 +347,25 @@ def ensure_tables():
         """)
         c.commit()
 
+        # coverage_events: one row per real firing of an automation control/phase
+        # (SL placement, gap-resize, reconciliation, duplicate-order block, etc.),
+        # tagged by which environment exercised it -- lets live_test_coverage.md's
+        # scenario ledger (automation_principles.md #10) be answered by query
+        # instead of hand-maintained status text.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS coverage_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts            TEXT NOT NULL DEFAULT (datetime('now')),
+                scenario_key  TEXT NOT NULL,
+                mode          TEXT NOT NULL,
+                ticker        TEXT,
+                position_id   INTEGER,
+                result        TEXT,
+                detail        TEXT
+            )
+        """)
+        c.commit()
+
 
 # ---------------------------------------------------------------------------
 # Watch list CRUD
@@ -604,6 +623,41 @@ def log_automation_scope_change(old_tickers, new_tickers):
     with _conn() as c:
         _log_audit(c, 'automation_scope_change', detail=f"{sorted(old_tickers)} -> {sorted(new_tickers)}")
         c.commit()
+
+
+def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, result='', detail=''):
+    """Records one real firing of an automation control/phase, tagged by which
+    environment exercised it. `mode` is one of 'paper'/'dry_run'/'live' -- the
+    caller determines this from its own context (e.g. paper_trading.py always
+    passes 'paper'; schwab_safety/signals_notify pass 'live' or 'dry_run' based
+    on the account's real dry_run flag), not inferred here. Fire-and-forget:
+    never raises past a logging failure into the caller's real control flow."""
+    try:
+        with _conn() as c:
+            c.execute("""
+                INSERT INTO coverage_events (scenario_key, mode, ticker, position_id, result, detail)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (scenario_key, mode, ticker, position_id, result, detail))
+            c.commit()
+    except Exception:
+        pass
+
+
+def get_coverage_events(scenario_key=None, mode=None, limit=500):
+    q = "SELECT * FROM coverage_events"
+    clauses, params = [], []
+    if scenario_key:
+        clauses.append("scenario_key = ?")
+        params.append(scenario_key)
+    if mode:
+        clauses.append("mode = ?")
+        params.append(mode)
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
 # ---------------------------------------------------------------------------

@@ -112,11 +112,24 @@ _RECONCILE_ALERTED: dict[str, float] = {}
 _RECONCILE_COOLDOWN_SECS = 900  # 15 min -- matches the reminder-nag/section-alert cadence elsewhere
 
 
+def _coverage_mode(account):
+    """'dry_run'/'live' for coverage_events logging, from the real per-account
+    flag -- falls back to 'dry_run' (the safe/conservative label) if the
+    account isn't recognized rather than raising, since logging must never
+    interfere with the real control-flow it's observing."""
+    limits = schwab_safety.ACCOUNTS.get(account)
+    return "live" if (limits and not limits.dry_run) else "dry_run"
+
+
 def _alert_reconcile_mismatch(pos, kind, text):
     """Posts a reconciliation mismatch alert, rate-limited per (position,
     mismatch-kind) so an already-alerted, still-unresolved mismatch doesn't
     repost every poll cycle (same pattern as active_signals._guarded's
     per-section cooldown)."""
+    db.log_coverage_event(
+        "reconciliation_mismatch", _coverage_mode(pos.get('account')),
+        ticker=pos.get('ticker'), position_id=pos.get('id'), result=kind
+    )
     key = f"{pos['id']}:{kind}"
     last = _RECONCILE_ALERTED.get(key, 0)
     if time.time() - last < _RECONCILE_COOLDOWN_SECS:
@@ -158,6 +171,10 @@ def check_live_state_reconciliation(open_positions):
             real_shares = schwab_client.get_real_position(account, ticker)
             orders = schwab_safety._open_orders(account)
         except Exception as e:
+            db.log_coverage_event(
+                "reconciliation_fetch_failed", _coverage_mode(account),
+                ticker=ticker, position_id=pos.get('id'), result="skipped", detail=str(e)
+            )
             print(f"  [reconcile] {ticker}: fetch failed, skipping this cycle: {e}")
             continue
 
@@ -243,17 +260,23 @@ def _place_stop_loss_for_position(node, ticker, signal_price):
     try:
         _, sl_order_id = schwab_client.place_stop_loss(account, ticker, int(pos['shares']), stop_price)
     except schwab_safety.SafetyViolation as e:
+        db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
+                               result="blocked", detail=str(e))
         _post_message(
             f"🚨 *{ticker}* ({account}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
             f"(stop-loss placement blocked: {e})"
         )
         return
     except Exception as e:
+        db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
+                               result="failed_unexpectedly", detail=str(e))
         _post_message(
             f"🚨 *{ticker}* ({account}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
             f"(stop-loss placement failed unexpectedly: {e})"
         )
         return
+    db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
+                           result="placed", detail=f"stop_price={stop_price:.4f}")
     if sl_order_id is not None:
         db.set_sl_order_id(ticker, sl_order_id)
 
@@ -280,6 +303,8 @@ def _sync_confirm_and_protect(ticker, node):
             break
         time.sleep(_SL_FAST_CONFIRM_INTERVAL_SECS)
     else:
+        db.log_coverage_event("sl_placement_fast_confirm_timeout", _coverage_mode(account), ticker=ticker,
+                               result="timed_out")
         _post_message(f"\U0001F6A8 {ticker_label} — market buy placed but fill not confirmed after "
                       f"{_SL_FAST_CONFIRM_ATTEMPTS * _SL_FAST_CONFIRM_INTERVAL_SECS}s — position may be "
                       f"temporarily UNPROTECTED (no stop-loss resting). Will be placed once the fill is "
@@ -570,6 +595,11 @@ def notify_trailing_activated(pos, current_price):
     # position fresh so the merge starts from the real just-armed state.
     fresh = db.get_position_by_id(pos['id']) or pos
     state = dict(fresh.get('trail_state') or {})
+    db.log_coverage_event(
+        "trailing_arm_state_reread", _coverage_mode(pos.get('account')), ticker=ticker,
+        position_id=pos['id'],
+        result="trailing_preserved" if state.get('trailing') else "trailing_missing_regression",
+    )
     state['reminder_channel'] = channel
     state['reminder_ts']      = ts
     state['reminder_count']   = 0
@@ -849,18 +879,26 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False):
                 schwab_client.place_equity_buy(account, ticker, top_up_shares, fill_price,
                                                 is_gap_correction=is_gap_correction)
             except schwab_safety.SafetyViolation as e:
+                db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
+                                       result="blocked", detail=str(e))
                 _post_message(f"🚫 {ticker} — top-up buy of {top_up_shares} shares blocked: {e} "
                               f"(position stays under target notional by ${delta:,.0f})")
                 return
             except Exception as e:
+                db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
+                                       result="failed_unexpectedly", detail=str(e))
                 _post_message(f"⚠️ {ticker} — top-up buy of {top_up_shares} shares failed "
                               f"unexpectedly: {e} (position stays under target notional by "
                               f"${delta:,.0f})")
                 return
             if db.top_up_position(ticker, top_up_shares, fill_price):
+                db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
+                                       result="placed", detail=f"shares={top_up_shares} price={fill_price:.4f}")
                 _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${fill_price:.4f} "
                               f"(fill was under target notional by ${delta:,.0f})")
     elif delta < -fill_price:
+        db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
+                               result="overspent_no_corrective_sell", detail=f"overspend=${-delta:,.0f}")
         _post_message(f"⚠️ {ticker} — fill exceeded target notional by ${-delta:,.0f} "
                       f"(no corrective sell placed)")
 
@@ -934,6 +972,8 @@ def check_gap_resize():
         try:
             current_price = schwab_client.get_current_price(ticker)
         except Exception as e:
+            db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
+                                   result="price_lookup_failed", detail=str(e))
             _post_message(f"⚠️ {ticker} gap-check price lookup failed: {e}")
             continue
         if current_price < buy_trigger:
@@ -944,6 +984,8 @@ def check_gap_resize():
             try:
                 schwab_client.cancel_order(account, ticker, order_id)
             except Exception as e:
+                db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
+                                       result="cancel_failed", detail=str(e))
                 _post_message(f"⚠️ {ticker} gap-correction cancel failed: {e} — leaving resting order in place")
                 continue
 
@@ -956,8 +998,12 @@ def check_gap_resize():
             _, new_order_id = schwab_client.place_equity_buy(
                 account, ticker, shares, current_price, is_gap_correction=True)
         except schwab_safety.SafetyViolation as e:
+            db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
+                                   result="blocked", detail=str(e))
             _post_message(f"🚫 {ticker} gap-correction MARKET order blocked: {e}")
             continue
+        db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
+                               result="replaced", detail=f"shares={shares} price={current_price:.4f}")
         db.set_pending_buy_order_id(ticker, new_order_id)
 
         if new_order_id is None:
@@ -1014,7 +1060,11 @@ def drain_fill_queue():
         if fill is None:
             # Order not yet FILLED at the broker -- leave it for the slow
             # check_auto_fills poll rather than acting on an unconfirmed partial.
+            db.log_coverage_event("fast_path_fill_reconciliation", _coverage_mode(account), ticker=ticker,
+                                   result="stream_event_not_yet_confirmed_filled")
             continue
+        db.log_coverage_event("fast_path_fill_reconciliation", _coverage_mode(account), ticker=ticker,
+                               result="confirmed_via_poll", detail=f"price={fill['price']:.4f} qty={fill['quantity']:g}")
         _reconcile_buy_fill(ticker, fill['price'], fill['quantity'])
 
 

@@ -440,6 +440,7 @@ def check_order(
         raise SafetyViolation(f"unknown account '{account}' -- not in the allowlist")
     if not limits.enabled:
         raise SafetyViolation(f"account '{account}' is disabled in the allowlist")
+    _mode = "dry_run" if limits.dry_run else "live"
 
     ticker_accounts = _live_ticker_accounts()
     if ticker not in ticker_accounts:
@@ -464,13 +465,23 @@ def check_order(
     # this settlement restriction (2026-07-20 finding, resolved 2026-07-22)
     # -- skip for them.
     if side == "BUY" and limits.account_type == "cash" and signals_db.closed_today(ticker):
+        signals_db.log_coverage_event(
+            "same_day_block", _mode, ticker=ticker, result="blocked",
+            detail=f"account={account} account_type={limits.account_type}"
+        )
         raise SafetyViolation(
             f"'{ticker}' was sold today -- same-day re-buy risks a cash-account good-faith violation"
+        )
+    elif side == "BUY" and limits.account_type == "margin" and signals_db.closed_today(ticker):
+        signals_db.log_coverage_event(
+            "same_day_block", _mode, ticker=ticker, result="skipped_margin_account",
+            detail=f"account={account} account_type={limits.account_type}"
         )
 
     if side == "BUY":
         orders = _open_orders(account)
         if _has_open_order(orders, ticker):
+            signals_db.log_coverage_event("dup_order_blocked", _mode, ticker=ticker, result="blocked_same_ticker")
             raise SafetyViolation(
                 f"'{ticker}' already has an open/working order in '{account}' -- refusing a second "
                 f"concurrent BUY (Schwab doesn't reserve buying power for a resting order, so nothing "
@@ -478,6 +489,10 @@ def check_order(
             )
         other_ticker = _has_open_buy_order_in_account(orders, ticker)
         if other_ticker:
+            signals_db.log_coverage_event(
+                "second_ticker_buy_blocked", _mode, ticker=ticker, result="blocked",
+                detail=f"account={account} other_ticker={other_ticker}"
+            )
             raise SafetyViolation(
                 f"account '{account}' already has a resting BUY order for '{other_ticker}' -- refusing "
                 f"a second concurrent BUY into the same account (Schwab doesn't reserve buying power "
@@ -495,6 +510,7 @@ def check_order(
     if side == "SELL":
         orders = _open_orders(account)
         if _has_open_sell_order(orders, ticker):
+            signals_db.log_coverage_event("dup_sell_order_blocked", _mode, ticker=ticker, result="blocked")
             raise SafetyViolation(
                 f"'{ticker}' already has a resting SELL order in '{account}' -- refusing a second "
                 f"concurrent SELL (prevents two live exit orders stacking for the same shares)"
@@ -537,13 +553,24 @@ def check_order(
         try:
             cash_available = schwab_client.get_account_balance(account)
         except Exception as e:
+            signals_db.log_coverage_event(
+                "cash_check", _mode, ticker=ticker, result="failed_closed", detail=str(e)
+            )
             raise SafetyViolation(f"could not verify '{account}' cash balance, blocking order: {e}")
         required = notional + CASH_SAFETY_BUFFER
         if cash_available < required:
+            signals_db.log_coverage_event(
+                "cash_check", _mode, ticker=ticker, result="blocked_insufficient",
+                detail=f"required=${required:,.0f} available=${cash_available:,.0f}"
+            )
             raise SafetyViolation(
                 f"order notional ${notional:,.0f} + ${CASH_SAFETY_BUFFER:,.0f} cash buffer = "
                 f"${required:,.0f} required, but '{account}' only has ${cash_available:,.0f} available"
             )
+        signals_db.log_coverage_event(
+            "cash_check", _mode, ticker=ticker, result="passed",
+            detail=f"required=${required:,.0f} available=${cash_available:,.0f}"
+        )
         # Informational only, not blocking (automation_principles.md #4) -- the
         # user keeps CASH_RESERVE_WATERMARK as their own operational cash
         # reserve per account; this doesn't gate the order, just flags that
@@ -594,7 +621,15 @@ def check_order(
         # (automation_principles.md #1). Dry-run accounts have no broker book
         # to check against, so keep the pure local-record behavior.
         if not limits.dry_run and not _broker_confirms_order(_all_orders(account), ticker, side, quantity):
+            signals_db.log_coverage_event(
+                "dup_order_retry_after_failure", _mode, ticker=ticker, result="allowed_retry",
+                detail=f"side={side} qty={quantity}"
+            )
             continue
+        signals_db.log_coverage_event(
+            "dup_order_window_blocked", _mode, ticker=ticker, result="blocked",
+            detail=f"side={side} qty={quantity} prior_qty={prior_qty:g}"
+        )
         raise SafetyViolation(
             f"duplicate order: {side} {quantity} {ticker} in {account} already submitted "
             f"{prior_qty:g} shares {time.time() - o['ts']:.0f}s ago "

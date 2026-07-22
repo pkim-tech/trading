@@ -1,5 +1,67 @@
 # Backlog
 
+## ✅ Backlog-hygiene pass, 2026-07-22 — five stale headings closed out, retroactively marked resolved
+Found while doing a dedicated backlog-hygiene pass (flagged as a to-do at the end of the
+prior session): these five `backlog_cache.md` headings described work that had actually
+already been completed (sometimes by the item's own later progress notes, sometimes by a
+separate later session), but the heading itself was never updated to say so — each one below
+gets its own entry with the real resolution date and pointer.
+
+## ✅ [live-trading][backtest] Resolved 2026-07-18 — v4 nodes (SL=1%, all 19 candidates) promoted into the real `watch_list` table, replacing v3.x SL=15% params
+Heading previously read "High priority... not started, no `watch_list` rows changed yet" —
+stale; its own later progress notes in the same entry already documented the real work: all
+19 walk-forward-screened tickers' v4 winning nodes (`fixed_sl=1%`, pulled from
+`backtest_cache` ranked by robust alpha) were inserted into watchlist 57 via direct SQL
+(worked around the `add_node` `fixed_sl` bug, separately fixed the same session), each
+annotated walk-forward-clean or flagged. All landed in `mode='research'`, not `mode='live'` —
+"promoted into `watch_list`" meant the table, not live execution status; live/paused status is
+tracked separately (see the watchlist-65 entry below).
+
+## ✅ [live-trading] Superseded 2026-07-20 — watchlist 65 ("Live v5") is now the active watchlist, not watchlist 57 ("Live v4", GDXD+EDC only)
+Heading previously described watchlist 57 (GDXD+EDC only) as "Active" — that was accurate as
+of 2026-07-18 but is stale now. Watchlist 65 ("Live v5", 10 tickers: AGQ, DPST, GDXU, HIBL,
+KORU, NUGT, SOXL, UDOW, USD, YANG) became the active watchlist 2026-07-20, selected from the
+full 18-ticker v5 resweep by cliff-safe robust alpha (see the 2026-07-20 watchlist-65 entry
+above). All 10 nodes are still `mode='research'` — nothing trades live yet. Watchlist 57's 18
+v4 nodes are preserved, untouched, just no longer polled (same non-destructive
+versioning pattern as every prior watchlist supersession). Always check `watchlists.is_active`
+rather than trusting a hardcoded id anywhere in docs.
+
+## ✅ [backtest] Resolved 2026-07-15/19/20 — trailing-buy fill logic kernel-correctness fix, executed in full across three sessions
+Heading previously ended "Action needed: implement per the plan file. Not started" despite its
+own later progress notes showing the opposite. Real timeline: kernel implemented 2026-07-15
+(`_simulate_trail_both` computes possible/pessimistic/certain per node, island/cliff-safety
+rank on `MIN` of the three, verified via `verify_v4_fill_bounds.py` across all 11 live nodes at
+the time); `phase` column backfilled for the pre-tagging SOXL/KORU rows via
+`scripts/backfill_v4_phase.py` (confirmed run clean, 0 rows left untagged — `docs/
+conversation_summary.md` session ~12); gap-through-trigger entry-side fix 2026-07-19 and
+exit-side fix 2026-07-20 (both in `CLAUDE.md`'s Key Files); full 18-ticker v4/v5 resweep under
+the corrected kernel completed 2026-07-20. Nothing outstanding from the original plan remains.
+
+## ✅ [backtest] Resolved 2026-07-17 — `entry_timing=open_check` live-actionable analog built
+Heading previously said "Not started, not scoped beyond the shape above" — stale; the exact
+proposed fix (a second poll window per signal time, ~9:31-9:40/14:31-14:40 alongside the
+existing close-check windows, reusing `compute_buy_signal`, with `buy_alerted` dedup
+preventing a double-fire) was built the same session as the GDXD promotion (`active_signals.
+_OPEN_CHECK_WINDOWS`, `watch_list.entry_timing` column). Confirmed still live and in use today:
+all 18 watchlist-65/57 v4 nodes use `entry_timing='open_check'` (`CLAUDE.md`'s Live Trading
+section).
+
+## ✅ [live-trading][security] Status corrected 2026-07-22 — one-account-per-ticker: infra built, rollout ongoing (not "not started")
+Heading previously ended "Not started, no code changes yet" — stale; substantial
+infrastructure now exists. `schwab_safety.ACCOUNTS` holds 4 account slots (brokerage/sep/
+roth/ira) each with its own `AccountLimits` (`notional_cap`, `daily_order_cap`, `account_type`);
+`watch_list.account` is a real per-node column; `_live_ticker_accounts()` derives the live
+ticker→account mapping fresh from `mode='live'` rows (currently empty — no ticker is
+`mode='live'` yet, so nothing is actually exercising per-ticker isolation live). The originally
+floated "account nickname = ticker symbol" placeholder naming was not what shipped — actual
+accounts are named by role (brokerage/sep/roth/ira), with `watch_list.account` doing the
+ticker→account assignment instead. A 5th account (limited-margin IRA, funded 2026-07-22) is
+queued to join this set once API token scope + compliance permission clear (see
+`project_new_ira_account_status` memory) — rollout is incremental, not a single completed
+migration, so this item stays open in spirit (tracking new-account onboarding) even though the
+core mechanism is done.
+
 ## ✅ [live-trading][security] Resolved 2026-07-22 — `same_day_block` account-type-awareness
 `schwab_safety.AccountLimits` gained `account_type` (`'cash'` or `'margin'` — regular and IRA
 limited margin treated identically, since both lack the T+1 cash-settlement restriction the

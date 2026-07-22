@@ -16,6 +16,60 @@ def _ensure_table(conn):
     """)
 
 
+def _ensure_mutation_log_table(conn):
+    # data_mutation_log: traceability (not full immutability/versioning, per the
+    # user's 2026-07-22 call -- see docs/research_log.md's 2026-07-22 entry) for
+    # every split-guard rescale of a cached *_1h.csv file. The rescale itself is
+    # scale-invariant to the %-based signals every strategy trades on, so re-running
+    # the same code against today's cache should reproduce a past backtest_cache
+    # number without needing the exact old bytes -- this table exists so the *fact*
+    # that a rescale happened (when/why/how) is never silently lost, and the actual
+    # pre-rescale data is still recoverable via pre_mutation_snapshot if ever needed.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS data_mutation_log (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker               TEXT NOT NULL,
+            factor               REAL NOT NULL,
+            detected_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            overlap_bar_time     TEXT,
+            price_before         REAL,
+            price_after          REAL,
+            notes                TEXT,
+            pre_mutation_snapshot TEXT
+        )
+    """)
+
+
+def log_data_mutation(ticker, factor, overlap_bar_time, price_before, price_after,
+                       notes, pre_mutation_df):
+    """Records one split-guard rescale event, with the full pre-rescale
+    DataFrame (CSV-serialized) so the actual old data is recoverable, not
+    just the fact that it changed. Called only from data_manager.py's rescale
+    branch, right before it overwrites df_local in place."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_mutation_log_table(conn)
+        conn.execute("""
+            INSERT INTO data_mutation_log
+                (ticker, factor, overlap_bar_time, price_before, price_after, notes, pre_mutation_snapshot)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, factor, overlap_bar_time, price_before, price_after, notes,
+              pre_mutation_df.to_csv()))
+
+
+def get_data_mutations(ticker=None, limit=200):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_mutation_log_table(conn)
+        conn.row_factory = sqlite3.Row
+        q = "SELECT id, ticker, factor, detected_at, overlap_bar_time, price_before, price_after, notes FROM data_mutation_log"
+        params = ()
+        if ticker:
+            q += " WHERE ticker = ?"
+            params = (ticker,)
+        q += " ORDER BY id DESC LIMIT ?"
+        params = params + (limit,)
+        return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+
 def get_kv(key):
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_table(conn)
