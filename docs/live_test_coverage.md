@@ -27,6 +27,7 @@ live, date + note).
 | Daemon survives an unhandled exception mid-loop | `active_signals._guarded` + outer try/except in `run_loop` | 6 unit tests (`test_run_loop_fault_tolerance.py`) exercise `_guarded` directly | Not started | Built this session; still no test that runs a real (or simulated) `run_loop` iteration end-to-end with a failing section — only the isolated helper is tested |
 | Duplicate-order guard doesn't false-block a legitimate top-up | `schwab_safety` quantity-aware guard | Unit tests (`test_schwab_safety.py`) | Not started | Only exercised in unit tests so far, not against real order timing |
 | Live-state reconciliation (position/order-book mismatch detection) | not built | N/A | Not started | Still just a design idea in backlog |
+| Automated sell correctly skipped for a non-live-mode node's position | `signals_notify._attempt_automated_sell` mode check | 2 new unit tests (`test_schwab_automation.py`) | Not started | Built this session (2026-07-21); no ticker has ever hit this exact scenario live (today's automation-scope tickers only run mode='live' nodes) |
 
 ## How to update this
 - New automation feature → add a row when it's built (even if `Status: Not started`).

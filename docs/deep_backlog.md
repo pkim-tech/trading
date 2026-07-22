@@ -69,22 +69,28 @@ constant `fixed_sl`) — an ad hoc query that used the literal `stop_loss` colum
 cliff-neighborhood check produced numbers that disagreed with the real
 `identify_full_mesh_candidates` log output until this was caught and fixed.
 
-## [live-trading][security] Medium priority, 2026-07-19 — SELL-side automated-order attempt isn't mode-gated, only ticker-gated
+## ✅ [live-trading][security] Resolved 2026-07-21 — SELL-side automated-order attempt is now mode-gated, not just ticker-gated
 
-Found while reviewing whether EDC (real open position, `research`-mode node) could safely
-join the widened automation scope. `notify_trailing_activated` (`signals_notify.py:309-321`)
-is called unconditionally from the real `open_positions` exit-check loop in `run_loop` and
-calls `_attempt_automated_sell(pos, current_price)` with no check on the position's node
-`mode` — only `_attempt_automated_sell`'s own `ticker not in AUTOMATION_ENABLED_TICKERS`
-gate stands between a `research`-mode ticker's real open position and a real/dry-run
-automated sell attempt. The BUY side doesn't have this gap: `_scan_buy_signals` only
-reaches `_attempt_automated_buy` when `node.get('mode')=='live'`. This is why EDC's node
-was removed from `watch_list` rather than folded into the widened automation scope —
-adding its ticker to `AUTOMATION_ENABLED_TICKERS` while its real position's node was still
-`research` would have exposed that position's exit to the automated-sell path. **Action
-needed**: gate `_attempt_automated_sell` (or its call site) on the position's mode too,
-not just ticker membership, so this can't bite a future ticker with both a real manual
-position and an unrelated reason to be in the automation set. Not started.
+Found 2026-07-19 while reviewing whether EDC (real open position, `research`-mode node) could
+safely join the widened automation scope. `notify_trailing_activated` (`signals_notify.py`) is
+called unconditionally from the real `open_positions` exit-check loop in `run_loop` and calls
+`_attempt_automated_sell(pos, current_price)` with no check on the position's node `mode` —
+only `_attempt_automated_sell`'s own `ticker not in AUTOMATION_ENABLED_TICKERS` gate stood
+between a `research`-mode ticker's real open position and a real/dry-run automated sell
+attempt. The BUY side didn't have this gap: `_scan_buy_signals` only reaches
+`_attempt_automated_buy` when `node.get('mode')=='live'`. This is why EDC's node was removed
+from `watch_list` rather than folded into the widened automation scope at the time — adding
+its ticker to `AUTOMATION_ENABLED_TICKERS` while its real position's node was still `research`
+would have exposed that position's exit to the automated-sell path.
+
+**Fixed 2026-07-21**: `_attempt_automated_sell` now looks up the position's own `(ticker,
+window)` node from `db.get_watchlist()` and only proceeds when a matching node exists with
+`mode=='live'` — falling back to the manual flow (not KeyError) both when the mode doesn't
+match and when no matching node exists at all (e.g. a since-removed node, mirroring EDC's
+removal). Matches `automation_principles.md` #7 (new automation surfaces inherit the full
+existing gating, not a subset). Two new tests in `tests/test_schwab_automation.py`:
+`test_automated_sell_falls_back_when_node_mode_not_live`,
+`test_automated_sell_falls_back_when_no_matching_node`. Full suite: 156 passed.
 
 ## [live-trading] Low priority, 2026-07-19 — paper-trading dedup is ticker-only, not `(ticker, window)`-aware
 

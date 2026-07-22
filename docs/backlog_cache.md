@@ -345,10 +345,17 @@ paper-trading's dedup is ticker-only (not `(ticker, window)`-aware like the real
 `open_position()`), and SELL-side automation (`_attempt_automated_sell`) is gated by
 ticker membership only, not by the position's node `mode` — unlike the BUY side.
 
-## [live-trading][security] Medium priority, 2026-07-19 — SELL-side automated-order attempt isn't mode-gated, only ticker-gated
-Full detail in `docs/deep_backlog.md`. Short version: `_attempt_automated_sell` is gated
-only by `ticker in AUTOMATION_ENABLED_TICKERS`, not by the position's node `mode` — unlike
-the BUY side (`_scan_buy_signals` requires `mode=='live'`). Not started.
+## [live-trading][security] Resolved 2026-07-21 — SELL-side automated-order attempt is now mode-gated, not just ticker-gated
+Full original context in `docs/deep_backlog.md`. `_attempt_automated_sell` (`signals_notify.py`)
+was gated only by `ticker in AUTOMATION_ENABLED_TICKERS`, not by the position's node `mode` —
+unlike the BUY side (`_scan_buy_signals` requires `mode=='live'`), per `automation_principles.md`
+#7 (new automation surfaces inherit the full existing gating, not a subset). Fixed: looks up
+the position's own `(ticker, window)` node from `db.get_watchlist()` and falls back to manual
+(returns `False`) unless a matching node exists with `mode=='live'` — also fail-closed if no
+matching node is found at all (e.g. the node was later removed, mirroring EDC's 2026-07-19
+removal). Two new tests in `tests/test_schwab_automation.py`
+(`test_automated_sell_falls_back_when_node_mode_not_live`,
+`test_automated_sell_falls_back_when_no_matching_node`).
 
 ## [live-trading] Low priority, 2026-07-19 — paper-trading dedup is ticker-only, not `(ticker, window)`-aware
 Full detail in `docs/deep_backlog.md`. Short version: `paper_trading.start_paper_buy`'s

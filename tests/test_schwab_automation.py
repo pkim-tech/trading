@@ -129,6 +129,42 @@ def test_automated_sell_falls_back_outside_scope(env, monkeypatch):
     assert not updated['trail_state'].get('order_placed')
 
 
+def test_automated_sell_falls_back_when_node_mode_not_live(env):
+    """Regression test for the SELL-side mode-gating gap (backlog, 2026-07-19):
+    _attempt_automated_sell used to only check ticker scope, so a research-mode
+    node's real position could still be routed through an automated sell. Flip
+    the node to 'research' (ticker stays in AUTOMATION_ENABLED_TICKERS) and
+    confirm the automated sell no longer fires."""
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    pos = signals_db.get_open_position(TICKER)
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET mode='research' WHERE ticker=?", (TICKER,))
+        c.commit()
+    signals_notify.notify_trailing_activated(pos, current_price=52.0)
+    updated = [p for p in signals_db.get_open_positions() if p['ticker'] == TICKER][0]
+    assert not updated['trail_state'].get('order_placed')
+
+
+def test_automated_sell_falls_back_when_no_matching_node(env):
+    """If the position's (ticker, window) has no corresponding watch_list row
+    at all (e.g. the node was later removed, mirroring EDC's 2026-07-19
+    removal), the automated sell must fail closed to manual, not KeyError."""
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    pos = signals_db.get_open_position(TICKER)
+    with signals_db._conn() as c:
+        c.execute("DELETE FROM watch_list WHERE ticker=?", (TICKER,))
+        c.commit()
+    signals_notify.notify_trailing_activated(pos, current_price=52.0)
+    updated = [p for p in signals_db.get_open_positions() if p['ticker'] == TICKER][0]
+    assert not updated['trail_state'].get('order_placed')
+
+
 # ---------------------------------------------------------------------------
 # Auto-fill-detection toggle (default off)
 # ---------------------------------------------------------------------------

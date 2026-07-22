@@ -55,9 +55,22 @@ def _attempt_automated_sell(pos, current_price):
     the manual flow). If a STOP order is already resting from entry
     (pos['sl_order_id'], Part 4 Section 6), cancels it first -- otherwise both
     orders would be live simultaneously for the same shares (oversell attempt
-    or rejected order)."""
+    or rejected order).
+
+    Gated on both ticker scope AND the position's own node mode=='live'
+    (automation_principles.md #7) -- the BUY side (_scan_buy_signals) already
+    requires mode=='live'; this mirrors it on exit instead of relying on
+    ticker membership alone, which would let a research-mode ticker's real
+    position (e.g. one sharing a ticker with an unrelated live-mode node) get
+    routed through an automated sell. Falls back to manual (False) if no
+    matching node is found at all, same fail-closed direction as a mode
+    mismatch."""
     ticker = pos['ticker']
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        return False
+    node = next((n for n in db.get_watchlist()
+                 if n['ticker'] == ticker and n['window'] == pos['window']), None)
+    if node is None or node.get('mode') != 'live':
         return False
     account = pos.get('account')
     shares = pos.get('shares')
