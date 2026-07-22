@@ -49,6 +49,32 @@ def _get_client():
     return _client
 
 
+# Retry only the actual broker submission call, not schwab_safety.approve_and_record()
+# -- that must run exactly once per attempt (it increments the daily/burst-cap
+# counters and records the duplicate-order fingerprint), so retrying it would
+# make one real order attempt look like several against those caps. A generic
+# exception here (timeout, connection error, a transient 5xx) is worth retrying
+# since the same call may simply succeed a moment later; a SafetyViolation
+# already happened earlier, before this helper is ever reached, so it's never
+# what's being retried.
+_ORDER_SUBMIT_RETRY_ATTEMPTS = 3
+_ORDER_SUBMIT_RETRY_INTERVAL_SECS = 2
+
+
+def _submit_order_with_retry(account_hash, order):
+    last_exc = None
+    for attempt in range(_ORDER_SUBMIT_RETRY_ATTEMPTS):
+        try:
+            r = _get_client().place_order(account_hash, order)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_exc = e
+            if attempt < _ORDER_SUBMIT_RETRY_ATTEMPTS - 1:
+                time.sleep(_ORDER_SUBMIT_RETRY_INTERVAL_SECS)
+    raise last_exc
+
+
 def _resolve_account_hashes() -> dict:
     global _account_hashes
     if _account_hashes is not None:
@@ -98,8 +124,7 @@ def _place_equity_order(
     account_hash = _resolve_account_hashes()[account]
     order_fn = equity_orders.equity_buy_market if side == "BUY" else equity_orders.equity_sell_market
     order = order_fn(ticker, quantity)
-    r = _get_client().place_order(account_hash, order)
-    r.raise_for_status()
+    r = _submit_order_with_retry(account_hash, order)
     order_id = Utils(_get_client(), account_hash).extract_order_id(r)
     _post_message(f"✅ {side} {quantity} {ticker} in {account} submitted to Schwab (~${quantity * price:,.0f})")
     return r, order_id
@@ -151,8 +176,7 @@ def _place_trailing_order(
         EquityInstruction.BUY if side == "BUY" else EquityInstruction.SELL, ticker, quantity
     )
 
-    r = _get_client().place_order(account_hash, order)
-    r.raise_for_status()
+    r = _submit_order_with_retry(account_hash, order)
     order_id = Utils(_get_client(), account_hash).extract_order_id(r)
     _post_message(f"✅ {label} {quantity} {ticker} in {account} submitted to Schwab "
                   f"(trail={trail_pct}%, ~${quantity * price:,.0f})")
@@ -285,8 +309,7 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float)
     order.set_stop_price(stop_price)
     order.add_equity_leg(EquityInstruction.SELL, ticker, quantity)
 
-    r = _get_client().place_order(account_hash, order)
-    r.raise_for_status()
+    r = _submit_order_with_retry(account_hash, order)
     order_id = Utils(_get_client(), account_hash).extract_order_id(r)
     _post_message(f"✅ STOP LOSS {quantity} {ticker} in {account} submitted to Schwab @ ${stop_price:.4f}")
     return r, order_id

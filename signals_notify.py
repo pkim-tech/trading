@@ -97,10 +97,10 @@ def _attempt_automated_sell(pos, current_price):
         if sl_order_id:
             sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos.get('stop_loss')
             sl_price = pos['signal_price'] * (1 - sl_pct / 100) if sl_pct else None
-            price_note = f" — manually re-place a stop-loss SELL at ~${sl_price:.2f}" if sl_price else ""
+            price_note = f"place stop-loss SELL {shares} @ ~${sl_price:.2f}" if sl_price else "place a stop-loss SELL manually"
             _post_message(
-                f"🚨 {ticker} — trailing-sell placement failed after cancelling the resting stop-loss "
-                f"{sl_order_id}: {e} — position UNPROTECTED{price_note}"
+                f"🚨 *{ticker}* ({account}) UNPROTECTED — {price_note}\n"
+                f"(auto trailing-sell failed after cancelling stop-loss {sl_order_id}: {e})"
             )
         elif not isinstance(e, schwab_safety.SafetyViolation):
             _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual")
@@ -243,10 +243,16 @@ def _place_stop_loss_for_position(node, ticker, signal_price):
     try:
         _, sl_order_id = schwab_client.place_stop_loss(account, ticker, int(pos['shares']), stop_price)
     except schwab_safety.SafetyViolation as e:
-        _post_message(f"\U0001F6A8 {ticker} — stop-loss placement blocked: {e} — position UNPROTECTED")
+        _post_message(
+            f"🚨 *{ticker}* ({account}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
+            f"(stop-loss placement blocked: {e})"
+        )
         return
     except Exception as e:
-        _post_message(f"\U0001F6A8 {ticker} — stop-loss placement failed unexpectedly: {e} — position UNPROTECTED")
+        _post_message(
+            f"🚨 *{ticker}* ({account}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
+            f"(stop-loss placement failed unexpectedly: {e})"
+        )
         return
     if sl_order_id is not None:
         db.set_sl_order_id(ticker, sl_order_id)

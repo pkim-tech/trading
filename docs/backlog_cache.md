@@ -1,5 +1,44 @@
 # Backlog Cache
 
+## [live-trading][security] Not started, discussed at length 2026-07-22 — max cumulative BUY notional per ticker per day (backstop against a repeat-buy/runaway bug)
+Raised while reviewing this session's order-submission retry mechanism: none
+of the existing guards actually bound total same-day BUY exposure to a
+single ticker. Walked through each one and confirmed the gap is real:
+`notional_cap`/`HARD_ORDER_CEILING` are per-*order* only; `daily_order_cap`
+counts orders per *account*, not per-ticker notional; the resting-order
+guard (`_has_open_order`) offers no protection against repeated **market**
+buys specifically, since a market order fills almost instantly — by the
+time a second buy attempt fires, the first is already `FILLED` (terminal,
+excluded from the open-orders check), so nothing stays resting for the
+guard to catch; the duplicate-order guard only catches a retry within
+`DUPLICATE_ORDER_WINDOW_SECS` (60s) and `DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT`
+(5%) of the same quantity — a bug that re-sizes each attempt or fires more
+than 60s apart slips past it entirely. The cash-balance check doesn't cover
+it either: it bounds total *account* capital, not intended *trade size* —
+an account can (and with compounding, is expected to) hold materially more
+cash than one ticker's `starting_notional`, so a 4x-sized repeat-buy bug
+could still pass the cash check every time.
+
+**Design converged on, not yet built**: a flat multiplier on
+`watch_list.starting_notional` (not a fixed dollar figure, so it scales per
+ticker automatically) — leaning **1.1x** for the normal case. **Dynamic
+case**: if a same-day sell already closed the position for this ticker
+(this strategy always exits fully, so "the most recent same-day sell" is
+unambiguous, no need to sum multiple), base the cap on that sell's real
+notional (shares × exit price) instead of the static `starting_notional` —
+tracks recycled capital rather than a plan-time number that may be stale
+relative to actual account growth. Leaning **~1.0-1.05x** the sell notional
+for that case specifically (not stacked on top of the normal 1.1x
+allowance) — 1.0x exactly is workable but would occasionally trip on the
+existing same-day sizing pad (`buy_order_sizing`'s ~1% `pad_pct`/
+`market_pad_pct` overshoot) for a perfectly legitimate re-buy, requiring a
+rare manual override; 1.05x absorbs that pad without ever blocking a normal
+re-buy. **User wants to think about this further before committing to
+a number or building it** — explicitly asked to backlog rather than
+implement now. On breach: block + Slack alert (not also tripping the kill
+switch — that idea was floated and dropped in favor of the simpler
+per-order block).
+
 ## [live-trading] Low priority, idea raised 2026-07-21 — should `CASH_SAFETY_BUFFER` scale with order size instead of staying a flat $200?
 Raised while fixing the buffer amount itself (see the resolved cash-check item
 below — flipped from an accidental $1,000 hard requirement to the intended

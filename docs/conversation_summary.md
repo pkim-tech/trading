@@ -2688,3 +2688,29 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 - If the user moves forward with opening the limited-margin IRA, resolve the `same_day_block` account-type-awareness backlog item with real facts (see `CLAUDE.md`).
 - If the user pursues trading one ticker across multiple accounts (e.g. SOXL across ira/brokerage), `schwab_safety._live_ticker_accounts()` needs to become `(ticker, window)`-aware instead of ticker-only — currently would silently misvalidate one of the two accounts.
 - Carried forward, all still open: `same_day_block` account-type awareness (now additionally blocked on the new IRA account existing); one-account-per-ticker rollout; dividend cash tracking; wash-sale holds on GDXU/AGQ in IRA-type accounts (clears 2026-08-05/06); consider the user's proposed $100 real-order empirical test now that several more safety layers exist.
+
+---
+
+## 2026-07-22 — Order-submission retry mechanism, mobile-readable UNPROTECTED alerts; per-ticker-per-day BUY cap discussed and backlogged
+
+### What we did
+- **Verified the UNPROTECTED-alert Slack message content directly** (user asked to actually see it, not just trust a passing test) — wrote a scratch script that monkeypatches `_post_message` and prints the literal rendered text for all three UNPROTECTED alert paths. Found the first draft buried the ticker/account/actionable price inside one long run-on sentence with no account at all.
+- **Established a new standing convention**: every Slack alert must render cleanly on mobile — actionable fact (ticker, account, price/quantity, action) on line 1, technical detail on a second parenthetical line, since Slack's mobile notification preview truncates. Reformatted all three UNPROTECTED alerts (`_attempt_automated_sell`'s SL-price fallback, `_place_stop_loss_for_position`'s two failure branches) to this shape. Saved as a memory file (`feedback_mobile_readable_slack.md`).
+- **Verified there's a real live Slack app configured in this environment** (`.env` has real `SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN`/`SLACK_CHANNEL`) — posted one real test message to the user's actual Slack channel (via a scratch script that never reads `.env` directly, just imports `signals_config`) so they could see the rendering on their phone directly, using a clearly fake ticker so it couldn't be mistaken for a real incident.
+- **Built an order-submission retry mechanism** (`schwab_client._submit_order_with_retry`, 3 attempts/2s apart): retries only the actual broker `place_order` call on a generic/transient exception (timeout, connection error, transient 5xx) — deliberately does NOT retry `schwab_safety.approve_and_record()` itself (must run exactly once per attempt, since it increments daily/burst-cap counters and the duplicate-order fingerprint) and does NOT retry a `SafetyViolation` (a deliberate policy block against unchanged state, not a transient failure — retrying it can't succeed, just delays the fallback alert). Wired into all three real placement paths: `_place_equity_order` (BUY/SELL market, covers the post-fill top-up), `_place_trailing_order` (trailing buy/sell), `place_stop_loss`. 3 new tests.
+- **Discussed at length, deliberately not built**: a max-cumulative-BUY-notional-per-ticker-per-day ceiling, raised as "what if a bug buys 4x what we wanted." Walked through why none of the existing guards (per-order caps, per-account daily order count, the resting-order guard — no protection against repeated *market* buys since they fill almost instantly — the 60s/5%-tolerance duplicate guard, or the cash-balance check — bounds total account capital, not intended trade size) actually cover this. Converged on a design (1.1x `starting_notional` normally; ~1.0-1.05x the most-recent same-day sell's real notional if a same-day sell already closed the position, since this strategy always exits fully) but the user wants to think it over before committing to a number — backlogged with full detail rather than built. Also briefly explored and ruled out "Schwab might already protect against this" — confirmed Schwab's own protections (real-time buying-power rejection, the client-UI-only duplicate-order dialog) don't cover this scenario at the API level.
+- Added one partial edit (a `MAX_BUY_NOTIONAL_MULTIPLIER` constant in `schwab_safety.py`) then reverted it cleanly when the user said to backlog instead of build — confirmed via `git diff` that the file matches the last commit exactly.
+- Updated `CLAUDE.md`, `docs/design.md`, `docs/backlog_cache.md` to reflect all of the above.
+
+### Verified
+- Full `pytest tests/`: 175 passed (was 172 at the top of this continuation).
+- `scripts/verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` — both clean.
+- One real Slack message posted and confirmed rendering acceptable-ish by the user (prompted the mobile-readable-alert rework).
+
+### Current state
+- Still every account `dry_run=True` — the retry mechanism has never been exercised against a real transient failure.
+- Not yet committed as of this entry.
+
+### Next session
+- If the user has a number in mind for the max-BUY-per-ticker-per-day cap, build it per the design already worked out in `docs/backlog_cache.md` (1.1x starting_notional normally, ~1.0-1.05x most-recent-same-day-sell-notional if applicable).
+- Carried forward, all still open: `same_day_block` account-type awareness (blocked on the new limited-margin IRA account not yet existing); one-account-per-ticker rollout, and note `schwab_safety._live_ticker_accounts()` would need to become `(ticker, window)`-aware if the user ever splits one ticker (e.g. SOXL) across multiple accounts; dividend cash tracking; wash-sale holds on GDXU/AGQ in IRA-type accounts (clears 2026-08-05/06); the user's proposed $100 real-order empirical test.

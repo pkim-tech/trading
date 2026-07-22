@@ -201,7 +201,9 @@ def test_automated_sell_notifies_sl_price_when_trailing_sell_fails_after_sl_canc
 
     unprotected_msgs = [m for m in posted if "UNPROTECTED" in m]
     assert len(unprotected_msgs) == 1
-    assert "manually re-place a stop-loss SELL" in unprotected_msgs[0]
+    assert f"*{TICKER}*" in unprotected_msgs[0]
+    assert "(ira)" in unprotected_msgs[0]
+    assert "place stop-loss SELL 100" in unprotected_msgs[0]
     # TrailingBothZScoreBreakout uses_fixed_sl -- real SL % comes from
     # pos['fixed_sl'] (config.json's fixed_stop_loss), not node['stop_loss'].
     expected_sl_price = 50.0 * (1 - pos['fixed_sl'] / 100)
