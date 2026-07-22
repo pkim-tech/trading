@@ -61,11 +61,22 @@ AUTO_FILL_DETECTION_PATH = Path(__file__).parent / "cache" / "live" / "schwab_au
 _SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]
 _OPEN_CHECK_WINDOWS = [(9, 30, 9, 40), (14, 30, 14, 40)]
 
-# Duplicate-submit guard: a second order for the same account+ticker+side
-# within this window is almost certainly a retry/double-call bug, not a real
-# distinct signal (signal windows are 15 min wide; genuine re-entries happen
-# on a completely different bar, not seconds/minutes later).
+# Duplicate-submit guard: a second order for the same account+ticker+side+
+# (approximately the same) quantity within this window is almost certainly a
+# retry/double-call bug, not a real distinct order (signal windows are 15 min
+# wide; genuine re-entries happen on a completely different bar, not
+# seconds/minutes later). Matching on quantity too (not just
+# account+ticker+side) is deliberate: a legitimately distinct second order
+# for the same account+ticker+side -- e.g. Part 3's post-fill top-up buy,
+# which fires within seconds of the primary buy fill -- almost always has a
+# very different quantity, so it passes through untouched with no bypass
+# flag needed. DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT (not an exact-equality
+# check) accounts for a genuine retry computing a slightly different share
+# count if it re-sizes off a moved price between the two attempts. Found
+# 2026-07-21 while wiring the top-up to actually place a real broker order
+# (previously it only wrote DB rows, so this guard was never exercised by it).
 DUPLICATE_ORDER_WINDOW_SECS = 60
+DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT = 5.0
 
 # One-BUY-order-per-ticker guard (2026-07-17): confirmed empirically that Schwab
 # does not reserve/check buying power for a resting order at placement time (a
@@ -402,13 +413,20 @@ def check_order(
         )
 
     for o in counts.get("recent_orders", []):
+        prior_qty = o.get("quantity")
+        qty_matches = (
+            prior_qty is not None
+            and abs(prior_qty - quantity) <= DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT / 100 * max(prior_qty, quantity)
+        )
         if (
             o["account"] == account and o["ticker"] == ticker and o["side"] == side
+            and qty_matches
             and time.time() - o["ts"] < DUPLICATE_ORDER_WINDOW_SECS
         ):
             raise SafetyViolation(
-                f"duplicate order: {side} {ticker} in {account} already submitted "
-                f"{time.time() - o['ts']:.0f}s ago (within {DUPLICATE_ORDER_WINDOW_SECS}s window)"
+                f"duplicate order: {side} {quantity} {ticker} in {account} already submitted "
+                f"{prior_qty:g} shares {time.time() - o['ts']:.0f}s ago "
+                f"(within {DUPLICATE_ORDER_WINDOW_SECS}s window, {DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT}% tolerance)"
             )
 
 
@@ -435,7 +453,8 @@ def approve_and_record(
             o for o in counts.get("recent_orders", [])
             if time.time() - o["ts"] < DUPLICATE_ORDER_WINDOW_SECS
         ]
-        recent_orders.append({"account": account, "ticker": ticker, "side": side, "ts": time.time()})
+        recent_orders.append({"account": account, "ticker": ticker, "side": side,
+                               "quantity": quantity, "ts": time.time()})
         counts["recent_orders"] = recent_orders
         f.seek(0)
         f.truncate()

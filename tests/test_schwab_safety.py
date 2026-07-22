@@ -166,6 +166,31 @@ def test_duplicate_guard_is_per_side(env):
     schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
 
 
+def test_duplicate_guard_allows_different_quantity(env):
+    # 2026-07-21: a same-side order for a different quantity (e.g. Part 3's
+    # post-fill top-up, which fires within seconds of the primary buy fill)
+    # is a legitimately distinct order, not a retry/double-call bug -- must
+    # not be blocked just because it shares account+ticker+side.
+    schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    schwab_client.place_equity_buy('ira', TICKER, 3, 50.0)  # should not raise
+
+
+def test_duplicate_guard_catches_retry_with_slightly_different_quantity(env):
+    # A genuine retry re-sizing off a moved price (e.g. 980 -> 981 shares)
+    # must still be caught -- exact-quantity matching alone would let this
+    # through. 981 is within the 5% tolerance of 980.
+    schwab_client.place_equity_buy('ira', TICKER, 980, 50.0)
+    with pytest.raises(schwab_safety.SafetyViolation, match="duplicate order"):
+        schwab_client.place_equity_buy('ira', TICKER, 981, 50.0)
+
+
+def test_duplicate_guard_tolerance_does_not_catch_top_up_sized_order(env):
+    # A real top-up (much smaller than the primary fill, e.g. 100 vs 980)
+    # sits well outside the 5% tolerance and must not be blocked.
+    schwab_client.place_equity_buy('ira', TICKER, 980, 50.0)
+    schwab_client.place_equity_buy('ira', TICKER, 100, 50.0)  # should not raise
+
+
 def test_notional_cap_blocked(env):
     cap = schwab_safety.ACCOUNTS['ira'].notional_cap
     with pytest.raises(schwab_safety.SafetyViolation, match="exceeds ira cap"):

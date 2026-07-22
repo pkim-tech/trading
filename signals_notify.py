@@ -106,11 +106,20 @@ _SL_FAST_CONFIRM_ATTEMPTS = 5
 _SL_FAST_CONFIRM_INTERVAL_SECS = 2
 
 
-def _place_stop_loss_for_position(node, ticker, fill_price):
+def _place_stop_loss_for_position(node, ticker, signal_price):
     """Places the real resting STOP order for a freshly-opened automated
     market-buy position (Part 4, Section 6) -- reads the final share count
     back off open_positions (post any top-up _reconcile_fill already applied)
-    so the stop covers the whole position, not just a provisional quantity."""
+    so the stop covers the whole position, not just a provisional quantity.
+    Anchored to signal_price (the trigger price), not the real fill price --
+    the backtest kernel computes stop_price = entry_price * (1 - sl%) where
+    entry_price IS the trigger (op/cp), with zero fill slippage modeled.
+    Anchoring to the real fill price instead would let market-order slippage
+    silently loosen or tighten the stop relative to what the backtest assumed
+    for that trade -- worst case, a real fill better than the trigger produces
+    a looser live stop than the backtest's, so a gap that would have exited
+    the backtest position could leave the live position open through a larger
+    drawdown than modeled."""
     pos = db.get_open_position(ticker)
     if not pos or not pos.get('shares'):
         return
@@ -118,7 +127,7 @@ def _place_stop_loss_for_position(node, ticker, fill_price):
     sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos['stop_loss']
     if not sl_pct:
         return
-    stop_price = fill_price * (1 - sl_pct / 100)
+    stop_price = signal_price * (1 - sl_pct / 100)
     try:
         _, sl_order_id = schwab_client.place_stop_loss(account, ticker, int(pos['shares']), stop_price)
     except schwab_safety.SafetyViolation as e:
@@ -158,7 +167,7 @@ def _sync_confirm_and_protect(ticker, node):
                       f"temporarily UNPROTECTED (no stop-loss resting). Will be placed once the fill is "
                       f"confirmed by the auto-fill poll or account-activity stream.")
         return
-    _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], place_sl=True)
+    _reconcile_buy_fill(ticker, fill['price'], fill['quantity'])
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +691,7 @@ def check_buy_reminders():
         db.update_pending_buy_reminder(pending['id'], channel, ts, reminder_num)
 
 
-def _reconcile_fill(node, fill_price, filled_shares):
+def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False):
     """Post-fill top-up (Part 3, branch C) -- compares the real fill notional
     against target_notional (the conservative worst-case sizing pads in
     buy_order_sizing/check_gap_resize mean a real fill usually comes in under
@@ -691,29 +700,61 @@ def _reconcile_fill(node, fill_price, filled_shares):
     check_gap_resize) gets a notify-only, no corrective sell, per Part 3 design.
     Called only from _reconcile_buy_fill, which clears the pending_buys row
     first -- that's the dedup marker preventing a double top-up if both the
-    poll and the websocket path notice the same fill."""
+    poll and the websocket path notice the same fill.
+    Places a real (or dry_run) broker market buy for the top-up shares before
+    recording them -- found and fixed 2026-07-21: this previously only wrote
+    open_positions.shares/entry_price via db.top_up_position with no broker
+    call at all, so the account never actually held the "topped-up" shares
+    while every downstream sell order (SL, trailing-sell) sized off the
+    inflated share count -- a real oversell/short-sell risk.
+    is_gap_correction is passed through from the triggering fill (True only
+    when the fill itself came from check_gap_resize's MARKET replacement,
+    which runs at _GAP_CHECK_WINDOW, outside _SIGNAL_WINDOWS/_OPEN_CHECK_WINDOWS)
+    so the top-up buy isn't wrongly blocked by the signal-window time gate."""
     ticker = node['ticker']
+    account = node.get('account')
     target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
     delta = target_notional - (fill_price * filled_shares)
     if delta > fill_price:
         top_up_shares = int(delta // fill_price)
-        if top_up_shares > 0 and db.top_up_position(ticker, top_up_shares, fill_price):
-            _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${fill_price:.4f} "
-                          f"(fill was under target notional by ${delta:,.0f})")
+        if top_up_shares > 0:
+            try:
+                schwab_client.place_equity_buy(account, ticker, top_up_shares, fill_price,
+                                                is_gap_correction=is_gap_correction)
+            except schwab_safety.SafetyViolation as e:
+                _post_message(f"🚫 {ticker} — top-up buy of {top_up_shares} shares blocked: {e} "
+                              f"(position stays under target notional by ${delta:,.0f})")
+                return
+            except Exception as e:
+                _post_message(f"⚠️ {ticker} — top-up buy of {top_up_shares} shares failed "
+                              f"unexpectedly: {e} (position stays under target notional by "
+                              f"${delta:,.0f})")
+                return
+            if db.top_up_position(ticker, top_up_shares, fill_price):
+                _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${fill_price:.4f} "
+                              f"(fill was under target notional by ${delta:,.0f})")
     elif delta < -fill_price:
         _post_message(f"⚠️ {ticker} — fill exceeded target notional by ${-delta:,.0f} "
                       f"(no corrective sell placed)")
 
 
-def _reconcile_buy_fill(ticker, fill_price, filled_shares, place_sl=False):
+def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=False):
     """Single entry point for a detected BUY fill -- shared by check_auto_fills
-    (slow poll path), drain_fill_queue (fast websocket path, Part 3), and
-    _sync_confirm_and_protect (synchronous fast-confirm path, Part 4). Clears
-    the pending_buys row before acting (the existing dedup marker: whichever
-    path notices the fill first wins, the other finds nothing to do), opens the
-    real position, then tops it up via _reconcile_fill. place_sl=True (only
-    passed by the market-buy sync-confirm path) places the resting STOP order
-    once the position is open/topped-up."""
+    (slow poll path), drain_fill_queue (fast websocket path, Part 3),
+    check_gap_resize's fill poll (Part 3), and _sync_confirm_and_protect
+    (synchronous fast-confirm path, Part 4). Clears the pending_buys row
+    before acting (the existing dedup marker: whichever path notices the fill
+    first wins, the other finds nothing to do), opens the real position, then
+    tops it up via _reconcile_fill (is_gap_correction passed through so a
+    top-up following a gap-correction fill isn't blocked by the signal-window
+    gate). Places the resting STOP order for any automated market-buy
+    (non-trailing-buy) node in automation scope -- determined here rather
+    than left to each caller, so the SL genuinely gets placed regardless of
+    *which* path ends up detecting the fill (previously only the synchronous
+    fast-confirm path passed place_sl=True explicitly; if that path timed
+    out, the async fallback paths below silently never placed a stop at all,
+    contradicting the timeout alert's own claim that the fallback would
+    eventually cover it -- found and fixed 2026-07-21)."""
     pendings = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
     if not pendings:
         return
@@ -729,9 +770,9 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, place_sl=False):
     drift_pct = (fill_price - signal_price) / signal_price * 100
     _post_message(f"🤖 {ticker} — auto-detected fill at ${fill_price:.4f}  "
                   f"(drift: {drift_pct:+.2f}%)  {filled_shares:g} shares")
-    _reconcile_fill(node, fill_price, filled_shares)
-    if place_sl:
-        _place_stop_loss_for_position(node, ticker, fill_price)
+    _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=is_gap_correction)
+    if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS and not db._is_trailing_buy(node):
+        _place_stop_loss_for_position(node, ticker, signal_price)
 
 
 _GAP_RESIZE_PAD_PCT = 5.0
@@ -807,7 +848,7 @@ def check_gap_resize():
                           f"will be caught by the next check_auto_fills poll")
             continue
 
-        _reconcile_buy_fill(ticker, fill['price'], fill['quantity'])
+        _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], is_gap_correction=True)
 
 
 def drain_fill_queue():

@@ -1,5 +1,34 @@
 # Backlog Cache
 
+## [live-trading][security] Medium priority, not started, 2026-07-21 — `schwab_safety`'s duplicate-order guard trusts a local pre-flight record, not Schwab's real order book
+Found while fixing Part 3's top-up to place a real broker order (see the
+resolved Part 4 review item below). `approve_and_record` writes the order
+into its local `recent_orders` dedup list *before* the real `place_order`
+call happens (`schwab_client._place_equity_order`) — if that broker call
+then fails/times out/is rejected, the guard still believes it succeeded, so
+a legitimate retry within `DUPLICATE_ORDER_WINDOW_SECS` (60s) is wrongly
+blocked as a duplicate. The more correct design (discussed, not built):
+query Schwab's real order book (`schwab_client.get_orders_for_account`,
+already used internally by `get_filled_order`) for a genuine WORKING/FILLED
+match instead of trusting a local heuristic — reflects ground truth,
+naturally handles the retry-after-rejection case with no tolerance-window
+guessing. Bigger structural change to the safety layer than a quick fix;
+scoped as its own session. Not urgent — no real order has been placed yet
+(`dry_run=True` everywhere).
+**Related, broader idea raised same session, detection-only in scope**: a
+periodic live-state reconciliation check — does `open_positions.shares`
+match the broker's real position size, and does a resting protective order
+(SL or trailing-sell, matching the position's current phase) actually exist
+at the broker for that exact quantity? Shares the same `get_orders_for_account`
+query surface as the fix above. **User explicitly flagged the danger**: this
+must stay detection/alert-only (Slack notify on mismatch) — an auto-correcting
+version would be a new automated-trading decision layer on top of the ones
+this session found real bugs in, and a false-positive mismatch (legitimate
+slippage, a deliberate manual override, a timing lag) would trigger a real,
+wrong, automated trade to "fix" something that wasn't actually broken. Any
+future auto-correction (if ever) should be narrowly scoped and human-gated
+via Slack, not silent. Not started.
+
 ## [live-trading] Implemented 2026-07-21, not yet live-tested — Entry Trigger/Fill/SL-Placement/Arm-latency automation for TrailingExitZScoreBreakout (Part 4)
 Full design at `/home/pkim/.claude/plans/replicated-gliding-quasar.md` (not
 git-tracked); implementation summary in `docs/design.md` (Layer 3, "Part 4"
@@ -21,10 +50,22 @@ real `signals_compute.compute_buy_signal` bug where `prev_close` read the
 unsliced `df_daily` (today's/latest close) instead of `df_daily_prior` — found
 via the new backtest-replay verification script, see `docs/research_log.md`'s
 2026-07-21 "Part 4 implementation" entry for the full writeup.
-Verified: full `pytest tests/` (131 passed, was 107 — 24 new in
-`tests/test_part4_entry_trigger.py`); `scripts/verify_pinned_entry_vs_backtest.py`
-(Deliverable 1) — 5/6 tickers 100% clean, AGQ's one mismatch is a real,
-expected stock-split-day divergence (see research log entry), not a defect.
+**A phase-by-phase scenario review the same day (continuing session) found and
+fixed three more real bugs**, see `docs/design.md`'s Part 3 entry for full
+detail: (1) the SL price was anchored to the real fill price instead of the
+trigger/signal price, diverging from the backtest's stop formula whenever a
+market order slipped; (2) the async fallback fill-detection paths
+(`check_auto_fills`/`drain_fill_queue`/`check_gap_resize`) never actually
+placed the SL if the synchronous fast-confirm path timed out, contradicting
+the timeout alert's own claim; (3) Part 3's post-fill top-up never placed a
+real broker order at all, only DB bookkeeping — fixed alongside a
+`schwab_safety` duplicate-order-guard tightening (now quantity-aware, ±5%
+tolerance) needed once the top-up started actually submitting orders.
+Verified: full `pytest tests/` (137 passed, was 107 pre-session);
+`scripts/verify_pinned_entry_vs_backtest.py` (Deliverable 1) — 5/6 tickers
+100% clean, AGQ's one mismatch is a real, expected stock-split-day divergence
+(see research log entry), not a defect; `verify_trailing_buy_resolution.py`/
+`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` clean post-fixes.
 **Not yet done**: Deliverable 2 (`scripts/verify_open_price_quality.py` +
 `open_price_quality_log` table) needs real trading-day data to populate — the
 daemon hasn't run live with this code yet; no real order tested end-to-end

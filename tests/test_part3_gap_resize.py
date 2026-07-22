@@ -166,6 +166,56 @@ def test_reconcile_fill_notifies_only_on_overspend(env, monkeypatch):
     assert any("exceeded target notional" in m for m in posted)
 
 
+def test_reconcile_fill_places_real_broker_order_for_topup(env, monkeypatch):
+    """2026-07-21 fix: the top-up used to only write open_positions.shares via
+    db.top_up_position with no broker call at all -- the account never
+    actually held the extra shares. Assert place_equity_buy is now called for
+    the top-up quantity before the DB is updated."""
+    _seed_pending_order(monkeypatch)
+    calls = []
+    monkeypatch.setattr(schwab_client, 'place_equity_buy',
+                         lambda account, ticker, qty, price, is_gap_correction=False:
+                             calls.append((qty, price, is_gap_correction)) or (object(), 999))
+    # 100 shares @ 51 = $5100, well under the $50k target -> real top-up expected
+    signals_notify._reconcile_buy_fill(TICKER, 51.0, 100)
+    assert len(calls) == 1
+    qty, price, is_gap_correction = calls[0]
+    assert qty > 0
+    assert is_gap_correction is False
+    pos = signals_db.get_open_position(TICKER)
+    assert pos['shares'] == 100 + qty
+
+
+def test_reconcile_fill_topup_blocked_leaves_shares_unchanged(env, monkeypatch):
+    """If schwab_safety blocks the top-up order, the DB must not record shares
+    the account never actually bought."""
+    _seed_pending_order(monkeypatch)
+    posted = []
+    monkeypatch.setattr(signals_notify, '_post_message', lambda msg, *a, **kw: posted.append(msg))
+
+    def _blocked(*a, **kw):
+        raise schwab_safety.SafetyViolation("kill switch engaged")
+    monkeypatch.setattr(schwab_client, 'place_equity_buy', _blocked)
+
+    signals_notify._reconcile_buy_fill(TICKER, 51.0, 100)
+    pos = signals_db.get_open_position(TICKER)
+    assert pos['shares'] == 100  # no phantom top-up shares recorded
+    assert any("top-up buy" in m and "blocked" in m for m in posted)
+
+
+def test_reconcile_fill_topup_passes_through_gap_correction(env, monkeypatch):
+    """A top-up following a gap-correction fill must itself bypass the
+    signal-window gate (check_gap_resize fires outside _SIGNAL_WINDOWS/
+    _OPEN_CHECK_WINDOWS) -- otherwise the top-up buy gets wrongly blocked."""
+    _seed_pending_order(monkeypatch)
+    calls = []
+    monkeypatch.setattr(schwab_client, 'place_equity_buy',
+                         lambda account, ticker, qty, price, is_gap_correction=False:
+                             calls.append(is_gap_correction) or (object(), 999))
+    signals_notify._reconcile_buy_fill(TICKER, 51.0, 100, is_gap_correction=True)
+    assert calls == [True]
+
+
 # ---------------------------------------------------------------------------
 # drain_fill_queue -- fast path
 # ---------------------------------------------------------------------------

@@ -287,8 +287,11 @@ def test_sync_confirm_and_protect_places_sl_on_fill(env, monkeypatch):
     assert len(placed_calls) == 1
     qty, stop_price = placed_calls[0]
     assert qty == pos['shares']
-    # fixed_sl=5.0 off the real fill price
-    assert stop_price == pytest.approx(49.0 * 0.95)
+    # fixed_sl=5.0 off the trigger/signal price (50.0 from _sig()), not the
+    # real fill price (49.0) -- anchoring to the trigger reproduces the
+    # backtest's stop_price = entry_price * (1 - sl%), where entry_price IS
+    # the trigger with zero fill slippage modeled.
+    assert stop_price == pytest.approx(50.0 * 0.95)
 
 
 def test_sync_confirm_and_protect_alerts_on_timeout(env, monkeypatch):
