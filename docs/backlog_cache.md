@@ -115,19 +115,18 @@ Not fully closed: still bounded by 10s, not eliminated — restructuring the
 lock so only the count/cap bookkeeping (not the network calls) runs under
 it remains a further option if 10s is ever observed to matter in practice.
 
-## [live-trading][security] Low priority, found 2026-07-21 — pre-existing test hygiene gap: some `schwab_safety` tests were silently hitting the real Schwab API
+## [live-trading][security] Resolved 2026-07-21 — pre-existing test hygiene gap: some `schwab_safety` tests were silently hitting the real Schwab API
 Found during the Opus review of the cash-balance check above. The same-ticker
 duplicate-order-book check (`_has_open_order`, now refactored to share a
 fetch with `_has_open_buy_order_in_account`) was being exercised in every
 BUY-path test via a real, unmocked `get_orders_for_account` call against
 whatever the actual `ira` account's real order book happened to contain at
-test-run time — not introduced this session, but only fixed for the tests
-this session's fixtures touch (`_open_orders` is now mocked to `[]` by
-default in all four fixture files). Worth a follow-up sweep of any other
-test file that exercises a BUY path through `schwab_safety`/`schwab_client`
-to confirm none of them still depend on live account state. Not urgent —
-no test failure has been observed from this yet, just a latent flakiness/
-information-leak risk (`automation_principles.md` #8).
+test-run time. Ran the follow-up sweep this item asked for: every test file
+that imports `schwab_safety`/`schwab_client`
+(`test_schwab_safety.py`/`test_part3_gap_resize.py`/`test_part4_entry_trigger.py`/
+`test_schwab_automation.py`/the new `test_schwab_client.py`) already mocks
+`schwab_safety._open_orders` and `schwab_client.get_filled_order` in its
+fixture — no stragglers found, nothing left to fix.
 
 ## [live-trading][security] Resolved 2026-07-21 — `active_signals.run_loop` fault tolerance built: per-section isolation + outer last-resort net
 Full original context preserved below the line. Fixed this session, using
