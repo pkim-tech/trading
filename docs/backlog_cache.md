@@ -97,19 +97,23 @@ function at all to read an account's real cash balance, and
 available cash would either get rejected (no-margin accounts) or silently
 draw on margin (margin-enabled accounts), with zero check on our side.
 
-## [live-trading][security] Low priority, found 2026-07-21 — cash-balance network call is held inside `approve_and_record`'s cross-account file lock
-Found during the Opus review of the cash-balance check above (resolved item
-above this one). `check_order`'s new cash-availability check runs while
-`approve_and_record` holds `_open_locked()` — a global lock shared across
-every account, not just the one being checked. A slow or hung
-`schwab_client.get_account_balance` call would stall order processing for
-*every* account's order, not just the current one, for as long as the
-network call takes (still fails closed if it eventually errors, so this is a
-liveness/latency concern, not a correctness bug). Not fixed — the
-proportionate fix (per `automation_principles.md` #7a, don't over-engineer)
-is probably a short timeout on the Schwab client call itself rather than
-restructuring lock ordering, but not scoped. Low urgency: the daemon is
-single-threaded and no real order has been placed yet.
+## [live-trading][security] Resolved 2026-07-21 — cash-balance network call held inside `approve_and_record`'s cross-account file lock
+Found during the Opus review of the cash-balance check (resolved item
+above). `check_order`'s cash-availability check (and the order-book fetch
+for the duplicate-BUY guard) run while `approve_and_record` holds
+`_open_locked()` — a global lock shared across every account. A slow or
+hung Schwab call would stall order processing for every account's order,
+not just the current one, for as long as schwab-py's 30s default httpx
+timeout takes to fire. Fixed per the proportionate option flagged at the
+time (`automation_principles.md` #7a): `schwab_client._get_client()` now
+calls `client.set_timeout(_CLIENT_TIMEOUT_SECS)` (10.0s) once at client
+creation, bounding every Schwab HTTP call — not just the two under the
+lock — to 10s instead of 30s. Simpler than restructuring lock ordering,
+same failure mode either way (fails closed once the call errors out).
+New `tests/test_schwab_client.py::test_get_client_applies_short_timeout`.
+Not fully closed: still bounded by 10s, not eliminated — restructuring the
+lock so only the count/cap bookkeeping (not the network calls) runs under
+it remains a further option if 10s is ever observed to matter in practice.
 
 ## [live-trading][security] Low priority, found 2026-07-21 — pre-existing test hygiene gap: some `schwab_safety` tests were silently hitting the real Schwab API
 Found during the Opus review of the cash-balance check above. The same-ticker

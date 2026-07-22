@@ -30,10 +30,21 @@ _account_hashes = None  # nickname -> Schwab's encrypted account hash, resolved 
 NICKNAMES = ["brokerage", "sep", "roth", "ira"]
 
 
+# schwab-py defaults to a 30s httpx timeout on every call. This daemon is
+# single-threaded and several calls (get_account_balance, the order-book
+# fetch) run inside schwab_safety's cross-account file lock, so a slow/hung
+# call stalls order processing for every account, not just the one being
+# checked (found in Opus review, 2026-07-21). A short, cheap global timeout
+# bounds that stall without restructuring lock ordering -- proportionate per
+# automation_principles.md #7a.
+_CLIENT_TIMEOUT_SECS = 10.0
+
+
 def _get_client():
     global _client
     if _client is None:
         _client = schwab_auth.get_client()
+        _client.set_timeout(_CLIENT_TIMEOUT_SECS)
     return _client
 
 
