@@ -28,6 +28,7 @@ live, date + note).
 | Duplicate-order guard doesn't false-block a legitimate top-up | `schwab_safety` quantity-aware guard | Unit tests (`test_schwab_safety.py`) | Not started | Only exercised in unit tests so far, not against real order timing |
 | Live-state reconciliation (position/order-book mismatch detection) | not built | N/A | Not started | Still just a design idea in backlog |
 | Automated sell correctly skipped for a non-live-mode node's position | `signals_notify._attempt_automated_sell` mode check | 2 new unit tests (`test_schwab_automation.py`) | Not started | Built this session (2026-07-21); no ticker has ever hit this exact scenario live (today's automation-scope tickers only run mode='live' nodes) |
+| Live-state reconciliation detects and alerts on a real mismatch | `signals_notify.check_live_state_reconciliation`, `schwab_client.get_real_position` | 8 unit tests (`test_live_state_reconciliation.py`) | Not started | Built 2026-07-22; no real mismatch has ever been observed (every account `dry_run=True`); `get_real_position`'s `longQuantity`/`positions` field names also unverified against a real account response |
 
 ## How to update this
 - New automation feature → add a row when it's built (even if `Status: Not started`).

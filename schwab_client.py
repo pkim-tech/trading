@@ -12,6 +12,7 @@ in source.
 import os
 import time
 
+import schwab.client
 import schwab.orders.equities as equity_orders
 from schwab.orders.generic import OrderBuilder
 from schwab.orders.common import (
@@ -305,6 +306,25 @@ def get_account_balance(account: str) -> float:
     r = _get_client().get_account(account_hash)
     r.raise_for_status()
     return float(r.json()["securitiesAccount"]["currentBalances"]["cashAvailableForTrading"])
+
+
+def get_real_position(account: str, ticker: str) -> float:
+    """Real share quantity held for `ticker` in `account`, read fresh (never
+    cached) -- Client.get_account(fields=[Account.Fields.POSITIONS]),
+    securitiesAccount.positions[].longQuantity for the matching instrument.
+    Field names follow Schwab's documented schema but are unverified against
+    a real account response (same caveat pattern as get_account_balance).
+    Returns 0.0 if the ticker isn't held at all -- used by the live-state
+    reconciliation check (signals_notify.check_live_state_reconciliation) to
+    compare the broker's real position against open_positions.shares."""
+    account_hash = _resolve_account_hashes()[account]
+    r = _get_client().get_account(account_hash, fields=[schwab.client.Client.Account.Fields.POSITIONS])
+    r.raise_for_status()
+    positions = r.json()["securitiesAccount"].get("positions", [])
+    for p in positions:
+        if p.get("instrument", {}).get("symbol") == ticker:
+            return float(p.get("longQuantity", 0.0))
+    return 0.0
 
 
 def get_current_price(ticker: str) -> float:

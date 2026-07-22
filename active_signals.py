@@ -87,6 +87,7 @@ from signals_notify import (
     EXIT_REMINDER_MINUTES, _exit_pending_blocks, check_exit_reminders,
     BUY_REMINDER_MINUTES, _trailing_buy_status, _pending_buy_blocks, check_buy_reminders,
     check_auto_fills, check_gap_resize, drain_fill_queue,
+    check_live_state_reconciliation,
     _ticker_block, _send_window_alert,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report,
@@ -482,6 +483,7 @@ def run_loop(tickers: set = None):
                 _guarded(f"exit_check[{pos['ticker']}]", _check_position_exit, pos)
 
             _guarded("paper_check_sells", paper_trading.check_paper_sells, last_seen_bar, paper_sell_alerted, _load_cache)
+            _guarded("live_state_reconciliation", check_live_state_reconciliation, open_positions)
 
             if _reminders_active(now):
                 _guarded("trailing_reminders", check_trailing_reminders, open_positions)

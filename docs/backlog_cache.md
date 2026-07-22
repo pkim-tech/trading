@@ -180,24 +180,44 @@ naturally handles the retry-after-rejection case with no tolerance-window
 guessing. Bigger structural change to the safety layer than a quick fix;
 scoped as its own session. Not urgent — no real order has been placed yet
 (`dry_run=True` everywhere).
-**Related, broader idea raised same session, detection-only in scope**: a
-periodic live-state reconciliation check — does `open_positions.shares`
-match the broker's real position size, and does a resting protective order
-(SL or trailing-sell, matching the position's current phase) actually exist
-at the broker for that exact quantity? Shares the same `get_orders_for_account`
-query surface as the fix above. **User explicitly flagged the danger**: this
-must stay detection/alert-only (Slack notify on mismatch) — an auto-correcting
-version would be a new automated-trading decision layer on top of the ones
-this session found real bugs in, and a false-positive mismatch (legitimate
+## [live-trading][security] Resolved 2026-07-22 — live-state reconciliation check built: detection + text-only proposed remediation, never auto-executes
+Related idea from the item above, split out once actually built. Originally
+scoped as: does `open_positions.shares` match the broker's real position
+size, and does a resting protective order (SL or trailing-sell, matching the
+position's current phase) actually exist at the broker for that exact
+quantity? **User explicitly flagged the danger**: this must stay detection/
+alert-only (Slack notify on mismatch) — an auto-correcting version would be
+a new automated-trading decision layer on top of the ones this project has
+already found real bugs in, and a false-positive mismatch (legitimate
 slippage, a deliberate manual override, a timing lag) would trigger a real,
 wrong, automated trade to "fix" something that wasn't actually broken.
-**Refined same session**: a hybrid middle ground — on a detected mismatch,
+**Refined at the time**: a hybrid middle ground — on a detected mismatch,
 compute and post a *proposed* remediation (e.g. "top up N shares" / "place
-missing SL at $X") to Slack for explicit human approval before anything
-executes, rather than either silent auto-correction or a bare alert with no
-suggested fix. Still human-gated, but saves the manual diagnosis step. Any
-auto-correction (silent, no approval step) stays out of scope regardless.
-Not started.
+missing SL at $X") to Slack, rather than either silent auto-correction or a
+bare alert with no suggested fix.
+
+**Built 2026-07-22, scoped down to text-only** (confirmed with the user
+before building: a clickable approve-button version would be a much bigger
+build — new Slack handler, new execution path through `schwab_safety`,
+needing its own dedicated safety review — deferred as a possible v2, not
+built now). New `schwab_client.get_real_position(account, ticker)` (real
+share quantity via `Client.get_account(fields=[Account.Fields.POSITIONS])`,
+field names unverified against a real response, same caveat pattern as
+`get_account_balance`). New `signals_notify.check_live_state_reconciliation`
+(called every `run_loop` poll cycle via `_guarded`, automation-scope tickers
+only — matches where the real order-placement risk actually is today):
+compares broker-real shares vs. `open_positions.shares`, and whether the
+expected resting order (SL pre-arm, trailing-sell post-arm) is actually
+resting, via the existing `schwab_safety._open_orders` order-book fetch.
+Posts a text-only Slack alert with the suggested fix on any mismatch —
+never places an order itself. Broker treated as ground truth (automation_
+principles.md #1); alerts rate-limited 15min per (position, mismatch-kind)
+to avoid repeat-alert spam. 8 new tests (`tests/test_live_state_reconciliation.py`).
+Full suite: 164 passed. `verify_trailing_buy_resolution.py`/
+`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` clean (required
+since `active_signals.py`/`signals_notify.py` changed).
+Not yet done: no real mismatch has ever been observed live (every account
+still `dry_run=True`) — tracked in `docs/live_test_coverage.md`.
 
 ## [live-trading] Implemented 2026-07-21, not yet live-tested — Entry Trigger/Fill/SL-Placement/Arm-latency automation for TrailingExitZScoreBreakout (Part 4)
 Full design at `/home/pkim/.claude/plans/replicated-gliding-quasar.md` (not

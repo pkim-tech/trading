@@ -95,6 +95,92 @@ def _attempt_automated_sell(pos, current_price):
     return True
 
 
+_RECONCILE_ALERTED: dict[str, float] = {}
+_RECONCILE_COOLDOWN_SECS = 900  # 15 min -- matches the reminder-nag/section-alert cadence elsewhere
+
+
+def _alert_reconcile_mismatch(pos, kind, text):
+    """Posts a reconciliation mismatch alert, rate-limited per (position,
+    mismatch-kind) so an already-alerted, still-unresolved mismatch doesn't
+    repost every poll cycle (same pattern as active_signals._guarded's
+    per-section cooldown)."""
+    key = f"{pos['id']}:{kind}"
+    last = _RECONCILE_ALERTED.get(key, 0)
+    if time.time() - last < _RECONCILE_COOLDOWN_SECS:
+        return
+    _RECONCILE_ALERTED[key] = time.time()
+    _post_message(text)
+
+
+def check_live_state_reconciliation(open_positions):
+    """Detection-only live-state reconciliation (automation_principles.md #5,
+    #1 -- backlog 2026-07-21). For each open position on an automation-scope
+    ticker, compares the broker's real state against what open_positions/
+    trail_state records, and posts a proposed-fix Slack alert (text only) on
+    any mismatch:
+      - share-count mismatch (open_positions.shares vs. the broker's real
+        position size)
+      - missing protective order (expected resting SL pre-arm, or resting
+        trailing-sell post-arm, isn't actually resting at the broker)
+
+    Deliberately detection/alert-only -- never executes a remediation itself,
+    matches the explicit user call that an auto-correcting version would be a
+    new automated-trading decision layer on top of ones this project has
+    already found real bugs in, and a false-positive mismatch (legitimate
+    slippage, a deliberate manual override, a timing lag) would trigger a
+    real, wrong "fix". The broker is treated as ground truth (automation_
+    principles.md #1) -- the suggested fix always corrects the DB/order side,
+    never assumes the broker is wrong. Best-effort: a fetch failure just skips
+    that position for this cycle (nothing here blocks or gates a real order,
+    so there's no fail-closed obligation the way schwab_safety.check_order
+    has)."""
+    for pos in open_positions:
+        ticker = pos['ticker']
+        if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            continue
+        account = pos.get('account')
+        if not account:
+            continue
+        try:
+            real_shares = schwab_client.get_real_position(account, ticker)
+            orders = schwab_safety._open_orders(account)
+        except Exception as e:
+            print(f"  [reconcile] {ticker}: fetch failed, skipping this cycle: {e}")
+            continue
+
+        expected_shares = pos.get('shares')
+        if expected_shares is not None and real_shares != expected_shares:
+            _alert_reconcile_mismatch(
+                pos, "shares",
+                f"⚠️ *{ticker}* live-state mismatch: `open_positions` tracks {expected_shares:g} "
+                f"shares, broker shows {real_shares:g} — broker is ground truth; suggested fix: "
+                f"verify no unexpected fill/manual trade explains the gap, then correct "
+                f"`open_positions.shares` to {real_shares:g}"
+            )
+
+        state = pos.get('trail_state') or {}
+        has_sell_order = any(
+            leg.get('instruction') == 'SELL' and leg.get('instrument', {}).get('symbol') == ticker
+            for o in orders for leg in o.get('orderLegCollection', [])
+        )
+        if expected_shares is None:
+            continue
+        if state.get('trailing') and state.get('order_placed') and not has_sell_order:
+            _alert_reconcile_mismatch(
+                pos, "missing_trailing_sell",
+                f"⚠️ *{ticker}* live-state mismatch: trailing-sell marked placed but no resting "
+                f"SELL order found at the broker — position may be unprotected; suggested fix: "
+                f"place a trailing-sell order for {expected_shares:g} shares now"
+            )
+        elif not state.get('trailing') and pos.get('sl_order_id') and not has_sell_order:
+            _alert_reconcile_mismatch(
+                pos, "missing_sl",
+                f"⚠️ *{ticker}* live-state mismatch: SL order id {pos['sl_order_id']} is recorded "
+                f"but no resting SELL order found at the broker — position may be unprotected; "
+                f"suggested fix: place a stop-loss order for {expected_shares:g} shares now"
+            )
+
+
 def _attempt_automated_market_buy(node, sizing):
     """Market-buy mirror of _attempt_automated_buy (Part 4, Section 4) --
     places a real (or dry_run) plain market order via schwab_client.place_equity_buy
