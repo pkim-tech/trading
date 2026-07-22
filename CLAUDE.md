@@ -30,6 +30,7 @@ A z-score mean reversion backtesting and optimization system targeting leveraged
 - **Entry price**: Real-time via `yfinance fast_info.last_price` at signal check time.
 
 ## Key Files
+- **Whenever you touch `active_signals.py` or any `signals_*.py` module** (the live-trading daemon), review `docs/automation_principles.md` first, and update `docs/live_test_coverage.md` if the change adds/affects a scenario that needs live validation.
 - `app.py` — Streamlit UI for configuring and launching optimization sweeps
 - `run_optimization_sweep.py` — main parallel optimization engine (brute force + generational refinement)
 - `backtester.py` — core backtest simulation logic (`run_backtest`)

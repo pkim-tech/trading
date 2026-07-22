@@ -280,6 +280,22 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float)
     return r, order_id
 
 
+def get_account_balance(account: str) -> float:
+    """Real available cash for the account, read fresh (never cached) --
+    Client.get_account, securitiesAccount.currentBalances.cashAvailableForTrading.
+    Field name follows Schwab's documented schema but is unverified against a
+    real account response (same caveat pattern as get_filled_order) -- confirm
+    against a real account before trusting this beyond the automation_principles.md
+    #2 fail-closed design it's built for. Raises on any failure (network,
+    missing field, etc.) rather than returning a fallback value -- the caller
+    (schwab_safety.check_order) must fail closed on a balance-check failure,
+    not silently allow the order through with an unknown balance."""
+    account_hash = _resolve_account_hashes()[account]
+    r = _get_client().get_account(account_hash)
+    r.raise_for_status()
+    return float(r.json()["securitiesAccount"]["currentBalances"]["cashAvailableForTrading"])
+
+
 def get_current_price(ticker: str) -> float:
     """Primary: Schwab's own get_quote, extended.lastPrice -- confirmed
     real-time (realtime: true, live quoteTime) unlike yfinance's pre-market

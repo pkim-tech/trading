@@ -39,6 +39,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
     monkeypatch.setattr(schwab_safety, '_now', lambda: _OPEN_CHECK_TIME)
     monkeypatch.setattr(schwab_client, '_post_message', lambda *a, **kw: (None, None))
+    monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 1_000_000.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
     monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: (None, None))
     monkeypatch.setattr(paper_trading, '_post_message', lambda *a, **kw: (None, None))
     monkeypatch.setattr(signals_notify, 'time', type('T', (), {'sleep': staticmethod(lambda *a: None)}))

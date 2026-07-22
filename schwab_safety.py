@@ -156,6 +156,21 @@ def _now():
 # per-account cap before it reaches the API.
 HARD_ORDER_CEILING = 100_000
 
+# Fixed cash cushion required on top of a BUY's notional (automation_principles.md
+# #7a) -- a small static buffer instead of exact real-time accounting for
+# fees or a quote-to-fill price tick. Deliberately small: this is not the
+# user's real safety margin -- the user separately keeps a much larger cash
+# reserve (~$1,000) sitting in the account as their own operational habit, so
+# cash_available already carries that headroom in practice. This constant
+# only needs to cover per-order overage, not restate the user's reserve.
+CASH_SAFETY_BUFFER = 200
+
+# The user's own operational cash-reserve target per account (not a hard
+# requirement -- see check_order's informational-only warning below). Lets
+# the user know to add cash before the reserve actually runs out, rather than
+# discovering it only once an order gets blocked.
+CASH_RESERVE_WATERMARK = 1_000
+
 # Global (all-accounts) burst cap, separate from each account's daily cap --
 # catches a runaway loop spamming orders within a single signal-check minute
 # before the daily cap would ever trip. Sized at 2x the 6-ticker live watchlist
@@ -304,22 +319,45 @@ def _live_ticker_accounts() -> dict:
     return {row["ticker"]: row["account"] for row in signals_db.get_watchlist() if row["mode"] == "live"}
 
 
-def _has_open_order(account: str, ticker: str) -> bool:
-    """True if Schwab's own live order book shows any non-terminal order for
-    this ticker in this account -- a real API call, not local state, since
-    local tracking could drift or miss an order placed outside our own code
-    (e.g. directly in Schwab's UI, as happened during today's settlement test)."""
+def _open_orders(account: str) -> list:
+    """Schwab's own live order book for the account, non-terminal orders only
+    -- a real API call, not local state, since local tracking could drift or
+    miss an order placed outside our own code (e.g. directly in Schwab's UI,
+    as happened during today's settlement test). Shared by _has_open_order
+    and _has_open_buy_order_in_account below so both checks cost one API call,
+    not two."""
     import schwab_client  # local import: schwab_client imports this module at load time
     account_hash = schwab_client._resolve_account_hashes()[account]
     r = schwab_client._get_client().get_orders_for_account(account_hash)
     r.raise_for_status()
-    for o in r.json():
-        if o.get("status") in _OPEN_ORDER_STATUSES_EXCLUDED:
-            continue
+    return [o for o in r.json() if o.get("status") not in _OPEN_ORDER_STATUSES_EXCLUDED]
+
+
+def _has_open_order(orders: list, ticker: str) -> bool:
+    """True if any resting order in `orders` (see _open_orders) is for this
+    ticker, regardless of side."""
+    for o in orders:
         legs = o.get("orderLegCollection", [])
         if any(leg.get("instrument", {}).get("symbol") == ticker for leg in legs):
             return True
     return False
+
+
+def _has_open_buy_order_in_account(orders: list, ticker: str) -> str | None:
+    """Ticker symbol of another resting BUY order anywhere in this account (or
+    None) -- used to block a second concurrent BUY into the same account.
+    Schwab does not reserve buying power for a resting order (see
+    _has_open_order's docstring context above), so the cash-availability
+    check in check_order compares each BUY's notional against the same
+    undecremented account balance -- a flat buffer alone can't cover two
+    simultaneous BUYs competing for the same cash once a second live ticker
+    ever shares an account (not reachable today: every live ticker has its
+    own account, see _live_ticker_accounts, but not structurally enforced)."""
+    for o in orders:
+        for leg in o.get("orderLegCollection", []):
+            if leg.get("instruction") == "BUY" and leg.get("instrument", {}).get("symbol") != ticker:
+                return leg.get("instrument", {}).get("symbol")
+    return None
 
 
 def check_order(
@@ -365,12 +403,22 @@ def check_order(
             f"'{ticker}' was sold today -- same-day re-buy risks a cash-account good-faith violation"
         )
 
-    if side == "BUY" and _has_open_order(account, ticker):
-        raise SafetyViolation(
-            f"'{ticker}' already has an open/working order in '{account}' -- refusing a second "
-            f"concurrent BUY (Schwab doesn't reserve buying power for a resting order, so nothing "
-            f"else stops these from stacking)"
-        )
+    if side == "BUY":
+        orders = _open_orders(account)
+        if _has_open_order(orders, ticker):
+            raise SafetyViolation(
+                f"'{ticker}' already has an open/working order in '{account}' -- refusing a second "
+                f"concurrent BUY (Schwab doesn't reserve buying power for a resting order, so nothing "
+                f"else stops these from stacking)"
+            )
+        other_ticker = _has_open_buy_order_in_account(orders, ticker)
+        if other_ticker:
+            raise SafetyViolation(
+                f"account '{account}' already has a resting BUY order for '{other_ticker}' -- refusing "
+                f"a second concurrent BUY into the same account (Schwab doesn't reserve buying power "
+                f"for a resting order, so two BUYs in one account can both pass a cash check against "
+                f"the same undecremented balance -- automation_principles.md #1)"
+            )
 
     # Signal-window time gate, BUY only (see _SIGNAL_WINDOWS comment above).
     # Skipped for a gap-correction replacement order (Part 3, branch B) -- that
@@ -396,6 +444,40 @@ def check_order(
         raise SafetyViolation(
             f"order notional ${notional:,.0f} ({ticker} x{quantity}) exceeds {account} cap ${limits.notional_cap:,.0f}"
         )
+
+    # Real cash-availability check, BUY only (automation_principles.md #1/#2/#7a)
+    # -- notional_cap above is a static ceiling, not a check against what the
+    # account can actually afford right now. Not bypassed by is_gap_correction:
+    # that flag exists for the signal-window timing gate specifically, this is
+    # a hard financial constraint. Fails closed (blocks the order) if the
+    # balance fetch itself errors -- an unchecked order is exactly the risk
+    # this check exists to prevent.
+    if side == "BUY":
+        import schwab_client  # local import: schwab_client imports this module at load time
+        try:
+            cash_available = schwab_client.get_account_balance(account)
+        except Exception as e:
+            raise SafetyViolation(f"could not verify '{account}' cash balance, blocking order: {e}")
+        required = notional + CASH_SAFETY_BUFFER
+        if cash_available < required:
+            raise SafetyViolation(
+                f"order notional ${notional:,.0f} + ${CASH_SAFETY_BUFFER:,.0f} cash buffer = "
+                f"${required:,.0f} required, but '{account}' only has ${cash_available:,.0f} available"
+            )
+        # Informational only, not blocking (automation_principles.md #4) -- the
+        # user keeps CASH_RESERVE_WATERMARK as their own operational cash
+        # reserve per account; this doesn't gate the order, just flags that
+        # the account is already running thin so cash can be topped up before
+        # it becomes a real problem.
+        if cash_available < CASH_RESERVE_WATERMARK:
+            try:
+                schwab_client._post_message(
+                    f"\U0001F4B0 '{account}' has ${cash_available:,.0f} cash available, below your "
+                    f"${CASH_RESERVE_WATERMARK:,.0f} reserve target -- consider adding cash "
+                    f"(not blocking this {ticker} BUY)"
+                )
+            except Exception:
+                pass
 
     if counts is None:
         with _open_locked() as f:

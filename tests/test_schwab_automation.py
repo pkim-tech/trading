@@ -35,6 +35,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
     monkeypatch.setattr(schwab_safety, '_now', lambda: _IN_WINDOW_TIME)
     monkeypatch.setattr(schwab_client, '_post_message', lambda *a, **kw: (None, None))
+    monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 1_000_000.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
     monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: (None, None))
     monkeypatch.delenv('SCHWAB_KILL_SWITCH', raising=False)
 

@@ -35,6 +35,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
     monkeypatch.setattr(schwab_safety, '_now', lambda: _IN_WINDOW_TIME)
     monkeypatch.setattr(schwab_client, '_post_message', lambda *a, **kw: (None, None))
+    monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 1_000_000.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
     monkeypatch.delenv('SCHWAB_KILL_SWITCH', raising=False)
 
     signals_db.ensure_tables()
@@ -195,6 +197,104 @@ def test_notional_cap_blocked(env):
     cap = schwab_safety.ACCOUNTS['ira'].notional_cap
     with pytest.raises(schwab_safety.SafetyViolation, match="exceeds ira cap"):
         schwab_client.place_equity_buy('ira', TICKER, 1, cap + 1)
+
+
+def test_insufficient_cash_blocked(env, monkeypatch):
+    monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 100.0)
+    with pytest.raises(schwab_safety.SafetyViolation, match="cash buffer"):
+        schwab_client.place_equity_buy('ira', TICKER, 1, 50.0)
+
+
+def test_cash_buffer_required_on_top_of_notional(env, monkeypatch):
+    # Exactly covers the notional but not the CASH_SAFETY_BUFFER on top of it.
+    monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 50.0)
+    with pytest.raises(schwab_safety.SafetyViolation, match="cash buffer"):
+        schwab_client.place_equity_buy('ira', TICKER, 1, 50.0)
+
+
+def test_sufficient_cash_including_buffer_not_blocked(env, monkeypatch):
+    monkeypatch.setattr(
+        schwab_client, 'get_account_balance',
+        lambda account: 50.0 + schwab_safety.CASH_SAFETY_BUFFER,
+    )
+    result = schwab_client.place_equity_buy('ira', TICKER, 1, 50.0)
+    assert result == (None, None)  # dry_run -- passed the check, not actually submitted
+
+
+def test_balance_fetch_failure_fails_closed(env, monkeypatch):
+    def _raise(account):
+        raise RuntimeError("API timeout")
+    monkeypatch.setattr(schwab_client, 'get_account_balance', _raise)
+    with pytest.raises(schwab_safety.SafetyViolation, match="could not verify"):
+        schwab_client.place_equity_buy('ira', TICKER, 1, 50.0)
+
+
+def test_cash_check_not_applied_to_sell(env, monkeypatch):
+    monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 0.0)
+    result = schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
+    assert result == (None, None)  # SELL doesn't need buying power, not blocked
+
+
+def test_second_ticker_resting_buy_in_same_account_blocked(env, monkeypatch):
+    # A second live ticker's BUY into the same account, while another ticker's
+    # BUY is already resting -- both would otherwise check cash against the
+    # same undecremented Schwab balance (Schwab doesn't reserve buying power
+    # for a resting order), so a flat cash buffer alone can't catch this.
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
+        {"status": "WORKING", "orderLegCollection": [
+            {"instruction": "BUY", "instrument": {"symbol": "OTHER_TICKER"}}
+        ]}
+    ])
+    with pytest.raises(schwab_safety.SafetyViolation, match="resting BUY order for 'OTHER_TICKER'"):
+        schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+
+
+def test_resting_sell_order_for_other_ticker_does_not_block_buy(env, monkeypatch):
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
+        {"status": "WORKING", "orderLegCollection": [
+            {"instruction": "SELL", "instrument": {"symbol": "OTHER_TICKER"}}
+        ]}
+    ])
+    result = schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    assert result == (None, None)
+
+
+def test_resting_buy_for_same_ticker_reported_by_ticker_specific_guard(env, monkeypatch):
+    # Same-ticker resting order should raise via the existing _has_open_order
+    # message, not the new account-wide one -- the two checks share one
+    # _open_orders() fetch and must not conflict.
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
+        {"status": "WORKING", "orderLegCollection": [
+            {"instruction": "BUY", "instrument": {"symbol": TICKER}}
+        ]}
+    ])
+    with pytest.raises(schwab_safety.SafetyViolation, match="already has an open/working order"):
+        schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+
+
+def test_reserve_watermark_warning_posted_but_not_blocking(env, monkeypatch):
+    # Cash comfortably covers notional + CASH_SAFETY_BUFFER, but the account's
+    # raw balance is already below CASH_RESERVE_WATERMARK -- should warn, not
+    # block.
+    posted = []
+    monkeypatch.setattr(schwab_client, '_post_message', lambda msg: posted.append(msg))
+    monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 500.0)
+    result = schwab_client.place_equity_buy('ira', TICKER, 1, 50.0)
+    assert result == (None, None)  # dry_run -- not blocked
+    reserve_msgs = [m for m in posted if "reserve target" in m]
+    assert len(reserve_msgs) == 1
+    assert "$500" in reserve_msgs[0]
+
+
+def test_no_reserve_warning_when_comfortably_above_watermark(env, monkeypatch):
+    posted = []
+    monkeypatch.setattr(schwab_client, '_post_message', lambda msg: posted.append(msg))
+    monkeypatch.setattr(
+        schwab_client, 'get_account_balance',
+        lambda account: schwab_safety.CASH_RESERVE_WATERMARK + 1,
+    )
+    schwab_client.place_equity_buy('ira', TICKER, 1, 50.0)
+    assert not any("reserve target" in m for m in posted)
 
 
 def test_hard_ceiling_blocked_regardless_of_account_cap(env, monkeypatch):

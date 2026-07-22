@@ -275,6 +275,36 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
             sell_alerted.add((pos['id'], last_bar_ts))
 
 
+_LAST_SECTION_ALERT: dict[str, float] = {}
+_SECTION_ALERT_COOLDOWN_SECS = 900  # 15 min -- matches the reminder-nag cadence elsewhere
+
+
+def _guarded(section: str, fn, *args, **kwargs):
+    """Runs fn(*args, **kwargs), catching and logging any exception so one
+    failing run_loop section can't crash the whole daemon (automation_principles.md
+    #3 -- per-unit failure isolation). Posts a Slack alert on failure so it
+    doesn't fail silently (#4), rate-limited per section (a persistent failure
+    would otherwise repost every poll cycle). Returns fn's result, or None on
+    failure -- callers that expect a list (e.g. summaries += _guarded(...))
+    must handle None."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        print(f"  [loop] section '{section}' failed: {e}")
+        last = _LAST_SECTION_ALERT.get(section, 0)
+        if time.time() - last > _SECTION_ALERT_COOLDOWN_SECS:
+            _LAST_SECTION_ALERT[section] = time.time()
+            try:
+                _post_message(
+                    f"⚠️ daemon loop section '{section}' failed: {e} "
+                    f"(will keep retrying every poll; repeat alerts suppressed for "
+                    f"{_SECTION_ALERT_COOLDOWN_SECS // 60}min)"
+                )
+            except Exception:
+                pass  # a Slack posting failure must not compound the original one
+        return None
+
+
 def run_loop(tickers: set = None):
     ensure_tables()
     schwab_safety.sync_automation_scope()
@@ -335,167 +365,194 @@ def run_loop(tickers: set = None):
         today = now.strftime('%Y-%m-%d')
         HEARTBEAT_PATH.write_text(now.strftime('%Y-%m-%d %H:%M:%S'))
 
-        if today != last_date:
-            buy_alerted.clear()
-            window_alerted.clear()
-            limit_fill_alerted.clear()
-            reference_alerted.clear()
-            gap_check_alerted.clear()
-            pinned_bar_alerted.clear()
-            last_date = today
+        # Outer last-resort net (automation_principles.md #3): every section
+        # below is already individually guarded via _guarded()/per-item
+        # try-except, so this should rarely trigger -- it exists only to catch
+        # whatever an unexpected exception in the glue code between sections
+        # (or a bug in a guard itself) would otherwise let crash the daemon.
+        try:
+            if today != last_date:
+                buy_alerted.clear()
+                window_alerted.clear()
+                limit_fill_alerted.clear()
+                reference_alerted.clear()
+                gap_check_alerted.clear()
+                pinned_bar_alerted.clear()
+                last_date = today
 
-        for rh, rm in _REFERENCE_TIMES:
-            rlabel = f"{rh:02d}:{rm:02d}"
-            rkey = (today, rlabel)
-            if (now.hour, now.minute) >= (rh, rm) and rkey not in reference_alerted:
-                reference_alerted.add(rkey)
-                wl = get_watchlist()
-                if tickers:
-                    wl = [n for n in wl if n['ticker'] in tickers]
-                send_reference_report(wl)
+            for rh, rm in _REFERENCE_TIMES:
+                rlabel = f"{rh:02d}:{rm:02d}"
+                rkey = (today, rlabel)
+                if (now.hour, now.minute) >= (rh, rm) and rkey not in reference_alerted:
+                    reference_alerted.add(rkey)
 
-        gap_h0, gap_m0, gap_h1, gap_m1 = _GAP_CHECK_WINDOW
-        if (gap_h0, gap_m0) <= (now.hour, now.minute) <= (gap_h1, gap_m1) and today not in gap_check_alerted:
-            gap_check_alerted.add(today)
-            check_gap_resize()
+                    def _send_reference():
+                        wl = get_watchlist()
+                        if tickers:
+                            wl = [n for n in wl if n['ticker'] in tickers]
+                        send_reference_report(wl)
+                    _guarded(f"reference_report[{rlabel}]", _send_reference)
 
-        watchlist = get_watchlist()
-        if tickers:
-            watchlist = [n for n in watchlist if n['ticker'] in tickers]
-        summaries = []
+            gap_h0, gap_m0, gap_h1, gap_m1 = _GAP_CHECK_WINDOW
+            if (gap_h0, gap_m0) <= (now.hour, now.minute) <= (gap_h1, gap_m1) and today not in gap_check_alerted:
+                gap_check_alerted.add(today)
+                _guarded("gap_resize", check_gap_resize)
 
-        def _refresh(ticker):
-            verbose_fh.write(f"\n--- {datetime.now():%Y-%m-%d %H:%M:%S} {ticker} ---\n")
-            with contextlib.redirect_stdout(verbose_fh), contextlib.redirect_stderr(verbose_fh):
-                fetch_live_data_smart(ticker)
-            verbose_fh.flush()
+            watchlist = get_watchlist()
+            if tickers:
+                watchlist = [n for n in watchlist if n['ticker'] in tickers]
+            summaries = []
 
-        refresh_tickers = {p['ticker'] for p in get_open_positions()} | {n['ticker'] for n in watchlist}
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            for t in sorted(refresh_tickers):
-                try:
-                    ex.submit(_refresh, t).result(timeout=15)
-                except FuturesTimeoutError:
-                    print(f"  [data] {t} refresh timed out — skipping")
-                except Exception as e:
-                    print(f"  [data] {t} refresh failed: {e}")
+            def _refresh(ticker):
+                verbose_fh.write(f"\n--- {datetime.now():%Y-%m-%d %H:%M:%S} {ticker} ---\n")
+                with contextlib.redirect_stdout(verbose_fh), contextlib.redirect_stderr(verbose_fh):
+                    fetch_live_data_smart(ticker)
+                verbose_fh.flush()
 
-        # Fire once per window: notify that algo is alive anywhere inside the window
-        # (POLL_SECS=300 means we rarely land on the exact opening minute).
-        for wh, wm, wh1, wm1 in _SIGNAL_WINDOWS:
-            label = f"{wh:02d}:{wm:02d}"
-            wkey = (today, label)
-            if (wh, wm) <= (now.hour, now.minute) <= (wh1, wm1) and wkey not in window_alerted:
-                window_alerted.add(wkey)
-                _send_window_alert(label, watchlist)
+            refresh_tickers = {p['ticker'] for p in get_open_positions()} | {n['ticker'] for n in watchlist}
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                for t in sorted(refresh_tickers):
+                    try:
+                        ex.submit(_refresh, t).result(timeout=15)
+                    except FuturesTimeoutError:
+                        print(f"  [data] {t} refresh timed out — skipping")
+                    except Exception as e:
+                        print(f"  [data] {t} refresh failed: {e}")
 
-        # Exit checks run every poll cycle (not gated to the entry signal windows) —
-        # the backtest evaluates TP/SL/TIME on every hourly bar once in a trade, so
-        # live monitoring needs to check at least that often, not just twice a day.
-        # SL/trailing checks are continuous (every poll); TP/TIME only fire when a
-        # genuinely new hourly bar has closed since the last check, using that bar's
-        # real Close/Low/High — not a live mid-bar tick — to match the backtest kernels.
-        open_positions = get_open_positions()
-        paper_positions = get_open_positions(paper=True)
-        open_position_keys = ({(p['ticker'], p['window']) for p in open_positions}
-                               | {(p['ticker'], p['window']) for p in paper_positions})
+            # Fire once per window: notify that algo is alive anywhere inside the window
+            # (POLL_SECS=300 means we rarely land on the exact opening minute).
+            for wh, wm, wh1, wm1 in _SIGNAL_WINDOWS:
+                label = f"{wh:02d}:{wm:02d}"
+                wkey = (today, label)
+                if (wh, wm) <= (now.hour, now.minute) <= (wh1, wm1) and wkey not in window_alerted:
+                    window_alerted.add(wkey)
+                    _guarded(f"window_alert[{label}]", _send_window_alert, label, watchlist)
 
-        # Pinned single-shot checks (Part 4) -- fire once per hourly bar boundary,
-        # ahead of/instead of relying purely on ambient POLL_SECS-cadence detection.
-        for ph, pm, ps in _PINNED_BAR_TIMES:
-            pkey = (today, ph, pm)
-            if (now.hour, now.minute) >= (ph, pm) and pkey not in pinned_bar_alerted:
-                pinned_bar_alerted.add(pkey)
-                _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar)
-                if (ph, pm) in _PINNED_ENTRY_TIMES:
-                    summaries += _scan_pinned_entry(ph, pm, watchlist, buy_alerted, open_position_keys)
+            # Exit checks run every poll cycle (not gated to the entry signal windows) —
+            # the backtest evaluates TP/SL/TIME on every hourly bar once in a trade, so
+            # live monitoring needs to check at least that often, not just twice a day.
+            # SL/trailing checks are continuous (every poll); TP/TIME only fire when a
+            # genuinely new hourly bar has closed since the last check, using that bar's
+            # real Close/Low/High — not a live mid-bar tick — to match the backtest kernels.
+            open_positions = get_open_positions()
+            paper_positions = get_open_positions(paper=True)
+            open_position_keys = ({(p['ticker'], p['window']) for p in open_positions}
+                                   | {(p['ticker'], p['window']) for p in paper_positions})
 
-        for pos in open_positions:
-            if tickers and pos['ticker'] not in tickers:
-                continue
-            df_hourly, _ = _load_cache(pos['ticker'])
-            if df_hourly is None or df_hourly.empty:
-                continue
-            last_bar_ts = df_hourly.index[-1]
-            if (pos['id'], last_bar_ts) in sell_alerted:
-                continue
-            at_bar_close = last_seen_bar.get(pos['ticker']) != last_bar_ts
-            if at_bar_close:
-                last_seen_bar[pos['ticker']] = last_bar_ts
-                bar = df_hourly.iloc[-1]
-                cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
-            else:
-                cp, _ = _current_price(pos['ticker'])
-                if cp is None:
+            # Pinned single-shot checks (Part 4) -- fire once per hourly bar boundary,
+            # ahead of/instead of relying purely on ambient POLL_SECS-cadence detection.
+            for ph, pm, ps in _PINNED_BAR_TIMES:
+                pkey = (today, ph, pm)
+                if (now.hour, now.minute) >= (ph, pm) and pkey not in pinned_bar_alerted:
+                    pinned_bar_alerted.add(pkey)
+                    _guarded("pinned_exit_arm", _scan_pinned_exit_arm, open_positions, sell_alerted, last_seen_bar)
+                    if (ph, pm) in _PINNED_ENTRY_TIMES:
+                        summaries += _guarded(
+                            "pinned_entry", _scan_pinned_entry, ph, pm, watchlist, buy_alerted, open_position_keys
+                        ) or []
+
+            def _check_position_exit(pos):
+                df_hourly, _ = _load_cache(pos['ticker'])
+                if df_hourly is None or df_hourly.empty:
+                    return
+                last_bar_ts = df_hourly.index[-1]
+                if (pos['id'], last_bar_ts) in sell_alerted:
+                    return
+                at_bar_close = last_seen_bar.get(pos['ticker']) != last_bar_ts
+                if at_bar_close:
+                    last_seen_bar[pos['ticker']] = last_bar_ts
+                    bar = df_hourly.iloc[-1]
+                    cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
+                else:
+                    cp, _ = _current_price(pos['ticker'])
+                    if cp is None:
+                        return
+                    low = high = op = cp
+                reason, target, just_activated_trailing = check_sell_condition(
+                    pos, cp, now, at_bar_close=at_bar_close, low=low, high=high, open_price=op, df_hourly=df_hourly)
+                if just_activated_trailing:
+                    notify_trailing_activated(pos, cp)
+                if reason:
+                    notify_sell_signal(pos, reason, cp, target)
+                    sell_alerted.add((pos['id'], last_bar_ts))
+
+            for pos in open_positions:
+                if tickers and pos['ticker'] not in tickers:
                     continue
-                low = high = op = cp
-            reason, target, just_activated_trailing = check_sell_condition(
-                pos, cp, now, at_bar_close=at_bar_close, low=low, high=high, open_price=op, df_hourly=df_hourly)
-            if just_activated_trailing:
-                notify_trailing_activated(pos, cp)
-            if reason:
-                notify_sell_signal(pos, reason, cp, target)
-                sell_alerted.add((pos['id'], last_bar_ts))
+                _guarded(f"exit_check[{pos['ticker']}]", _check_position_exit, pos)
 
-        paper_trading.check_paper_sells(last_seen_bar, paper_sell_alerted, _load_cache)
+            _guarded("paper_check_sells", paper_trading.check_paper_sells, last_seen_bar, paper_sell_alerted, _load_cache)
 
-        if _reminders_active(now):
-            check_trailing_reminders(open_positions)
-            check_exit_reminders(open_positions)
-            check_buy_reminders()
+            if _reminders_active(now):
+                _guarded("trailing_reminders", check_trailing_reminders, open_positions)
+                _guarded("exit_reminders", check_exit_reminders, open_positions)
+                _guarded("buy_reminders", check_buy_reminders)
 
-        # Not gated to market hours -- a GTC trailing order can fill any time it's
-        # resting at the broker, and auto-fill-detection is opt-in per ticker anyway
-        # (schwab_safety.auto_fill_detection_enabled, off by default).
-        check_auto_fills(open_positions)
+            # Not gated to market hours -- a GTC trailing order can fill any time it's
+            # resting at the broker, and auto-fill-detection is opt-in per ticker anyway
+            # (schwab_safety.auto_fill_detection_enabled, off by default).
+            _guarded("auto_fills", check_auto_fills, open_positions)
 
-        # Fast-path fill reconciliation (Part 3, branch C) -- cheap, non-blocking
-        # drain of whatever schwab_stream's account-activity websocket has queued
-        # since the last iteration. check_auto_fills above is the always-on
-        # fallback, so this is a latency improvement, not a new dependency.
-        drain_fill_queue()
+            # Fast-path fill reconciliation (Part 3, branch C) -- cheap, non-blocking
+            # drain of whatever schwab_stream's account-activity websocket has queued
+            # since the last iteration. check_auto_fills above is the always-on
+            # fallback, so this is a latency improvement, not a new dependency.
+            _guarded("drain_fill_queue", drain_fill_queue)
 
-        # Same "not gated to a window" reasoning as check_auto_fills above -- a
-        # simulated trailing buy can bounce-fill any time after the signal fires.
-        paper_trading.update_paper_buys()
+            # Same "not gated to a window" reasoning as check_auto_fills above -- a
+            # simulated trailing buy can bounce-fill any time after the signal fires.
+            _guarded("paper_update_buys", paper_trading.update_paper_buys)
 
-        if not watchlist:
-            print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
-            _sleep_until_next_cycle(now)
-            continue
-
-        # Intrabar fill detection for limit-entry nodes (all day, not just signal window)
-        for node in watchlist:
-            if node.get('mode') != 'live':
+            if not watchlist:
+                print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
+                _sleep_until_next_cycle(now)
                 continue
-            if node.get('strategy') != 'LimitOrderZScoreBreakout':
-                continue
-            fill_key = (node['ticker'], node['window'], today)
-            if fill_key in limit_fill_alerted:
-                continue
-            cp, _ = _current_price(node['ticker'])
-            if cp is None:
-                continue
-            sig = compute_buy_signal(node)
-            if sig is None:
-                continue
-            if cp <= sig['lower_band']:
-                limit_fill_alerted.add(fill_key)
-                notify_limit_fill(node, cp, sig['lower_band'])
 
-        in_window = _in_buy_window(now)
-        in_open_check_window = _in_window(now, _OPEN_CHECK_WINDOWS)
-        if in_open_check_window:
-            open_check_nodes = [n for n in watchlist if n.get('entry_timing') == 'open_check']
-            if open_check_nodes:
-                summaries += _scan_buy_signals(open_check_nodes, buy_alerted, open_position_keys)
-        if in_window:
-            summaries += _scan_buy_signals(watchlist, buy_alerted, open_position_keys)
-        elif not in_open_check_window:
-            summaries.append(f"outside signal window — next: 10:25 or 14:55 ET")
+            def _check_limit_fill(node):
+                fill_key = (node['ticker'], node['window'], today)
+                if fill_key in limit_fill_alerted:
+                    return
+                cp, _ = _current_price(node['ticker'])
+                if cp is None:
+                    return
+                sig = compute_buy_signal(node)
+                if sig is None:
+                    return
+                if cp <= sig['lower_band']:
+                    limit_fill_alerted.add(fill_key)
+                    notify_limit_fill(node, cp, sig['lower_band'])
 
-        if summaries:
-            print(f"[{now.strftime('%H:%M:%S')}] {' | '.join(summaries)}")
+            # Intrabar fill detection for limit-entry nodes (all day, not just signal window)
+            for node in watchlist:
+                if node.get('mode') != 'live':
+                    continue
+                if node.get('strategy') != 'LimitOrderZScoreBreakout':
+                    continue
+                _guarded(f"limit_fill[{node['ticker']}]", _check_limit_fill, node)
+
+            in_window = _in_buy_window(now)
+            in_open_check_window = _in_window(now, _OPEN_CHECK_WINDOWS)
+            if in_open_check_window:
+                open_check_nodes = [n for n in watchlist if n.get('entry_timing') == 'open_check']
+                if open_check_nodes:
+                    summaries += _guarded(
+                        "scan_buy_open_check", _scan_buy_signals, open_check_nodes, buy_alerted, open_position_keys
+                    ) or []
+            if in_window:
+                summaries += _guarded(
+                    "scan_buy_signals", _scan_buy_signals, watchlist, buy_alerted, open_position_keys
+                ) or []
+            elif not in_open_check_window:
+                summaries.append(f"outside signal window — next: 10:25 or 14:55 ET")
+
+            if summaries:
+                print(f"[{now.strftime('%H:%M:%S')}] {' | '.join(summaries)}")
+        except Exception as e:
+            print(f"  [loop] unhandled exception in main iteration: {e}")
+            try:
+                _post_message(f"🔴 daemon loop iteration crashed: {e} (recovering, continuing to next poll)")
+            except Exception:
+                pass
 
         _sleep_until_next_cycle(now)
 
