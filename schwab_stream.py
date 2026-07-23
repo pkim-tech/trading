@@ -34,6 +34,15 @@ FILL_QUEUE = queue.Queue()
 
 _BACKOFF_STEPS = [5, 10, 20, 40, 60]  # seconds, capped at 60
 
+# Reconnect retries as fast as every 5-60s and never gives up (see
+# run_stream_forever docstring) -- without a cooldown, a persistently stale/
+# missing token would Slack-alert the real trading channel on that same
+# cadence indefinitely, burying real trade alerts (found by Opus review,
+# 2026-07-23). Console/log output is unthrottled (cheap, stays local);
+# only the Slack post is rate-limited.
+_ALERT_COOLDOWN_SECS = 900  # 15 min -- matches active_signals._SECTION_ALERT_COOLDOWN_SECS
+_last_alert_at = 0.0
+
 
 def _parse_activity_message(msg: dict):
     """Best-effort extraction of (account, ticker, side, fill_price,
@@ -68,7 +77,7 @@ def _handle_activity_message(msg: dict):
 
 
 async def _run_stream_once():
-    client = schwab_auth.get_client()
+    client = schwab_auth.get_client(interactive=False)
     stream = StreamClient(client)
     stream.add_account_activity_handler(_handle_activity_message)
     await stream.login()
@@ -83,6 +92,7 @@ def run_stream_forever():
     exception; never gives up (a silent permanent stop would be worse than a
     noisy reconnect loop -- the Slack warning already surfaces the degraded
     state)."""
+    global _last_alert_at
     backoff_idx = 0
     while True:
         try:
@@ -91,7 +101,10 @@ def run_stream_forever():
             delay = _BACKOFF_STEPS[min(backoff_idx, len(_BACKOFF_STEPS) - 1)]
             backoff_idx += 1
             print(f"[schwab_stream] disconnected: {e}\n{traceback.format_exc()}")
-            _post_message(f"⚠️ account-activity stream disconnected: {e} — reconnecting in {delay}s")
+            now = time.time()
+            if now - _last_alert_at > _ALERT_COOLDOWN_SECS:
+                _last_alert_at = now
+                _post_message(f"⚠️ account-activity stream disconnected: {e} — reconnecting in {delay}s")
             time.sleep(delay)
         else:
             backoff_idx = 0

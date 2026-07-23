@@ -34,6 +34,7 @@ def test_reconnect_backoff_increases_and_caps(monkeypatch):
     monkeypatch.setattr(schwab_stream.asyncio, 'run', fake_asyncio_run)
     monkeypatch.setattr(schwab_stream.time, 'sleep', fake_sleep)
     monkeypatch.setattr(schwab_stream, '_post_message', lambda msg: posted.append(msg))
+    monkeypatch.setattr(schwab_stream, '_last_alert_at', 0.0)
 
     with pytest.raises(_StopLoop):
         schwab_stream.run_stream_forever()
@@ -42,7 +43,10 @@ def test_reconnect_backoff_increases_and_caps(monkeypatch):
     # capped -- stays at the last step once past the list
     assert delays[len(schwab_stream._BACKOFF_STEPS)] == schwab_stream._BACKOFF_STEPS[-1]
     assert all("disconnected" in m for m in posted)
-    assert len(posted) == len(delays)
+    # cooldown-gated (2026-07-23): a persistent disconnect no longer alerts on
+    # every retry (a fast real-clock loop like this one never clears the 15min
+    # cooldown), just the first
+    assert len(posted) == 1
 
 
 def test_reconnect_resets_backoff_after_a_clean_run(monkeypatch):

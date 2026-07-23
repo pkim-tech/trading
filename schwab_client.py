@@ -41,10 +41,10 @@ NICKNAMES = ["brokerage", "sep", "roth", "ira"]
 _CLIENT_TIMEOUT_SECS = 10.0
 
 
-def _get_client():
+def _get_client(interactive: bool = False):
     global _client
     if _client is None:
-        _client = schwab_auth.get_client()
+        _client = schwab_auth.get_client(interactive=interactive)
         _client.set_timeout(_CLIENT_TIMEOUT_SECS)
     return _client
 

@@ -1,5 +1,26 @@
 # Backlog Cache
 
+## [live-trading][security] Open, urgent — revert 2026-07-23 live-fire dry-run test state before any real trading day
+All 16 `watchlist_id=65` nodes are currently `mode='live'` (should be `research`), the kill switch
+is disengaged (should be engaged), and UDOW has a fake open position (740 sh @ $67.55,
+`account='ira'`) seeded directly into the real `open_positions` table. `dry_run=True` protected
+this throughout so no real order was ever possible, but this is real production DB/state
+deviation, not just a doc note. Full detail: `docs/deep_backlog.md`'s 2026-07-23 "Live-fire
+dry-run test state left in place" entry. **Revert before market open next real trading session.**
+
+## [live-trading] Resolved 2026-07-23 — Schwab OAuth `interactive=True` default hung the daemon (main client + stream thread), both fixed; alert-spam gap also closed
+Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry. Short version: `schwab_client._get_client()`
+and `schwab_stream._run_stream_once()` both defaulted to `interactive=True`, contra
+`schwab_auth.py`'s own documented unattended-context intent — fixed to `interactive=False` at both
+call sites. Real nuance: schwab-py's `easy_client()` still attempts (and fails) the login flow
+even with `interactive=False` when the token's stale/missing — converts a hang into a clean
+exception, not a no-op — so `schwab_stream`'s existing reconnect loop will still retry-and-fail
+indefinitely on a persistently stale token (not yet fixed, see deep_backlog). Opus review of the
+diff also caught the reconnect loop's failure-alert Slack-posting the real trading channel on
+every retry (not just logging) — fixed with a 15-min cooldown on the alert specifically (matches
+`active_signals._SECTION_ALERT_COOLDOWN_SECS`'s existing convention; console/log stays
+unthrottled). Full suite: 185 passed.
+
 ## [live-trading][security] Resolved 2026-07-22 — stale-cache race at market open (HIBL paper trade entered and SL'd in 31 seconds)
 Full writeup: `docs/research_log.md`'s 2026-07-22 "HIBL paper trade" entry. Short version:
 `signals_compute._current_price()` read the local CSV cache with zero staleness check, so a poll

@@ -715,3 +715,55 @@ Structured `detail` (human-readable short text + JSON, per the user's stated pre
 discussed and deliberately deferred, not built this session.
 `coverage_events` is now considered fully wired against every real control site identified so
 far — treat as closed, not a standing backlog item; revisit only if a new control site is added.
+
+## [live-trading] Resolved 2026-07-23 — Schwab OAuth `interactive=True` default hung the daemon (main client + account-activity stream), both fixed
+Found live: the daemon printed schwab-py's "Press ENTER to open the browser" banner at startup
+(stale/expired 7-day OAuth token), then a second real stall — heartbeat frozen for 2+ minutes,
+two processes parked in `futex_do_wait` — traced to `schwab_client.py::_get_client()` and
+`schwab_stream.py::_run_stream_once()` (the account-activity fast-path stream thread, started
+unconditionally at daemon startup) both calling `schwab_auth.get_client()` with the default
+`interactive=True`, contra `schwab_auth.py`'s own documented intent that unattended contexts
+should use `interactive=False` so a stale token surfaces as an error, not a blocking prompt.
+Fixed: both call sites now pass `interactive=False` explicitly (`_get_client(interactive: bool =
+False)`, default flips; all 13 existing no-arg callers unaffected).
+**Real nuance found empirically, not just from docs**: schwab-py's `easy_client()` does NOT skip
+the login-flow attempt when `interactive=False` and the cached token is missing/stale — it still
+calls `client_from_login_flow(..., interactive=interactive)`, which still calls `webbrowser.get()`
+and raises a real exception (`could not locate runnable browser`, confirmed in this headless WSL
+session) rather than blocking on `input()`. So the fix converts a silent hang into a clean raised
+exception — it does not prevent the attempt itself, and `schwab_stream.run_stream_forever`'s
+existing capped-backoff reconnect loop (5-60s, never gives up) will keep retrying-and-failing
+indefinitely on a stale token.
+**Second real gap found by an Opus review of this exact diff**: that reconnect loop's exception
+handler `_post_message`s a real Slack alert to the live trading channel on every retry, not just
+console/log — a persistently stale token would alert the real channel every ≤60s indefinitely,
+risking burial of real trade alerts and Slack rate-limiting. Fixed: new `_ALERT_COOLDOWN_SECS =
+900` (15 min, matches `active_signals._SECTION_ALERT_COOLDOWN_SECS`'s existing convention) gates
+the Slack post specifically; console/log output stays unthrottled (cheap, local only). Considered
+and declined making the alert itself back off exponentially (mirroring the connection retry's own
+backoff) — user's call: connection-retry backoff bounds server load, alert-cooldown bounds human
+attention, no reason to conflate the two into one mechanism; flat cooldown matches the one
+existing precedent in this codebase.
+2 existing tests updated for the new `interactive` kwarg / cooldown-gated alert count
+(`test_schwab_client.py::test_get_client_applies_short_timeout`,
+`test_schwab_stream.py::test_reconnect_backoff_increases_and_caps`). Full suite: 185 passed.
+**Not yet fixed** (real, still open): nothing actually prevents the stream thread from retrying
+forever against a token that can never succeed without a human completing the browser login —
+the fail-fast fix only converts hang-forever into fail-and-retry-forever. A real fix would check
+token file validity/freshness before ever calling `easy_client` and stop retrying (or fall back to
+a single one-time warning) once it's structurally clear no reconnect can succeed headless. See
+`docs/backlog_cache.md`.
+
+## [live-trading][security] Live-fire dry-run test state left in place 2026-07-23 — needs manual revert
+Session included a deliberate real-daemon dry-run exercise (not a harness/sim): kill switch
+disengaged, all 16 `watchlist_id=65` nodes (10 real v5 + 6 canary) flipped to `mode='live'`,
+UDOW additionally given `account='ira'` and a fake open position seeded directly into the real
+`open_positions` table (740 sh @ $67.55, no real order behind it) so a SELL trigger had something
+to fire against. `dry_run=True` on all 4 accounts throughout — confirmed (via Opus review
+precedent + direct code read of `schwab_safety.check_order`'s ordering) that no real order could
+reach Schwab regardless of kill-switch/mode state. Daemon was started/stopped several times during
+the session and is **currently not running**. None of this was reverted before session end.
+**Action needed next session**: revert all 16 nodes back to `mode='research'`, re-engage the kill
+switch, delete UDOW's fake `open_positions` row (and any `trade_log`/`coverage_events` rows it
+generated), and drop the `account='ira'` assignment. Real Schwab OAuth login (browser-based) also
+still not done — needed before the cash-balance check can pass for any real BUY-side dry-run test.

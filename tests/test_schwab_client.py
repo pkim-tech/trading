@@ -71,7 +71,7 @@ def test_get_client_applies_short_timeout(monkeypatch):
         def set_timeout(self, timeout):
             calls.append(timeout)
 
-    monkeypatch.setattr(schwab_client.schwab_auth, "get_client", lambda: FakeClient())
+    monkeypatch.setattr(schwab_client.schwab_auth, "get_client", lambda interactive=False: FakeClient())
 
     schwab_client._get_client()
 
