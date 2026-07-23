@@ -604,3 +604,76 @@ synthetic positions instead.
 6 canary) via direct query. Deploying them is what surfaced the reference-report bugs — see
 `docs/research_log.md`'s 2026-07-23 entry and `docs/backlog_cache.md`'s resolved entries for
 that investigation.
+
+## ✅ [live-trading] Resolved 2026-07-23 — `scripts/live_sim_harness.py` built: non-interactive coverage harness for `active_signals.py`/`signals_*.py`
+Decided 2026-07-22 (see the entry directly above this one), built 2026-07-23. Six scenarios,
+each calling the real orchestration function directly against an isolated sim DB
+(`TRADING_DB_PATH` override, same mechanism `scripts/live_sim.py` already used) — full run takes
+~2s: `scenario_pinned_entry_trailing_buy` (`_scan_pinned_entry`, the real open-check trailing-buy
+entry path), `scenario_pinned_exit_arm` (`_scan_pinned_exit_arm` arming + `notify_trailing_
+activated` persisting both `trailing` and `peak`, regression coverage for the 2026-07-22
+stale-clobber bug), `scenario_reconcile_fill_topup` (`signals_notify._reconcile_fill` with a
+deliberately forced shortfall), `scenario_gap_resize` (`signals_notify.check_gap_resize`,
+asserting the actual replacement order's ticker/shares/price via a `wraps=` spy on
+`place_equity_buy`, not just the Slack text), `scenario_time_exit` (`check_sell_condition`'s TIME
+trigger via bars-held, not wall-clock hours), and `scenario_ambient_market_buy_entry` (the second
+real entry path — an automated market buy via `_scan_buy_signals` → `notify_buy_signal` →
+`_attempt_automated_market_buy` → synchronous fast-confirm → `_reconcile_buy_fill` → SL
+placement). Real z-score math runs unmodified against a real synthetic CSV written to
+`cache/research/` (same convention as `tests/conftest.py`'s `make_synthetic_csv`) — only the
+`schwab_client` broker-network boundary is stubbed via `unittest.mock.patch.object`, since the
+harness's job is verifying wiring (dedup, mode-gating, arm/re-arm state, sizing math, Slack
+content), not re-verifying signal math (`backtest-change-rollout`'s job).
+
+**Found and fixed along the way** (real bugs, not hypothetical):
+1. `signals_db.get_open_position()` (singular ticker lookup) never coerced `trail_state` from
+   `None` to `{}` the way `get_open_positions()`/`get_position_by_id()` already do — calling
+   `check_sell_condition` against its result raised `TypeError: 'NoneType' object is not
+   iterable` inside `strategies.py`'s `check_exit`. A pre-existing inconsistency (a stale comment
+   in `tests/test_part4_entry_trigger.py` even documented it as expected), not previously hit
+   because nothing in production called `check_sell_condition` against this function's raw
+   result. Fixed to match its siblings; full suite unaffected (184 passed).
+2. **Safety incident, found and remediated the same session**: `schwab_safety.py` has several
+   real, hardcoded (`Path(__file__).parent / ...`) state files — order counts (`STATE_PATH`),
+   kill switch, ticker-automation pause, auto-fill-detection toggle, automation-scope — none
+   gated by `TRADING_DB_PATH` the way the DB is. An early version of this harness (before this
+   was known) placed real dry-run BUY attempts that wrote straight into the real
+   `cache/live/schwab_order_counts.json` across repeated debug runs, driving the real `ira`
+   account's `daily_order_cap` counter to its actual limit (10/10) before it was caught (the
+   harness's own scenarios started silently failing cross-contamination, which is what surfaced
+   it). The file was reset (confirmed safe: its `recent_orders` contents were entirely the
+   harness's own synthetic `ZHARN*` tickers, all counts are self-expiring/date-keyed, and the
+   real kill switch — engaged since 2026-07-16 — meant no real order could have gone through
+   regardless). **Structural fix, not just a harness workaround**: added `SCHWAB_STATE_DIR` env
+   var to `schwab_safety.py` (mirrors `TRADING_DB_PATH` exactly — `_STATE_DIR` computed once at
+   import time, all five real paths derive from it), so the harness now sets
+   `SCHWAB_STATE_DIR` to a fresh `tempfile.mkdtemp()` before importing any project module,
+   isolating all five files at once (kill-switch-engaged reads as `False` for a nonexistent
+   file, no separate stub needed). This is the durable fix — any future test/sim script gets the
+   same isolation automatically, not just this one harness.
+3. Independent Opus review (requested mid-build) verified the `SCHWAB_STATE_DIR` remediation was
+   complete (no other real file/OAuth-token path reachable given `dry_run=True` short-circuits
+   before any real client call) and flagged two of the six scenarios' assertions as weaker than
+   the regression they claimed to guard — both tightened: `scenario_pinned_exit_arm` now checks
+   `peak` survived alongside `trailing` (the original clobber bug dropped both), and
+   `scenario_gap_resize` now spies on the real `place_equity_buy` call args instead of asserting
+   only the Slack message text.
+
+Full suite: 184 passed (was 181; +3 from the stale-price-exit-alert item below, +0 net from this
+item's `get_open_position` fix). Not yet adopted as a required step in any workflow (e.g.
+`feature wrap`/`session wrap`) or documented in `docs/automation_principles.md` — still just a
+tool that exists, per the original 2026-07-22 decision's "document as standing convention" being
+left undone.
+
+## ✅ [live-trading] Resolved 2026-07-23 — Slack alert for the stale-price-guard silent-suppression gap (2026-07-22 HIBL incident's residual finding)
+The one gap the 2026-07-22 independent Opus review flagged as not-yet-fixed: when
+`signals_compute._current_price()` returns `(None, None)` (its market-open staleness guard, or a
+genuine same-day data-refresh failure), `active_signals._check_position_exit`'s mid-bar branch
+silently `return`s — no SL/trailing-stop/TIME check runs against that real position for that
+poll, previously with only a `log_poll` trace line, no Slack alert. Fixed:
+`signals_notify.alert_stale_price_exit_suppressed(pos)`, rate-limited 15min per position id (same
+cooldown pattern as `_alert_reconcile_mismatch`/`_guarded`'s per-section cooldown), wired into
+`_check_position_exit` at the `cp is None` branch. 3 new tests
+(`tests/test_stale_price_exit_alert.py`): fires with ticker/account/function name in the message,
+rate-limited on a second call, and keyed per-position (not shared across positions). Full suite:
+184 passed (was 181).

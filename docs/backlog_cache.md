@@ -10,9 +10,10 @@ landed. Fixed: `_current_price()` now returns `(None, None)` if the cache predat
 market's open; all 6 call sites already handled `None`. Real (non-paper) exposure existed too —
 `_check_position_exit`'s mid-bar branch and `_check_limit_fill` share the same function — but
 never fired live (`dry_run=True` everywhere). Independent Opus review confirmed the fix and flagged
-one residual gap, not yet fixed: on a live day, a genuine (non-open-race) data-refresh failure now
-silently suppresses a real position's intrabar exit check via only a `log_poll` trace, no Slack
-alert. **Action needed**: add that alert.
+one residual gap: on a live day, a genuine (non-open-race) data-refresh failure now silently
+suppresses a real position's intrabar exit check via only a `log_poll` trace, no Slack alert.
+**Resolved 2026-07-23** — see `docs/deep_backlog.md`'s 2026-07-23 "Slack alert for the
+stale-price-guard silent-suppression gap" entry.
 Also built this session: `signals_db.slack_message_log`/`log_slack_message`/`get_slack_messages`
 (full text + mode of every real `_post_message` call — previously zero persistent record existed,
 which is why the user's morning reference report was unrecoverable after scrolling past it in
@@ -85,23 +86,13 @@ flush behavior and the error-column plumbing are both straightforward enough tha
 was the real verification — see `docs/live_test_coverage.md` if this should get a synthetic test
 later). Full suite: 181 passed throughout.
 
-## [live-trading] Not started, decided 2026-07-22 — extend `scripts/live_sim.py` into a scriptable, standard coverage harness for `active_signals.py`/`signals_*.py` changes
-Raised because calendar-paced canaries (above) are too slow to exercise everything — e.g. proving
-the top-up buffer logic (`signals_notify._reconcile_fill`, fires when a real fill's shortfall vs.
-target notional exceeds one share's price) by waiting for a real fill to happen to underfill by
-that much could take a long time, and canaries fundamentally can't reach any real-broker-order
-mechanic (SL placement, top-up, gap-resize) at all without a `mode='live'` + real dry_run account,
-a bigger and different undertaking. `scripts/live_sim.py` already drives the real `compute_buy_
-signal`/`check_sell_condition`/`notify_*` functions against an isolated `trading_sim.db`, but only
-interactively (manual REPL commands). **Decided**: extend it to call `_scan_pinned_entry`/
-`_scan_pinned_exit_arm`/`_reconcile_fill` (with a deliberately-forced shortfall)/`check_gap_resize`/
-TIME-exit/both entry paths directly and non-interactively, so a full pass takes seconds, not days —
-and adopt this as the standard verification step for any future `active_signals.py`/`signals_*.py`
-change, the same role `backtest-change-rollout` plays for kernel changes. Canaries stay complementary
-(day-to-day visual proof-of-life in Slack) rather than being replaced. **Action needed**: build the
-harness; canary design (above) should probably be finalized after, not in parallel, per user's lean.
-Also not yet done: document this as a standing convention (likely `docs/automation_principles.md`
-or a new project skill mirroring `backtest-change-rollout`).
+## [live-trading] Resolved 2026-07-23 — `scripts/live_sim_harness.py` built (non-interactive coverage harness)
+Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry — 6 scenarios, ~2s full run, plus a real
+`get_open_position` trail_state bug and a real safety incident (harness polluted the live
+`schwab_order_counts.json`, remediated with a new `SCHWAB_STATE_DIR` env override in
+`schwab_safety.py`) found and fixed along the way. **Still not done**: adopt as a required step in
+any workflow, and document as a standing convention in `docs/automation_principles.md` or a new
+skill (mirroring `backtest-change-rollout`) — the tool exists but isn't yet wired into practice.
 
 ## [backtest] Open, paused 2026-07-22 — "v6" idle-capital parking idea; inconclusive, downturn-specific follow-up queued
 Full detail in `docs/research_log.md`'s 2026-07-22 entry. Short version, in the order the

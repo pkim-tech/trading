@@ -2832,3 +2832,35 @@ User asked explicitly for this to become a standing convention: any future strat
 ### Next session
 - Pick up task 2 (stale-price-guard alert) and task 1 (`live_sim.py` harness) from the prior session's plan, still both outstanding.
 - Watch the Morning Report over the next few real sends to confirm the block-count fix holds as more canaries/nodes potentially get added later (currently 16 nodes fits comfortably under 50 blocks, but there's no hard ceiling/guard against it recurring if the watchlist grows further — worth a defensive check if it becomes a recurring risk).
+
+---
+
+## 2026-07-23 — Stale-price exit alert built; live_sim_harness.py built and found/fixed a real safety-state leak along the way
+
+### What we did
+- **Task 2 (carried over from 2026-07-22)**: built `signals_notify.alert_stale_price_exit_suppressed(pos)` — fires when `_current_price()` returns `None` and silently skips a real position's mid-bar exit check, rate-limited 15min/position. Wired into `active_signals._check_position_exit`. 3 new tests (`tests/test_stale_price_exit_alert.py`).
+- **Task 1 (carried over from 2026-07-22)**: built `scripts/live_sim_harness.py`, a non-interactive coverage harness extending `scripts/live_sim.py` — 6 scenarios calling the real orchestration functions directly (`_scan_pinned_entry`, `_scan_pinned_exit_arm`, `signals_notify._reconcile_fill` with a forced shortfall, `signals_notify.check_gap_resize`, TIME-exit via `check_sell_condition`, and an ambient market-buy entry path), against real synthetic z-score data, full run ~2s.
+- **Found and fixed a real, pre-existing bug while building the harness**: `signals_db.get_open_position()` (singular ticker lookup) never coerced `trail_state` from `None` to `{}` the way `get_open_positions()`/`get_position_by_id()` already do — a stale comment in `tests/test_part4_entry_trigger.py` had even documented this as expected behavior. Fixed to match its siblings.
+- **Found and remediated a real safety incident while building the harness**: `schwab_safety.py` has several hardcoded state files (order counts, kill switch, ticker-automation pause, auto-fill toggle, automation scope) not gated by `TRADING_DB_PATH` the way the DB is. An early version of the harness wrote real dry-run BUY attempts straight into the real `cache/live/schwab_order_counts.json` across repeated debug runs, driving the real `ira` account's `daily_order_cap` counter to its actual limit (10/10) before this was caught. Reset the file (confirmed safe — pure synthetic-ticker pollution, all counts self-expiring/date-keyed, and the real kill switch has been engaged since 2026-07-16 anyway so no real order could have gone through regardless). **Structural fix, not just a workaround**: added `SCHWAB_STATE_DIR` env var to `schwab_safety.py`, mirroring `TRADING_DB_PATH` exactly — the harness now isolates all five real state files at once via a fresh `tempfile.mkdtemp()`, and any future test/sim script gets the same isolation automatically.
+- **Independent Opus review** (requested mid-build) verified the `SCHWAB_STATE_DIR` remediation was complete (no other real file/OAuth path reachable given `dry_run=True` short-circuits before any real client call) and flagged two scenario assertions as weaker than the regression they claimed to guard. Both tightened: `scenario_pinned_exit_arm` now checks `peak` survived alongside `trailing` (the original 2026-07-22 clobber bug dropped both, not just one); `scenario_gap_resize` now spies on the real `place_equity_buy` call args (ticker/shares/price/`is_gap_correction`) instead of asserting only the Slack message text. Also fixed a cross-scenario DB-sharing bug this surfaced: `check_gap_resize()` iterates every pending_buys row, so a ticker-agnostic mocked `get_current_price` return value spuriously cleared a different scenario's leftover pending-buy trigger too — fixed with a ticker-gated `side_effect`.
+- Ran the required pre-commit regression check (`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`) — clean, consistent with prior documented drift.
+- Full `pytest tests/`: 184 passed throughout (was 181 at session start).
+
+### Backlog additions
+- `docs/backlog_cache.md`: stale-price-guard alert item marked resolved (pointer to deep_backlog); "extend live_sim.py" item resolved and shrunk to a pointer.
+- `docs/deep_backlog.md`: two new resolved (✅) entries with full detail — the harness build (incl. the `get_open_position` bug and the `SCHWAB_STATE_DIR` safety incident) and the stale-price-exit alert.
+- `docs/live_test_coverage.md`: updated the Offline coverage column for 5 rows (pinned entry, market-buy placement, top-up, gap-resize, exit-arm) to reference the new harness scenarios.
+
+### Not yet done
+- Adopting `scripts/live_sim_harness.py` as a required step in any workflow (`feature wrap`/`session wrap`) — it exists but isn't wired into practice yet.
+- Documenting the harness as a standing convention in `docs/automation_principles.md` or a new project skill (mirroring `backtest-change-rollout`) — still open from the original 2026-07-22 decision.
+- Whether to add an Opus code-review step to `session wrap` by default (raised twice now, 2026-07-22 and again implicitly this session) — still just discussed, not decided.
+
+### Current state
+- Kill switch still engaged (🛑 STOPPED) since 2026-07-16 — untouched by anything this session, confirmed via direct file read after the harness runs.
+- Real `cache/live/schwab_order_counts.json` confirmed absent/clean after the final harness run (no leak recurrence).
+- All accounts still `dry_run=True`, all real nodes still `mode='research'` — nothing here changes real-money exposure.
+
+### Next session
+- Decide whether/how to formalize `live_sim_harness.py` as a required step (workflow doc + skill).
+- Revisit the Opus-review-in-session-wrap question if it comes up again.

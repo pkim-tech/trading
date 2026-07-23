@@ -138,6 +138,34 @@ def _alert_reconcile_mismatch(pos, kind, text):
     _post_message(text)
 
 
+_STALE_PRICE_ALERTED: dict[str, float] = {}
+_STALE_PRICE_COOLDOWN_SECS = 900  # 15 min -- same cadence as the other suppression/mismatch alerts
+
+
+def alert_stale_price_exit_suppressed(pos):
+    """A real (non-paper) position's mid-bar exit check was silently skipped
+    because `signals_compute._current_price` returned None -- either the
+    open-market-before-first-refresh race the stale-price guard was built for
+    (2026-07-22, HIBL paper trade), or a genuine same-day data-refresh
+    failure. Either way, no SL/trailing-stop/TIME check ran against this
+    position at all for this poll (backlog item, HIBL incident writeup: a
+    real position's stale-guard suppression previously produced only a
+    `log_poll` trace line, no Slack alert). Rate-limited per position so a
+    persistent same-day data outage doesn't repost every poll cycle."""
+    ticker = pos['ticker']
+    account = pos.get('account')
+    key = str(pos['id'])
+    last = _STALE_PRICE_ALERTED.get(key, 0)
+    if time.time() - last < _STALE_PRICE_COOLDOWN_SECS:
+        return
+    _STALE_PRICE_ALERTED[key] = time.time()
+    _post_message(
+        f"⚠️ *{ticker}* ({account}) exit check skipped this poll — no fresh price available\n"
+        f"(`_current_price` returned None: stale/missing same-day data; position remains open, "
+        f"unmonitored until the next successful refresh)"
+    )
+
+
 def check_live_state_reconciliation(open_positions):
     """Detection-only live-state reconciliation (automation_principles.md #5,
     #1 -- backlog 2026-07-21). For each open position on an automation-scope

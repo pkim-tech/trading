@@ -747,7 +747,11 @@ def get_open_position(ticker, paper=False):
             f"SELECT * FROM {positions_table} WHERE ticker=? ORDER BY entry_time DESC LIMIT 1",
             (ticker,)
         ).fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    d = dict(row)
+    d['trail_state'] = json.loads(d['trail_state']) if d.get('trail_state') else {}
+    return d
 
 
 def get_position_by_id(position_id, paper=False):

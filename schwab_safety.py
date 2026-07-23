@@ -23,20 +23,29 @@ import signals_db
 
 load_dotenv()
 
-STATE_PATH = Path(__file__).parent / "cache" / "live" / "schwab_order_counts.json"
+# Overridable so a test/sim script (e.g. scripts/live_sim_harness.py) can isolate
+# every real safety-state file the same way signals_config.DB_PATH is isolated via
+# TRADING_DB_PATH -- found 2026-07-23 the hard way: none of these paths were
+# overridable, and a harness script under active development wrote real dry-run
+# BUY attempts straight into the real STATE_PATH across repeated runs, driving the
+# real 'ira' account's daily_order_cap counter to its actual limit before this was
+# caught. Defaults to the original hardcoded location when unset.
+_STATE_DIR = Path(os.environ.get("SCHWAB_STATE_DIR", str(Path(__file__).parent / "cache" / "live")))
+
+STATE_PATH = _STATE_DIR / "schwab_order_counts.json"
 
 # Separate file (not just SCHWAB_KILL_SWITCH env var) so a Slack "Stop Engine"
 # button click survives a daemon restart -- an env var set in-process would
 # silently reset to "running" on the next restart, the wrong default for a
 # safety-critical switch (2026-07-15).
-KILL_SWITCH_PATH = Path(__file__).parent / "cache" / "live" / "schwab_kill_switch.json"
+KILL_SWITCH_PATH = _STATE_DIR / "schwab_kill_switch.json"
 
 # Per-ticker on/off within AUTOMATION_ENABLED_TICKERS scope (2026-07-17) -- the
 # scope set itself is a deliberate code change (widen once a pilot is proven
 # out), but day to day a single ticker's automation needs to be pausable from a
 # phone without touching code, same rationale as the global kill switch above.
 # Same persisted-file pattern so a pause survives a daemon restart.
-TICKER_AUTOMATION_PATH = Path(__file__).parent / "cache" / "live" / "schwab_ticker_automation.json"
+TICKER_AUTOMATION_PATH = _STATE_DIR / "schwab_ticker_automation.json"
 
 # Auto-fill-detection toggle (2026-07-17) -- separate from ticker_automation_enabled
 # above (which gates order *placement*) and opposite default: placement automation
@@ -45,7 +54,7 @@ TICKER_AUTOMATION_PATH = Path(__file__).parent / "cache" / "live" / "schwab_tick
 # distinct, newer capability that stays off until explicitly enabled per ticker,
 # since schwab_client.get_filled_order's field parsing hasn't been confirmed
 # against a real fill response yet.
-AUTO_FILL_DETECTION_PATH = Path(__file__).parent / "cache" / "live" / "schwab_auto_fill_detection.json"
+AUTO_FILL_DETECTION_PATH = _STATE_DIR / "schwab_auto_fill_detection.json"
 
 # Mirrors active_signals._SIGNAL_WINDOWS + _OPEN_CHECK_WINDOWS -- kept as separate
 # constants here (not imported) to avoid a real circular import (active_signals ->
@@ -145,7 +154,7 @@ AUTOMATION_ENABLED_TICKERS = {
     t.strip() for t in os.environ.get("SCHWAB_AUTOMATION_TICKERS", "").split(",") if t.strip()
 }
 
-AUTOMATION_SCOPE_STATE_PATH = Path(__file__).parent / "cache" / "live" / "schwab_automation_scope.json"
+AUTOMATION_SCOPE_STATE_PATH = _STATE_DIR / "schwab_automation_scope.json"
 
 
 def sync_automation_scope():

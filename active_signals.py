@@ -87,7 +87,7 @@ from signals_notify import (
     EXIT_REMINDER_MINUTES, _exit_pending_blocks, check_exit_reminders,
     BUY_REMINDER_MINUTES, _trailing_buy_status, _pending_buy_blocks, check_buy_reminders,
     check_auto_fills, check_gap_resize, drain_fill_queue,
-    check_live_state_reconciliation,
+    check_live_state_reconciliation, alert_stale_price_exit_suppressed,
     _ticker_block, _send_window_alert,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report,
@@ -486,6 +486,7 @@ def run_loop(tickers: set = None):
                 else:
                     cp, _ = _current_price(pos['ticker'])
                     if cp is None:
+                        alert_stale_price_exit_suppressed(pos)
                         return
                     low = high = op = cp
                 log_poll(f"{pos['ticker']} exit_check bar={last_bar_ts} at_bar_close={at_bar_close} "
