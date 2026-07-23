@@ -88,7 +88,7 @@ from signals_notify import (
     BUY_REMINDER_MINUTES, _trailing_buy_status, _pending_buy_blocks, check_buy_reminders,
     check_auto_fills, check_gap_resize, drain_fill_queue,
     check_live_state_reconciliation, alert_stale_price_exit_suppressed,
-    _ticker_block, _send_window_alert,
+    _ticker_block, _send_window_alert, _coverage_mode,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report,
 )
@@ -296,6 +296,8 @@ def _guarded(section: str, fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except Exception as e:
         print(f"  [loop] section '{section}' failed: {e}")
+        db.log_coverage_event("daemon_section_exception", _coverage_mode(None),
+                               result=section, detail=str(e))
         last = _LAST_SECTION_ALERT.get(section, 0)
         if time.time() - last > _SECTION_ALERT_COOLDOWN_SECS:
             _LAST_SECTION_ALERT[section] = time.time()

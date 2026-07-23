@@ -126,25 +126,12 @@ further conclusion. Scripts ready: `scripts/sim_v6_parking_vehicle_sweep.py` (wi
 cached in `output/v6_gap_windows.csv` with the broadened 776-window definition),
 `scripts/sim_v6_split_check.py --split 50-50`/`70-30`/`5fold` (supports arbitrary fold configs).
 
-## [live-trading] In progress, 2026-07-22 — coverage_events matrix: transaction-phase/control coverage tracking across paper/dry_run/live
-Built this session (uncommitted): new `signals_db.coverage_events` table + `log_coverage_event()`/
-`get_coverage_events()`, `scripts/coverage_matrix.py` (pivot: rows=scenario_key, columns=paper/
-dry_run/live, cell=count+most-recent-date+result; `--detail` drills into raw rows). Answers
-`automation_principles.md` #10's ledger by query instead of hand-maintained status text in
-`docs/live_test_coverage.md`. Wired into 7 real control sites so far: `cash_check`, `same_day_block`
-(both branches), `dup_order_blocked`/`dup_sell_order_blocked`/`second_ticker_buy_blocked`/
-`dup_order_window_blocked`/`dup_order_retry_after_failure` (all in `schwab_safety.check_order`),
-`gap_resize` (all 3 failure/success branches in `signals_notify.check_gap_resize`),
-`reconciliation_mismatch`/`reconciliation_fetch_failed` (`check_live_state_reconciliation`), and
-paper-trading's `entry_fill`/`exit_fill` (`paper_trading.py`, both trailing-bounce and market-buy
-paths, plus sell). Verified against a scratch DB (`TRADING_DB_PATH` override) — real
-`trading_live.db` untouched. Full suite still 177 passed after wiring.
-**Not yet done**: remaining ~13 scenarios from `docs/live_test_coverage.md` not yet wired (SL
-placement sync/async, top-up/`_reconcile_fill`, trailing-arm re-read in
-`notify_trailing_activated`, `drain_fill_queue` fast-path, daemon-survives-exception,
-open-price-quality, second-live-ticker-BUY-blocked already covered above actually — double check
-overlap before wiring more). **Action needed**: decide whether to wire the rest now or let this
-set run for a while first and see how useful it is. Not yet committed.
+## [live-trading] Resolved 2026-07-23 — coverage_events fully wired (stale "~13 remaining" note corrected, `daemon_section_exception` added)
+Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry. Short version: nearly everything on the
+old "not yet wired" list turned out to already be wired (the note was stale); the one real gap
+(`_guarded()` not logging whether the daemon survives a section exception) is now fixed via a
+new `daemon_section_exception` scenario key. Full suite: 185 passed. Treat as closed — revisit
+only if a new control site is added.
 
 ## [live-trading][security] Planned for Friday (2026-07-24 WFH day) — real-account sanity tests: oversized BUY + naked SELL across several tickers, on the new limited-margin IRA only
 Built this session (uncommitted): `scripts/live_sanity_check.py` — standalone, bypasses

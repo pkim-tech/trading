@@ -2864,3 +2864,34 @@ User asked explicitly for this to become a standing convention: any future strat
 ### Next session
 - Decide whether/how to formalize `live_sim_harness.py` as a required step (workflow doc + skill).
 - Revisit the Opus-review-in-session-wrap question if it comes up again.
+
+---
+
+## 2026-07-23 — session wrap process hardened (Opus review + live-sim harness both required); coverage_events audited and fully wired
+
+### What we did
+- **Made `scripts/live_sim_harness.py` a required `session wrap` step** (was built last session but never adopted into practice): `CLAUDE.md`'s `session wrap` now runs it whenever `active_signals.py`/`signals_*.py`/`schwab_*.py` changed, documented as `docs/automation_principles.md` #11.
+- **Added an independent Opus code-review step to `session wrap`**, resolving a question raised twice in prior session caches and never decided: whenever live-trading modules *or* the backtest kernel (`backtester.py`/`strategies.py`/`run_optimization_sweep.py`) changed, spawn a fresh Opus review agent against the real diff and resolve any CONFIRMED finding before committing. Widened to include the kernel deliberately — a kernel bug is just as load-bearing as a live-trading bug, since paper trading/dry run/live all inherit whatever the kernel got wrong (same rationale as the gap-through-trigger fixes found this way in prior sessions). Documented as `docs/automation_principles.md` #12.
+- **Audited `coverage_events` wiring and found the "~13 remaining scenarios" backlog note was stale.** Grepped every real `log_coverage_event(` call site: `sl_placement` (+ fast-confirm timeout), `top_up`, `trailing_arm_state_reread`, `gap_resize`, `fast_path_fill_reconciliation`, `reconciliation_mismatch`/`reconciliation_fetch_failed`, `cash_check`, `same_day_block`, and all 5 dup-order guards were already wired — presumably done in a later session without the backlog note ever being updated. `open_price_quality` was never meant to live in `coverage_events` at all; it already has its own dedicated `open_price_quality_log` table.
+- **The one real gap found and fixed**: `active_signals._guarded()` (wraps every `run_loop` section so one section's exception can't crash the daemon) caught and alerted on exceptions but never logged whether the daemon actually survived one. Added a new `daemon_section_exception` scenario key, logged inside `_guarded`'s except block (`mode` via `signals_notify._coverage_mode(None)`, safely falls back to `"dry_run"`; `result=<section>`; `detail=<exception text>`). New test `test_guarded_logs_coverage_event_on_failure` (`tests/test_run_loop_fault_tolerance.py`), using the same `signals_config.DB_PATH` monkeypatch isolation pattern as `test_db_roundtrip.py`.
+- Discussed whether `coverage_events` captures enough state to support the kind of manual cross-check done with the HIBL trailing-buy CSV a week prior: concluded `detail` is free-text (real numbers present, e.g. `shares=`/`price=`/`required=$`/`available=$`, but not structured columns, and expected-vs-actual values aren't stored side by side) — good for spot-checking a row, not for query-level aggregation or automated verification yet. User's stated preference for a future upgrade: human-readable short text *and* CSV-reviewable *and* JSON — deliberately deferred, not built this session.
+- Ran the new session-wrap steps for real on this session's own changes: independent Opus review of the `_guarded`/coverage_events diff came back clean (one accepted non-issue: the new log call fires on every caught exception, not cooldown-gated like the paired Slack alert — judged fine given the table's count+most-recent-date purpose). `scripts/live_sim_harness.py`: 6/6 scenarios passed. `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`: clean, consistent with prior documented drift.
+- Full `pytest tests/`: 185 passed (was 184).
+
+### Backlog additions
+- `docs/backlog_cache.md`: `live_sim_harness.py` adoption item marked resolved (pointer to `automation_principles.md` #11); `coverage_events` item marked resolved and shrunk to a one-line pointer at `docs/deep_backlog.md`.
+- `docs/deep_backlog.md`: full-detail resolved (✅) entry for the coverage_events audit + `daemon_section_exception` fix.
+- `docs/automation_principles.md`: new #11 (live-sim harness required in session wrap) and #12 (Opus review required in session wrap for live-trading/kernel changes).
+- `docs/live_test_coverage.md`: "Daemon survives an unhandled exception mid-loop" row updated to note the new `daemon_section_exception` coverage_events instrumentation and the 7th unit test.
+- Memory: `feedback_session_commands.md` updated to reflect the new (longer) `session wrap` definition.
+
+### Not yet done
+- Structured `detail` field for `coverage_events` (human-readable short text + JSON, per the user's stated preference) — discussed, deliberately deferred.
+- Whether/when to revisit `coverage_events` further is now considered closed unless a new control site gets added — no longer a standing backlog item.
+
+### Current state
+- Kill switch still engaged (🛑 STOPPED) since 2026-07-16 — untouched this session.
+- All accounts still `dry_run=True`, all real nodes still `mode='research'` — nothing here changes real-money exposure.
+
+### Next session
+- Nothing specifically queued from this session — check `docs/backlog_cache.md` in full at session start as usual (WFH real-account sanity tests were planned for 2026-07-24, i.e. tomorrow relative to this session).

@@ -2,7 +2,9 @@
 that lets run_loop survive an exception in any one loop-body section
 (automation_principles.md #3/#4). No real Schwab/Slack calls -- _post_message
 is stubbed, no daemon loop is actually started."""
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import active_signals
+import signals_config
+import signals_db as db
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +21,16 @@ def _reset_alert_cooldown(monkeypatch):
     # Each test gets a clean cooldown state -- otherwise test order could
     # suppress an alert that a given test expects to see.
     monkeypatch.setattr(active_signals, '_LAST_SECTION_ALERT', {})
+
+
+@pytest.fixture
+def isolated_db(monkeypatch):
+    tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tmp_db.close()
+    monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))
+    active_signals.ensure_tables()
+    yield
+    os.unlink(tmp_db.name)
 
 
 def test_guarded_returns_result_on_success():
@@ -84,3 +98,16 @@ def test_guarded_different_sections_each_get_their_own_alert(monkeypatch):
     active_signals._guarded("section_a", _raise)
     active_signals._guarded("section_b", _raise)
     assert len(posted) == 2  # different sections don't share a cooldown bucket
+
+
+def test_guarded_logs_coverage_event_on_failure(monkeypatch, isolated_db):
+    monkeypatch.setattr(active_signals, '_post_message', lambda *a, **kw: None)
+
+    def _raise():
+        raise RuntimeError("boom")
+
+    active_signals._guarded("failing_section", _raise)
+    events = db.get_coverage_events(scenario_key="daemon_section_exception")
+    assert len(events) == 1
+    assert events[0]['result'] == "failing_section"
+    assert "boom" in events[0]['detail']

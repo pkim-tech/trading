@@ -677,3 +677,41 @@ cooldown pattern as `_alert_reconcile_mismatch`/`_guarded`'s per-section cooldow
 (`tests/test_stale_price_exit_alert.py`): fires with ticker/account/function name in the message,
 rate-limited on a second call, and keyed per-position (not shared across positions). Full suite:
 184 passed (was 181).
+
+## ✅ [live-trading] Resolved 2026-07-23 — coverage_events fully wired; stale "~13 remaining" note corrected; `daemon_section_exception` added
+Originally built 2026-07-22 (`signals_db.coverage_events` table + `log_coverage_event()`/
+`get_coverage_events()`, `scripts/coverage_matrix.py` pivot view — see that session's entry
+above) with 7 real control sites wired. A follow-up backlog note at the time listed ~13
+scenarios as "not yet wired": SL placement (sync/async), top-up/`_reconcile_fill`, trailing-arm
+re-read in `notify_trailing_activated`, `drain_fill_queue` fast-path, daemon-survives-exception,
+open-price-quality, and (flagged as possibly-already-covered) second-live-ticker-BUY-blocked.
+**2026-07-23 audit**: grepped every real `log_coverage_event(` call site in the codebase and
+found the note was stale — `sl_placement` (+ `sl_placement_fast_confirm_timeout`), `top_up`,
+`trailing_arm_state_reread`, `gap_resize`, `fast_path_fill_reconciliation`,
+`reconciliation_mismatch`/`reconciliation_fetch_failed`, `cash_check`, `same_day_block`, and all
+5 dup-order guards were already wired (in `signals_notify.py`/`schwab_safety.py`), evidently
+done in a later session without this backlog entry ever being updated to reflect it.
+`open_price_quality` was never meant to live in `coverage_events` in the first place — it already
+has its own dedicated `open_price_quality_log` table (Part 4 Deliverable 2), a separate design
+choice, not a gap.
+**The one real gap found**: `active_signals._guarded()` (wraps every `run_loop` section in
+try/except so one section's exception can't crash the daemon, automation_principles.md #3/#4)
+caught and alerted on exceptions but never logged whether the daemon actually survived one — no
+queryable record of which sections fail, how often, or when. Fixed: new `daemon_section_exception`
+scenario key logged inside `_guarded`'s except block, `mode` via `signals_notify._coverage_mode(None)`
+(safe fallback to `"dry_run"` since `_guarded` wraps whole daemon-loop sections, not one
+account), `result=<section name>`, `detail=<exception text>`. Logs on every caught exception
+(not cooldown-gated like the paired Slack alert) — an independent Opus review confirmed this is
+an accepted non-issue given the table's diagnostic (count + most-recent) purpose, not a
+correctness bug. New test `test_guarded_logs_coverage_event_on_failure`
+(`tests/test_run_loop_fault_tolerance.py`), using the same `signals_config.DB_PATH` monkeypatch
+isolation pattern as `test_db_roundtrip.py`. Full suite: 185 passed (was 184).
+Prompted by discussing whether `coverage_events` captures enough state to support the kind of
+manual cross-check the user did with the HIBL trailing-buy CSV a week prior — concluded
+`detail` is free-text (real numbers like `shares=`/`price=`/`required=$`/`available=$` are
+present, but not structured columns, and expected-vs-actual isn't stored side by side), so it
+supports spot-checking a row but not query-level aggregation or automated verification yet.
+Structured `detail` (human-readable short text + JSON, per the user's stated preference) was
+discussed and deliberately deferred, not built this session.
+`coverage_events` is now considered fully wired against every real control site identified so
+far — treat as closed, not a standing backlog item; revisit only if a new control site is added.
