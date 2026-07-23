@@ -90,9 +90,9 @@ later). Full suite: 181 passed throughout.
 Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry — 6 scenarios, ~2s full run, plus a real
 `get_open_position` trail_state bug and a real safety incident (harness polluted the live
 `schwab_order_counts.json`, remediated with a new `SCHWAB_STATE_DIR` env override in
-`schwab_safety.py`) found and fixed along the way. **Still not done**: adopt as a required step in
-any workflow, and document as a standing convention in `docs/automation_principles.md` or a new
-skill (mirroring `backtest-change-rollout`) — the tool exists but isn't yet wired into practice.
+`schwab_safety.py`) found and fixed along the way. **Resolved 2026-07-23**: wired into `CLAUDE.md`'s
+`session wrap` (runs when `active_signals.py`/`signals_*.py`/`schwab_*.py` changed) and documented
+as `docs/automation_principles.md` #11.
 
 ## [backtest] Open, paused 2026-07-22 — "v6" idle-capital parking idea; inconclusive, downturn-specific follow-up queued
 Full detail in `docs/research_log.md`'s 2026-07-22 entry. Short version, in the order the

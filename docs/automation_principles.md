@@ -117,3 +117,30 @@ the same claim as "this scenario has actually run correctly in production."
 live validation (Deliverable 2's `open_price_quality_log`, the cash-balance check, the whole
 Part 3/Part 4 automation surface) with no single place tracking which scenarios still lack a
 real live observation — easy to lose track of across sessions without one.
+
+## 11. Run the live-sim coverage harness before closing a session that touched live-trading code
+Whenever `active_signals.py` or any `signals_*.py`/`schwab_*.py` module changed during a
+session, run `python scripts/live_sim_harness.py` (all 6 scenarios, ~2s) and confirm every
+scenario passes before that session's `session wrap`/`session close`, in addition to the unit
+suite and the kernel-parity verify scripts (#9).
+**Why**: the harness exercises real orchestration functions (`_scan_pinned_entry`,
+`_scan_pinned_exit_arm`, `_reconcile_fill`, `check_gap_resize`, TIME-exit, ambient market-buy)
+end-to-end against synthetic data — a layer unit tests don't cover and the real daemon can't
+safely be used to test. Built 2026-07-23; found a real `get_open_position` bug and a real state-
+file pollution incident (`SCHWAB_STATE_DIR`) in its first build session, so it has already
+demonstrated value beyond what the unit suite alone catches.
+
+## 12. Independent Opus review before closing a session that touched live-trading code or the backtest kernel
+`session wrap` now spawns a fresh Opus review agent (no context from the session's own reasoning)
+against the real diff whenever `active_signals.py`, any `signals_*.py`/`schwab_*.py` module, or
+the backtest kernel (`backtester.py`, `strategies.py`, `run_optimization_sweep.py`) changed —
+resolve any CONFIRMED finding before committing.
+**Why**: this project's most serious bugs (the 2026-07-22 trailing-arm state clobber causing
+duplicate live sell orders; the 2026-07-19/20 trailing-buy/trailing-stop gap-through-trigger
+kernel bugs) were caught by an ad hoc independent Opus review requested mid-session, not by the
+author's own inspection or the unit suite. A kernel mistake is just as load-bearing as a
+live-trading one — paper trading, dry run, and eventual live execution all inherit whatever the
+kernel got wrong, so a resweep built on a silent kernel bug produces confidently wrong numbers
+same as a live daemon bug produces a wrong order. Making the review a standing, required step
+(rather than something raised occasionally, per session_cache's 2026-07-22/23 notes) closes that
+gap instead of relying on remembering to ask for it.
