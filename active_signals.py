@@ -314,7 +314,13 @@ def run_loop(tickers: set = None):
     ensure_tables()
     schwab_safety.sync_automation_scope()
 
-    human_fh = open(HUMAN_LOG_PATH, "a")
+    # buffering=1 (line-buffered) -- without it this file object block-buffers
+    # since it's not a tty, so console output (including any Slack post error)
+    # can sit invisible on disk for a long time; found 2026-07-22 debugging a
+    # live missing-report incident where the file's mtime was frozen for 10+
+    # minutes while the daemon was demonstrably still looping (heartbeat proved
+    # it), making the buffered output useless for real-time diagnosis.
+    human_fh = open(HUMAN_LOG_PATH, "a", buffering=1)
     sys.stdout = _Tee(sys.__stdout__, human_fh)
     sys.stderr = _Tee(sys.__stderr__, human_fh)
     verbose_fh = open(VERBOSE_LOG_PATH, "a")
@@ -342,7 +348,14 @@ def run_loop(tickers: set = None):
     startup_wl = get_watchlist()
     if tickers:
         startup_wl = [n for n in startup_wl if n['ticker'] in tickers]
-    send_reference_report(startup_wl)
+    _ref_channel, _ref_ts = send_reference_report(startup_wl)
+    # 2026-07-22: run_loop previously discarded this return value entirely --
+    # a real live incident (startup report sent but never received) had no way
+    # to be confirmed/denied afterward since there was no ts to check against
+    # Slack directly (chat.getPermalink). Print it so it lands in the
+    # now-line-buffered human log immediately, not just trusted silently.
+    print(f"  [slack] startup reference report: channel={_ref_channel} ts={_ref_ts}"
+          f"{' (no confirmed post -- check for a prior [slack error] line)' if not _ref_channel else ''}")
 
     buy_alerted:        set[tuple] = set()
     sell_alerted:       set[tuple] = set()  # (position_id, bar_ts) — dedups within a bar, not across bars
@@ -395,7 +408,9 @@ def run_loop(tickers: set = None):
                         wl = get_watchlist()
                         if tickers:
                             wl = [n for n in wl if n['ticker'] in tickers]
-                        send_reference_report(wl)
+                        rc, rts = send_reference_report(wl)
+                        print(f"  [slack] {rlabel} reference report: channel={rc} ts={rts}"
+                              f"{' (no confirmed post -- check for a prior [slack error] line)' if not rc else ''}")
                     _guarded(f"reference_report[{rlabel}]", _send_reference)
 
             gap_h0, gap_m0, gap_h1, gap_m1 = _GAP_CHECK_WINDOW

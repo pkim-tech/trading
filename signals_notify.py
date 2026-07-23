@@ -1166,8 +1166,15 @@ def _ticker_block(row):
         z_trig = row.get('Z Trigger')
         z_trig_str = f"z1 `{z_trig:g}`  " if z_trig is not None else ''
         trig_label = row.get('Trigger Label', 'trig')
+        # Not-live rows are visible in the report (2026-07-22 fix) but must
+        # never read as an actionable live trigger -- research is the normal
+        # state right now (whole watchlist), canary is a synthetic test node
+        # not meant to be traded at all (see the "Manually Open" suppression
+        # below, automation_principles.md #0/#7).
+        mode_tag = ' 🧪CANARY' if (row.get('_node') or {}).get('version') == 'canary' \
+            else (' (research)' if row.get('Mode') == 'research' else '')
         text = (
-            f"{phase_str}*{ticker}* `{version}`{account_str}{last_sale_str}\n"
+            f"{phase_str}*{ticker}* `{version}`{mode_tag}{account_str}{last_sale_str}\n"
             f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_\n"
             f"{z_trig_str}tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
@@ -1175,51 +1182,64 @@ def _ticker_block(row):
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
 
     if cfg.INTERACTIVE:
+        # 2026-07-22: collapsed from up to 3 separate `actions` blocks per row
+        # into 1 (Slack allows up to 5 elements per actions block, we use at
+        # most 3) -- with the mode filter fix above making every watchlist row
+        # render instead of none, 16 rows x up to 4 blocks each blew past
+        # Slack's hard 50-block-per-message limit and the report failed
+        # outright (invalid_blocks). This cuts the per-row block count enough
+        # to fit the full watchlist in one message again.
+        elements = []
         node = row.get('_node')
         if row['Held']:
             pos = row.get('_pos')
             if pos:
                 value = json.dumps({"position_id": pos['id'], "ticker": ticker, "entry_price": pos['entry_price']})
-                blocks.append({"type": "actions", "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": f"Manually Close {ticker}"},
-                     "action_id": "manual_close", "value": value},
-                ]})
-        elif node:
+                elements.append({"type": "button", "text": {"type": "plain_text", "text": f"Manually Close {ticker}"},
+                                  "action_id": "manual_close", "value": value})
+        # Canary nodes are synthetic test fixtures with deliberately absurd
+        # parameters (hair-trigger z-thresholds, unreachable SL) -- never
+        # offer a real "Manually Open" button for one (automation_principles.md
+        # #0/#7: a new surface, here "research rows are now visible", must not
+        # silently inherit an action that was previously unreachable because
+        # nothing research-mode ever rendered here before 2026-07-22).
+        elif node and node.get('version') != 'canary':
             node_fields = {k: node.get(k) for k in ('ticker', 'strategy', 'version', 'window',
                                                       'take_profit', 'stop_loss', 'max_hold_hours',
                                                       'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct',
                                                       'starting_notional')}
             value = json.dumps({"node": node_fields})
-            blocks.append({"type": "actions", "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": f"Manually Open {ticker}"},
-                 "action_id": "manual_open", "value": value},
-            ]})
+            elements.append({"type": "button", "text": {"type": "plain_text", "text": f"Manually Open {ticker}"},
+                              "action_id": "manual_open", "value": value})
 
         # Per-ticker automation pause/resume -- only shown for tickers actually in
         # the automation pilot scope (see schwab_safety.AUTOMATION_ENABLED_TICKERS),
         # so the other manual-only tickers don't show a button that does nothing.
         if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
             automation_on = schwab_safety.ticker_automation_enabled(ticker)
-            blocks.append({"type": "actions", "elements": [
+            elements.append(
                 {"type": "button", "text": {"type": "plain_text", "text": f"⏸️ Pause {ticker} Automation"},
                  "style": "danger", "action_id": "pause_ticker_automation", "value": ticker}
                 if automation_on else
                 {"type": "button", "text": {"type": "plain_text", "text": f"▶️ Resume {ticker} Automation"},
-                 "style": "primary", "action_id": "resume_ticker_automation", "value": ticker},
-            ]})
+                 "style": "primary", "action_id": "resume_ticker_automation", "value": ticker}
+            )
 
             # Auto-fill-detection toggle -- separate from the placement toggle above and
             # defaults off (see schwab_safety.AUTO_FILL_DETECTION_PATH comment): placement
             # automation is proven via this session's dry-run testing, fill detection isn't
             # exercised against a real fill yet.
             fill_detection_on = schwab_safety.auto_fill_detection_enabled(ticker)
-            blocks.append({"type": "actions", "elements": [
+            elements.append(
                 {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Disable {ticker} Auto-Fill Detection"},
                  "style": "danger", "action_id": "disable_auto_fill_detection", "value": ticker}
                 if fill_detection_on else
                 {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Enable {ticker} Auto-Fill Detection"},
-                 "action_id": "enable_auto_fill_detection", "value": ticker},
-            ]})
+                 "action_id": "enable_auto_fill_detection", "value": ticker}
+            )
+
+        if elements:
+            blocks.append({"type": "actions", "elements": elements})
 
     return blocks
 
@@ -1257,7 +1277,14 @@ def build_reference_table(watchlist):
     positions = {p['ticker']: p for p in db.get_open_positions()}
     pending_buys = {p['ticker']: p for p in db.get_pending_buys()}
     rows = []
-    for node in [n for n in watchlist if n.get('mode') == 'live']:
+    # 2026-07-22 fix: this used to filter to mode=='live' only -- silently
+    # correct while every node really was live, but once the whole watchlist
+    # moved to mode='research' (2026-07-20 v5 promotion) it made the entire
+    # Morning Report render empty (structure/header only, zero candidate rows)
+    # with no error or indication anything was wrong. The report's whole
+    # purpose is visibility into watchlist/canary state regardless of mode --
+    # show everything, mark mode on each row instead of hiding non-live ones.
+    for node in watchlist:
         ticker = node['ticker']
         pos = positions.get(ticker)
         sig = compute.compute_buy_signal(node)
@@ -1273,7 +1300,7 @@ def build_reference_table(watchlist):
                 'Z': None, 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': node.get('trail_buy_pct'), 'Arm%': node.get('arm_sell_pct'),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
-                'Strategy': node['strategy'], 'Held': False, 'Phase': phase,
+                'Strategy': node['strategy'], 'Held': False, 'Phase': phase, 'Mode': node.get('mode'),
                 '_node': node, '_pos': None, '_sig': None,
             })
             continue
@@ -1305,7 +1332,7 @@ def build_reference_table(watchlist):
                 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': trail_buy_pct, 'Arm%': node.get('arm_sell_pct'),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
-                'Strategy': node['strategy'], 'Held': False, 'Phase': phase,
+                'Strategy': node['strategy'], 'Held': False, 'Phase': phase, 'Mode': node.get('mode'),
                 'SL $': trigger * (1 - schwab_sl_pct / 100), 'Arm $': trigger * (1 + db._tp_or_arm_pct(node) / 100),
                 'Overnight %': (now_price - sig['prev_close']) / sig['prev_close'] * 100,
                 'Prev Close': sig['prev_close'], 'Data Date': sig['last_daily_bar'],
@@ -1356,6 +1383,7 @@ def build_reference_table(watchlist):
                 'TrailBuy%': pos.get('trail_buy_pct'), 'Arm%': arm_pct,
                 'TrailSell%': trail_sell_pct, 'Account': account, 'Last Sale $': last_sale,
                 'Strategy': pos.get('strategy', node['strategy']), 'Held': True, 'Phase': phase,
+                'Mode': node.get('mode'),
                 'SL $': sl_price, 'PnL %': (now_price - pos['entry_price']) / pos['entry_price'] * 100,
                 '_node': node, '_pos': pos, '_sig': sig,
             })
@@ -1465,4 +1493,4 @@ def send_reference_report(watchlist):
             emoji = _proximity_emoji(r['Proximity'])
             print(f"  {emoji} {r['Ticker']:<6} {r['Version']}  now=${r['Now']:>7.2f}  trigger=${r['Next Trigger $']:>7.2f}  ({r['Proximity']:+.1f}%)  z={r['Z']:>+5.2f}  [{r['Strategy']}]")
 
-    _post_message(f"Morning Report — {now_str}", blocks=blocks)
+    return _post_message(f"Morning Report — {now_str}", blocks=blocks)

@@ -25,14 +25,14 @@ def _post_message(text, blocks=None):
             footer_marker = {"type": "context", "elements": [{"type": "mrkdwn", "text": "🧪 *SIM MODE END*"}]}
             blocks = [header_marker] + blocks + [footer_marker]
     log_mode = 'sim' if cfg.SIM_MODE else ('live' if cfg.SOCKET_MODE else ('webhook' if cfg.SLACK_HOOK else 'console'))
-    db.log_slack_message(log_mode, text)
+    channel, ts, error = None, None, None
     if cfg.SOCKET_MODE:
         try:
             resp = cfg.bolt_app.client.chat_postMessage(channel=cfg.SLACK_CHANNEL, text=text, blocks=blocks)
-            return resp['channel'], resp['ts']
+            channel, ts = resp['channel'], resp['ts']
         except Exception as e:
+            error = str(e)
             print(f"  [slack error] {e}")
-            return None, None
     elif cfg.SLACK_HOOK:
         payload = {'text': text}
         if blocks:
@@ -40,10 +40,15 @@ def _post_message(text, blocks=None):
         try:
             r = requests.post(cfg.SLACK_HOOK, json=payload, timeout=5)
             if not r.ok:
-                print(f"  [slack error] HTTP {r.status_code}")
+                error = f"HTTP {r.status_code}"
+                print(f"  [slack error] {error}")
         except Exception as e:
+            error = str(e)
             print(f"  [slack error] {e}")
-    return None, None
+    # Logged after the attempt (not before) so a row reflects the real outcome
+    # -- see log_slack_message's docstring for why this ordering matters.
+    db.log_slack_message(log_mode, text, error=error)
+    return channel, ts
 
 
 def _fields_block(fields: dict):

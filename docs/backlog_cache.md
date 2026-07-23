@@ -21,35 +21,69 @@ lines to `VERBOSE_LOG_PATH`, wired into every price/bar-consuming decision point
 investigation. Full suite: 181 passed. Not yet committed as of this backlog entry — see session
 close commit.
 
-## [live-trading] Not started, designed 2026-07-22 — canary watchlist nodes for daily paper-trading proof-of-life; has a real sizing bug, not deployed
-Goal: synthetic watchlist nodes with extreme parameters that reliably exercise a specific paper-
-trading code path every trading day, so a regression in the daemon's polling/fill/arm/exit
-pipeline shows up as "a canary didn't do what it should have" instead of going unnoticed (this is
-how the HIBL bug above was found — by accident, not by any standing check). Six were scoped:
-- A (SPY, `TrailingBothZScoreBreakout`, `entry_timing='close'`, z=0.1 w=5 tb=.1 arm=.1 sl=30 ts=.1):
-  full happy path same day — ambient entry → bounce-fill → arm → trailing-sell.
-- B (QQQ, same shape, sl=.1 arm=10): ambient entry → bounce-fill → immediate SL.
-- C (same as A, `entry_timing='open_check'`): exercises `_scan_pinned_entry` + `open_price_quality_log`.
-- D (signal late-day, larger `trail_buy_pct`): pending buy carried overnight → next-open bounce-fill,
-  a direct regression test for the stale-cache fix above.
-- E (`strategy='TrailingExitZScoreBreakout'`, not TrailingBoth): `signals_db._is_trailing_buy` routes
-  on the strategy's axis schema, not the `trail_buy_pct` value, so only a real TrailingExit node can
-  ever reach `paper_trading.start_paper_market_buy` — a TrailingBoth node with `trail_buy_pct=0`
-  would NOT have tested this (an earlier version of this plan got this wrong).
-- F (arm/SL practically unreachable, tiny `max_hold_hours`): TIME exit.
-Verified (diffed programmatically, not eyeballed): `TrailingBothZScoreBreakout.check_exit` and
-`TrailingExitZScoreBreakout.check_exit` are functionally identical (only blank-line differences) —
-so A/B/C/D/F's exit-side coverage applies to both live strategies even though they're tagged
-TrailingBoth. Also confirmed: `_scan_pinned_exit_arm` only ever reads real (`paper=False`)
-`open_positions` — no canary, however designed, can exercise it; either a real coverage gap worth
-closing or an accepted limitation, not decided.
-**Real bug found by independent Opus review, not yet fixed**: `starting_notional=500` in the draft
-script (`scripts/add_canary_nodes.py`, A/B only, uncommitted) sizes to `int(500 // price) == 0`
-shares at SPY/QQQ's real price (~$700+) — both canaries would silently never fill. Needs raising to
-something like $10k+ before this is usable.
-**Action needed**: fix the sizing bug, add C/D/E/F to the script, decide on `_scan_pinned_exit_arm`'s
-paper-blind-spot. User leaning toward building the `live_sim.py` extension below first and
-validating canary design against it, rather than building both in parallel.
+## [live-trading] Resolved 2026-07-22/23 — canary watchlist nodes for daily paper-trading proof-of-life, all six built and live
+Full design writeup moved to `docs/deep_backlog.md`'s 2026-07-23 entry. Short version: `scripts/
+add_canary_nodes.py` now adds all six (A-F) to the active watchlist, `starting_notional` raised
+500→10000 (the sizing bug that would've sized to 0 shares at SPY/QQQ prices, caught by Opus review),
+and run — all 6 confirmed present in `watch_list` (watchlist_id=65, 16 nodes total now: 10 real v5 +
+6 canary). `_scan_pinned_exit_arm`'s paper-blind-spot (no canary can exercise it, real positions only)
+left as an accepted limitation, not closed — deferred to the `live_sim.py` harness item below, which
+can call it directly against synthetic positions.
+**Immediate follow-on discovery, same session**: adding these 6 research-mode rows to the watchlist
+is what surfaced the reference-report bugs below — they'd been invisible for weeks because the
+report had been silently rendering zero candidate rows the whole time.
+
+## [live-trading][security] Resolved 2026-07-23 — Morning Report silently rendered empty for weeks (mode filter), then broke outright once fixed (Slack block-limit)
+Full incident writeup in `docs/research_log.md`'s 2026-07-23 entry (the debugging path is worth
+keeping — it's a case study in an observability gap producing a wrong initial diagnosis). Two
+real, separate bugs, found while chasing "the restart didn't send a report":
+1. **`build_reference_table` (`signals_notify.py`) filtered to `mode == 'live'` only.** Every
+   watchlist node has been `mode='research'` since the 2026-07-20 v5 promotion, so the report has
+   been posting successfully (header/kill-switch/context blocks) with **zero candidate rows**
+   underneath — no error, no indication anything was wrong, just silently useless. This is
+   exactly what the user originally suspected ("send it even if not live") and what got wrongly
+   ruled out mid-session (checked `send_reference_report` for mode-gating, found none, missed
+   that the function it calls has its own filter). Fixed: removed the filter, all nodes render
+   now, each row carries `Mode` for display.
+2. **Immediately exposed a second bug**: with all 16 rows rendering, the message hit 53 Slack
+   blocks — over the hard 50-block-per-message limit — and Slack rejected it outright
+   (`invalid_blocks`). Fixed: collapsed each row's up-to-3 separate `actions` blocks (manual
+   open/close, automation pause/resume, auto-fill toggle) into one (Slack allows up to 5 elements
+   per actions block), cutting per-row block count enough to fit again.
+3. **Safety fix alongside #1**: research-mode rows becoming visible meant canary nodes (deliberately
+   absurd parameters, never meant to be traded) would get the same "Manually Open {ticker}" button
+   as any real candidate for the first time. Suppressed for any node with `version == 'canary'`
+   (automation_principles.md #0/#7 — a newly-exposed surface must not silently inherit an action
+   that was previously unreachable). Also added a `🧪CANARY`/`(research)` tag to non-live rows so
+   they're never visually confused with an actionable live trigger.
+Verified: fresh report sent and independently confirmed via `chat.getPermalink` (not just trusting
+the API response) — real permalink, all 16 rows present, canaries tagged. Full suite: 181 passed.
+
+## [live-trading] Resolved 2026-07-23 — two logging/observability gaps found while chasing the above, both fixed
+Found because the above incident was genuinely undiagnosable in real time — worth fixing on its
+own merits, not just as a side effect:
+1. **`logs/active_signals.log` never flushed.** `human_fh = open(HUMAN_LOG_PATH, "a")`
+   (`active_signals.py`) had no explicit `.flush()` anywhere, unlike the verbose log — since it's
+   not a tty, Python fully block-buffers it, so console output (including any `[slack error]`
+   line) could sit invisible on disk for the buffer's lifetime. Confirmed live: the file's mtime
+   was frozen for 10+ minutes while the daemon was demonstrably still looping (heartbeat proved
+   it). Fixed: `open(HUMAN_LOG_PATH, "a", buffering=1)` (line-buffered). Takes effect on next
+   restart — done, daemon already restarted with the fix live.
+2. **`slack_message_log` recorded intent, not delivery.** `db.log_slack_message(mode, text)` was
+   called *before* the real `chat_postMessage`/webhook attempt in `signals_blocks._post_message`
+   — a row's existence was wrongly read as proof of a successful send mid-incident (a real mistake
+   made in this session, not just a hypothetical risk). Fixed: new nullable `error` column
+   (migration applied to the live DB, backed up first as
+   `trading_live.db.bak_20260722_233127_pre_slack_log_migration`), and the log call moved to
+   *after* the attempt, populated with the caught exception/HTTP-status string (`None` = no error
+   caught). `_post_message` also now returns `(channel, ts)` reliably from a single code path.
+   `send_reference_report` and `active_signals.py`'s two call sites (startup + scheduled) now
+   print/capture that return value instead of discarding it, so a future incident has a real
+   `ts` to check via `chat.getPermalink` instead of nothing.
+Both root-caused entirely by inspection/live testing, no unit tests added yet for either (the
+flush behavior and the error-column plumbing are both straightforward enough that a live restart
+was the real verification — see `docs/live_test_coverage.md` if this should get a synthetic test
+later). Full suite: 181 passed throughout.
 
 ## [live-trading] Not started, decided 2026-07-22 — extend `scripts/live_sim.py` into a scriptable, standard coverage harness for `active_signals.py`/`signals_*.py` changes
 Raised because calendar-paced canaries (above) are too slow to exercise everything — e.g. proving

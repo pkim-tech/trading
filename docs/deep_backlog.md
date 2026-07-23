@@ -568,3 +568,39 @@ instead of the real `1.0`, silently wrong, no error — worked around that sessi
 SQL inserts. **Fixed**: `add_node` gained a `fixed_sl_override=None` parameter — when set,
 used instead of `_config_fixed_stop_loss()`; `None` (the default) preserves the old
 config-read behavior for legacy v3.x callers, so no existing call site needed to change.
+
+## ✅ [live-trading] Resolved 2026-07-23 — canary watchlist nodes (A-F) built, sizing bug fixed, all live
+Designed 2026-07-22, built 2026-07-23. `scripts/add_canary_nodes.py` adds six synthetic
+`watch_list` nodes (SPY/QQQ/IWM/DIA/VOO/XLF — liquid, cached, unused by any real node) to the
+active watchlist, all `mode='research'`, `version='canary'`, with deliberately extreme parameters
+so each should complete its expected lifecycle every trading day:
+- **A** (SPY, `TrailingBothZScoreBreakout`, `entry_timing='close'`): full happy path — ambient
+  entry → bounce-fill → arm → trailing-sell, all same day. `fixed_sl=30` (unreachable),
+  `arm_sell_pct`/`trail_buy_pct`/`trail_sell_pct`=0.1 (hair-trigger).
+- **B** (QQQ, same shape): early-SL path — bounce-fill → immediate SL. `arm_sell_pct=10`
+  (unreachable), `fixed_sl=0.1` (hair-trigger).
+- **C** (IWM, same as A but `entry_timing='open_check'`): exercises `_scan_pinned_entry` +
+  `open_price_quality_log` — the pinned intrabar-open scan, distinct from A's bar-close-only path.
+- **D** (DIA, `trail_buy_pct=5.0`): large enough that the bounce-fill is unlikely to complete
+  same day — a pending trailing-buy carried overnight into the next session's open is a direct
+  daily regression check for the 2026-07-22 stale-cache fix (`_current_price`'s market-open
+  staleness guard).
+- **E** (VOO, `strategy='TrailingExitZScoreBreakout'`, not TrailingBoth): `signals_db.
+  _is_trailing_buy` routes on the strategy's axis schema (`sl_axis` class attribute), not the
+  `trail_buy_pct` value — only a real TrailingExit node reaches `paper_trading.
+  start_paper_market_buy` (immediate market buy, no `pending_buys` row) instead of the
+  bounce-fill path A-D exercise. A TrailingBoth node with `trail_buy_pct=0` would NOT have
+  tested this (an earlier version of the plan got this wrong).
+- **F** (XLF, `take_profit=50`/`fixed_sl_override=50`, `max_hold_hours=2`): arm and SL both
+  practically unreachable, tiny hold cap — the only exit path left open is TIME.
+**Sizing bug fixed**: `starting_notional=500` (the original A/B draft) sizes to
+`int(500 // price) == 0` shares at SPY/QQQ's real price (~$700+) — both would have silently
+never filled. Caught by independent Opus review before deployment; raised to `10000` for all six.
+**Accepted limitation, not closed**: `_scan_pinned_exit_arm` only ever reads real (non-paper)
+`open_positions` — no canary, however designed, can exercise it. Deferred to the planned
+`live_sim.py` harness extension (`docs/backlog_cache.md`), which can call it directly against
+synthetic positions instead.
+**Verified**: all 6 present in `watch_list` (watchlist_id=65, 16 nodes total: 10 real v5 +
+6 canary) via direct query. Deploying them is what surfaced the reference-report bugs — see
+`docs/research_log.md`'s 2026-07-23 entry and `docs/backlog_cache.md`'s resolved entries for
+that investigation.

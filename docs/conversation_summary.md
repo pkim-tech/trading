@@ -2801,3 +2801,34 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 
 ### User note
 User asked explicitly for this to become a standing convention: any future strategy/live-trading code change should get exercised through the extended `live_sim.py` harness before being trusted, not just unit tests.
+
+---
+
+## 2026-07-23 — Canary watchlist nodes deployed; Morning Report found silently broken for weeks (mode filter + Slack block limit), both fixed
+
+### What we did
+- **Deployed all six canary proof-of-life nodes** (SPY/QQQ/IWM/DIA/VOO/XLF, `version='canary'`, `mode='research'`) to the active watchlist via `scripts/add_canary_nodes.py`, fixing the sizing bug (`starting_notional` 500→10000) flagged by last session's Opus review. Watchlist 65 now has 16 nodes (10 real v5 + 6 canary). `_scan_pinned_exit_arm`'s paper-blind-spot left as an accepted limitation, deferred to the planned `live_sim.py` harness extension.
+- **Chased a "restart didn't send a Morning Report" complaint through a wrong initial diagnosis before finding the real root cause.** Initially ruled out the user's own hypothesis (report skips non-live tickers) by checking the wrong function (`send_reference_report` has no mode-gating — but the function it calls does). Wasted several rounds confirming "delivery works" via manual sends + `chat.getPermalink`, which was true but not the actual question.
+- **Found and fixed two real observability gaps** that made the investigation genuinely impossible until fixed: (1) `logs/active_signals.log` never flushed (`open(..., "a")` with no explicit flush, block-buffered since not a tty) — fixed via `buffering=1`; confirmed the file's mtime was frozen 10+ minutes while the daemon's heartbeat proved it was actively looping. (2) `slack_message_log` logged intent (before the send attempt) not delivery — fixed by moving the log call after the attempt, with a new `error` column (migration applied to the live DB, backed up first). `_post_message` and `send_reference_report` now reliably return `(channel, ts)` instead of discarding it.
+- **Root cause, once observability actually worked**: `build_reference_table` filtered to `mode == 'live'` only. Every watchlist node has been `mode='research'` since the 2026-07-20 v5 promotion — the report has been posting successfully (header/kill-switch/context blocks) with **zero candidate rows** underneath for weeks, no error anywhere. This was exactly the user's original hypothesis, wrongly dismissed earlier in the same conversation.
+- **Fixing the filter immediately exposed a second real bug**: 16 full rows pushed the message to 53 Slack blocks, over the hard 50-block limit — rejected outright (`invalid_blocks`), caught instantly by the now-working error logging instead of another blind chase. Fixed by collapsing each row's up-to-3 separate `actions` blocks into one (Slack allows up to 5 elements per block).
+- **Safety fix alongside the filter change**: research-mode rows becoming visible meant canary nodes (deliberately absurd parameters) would get a real "Manually Open {ticker}" button for the first time. Suppressed for `version == 'canary'` nodes; added a `🧪CANARY`/`(research)` tag so non-live rows are never visually confused with an actionable live trigger.
+- Verified the final fix with a real, independently-checked permalink (`chat.getPermalink`), not just trusting `_post_message`'s return value — confirmed all 16 rows present and correctly tagged.
+- Full `pytest tests/`: 181 passed throughout (no regressions from any of the above). Ran the required pre-commit regression check (`verify_trailing_buy/sell_resolution.py --tickers AGQ,SOXL`) — clean, consistent with prior documented drift.
+
+### Backlog additions
+- `docs/backlog_cache.md`: canary deployment (resolved), Morning Report mode-filter + block-limit bugs (resolved), logging observability gaps (resolved). `docs/deep_backlog.md`: full canary build detail. `docs/research_log.md`: full misdiagnosis-then-root-cause writeup, worth reading as a case study in how a missing observability layer can produce a confidently wrong diagnosis.
+
+### Not yet done
+- Task 2 from the original session plan (Slack alert for the stale-price-guard silent-suppression gap, from last session's HIBL incident) — not started.
+- Task 1 (`live_sim.py` scriptable harness extension) — not started, still just designed.
+- Whether to add a code-review-by-Opus step as the first part of `session wrap` (raised by the user mid-session, conditional on live-trading code having changed) — discussed, not decided or implemented.
+
+### Current state
+- Daemon restarted twice this session; currently running with all of tonight's fixes live (flush fix, delivery-confirmed logging, mode-filter fix, block-limit fix, canaries).
+- Kill switch has been engaged (`🛑 STOPPED`) since 2026-07-16 (deliberate, via Slack "Stop Engine" button) — noticed via the now-working Morning Report, not a new issue, but flagged since it's an easy thing to forget is set.
+- All accounts still `dry_run=True`, all real nodes still `mode='research'` — nothing here changes real-money exposure.
+
+### Next session
+- Pick up task 2 (stale-price-guard alert) and task 1 (`live_sim.py` harness) from the prior session's plan, still both outstanding.
+- Watch the Morning Report over the next few real sends to confirm the block-count fix holds as more canaries/nodes potentially get added later (currently 16 nodes fits comfortably under 50 blocks, but there's no hard ceiling/guard against it recurring if the watchlist grows further — worth a defensive check if it becomes a recurring risk).

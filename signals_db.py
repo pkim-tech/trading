@@ -376,9 +376,19 @@ def ensure_tables():
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts       TEXT NOT NULL DEFAULT (datetime('now')),
                 mode     TEXT NOT NULL,
-                text     TEXT NOT NULL
+                text     TEXT NOT NULL,
+                error    TEXT
             )
         """)
+        c.commit()
+        # error column added 2026-07-22 -- the original schema logged intent
+        # (this call was about to attempt a post) not delivery; a row's mere
+        # existence was wrongly read as proof of a successful send during a
+        # live missing-report incident. NULL = delivered/attempted with no
+        # caught error, non-NULL = the exception/HTTP status _post_message caught.
+        sml_cols = {r[1] for r in c.execute("PRAGMA table_info(slack_message_log)").fetchall()}
+        if 'error' not in sml_cols:
+            c.execute("ALTER TABLE slack_message_log ADD COLUMN error TEXT")
         c.commit()
 
 
@@ -675,12 +685,15 @@ def get_coverage_events(scenario_key=None, mode=None, limit=500):
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
-def log_slack_message(mode, text):
+def log_slack_message(mode, text, error=None):
     """Fire-and-forget, same pattern as log_coverage_event -- never raises past
-    a logging failure into the real Slack-posting control flow."""
+    a logging failure into the real Slack-posting control flow. `error` is the
+    caught exception/HTTP-status string from the real send attempt (None means
+    no error was caught) -- call this after attempting the send, not before,
+    so a row actually reflects the outcome rather than just the intent."""
     try:
         with _conn() as c:
-            c.execute("INSERT INTO slack_message_log (mode, text) VALUES (?, ?)", (mode, text))
+            c.execute("INSERT INTO slack_message_log (mode, text, error) VALUES (?, ?, ?)", (mode, text, error))
             c.commit()
     except Exception:
         pass
