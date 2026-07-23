@@ -24,6 +24,8 @@ def _post_message(text, blocks=None):
             header_marker = {"type": "context", "elements": [{"type": "mrkdwn", "text": f"🧪 *SIM MODE{scenario_str}*"}]}
             footer_marker = {"type": "context", "elements": [{"type": "mrkdwn", "text": "🧪 *SIM MODE END*"}]}
             blocks = [header_marker] + blocks + [footer_marker]
+    log_mode = 'sim' if cfg.SIM_MODE else ('live' if cfg.SOCKET_MODE else ('webhook' if cfg.SLACK_HOOK else 'console'))
+    db.log_slack_message(log_mode, text)
     if cfg.SOCKET_MODE:
         try:
             resp = cfg.bolt_app.client.chat_postMessage(channel=cfg.SLACK_CHANNEL, text=text, blocks=blocks)

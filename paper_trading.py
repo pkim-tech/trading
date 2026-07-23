@@ -16,7 +16,7 @@ from datetime import datetime
 import signals_db as db
 from signals_compute import _current_price, check_sell_condition
 from signals_blocks import _post_message
-from signals_helpers import buy_order_sizing
+from signals_helpers import buy_order_sizing, log_poll
 
 
 def start_paper_buy(node, sig):
@@ -68,6 +68,7 @@ def update_paper_buys():
         running_low = min(pb['running_low'], price)
         trail_buy_pct = node.get('trail_buy_pct') or 0.0
         trigger = running_low * (1 + trail_buy_pct / 100)
+        log_poll(f"{ticker} paper_update_buys price={price:.4f} running_low={running_low:.4f} trigger={trigger:.4f}")
         if price > running_low and price >= trigger:
             starting_notional = node.get('starting_notional') or 50000
             shares = int(starting_notional // price)
@@ -108,6 +109,8 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
             if cp is None:
                 continue
             low = high = op = cp
+        log_poll(f"{ticker} paper_check_sells bar={last_bar_ts} at_bar_close={at_bar_close} "
+                 f"cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
         reason, target, just_activated_trailing = check_sell_condition(
             pos, cp, datetime.now(), at_bar_close=at_bar_close, low=low, high=high, open_price=op,
             df_hourly=df_hourly, paper=True)

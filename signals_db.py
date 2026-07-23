@@ -366,6 +366,21 @@ def ensure_tables():
         """)
         c.commit()
 
+        # slack_message_log: full text of every real _post_message call (live,
+        # sim, and webhook/socket alike) -- a message that scrolls past or gets
+        # lost in Slack itself (e.g. the morning reference report) is otherwise
+        # unrecoverable. Not a substitute for coverage_events (which tracks
+        # control-site firing, not message content).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS slack_message_log (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts       TEXT NOT NULL DEFAULT (datetime('now')),
+                mode     TEXT NOT NULL,
+                text     TEXT NOT NULL
+            )
+        """)
+        c.commit()
+
 
 # ---------------------------------------------------------------------------
 # Watch list CRUD
@@ -652,6 +667,34 @@ def get_coverage_events(scenario_key=None, mode=None, limit=500):
     if mode:
         clauses.append("mode = ?")
         params.append(mode)
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
+def log_slack_message(mode, text):
+    """Fire-and-forget, same pattern as log_coverage_event -- never raises past
+    a logging failure into the real Slack-posting control flow."""
+    try:
+        with _conn() as c:
+            c.execute("INSERT INTO slack_message_log (mode, text) VALUES (?, ?)", (mode, text))
+            c.commit()
+    except Exception:
+        pass
+
+
+def get_slack_messages(mode=None, since=None, limit=200):
+    q = "SELECT * FROM slack_message_log"
+    clauses, params = [], []
+    if mode:
+        clauses.append("mode = ?")
+        params.append(mode)
+    if since:
+        clauses.append("ts >= ?")
+        params.append(since)
     if clauses:
         q += " WHERE " + " AND ".join(clauses)
     q += " ORDER BY id DESC LIMIT ?"

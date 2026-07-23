@@ -2773,3 +2773,31 @@ Design-only session (no code changed) — extensive back-and-forth landed on a f
 - Finalize the SOXL-vs-AGQ brokerage-account decision (real numbers already pulled, no blocker remaining except the user's judgment call).
 - Consider wiring `coverage_events` into the remaining few scenarios in `docs/live_test_coverage.md` not yet instrumented (open-price-quality, a couple of the "not started" daemon-fault-tolerance rows) if useful.
 - Carried forward, all still open: max-cumulative-BUY-notional-per-ticker-per-day cap (needs a multiplier decision), `CASH_SAFETY_BUFFER` scaling, GDXU/AGQ wash-sale IRA holds (clear 2026-08-05/06), dividend cash tracking, chaos-monkey SOXL/DPST anomaly, EDC 10-share live-pilot design (account/node/automation-scope not yet decided).
+
+---
+
+## 2026-07-22 — Stale-cache race found and fixed (HIBL paper trade), new observability primitives, canary/harness plan designed (not yet built)
+
+### What we did
+- **Diagnosed a real bug live**: a HIBL paper-trading position entered at $104.09 and stopped out via SL 31 seconds later at $100.68. Root cause: `signals_compute._current_price()` read the locally cached CSV with zero staleness check — a poll landing between market open and that ticker's first same-day data refresh could silently hand back yesterday's close as if it were live. The pending trailing-buy's bounce trigger cleared against that stale price, "filling" at a price that was never actually tradable, and the next poll's fresh data immediately tripped the SL. Full reconstruction in `docs/research_log.md`'s 2026-07-22 entry.
+- **Fixed it**: `_current_price()` now returns `(None, None)` if the cache's last row predates today and the market's already open. Verified all 6 call sites (2 of them real, non-paper: `active_signals._check_position_exit`'s mid-bar branch and `_check_limit_fill`) already handle `None` gracefully. Independent Opus review confirmed the fix logic is correct and strictly safer, and flagged one residual gap not yet fixed: a genuine live-day data-refresh failure (not just the open-race) now silently suppresses a real position's intrabar exit check with only a trace-log line, no Slack alert.
+- **Built two new observability primitives**, prompted directly by this investigation and by the user losing the morning reference report with no way to reconstruct it:
+  - `signals_db.slack_message_log`/`log_slack_message`/`get_slack_messages` — full text + mode (live/sim/webhook/console) of every real `_post_message` call, wired into `signals_blocks._post_message`. Previously zero persistent record of any Slack send existed.
+  - `signals_helpers.log_poll()` — shared helper writing `[poll]`-prefixed trace lines to the existing `VERBOSE_LOG_PATH`, wired into every price/bar-consuming decision point found during the investigation: `_current_price`, `_check_position_exit`, `_scan_pinned_exit_arm`, `_scan_pinned_entry`, `_check_limit_fill`, and both `paper_trading.py` poll functions.
+- **Designed a six-canary plan** (synthetic watchlist nodes with extreme parameters meant to reliably exercise specific paper-trading code paths daily) and got it independently reviewed by Opus before building further. Several claims were checked rigorously rather than assumed — including a literal `difflib` diff proving `TrailingBothZScoreBreakout.check_exit` and `TrailingExitZScoreBreakout.check_exit` are functionally identical (only blank-line differences), so canaries tagged as one strategy still validate the other's exit-side logic. Also confirmed `_scan_pinned_exit_arm` only ever reads real (non-paper) `open_positions` — no canary, however designed, can exercise it.
+- **Opus review found a real bug in the canary design before anything was deployed**: `starting_notional=500` in the draft script sizes to 0 shares at SPY/QQQ's real price (~$700+) — both scripted canaries would have silently never filled. Not fixed yet; script left uncommitted/untracked.
+- **Pivoted mid-discussion**: calendar-paced canaries are too slow to exercise everything (e.g. proving the top-up buffer logic in `signals_notify._reconcile_fill` by waiting for a real fill to underfill by more than one share's price could take a long time), and structurally can't reach any real-broker-order mechanic (SL placement, top-up, gap-resize) without a `mode='live'` + real dry_run account — a bigger, different undertaking. Decided: extend `scripts/live_sim.py` (currently an interactive-only REPL) into a scriptable, non-interactive coverage harness driving `active_signals.py`'s real functions directly (pinned entry/exit, forced-shortfall top-up, gap-resize, TIME exit, both entry paths), and adopt it as the standard verification step for any future `active_signals.py`/`signals_*.py` change — the same role `backtest-change-rollout` plays for kernel changes. Canaries stay complementary for day-to-day visual proof-of-life in Slack, not a replacement.
+- Ran the required pre-commit regression check (`verify_trailing_buy_resolution.py --tickers AGQ,SOXL`) — clean, no new mismatch. Full suite: 181 passed (was 172).
+
+### Backlog additions
+- `docs/backlog_cache.md`: stale-cache fix (resolved, with the Slack-alert follow-up still open), canary plan (designed, has a real sizing bug, not deployed), `live_sim.py` harness extension (decided, not started).
+
+### Not yet done
+- Slack alert for the real-position stale-guard suppression case.
+- Canary sizing fix + building C/D/E/F + deciding on the `_scan_pinned_exit_arm` paper-blind-spot.
+- The `live_sim.py` harness extension itself.
+- Documenting the harness-as-standard convention in `docs/automation_principles.md` or a new skill.
+- Daemon is running but stale relative to all of today's edits — user plans to restart it tomorrow.
+
+### User note
+User asked explicitly for this to become a standing convention: any future strategy/live-trading code change should get exercised through the extended `live_sim.py` harness before being trusted, not just unit tests.

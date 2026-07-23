@@ -78,7 +78,7 @@ from signals_blocks import (
     _build_buy_blocks, _build_sell_blocks,
 )
 from signals_helpers import (
-    _add_trading_hours, _proximity_emoji, _last_sale_recovery, _phase_emoji,
+    _add_trading_hours, _proximity_emoji, _last_sale_recovery, _phase_emoji, log_poll,
 )
 from signals_notify import (
     notify_buy_signal, notify_limit_fill, notify_sell_signal,
@@ -236,8 +236,10 @@ def _scan_pinned_entry(target_h, target_m, watchlist, buy_alerted, open_position
                 price, is_true_open = schwab_client.get_current_price(ticker), False
         except Exception as e:
             print(f"  [pinned] {ticker} price fetch failed at {target_h:02d}:{target_m:02d}: {e}")
+            log_poll(f"{ticker} pinned_entry target={target_h:02d}:{target_m:02d} FETCH FAILED: {e}")
             continue
         price_overrides[ticker] = price
+        log_poll(f"{ticker} pinned_entry target={target_h:02d}:{target_m:02d} price={price:.4f} is_true_open={is_true_open}")
         db.log_open_price_quality(ticker, target_h, target_m, price, is_true_open)
     return _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=price_overrides)
 
@@ -263,10 +265,12 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
         if (pos['id'], last_bar_ts) in sell_alerted:
             continue
         if last_seen_bar.get(pos['ticker']) == last_bar_ts:
+            log_poll(f"{pos['ticker']} pinned_exit_arm bar={last_bar_ts} matches last_seen -- SKIPPED (no new bar)")
             continue  # no new bar since the last check -- nothing to react to early
         last_seen_bar[pos['ticker']] = last_bar_ts
         bar = df_hourly.iloc[-1]
         cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
+        log_poll(f"{pos['ticker']} pinned_exit_arm bar={last_bar_ts} cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
         reason, target, just_activated_trailing = check_sell_condition(
             pos, cp, datetime.now(), at_bar_close=True, low=low, high=high, open_price=op, df_hourly=df_hourly)
         if just_activated_trailing:
@@ -469,6 +473,8 @@ def run_loop(tickers: set = None):
                     if cp is None:
                         return
                     low = high = op = cp
+                log_poll(f"{pos['ticker']} exit_check bar={last_bar_ts} at_bar_close={at_bar_close} "
+                         f"cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
                 reason, target, just_activated_trailing = check_sell_condition(
                     pos, cp, now, at_bar_close=at_bar_close, low=low, high=high, open_price=op, df_hourly=df_hourly)
                 if just_activated_trailing:
@@ -520,6 +526,7 @@ def run_loop(tickers: set = None):
                 sig = compute_buy_signal(node)
                 if sig is None:
                     return
+                log_poll(f"{node['ticker']} limit_fill_check cp={cp:.4f} lower_band={sig['lower_band']:.4f}")
                 if cp <= sig['lower_band']:
                     limit_fill_alerted.add(fill_key)
                     notify_limit_fill(node, cp, sig['lower_band'])

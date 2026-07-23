@@ -5,7 +5,7 @@ SMA/Std indicator cache), and sell-condition checking.
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, time as _time
 
 import pandas as pd
 import yfinance as yf
@@ -15,7 +15,7 @@ import signals_config as cfg
 import signals_db as db
 from signals_helpers import (
     detect_price_discontinuity, nearest_split_factor,
-    already_alerted_corp_action, mark_corp_action_alerted,
+    already_alerted_corp_action, mark_corp_action_alerted, log_poll,
 )
 from signals_blocks import _post_message
 
@@ -35,12 +35,30 @@ def _load_cache(ticker):
     return df, df_daily
 
 
+_MARKET_OPEN = _time(9, 30)
+
+
 def _current_price(ticker):
+    """Returns (None, None) if the cache's last row predates today and the
+    market's already open -- a real gap found 2026-07-22 (HIBL paper trade):
+    a poll landing between market open and that ticker's first same-day
+    refresh would otherwise hand back yesterday's stale close as if it were
+    live, letting a trailing-buy bounce-fill (or a real SL/trailing-sell
+    check) act on a price that was never actually available at that moment."""
     df, _ = _load_cache(ticker)
     if df is None:
         return None, None
     prices = df['Close'].dropna()
-    return float(prices.iloc[-1]), df.index[-1]
+    if prices.empty:
+        return None, None
+    last_ts = df.index[-1]
+    now = datetime.now()
+    if last_ts.date() < now.date() and now.weekday() < 5 and now.time() >= _MARKET_OPEN:
+        log_poll(f"{ticker} _current_price STALE bar={last_ts} now={now:%Y-%m-%d %H:%M:%S} -> skipped")
+        return None, None
+    price = float(prices.iloc[-1])
+    log_poll(f"{ticker} _current_price bar={last_ts} price={price:.4f}")
+    return price, last_ts
 
 
 # ---------------------------------------------------------------------------

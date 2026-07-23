@@ -1,5 +1,74 @@
 # Backlog Cache
 
+## [live-trading][security] Resolved 2026-07-22 — stale-cache race at market open (HIBL paper trade entered and SL'd in 31 seconds)
+Full writeup: `docs/research_log.md`'s 2026-07-22 "HIBL paper trade" entry. Short version:
+`signals_compute._current_price()` read the local CSV cache with zero staleness check, so a poll
+landing between market open and that ticker's first same-day refresh could silently hand back
+*yesterday's* closing price as if it were live — the mechanism behind HIBL's paper entry filling
+at a stale $104.09 (matching the prior day's close exactly) and immediately SL'ing once fresh data
+landed. Fixed: `_current_price()` now returns `(None, None)` if the cache predates today and the
+market's open; all 6 call sites already handled `None`. Real (non-paper) exposure existed too —
+`_check_position_exit`'s mid-bar branch and `_check_limit_fill` share the same function — but
+never fired live (`dry_run=True` everywhere). Independent Opus review confirmed the fix and flagged
+one residual gap, not yet fixed: on a live day, a genuine (non-open-race) data-refresh failure now
+silently suppresses a real position's intrabar exit check via only a `log_poll` trace, no Slack
+alert. **Action needed**: add that alert.
+Also built this session: `signals_db.slack_message_log`/`log_slack_message`/`get_slack_messages`
+(full text + mode of every real `_post_message` call — previously zero persistent record existed,
+which is why the user's morning reference report was unrecoverable after scrolling past it in
+Slack) and a shared `log_poll()` helper (`signals_helpers.py`) writing `[poll]`-prefixed trace
+lines to `VERBOSE_LOG_PATH`, wired into every price/bar-consuming decision point found during this
+investigation. Full suite: 181 passed. Not yet committed as of this backlog entry — see session
+close commit.
+
+## [live-trading] Not started, designed 2026-07-22 — canary watchlist nodes for daily paper-trading proof-of-life; has a real sizing bug, not deployed
+Goal: synthetic watchlist nodes with extreme parameters that reliably exercise a specific paper-
+trading code path every trading day, so a regression in the daemon's polling/fill/arm/exit
+pipeline shows up as "a canary didn't do what it should have" instead of going unnoticed (this is
+how the HIBL bug above was found — by accident, not by any standing check). Six were scoped:
+- A (SPY, `TrailingBothZScoreBreakout`, `entry_timing='close'`, z=0.1 w=5 tb=.1 arm=.1 sl=30 ts=.1):
+  full happy path same day — ambient entry → bounce-fill → arm → trailing-sell.
+- B (QQQ, same shape, sl=.1 arm=10): ambient entry → bounce-fill → immediate SL.
+- C (same as A, `entry_timing='open_check'`): exercises `_scan_pinned_entry` + `open_price_quality_log`.
+- D (signal late-day, larger `trail_buy_pct`): pending buy carried overnight → next-open bounce-fill,
+  a direct regression test for the stale-cache fix above.
+- E (`strategy='TrailingExitZScoreBreakout'`, not TrailingBoth): `signals_db._is_trailing_buy` routes
+  on the strategy's axis schema, not the `trail_buy_pct` value, so only a real TrailingExit node can
+  ever reach `paper_trading.start_paper_market_buy` — a TrailingBoth node with `trail_buy_pct=0`
+  would NOT have tested this (an earlier version of this plan got this wrong).
+- F (arm/SL practically unreachable, tiny `max_hold_hours`): TIME exit.
+Verified (diffed programmatically, not eyeballed): `TrailingBothZScoreBreakout.check_exit` and
+`TrailingExitZScoreBreakout.check_exit` are functionally identical (only blank-line differences) —
+so A/B/C/D/F's exit-side coverage applies to both live strategies even though they're tagged
+TrailingBoth. Also confirmed: `_scan_pinned_exit_arm` only ever reads real (`paper=False`)
+`open_positions` — no canary, however designed, can exercise it; either a real coverage gap worth
+closing or an accepted limitation, not decided.
+**Real bug found by independent Opus review, not yet fixed**: `starting_notional=500` in the draft
+script (`scripts/add_canary_nodes.py`, A/B only, uncommitted) sizes to `int(500 // price) == 0`
+shares at SPY/QQQ's real price (~$700+) — both canaries would silently never fill. Needs raising to
+something like $10k+ before this is usable.
+**Action needed**: fix the sizing bug, add C/D/E/F to the script, decide on `_scan_pinned_exit_arm`'s
+paper-blind-spot. User leaning toward building the `live_sim.py` extension below first and
+validating canary design against it, rather than building both in parallel.
+
+## [live-trading] Not started, decided 2026-07-22 — extend `scripts/live_sim.py` into a scriptable, standard coverage harness for `active_signals.py`/`signals_*.py` changes
+Raised because calendar-paced canaries (above) are too slow to exercise everything — e.g. proving
+the top-up buffer logic (`signals_notify._reconcile_fill`, fires when a real fill's shortfall vs.
+target notional exceeds one share's price) by waiting for a real fill to happen to underfill by
+that much could take a long time, and canaries fundamentally can't reach any real-broker-order
+mechanic (SL placement, top-up, gap-resize) at all without a `mode='live'` + real dry_run account,
+a bigger and different undertaking. `scripts/live_sim.py` already drives the real `compute_buy_
+signal`/`check_sell_condition`/`notify_*` functions against an isolated `trading_sim.db`, but only
+interactively (manual REPL commands). **Decided**: extend it to call `_scan_pinned_entry`/
+`_scan_pinned_exit_arm`/`_reconcile_fill` (with a deliberately-forced shortfall)/`check_gap_resize`/
+TIME-exit/both entry paths directly and non-interactively, so a full pass takes seconds, not days —
+and adopt this as the standard verification step for any future `active_signals.py`/`signals_*.py`
+change, the same role `backtest-change-rollout` plays for kernel changes. Canaries stay complementary
+(day-to-day visual proof-of-life in Slack) rather than being replaced. **Action needed**: build the
+harness; canary design (above) should probably be finalized after, not in parallel, per user's lean.
+Also not yet done: document this as a standing convention (likely `docs/automation_principles.md`
+or a new project skill mirroring `backtest-change-rollout`).
+
 ## [backtest] Open, paused 2026-07-22 — "v6" idle-capital parking idea; inconclusive, downturn-specific follow-up queued
 Full detail in `docs/research_log.md`'s 2026-07-22 entry. Short version, in the order the
 analysis actually evolved this session:

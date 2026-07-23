@@ -1,12 +1,26 @@
 """Small shared helpers with no cross-dependency on blocks/charts/handlers."""
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import signals_config as cfg
 import signals_db as db
 
 _CORP_ACTION_ALERT_PATH = Path(__file__).parent / "cache" / "live" / "corporate_action_alerts.json"
+
+
+def log_poll(msg):
+    """Appends one [poll] trace line to VERBOSE_LOG_PATH -- every price/bar a
+    live-trading decision point actually used, kept out of the human-readable
+    log so day-to-day monitoring isn't buried. Built 2026-07-22 after a real
+    stale-cache bug (HIBL paper trade) went unnoticed with no way to see what
+    price/bar each poller had actually read at decision time."""
+    try:
+        with open(cfg.VERBOSE_LOG_PATH, "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [poll] {msg}\n")
+    except Exception:
+        pass
 
 
 def _load_corp_action_alerts():
