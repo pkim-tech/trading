@@ -3004,3 +3004,100 @@ user this session (dry_run protects everything, per architecture, not leftover t
 - A real fill, to confirm `get_filled_order` field parsing and the account-activity stream fast path.
 - User wants this whole night's findings (`docs/backlog_cache.md`'s top two entries) reviewed
   together this weekend.
+
+---
+
+## 2026-07-24 — First real (dry_run=False) order day on soxl_ira: fixed async order-confirmation gap (2 rounds), built the full test plan and 7 real test nodes, placed real gap-resize orders
+
+### What we did
+- **Fixed the async placement/cancellation verification gap flagged 2026-07-23 night**: `schwab_client.py`'s
+  `_place_equity_order`/`_place_trailing_order`/`place_stop_loss` posted an optimistic "✅ submitted"
+  immediately after the HTTP response, when placement/cancellation are actually asynchronous (confirmed a
+  real rejection can resolve ~0.3-0.7s later). New `_confirm_order_status` (4 attempts/0.5s) polls the real
+  status before posting; a confirmed REJECTED/CANCELED/EXPIRED now raises `schwab_client.OrderRejected`.
+- **First Opus review** (mid-fix) caught two real bugs, both fixed same session: (1) a confirmed rejection
+  still returned a real `order_id` with no exception, so callers treated it as a successful placement,
+  creating a phantom `pending_buys` row that would nag forever and could seed a duplicate real order the
+  next morning via `check_gap_resize` — fixed via `OrderRejected`, caught by every real call site
+  (`_attempt_automated_buy`, `_attempt_automated_market_buy`, `_attempt_automated_sell`,
+  `_place_stop_loss_for_position`, `_reconcile_fill`'s top-up, `check_gap_resize`); (2)
+  `_confirm_order_status` gave up on the first transient poll error instead of retrying through all
+  attempts — fixed. Also fixed `place_stop_loss`'s schwab-py float-to-`set_stop_price` deprecation warning
+  (now passes a string).
+- **Second Opus review** (session wrap, after building the real test day's nodes) found a deeper gap in the
+  cancel-confirmation fix itself: `cancel_order` confirmed the real post-cancel status but both callers
+  (`check_gap_resize`, `_attempt_automated_sell`) proceeded as if the cancel succeeded regardless — a real
+  double-order risk (gap-resize placing a replacement MARKET order while the original trailing-buy was
+  still actually resting) and a real oversell risk (a new trailing-sell placed after the old SL had already
+  filled the shares). Fixed: `cancel_order` now returns `(response, confirmed_status)`; both callers abort
+  (fall back to manual / leave state as-is) unless `confirmed_status == 'CANCELED'`. 4 existing tests
+  updated for the new return signature. Full suite: 185 passed throughout both review rounds.
+- **Built the full 2026-07-24 real test day**, tracked start-to-finish in the new
+  `docs/live_test_plan_2026-07-24.md` (built *before* execution this time, specifically so nothing gets
+  lost the way an earlier informal "4 tranches" framing did last session — never got written down and had
+  to be reconstructed from memory this morning). `soxl_ira.dry_run` flipped to `False` (the only account
+  going live; every other account stays `dry_run=True`). `.env` `SCHWAB_AUTOMATION_TICKERS` widened with
+  ERX, ERY, LABD, SH, GDXU (SPY/GDXD already present).
+- **7 new `watch_list` nodes** (`scripts/setup_2026_07_24_soxl_ira_live_test.py`, watchlist_id=65,
+  `version='soxl_test'`, all `mode='live'`, `account='soxl_ira'`): SPY/SH (real SELL exercise on the
+  existing 3sh/50sh pre-staged positions, tight 0.3% arm/trail/SL thresholds), ERX/ERY (real BUY signal +
+  post-fill top-up test, opposite-direction pair, `entry_timing='close'`), LABD (real market-buy path test
+  via `_attempt_automated_market_buy`, `entry_timing='open_check'` — the one strategy-gated path that
+  can't be exercised via an already-held position), GDXD/GDXU (Part 3 branch B gap-resize cancel+replace
+  test, two tickers as a safety net). `open_positions` seeded for SPY/SH (entry price = current market
+  price as a placeholder, not the user's real cost basis, which isn't tracked in this system).
+  `auto_fill_detection` enabled for ERX/ERY so a real fill gets recorded automatically.
+- **Real orders placed pre-market for the gap-resize test**: GDXD (5 sh) and GDXU (3 sh), real
+  `TRAILING_STOP` BUY orders (trail=0.3%), placed via direct bypass (same pattern as 2026-07-23 night,
+  since `check_order`'s signal-window gate blocks a real BUY outside a signal window and this is a
+  deliberately-constructed overnight-gap scenario, not an organic signal). `signal_price` seeded off
+  **yesterday's close** (not today's already-moved price) specifically so the 9:15-9:29 gap-check window
+  measures a genuine overnight gap. Both confirmed real and resting (`AWAITING_STOP_CONDITION`) against the
+  real order book. Sized at half the original plan (5/3 shares, not 10/6) after confirming real cash
+  ($1,110.43) wouldn't stretch across the rest of the day's planned real BUYs otherwise.
+- **Real observation, not yet explained**: cash stayed at $1,110.43 unchanged immediately after both
+  trailing-buy orders went resting — contrasts with 2026-07-23 night's finding that Schwab reserves cash
+  for a resting order. Leading theory (informed by that night's PLUG boundary-search, which found only a
+  small $1.82-$10.55 buffer, not the full notional): the reservation may not be the full order notional,
+  and/or may behave differently for unbounded-price `TRAILING_STOP` orders vs. a bounded-price order. Not
+  resolved — flagged for follow-up.
+- **A stale (pre-restart) daemon instance fired a real SELL SIGNAL for the freshly-seeded SPY position**
+  before the intended restart — confirmed harmless (the running process still had the old in-memory
+  `dry_run=True`; verified directly against the real order book and real position, zero resting orders,
+  shares unchanged). Killed and restarted twice total today to pick up all fixes.
+- **Two backlog items opened from real friction points**: (1) signal/reminder alerts (unlike the
+  placement-confirmation messages) don't show account `dry_run` status, causing exactly the "is this
+  real?" ambiguity above; (2) the single trading Slack channel is getting chatty now that paper
+  trading + today's real activity both post to it — needs a mode-aware channel-routing design (a version of
+  this was raised once before, 2026-07-22, but never got tracked). Also captured: the Morning Report's
+  block-limit failure regressed (23 nodes now exceeds Slack's 50-block cap) — user's call is to fix via
+  ticker-scope reduction later, not another patch; and a design idea to keep permanent canary tickers in
+  the dormant `ira` account as a standing regression test.
+
+### Verified
+- 185/185 tests passed after both rounds of fixes; `live_sim_harness.py` 6/6 scenarios passed after both
+  rounds; daemon restarted and confirmed current (`daemon_status.py`) after each round of code changes.
+- Real order book/position checks confirmed the stale-daemon SPY signal never reached placement, and that
+  the two real GDXD/GDXU trailing-buy orders are genuinely resting.
+- Wash-sale check run against all planned test tickers (SPY, SH, ERX, ERY, KORU→dropped, LABD, GDXU,
+  LABU) before committing to any of them — all confirmed clean (no recent taxable-account losses).
+
+### Current state
+- `soxl_ira`: `dry_run=False`, real cash $1,110.43, 2 real resting orders (GDXD 5sh, GDXU 3sh trailing
+  buys), real pre-existing positions unchanged (3 SPY, 50 SH), plus the new `open_positions` rows seeded
+  for SPY/SH today. Daemon running (restarted 08:20:41 ET), confirmed current.
+- Every other account still `dry_run=True`, untouched.
+- Full run-of-show, real order details, and known gaps are all in `docs/live_test_plan_2026-07-24.md` —
+  the source of truth for the rest of today, updated live as things happen rather than reconstructed
+  afterward.
+
+### Next session
+- Today's real testing continues through the 9:15-9:29 gap-resize window, 9:30:02 LABD pinned check,
+  10:25-10:40 AM signal window (ERX/ERY real BUY + manual top-up test, LABD re-check, second-ticker-BUY
+  guard test, Test A + retry), and the 15:25-15:40 PM window as backup — see the tracking doc for the
+  full sequencing and which steps need a manual action vs. run unattended.
+- User plans a full top-to-bottom re-review of the test plan around noon, separately reviewing `ira` vs
+  `soxl_ira` account scope.
+- Unresolved: the cash-reservation-for-trailing-orders question; the Morning Report block-limit
+  regression (deferred to ticker-scope cleanup); the two new backlog items (dry_run visibility on
+  earlier-stage alerts, Slack channel noise separation) are both design-only, not built.

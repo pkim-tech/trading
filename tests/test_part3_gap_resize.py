@@ -106,9 +106,13 @@ def test_gap_resize_no_action_when_trigger_not_cleared(env, monkeypatch):
 def test_gap_resize_replaces_order_when_trigger_cleared(env, monkeypatch):
     _seed_pending_order(monkeypatch, order_id=555)
     cancelled = []
+
+    def _fake_cancel(account, ticker, order_id):
+        cancelled.append(order_id)
+        return object(), 'CANCELED'
+
     monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 52.0)
-    monkeypatch.setattr(schwab_client, 'cancel_order',
-                         lambda account, ticker, order_id: cancelled.append(order_id))
+    monkeypatch.setattr(schwab_client, 'cancel_order', _fake_cancel)
     monkeypatch.setattr(schwab_client, 'place_equity_buy',
                          lambda account, ticker, qty, price, is_gap_correction=False: (object(), 999))
     monkeypatch.setattr(schwab_client, 'get_filled_order',
@@ -128,7 +132,7 @@ def test_gap_resize_dry_run_leaves_pending_row_intact(env, monkeypatch):
     appear, so check_gap_resize must not poll forever or crash."""
     _seed_pending_order(monkeypatch, order_id=555)
     monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 52.0)
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda *a, **kw: None)
+    monkeypatch.setattr(schwab_client, 'cancel_order', lambda *a, **kw: (object(), 'CANCELED'))
     monkeypatch.setattr(schwab_client, 'place_equity_buy', lambda *a, **kw: (None, None))
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda *a, **kw: pytest.fail("should not poll for a fill in dry_run"))

@@ -192,7 +192,7 @@ def test_automated_sell_notifies_sl_price_when_trailing_sell_fails_after_sl_canc
         return (None, None)
 
     monkeypatch.setattr(signals_notify, '_post_message', _capture)
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: None)
+    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: (object(), 'CANCELED'))
     monkeypatch.setattr(
         schwab_client, 'place_trailing_sell',
         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("order rejected")),

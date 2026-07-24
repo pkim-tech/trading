@@ -322,8 +322,12 @@ def test_attempt_automated_sell_cancels_sl_order_id_first(env, monkeypatch):
     pos = signals_db.get_open_position(TICKER)
 
     cancelled = []
-    monkeypatch.setattr(schwab_client, 'cancel_order',
-                         lambda account, ticker, order_id: cancelled.append(order_id))
+
+    def _fake_cancel(account, ticker, order_id):
+        cancelled.append(order_id)
+        return object(), 'CANCELED'
+
+    monkeypatch.setattr(schwab_client, 'cancel_order', _fake_cancel)
     placed = []
     monkeypatch.setattr(schwab_client, 'place_trailing_sell',
                          lambda *a, **kw: placed.append(a) or (object(), 888))

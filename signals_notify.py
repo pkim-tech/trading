@@ -80,10 +80,22 @@ def _attempt_automated_sell(pos, current_price):
     sl_order_id = pos.get('sl_order_id')
     if sl_order_id:
         try:
-            schwab_client.cancel_order(account, ticker, sl_order_id)
+            _, cancel_status = schwab_client.cancel_order(account, ticker, sl_order_id)
         except Exception as e:
             _post_message(f"⚠️ {ticker} failed to cancel resting stop-loss {sl_order_id} before "
                           f"arming trailing-sell: {e} — falling back to manual")
+            return False
+        if cancel_status != "CANCELED":
+            # Don't place a new trailing-sell without confirmed proof the old SL
+            # is gone -- if it actually FILLED (not CANCELED), the shares are
+            # already sold and a new sell here would be a real oversell attempt;
+            # if unconfirmed, we can't tell either way. Fail safe: fall back to
+            # manual instead of guessing (found via Opus review, 2026-07-24).
+            _post_message(
+                f"⚠️ {ticker} stop-loss {sl_order_id} cancel not confirmed CANCELED "
+                f"(real status: {cancel_status!r}) — refusing to place a new trailing-sell "
+                f"without proof the old order is gone; falling back to manual"
+            )
             return False
     try:
         schwab_client.place_trailing_sell(account, ticker, shares, current_price, trail_sell_pct)
@@ -1010,11 +1022,26 @@ def check_gap_resize():
         order_id = pending.get('order_id')
         if order_id:
             try:
-                schwab_client.cancel_order(account, ticker, order_id)
+                _, cancel_status = schwab_client.cancel_order(account, ticker, order_id)
             except Exception as e:
                 db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                        result="cancel_failed", detail=str(e))
                 _post_message(f"⚠️ {ticker} gap-correction cancel failed: {e} — leaving resting order in place")
+                continue
+            if cancel_status != "CANCELED":
+                # Don't place a replacement MARKET order without confirmed proof
+                # the original trailing-buy is gone -- proceeding here risks a
+                # real double-order (both the original and the replacement fill)
+                # if the cancel didn't actually take effect. Leave the pending_buys
+                # row in place so a stray fill of the original order is still
+                # reconciled normally (found via Opus review, 2026-07-24).
+                db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
+                                       result="cancel_unconfirmed", detail=f"status={cancel_status!r}")
+                _post_message(
+                    f"⚠️ {ticker} gap-correction cancel not confirmed CANCELED "
+                    f"(real status: {cancel_status!r}) — refusing to place a replacement order; "
+                    f"leaving resting order/pending row as-is"
+                )
                 continue
 
         target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
@@ -1029,6 +1056,12 @@ def check_gap_resize():
             db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                    result="blocked", detail=str(e))
             _post_message(f"🚫 {ticker} gap-correction MARKET order blocked: {e}")
+            continue
+        except schwab_client.OrderRejected as e:
+            db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
+                                   result="rejected", detail=str(e))
+            _post_message(f"🚫 {ticker} gap-correction MARKET order was rejected by Schwab: {e}")
+            db.clear_pending_buy(ticker)
             continue
         db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                result="replaced", detail=f"shares={shares} price={current_price:.4f}")

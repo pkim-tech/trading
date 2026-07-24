@@ -1,5 +1,50 @@
 # Backlog Cache
 
+## [live-trading] Idea, raised 2026-07-24 morning — permanent canary tickers in the dormant `ira` account as a standing delayed-regression test
+Insight from today's real `soxl_ira` test day: the canary-node pattern (deliberately inert
+proof-of-life tickers, absurd thresholds, real Slack alerts but suppressed real-trade buttons) is
+genuinely valuable beyond one-off testing. Since the existing `ira` account isn't supposed to carry
+real trading activity anyway (manual live trading paused since 2026-07-18), it could permanently host
+a small canary set — a standing, always-on regression signal that the full pipeline (signal
+detection, Slack alerts, order-construction code paths) still works, without needing a dedicated test
+day each time. Not scoped yet — which tickers, how many, whether `dry_run` stays True forever for
+this account or gets a narrower always-real canary lane. Design conversation for later, not
+blocking today's test plan.
+
+## [live-trading] Open, raised 2026-07-24 morning — Morning Report block-limit failure regressed (23 nodes now), fix via ticker-scope reduction not another patch
+The 2026-07-23 fix (collapsing each row's actions blocks) worked for 16 nodes; adding 7 more
+`soxl_test` nodes this morning (SPY/SH/ERX/ERY/LABD/GDXD/GDXU) pushed the reference table back over
+Slack's 50-block cap — `invalid_blocks` again, report failed to send entirely at today's restart.
+**User's call**: don't patch the block count again — the real fix is trimming the live/canary ticker
+list down to the realistic ~3-4 tickers actually trading at once, which naturally keeps the report
+under the limit. Revisit once the `soxl_test`/canary sprawl is cleaned up post-test-day, not before.
+
+## [live-trading] Open, raised 2026-07-24 morning — signal/reminder alerts don't show dry_run status, only real order-placement messages do
+Found live: a stale (pre-restart) daemon fired a real `SELL SIGNAL — STOP LOSS` alert for the
+newly-seeded SPY test position and sat "Waiting for Slack response (Exited/Skipped)" — required a
+manual real-order-book/position check (`schwab_safety._open_orders`, `schwab_client.get_real_position`)
+to confirm nothing was actually placed, purely because the alert itself gave no indication of the
+account's `dry_run` state. `[DRY RUN]` is already prefixed on the real order-placement messages
+(`_place_equity_order`/`_place_trailing_order`/`place_stop_loss` in `schwab_client.py`), but the
+earlier signal/reminder alerts (`notify_buy_signal`, `notify_sell_signal`, trailing-buy/reminder
+messages in `signals_notify.py`) fire before any placement attempt and say nothing about it.
+**Action needed**: surface the account's real `dry_run` flag (or "🧪 TEST" style tag for a
+non-production node/account) directly on these earlier alerts too, not just the placement
+confirmation — cheap, avoids exactly this kind of "is this real?" ambiguity during real trading days.
+
+## [live-trading] Open, raised 2026-07-24 morning — split paper-trading/dry-run/live notifications into separate channels (or otherwise reduce chattiness)
+User's real complaint: the single trading Slack channel is getting noisy now that paper trading
+(10 real v5 + 6 canary nodes, all research-mode) runs continuously alongside today's real `soxl_ira`
+dry_run=False test activity and the stale-daemon SPY/SH signals from this morning — everything posts
+to the same channel today, making it harder to tell what's actually real at a glance (compounds the
+dry_run-visibility gap above). A version of this was raised once before (2026-07-22 session notes,
+"paper-trading Slack-channel-noise separation, deferred until paper trading is actually turned back
+on") but never became a tracked backlog item and paper trading has been running since. **Action
+needed**: design a channel-routing scheme (e.g. separate channels/webhooks per mode — paper / dry_run
+/ live — or at minimum a consistent, filterable tag prefix per message) so the real trading channel
+isn't drowned out by paper/dry-run noise. Not scoped yet — needs a design conversation, not a
+quick fix, since every `_post_message` call site would need a mode-aware destination.
+
 ## [live-trading][security] Open, raised by session-wrap Opus review 2026-07-23 night — `availableFunds` is leverage-inclusive for a real margin account, unverified whether that's safe for `brokerage`
 `schwab_client.get_account_balance`'s new fallback (`cashAvailableForTrading` → `availableFunds`,
 see the balance-bug fix below) is confirmed correct/fail-closed for `soxl_ira` (a *limited-margin*

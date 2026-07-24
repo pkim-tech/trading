@@ -75,6 +75,79 @@ def _submit_order_with_retry(account_hash, order):
     raise last_exc
 
 
+# Order placement/cancellation are asynchronous -- the initial HTTP response only
+# means "received," not the final verdict. Confirmed live 2026-07-24: an oversized
+# BUY returned HTTP 201 (no exception) but resolved REJECTED ~0.3-0.7s later; a
+# cancel_order returned HTTP 200 before the order was actually CANCELED. Without
+# this poll, a real rejection looked identical to a real success in Slack. 4
+# attempts / 0.5s apart bounds the wait comfortably above the observed worst case
+# while still posting the Slack alert within ~1-2s of placement.
+_ORDER_CONFIRM_POLL_ATTEMPTS = 4
+_ORDER_CONFIRM_POLL_INTERVAL_SECS = 0.5
+_ORDER_TERMINAL_BAD_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
+
+
+class OrderRejected(Exception):
+    """Raised when the post-placement status poll confirms an order was
+    REJECTED/CANCELED/EXPIRED rather than resting. Lets callers (all of which
+    already catch schwab_safety.SafetyViolation and fall back to the manual
+    flow) treat a dead-on-arrival order the same way as a blocked one --
+    without this, a confirmed rejection still returned a real order_id with no
+    exception, so callers set auto_placed=True and marked a pending_buys row
+    as order_placed, which then nags the fill reminder forever for an order
+    that will never fill, and can seed a real check_gap_resize replacement
+    order off the phantom pending row the next morning (found via Opus review,
+    2026-07-24, ahead of the first real dry_run=False day)."""
+
+
+def _confirm_order_status(account_hash, order_id):
+    """Best-effort poll of the real order status right after placement/cancel.
+    Returns the status string (e.g. 'FILLED', 'REJECTED', 'AWAITING_STOP_CONDITION'),
+    or None if every attempt's poll fails (network error, etc.) -- callers must
+    treat None as 'unconfirmed', not as any particular status, and fall back to
+    the optimistic message rather than block on this. A transient failure on
+    one attempt retries the remaining attempts rather than giving up
+    immediately (fixed 2026-07-24 Opus review -- returning on the first error
+    silently disabled rejection detection during exactly the window right
+    after placement where get_order-by-id is flakiest). Stops early once a
+    terminal status (good or bad) is observed; otherwise returns whatever the
+    last successful poll showed after exhausting all attempts."""
+    last_status = None
+    for attempt in range(_ORDER_CONFIRM_POLL_ATTEMPTS):
+        try:
+            r = _get_client().get_order(order_id, account_hash)
+            r.raise_for_status()
+            last_status = r.json().get("status")
+        except Exception:
+            if attempt < _ORDER_CONFIRM_POLL_ATTEMPTS - 1:
+                time.sleep(_ORDER_CONFIRM_POLL_INTERVAL_SECS)
+            continue
+        if last_status in _ORDER_TERMINAL_BAD_STATUSES or last_status == "FILLED":
+            return last_status
+        if attempt < _ORDER_CONFIRM_POLL_ATTEMPTS - 1:
+            time.sleep(_ORDER_CONFIRM_POLL_INTERVAL_SECS)
+    return last_status
+
+
+def _post_order_confirmation(label, account_hash, order_id, ticker, account, submitted_msg):
+    """Shared by every real placement call site: polls the real status and posts
+    an accurate Slack message instead of always claiming success. A confirmed
+    REJECTED/CANCELED/EXPIRED gets a distinct 🚫 alert and raises OrderRejected
+    so the caller falls back to the manual flow instead of treating this as a
+    successful placement; FILLED gets an immediate fill confirmation; anything
+    else (still resting, or unconfirmed) falls back to the existing optimistic
+    'submitted' message, which remains accurate for a genuinely-resting order."""
+    status = _confirm_order_status(account_hash, order_id)
+    if status in _ORDER_TERMINAL_BAD_STATUSES:
+        _post_message(f"\U0001F6AB {label} {ticker} in {account} was {status} by Schwab "
+                       f"(order {order_id}) — not resting, no position/order resulted")
+        raise OrderRejected(f"{label} {ticker} order {order_id} was {status}")
+    elif status == "FILLED":
+        _post_message(f"✅ {label} {ticker} in {account} FILLED immediately (order {order_id})")
+    else:
+        _post_message(submitted_msg)
+
+
 def _resolve_account_hashes() -> dict:
     global _account_hashes
     if _account_hashes is not None:
@@ -126,7 +199,9 @@ def _place_equity_order(
     order = order_fn(ticker, quantity)
     r = _submit_order_with_retry(account_hash, order)
     order_id = Utils(_get_client(), account_hash).extract_order_id(r)
-    _post_message(f"✅ {side} {quantity} {ticker} in {account} submitted to Schwab (~${quantity * price:,.0f})")
+    _post_order_confirmation(
+        side, account_hash, order_id, ticker, account,
+        f"✅ {side} {quantity} {ticker} in {account} submitted to Schwab (~${quantity * price:,.0f})")
     return r, order_id
 
 
@@ -178,8 +253,10 @@ def _place_trailing_order(
 
     r = _submit_order_with_retry(account_hash, order)
     order_id = Utils(_get_client(), account_hash).extract_order_id(r)
-    _post_message(f"✅ {label} {quantity} {ticker} in {account} submitted to Schwab "
-                  f"(trail={trail_pct}%, ~${quantity * price:,.0f})")
+    _post_order_confirmation(
+        label, account_hash, order_id, ticker, account,
+        f"✅ {label} {quantity} {ticker} in {account} submitted to Schwab "
+        f"(trail={trail_pct}%, ~${quantity * price:,.0f})")
     return r, order_id
 
 
@@ -246,13 +323,32 @@ def cancel_order(account: str, ticker: str, order_id: int):
     """Cancels a still-resting order -- used by signals_notify.check_gap_resize
     (Part 3, branch B) to pull a stale trailing-buy order once an overnight
     gap has already cleared its trigger, before replacing it with a plain
-    MARKET order. No approve_and_record gate -- this isn't a new placement,
-    just withdrawing one already approved."""
+    MARKET order; and by _attempt_automated_sell to pull a resting SL before
+    arming a trailing-sell. No approve_and_record gate -- this isn't a new
+    placement, just withdrawing one already approved.
+
+    Returns (response, confirmed_status) -- confirmed_status is 'CANCELED' only
+    if the post-cancel poll actually confirmed it; None means unconfirmed
+    (poll failed), anything else (e.g. 'FILLED') means the cancel didn't take
+    effect the way the caller assumed. Callers MUST check this before treating
+    the original order as gone -- a cancel HTTP 200 doesn't mean cancelled
+    (confirmed live 2026-07-23 night), and proceeding as if it did risks a
+    double-order (gap-resize placing a replacement while the original still
+    fills) or an oversell (a new trailing-sell placed after the old SL already
+    filled the shares) -- found via Opus review, 2026-07-24 session wrap."""
     account_hash = _resolve_account_hashes()[account]
     r = _get_client().cancel_order(order_id, account_hash)
     r.raise_for_status()
-    _post_message(f"\U0001F5D1️ cancelled resting order {order_id} ({ticker} in {account})")
-    return r
+    status = _confirm_order_status(account_hash, order_id)
+    if status == "CANCELED":
+        _post_message(f"\U0001F5D1️ confirmed cancelled resting order {order_id} ({ticker} in {account})")
+    elif status is None:
+        _post_message(f"\U0001F5D1️ cancel request accepted for order {order_id} ({ticker} in {account}) "
+                       f"— status unconfirmed (poll failed)")
+    else:
+        _post_message(f"⚠️ cancel request accepted for order {order_id} ({ticker} in {account}) but real "
+                       f"status is '{status}', not CANCELED — may still be resting or already resolved")
+    return r, status
 
 
 _OPEN_PRICE_RETRY_ATTEMPTS = 3
@@ -306,12 +402,17 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float)
     order.set_session(Session.NORMAL)
     order.set_duration(Duration.GOOD_TILL_CANCEL)
     order.set_order_strategy_type(OrderStrategyType.SINGLE)
-    order.set_stop_price(stop_price)
+    # Passed as a string, not a float -- schwab-py deprecation warning (found
+    # 2026-07-24, a real STOP order placement): float truncation is deprecated
+    # and will be removed. See :ref:`number_truncation` in schwab-py's docs.
+    order.set_stop_price(f"{stop_price:.2f}")
     order.add_equity_leg(EquityInstruction.SELL, ticker, quantity)
 
     r = _submit_order_with_retry(account_hash, order)
     order_id = Utils(_get_client(), account_hash).extract_order_id(r)
-    _post_message(f"✅ STOP LOSS {quantity} {ticker} in {account} submitted to Schwab @ ${stop_price:.4f}")
+    _post_order_confirmation(
+        "STOP LOSS", account_hash, order_id, ticker, account,
+        f"✅ STOP LOSS {quantity} {ticker} in {account} submitted to Schwab @ ${stop_price:.2f}")
     return r, order_id
 
 
