@@ -1,5 +1,85 @@
 # Backlog Cache
 
+## [live-trading] Design note, raised 2026-07-24 ~16:20 ET — paper trading and dry_run test genuinely different things, not redundant with each other
+`dry_run=True` runs the real order-placement code path (`schwab_safety.check_order` and every real
+guard — cash check, `notional_cap`, `daily_order_cap`, duplicate-order guards, automation scope) all
+the way to the real broker call, then stops — proves "would this order be correctly placed/blocked,"
+never simulates a fill or tracks P&L. Paper trading (`paper_trading.py`) bypasses
+`schwab_client`/`schwab_safety` entirely — never exercises the real guard code at all — and instead
+simulates the full fill-to-exit lifecycle (bounce-fill timing, arm/trail/SL state machine, realized
+P&L) against real price data. **Confirmed by today's actual results**: every single bug found today
+(`notional_cap` blocking SELL, `daily_order_cap` starving SL placement, the `brokerage` account-hash
+crash, the `add_node` dedup bug) came from dry_run/live activity going through the real guard code —
+paper trading, even running, would never have caught any of them. Conversely dry_run never validates
+whether the strategy's actual exit logic behaves realistically against real price movement, since it
+never simulates a fill at all. **Conclusion**: complementary, not redundant — dry_run validates the
+safety/guard layer, paper trading validates the strategy/execution-realism layer. Reinforces why
+paper trading being fully dormant (see the entry below) is a real, separate gap, not something
+today's dry_run-driven bug hunt already covers.
+
+## [live-trading] Idea, raised 2026-07-24 ~15:05 ET — open a new margin account strictly dedicated to one real production ticker; keep soxl_ira as the standing multi-ticker test account
+Today's `daily_order_cap` exhaustion (see entry below) traces to a real account-role mismatch:
+`soxl_ira` ran 4 different tickers (GDXD/GDXU/ERY/LABU) through it today for setup convenience, which
+doesn't match the real one-account-per-ticker model (`[[project_account_segregation_model]]`) —
+`daily_order_cap=3` was sized for one ticker's real daily order volume, not four tickers sharing a
+quota. **User's plan**: keep `soxl_ira` as a standing multi-ticker live-test account (not meant to
+carry real production trading), and open a **new, separate margin account strictly dedicated to one
+ticker** for actual real production trading, matching the intended model properly. Not scoped/actioned
+yet — a real account-opening + `schwab_safety.ACCOUNTS` addition to do later, not today.
+**Alternative/complementary feature idea, same discussion**: instead of (or alongside) the new
+dedicated account, make `daily_order_cap` per-**ticker** rather than per-**account** — explicitly not
+framed as a bug fix, but as a real feature needed *if* multi-ticker-per-account usage (like today's
+`soxl_ira` test setup) continues rather than being fully replaced by one-account-per-ticker. A
+per-ticker cap would let each ticker draw from its own quota, so one ticker's entries/exits/SL-
+placements can't starve another's, without requiring a new account per ticker. Not scoped (schema
+change to `AccountLimits`, how `check_order`/`schwab_order_counts.json` would need to key by
+ticker+account instead of just account) — a real alternative design, worth weighing against the
+new-account plan above rather than assuming one supersedes the other.
+**User's leaning, same discussion**: if the real discipline is strict one-ticker-per-account
+isolation (blast-radius containment, per `[[project_account_segregation_model]]`), then deliberately
+blending tickers into one account's "swimlane" — even to solve the order-cap starvation problem —
+undermines the reason that discipline exists in the first place. Leaning toward the new-dedicated-
+account plan as the real fix, and treating the per-ticker-cap feature as a lower-priority fallback
+only worth building if the team ever deliberately chooses to relax single-ticker-per-account
+isolation, not as a way to avoid opening new accounts.
+
+## [live-trading][tax] Idea, raised 2026-07-24 ~15:10 ET — run SOXL in both `roth` and `soxl_ira`, but `roth` needs to become limited-margin first
+Grew out of the same-day-re-entry discussion (SOXL: ~29% of real historical trades involve a same-day
+re-buy — see the `buy_alerted` day-lockout entry above) plus the account-segregation planning above.
+`roth` is currently `account_type="cash"` (`schwab_safety.py:141`), so `same_day_block` would
+structurally prevent it from ever capturing that same-day-re-entry slice of SOXL's edge — only a
+margin/limited-margin account (like `soxl_ira`, `account_type="margin"`) can. **User's plan**: open a
+**new Roth IRA with limited margin** (the existing `roth` account is a plain cash IRA) before SOXL
+could meaningfully run there alongside `soxl_ira`/a future dedicated SOXL account. Both existing
+`roth`/`soxl_ira` accounts are IRA-type, so no wash-sale cross-account concern between them (per the
+already-resolved 2026-07-07 finding that IRA-realized losses never trigger wash-sale disallowance).
+Not scoped/actioned — real account-opening step for later, tied to the broader account-segregation
+plan above rather than a separate initiative.
+
+## [live-trading][security] Open, found 2026-07-24 ~14:30 ET — `daily_order_cap` counts SL-placement/top-up attempts against the same limit as entries, leaving a real fresh fill unprotected
+LABU's real market-buy fired and filled cleanly at 14:30:23 ET (1 sh @ $245.1434, first real `open_check`
+pinned-window fill of the day) — `TrailingExitZScoreBreakout`, so it should have gotten a real
+automatic broker-side stop via `_place_stop_loss_for_position` (unlike `TrailingBoth` fills, see the
+earlier gating-gap entry). Instead, both the SL placement **and** a top-up-buy attempt were blocked
+in real time:
+```
+🚨 LABU (soxl_ira) UNPROTECTED — place stop-loss SELL 1 @ ~$254.83
+(stop-loss placement blocked: account 'soxl_ira' has hit its daily order cap (3))
+🚫 LABU — top-up buy of 1 shares blocked: daily order cap (3)
+```
+`soxl_ira`'s `daily_order_cap=3` had already been exhausted by the day's 3 earlier real BUY
+placements (GDXD, GDXU, ERY), so LABU's follow-on protective actions had no quota left, even though
+its own BUY (the 3rd or earlier order) succeeded. **Real design gap**: `daily_order_cap` counts every
+real placement attempt uniformly — new entries, SL placement, and top-ups all draw from the same pool
+— so a legitimately protective follow-on action (placing a stop right after a fill) can get starved
+by unrelated earlier entries, leaving a brand-new real position with zero automated downside
+protection purely due to order-count bookkeeping, not any real risk assessment. **User's call**: not
+fixing same day — manually closing out LABU instead of placing a real stop, since the daily cap is
+already exhausted. **Action needed**: consider whether SL/protective-action placements should draw
+from a separate quota (or be exempt from `daily_order_cap` entirely, similar to how `notional_cap`
+probably shouldn't gate SELLs per the entry above) so a legitimately protective action never gets
+starved by unrelated earlier entries on the same day.
+
 ## [live-trading][security] Open, found 2026-07-24 ~12:20 ET — real bug: `notional_cap` blocks the automated trailing-SELL, not just BUYs, permanently dead-ending the automated exit for any position bigger than the cap
 Confirmed live: `🚫 BLOCKED TRAILING SELL 3.0 SPY in soxl_ira (trail=0.3%): order notional $2,227
 (SPY x3.0) exceeds soxl_ira cap $800` — SPY armed for real at 11:21 ET (`trailing_arm_state_reread`
@@ -22,11 +102,34 @@ needed**: `check_order`'s notional check should likely not apply to SELL orders 
 separate (much higher, or no) limit for closing an existing position — a BUY-side risk cap has no
 principled reason to also gate the SELL side. Not fixed same day — found live, mid test day; SPY's
 real position is currently stuck relying on manual trailing-sell placement as a result.
+**Follow-on, raised same session**: even once `notional_cap` is fixed/raised, SPY's automated sell
+won't self-heal — `_attempt_automated_sell` is only ever invoked once, at the moment of arming
+(inside `notify_trailing_activated`); `check_trailing_reminders` (the nag loop currently pestering
+for manual placement) only re-posts the reminder, it never retries the automated attempt. So SPY
+needs an explicit manual re-trigger once the cap's fixed, not just a passive "it'll work next time."
+**Action needed, tie to the fix above**: either have `check_trailing_reminders` retry
+`_attempt_automated_sell` periodically (at least for config-based blocks like this one, which are
+plausibly transient — a code/config bug, unlike e.g. a real duplicate-order block that won't resolve
+itself), or clearly document that a blocked automated sell always requires a manual nudge to retry
+once the root cause is fixed.
 
-## [live-trading] Idea, raised 2026-07-24 ~11:35-11:45 ET — a real status/coverage dashboard, indexed by scenario × mode × strategy-type, with per-node expected-vs-actual daily tracking
-Grew out of today's real-money test day pain: state (cash/orders/positions/pending_buys) had to be
-pulled ad hoc via one-off scripts all day, coverage had to be hand-mapped in chat (the canary
-scenario table), and none of it persists for tomorrow. Three pieces, one coherent project:
+## [live-trading] ELEVATED TO TOP PRIORITY 2026-07-24 ~16:10 ET — the coverage/expected-vs-actual system is the compass, not a nice-to-have dashboard; build it before chasing individual bug fixes
+**Reframed by the user at end of today's test day**: the real lesson from today isn't "fix these N
+bugs" — it's that the user can't always be present (working from home, watching Slack closely) to
+manually notice something's wrong the way they did today. Today's bugs only got caught because of
+active human attention, not because anything structurally surfaced them. That doesn't scale to a day
+the user isn't watching closely. **The fix isn't more manual vigilance — it's this coverage system,
+elevated from "nice dashboard idea" to the actual compass**: every node has documented test cases /
+expected scenarios (already partially true — canaries' designed scenarios, the ~20-row
+`docs/live_test_coverage.md` list); the system should track expected-vs-actual per scenario
+automatically; and **critically, any deviation from expected must have a captured reason — an
+unexplained failure is not an acceptable end state, it's a bug by definition.** This is a stronger
+contract than a status display: it's a verification discipline where "why did this deviate" is
+always answerable by query, not by someone happening to notice and asking a human (or an LLM) to dig
+through logs. Build this *before* prioritizing individual bug fixes from today's punch list — the
+system itself should be what surfaces which of those bugs actually matter and whether new ones
+appear, rather than relying on another day like today's to manually re-discover them.
+Original scope, now serving this larger goal, four pieces:
 1. **Real-time status dashboard** (Streamlit, extending the existing `app.py`/`pages/` app rather than
    a new tool) — account balance/resting orders/open positions/pending buys, live-queried, replacing
    today's pattern of me running ad hoc scripts on request throughout the day.
@@ -53,6 +156,20 @@ scenario table), and none of it persists for tomorrow. Three pieces, one coheren
    already being written to today. This isn't blocked on new instrumentation; it's a presentation/
    indexing layer over existing data, plus the one new piece (structuring the designed-scenario
    mapping, currently prose-only).
+6. **New requirement from today's reframe — the "no unexplained failure" contract**: every tracked
+   scenario needs an explicit expected outcome, and every observed deviation needs a captured reason
+   field, not just a pass/fail flag. A row with a fail/deviation and no reason should itself be
+   flagged as incomplete/actionable — the system should never let "something looked off but nobody
+   knows why" sit silently, since that's exactly the failure mode today's bugs exploited (nothing
+   structural noticed the account-hash crash, the daily_order_cap starvation, or the dedup bug — a
+   human had to notice and ask). This is the actual point of the whole project, not an add-on to it.
+7. **Delivery target, longer-term**: a Streamlit page assumes being at a computer to check it — the
+   user isn't always working from home. Eventually (once on cloud infra, or if the report can be
+   encoded compactly enough now) this should also be callable as a real Slack report — request it,
+   get a compact summary of expected-vs-actual + any unexplained deviations, review from a phone.
+   Could piggyback on/extend the existing Reference Report infrastructure (`send_reference_report`)
+   rather than being a wholly separate delivery mechanism. Not the first thing to build (the
+   Streamlit/query layer matters more initially), but the real end-state goal.
 Not scoped in detail (schema for the designed-scenario mapping, dashboard page layout) — a real
 feature to design and build later, not urgent mid-test-day.
 
@@ -388,6 +505,15 @@ or a consistent filterable tag prefix per message) so the real trading channel i
 still needs a design conversation, not a quick fix, since every `_post_message` call site would need
 a mode-aware destination. Revisit once the Monday paper-trading-mode decision (see entry above) is
 made, since that'll add a third real message source back into the mix.
+**Further refined 2026-07-24 ~16:15 ET**: today's chattiness is a **shakeout-phase** artifact, not
+the permanent target state — many tickers/canaries/tests all live at once, actively being debugged.
+Once the real watchlist narrows to its actual production size (1-3 tickers genuinely live-trading),
+the **live channel specifically** should get quiet/focused again — real trading shouldn't be noisy.
+Other channels (paper/canary/ongoing-test activity) can stay as chatty as needed, since that's where
+exploratory shakeout work belongs. So the channel-routing design should explicitly account for this
+trajectory (loud-now/quiet-later on the live channel specifically) rather than just splitting by mode
+as a static end-state — ties directly into the coverage-system reframe above, which is itself meant
+to be the shakeout-phase tool that eventually lets the live channel go quiet with confidence.
 
 ## [live-trading][security] Open, raised by session-wrap Opus review 2026-07-23 night — `availableFunds` is leverage-inclusive for a real margin account, unverified whether that's safe for `brokerage`
 `schwab_client.get_account_balance`'s new fallback (`cashAvailableForTrading` → `availableFunds`,

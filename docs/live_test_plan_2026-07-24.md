@@ -13,12 +13,26 @@ actually worked as expected, not just whether an order was accepted.
 - `.env` `SCHWAB_AUTOMATION_TICKERS` widened today to add ERX, ERY, LABD, SH, GDXU (SPY/GDXD already
   present).
 
-## LIVE STATUS — read this first (updated 11:30 ET)
-**soxl_ira real state right now:**
-- Cash: **$1,088.28**
-- **ERY**: real filled position (2 sh @ $10.1375, auto-detected/auto-reconciled ~10:47 ET — first
-  fully-automated real BUY→fill→position of the day, zero manual clicks). No real broker stop
-  (`TrailingBoth` gating gap, see backlog).
+## FINAL STATUS — end of day (16:02 ET, daemon shut down)
+**soxl_ira real state at close:**
+- Final cash: **$1,110.46** (started $1,110.43 — net day P&L ≈ **+$0.03**, essentially flat: GDXD/GDXU
+  round trip -$1.87, LABU +$1.44, ERY +$0.47)
+- **ERY**: CLOSED. Full round trip: auto-detected BUY fill $10.1375 (10:47 ET, zero manual clicks) →
+  real Market-on-Close SELL @ $10.37 (16:00:00 ET exactly, first MOC order the user has ever placed)
+  → +2.3%, ~$0.47 gain. Clean, fully-reconciled test of the automated-entry path end to end.
+- **SPY**: left OPEN through Monday (3 sh, entry $738.18, armed & tracking peak $743.57+, automated
+  sell permanently blocked by `notional_cap` — real bug filed, see below).
+- **SH**: left OPEN through Monday (50 sh, entry $33.52, hit real fixed-SL, never armed — real bug/gap
+  filed re: no automated protection for manually-seeded positions).
+- **LABD**: never triggered all day (wrong-sign z) — no position, no test exercised.
+- **ERX**: never triggered all day (wrong-sign z) — no position, no test exercised.
+- **GDXD/GDXU**: fully closed mid-morning (see below), net -$1.87.
+- **LABU**: fully closed mid-afternoon (see below), net +$1.44.
+
+## Earlier status detail (kept for the record)
+- **ERY** (entry detail): real filled position (2 sh @ $10.1375, auto-detected/auto-reconciled ~10:47
+  ET — first fully-automated real BUY→fill→position of the day, zero manual clicks). No real broker
+  stop (`TrailingBoth` gating gap, see backlog).
 - **SPY**: ARMED for real ~11:21 ET (`arm_sell_pct` lowered to 0.1% earlier), peak $743.57+, real
   price ran up well past entry intraday — but the **automated trailing-sell is permanently blocked**:
   `notional_cap=$800` applies to the SELL side too, and SPY's real position (~$2,227) exceeds it, so
@@ -44,9 +58,14 @@ actually worked as expected, not just whether an order was accepted.
   Gap-resize (`check_gap_resize`) ran correctly at 9:15-9:29 and did nothing, since neither had
   actually gapped past its trigger — the cancel+replace code path itself was **not exercised** today.
 - **ERX**: never triggered (z stayed positive all morning) — no order, no test exercised for this leg.
-- **LABU**: BUY signal fired at 9:30:02 (z=-1.09) but automated placement crashed on a sizing bug
-  (`starting_notional=$22` → 0 shares, my mistake copying LABD's config) — no real order exists,
-  Skip it.
+- **LABU**: 9:30:02 attempt crashed on a sizing bug (`starting_notional=$22` → 0 shares, fixed to
+  $500). **Retried successfully at the 14:30:02 pinned check** — real BUY fired, filled cleanly
+  (1 sh @ $245.1434, first real `open_check` fill of the day). **But the actual test goal — proving
+  `TrailingExit`'s automatic SL placement works — still failed**: both the SL placement and a
+  top-up-buy attempt got blocked by `daily_order_cap=3`, already exhausted by the day's 3 earlier real
+  BUYs (GDXD/GDXU/ERY). Real bug filed. **Clean fail on the intended test, for a third distinct
+  reason** (not the `TrailingBoth` gate, not `notional_cap` — this time `daily_order_cap`). User's
+  call: manually close out LABU rather than place a real stop, since the daily quota's already spent.
 - **Account-mapping backfill done ~10:15-10:40 ET** (separate from the soxl_ira test, applies to the
   other 15 `mode='live'` nodes that had `account=None`): all mapped to `ira` except canary SPY, which
   was swapped to ticker **IVV** on account **brokerage** to avoid a real ticker/account collision with

@@ -3166,3 +3166,88 @@ user this session (dry_run protects everything, per architecture, not leftover t
   notional guard (now elevated with real evidence from today).
 - Unresolved: the cash-reservation-for-trailing-orders question (does Schwab reserve anything at all for
   a `TRAILING_STOP` order, or none?) — flagged, not chased down today.
+
+---
+
+## 2026-07-24 — soxl_ira real-money live test day: 15+ real bugs found, coverage/dashboard system elevated to top priority
+
+### What we did
+- **Ran the full `soxl_ira` real-money test day** (see `docs/live_test_plan_2026-07-24.md`, fully
+  rewritten with a live-status section, real outcomes vs. plan, and a bugs-found index). Real trades:
+  GDXD/GDXU pre-market trailing-buys both filled organically at the open (not via the intended
+  gap-resize path — that code branch was never exercised, no real gap occurred), manually reconciled
+  and sold (-$1.87 net); ERY auto-detected fill → real Market-on-Close sell at exactly 16:00:00 ET
+  (+$0.47, user's first-ever MOC order); LABU fired at the 14:30 pinned retry after a sizing fix
+  (+$1.44). SPY armed for real and is tracking peak $743.57+ but its automated sell is permanently
+  blocked (see bugs). SH hit its real fixed-SL, never armed. SPY/SH deliberately left open through
+  Monday. Final cash $1,110.46 vs. $1,110.43 start — net day P&L ≈ +$0.03, essentially flat; the real
+  value was proving/breaking the pipes, not P&L.
+- **Fixed live, same day**: `add_node`'s NULL-based dedup silently failing for every `TrailingBoth`
+  node (15 real duplicate watch_list rows found and removed, root cause backlogged); 15 of 24
+  `mode='live'` nodes had no account assigned at all (`account=None`, fail-closed as BLOCKED) —
+  backfilled to `ira`; a genuine SPY/soxl_ira ticker-account collision from that backfill (canary SPY
+  renamed to IVV, moved account twice — first to `brokerage` unnecessarily, which has no configured
+  `SCHWAB_ACCOUNT_BROKERAGE` suffix and crashed with a raw `KeyError`, then corrected to `ira`).
+- **Found and backlogged, not fixed same day** (12+ real, distinct issues — see `docs/backlog_cache.md`
+  for full detail on each): `notional_cap` blocking the automated trailing-SELL (not just BUYs),
+  permanently dead-ending SPY's real exit; `daily_order_cap` counting SL-placement/top-up attempts
+  against the same pool as entries, leaving LABU's real fresh fill unprotected; a mid-day daemon
+  restart forcing a spurious off-schedule bar-close evaluation (`last_seen_bar` reset) — real
+  divergence from backtest parity, confirmed on SPY's arm timing; `check_buy_reminders`' fill-reminder
+  suppression using a stale/wrong hourly-cache trigger estimate (confirmed on GDXU, silently suppressed
+  a reminder for an order that had already filled for real); a false "UNPROTECTED" alarm on dry_run
+  market buys (`_sync_confirm_and_protect` polling a real fill that was never placed, demonstrated on
+  VOO); real BUY/SELL alerts carrying no canary tag (demonstrated on IVV); `TrailingBoth` fills never
+  getting a real automated broker-side stop (only `TrailingExit` does) — plan is a small real live test
+  Monday; a quantified, corrected finding that `buy_alerted`'s day-lockout blocks ~8% of a real winning
+  node's backtested trades (SOXL, 12/153 buy-sell-buy days), separate from the already-understood 21%
+  same-day-block case.
+- **Reframed the path forward, end of day**: user's real conclusion is that today's bugs were only
+  caught by active human attention, which doesn't scale to a day they're not watching closely. Elevated
+  the "status/coverage dashboard" idea (previously a nice-to-have) to top priority — reframed as a
+  verification *compass*, not a display: every scenario needs a documented expected outcome, tracked
+  expected-vs-actual, and **any deviation must have a captured reason — an unexplained failure is a bug
+  by definition**, not an acceptable end state. Longer-term delivery target: a Slack-callable report
+  (phone-reviewable), not just a Streamlit page, tied to the existing Reference Report infra. Also
+  refined the channel-routing/chattiness backlog item: today's noise is a shakeout-phase artifact, not
+  the permanent target — once the watchlist narrows to 1-3 real production tickers, the live channel
+  specifically should go quiet again, with the coverage system as the tool that gets there with
+  confidence. Real design note captured: paper trading and `dry_run=True` are complementary, not
+  redundant (dry_run validates the safety/guard layer — proven by today, every bug found came from
+  dry_run/live activity; paper trading validates execution-realism/P&L, currently fully dormant, a
+  separate real gap).
+- **Account-model plan clarified**: keep `soxl_ira` as a standing multi-ticker live-test account (not
+  meant to carry real production trading); open a new, separate margin account strictly dedicated to
+  one real production ticker, matching the real one-account-per-ticker model — today's
+  `daily_order_cap` friction traced directly to `soxl_ira` running 4 tickers at once, a role mismatch,
+  not a sizing bug. Also raised (not yet actioned): open a new limited-margin Roth to eventually run
+  SOXL there too, since the current `roth` is cash-type and would structurally block the same-day
+  re-entry trades that account type is uniquely positioned to capture (reinforced by prior research —
+  SOXL retained only 5.2% of its robust alpha under a cash-account same-day-block simulation).
+
+### Verified
+- Daemon confirmed current vs. all source edits at every restart today (3 restarts: 08:07, 08:20:41,
+  11:14:35). No `.py` files changed this session — only `docs/backlog_cache.md`,
+  `docs/live_test_plan_2026-07-24.md`, and one new one-off script (`scripts/add_labu_backup_node.py`).
+  No Opus review/harness run needed per the session-wrap gating (no live-trading source changed).
+- Final real state cross-checked: `soxl_ira` cash $1,110.46 matches the sum of today's real realized
+  P&L (-$1.87 GDXD/GDXU, +$1.44 LABU, +$0.47 ERY) applied to the $1,110.43 starting balance. Only SPY
+  (3 sh) and SH (50 sh) remain open, both deliberately, confirmed via direct DB query at end of day.
+  Daemon confirmed stopped (`scripts/daemon_status.py`).
+
+### Current state
+- Daemon down. `soxl_ira`: $1,110.46 cash, SPY (3 sh, armed, unprotected sell) and SH (50 sh, real SL
+  hit, unarmed) open through the weekend. All other accounts still `dry_run=True`, untouched.
+  `docs/backlog_cache.md` holds ~15 new entries from today, all uncommitted-code (DB/config only) —
+  no code changes landed this session.
+
+### Next session
+- **User wants to start building the coverage/verification-compass system** — the top-priority backlog
+  item from tonight's reframe. Not yet scoped in detail (schema for the designed-scenario mapping,
+  dashboard page layout, which piece to build first). Should NOT default to fixing individual bugs
+  from today's list first — that's explicitly the wrong order per tonight's discussion.
+- Real account-opening steps discussed but not started: a new dedicated margin account for one real
+  production ticker; a new limited-margin Roth for SOXL.
+- Monday: small real live test of the `TrailingBoth` SL-automation fix (once built) — user won't be
+  working from home, so the test design needs to account for lower attention (see the dashboard-as-
+  compass reframe — this is presumably the actual first real use case for it).
