@@ -366,6 +366,53 @@ def ensure_tables():
         """)
         c.commit()
 
+        # scenario_expectations: the "what should this node/control do" mapping,
+        # structured instead of prose (was hand-maintained in deep_backlog.md's
+        # canary writeup and live_test_coverage.md's table). check_method tells
+        # coverage_check.py which real table to verify against -- 'coverage_event'
+        # (a control-site scenario_key fired at all) or 'trade_lifecycle' (a real
+        # trade_log/open_positions row shows the expected same-day entry/exit
+        # shape) -- since coverage_events only logs control-site firings, not
+        # entry/arm/exit for live/dry_run nodes (only paper_trading.py logs those).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS scenario_expectations (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                scenario_key        TEXT NOT NULL,
+                ticker              TEXT,
+                strategy_type       TEXT,
+                expected_outcome    TEXT NOT NULL,
+                expected_frequency  TEXT NOT NULL,
+                check_method        TEXT NOT NULL,
+                check_params        TEXT,
+                active              INTEGER NOT NULL DEFAULT 1,
+                created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(scenario_key, ticker)
+            )
+        """)
+        c.commit()
+
+        # coverage_deviations: one row per (check_date, scenario_key, ticker)
+        # where a daily expectation wasn't met. `reason` starts NULL --
+        # unexplained -- until explain_deviation() fills it in. A row with
+        # reason IS NULL is itself the actionable thing: an unexplained failure
+        # is a bug by definition, not an acceptable end state (2026-07-24 reframe).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS coverage_deviations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              TEXT NOT NULL DEFAULT (datetime('now')),
+                check_date      TEXT NOT NULL,
+                scenario_key    TEXT NOT NULL,
+                ticker          TEXT,
+                expected_outcome TEXT NOT NULL,
+                actual_summary  TEXT NOT NULL,
+                reason          TEXT,
+                reason_by       TEXT,
+                reason_ts       TEXT,
+                UNIQUE(check_date, scenario_key, ticker)
+            )
+        """)
+        c.commit()
+
         # slack_message_log: full text of every real _post_message call (live,
         # sim, and webhook/socket alike) -- a message that scrolls past or gets
         # lost in Slack itself (e.g. the morning reference report) is otherwise
@@ -683,6 +730,111 @@ def get_coverage_events(scenario_key=None, mode=None, limit=500):
     params.append(limit)
     with _conn() as c:
         return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
+def add_scenario_expectation(scenario_key, expected_outcome, expected_frequency, check_method,
+                              ticker=None, strategy_type=None, check_params=None):
+    """Insert-or-update one row of the structured designed-scenario mapping.
+    expected_frequency: 'daily' / 'occasional' / 'regression-only'.
+    check_method: 'coverage_event' (verify via coverage_events scenario_key) or
+    'trade_lifecycle' (verify via a real trade_log/open_positions row today).
+    check_params is a free-form JSON string interpreted by coverage_check.py
+    according to check_method (e.g. {"exit_reason": "TIME"} for trade_lifecycle)."""
+    ticker = ticker or ''  # NULL never conflicts with NULL under UNIQUE -- '' does, so a
+    # ticker-less scenario still upserts on rerun instead of duplicating (same bug class as
+    # add_node's take_profit=NULL dedup failure).
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO scenario_expectations
+                (scenario_key, ticker, strategy_type, expected_outcome, expected_frequency, check_method, check_params)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scenario_key, ticker) DO UPDATE SET
+                strategy_type=excluded.strategy_type,
+                expected_outcome=excluded.expected_outcome,
+                expected_frequency=excluded.expected_frequency,
+                check_method=excluded.check_method,
+                check_params=excluded.check_params,
+                active=1
+        """, (scenario_key, ticker, strategy_type, expected_outcome, expected_frequency, check_method, check_params))
+        c.commit()
+
+
+def get_scenario_expectations(expected_frequency=None, active_only=True):
+    q = "SELECT * FROM scenario_expectations"
+    clauses, params = [], []
+    if expected_frequency:
+        clauses.append("expected_frequency = ?")
+        params.append(expected_frequency)
+    if active_only:
+        clauses.append("active = 1")
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY id"
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
+def record_deviation(check_date, scenario_key, expected_outcome, actual_summary, ticker=None):
+    """Upsert a deviation row for this (check_date, scenario_key, ticker). Leaves
+    an existing reason in place if the row already exists (re-running the daily
+    check shouldn't clobber a reason someone already attached) but refreshes
+    actual_summary/ts so the row reflects the latest observation."""
+    ticker = ticker or ''  # see add_scenario_expectation -- NULL never conflicts with NULL
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO coverage_deviations
+                (check_date, scenario_key, ticker, expected_outcome, actual_summary)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(check_date, scenario_key, ticker) DO UPDATE SET
+                actual_summary=excluded.actual_summary,
+                ts=datetime('now')
+        """, (check_date, scenario_key, ticker, expected_outcome, actual_summary))
+        c.commit()
+
+
+def explain_deviation(deviation_id, reason, reason_by='user'):
+    with _conn() as c:
+        c.execute("""
+            UPDATE coverage_deviations SET reason = ?, reason_by = ?, reason_ts = datetime('now')
+            WHERE id = ?
+        """, (reason, reason_by, deviation_id))
+        c.commit()
+
+
+def get_deviations(unexplained_only=False, check_date=None, limit=500):
+    q = "SELECT * FROM coverage_deviations"
+    clauses, params = [], []
+    if unexplained_only:
+        clauses.append("reason IS NULL")
+    if check_date:
+        clauses.append("check_date = ?")
+        params.append(check_date)
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
+def get_closed_trades_for_ticker_on_date(ticker, check_date):
+    """trade_log rows that both entered and exited on check_date (YYYY-MM-DD) --
+    the 'same-day full lifecycle' shape coverage_check.py's trade_lifecycle
+    check needs. Newest first."""
+    with _conn() as c:
+        return [dict(r) for r in c.execute("""
+            SELECT * FROM trade_log
+            WHERE ticker = ? AND date(entry_time) = ? AND date(exit_time) = ?
+            ORDER BY id DESC
+        """, (ticker, check_date, check_date)).fetchall()]
+
+
+def get_pending_buys_for_ticker_on_date(ticker, check_date):
+    with _conn() as c:
+        return [dict(r) for r in c.execute("""
+            SELECT * FROM pending_buys WHERE ticker = ? AND date(signal_time) = ?
+            ORDER BY id DESC
+        """, (ticker, check_date)).fetchall()]
 
 
 def log_slack_message(mode, text, error=None):

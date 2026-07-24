@@ -173,6 +173,22 @@ Original scope, now serving this larger goal, four pieces:
 Not scoped in detail (schema for the designed-scenario mapping, dashboard page layout) — a real
 feature to design and build later, not urgent mid-test-day.
 
+**Progress, 2026-07-24 later same session — pieces #3 and #6 built**: `signals_db.
+scenario_expectations` (the structured designed-scenario mapping — canary A-F's prose from
+`deep_backlog.md` is now real rows, seeded via `scripts/seed_scenario_expectations.py`) +
+`coverage_deviations` (the expected-vs-actual log, `reason` starting `NULL` until
+`explain_deviation()` fills it in — the "no unexplained failure" contract). `scripts/
+coverage_check.py` runs the daily check against real `trade_log`/`pending_buys` (not
+`coverage_events`, which turned out not to log entry/arm/exit for live/dry_run nodes — only
+control-site firings like SL placement/gap-resize/dup-guards; only `paper_trading.py` logs
+entry/exit fills). First real run (2026-07-24) immediately surfaced 5/6 canaries not
+completing their designed lifecycle that day — real signal, not a bug in the checker (IVV was
+mid-rename from SPY same day; others likely just didn't get a same-day signal). 10 new tests
+(`tests/test_coverage_check.py`), full suite 195 passed (was 185). **Not yet done**: pieces #1
+(Streamlit dashboard), #2 (3rd strategy-type axis on `coverage_events`), #4 (per-node
+drill-down), #7 (Slack-callable report) — this is the core "compass" logic only, presentation
+layers deferred per the user's explicit sequencing call.
+
 ## [live-trading][security] Open, found 2026-07-24 ~11:22 ET — real bug: a mid-day daemon restart forces a spurious off-schedule bar-close evaluation on every open position, diverging from backtest parity
 `active_signals.py`'s `last_seen_bar` (the dict tracking, per ticker, the last hourly bar the ambient
 poll actually evaluated) is an in-memory local, reset to empty on every daemon restart. The ambient

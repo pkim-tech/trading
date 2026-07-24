@@ -11,6 +11,18 @@ Status values: **Not started** (no live observation, may not even be built) / **
 (built, `dry_run=True`, waiting for a live window to exercise it) / **Verified** (observed
 live, date + note).
 
+**2026-07-24: daily canary designed-scenarios are now structured data, not prose** —
+`signals_db.scenario_expectations` (the designed-scenario mapping, e.g. the six canary
+lifecycles previously only described in `deep_backlog.md`'s 2026-07-23 entry) +
+`coverage_deviations` (one row per day a `daily`-frequency expectation wasn't met, `reason`
+starting `NULL` until explained via `explain_deviation`). `scripts/coverage_check.py` runs the
+daily expected-vs-actual check and surfaces every still-unexplained deviation — this is the
+"compass" from the 2026-07-24 reframe (`docs/backlog_cache.md`): an unexplained deviation is a
+bug by definition, not an acceptable end state. Seed/extend scenarios via
+`scripts/seed_scenario_expectations.py`. This is separate from (and a layer above)
+`coverage_events`/`coverage_matrix.py` below, which tracks raw control-site firings, not
+designed-scenario completion.
+
 **2026-07-22: most rows below now also have a queryable backing** — `signals_db.coverage_events`
 (new table) is logged at ~18 real control sites across `schwab_safety.check_order`,
 `signals_notify.py`, and `paper_trading.py` (`scenario_key`, `mode` ∈ paper/dry_run/live, ticker,
