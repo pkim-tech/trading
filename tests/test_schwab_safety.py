@@ -276,6 +276,43 @@ def test_notional_cap_blocked(env):
         schwab_client.place_equity_buy('ira', TICKER, 1, cap + 1)
 
 
+def test_notional_cap_does_not_block_sell(env):
+    """Found live 2026-07-24: a real armed SPY trailing-sell was permanently
+    blocked because its notional exceeded soxl_ira's $800 BUY-sizing cap --
+    notional_cap bounds new risk-adding exposure, not closing an existing
+    position, so SELL must not be gated by it."""
+    cap = schwab_safety.ACCOUNTS['ira'].notional_cap
+    result = schwab_client.place_equity_sell('ira', TICKER, 1, cap + 1)
+    assert result == (None, None)  # dry_run -- not blocked
+
+
+def test_hard_ceiling_still_blocks_sell(env):
+    """notional_cap is exempt for SELL, but the absolute HARD_ORDER_CEILING
+    sanity backstop must still apply to both sides."""
+    with pytest.raises(schwab_safety.SafetyViolation, match="exceeds hard ceiling"):
+        schwab_client.place_equity_sell('ira', TICKER, 1, schwab_safety.HARD_ORDER_CEILING + 1)
+
+
+def test_sell_exceeding_real_position_blocked(env):
+    """Found by Opus review 2026-07-24: with notional_cap gone from the SELL
+    side, nothing on our side bounded SELL quantity at all -- a real
+    position-size check replaces it, catching a would-be short/oversell
+    before it reaches the broker."""
+    node = [n for n in signals_db.get_watchlist() if n['ticker'] == TICKER][0]
+    signals_db.open_position(node, signal_price=50.0, signal_time=_IN_WINDOW_TIME,
+                              entry_price=50.0, entry_time=_IN_WINDOW_TIME, shares=5)
+    with pytest.raises(schwab_safety.SafetyViolation, match="exceeds the 5"):
+        schwab_client.place_equity_sell('ira', TICKER, 6, 50.0)
+
+
+def test_sell_within_real_position_allowed(env):
+    node = [n for n in signals_db.get_watchlist() if n['ticker'] == TICKER][0]
+    signals_db.open_position(node, signal_price=50.0, signal_time=_IN_WINDOW_TIME,
+                              entry_price=50.0, entry_time=_IN_WINDOW_TIME, shares=5)
+    result = schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
+    assert result == (None, None)  # dry_run -- not blocked
+
+
 def test_insufficient_cash_blocked(env, monkeypatch):
     monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 100.0)
     with pytest.raises(schwab_safety.SafetyViolation, match="cash buffer"):
@@ -387,6 +424,28 @@ def test_daily_cap_blocked(env, monkeypatch):
     schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
     with pytest.raises(schwab_safety.SafetyViolation, match="daily order cap"):
         schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+
+
+def test_protective_stop_loss_bypasses_exhausted_daily_cap(env, monkeypatch):
+    """Found live 2026-07-24: LABU's real fill had its SL placement blocked by
+    an already-exhausted daily_order_cap from unrelated earlier entries,
+    leaving a brand-new fill unprotected. place_stop_loss must succeed
+    (is_protective=True) even once the account's cap is fully spent."""
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
+    schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)  # exhaust the cap
+    with pytest.raises(schwab_safety.SafetyViolation, match="daily order cap"):
+        schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    result = schwab_client.place_stop_loss('ira', TICKER, 20, 45.0)  # qty far outside dup-order tolerance
+    assert result == (None, None)  # dry_run -- not blocked
+
+
+def test_protective_top_up_bypasses_exhausted_daily_cap(env, monkeypatch):
+    """Same starvation shape as the SL case above, confirmed live for the
+    top-up-buy path too ('LABU -- top-up buy of 1 shares blocked')."""
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
+    schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)  # exhaust the cap
+    result = schwab_client.place_equity_buy('ira', TICKER, 1, 50.0, is_protective=True)
+    assert result == (None, None)  # dry_run -- not blocked, not raised
 
 
 def test_global_burst_cap_blocked(env, monkeypatch):

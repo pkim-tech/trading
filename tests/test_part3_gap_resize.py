@@ -114,7 +114,7 @@ def test_gap_resize_replaces_order_when_trigger_cleared(env, monkeypatch):
     monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 52.0)
     monkeypatch.setattr(schwab_client, 'cancel_order', _fake_cancel)
     monkeypatch.setattr(schwab_client, 'place_equity_buy',
-                         lambda account, ticker, qty, price, is_gap_correction=False: (object(), 999))
+                         lambda account, ticker, qty, price, is_gap_correction=False, is_protective=False: (object(), 999))
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side: {'price': 52.0, 'quantity': 900})
 
@@ -180,7 +180,7 @@ def test_reconcile_fill_places_real_broker_order_for_topup(env, monkeypatch):
     _seed_pending_order(monkeypatch)
     calls = []
     monkeypatch.setattr(schwab_client, 'place_equity_buy',
-                         lambda account, ticker, qty, price, is_gap_correction=False:
+                         lambda account, ticker, qty, price, is_gap_correction=False, is_protective=False:
                              calls.append((qty, price, is_gap_correction)) or (object(), 999))
     # 100 shares @ 51 = $5100, well under the $50k target -> real top-up expected
     signals_notify._reconcile_buy_fill(TICKER, 51.0, 100)
@@ -216,10 +216,27 @@ def test_reconcile_fill_topup_passes_through_gap_correction(env, monkeypatch):
     _seed_pending_order(monkeypatch)
     calls = []
     monkeypatch.setattr(schwab_client, 'place_equity_buy',
-                         lambda account, ticker, qty, price, is_gap_correction=False:
+                         lambda account, ticker, qty, price, is_gap_correction=False, is_protective=False:
                              calls.append(is_gap_correction) or (object(), 999))
     signals_notify._reconcile_buy_fill(TICKER, 51.0, 100, is_gap_correction=True)
     assert calls == [True]
+
+
+def test_reconcile_buy_fill_places_sl_for_trailing_both_node(env, monkeypatch):
+    """Found live 2026-07-24: TrailingBothZScoreBreakout fills never got a real
+    automated broker-side stop, unlike TrailingExitZScoreBreakout -- only
+    _is_trailing_buy(node) gated it out. Extended 2026-07-24: any automated
+    fill in automation scope, trailing-buy or not, must get a resting SL."""
+    _seed_pending_order(monkeypatch)
+    sl_calls = []
+    monkeypatch.setattr(schwab_client, 'place_stop_loss',
+                         lambda account, ticker, qty, stop_price: sl_calls.append((qty, stop_price)) or (object(), 777))
+    signals_notify._reconcile_buy_fill(TICKER, 51.0, 100)
+    assert len(sl_calls) == 1
+    qty, stop_price = sl_calls[0]
+    assert qty > 0
+    pos = signals_db.get_open_position(TICKER)
+    assert pos['sl_order_id'] == 777
 
 
 # ---------------------------------------------------------------------------

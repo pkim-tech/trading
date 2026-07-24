@@ -3309,3 +3309,69 @@ user this session (dry_run protects everything, per architecture, not leftover t
   (determines whether the daily coverage check is trustworthy for 5/6 canaries), and the minor
   `expected_outcome` staleness gap.
 - Full suite: 197 passed (was 195 pre-session).
+
+---
+
+## 2026-07-24 — Batch-fixed seven live-test-day bugs (the "compass" cleanup), caught 4 more via a second Opus review round, added 3 standing architectural conventions
+
+### What we did
+- User asked, with ~10 minutes before stepping away for hours, to fix "almost everything" found
+  during the 2026-07-24 real soxl_ira live test day except the dry_run-completion design question
+  (deliberately deferred to next session). Confirmed via `AskUserQuestion` on the ambiguous design
+  forks (protective-action exemption shape, TrailingBoth SL timing, existing-duplicate cleanup,
+  buy_alerted reset scope), then worked through 7 backlog items sequentially, each with a
+  regression test, while the user was away (background session).
+- **Also answered a standing question the user raised mid-turn**: are these bugs "architectural —
+  slop we created carelessly"? Answer: yes, in the sense of missing standing conventions (not
+  careless individual mistakes) — three repeated shapes: null-unsafe dedup, guards inheriting a
+  purpose they weren't designed for, and restart-unsafe in-memory state. Recorded as new
+  `docs/automation_principles.md` #13/#14/#15.
+- **Seven fixes** (full detail: `docs/deep_backlog.md`'s 2026-07-24 evening entry): `add_node`'s
+  NULL-unsafe dedup (explicit check-then-skip, existing live duplicate rows cleaned up via
+  `remove_node`, not raw SQL — the permission classifier correctly blocked a direct `DELETE`);
+  `daily_order_cap` no longer starves SL-placement/top-up (`is_protective` param, narrowly scoped);
+  `notional_cap` now BUY-only (SELL was permanently dead-ending a real automated exit once a
+  position grew past the cap); `TrailingBothZScoreBreakout` fills now get a real automated
+  stop-loss (both the auto-fill-detection path and the manual "Filled" Slack button path — the
+  latter was a deeper gap than the original backlog entry described, it never called SL placement
+  at all); `last_seen_bar` seeded from the real current bar at startup (fixes a confirmed live
+  restart bug — a mid-day restart triggered SPY's arm/TP check off-schedule); `buy_alerted`'s
+  once-per-day lockout now clears after a genuine same-day close (recovers ~8% of SOXL's
+  backtested trades); `_trailing_buy_status` now anchors its trigger to the real `signal_price`
+  instead of a cache-derived one (fixes a confirmed live reminder-suppression bug, GDXU).
+- **Second independent Opus review round caught 4 more issues in this same diff before commit** —
+  all fixed or triaged, not just noted: (1) CONFIRMED — the `buy_alerted` unlock didn't check
+  `pending_buys`, so it would have re-fired (and re-placed a real order) on every poll while a
+  re-entry order was still resting; fixed by also requiring no pending buy (real or paper) for the
+  ticker. (2) CONFIRMED — the first-pass `_trailing_buy_status` fix returned `met=False` instead of
+  `met=None` on a missing cache, which would have silently suppressed reminders in exactly the
+  "unknown" case the whole fix exists to protect; fixed to return `None`. (3) CONFIRMED —
+  `add_node`'s new dedup key mirrored the *old* UNIQUE constraint, which never included
+  `arm_sell_pct` — once NULL-matching started actually working, two genuinely different
+  TrailingBoth nodes (same `take_profit=NULL`, different `arm_sell_pct`) would have silently
+  collapsed to one; fixed by adding `arm_sell_pct`/trail axes to the dedup key. (4) CONFIRMED —
+  `closed_today()` only ever queried the real `trade_log`, so the `buy_alerted` unlock could never
+  fire for a paper-trading node; fixed with a new `paper=` param. (5) PLAUSIBLE, addressed —
+  removing `notional_cap` from SELL also removed the only real bound our own code put on SELL
+  quantity (oversell protection had always relied on Schwab's own rejection); added a more
+  principled real-position-size check instead. (6) PLAUSIBLE, not currently reachable — the manual
+  "Filled" SL call isn't mode-gated like the BUY-side routing is, but traced that this has no live
+  path today (paper-mode BUYs never populate the real `pending_buys` table the "Filled" button
+  needs) — backlogged as a defense-in-depth note tied to future mode-routing changes, not coded.
+- Full suite 210 passed (was 195 at session start), `scripts/live_sim_harness.py` 6/6,
+  `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` both clean (no MISMATCH)
+  per the pre-commit checklist's `active_signals.py`-changed rule.
+- `docs/backlog_cache.md` shrunk (1775→~1600 lines): all 7 resolved entries collapsed to one-line
+  pointers into the new `docs/deep_backlog.md` entry; one new deferred item added (the
+  not-currently-reachable mode-gating gap above).
+
+### State / follow-ups
+- Dry_run-completion design question (does dry_run ever auto-complete a TrailingBoth fill without
+  a human tap?) is still the explicitly deferred first item for next session, per the user's own
+  sequencing call last session.
+- `sell_alerted`/`window_alerted`/`limit_fill_alerted` are still restart-unsafe (same shape as the
+  fixed `last_seen_bar`) — deliberately scoped down and left open; no dedicated DB column exists to
+  reconstruct "already alerted today" the way the clock-keyed trackers can.
+- TrailingBoth automated-SL fix is code-ready; live verification still planned for Monday
+  2026-07-27 per the original plan.
+- Session not yet committed as of this entry — see session close commit.

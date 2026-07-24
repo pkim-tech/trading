@@ -440,13 +440,18 @@ def _broker_confirms_order(orders: list, ticker: str, side: str, quantity: int) 
 
 def check_order(
     account: str, ticker: str, quantity: int, price: float, side: str, counts: dict | None = None,
-    is_gap_correction: bool = False,
+    is_gap_correction: bool = False, is_protective: bool = False,
 ) -> None:
     """Raises SafetyViolation if the order should not proceed. `counts`, if
     given, is used for the daily-cap/burst-cap/duplicate checks instead of
     re-reading the state file -- lets approve_and_record() validate against
     the exact snapshot it's about to increment, under one lock, instead of a
-    separate read."""
+    separate read. is_protective exempts a stop-loss placement or post-fill
+    top-up from the daily_order_cap check only (every other guard still
+    applies) -- found live 2026-07-24 (LABU) that daily_order_cap counts every
+    placement uniformly, so unrelated earlier entries can starve a
+    legitimately protective follow-on action, leaving a brand-new fill
+    unprotected purely from order-count bookkeeping, not real risk."""
     if kill_switch_engaged():
         raise SafetyViolation(f"global kill switch engaged ({kill_switch_reason()})")
 
@@ -530,6 +535,25 @@ def check_order(
                 f"'{ticker}' already has a resting SELL order in '{account}' -- refusing a second "
                 f"concurrent SELL (prevents two live exit orders stacking for the same shares)"
             )
+        # Real position-size bound, added 2026-07-24 alongside exempting SELL
+        # from notional_cap (see above) -- flagged by Opus review: with
+        # notional_cap gone, nothing on our side bounded SELL quantity at all
+        # (oversell protection relied entirely on Schwab's own rejection).
+        # This is a narrower, more principled bound than notional_cap ever
+        # was: it can't false-positive-block a legitimate large exit, but it
+        # does catch our own inflated-share-count bugs (e.g. a top-up that
+        # recorded shares before the real fill was confirmed) before they
+        # reach the broker as a would-be short.
+        pos = signals_db.get_open_position(ticker)
+        if pos and quantity > pos['shares'] * 1.001:  # tolerance for float share counts
+            signals_db.log_coverage_event(
+                "sell_exceeds_position_blocked", _mode, ticker=ticker, result="blocked",
+                detail=f"quantity={quantity:g} held={pos['shares']:g}"
+            )
+            raise SafetyViolation(
+                f"SELL {quantity:g} {ticker} exceeds the {pos['shares']:g} shares on file for "
+                f"'{account}' -- refusing a would-be short"
+            )
 
     # Signal-window time gate, BUY only (see _SIGNAL_WINDOWS comment above).
     # Skipped for a gap-correction replacement order (Part 3, branch B) -- that
@@ -551,7 +575,15 @@ def check_order(
         raise SafetyViolation(
             f"order notional ${notional:,.0f} ({ticker} x{quantity}) exceeds hard ceiling ${HARD_ORDER_CEILING:,.0f}"
         )
-    if notional > limits.notional_cap:
+    # notional_cap bounds new risk-adding exposure (BUY) -- a SELL closes an
+    # existing position instead of opening one, so a real position that grew
+    # past the cap (price appreciation, or was pre-staged larger than the cap)
+    # would otherwise have its automated exit permanently dead-ended. Confirmed
+    # live 2026-07-24: a real armed SPY trailing-sell (soxl_ira, cap $800) was
+    # blocked at $2,227 notional, with no way to ever clear since the position
+    # itself never shrinks below the cap on its own. HARD_ORDER_CEILING above
+    # still applies to both sides as an absolute sanity backstop.
+    if side == "BUY" and notional > limits.notional_cap:
         raise SafetyViolation(
             f"order notional ${notional:,.0f} ({ticker} x{quantity}) exceeds {account} cap ${limits.notional_cap:,.0f}"
         )
@@ -607,7 +639,13 @@ def check_order(
     today = counts.get(str(date.today()), {})
     count = today.get(account, 0)
     if count >= limits.daily_order_cap:
-        raise SafetyViolation(f"account '{account}' has hit its daily order cap ({limits.daily_order_cap})")
+        if is_protective:
+            signals_db.log_coverage_event(
+                "daily_cap_protective_bypass", _mode, ticker=ticker, result="allowed",
+                detail=f"account={account} count={count} cap={limits.daily_order_cap} side={side}"
+            )
+        else:
+            raise SafetyViolation(f"account '{account}' has hit its daily order cap ({limits.daily_order_cap})")
 
     recent = [t for t in counts.get("recent_order_timestamps", []) if time.time() - t < 60]
     if len(recent) >= GLOBAL_ORDERS_PER_MINUTE:
@@ -653,7 +691,8 @@ def check_order(
 
 
 def approve_and_record(
-    account: str, ticker: str, quantity: int, price: float, side: str, is_gap_correction: bool = False
+    account: str, ticker: str, quantity: int, price: float, side: str, is_gap_correction: bool = False,
+    is_protective: bool = False,
 ) -> bool:
     """Call immediately before placing a real order. Raises SafetyViolation if
     blocked; otherwise records the order against the daily cap, the global
@@ -661,10 +700,13 @@ def approve_and_record(
     the account is in dry_run mode (caller must skip the real API call if so).
     Checks and increments happen under the same file lock so two concurrent
     callers can't both slip past a cap. is_gap_correction bypasses only the
-    signal-window time gate (see check_order) -- Part 3, branch B."""
+    signal-window time gate (see check_order) -- Part 3, branch B.
+    is_protective bypasses only the daily_order_cap check -- for a stop-loss
+    placement or post-fill top-up, see check_order's docstring."""
     with _open_locked() as f:
         counts = json.loads(f.read() or "{}")
-        check_order(account, ticker, quantity, price, side, counts=counts, is_gap_correction=is_gap_correction)
+        check_order(account, ticker, quantity, price, side, counts=counts,
+                    is_gap_correction=is_gap_correction, is_protective=is_protective)
         key = str(date.today())
         today = counts.setdefault(key, {})
         today[account] = today.get(account, 0) + 1

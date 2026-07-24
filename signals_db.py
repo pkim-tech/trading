@@ -609,8 +609,36 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
         stored_arm_sell_pct = None
 
     with _conn() as c:
+        # Explicit check-then-skip instead of relying on the UNIQUE constraint +
+        # INSERT OR IGNORE: SQLite never treats NULL == NULL as a conflict match,
+        # and take_profit is genuinely NULL for TrailingBothZScoreBreakout nodes
+        # (see docstring above), so INSERT OR IGNORE silently duplicates those
+        # every rerun instead of no-op'ing. COALESCE normalizes NULL to a sentinel
+        # so this check catches it regardless of column nullability.
+        # arm_sell_pct/trail_buy_pct/trail_sell_pct are included even though
+        # they were never part of the original UNIQUE constraint -- found by
+        # Opus review 2026-07-24: for TrailingBothZScoreBreakout, take_profit
+        # is always NULL and the real distinguishing value lives in
+        # arm_sell_pct instead, so without it here two genuinely different
+        # nodes (same take_profit=NULL, different arm_sell_pct) would now
+        # silently collapse to one the moment the NULL-matching fix above
+        # started actually enforcing the rest of the key -- a new silent-drop
+        # bug introduced while fixing the old silent-duplicate one.
+        existing = c.execute("""
+            SELECT id FROM watch_list
+            WHERE watchlist_id = ? AND ticker = ? AND strategy = ? AND version = ?
+              AND window = ? AND COALESCE(take_profit, -1) = COALESCE(?, -1)
+              AND stop_loss = ? AND max_hold_hours = ?
+              AND COALESCE(arm_sell_pct, -1) = COALESCE(?, -1)
+              AND COALESCE(trail_buy_pct, -1) = COALESCE(?, -1)
+              AND COALESCE(trail_sell_pct, -1) = COALESCE(?, -1)
+        """, (watchlist_id, ticker, strategy, version, int(window), stored_take_profit,
+              int(stop_loss), int(max_hold_hours),
+              stored_arm_sell_pct, stored_trail_buy_pct, stored_trail_sell_pct)).fetchone()
+        if existing:
+            return
         cur = c.execute("""
-            INSERT OR IGNORE INTO watch_list
+            INSERT INTO watch_list
                 (watchlist_id, mode, ticker, strategy, version, window, take_profit,
                  stop_loss, max_hold_hours, label, z_score_threshold, trail_sell_pct, fixed_sl,
                  trail_buy_pct, arm_sell_pct, entry_timing, starting_notional)
@@ -1058,13 +1086,18 @@ def update_position_trail_state(position_id, state, paper=False):
                   (json.dumps(state), position_id))
 
 
-def closed_today(ticker):
+def closed_today(ticker, paper=False):
     """True if this ticker had a trade_log exit today -- IRA/SEP cash accounts can't
-    reuse that capital until T+1 settlement, so a same-day re-buy needs a warning."""
+    reuse that capital until T+1 settlement, so a same-day re-buy needs a warning.
+    paper=True checks paper_trade_log instead -- found by Opus review 2026-07-24:
+    the real-only default meant active_signals's buy_alerted same-day unlock
+    (which calls this to detect a genuine close) could never fire for a
+    paper-trading node, since paper fills only ever land in paper_trade_log."""
+    _, trade_log_table = _pos_tables(paper)
     today = datetime.now().strftime('%Y-%m-%d')
     with _conn() as c:
         row = c.execute(
-            "SELECT 1 FROM trade_log WHERE ticker = ? AND exit_time LIKE ? LIMIT 1",
+            f"SELECT 1 FROM {trade_log_table} WHERE ticker = ? AND exit_time LIKE ? LIMIT 1",
             (ticker, f"{today}%"),
         ).fetchone()
     return row is not None

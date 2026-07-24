@@ -277,9 +277,12 @@ _SL_FAST_CONFIRM_INTERVAL_SECS = 2
 
 def _place_stop_loss_for_position(node, ticker, signal_price):
     """Places the real resting STOP order for a freshly-opened automated
-    market-buy position (Part 4, Section 6) -- reads the final share count
-    back off open_positions (post any top-up _reconcile_fill already applied)
-    so the stop covers the whole position, not just a provisional quantity.
+    position -- market-buy (Part 4, Section 6) or trailing-buy (extended
+    2026-07-24, called from both _reconcile_buy_fill's auto-fill path and
+    signals_handlers.handle_trail_buy_fill_price's manual 'Filled' path).
+    Reads the final share count back off open_positions (post any top-up
+    _reconcile_fill already applied for market-buy fills) so the stop covers
+    the whole position, not just a provisional quantity.
     Anchored to signal_price (the trigger price), not the real fill price --
     the backtest kernel computes stop_price = entry_price * (1 - sl%) where
     entry_price IS the trigger (op/cp), with zero fill slippage modeled.
@@ -777,18 +780,32 @@ def _trailing_buy_status(pending):
     back up by trail_buy_pct%. Only as accurate as the hourly cache (no true intrabar
     low live, same caveat as compute_buy_signal) -- a reasonable signal for reminder
     wording, not a substitute for the real live state machine (still unimplemented,
-    tracked in docs/backlog_cache.md)."""
+    tracked in docs/backlog_cache.md).
+    running_low is anchored to pending['signal_price'] -- the same real basis
+    check_gap_resize uses for the real order's trigger -- not re-derived from
+    the hourly cache's first Low. Confirmed live 2026-07-24 (GDXU): the real
+    order was placed off a $79.665 signal-price-anchored trigger ($79.90) and
+    genuinely filled at $80.805, but the old cache-derived running_low computed
+    a meaningfully different $81.14 trigger and wrongly returned met=False,
+    silently suppressing a fill reminder for an order that had already filled.
+    Hourly bars are still used from here forward to track any further real dip
+    before the bounce -- only the anchor was wrong, not the ongoing tracking."""
     node = pending['node']
     trail_buy_pct = (node.get('trail_buy_pct') or 0) / 100.0
-    df_hourly, _ = compute._load_cache(pending['ticker'])
-    if df_hourly is None or not trail_buy_pct:
+    if not trail_buy_pct:
         return None, None
+    running_low = float(pending['signal_price'])
+    trigger = running_low * (1 + trail_buy_pct)
+    df_hourly, _ = compute._load_cache(pending['ticker'])
+    if df_hourly is None:
+        # met=None (unknown), not False -- check_buy_reminders treats False as
+        # "confirmed not met yet, safe to skip nagging" but None as "can't
+        # tell, nag anyway." Returning False here would have silently
+        # suppressed reminders for every ticker with no cache at all -- caught
+        # by Opus review, same failure mode this whole fix exists to close.
+        return None, trigger
     signal_time = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
     bars = df_hourly[df_hourly.index >= signal_time]
-    if bars.empty:
-        return None, None
-    running_low = float(bars['Low'].iloc[0])
-    trigger = running_low * (1 + trail_buy_pct)
     met = False
     for _, bar in bars.iterrows():
         if bar['Low'] < running_low:
@@ -917,7 +934,7 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False):
         if top_up_shares > 0:
             try:
                 schwab_client.place_equity_buy(account, ticker, top_up_shares, fill_price,
-                                                is_gap_correction=is_gap_correction)
+                                                is_gap_correction=is_gap_correction, is_protective=True)
             except schwab_safety.SafetyViolation as e:
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
                                        result="blocked", detail=str(e))
@@ -952,14 +969,21 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
     first wins, the other finds nothing to do), opens the real position, then
     tops it up via _reconcile_fill (is_gap_correction passed through so a
     top-up following a gap-correction fill isn't blocked by the signal-window
-    gate). Places the resting STOP order for any automated market-buy
-    (non-trailing-buy) node in automation scope -- determined here rather
-    than left to each caller, so the SL genuinely gets placed regardless of
-    *which* path ends up detecting the fill (previously only the synchronous
-    fast-confirm path passed place_sl=True explicitly; if that path timed
-    out, the async fallback paths below silently never placed a stop at all,
-    contradicting the timeout alert's own claim that the fallback would
-    eventually cover it -- found and fixed 2026-07-21)."""
+    gate). Places the resting STOP order for any automated fill (market-buy or
+    trailing-buy) in automation scope -- determined here rather than left to
+    each caller, so the SL genuinely gets placed regardless of *which* path
+    ends up detecting the fill (previously only the synchronous fast-confirm
+    path passed place_sl=True explicitly; if that path timed out, the async
+    fallback paths below silently never placed a stop at all, contradicting
+    the timeout alert's own claim that the fallback would eventually cover it
+    -- found and fixed 2026-07-21). Trailing-buy (TrailingBothZScoreBreakout)
+    fills were excluded here until 2026-07-24 -- found live that this left
+    every real automated TrailingBoth fill with no broker-side stop at all,
+    same exposure as a manually-seeded position with no broker_stop_price on
+    file. This auto-fill path is the minority case for trailing-buy fills
+    (the manual 'Filled' Slack button is the primary workflow, see
+    handle_trail_buy_fill_price in signals_handlers.py, which places its own
+    SL for the same reason)."""
     pendings = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
     if not pendings:
         return
@@ -976,7 +1000,7 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
     _post_message(f"🤖 {ticker} — auto-detected fill at ${fill_price:.4f}  "
                   f"(drift: {drift_pct:+.2f}%)  {filled_shares:g} shares")
     _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=is_gap_correction)
-    if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS and not db._is_trailing_buy(node):
+    if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         _place_stop_loss_for_position(node, ticker, signal_price)
 
 

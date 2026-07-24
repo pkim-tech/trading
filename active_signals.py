@@ -184,6 +184,17 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
     precise fetched price for the default ambient yfinance lookup inside
     compute_buy_signal."""
     price_overrides = price_overrides or {}
+    # Pending (order placed but not yet confirmed filled) tickers, real and
+    # paper -- the same-day unlock below must not re-fire while one of these
+    # is still resting, or it would re-notify (and, if wired to automated
+    # placement, re-place a real order) on every single poll until the human
+    # clicks Filled / the paper bounce-fill lands. Found by Opus review
+    # 2026-07-24: closed_today + no open position is also true for the whole
+    # window between "order placed" and "position opens on fill confirmation,"
+    # not just after a genuine close. Paper trailing-buy nodes have the exact
+    # same pending-window shape (paper_trading.start_paper_buy/
+    # paper_pending_buys), so both tables are checked.
+    pending_tickers = {p['ticker'] for p in get_pending_buys()} | {p['ticker'] for p in db.get_paper_pending_buys()}
     summaries = []
     for node in nodes:
         sig = compute_buy_signal(node, price_override=price_overrides.get(node['ticker']))
@@ -192,6 +203,23 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
             continue
 
         alert_key = (sig['ticker'], node['strategy'], sig['window'])
+
+        # buy_alerted's once-per-day lockout structurally blocked a real,
+        # quantified slice (~8% for SOXL) of a winning node's backtested
+        # trades: buy -> sell -> buy all in one day, where the ticker already
+        # got its one alert before the position even closed. Once the
+        # position has genuinely closed (not just still open/pending) and a
+        # real exit was recorded today, clear the lock so a later same-day
+        # signal can alert again -- same-day re-buy risk itself is still
+        # covered separately by check_order's same_day_block guard.
+        # closed_today's paper flag matters here (Opus review 2026-07-24): a
+        # research-mode/paper node's real exit only ever lands in
+        # paper_trade_log, never trade_log -- without it this unlock could
+        # never fire for a paper node at all.
+        is_paper_node = node.get('mode', 'live') != 'live'
+        if (alert_key in buy_alerted and (sig['ticker'], sig['window']) not in open_position_keys
+                and sig['ticker'] not in pending_tickers and closed_today(sig['ticker'], paper=is_paper_node)):
+            buy_alerted.discard(alert_key)
 
         if sig['signal'] == 'BUY' and alert_key not in buy_alerted:
             buy_alerted.add(alert_key)
@@ -280,6 +308,19 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
             sell_alerted.add((pos['id'], last_bar_ts))
 
 
+def _seed_last_seen_bar(open_positions):
+    """Startup seed for last_seen_bar (see run_loop) -- ticker -> real current
+    hourly bar timestamp for every currently-open position. See run_loop's
+    last_seen_bar comment for why an empty dict causes a spurious off-schedule
+    bar-close evaluation on every restart."""
+    seeded = {}
+    for pos in open_positions:
+        df_hourly, _ = _load_cache(pos['ticker'])
+        if df_hourly is not None and not df_hourly.empty:
+            seeded[pos['ticker']] = df_hourly.index[-1]
+    return seeded
+
+
 _LAST_SECTION_ALERT: dict[str, float] = {}
 _SECTION_ALERT_COOLDOWN_SECS = 900  # 15 min -- matches the reminder-nag cadence elsewhere
 
@@ -364,7 +405,17 @@ def run_loop(tickers: set = None):
     paper_sell_alerted: set[tuple] = set()  # same shape, separate set — paper position ids aren't real ones
     window_alerted:     set[tuple] = set()
     limit_fill_alerted: set[tuple] = set()
-    last_seen_bar:      dict       = {}   # ticker -> last hourly bar timestamp checked
+    # ticker -> last hourly bar timestamp checked. Seeded from each open
+    # position's real current bar below (not left empty) -- found live
+    # 2026-07-24: last_seen_bar.get(ticker) returning None on a fresh restart
+    # trivially != last_bar_ts, so at_bar_close evaluates True on the very
+    # first poll after ANY restart regardless of real timing (confirmed:
+    # restarting at 11:14 ET caused SPY's arm/TP check to fire at 11:21 ET,
+    # not a real hourly bar close or pinned exit-arm time). Seeding to the
+    # real current bar means a restart's first poll correctly recognizes "no
+    # new bar since last real close" instead of "no record at all" == "a new
+    # bar just happened."
+    last_seen_bar: dict = _seed_last_seen_bar(get_open_positions())
     last_date = datetime.now().strftime('%Y-%m-%d')
     # Slots already past today are pre-marked "done" since the unconditional
     # send_reference_report() above just covered them -- only upcoming slots fire.

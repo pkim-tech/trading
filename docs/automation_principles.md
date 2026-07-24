@@ -144,3 +144,44 @@ kernel got wrong, so a resweep built on a silent kernel bug produces confidently
 same as a live daemon bug produces a wrong order. Making the review a standing, required step
 (rather than something raised occasionally, per session_cache's 2026-07-22/23 notes) closes that
 gap instead of relying on remembering to ask for it.
+
+## 13. Never rely on a UNIQUE constraint over a nullable column for dedup
+SQLite (and most SQL engines) never treat `NULL == NULL` as a match for uniqueness purposes, so
+`INSERT OR IGNORE`/`ON CONFLICT` silently stops deduping the moment any column in the UNIQUE key
+can be NULL. Either normalize the nullable column to a real sentinel value before the constraint
+sees it, or do an explicit check-then-skip (query for an equivalent row first, using `COALESCE`
+to treat NULL as equal to NULL, then only insert if nothing matched) instead of trusting the
+constraint alone.
+**Why**: this exact bug hit the codebase twice in one day (2026-07-24) — `add_node`'s
+`take_profit=NULL` for `TrailingBothZScoreBreakout` nodes (15 real duplicate live `watch_list`
+rows on `soxl_ira`), then `add_scenario_expectation`/`record_deviation`'s `ticker=NULL` for
+control-site scenarios. Two independent authors hit the identical shape without recognizing it as
+a pattern until the second occurrence — worth checking any future nullable-column-in-a-UNIQUE-key
+design against this before it becomes a third incident.
+
+## 14. Re-examine a safety guard's purpose before a new order type or code path routes through it
+A limit built for one purpose (e.g. bounding new risk-adding exposure on a BUY) does not
+automatically make sense for every order type that later starts calling through the same
+chokepoint. When a new caller (a SELL, a protective follow-on action, a top-up) is wired into an
+existing guard, explicitly ask whether the guard's original rationale still applies — don't let it
+silently inherit a limit designed around a different scenario.
+**Why**: `notional_cap` (sized for new-BUY risk) permanently dead-ended a real automated
+trailing-SELL once a position grew past it, since a SELL closes exposure rather than adding it;
+`daily_order_cap` (sized for entry-order volume) starved a stop-loss placement and a top-up-buy
+purely on order-count bookkeeping, leaving a genuine fresh fill unprotected. Both found live
+2026-07-24, both fixed by asking "does this guard's purpose apply to this order type" rather than
+by loosening the limit itself.
+
+## 15. Any in-memory dedup/tracking set in `run_loop` must be smart-initialized at startup, not left empty
+A plain `set()`/`dict()` seeded empty at daemon startup means the very first poll after *any*
+restart trivially treats "no record at all" as "this just happened for the first time" — even
+when the real state (a bar already closed, an alert already sent) hasn't actually changed.
+Initialize from real persisted/derivable state instead: either the clock (if the tracker is keyed
+on a fixed daily time slot, like `reference_alerted`/`gap_check_alerted`/`pinned_bar_alerted`) or
+the real current data (if it's keyed on a moving value like a bar timestamp, like
+`last_seen_bar`, seeded from each open position's real current bar).
+**Why**: `last_seen_bar` starting empty caused a restart to force a spurious off-schedule
+bar-close evaluation on every open position, confirmed live 2026-07-24 (a restart at 11:14 ET
+triggered SPY's arm/TP check at 11:21 ET, not a real bar close or pinned exit-arm time) — same
+underlying restart-safety gap `reference_alerted` and friends were already deliberately built to
+avoid, just not applied consistently to every tracker of that shape.

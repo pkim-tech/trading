@@ -178,13 +178,15 @@ def _resolve_account_hashes() -> dict:
 
 def _place_equity_order(
     side: str, account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
+    is_protective: bool = False,
 ):
     """side is 'BUY' or 'SELL'. price is only used for the safety-cap notional
     check, not sent to the API -- this places a market order. Returns
     (response, order_id); dry_run returns (None, None)."""
     try:
         dry_run = schwab_safety.approve_and_record(
-            account, ticker, quantity, price, side, is_gap_correction=is_gap_correction)
+            account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
+            is_protective=is_protective)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED {side} {quantity} {ticker} in {account}: {e}")
         raise
@@ -205,8 +207,10 @@ def _place_equity_order(
     return r, order_id
 
 
-def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False):
-    return _place_equity_order("BUY", account, ticker, quantity, price, is_gap_correction=is_gap_correction)
+def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
+                      is_protective: bool = False):
+    return _place_equity_order("BUY", account, ticker, quantity, price, is_gap_correction=is_gap_correction,
+                                is_protective=is_protective)
 
 
 def place_equity_sell(account: str, ticker: str, quantity: int, price: float):
@@ -385,7 +389,8 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float)
     TRAILING_STOP + link-basis/offset. Returns (response, order_id); dry_run
     returns (None, None)."""
     try:
-        dry_run = schwab_safety.approve_and_record(account, ticker, quantity, stop_price, "SELL")
+        dry_run = schwab_safety.approve_and_record(
+            account, ticker, quantity, stop_price, "SELL", is_protective=True)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.4f}: {e}")
         raise

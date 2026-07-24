@@ -174,6 +174,7 @@ def test_trailing_buy_status_met_when_bounce_clears_trigger():
         pending = {
             'ticker': ticker,
             'signal_time': (idx[0] - timedelta(minutes=1)).strftime('%Y-%m-%d %H:%M:%S'),
+            'signal_price': 100.0,  # matches lows[0] -- preserves the running_low sequence below
             'node': {'trail_buy_pct': 5.0},
         }
         met, trigger = A._trailing_buy_status(pending)
@@ -192,6 +193,7 @@ def test_trailing_buy_status_not_met_when_no_bounce():
         pending = {
             'ticker': ticker,
             'signal_time': (idx[0] - timedelta(minutes=1)).strftime('%Y-%m-%d %H:%M:%S'),
+            'signal_price': 100.0,  # matches lows[0] -- preserves the running_low sequence below
             'node': {'trail_buy_pct': 5.0},
         }
         met, _ = A._trailing_buy_status(pending)
@@ -200,13 +202,52 @@ def test_trailing_buy_status_not_met_when_no_bounce():
         cleanup_csv(ticker)
 
 
-def test_trailing_buy_status_no_cache_returns_none():
+def test_trailing_buy_status_no_cache_falls_back_to_real_signal_price_trigger():
+    """Found live 2026-07-24 (GDXU): the old cache-derived running_low anchor
+    could diverge meaningfully from the real trigger check_gap_resize used to
+    place the order, silently suppressing a fill reminder. Anchoring to
+    pending['signal_price'] (the same real basis check_gap_resize uses) means
+    even with no cache at all, the trigger returned is the real one.
+    met stays None (unknown), not False -- caught by Opus review: returning
+    False here would have made check_buy_reminders treat "no cache at all" as
+    "confirmed not met yet" and silently skip nagging, the exact suppression
+    bug this whole fix exists to close, just via a different trigger."""
     cleanup_csv('TEST_TBSTATUS_NOCACHE')
     pending = {
         'ticker': 'TEST_TBSTATUS_NOCACHE',
         'signal_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'signal_price': 100.0,
         'node': {'trail_buy_pct': 5.0},
     }
     met, trigger = A._trailing_buy_status(pending)
     assert met is None
-    assert trigger is None
+    assert trigger == 105.0
+
+
+def test_trailing_buy_status_uses_real_signal_price_not_first_cached_bar_low():
+    """Reproduces the real GDXU divergence: the hourly cache's first bar after
+    signal_time can print a materially higher Low than the real price at the
+    moment the signal/order actually fired (pre-market/opening dynamics an
+    hourly bar doesn't capture) -- anchoring to that instead of the real
+    signal_price computed a wrong (too high) trigger and could report
+    met=False for an order that had already genuinely filled."""
+    ticker = 'TEST_TBSTATUS_REALANCHOR'
+    # cache's first bar Low (81.0) is well above the real signal_price (79.665)
+    # -- old code anchored here and got trigger ~81.0*1.003=81.24, too high.
+    lows  = [81.0, 81.0]
+    highs = [81.0, 80.9]  # never clears the wrong cache-derived trigger (~81.24)
+    idx = _write_low_high_csv(ticker, lows, highs)
+    try:
+        pending = {
+            'ticker': ticker,
+            'signal_time': (idx[0] - timedelta(minutes=1)).strftime('%Y-%m-%d %H:%M:%S'),
+            'signal_price': 79.665,
+            'node': {'trail_buy_pct': 0.3},
+        }
+        met, trigger = A._trailing_buy_status(pending)
+        # real trigger anchored off signal_price: 79.665 * 1.003 = 79.90 -- the
+        # cache's Low never goes below signal_price, so running_low stays at
+        # signal_price and the real fill (80.805) would have cleared it.
+        assert round(trigger, 2) == 79.90
+    finally:
+        cleanup_csv(ticker)

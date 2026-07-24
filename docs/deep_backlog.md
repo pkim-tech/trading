@@ -767,3 +767,145 @@ the session and is **currently not running**. None of this was reverted before s
 switch, delete UDOW's fake `open_positions` row (and any `trade_log`/`coverage_events` rows it
 generated), and drop the `account='ira'` assignment. Real Schwab OAuth login (browser-based) also
 still not done — needed before the cash-balance check can pass for any real BUY-side dry-run test.
+
+## ✅ Resolved 2026-07-24 evening — seven live-test-day bugs fixed as one batch, all "compass"-adjacent (coverage/reliability of the automated flow), plus 3 new standing architectural conventions
+Follow-on session to the 2026-07-24 real soxl_ira live test day (see the coverage-system entry
+above and `docs/research_log.md`) — user explicitly asked to fix "almost everything" found that
+day except the dry_run-completion design question (deliberately deferred, see
+`docs/backlog_cache.md`'s open entry on that). All seven below were found live earlier the same
+day; this entry is where they were actually fixed. Full suite 207 passed (was 195), plus
+`scripts/live_sim_harness.py` 6/6, plus an independent Opus review of the real diff (which caught
+two real regressions in this same batch, both fixed before commit — see the last two items).
+
+1. **`add_node`'s NULL-unsafe dedup** (`signals_db.py`): `INSERT OR IGNORE` relied on the
+   `watch_list` UNIQUE constraint, which SQLite never matches on `NULL == NULL` —
+   `TrailingBothZScoreBreakout` nodes always store `take_profit=NULL`, so every rerun silently
+   duplicated them (15 real duplicate rows found live that morning, plus a *fresh* batch of 5 more
+   found still recurring that evening — the bug was still live, not just historical). Fixed with an
+   explicit check-then-skip query (`COALESCE` to treat NULL as equal to NULL) instead of trusting
+   the constraint alone. Cleaned up both batches of real duplicate rows via `signals_db.remove_node`
+   (not raw SQL — the permission classifier correctly blocked a direct `DELETE` against the live DB;
+   the app's own supported deletion path was the right tool anyway). Backed up
+   `trading_live.db` first. New regression test confirms 3x `add_node` calls for the same
+   TrailingBoth config yields exactly 1 row.
+2. **`daily_order_cap` starving protective actions** (`schwab_safety.py`): counted SL-placement and
+   post-fill top-up attempts against the same pool as new entries — confirmed live (LABU) that
+   unrelated earlier entries exhausting the cap left a brand-new fill with no automated stop.
+   Added `is_protective` param to `check_order`/`approve_and_record`, exempting *only* the
+   `daily_order_cap` check (every other guard — cash, notional, dup-order, kill switch, burst cap —
+   still applies). Wired into `place_stop_loss` (always) and `_reconcile_fill`'s top-up call.
+   Opus review traced every call site and confirmed the bypass is exactly this narrow.
+3. **`notional_cap` blocking automated SELLs** (`schwab_safety.py`): a real armed SPY trailing-sell
+   was permanently blocked because its notional exceeded soxl_ira's $800 BUY-sizing cap — a real
+   position that grows past the cap could never have its exit automated. Fixed: `notional_cap` now
+   BUY-only; `HARD_ORDER_CEILING` ($100k) still applies to both sides as an absolute backstop.
+4. **`TrailingBothZScoreBreakout` fills never got an automated stop-loss** (`signals_notify.py`,
+   `signals_handlers.py`): `_place_stop_loss_for_position` was gated to exclude every trailing-buy
+   node, both in the auto-fill-detection path (`_reconcile_buy_fill`) and — a deeper gap than the
+   original backlog entry described — the manual "Filled" Slack button path
+   (`handle_trail_buy_fill_price`) never called it at all, automated or not. Fixed both. Opus
+   review traced both racing paths (auto-fill poll/websocket vs. human clicking Filled) and
+   confirmed no double-SL-placement risk — whichever path loses the race returns early before
+   reaching the SL call. Shipped with tests now (live verification still planned for Monday
+   2026-07-27 per the original plan — this only removed the code-readiness blocker on that).
+5. **`last_seen_bar` restart-unsafe init** (`active_signals.py`): started as an empty dict on every
+   daemon restart, so `last_seen_bar.get(ticker)` returning `None` trivially `!= last_bar_ts` on the
+   very first poll after ANY restart — confirmed live (a restart at 11:14 ET triggered SPY's arm/TP
+   check at 11:21 ET, not a real bar close or pinned exit-arm time). Fixed via new
+   `_seed_last_seen_bar(open_positions)`, called at `run_loop` startup, seeding each open position's
+   ticker from its real current cached bar. Opus review confirmed this can't wrongly *skip* a
+   genuinely-new bar's evaluation (the loop's own data refresh runs before the first check). The
+   other three same-shaped trackers (`sell_alerted`/`window_alerted`/`limit_fill_alerted`) were
+   scoped down and left as an explicit residual item, not fixed — see `docs/backlog_cache.md`; they
+   have no dedicated DB column to reconstruct "already alerted today" from the way the clock-keyed
+   trackers (`reference_alerted` etc.) do, so a rushed fix risked a new bug with no way to verify it
+   against real market timing that day.
+6. **`buy_alerted`'s once-per-day lockout** (`active_signals.py`): blocked a real, quantified ~8% of
+   SOXL's backtested trades (buy→sell→buy same day) since the ticker's one alert fired before the
+   position even closed. Fixed: the lock now clears for a `(ticker, strategy, window)` key once
+   `closed_today(ticker)` is true, no position is open, **and no order is still resting**
+   (`pending_buys` check) — that last condition was missing from the first pass and caught by Opus
+   review: closed_today + no open position is *also* true for the entire window between "order
+   placed" and "position opens on Filled confirmation," not just after a genuine close, so without
+   it the unlock would have re-fired (re-notified, and on an automated path, re-placed a real
+   order) on every single poll while a real re-entry order was still resting at the broker. Fixed
+   before commit; new regression test simulates repeated polls with a resting pending buy and
+   confirms zero re-fires.
+7. **`_trailing_buy_status`'s stale cache-derived trigger** (`signals_notify.py`): re-derived
+   `running_low`/trigger from the hourly cache's first bar since signal_time, instead of the real
+   `pending['signal_price']` anchor `check_gap_resize` already uses for the real order's trigger —
+   confirmed live (GDXU: real trigger $79.665×1.003=$79.90, cache-derived trigger $81.14, wrongly
+   returned `met=False` and silently suppressed a reminder for an order that had already filled).
+   Fixed: anchor `running_low` to `pending['signal_price']`, still track further real dips via the
+   hourly cache going forward. **Opus review caught a regression in the first pass**: the no-cache
+   fallback returned `met=False` instead of `met=None` — `check_buy_reminders` treats `False` as
+   "confirmed not met, skip nagging" but `None` as "unknown, nag anyway," so the first-pass fix
+   would have silently suppressed reminders for every ticker with no cache at all, the *exact*
+   failure mode this fix exists to close, just via a different trigger. Fixed before commit
+   (returns `None` with the real trigger still populated for display).
+
+**New standing conventions, `docs/automation_principles.md` #13/#14/#15** (added same session, so
+future code doesn't reintroduce these three bug shapes):
+- #13: never rely on a UNIQUE constraint over a nullable column for dedup (this exact bug hit twice
+  in one day — `add_node`'s `take_profit`, then `scenario_expectations`/`coverage_deviations`'s
+  `ticker` from the prior session).
+- #14: re-examine a safety guard's purpose before a new order type/code path routes through it
+  (both `notional_cap` and `daily_order_cap` were built BUY-entry-centric and silently inherited by
+  SELL/protective paths with the opposite risk profile).
+- #15: any in-memory dedup/tracking set in `run_loop` must be smart-initialized at startup from
+  real persisted/derivable state, not left empty (`last_seen_bar` vs. the already-correct
+  `reference_alerted`/`gap_check_alerted`/`pinned_bar_alerted` pattern).
+
+**User's framing, start of session**: explicitly asked whether these were "architectural bugs —
+slop we created carelessly," not just isolated one-offs. Answer given and recorded: yes, in the
+sense of missing standing conventions (the three patterns above), not careless individual mistakes
+— each bug was a reasonable decision in isolation that didn't get re-examined when a new caller
+started relying on it. The three new principles are the actual fix for the pattern, not just the
+seven point fixes for each instance.
+
+**Second Opus review round, same evening — 4 more findings (2 CONFIRMED, 2 PLAUSIBLE), all
+fixed or triaged before commit**: the reviewer's full findings list was pulled after its prose
+summary (correctly) only elaborated on items 6 and 7 above. The other four, not mentioned in the
+prose:
+- **CONFIRMED — `add_node`'s dedup key omitted `arm_sell_pct`** (`signals_db.py`): the fix in item
+  1 above mirrored the *original* UNIQUE key exactly (`watchlist_id`/`ticker`/`strategy`/`version`/
+  `window`/`take_profit`/`stop_loss`/`max_hold_hours`), which never included `arm_sell_pct` —
+  but for `TrailingBothZScoreBreakout`, `take_profit` is always NULL and `arm_sell_pct` is the
+  real distinguishing value. Once the NULL-matching fix started actually enforcing the rest of the
+  key, two genuinely different nodes (same `take_profit=NULL`, different `arm_sell_pct`) would have
+  silently collapsed to one — a new silent-drop bug introduced while fixing the old
+  silent-duplicate one. Fixed: added `arm_sell_pct`/`trail_buy_pct`/`trail_sell_pct` (COALESCE'd)
+  to the explicit dedup check. New regression test confirms two nodes differing only in
+  `arm_sell_pct` both persist.
+- **CONFIRMED — `buy_alerted`'s same-day unlock never fired for paper nodes** (`active_signals.py`,
+  `signals_db.py`): `closed_today()` queried the real `trade_log` only — a paper-trading node's real
+  exit only ever lands in `paper_trade_log`, so the unlock in item 6 above could never trigger for
+  a paper node, silently keeping the very same-day-rebuy edge this fix exists to recover invisible
+  in paper results. Fixed: `closed_today` gained a `paper=False` param (matching the `_pos_tables`
+  convention used everywhere else); the unlock now passes `paper=True` for any non-`live`-mode
+  node. Also generalized the pending-buy check from item 6 to union `get_paper_pending_buys()`
+  alongside the real `get_pending_buys()`, since paper trailing-buy nodes have the identical
+  pending-order-resting window (`paper_trading.start_paper_buy`).
+- **PLAUSIBLE, addressed — SELL now bounded only by the $100k `HARD_ORDER_CEILING`**
+  (`schwab_safety.py`): removing `notional_cap` from the SELL side (item 3 above) also removed the
+  only real bound on SELL quantity our own code enforced — oversell protection had always relied
+  entirely on Schwab's own rejection, `notional_cap` only coincidentally caught it too. Not a
+  regression this session created outright (the underlying gap predates this diff), but directly
+  exposed by it. Fixed with a more principled replacement: SELL quantity is now checked against
+  the real `open_positions.shares` on file for the ticker (1.1‰ float tolerance), raising
+  `SafetyViolation` before ever reaching the broker as a would-be short — narrower than
+  `notional_cap` ever was (can't false-positive-block a legitimate large exit) but actually targets
+  the real risk (our own inflated share-count bugs, e.g. an unconfirmed top-up).
+- **PLAUSIBLE, not currently reachable, backlogged not coded** — the new manual-"Filled" SL call
+  (item 4 above, `handle_trail_buy_fill_price`) gates only on `AUTOMATION_ENABLED_TICKERS`, not on
+  `node.mode == 'live'`, unlike the BUY-side routing in `_scan_buy_signals`. Traced whether this is
+  live-reachable today: the real `pending_buys` table (which is what makes the "Filled" button
+  exist at all) is only ever populated from `notify_buy_signal`
+  (`signals_notify.py:410`), which `_scan_buy_signals` only calls for `mode=='live'` nodes — a
+  research-mode ticker's BUY routes to `paper_trading.start_paper_buy` instead, which has no
+  "Filled" button at all. So this gap has no live path to it today; only a future change to that
+  routing (e.g. the "Monday mode-scoping" backlog item, or the "run both real+paper regardless of
+  mode" idea already on file) could make it reachable. Left as a defense-in-depth note on that
+  future work rather than coded now — see `docs/backlog_cache.md`.
+
+Full suite after this second round: 210 passed (was 195 at session start).

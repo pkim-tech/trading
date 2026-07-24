@@ -10,7 +10,7 @@ import signals_compute as compute
 import schwab_safety
 from signals_blocks import _post_message, _price_input_block, _shares_input_block
 from signals_helpers import _existing_position_note, _last_sale_recovery, clear_corp_action_alert
-from signals_notify import send_reference_report
+from signals_notify import send_reference_report, _place_stop_loss_for_position
 
 if cfg.SOCKET_MODE:
 
@@ -151,6 +151,9 @@ if cfg.SOCKET_MODE:
                                  f"was *not* recorded (no duplicate created). {_existing_position_note(ticker)}"}}],
             )
             return
+
+        if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            _place_stop_loss_for_position(node, ticker, signal_price)
 
         note = f"${fill_price:.4f}  (drift: {drift_pct:+.2f}%)  {shares} shares"
         print(f"  Trailing buy filled via Slack: {ticker} at {note}")
