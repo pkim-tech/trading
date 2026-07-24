@@ -34,7 +34,10 @@ actually worked as expected, not just whether an order was accepted.
    fill for real money) if the cancel silently didn't take effect; (b) `_attempt_automated_sell` — **not**
    an actual oversell (confirmed empirically 2026-07-23 night that Schwab rejects a real oversell attempt,
    e.g. SPY 4-vs-3-held), just a rejected/wasted order attempt (now cleanly caught as `OrderRejected`
-   anyway) that would've left the position without its intended new protection. Corrected here after the
+   anyway) that would've left the position without its intended new protection — and even that has an
+   independent backstop: `signals_notify.check_live_state_reconciliation` runs every poll cycle and
+   specifically detects an open position missing its expected resting SL/trailing-sell order, alerting
+   with a proposed fix. Corrected here after the
    user caught the overstated "oversell risk" framing. 4 existing tests updated for the new return
    signature. Daemon restarted again (pid 671527, 08:20:41) to pick this up before the 9:15 window.
 
