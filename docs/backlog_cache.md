@@ -15,6 +15,14 @@ built to eliminate false "something looked off" ambiguity. **Action needed**: tr
 auto-produces a fill event for TrailingBoth orders (check `signals_notify.py`'s fill-reconciliation path
 against a dry_run account) before trusting `coverage_check.py`'s daily output for these 5 tickers.
 Not investigated further same session — user deliberately deferred, heading out.
+**User's framing, next session (2026-07-24 evening)**: called this "an important idea" in its own
+right, not just a coverage-check caveat — this is really about **how dry_run tests completion** at
+all, a question the user had already been independently thinking about (on the train the day before,
+re: "how dry_run was going to handle no positions"). A candidate design raised: handle it the same way
+paper trading does — **stage some positions as if they'd filled** (rather than requiring dry_run to
+wait on a real fill event that may never come from a broker it never actually calls). Not the only
+option discussed, just the one floated — pick this up as the first thing next session, per user's
+explicit sequencing call.
 
 ## [live-trading][coverage] Minor, found 2026-07-24 ~evening via Opus review — record_deviation doesn't refresh expected_outcome on rerun
 `signals_db.record_deviation`'s `ON CONFLICT` `UPDATE SET` refreshes `actual_summary`/`ts` but not
