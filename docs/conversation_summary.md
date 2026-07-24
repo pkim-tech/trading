@@ -3251,3 +3251,61 @@ user this session (dry_run protects everything, per architecture, not leftover t
 - Monday: small real live test of the `TrailingBoth` SL-automation fix (once built) — user won't be
   working from home, so the test design needs to account for lower attention (see the dashboard-as-
   compass reframe — this is presumably the actual first real use case for it).
+
+---
+
+## 2026-07-24 — Recovered and hardened a frozen session's coverage-check build; found a real NULL-dedup bug and an Opus-review table-routing question
+
+### What we did
+- **Recovered a frozen/stuck prior session's in-progress work**: `signals_db.py` (modified,
+  uncommitted), `scripts/coverage_check.py`, `scripts/seed_scenario_expectations.py`,
+  `tests/test_coverage_check.py` (all new, uncommitted) were sitting on disk from a session that froze
+  mid-step ("Add tests + wire into CLAUDE.md conventions" — tests were written, CLAUDE.md wiring
+  wasn't). Confirmed nothing was lost (file edits persist independent of session state) and picked up
+  from there rather than restarting.
+- **Deeper review before trusting it, at user's explicit request**: read all four files fully, ran the
+  new test suite (10/10 passed) and the full suite (195 passed, no regressions from the additive
+  `signals_db.py` schema changes), then went one level further and **found a real bug**:
+  `add_scenario_expectation`/`record_deviation` accept `ticker=None`, and their `UNIQUE`/`ON CONFLICT`
+  keys include `ticker` — but SQLite never treats `NULL == NULL` as a conflict match, so a ticker-less
+  (control-site) scenario would silently duplicate on every rerun instead of upserting. **Same bug
+  class that hit this exact codebase in production the same day** (`add_node`'s `take_profit=NULL`
+  dedup failure, 15 real duplicate live watch_list rows). Verified empirically (reproduced 2 rows where
+  1 was expected), fixed by normalizing `ticker = ticker or ''` before insert in both functions, added
+  2 regression tests (12/12 passing after).
+- **Finished the frozen session's last step**: wrote the `CLAUDE.md` Key Files entry documenting
+  `scenario_expectations`/`coverage_deviations`/`coverage_check.py`/`seed_scenario_expectations.py`
+  (pieces #3 and #6 of the 2026-07-24 coverage-system reframe), matching the existing `coverage_events`
+  entry's style, explicitly calling out the NULL-ticker fix and its production precedent.
+- **Committed** (`e447128`): `signals_db.py`, both new scripts, the test file, `CLAUDE.md`,
+  `docs/backlog_cache.md`, `docs/live_test_coverage.md` — 7 files, 525 insertions.
+- **Session wrap, per CLAUDE.md's `signals_*.py`-changed convention**: ran `live_sim_harness.py`
+  (6/6 scenarios passed) and spawned an independent Opus review agent against the real `signals_db.py`
+  diff (`e447128`). Review found the NULL-key fix correct and no daemon poll-loop exception risk, plus
+  two findings:
+  1. **Premise-checked before accepting**: reviewer claimed the new `trade_lifecycle` checker
+     (`coverage_check.py`) queries `trade_log`/`pending_buys` while all 6 seeded canaries are
+     paper-mode, making the check permanently false-positive. **Checked the live DB directly — this
+     premise was wrong**: all 6 canaries are actually `mode='live'`, `account='ira'`, not `research`,
+     so `trade_log` is the structurally correct table. But digging one level further surfaced a real,
+     *different* uncertainty: for the 5 `TrailingBoth` canaries, a real trade only lands in `trade_log`
+     after a manual Slack button sequence (or an unconfirmed automated dry_run fill-reconciliation
+     path) — so the same false-positive risk may still be real, just for a different reason. Backlogged
+     (user deferred, heading out) rather than resolved by guessing.
+  2. **Minor, backlogged**: `record_deviation`'s upsert refreshes `actual_summary`/`ts` but not
+     `expected_outcome` on rerun — stale value if a scenario's wording is edited same-day. Low-risk,
+     informational-only.
+- **User feedback, explicit and important**: mid-session, the user said "I need you to ask more
+  detailed questions rather than assuming going forward — I feel like we had a few misses this round
+  because of that." Saved as a standing feedback memory. Applied it immediately for the rest of the
+  session — surfaced the two Opus-review findings as explicit AskUserQuestion choices (dig now vs.
+  backlog) rather than deciding unilaterally, and both were deliberately backlogged rather than chased
+  down same-session.
+
+### State / follow-ups
+- Coverage system (pieces #3, #6) is committed and working; pieces #1 (Streamlit dashboard), #2 (3rd
+  strategy-type axis), #4 (drill-down), #7 (Slack report) remain open — see `docs/backlog_cache.md`.
+- Two new backlog items from tonight's review: whether `dry_run` auto-completes `TrailingBoth` fills
+  (determines whether the daily coverage check is trustworthy for 5/6 canaries), and the minor
+  `expected_outcome` staleness gap.
+- Full suite: 197 passed (was 195 pre-session).

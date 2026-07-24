@@ -1,5 +1,28 @@
 # Backlog Cache
 
+## [live-trading][coverage] Open, found 2026-07-24 ~evening via Opus review — coverage_check.py's trade_lifecycle checker may false-positive daily for TrailingBoth canaries under dry_run
+`_check_trade_lifecycle` (`scripts/coverage_check.py`) reads `trade_log`/`pending_buys` via
+`signals_db.get_closed_trades_for_ticker_on_date`/`get_pending_buys_for_ticker_on_date` — correct
+tables given all 6 canaries are currently `mode='live'`, `account='ira'` (not `research`/paper, an
+initial reviewer premise that was checked against the live DB and found wrong). But for the 5
+TrailingBoth canaries (IVV/QQQ/IWM/DIA/XLF — not VOO, which is `TrailingExitZScoreBreakout`), a real
+trade only lands in `trade_log` after the manual "Trailing Buy Order Placed" → "Filled" Slack button
+sequence, or via whatever automated fill-reconciliation path exists (`drain_fill_queue` et al.) — **not
+yet confirmed whether `dry_run=True` ever auto-completes that sequence without a human tap**. If it
+doesn't, the daily coverage check could show a "deviation" (no closed trade) for those 5 canaries most
+days even when nothing is actually wrong — a false-positive-generating design gap in the very system
+built to eliminate false "something looked off" ambiguity. **Action needed**: trace whether dry_run
+auto-produces a fill event for TrailingBoth orders (check `signals_notify.py`'s fill-reconciliation path
+against a dry_run account) before trusting `coverage_check.py`'s daily output for these 5 tickers.
+Not investigated further same session — user deliberately deferred, heading out.
+
+## [live-trading][coverage] Minor, found 2026-07-24 ~evening via Opus review — record_deviation doesn't refresh expected_outcome on rerun
+`signals_db.record_deviation`'s `ON CONFLICT` `UPDATE SET` refreshes `actual_summary`/`ts` but not
+`expected_outcome` — if a `scenario_expectations` row's `expected_outcome` text is edited and the same
+`(check_date, scenario_key, ticker)` deviation is re-recorded same day, the deviation row keeps the
+stale `expected_outcome` value. Low-risk (informational field only, doesn't affect the met/not-met
+pass/fail logic or any real trading decision) — backlogged, not fixed same session per user's call.
+
 ## [live-trading] Design note, raised 2026-07-24 ~16:20 ET — paper trading and dry_run test genuinely different things, not redundant with each other
 `dry_run=True` runs the real order-placement code path (`schwab_safety.check_order` and every real
 guard — cash check, `notional_cap`, `daily_order_cap`, duplicate-order guards, automation scope) all
