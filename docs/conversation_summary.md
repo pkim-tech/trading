@@ -2927,3 +2927,80 @@ User asked explicitly for this to become a standing convention: any future strat
 ### Next session
 - Revert the live-fire test state (see urgent backlog item) before anything else touches the daemon.
 - Decide whether to do the real OAuth login now or continue deferring BUY-side dry-run testing.
+
+---
+
+## 2026-07-24 — Wired new soxl_ira account, found and fixed real balance-field bug, extensive live-order sanity testing ahead of Friday's real-account test
+
+### What we did
+- **Wired the new limited-margin IRA account** ("SOXL-IRA", suffix 931) into the system: `.env`
+  (`SCHWAB_ACCOUNT_SOXL_IRA=931`), `schwab_client.NICKNAMES`, and a new `schwab_safety.ACCOUNTS`
+  entry (`notional_cap=$800` after iterating from an initial guess, `daily_order_cap=3`,
+  `dry_run=True`, `account_type="margin"`). User confirmed the existing `ira` account and its fake
+  UDOW test position stay untouched/dry_run — not part of Friday's plan.
+- **Reauth friction resolved**: first `scripts/schwab_oauth_setup.py` run only linked the new account
+  (user forgot to flag the existing accounts for relinking); second run correctly linked both `ira`
+  and `soxl_ira`. Confirmed `schwab_client._client`/`_account_hashes` are cached in-process, so the
+  running daemon needs a restart to pick up a fresh token or account wiring — done twice this
+  session, confirmed clean via `daemon_status.py`/log tail each time.
+- **Found and fixed a real bug**: `schwab_client.get_account_balance` read
+  `cashAvailableForTrading`, which doesn't exist on a real MARGIN-type account (confirmed against
+  both `soxl_ira` and the existing `ira`, which is actually type MARGIN despite being configured
+  `account_type="cash"` — a separate flagged discrepancy). Correct field: `availableFunds`. This had
+  been failing closed (blocking every real BUY on a margin account outright via an uncaught
+  `KeyError`), not a silent bypass, but would have blocked Friday's real buy-side testing entirely if
+  not caught. Fixed with a fallback (`cashAvailableForTrading` else `availableFunds`); same bug fixed
+  in `scripts/live_sanity_check.py`'s duplicated balance-reading code.
+- **Extensive real live-order testing against `soxl_ira`** (all via direct bypass of
+  `schwab_safety`/`active_signals.py`, same pattern as `live_sanity_check.py`, since the account
+  isn't wired into any watch_list node yet): oversized BUY (rejected, insufficient funds — but only
+  after learning placement/cancellation are both asynchronous, see below), market SELL of a real held
+  share (accepted/resting, cancelled), naked sell (rejected, oversold/overbought, no accidental short
+  despite margin account), oversell of a partial real position (rejected, same reason, even with
+  competing resting orders), trailing buy/sell (both accepted, real `TRAILING_STOP` orders via
+  schwab-py's actual `OrderBuilder`), a stacked-orders sequence confirming Schwab tracks cumulative
+  reserved share/cash quantity across ALL resting orders (not just raw position/balance), a resting
+  unfilled BUY correctly NOT counting toward sellable shares, a real penny-stock restriction found
+  (SNDL: "Opening transactions for this security must be placed with a broker"), a boundary search
+  on PLUG bounding Schwab's real cash-reservation buffer to $1.82-$10.55 (much smaller than our own
+  $200 `CASH_SAFETY_BUFFER`), a real STOP order (accepted, surfaced a schwab-py deprecation warning
+  about passing floats to `set_stop_price` that `place_stop_loss` triggers), and confirmation that
+  `schwab_safety._broker_confirms_order` correctly returns both `False` (resolved orders) and `True`
+  (a genuinely resting order) against real order-book data.
+- **Real, not-yet-fixed gap found**: both order placement and cancellation are asynchronous — the
+  initial HTTP response only means "received," not the final verdict (confirmed via follow-up
+  `get_order` polls, e.g. an oversized BUY read as HTTP-success but resolved REJECTED ~0.3-0.7s
+  later). Production code (`schwab_client._place_equity_order`/`_place_trailing_order`) doesn't
+  currently do this follow-up check and posts a Slack "✅ submitted" immediately — a real rejection
+  would look identical to success today. Deliberately not fixed tonight (user's call: finish testing,
+  backlog everything, fix once, retest) — full detail and two dedicated test cases (Test A/B for
+  `notional_cap` vs. the real cash check) are in `docs/backlog_cache.md`.
+- **All tonight's ad hoc real-order tests backfilled into `signals_db.coverage_events`** after the
+  fact (11 new events under `manual_*` scenario keys), plus corrected the two existing
+  `sanity_oversized_buy`/`sanity_naked_sell` events that had logged the same false-positive
+  "unexpectedly_accepted" read (appended corrections, didn't mutate history).
+- **Biggest remaining gap flagged for tomorrow**: every real order tonight bypassed
+  `schwab_safety.check_order` and the actual production/Slack workflow entirely — none of it
+  exercised the real "Trailing Buy Order Placed" → "Filled" flow a human will actually use live.
+  Real-fill confirmation (`get_filled_order`'s field parsing) and the Part-3 gap-correction
+  cancel+replace sequence are also still untested.
+- **Session-wrap Opus review** (schwab_client.py/schwab_safety.py/scripts/live_sanity_check.py diff):
+  no CONFIRMED bugs. Flagged one design concern for later (not fixed): `availableFunds` is
+  leverage-inclusive for a real Reg-T margin account like `brokerage` (fine for `soxl_ira`, a
+  limited-margin IRA with no leverage) — should be resolved before ever flipping `brokerage` live.
+  Also flagged the duplicated fallback logic in `live_sanity_check.py` as a minor future-drift risk.
+  `scripts/live_sim_harness.py`: 6/6 scenarios passed.
+
+### Real account state at end of session
+`soxl_ira`: 3 SPY + 50 SH held (real, pre-staged by user), no resting orders, `dry_run=True`,
+`notional_cap=$800`. Existing `ira` account and its fake UDOW test position untouched. Kill switch
+still disengaged, all 16 watchlist-65 nodes still `mode='live'` — both confirmed intentional by the
+user this session (dry_run protects everything, per architecture, not leftover test state).
+
+### Next steps (Friday 2026-07-24, real market hours)
+- Test A: `soxl_ira.notional_cap=$1`, confirm a real BUY gets blocked by our own gate.
+- Wire SPY/SH into `watch_list` (real, non-canary node) if a real production-path test is wanted.
+- At least one real order through the actual daemon/Slack workflow, not just the bypass.
+- A real fill, to confirm `get_filled_order` field parsing and the account-activity stream fast path.
+- User wants this whole night's findings (`docs/backlog_cache.md`'s top two entries) reviewed
+  together this weekend.

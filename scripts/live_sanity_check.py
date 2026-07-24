@@ -63,7 +63,8 @@ def _real_balance_and_position(client, account_hash, ticker):
     r = client.get_account(account_hash, fields=[client.Account.Fields.POSITIONS])
     r.raise_for_status()
     acct = r.json()["securitiesAccount"]
-    cash = float(acct["currentBalances"]["cashAvailableForTrading"])
+    balances = acct["currentBalances"]
+    cash = float(balances["cashAvailableForTrading"]) if "cashAvailableForTrading" in balances else float(balances["availableFunds"])
     shares = 0.0
     for p in acct.get("positions", []):
         if p.get("instrument", {}).get("symbol") == ticker:

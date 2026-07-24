@@ -28,7 +28,7 @@ from signals_blocks import _post_message
 _client = None
 _account_hashes = None  # nickname -> Schwab's encrypted account hash, resolved lazily
 
-NICKNAMES = ["brokerage", "sep", "roth", "ira"]
+NICKNAMES = ["brokerage", "sep", "roth", "ira", "soxl_ira"]
 
 
 # schwab-py defaults to a 30s httpx timeout on every call. This daemon is
@@ -317,18 +317,26 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float)
 
 def get_account_balance(account: str) -> float:
     """Real available cash for the account, read fresh (never cached) --
-    Client.get_account, securitiesAccount.currentBalances.cashAvailableForTrading.
-    Field name follows Schwab's documented schema but is unverified against a
-    real account response (same caveat pattern as get_filled_order) -- confirm
-    against a real account before trusting this beyond the automation_principles.md
-    #2 fail-closed design it's built for. Raises on any failure (network,
-    missing field, etc.) rather than returning a fallback value -- the caller
-    (schwab_safety.check_order) must fail closed on a balance-check failure,
-    not silently allow the order through with an unknown balance."""
+    Client.get_account, securitiesAccount.currentBalances. Confirmed 2026-07-23
+    against two real margin-type accounts: 'cashAvailableForTrading' (the
+    original field name, from Schwab's documented schema but never checked
+    against a real response until then) doesn't exist on either -- Schwab
+    returns 'availableFunds' instead for a MARGIN account. Falls back to
+    'availableFunds' when the first key is missing rather than assuming one or
+    the other; cash-type accounts (sep/roth) haven't been confirmed to return
+    'cashAvailableForTrading' for real either, but no real response has
+    disproven it yet, so it stays the first choice. Raises on any failure
+    (network, both fields missing, etc.) rather than returning a fallback
+    value -- the caller (schwab_safety.check_order) must fail closed on a
+    balance-check failure, not silently allow the order through with an
+    unknown balance."""
     account_hash = _resolve_account_hashes()[account]
     r = _get_client().get_account(account_hash)
     r.raise_for_status()
-    return float(r.json()["securitiesAccount"]["currentBalances"]["cashAvailableForTrading"])
+    balances = r.json()["securitiesAccount"]["currentBalances"]
+    if "cashAvailableForTrading" in balances:
+        return float(balances["cashAvailableForTrading"])
+    return float(balances["availableFunds"])
 
 
 def get_real_position(account: str, ticker: str) -> float:

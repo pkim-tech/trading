@@ -140,6 +140,10 @@ ACCOUNTS = {
     "sep":       AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  dry_run=True, account_type="cash"),
     "roth":      AccountLimits(enabled=True, notional_cap=50_000, daily_order_cap=10, dry_run=True, account_type="cash"),
     "ira":       AccountLimits(enabled=True, notional_cap=75_000, daily_order_cap=10, dry_run=True, account_type="cash"),
+    # New limited-margin IRA (2026-07-24 Friday test plan). Only ~$5k funded total,
+    # and two real positions already staged, so remaining buying power is small --
+    # notional_cap set conservatively low pending a real balance check.
+    "soxl_ira":  AccountLimits(enabled=True, notional_cap=800,    daily_order_cap=3,  dry_run=True, account_type="margin"),
 }
 
 # Live-automation scope -- moved from a hardcoded Python literal to SCHWAB_AUTOMATION_TICKERS
