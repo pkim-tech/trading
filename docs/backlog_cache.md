@@ -1,5 +1,318 @@
 # Backlog Cache
 
+## [live-trading][security] Open, found 2026-07-24 ~12:20 ET — real bug: `notional_cap` blocks the automated trailing-SELL, not just BUYs, permanently dead-ending the automated exit for any position bigger than the cap
+Confirmed live: `🚫 BLOCKED TRAILING SELL 3.0 SPY in soxl_ira (trail=0.3%): order notional $2,227
+(SPY x3.0) exceeds soxl_ira cap $800` — SPY armed for real at 11:21 ET (`trailing_arm_state_reread`
+confirmed `trailing_preserved`), and `_attempt_automated_sell` (`signals_notify.py:51`) correctly
+tried to place the real trailing-sell via `schwab_client.place_trailing_sell` → `_place_trailing_order`
+(`schwab_client.py:216`) → `schwab_safety.approve_and_record`/`check_order` — which raised a
+`SafetyViolation` because `notional_cap=$800` (set low deliberately for today's BUY-side tests) is
+applied uniformly to every order regardless of side. SPY's real position (3 sh × current price) is
+worth ~$2,227 — well over the cap — so the automated SELL can **never** succeed while the cap stays
+at $800, permanently falling back to manual placement (`_trailing_order_blocks`' nagging "STILL
+PENDING" reminder loop) for the rest of this position's life.
+**Not a safety incident** — fail-closed, not fail-open. Nothing was placed incorrectly; the automated
+attempt was simply refused, leaving the real position open and unprotected by an automated order
+(same practical state as SPY/SH's other known SL gaps today), not executing anything wrong.
+**Real design flaw**: `notional_cap` exists to bound new *risk-adding* exposure (BUYs) — applying the
+same limit to a SELL (which *reduces* existing exposure, closing a position rather than opening one)
+means any real position that grows past the cap (via price appreciation, or simply because it was
+pre-staged larger than the cap, as SPY/SH were today) can never have its exit automated. **Action
+needed**: `check_order`'s notional check should likely not apply to SELL orders at all, or apply a
+separate (much higher, or no) limit for closing an existing position — a BUY-side risk cap has no
+principled reason to also gate the SELL side. Not fixed same day — found live, mid test day; SPY's
+real position is currently stuck relying on manual trailing-sell placement as a result.
+
+## [live-trading] Idea, raised 2026-07-24 ~11:35-11:45 ET — a real status/coverage dashboard, indexed by scenario × mode × strategy-type, with per-node expected-vs-actual daily tracking
+Grew out of today's real-money test day pain: state (cash/orders/positions/pending_buys) had to be
+pulled ad hoc via one-off scripts all day, coverage had to be hand-mapped in chat (the canary
+scenario table), and none of it persists for tomorrow. Three pieces, one coherent project:
+1. **Real-time status dashboard** (Streamlit, extending the existing `app.py`/`pages/` app rather than
+   a new tool) — account balance/resting orders/open positions/pending buys, live-queried, replacing
+   today's pattern of me running ad hoc scripts on request throughout the day.
+2. **Scenario coverage indexed on 3 axes, not just 2**: `signals_db.coverage_events` +
+   `scripts/coverage_matrix.py` already pivot scenario_key × mode (paper/dry_run/live) — add
+   **strategy-type** (manual/bypass, `TrailingExitZScoreBreakout`, `TrailingBothZScoreBreakout`) as a
+   third axis, so "has the TrailingBoth SL-gating gap actually been exercised, in which mode" is a
+   real query, not a manual cross-reference like today's canary table required.
+3. **Per-node expected-vs-actual daily tracking**: each canary already has a documented *designed*
+   scenario (2026-07-23 build, currently prose-only in `docs/deep_backlog.md` — IVV=full happy path,
+   QQQ=early-SL, IWM=pinned open_check, DIA=overnight-carry regression, VOO=market-buy routing,
+   XLF=TIME-only exit) but there's no structured, persistent, daily "did node X actually do what it
+   was built to test today?" check — today's canary-vs-scenario comparison was hand-built in chat
+   (see today's conversation) and won't repeat automatically tomorrow. Needs the designed-scenario
+   mapping turned into real structured data (not prose) and checked against `coverage_events` daily,
+   not just when someone asks.
+4. **Drill-down/detail view per scenario or node** — a summary row (pass/fail/pending) should be
+   clickable into the raw underlying events, matching the precedent `scripts/coverage_matrix.py
+   --detail` already establishes for scenario-level drill-down; extend the same idea to per-node
+   drill-down (click a canary/node row → see its actual `coverage_events`/`slack_message_log`/
+   `open_positions` history, not just the aggregate).
+5. **Feasibility note, important**: this should be buildable largely from data *already being
+   collected* — `coverage_events`, `slack_message_log`, `watch_list_audit` all already exist and are
+   already being written to today. This isn't blocked on new instrumentation; it's a presentation/
+   indexing layer over existing data, plus the one new piece (structuring the designed-scenario
+   mapping, currently prose-only).
+Not scoped in detail (schema for the designed-scenario mapping, dashboard page layout) — a real
+feature to design and build later, not urgent mid-test-day.
+
+## [live-trading][security] Open, found 2026-07-24 ~11:22 ET — real bug: a mid-day daemon restart forces a spurious off-schedule bar-close evaluation on every open position, diverging from backtest parity
+`active_signals.py`'s `last_seen_bar` (the dict tracking, per ticker, the last hourly bar the ambient
+poll actually evaluated) is an in-memory local, reset to empty on every daemon restart. The ambient
+exit-check's `at_bar_close` flag is computed as `last_seen_bar.get(ticker) != last_bar_ts`
+(`active_signals.py:483`) — on the very first poll after *any* restart, `last_seen_bar.get(ticker)`
+returns `None`, which trivially `!= last_bar_ts`, so `at_bar_close` evaluates `True` regardless of
+real timing. **Confirmed live today**: restarting at 11:14 ET caused SPY's arm/TP check to fire at
+**11:21 ET** — not a real hourly bar close (those land on :30) and not one of the 7 pinned
+exit-arm-scan times either — purely an artifact of the restart. SPY's arm state itself was
+legitimate (price had genuinely crossed the 0.1% arm threshold), but the *timing* of when that got
+checked was off-schedule in a way the backtest kernel's bar-close-only semantics would never produce.
+**User's framing, and the reason this is a bug, not just a quirk**: restarting the daemon should be
+operationally transparent — it shouldn't itself change *when* a position gets evaluated relative to
+what would have happened without the restart. Right now it does, for every open position, on every
+restart, which is real execution drift from backtest parity, not just today's one observation.
+**Action needed**: initialize `last_seen_bar` from the real current bar (e.g. seeded from each
+ticker's `df_hourly` last row) at startup, instead of leaving it empty — so a restart's first poll
+correctly recognizes "no new bar since last real close" instead of treating "no record at all" as
+"a new bar just happened." Not fixed same day — found mid test day.
+
+**Follow-up audit, same session, at user's request ("look for other instances of this")**:
+checked every other in-memory dedup tracker in `run_loop` (`active_signals.py:362-379`) for the same
+naive-empty-reset pattern. Two groups, genuinely different risk:
+- **Same bug family, no backfill protection**: `sell_alerted`, `buy_alerted`, `window_alerted`,
+  `limit_fill_alerted` are all plain `set()` at startup with no "already covered" logic — same root
+  cause as `last_seen_bar`, same risk shape (a restart could produce a duplicate alert for something
+  already alerted within the same still-open bar/window before the restart). `buy_alerted`'s reset was
+  already deliberately relied on today (to give LABD/LABU/HIBL/etc. a fresh shot after fixing the
+  sizing/account bugs) — useful in that context, but it's the same underlying gap, just currently
+  working in our favor rather than against us.
+- **NOT vulnerable** — `reference_alerted`, `gap_check_alerted`, `pinned_bar_alerted` are all
+  smart-initialized at startup (they check the real clock and pre-mark any slot already past as
+  "done"), specifically defending against this exact restart quirk. `gap_check_alerted` is
+  additionally protected by `check_gap_resize`'s own hard clock-window gate regardless.
+- **Separate, unrelated finding while auditing this**: today's 5 repeated "Morning Report" Slack
+  posts (once per restart: 07:00, 08:07, 08:52, 09:20, 11:14) are **not** this bug at all — there's a
+  deliberate, unconditional `send_reference_report()` call on every startup, independent of
+  `reference_alerted`'s dedup logic. Different mechanism, same visible symptom (repeat messages);
+  don't conflate the two when fixing either one.
+
+## [live-trading] Open, raised 2026-07-24 ~10:55 ET — retry `check_gap_resize`'s cancel+replace test properly pre-market on a future day, not mid-day
+Today's GDXD/GDXU gap-resize test (docs/live_test_plan_2026-07-24.md) missed its actual goal — neither
+ticker had genuinely gapped past its trigger overnight, so `check_gap_resize` correctly did nothing
+and the real cancel+replace-with-MARKET code path remained unexercised. Considered manufacturing the
+scenario mid-day (place a real trailing-buy now, seed `pending_buys.signal_price` artificially low so
+the current price already "clears" the trigger, then call `check_gap_resize()` directly) — **rejected
+by the user**: `check_gap_resize` is specifically a pre-market/before-open mechanic (correcting a
+resting order based on real overnight price movement before the 9:30 open), and forcing it mid-day
+wouldn't test that same thing — the underlying mechanics (cancel-order confirmation, market-buy
+placement) are already separately proven via today's other real tests anyway, so a mid-day manufactured
+version would add nothing new. **Real action for next time**: retry this properly on a future pre-market
+morning — same setup pattern as today (seed a resting trailing-buy + `pending_buys` before market open),
+but this time pick a ticker already showing real overnight gap movement (per the KORU 8.26% gap lesson
+from today) instead of picking blind and hoping.
+
+## [live-trading] Open, found 2026-07-24 ~10:35 ET — real BUY/SELL Slack alerts carry no canary tag, unlike the Reference Report or paper-trading's console tag
+`notify_buy_signal`/`_build_buy_blocks` (`signals_notify.py:359`/`signals_blocks.py:91`, the actual
+per-signal alert with buttons) have zero `version=='canary'` awareness — no tag, no visual distinction
+from a genuine live candidate signal. Contrast with two places that got this right: (1) the Reference
+Report table (`signals_notify.py:1235`) tags canary rows 🧪CANARY, a 2026-07-23 fix specifically
+because canary rows becoming visible without a tag was flagged as unsafe; (2) the paper-trading print
+path (`active_signals.py:203`) explicitly labels `(paper-trading)`. The per-signal live alert — the
+one that actually posts to Slack with real buttons in real time — has neither. **Demonstrated live
+today**: IVV's canary BUY signal (10:34 ET, after today's SPY-canary-swap) posted as a plain
+"BUY SIGNAL — IVV $742.21 z=-1.23" message, visually identical to a real candidate alert, no
+indication anywhere in the message that it's a canary. Action needed: add the same 🧪CANARY-style tag
+to `notify_buy_signal`'s console print and `_build_buy_blocks`' Slack message (and check the SELL
+alert path, `_build_sell_blocks`, for the same gap). Not fixed same day — found mid test day, low
+urgency since canary real-trade buttons are already suppressed separately, but a real "is this real?"
+ambiguity risk during any future live session with canaries mixed into the same channel.
+**User's broader ask, raised same discussion, taxonomy corrected after discussion**: don't just fix
+canary tagging specifically — tag *every* message with its real mode as a standing policy, regardless
+of which channel it lands in. **There are only 3 real modes: Live / Dry-run / Paper — Canary is not a
+4th mode, it's a deliberately-extreme parameterization of Paper trading** (same underlying mechanism —
+`paper_trading.py`'s simulation — just absurd thresholds for fast proof-of-life, per the original
+canary design). This reframes the "paper trading fully dormant" entry above too: today's canaries
+running as `mode='live'` isn't a separate, unrelated gap — it's the *same* 2026-07-23 mode-flip
+collision also breaking canary's intended design specifically, since canaries were meant to run as
+paper trades (with extreme params), not live-mode nodes. Rationale for universal tagging: the
+channel-routing idea (separate entry above, "split paper-trading/dry-run/live notifications into
+separate channels") is the primary fix for noise/ambiguity, but if a message ever gets posted to the
+wrong channel (misconfigured routing, a future code path that forgets to route correctly, etc.), a
+universal mode tag on the message itself is a defense-in-depth backstop — self-identifying regardless
+of where it ends up, rather than trusting channel placement alone. Fold into the same design
+conversation as the channel-routing item and the Monday mode-scoping decision; every `_post_message`
+call site would need this tag threaded through alongside whatever destination-routing logic gets built.
+
+## [live-trading][backtest] Elevated 2026-07-24 ~12:15 ET — `buy_alerted`'s once-per-day lockout structurally blocks a real, quantified slice of a winning node's backtested trades, not just a research curiosity
+Started as a chaos-monkey research idea (below original framing), escalated once real numbers came
+back. The live daemon's `buy_alerted` dedup is a deliberate once-per-day lockout — a ticker alerted
+once (successfully or not) never gets a second real alert that same day, even if its z-score is still
+in BUY territory at a later window (confirmed live today with HIBL/IWM).
+**Quantified against the real current SOXL v5 node** (window=10, arm=30%, fixed_sl=2%, tb=3%, ts=1%,
+z_thresh=1.0 — 153 total historical trades, matching the user's remembered ~151 figure; corrected
+after an earlier same-session mistake that ran this analysis against a stale 2026-07-10 export file
+using an old `watchlist_id=9` node instead of the real current `v5` one):
+- **Buy → sell → buy, all in one day**: 12 of 153 trades (~8%) — genuinely blocked by `buy_alerted`,
+  since the ticker already got its one alert that day before the position even closed.
+- **Sell (carried in from a prior day) → buy same day**: 32 of 153 (~21%) — a separate, already-
+  understood case (this is what `same_day_block` exists for), not newly discovered.
+- **Max entries observed in a single day: 2** — no evidence of 3+ trades/day (no "4 trades a day"
+  pattern) across this ticker's full history.
+Nothing structurally stops the *user* from manually re-entering after a sell (same bypass pattern as
+today's GDXD/GDXU manual reconciliation) — what's actually blocked is the automated alert/placement
+pipeline ever surfacing or acting on that second real opportunity for them.
+**Action needed**: decide whether `buy_alerted` should reset once a position genuinely closes (rather
+than staying locked for the full calendar day), and/or run the chaos-monkey-style research variant
+(flat/permanent miss of the second daily window, not a probabilistic per-check miss — `scripts/
+sim_chaos_monkey.py`'s existing `drop`/`delay` modes don't model this) across more tickers to see if
+SOXL's ~8% figure is typical or an outlier. Not fixed same day — real design decision, worth doing
+properly rather than rushing.
+
+## [live-trading] Open, found 2026-07-24 ~10:15 ET — paper trading is currently fully dormant system-wide (side effect of the 2026-07-23 all-mode='live' decision, not a deliberate choice); revisit Monday
+`active_signals.py:199-203`'s BUY-signal routing is a strict if/elif: `mode='live'` → real/dry_run
+alert path (`notify_buy_signal`); `mode!='live'` (i.e. `research`) + in `AUTOMATION_ENABLED_TICKERS`
+→ `paper_trading.start_paper_buy`. Since every node in the watchlist has been `mode='live'` since the
+2026-07-23 "revert live-fire dry-run test state... confirmed intentional" decision (see the superseded
+entry below), the paper-trading branch is currently unreachable for every ticker, not just today's
+soxl_ira test scope — a system-wide side effect the user hadn't realized until asking today "why am I
+not getting anything in paper trading."
+**Root cause is two good decisions from different sessions silently canceling each other out**, not a
+single mistake: `docs/conversation_summary.md:2214` (~2026-07-18) records the *original* decision —
+"Research mode now doubles as the target state for automation-engine dry-run ('paper trading')" —
+i.e. keep everything in `mode='research'` as the simplified default, with paper trading as the
+standing dry-run layer. The 2026-07-23 decision to flip all 16 nodes to `mode='live'` (justified on
+its own terms — safe because `dry_run=True` protects every account except `soxl_ira`) never got
+reconciled against that earlier research-mode-as-default decision, so nobody noticed it would also
+kill paper trading system-wide as an unintended side effect — **including the 6 canary nodes**, which
+per their original design are meant to run as a deliberately-extreme *parameterization* of paper
+trading (same mechanism, absurd thresholds for fast proof-of-life), not as a separate concept. There
+are only 3 real modes — Live / Dry-run / Paper — canary is not a 4th; today's canaries running as
+`mode='live'` is the same root-cause collision misfiring on canary's design specifically, not a
+separate gap (see the "tag every message with its mode" entry below for the corrected taxonomy).
+Follow-ups user wants to revisit **Monday (2026-07-27)**, not this week:
+1. Decide whether some/all research-mode-eligible tickers should go back to `mode='research'` now
+   that today's live test day is done, to restore paper-trading coverage.
+2. **Real feature idea, bigger than a quick fix**: restructure the if/elif into "do both" — run the
+   real/dry_run alert path AND a parallel paper-trading simulation for the same node regardless of
+   `mode`, so paper trading runs continuously as a standing regression signal (ties into the
+   2026-07-24 "permanent canary tickers in ira" idea above) instead of being mutually exclusive with
+   live/dry_run alerting. Would also need `paper_trading.py`'s dedup (currently ticker-only) to
+   handle a ticker being tracked both ways simultaneously without colliding.
+3. **Compounding gap found same investigation**: 15 of the 24 `mode='live'` nodes (all v5 tickers +
+   4 of 6 canaries) have `account=None` — never assigned a real account at all. `check_order` requires
+   a real account before it can even evaluate `dry_run` vs `live`, so these fail-closed as `BLOCKED
+   ... unknown account 'None'` (confirmed live: the HIBL/IWM "BLOCKED TRAILING BUY" messages this
+   morning) instead of producing a useful dry_run simulation. Net effect: with today's `mode='live'`-
+   everywhere state, almost nothing produces an informative dry_run walkthrough at all — only UDOW
+   has a real account (`ira`), and it's dedup-blocked from new BUYs by its existing position. Fold
+   into the Monday mode-scoping decision above — deciding `mode='research'` vs `'live'` per ticker
+   should go hand-in-hand with deciding whether it needs a real account assigned.
+4. **Process note**: this whole chain (two colliding decisions + the account-mapping gap) slipped
+   past the 2026-07-23 session-wrap Opus review, even though that review covered the very session
+   where the mode='live' flip happened. Not a failure of that review specifically — a diff-scoped
+   review checks the day's actual changes, not a 7-session-old decision it was never shown alongside
+   the new one. Worth remembering as a class of gap that kind of review structurally can't catch:
+   cross-session decision reconciliation, not single-diff correctness.
+
+## [live-trading][security] Open, found 2026-07-24 ~09:39 ET, real evidence — `check_buy_reminders`' fill-reminder suppression uses a stale/wrong hourly-cache trigger estimate, can silently suppress a reminder for an order that already filled for real
+`check_buy_reminders` (`signals_notify.py:871-880`) skips nagging for a still-`order_placed` pending
+buy if `_trailing_buy_status(pending)` returns `met=False` — a noise-reduction optimization (don't
+nag every 15 min if the bounce trigger plausibly hasn't been hit yet). `_trailing_buy_status`
+(`signals_notify.py:773-798`) derives its own `running_low`/trigger from the **hourly cached CSV**
+(`compute._load_cache`) starting at `signal_time`, rather than using the real `running_low`/trigger
+that was actually used to place the order (available right there in `pending['signal_price']` +
+`trail_buy_pct`).
+**Confirmed live, real divergence**: GDXU's order was placed using the real trigger $79.665 × 1.003 =
+**$79.90** (per this morning's setup) and genuinely filled at the broker for **$80.805** at 09:30:03 ET
+(confirmed via `schwab_safety._all_orders`). But `_trailing_buy_status` computed its own cache-derived
+trigger as **$81.14** — meaningfully different from the real $79.90 — and returned `met=False`, so
+GDXU's reminder #3 (due ~09:30, matching GDXD's) was silently skipped. User noticed the missing
+reminder and asked directly ("GDXU essage still not received") before this was caught — without
+that, a real stalled/unconfirmed fill could go unnoticed for cycle after cycle purely because the
+cache-based heuristic disagreed with reality, exactly the failure mode `check_buy_reminders`'s own
+docstring says it exists to prevent ("a stalled trailing-buy at the broker is invisible until the
+user happens to remember to check").
+Likely root cause of the divergence: hourly bars don't capture the true pre-market/opening intraday
+low the same way a continuous feed would, so the cache-derived `running_low` starting point differs
+from the real one used at order-placement time — the general "no true intrabar low live" caveat
+`_trailing_buy_status`'s own docstring already flags, but here it was severe enough to fully invert
+the met/not-met conclusion, not just be imprecise.
+**Action needed**: either (a) have `_trailing_buy_status` use the real trigger already stored/derivable
+from `pending['signal_price']` instead of re-deriving one from the hourly cache, or (b) don't suppress
+reminders at all once real market hours have started (the noise-reduction rationale mattered most
+for reminders firing overnight/pre-market before intraday movement is even possible — that's less true
+once the market's open and a real fill is plausible any moment). Not fixed same day — found mid real
+test day, backlogged per user's call.
+
+## [live-trading] Open, found 2026-07-24 ~09:19 ET — `TrailingBothZScoreBreakout` fills never get a real automated broker-side stop-loss placed, unlike `TrailingExitZScoreBreakout`; plan is a small live test Monday
+`_place_stop_loss_for_position` (`signals_notify.py:979-980`) only fires after a real fill when
+`ticker in AUTOMATION_ENABLED_TICKERS and not db._is_trailing_buy(node)` — `_is_trailing_buy` is True
+for any strategy whose buy axis is `trail_buy_pct` (`signals_db.py:507-509`), which includes
+`TrailingBothZScoreBreakout` (ERX/ERY/GDXD/GDXU today). So a real automated-flow fill on a TrailingBoth
+node currently ends up with **no real broker-side stop order at all** — same exposure as SPY/SH's
+manually-seeded positions (no `broker_stop_price` on file, pre-arm fixed-SL alerts fall back to
+manual Exited/Skipped), even though these are genuine automated BUYs, not manually seeded. Only
+`TrailingExitZScoreBreakout` fills (LABD/LABU) currently get the real automatic stop placement.
+**Found live, deliberately not fixed same-day** — too close to the 9:15/9:30 windows to safely edit
+a core live-trading module (`signals_notify.py`) and restart the daemon mid-window; also needs the
+usual Opus review + `live_sim_harness` pass per `CLAUDE.md`'s live-trading-file convention, not a
+rushed edit. **User's plan**: extend `_place_stop_loss_for_position`'s gate to also cover
+`TrailingBoth`/trailing-buy fills, then verify with a real, deliberately tiny position live on Monday
+(2026-07-27) rather than folding it into today's already-in-progress test day.
+
+## [live-trading] Open, found 2026-07-24 ~08:53 ET — SL Slack alert falls back to a generic "should have auto-filled" guess instead of checking the real broker order book; user's call is this needs two code paths, not one query fix
+Hit live: SPY's real SL alert (manually-seeded soxl_ira position, no `broker_stop_price` on file)
+showed "Check account — Stop Loss order should have auto-filled @ $735.97" — a generic fallback in
+`signals_blocks._build_sell_blocks` (`signals_blocks.py:225-231`) that branches only on our own DB's
+`broker_stop_price` field, never the real broker order book. Confirmed manually via
+`schwab_safety._open_orders("soxl_ira")` + `_has_open_sell_order` (already exist, used elsewhere,
+e.g. `check_order`'s duplicate-order guard) that SPY genuinely has no resting stop order right now —
+harmless this time (user's read: it's just an old generic code block firing, not a real risk), but
+the alert could have said this definitively instead of guessing.
+**User's framing, broader than a single query fix**: this is really two different kinds of position
+wearing the same alert path — (1) a position the automation itself opened/placed the stop for
+(`broker_stop_price` genuinely on file, trustworthy) vs. (2) a manually-seeded/manually-traded
+position where we never placed anything and have no real broker linkage recorded at all (today's
+SPY/SH test positions, and potentially any future manually-tracked position). Rather than patching
+`_build_sell_blocks`'s single fallback string, worth auditing for other call sites that assume
+`broker_stop_price`/our own DB state accurately reflects broker reality, and giving automated vs.
+manual positions two explicit, clearly-labeled code paths: automated path trusts/reports the known
+`broker_stop_price`; manual path always queries the live broker order book
+(`_has_open_sell_order`/`_open_orders`) rather than guessing, since no DB field can be trusted for it.
+**Action needed**: scope which other alert/decision sites have this same DB-assumed-true-for-broker-
+state pattern before designing the two-path split — not just this one line. Backlogged, not fixed
+same day per user's call (close to market open, low urgency since manual account-check is always the
+safe fallback either way today).
+
+## [live-trading][security] Open, found 2026-07-24 ~08:45 ET, NOT fixed yet (too close to market open) — `add_node`'s dedup silently fails for every TrailingBoth node, real duplicate live nodes exist right now on soxl_ira
+Root cause: `watch_list`'s `UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
+stop_loss, max_hold_hours)` constraint relies on SQLite treating repeat inserts as conflicts —
+but SQLite never considers `NULL == NULL` a match for uniqueness purposes, and
+`TrailingBothZScoreBreakout` nodes always store `take_profit=NULL` (the arm-sell value goes in
+`arm_sell_pct` instead, see `add_node`'s docstring). So `INSERT OR IGNORE` never dedupes any
+TrailingBoth node — reruns silently insert full duplicates instead of no-op'ing.
+**Confirmed real right now**: `scripts/setup_2026_07_24_soxl_ira_live_test.py` was run 4 times today
+(11:38, 12:05, 12:17, 12:19 — timestamps in `added_at`), and every TrailingBoth ticker in today's
+plan now has 4 duplicate `mode='live'`, `account='soxl_ira'` rows: SPY (ids 102/109/115/121), SH
+(103/110/116/122), ERX (104/111/117/123), ERY (105/112/118/124), GDXD (107/114/120/126). LABD/LABU/
+GDXU are unaffected — `TrailingExitZScoreBreakout`'s `take_profit` is a real non-null int, so those
+correctly deduped (single row each). `open_positions` also unaffected — the SPY/SH real position
+seeding step deduped correctly (one row each), so the exposure is scan-side, not position-side.
+**Real-world risk**: with this many duplicate nodes live on a `dry_run=False` account, every poll
+scans each duplicate independently — ERX/ERY/GDXD's BUY tests and SPY/SH's SELL monitoring could
+each fire up to 4x the Slack alerts / real order attempts per ticker per signal event (the
+duplicate-order guard's 60s/5%-tolerance window is the only backstop, not a designed dedup).
+**Deliberately not fixed this morning** — user's call, too close to market open (~08:45 ET, gap-check
+window at 9:15) to risk a live DB mutation right before signal windows start. A backup was taken
+first (`cache/live/trading_live.db.bak_20260724_084527_pre_dup_node_cleanup`) in case a same-day fix
+becomes urgent later today, but no rows have been deleted — the duplicates are still live as of this
+entry. **Two separate action items**: (1) today, if time allows before the daemon comes back up:
+delete the 15 extra rows (keep earliest id per ticker: 102/103/104/105/107), matching the removal
+list already prepared in conversation; (2) root-cause fix, not urgent same-day: either give
+`TrailingBothZScoreBreakout` nodes a real sentinel value in `take_profit` instead of `NULL` so the
+UNIQUE constraint actually catches it, or make `add_node` check-then-skip explicitly instead of
+relying on `INSERT OR IGNORE` at all.
+
 ## [live-trading][security] Elevated priority 2026-07-24 morning — real evidence that neither notional_cap nor the cash check would catch a same-account double-buy
 Confirmed empirically today, not just theoretical: placing two real resting `TRAILING_STOP` BUY orders
 (GDXD 5sh, GDXU 3sh) left `get_account_balance('soxl_ira')` completely unchanged ($1,110.43 before and
@@ -59,18 +372,22 @@ messages in `signals_notify.py`) fire before any placement attempt and say nothi
 non-production node/account) directly on these earlier alerts too, not just the placement
 confirmation — cheap, avoids exactly this kind of "is this real?" ambiguity during real trading days.
 
-## [live-trading] Open, raised 2026-07-24 morning — split paper-trading/dry-run/live notifications into separate channels (or otherwise reduce chattiness)
-User's real complaint: the single trading Slack channel is getting noisy now that paper trading
-(10 real v5 + 6 canary nodes, all research-mode) runs continuously alongside today's real `soxl_ira`
-dry_run=False test activity and the stale-daemon SPY/SH signals from this morning — everything posts
-to the same channel today, making it harder to tell what's actually real at a glance (compounds the
-dry_run-visibility gap above). A version of this was raised once before (2026-07-22 session notes,
-"paper-trading Slack-channel-noise separation, deferred until paper trading is actually turned back
-on") but never became a tracked backlog item and paper trading has been running since. **Action
-needed**: design a channel-routing scheme (e.g. separate channels/webhooks per mode — paper / dry_run
-/ live — or at minimum a consistent, filterable tag prefix per message) so the real trading channel
-isn't drowned out by paper/dry-run noise. Not scoped yet — needs a design conversation, not a
-quick fix, since every `_post_message` call site would need a mode-aware destination.
+## [live-trading] Open, raised 2026-07-24 morning, CORRECTED 2026-07-24 ~10:15 ET — split paper-trading/dry-run/live notifications into separate channels (or otherwise reduce chattiness)
+User's real complaint: the single trading Slack channel is getting noisy alongside today's real
+`soxl_ira` dry_run=False test activity and the stale-daemon SPY/SH signals from this morning — hard
+to tell what's actually real at a glance (compounds the dry_run-visibility gap above). **Correction**:
+this entry originally assumed "10 real v5 + 6 canary nodes, all research-mode" were the noise source
+via paper trading "running continuously" — that assumption is wrong. Confirmed today (see the
+"paper trading fully dormant" entry above) that every node in the watchlist is actually `mode='live'`,
+not `research`, so paper trading isn't running at all right now — the actual noise source today is
+real/dry_run alerts across many simultaneously-live nodes (soxl_test + v5 + canary, all `mode='live'`),
+not a paper-trading/live mix. The channel-routing need still stands (still hard to tell what's real
+at a glance across dry_run vs. live vs. eventually-paper messages), but the framing of *why* was
+wrong. **Action needed**: design a channel-routing scheme (e.g. separate channels/webhooks per mode,
+or a consistent filterable tag prefix per message) so the real trading channel isn't drowned out —
+still needs a design conversation, not a quick fix, since every `_post_message` call site would need
+a mode-aware destination. Revisit once the Monday paper-trading-mode decision (see entry above) is
+made, since that'll add a third real message source back into the mix.
 
 ## [live-trading][security] Open, raised by session-wrap Opus review 2026-07-23 night — `availableFunds` is leverage-inclusive for a real margin account, unverified whether that's safe for `brokerage`
 `schwab_client.get_account_balance`'s new fallback (`cashAvailableForTrading` → `availableFunds`,
