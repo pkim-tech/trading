@@ -19,6 +19,13 @@ single-ticker-per-scenario test. Candidate fix (not designed yet): a per-ticker 
 notional cap (ties into the already-backlogged 2026-07-22 "max cumulative BUY notional per ticker per
 day" item, which was scoped for a different but related runaway-repeat-buy scenario — worth designing
 both together).
+**Existing partial mitigation, confirmed insufficient**: `signals_helpers._last_sale_recovery` already
+sizes each order off the ticker's last-closed-trade proceeds (or `starting_notional` if none yet) — a
+real soft ceiling against any *one* order being wildly oversized, used by both `buy_order_sizing` and
+`check_gap_resize`'s replacement sizing. But it's per-order, not cross-order: for a ticker with no trade
+history (like today's GDXD/GDXU), it falls back to the same `starting_notional` target for *any* order
+attempt, so two independent, individually-reasonable-sized orders for the same ticker (the double-buy
+case) would each pass it and still double real exposure together. Doesn't close the gap.
 
 ## [live-trading] Idea, raised 2026-07-24 morning — permanent canary tickers in the dormant `ira` account as a standing delayed-regression test
 Insight from today's real `soxl_ira` test day: the canary-node pattern (deliberately inert

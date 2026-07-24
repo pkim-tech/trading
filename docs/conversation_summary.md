@@ -3101,3 +3101,68 @@ user this session (dry_run protects everything, per architecture, not leftover t
 - Unresolved: the cash-reservation-for-trailing-orders question; the Morning Report block-limit
   regression (deferred to ticker-scope cleanup); the two new backlog items (dry_run visibility on
   earlier-stage alerts, Slack channel noise separation) are both design-only, not built.
+
+---
+
+## 2026-07-24 (continued) — Post-mortem discussion on the cancel_order fix's real risk profile, corrected two overstated claims, elevated a real capital-guard gap with evidence
+
+### What we did
+- **User pressure-tested the "oversell risk" framing** from the earlier session-wrap Opus review write-up
+  and caught it overstated: Schwab already rejects a real oversell attempt (confirmed empirically
+  2026-07-23 night, e.g. SPY 4-vs-3-held), so `_attempt_automated_sell`'s cancel-confirmation gate
+  prevents a rejected/wasted order attempt, not an actual oversell. Corrected in
+  `docs/live_test_plan_2026-07-24.md` (committed separately). The `check_gap_resize` side of the same fix
+  (a genuine double-buy risk, unrelated to Schwab's share-count checks) was accurate as stated and stands.
+- **User also credited `signals_notify.check_live_state_reconciliation`** as an independent backstop —
+  runs every poll cycle, specifically detects an open position missing its expected resting SL/trailing-
+  sell order and alerts with a proposed fix. Added to the tracking doc as a defense-in-depth note.
+- **Traced exactly which guards would/wouldn't catch a same-ticker double-buy**, precisely: the
+  pre-existing `_has_open_order` guard catches the "cancel silently failed, order still resting" case
+  (same-ticker resting-order block); it does *not* catch the "original filled right before/during the
+  cancel" race, since a FILLED order isn't in the "open orders" list any more — that race is the one
+  scenario where today's `cancel_order` confirmation fix is the actual, sole backstop.
+- **Real-world margin nuance from the user**: GDXD/GDXU are actually 2x (not 3x — corrected), LABD is 3x;
+  leveraged ETFs get reduced margin credit (roughly 50% for 2x, 30% for 3x per the user), which would add
+  a real backstop against a double-buy in a full-margin account — but `soxl_ira` is specifically a
+  limited-margin IRA with no leverage extended, so that backstop doesn't apply to today's actual test
+  account. Real dollar amounts today (~$232/$239) are small enough that available cash alone wouldn't
+  reject a double-buy either way.
+- **Confirmed (and the user flagged as "not good enough")**: neither `notional_cap` (per-order, not
+  cumulative) nor the real cash-availability check would catch a same-account double-buy — the cash check
+  in particular is undermined by today's real finding that resting/just-filled `TRAILING_STOP` orders
+  don't appear to move `availableFunds`. Elevated the existing 2026-07-22 backlog item
+  ("max cumulative BUY notional per ticker per day") with this real evidence, explicitly tying it to
+  today's `cancel_order` fix and marking it needs an actual fix design, not just documentation.
+- **Also surfaced and documented `_last_sale_recovery`** (`signals_helpers.py`) as a real, existing
+  partial mitigation — sizes each order off the ticker's last-closed-trade proceeds (or
+  `starting_notional` as fallback) — but confirmed it's per-order, not cross-order, so it doesn't close
+  the double-buy gap either (two independently-reasonable-sized orders for the same ticker would each
+  pass it and still double real exposure together).
+- All of the above is doc-only (backlog_cache.md, docs/live_test_plan_2026-07-24.md) — no further code
+  changes this round, so no additional Opus review/harness run needed (nothing in
+  active_signals.py/signals_*.py/schwab_*.py changed since the last review).
+
+### Verified
+- Nothing new to verify (discussion + doc updates only). Prior round's verification stands: 185/185
+  tests, 6/6 harness scenarios, daemon confirmed current (pid 671527, restarted 08:20:41).
+
+### Current state
+- **Daemon running, real test day still in progress**: `soxl_ira` `dry_run=False`, 2 real resting
+  `TRAILING_STOP` BUY orders (GDXD 5sh, GDXU 3sh), real cash $1,110.43, real pre-existing positions
+  unchanged (3 SPY, 50 SH) plus today's seeded `open_positions` rows for them. Every other account still
+  `dry_run=True`.
+- As of 08:33 ET, still ~42 minutes before the 9:15-9:29 gap-check window. Nothing else pending before
+  then — the full run-of-show, real order details, and all known gaps are in
+  `docs/live_test_plan_2026-07-24.md`, kept live/current throughout rather than reconstructed afterward.
+
+### Next session
+- **User wants to re-review the full `soxl_ira` test plan top to bottom one more time** at the start of
+  the next session, before/alongside the day's real windows continuing (9:15 gap-check, 9:30:02 LABD
+  pinned check, 10:25-10:40 AM window: ERX/ERY real BUY + manual top-up test, guard test, Test A+retry;
+  15:25-15:40 PM backup) — separately covering `ira` (dormant, `dry_run=True`, not part of today's plan)
+  vs `soxl_ira` (today's real account) scope, to make sure nothing about the two accounts' roles is
+  conflated.
+- Real, not-yet-designed backlog item to eventually pick up: the per-ticker cumulative same-day BUY
+  notional guard (now elevated with real evidence from today).
+- Unresolved: the cash-reservation-for-trailing-orders question (does Schwab reserve anything at all for
+  a `TRAILING_STOP` order, or none?) — flagged, not chased down today.
