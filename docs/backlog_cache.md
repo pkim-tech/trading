@@ -1,5 +1,25 @@
 # Backlog Cache
 
+## [live-trading][security] Elevated priority 2026-07-24 morning — real evidence that neither notional_cap nor the cash check would catch a same-account double-buy
+Confirmed empirically today, not just theoretical: placing two real resting `TRAILING_STOP` BUY orders
+(GDXD 5sh, GDXU 3sh) left `get_account_balance('soxl_ira')` completely unchanged ($1,110.43 before and
+after) — contradicts the assumption in `_has_open_buy_order_in_account`'s own docstring that Schwab
+reserves buying power for a resting order (that finding was based on a bounded-price order the night
+before, not a `TRAILING_STOP`). Practical consequence, walked through in detail this morning: in a
+same-ticker double-buy scenario (e.g. `check_gap_resize` placing a replacement order while the original
+somehow also still resolves for real — see the `cancel_order` confirmation fix above), **neither**
+`notional_cap` (checked per-order, not cumulative) **nor** the real cash-availability check (sees the
+undecremented balance, since the resting/just-filled original doesn't seem to move it) would catch it —
+both individual orders are small enough to independently pass. This is the same structural gap already
+flagged 2026-07-22 for the *multi-ticker-sharing-one-account* case
+(`_has_open_buy_order_in_account`'s docstring), now confirmed to apply to the *same-ticker* double-buy
+case too, and confirmed with real data instead of just reasoning about it. **User's call: "not good
+enough"** — this needs an actual fix, not just a documented gap, before scaling beyond today's
+single-ticker-per-scenario test. Candidate fix (not designed yet): a per-ticker cumulative same-day BUY
+notional cap (ties into the already-backlogged 2026-07-22 "max cumulative BUY notional per ticker per
+day" item, which was scoped for a different but related runaway-repeat-buy scenario — worth designing
+both together).
+
 ## [live-trading] Idea, raised 2026-07-24 morning — permanent canary tickers in the dormant `ira` account as a standing delayed-regression test
 Insight from today's real `soxl_ira` test day: the canary-node pattern (deliberately inert
 proof-of-life tickers, absurd thresholds, real Slack alerts but suppressed real-trade buttons) is
