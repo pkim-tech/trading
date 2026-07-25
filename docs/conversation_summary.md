@@ -3951,3 +3951,36 @@ assigned and fail-closed as unknown-account rather than producing a useful dry_r
 Candidate: validate/require an account at `add_node`-time whenever `mode='live'` is set, rather than
 discovering the gap at signal-check time. See `docs/backlog_cache.md`'s "paper trading is currently
 fully dormant system-wide" entry (item 3) for full context.
+
+---
+
+## 2026-07-26 — Corrected the account=None backlog conclusion; new memory on checking history
+
+### What we did
+After last session's `session wrap` closed out the `account=None` backlog item (15/24 `mode='live'`
+nodes with no account assigned) as "reconfirmed moot" — reasoning that the affected nodes just
+aren't live anymore — the user pushed back twice: first that it was a real issue, then that it was
+fixed via a direct patch + daemon restart, not by the nodes becoming irrelevant. Checked
+`signals_db.get_watchlist_audit()` and found the actual fix: 16 nodes (10 v5 + 6 canary) were
+explicitly backfilled `account None -> ira` via direct `edit_node` updates, all timestamped
+`2026-07-24 14:15:06` — a deliberate operational patch, not a coincidence of later mode flips.
+Corrected `docs/backlog_cache.md`'s entry to reflect this, and flagged the real residual: `add_node`
+still has no validation preventing a future `mode='live'` call from omitting `account` again — the
+2026-07-24 fix closed the specific instances, not the class of bug (low priority, hasn't recurred).
+
+Saved a new feedback memory (`feedback_check_history_not_just_current_state`): before declaring a
+backlog item moot/coincidentally-resolved from current DB state alone, check `watch_list_audit`
+(or git log / deep_backlog) for an actual fix event first. The audit query was one call away and
+would have caught the wrong conclusion before it was stated.
+
+### Verification
+Docs-only change this stretch (`docs/backlog_cache.md`) — no `signals_*.py`/`schwab_*.py`/
+backtest-kernel files touched, so no Opus review or `live_sim_harness.py` run required this time.
+
+### Next
+Resuming discussion on testing and the Monday (2026-07-27) plan: `soxl_ira` unattended test day —
+watch for a real successful (not blocked) SL placement/top-up on LABU, confirm SH/SPY read the
+surviving single node correctly, overnight gap-resize on ERX/ERY/GDXD/GDXU now that they're
+`open_check`+TrailingBoth. Also still open: PDT/Schwab-rollout confirmation, channel-routing for
+Slack noise, the max-cumulative-BUY-notional-per-ticker-per-day backstop (design converged, not
+built).

@@ -362,7 +362,19 @@ dedup is wl_id-keyed, not ticker-keyed (already fixed by the refactor), and `ope
 don't collide. Restructuring the if/elif to run both paths off one node would have duplicated what
 adding a second node already gives you for free; not worth building.
 
-Item 3 (`account=None` gap) still open, still targeted for Monday 2026-07-27.
+**Item 3 (`account=None` gap) reconfirmed resolved, corrected 2026-07-26**: re-checked directly
+against the live DB — `get_watchlist()` (`signals_db.py:733`, filters to the active watchlist only,
+`watchlist_id=65`, which is all `active_signals.py` ever polls) shows 0 of the current 15
+`mode='live'` nodes have `account=None` today. Initially mischaracterized this as "moot because the
+affected nodes are gone" — corrected: it was a real, deliberate fix, not an accident of the mode
+flips. `watch_list_audit` (ids 168-182, all `2026-07-24 14:15:06`) shows all 16 nodes that had
+`account=None` that day (10 v5 + 6 canary) were explicitly backfilled `account None -> ira` via
+direct `edit_node` updates — an operational patch applied after the gap was found live, same day,
+not a code-level guard. **Residual, not yet closed**: `add_node` still has no validation preventing
+a *future* `mode='live'` call from omitting `account` again — the fix closed the specific instances,
+not the class of bug. Low priority (hasn't recurred since; every live-node-creation script since has
+passed `account` explicitly) — worth a cheap guard (warn or reject `add_node(mode='live',
+account=None)`) if it's ever worth the effort, not urgent enough to block anything.
 
 ## [live-trading] Far-backlog, raised 2026-07-25, deprioritized same day — v5 watchlist skews long-only, consider adding inverse counterparts
 All 10 v5 tickers are one-directional leveraged longs (SOXL, GDXU, NUGT, HIBL, KORU, DPST, UDOW, USD,
