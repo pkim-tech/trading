@@ -1,5 +1,7 @@
 # Backlog Cache
 
+## [live-trading][security] Resolved 2026-07-26 — Opus review of paper_alert_verbose/account-dedup diff: HIGH duplicate-node idempotency bug in 2 live-setup scripts, plus a rebuild forward-hazard and a stale-snapshot alert gate, all fixed. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
+
 ## [live-trading][security] Resolved 2026-07-25/26 — wl_id-keyed refactor implemented, reviewed (2 Opus rounds), landed. Full detail: `docs/deep_backlog.md`'s 2026-07-25/26 entry.
 
 ## [live-trading][security] Idea, raised 2026-07-26, explicitly gated on the wl_id refactor above landing and being observed correct first — per-node `dry_run` override, additive/OR-logic only, never replacing the account-level flag

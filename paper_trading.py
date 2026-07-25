@@ -83,7 +83,11 @@ def update_paper_buys():
             db.clear_paper_pending_buy(node['id'])
             db.log_coverage_event("entry_fill", "paper", ticker=ticker, node_id=node.get('id'), result="trailing_bounce_filled",
                                    detail=f"shares={shares} price={price:.4f}")
-            if node.get('paper_alert_verbose'):
+            # Re-read live, not the frozen node snapshot from when the pending buy was
+            # created -- flipping paper_alert_verbose=1 after a buy signal fired but
+            # before it filled should still produce this alert (found by Opus review 2026-07-26).
+            live_node = db.get_watch_list_node_by_id(node['id']) if node.get('id') else None
+            if live_node and live_node.get('paper_alert_verbose'):
                 _post_message(f"🧪 PAPER BUY FILLED — {ticker}  {shares}sh @ ${price:.4f}")
         elif running_low != pb['running_low']:
             db.update_paper_pending_buy_running_low(pb['id'], running_low)

@@ -200,20 +200,15 @@ def ensure_tables():
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account)
                 );
-                INSERT INTO watch_list_new
-                    (id, watchlist_id, mode, ticker, strategy, version, window, take_profit,
-                     stop_loss, max_hold_hours, z_score_threshold, label, added_at,
-                     trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, cached_avg_vol_10d,
-                     account, alpha, entry_timing, starting_notional, annotation, paper_alert_verbose)
-                SELECT
-                    id, watchlist_id, mode, ticker, strategy, version, window, take_profit,
-                    stop_loss, max_hold_hours, z_score_threshold, label, added_at,
-                    trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, cached_avg_vol_10d,
-                    account, alpha, entry_timing, starting_notional, annotation, paper_alert_verbose
-                FROM watch_list;
-                DROP TABLE watch_list;
-                ALTER TABLE watch_list_new RENAME TO watch_list;
             """)
+            # Copy every column watch_list actually has (not a hardcoded list) --
+            # a hardcoded list here would silently drop any column added by the
+            # ALTER ladder above within this same ensure_tables() call on a DB
+            # that hasn't been rebuilt yet (found by Opus review 2026-07-26).
+            live_cols = ', '.join(r[1] for r in c.execute("PRAGMA table_info(watch_list)"))
+            c.execute(f"INSERT INTO watch_list_new ({live_cols}) SELECT {live_cols} FROM watch_list")
+            c.execute("DROP TABLE watch_list")
+            c.execute("ALTER TABLE watch_list_new RENAME TO watch_list")
 
         # open_positions
         c.execute("""

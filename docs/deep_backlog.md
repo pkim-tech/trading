@@ -1069,3 +1069,35 @@ because its filename ends in `_test.py`, matching pytest's default discovery glo
 `if __name__ == "__main__":`. Pre-existing hazard, unrelated to this refactor, found only because
 the schema migration briefly broke it mid-run (caught before any real data was written past the
 existing idempotent `add_node` calls).
+
+## ✅ Resolved 2026-07-26 — Opus review of the paper_alert_verbose/account-dedup diff: 1 HIGH, 2 lower findings, all fixed
+Background Opus review of the prior session's `paper_trading.py`/`signals_db.py` diff (paper-alert
+suppression + the `account`-inclusive `watch_list` dedup, see the entry above) came back with:
+1. **HIGH, fixed**: the new `account`-inclusive dedup broke idempotency of two live-setup scripts
+   (`scripts/add_labu_backup_node.py`, `scripts/setup_2026_07_24_soxl_ira_live_test.py`) that called
+   `add_node(...)` without `account`, then patched it in via a raw `UPDATE watch_list SET account=...`
+   afterward. A rerun's dedup check now compares `account=NULL` against the real stored account,
+   never matches, and inserts a second live node with its own `wl_id` — reproduced live against a
+   copy of `trading_live.db` (91→92 rows, a duplicate LABU node). This is the exact failure mode
+   behind the two `pre_dup_node_cleanup` backups already on file from 2026-07-24. Fixed: both
+   scripts now pass `account="soxl_ira"` directly into `add_node`, `_set_account` helpers deleted,
+   stale "rerun is a harmless no-op" docstring claims corrected. `scripts/live_sim_harness.py` had
+   the identical pattern but was already safe (wipes its sim DB first) — left as-is.
+2. **MEDIUM (forward hazard), fixed**: the `watch_list` account-rebuild migration
+   (`signals_db.ensure_tables()`) copied columns via a hardcoded 24-column list that ran *after* the
+   ALTER ladder — on any DB that hadn't been rebuilt yet, a future new column added by the ALTER
+   ladder within the same `ensure_tables()` call would be silently dropped by the rebuild's fixed
+   list. Fixed: column list now derived from `PRAGMA table_info(watch_list)` at runtime. Verified
+   against a synthetic pre-migration DB (old schema, no `account` in `UNIQUE`, ALTER ladder + rebuild
+   both firing in one call) — row survived with all 24 columns intact.
+3. **LOW, fixed**: `update_paper_buys`'s fill alert read `paper_alert_verbose` off the frozen node
+   snapshot captured in `pending_buys.node` at signal time, not the live `watch_list` row — flipping
+   the flag on after a paper buy signal fired but before it filled wouldn't produce the "just turned
+   verbosity on" alert you'd most want. Fixed: re-reads the live node via
+   `get_watch_list_node_by_id` before checking the flag. Zero live impact today (0 rows in
+   `paper_pending_buys` at review time).
+Two PLAUSIBLE-but-not-CONFIRMED items left open, no live impact: the same rebuild's `UNIQUE(`
+string-match schema check could false-positive on a hand-modified DB with no `UNIQUE` clause at all
+(needs a hand-crafted DB to trigger); the rebuild has no explicit transaction wrapping (matches the
+pre-existing 2026-07-18 `watchlist_id` migration's shape, not a new pattern). Full suite: 232
+passed. `live_sim_harness.py`: 6/6 scenarios passed.

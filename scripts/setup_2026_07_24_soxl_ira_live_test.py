@@ -1,30 +1,20 @@
 """One-off setup for the 2026-07-24 soxl_ira real-order test day
 (docs/live_test_plan_2026-07-24.md). Adds 6 new watch_list nodes and seeds
 open_positions for the 2 real pre-staged positions (SPY/SH). Run once;
-add_node uses INSERT OR IGNORE so a rerun is a harmless no-op for nodes that
-already exist by (ticker, strategy, version, window).
+add_node's dedup includes account, so a rerun with the same account is a
+harmless no-op for nodes that already exist by
+(ticker, strategy, version, window, account).
 """
-import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import signals_config as cfg
 import signals_db as db
 
 WATCHLIST_ID = 65
 VERSION = "soxl_test"
-
-
-def _set_account(ticker, version, window, account):
-    with sqlite3.connect(cfg.DB_PATH) as conn:
-        conn.execute(
-            "UPDATE watch_list SET account=? WHERE ticker=? AND version=? AND window=?",
-            (account, ticker, version, window),
-        )
-        conn.commit()
 
 
 def _node_id(ticker, version, window):
@@ -45,18 +35,16 @@ def main():
         take_profit=0.3, stop_loss=0, max_hold_hours=48, label="soxl_ira live-sell test",
         z_score_threshold=2.0, watchlist_id=WATCHLIST_ID, mode="live",
         trail_buy_pct=1.0, trail_pct=0.3, entry_timing="close", starting_notional=50000,
-        fixed_sl_override=0.3,
+        fixed_sl_override=0.3, account="soxl_ira",
     )
-    _set_account("SPY", VERSION, 99, "soxl_ira")
 
     db.add_node(
         ticker="SH", strategy="TrailingBothZScoreBreakout", version=VERSION, window=99,
         take_profit=0.3, stop_loss=0, max_hold_hours=48, label="soxl_ira live-sell test",
         z_score_threshold=2.0, watchlist_id=WATCHLIST_ID, mode="live",
         trail_buy_pct=1.0, trail_pct=0.3, entry_timing="close", starting_notional=50000,
-        fixed_sl_override=0.3,
+        fixed_sl_override=0.3, account="soxl_ira",
     )
-    _set_account("SH", VERSION, 99, "soxl_ira")
 
     # 3/4 -- ERX / ERY real trailing-buy + top-up test. starting_notional sized for
     # ~2 shares so a manually-fed 1-share fill leaves a real shortfall for
@@ -68,18 +56,16 @@ def main():
         take_profit=5, stop_loss=0, max_hold_hours=24, label="soxl_ira live-buy test",
         z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, mode="live",
         trail_buy_pct=0.5, trail_pct=2, entry_timing="close", starting_notional=190,
-        fixed_sl_override=3,
+        fixed_sl_override=3, account="soxl_ira",
     )
-    _set_account("ERX", VERSION, 20, "soxl_ira")
 
     db.add_node(
         ticker="ERY", strategy="TrailingBothZScoreBreakout", version=VERSION, window=20,
         take_profit=5, stop_loss=0, max_hold_hours=24, label="soxl_ira live-buy test",
         z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, mode="live",
         trail_buy_pct=0.5, trail_pct=2, entry_timing="close", starting_notional=21,
-        fixed_sl_override=3,
+        fixed_sl_override=3, account="soxl_ira",
     )
-    _set_account("ERY", VERSION, 20, "soxl_ira")
 
     # 5 -- LABD real market-buy path test (_attempt_automated_market_buy,
     # TrailingExitZScoreBreakout is non-trailing-buy -> market-buy eligible).
@@ -89,9 +75,8 @@ def main():
         take_profit=10, stop_loss=0, max_hold_hours=24, label="soxl_ira live-buy test (market-buy path)",
         z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, mode="live",
         trail_pct=0.5, entry_timing="open_check", starting_notional=22,
-        fixed_sl_override=0.3,
+        fixed_sl_override=0.3, account="soxl_ira",
     )
-    _set_account("LABD", VERSION, 20, "soxl_ira")
 
     # 6 -- GDXD, dedicated ticker for the Part 3 branch B gap-resize test (needs
     # its own trailing-buy node, distinct from ERX/ERY so the real signal-window
@@ -105,9 +90,8 @@ def main():
         take_profit=5, stop_loss=0, max_hold_hours=24, label="soxl_ira gap-resize test",
         z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, mode="live",
         trail_buy_pct=0.3, trail_pct=2, entry_timing="close", starting_notional=500,
-        fixed_sl_override=3,
+        fixed_sl_override=3, account="soxl_ira",
     )
-    _set_account("GDXD", VERSION, 20, "soxl_ira")
 
     print("Nodes created:")
     for ticker, window in [("SPY", 99), ("SH", 99), ("ERX", 20), ("ERY", 20), ("LABD", 20), ("GDXD", 20)]:
