@@ -3908,3 +3908,46 @@ trading section: `paper_alert_verbose` gating detail).
   running for the auto-reconciliation alert to fire.
 - Channel separation (live/dry_run/paper to separate Slack destinations) remains backlogged,
   deliberately not started this session.
+
+---
+
+## 2026-07-26 — Opus review fixes; dropped the "run both" real+paper restructure
+
+### What we did
+Session opened with `go`, then fixed 3 findings from a background Opus review of the prior
+session's diff (`paper_trading.py`/`signals_db.py`): a HIGH duplicate-live-node idempotency bug in
+two setup scripts (both now pass `account=` directly to `add_node` instead of patching it in via a
+raw `UPDATE` afterward), a MEDIUM forward-hazard in the `watch_list` rebuild migration (column list
+now derived from `PRAGMA table_info` at runtime instead of hardcoded), and a LOW stale-snapshot read
+in `update_paper_buys`'s verbose-alert gate (now re-reads the live node). Ran `feature wrap`
+(docs updated, checklist reviewed, committed `e2d139c`).
+
+Discussed the Monday (2026-07-27) mode-scoping backlog item and, after actually re-reading the
+relevant code (not just recalling the backlog text), corrected an initial claim: `paper_trading.py`'s
+dedup is already `wl_id`-keyed (fixed by the wl_id refactor), not ticker-keyed as backlogged. That
+meant the "restructure the if/elif to run both real+paper off one node" idea was solving a problem
+the two-node pattern (DPST's pairing from last session) already solves for free — dropped the idea
+rather than building it. The `account=None` gap (15/24 `mode='live'` nodes with no account, failing
+closed as `BLOCKED ... unknown account`) stays open, still targeted for Monday.
+
+Ran `session wrap`: since `signals_db.py`/`paper_trading.py` changed, spawned an independent Opus
+review of this session's own diff. It found 1 CONFIRMED (MEDIUM): the `watch_list_new` rebuild table
+had no `DROP TABLE IF EXISTS` guard — a failed rebuild (future column mismatch) would leave an orphan
+table that permanently bricks every subsequent `ensure_tables()` call, i.e. daemon startup. Fixed
+with one `DROP TABLE IF EXISTS watch_list_new` before the rebuild. One LOW item (paper alert
+silently suppressed if a node is deleted mid-flight between signal and fill) left as-is — no
+trade/P&L impact, an intentional-vs-accidental question not a defect. The review also confirmed the
+earlier `paper_alert_verbose` bug was worse than believed — the key was never in
+`_PENDING_BUY_NODE_KEYS`, so the alert could never fire at all, not just on a narrow timing window —
+and that the executescript-to-3-execute()-calls change actually improved transaction atomicity
+rather than introducing a new crash window.
+
+### Verification
+Full suite: 232 passed (after each fix). `scripts/live_sim_harness.py`: 6/6 scenarios passed.
+
+### Next
+Monday (2026-07-27): decide the `account=None` gap — 15/24 `mode='live'` nodes have no account
+assigned and fail-closed as unknown-account rather than producing a useful dry_run walkthrough.
+Candidate: validate/require an account at `add_node`-time whenever `mode='live'` is set, rather than
+discovering the gap at signal-check time. See `docs/backlog_cache.md`'s "paper trading is currently
+fully dormant system-wide" entry (item 3) for full context.

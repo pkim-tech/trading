@@ -1101,3 +1101,38 @@ string-match schema check could false-positive on a hand-modified DB with no `UN
 (needs a hand-crafted DB to trigger); the rebuild has no explicit transaction wrapping (matches the
 pre-existing 2026-07-18 `watchlist_id` migration's shape, not a new pattern). Full suite: 232
 passed. `live_sim_harness.py`: 6/6 scenarios passed.
+
+## ✅ Resolved 2026-07-26 — session-wrap Opus review of the above fix: 1 CONFIRMED (fixed), 1 LOW (no action)
+Mandatory review of this session's own diff (`signals_db.py`/`paper_trading.py`, the 3 fixes above)
+before closing. Findings:
+1. **MEDIUM, CONFIRMED, fixed**: the `watch_list_new` rebuild table had no `DROP TABLE IF EXISTS`
+   before its `CREATE TABLE` — reproduced live: if the `INSERT`/rebuild ever fails partway (e.g. a
+   future ALTER-added column not yet reflected in the hardcoded `CREATE TABLE watch_list_new`
+   definition), the orphaned table survives the failed transaction, and every subsequent
+   `ensure_tables()` call (i.e. every daemon startup) dies at the `CREATE TABLE` with "table already
+   exists" — a total outage, not a degraded mode, requiring manual `DROP TABLE watch_list_new` to
+   recover. Real data was never at risk (the failing INSERT/DROP/RENAME transaction rolls back
+   cleanly). Fixed: one `c.execute("DROP TABLE IF EXISTS watch_list_new")` before the executescript.
+2. **LOW, no action**: `paper_trading.py`'s live-node re-read for the verbose-alert gate returns
+   `None` (silently suppressing the alert) if the `watch_list` row is deleted between signal and
+   fill — paper-only, alerts-only, no trade/P&L impact, flagged as an intentional-vs-accidental
+   question rather than a defect.
+Also confirmed by this review, worth keeping: the `paper_alert_verbose` bug fixed earlier this
+session was actually worse than "stale" — the key was never in `_PENDING_BUY_NODE_KEYS`
+(`signals_db.py`), so the frozen snapshot never carried it at all and the alert **could never fire**
+regardless of flag state, not just on a narrow timing window. And the executescript→3-separate-
+`execute()` change actually *improved* transaction atomicity (verified via a direct `in_transaction`
+probe) rather than introducing a new crash window, since the old `executescript()` form auto-
+committed the `DROP`/`RENAME` as separate transactions.
+Full suite: 232 passed. `live_sim_harness.py`: 6/6 scenarios passed.
+
+## ✅ Resolved 2026-07-26 — "run both" real+paper restructure dropped; the two-node pattern already covers it
+Item 2 of the 2026-07-24 "paper trading fully dormant" Monday follow-up list (restructure the
+BUY-routing if/elif so a node runs both the real/dry_run alert path and paper trading regardless of
+`mode`) was dropped after verifying the wl_id refactor already makes a simpler alternative safe: two
+separate `watch_list` nodes for the same ticker (one `research`, one `live`) — the exact DPST
+pairing added last session — give continuous paper coverage and live trading simultaneously with no
+code change. Verified before dropping: `paper_trading.py`'s dedup is `wl_id`-keyed, not
+ticker-keyed, and `active_signals.py`'s `open_position_keys` (line 530-531) already merges real +
+paper positions, so the two nodes don't collide. Item 3 (`account=None` gap on 15/24 `mode='live'`
+nodes) remains open, still targeted for Monday 2026-07-27.

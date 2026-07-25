@@ -1,5 +1,9 @@
 # Backlog Cache
 
+## [live-trading] Resolved 2026-07-26 — "run both" real+paper restructure dropped, two-node pattern already covers it. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
+
+## [live-trading][security] Resolved 2026-07-26 — session-wrap Opus review found+fixed an orphan-table forward hazard in the watch_list rebuild migration. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
+
 ## [live-trading][security] Resolved 2026-07-26 — Opus review of paper_alert_verbose/account-dedup diff: HIGH duplicate-node idempotency bug in 2 live-setup scripts, plus a rebuild forward-hazard and a stale-snapshot alert gate, all fixed. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
 
 ## [live-trading][security] Resolved 2026-07-25/26 — wl_id-keyed refactor implemented, reviewed (2 Opus rounds), landed. Full detail: `docs/deep_backlog.md`'s 2026-07-25/26 entry.
@@ -347,8 +351,18 @@ Follow-ups user wants to revisit **Monday (2026-07-27)**, not this week:
 `watch_list` update (backfilled into `watch_list_audit`) — restores continuous paper-trading coverage
 on the actual live tickers/strategy, matching the original research-mode-as-default design. Canaries
 deliberately left as-is; user's read is they don't need coverage diversity the way the real watchlist
-does (already non-overlapping ticker set, distinct proof-of-life purpose). Items 2 (run-both
-restructure) and 3 (`account=None` gap) still open, still targeted for Monday 2026-07-27.
+does (already non-overlapping ticker set, distinct proof-of-life purpose).
+
+**Item 2 (run-both restructure) dropped, 2026-07-26**: the wl_id refactor already makes the
+two-node pattern (one `research` node for continuous paper coverage, a second `live` node in the
+real account, same ticker/strategy/params — exactly the DPST pairing added last session) a safe,
+zero-code-change way to get both simultaneously. Verified before dropping: `paper_trading.py`'s
+dedup is wl_id-keyed, not ticker-keyed (already fixed by the refactor), and `open_position_keys`
+(`active_signals.py:530-531`) already merges real + paper positions — so two nodes for one ticker
+don't collide. Restructuring the if/elif to run both paths off one node would have duplicated what
+adding a second node already gives you for free; not worth building.
+
+Item 3 (`account=None` gap) still open, still targeted for Monday 2026-07-27.
 
 ## [live-trading] Far-backlog, raised 2026-07-25, deprioritized same day — v5 watchlist skews long-only, consider adding inverse counterparts
 All 10 v5 tickers are one-directional leveraged longs (SOXL, GDXU, NUGT, HIBL, KORU, DPST, UDOW, USD,

@@ -170,6 +170,11 @@ def ensure_tables():
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='watch_list'"
         ).fetchone()[0]
         if 'account' not in wl_schema_sql.split('UNIQUE(')[-1]:
+            # DROP IF EXISTS first -- a prior failed rebuild attempt (e.g. a future
+            # column mismatch between this CREATE and the live table) leaves this
+            # orphaned, and CREATE TABLE with no IF NOT EXISTS would then permanently
+            # brick every future ensure_tables() call (found by Opus review 2026-07-26).
+            c.execute("DROP TABLE IF EXISTS watch_list_new")
             c.executescript("""
                 CREATE TABLE watch_list_new (
                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
