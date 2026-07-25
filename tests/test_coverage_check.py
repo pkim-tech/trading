@@ -420,6 +420,33 @@ def test_send_coverage_report_reflects_explained_deviation(isolated_db, monkeypa
     assert '(explained)' in captured['text']
 
 
+def test_send_coverage_report_does_not_collapse_rows_sharing_a_scenario_key(isolated_db, monkeypatch):
+    """Opus review, 2026-07-25: scenario_key alone is not a unique key -- two
+    active scenario_expectations rows can share one scenario_key when
+    disambiguated by node_id (e.g. the same designed scenario run against two
+    different nodes on purpose). Explaining one node's deviation must not mask
+    the other node's still-unexplained one in the Slack report."""
+    import signals_notify
+    captured = {}
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda text, blocks=None: (captured.setdefault('text', text), ('C1', '1'))[1])
+
+    db.add_scenario_expectation('sk_shared', 'expected happy path', 'daily', 'trade_lifecycle',
+                                 ticker=TICKER, node_id=201, check_params='{"expect_exit_reason": ["WIN"]}')
+    db.add_scenario_expectation('sk_shared', 'expected happy path', 'daily', 'trade_lifecycle',
+                                 ticker=TICKER, node_id=202, check_params='{"expect_exit_reason": ["WIN"]}')
+    check_date = '2026-07-24'
+    signals_notify.send_coverage_report(check_date)
+    assert len(db.get_deviations()) == 2
+
+    dev_node_201 = [d for d in db.get_deviations() if d['node_id'] == 201][0]
+    db.explain_deviation(dev_node_201['id'], 'known issue on node 201')
+
+    captured.clear()
+    signals_notify.send_coverage_report(check_date)
+    assert ':red_circle: 1 UNEXPLAINED' in captured['text']  # node 202's deviation, not masked by node 201's
+
+
 def test_send_coverage_report_refuses_weekend(isolated_db, monkeypatch):
     """Opus review, 2026-07-25: a trade_lifecycle expectation like 'a trade
     closed today' is trivially, permanently false on a day the market never
@@ -462,3 +489,19 @@ def test_send_coverage_report_clears_stale_deviation_once_met(isolated_db, monke
     assert 'UNEXPLAINED' not in captured['text']
     assert '✓' in captured['text']
     assert db.get_deviations() == []  # stale row cleared, not left behind
+
+
+def test_clear_deviation_if_resolved_preserves_explained_row(isolated_db):
+    """Opus review, 2026-07-25: a deviation a human already explained is real
+    historical record (something did deviate and someone looked at it), not
+    noise -- must never be silently destroyed just because the scenario is
+    later met on a same-day re-check."""
+    db.record_deviation('2026-07-24', 'sk_e', 'expected X', 'got Y', ticker=TICKER)
+    dev_id = db.get_deviations()[0]['id']
+    db.explain_deviation(dev_id, 'known transient issue')
+
+    db.clear_deviation_if_resolved('2026-07-24', 'sk_e', ticker=TICKER)
+
+    rows = db.get_deviations()
+    assert len(rows) == 1
+    assert rows[0]['reason'] == 'known transient issue'

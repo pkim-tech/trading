@@ -1589,10 +1589,19 @@ def send_coverage_report(check_date=None):
     except Exception as e:
         return _post_message(f"⚠️ Coverage Report failed to run: {e}")
 
-    reasons = {d['scenario_key']: d['reason'] for d in db.get_deviations(check_date=check_date)}
+    # scenario_key alone is not a unique key -- two active scenario_expectations
+    # rows can share one scenario_key when disambiguated by node_id/mode (e.g.
+    # the same designed scenario run against two different nodes on purpose).
+    # Keying by scenario_key alone would let explaining one row's deviation
+    # silently mask the other's (found by Opus review, 2026-07-25).
+    def _key(row_or_result):
+        return (row_or_result['scenario_key'], row_or_result.get('ticker') or '',
+                row_or_result.get('node_id'), row_or_result.get('mode') or '')
+
+    reasons = {_key(d): d['reason'] for d in db.get_deviations(check_date=check_date)}
 
     lines = [f"*Coverage Report — {check_date}*"]
-    unexplained = [r for r in results if r['status'] == 'deviated' and not reasons.get(r['scenario_key'])]
+    unexplained = [r for r in results if r['status'] == 'deviated' and not reasons.get(_key(r))]
     if unexplained:
         lines.append(f":red_circle: {len(unexplained)} UNEXPLAINED deviation(s):")
         for r in unexplained:
@@ -1606,7 +1615,7 @@ def send_coverage_report(check_date=None):
             status = "✓"
         elif r['status'] == 'skipped':
             status = "?  not checked"
-        elif reasons.get(r['scenario_key']):
+        elif reasons.get(_key(r)):
             status = "✗ (explained)"
         else:
             status = "✗ UNEXPLAINED"

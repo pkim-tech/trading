@@ -1021,18 +1021,23 @@ def record_deviation(check_date, scenario_key, expected_outcome, actual_summary,
 
 
 def clear_deviation_if_resolved(check_date, scenario_key, ticker=None, node_id=None, mode=None):
-    """Deletes a same-day deviation row for this (scenario_key, node_id, ticker,
-    mode) if one exists -- called when a re-check finds the expectation now met.
-    Without this, a scenario that deviated earlier in the day (e.g. a trade
-    that hadn't closed yet) and later becomes genuinely met would leave a
-    stale, permanently-unexplained deviation row behind even though nothing is
-    actually wrong anymore -- the exact false-positive noise the "no
-    unexplained failure" contract is supposed to prevent, not manufacture.
-    No-op if no matching row exists (the common case on a first, clean run)."""
+    """Deletes a same-day UNEXPLAINED deviation row for this (scenario_key,
+    node_id, ticker, mode) if one exists -- called when a re-check finds the
+    expectation now met. Without this, a scenario that deviated earlier in the
+    day (e.g. a trade that hadn't closed yet) and later becomes genuinely met
+    would leave a stale, permanently-unexplained deviation row behind even
+    though nothing is actually wrong anymore -- the exact false-positive noise
+    the "no unexplained failure" contract is supposed to prevent, not
+    manufacture. Only deletes when reason IS NULL -- a row a human already
+    explained is real historical record (something did deviate and someone
+    looked at it), not noise, and must never be silently destroyed just
+    because the scenario happens to be met on a later check the same day (see
+    record_deviation's identical "never clobber a reason" rule). No-op if no
+    matching unexplained row exists (the common case on a first, clean run)."""
     with _conn() as c:
         c.execute("""
             DELETE FROM coverage_deviations
-            WHERE check_date = ? AND scenario_key = ?
+            WHERE check_date = ? AND scenario_key = ? AND reason IS NULL
               AND COALESCE(node_id, -1) = COALESCE(?, -1)
               AND COALESCE(ticker, '') = COALESCE(?, '')
               AND COALESCE(mode, '') = COALESCE(?, '')

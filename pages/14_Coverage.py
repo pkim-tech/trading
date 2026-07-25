@@ -1,9 +1,14 @@
 import sqlite3
+import sys
 from collections import defaultdict
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts.coverage_check import CHECKERS  # pure dict of checker functions, no side effects/Slack config
 
 DB_PATH = "./cache/live/trading_live.db"
 MODES = ["paper", "dry_run", "live", "unattributed"]
@@ -97,13 +102,31 @@ st.divider()
 # --- Section 2: today's scenario status ---
 st.header("Today's Scenarios")
 today = date.today().isoformat()
-today_deviations = {d["scenario_key"]: d for d in load_deviations() if d["check_date"] == today}
+# scenario_key alone is not a unique key -- two active scenario_expectations
+# rows can share one scenario_key when disambiguated by node_id/mode (e.g. the
+# same designed scenario run against two different nodes on purpose); keying
+# by scenario_key alone would let one row's deviation mask the other's (found
+# by Opus review, 2026-07-25).
+today_deviations = {
+    (d["scenario_key"], d["ticker"] or "", d["node_id"], d["mode"] or ""): d
+    for d in load_deviations() if d["check_date"] == today
+}
 expectations = load_scenario_expectations()
 
 rows = []
 for s in expectations:
-    dev = today_deviations.get(s["scenario_key"])
-    if dev is None:
+    key = (s["scenario_key"], s["ticker"] or "", s["node_id"], s["mode"] or "")
+    dev = today_deviations.get(key)
+    if s["expected_frequency"] != "daily":
+        # coverage_check.py's run_check only evaluates 'daily' scenarios --
+        # rendering these as "met" (just because no deviation row exists)
+        # would be a guess, not an observation (found by Opus review, 2026-07-25).
+        status = "— not daily-checked"
+        actual = reason = ""
+    elif s["check_method"] not in CHECKERS:
+        status = "?  unknown check_method"
+        actual = reason = ""
+    elif dev is None:
         status = "✓ met"
         actual = ""
         reason = ""

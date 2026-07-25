@@ -963,3 +963,24 @@ failure would silently no-op the button, now posts a visible failure message.
 Final state: full suite 228 passed (was 195 at the start of this arc), `live_sim_harness.py` 6/6.
 All 7 pieces of the original 2026-07-24 coverage-system reframe (dashboard, 3rd axis, structured
 expected-vs-actual, drill-down, no-unexplained-failure contract, Slack report) are done.
+
+**Session-close Opus review (2026-07-25), covering the full session diff including `signals_db.py`'s
+changes not yet independently reviewed** — 2 CONFIRMED + 1 PLAUSIBLE, all fixed: (1) CONFIRMED —
+`scenario_key` alone is not a unique key (two active `scenario_expectations` rows can legitimately
+share one `scenario_key`, disambiguated by `node_id`/`mode`, e.g. the same designed scenario run
+against two nodes on purpose), but `send_coverage_report` and `pages/14_Coverage.py` both keyed their
+deviation-lookup dicts by `scenario_key` alone — explaining one node's deviation would silently mask
+a different node's still-unexplained one. Fixed: `coverage_check.run_check`'s result dicts now carry
+`node_id`/`mode`, and both callers key by the composite `(scenario_key, ticker, node_id, mode)`. Live
+data checked: the 6 pre-migration `node_id=NULL` canary rows are already `active=0` (not double-
+counting today), so this wasn't yet live-triggering, but the code path was a real bug. (2) CONFIRMED
+— `pages/14_Coverage.py`'s "Today's Scenarios" table inferred "✓ met" from "no deviation row today"
+alone, without checking whether `coverage_check.run_check` actually evaluates that scenario at all —
+an `occasional`/`regression-only`-frequency row or an unrecognized `check_method` would render green
+having never been checked. Fixed: the page now imports `scripts.coverage_check.CHECKERS` and renders
+"— not daily-checked" / "? unknown check_method" instead of assuming met for those cases. (3)
+PLAUSIBLE — `clear_deviation_if_resolved` deleted unconditionally, including a row a human had
+already explained; if the scenario later became met on a same-day re-check, the explanation and the
+record that anything had deviated at all would be silently destroyed. Fixed: added `AND reason IS
+NULL` to the delete, matching `record_deviation`'s existing "never clobber a reason" rule. 3 new
+regression tests. Full suite 230 passed (was 228), `live_sim_harness.py` 6/6.

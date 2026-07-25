@@ -96,23 +96,29 @@ def run_check(check_date):
     results = []
     print(f"Coverage check for {check_date}\n")
     for s in scenarios:
+        # scenario_key alone is not a unique key -- two active rows can share
+        # one scenario_key when disambiguated by node_id/mode (e.g. the same
+        # designed scenario run against two different nodes on purpose), so
+        # every result carries node_id/mode too -- a caller that dedups/looks
+        # up by scenario_key alone would silently collapse two distinct rows
+        # (found by Opus review, 2026-07-25).
+        base = dict(scenario_key=s['scenario_key'], ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
         checker = CHECKERS.get(s['check_method'])
         if checker is None:
             print(f"  ? {s['scenario_key']:26s} {s['ticker'] or '':6s} unknown check_method={s['check_method']!r}, skipped")
-            results.append(dict(status='skipped', scenario_key=s['scenario_key'], ticker=s['ticker'],
-                                 summary=f"unknown check_method={s['check_method']!r}"))
+            results.append(dict(base, status='skipped', summary=f"unknown check_method={s['check_method']!r}"))
             continue
         met, actual_summary = checker(s, check_date)
         if met:
             db.clear_deviation_if_resolved(check_date, s['scenario_key'],
                                             ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
             print(f"  ✓ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
-            results.append(dict(status='met', scenario_key=s['scenario_key'], ticker=s['ticker'], summary=actual_summary))
+            results.append(dict(base, status='met', summary=actual_summary))
         else:
             db.record_deviation(check_date, s['scenario_key'], s['expected_outcome'], actual_summary,
                                  ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
             print(f"  ✗ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
-            results.append(dict(status='deviated', scenario_key=s['scenario_key'], ticker=s['ticker'], summary=actual_summary))
+            results.append(dict(base, status='deviated', summary=actual_summary))
 
     unexplained = db.get_deviations(unexplained_only=True)
     if unexplained:
