@@ -10,7 +10,7 @@ import signals_compute as compute
 import schwab_safety
 from signals_blocks import _post_message, _price_input_block, _shares_input_block
 from signals_helpers import _existing_position_note, _last_sale_recovery, clear_corp_action_alert
-from signals_notify import send_reference_report, _place_stop_loss_for_position
+from signals_notify import send_reference_report, send_coverage_report, _place_stop_loss_for_position
 
 if cfg.SOCKET_MODE:
 
@@ -438,6 +438,11 @@ if cfg.SOCKET_MODE:
         manual-open/close buttons) stays as a historical record."""
         ack()
         send_reference_report(db.get_watchlist())
+
+    @cfg.bolt_app.action("send_coverage_report")
+    def handle_send_coverage_report(ack, body, client):
+        ack()
+        send_coverage_report()
 
     @cfg.bolt_app.action("stop_engine")
     def handle_stop_engine(ack, body, client):

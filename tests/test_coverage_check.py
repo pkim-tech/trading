@@ -376,3 +376,89 @@ def test_pending_buy_node_account_stays_pinned_to_signal_time_snapshot(isolated_
 
     pending = db.get_pending_buys()[0]
     assert pending['node']['account'] == 'brokerage'  # pinned, NOT 'ira'
+
+
+def test_send_coverage_report_surfaces_unexplained_deviation(isolated_db, monkeypatch):
+    """signals_notify.send_coverage_report is piece #7 of the coverage-system
+    reframe (Slack-callable report) -- it must run the real check live (not
+    just read stale coverage_deviations rows) and post the unexplained
+    deviation, since that's the actionable fact per automation_principles.md
+    #16's "no unexplained failure" contract."""
+    import signals_notify
+    captured = {}
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda text, blocks=None: (captured.setdefault('text', text), ('C1', '1'))[1])
+
+    db.add_scenario_expectation('sk_a', 'expected happy path', 'daily', 'trade_lifecycle',
+                                 ticker=TICKER, check_params='{"expect_exit_reason": ["WIN"]}')
+    check_date = '2026-07-24'  # a Friday -- Saturday/Sunday are gated, see below
+    signals_notify.send_coverage_report(check_date)
+
+    assert 'UNEXPLAINED' in captured['text']
+    assert 'sk_a' in captured['text']
+    unexplained = db.get_deviations(unexplained_only=True)
+    assert len(unexplained) == 1
+    assert unexplained[0]['scenario_key'] == 'sk_a'
+
+
+def test_send_coverage_report_reflects_explained_deviation(isolated_db, monkeypatch):
+    import signals_notify
+    captured = {}
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda text, blocks=None: (captured.setdefault('text', text), ('C1', '1'))[1])
+
+    db.add_scenario_expectation('sk_b', 'expected happy path', 'daily', 'trade_lifecycle',
+                                 ticker=TICKER, check_params='{"expect_exit_reason": ["WIN"]}')
+    check_date = '2026-07-24'  # a Friday -- Saturday/Sunday are gated, see below
+    signals_notify.send_coverage_report(check_date)
+    dev_id = db.get_deviations()[0]['id']
+    db.explain_deviation(dev_id, 'known -- no signal today')
+
+    captured.clear()
+    signals_notify.send_coverage_report(check_date)
+    assert 'No unexplained deviations' in captured['text']
+    assert '(explained)' in captured['text']
+
+
+def test_send_coverage_report_refuses_weekend(isolated_db, monkeypatch):
+    """Opus review, 2026-07-25: a trade_lifecycle expectation like 'a trade
+    closed today' is trivially, permanently false on a day the market never
+    opened -- confirmed live, this produced real unexplained deviation rows
+    dated a Saturday before this gate was added. The Slack button (unlike the
+    CLI tool, normally run deliberately) makes an accidental weekend tap easy."""
+    import signals_notify
+    captured = {}
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda text, blocks=None: (captured.setdefault('text', text), ('C1', '1'))[1])
+
+    db.add_scenario_expectation('sk_c', 'expected happy path', 'daily', 'trade_lifecycle',
+                                 ticker=TICKER, check_params='{"expect_exit_reason": ["WIN"]}')
+    signals_notify.send_coverage_report('2026-07-25')  # a Saturday
+
+    assert 'weekend' in captured['text'].lower()
+    assert db.get_deviations() == []  # no deviation row manufactured
+
+
+def test_send_coverage_report_clears_stale_deviation_once_met(isolated_db, monkeypatch):
+    """Opus review, 2026-07-25: a scenario that deviated earlier in the day
+    (no trade yet) and is genuinely met by the time of a later re-check must
+    not still be reported as ✗ UNEXPLAINED -- the report contradicting the
+    check it just ran."""
+    import signals_notify
+    captured = {}
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda text, blocks=None: (captured.setdefault('text', text), ('C1', '1'))[1])
+
+    db.add_scenario_expectation('sk_d', 'expected happy path', 'daily', 'trade_lifecycle',
+                                 ticker=TICKER, check_params='{"expect_exit_reason": ["WIN"]}')
+    check_date = '2026-07-24'
+    signals_notify.send_coverage_report(check_date)  # first tap: no trade yet -> deviated
+    assert len(db.get_deviations()) == 1
+
+    _add_closed_trade('WIN', datetime(2026, 7, 24), datetime(2026, 7, 24))  # trade lands later
+
+    captured.clear()
+    signals_notify.send_coverage_report(check_date)  # second tap: now met
+    assert 'UNEXPLAINED' not in captured['text']
+    assert '✓' in captured['text']
+    assert db.get_deviations() == []  # stale row cleared, not left behind

@@ -22,6 +22,11 @@ from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
     buy_order_sizing,
 )
+# scripts/ has no __init__.py but is still importable as a Python 3 implicit
+# namespace package as long as repo root is on sys.path (true whenever this
+# module is reached via active_signals.py, run from repo root) -- same
+# import tests/test_coverage_check.py already uses.
+from scripts.coverage_check import run_check as _coverage_run_check
 
 
 def _attempt_automated_buy(node, sizing):
@@ -1553,6 +1558,63 @@ _STRATEGY_LABELS = {
 }
 
 
+def send_coverage_report(check_date=None):
+    """Slack-callable version of scripts/coverage_check.py -- piece #7 of the
+    2026-07-24 coverage-system reframe. Runs the same daily expected-vs-actual
+    check live (not just reading whatever a prior manual/cron run of
+    coverage_check.py already recorded) so a request always reflects current
+    state, then posts a compact mobile-readable summary: every still-
+    unexplained deviation first (the actionable fact per automation_
+    principles.md #16's "no unexplained failure" contract), then a per-scenario
+    pass/fail line. Piggybacks on the existing reference-report delivery
+    (_post_message), not a separate mechanism.
+
+    Renders status from run_check's own live return value, not a re-query of
+    coverage_deviations -- a scenario the same run just found met must not be
+    reported as a deviation (found by Opus review, 2026-07-25: re-querying
+    stale rows made the report contradict the check it had just run). Also
+    refuses to run on a weekend, since a trade_lifecycle expectation like
+    "no closed trade today" is trivially, permanently false on a day the
+    market never opened -- the button being one tap away (unlike the CLI
+    tool, normally run deliberately at end of day) turned that into a real
+    risk of manufacturing permanent false-positive deviation rows (confirmed
+    live: this bug produced exactly that on a Saturday before this fix)."""
+    check_date = check_date or datetime.now().strftime('%Y-%m-%d')
+    if datetime.strptime(check_date, '%Y-%m-%d').weekday() >= 5:
+        return _post_message(f"Coverage Report — {check_date} is a weekend, no trading day to check.")
+
+    try:
+        db.ensure_tables()
+        results = _coverage_run_check(check_date)
+    except Exception as e:
+        return _post_message(f"⚠️ Coverage Report failed to run: {e}")
+
+    reasons = {d['scenario_key']: d['reason'] for d in db.get_deviations(check_date=check_date)}
+
+    lines = [f"*Coverage Report — {check_date}*"]
+    unexplained = [r for r in results if r['status'] == 'deviated' and not reasons.get(r['scenario_key'])]
+    if unexplained:
+        lines.append(f":red_circle: {len(unexplained)} UNEXPLAINED deviation(s):")
+        for r in unexplained:
+            lines.append(f"  • {r['scenario_key']} ({r['ticker'] or 'n/a'}): {r['summary']}")
+    else:
+        lines.append(":white_check_mark: No unexplained deviations.")
+
+    lines.append("")
+    for r in results:
+        if r['status'] == 'met':
+            status = "✓"
+        elif r['status'] == 'skipped':
+            status = "?  not checked"
+        elif reasons.get(r['scenario_key']):
+            status = "✗ (explained)"
+        else:
+            status = "✗ UNEXPLAINED"
+        lines.append(f"{status}  {r['scenario_key']}  ({r['ticker'] or ''})")
+
+    return _post_message("\n".join(lines))
+
+
 def send_reference_report(watchlist):
     """One source of truth (build_reference_table) rendered as mobile-readable
     prose per ticker -- flat and held both shown with their real next trigger,
@@ -1583,6 +1645,7 @@ def send_reference_report(watchlist):
     if cfg.INTERACTIVE:
         blocks.append({"type": "actions", "elements": [
             {"type": "button", "text": {"type": "plain_text", "text": "🔄 Resend Report"}, "action_id": "resend_ref_table"},
+            {"type": "button", "text": {"type": "plain_text", "text": "🧭 Coverage Report"}, "action_id": "send_coverage_report"},
         ]})
 
     if held_rows:

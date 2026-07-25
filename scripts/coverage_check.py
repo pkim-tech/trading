@@ -17,7 +17,7 @@ Usage:
 import argparse
 import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -72,25 +72,47 @@ CHECKERS = {
 
 
 def run_check(check_date):
+    """Returns a list of per-scenario result dicts (status: 'met'/'deviated'/
+    'skipped', scenario_key, ticker, summary) in addition to printing/
+    recording -- callers that need the live result (e.g.
+    signals_notify.send_coverage_report) should use the return value rather
+    than re-querying coverage_deviations afterward, since a scenario that
+    deviated earlier the same day and is now met has its stale deviation row
+    cleared here, not left behind as a contradiction."""
     db.ensure_tables()
+    if datetime.strptime(check_date, '%Y-%m-%d').weekday() >= 5:
+        # A 'trade closed today' expectation is trivially, permanently false on
+        # a day the market never opened -- checking it would just manufacture a
+        # real, permanent unexplained deviation row for no reason (found live,
+        # 2026-07-25 Opus review: exactly this happened via the Slack report
+        # button). Applies to both the CLI and any caller of run_check.
+        print(f"{check_date} is a weekend, no trading day to check.")
+        return []
     scenarios = db.get_scenario_expectations(expected_frequency='daily')
     if not scenarios:
         print("No daily scenario_expectations rows -- run scripts/seed_scenario_expectations.py first.")
-        return
+        return []
 
+    results = []
     print(f"Coverage check for {check_date}\n")
     for s in scenarios:
         checker = CHECKERS.get(s['check_method'])
         if checker is None:
             print(f"  ? {s['scenario_key']:26s} {s['ticker'] or '':6s} unknown check_method={s['check_method']!r}, skipped")
+            results.append(dict(status='skipped', scenario_key=s['scenario_key'], ticker=s['ticker'],
+                                 summary=f"unknown check_method={s['check_method']!r}"))
             continue
         met, actual_summary = checker(s, check_date)
         if met:
+            db.clear_deviation_if_resolved(check_date, s['scenario_key'],
+                                            ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
             print(f"  ✓ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
+            results.append(dict(status='met', scenario_key=s['scenario_key'], ticker=s['ticker'], summary=actual_summary))
         else:
             db.record_deviation(check_date, s['scenario_key'], s['expected_outcome'], actual_summary,
                                  ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
             print(f"  ✗ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
+            results.append(dict(status='deviated', scenario_key=s['scenario_key'], ticker=s['ticker'], summary=actual_summary))
 
     unexplained = db.get_deviations(unexplained_only=True)
     if unexplained:
@@ -99,6 +121,8 @@ def run_check(check_date):
             print(f"  [{d['id']}] {d['check_date']} {d['scenario_key']} ({d['ticker']}): {d['actual_summary']}")
     else:
         print("\nNo unexplained deviations.")
+
+    return results
 
 
 def main():

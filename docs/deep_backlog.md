@@ -909,3 +909,57 @@ prose:
   future work rather than coded now — see `docs/backlog_cache.md`.
 
 Full suite after this second round: 210 passed (was 195 at session start).
+
+## ✅ [live-trading] Resolved 2026-07-25 — coverage-system "compass" v2 complete: node_id/mode/strategy_type identity, six-round Opus review chain, Streamlit dashboard, Slack-callable report
+Spanned two sessions (2026-07-24 late night start through 2026-07-25). Real ask: not "add a
+scenario_expectations row per known bug" but capture *all* intended behavior across paper/dry_run/
+live, so a deviation with no reason is always the actionable finding (automation_principles.md #16's
+"no unexplained failure" contract) — and along the way, close two architectural gaps the user flagged
+directly: ticker alone isn't a real node identity key, and some safety controls weren't scoped at the
+right level.
+
+**Identity migration**: `scenario_expectations`/`coverage_deviations`/`coverage_events` gained
+nullable `node_id` (FK `watch_list.id`) + `mode` (paper/dry_run/live), replacing ticker-only identity
+(SQLite `UNIQUE` over nullable columns can't dedup — same bug class as `add_node`'s `take_profit=NULL`
+failure). `add_scenario_expectation`/`record_deviation` rewritten with explicit COALESCE-based
+check-then-upsert (automation_principles.md #13). New `signals_db.get_watch_list_node`/
+`get_watch_list_node_by_id` (fail-open by design — pure observability, must never raise into live
+control flow).
+
+**Six independent Opus review rounds** on the growing diff (real money at stake) found and fixed,
+with rising-then-falling severity: watchlist-scoping bugs in node resolution; `_PENDING_BUY_NODE_KEYS`
+missing `'id'` (silently made ~14 of ~18 wired call sites dead code); a stale `pending_buys` account
+snapshot (IVV, cleared per user decision); **the most severe finding** — `signals_blocks.py`'s
+BUY-alert button and the Reference Report's "Manually Open" button both omitted `account`/`id` from
+their node whitelist, so every manual BUY confirmation (the primary way live positions get opened)
+could write `open_positions.account=NULL`, invisible to live-state reconciliation — fixed both
+locations, a real pre-existing bug independent of the migration that this audit chain happened to
+surface; a diverged same-day-buy-warning check misfiring on the live `soxl_ira` margin account; a
+dead-code `_fresh_node` helper removed after its own fix made it a no-op; a fail-open regression in
+an earlier round's own fix. Full suite 224 passed, `live_sim_harness.py` 6/6.
+
+**Streamlit dashboard + strategy_type axis (2026-07-25)**: `pages/14_Coverage.py` ("Coverage
+Compass") — unexplained deviations at top with an inline Explain action, today's per-scenario
+pass/fail, the scenario x mode coverage matrix, per-scenario drill-down into raw events. Direct
+`sqlite3` reads (not `signals_db`) to avoid constructing a Slack Bolt `App()` inside the Streamlit
+process. `coverage_events` gained a nullable `strategy_type` column, auto-derived by
+`log_coverage_event` from `node_id`'s real `watch_list.strategy` — no call site needed to change.
+`scripts/coverage_matrix.py` gained a `--strategy` filter.
+
+**Slack-callable report (piece #7)**: `signals_notify.send_coverage_report()` runs `scripts/
+coverage_check.py`'s real check live and posts a compact summary, wired to a "🧭 Coverage Report"
+button on the Morning Report. A required Opus review (automation_principles.md #12) found 2
+CONFIRMED + 2 PLAUSIBLE, all fixed: an on-demand weekend tap manufactured permanent false-positive
+deviations (a "trade closed today" expectation is trivially false when the market never opened —
+confirmed live, 6 real Saturday rows in `trading_live.db`, cleaned up) — fixed with a weekday gate
+inside `run_check` itself, covering both the CLI and the Slack caller; the Slack report re-queried
+`coverage_deviations` after running the check, so a scenario that deviated earlier and became met
+later still rendered UNEXPLAINED, contradicting the check that had just passed it — fixed by having
+`run_check` return structured results (and a new `clear_deviation_if_resolved` delete a stale same-
+day deviation once met), with the Slack report rendering from that live return value; an unknown
+`check_method` silently rendered ✓, now shown as "not checked"; no exception handling meant a
+failure would silently no-op the button, now posts a visible failure message.
+
+Final state: full suite 228 passed (was 195 at the start of this arc), `live_sim_harness.py` 6/6.
+All 7 pieces of the original 2026-07-24 coverage-system reframe (dashboard, 3rd axis, structured
+expected-vs-actual, drill-down, no-unexplained-failure contract, Slack report) are done.
