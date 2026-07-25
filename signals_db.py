@@ -370,6 +370,15 @@ def ensure_tables():
         if 'node_id' not in ce_cols:
             c.execute("ALTER TABLE coverage_events ADD COLUMN node_id INTEGER REFERENCES watch_list(id)")
             c.commit()
+        if 'strategy_type' not in ce_cols:
+            # 3rd coverage axis (scenario_key x mode already existed) -- lets
+            # "has the TrailingBoth SL-gating gap actually been exercised, in
+            # which mode" be a real query. Not backfilled for existing rows
+            # (their node_id may no longer resolve to a live watch_list row);
+            # log_coverage_event derives it going forward from node_id when the
+            # caller doesn't pass one explicitly.
+            c.execute("ALTER TABLE coverage_events ADD COLUMN strategy_type TEXT")
+            c.commit()
 
         # scenario_expectations: the "what should this node/control do" mapping,
         # structured instead of prose (was hand-maintained in deep_backlog.md's
@@ -877,27 +886,35 @@ def log_automation_scope_change(old_tickers, new_tickers):
         c.commit()
 
 
-def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, node_id=None, result='', detail=''):
+def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, node_id=None,
+                        result='', detail='', strategy_type=None):
     """Records one real firing of an automation control/phase, tagged by which
     environment exercised it. `mode` is one of 'paper'/'dry_run'/'live' -- the
     caller determines this from its own context (e.g. paper_trading.py always
     passes 'paper'; schwab_safety/signals_notify pass 'live' or 'dry_run' based
     on the account's real dry_run flag), not inferred here. node_id is the real
     watch_list.id identity key when the caller can resolve one (ticker alone is
-    ambiguous -- two distinct nodes can share a ticker). Fire-and-forget: never
-    raises past a logging failure into the caller's real control flow."""
+    ambiguous -- two distinct nodes can share a ticker). strategy_type (the 3rd
+    coverage axis, e.g. 'TrailingBothZScoreBreakout') is derived from node_id's
+    real watch_list row when the caller doesn't pass one explicitly -- existing
+    call sites don't need to change. Fire-and-forget: never raises past a
+    logging failure into the caller's real control flow."""
     try:
+        if strategy_type is None and node_id is not None:
+            with _conn() as c:
+                row = c.execute("SELECT strategy FROM watch_list WHERE id = ?", (node_id,)).fetchone()
+            strategy_type = row['strategy'] if row else None
         with _conn() as c:
             c.execute("""
-                INSERT INTO coverage_events (scenario_key, mode, ticker, position_id, node_id, result, detail)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (scenario_key, mode, ticker, position_id, node_id, result, detail))
+                INSERT INTO coverage_events (scenario_key, mode, ticker, position_id, node_id, result, detail, strategy_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (scenario_key, mode, ticker, position_id, node_id, result, detail, strategy_type))
             c.commit()
     except Exception:
         pass
 
 
-def get_coverage_events(scenario_key=None, mode=None, limit=500):
+def get_coverage_events(scenario_key=None, mode=None, strategy_type=None, limit=500):
     q = "SELECT * FROM coverage_events"
     clauses, params = [], []
     if scenario_key:
@@ -906,6 +923,9 @@ def get_coverage_events(scenario_key=None, mode=None, limit=500):
     if mode:
         clauses.append("mode = ?")
         params.append(mode)
+    if strategy_type:
+        clauses.append("strategy_type = ?")
+        params.append(strategy_type)
     if clauses:
         q += " WHERE " + " AND ".join(clauses)
     q += " ORDER BY id DESC LIMIT ?"

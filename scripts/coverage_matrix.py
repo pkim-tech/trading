@@ -4,7 +4,7 @@ Each cell shows the count of real firings plus the most recent date + result,
 so any control x environment combination can be looked up directly instead of
 hand-maintaining docs/live_test_coverage.md's status text.
 
-Usage: .venv/bin/python scripts/coverage_matrix.py [--scenario KEY] [--ticker T]
+Usage: .venv/bin/python scripts/coverage_matrix.py [--scenario KEY] [--ticker T] [--strategy S]
 """
 import argparse
 import sys
@@ -20,8 +20,8 @@ MODES = ["paper", "dry_run", "live", "unattributed"]  # "unattributed": a real e
 # skip) -- must stay in this list or that event silently disappears from the pivot.
 
 
-def build_matrix(scenario=None, ticker=None):
-    events = db.get_coverage_events(scenario_key=scenario, limit=100_000)
+def build_matrix(scenario=None, ticker=None, strategy=None):
+    events = db.get_coverage_events(scenario_key=scenario, strategy_type=strategy, limit=100_000)
     if ticker:
         events = [e for e in events if e["ticker"] == ticker]
 
@@ -44,19 +44,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", default=None)
     ap.add_argument("--ticker", default=None)
+    ap.add_argument("--strategy", default=None, help="filter to one strategy_type, e.g. TrailingBothZScoreBreakout")
     ap.add_argument("--detail", action="store_true", help="print every raw event row for the matched scenario/ticker instead of the pivot")
     args = ap.parse_args()
 
     if args.detail:
-        events = db.get_coverage_events(scenario_key=args.scenario, limit=200)
+        events = db.get_coverage_events(scenario_key=args.scenario, strategy_type=args.strategy, limit=200)
         if args.ticker:
             events = [e for e in events if e["ticker"] == args.ticker]
         for e in events:
             print(f"{e['ts']}  {e['scenario_key']:<30} {e['mode']:<8} {e['ticker'] or '':<6} "
-                  f"{e['result']:<25} {e['detail']}")
+                  f"{e.get('strategy_type') or '':<28} {e['result']:<25} {e['detail']}")
         return
 
-    scenario_keys, cells = build_matrix(args.scenario, args.ticker)
+    scenario_keys, cells = build_matrix(args.scenario, args.ticker, args.strategy)
     if not scenario_keys:
         print("No coverage_events rows yet -- nothing has fired through an instrumented control "
               "path since this table was added. Run the daemon (paper/dry_run) or check back "

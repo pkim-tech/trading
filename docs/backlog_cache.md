@@ -493,6 +493,28 @@ mid-rename from SPY same day; others likely just didn't get a same-day signal). 
 drill-down), #7 (Slack-callable report) — this is the core "compass" logic only, presentation
 layers deferred per the user's explicit sequencing call.
 
+**Progress, 2026-07-25 — pieces #1, #2, #4 built**: new `pages/14_Coverage.py` Streamlit page
+("Coverage Compass") — unexplained deviations at top with an inline `st.form` "Explain" action
+writing straight to `coverage_deviations.reason` (closes the loop on the no-unexplained-failure
+contract without needing the CLI), today's per-scenario pass/fail derived the same way
+`coverage_check.py` does, the scenario x mode coverage matrix, and a per-scenario drill-down into
+raw `coverage_events` rows (piece #4) — all direct `sqlite3` reads against `trading_live.db`,
+matching the existing pages' convention (`pages/10_Open_Positions.py`), deliberately not importing
+`signals_db`/`signals_config` to avoid constructing a Slack Bolt `App()` inside the Streamlit
+process. Smoke-tested by actually launching `streamlit run pages/14_Coverage.py` and confirming a
+200 + no server errors. Piece #2: `coverage_events` gained a nullable `strategy_type` column
+(migration in `signals_db.ensure_tables()`, DB backed up first) — `log_coverage_event` derives it
+automatically from `node_id`'s real `watch_list.strategy` when the caller doesn't pass one
+explicitly, so **none of the ~18 real call sites needed to change** (same low-blast-radius pattern
+as the node_id migration's fail-open lookups, just skipping the multi-site rewrite entirely since
+node_id was already threaded through). `get_coverage_events`/`scripts/coverage_matrix.py` (new
+`--strategy` filter) and the new Streamlit drill-down all read it. Verified against the real DB:
+`log_coverage_event(node_id=88)` correctly resolved `strategy_type='TrailingBothZScoreBreakout'`
+for the real GDXU node; test row cleaned up after. Full suite 224 passed (unchanged count — no new
+tests added for the Streamlit page itself, consistent with other `pages/*.py` files having no test
+coverage in this repo; `strategy_type` derivation exercised only by the manual smoke test above, not
+a committed regression test). **Still not done**: piece #7 (Slack-callable report).
+
 ## [live-trading][security] Resolved 2026-07-24 evening — `last_seen_bar` now seeded from real current bar at startup. Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry. Residual: `sell_alerted`/`window_alerted`/`limit_fill_alerted` still restart-unsafe, deliberately not fixed (no clean persisted-state reconstruction) — see that entry.
 
 ## [live-trading] Open, raised 2026-07-24 ~10:55 ET — retry `check_gap_resize`'s cancel+replace test properly pre-market on a future day, not mid-day
