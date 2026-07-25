@@ -10,6 +10,10 @@ Used by `feature wrap` and `session wrap` before committing.
 - [ ] `docs/backlog_cache.md`/`docs/deep_backlog.md` updated if new issues or ideas surfaced
 - [ ] `readme.md` updated if layer behavior changed
 - [ ] Staged files reviewed — nothing unexpected included
+- [ ] `.venv/bin/python signals_invariants.py` — config-invariant sanity check (currently: every
+      `mode='live'` `TrailingExitZScoreBreakout` node is in `AUTOMATION_ENABLED_TICKERS`). Also
+      runs automatically at daemon startup with a Slack alert; running it here catches a
+      watchlist edit before the next restart.
 - [ ] **If `active_signals.py`, `strategies.py`, or `backtester.py` changed this session**: run
       `.venv/bin/python scripts/verify_trailing_buy_resolution.py --tickers AGQ,SOXL` and
       `.venv/bin/python scripts/verify_trailing_sell_resolution.py --tickers AGQ,SOXL` — quick

@@ -1,5 +1,25 @@
 # Backlog Cache
 
+## [live-trading][security] Resolved 2026-07-26 — `signals_invariants.py` built: startup + pre-commit config-invariant checks, 4 checks live. Full detail: `CLAUDE.md`'s Key Files entry.
+Mitigates the Opus round-6 "stale-pending-buys guard" finding (still open, still needs live-Slack
+testing before the handler itself is fixed) by guarding the config-state precondition instead —
+plus 3 more checks from already-known backlog gaps (research-mode ticker still automation-scoped
+with a real open position; `mode='live'` node with `account=None`; `brokerage.dry_run` flipping
+False while the leverage-inclusive-cash gap is open). 1 known violation currently fires (UDOW's
+seeded 2026-07-23 test position) — accepted, not a new bug, safe only because `ira` stays
+`dry_run=True`.
+Session-wrap Opus review of the diff found 2 CONFIRMED issues, both fixed same session: (1)
+MEDIUM-HIGH — the new `run_loop` startup block was unguarded (outside any try/except, before
+`_guarded`'s own per-section isolation kicks in), so a transient DB lock or a `log_slack_message`
+exception could have prevented the live daemon from starting at all; fixed by routing through
+`_guarded("invariants", ...)` and wrapping the `_post_message` call in its own try/except. (2)
+MEDIUM — the research-mode-with-open-position check used a ticker-only `get_open_position` lookup,
+which would false-positive on the deliberate DPST/GDXU live+research node pairs whenever the
+*live* node held the real position; fixed to use `get_open_position_by_wl_id(node['id'])`. Also
+noted, not acted on: the UDOW violation re-alerts on every daemon restart with no cooldown/dedup —
+acceptable per user's call (it's a known, accepted condition), revisit if it becomes noisy.
+`scripts/live_sim_harness.py`: 6/6 scenarios passed, both before and after the fixes.
+
 ## [live-trading] Resolved 2026-07-26 — "run both" real+paper restructure dropped, two-node pattern already covers it. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
 
 ## [live-trading][security] Resolved 2026-07-26 — session-wrap Opus review found+fixed an orphan-table forward hazard in the watch_list rebuild migration. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.

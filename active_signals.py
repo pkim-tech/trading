@@ -49,6 +49,7 @@ import schwab_safety
 import schwab_client
 import schwab_stream
 import paper_trading
+import signals_invariants
 
 # --- Backward-compatible re-exports -----------------------------------------
 
@@ -367,6 +368,22 @@ def _guarded(section: str, fn, *args, **kwargs):
 def run_loop(tickers: set = None):
     ensure_tables()
     schwab_safety.sync_automation_scope()
+
+    # Config-invariant checks (signals_invariants.py) -- non-blocking, alerted
+    # loudly rather than silently: a violation means some other code's
+    # assumption is already broken, not that anything is unsafe to keep running.
+    # Routed through _guarded (fault-isolated, per automation_principles.md #3)
+    # since this runs before the loop's own per-section guarding starts -- a
+    # pure-observability diagnostic (e.g. a transient DB lock) must never be
+    # able to prevent the daemon itself from starting.
+    _invariant_violations = _guarded("invariants", signals_invariants.run_all)
+    if _invariant_violations:
+        _msg = "\n".join(f"- {v}" for v in _invariant_violations)
+        print(f"[invariants] {len(_invariant_violations)} violation(s):\n{_msg}")
+        try:
+            _post_message(f"⚠️ Config invariant violation(s) at startup:\n{_msg}")
+        except Exception:
+            pass  # a Slack posting failure must not prevent daemon startup
 
     # buffering=1 (line-buffered) -- without it this file object block-buffers
     # since it's not a tty, so console output (including any Slack post error)

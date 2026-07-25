@@ -3984,3 +3984,45 @@ surviving single node correctly, overnight gap-resize on ERX/ERY/GDXD/GDXU now t
 `open_check`+TrailingBoth. Also still open: PDT/Schwab-rollout confirmation, channel-routing for
 Slack noise, the max-cumulative-BUY-notional-per-ticker-per-day backstop (design converged, not
 built).
+
+---
+
+## 2026-07-26 — Built signals_invariants.py: config-invariant sanity checks at startup + pre-commit
+
+### What we did
+Grew out of discussing the Opus round-6 "stale-pending-buys guard" finding (a live
+`TrailingExitZScoreBreakout` ticker outside `AUTOMATION_ENABLED_TICKERS` could have a real manual
+fill silently discarded) — rather than fixing the fragile handler assumption itself (blocked on
+live-Slack testing we can't do offline), the user proposed guarding the config-state precondition
+instead: a startup script that checks known assumptions hold. Built `signals_invariants.py`, a new
+module of small check functions (each documents in its own docstring exactly which downstream code
+depends on the invariant), wired into `active_signals.py`'s `run_loop` startup (non-blocking Slack
+alert) and runnable standalone as a pre-commit sanity check (`docs/pre_commit_checklist.md` updated).
+
+Added 3 more checks from already-known backlog gaps, without further digging (explicitly deferred a
+fuller `deep_backlog.md`/`research_log.md` scrape for a later session, per user's call — "we do need
+to clean the docs eventually, save that for later tonight"): a `research`-mode ticker still
+automation-scoped with a real open position (SELL-side automation is ticker-gated only, not
+mode-gated); any `mode='live'` node with `account=None`; `brokerage.dry_run` ever flipping False
+while the `availableFunds` leverage-inclusive-cash gap stays unresolved.
+
+First real run surfaced 1 genuine violation: UDOW's deliberately-seeded 2026-07-23 test position
+(`research` mode, real open position, automation-scoped) — confirmed as the known artifact, accepted
+as a standing, safe-only-because-`dry_run` condition rather than something to clean up or suppress.
+
+Ran `session wrap`: since `active_signals.py` changed, spawned an independent Opus review of the
+diff (background, `model: opus`). Found 2 CONFIRMED issues, both fixed: (1) MEDIUM-HIGH — the new
+startup block was unguarded, so a transient DB lock or Slack-logging exception could have prevented
+the live daemon from starting at all; fixed by routing through the existing `_guarded()` per-section
+fault-isolation helper. (2) MEDIUM — the research-mode-with-open-position check used a ticker-only
+position lookup, which would false-positive on the deliberate DPST/GDXU live+research node pairs;
+fixed to use the wl_id-keyed lookup instead. `scripts/live_sim_harness.py`: 6/6 scenarios passed
+before and after the fixes.
+
+### Verification
+`signals_invariants.py` run standalone: 1 known violation (UDOW), exit 1 as designed. Live-sim
+harness: 6/6 passed. `py_compile` clean on both changed files.
+
+### Next
+Resume the Monday (2026-07-27) `soxl_ira` unattended live-test plan. Separately, the user flagged
+wanting a broader docs/backlog cleanup pass "eventually" — not scoped, deferred to a later session.
