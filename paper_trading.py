@@ -31,9 +31,10 @@ def start_paper_buy(node, sig):
     if db.get_paper_pending_buy(node['id']) or db.get_open_position_by_wl_id(node['id'], paper=True):
         return
     db.add_paper_pending_buy(node, sig)
-    _post_message(
-        f"🧪 PAPER BUY SIGNAL — {ticker}  ${sig['current_price']:.4f}  z={sig['z_score']:+.2f}"
-    )
+    if node.get('paper_alert_verbose'):
+        _post_message(
+            f"🧪 PAPER BUY SIGNAL — {ticker}  ${sig['current_price']:.4f}  z={sig['z_score']:+.2f}"
+        )
 
 
 def start_paper_market_buy(node, sig):
@@ -53,7 +54,8 @@ def start_paper_market_buy(node, sig):
                       shares=sizing['shares'], paper=True)
     db.log_coverage_event("entry_fill", "paper", ticker=ticker, node_id=node.get('id'), result="market_filled",
                            detail=f"shares={sizing['shares']} price={sig['current_price']:.4f}")
-    _post_message(f"🧪 PAPER MARKET BUY — {ticker}  {sizing['shares']}sh @ ${sig['current_price']:.4f}")
+    if node.get('paper_alert_verbose'):
+        _post_message(f"🧪 PAPER MARKET BUY — {ticker}  {sizing['shares']}sh @ ${sig['current_price']:.4f}")
 
 
 def update_paper_buys():
@@ -81,7 +83,8 @@ def update_paper_buys():
             db.clear_paper_pending_buy(node['id'])
             db.log_coverage_event("entry_fill", "paper", ticker=ticker, node_id=node.get('id'), result="trailing_bounce_filled",
                                    detail=f"shares={shares} price={price:.4f}")
-            _post_message(f"🧪 PAPER BUY FILLED — {ticker}  {shares}sh @ ${price:.4f}")
+            if node.get('paper_alert_verbose'):
+                _post_message(f"🧪 PAPER BUY FILLED — {ticker}  {shares}sh @ ${price:.4f}")
         elif running_low != pb['running_low']:
             db.update_paper_pending_buy_running_low(pb['id'], running_low)
 
@@ -93,6 +96,8 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
     position ids are independent of real open_positions ids."""
     for pos in db.get_open_positions(paper=True):
         ticker = pos['ticker']
+        node = db.get_watch_list_node_by_id(pos['wl_id']) if pos.get('wl_id') else None
+        verbose = bool(node and node.get('paper_alert_verbose'))
         df_hourly, _ = load_cache(ticker)
         if df_hourly is None or df_hourly.empty:
             continue
@@ -114,12 +119,13 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
         reason, target, just_activated_trailing = check_sell_condition(
             pos, cp, datetime.now(), at_bar_close=at_bar_close, low=low, high=high, open_price=op,
             df_hourly=df_hourly, paper=True)
-        if just_activated_trailing:
+        if just_activated_trailing and verbose:
             _post_message(f"🧪 PAPER trailing-sell armed — {ticker}")
         if reason:
             db.close_position(pos['id'], exit_signal_price=cp, exit_price=target,
                                exit_time=datetime.now(), exit_reason=reason, paper=True)
             db.log_coverage_event("exit_fill", "paper", ticker=ticker, position_id=pos['id'],
                                    node_id=pos.get('wl_id'), result=reason, detail=f"price={target:.4f}")
-            _post_message(f"🧪 PAPER SELL — {ticker}  {reason} @ ${target:.4f}")
+            if verbose:
+                _post_message(f"🧪 PAPER SELL — {ticker}  {reason} @ ${target:.4f}")
             paper_sell_alerted.add((pos['id'], last_bar_ts))

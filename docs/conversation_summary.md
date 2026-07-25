@@ -3835,3 +3835,76 @@ observation: the two-account oversell-guard fix, and the node-level-pause known 
   threading a real `wl_id` through `schwab_client`'s order functions (currently `check_order`'s
   node-pause check falls back to a fuzzy ticker+account lookup), and `_last_sale_recovery`'s
   sizing-behavior change for v5 nodes (confirmed benign, not a bug, just worth knowing about).
+
+---
+
+## 2026-07-26 — paper_alert_verbose suppression, DPST volunteered live (soxl_ira), account joined watch_list dedup key
+
+### What we did
+Started from a design question: paper trading (`paper_trading.py`) posts to Slack via the same
+`_post_message` sender as live/dry_run alerts, just prefixed 🧪 — not silent. User's real usage
+pattern is troubleshooting, not routine review, so default should be suppression with an opt-in
+"let's have a look" exception per ticker when actually weighing a go-live decision.
+
+Added `watch_list.paper_alert_verbose` (INTEGER, default 0, matching this codebase's INTEGER-not-
+BOOLEAN convention). Gated all 5 `_post_message` calls in `paper_trading.py` (buy signal, market-buy
+fill, trailing-buy fill, trailing-sell-armed, sell) on this per-node flag. `check_paper_sells` needed
+a new `db.get_watch_list_node_by_id(pos['wl_id'])` lookup per position per poll since `open_positions`
+rows don't carry watch_list columns. Explicitly scoped down from a bigger channel-separation idea
+(routing live/dry_run/paper to separate Slack channels) — that stays backlogged as its own follow-up,
+deliberately not bundled in given its larger blast radius (touches every `_post_message` call site).
+
+User picked DPST as a "volunteer for live" (higher trade count + more liquidity than HIBL, despite
+DPST's own v5-checklist annotation flagging SEVERE -65.5% max drawdown / 2 negative walk-forward
+folds — user's call, made with the flag in view, not overlooked). First attempt flipped the existing
+research-mode DPST node (`wl_id=87`) straight to `mode='live'` — user immediately said this wasn't
+wanted; reverted same-session. Real intent was a **second, new** DPST node (real live, `soxl_ira`,
+`starting_notional=800` matching the account's existing `notional_cap`) sitting alongside the
+untouched research node, so paper trading keeps running independently for comparison.
+
+Hit a real dedup gap building that: neither `add_node`'s Python-level check-then-skip nor the
+table's own SQL `UNIQUE` constraint on `watch_list` included `account` — two nodes with identical
+ticker/strategy/params but different accounts were silently deduped as if the same node (an add_node
+call for the new DPST node initially no-op'd; a direct-SQL attempt then hit a hard `IntegrityError`
+on the `UNIQUE` constraint itself). Fixed both layers: `add_node` gained an `account` param, folded
+into the dedup SELECT (`COALESCE(account,'') = COALESCE(?, '')`); `ensure_tables()` gained a one-time
+table-rebuild migration (create `watch_list_new` with `account` inside the `UNIQUE(...)` clause, copy
+all 24 columns, drop old, rename) gated on parsing the live `sqlite_master.sql` so it only runs once
+per DB. Applied to the real `cache/live/trading_live.db` (backed up first, daemon confirmed not
+running throughout, row count verified unchanged 90→90 across both migrations). New DPST node
+(`wl_id=136`) created successfully afterward.
+
+Confirmed the real `soxl_ira` cash balance ($1,110.46) comfortably covers DPST's ~$715 worst-case
+order size before treating this as ready to go live — no need to add cash preemptively.
+
+Tangent: discussed manually selling 2/3 shares of a stuck SPY test position (`wl_id=134`, real,
+18-reminder pending TRAIL exit) Monday at market open while away from keyboard. Confirmed
+`check_live_state_reconciliation` (runs every poll when the daemon is up) will auto-detect the
+post-sale share-count mismatch against the real broker and post a detection-only Slack alert
+suggesting the DB fix — no need to message mid-workday, just needs the daemon actually running.
+
+Caught and corrected my own mistake mid-session: claimed GDXU had an identical-params pairing like
+DPST's; it didn't (different window/trail%/arm% entirely, pre-existing, unrelated to the account-
+dedup fix). User: "that was dangerous" — saved a feedback memory to verify watch_list/node state
+against the DB before any claim, not from conversation memory, given the real financial stakes.
+
+### Verification
+Full suite: 232 passed (after each of the two code changes). `scripts/live_sim_harness.py`: 6/6
+scenarios passed. Independent Opus review launched in background against the real diff
+(`paper_trading.py`, `signals_db.py`) — findings to be resolved per session-wrap convention before
+this entry's work is considered fully closed if anything CONFIRMED comes back.
+
+### Docs updated
+`CLAUDE.md` (Live Trading — Current State: real current watchlist mode mix, `paper_alert_verbose`,
+account-dedup fix), `docs/design.md` (Multi-watchlist section: account-in-UNIQUE-key note; paper
+trading section: `paper_alert_verbose` gating detail).
+
+### Next
+- Resolve any CONFIRMED findings from the backgrounded Opus review before treating this session's
+  live-daemon changes as fully verified.
+- DPST (`wl_id=136`) is live in `soxl_ira` with real order placement now unblocked — nothing to do,
+  just watch for its first signal.
+- SPY (`wl_id=134`) manual partial sell planned for Monday 2026-07-27 market open; daemon needs to be
+  running for the auto-reconciliation alert to fire.
+- Channel separation (live/dry_run/paper to separate Slack destinations) remains backlogged,
+  deliberately not started this session.

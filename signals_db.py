@@ -155,6 +155,65 @@ def ensure_tables():
             # from `label` (short display tag) and from watch_list_audit (mechanical mutation
             # log) -- this is the human-readable "why", not just the "what changed".
             c.execute("ALTER TABLE watch_list ADD COLUMN annotation TEXT")
+        if 'paper_alert_verbose' not in wl_cols:
+            # Default 0 (suppressed): paper trading is mostly for troubleshooting, not
+            # routine review, so its Slack alerts are noise by default. Flip to 1 for a
+            # ticker when actually weighing a go-live decision on it.
+            c.execute("ALTER TABLE watch_list ADD COLUMN paper_alert_verbose INTEGER NOT NULL DEFAULT 0")
+
+        # account wasn't part of the original UNIQUE constraint -- found 2026-07-26 while
+        # adding a second real DPST node in a different account: two nodes with identical
+        # strategy params but different accounts are genuinely distinct (the whole point of
+        # the wl_id refactor), but the DB itself couldn't tell them apart and rejected the
+        # insert outright. SQLite can't ALTER a UNIQUE constraint in place -- rebuild required.
+        wl_schema_sql = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='watch_list'"
+        ).fetchone()[0]
+        if 'account' not in wl_schema_sql.split('UNIQUE(')[-1]:
+            c.executescript("""
+                CREATE TABLE watch_list_new (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    watchlist_id       INTEGER NOT NULL,
+                    mode               TEXT NOT NULL DEFAULT 'live',
+                    ticker             TEXT NOT NULL,
+                    strategy           TEXT NOT NULL,
+                    version            TEXT NOT NULL,
+                    window             INTEGER NOT NULL,
+                    take_profit        INTEGER,
+                    stop_loss          INTEGER NOT NULL,
+                    max_hold_hours     INTEGER NOT NULL,
+                    z_score_threshold  REAL NOT NULL DEFAULT 2.0,
+                    label              TEXT DEFAULT '',
+                    added_at           TEXT DEFAULT (datetime('now')),
+                    trail_sell_pct     REAL,
+                    fixed_sl           REAL,
+                    trail_buy_pct      REAL,
+                    arm_sell_pct       REAL,
+                    cached_avg_vol_10d REAL,
+                    account            TEXT,
+                    alpha              REAL,
+                    entry_timing       TEXT NOT NULL DEFAULT 'close',
+                    starting_notional  REAL NOT NULL DEFAULT 50000,
+                    annotation         TEXT,
+                    paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
+                           stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
+                           trail_sell_pct, account)
+                );
+                INSERT INTO watch_list_new
+                    (id, watchlist_id, mode, ticker, strategy, version, window, take_profit,
+                     stop_loss, max_hold_hours, z_score_threshold, label, added_at,
+                     trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, cached_avg_vol_10d,
+                     account, alpha, entry_timing, starting_notional, annotation, paper_alert_verbose)
+                SELECT
+                    id, watchlist_id, mode, ticker, strategy, version, window, take_profit,
+                    stop_loss, max_hold_hours, z_score_threshold, label, added_at,
+                    trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, cached_avg_vol_10d,
+                    account, alpha, entry_timing, starting_notional, annotation, paper_alert_verbose
+                FROM watch_list;
+                DROP TABLE watch_list;
+                ALTER TABLE watch_list_new RENAME TO watch_list;
+            """)
 
         # open_positions
         c.execute("""
@@ -772,7 +831,7 @@ def _is_trailing_buy(node):
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
              label='', z_score_threshold=2.0, watchlist_id=None, mode='live',
              trail_buy_pct=None, trail_pct=None, entry_timing='close', starting_notional=50000,
-             fixed_sl_override=None):
+             fixed_sl_override=None, account=None):
     """trail_buy_pct/trail_pct: pass the real values directly for v3.x nodes (where
     backtest_cache has real named columns). Omit both for legacy v1.x/v2.x nodes —
     falls back to reinterpreting stop_loss the way it's always meant for the 4
@@ -837,6 +896,10 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
         # silently collapse to one the moment the NULL-matching fix above
         # started actually enforcing the rest of the key -- a new silent-drop
         # bug introduced while fixing the old silent-duplicate one.
+        # account is included too (2026-07-26) -- two nodes with otherwise
+        # identical strategy params in *different* accounts are genuinely
+        # distinct (the whole point of the wl_id refactor); only same-account
+        # duplicates should be treated as real dedup hits.
         existing = c.execute("""
             SELECT id FROM watch_list
             WHERE watchlist_id = ? AND ticker = ? AND strategy = ? AND version = ?
@@ -845,21 +908,22 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
               AND COALESCE(arm_sell_pct, -1) = COALESCE(?, -1)
               AND COALESCE(trail_buy_pct, -1) = COALESCE(?, -1)
               AND COALESCE(trail_sell_pct, -1) = COALESCE(?, -1)
+              AND COALESCE(account, '') = COALESCE(?, '')
         """, (watchlist_id, ticker, strategy, version, int(window), stored_take_profit,
               int(stop_loss), int(max_hold_hours),
-              stored_arm_sell_pct, stored_trail_buy_pct, stored_trail_sell_pct)).fetchone()
+              stored_arm_sell_pct, stored_trail_buy_pct, stored_trail_sell_pct, account)).fetchone()
         if existing:
             return
         cur = c.execute("""
             INSERT INTO watch_list
                 (watchlist_id, mode, ticker, strategy, version, window, take_profit,
                  stop_loss, max_hold_hours, label, z_score_threshold, trail_sell_pct, fixed_sl,
-                 trail_buy_pct, arm_sell_pct, entry_timing, starting_notional)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_buy_pct, arm_sell_pct, entry_timing, starting_notional, account)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (watchlist_id, mode, ticker, strategy, version, int(window), stored_take_profit,
               int(stop_loss), int(max_hold_hours), label, float(z_score_threshold),
               stored_trail_sell_pct, fixed_sl, stored_trail_buy_pct, stored_arm_sell_pct,
-              entry_timing, float(starting_notional)))
+              entry_timing, float(starting_notional), account))
         _log_audit(c, 'add_node', watchlist_id=watchlist_id, watch_id=cur.lastrowid,
                    ticker=ticker, detail=f"strategy={strategy} version={version} mode={mode}")
         c.commit()
