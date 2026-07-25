@@ -23,8 +23,14 @@ def _reset_alert_cooldown(monkeypatch):
     monkeypatch.setattr(active_signals, '_LAST_SECTION_ALERT', {})
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def isolated_db(monkeypatch):
+    """Autouse -- every test in this file exercises _guarded with a real
+    raising exception, which logs a real coverage_events row
+    (daemon_section_exception) via signals_db.log_coverage_event. Without
+    this, that write lands in the real cache/live/trading_live.db (fire-
+    and-forget, so the test itself wouldn't fail) -- found 2026-07-25 after
+    360 real "boom" rows had accumulated there from repeated test runs."""
     tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
     tmp_db.close()
     monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))

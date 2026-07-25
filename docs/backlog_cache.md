@@ -1,5 +1,100 @@
 # Backlog Cache
 
+## [live-trading][security] Resolved 2026-07-25 — second Opus review round on the daily_order_cap change, 2 findings
+Full-diff review of the final `schwab_safety.py` state (increment + check both BUY-only, `soxl_ira`
+cap 3→100), after the first round's SELL-blocked-by-BUY-exhausted-cap bug was already fixed.
+Mutation-tested the new regression test (`test_sell_not_blocked_by_buy_exhausted_daily_cap`) by
+reverting the guard — confirmed it actually fails without the fix, not passing coincidentally.
+Two findings:
+1. **CONFIRMED, fixed same session**: `is_protective`'s docstrings (`check_order`/
+   `approve_and_record`) still advertised it as covering "a stop-loss placement or post-fill
+   top-up" — stale now that SELL (including stop-loss placement) is unconditionally exempt from
+   `daily_order_cap` regardless of `is_protective`. The flag is dead on that path now, only
+   meaningful for the BUY-side top-up. Docstrings corrected to say so explicitly.
+2. **PLAUSIBLE, not fixed, user's known tradeoff**: bumping `soxl_ira`'s cap 3→100 with
+   `notional_cap` unchanged at $800 removes the de-facto cumulative same-day BUY-notional bound
+   the low cap was incidentally providing (~$2.4k/day → ~$80k/day). Nothing else in the codebase
+   reads the counter for a second purpose (checked — `STATE_PATH` is read only in `check_order`,
+   written only in `approve_and_record`), so this isn't a hidden second-order bug, just the
+   explicit consequence of the bump the user already asked for. Ties into the existing
+   still-open "max cumulative BUY notional per ticker per day" backlog item.
+Full suite: 232 passed. `scripts/live_sim_harness.py`: 6/6 scenarios passed.
+
+## [live-trading][coverage] Resolved 2026-07-25 — pytest was polluting the real coverage_events table with fake "daemon_section_exception" rows
+Found while cross-checking `docs/live_test_coverage.md` against real `coverage_matrix.py` output
+for the Monday live-test replan: `daemon_section_exception` showed 360 real-looking rows
+(detail=`boom`), which turned out to be pytest fault-injection noise, not real daemon failures.
+Root cause: 5 of 6 test functions in `tests/test_run_loop_fault_tolerance.py` called
+`active_signals._guarded` with a real raising exception but never requested the file's own
+`isolated_db` fixture — `signals_db.log_coverage_event` is fire-and-forget (never raises into the
+caller), so each test passed while silently writing a real row into
+`cache/live/trading_live.db`'s `coverage_events` table. Only one test out of six had opted into
+isolation. Fixed: made `isolated_db` `autouse=True` for the whole file. Backed up
+`trading_live.db` (`cache/live/trading_live.db.bak_20260725_114349_pre_coverage_events_test_pollution_cleanup`)
+then deleted the 360 polluted rows (`scenario_key='daemon_section_exception' AND detail='boom'`).
+Checked `tests/test_coverage_check.py` (the only other file touching `log_coverage_event`) — every
+one of its 32 tests already explicitly requests `isolated_db`, no gap there. Full suite: 232 passed.
+
+## [live-trading][compliance] Open, raised 2026-07-25 (3rd time this has come up in conversation, not previously backlogged) — FINRA eliminated the PDT rule/$25k threshold in 2026; re-evaluate daily_order_cap's purpose and confirm Schwab's rollout status
+Came up while discussing whether `daily_order_cap` (currently per-*account*, not per-ticker —
+`schwab_safety.py:643`/`714`) should exempt SELL orders from *incrementing* the counter (currently
+only `is_protective` SL/top-up orders are exempted from being *blocked* by it, not from counting
+toward it — a real, separate gap from the already-fixed `is_protective` bypass, found this session,
+not yet fixed or scoped). That question was originally framed as a PDT-compliance concern (does
+Schwab/FINRA care how many same-day round trips — buy+sell same ticker same day — we do), which
+prompted a real web-research check since the user suspected FINRA had changed something here and
+this exact topic had already come up twice before without ever getting checked or backlogged.
+**Confirmed via research (WebSearch, 2026-07-25)**: FINRA Rule 4210 was amended, SEC-approved
+2026-04-14, effective 2026-06-04 (`Regulatory Notice 26-10`) — **eliminates the Pattern Day Trader
+designation and the $25,000 minimum equity requirement entirely**, replacing the old "4+ day trades
+in 5 rolling business days locks a sub-$25k account out" rule with a risk-based intraday-margin
+framework (equity requirements now scale with actual intraday exposure; accounts with as little as
+$2,000 can day trade without frequency restrictions under the new rule). **Caveat, not yet
+confirmed**: brokers have until 2027-10-20 to fully implement — unconfirmed whether Schwab has
+actually rolled this out on our specific accounts as of today (~7 weeks post-effective-date).
+**Practical implications, not yet acted on**:
+1. If Schwab has already implemented this, the original PDT round-trip-counting concern that started
+   this whole discussion may be moot for our accounts — worth confirming directly with Schwab (account
+   PDT-flag status) rather than assuming either way.
+2. `daily_order_cap`'s design purpose should be revisited regardless of PDT: it was never actually a
+   day-trade counter (it counts raw orders, not buy+sell round trips, and it's per-account not
+   per-ticker — see the still-undecided per-ticker-vs-per-account item below) — it's a bug-safety
+   backstop against a runaway/repeat-order bug, a distinct concern from PDT compliance either way.
+3. **The SELL-increment gap found this session is still open regardless of the PDT question** — SELL
+   orders (including protective ones) currently still consume the same shared daily counter as BUYs
+   (`approve_and_record`'s `today[account] += 1` runs unconditionally for every order/side). Candidate
+   fix, following the same precedent as `notional_cap` being made BUY-only (2026-07-24): stop SELL
+   orders from incrementing `daily_order_cap` at all, not just exempt protective ones from the check.
+   Not yet built — user was mid-decision on this when the PDT tangent came up.
+**Action needed**: (a) confirm Schwab's real PDT-framework rollout status on the actual live accounts,
+(b) decide the SELL-increment fix independent of that, (c) decide the actual bumped `daily_order_cap`
+number for `soxl_ira` (was mid-discussion, not resolved this session either).
+
+## [backtest][live-trading] Research idea, raised 2026-07-25 — monthly universe rescreen (recurring cadence) + a possible "v6" momentum-exhaustion-bounce strategy variant
+Two related but distinct ideas from the same discussion:
+1. **Recurring monthly rescreen, not a one-time backlog item**: rerun the same kind of full-universe
+   resweep/screen used to originally find v5 candidates on a monthly cadence, watching for tickers
+   trending positively that aren't on the current watchlist yet. User's framing: this is literally how
+   AGQ was found the first time, before its later results soured (`[[project_watchlist_selection_rationale]]`)
+   — a standing process, not a single research task. Not scoped: which script/cadence mechanism (cron?
+   manual monthly reminder?), what "trending positively" threshold triggers a closer look, whether this
+   folds into the existing per-ticker resumable sweep tooling (`scripts/run_sweep_queue.sh`,
+   `scripts/campaign_comparison_table.py`) or needs its own lighter-weight screen.
+2. **Possible "v6" idea, momentum-exhaustion bounce plays**: distinct from the current z-score
+   mean-reversion-on-dislocation strategy family. Observation: a ticker that's had a lot of momentum,
+   as it starts losing steam, often gets a technical-analysis-driven bounce (people keep trying to buy
+   the dip/breakout continuation even as the real trend is rolling over) — a different signal shape
+   than the existing "dislocation from a stable mean" setup. **Core risk-management idea**: if the big
+   down days (the real trend continuation, not the bounce) can be avoided via a tight stop (~1%), the
+   small bounce attempts might be clippable for alpha even in a name whose longer trend is turning
+   negative. Not designed: what defines "losing steam" (momentum indicator, volume pattern, RSI/MACD
+   divergence?), how this differs mechanically from the existing z-score entry logic, backtest period
+   selection (same overfitting concern already flagged for the "v6" idle-capital-parking idea —
+   momentum-exhaustion regimes are likely just as period-dependent). **Not yet named/versioned for
+   real** — "v6" is already tentatively claimed by the idle-capital-parking research idea (see the
+   2026-07-22 resolved/paused entry below); if both ideas proceed, one will need a different version
+   tag. Pure research idea, not scoped or started.
+
 ## [live-trading] Resolved 2026-07-25 — coverage-system "compass" v2: node_id/mode identity migration + six-round Opus review chain. Full detail: `docs/deep_backlog.md`'s 2026-07-25 entry.
 
 ## [live-trading][security] Latent, found by Opus review round 6, 2026-07-25 -- stale-pending-buys guard could silently discard a real manual fill confirmation if a ticker is ever outside SCHWAB_AUTOMATION_TICKERS
@@ -230,14 +325,27 @@ deliberately left as-is; user's read is they don't need coverage diversity the w
 does (already non-overlapping ticker set, distinct proof-of-life purpose). Items 2 (run-both
 restructure) and 3 (`account=None` gap) still open, still targeted for Monday 2026-07-27.
 
-## [live-trading] Idea, raised 2026-07-25 — v5 watchlist skews long-only, consider adding inverse counterparts
+## [live-trading] Far-backlog, raised 2026-07-25, deprioritized same day — v5 watchlist skews long-only, consider adding inverse counterparts
 All 10 v5 tickers are one-directional leveraged longs (SOXL, GDXU, NUGT, HIBL, KORU, DPST, UDOW, USD,
 AGQ) except YANG (the only inverse ticker) — the whole book loses together in a broad leveraged-long
 selloff, unlike the old v4 set which had some hedge-like pairing (EDC/AGQ as SOXL/KORU hedges, per
 `[[project_watchlist_selection_rationale]]`). That portfolio-balance logic didn't carry over into the
-v5 selection, which picked per-ticker on cliff-safe robust alpha only. Not scoped — which inverse
-counterparts (e.g. a bear pair for SOXL/GDXU), whether via a fresh resweep or grafting existing v4
-inverse nodes onto watchlist 65. Design conversation for later, not blocking anything today.
+v5 selection, which picked per-ticker on cliff-safe robust alpha only.
+**Original motivation, clarified same day**: the real point of pairing isn't just directional balance
+in the abstract — it's two concrete operational goals once manual live trading resumes: (1) a genuine
+hedge (a down move in one leg is offset by the paired inverse leg), and (2) **guaranteed fill
+activity** — pairing a long with its inverse means at least one leg of the pair is likely to be
+signaling/filling at any given time, addressing the same sparse-signal problem that motivated flipping
+v5 back to research mode this session (too few live orders to spread tests/validation across).
+**User's call, same day**: pushed to far-backlog, not near-term. Two reasons: (1) the mean-reversion
+strategy itself already makes money in both up and down periods (z-score breakout on a dislocation,
+not a directional bet), so long-only isn't the raw exposure risk it looks like at first glance — a
+50/50 long/short allocation would be a seismic reallocation shift, not a quick tweak; (2) there isn't
+a good backtest period to properly optimize/validate a bear-pair selection without overfitting to
+whatever the sample period happened to contain (same class of problem as the "v6" idle-capital-parking
+work's overfitting issue, `[[project ... v6 parking]]`/see the resolved 2026-07-22 entry). Worth
+researching eventually, but needs a real design conversation (allocation split, which counterparts,
+how to validate without overfitting) before scoping, not just grafting existing v4 inverse nodes on.
 
 ## [live-trading][security] Resolved 2026-07-24 evening — `_trailing_buy_status` now anchors to the real `signal_price` trigger instead of a cache-derived one. Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry.
 

@@ -421,9 +421,32 @@ def test_hard_ceiling_blocked_regardless_of_account_cap(env, monkeypatch):
 
 def test_daily_cap_blocked(env, monkeypatch):
     monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
-    schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
+    schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
     with pytest.raises(schwab_safety.SafetyViolation, match="daily order cap"):
-        schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+        schwab_client.place_equity_buy('ira', TICKER, 50, 50.0)  # qty far outside dup-order tolerance
+
+
+def test_sell_does_not_increment_daily_cap(env, monkeypatch):
+    """Fixed 2026-07-25: SELL orders (including protective ones) used to
+    consume the same shared daily_order_cap pool as BUYs, so unrelated exits
+    could starve a later entry's budget. SELLs must no longer count at all --
+    matches the precedent already set for notional_cap (BUY-only)."""
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
+    schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
+    schwab_client.place_equity_sell('ira', TICKER, 6, 50.0)  # different qty avoids dup-order block
+    schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # still allowed -- cap untouched by SELLs
+
+
+def test_sell_not_blocked_by_buy_exhausted_daily_cap(env, monkeypatch):
+    """Found by Opus review, 2026-07-25: the increment was made BUY-only but
+    the check itself stayed side-agnostic, so a real exit SELL could still be
+    blocked by a cap only BUYs contributed to -- dangerous since
+    _attempt_automated_sell cancels the resting stop-loss before placing the
+    trailing-sell, so a blocked sell here would leave a position unprotected.
+    The check must be BUY-only too."""
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
+    schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # exhaust the cap
+    schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)  # must not be blocked
 
 
 def test_protective_stop_loss_bypasses_exhausted_daily_cap(env, monkeypatch):
@@ -432,9 +455,9 @@ def test_protective_stop_loss_bypasses_exhausted_daily_cap(env, monkeypatch):
     leaving a brand-new fill unprotected. place_stop_loss must succeed
     (is_protective=True) even once the account's cap is fully spent."""
     monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
-    schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)  # exhaust the cap
+    schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # exhaust the cap
     with pytest.raises(schwab_safety.SafetyViolation, match="daily order cap"):
-        schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+        schwab_client.place_equity_buy('ira', TICKER, 50, 50.0)  # qty far outside dup-order tolerance
     result = schwab_client.place_stop_loss('ira', TICKER, 20, 45.0)  # qty far outside dup-order tolerance
     assert result == (None, None)  # dry_run -- not blocked
 
@@ -443,8 +466,8 @@ def test_protective_top_up_bypasses_exhausted_daily_cap(env, monkeypatch):
     """Same starvation shape as the SL case above, confirmed live for the
     top-up-buy path too ('LABU -- top-up buy of 1 shares blocked')."""
     monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
-    schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)  # exhaust the cap
-    result = schwab_client.place_equity_buy('ira', TICKER, 1, 50.0, is_protective=True)
+    schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # exhaust the cap
+    result = schwab_client.place_equity_buy('ira', TICKER, 50, 50.0, is_protective=True)
     assert result == (None, None)  # dry_run -- not blocked, not raised
 
 

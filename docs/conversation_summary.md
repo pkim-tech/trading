@@ -3598,3 +3598,96 @@ Short discussion-driven session, no code changes — one deliberate DB mutation 
 
 No code files changed this session (DB mutation + `CLAUDE.md`/`docs/backlog_cache.md` updates only) —
 no Opus review or `live_sim_harness.py` run needed per the session-wrap gate.
+
+---
+
+## 2026-07-25 — daily_order_cap SELL-exemption fix (2 Opus rounds), inverse_pair reference column, Monday soxl_ira test-node prep, live-test-coverage doc synced to real matrix
+
+### What we did
+Mixed session: continued discussion threads (long-only watchlist skew, monthly rescreen/"v6"
+momentum idea, ETF pairing inventory), then shifted into a real safety-guard fix + Monday
+(2026-07-27) live-test prep for `soxl_ira`.
+
+- **ETF inverse-pair inventory, built into real data**: added a nullable `inverse_pair` column to
+  `cache/research/trading_universe.db`'s existing `tickers` table (backed up first) and populated
+  it for 63 tickers — all 10 v5 watchlist tickers (verified against real issuer/data-provider
+  sources via WebSearch, not just recall — caught GDXU's real pair is GDXD, not the underlier-text
+  match DULL) plus 5 additional volatile-sector pairs (LABU/LABD, FAS/FAZ, GUSH/DRIP, TNA/TZA,
+  BOIL/KOLD). DPST/KORU/USD needed real bear counterparts (WDRW, KORZ, SSG) inserted as minimal
+  reference rows since they weren't in the scraped universe at all.
+- **`daily_order_cap` fix, `schwab_safety.py` — two Opus review rounds**:
+  1. `soxl_ira`'s `daily_order_cap` bumped 3→100 (user's call: account "has been somewhat
+     thoroughly tested"; `notional_cap` stays $800).
+  2. SELL orders no longer increment `daily_order_cap` at all (matches `notional_cap`'s existing
+     BUY-only precedent, 2026-07-24) — fixes a real gap where SELLs (including protective ones)
+     were consuming the same shared budget as BUYs.
+  3. **First Opus review round caught a real bug**: the increment was made BUY-only but the
+     *check* stayed side-agnostic, so a real exit SELL could still be blocked by a cap only BUYs
+     exhausted — dangerous because `_attempt_automated_sell` cancels the resting stop-loss before
+     placing the replacement trailing-sell, so a blocked SELL would leave a position with zero
+     broker-side protection. Fixed: check is now BUY-only too.
+  4. **Second Opus review round** (full final diff): confirmed the fix via mutation testing (the
+     new regression test genuinely fails if the guard is reverted). Found and fixed one more
+     CONFIRMED issue: `is_protective`'s docstrings were stale, still describing stop-loss placement
+     coverage that no longer applies now that all SELLs are unconditionally cap-exempt — corrected.
+     One PLAUSIBLE, accepted-tradeoff finding logged (not fixed): the cap bump removes the de-facto
+     ~$2.4k/day cumulative BUY-notional bound the low cap was incidentally providing (now ~$80k/day)
+     — ties into the existing "max cumulative BUY notional per ticker per day" backlog item.
+  Full suite: 232 passed throughout. `scripts/live_sim_harness.py`: 6/6 scenarios passed.
+- **Test-pollution bug found and fixed**: 5 of 6 test functions in
+  `tests/test_run_loop_fault_tolerance.py` called `active_signals._guarded` with a real raising
+  exception but never requested the file's own `isolated_db` fixture — since `log_coverage_event`
+  is fire-and-forget, every real pytest run of this file was silently writing fake
+  `daemon_section_exception`/"boom" rows into the real `cache/live/trading_live.db`. 360 such rows
+  had accumulated since 2026-07-23. Fixed (`isolated_db` now `autouse=True` for the file); backed
+  up `trading_live.db` and deleted the 360 polluted rows. Checked `tests/test_coverage_check.py`
+  (the only other file touching `log_coverage_event`) — all 32 tests there already isolate
+  correctly, no gap.
+- **`docs/live_test_coverage.md` reconciled against real `coverage_matrix.py` output**, in prep for
+  Monday's unattended `soxl_ira` window: 6 rows were stale ("Not started" despite a real event
+  already existing). Cash-check passing path + real balance fetch now Verified; live-state-
+  reconciliation detection now Verified (8 real `soxl_ira` mismatches, 2026-07-24); trailing-arm
+  re-read fix now Verified live (SPY); SL-sync placement and top-up both show a real pre-fix
+  `daily_order_cap`-blocked attempt (LABU, now fixed, needs a post-fix success observed); SL
+  async-fallback timeout confirmed fired (VOO, dry_run).
+- **soxl_ira node cleanup for Monday**:
+  - Removed 2 stale duplicate `watch_list` rows (SH/SPY, `arm_sell_pct=0.1`) — confirmed via the
+    actual setup script (`scripts/setup_2026_07_24_soxl_ira_live_test.py`) that `0.3` (the
+    surviving rows) is the real intended value, not `0.1` as initially assumed.
+  - **Found and closed a real test-coverage gap**: none of the 8 `soxl_test` nodes combined
+    `TrailingBoth` (trailing-buy/gap-resize logic) with `entry_timing='open_check'` (the real v5
+    production timing) — the TrailingBoth nodes were all `close`, the `open_check` nodes
+    (LABD/LABU) were all TrailingExit (no trailing-buy at all). Retagged the 4 entry-only
+    TrailingBoth nodes (ERX, ERY, GDXD, GDXU) to `open_check`; left SPY/SH (already-open positions)
+    untouched since `entry_timing` only affects the BUY-signal scan, not exit logic. Backfilled to
+    `watch_list_audit`.
+  - Confirmed `entry_timing` is purely a scheduling difference, not a distinct execution path —
+    `_scan_buy_signals`'s own docstring confirms nodes checked via any window get identical
+    downstream handling.
+- **FINRA PDT rule research**: confirmed via WebSearch that FINRA Rule 4210 was amended (SEC-
+  approved 2026-04-14, effective 2026-06-04) — eliminates the Pattern Day Trader designation and
+  the $25k minimum entirely, replaced with a risk-based intraday-margin framework. Brokers have
+  until 2027-10-20 to fully implement; unconfirmed whether Schwab has rolled it out on our
+  accounts yet. Logged as its own backlog item (this was asked about 3 times across sessions
+  without ever being checked or backlogged before now).
+- **Backlog additions**: long-only watchlist skew deprioritized to far-backlog (strategy already
+  profits both directions per user; original motivation was hedge + guaranteed fill activity, tied
+  to today's mode-flip sparse-signal issue); monthly universe rescreen + a possible "v6" momentum-
+  exhaustion-bounce strategy idea (distinct from the existing v6 idle-capital-parking idea, would
+  need its own version tag if both proceed).
+
+### What's next
+- **Monday (2026-07-27) `soxl_ira` test plan** (unattended — user won't be watching, ~$5k capital,
+  bounded risk accepted): watch for a real successful (not blocked) SL placement/top-up on LABU
+  (the exact ticker from Friday's incident); confirm SH/SPY read the surviving single node
+  correctly; overnight gap-resize on ERX/ERY/GDXD/GDXU now that they're `open_check`+TrailingBoth;
+  two-tickers-one-account BUY block and `same_day_block` margin-skip are both opportunistically
+  reachable now with real headroom (cap=100).
+- Still open: whether Schwab has actually rolled out the new PDT framework on our accounts;
+  channel-routing for paper/dry_run/live Slack noise (still one channel, not built); the "max
+  cumulative BUY notional per ticker per day" backstop (design converged, not built); Monday's two
+  carried-over mode-scoping decisions (run-both BUY routing restructure, 15-of-24 `account=None`
+  nodes failing closed).
+- Saved two new standing feedback memories this session: scope "resolved" claims explicitly (name
+  what's done vs. what's still open in the same breath), and default review-agent launches to
+  `run_in_background: true`.

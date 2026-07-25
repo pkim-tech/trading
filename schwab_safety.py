@@ -115,7 +115,7 @@ class SafetyViolation(Exception):
 class AccountLimits:
     enabled: bool          # allowlist -- False blocks every order for this account
     notional_cap: float    # max $ per single order
-    daily_order_cap: int   # max orders per calendar day
+    daily_order_cap: int   # max BUY orders per calendar day (SELLs don't count, 2026-07-25)
     dry_run: bool          # True: log what would happen, never call place_order
     account_type: str      # 'cash' or 'margin' (regular or IRA limited margin, same_day_block treats both the same)
 
@@ -145,7 +145,7 @@ ACCOUNTS = {
     # notional_cap set conservatively low pending a real balance check.
     # dry_run=False 2026-07-24 -- the only account going live for today's real-order
     # test plan (docs/live_test_plan_2026-07-24.md). Every other account stays dry_run=True.
-    "soxl_ira":  AccountLimits(enabled=True, notional_cap=800,    daily_order_cap=3,  dry_run=False, account_type="margin"),
+    "soxl_ira":  AccountLimits(enabled=True, notional_cap=800,    daily_order_cap=100, dry_run=False, account_type="margin"),
 }
 
 # Live-automation scope -- moved from a hardcoded Python literal to SCHWAB_AUTOMATION_TICKERS
@@ -446,12 +446,17 @@ def check_order(
     given, is used for the daily-cap/burst-cap/duplicate checks instead of
     re-reading the state file -- lets approve_and_record() validate against
     the exact snapshot it's about to increment, under one lock, instead of a
-    separate read. is_protective exempts a stop-loss placement or post-fill
-    top-up from the daily_order_cap check only (every other guard still
-    applies) -- found live 2026-07-24 (LABU) that daily_order_cap counts every
-    placement uniformly, so unrelated earlier entries can starve a
-    legitimately protective follow-on action, leaving a brand-new fill
-    unprotected purely from order-count bookkeeping, not real risk."""
+    separate read. is_protective exempts a post-fill top-up BUY from the
+    daily_order_cap check (every other guard still applies) -- found live
+    2026-07-24 (LABU) that daily_order_cap counts every placement uniformly,
+    so unrelated earlier entries can starve a legitimately protective
+    follow-on action, leaving a brand-new fill unprotected purely from
+    order-count bookkeeping, not real risk.
+    (2026-07-25: SELL -- including a stop-loss placement -- is now
+    unconditionally exempt from this cap regardless of is_protective, so this
+    flag no longer does anything on that path; kept for the BUY-side top-up
+    case and for is_protective's other callers, not removed to avoid
+    unnecessarily changing call sites.)"""
     if kill_switch_engaged():
         raise SafetyViolation(f"global kill switch engaged ({kill_switch_reason()})")
 
@@ -640,7 +645,12 @@ def check_order(
             counts = json.loads(f.read() or "{}")
     today = counts.get(str(date.today()), {})
     count = today.get(account, 0)
-    if count >= limits.daily_order_cap:
+    # BUY-only, matching the increment above (and notional_cap's precedent, 2026-07-24) --
+    # a SELL no longer contributes to this count, so it must not be blocked by it either;
+    # otherwise a real exit could be blocked by a cap only BUYs exhausted (found by Opus
+    # review, 2026-07-25 -- a blocked automated trailing-sell after its stop-loss was
+    # already cancelled would leave the position with zero broker-side protection).
+    if side == "BUY" and count >= limits.daily_order_cap:
         if is_protective:
             signals_db.log_coverage_event(
                 "daily_cap_protective_bypass", _mode, ticker=ticker, node_id=_node_id, result="allowed",
@@ -703,15 +713,18 @@ def approve_and_record(
     Checks and increments happen under the same file lock so two concurrent
     callers can't both slip past a cap. is_gap_correction bypasses only the
     signal-window time gate (see check_order) -- Part 3, branch B.
-    is_protective bypasses only the daily_order_cap check -- for a stop-loss
-    placement or post-fill top-up, see check_order's docstring."""
+    is_protective bypasses only the daily_order_cap check, for a post-fill
+    top-up BUY -- see check_order's docstring (SELL, including a stop-loss
+    placement, is unconditionally exempt from this cap since 2026-07-25
+    regardless of is_protective)."""
     with _open_locked() as f:
         counts = json.loads(f.read() or "{}")
         check_order(account, ticker, quantity, price, side, counts=counts,
                     is_gap_correction=is_gap_correction, is_protective=is_protective)
         key = str(date.today())
         today = counts.setdefault(key, {})
-        today[account] = today.get(account, 0) + 1
+        if side == "BUY":
+            today[account] = today.get(account, 0) + 1
         recent = [t for t in counts.get("recent_order_timestamps", []) if time.time() - t < 60]
         recent.append(time.time())
         counts["recent_order_timestamps"] = recent
