@@ -3691,3 +3691,78 @@ momentum idea, ETF pairing inventory), then shifted into a real safety-guard fix
 - Saved two new standing feedback memories this session: scope "resolved" claims explicitly (name
   what's done vs. what's still open in the same breath), and default review-agent launches to
   `run_in_background: true`.
+
+---
+
+## 2026-07-26 — wl_id refactor scoped via extended design conversation + two Opus review rounds; no code shipped
+
+### What we did
+Long design conversation started from wanting to verify a live/dry_run SOXL node's
+signal behavior against paper trading as a "reconciliation" check, and evolved
+through several rejected designs (a `watch_list.paper_shadow` flag column;
+deduping paper tracking on `(ticker, window, strategy)`) before landing on the
+real structural fix: everything currently assuming "one ticker == one active
+watch_list node" needs to key on the watch_list row's own primary key (`id`),
+referenced elsewhere as `wl_id` — not ticker, and not the existing
+`watchlist_id` grouping column (a different, coarser concept: the named
+watchlist like "Live v5", shared across many tickers). Real motivating insight
+from the user: this isn't a one-off need for a single SOXL test — once
+multiple strategies run as a matter of course, a ticker having 2+ concurrent
+nodes becomes the normal case, not an edge case.
+
+Two Opus review rounds (background agents) validated and expanded the scope:
+- **First round** confirmed the initial design draft's description of current
+  code was accurate, and found 8 additional ticker-only-keyed sites beyond the
+  3 originally identified — notably `buy_alerted`'s `(ticker, strategy,
+  window)` key already live in production alerting code, and
+  `clear_paper_pending_buy(ticker)`'s silent multi-row-delete bug (deletes
+  both nodes' pending rows when only one fills).
+- **Second round** (broader sweep across `signals_notify.py`,
+  `signals_handlers.py`, `schwab_safety.py`, `signals_helpers.py`,
+  `scripts/*.py`) found 9 more sites, several touching the **real**
+  (non-paper) order path — most importantly `schwab_safety.
+  _live_ticker_accounts()`'s `{ticker: account}` map, which would directly
+  hard-block the motivating SOXL-in-two-accounts design; the real
+  `pending_buys` table's identical ticker-only pattern
+  (`clear_pending_buy`/`mark_pending_buy_placed`/`set_pending_buy_order_id`,
+  including writing one node's real broker `order_id` onto the wrong row);
+  and all six BUY-side Slack button handlers resolving by ticker despite the
+  click payload already carrying the node's real `id` (SELL-side buttons
+  already do this correctly via `position_id`).
+
+Total: 20 sites scoped, full plan (schema migration on `trading_live.db` —
+`wl_id` is backfillable from `node_json` already persisted, not
+nullable-forever; re-key all 20 sites; fix BUY-button handlers to match
+SELL-side's already-correct pattern; fix `_live_ticker_accounts()` before the
+two-account design is usable) written into `docs/backlog_cache.md` for
+dedicated implementation next session — deliberately not attempted
+mid-conversation once the real severity became clear.
+
+Also logged a dependent follow-on idea: a per-node `dry_run` override,
+additive/OR-logic only (`real_order_allowed = (account.dry_run == False) AND
+(node.dry_run != True)` — a node can only force *more* conservative behavior,
+never override an account's real `dry_run=True` to force real execution),
+explicitly gated on the wl_id refactor landing and being observed correct in
+the field first — a naive node-replaces-account version was rejected since it
+would multiply the blast radius of the exact ticker-vs-node bug class the
+wl_id refactor exists to fix.
+
+One exploratory code edit (a rejected `paper_shadow`-flag version of the
+design) was made to `active_signals.py` and fully reverted before committing —
+working tree only carries the `docs/backlog_cache.md` design writeup.
+
+### What's next
+- Implement the wl_id refactor (dedicated session, per the staged plan in
+  `docs/backlog_cache.md`) — touches live DB schema + 20 call sites across
+  `signals_db.py`, `paper_trading.py`, `active_signals.py`,
+  `signals_notify.py`, `signals_handlers.py`, `schwab_safety.py`,
+  `signals_helpers.py`. User's plan: background the implementation work once
+  started so design discussion can continue in parallel, given the size.
+- Once landed: create the second SOXL node (`soxl_ira`, `mode='live'`) for the
+  original reconciliation ask.
+- Later, gated on the above: the per-node `dry_run` override idea.
+- Monday 2026-07-27 soxl_ira live test still stands, unaffected by any of this
+  (uses different, non-watchlist tickers) — daemon (`active_signals.py`) was
+  confirmed NOT RUNNING as of this session; restart before Monday if not
+  already planned, since live-state reconciliation only fires while the daemon
+  polls.

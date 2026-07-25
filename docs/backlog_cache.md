@@ -177,6 +177,27 @@ fix `_live_ticker_accounts()` before the soxl_ira two-account design is
 usable; then create the second SOXL `soxl_ira` node once everything above
 lands.
 
+## [live-trading][security] Idea, raised 2026-07-26, explicitly gated on the wl_id refactor above landing and being observed correct first — per-node `dry_run` override, additive/OR-logic only, never replacing the account-level flag
+Grew directly out of the wl_id-refactor design conversation above: once `wl_id`
+gives real per-node identity, a node-level `dry_run` parameter becomes
+possible where it wasn't safely before. **Deliberately additive, not a
+replacement** for the existing account-level `dry_run` (`schwab_safety.
+ACCOUNTS[account].dry_run`) — a node's flag can only make things *more*
+conservative, never less:
+`real_order_allowed = (account.dry_run == False) AND (node.dry_run != True)`
+A node-level `dry_run=True` can force a specific node into simulation even
+inside an otherwise-live account (e.g. keep a new/unproven node dry even once
+its account goes real); it can never force real execution in a `dry_run=True`
+account. This bounds the failure mode of a wl_id-resolution bug to "wrongly
+forces a node into dry_run," never "wrongly executes a real order" — much
+lower stakes than a naive node-replaces-account design, which was rejected
+specifically because it would have multiplied the blast radius of the exact
+class of ticker-vs-node bug the wl_id refactor above exists to fix.
+**Explicitly not to be built alongside or immediately after the wl_id
+refactor** — needs the refactor landed and observed correct in the field
+first, since this idea's safety case depends entirely on `wl_id` being
+correctly threaded through real order placement already.
+
 ## [live-trading][security] Resolved 2026-07-25 — second Opus review round on the daily_order_cap change, 2 findings
 Full-diff review of the final `schwab_safety.py` state (increment + check both BUY-only, `soxl_ira`
 cap 3→100), after the first round's SELL-blocked-by-BUY-exhausted-cap bug was already fixed.
