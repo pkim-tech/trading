@@ -461,6 +461,8 @@ def check_order(
     if not limits.enabled:
         raise SafetyViolation(f"account '{account}' is disabled in the allowlist")
     _mode = "dry_run" if limits.dry_run else "live"
+    _node = signals_db.get_watch_list_node(ticker=ticker, account=account)
+    _node_id = _node['id'] if _node else None
 
     ticker_accounts = _live_ticker_accounts()
     if ticker not in ticker_accounts:
@@ -486,7 +488,7 @@ def check_order(
     # -- skip for them.
     if side == "BUY" and limits.account_type == "cash" and signals_db.closed_today(ticker):
         signals_db.log_coverage_event(
-            "same_day_block", _mode, ticker=ticker, result="blocked",
+            "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="blocked",
             detail=f"account={account} account_type={limits.account_type}"
         )
         raise SafetyViolation(
@@ -494,14 +496,14 @@ def check_order(
         )
     elif side == "BUY" and limits.account_type == "margin" and signals_db.closed_today(ticker):
         signals_db.log_coverage_event(
-            "same_day_block", _mode, ticker=ticker, result="skipped_margin_account",
+            "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="skipped_margin_account",
             detail=f"account={account} account_type={limits.account_type}"
         )
 
     if side == "BUY":
         orders = _open_orders(account)
         if _has_open_order(orders, ticker):
-            signals_db.log_coverage_event("dup_order_blocked", _mode, ticker=ticker, result="blocked_same_ticker")
+            signals_db.log_coverage_event("dup_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_same_ticker")
             raise SafetyViolation(
                 f"'{ticker}' already has an open/working order in '{account}' -- refusing a second "
                 f"concurrent BUY (Schwab doesn't reserve buying power for a resting order, so nothing "
@@ -510,7 +512,7 @@ def check_order(
         other_ticker = _has_open_buy_order_in_account(orders, ticker)
         if other_ticker:
             signals_db.log_coverage_event(
-                "second_ticker_buy_blocked", _mode, ticker=ticker, result="blocked",
+                "second_ticker_buy_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked",
                 detail=f"account={account} other_ticker={other_ticker}"
             )
             raise SafetyViolation(
@@ -530,7 +532,7 @@ def check_order(
     if side == "SELL":
         orders = _open_orders(account)
         if _has_open_sell_order(orders, ticker):
-            signals_db.log_coverage_event("dup_sell_order_blocked", _mode, ticker=ticker, result="blocked")
+            signals_db.log_coverage_event("dup_sell_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked")
             raise SafetyViolation(
                 f"'{ticker}' already has a resting SELL order in '{account}' -- refusing a second "
                 f"concurrent SELL (prevents two live exit orders stacking for the same shares)"
@@ -547,7 +549,7 @@ def check_order(
         pos = signals_db.get_open_position(ticker)
         if pos and quantity > pos['shares'] * 1.001:  # tolerance for float share counts
             signals_db.log_coverage_event(
-                "sell_exceeds_position_blocked", _mode, ticker=ticker, result="blocked",
+                "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked",
                 detail=f"quantity={quantity:g} held={pos['shares']:g}"
             )
             raise SafetyViolation(
@@ -601,13 +603,13 @@ def check_order(
             cash_available = schwab_client.get_account_balance(account)
         except Exception as e:
             signals_db.log_coverage_event(
-                "cash_check", _mode, ticker=ticker, result="failed_closed", detail=str(e)
+                "cash_check", _mode, ticker=ticker, node_id=_node_id, result="failed_closed", detail=str(e)
             )
             raise SafetyViolation(f"could not verify '{account}' cash balance, blocking order: {e}")
         required = notional + CASH_SAFETY_BUFFER
         if cash_available < required:
             signals_db.log_coverage_event(
-                "cash_check", _mode, ticker=ticker, result="blocked_insufficient",
+                "cash_check", _mode, ticker=ticker, node_id=_node_id, result="blocked_insufficient",
                 detail=f"required=${required:,.0f} available=${cash_available:,.0f}"
             )
             raise SafetyViolation(
@@ -615,7 +617,7 @@ def check_order(
                 f"${required:,.0f} required, but '{account}' only has ${cash_available:,.0f} available"
             )
         signals_db.log_coverage_event(
-            "cash_check", _mode, ticker=ticker, result="passed",
+            "cash_check", _mode, ticker=ticker, node_id=_node_id, result="passed",
             detail=f"required=${required:,.0f} available=${cash_available:,.0f}"
         )
         # Informational only, not blocking (automation_principles.md #4) -- the
@@ -641,7 +643,7 @@ def check_order(
     if count >= limits.daily_order_cap:
         if is_protective:
             signals_db.log_coverage_event(
-                "daily_cap_protective_bypass", _mode, ticker=ticker, result="allowed",
+                "daily_cap_protective_bypass", _mode, ticker=ticker, node_id=_node_id, result="allowed",
                 detail=f"account={account} count={count} cap={limits.daily_order_cap} side={side}"
             )
         else:
@@ -675,12 +677,12 @@ def check_order(
         # to check against, so keep the pure local-record behavior.
         if not limits.dry_run and not _broker_confirms_order(_all_orders(account), ticker, side, quantity):
             signals_db.log_coverage_event(
-                "dup_order_retry_after_failure", _mode, ticker=ticker, result="allowed_retry",
+                "dup_order_retry_after_failure", _mode, ticker=ticker, node_id=_node_id, result="allowed_retry",
                 detail=f"side={side} qty={quantity}"
             )
             continue
         signals_db.log_coverage_event(
-            "dup_order_window_blocked", _mode, ticker=ticker, result="blocked",
+            "dup_order_window_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked",
             detail=f"side={side} qty={quantity} prior_qty={prior_qty:g}"
         )
         raise SafetyViolation(

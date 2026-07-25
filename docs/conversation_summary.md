@@ -3375,3 +3375,112 @@ user this session (dry_run protects everything, per architecture, not leftover t
 - TrailingBoth automated-SL fix is code-ready; live verification still planned for Monday
   2026-07-27 per the original plan.
 - Session not yet committed as of this entry — see session close commit.
+
+---
+
+## 2026-07-25 — Coverage node_id migration turned into a six-round Opus review chain that found and fixed real, previously-undetected live-order bugs
+
+### What we did
+- User's real ask, start of session: not "add scenario_expectations rows per known bug" but build the
+  coverage system to capture *all* intended behavior across paper/dry_run/live, then use it to
+  re-audit the actual live test day findings instead of trusting memory/prose. Along the way, user
+  flagged two deeper architectural gaps directly: (1) `ticker` alone is not a real node identity key
+  (proven by the `add_node` dedup bug two sessions ago), (2) some safety controls aren't scoped at the
+  right level (global/account/ticker/node) and that's been silently biting the system. Both became the
+  real scope of tonight's work.
+- **Core migration**: added nullable `node_id` (FK `watch_list.id`) + `mode` (paper/dry_run/live) to
+  `scenario_expectations`/`coverage_deviations`/`coverage_events`, replacing the old ticker-only
+  identity (SQLite `UNIQUE` over nullable columns can't dedup correctly — same bug class as `add_node`'s
+  `take_profit=NULL` failure two sessions ago). New `signals_db.get_watch_list_node`/
+  `get_watch_list_node_by_id` helpers (fail-open by design — pure observability enrichment must never
+  raise into live control flow). `add_scenario_expectation`/`record_deviation` rewritten with explicit
+  COALESCE-based check-then-upsert. Migrated the 6 canary rows to carry real `node_id`; wired `node_id`
+  into all ~18 real `log_coverage_event` call sites across `schwab_safety.py`/`signals_notify.py`/
+  `paper_trading.py`. Backed up `trading_live.db` before every live-data write.
+- **Six independent Opus review rounds** on the growing diff (real money at stake, user asked for
+  "another pass" repeatedly) — each found and fixed real issues, with diminishing-then-resurging
+  severity as the reviews dug into adjacent order-flow code:
+  - Round 1: `get_watch_list_node` missing a `watchlist_id` filter (7/10 live tickers ambiguous,
+    could mis-resolve to an archived node); `_PENDING_BUY_NODE_KEYS` missing `'id'` (silently made
+    ~14 of ~18 call-site edits dead code); `get_watch_list_node` needed to fail-open.
+  - Round 2: `coverage_check.py`'s `_check_trade_lifecycle` stored `node_id` but never used it to scope
+    the lookup — real production ambiguity (two live GDXU nodes share a ticker) was still unresolved.
+    Fixed with `get_watch_list_node_by_id` + new disambiguator params on the lookup functions. Also
+    fixed an invalid `ALTER TABLE ADD COLUMN ... DEFAULT (datetime('now'))` on a non-empty table
+    (unreachable branch, would've crashed daemon startup if ever hit).
+  - Round 3: found a **real live bug**, not caused by this migration — a stale `pending_buys` snapshot
+    (IVV, no order yet) still carried the pre-fix `account='brokerage'` after an earlier account
+    correction to `'ira'`. User chose to clear the row (asked directly via AskUserQuestion) rather than
+    patch in place, since no real order existed yet. Added a `_fresh_node` helper (later revised, see
+    round 6).
+  - Round 4, most severe finding of the night: `signals_blocks.py`'s BUY-alert Slack button payload has
+    **always** (pre-existing, not from this session) omitted `account`/`id` from its node whitelist —
+    every manual BUY confirmation (the primary way live positions get opened per this repo's docs)
+    could open a real position with `open_positions.account=NULL`, invisible to
+    `check_live_state_reconciliation`. Fixed the whitelist. Also added stale-pending-buys-row guards to
+    the fill-confirmation handlers, and backfilled real `node_id` into the 4 actual live `pending_buys`
+    rows (3 with resting real orders) so the fix wasn't just protecting rows going forward.
+  - Round 5: found the **identical bug in a second location** (the Reference Report's "Manually Open"
+    button) — fixed the same way. Also found a duplicated, diverged same-day-buy-warning check
+    (`!= 'brokerage'` as a wrong cash-account proxy) misfiring on the real live `soxl_ira` margin
+    account — fixed both sites to read the real `schwab_safety.ACCOUNTS[account].account_type`. Also
+    resolved a genuinely ambiguous design question via AskUserQuestion: should `_fresh_node` refresh
+    `account` for an already-placed order? User's call: no — a resting order's real account is a
+    physical fact fixed at placement time, pin to the signal-time snapshot.
+  - Round 6: found round 5's `_fresh_node` had become a provable no-op (nothing left to refresh once
+    `account` was pinned) — removed the function entirely, call sites read `pending['node']` directly.
+    Found and fixed a fail-open regression in round 5's own account-type fix (an unrecognized account
+    now silently suppressed the same-day-buy warning instead of the old, wrong-but-visible behavior).
+    Found one real latent gap — the stale-pending-buys guard could silently discard a real manual fill
+    confirmation for a ticker outside `SCHWAB_AUTOMATION_TICKERS` — not currently reachable, deliberately
+    **not** blind-fixed without live-Slack testing ability; backlogged with full detail instead.
+  - Investigated (not a bug): two apparent "duplicate" SPY/SH watch_list nodes turned out to be a
+    deliberate second `arm_sell_pct` test variant, confirmed with the user directly.
+- **New standing convention, `automation_principles.md` #16**: every new DB table gets a Streamlit
+  reference page going forward — user's explicit instruction mid-session ("I need the reference
+  pages"), not yet acted on (see Next session).
+- Full suite: 224 passed (was 195 at session start via prior session's baseline, 210 after the prior
+  session's batch fix — net +14 this session). `scripts/live_sim_harness.py` 6/6. `coverage_check.py`/
+  `coverage_matrix.py` re-run clean against the live DB after every round.
+
+### Verified
+- Live DB (`trading_live.db`) backed up before every write this session (3 separate backup points).
+- `scenario_expectations`: 6 active rows, each with a real `node_id`. `coverage_deviations`: 5 rows,
+  1 with a preserved human-written reason (migrated forward, not lost, during a self-inflicted
+  duplicate-row cleanup).
+- `pending_buys`: all 4 real rows (DIA x2, QQQ, VOO) backfilled with real `node_id`; the one stale IVV
+  row was cleared per user decision.
+- Current `open_positions` (4 real rows: EDC/sep, UDOW/ira, SPY/soxl_ira, SH/soxl_ira) all have valid
+  non-NULL accounts — the NULL-account bug hasn't visibly damaged current live state, though 2
+  historical `trade_log` rows (ids 9 KORU, 10 HIBL, both ~10 days old) show the NULL-account signature
+  and weren't independently re-verified against this specific bug's mechanism (flagged, not chased).
+
+### Current state
+- Everything above is uncommitted in the working tree. Files changed: `signals_db.py`,
+  `schwab_safety.py`, `signals_notify.py`, `signals_blocks.py`, `signals_handlers.py`,
+  `paper_trading.py`, `scripts/coverage_check.py`, `scripts/coverage_matrix.py`,
+  `scripts/seed_scenario_expectations.py`, `tests/test_coverage_check.py`,
+  `docs/automation_principles.md`, `docs/backlog_cache.md`, `docs/live_test_coverage.md`.
+- Daemon confirmed down at session start; not restarted this session (no live daemon exposure to any
+  of tonight's changes yet).
+
+### Next session
+- **The account=NULL button-whitelist fix is real but not yet live-tested** — the very next manual
+  BUY confirmation (Executed/Filled/Manual Open) should be checked for a non-NULL `account` on the
+  resulting `open_positions` row. See `docs/live_test_coverage.md`'s two new rows.
+- **User's standing instruction not yet acted on**: build a Streamlit reference page for the coverage
+  tables (`scenario_expectations`/`coverage_deviations`/`coverage_events`), and going forward for any
+  new table (`automation_principles.md` #16).
+- **Original task #5 (scope-level audit of every control/tracker) was not finished** — got redirected
+  into the deeper button/handler bug hunt above, which turned out more valuable, but the systematic
+  audit (in-memory trackers: `buy_alerted`, `sell_alerted`, `window_alerted`, `limit_fill_alerted`,
+  `reference_alerted`, `gap_check_alerted`, `pinned_bar_alerted`, `paper_sell_alerted`,
+  `_RECONCILE_ALERTED`, `_STALE_PRICE_ALERTED`) is still open.
+- **Backlogged, not fixed, needs live-Slack testing**: the stale-pending-buys-guard/
+  `SCHWAB_AUTOMATION_TICKERS`-coupling gap from round 6 — see `docs/backlog_cache.md`'s dedicated entry.
+- `open_positions` itself still has no `node_id`/`watch_id` column (same identity gap as
+  `pending_buys` had, one level deeper) — flagged in an earlier round, not fixed, bigger/riskier since
+  it touches real open positions.
+- Deliberately not committed yet — user should review the diff (or ask for a `git diff` walkthrough)
+  before this lands, given how much of it turned out to be real live-order-flow fixes beyond the
+  original coverage-migration scope.

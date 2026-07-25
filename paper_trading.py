@@ -51,7 +51,7 @@ def start_paper_market_buy(node, sig):
         return
     db.open_position(node, sig['current_price'], sig['last_bar'], sig['current_price'], datetime.now(),
                       shares=sizing['shares'], paper=True)
-    db.log_coverage_event("entry_fill", "paper", ticker=ticker, result="market_filled",
+    db.log_coverage_event("entry_fill", "paper", ticker=ticker, node_id=node.get('id'), result="market_filled",
                            detail=f"shares={sizing['shares']} price={sig['current_price']:.4f}")
     _post_message(f"🧪 PAPER MARKET BUY — {ticker}  {sizing['shares']}sh @ ${sig['current_price']:.4f}")
 
@@ -79,7 +79,7 @@ def update_paper_buys():
             db.open_position(node, pb['signal_price'], pb['signal_time'], price, datetime.now(),
                               shares=shares, paper=True)
             db.clear_paper_pending_buy(ticker)
-            db.log_coverage_event("entry_fill", "paper", ticker=ticker, result="trailing_bounce_filled",
+            db.log_coverage_event("entry_fill", "paper", ticker=ticker, node_id=node.get('id'), result="trailing_bounce_filled",
                                    detail=f"shares={shares} price={price:.4f}")
             _post_message(f"🧪 PAPER BUY FILLED — {ticker}  {shares}sh @ ${price:.4f}")
         elif running_low != pb['running_low']:
@@ -119,7 +119,9 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
         if reason:
             db.close_position(pos['id'], exit_signal_price=cp, exit_price=target,
                                exit_time=datetime.now(), exit_reason=reason, paper=True)
+            _node = db.get_watch_list_node(ticker=ticker, strategy=pos.get('strategy'),
+                                            version=pos.get('version'), window=pos.get('window'))
             db.log_coverage_event("exit_fill", "paper", ticker=ticker, position_id=pos['id'],
-                                   result=reason, detail=f"price={target:.4f}")
+                                   node_id=_node['id'] if _node else None, result=reason, detail=f"price={target:.4f}")
             _post_message(f"🧪 PAPER SELL — {ticker}  {reason} @ ${target:.4f}")
             paper_sell_alerted.add((pos['id'], last_bar_ts))

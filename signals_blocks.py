@@ -4,6 +4,7 @@ import sqlite3
 
 import requests
 
+import schwab_safety
 import signals_config as cfg
 import signals_db as db
 from signals_helpers import _add_trading_hours, _last_sale_recovery, buy_order_sizing
@@ -137,11 +138,20 @@ def _build_buy_blocks(node, sig, auto_placed=False):
         entry_line = f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}"
 
     warning_line = ""
-    if (node.get('account') or '').lower() != 'brokerage' and db.closed_today(ticker):
-        warning_line = (
-            f"\n⚠️🔁 *SAME DAY BUY WARNING:* {ticker} already sold today in a "
-            f"{node.get('account', 'non-brokerage')} account — cash may not be settled (T+1). Confirm funds are available before entering."
-        )
+    _limits = schwab_safety.ACCOUNTS.get(node.get('account'))
+    if db.closed_today(ticker):
+        if _limits and _limits.account_type == 'cash':
+            warning_line = (
+                f"\n⚠️🔁 *SAME DAY BUY WARNING:* {ticker} already sold today in a "
+                f"{node.get('account', 'non-brokerage')} account — cash may not be settled (T+1). Confirm funds are available before entering."
+            )
+        elif not _limits:
+            # See notify_buy_signal's matching fix -- an unrecognized account
+            # must warn too, not silently assume it's safe (round 6).
+            warning_line = (
+                f"\n⚠️🔁 *SAME DAY BUY WARNING:* {ticker} already sold today, account "
+                f"'{node.get('account')}' not recognized — cash-settlement status unknown, confirm before entering."
+            )
 
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
@@ -151,10 +161,10 @@ def _build_buy_blocks(node, sig, auto_placed=False):
     if cfg.INTERACTIVE:
         value = json.dumps({
             "type":         "buy",
-            "node":         {k: node.get(k) for k in ('ticker', 'strategy', 'version', 'window',
+            "node":         {k: node.get(k) for k in ('id', 'ticker', 'strategy', 'version', 'window',
                                                         'take_profit', 'stop_loss', 'max_hold_hours', 'label',
                                                         'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct',
-                                                        'starting_notional')},
+                                                        'starting_notional', 'account')},
             "signal_price": price,
             "signal_time":  sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'),
             "lower_band":   sig['lower_band'],

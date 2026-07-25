@@ -15,7 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import signals_db as db
 
-MODES = ["paper", "dry_run", "live"]
+MODES = ["paper", "dry_run", "live", "unattributed"]  # "unattributed": a real event
+# fired but the mode couldn't be determined (e.g. check_gap_resize's missing-account
+# skip) -- must stay in this list or that event silently disappears from the pivot.
 
 
 def build_matrix(scenario=None, ticker=None):

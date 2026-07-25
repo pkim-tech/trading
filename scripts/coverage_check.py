@@ -29,18 +29,35 @@ def _check_trade_lifecycle(scenario, check_date):
     """Returns (met: bool, actual_summary: str)."""
     params = json.loads(scenario['check_params'] or '{}')
     ticker = scenario['ticker']
+    # ticker alone is ambiguous when a ticker has more than one real node (e.g.
+    # GDXU: watch_list ids 88/108, different accounts/versions on the same
+    # active watchlist) -- resolve the real node by its PK (node_id, if the
+    # scenario carries one) and scope the trade_log/pending_buys lookup to it,
+    # so a different node's trade can't silently satisfy this expectation
+    # (found by Opus review, 2026-07-24).
+    node_id = scenario.get('node_id')
+    node = db.get_watch_list_node_by_id(node_id)
+    if node_id is not None and node is None:
+        # A scenario carries a node_id that no longer resolves (node deleted/
+        # renamed) -- falling through to ticker-only scoping here would
+        # silently reintroduce the exact ambiguity node_id exists to close,
+        # with no signal that it happened. Surface it instead.
+        print(f"  ! {scenario['scenario_key']:26s} {ticker or '':6s} node_id={node_id} no longer "
+              f"resolves -- falling back to ticker-only scoping (ambiguous if ticker has >1 node)")
+    disambig = dict(strategy=node.get('strategy'), version=node.get('version'),
+                     window=node.get('window'), account=node.get('account')) if node else {}
 
     if params.get('expect_pending_carryover'):
-        pending = db.get_pending_buys_for_ticker_on_date(ticker, check_date)
+        pending = db.get_pending_buys_for_ticker_on_date(ticker, check_date, **disambig)
         if pending:
             return True, f"pending_buys row present (order_placed={pending[0]['order_placed']})"
-        trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date)
+        trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date, **disambig)
         if trades:
             return True, f"same-day fill instead of carryover (exit_reason={trades[0]['exit_reason']}) -- not the designed scenario but real activity occurred"
         return False, f"no pending_buys row and no closed trade found for {ticker} on {check_date}"
 
     expect_reasons = params.get('expect_exit_reason', [])
-    trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date)
+    trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date, **disambig)
     if not trades:
         return False, f"no closed trade found for {ticker} on {check_date}"
     reason = trades[0]['exit_reason']
@@ -71,7 +88,8 @@ def run_check(check_date):
         if met:
             print(f"  ✓ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
         else:
-            db.record_deviation(check_date, s['scenario_key'], s['expected_outcome'], actual_summary, ticker=s['ticker'])
+            db.record_deviation(check_date, s['scenario_key'], s['expected_outcome'], actual_summary,
+                                 ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
             print(f"  ✗ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
 
     unexplained = db.get_deviations(unexplained_only=True)

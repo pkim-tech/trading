@@ -76,10 +76,20 @@ SCENARIOS = [
 if __name__ == '__main__':
     db.ensure_tables()
     for s in SCENARIOS:
+        node = db.get_watch_list_node(ticker=s['ticker'], version='canary')
+        node_id = node['id'] if node else None
+        if node_id is None:
+            # get_watch_list_node fails open (returns None on ambiguity/error, not
+            # just "not found") -- since node_id is part of this row's dedup key,
+            # a transient failure here would duplicate the row on rerun instead of
+            # upserting it. Flag loudly rather than silently seeding node_id=None.
+            print(f"  WARNING: could not resolve a node_id for {s['ticker']} (canary) -- "
+                  f"check watch_list before trusting this seed")
         db.add_scenario_expectation(
             scenario_key=s['scenario_key'], expected_outcome=s['expected_outcome'],
             expected_frequency=s['expected_frequency'], check_method=s['check_method'],
-            ticker=s['ticker'], strategy_type=s['strategy_type'], check_params=s['check_params'],
+            ticker=s['ticker'], node_id=node_id, mode='live',
+            strategy_type=s['strategy_type'], check_params=s['check_params'],
         )
-        print(f"seeded {s['scenario_key']:28s} {s['ticker']}")
+        print(f"seeded {s['scenario_key']:28s} {s['ticker']:5s} node_id={node_id}")
     print(f"\n{len(SCENARIOS)} scenario_expectations rows seeded/updated.")

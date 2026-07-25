@@ -185,3 +185,13 @@ bar-close evaluation on every open position, confirmed live 2026-07-24 (a restar
 triggered SPY's arm/TP check at 11:21 ET, not a real bar close or pinned exit-arm time) — same
 underlying restart-safety gap `reference_alerted` and friends were already deliberately built to
 avoid, just not applied consistently to every tracker of that shape.
+
+## 16. Every new DB table gets a Streamlit reference page
+When a new table is added (anywhere — `trading_live.db`, `trading_universe.db`, `watchlist_sweep.db`),
+build or extend a `pages/` view for it in the same session, not later. Data that only exists behind an
+ad hoc script (`scripts/foo_status.py`) or raw SQL means the user has to know to ask for it and wait on
+a tool call — a live reference page means they can just look. This applies even to tables built as
+internal plumbing (e.g. a coverage/audit table), not just user-facing ones.
+**Why**: user's explicit standing instruction, 2026-07-24 late night, raised while building the
+`scenario_expectations`/`coverage_deviations`/`node_id` migration — "I need the reference pages,"
+i.e. a page is the actual deliverable, not an optional nice-to-have layered on after the schema work.

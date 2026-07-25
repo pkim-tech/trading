@@ -360,11 +360,16 @@ def ensure_tables():
                 mode          TEXT NOT NULL,
                 ticker        TEXT,
                 position_id   INTEGER,
+                node_id       INTEGER REFERENCES watch_list(id),
                 result        TEXT,
                 detail        TEXT
             )
         """)
         c.commit()
+        ce_cols = {r[1] for r in c.execute("PRAGMA table_info(coverage_events)").fetchall()}
+        if 'node_id' not in ce_cols:
+            c.execute("ALTER TABLE coverage_events ADD COLUMN node_id INTEGER REFERENCES watch_list(id)")
+            c.commit()
 
         # scenario_expectations: the "what should this node/control do" mapping,
         # structured instead of prose (was hand-maintained in deep_backlog.md's
@@ -374,11 +379,25 @@ def ensure_tables():
         # trade_log/open_positions row shows the expected same-day entry/exit
         # shape) -- since coverage_events only logs control-site firings, not
         # entry/arm/exit for live/dry_run nodes (only paper_trading.py logs those).
+        # node_id (FK to watch_list.id, nullable) is the real per-node identity key --
+        # `ticker` alone is ambiguous (two distinct nodes can share a ticker, e.g. the
+        # add_node dedup bug that shipped two TrailingBoth nodes differing only in
+        # arm_sell_pct under the same ticker) and account-scoped, so a node_id-less
+        # scenario means "applies at the ticker/account/global level, not one node".
+        # `mode` (paper/dry_run/live, nullable = same expectation across all modes)
+        # exists because the same scenario_key can legitimately behave differently per
+        # environment (e.g. notional_cap is BUY-only in live/dry_run, meaningless in paper).
+        # No UNIQUE constraint here on purpose -- see automation_principles.md #13 (never
+        # rely on a UNIQUE constraint over a nullable column for dedup, the exact bug that
+        # hit add_node twice). add_scenario_expectation() does an explicit COALESCE-based
+        # check-then-upsert in Python instead.
         c.execute("""
             CREATE TABLE IF NOT EXISTS scenario_expectations (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 scenario_key        TEXT NOT NULL,
                 ticker              TEXT,
+                node_id             INTEGER REFERENCES watch_list(id),
+                mode                TEXT,
                 strategy_type       TEXT,
                 expected_outcome    TEXT NOT NULL,
                 expected_frequency  TEXT NOT NULL,
@@ -386,16 +405,64 @@ def ensure_tables():
                 check_params        TEXT,
                 active              INTEGER NOT NULL DEFAULT 1,
                 created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(scenario_key, ticker)
+                updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
         c.commit()
+        se_cols = {r[1] for r in c.execute("PRAGMA table_info(scenario_expectations)").fetchall()}
+        if 'node_id' not in se_cols:
+            # recreate without the old UNIQUE(scenario_key, ticker) -- it would reject a
+            # second node sharing a ticker, exactly the identity gap node_id exists to close
+            c.executescript("""
+                CREATE TABLE scenario_expectations_new (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scenario_key        TEXT NOT NULL,
+                    ticker              TEXT,
+                    node_id             INTEGER REFERENCES watch_list(id),
+                    mode                TEXT,
+                    strategy_type       TEXT,
+                    expected_outcome    TEXT NOT NULL,
+                    expected_frequency  TEXT NOT NULL,
+                    check_method        TEXT NOT NULL,
+                    check_params        TEXT,
+                    active              INTEGER NOT NULL DEFAULT 1,
+                    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT INTO scenario_expectations_new
+                    (id, scenario_key, ticker, strategy_type, expected_outcome,
+                     expected_frequency, check_method, check_params, active, created_at, updated_at)
+                SELECT id, scenario_key, NULLIF(ticker, ''), strategy_type, expected_outcome,
+                       expected_frequency, check_method, check_params, active, created_at, created_at
+                FROM scenario_expectations;
+                DROP TABLE scenario_expectations;
+                ALTER TABLE scenario_expectations_new RENAME TO scenario_expectations;
+            """)
+            c.commit()
+        elif 'updated_at' not in se_cols:
+            # SQLite rejects a non-constant (datetime('now')) default in ADD COLUMN
+            # on a non-empty table ("Cannot add a column with non-constant
+            # default") -- add nullable first, then backfill real rows explicitly,
+            # matching created_at as a reasonable value for pre-existing rows
+            # (this branch only runs on a DB that already has node_id but not
+            # updated_at, i.e. an interrupted prior migration -- unreachable in
+            # normal operation since both columns are added together in the
+            # recreate branch above, but must not crash daemon startup if it ever is).
+            # Deliberately nullable here (unlike the CREATE TABLE's NOT NULL DEFAULT) --
+            # SQLite can't express the same NOT NULL+non-constant-default in an ALTER on
+            # a non-empty table, and the immediate backfill below leaves no real row
+            # NULL anyway, so this divergence from the canonical schema is harmless.
+            c.execute("ALTER TABLE scenario_expectations ADD COLUMN updated_at TEXT")
+            c.execute("UPDATE scenario_expectations SET updated_at = created_at WHERE updated_at IS NULL")
+            c.commit()
 
-        # coverage_deviations: one row per (check_date, scenario_key, ticker)
+        # coverage_deviations: one row per (check_date, scenario_key, node_id/ticker, mode)
         # where a daily expectation wasn't met. `reason` starts NULL --
         # unexplained -- until explain_deviation() fills it in. A row with
         # reason IS NULL is itself the actionable thing: an unexplained failure
         # is a bug by definition, not an acceptable end state (2026-07-24 reframe).
+        # Same node_id/mode rationale and no-UNIQUE-on-nullable-columns rule as
+        # scenario_expectations above.
         c.execute("""
             CREATE TABLE IF NOT EXISTS coverage_deviations (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -403,15 +470,43 @@ def ensure_tables():
                 check_date      TEXT NOT NULL,
                 scenario_key    TEXT NOT NULL,
                 ticker          TEXT,
+                node_id         INTEGER REFERENCES watch_list(id),
+                mode            TEXT,
                 expected_outcome TEXT NOT NULL,
                 actual_summary  TEXT NOT NULL,
                 reason          TEXT,
                 reason_by       TEXT,
-                reason_ts       TEXT,
-                UNIQUE(check_date, scenario_key, ticker)
+                reason_ts       TEXT
             )
         """)
         c.commit()
+        cd_cols = {r[1] for r in c.execute("PRAGMA table_info(coverage_deviations)").fetchall()}
+        if 'node_id' not in cd_cols:
+            c.executescript("""
+                CREATE TABLE coverage_deviations_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts              TEXT NOT NULL DEFAULT (datetime('now')),
+                    check_date      TEXT NOT NULL,
+                    scenario_key    TEXT NOT NULL,
+                    ticker          TEXT,
+                    node_id         INTEGER REFERENCES watch_list(id),
+                    mode            TEXT,
+                    expected_outcome TEXT NOT NULL,
+                    actual_summary  TEXT NOT NULL,
+                    reason          TEXT,
+                    reason_by       TEXT,
+                    reason_ts       TEXT
+                );
+                INSERT INTO coverage_deviations_new
+                    (id, ts, check_date, scenario_key, ticker, expected_outcome,
+                     actual_summary, reason, reason_by, reason_ts)
+                SELECT id, ts, check_date, scenario_key, NULLIF(ticker, ''), expected_outcome,
+                       actual_summary, reason, reason_by, reason_ts
+                FROM coverage_deviations;
+                DROP TABLE coverage_deviations;
+                ALTER TABLE coverage_deviations_new RENAME TO coverage_deviations;
+            """)
+            c.commit()
 
         # slack_message_log: full text of every real _post_message call (live,
         # sim, and webhook/socket alike) -- a message that scrolls past or gets
@@ -525,6 +620,63 @@ def get_watchlist(watchlist_id=None):
             "SELECT * FROM watch_list WHERE watchlist_id = ? ORDER BY ticker, id",
             (watchlist_id,)
         ).fetchall()]
+
+
+def get_watch_list_node_by_id(node_id):
+    """Real PK lookup -- unambiguous by construction, unlike get_watch_list_node's
+    ticker-based best-effort matching. Returns None if node_id is None or the
+    row no longer exists (e.g. a since-removed node)."""
+    if node_id is None:
+        return None
+    try:
+        with _conn() as c:
+            row = c.execute("SELECT * FROM watch_list WHERE id = ?", (node_id,)).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def get_watch_list_node(ticker, version=None, strategy=None, account=None, window=None,
+                         watchlist_id=None):
+    """Look up a single real watch_list row by ticker + optional disambiguators.
+    Returns None if no match, more than one match (ambiguous -- caller should
+    narrow with version/strategy/account/window rather than guess), or the
+    lookup itself fails for any reason -- every current caller uses this only
+    for coverage/observability enrichment (resolving a node_id to log
+    alongside a real event), never as a gate on whether a real action
+    proceeds, so this must never raise into that control flow (same
+    fire-and-forget contract as log_coverage_event). Scoped to watchlist_id
+    (defaults to the real active watchlist) -- without this, old watchlists
+    (archived/superseded, e.g. watchlist 7's v3.26 nodes) can supply a
+    same-ticker row that either falsely disambiguates a real live node to a
+    stale one, or makes an otherwise-unique live node look ambiguous. Pass
+    watchlist_id=False to search across all watchlists deliberately (e.g. a
+    canary/test node not on the currently-active watchlist)."""
+    try:
+        if watchlist_id is None:
+            watchlist_id = get_active_watchlist_id()
+        q = "SELECT * FROM watch_list WHERE ticker = ?"
+        params = [ticker]
+        if watchlist_id:
+            q += " AND watchlist_id = ?"
+            params.append(watchlist_id)
+        if version:
+            q += " AND version = ?"
+            params.append(version)
+        if strategy:
+            q += " AND strategy = ?"
+            params.append(strategy)
+        if account:
+            q += " AND account = ?"
+            params.append(account)
+        if window is not None:
+            q += " AND window = ?"
+            params.append(window)
+        with _conn() as c:
+            rows = c.execute(q, params).fetchall()
+        return dict(rows[0]) if len(rows) == 1 else None
+    except Exception:
+        return None
 
 
 def _config_fixed_stop_loss():
@@ -725,19 +877,21 @@ def log_automation_scope_change(old_tickers, new_tickers):
         c.commit()
 
 
-def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, result='', detail=''):
+def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, node_id=None, result='', detail=''):
     """Records one real firing of an automation control/phase, tagged by which
     environment exercised it. `mode` is one of 'paper'/'dry_run'/'live' -- the
     caller determines this from its own context (e.g. paper_trading.py always
     passes 'paper'; schwab_safety/signals_notify pass 'live' or 'dry_run' based
-    on the account's real dry_run flag), not inferred here. Fire-and-forget:
-    never raises past a logging failure into the caller's real control flow."""
+    on the account's real dry_run flag), not inferred here. node_id is the real
+    watch_list.id identity key when the caller can resolve one (ticker alone is
+    ambiguous -- two distinct nodes can share a ticker). Fire-and-forget: never
+    raises past a logging failure into the caller's real control flow."""
     try:
         with _conn() as c:
             c.execute("""
-                INSERT INTO coverage_events (scenario_key, mode, ticker, position_id, result, detail)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (scenario_key, mode, ticker, position_id, result, detail))
+                INSERT INTO coverage_events (scenario_key, mode, ticker, position_id, node_id, result, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (scenario_key, mode, ticker, position_id, node_id, result, detail))
             c.commit()
     except Exception:
         pass
@@ -761,29 +915,43 @@ def get_coverage_events(scenario_key=None, mode=None, limit=500):
 
 
 def add_scenario_expectation(scenario_key, expected_outcome, expected_frequency, check_method,
-                              ticker=None, strategy_type=None, check_params=None):
+                              ticker=None, node_id=None, mode=None, strategy_type=None, check_params=None):
     """Insert-or-update one row of the structured designed-scenario mapping.
     expected_frequency: 'daily' / 'occasional' / 'regression-only'.
     check_method: 'coverage_event' (verify via coverage_events scenario_key) or
     'trade_lifecycle' (verify via a real trade_log/open_positions row today).
     check_params is a free-form JSON string interpreted by coverage_check.py
-    according to check_method (e.g. {"exit_reason": "TIME"} for trade_lifecycle)."""
-    ticker = ticker or ''  # NULL never conflicts with NULL under UNIQUE -- '' does, so a
-    # ticker-less scenario still upserts on rerun instead of duplicating (same bug class as
-    # add_node's take_profit=NULL dedup failure).
+    according to check_method (e.g. {"exit_reason": "TIME"} for trade_lifecycle).
+    node_id is the real watch_list.id identity key (nullable -- a scenario that
+    applies at the ticker/account/global level, not one node, leaves it None).
+    mode is 'paper'/'dry_run'/'live' (nullable -- None means the expectation is
+    the same across all modes). Dedup is on (scenario_key, node_id, ticker, mode)
+    via an explicit COALESCE-based check-then-upsert, not a UNIQUE constraint --
+    see automation_principles.md #13 (a raw UNIQUE over nullable columns silently
+    fails to match NULL==NULL, the exact bug that hit add_node twice)."""
     with _conn() as c:
-        c.execute("""
-            INSERT INTO scenario_expectations
-                (scenario_key, ticker, strategy_type, expected_outcome, expected_frequency, check_method, check_params)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(scenario_key, ticker) DO UPDATE SET
-                strategy_type=excluded.strategy_type,
-                expected_outcome=excluded.expected_outcome,
-                expected_frequency=excluded.expected_frequency,
-                check_method=excluded.check_method,
-                check_params=excluded.check_params,
-                active=1
-        """, (scenario_key, ticker, strategy_type, expected_outcome, expected_frequency, check_method, check_params))
+        existing = c.execute("""
+            SELECT id FROM scenario_expectations
+            WHERE scenario_key = ?
+              AND COALESCE(node_id, -1) = COALESCE(?, -1)
+              AND COALESCE(ticker, '') = COALESCE(?, '')
+              AND COALESCE(mode, '') = COALESCE(?, '')
+        """, (scenario_key, node_id, ticker, mode)).fetchone()
+        if existing:
+            c.execute("""
+                UPDATE scenario_expectations SET
+                    strategy_type=?, expected_outcome=?, expected_frequency=?,
+                    check_method=?, check_params=?, active=1, updated_at=datetime('now')
+                WHERE id=?
+            """, (strategy_type, expected_outcome, expected_frequency, check_method, check_params, existing[0]))
+        else:
+            c.execute("""
+                INSERT INTO scenario_expectations
+                    (scenario_key, ticker, node_id, mode, strategy_type, expected_outcome,
+                     expected_frequency, check_method, check_params)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (scenario_key, ticker, node_id, mode, strategy_type, expected_outcome,
+                  expected_frequency, check_method, check_params))
         c.commit()
 
 
@@ -802,21 +970,33 @@ def get_scenario_expectations(expected_frequency=None, active_only=True):
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
-def record_deviation(check_date, scenario_key, expected_outcome, actual_summary, ticker=None):
-    """Upsert a deviation row for this (check_date, scenario_key, ticker). Leaves
-    an existing reason in place if the row already exists (re-running the daily
+def record_deviation(check_date, scenario_key, expected_outcome, actual_summary, ticker=None,
+                      node_id=None, mode=None):
+    """Upsert a deviation row for this (check_date, scenario_key, node_id, ticker, mode).
+    Leaves an existing reason in place if the row already exists (re-running the daily
     check shouldn't clobber a reason someone already attached) but refreshes
-    actual_summary/ts so the row reflects the latest observation."""
-    ticker = ticker or ''  # see add_scenario_expectation -- NULL never conflicts with NULL
+    actual_summary/ts so the row reflects the latest observation. See
+    add_scenario_expectation for why this is an explicit COALESCE-based
+    check-then-upsert rather than a UNIQUE-backed ON CONFLICT."""
     with _conn() as c:
-        c.execute("""
-            INSERT INTO coverage_deviations
-                (check_date, scenario_key, ticker, expected_outcome, actual_summary)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(check_date, scenario_key, ticker) DO UPDATE SET
-                actual_summary=excluded.actual_summary,
-                ts=datetime('now')
-        """, (check_date, scenario_key, ticker, expected_outcome, actual_summary))
+        existing = c.execute("""
+            SELECT id FROM coverage_deviations
+            WHERE check_date = ? AND scenario_key = ?
+              AND COALESCE(node_id, -1) = COALESCE(?, -1)
+              AND COALESCE(ticker, '') = COALESCE(?, '')
+              AND COALESCE(mode, '') = COALESCE(?, '')
+        """, (check_date, scenario_key, node_id, ticker, mode)).fetchone()
+        if existing:
+            c.execute("""
+                UPDATE coverage_deviations SET actual_summary=?, ts=datetime('now')
+                WHERE id=?
+            """, (actual_summary, existing[0]))
+        else:
+            c.execute("""
+                INSERT INTO coverage_deviations
+                    (check_date, scenario_key, ticker, node_id, mode, expected_outcome, actual_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (check_date, scenario_key, ticker, node_id, mode, expected_outcome, actual_summary))
         c.commit()
 
 
@@ -845,24 +1025,63 @@ def get_deviations(unexplained_only=False, check_date=None, limit=500):
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
-def get_closed_trades_for_ticker_on_date(ticker, check_date):
+def get_closed_trades_for_ticker_on_date(ticker, check_date, strategy=None, version=None,
+                                          window=None, account=None):
     """trade_log rows that both entered and exited on check_date (YYYY-MM-DD) --
     the 'same-day full lifecycle' shape coverage_check.py's trade_lifecycle
-    check needs. Newest first."""
+    check needs. Newest first. Ticker alone is ambiguous when a ticker has more
+    than one real node (e.g. GDXU: watch_list ids 88 and 108, different
+    accounts/versions on the same active watchlist) -- pass the node's
+    disambiguators (from get_watch_list_node) to scope correctly, or a wrong
+    node's trade can satisfy a different node's expectation (found by Opus
+    review, 2026-07-24)."""
+    q = "SELECT * FROM trade_log WHERE ticker = ? AND date(entry_time) = ? AND date(exit_time) = ?"
+    params = [ticker, check_date, check_date]
+    if strategy:
+        q += " AND strategy = ?"
+        params.append(strategy)
+    if version:
+        q += " AND version = ?"
+        params.append(version)
+    if window is not None:
+        q += " AND window = ?"
+        params.append(window)
+    if account:
+        q += " AND account = ?"
+        params.append(account)
+    q += " ORDER BY id DESC"
     with _conn() as c:
-        return [dict(r) for r in c.execute("""
-            SELECT * FROM trade_log
-            WHERE ticker = ? AND date(entry_time) = ? AND date(exit_time) = ?
-            ORDER BY id DESC
-        """, (ticker, check_date, check_date)).fetchall()]
+        return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
-def get_pending_buys_for_ticker_on_date(ticker, check_date):
+def get_pending_buys_for_ticker_on_date(ticker, check_date, strategy=None, version=None,
+                                         window=None, account=None):
+    """See get_closed_trades_for_ticker_on_date for why ticker alone is
+    ambiguous. pending_buys has no real strategy/version/window/account
+    columns (they live inside node_json), so disambiguation is a Python-side
+    filter after the ticker/date SQL match, not a SQL WHERE clause."""
     with _conn() as c:
-        return [dict(r) for r in c.execute("""
+        rows = [dict(r) for r in c.execute("""
             SELECT * FROM pending_buys WHERE ticker = ? AND date(signal_time) = ?
             ORDER BY id DESC
         """, (ticker, check_date)).fetchall()]
+    for r in rows:
+        r['node'] = json.loads(r['node_json'])
+    if not any([strategy, version, window is not None, account]):
+        return rows
+    out = []
+    for r in rows:
+        node = r['node'] or {}
+        if strategy and node.get('strategy') != strategy:
+            continue
+        if version and node.get('version') != version:
+            continue
+        if window is not None and node.get('window') != window:
+            continue
+        if account and node.get('account') != account:
+            continue
+        out.append(r)
+    return out
 
 
 def log_slack_message(mode, text, error=None):
@@ -958,7 +1177,7 @@ def get_held_tickers():
     return {p['ticker'] for p in get_open_positions()}
 
 
-_PENDING_BUY_NODE_KEYS = ('ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
+_PENDING_BUY_NODE_KEYS = ('id', 'ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
                           'max_hold_hours', 'label', 'trail_sell_pct', 'fixed_sl', 'trail_buy_pct',
                           'arm_sell_pct', 'account', 'starting_notional')
 

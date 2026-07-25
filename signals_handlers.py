@@ -138,6 +138,20 @@ if cfg.SOCKET_MODE:
         drift_pct  = (fill_price - signal_price) / signal_price * 100
         shares     = int(body['view']['state']['values']['shares_block']['shares_input']['value'])
 
+        if not any(p['ticker'] == ticker for p in db.get_pending_buys()):
+            # See handle_entry_price's identical guard -- the pending_buys row
+            # this button was built from is already gone (Missed It/Cancelled,
+            # or a stale click on an old message).
+            print(f"  [warn] {ticker} — no pending_buys row found, ignoring stale Filled confirmation")
+            client.chat_update(
+                channel=channel, ts=ts,
+                text=f"{ticker} — already resolved, this confirmation was ignored",
+                blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                         "text": f"⚠️ *{ticker}* — this signal was already resolved (missed/cancelled) -- "
+                                 f"this stale confirmation was *not* recorded."}}],
+            )
+            return
+
         opened = db.open_position(node, signal_price, signal_time, fill_price, datetime.now(), shares=shares)
         db.clear_pending_buy(ticker)
 
@@ -195,6 +209,21 @@ if cfg.SOCKET_MODE:
         drift_pct  = (exec_price - signal_price) / signal_price * 100
         now        = datetime.now()
         shares     = int(_last_sale_recovery(ticker, node.get('starting_notional')) // exec_price)
+
+        if not any(p['ticker'] == ticker for p in db.get_pending_buys()):
+            # The pending_buys row this button was built from is already gone
+            # (Skipped, cleared by another path, or a stale/duplicate button
+            # click on an old message) -- proceeding would open a real
+            # position for an abandoned/already-resolved signal.
+            print(f"  [warn] {ticker} — no pending_buys row found, ignoring stale Executed confirmation")
+            client.chat_update(
+                channel=channel, ts=ts,
+                text=f"{ticker} — already resolved, this confirmation was ignored",
+                blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                         "text": f"⚠️ *{ticker}* — this signal was already resolved (skipped/cleared) -- "
+                                 f"this stale confirmation was *not* recorded."}}],
+            )
+            return
 
         opened = db.open_position(node, signal_price, signal_time, exec_price, now, shares=shares)
 
