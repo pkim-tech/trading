@@ -3554,3 +3554,47 @@ to one-line pointers per convention.
   per-ticker design decision (undecided), the dry_run-completion design question (deferred), the
   stale-pending-buys-guard latent gap (not currently reachable), and the account-segregation /
   new-dedicated-account plans discussed in prior sessions.
+
+---
+
+## 2026-07-25 — v5 watchlist flipped back to research mode, restoring paper trading (Monday item resolved early); inverse-pair gap flagged
+
+### What we did
+Short discussion-driven session, no code changes — one deliberate DB mutation plus doc updates.
+
+- User reflected that live-trading prep should have included more inverse-pair tickers, and that
+  paper trading only produced 6 orders — too sparse to spread tests across. Traced the sparseness to
+  the already-known root cause (paper trading fully dormant since the 2026-07-23 mode='live' flip),
+  not a ticker-count problem.
+- Considered adding more `mode='research'` nodes to generate paper-trading volume, but concluded that
+  just adds coverage on *different* tickers, not on the real live watchlist — the actual fix is
+  flipping the real v5 tickers back to `research` so paper trading validates the tickers/strategy that
+  are actually meant to go live.
+- Clarified canaries (SPY/QQQ/IWM/DIA/VOO/XLF) don't need this treatment — already non-overlapping
+  with the v5 set, different purpose (proof-of-life, not real coverage).
+- **Executed**: flipped all 10 v5-version nodes on watchlist 65 (AGQ, DPST, GDXU, HIBL, KORU, NUGT,
+  SOXL, UDOW, USD, YANG) from `mode='live'` to `mode='research'` via direct SQL (scoped by
+  `version='v5'` specifically to avoid also touching GDXU's separate `soxl_test` node, which shares a
+  ticker). All 10 are already in `SCHWAB_AUTOMATION_TICKERS`, so paper trading should start firing on
+  the next poll — no daemon restart needed, `active_signals.py` reads `watch_list` live each cycle.
+  Backfilled the mutation into `watch_list_audit` (bypassed by the raw SQL write, so logged manually
+  to keep `get_watchlist_audit` accurate). Canary and `soxl_test` nodes untouched.
+- This resolves item 1 of the 2026-07-24 "paper trading fully dormant" backlog entry's Monday
+  (2026-07-27) follow-up list, ahead of schedule. Items 2 (restructure BUY routing to run real+paper
+  regardless of mode) and 3 (`account=None` gap on 15/24 live nodes) remain open, still targeted for
+  Monday.
+- New backlog idea logged: v5 watchlist skews long-only (only YANG is inverse) — the old v4 set had
+  hedge-like pairing (EDC/AGQ vs SOXL/KORU) that didn't carry over into the v5 selection, which picked
+  per-ticker on cliff-safe robust alpha only. Not scoped yet.
+- `CLAUDE.md`'s Live Trading state section updated to reflect the flip and note it had briefly gone
+  `live` 2026-07-23 for a real-account test day (`dry_run=True` throughout, no real orders resulted).
+
+### What's next
+- Monday (2026-07-27): decide on the run-both restructure and the `account=None` gap (items 2/3 of
+  the paper-trading-dormant entry).
+- Watch the coverage compass (finished last session) and the newly-restored paper trading run through
+  a real week — no other build work queued.
+- Inverse-pair watchlist idea is open, unscoped — pick up whenever ticker selection is revisited.
+
+No code files changed this session (DB mutation + `CLAUDE.md`/`docs/backlog_cache.md` updates only) —
+no Opus review or `live_sim_harness.py` run needed per the session-wrap gate.

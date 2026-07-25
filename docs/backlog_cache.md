@@ -222,6 +222,23 @@ Follow-ups user wants to revisit **Monday (2026-07-27)**, not this week:
    the new one. Worth remembering as a class of gap that kind of review structurally can't catch:
    cross-session decision reconciliation, not single-diff correctness.
 
+**Item 1 resolved 2026-07-25, ahead of the planned Monday date**: all 10 v5-version nodes (watchlist
+65, excluding the 6 canary + `soxl_test` nodes) flipped back `mode='live'` → `research` via a direct
+`watch_list` update (backfilled into `watch_list_audit`) — restores continuous paper-trading coverage
+on the actual live tickers/strategy, matching the original research-mode-as-default design. Canaries
+deliberately left as-is; user's read is they don't need coverage diversity the way the real watchlist
+does (already non-overlapping ticker set, distinct proof-of-life purpose). Items 2 (run-both
+restructure) and 3 (`account=None` gap) still open, still targeted for Monday 2026-07-27.
+
+## [live-trading] Idea, raised 2026-07-25 — v5 watchlist skews long-only, consider adding inverse counterparts
+All 10 v5 tickers are one-directional leveraged longs (SOXL, GDXU, NUGT, HIBL, KORU, DPST, UDOW, USD,
+AGQ) except YANG (the only inverse ticker) — the whole book loses together in a broad leveraged-long
+selloff, unlike the old v4 set which had some hedge-like pairing (EDC/AGQ as SOXL/KORU hedges, per
+`[[project_watchlist_selection_rationale]]`). That portfolio-balance logic didn't carry over into the
+v5 selection, which picked per-ticker on cliff-safe robust alpha only. Not scoped — which inverse
+counterparts (e.g. a bear pair for SOXL/GDXU), whether via a fresh resweep or grafting existing v4
+inverse nodes onto watchlist 65. Design conversation for later, not blocking anything today.
+
 ## [live-trading][security] Resolved 2026-07-24 evening — `_trailing_buy_status` now anchors to the real `signal_price` trigger instead of a cache-derived one. Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry.
 
 ## [live-trading] Resolved 2026-07-24 evening — `TrailingBothZScoreBreakout` fills now get a real automated stop-loss (both auto-fill and manual-Filled paths). Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry. Live verification still planned for Monday 2026-07-27 per the original plan.
