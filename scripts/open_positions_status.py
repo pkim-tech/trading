@@ -16,7 +16,8 @@ def main():
     if not positions:
         print("No open positions.")
         return
-    cols = ["ticker", "strategy", "version", "window", "shares", "entry_price", "entry_time", "signal_time"]
+    cols = ["ticker", "strategy", "version", "window", "shares", "entry_price", "entry_time", "signal_time",
+            "is_dry_run_sim"]
     widths = {c: max(len(c), *(len(str(p.get(c, ""))) for p in positions)) for c in cols}
     print("  ".join(c.ljust(widths[c]) for c in cols))
     for p in positions:

@@ -4026,3 +4026,64 @@ harness: 6/6 passed. `py_compile` clean on both changed files.
 ### Next
 Resume the Monday (2026-07-27) `soxl_ira` unattended live-test plan. Separately, the user flagged
 wanting a broader docs/backlog cleanup pass "eventually" — not scoped, deferred to a later session.
+
+---
+
+## 2026-07-26 — Built dry_run fill synthesis, closing the canary/dry_run "no closed trade" false-positive gap
+
+### What we did
+Investigated 4 unexplained `coverage_deviations` rows (XLF/VOO/IWM/QQQ, dated 2026-07-24, still
+unexplained) — traced to a real design gap flagged 2026-07-24 evening but not yet built: a
+`dry_run=True` account's real broker order-placement call short-circuits before the actual API
+call, so the `pending_buys` row `notify_buy_signal` created never gets a real fill confirmation.
+It just sits forever — `open_positions`/`trade_log` never gets a row, so the daily coverage check
+correctly (if unhelpfully) flags "no closed trade found" every single day for these canaries.
+
+Built the fix the user's own earlier candidate design called for: stage positions as if they'd
+filled, the same way paper trading does — but per explicit user decision, write to the REAL
+`open_positions`/`trade_log` tables (tagged `is_dry_run_sim=1`), not `paper_trading.py`'s separate
+tables, so `coverage_check.py` needs no changes. New `signals_notify.update_dry_run_buys`/
+`_fill_dry_run_buy` (bounce-fill or immediate fill depending on trailing-buy vs market-buy-eligible,
+mirroring `paper_trading.py`'s simulation) and `check_dry_run_sim_sells` (immediate close on exit
+signal, instead of waiting on a Slack button that will never be tapped). Schema: `is_dry_run_sim`
+added to `open_positions`/`trade_log` (+ mirrored on paper tables so the shared INSERT works
+unchanged), `running_low` added to `pending_buys`.
+
+Per `session wrap` convention, spawned an independent Opus review of the diff (background,
+`model: opus`) since this touches `active_signals.py`/`signals_notify.py`/`signals_db.py`. Found 6
+CONFIRMED + 2 PLAUSIBLE issues, all fixed same session:
+1. **Most severe**: `active_signals._scan_pinned_exit_arm` (a separate, earlier exit-check loop)
+   was missed by the original skip guard — it shares `last_seen_bar` with the new function
+   (would have corrupted its own bar-close detection) and would have fired real
+   `notify_trailing_activated`/`notify_sell_signal` Slack flows on a synthetic position with no
+   real order behind it. Fixed: added the same `is_dry_run_sim` skip there.
+2. This also meant the reminder loops were only accidentally safe — resolved by fixing #1.
+3. `_fill_dry_run_buy` never checked `open_position()`'s return value — a duplicate fill attempt
+   would re-post a false "would have filled" alert and coverage row every poll, forever. Fixed:
+   checks `opened`, bails on `False`.
+4. A `wl_id`-less `pending_buys` row would never clear and re-fire forever. Fixed: fails closed,
+   skips any `wl_id`-less row.
+5. `closed_today()`/`_last_sale_recovery()` read `trade_log` with no filter — a simulated dry-run
+   exit could block a real same-day re-buy or size a real order off fake proceeds. Fixed: both now
+   exclude `is_dry_run_sim` rows.
+6. Synthetic positions were indistinguishable from real ones in the Morning Report/`cmd_positions`/
+   `open_positions_status.py`. Fixed: tagged `🧪DRY-RUN-SIM`, "Manually Close" button suppressed.
+7/8. Plausible, cheap: added a `mode=='live'` gate on the new buy-side function; synced
+   `check_gap_resize` to read the new `running_low` column instead of `signal_price`.
+
+Added 12 tests total in new `tests/test_dry_run_sim.py`, targeting exactly these failure modes
+(double-fill, market-buy branch, wl_id-less fallback, `closed_today`/`_last_sale_recovery`
+exclusion, `_scan_pinned_exit_arm` skip) — not just the happy path.
+
+### Verification
+Full suite: 244 passed (was 232 at session start, 238 after first pass, 244 after fixes).
+`scripts/live_sim_harness.py`: 6/6. `signals_invariants.py`: unchanged, 1 known accepted violation
+(UDOW). `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers
+AGQ,SOXL`: both clean, no new mismatches.
+
+### Next
+Not yet observed live — this is new daemon logic, not yet run against a real restart. Next natural
+checkpoint: the canaries' `coverage_deviations` rows should stop reappearing once the daemon
+restarts with this change; check `coverage_matrix.py`/`coverage_check.py` for a real `entry_fill`/
+`exit_fill` `mode=dry_run` row to confirm the synthesis fires live, not just in tests. Also resume
+the Monday (2026-07-27) `soxl_ira` unattended live-test plan, carried over from last session.

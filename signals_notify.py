@@ -20,7 +20,7 @@ from signals_charts import _chart_buy, _chart_sell, _upload_chart
 from signals_blocks import _post_message, _build_buy_blocks, _build_sell_blocks
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
-    buy_order_sizing,
+    buy_order_sizing, log_poll, _pos_key,
 )
 # scripts/ has no __init__.py but is still importable as a Python 3 implicit
 # namespace package as long as repo root is on sys.path (true whenever this
@@ -224,6 +224,12 @@ def check_live_state_reconciliation(open_positions):
     so there's no fail-closed obligation the way schwab_safety.check_order
     has)."""
     for pos in open_positions:
+        if pos.get('is_dry_run_sim'):
+            # No real order was ever placed for this position -- the broker has
+            # no matching state to compare against at all (that's the whole
+            # reason it's synthesized), so this would only ever produce a false
+            # share-count/missing-protective-order mismatch.
+            continue
         ticker = pos['ticker']
         if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
             continue
@@ -381,6 +387,139 @@ def _sync_confirm_and_protect(ticker, node):
                       f"confirmed by the auto-fill poll or account-activity stream.")
         return
     _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'])
+
+
+# ---------------------------------------------------------------------------
+# Dry-run fill synthesis
+# ---------------------------------------------------------------------------
+
+def update_dry_run_buys():
+    """Mirrors paper_trading.update_paper_buys, but for a real mode='live' node
+    whose account is dry_run=True (schwab_safety.ACCOUNTS[account].dry_run).
+    schwab_client short-circuits before the real broker call for such an
+    account (_place_trailing_order/_place_equity_order both return (None, None)
+    on dry_run), so the pending_buys row notify_buy_signal created will never
+    be confirmed by a real fill event -- it just sits forever (the root cause
+    of canaries/other dry_run nodes never showing a closed trade in
+    coverage_check.py). Synthesizes the fill against real price data instead,
+    writing to the real open_positions/trade_log tables tagged
+    is_dry_run_sim=1 so it's never confused with a genuine fill. Called
+    unconditionally every poll, same as paper_update_buys -- a dry_run
+    trailing buy can bounce-fill any time after the signal fires."""
+    for pb in db.get_pending_buys():
+        wl_id = pb.get('wl_id')
+        if not wl_id:
+            # Legacy/unbackfillable row predating the wl_id migration -- the
+            # frozen node_json snapshot's 'id' can't be trusted to key
+            # update_pending_buy_running_low/clear_pending_buy_by_wl_id (both
+            # WHERE wl_id=?, which NULL never matches), which would leave the
+            # row stuck and re-fire a synthetic fill every poll forever (Opus
+            # review 2026-07-26). Fail closed -- leave it to the manual/legacy
+            # ticker-keyed flow instead.
+            continue
+        node = db.get_watch_list_node_by_id(wl_id)
+        if node is None:
+            continue
+        if node.get('mode') != 'live':
+            # A research-mode node's BUY never reaches here today (routed to
+            # paper_trading.start_paper_buy instead, which never creates a
+            # pending_buys row) -- explicit guard anyway, so a future routing
+            # change can't open a real open_positions row alongside the node's
+            # own paper_positions row for the same wl_id (Opus review 2026-07-26).
+            continue
+        account = node.get('account')
+        limits = schwab_safety.ACCOUNTS.get(account)
+        if not limits or not limits.dry_run:
+            continue
+        ticker = pb['ticker']
+        price, _ = compute._current_price(ticker)
+        if price is None:
+            continue
+        if db._is_trailing_buy(node):
+            running_low = min(pb['running_low'] or pb['signal_price'], price)
+            trail_buy_pct = node.get('trail_buy_pct') or 0.0
+            trigger = running_low * (1 + trail_buy_pct / 100)
+            log_poll(f"{ticker} dry_run_update_buys price={price:.4f} running_low={running_low:.4f} "
+                     f"trigger={trigger:.4f}")
+            if price > running_low and price >= trigger:
+                _fill_dry_run_buy(node, pb, price)
+            elif running_low != pb['running_low']:
+                db.update_pending_buy_running_low(wl_id, running_low)
+        else:
+            # Market-buy-eligible node: a real market order fills near-immediately,
+            # no bounce phase to simulate -- same reasoning as
+            # paper_trading.start_paper_market_buy.
+            _fill_dry_run_buy(node, pb, price)
+
+
+def _fill_dry_run_buy(node, pb, price):
+    ticker = node['ticker']
+    trailing_buy = db._is_trailing_buy(node)
+    sizing = buy_order_sizing(node, {'ticker': ticker, 'current_price': price})
+    shares = sizing['shares']
+    if shares < 1:
+        print(f"  [dry-run-sim] {ticker} fill at ${price:.4f} too small to size a share — dropping pending buy")
+        db.clear_pending_buy_by_wl_id(node['id'])
+        return
+    opened = db.open_position(node, pb['signal_price'], pb['signal_time'], price, datetime.now(),
+                               shares=shares, is_dry_run_sim=True)
+    db.clear_pending_buy_by_wl_id(node['id'])
+    if not opened:
+        # Already open for this node (e.g. a prior poll's fill already landed) --
+        # a silent skip must not be reported as a fill (same contract as every
+        # other open_position() caller; Opus review 2026-07-26 caught this one
+        # missing the check, which would otherwise re-post a false "would have
+        # filled" message and a false coverage row every poll forever).
+        print(f"  [dry-run-sim] {ticker} already has an open position — dropping duplicate pending buy")
+        return
+    db.log_coverage_event("entry_fill", "dry_run", ticker=ticker, node_id=node.get('id'),
+                           result="sim_filled", detail=f"shares={shares} price={price:.4f}")
+    label = "TRAILING BUY" if trailing_buy else "MARKET BUY"
+    _post_message(f"[DRY RUN] would have filled {label} — {ticker}  {shares}sh @ ${price:.4f}")
+
+
+def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
+    """Sell-side mirror of update_dry_run_buys, following the same pattern as
+    paper_trading.check_paper_sells -- an is_dry_run_sim position has no real
+    resting order at the broker, so nothing will ever confirm an exit either;
+    close it immediately against real price data once check_sell_condition
+    fires, instead of routing through notify_sell_signal's Slack-button wait
+    (which real/live positions correctly use, since those DO have a real order
+    to confirm)."""
+    for pos in db.get_open_positions():
+        if not pos.get('is_dry_run_sim'):
+            continue
+        ticker = pos['ticker']
+        df_hourly, _ = load_cache(ticker)
+        if df_hourly is None or df_hourly.empty:
+            continue
+        last_bar_ts = df_hourly.index[-1]
+        if (pos['id'], last_bar_ts) in dry_run_sell_alerted:
+            continue
+        at_bar_close = last_seen_bar.get(_pos_key(pos)) != last_bar_ts
+        if at_bar_close:
+            last_seen_bar[_pos_key(pos)] = last_bar_ts
+            bar = df_hourly.iloc[-1]
+            cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
+        else:
+            cp, _ = compute._current_price(ticker)
+            if cp is None:
+                continue
+            low = high = op = cp
+        log_poll(f"{ticker} dry_run_check_sells bar={last_bar_ts} at_bar_close={at_bar_close} "
+                 f"cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
+        reason, target, just_activated_trailing = compute.check_sell_condition(
+            pos, cp, datetime.now(), at_bar_close=at_bar_close, low=low, high=high, open_price=op,
+            df_hourly=df_hourly)
+        if just_activated_trailing:
+            _post_message(f"[DRY RUN] trailing-sell would arm — {ticker}")
+        if reason:
+            db.close_position(pos['id'], exit_signal_price=cp, exit_price=target,
+                               exit_time=datetime.now(), exit_reason=reason)
+            db.log_coverage_event("exit_fill", "dry_run", ticker=ticker, position_id=pos['id'],
+                                   node_id=pos.get('wl_id'), result=reason, detail=f"price={target:.4f}")
+            _post_message(f"[DRY RUN] would have closed — {ticker}  {reason} @ ${target:.4f}")
+            dry_run_sell_alerted.add((pos['id'], last_bar_ts))
 
 
 # ---------------------------------------------------------------------------
@@ -1115,7 +1254,12 @@ def check_gap_resize():
                           f"(resting order's overnight gap wasn't checked)")
             continue
         trail_buy_pct = node.get('trail_buy_pct') or 0.0
-        running_low = pending['signal_price']
+        # running_low (added for dry-run-sim tracking) starts equal to signal_price
+        # at creation and only moves via intraday polling -- reading it here keeps
+        # this in sync with whatever update_dry_run_buys/the real broker have
+        # already observed, instead of a hardcoded signal_price that could go
+        # stale if this function is ever invoked after some intraday polling did occur.
+        running_low = pending['running_low'] or pending['signal_price']
         buy_trigger = running_low * (1 + trail_buy_pct / 100)
         try:
             current_price = schwab_client.get_current_price(ticker)
@@ -1328,8 +1472,13 @@ def _ticker_block(row):
         else:
             arm, ts = row.get('Arm%'), row.get('TrailSell%')
             arm_ts_line = f"\narm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
+        # No real broker fill/order exists behind this row -- must never read as
+        # an actionable real position (same reasoning as the 🧪CANARY tag below,
+        # Opus review 2026-07-26 flagged this row was otherwise indistinguishable
+        # from a genuine held position).
+        sim_tag = ' 🧪DRY-RUN-SIM' if pos and pos.get('is_dry_run_sim') else ''
         text = (
-            f"{phase_str}*{ticker}* `{version}` — {row['Hold']}{account_str}{entry_str}\n"
+            f"{phase_str}*{ticker}* `{version}`{sim_tag} — {row['Hold']}{account_str}{entry_str}\n"
             f"now `${now:.2f}` {pnl:+.1f}%  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_{sl_str}{arm_ts_line}"
         )
@@ -1369,7 +1518,7 @@ def _ticker_block(row):
         node = row.get('_node')
         if row['Held']:
             pos = row.get('_pos')
-            if pos:
+            if pos and not pos.get('is_dry_run_sim'):
                 value = json.dumps({"position_id": pos['id'], "ticker": ticker, "entry_price": pos['entry_price']})
                 elements.append({"type": "button", "text": {"type": "plain_text", "text": f"Manually Close {ticker}"},
                                   "action_id": "manual_close", "value": value})

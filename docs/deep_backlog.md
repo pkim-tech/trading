@@ -1,5 +1,103 @@
 # Backlog
 
+## ✅ [live-trading][coverage] Resolved 2026-07-26 — dry_run fill synthesis: a dry_run account's trailing/market-buy order now closes the loop against real price data
+**Problem**: `coverage_deviations` showed real, unexplained "no closed trade found" rows for the 6
+canary tickers (specifically XLF/VOO/IWM/QQQ, ids 7-10, dated 2026-07-24, still unexplained as of
+this session) — traced to a real design gap, not a bug in the checker: a `dry_run=True` account's
+real broker order-placement call short-circuits *before* the actual API call
+(`schwab_client._place_trailing_order`/`_place_equity_order` both return `(None, None)` and post a
+`"[DRY RUN] would ..."` Slack message), so the `pending_buys` row `notify_buy_signal` created never
+gets a real fill confirmation — it just sits forever, `open_positions`/`trade_log` never gets a row,
+and the daily coverage check correctly (if unhelpfully) flags it as a deviation every single day.
+This is the same open question flagged 2026-07-24 evening ("how does dry_run test completion at
+all") — the user's own candidate design from that session (stage positions as if they'd filled, the
+same way paper trading does) is what got built.
+
+**Design decision**: write to the REAL `open_positions`/`trade_log` tables (not `paper_trading.py`'s
+separate `paper_positions`/`paper_trade_log`), tagged with a new `is_dry_run_sim` column — user's
+explicit call, so `coverage_check.py`'s existing `trade_log`-reading logic needs no changes at all.
+Schema: `is_dry_run_sim` added to `open_positions`/`trade_log` (mirrored onto `paper_positions`/
+`paper_trade_log` purely so `open_position()`'s shared INSERT statement works unchanged against
+either table pair — a paper position is never also dry-run-sim). `running_low` added to
+`pending_buys` (mirrors `paper_pending_buys.running_low`), used only for dry_run trailing-buy
+bounce tracking.
+
+**Implementation** (`signals_notify.py`): `update_dry_run_buys()` iterates all `pending_buys`,
+skips any node whose account isn't `dry_run=True` (or whose mode isn't `'live'`), then either
+tracks running_low/synthesizes a bounce-fill (trailing-buy nodes, same math as
+`paper_trading.update_paper_buys`) or fills immediately (market-buy-eligible nodes, same reasoning
+as `paper_trading.start_paper_market_buy`) — calling `open_position(..., is_dry_run_sim=True)` and
+posting a `[DRY RUN] would have filled ...` Slack message. `check_dry_run_sim_sells()` mirrors
+`paper_trading.check_paper_sells()`: once `check_sell_condition` fires an exit reason on an
+`is_dry_run_sim` position, closes it immediately rather than routing through `notify_sell_signal`'s
+Slack-button-wait flow (correct only for a real order that might actually get a human tap). Both
+wired into `active_signals.py`'s `run_loop` at the same cadence as their paper-trading equivalents;
+the normal per-position exit-check loop skips `is_dry_run_sim` positions (routed to the new function
+instead), as does `check_live_state_reconciliation` (no real broker state exists to compare
+against for a synthetic position, by design).
+
+**Opus review (session-wrap convention, since this touches `active_signals.py`/`signals_notify.py`/
+`signals_db.py`) found 6 CONFIRMED + 2 PLAUSIBLE issues, all fixed same session**:
+1. **Most severe** — `active_signals._scan_pinned_exit_arm` (a separate, earlier-firing exit-check
+   loop) was missed by the original `is_dry_run_sim` skip guard. It shares the `last_seen_bar` dict
+   with `check_dry_run_sim_sells`, so it would have consumed the bar-close marker out from under the
+   new function (silently downgrading it to the mid-bar/continuous branch, bypassing the real
+   intrabar Low/High gap-through-trigger logic) — and it would have fired real
+   `notify_trailing_activated`/`notify_sell_signal` Slack flows (arm + interactive SELL button) for a
+   position with no real order behind it at all. Fixed: added the same skip guard there too.
+2. This also meant `check_trailing_reminders`/`check_exit_reminders` (which look mostly like no-ops
+   for a sim position, since `trail_state`'s `trailing`/`exit_pending` fields are normally never set
+   for one) were only safe *because* of finding #1's absence — once `notify_trailing_activated`/
+   `notify_sell_signal` fired via that gap, they'd start nagging every 15 minutes forever. Resolved
+   by fixing #1, no separate change needed.
+3. `_fill_dry_run_buy` never checked `open_position()`'s own return value (`False` on a duplicate/
+   already-open node) — its docstring explicitly warns every caller must check this "since a silent
+   skip must not be reported as a fill." A duplicate fill attempt (e.g. a stale leftover
+   `pending_buys` row) would have re-posted a false `[DRY RUN] would have filled` Slack message and a
+   false `coverage_events` row every poll, forever. Fixed: checks `opened`, bails cleanly on `False`.
+4. A `pending_buys` row with a falsy `wl_id` (legacy/pre-migration, or any future edge case) would
+   never actually clear (`clear_pending_buy_by_wl_id`/`update_pending_buy_running_low` both key on
+   `wl_id`, and SQL `NULL = ?` never matches) — combined with #3's missing check, this would re-fire
+   a synthetic fill attempt and a false alert every poll indefinitely. Fixed: fails closed, skips any
+   `wl_id`-less row entirely rather than trusting the frozen `node_json` snapshot fallback.
+5. Simulated dry-run fills were contaminating two real safety/sizing code paths with no filter:
+   `signals_db.closed_today()` (the same-day-rebuy cash-settlement warning/`SafetyViolation`) and
+   `signals_helpers._last_sale_recovery()` (real order sizing off the last closed trade's proceeds).
+   A simulated exit could have suppressed a real order or sized a real order off fake proceeds —
+   currently latent (the one `dry_run=False` account, `soxl_ira`, is `account_type="margin"`, which
+   `closed_today` doesn't even branch on; no shared account currently mixes sim and real trade
+   history), but a real hazard the moment either changes. Fixed: both queries now filter
+   `is_dry_run_sim=0`.
+6. Synthetic positions were completely indistinguishable from real ones in every human-facing
+   surface (`build_reference_table`/`_ticker_block`'s Held branch, `cmd_positions`,
+   `scripts/open_positions_status.py`) — the exact class of ambiguity the existing 🧪CANARY/
+   `(research)` tagging convention (2026-07-23) was built to prevent. Fixed: added a `🧪DRY-RUN-SIM`
+   tag to the Held branch, suppressed the "Manually Close" button for a sim position (no real
+   position to close), added an `is_dry_run_sim`/Sim column to both CLI tools.
+7. (Plausible) No `node['mode'] == 'live'` gate on `update_dry_run_buys` — not currently reachable
+   (a `research`-mode node's BUY never creates a `pending_buys` row today), but added defensively so
+   a future BUY-routing change can't silently open a real `open_positions` row alongside a node's own
+   `paper_positions` row for the same `wl_id`.
+8. (Plausible, cosmetic) `check_gap_resize` was still reading `pending['signal_price']` as its
+   running-low reference instead of the new `running_low` column — synced for consistency (no
+   material behavior change pre-fix, since overnight polling never moves `running_low` anyway).
+
+**Verification**: 12 new tests in `tests/test_dry_run_sim.py`, added incrementally as each Opus
+finding was fixed — specifically target double-fill prevention, the market-buy-eligible immediate-
+fill branch, the `wl_id`-less fail-closed skip, `closed_today`/`_last_sale_recovery` exclusion, and
+the `_scan_pinned_exit_arm` skip guard (not just the original happy-path fill/close tests). Full
+suite: 244 passed (was 238 pre-session). `scripts/live_sim_harness.py`: 6/6. `signals_invariants.py`:
+unchanged, 1 known accepted violation (UDOW). `verify_trailing_buy_resolution.py`/
+`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`: both clean, no new mismatches (this diff
+never touched `strategies.py`/`backtester.py`, run per the pre-commit checklist's
+`active_signals.py`-changed trigger anyway).
+
+**Not yet observed live** — this is new daemon logic, not yet run against a real restart. Next
+natural checkpoint: the canaries' `coverage_deviations` rows should stop reappearing once the daemon
+restarts with this change; watch `coverage_matrix.py`/`coverage_check.py` output for a real
+`entry_fill`/`exit_fill` `mode=dry_run` row to confirm the synthesis actually fires live, not just in
+tests.
+
 ## ✅ Backlog-hygiene pass, 2026-07-22 — five stale headings closed out, retroactively marked resolved
 Found while doing a dedicated backlog-hygiene pass (flagged as a to-do at the end of the
 prior session): these five `backlog_cache.md` headings described work that had actually

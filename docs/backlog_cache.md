@@ -1,5 +1,28 @@
 # Backlog Cache
 
+## [live-trading][coverage] Resolved 2026-07-26 — dry_run fill synthesis built: a dry_run account's trailing/market-buy order now closes the loop against real price data instead of stalling forever. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
+Fixes the canary/dry_run "no closed trade found" false-positive `coverage_deviations` (XLF/VOO/
+IWM/QQQ, ids 7-10, unexplained since 2026-07-24) — root cause: a `dry_run=True` account's real
+broker order never gets a real fill event (schwab_client short-circuits before the broker call),
+so the `pending_buys` row just sits forever and no `open_positions`/`trade_log` row is ever
+written. New `signals_notify.update_dry_run_buys`/`check_dry_run_sim_sells` mirror
+`paper_trading.py`'s bounce-fill/immediate-close simulation but against the real
+`open_positions`/`trade_log` tables (user's explicit call, not the paper tables), tagged
+`is_dry_run_sim=1`. Opus review found 6 CONFIRMED + 2 PLAUSIBLE issues, all fixed same session:
+(1) most severe — `active_signals._scan_pinned_exit_arm` was missed by the initial skip guard,
+which would have corrupted the new function's own bar-close detection (shared `last_seen_bar`)
+and fired real `notify_trailing_activated`/`notify_sell_signal` Slack flows on a synthetic
+position; (2) `_fill_dry_run_buy` didn't check `open_position()`'s return value, so a duplicate
+fill attempt would re-post a false "would have filled" alert forever; (3) a `wl_id`-less
+`pending_buys` row would never clear and re-fire forever — now fails closed; (4) `closed_today`/
+`_last_sale_recovery` read `trade_log` with no filter, so a simulated exit could block a real
+same-day re-buy or size a real order off fake proceeds — both now exclude `is_dry_run_sim` rows;
+(5) synthetic positions were indistinguishable from real ones in the Morning Report/`cmd_positions`/
+`open_positions_status.py` — now tagged `🧪DRY-RUN-SIM`, "Manually Close" button suppressed; (6) no
+mode gate on the new buy-side function — added defensively. 6 new tests target these exact failure
+modes. Full suite: 244 passed (was 238). `live_sim_harness.py`: 6/6. `signals_invariants.py`: 1
+known accepted violation (UDOW), unchanged.
+
 ## [live-trading][security] Resolved 2026-07-26 — `signals_invariants.py` built: startup + pre-commit config-invariant checks, 4 checks live. Full detail: `CLAUDE.md`'s Key Files entry.
 Mitigates the Opus round-6 "stale-pending-buys guard" finding (still open, still needs live-Slack
 testing before the handler itself is fixed) by guarding the config-state precondition instead —
@@ -176,7 +199,7 @@ decision). Add a `node.get('mode', 'live') == 'live'` guard alongside the ticker
 that routing changes — see `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry for full
 context.
 
-## [live-trading][coverage] Open, found 2026-07-24 ~evening via Opus review — coverage_check.py's trade_lifecycle checker may false-positive daily for TrailingBoth canaries under dry_run
+## [live-trading][coverage] Resolved 2026-07-26 — dry_run fill synthesis built (see the 2026-07-26 resolved entry above), closing this gap: dry_run does NOT auto-complete without it, which is exactly why the synthesis exists.
 `_check_trade_lifecycle` (`scripts/coverage_check.py`) reads `trade_log`/`pending_buys` via
 `signals_db.get_closed_trades_for_ticker_on_date`/`get_pending_buys_for_ticker_on_date` — correct
 tables given all 6 canaries are currently `mode='live'`, `account='ira'` (not `research`/paper, an

@@ -92,6 +92,7 @@ from signals_notify import (
     _ticker_block, _send_window_alert, _coverage_mode,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report,
+    update_dry_run_buys, check_dry_run_sim_sells,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
@@ -296,6 +297,14 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
     exit-check loop, so whichever notices a bar-close first suppresses the
     other -- call this before that loop each iteration."""
     for pos in open_positions:
+        if pos.get('is_dry_run_sim'):
+            # No real order/broker linkage exists for this position -- routed
+            # through check_dry_run_sim_sells instead (Opus review 2026-07-26:
+            # this loop was missed by the original is_dry_run_sim skip, letting
+            # it consume last_seen_bar's bar-close marker out from under
+            # check_dry_run_sim_sells AND fire real notify_trailing_activated/
+            # notify_sell_signal Slack flows for a synthetic position).
+            continue
         if pos['ticker'] not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
             continue
         df_hourly, _ = _load_cache(pos['ticker'])
@@ -431,6 +440,7 @@ def run_loop(tickers: set = None):
     buy_alerted:        set[tuple] = set()
     sell_alerted:       set[tuple] = set()  # (position_id, bar_ts) — dedups within a bar, not across bars
     paper_sell_alerted: set[tuple] = set()  # same shape, separate set — paper position ids aren't real ones
+    dry_run_sell_alerted: set[tuple] = set()  # same shape, for is_dry_run_sim positions (real ids, own set)
     window_alerted:     set[tuple] = set()
     limit_fill_alerted: set[tuple] = set()
     # wl_id -> last hourly bar timestamp checked. Seeded from each open
@@ -590,9 +600,17 @@ def run_loop(tickers: set = None):
             for pos in open_positions:
                 if tickers and pos['ticker'] not in tickers:
                     continue
+                if pos.get('is_dry_run_sim'):
+                    # No real order was ever placed for this position (the account
+                    # is dry_run) -- routed through check_dry_run_sim_sells below
+                    # instead, which closes immediately rather than waiting on a
+                    # Slack button tap confirming a real fill that will never come.
+                    continue
                 _guarded(f"exit_check[{pos['ticker']}]", _check_position_exit, pos)
 
             _guarded("paper_check_sells", paper_trading.check_paper_sells, last_seen_bar, paper_sell_alerted, _load_cache)
+            _guarded("dry_run_sim_check_sells", check_dry_run_sim_sells,
+                     last_seen_bar, dry_run_sell_alerted, _load_cache)
             _guarded("live_state_reconciliation", check_live_state_reconciliation, open_positions)
 
             if _reminders_active(now):
@@ -614,6 +632,7 @@ def run_loop(tickers: set = None):
             # Same "not gated to a window" reasoning as check_auto_fills above -- a
             # simulated trailing buy can bounce-fill any time after the signal fires.
             _guarded("paper_update_buys", paper_trading.update_paper_buys)
+            _guarded("dry_run_update_buys", update_dry_run_buys)
 
             if not watchlist:
                 print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
@@ -696,17 +715,18 @@ def cmd_positions():
     if not positions:
         print("No open positions.")
         return
-    hdr = f"{'ID':<4} {'Ticker':<7} {'Entry Price':<13} {'Entry Time':<22} {'Bars Held':<9} {'TP%':<5} {'SL%':<5} {'Hold'}"
+    hdr = f"{'ID':<4} {'Ticker':<7} {'Entry Price':<13} {'Entry Time':<22} {'Bars Held':<9} {'TP%':<5} {'SL%':<5} {'Hold':<6} {'Sim'}"
     print(hdr)
     print('-' * len(hdr))
     for p in positions:
         signal_time = datetime.strptime(p['signal_time'], '%Y-%m-%d %H:%M:%S')
         df_hourly_p, _ = _load_cache(p['ticker'])
         hours = _bars_held(df_hourly_p, signal_time)
+        sim_tag = 'DRY-RUN-SIM' if p.get('is_dry_run_sim') else ''
         print(
             f"{p['id']:<4} {p['ticker']:<7} ${p['entry_price']:<12.4f} "
             f"{p['entry_time']:<22} {hours:<9} {_tp_or_arm_pct(p)!s:<5} "
-            f"{p['stop_loss']:<5} {p['max_hold_hours']}"
+            f"{p['stop_loss']:<5} {p['max_hold_hours']:<6} {sim_tag}"
         )
 
 

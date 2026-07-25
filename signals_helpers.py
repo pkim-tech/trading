@@ -147,14 +147,16 @@ def _last_sale_recovery(node):
     it belonged to" (a real live-sizing bug once 2+ nodes share a ticker with
     different starting_notional/account). A rough estimate, not a live capital
     feed -- doesn't know about other trades competing for the same account's cash
-    in between."""
+    in between. Excludes is_dry_run_sim rows -- a synthesized dry-run fill's
+    proceeds must never size a real order, including in the same account if its
+    dry_run flag is later flipped to live (Opus review 2026-07-26)."""
     ticker = node['ticker']
     with db._conn() as c:
         c.row_factory = sqlite3.Row
         row = c.execute(
             "SELECT exit_price, shares FROM trade_log WHERE ticker=? AND strategy=? AND version=? "
             "AND window=? AND COALESCE(account,'')=COALESCE(?,'') AND exit_price IS NOT NULL "
-            "AND shares IS NOT NULL ORDER BY exit_time DESC LIMIT 1",
+            "AND shares IS NOT NULL AND is_dry_run_sim=0 ORDER BY exit_time DESC LIMIT 1",
             (ticker, node.get('strategy'), node.get('version'), node.get('window'), node.get('account')),
         ).fetchone()
     if row and row['exit_price'] and row['shares']:

@@ -234,6 +234,13 @@ def ensure_tables():
             )
         """)
         op_cols = {r[1] for r in c.execute("PRAGMA table_info(open_positions)").fetchall()}
+        if 'is_dry_run_sim' not in op_cols:
+            # A dry_run account's real broker order is short-circuited before the API
+            # call (schwab_client._place_trailing_order/_place_equity_order), so it
+            # never generates a real fill event -- these positions are synthesized
+            # against real price data instead (signals_notify.update_dry_run_buys)
+            # and must be visibly distinguished from a genuine real/paper fill.
+            c.execute("ALTER TABLE open_positions ADD COLUMN is_dry_run_sim INTEGER NOT NULL DEFAULT 0")
         if 'trade_log_id' not in op_cols:
             c.execute("ALTER TABLE open_positions ADD COLUMN trade_log_id INTEGER")
         if 'trail_state' not in op_cols:
@@ -297,6 +304,8 @@ def ensure_tables():
             c.execute("ALTER TABLE trade_log ADD COLUMN shares REAL")
         if 'account' not in tl_cols:
             c.execute("ALTER TABLE trade_log ADD COLUMN account TEXT")
+        if 'is_dry_run_sim' not in tl_cols:
+            c.execute("ALTER TABLE trade_log ADD COLUMN is_dry_run_sim INTEGER NOT NULL DEFAULT 0")
 
         # pending_buys -- tracks a trailing-buy order from BUY alert until Executed/Skipped
         # is confirmed, so a stalled broker-side fill can be reminded on (mirrors trail_state
@@ -330,6 +339,11 @@ def ensure_tables():
             # embedded in every row's node_json via _PENDING_BUY_NODE_KEYS) to a real,
             # queryable column so lookups/updates/deletes can key on it instead of ticker.
             c.execute("ALTER TABLE pending_buys ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
+        if 'running_low' not in pb_cols:
+            # Only populated/read for a dry_run-account trailing buy (see
+            # signals_notify.update_dry_run_buys) -- a real trailing-buy order's
+            # running low is tracked by the broker itself, not this table.
+            c.execute("ALTER TABLE pending_buys ADD COLUMN running_low REAL")
 
         # paper_positions/paper_trade_log -- schema-identical mirrors of open_positions/
         # trade_log for schwab_safety.AUTOMATION_ENABLED_TICKERS tickers running in research
@@ -362,6 +376,11 @@ def ensure_tables():
         pp_cols = {r[1] for r in c.execute("PRAGMA table_info(paper_positions)").fetchall()}
         if 'wl_id' not in pp_cols:
             c.execute("ALTER TABLE paper_positions ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
+        if 'is_dry_run_sim' not in pp_cols:
+            # Always 0 here -- kept schema-identical with open_positions purely so
+            # open_position()'s shared INSERT works unchanged against either table;
+            # a paper position is never also a dry-run-sim one.
+            c.execute("ALTER TABLE paper_positions ADD COLUMN is_dry_run_sim INTEGER NOT NULL DEFAULT 0")
         c.execute("""
             CREATE TABLE IF NOT EXISTS paper_trade_log (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -388,6 +407,10 @@ def ensure_tables():
                 account             TEXT
             )
         """)
+        ptl_cols = {r[1] for r in c.execute("PRAGMA table_info(paper_trade_log)").fetchall()}
+        if 'is_dry_run_sim' not in ptl_cols:
+            # Always 0 -- see paper_positions.is_dry_run_sim above.
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN is_dry_run_sim INTEGER NOT NULL DEFAULT 0")
         # paper_pending_buys -- lighter than pending_buys: no reminder machinery, since a
         # simulated fill is auto-detected every poll (paper_trading.update_paper_buys),
         # never confirmed by a human clicking a button.
@@ -1392,11 +1415,12 @@ def add_pending_buy(node, sig, channel, ts, order_id=None):
     with _conn() as c:
         c.execute(
             "INSERT INTO pending_buys (ticker, node_json, signal_price, signal_time, "
-            "reminder_channel, reminder_ts, reminder_count, last_reminder_at, created_at, order_id, wl_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+            "reminder_channel, reminder_ts, reminder_count, last_reminder_at, created_at, order_id, wl_id, "
+            "running_low) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
             (node['ticker'], json.dumps(node_subset), sig['current_price'],
              sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), channel, ts, now_str, now_str, order_id,
-             node.get('id')),
+             node.get('id'), sig['current_price']),
         )
         c.commit()
 
@@ -1415,6 +1439,15 @@ def set_pending_buy_order_id(ticker, order_id):
 def set_pending_buy_order_id_by_wl_id(wl_id, order_id):
     with _conn() as c:
         c.execute("UPDATE pending_buys SET order_id=? WHERE wl_id=?", (order_id, wl_id))
+        c.commit()
+
+
+def update_pending_buy_running_low(wl_id, running_low):
+    """Mirrors update_paper_pending_buy_running_low -- only ever called for a
+    dry_run-account trailing buy (signals_notify.update_dry_run_buys), since a
+    real trailing-buy order's running low is tracked by the broker itself."""
+    with _conn() as c:
+        c.execute("UPDATE pending_buys SET running_low=? WHERE wl_id=?", (running_low, wl_id))
         c.commit()
 
 
@@ -1557,32 +1590,40 @@ def closed_today(ticker, paper=False, node=None):
     different question -- "did *this node's own* position close today" (the
     buy_alerted same-day re-arm unlock in active_signals.py) -- where ticker-
     only would let one node's exit wrongly re-arm a sibling node's lock when
-    2+ nodes share a ticker (see docs/backlog_cache.md's wl_id refactor entry)."""
+    2+ nodes share a ticker (see docs/backlog_cache.md's wl_id refactor entry).
+    Excludes is_dry_run_sim rows -- a synthesized dry-run exit is not a real
+    settlement event and must never suppress/warn on a real same-day re-buy
+    in a different (possibly live) account for the same ticker (Opus review
+    2026-07-26)."""
     _, trade_log_table = _pos_tables(paper)
     today = datetime.now().strftime('%Y-%m-%d')
     with _conn() as c:
         if node is not None:
             row = c.execute(
                 f"SELECT 1 FROM {trade_log_table} WHERE ticker=? AND strategy=? AND version=? AND window=? "
-                f"AND COALESCE(account,'')=COALESCE(?,'') AND exit_time LIKE ? LIMIT 1",
+                f"AND COALESCE(account,'')=COALESCE(?,'') AND exit_time LIKE ? AND is_dry_run_sim=0 LIMIT 1",
                 (ticker, node.get('strategy'), node.get('version'), node.get('window'),
                  node.get('account'), f"{today}%"),
             ).fetchone()
         else:
             row = c.execute(
-                f"SELECT 1 FROM {trade_log_table} WHERE ticker = ? AND exit_time LIKE ? LIMIT 1",
+                f"SELECT 1 FROM {trade_log_table} WHERE ticker = ? AND exit_time LIKE ? AND is_dry_run_sim=0 LIMIT 1",
                 (ticker, f"{today}%"),
             ).fetchone()
     return row is not None
 
 
-def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False):
+def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False,
+                   is_dry_run_sim=False):
     """Returns True if a position was opened, False if skipped because one was
     already open for this node — callers that report success to Slack
     must check this, since a silent skip must not be reported as a fill.
     Dedup keys on node['id'] (wl_id), not (ticker, window) -- two concurrent
     nodes could otherwise share a window and collide (see docs/backlog_cache.md's
-    wl_id refactor entry)."""
+    wl_id refactor entry).
+    is_dry_run_sim tags a fill synthesized against real price data because the
+    account is dry_run (no real broker fill will ever arrive) -- mutually
+    exclusive with paper (a dry_run node is always mode='live', never research)."""
     positions_table, _ = _pos_tables(paper)
     with _position_lock, _conn() as c:
         # OR (wl_id IS NULL AND ticker=? AND window=?): a legacy position
@@ -1602,14 +1643,15 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             return False
         sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
         entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
-        trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares, paper=paper)
+        trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares,
+                                        paper=paper, is_dry_run_sim=is_dry_run_sim)
         tp = node.get('take_profit')
         c.execute(f"""
             INSERT INTO {positions_table}
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, trade_log_id,
-                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares, account, wl_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares, account, wl_id, is_dry_run_sim)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
@@ -1618,7 +1660,7 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             float(entry_price), entry_time_str, trade_log_id,
             node.get('trail_sell_pct'), node.get('fixed_sl'), node.get('trail_buy_pct'),
             node.get('arm_sell_pct'), float(shares) if shares is not None else None,
-            node.get('account'), node.get('id'),
+            node.get('account'), node.get('id'), 1 if is_dry_run_sim else 0,
         ))
         c.commit()
         return True
@@ -1733,7 +1775,8 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
         return True
 
 
-def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False):
+def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False,
+                     is_dry_run_sim=False):
     _, trade_log_table = _pos_tables(paper)
     sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
     entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
@@ -1743,15 +1786,16 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, sh
         c.execute(f"""
             INSERT INTO {trade_log_table}
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
-                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct, shares, account)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct, shares, account,
+                 is_dry_run_sim)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
             int(node['max_hold_hours']),
             float(signal_price), sig_time_str,
             float(entry_price), entry_time_str, entry_drift, node.get('arm_sell_pct'),
-            float(shares) if shares is not None else None, node.get('account'),
+            float(shares) if shares is not None else None, node.get('account'), 1 if is_dry_run_sim else 0,
         ))
         c.commit()
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
