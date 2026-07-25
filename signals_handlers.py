@@ -45,7 +45,7 @@ if cfg.SOCKET_MODE:
         channel = body['channel']['id']
         ts      = body['message']['ts']
         ticker  = data['node']['ticker']
-        db.mark_pending_buy_placed(ticker)
+        db.mark_pending_buy_placed_by_wl_id(data['node']['id'])
         client.chat_update(
             channel=channel, ts=ts,
             text=f"BUY {ticker} — order placed, waiting for fill",
@@ -71,7 +71,7 @@ if cfg.SOCKET_MODE:
         ts                = body['message']['ts']
         ticker            = data['node']['ticker']
         signal_price      = data['signal_price']
-        suggested_shares  = int(_last_sale_recovery(ticker, data['node'].get('starting_notional')) // signal_price) if signal_price else None
+        suggested_shares  = int(_last_sale_recovery(data['node']) // signal_price) if signal_price else None
         client.views_open(
             trigger_id=body['trigger_id'],
             view={
@@ -97,7 +97,7 @@ if cfg.SOCKET_MODE:
         channel = body['channel']['id']
         ts      = body['message']['ts']
         ticker  = data['node']['ticker']
-        db.clear_pending_buy(ticker)
+        db.clear_pending_buy_by_wl_id(data['node']['id'])
         client.chat_update(
             channel=channel, ts=ts,
             text=f"BUY {ticker} — missed it",
@@ -114,7 +114,7 @@ if cfg.SOCKET_MODE:
         channel = body['channel']['id']
         ts      = body['message']['ts']
         ticker  = data['node']['ticker']
-        db.clear_pending_buy(ticker)
+        db.clear_pending_buy_by_wl_id(data['node']['id'])
         client.chat_update(
             channel=channel, ts=ts,
             text=f"BUY {ticker} — order cancelled",
@@ -138,10 +138,13 @@ if cfg.SOCKET_MODE:
         drift_pct  = (fill_price - signal_price) / signal_price * 100
         shares     = int(body['view']['state']['values']['shares_block']['shares_input']['value'])
 
-        if not any(p['ticker'] == ticker for p in db.get_pending_buys()):
+        if not any(p['node']['id'] == node['id'] for p in db.get_pending_buys()):
             # See handle_entry_price's identical guard -- the pending_buys row
             # this button was built from is already gone (Missed It/Cancelled,
-            # or a stale click on an old message).
+            # or a stale click on an old message). Matched on the node's own
+            # wl_id, not ticker -- a ticker-only match would incorrectly pass
+            # if a *different* concurrent node on the same ticker still has a
+            # pending row (see docs/backlog_cache.md's wl_id refactor entry).
             print(f"  [warn] {ticker} — no pending_buys row found, ignoring stale Filled confirmation")
             client.chat_update(
                 channel=channel, ts=ts,
@@ -153,7 +156,7 @@ if cfg.SOCKET_MODE:
             return
 
         opened = db.open_position(node, signal_price, signal_time, fill_price, datetime.now(), shares=shares)
-        db.clear_pending_buy(ticker)
+        db.clear_pending_buy_by_wl_id(node['id'])
 
         if not opened:
             print(f"  [warn] {ticker} already has an open position — ignored duplicate Filled confirmation")
@@ -162,7 +165,7 @@ if cfg.SOCKET_MODE:
                 text=f"{ticker} — ALREADY OPEN, this fill was ignored",
                 blocks=[{"type": "section", "text": {"type": "mrkdwn",
                          "text": f"⚠️ *{ticker}* — a position was already open, this Filled confirmation "
-                                 f"was *not* recorded (no duplicate created). {_existing_position_note(ticker)}"}}],
+                                 f"was *not* recorded (no duplicate created). {_existing_position_note(ticker, wl_id=node['id'])}"}}],
             )
             return
 
@@ -185,7 +188,7 @@ if cfg.SOCKET_MODE:
         channel = body['channel']['id']
         ts      = body['message']['ts']
         ticker  = data['node']['ticker']
-        db.clear_pending_buy(ticker)
+        db.clear_pending_buy_by_wl_id(data['node']['id'])
         client.chat_update(
             channel=channel, ts=ts,
             text=f"BUY {ticker} — Skipped",
@@ -208,13 +211,15 @@ if cfg.SOCKET_MODE:
         exec_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
         drift_pct  = (exec_price - signal_price) / signal_price * 100
         now        = datetime.now()
-        shares     = int(_last_sale_recovery(ticker, node.get('starting_notional')) // exec_price)
+        shares     = int(_last_sale_recovery(node) // exec_price)
 
-        if not any(p['ticker'] == ticker for p in db.get_pending_buys()):
+        if not any(p['node']['id'] == node['id'] for p in db.get_pending_buys()):
             # The pending_buys row this button was built from is already gone
             # (Skipped, cleared by another path, or a stale/duplicate button
             # click on an old message) -- proceeding would open a real
-            # position for an abandoned/already-resolved signal.
+            # position for an abandoned/already-resolved signal. Matched on
+            # the node's own wl_id, not ticker -- see handle_trail_buy_fill_
+            # price's identical guard.
             print(f"  [warn] {ticker} — no pending_buys row found, ignoring stale Executed confirmation")
             client.chat_update(
                 channel=channel, ts=ts,
@@ -227,7 +232,7 @@ if cfg.SOCKET_MODE:
 
         opened = db.open_position(node, signal_price, signal_time, exec_price, now, shares=shares)
 
-        db.clear_pending_buy(ticker)
+        db.clear_pending_buy_by_wl_id(node['id'])
 
         if not opened:
             print(f"  [warn] {ticker} already has an open position — ignored duplicate Executed confirmation")
@@ -236,7 +241,7 @@ if cfg.SOCKET_MODE:
                 text=f"{ticker} — ALREADY OPEN, this fill was ignored",
                 blocks=[{"type": "section", "text": {"type": "mrkdwn",
                          "text": f"⚠️ *{ticker}* — a position was already open, this Executed confirmation "
-                                 f"was *not* recorded (no duplicate created). {_existing_position_note(ticker)}"}}],
+                                 f"was *not* recorded (no duplicate created). {_existing_position_note(ticker, wl_id=node['id'])}"}}],
             )
             return
 
@@ -349,7 +354,7 @@ if cfg.SOCKET_MODE:
         data   = json.loads(body['actions'][0]['value'])
         ticker = data['node']['ticker']
         current_price, _ = compute._current_price(ticker)
-        suggested_shares = int(_last_sale_recovery(ticker, data['node'].get('starting_notional')) // current_price) if current_price else None
+        suggested_shares = int(_last_sale_recovery(data['node']) // current_price) if current_price else None
         client.views_open(
             trigger_id=body['trigger_id'],
             view={
@@ -375,14 +380,14 @@ if cfg.SOCKET_MODE:
         now    = datetime.now()
 
         opened = db.open_position(node, price, now, price, now, shares=shares)
-        db.clear_pending_buy(ticker)
+        db.clear_pending_buy_by_wl_id(node['id'])
 
         if not opened:
             print(f"  [warn] {ticker} already has an open position — ignored duplicate Manual Open")
             _post_message(f"{ticker} — ALREADY OPEN, this Manual Open was ignored",
                           blocks=[{"type": "section", "text": {"type": "mrkdwn",
                           "text": f"⚠️ *{ticker}* — a position was already open, this Manual Open "
-                                  f"was *not* recorded (no duplicate created). {_existing_position_note(ticker)}"}}])
+                                  f"was *not* recorded (no duplicate created). {_existing_position_note(ticker, wl_id=node['id'])}"}}])
             return
 
         note = f"${price:.4f}  {shares} shares"

@@ -97,11 +97,11 @@ def test_seed_last_seen_bar_uses_real_current_bar_for_open_positions(db):
     triggered SPY's arm/TP check at 11:21 ET, not a real bar close). Seeding
     from the real current bar at startup fixes this."""
     A = db
-    _add_node_and_open_position(A)
+    node, _ = _add_node_and_open_position(A)
     open_positions = [p for p in A.get_open_positions() if p['ticker'] == TICKER]
     seeded = A._seed_last_seen_bar(open_positions)
     df_hourly, _ = A._load_cache(TICKER)
-    assert seeded[TICKER] == df_hourly.index[-1]
+    assert seeded[node['id']] == df_hourly.index[-1]
 
 
 def test_scan_buy_signals_relocks_after_real_same_day_close(db, monkeypatch):
@@ -126,8 +126,7 @@ def test_scan_buy_signals_relocks_after_real_same_day_close(db, monkeypatch):
     buy_alerted = set()
     A._scan_buy_signals([node], buy_alerted, open_position_keys=set())
     assert notified == [TICKER]
-    key = (TICKER, node['strategy'], node['window'])
-    assert key in buy_alerted
+    assert node['id'] in buy_alerted
 
     # Still locked: same day, no close yet -- a second scan must not re-alert.
     A._scan_buy_signals([node], buy_alerted, open_position_keys=set())
@@ -166,7 +165,7 @@ def test_scan_buy_signals_does_not_refire_while_reentry_order_still_pending(db, 
     notified = []
     monkeypatch.setattr(A, 'notify_buy_signal', lambda node, sig: notified.append(sig['ticker']))
 
-    buy_alerted = {(TICKER, node['strategy'], node['window'])}  # already alerted once today
+    buy_alerted = {node['id']}  # already alerted once today
 
     # Real prior close on file, but a real re-entry order is now resting
     # (pending_buys row exists) -- position hasn't opened yet.

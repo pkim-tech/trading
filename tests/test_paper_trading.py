@@ -33,7 +33,7 @@ def isolated_db(monkeypatch):
 
 def _node():
     return {
-        'ticker': TICKER, 'strategy': 'TrailingBothZScoreBreakout', 'version': 'test',
+        'id': 1, 'ticker': TICKER, 'strategy': 'TrailingBothZScoreBreakout', 'version': 'test',
         'window': 20, 'take_profit': None, 'stop_loss': 1, 'max_hold_hours': 7,
         'trail_buy_pct': 5.0, 'trail_sell_pct': 1.0, 'fixed_sl': 1.0, 'arm_sell_pct': 7.0,
         'starting_notional': 5000, 'account': 'ira',
@@ -100,7 +100,7 @@ def test_check_paper_sells_closes_on_sl_and_writes_paper_trade_log(monkeypatch, 
     # (continuous) branch, which prices off _current_price -- the synthetic CSV
     # fixture only has a Close column, no Low/High, so the bar-close branch
     # (which would read bar['Low']/bar['High']) isn't exercisable here.
-    last_seen_bar = {TICKER: df_hourly.index[-1]}
+    last_seen_bar = {pos['wl_id']: df_hourly.index[-1]}
 
     paper_trading.check_paper_sells(last_seen_bar, set(), _load_cache)
 

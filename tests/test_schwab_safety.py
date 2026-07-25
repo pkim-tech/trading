@@ -74,7 +74,7 @@ def test_trailing_buy_dry_run_blocks_real_api_call(env):
 
 
 def test_trailing_buy_goes_through_same_safety_checks(env):
-    with pytest.raises(schwab_safety.SafetyViolation, match="assigned to account 'ira'"):
+    with pytest.raises(schwab_safety.SafetyViolation, match="not assigned to account 'brokerage'"):
         schwab_client.place_trailing_buy('brokerage', TICKER, 5, 50.0, trail_pct=1.0)
 
 
@@ -84,7 +84,7 @@ def test_trailing_sell_dry_run_blocks_real_api_call(env):
 
 
 def test_trailing_sell_goes_through_same_safety_checks(env):
-    with pytest.raises(schwab_safety.SafetyViolation, match="assigned to account 'ira'"):
+    with pytest.raises(schwab_safety.SafetyViolation, match="not assigned to account 'brokerage'"):
         schwab_client.place_trailing_sell('brokerage', TICKER, 5, 50.0, trail_pct=15.0)
 
 
@@ -149,7 +149,7 @@ def test_trailing_buy_shares_duplicate_window_with_market_buy(env):
 
 
 def test_wrong_account_for_ticker_blocked(env):
-    with pytest.raises(schwab_safety.SafetyViolation, match="assigned to account 'ira'"):
+    with pytest.raises(schwab_safety.SafetyViolation, match="not assigned to account 'brokerage'"):
         schwab_client.place_equity_buy('brokerage', TICKER, 5, 50.0)
 
 

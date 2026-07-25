@@ -984,3 +984,88 @@ already explained; if the scenario later became met on a same-day re-check, the 
 record that anything had deviated at all would be silently destroyed. Fixed: added `AND reason IS
 NULL` to the delete, matching `record_deviation`'s existing "never clobber a reason" rule. 3 new
 regression tests. Full suite 230 passed (was 228), `live_sim_harness.py` 6/6.
+
+## ✅ wl_id-keyed refactor — implemented, reviewed (2 Opus rounds), landed 2026-07-25/26
+Resolves the systemic ticker-only-keying gap scoped over the prior two sessions (see the
+2026-07-25/26 design-conversation entry above, now historical) — everything in the live-trading
+stack that assumed "one ticker == one active `watch_list` node" is rekeyed onto the `watch_list`
+row's own PK (`id`, called `wl_id` in code/comments), across 20+ sites in `signals_db.py`,
+`active_signals.py`, `paper_trading.py`, `signals_helpers.py`, `signals_handlers.py`,
+`signals_notify.py`, `schwab_safety.py`.
+
+**Schema migration** (`signals_db.ensure_tables()`): new `wl_id` column on `open_positions`,
+`paper_positions`, `pending_buys`, `paper_pending_buys`. Backfill: `pending_buys`/
+`paper_pending_buys` deterministically from `node_json['id']` (already embedded via
+`_PENDING_BUY_NODE_KEYS`); `open_positions`/`paper_positions` best-effort matched against current
+`watch_list` on `(ticker, strategy, version, window, account)`, left `NULL` on an ambiguous match
+(confirmed real on `cache/live/trading_live.db`: EDC's real 423-share legacy position, id=15,
+matches 2 candidate rows across 2 superseded watchlists and is correctly left `NULL` rather than
+guessing). Applied to the real live DB this session (daemon confirmed not running first; backed up
+to `cache/live/trading_live.db.bak_wl_id_migration_20260725_130800` beforehand).
+
+**Key fixes on the real (non-paper) order path**: `schwab_safety._live_ticker_accounts()` changed
+from `{ticker: account}` to `{ticker: set-of-accounts}` (this is what actually unblocks the
+motivating SOXL-in-two-accounts design — the old single-value map hard-rejected a second live
+node's real orders as "assigned to the wrong account"); `open_position()`'s duplicate-position dedup
+moved from `(ticker, window)` to `wl_id` (with a `(wl_id IS NULL AND ticker=? AND window=?)`
+fallback clause so legacy/unbackfillable rows keep the old protection); all 6 BUY-side Slack button
+handlers now clear/mark `pending_buys` rows by `wl_id` instead of ticker, matching the SELL-side
+`position_id` pattern that was already correct; `_reconcile_buy_fill` gained a `wl_id` disambiguation
+hint (bails + alerts rather than guessing when it doesn't match); `_place_stop_loss_for_position`
+now resolves the position by `wl_id` instead of ticker (was sizing/anchoring the stop off whichever
+position had the latest `entry_time`, regardless of node); `check_order`'s oversell guard now
+resolves the position by `(ticker, account)` via new `get_open_position_for_account` instead of
+ticker alone.
+
+**Additive, not built out further**: node-level automation pause (`schwab_safety.
+pause_node_automation`/`resume_node_automation`/`node_automation_enabled`) alongside the existing
+ticker-level pause, AND-gated (`ticker_automation_enabled(ticker) AND node_automation_enabled(wl_id)`)
+— no Slack button wired yet, console/script-only. The per-node `dry_run` override idea (backlogged
+2026-07-26, see below) remains gated on this landing and being observed correct live first.
+
+**Known, deliberately-not-fixed residuals** (documented in code, not silently dropped):
+- `check_order`'s `node_automation_enabled` gate still derives `_node_id` via a ticker+account fuzzy
+  `get_watch_list_node()` lookup (returns `None` on ambiguity → pause silently no-ops for 2 nodes
+  sharing both ticker AND account) — full plumbing of a real `wl_id` through `schwab_client`'s 6
+  order-placement functions was scoped as its own follow-up, not done this session.
+- `_last_sale_recovery`'s new narrowing to `(ticker, strategy, version, window, account)` is a real
+  live sizing-behavior change: most v5 nodes' `trade_log` history is under a different `version`
+  (v4/v3.x) so they now fall back to `starting_notional` instead of compounding off the last
+  recycle. Confirmed benign (no node has a `NULL starting_notional`), but stated explicitly since
+  it changes real position sizing.
+- Legacy Slack messages predating the `node['id']` payload field (added 2026-07-25, commit
+  `3accd4e`) would `KeyError` if clicked — confirmed no currently-outstanding `pending_buys` row
+  lacks it; self-expiring, not fixed defensively.
+- `_has_open_order`/`_has_open_buy_order_in_account`/`_has_open_sell_order` (schwab_safety.py)
+  deliberately stay ticker(+account)-keyed — permanent policy constraint, the real broker order book
+  has no `wl_id` concept; two live nodes on the same ticker in the *same* account still cannot both
+  hold resting orders.
+- Per-ticker pause/kill-switch stays ticker-scoped by explicit user decision (a pause is meant to be
+  a blunt instrument); a proposed 3rd, strategy-wide pause level was explicitly rejected as
+  over-engineering ("I'd probably just kill the full program").
+
+**Verification**: full suite 232 passed throughout (was 232 pre-refactor too — pure rekeying, no
+new test surface beyond fixing tests that hardcoded the old ticket-keyed shapes),
+`live_sim_harness.py` 6/6, `verify_trailing_buy_resolution.py --tickers AGQ,SOXL` and
+`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` both clean (expected — this refactor is
+identity-keying only, doesn't touch signal/fill computation). Two independent Opus review rounds:
+first round (against the initial implementation) found 11 issues, 2 HIGH on the real order path —
+9 fixed same session, 2 left as documented limitations (above). Second round (against the fixed
+diff, explicitly re-verifying the first round's fixes and sweeping fresh) confirmed all 9 fixes
+landed correctly, then found 4 more real issues (1 HIGH: the oversell-guard ticker-only lookup
+above; 1 MEDIUM-HIGH: `drain_fill_queue` had started passing its own fuzzy ticker+account node-id
+guess as a hard disambiguation gate into `_reconcile_buy_fill`, which could block reconciliation of
+a real confirmed fill — reverted to logging-only; 2 MEDIUM: `_pos_key`'s `last_seen_bar`-collision
+fix wasn't applied to `paper_trading.py`'s copy of the same lookup, and `open_position_keys`'s
+NULL-`wl_id` fallback was dropped in the exact same way `open_position()`'s SQL dedup already
+needed one) — all 4 fixed and re-verified (full suite + harness + parity scripts green again).
+
+**Not done this session** (deliberately deferred, per the original scoping): creating the second
+SOXL `soxl_ira` node — planned as the next step once this refactor is observed correct in the field.
+
+Also fixed opportunistically while verifying: `scripts/setup_2026_07_24_soxl_ira_live_test.py`'s
+top-level code (real DB writes) was unconditionally executing on every bare `pytest` invocation
+because its filename ends in `_test.py`, matching pytest's default discovery glob — wrapped in
+`if __name__ == "__main__":`. Pre-existing hazard, unrelated to this refactor, found only because
+the schema migration briefly broke it mid-run (caught before any real data was written past the
+existing idempotent `add_node` calls).

@@ -199,6 +199,12 @@ def ensure_tables():
             # have one. Cancelled (and this cleared implicitly, the row goes away with the
             # arm transition) once the trailing-sell order takes over on TP arm.
             c.execute("ALTER TABLE open_positions ADD COLUMN sl_order_id INTEGER")
+        if 'wl_id' not in op_cols:
+            # The watch_list row's own PK -- the real per-node identity, since a ticker
+            # alone (or (ticker, window)) is not unique once 2+ concurrent nodes exist for
+            # the same ticker. Nullable: legacy rows opened before this migration are
+            # backfilled best-effort below; new rows are always populated by open_position().
+            c.execute("ALTER TABLE open_positions ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
 
         # trade_log
         c.execute("""
@@ -260,6 +266,11 @@ def ensure_tables():
             # to cancel a still-resting automated trailing-buy order before replacing
             # it -- nullable since manual (non-automated) pending buys never have one.
             c.execute("ALTER TABLE pending_buys ADD COLUMN order_id INTEGER")
+        if 'wl_id' not in pb_cols:
+            # Same rationale as open_positions.wl_id -- promotes the watch_list PK (already
+            # embedded in every row's node_json via _PENDING_BUY_NODE_KEYS) to a real,
+            # queryable column so lookups/updates/deletes can key on it instead of ticker.
+            c.execute("ALTER TABLE pending_buys ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
 
         # paper_positions/paper_trade_log -- schema-identical mirrors of open_positions/
         # trade_log for schwab_safety.AUTOMATION_ENABLED_TICKERS tickers running in research
@@ -289,6 +300,9 @@ def ensure_tables():
                 broker_stop_price REAL
             )
         """)
+        pp_cols = {r[1] for r in c.execute("PRAGMA table_info(paper_positions)").fetchall()}
+        if 'wl_id' not in pp_cols:
+            c.execute("ALTER TABLE paper_positions ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
         c.execute("""
             CREATE TABLE IF NOT EXISTS paper_trade_log (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -329,6 +343,9 @@ def ensure_tables():
                 created_at    TEXT NOT NULL
             )
         """)
+        ppb_cols = {r[1] for r in c.execute("PRAGMA table_info(paper_pending_buys)").fetchall()}
+        if 'wl_id' not in ppb_cols:
+            c.execute("ALTER TABLE paper_pending_buys ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
         # open_price_quality_log -- Part 4 Deliverable 2: logs every pinned-check
         # get_session_open_price fetch (timestamp, ticker, target time, price,
         # is_true_open) so scripts/verify_open_price_quality.py can join it against
@@ -540,6 +557,41 @@ def ensure_tables():
         sml_cols = {r[1] for r in c.execute("PRAGMA table_info(slack_message_log)").fetchall()}
         if 'error' not in sml_cols:
             c.execute("ALTER TABLE slack_message_log ADD COLUMN error TEXT")
+        c.commit()
+
+        # wl_id backfill -- pending_buys/paper_pending_buys already embed node['id']
+        # (the watch_list PK) inside node_json (_PENDING_BUY_NODE_KEYS), so this is a
+        # deterministic parse-and-set, not a fuzzy match. Idempotent (only ever touches
+        # still-NULL rows, cheap to re-run on every startup given this DB's size).
+        for tbl in ('pending_buys', 'paper_pending_buys'):
+            rows = c.execute(f"SELECT id, node_json FROM {tbl} WHERE wl_id IS NULL").fetchall()
+            for r in rows:
+                try:
+                    node_id = json.loads(r['node_json']).get('id')
+                except (TypeError, ValueError):
+                    node_id = None
+                if node_id is not None:
+                    c.execute(f"UPDATE {tbl} SET wl_id=? WHERE id=?", (node_id, r['id']))
+        c.commit()
+
+        # open_positions/paper_positions carry no node_json to recover wl_id from --
+        # best-effort match each still-NULL row to a current watch_list row on
+        # (ticker, strategy, version, window, account). An unmatched/ambiguous row is
+        # left NULL (acceptable: a legacy position from a now-changed/deleted node,
+        # not a live one) -- every position opened via open_position() from here
+        # forward always gets a real wl_id written at insert time.
+        for tbl in ('open_positions', 'paper_positions'):
+            rows = c.execute(
+                f"SELECT id, ticker, strategy, version, window, account FROM {tbl} WHERE wl_id IS NULL"
+            ).fetchall()
+            for r in rows:
+                candidates = c.execute(
+                    "SELECT id FROM watch_list WHERE ticker=? AND strategy=? AND version=? AND window=? "
+                    "AND COALESCE(account,'')=COALESCE(?,'')",
+                    (r['ticker'], r['strategy'], r['version'], r['window'], r['account']),
+                ).fetchall()
+                if len(candidates) == 1:
+                    c.execute(f"UPDATE {tbl} SET wl_id=? WHERE id=?", (candidates[0]['id'], r['id']))
         c.commit()
 
 
@@ -1198,6 +1250,49 @@ def get_open_position(ticker, paper=False):
     return d
 
 
+def get_open_position_for_account(ticker, account, paper=False):
+    """(ticker, account)-keyed sibling of get_open_position() -- used by
+    schwab_safety.check_order's oversell guard, which already has `account` in
+    scope but no wl_id (check_order isn't threaded a node -- see docs/
+    backlog_cache.md's wl_id refactor entry). Ticker-only would resolve to
+    whichever position for this ticker has the latest entry_time regardless of
+    account -- with 2 live nodes on the same ticker in different accounts (the
+    refactor's own motivating configuration), a real SELL for the older
+    position's account could be bound-checked against a newer position in a
+    *different* account and wrongly rejected as an oversell."""
+    positions_table, _ = _pos_tables(paper)
+    with _conn() as c:
+        row = c.execute(
+            f"SELECT * FROM {positions_table} WHERE ticker=? AND account=? ORDER BY entry_time DESC LIMIT 1",
+            (ticker, account)
+        ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d['trail_state'] = json.loads(d['trail_state']) if d.get('trail_state') else {}
+    return d
+
+
+def get_open_position_by_wl_id(wl_id, paper=False):
+    """wl_id-keyed sibling of get_open_position() -- use this at any call site
+    that already has a specific node's id in scope, since ticker alone is
+    ambiguous once 2+ concurrent nodes exist for the same ticker (see
+    docs/backlog_cache.md's wl_id refactor entry). get_open_position() itself
+    is left ticker-only (widely relied on by the test suite/legacy callers as
+    a single-position-per-ticker convenience lookup)."""
+    positions_table, _ = _pos_tables(paper)
+    with _conn() as c:
+        row = c.execute(
+            f"SELECT * FROM {positions_table} WHERE wl_id=? ORDER BY entry_time DESC LIMIT 1",
+            (wl_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d['trail_state'] = json.loads(d['trail_state']) if d.get('trail_state') else {}
+    return d
+
+
 def get_position_by_id(position_id, paper=False):
     """Fresh single-row lookup by primary key -- used where a caller holds a
     possibly-stale in-memory position dict (e.g. notify_trailing_activated
@@ -1233,10 +1328,11 @@ def add_pending_buy(node, sig, channel, ts, order_id=None):
     with _conn() as c:
         c.execute(
             "INSERT INTO pending_buys (ticker, node_json, signal_price, signal_time, "
-            "reminder_channel, reminder_ts, reminder_count, last_reminder_at, created_at, order_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            "reminder_channel, reminder_ts, reminder_count, last_reminder_at, created_at, order_id, wl_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
             (node['ticker'], json.dumps(node_subset), sig['current_price'],
-             sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), channel, ts, now_str, now_str, order_id),
+             sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), channel, ts, now_str, now_str, order_id,
+             node.get('id')),
         )
         c.commit()
 
@@ -1244,9 +1340,17 @@ def add_pending_buy(node, sig, channel, ts, order_id=None):
 def set_pending_buy_order_id(ticker, order_id):
     """Mirrors mark_pending_buy_placed's shape -- called once the broker order id
     is known (e.g. after check_gap_resize replaces a resting order with a market
-    order, or if a future automated-buy path captures it post-hoc)."""
+    order, or if a future automated-buy path captures it post-hoc).
+    Ticker-keyed -- kept for legacy/single-node-per-ticker callers; use
+    set_pending_buy_order_id_by_wl_id where a specific node's id is in scope."""
     with _conn() as c:
         c.execute("UPDATE pending_buys SET order_id=? WHERE ticker=?", (order_id, ticker))
+        c.commit()
+
+
+def set_pending_buy_order_id_by_wl_id(wl_id, order_id):
+    with _conn() as c:
+        c.execute("UPDATE pending_buys SET order_id=? WHERE wl_id=?", (order_id, wl_id))
         c.commit()
 
 
@@ -1260,8 +1364,17 @@ def get_pending_buys():
 
 
 def clear_pending_buy(ticker):
+    """Ticker-keyed -- kept for legacy/single-node-per-ticker callers; use
+    clear_pending_buy_by_wl_id where a specific node's id is in scope (deletes
+    only that node's row instead of every pending_buys row for the ticker)."""
     with _conn() as c:
         c.execute("DELETE FROM pending_buys WHERE ticker = ?", (ticker,))
+        c.commit()
+
+
+def clear_pending_buy_by_wl_id(wl_id):
+    with _conn() as c:
+        c.execute("DELETE FROM pending_buys WHERE wl_id = ?", (wl_id,))
         c.commit()
 
 
@@ -1273,12 +1386,24 @@ def mark_pending_buy_placed(ticker):
     its own reminder numbering (#1, #2, ...) instead of continuing the placement
     phase's count -- the two are different questions ('is it placed?' vs 'did it
     fill?') and sharing one counter across them reads as a lie about how many
-    times you've actually been asked about the fill."""
+    times you've actually been asked about the fill.
+    Ticker-keyed -- kept for legacy/single-node-per-ticker callers; use
+    mark_pending_buy_placed_by_wl_id where a specific node's id is in scope."""
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with _conn() as c:
         c.execute(
             "UPDATE pending_buys SET order_placed=1, reminder_count=0, last_reminder_at=? WHERE ticker = ?",
             (now_str, ticker),
+        )
+        c.commit()
+
+
+def mark_pending_buy_placed_by_wl_id(wl_id):
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with _conn() as c:
+        c.execute(
+            "UPDATE pending_buys SET order_placed=1, reminder_count=0, last_reminder_at=? WHERE wl_id = ?",
+            (now_str, wl_id),
         )
         c.commit()
 
@@ -1309,9 +1434,9 @@ def add_paper_pending_buy(node, sig):
     with _conn() as c:
         c.execute(
             "INSERT INTO paper_pending_buys (ticker, node_json, signal_price, signal_time, "
-            "running_low, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "running_low, created_at, wl_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (node['ticker'], json.dumps(node_subset), sig['current_price'],
-             sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), sig['current_price'], now_str),
+             sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), sig['current_price'], now_str, node.get('id')),
         )
         c.commit()
 
@@ -1324,15 +1449,18 @@ def get_paper_pending_buys():
     return rows
 
 
-def get_paper_pending_buy(ticker):
+def get_paper_pending_buy(wl_id):
+    """wl_id-keyed -- only caller is paper_trading.py, which always has the
+    node's id in scope; ticker alone would match another concurrent node's
+    pending row (see docs/backlog_cache.md's wl_id refactor entry)."""
     with _conn() as c:
-        row = c.execute("SELECT * FROM paper_pending_buys WHERE ticker = ?", (ticker,)).fetchone()
+        row = c.execute("SELECT * FROM paper_pending_buys WHERE wl_id = ?", (wl_id,)).fetchone()
     return dict(row) if row else None
 
 
-def clear_paper_pending_buy(ticker):
+def clear_paper_pending_buy(wl_id):
     with _conn() as c:
-        c.execute("DELETE FROM paper_pending_buys WHERE ticker = ?", (ticker,))
+        c.execute("DELETE FROM paper_pending_buys WHERE wl_id = ?", (wl_id,))
         c.commit()
 
 
@@ -1350,35 +1478,63 @@ def update_position_trail_state(position_id, state, paper=False):
                   (json.dumps(state), position_id))
 
 
-def closed_today(ticker, paper=False):
+def closed_today(ticker, paper=False, node=None):
     """True if this ticker had a trade_log exit today -- IRA/SEP cash accounts can't
     reuse that capital until T+1 settlement, so a same-day re-buy needs a warning.
     paper=True checks paper_trade_log instead -- found by Opus review 2026-07-24:
     the real-only default meant active_signals's buy_alerted same-day unlock
     (which calls this to detect a genuine close) could never fire for a
-    paper-trading node, since paper fills only ever land in paper_trade_log."""
+    paper-trading node, since paper fills only ever land in paper_trade_log.
+    Ticker-only is the *correct* granularity for the cash-settlement warning
+    callers (signals_notify/signals_blocks, schwab_safety.check_order) -- a
+    real account's T+1 settlement constraint applies to the account/ticker
+    regardless of which node closed the trade. The optional `node` narrows to
+    (ticker, strategy, version, window, account) for the one caller asking a
+    different question -- "did *this node's own* position close today" (the
+    buy_alerted same-day re-arm unlock in active_signals.py) -- where ticker-
+    only would let one node's exit wrongly re-arm a sibling node's lock when
+    2+ nodes share a ticker (see docs/backlog_cache.md's wl_id refactor entry)."""
     _, trade_log_table = _pos_tables(paper)
     today = datetime.now().strftime('%Y-%m-%d')
     with _conn() as c:
-        row = c.execute(
-            f"SELECT 1 FROM {trade_log_table} WHERE ticker = ? AND exit_time LIKE ? LIMIT 1",
-            (ticker, f"{today}%"),
-        ).fetchone()
+        if node is not None:
+            row = c.execute(
+                f"SELECT 1 FROM {trade_log_table} WHERE ticker=? AND strategy=? AND version=? AND window=? "
+                f"AND COALESCE(account,'')=COALESCE(?,'') AND exit_time LIKE ? LIMIT 1",
+                (ticker, node.get('strategy'), node.get('version'), node.get('window'),
+                 node.get('account'), f"{today}%"),
+            ).fetchone()
+        else:
+            row = c.execute(
+                f"SELECT 1 FROM {trade_log_table} WHERE ticker = ? AND exit_time LIKE ? LIMIT 1",
+                (ticker, f"{today}%"),
+            ).fetchone()
     return row is not None
 
 
 def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False):
     """Returns True if a position was opened, False if skipped because one was
-    already open for this ticker/window — callers that report success to Slack
-    must check this, since a silent skip must not be reported as a fill."""
+    already open for this node — callers that report success to Slack
+    must check this, since a silent skip must not be reported as a fill.
+    Dedup keys on node['id'] (wl_id), not (ticker, window) -- two concurrent
+    nodes could otherwise share a window and collide (see docs/backlog_cache.md's
+    wl_id refactor entry)."""
     positions_table, _ = _pos_tables(paper)
     with _position_lock, _conn() as c:
+        # OR (wl_id IS NULL AND ticker=? AND window=?): a legacy position
+        # predating the wl_id migration (or one the backfill couldn't
+        # uniquely resolve, e.g. duplicated across watchlists) has wl_id=NULL
+        # -- `wl_id=?` alone would never match it, silently reopening a
+        # duplicate for a still-live node whose ticker+window it shares. This
+        # preserves the original (ticker, window) protection for exactly
+        # those unbackfilled rows, without weakening the wl_id check for
+        # everything else.
         existing = c.execute(
-            f"SELECT id FROM {positions_table} WHERE ticker=? AND window=?",
-            (node['ticker'], int(node['window']))
+            f"SELECT id FROM {positions_table} WHERE wl_id=? OR (wl_id IS NULL AND ticker=? AND window=?)",
+            (node['id'], node['ticker'], int(node['window']))
         ).fetchone()
         if existing:
-            print(f"  [warn] {'paper ' if paper else ''}position already open for {node['ticker']} w={node['window']} — skipping duplicate")
+            print(f"  [warn] {'paper ' if paper else ''}position already open for {node['ticker']} wl_id={node['id']} — skipping duplicate")
             return False
         sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
         entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
@@ -1388,8 +1544,8 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             INSERT INTO {positions_table}
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, trade_log_id,
-                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares, account)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares, account, wl_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
@@ -1398,22 +1554,24 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             float(entry_price), entry_time_str, trade_log_id,
             node.get('trail_sell_pct'), node.get('fixed_sl'), node.get('trail_buy_pct'),
             node.get('arm_sell_pct'), float(shares) if shares is not None else None,
-            node.get('account'),
+            node.get('account'), node.get('id'),
         ))
         c.commit()
         return True
 
 
-def top_up_position(ticker, additional_shares, fill_price, paper=False):
+def top_up_position(wl_id, additional_shares, fill_price, paper=False):
     """Adds top-up shares to an already-open position, blending entry_price by
     share-weighted average -- used by signals_notify._reconcile_fill (Part 3,
     branch C) when a real fill under-spent target_notional relative to the
     conservative worst-case sizing pads (branch A/B). Returns False if no open
-    position exists for the ticker (nothing to top up)."""
+    position exists for this node (nothing to top up). Keyed on wl_id, not
+    ticker -- ticker-only would blend the wrong node's shares/entry_price if
+    2+ nodes hold the same ticker concurrently."""
     positions_table, _ = _pos_tables(paper)
     with _conn() as c:
         row = c.execute(
-            f"SELECT shares, entry_price FROM {positions_table} WHERE ticker=?", (ticker,)
+            f"SELECT shares, entry_price FROM {positions_table} WHERE wl_id=?", (wl_id,)
         ).fetchone()
         if not row or not row['shares']:
             return False
@@ -1421,8 +1579,8 @@ def top_up_position(ticker, additional_shares, fill_price, paper=False):
         new_shares = old_shares + additional_shares
         blended_entry = (old_shares * old_entry + additional_shares * fill_price) / new_shares
         c.execute(
-            f"UPDATE {positions_table} SET shares=?, entry_price=? WHERE ticker=?",
-            (new_shares, blended_entry, ticker),
+            f"UPDATE {positions_table} SET shares=?, entry_price=? WHERE wl_id=?",
+            (new_shares, blended_entry, wl_id),
         )
         c.commit()
     return True
@@ -1441,9 +1599,18 @@ def set_sl_order_id(ticker, sl_order_id):
     """Records the resting STOP order's broker order id (Part 4, Section 6) --
     read back by _attempt_automated_sell to cancel it before placing the
     trailing-sell order on arm, avoiding two live sell orders for the same
-    shares."""
+    shares. Ticker-keyed -- kept for legacy/single-node-per-ticker callers
+    (and the existing test suite); use set_sl_order_id_by_position where the
+    position's own PK is in scope, since 2 concurrent same-ticker positions
+    would otherwise both get the same sl_order_id written."""
     with _conn() as c:
         c.execute("UPDATE open_positions SET sl_order_id = ? WHERE ticker = ?", (sl_order_id, ticker))
+        c.commit()
+
+
+def set_sl_order_id_by_position(position_id, sl_order_id):
+    with _conn() as c:
+        c.execute("UPDATE open_positions SET sl_order_id = ? WHERE id = ?", (sl_order_id, position_id))
         c.commit()
 
 

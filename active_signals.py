@@ -78,7 +78,7 @@ from signals_blocks import (
     _build_buy_blocks, _build_sell_blocks,
 )
 from signals_helpers import (
-    _add_trading_hours, _proximity_emoji, _last_sale_recovery, _phase_emoji, log_poll,
+    _add_trading_hours, _proximity_emoji, _last_sale_recovery, _phase_emoji, log_poll, _pos_key,
 )
 from signals_notify import (
     notify_buy_signal, notify_limit_fill, notify_sell_signal,
@@ -194,7 +194,7 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
     # not just after a genuine close. Paper trailing-buy nodes have the exact
     # same pending-window shape (paper_trading.start_paper_buy/
     # paper_pending_buys), so both tables are checked.
-    pending_tickers = {p['ticker'] for p in get_pending_buys()} | {p['ticker'] for p in db.get_paper_pending_buys()}
+    pending_wl_ids = {p['node']['id'] for p in get_pending_buys()} | {p['node']['id'] for p in db.get_paper_pending_buys()}
     summaries = []
     for node in nodes:
         sig = compute_buy_signal(node, price_override=price_overrides.get(node['ticker']))
@@ -202,7 +202,18 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
             summaries.append(f"{node['ticker']} w={node['window']} NO_DATA")
             continue
 
-        alert_key = (sig['ticker'], node['strategy'], sig['window'])
+        # Keyed on the watch_list row's own PK (wl_id), not (ticker, strategy, window) --
+        # two concurrent nodes differing only in account/take_profit/label could otherwise
+        # share one alert_key and dedupe against each other (see docs/backlog_cache.md's
+        # wl_id refactor entry).
+        alert_key = node['id']
+        # open_position_keys entries are wl_id (int) when available, else a
+        # (ticker, window) fallback for legacy/unbackfillable positions -- a
+        # live node's own id never collides with that fallback shape, but the
+        # fallback must still be checked or a NULL-wl_id legacy position on
+        # this exact ticker+window silently stops suppressing a duplicate BUY
+        # (found by a second Opus review round, 2026-07-26).
+        already_held = node['id'] in open_position_keys or (sig['ticker'], node['window']) in open_position_keys
 
         # buy_alerted's once-per-day lockout structurally blocked a real,
         # quantified slice (~8% for SOXL) of a winning node's backtested
@@ -217,13 +228,13 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
         # paper_trade_log, never trade_log -- without it this unlock could
         # never fire for a paper node at all.
         is_paper_node = node.get('mode', 'live') != 'live'
-        if (alert_key in buy_alerted and (sig['ticker'], sig['window']) not in open_position_keys
-                and sig['ticker'] not in pending_tickers and closed_today(sig['ticker'], paper=is_paper_node)):
+        if (alert_key in buy_alerted and not already_held
+                and node['id'] not in pending_wl_ids and closed_today(sig['ticker'], paper=is_paper_node, node=node)):
             buy_alerted.discard(alert_key)
 
         if sig['signal'] == 'BUY' and alert_key not in buy_alerted:
             buy_alerted.add(alert_key)
-            if (sig['ticker'], sig['window']) in open_position_keys:
+            if already_held:
                 print(f"  [skip] BUY {sig['ticker']} z={sig['z_score']:+.2f} — position already open, no alert")
             elif node.get('mode', 'live') == 'live':
                 notify_buy_signal(node, sig)
@@ -292,10 +303,10 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
         last_bar_ts = df_hourly.index[-1]
         if (pos['id'], last_bar_ts) in sell_alerted:
             continue
-        if last_seen_bar.get(pos['ticker']) == last_bar_ts:
+        if last_seen_bar.get(_pos_key(pos)) == last_bar_ts:
             log_poll(f"{pos['ticker']} pinned_exit_arm bar={last_bar_ts} matches last_seen -- SKIPPED (no new bar)")
             continue  # no new bar since the last check -- nothing to react to early
-        last_seen_bar[pos['ticker']] = last_bar_ts
+        last_seen_bar[_pos_key(pos)] = last_bar_ts
         bar = df_hourly.iloc[-1]
         cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
         log_poll(f"{pos['ticker']} pinned_exit_arm bar={last_bar_ts} cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
@@ -309,7 +320,7 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
 
 
 def _seed_last_seen_bar(open_positions):
-    """Startup seed for last_seen_bar (see run_loop) -- ticker -> real current
+    """Startup seed for last_seen_bar (see run_loop) -- wl_id -> real current
     hourly bar timestamp for every currently-open position. See run_loop's
     last_seen_bar comment for why an empty dict causes a spurious off-schedule
     bar-close evaluation on every restart."""
@@ -317,7 +328,7 @@ def _seed_last_seen_bar(open_positions):
     for pos in open_positions:
         df_hourly, _ = _load_cache(pos['ticker'])
         if df_hourly is not None and not df_hourly.empty:
-            seeded[pos['ticker']] = df_hourly.index[-1]
+            seeded[_pos_key(pos)] = df_hourly.index[-1]
     return seeded
 
 
@@ -405,7 +416,7 @@ def run_loop(tickers: set = None):
     paper_sell_alerted: set[tuple] = set()  # same shape, separate set — paper position ids aren't real ones
     window_alerted:     set[tuple] = set()
     limit_fill_alerted: set[tuple] = set()
-    # ticker -> last hourly bar timestamp checked. Seeded from each open
+    # wl_id -> last hourly bar timestamp checked. Seeded from each open
     # position's real current bar below (not left empty) -- found live
     # 2026-07-24: last_seen_bar.get(ticker) returning None on a fresh restart
     # trivially != last_bar_ts, so at_bar_close evaluates True on the very
@@ -509,8 +520,15 @@ def run_loop(tickers: set = None):
             # real Close/Low/High — not a live mid-bar tick — to match the backtest kernels.
             open_positions = get_open_positions()
             paper_positions = get_open_positions(paper=True)
-            open_position_keys = ({(p['ticker'], p['window']) for p in open_positions}
-                                   | {(p['ticker'], p['window']) for p in paper_positions})
+            # Keyed via _pos_key: wl_id (the watch_list row's own PK) when available,
+            # else a (ticker, window) fallback for legacy positions that predate the
+            # wl_id migration and couldn't be backfilled unambiguously (see
+            # docs/backlog_cache.md's wl_id refactor entry). A bare wl_id=None for
+            # every such row would let a real live node's duplicate-position
+            # suppression silently stop working -- found by a second Opus review
+            # round, 2026-07-26 -- so the fallback must still be checkable below.
+            open_position_keys = ({_pos_key(p) for p in open_positions}
+                                   | {_pos_key(p) for p in paper_positions})
 
             # Pinned single-shot checks (Part 4) -- fire once per hourly bar boundary,
             # ahead of/instead of relying purely on ambient POLL_SECS-cadence detection.
@@ -531,9 +549,9 @@ def run_loop(tickers: set = None):
                 last_bar_ts = df_hourly.index[-1]
                 if (pos['id'], last_bar_ts) in sell_alerted:
                     return
-                at_bar_close = last_seen_bar.get(pos['ticker']) != last_bar_ts
+                at_bar_close = last_seen_bar.get(_pos_key(pos)) != last_bar_ts
                 if at_bar_close:
-                    last_seen_bar[pos['ticker']] = last_bar_ts
+                    last_seen_bar[_pos_key(pos)] = last_bar_ts
                     bar = df_hourly.iloc[-1]
                     cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
                 else:

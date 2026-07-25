@@ -16,7 +16,7 @@ from datetime import datetime
 import signals_db as db
 from signals_compute import _current_price, check_sell_condition
 from signals_blocks import _post_message
-from signals_helpers import buy_order_sizing, log_poll
+from signals_helpers import buy_order_sizing, log_poll, _pos_key
 
 
 def start_paper_buy(node, sig):
@@ -28,7 +28,7 @@ def start_paper_buy(node, sig):
     if not db._is_trailing_buy(node):
         start_paper_market_buy(node, sig)
         return
-    if db.get_paper_pending_buy(ticker) or db.get_open_position(ticker, paper=True):
+    if db.get_paper_pending_buy(node['id']) or db.get_open_position_by_wl_id(node['id'], paper=True):
         return
     db.add_paper_pending_buy(node, sig)
     _post_message(
@@ -44,7 +44,7 @@ def start_paper_market_buy(node, sig):
     faithfully dry-runs the real sizing/pad, not a simplified stand-in, and
     opens the paper position directly."""
     ticker = sig['ticker']
-    if db.get_open_position(ticker, paper=True):
+    if db.get_open_position_by_wl_id(node['id'], paper=True):
         return
     sizing = buy_order_sizing(node, sig)
     if sizing['shares'] < 1:
@@ -74,11 +74,11 @@ def update_paper_buys():
             shares = int(starting_notional // price)
             if shares < 1:
                 print(f"  [paper] {ticker} bounce-fill at ${price:.4f} too small to size a share — dropping pending buy")
-                db.clear_paper_pending_buy(ticker)
+                db.clear_paper_pending_buy(node['id'])
                 continue
             db.open_position(node, pb['signal_price'], pb['signal_time'], price, datetime.now(),
                               shares=shares, paper=True)
-            db.clear_paper_pending_buy(ticker)
+            db.clear_paper_pending_buy(node['id'])
             db.log_coverage_event("entry_fill", "paper", ticker=ticker, node_id=node.get('id'), result="trailing_bounce_filled",
                                    detail=f"shares={shares} price={price:.4f}")
             _post_message(f"🧪 PAPER BUY FILLED — {ticker}  {shares}sh @ ${price:.4f}")
@@ -99,9 +99,9 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
         last_bar_ts = df_hourly.index[-1]
         if (pos['id'], last_bar_ts) in paper_sell_alerted:
             continue
-        at_bar_close = last_seen_bar.get(ticker) != last_bar_ts
+        at_bar_close = last_seen_bar.get(_pos_key(pos)) != last_bar_ts
         if at_bar_close:
-            last_seen_bar[ticker] = last_bar_ts
+            last_seen_bar[_pos_key(pos)] = last_bar_ts
             bar = df_hourly.iloc[-1]
             cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
         else:
@@ -119,9 +119,7 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
         if reason:
             db.close_position(pos['id'], exit_signal_price=cp, exit_price=target,
                                exit_time=datetime.now(), exit_reason=reason, paper=True)
-            _node = db.get_watch_list_node(ticker=ticker, strategy=pos.get('strategy'),
-                                            version=pos.get('version'), window=pos.get('window'))
             db.log_coverage_event("exit_fill", "paper", ticker=ticker, position_id=pos['id'],
-                                   node_id=_node['id'] if _node else None, result=reason, detail=f"price={target:.4f}")
+                                   node_id=pos.get('wl_id'), result=reason, detail=f"price={target:.4f}")
             _post_message(f"🧪 PAPER SELL — {ticker}  {reason} @ ${target:.4f}")
             paper_sell_alerted.add((pos['id'], last_bar_ts))

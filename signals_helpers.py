@@ -109,33 +109,57 @@ def _proximity_emoji(pct_away):
     return "⚪"
 
 
-def _existing_position_note(ticker):
+def _pos_key(pos):
+    """Dict/set key for last_seen_bar, shared between active_signals.py's main
+    loop/_scan_pinned_exit_arm and paper_trading.check_paper_sells (one dict,
+    passed by reference across both) -- pos['wl_id'] when available, else a
+    (ticker, window) fallback. A bare None would collide across every legacy/
+    unbackfillable position (wl_id=NULL, see docs/backlog_cache.md's wl_id
+    refactor entry): one such position's last_seen_bar write would make a
+    second, unrelated None-wl_id position's at_bar_close check silently read
+    as 'already seen', skipping its real bar-close exit evaluation."""
+    return pos['wl_id'] if pos.get('wl_id') is not None else (pos['ticker'], pos['window'])
+
+
+def _existing_position_note(ticker, wl_id=None):
     """Formats the already-open position for a duplicate-attempt warning, so the
-    user doesn't have to go run scripts/open_positions_status.py separately."""
-    pos = db.get_open_position(ticker)
+    user doesn't have to go run scripts/open_positions_status.py separately.
+    Prefers wl_id (unambiguous) when the caller has it -- ticker alone
+    arbitrarily picks the most-recently-entered position if 2+ nodes share
+    a ticker."""
+    pos = db.get_open_position_by_wl_id(wl_id) if wl_id is not None else db.get_open_position(ticker)
     if not pos:
         return "check `open_positions` if unsure what's live."
     return (f"currently open: `${pos['entry_price']:.4f}` x `{pos['shares']}` shares, "
             f"entered `{pos['entry_time']}` ({pos['account']}).")
 
 
-def _last_sale_recovery(ticker, starting_notional):
-    """Estimated next-buy notional: proceeds (exit_price * shares) from this ticker's
+def _last_sale_recovery(node):
+    """Estimated next-buy notional: proceeds (exit_price * shares) from this node's
     most recent closed trade, so sizing roughly compounds off the last recycle. Falls
     back to `starting_notional` (the node's own watch_list.starting_notional column)
-    only if no closed trade has shares logged yet -- callers must supply this
-    explicitly (no hidden flat-$50k default here) so a new pilot with a different
-    real book size (e.g. GDXD's $5k) can't silently get sized like everyone else's
-    $50k. A rough estimate, not a live capital feed -- doesn't know about other
-    trades competing for the same account's cash in between."""
+    only if no closed trade has shares logged yet -- callers must supply a node with
+    it set (no hidden flat-$50k default here) so a new pilot with a different real
+    book size (e.g. GDXD's $5k) can't silently get sized like everyone else's $50k.
+    Narrows by (ticker, strategy, version, window, account) -- trade_log has no
+    wl_id column, so this is the closest available match to "this node's own
+    history", not just "this ticker's most recent trade regardless of which node
+    it belonged to" (a real live-sizing bug once 2+ nodes share a ticker with
+    different starting_notional/account). A rough estimate, not a live capital
+    feed -- doesn't know about other trades competing for the same account's cash
+    in between."""
+    ticker = node['ticker']
     with db._conn() as c:
         c.row_factory = sqlite3.Row
         row = c.execute(
-            "SELECT exit_price, shares FROM trade_log WHERE ticker=? AND exit_price IS NOT NULL "
-            "AND shares IS NOT NULL ORDER BY exit_time DESC LIMIT 1", (ticker,)
+            "SELECT exit_price, shares FROM trade_log WHERE ticker=? AND strategy=? AND version=? "
+            "AND window=? AND COALESCE(account,'')=COALESCE(?,'') AND exit_price IS NOT NULL "
+            "AND shares IS NOT NULL ORDER BY exit_time DESC LIMIT 1",
+            (ticker, node.get('strategy'), node.get('version'), node.get('window'), node.get('account')),
         ).fetchone()
     if row and row['exit_price'] and row['shares']:
         return row['exit_price'] * row['shares']
+    starting_notional = node.get('starting_notional')
     if starting_notional is None:
         raise ValueError(f"_last_sale_recovery({ticker}): no trade history and no starting_notional configured")
     return starting_notional
@@ -167,7 +191,7 @@ def buy_order_sizing(node, sig, pad_pct=1.0, market_pad_pct=DEFAULT_MARKET_ENTRY
     automated-placement path so there's one sizing formula, not two."""
     ticker = sig['ticker']
     price = sig['current_price']
-    target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
+    target_notional = _last_sale_recovery(node)
     trailing_buy = db._is_trailing_buy(node)
     trail_buy_pct = node.get('trail_buy_pct') or 0.0
     if trailing_buy:

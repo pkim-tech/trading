@@ -69,13 +69,17 @@ def _attempt_automated_sell(pos, current_price):
     position (e.g. one sharing a ticker with an unrelated live-mode node) get
     routed through an automated sell. Falls back to manual (False) if no
     matching node is found at all, same fail-closed direction as a mode
-    mismatch."""
+    mismatch. Looks the node up by wl_id (the position's own FK to
+    watch_list), not (ticker, window) -- two concurrent nodes could otherwise
+    share a window and resolve to the wrong one's mode (see docs/
+    backlog_cache.md's wl_id refactor entry)."""
     ticker = pos['ticker']
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         return False
-    node = next((n for n in db.get_watchlist()
-                 if n['ticker'] == ticker and n['window'] == pos['window']), None)
+    node = db.get_watch_list_node_by_id(pos.get('wl_id'))
     if node is None or node.get('mode') != 'live':
+        return False
+    if not schwab_safety.node_automation_enabled(pos.get('wl_id')):
         return False
     account = pos.get('account')
     shares = pos.get('shares')
@@ -156,11 +160,10 @@ def _alert_reconcile_mismatch(pos, kind, text):
     mismatch-kind) so an already-alerted, still-unresolved mismatch doesn't
     repost every poll cycle (same pattern as active_signals._guarded's
     per-section cooldown)."""
-    _node = db.get_watch_list_node(ticker=pos.get('ticker'), account=pos.get('account'))
     db.log_coverage_event(
         "reconciliation_mismatch", _coverage_mode(pos.get('account')),
         ticker=pos.get('ticker'), position_id=pos.get('id'),
-        node_id=_node['id'] if _node else None, result=kind
+        node_id=pos.get('wl_id'), result=kind
     )
     key = f"{pos['id']}:{kind}"
     last = _RECONCILE_ALERTED.get(key, 0)
@@ -227,8 +230,7 @@ def check_live_state_reconciliation(open_positions):
         account = pos.get('account')
         if not account:
             continue
-        _node = db.get_watch_list_node(ticker=ticker, account=account)
-        _node_id = _node['id'] if _node else None
+        _node_id = pos.get('wl_id')
         try:
             real_shares = schwab_client.get_real_position(account, ticker)
             orders = schwab_safety._open_orders(account)
@@ -313,8 +315,11 @@ def _place_stop_loss_for_position(node, ticker, signal_price):
     for that trade -- worst case, a real fill better than the trigger produces
     a looser live stop than the backtest's, so a gap that would have exited
     the backtest position could leave the live position open through a larger
-    drawdown than modeled."""
-    pos = db.get_open_position(ticker)
+    drawdown than modeled. Looks the position up by node['id'] (wl_id), not
+    ticker -- ticker-only would size/anchor off a sibling node's position and
+    stamp its broker order id onto the wrong row if 2+ nodes share this ticker
+    (see docs/backlog_cache.md's wl_id refactor entry)."""
+    pos = db.get_open_position_by_wl_id(node['id'])
     if not pos or not pos.get('shares'):
         return
     account = node.get('account')
@@ -343,7 +348,7 @@ def _place_stop_loss_for_position(node, ticker, signal_price):
     db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                            node_id=node.get('id'), result="placed", detail=f"stop_price={stop_price:.4f}")
     if sl_order_id is not None:
-        db.set_sl_order_id(ticker, sl_order_id)
+        db.set_sl_order_id_by_position(pos['id'], sl_order_id)
 
 
 def _sync_confirm_and_protect(ticker, node):
@@ -375,7 +380,7 @@ def _sync_confirm_and_protect(ticker, node):
                       f"temporarily UNPROTECTED (no stop-loss resting). Will be placed once the fill is "
                       f"confirmed by the auto-fill poll or account-activity stream.")
         return
-    _reconcile_buy_fill(ticker, fill['price'], fill['quantity'])
+    _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'])
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +446,7 @@ def notify_buy_signal(node, sig):
         db.add_pending_buy(node, sig, channel, ts, order_id=order_id)
         if auto_placed:
             if trailing_buy:
-                db.mark_pending_buy_placed(ticker)
+                db.mark_pending_buy_placed_by_wl_id(node['id'])
             else:
                 # Market-buy sync-confirm (Part 4, Section 6) -- runs the
                 # synchronous fast-confirm poll and, on a hit, opens/tops-up/
@@ -473,11 +478,11 @@ def notify_buy_signal(node, sig):
         except (EOFError, KeyboardInterrupt):
             resp = ''
         if resp == 'y':
-            db.mark_pending_buy_placed(ticker)
+            db.mark_pending_buy_placed_by_wl_id(node['id'])
             print(f"  {ticker} order marked placed — no position yet, waiting for fill.")
             _post_message(f"{ticker} trailing buy order placed, waiting for fill.")
         else:
-            db.clear_pending_buy(ticker)
+            db.clear_pending_buy_by_wl_id(node['id'])
             print("  Skipped.")
         return
 
@@ -493,10 +498,10 @@ def notify_buy_signal(node, sig):
             drift_pct  = (exec_price - price) / price * 100
             now        = datetime.now()
             opened     = db.open_position(node, price, bar_time, exec_price, now)
-            db.clear_pending_buy(ticker)
+            db.clear_pending_buy_by_wl_id(node['id'])
             if not opened:
                 print(f"  [warn] {ticker} already has an open position — ignored duplicate")
-                _post_message(f"{ticker} — ALREADY OPEN, this fill was ignored. {_existing_position_note(ticker)}")
+                _post_message(f"{ticker} — ALREADY OPEN, this fill was ignored. {_existing_position_note(ticker, wl_id=node['id'])}")
             else:
                 note = f"Entered at ${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
                 print(f"  Position opened. {note}")
@@ -504,7 +509,7 @@ def notify_buy_signal(node, sig):
         except ValueError:
             print("  Invalid price — position not opened.")
     else:
-        db.clear_pending_buy(ticker)
+        db.clear_pending_buy_by_wl_id(node['id'])
         print("  Skipped.")
 
 
@@ -512,7 +517,7 @@ def notify_limit_fill(node, current_price, lower_band):
     ticker          = node['ticker']
     schwab_sl_pct   = node['stop_loss']
     schwab_sl_price = lower_band * (1 - schwab_sl_pct / 100)
-    target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
+    target_notional = _last_sale_recovery(node)
     shares          = int(target_notional // lower_band)
     now_str = datetime.now().strftime('%H:%M:%S')
 
@@ -669,10 +674,9 @@ def notify_trailing_activated(pos, current_price):
     # position fresh so the merge starts from the real just-armed state.
     fresh = db.get_position_by_id(pos['id']) or pos
     state = dict(fresh.get('trail_state') or {})
-    _node = db.get_watch_list_node(ticker=ticker, account=pos.get('account'))
     db.log_coverage_event(
         "trailing_arm_state_reread", _coverage_mode(pos.get('account')), ticker=ticker,
-        position_id=pos['id'], node_id=_node['id'] if _node else None,
+        position_id=pos['id'], node_id=fresh.get('wl_id'),
         result="trailing_preserved" if state.get('trailing') else "trailing_missing_regression",
     )
     state['reminder_channel'] = channel
@@ -959,7 +963,7 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False):
     so the top-up buy isn't wrongly blocked by the signal-window time gate."""
     ticker = node['ticker']
     account = node.get('account')
-    target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
+    target_notional = _last_sale_recovery(node)
     delta = target_notional - (fill_price * filled_shares)
     if delta > fill_price:
         top_up_shares = int(delta // fill_price)
@@ -980,11 +984,26 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False):
                               f"unexpectedly: {e} (position stays under target notional by "
                               f"${delta:,.0f})")
                 return
-            if db.top_up_position(ticker, top_up_shares, fill_price):
+            if db.top_up_position(node['id'], top_up_shares, fill_price):
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
                                        node_id=node.get('id'), result="placed", detail=f"shares={top_up_shares} price={fill_price:.4f}")
                 _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${fill_price:.4f} "
                               f"(fill was under target notional by ${delta:,.0f})")
+            else:
+                # The real top-up order is already placed at the broker at this
+                # point -- if the DB-side update can't find a matching position
+                # (wl_id mismatch/NULL), the account now holds more shares than
+                # open_positions.shares records, understating every downstream
+                # SL/trailing-sell sizing. Must not fail silently.
+                db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
+                                       node_id=node.get('id'), result="db_update_failed_after_real_order",
+                                       detail=f"shares={top_up_shares} price={fill_price:.4f}")
+                _post_message(
+                    f"🚨 {ticker} — top-up BUY of {top_up_shares} shares @ ${fill_price:.4f} was placed "
+                    f"at the broker, but the position record could not be updated (no matching open "
+                    f"position for this node) — open_positions.shares is now UNDERSTATED, SL/trailing-sell "
+                    f"sizing will be wrong until this is corrected manually."
+                )
     elif delta < -fill_price:
         db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
                                node_id=node.get('id'), result="overspent_no_corrective_sell", detail=f"overspend=${-delta:,.0f}")
@@ -992,7 +1011,7 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False):
                       f"(no corrective sell placed)")
 
 
-def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=False):
+def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=False, wl_id=None):
     """Single entry point for a detected BUY fill -- shared by check_auto_fills
     (slow poll path), drain_fill_queue (fast websocket path, Part 3),
     check_gap_resize's fill poll (Part 3), and _sync_confirm_and_protect
@@ -1015,15 +1034,40 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
     file. This auto-fill path is the minority case for trailing-buy fills
     (the manual 'Filled' Slack button is the primary workflow, see
     handle_trail_buy_fill_price in signals_handlers.py, which places its own
-    SL for the same reason)."""
+    SL for the same reason).
+    wl_id (when the caller has it -- every caller except drain_fill_queue's
+    stream entry point does) disambiguates which node's pending row this real
+    broker fill belongs to -- the broker fill event itself only ever carries
+    ticker/account, so 2+ concurrent pending buys for the same ticker can't be
+    told apart from the fill alone (see docs/backlog_cache.md's wl_id refactor
+    entry). Ambiguity is surfaced, never silently guessed (automation_
+    principles.md #4)."""
     pendings = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
     if not pendings:
         return
+    if wl_id is not None:
+        matched = [p for p in pendings if p['node']['id'] == wl_id]
+        if not matched:
+            # The hinted node has no resting pending row (already resolved by
+            # another path, or a stale hint) -- reconciling against a
+            # *different* node's row here would silently attribute a real
+            # fill to the wrong node's account/params. Surface it instead of
+            # guessing (automation_principles.md #4).
+            _post_message(f"⚠️ {ticker} — fill detected for node wl_id={wl_id} but no matching "
+                          f"pending_buys row found (pending wl_ids: {[p['node']['id'] for p in pendings]}) "
+                          f"— not reconciled, verify and record manually.")
+            return
+        pendings = matched
+    pendings.sort(key=lambda p: p['created_at'])
+    if len(pendings) > 1:
+        _post_message(f"⚠️ {ticker} — {len(pendings)} pending buys matched this fill"
+                      f"{f' (wl_id={wl_id})' if wl_id is not None else ' (wl_id could not disambiguate)'}"
+                      f" — reconciling against the oldest; verify the others manually.")
     pending = pendings[0]
     node = pending['node']
     signal_price = pending['signal_price']
     signal_time = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
-    db.clear_pending_buy(ticker)
+    db.clear_pending_buy_by_wl_id(node['id'])
     opened = db.open_position(node, signal_price, signal_time, fill_price, datetime.now(),
                                shares=filled_shares)
     if not opened:
@@ -1108,7 +1152,7 @@ def check_gap_resize():
                 )
                 continue
 
-        target_notional = _last_sale_recovery(ticker, node.get('starting_notional'))
+        target_notional = _last_sale_recovery(node)
         padded_price = current_price * (1 + _GAP_RESIZE_PAD_PCT / 100)
         shares = int(target_notional // padded_price)
         _post_message(f"🌅 {ticker} — overnight gap cleared trigger (${current_price:.4f} vs "
@@ -1125,11 +1169,11 @@ def check_gap_resize():
             db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                    node_id=node.get('id'), result="rejected", detail=str(e))
             _post_message(f"🚫 {ticker} gap-correction MARKET order was rejected by Schwab: {e}")
-            db.clear_pending_buy(ticker)
+            db.clear_pending_buy_by_wl_id(node['id'])
             continue
         db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                node_id=node.get('id'), result="replaced", detail=f"shares={shares} price={current_price:.4f}")
-        db.set_pending_buy_order_id(ticker, new_order_id)
+        db.set_pending_buy_order_id_by_wl_id(node['id'], new_order_id)
 
         if new_order_id is None:
             # dry_run -- no real fill will ever appear on Schwab's order book
@@ -1146,7 +1190,7 @@ def check_gap_resize():
                           f"will be caught by the next check_auto_fills poll")
             continue
 
-        _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], is_gap_correction=True)
+        _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], is_gap_correction=True, wl_id=node['id'])
 
 
 def drain_fill_queue():
@@ -1192,6 +1236,11 @@ def drain_fill_queue():
             continue
         db.log_coverage_event("fast_path_fill_reconciliation", _coverage_mode(account), ticker=ticker,
                                node_id=_node_id, result="confirmed_via_poll", detail=f"price={fill['price']:.4f} qty={fill['quantity']:g}")
+        # _node_id is only a fuzzy ticker+account hint (get_watch_list_node's
+        # documented contract is enrichment/logging, never a gate on a real
+        # action) -- passing it as _reconcile_buy_fill's wl_id would let a
+        # stale/ambiguous hint block reconciliation of a real, confirmed-FILLED
+        # broker fill outright. Kept for the coverage event above only.
         _reconcile_buy_fill(ticker, fill['price'], fill['quantity'])
 
 
@@ -1218,7 +1267,7 @@ def check_auto_fills(open_positions):
         fill = schwab_client.get_filled_order(account, ticker, 'BUY')
         if fill is None:
             continue
-        _reconcile_buy_fill(ticker, fill['price'], fill['quantity'])
+        _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'])
 
     for pos in open_positions:
         ticker = pos['ticker']
@@ -1401,8 +1450,11 @@ def build_reference_table(watchlist):
     info if held. `Proximity` is signed so negative always means the trigger has
     already been crossed (price fell through a buy/sell-trail trigger, or rose
     through an arm trigger) -- sign convention, not raw distance."""
-    positions = {p['ticker']: p for p in db.get_open_positions()}
-    pending_buys = {p['ticker']: p for p in db.get_pending_buys()}
+    # Keyed on wl_id, not ticker -- a ticker-keyed dict would silently mask one
+    # node's position/pending row behind another's if 2+ nodes share a ticker
+    # (see docs/backlog_cache.md's wl_id refactor entry).
+    positions = {p['wl_id']: p for p in db.get_open_positions()}
+    pending_buys = {p['node']['id']: p for p in db.get_pending_buys()}
     rows = []
     # 2026-07-22 fix: this used to filter to mode=='live' only -- silently
     # correct while every node really was live, but once the whole watchlist
@@ -1413,12 +1465,12 @@ def build_reference_table(watchlist):
     # show everything, mark mode on each row instead of hiding non-live ones.
     for node in watchlist:
         ticker = node['ticker']
-        pos = positions.get(ticker)
+        pos = positions.get(node['id'])
         sig = compute.compute_buy_signal(node)
         account = node.get('account') or ''
         alpha = node.get('alpha')
-        last_sale = _last_sale_recovery(ticker, node.get('starting_notional'))
-        phase = _phase_emoji(pos, pending_buys.get(ticker))
+        last_sale = _last_sale_recovery(node)
+        phase = _phase_emoji(pos, pending_buys.get(node['id']))
 
         if sig is None:
             rows.append({
@@ -1436,7 +1488,7 @@ def build_reference_table(watchlist):
         schwab_sl_pct = node['stop_loss']
 
         if pos is None:
-            pending = pending_buys.get(ticker)
+            pending = pending_buys.get(node['id'])
             trail_buy_pct = node.get('trail_buy_pct')
             if pending is not None:
                 # z already crossed, trailing-buy order active -- the bounce-above-

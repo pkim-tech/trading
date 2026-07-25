@@ -297,6 +297,60 @@ def resume_ticker_automation(ticker: str):
     TICKER_AUTOMATION_PATH.write_text(json.dumps(state))
 
 
+NODE_AUTOMATION_PATH = _STATE_DIR / "schwab_node_automation.json"
+
+
+def node_automation_enabled(node_id) -> bool:
+    """Additive sibling of ticker_automation_enabled -- a node-level pause that
+    can only make things MORE restrictive, never override a ticker-level
+    pause (real gate is `ticker_automation_enabled(ticker) AND
+    node_automation_enabled(wl_id)`, see docs/backlog_cache.md's wl_id
+    refactor entry). node_id=None (the caller couldn't resolve a specific
+    node, e.g. an ambiguous ticker+account match) defaults to True -- this is
+    a supplementary, opt-in-to-pause toggle, not a fail-closed safety gate on
+    its own; the ticker-level pause remains the real safety net when identity
+    can't be resolved."""
+    if node_id is None:
+        return True
+    if NODE_AUTOMATION_PATH.exists():
+        try:
+            state = json.loads(NODE_AUTOMATION_PATH.read_text())
+            if str(node_id) in state:
+                return bool(state[str(node_id)])
+        except (json.JSONDecodeError, OSError):
+            pass
+    return True
+
+
+def pause_node_automation(node_id, reason: str = ""):
+    """Node-scoped sibling of pause_ticker_automation -- pauses just this
+    watch_list node's automation, leaving sibling nodes on the same ticker
+    (e.g. a different account) untouched."""
+    NODE_AUTOMATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {}
+    if NODE_AUTOMATION_PATH.exists():
+        try:
+            state = json.loads(NODE_AUTOMATION_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    state[str(node_id)] = False
+    state[f"{node_id}_reason"] = reason
+    NODE_AUTOMATION_PATH.write_text(json.dumps(state))
+
+
+def resume_node_automation(node_id):
+    NODE_AUTOMATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {}
+    if NODE_AUTOMATION_PATH.exists():
+        try:
+            state = json.loads(NODE_AUTOMATION_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    state[str(node_id)] = True
+    state.pop(f"{node_id}_reason", None)
+    NODE_AUTOMATION_PATH.write_text(json.dumps(state))
+
+
 def auto_fill_detection_enabled(ticker: str) -> bool:
     """False unless a persisted per-ticker override has explicitly enabled it --
     opposite default from ticker_automation_enabled (see AUTO_FILL_DETECTION_PATH
@@ -348,11 +402,24 @@ def _open_locked():
 
 
 def _live_ticker_accounts() -> dict:
-    """ticker -> assigned account nickname, for watchlist rows currently in
-    'live' mode -- queried fresh (not cached) since mode/account assignment
-    can change during a running day (e.g. AGQ moved to research mid-session
-    2026-07-13)."""
-    return {row["ticker"]: row["account"] for row in signals_db.get_watchlist() if row["mode"] == "live"}
+    """ticker -> set of assigned account nicknames, for watchlist rows
+    currently in 'live' mode -- queried fresh (not cached) since mode/account
+    assignment can change during a running day (e.g. AGQ moved to research
+    mid-session 2026-07-13). A set, not a single value: 2+ concurrent live
+    nodes for the same ticker in *different* accounts is a real, intended
+    configuration (e.g. the same ticker live in two separate accounts for
+    blast-radius containment, see docs/backlog_cache.md's wl_id refactor
+    entry) -- collapsing to one account per ticker would hard-reject the
+    second node's real orders as 'assigned to the wrong account'."""
+    accounts_by_ticker: dict = {}
+    for row in signals_db.get_watchlist():
+        # Exclude a NULL/missing account -- it can never equal a real account
+        # string passed into check_order, and letting it into the set risks
+        # sorted() raising TypeError (None vs str) when check_order formats
+        # the rejection message below.
+        if row["mode"] == "live" and row["account"]:
+            accounts_by_ticker.setdefault(row["ticker"], set()).add(row["account"])
+    return accounts_by_ticker
 
 
 def _all_orders(account: str) -> list:
@@ -378,7 +445,14 @@ def _open_orders(account: str) -> list:
 
 def _has_open_order(orders: list, ticker: str) -> bool:
     """True if any resting order in `orders` (see _open_orders) is for this
-    ticker, regardless of side."""
+    ticker, regardless of side.
+    Deliberately ticker(+account)-keyed, not wl_id-keyed, and not part of the
+    wl_id refactor (docs/backlog_cache.md) -- the real broker's order book has
+    no concept of wl_id, only ticker symbol per leg. Permanent policy
+    constraint: two live nodes on the same ticker in the *same* account still
+    cannot both hold resting orders, regardless of that refactor (two live
+    nodes on the same ticker in *different* accounts is fine -- see
+    _live_ticker_accounts)."""
     for o in orders:
         legs = o.get("orderLegCollection", [])
         if any(leg.get("instrument", {}).get("symbol") == ticker for leg in legs):
@@ -466,16 +540,28 @@ def check_order(
     if not limits.enabled:
         raise SafetyViolation(f"account '{account}' is disabled in the allowlist")
     _mode = "dry_run" if limits.dry_run else "live"
+    # KNOWN LIMITATION (docs/backlog_cache.md's wl_id refactor entry): _node_id
+    # is re-derived via a ticker+account best-effort lookup because no caller
+    # in the schwab_client chain threads a real wl_id through yet -- that
+    # plumbing (schwab_client's 6 place_* functions -> approve_and_record ->
+    # here) was scoped as its own follow-up, not done this session.
+    # get_watch_list_node() returns None on an ambiguous match (2+ nodes same
+    # ticker+account), so node_automation_enabled(None) below silently
+    # defaults to True in exactly that case -- a node-level pause is a no-op
+    # for two same-account nodes on one ticker until this is threaded properly.
     _node = signals_db.get_watch_list_node(ticker=ticker, account=account)
     _node_id = _node['id'] if _node else None
 
     ticker_accounts = _live_ticker_accounts()
     if ticker not in ticker_accounts:
         raise SafetyViolation(f"'{ticker}' is not a live-mode ticker on the active watchlist")
-    if ticker_accounts[ticker] != account:
+    if account not in ticker_accounts[ticker]:
         raise SafetyViolation(
-            f"'{ticker}' is assigned to account '{ticker_accounts[ticker]}', not '{account}'"
+            f"'{ticker}' is not assigned to account '{account}' "
+            f"(assigned accounts: {sorted(ticker_accounts[ticker])})"
         )
+    if not node_automation_enabled(_node_id):
+        raise SafetyViolation(f"node id={_node_id} for '{ticker}' has automation paused")
     if ticker not in AUTOMATION_ENABLED_TICKERS:
         raise SafetyViolation(
             f"'{ticker}' is not in the automation pilot scope {AUTOMATION_ENABLED_TICKERS} "
@@ -551,7 +637,7 @@ def check_order(
         # does catch our own inflated-share-count bugs (e.g. a top-up that
         # recorded shares before the real fill was confirmed) before they
         # reach the broker as a would-be short.
-        pos = signals_db.get_open_position(ticker)
+        pos = signals_db.get_open_position_for_account(ticker, account)
         if pos and quantity > pos['shares'] * 1.001:  # tolerance for float share counts
             signals_db.log_coverage_event(
                 "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked",
