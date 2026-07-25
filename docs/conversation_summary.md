@@ -3484,3 +3484,73 @@ user this session (dry_run protects everything, per architecture, not leftover t
 - Deliberately not committed yet — user should review the diff (or ask for a `git diff` walkthrough)
   before this lands, given how much of it turned out to be real live-order-flow fixes beyond the
   original coverage-migration scope.
+
+---
+
+## 2026-07-25 — Coverage compass finished: Streamlit dashboard, strategy_type axis, Slack-callable report — all 7 pieces done, two rounds of Opus review, both with real findings fixed
+
+### What we did
+Picked up from the prior session's node_id-identity migration (already committed) and finished the
+remaining pieces of the 2026-07-24 coverage-system reframe end to end, working through the backlog
+item's numbered list one piece at a time with the user directing which to tackle next.
+
+- **Piece #1/#4 (Streamlit dashboard + drill-down)**: new `pages/14_Coverage.py` ("Coverage
+  Compass") — unexplained deviations at top with an inline Explain form writing directly to
+  `coverage_deviations.reason`, today's per-scenario pass/fail, the scenario x mode coverage
+  matrix, and a per-scenario drill-down into raw `coverage_events`. Reads `trading_live.db` via
+  raw `sqlite3` (not `signals_db`), matching other `pages/*.py` files, specifically to avoid
+  constructing a Slack Bolt `App()` inside the Streamlit process. Smoke-tested by actually
+  launching the page and confirming a clean 200.
+- **Piece #2 (3rd coverage axis)**: `coverage_events` gained a nullable `strategy_type` column.
+  `log_coverage_event` derives it automatically from `node_id`'s real `watch_list.strategy` when
+  not passed explicitly, so none of the ~18 real call sites needed to change. `coverage_matrix.py`
+  gained a `--strategy` filter.
+- **Piece #7 (Slack-callable report)**: `signals_notify.send_coverage_report()` runs the real
+  daily check live and posts a compact summary, wired to a new "🧭 Coverage Report" button on the
+  Morning Report.
+- **Two independent Opus review rounds** (required by `automation_principles.md` #12 for any
+  `signals_*.py`/`schwab_*.py` change), both found real bugs, all fixed:
+  - Round 1 (scoped to the piece #7 diff): a weekend Slack tap manufactured permanent
+    false-positive `coverage_deviations` rows (confirmed live — 6 real Saturday rows already in
+    `trading_live.db`, cleaned up); the report re-queried stale deviation rows after running the
+    check, so a scenario that deviated earlier and became met later still rendered UNEXPLAINED,
+    contradicting the check it had just run; an unknown `check_method` silently rendered as met;
+    no exception handling meant a failure would silently no-op the button. Fixed: a weekday gate
+    inside `run_check` itself (covers CLI and Slack); `run_check` now returns structured
+    per-scenario results and a new `clear_deviation_if_resolved` clears a stale same-day
+    deviation, with the Slack report rendering from that live return value instead of a re-query;
+    unknown methods now render "? not checked"; failures now post a visible `⚠️` message.
+  - Round 2 (session-close review, covering the full session diff including `signals_db.py`,
+    which round 1 hadn't scoped): `scenario_key` alone is not a unique key — two active
+    `scenario_expectations` rows can share one `scenario_key` disambiguated by `node_id`/`mode`
+    (the same designed scenario run against two nodes on purpose) — but both the Slack report and
+    the new Streamlit page keyed their deviation lookups by `scenario_key` alone, so explaining
+    one node's deviation could mask a different node's still-unexplained one. Fixed by threading
+    `node_id`/`mode` through `run_check`'s results and keying both callers on the composite tuple.
+    Also fixed: the Streamlit page rendered any scenario with no deviation row as "met" without
+    checking whether `run_check` actually evaluates it (non-daily frequency, unrecognized
+    `check_method`) — now renders those explicitly instead of assuming met.
+    `clear_deviation_if_resolved` deleted unconditionally (could destroy a human-entered reason if
+    the scenario later became met) — fixed with `AND reason IS NULL`, matching
+    `record_deviation`'s existing "never clobber a reason" rule.
+- User pushed back mid-session on the weekend gate, worried it would complicate testing ("could we
+  mock data returning to test the fill gap?") — resolved by discussion, not code: the gate only
+  checks the passed-in `check_date`, not wall-clock time, so tests already avoid it by passing
+  explicit dates and controlling `trade_log`/`pending_buys` rows directly, the same pattern already
+  used to simulate fills/gaps. User agreed to keep the gate as-is.
+
+**Full suite**: 195 → 230 passed across the session (two commits: `1214351`, `d966818`, `5da4ddd`).
+`scripts/live_sim_harness.py` 6/6 after every `signals_*.py` change. All 7 pieces of the
+2026-07-24 coverage-system reframe (dashboard, 3rd axis, structured expected-vs-actual, drill-down,
+no-unexplained-failure contract, Slack report) are now done — full detail in
+`docs/deep_backlog.md`'s 2026-07-25 entry; `docs/backlog_cache.md`'s long-running entries collapsed
+to one-line pointers per convention.
+
+### What's next
+- The compass is now built and live-tested end to end; the natural next step is watching it run for
+  a real trading week and seeing what `coverage_check.py`/the Slack report/the Streamlit page
+  actually surface day to day — no further build work queued for this specific backlog item.
+- Still-open, unrelated backlog items carried forward: the `daily_order_cap` per-account-vs-
+  per-ticker design decision (undecided), the dry_run-completion design question (deferred), the
+  stale-pending-buys-guard latent gap (not currently reachable), and the account-segregation /
+  new-dedicated-account plans discussed in prior sessions.
