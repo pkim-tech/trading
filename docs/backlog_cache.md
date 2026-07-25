@@ -1,5 +1,182 @@
 # Backlog Cache
 
+## [live-trading][security][architecture] Open design, scoped 2026-07-25/26, two Opus review rounds — ticker-only keying is a systemic pattern across the codebase, real (not just paper) order-routing correctness at stake; wl_id-keyed fix designed, not built
+Grew out of a long design conversation about verifying a live/dry_run node's real
+signal behavior against paper trading's simulated fill/exit as a reconciliation
+check (motivating case: SOXL live/dry_run in a new `soxl_ira` node while SOXL's
+existing `ira` node, id 92, `mode='research'`/`v5`, keeps paper-trading as it does
+today). Two designs were explicitly considered and rejected before landing here:
+1. A single node running both the real alert path and a paper shadow (a new
+   `watch_list.paper_shadow` flag column). Abandoned once it was clear the real
+   need (SOXL live in one account, paper in another) already produces two
+   separate `watch_list` rows naturally — `account` is a per-row field, so one
+   node can't serve two accounts anyway. The existing mode-routing already does
+   the right thing per-row; no flag needed.
+2. Deduping paper tracking on `(ticker, window, strategy)`. Wrong because two
+   rows can share all three but differ in `fixed_sl`/`arm_sell_pct`/
+   `trail_sell_pct`/`trail_buy_pct`/`entry_timing`/`starting_notional` — a
+   coarser key would silently simulate one row's signal using another row's
+   parameters.
+
+**Landed on**: key everything on the `watch_list` row's own primary key (`id`),
+stored/referenced elsewhere as a new `wl_id` column — deliberately not reusing
+the existing `watch_list.watchlist_id` column (the *named watchlist* grouping,
+e.g. `65` = "Live v5", shared by many unrelated tickers — far too coarse).
+
+**Real motivating insight** (not just today's test): once multiple strategies
+are running as a matter of course, "one ticker has one active node" stops
+holding structurally, not just as an edge case. Every place assuming that
+invariant needs the same fix.
+
+**Opus review (2026-07-26) confirmed the draft's description of current code
+was fully accurate, but found the scope incomplete — 8 additional ticker-only-
+keyed sites, beyond the 3 originally identified (`paper_pending_buys` table,
+`active_signals.py`'s shared `last_seen_bar` dict, `paper_positions`/
+`open_position`'s `(ticker, window)` key)**:
+1. **`buy_alerted`'s key is `(ticker, strategy, window)`** (`active_signals.py:205`)
+   — the exact same insufficiency already rejected for paper dedup (design #2
+   above), but still live in production alerting code today. Two nodes
+   differing only in `fixed_sl`/`account` would collide; one could silently
+   never alert. Biggest single omission from the original draft.
+2. **`pending_tickers`** (`active_signals.py:197`, ticker-only, both real and
+   paper) — one node's resting order would block another node's same-day
+   unlock.
+3. **`open_position_keys`** (`active_signals.py:220,226`) — same `(ticker,
+   window)` coarseness as the paper position table.
+4. **A third `last_seen_bar` writer**: `_scan_pinned_exit_arm`
+   (`active_signals.py:295,298`) — the original draft only named two.
+5. **`_seed_last_seen_bar`** (`active_signals.py:311-321`) seeds only from real
+   positions, never paper — already a latent gap today given the dict is
+   shared.
+6. **`clear_paper_pending_buy(ticker)`** (`paper_trading.py:77,81`) would
+   delete *both* nodes' pending rows when only one fills — silent data loss,
+   worse than a missed signal.
+7. **`top_up_position`** (`signals_db.py:1407-1416`) is `WHERE ticker=?` with
+   no window at all — picks an arbitrary row. Already broken today for two
+   windows, independent of this work.
+8. **`get_watch_list_node(ticker, strategy, version, window)`** for coverage
+   enrichment (`paper_trading.py:122`) — fails safe (`None` on ambiguity,
+   `signals_db.py:648-663`), low severity, but should read the position's
+   `wl_id` once it exists.
+
+**Also confirmed by the review**:
+- `update_paper_pending_buy_running_low` needs no change — already keys on its
+  own row PK (`pending_id`), not ticker.
+- `wl_id` is already recoverable without treating existing rows as unbackfillable
+  — `node['id']` is already persisted in `node_json` on both `paper_pending_buys`
+  and `paper_positions` (`_PENDING_BUY_NODE_KEYS`, `signals_db.py:1225`, reused
+  at `:1297`), so the migration is fully backfillable, not nullable-forever.
+- Leaving `open_position(paper=True)` on `(ticker, window)` is a real risk, not
+  a safe simplification — nothing in the schema forbids two nodes sharing a
+  window, and `open_position_keys` uses the identical tuple, so the collision
+  would be consistent-but-wrong across both real and paper paths. Migrate it
+  to `wl_id` in the same pass, don't defer it.
+- **Not a gap**: `schwab_safety`'s broker-order-book guards
+  (`_has_open_order`/`_has_open_buy_order_in_account`/`_has_open_sell_order`,
+  `schwab_safety.py:379-419`) are correctly ticker-keyed by nature — the real
+  broker's order book has no concept of `wl_id`. Worth recording as a
+  deliberate, permanent policy constraint: two live nodes on the same ticker in
+  the same account still cannot both hold resting orders, regardless of this
+  fix. `coverage_events` already has `node_id`/`strategy_type` — no gap there.
+
+**Second Opus review round (2026-07-26), broader sweep beyond the first pass's
+scope (`signals_notify.py`, `signals_handlers.py`, `signals_compute.py`,
+`signals_helpers.py`, `schwab_safety.py`, `scripts/*.py`) — found 16 MORE
+ticker-only-keyed sites, several on the real (non-paper) order path, elevating
+this from a paper-trading nicety to a real order-routing correctness concern**:
+
+**Directly blocks the motivating SOXL-in-two-accounts case**:
+9. **`schwab_safety._live_ticker_accounts()`** (`schwab_safety.py:471-477`) is a
+   `{ticker: account}` map — two live nodes for the same ticker in different
+   accounts collapse to one entry, and the second node's real orders get
+   hard-rejected ("assigned to account X"). This is the actual mechanism that
+   would block the soxl_ira + ira design this whole conversation was aiming
+   for — must be fixed before that design is usable, not just nice-to-have.
+
+**Real (non-paper) equivalents of the paper-side bugs already found**:
+10. **The real `pending_buys` table has the identical ticker-only pattern**:
+    `clear_pending_buy(ticker)` (`signals_db.py:1262`),
+    `mark_pending_buy_placed(ticker)` (`:1268`),
+    `set_pending_buy_order_id(ticker, order_id)` (`:1243`) — resolving one
+    node's order deletes/overwrites the other node's row, including writing
+    one node's real broker `order_id` onto the wrong row (a later
+    `cancel_order` in `check_gap_resize` would cancel the wrong node's real
+    order). Callers: `signals_handlers.py:48,100,117,156,188,230,378`;
+    `signals_notify.py:444,476,480,496,507,1026,1128,1156`.
+11. **All six BUY Slack buttons resolve by ticker, not node/position id**,
+    despite the click payload already carrying the full node with its `id`
+    (`signals_handlers.py:46,99,116,140,187,229` —
+    `trail_buy_order_placed`/`trail_buy_missed`/`trail_buy_cancelled`/
+    `buy_skipped`/`trail_buy_fill_price_submit`/`entry_price_submit`).
+    **SELL-side buttons already do this correctly** (`signals_handlers.py:278,
+    297,321,417`, matching on `data['position_id']`/`p['id']`) — BUY-side
+    never adopted that pattern. Stale-click guards at `:141`/`:213`
+    (`any(p['ticker'] == ticker for p in db.get_pending_buys())`) mean node
+    B's pending row can make a stale click on node A's already-resolved
+    message look valid and proceed to `open_position`.
+12. **`signals_notify.py:1019`** — the auto-fill reconciliation path takes
+    `pendings[0]`, an arbitrary matching row when 2 nodes both have pending
+    buys for the same ticker, and opens a real position using whichever
+    node's params come first — could bake the wrong `fixed_sl`/`account`/
+    sizing onto a real `open_positions` row.
+13. **Morning Report dicts** (`signals_notify.py:1404-1405,1416,1439`) key
+    `{ticker: position/pending}` — with 2 nodes, one silently masks the
+    other's row in the report.
+14. **`_attempt_automated_sell`'s mode gate** (`signals_notify.py:77`) matches
+    on `(ticker, window)` — two same-window nodes could read the wrong node's
+    `mode`, letting a research node's position route through automated sell
+    (or vice versa).
+15. **`get_watch_list_node(ticker=, account=)`** used for coverage `node_id`
+    enrichment beyond the one site the first pass found
+    (`paper_trading.py:122`): also `signals_notify.py:159,230,672,1179` and
+    `schwab_safety.py:468` (inside the real order path).
+16. **Per-ticker pause/kill-switch** (`schwab_safety.py:266,281,295,308,323,
+    336`) — pausing one node silences automation for every node on that
+    ticker. May be acceptable as a deliberate coarse safety behavior (a pause
+    is meant to be a blunt instrument) rather than a bug — needs a explicit
+    decision, not an assumed fix.
+17. **`_last_sale_recovery(ticker, ...)`** (`signals_helpers.py:133-137`)
+    sizes the next buy off the most recent `trade_log` row for the ticker
+    regardless of node/account — node A's $50k exit could size node B's $5k
+    pilot buy.
+18. **`_existing_position_note`/corp-action alert state**
+    (`signals_helpers.py:34-48,115`, JSON keyed by ticker) — one node's
+    discontinuity alert suppresses the other's.
+19. **`scripts/watchlist_status.py:38`** — display-only ticker-keyed dict,
+    low severity (masks in a status printout, not a live decision).
+20. **`scripts/live_sim.py:259`** — inherits `clear_pending_buy(ticker)`'s bug
+    above.
+
+**Confirmed clean, no gap**: `signals_compute.py` (already
+node/position-scoped throughout — `compute_buy_signal(node,...)`,
+`check_sell_condition(pos,...)` uses `pos['id']`; `_indicator_cache`'s
+`(ticker, strategy, window)` key is safe since it caches only SMA/Std,
+independent of per-node SL/trail/z-threshold params). `signals_blocks.py`,
+`schwab_client.py` (correctly symbol-level at the real broker boundary).
+`scripts/daemon_status.py`/`open_positions_status.py`/
+`paper_trading_status.py`/`coverage_check.py` (row-wise or already
+`node_id`-scoped).
+
+**Not built this session** — one exploratory edit to `active_signals.py`'s
+`_scan_buy_signals` (the rejected flag-based design) was made and fully
+reverted; working tree confirmed clean throughout. This is scoped design work
+only, picked up as dedicated implementation next session. **Given the real
+severity found in the second review round (items 9-12 especially touch real
+order placement/cancellation correctness), this may warrant its own staged
+rollout** (per the existing `backtest-change-rollout`-style staged-verification
+pattern, though that skill is scoped to backtest kernel changes specifically —
+worth a design conversation on the right staging for a live-daemon
+state-keying refactor of this size) rather than a single big-bang PR. Full
+plan: schema migration on `cache/live/trading_live.db` (back up first; `wl_id`
+recoverable from already-persisted `node_json` on the paper tables, so
+backfillable, not nullable-forever) and `trading_live.db`'s real
+`pending_buys`/`open_positions` tables too; re-key all 20 items above
+(11 original + this round's 9 renumbered into one list); fix BUY-side Slack
+button handlers to match the already-correct SELL-side `position_id` pattern;
+fix `_live_ticker_accounts()` before the soxl_ira two-account design is
+usable; then create the second SOXL `soxl_ira` node once everything above
+lands.
+
 ## [live-trading][security] Resolved 2026-07-25 — second Opus review round on the daily_order_cap change, 2 findings
 Full-diff review of the final `schwab_safety.py` state (increment + check both BUY-only, `soxl_ira`
 cap 3→100), after the first round's SELL-blocked-by-BUY-exhausted-cap bug was already fixed.
