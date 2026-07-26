@@ -1,5 +1,7 @@
 # Backlog Cache
 
+## [live-trading][coverage] Resolved 2026-07-26 — `live_sim_harness.py` gained `scenario_dry_run_sim_cycle`, closing a coverage gap in testing the dry_run fill-synthesis logic itself (neither `live_sim.py`'s REPL nor the unit tests drove it end-to-end through the real daemon wiring). Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
+
 ## [live-trading][coverage] Resolved 2026-07-26 — dry_run fill synthesis built: a dry_run account's trailing/market-buy order now closes the loop against real price data instead of stalling forever. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
 Fixes the canary/dry_run "no closed trade found" false-positive `coverage_deviations` (XLF/VOO/
 IWM/QQQ, ids 7-10, unexplained since 2026-07-24) — root cause: a `dry_run=True` account's real

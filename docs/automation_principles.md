@@ -120,11 +120,12 @@ real live observation — easy to lose track of across sessions without one.
 
 ## 11. Run the live-sim coverage harness before closing a session that touched live-trading code
 Whenever `active_signals.py` or any `signals_*.py`/`schwab_*.py` module changed during a
-session, run `python scripts/live_sim_harness.py` (all 6 scenarios, ~2s) and confirm every
+session, run `python scripts/live_sim_harness.py` (all 7 scenarios, ~2s) and confirm every
 scenario passes before that session's `session wrap`/`session close`, in addition to the unit
 suite and the kernel-parity verify scripts (#9).
 **Why**: the harness exercises real orchestration functions (`_scan_pinned_entry`,
-`_scan_pinned_exit_arm`, `_reconcile_fill`, `check_gap_resize`, TIME-exit, ambient market-buy)
+`_scan_pinned_exit_arm`, `_reconcile_fill`, `check_gap_resize`, TIME-exit, ambient market-buy,
+dry_run fill synthesis)
 end-to-end against synthetic data — a layer unit tests don't cover and the real daemon can't
 safely be used to test. Built 2026-07-23; found a real `get_open_position` bug and a real state-
 file pollution incident (`SCHWAB_STATE_DIR`) in its first build session, so it has already

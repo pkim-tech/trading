@@ -4087,3 +4087,43 @@ checkpoint: the canaries' `coverage_deviations` rows should stop reappearing onc
 restarts with this change; check `coverage_matrix.py`/`coverage_check.py` for a real `entry_fill`/
 `exit_fill` `mode=dry_run` row to confirm the synthesis fires live, not just in tests. Also resume
 the Monday (2026-07-27) `soxl_ira` unattended live-test plan, carried over from last session.
+
+---
+
+## 2026-07-26 — Added scenario_dry_run_sim_cycle to live_sim_harness.py, closing a coverage gap in the dry_run fill-synthesis logic itself
+
+### What we did
+Started from a practical question: with markets closed for the weekend, last session's dry_run
+fill-synthesis work (`update_dry_run_buys`/`_fill_dry_run_buy`/`check_dry_run_sim_sells`) couldn't
+be observed live before Monday. Checked whether `scripts/live_sim_harness.py` (the automated
+coverage harness) or `scripts/live_sim.py` (the manual REPL) already exercised that new path --
+neither did. `tests/test_dry_run_sim.py`'s 12 unit tests cover the logic in isolation, but the
+harness -- built specifically to verify end-to-end *wiring* through the real
+`active_signals.py`/`signals_notify.py` call graph -- had no scenario for it at all.
+
+Added `scenario_dry_run_sim_cycle`: creates a `mode='live'`/`account='ira'` (dry_run=True)
+`TrailingBothZScoreBreakout` node, seeds a `pending_buys` row, patches
+`signals_compute._current_price` to trigger a bounce-fill BUY through the real
+`update_dry_run_buys`, asserts the synthesized `open_positions` row is tagged `is_dry_run_sim=1`
+and the pending-buy row cleared and the Slack fill message posted, then patches
+`active_signals._load_cache` with a hand-built OHLC bar that breaches `fixed_sl` and calls the
+real `check_dry_run_sim_sells`, asserting the position closes with `exit_reason='SL'`, the closed
+`trade_log` row carries `is_dry_run_sim=1`, and the close Slack message posted.
+
+Only `scripts/live_sim_harness.py` changed this session -- no `active_signals.py`/`signals_*.py`/
+`schwab_*.py`/kernel module touched, so no Opus review or the verify_trailing_*_resolution scripts
+were required per the session-wrap gate.
+
+### Docs updated
+- `docs/live_test_coverage.md`: both dry_run-fill-synthesis rows now list the new harness scenario
+  alongside the existing unit tests.
+- `docs/automation_principles.md` #11: scenario count 6 -> 7, function list updated.
+- `docs/deep_backlog.md`: new resolved entry (top).
+- `docs/backlog_cache.md`: one-line pointer added (top).
+
+### Verification
+Harness: 7/7 scenarios passed (~2s). Full suite: 244 passed, unchanged from session start.
+
+### Next
+Still true from last session: the dry_run fill-synthesis daemon logic itself hasn't been observed
+against a real restart/live signal window yet -- next natural checkpoint is Monday 2026-07-27.

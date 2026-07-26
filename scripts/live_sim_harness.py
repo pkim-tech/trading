@@ -66,6 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import active_signals as A  # noqa: E402  (must import after env vars are set)
 import signals_config as cfg  # noqa: E402
+import signals_compute as compute  # noqa: E402
 import signals_db as db  # noqa: E402
 import signals_notify as notify  # noqa: E402
 import schwab_client  # noqa: E402
@@ -262,6 +263,52 @@ def scenario_ambient_market_buy_entry(posted):
     assert any('auto-detected fill' in m.lower() for m in posted), "expected the fill-detected Slack message"
 
 
+def scenario_dry_run_sim_cycle(posted):
+    """Real dry_run fill-synthesis path (added 2026-07-26): a mode='live' node
+    in a dry_run=True account never gets a real broker fill event
+    (schwab_client short-circuits before the API call), so
+    update_dry_run_buys/_fill_dry_run_buy synthesize the bounce-fill BUY and
+    check_dry_run_sim_sells synthesizes the close, against real price data,
+    into the real open_positions/trade_log tables (tagged is_dry_run_sim=1) --
+    the fix for the canary/dry_run "no closed trade found" false-positive
+    coverage_deviations. Exercises the full bounce-fill BUY followed by an
+    SL-triggered close, since neither scripts/live_sim.py's manual REPL nor
+    tests/test_dry_run_sim.py's unit tests drive this path end-to-end through
+    the real active_signals.py/signals_notify.py wiring."""
+    ticker = 'ZHARN7'
+    node = make_node(ticker, 'TrailingBothZScoreBreakout', trail_buy_pct=1.0, fixed_sl_override=5)
+    sig = {'current_price': 100.0, 'last_bar': datetime.now()}
+    db.add_pending_buy(node, sig, channel=None, ts=None)
+
+    fill_price = 102.0
+    with patch.object(compute, '_current_price', return_value=(fill_price, None)):
+        notify.update_dry_run_buys()
+
+    pos = db.get_open_position(ticker)
+    assert pos is not None, "expected a synthesized open position after update_dry_run_buys"
+    assert pos.get('is_dry_run_sim'), "expected the synthesized position to be tagged is_dry_run_sim"
+    assert not db.get_pending_buys(), "expected the pending_buys row to clear after the synthetic fill"
+    assert any('would have filled' in m.lower() for m in posted), "expected the dry-run fill Slack message"
+
+    # SL breach well below entry_price(102) * (1 - 5%) -> reason='SL'. Hand-built
+    # OHLC df (same pattern as scenario_pinned_exit_arm) since check_dry_run_sim_sells's
+    # at_bar_close path needs real Open/Low/High, not the Close-only synthetic CSV.
+    df = pd.DataFrame(
+        {'Open': [95.0], 'Close': [80.0], 'Low': [78.0], 'High': [96.0]},
+        index=pd.to_datetime(['2026-01-02 10:30:00']),
+    )
+    with patch.object(A, '_load_cache', lambda t, _df=df: (_df, None) if t == ticker else (None, None)):
+        notify.check_dry_run_sim_sells({}, set(), A._load_cache)
+
+    assert db.get_open_position(ticker) is None, "expected the synthesized position to close on SL breach"
+    today = datetime.now().strftime('%Y-%m-%d')
+    closed = db.get_closed_trades_for_ticker_on_date(ticker, today)
+    assert closed, "expected a trade_log row for the synthesized close"
+    assert closed[0]['is_dry_run_sim'], "expected the closed trade to be tagged is_dry_run_sim"
+    assert closed[0]['exit_reason'] == 'SL', f"expected exit_reason='SL', got {closed[0]['exit_reason']!r}"
+    assert any('would have closed' in m.lower() for m in posted), "expected the dry-run close Slack message"
+
+
 SCENARIOS = [
     scenario_pinned_entry_trailing_buy,
     scenario_pinned_exit_arm,
@@ -269,6 +316,7 @@ SCENARIOS = [
     scenario_gap_resize,
     scenario_time_exit,
     scenario_ambient_market_buy_entry,
+    scenario_dry_run_sim_cycle,
 ]
 
 
@@ -279,7 +327,7 @@ def main():
         pass
     db.ensure_tables()
 
-    tickers = ['ZHARN1', 'ZHARN2', 'ZHARN3', 'ZHARN4', 'ZHARN5', 'ZHARN6']
+    tickers = ['ZHARN1', 'ZHARN2', 'ZHARN3', 'ZHARN4', 'ZHARN5', 'ZHARN6', 'ZHARN7']
     failures = []
     t0 = _time.time()
 

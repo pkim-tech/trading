@@ -1,5 +1,28 @@
 # Backlog
 
+## ✅ [live-trading][coverage] Resolved 2026-07-26 — `live_sim_harness.py` gained `scenario_dry_run_sim_cycle`, closing a coverage gap in the dry_run fill-synthesis testing itself
+**Problem, found while deciding how to verify the previous session's dry_run fill-synthesis
+work over a weekend (markets closed, no real signal windows to observe)**: neither
+`scripts/live_sim.py` (the manual REPL) nor `tests/test_dry_run_sim.py` (12 unit tests, added
+2026-07-26) drove `update_dry_run_buys`/`_fill_dry_run_buy`/`check_dry_run_sim_sells` end-to-end
+through the real `active_signals.py`/`signals_notify.py` orchestration — the exact kind of gap
+`scripts/live_sim_harness.py` exists to close for every other live-trading code path (see the
+2026-07-23 entry below), but this new path had no harness scenario at all.
+
+**Fix**: added `scenario_dry_run_sim_cycle` — creates a `mode='live'`/`account='ira'`
+(dry_run=True) `TrailingBothZScoreBreakout` node, seeds a `pending_buys` row, patches
+`signals_compute._current_price` to trigger a bounce-fill BUY through the real
+`update_dry_run_buys`, asserts the synthesized `open_positions` row is tagged
+`is_dry_run_sim=1` and the pending-buy row cleared, then patches `active_signals._load_cache`
+with a hand-built OHLC bar that breaches `fixed_sl` and calls the real
+`check_dry_run_sim_sells`, asserting the position closes with `exit_reason='SL'` and the
+closed `trade_log` row carries `is_dry_run_sim=1`. Harness now 7/7 scenarios (~2s). Full suite:
+244 passed, unchanged.
+
+Updated `docs/live_test_coverage.md`'s two dry_run-fill-synthesis rows to list the new harness
+scenario alongside the existing unit tests, and `docs/automation_principles.md` #11's scenario
+count (6 → 7).
+
 ## ✅ [live-trading][coverage] Resolved 2026-07-26 — dry_run fill synthesis: a dry_run account's trailing/market-buy order now closes the loop against real price data
 **Problem**: `coverage_deviations` showed real, unexplained "no closed trade found" rows for the 6
 canary tickers (specifically XLF/VOO/IWM/QQQ, ids 7-10, dated 2026-07-24, still unexplained as of
