@@ -10,7 +10,7 @@ import signals_compute as compute
 import schwab_safety
 from signals_blocks import _post_message, _price_input_block, _shares_input_block
 from signals_helpers import _existing_position_note, _last_sale_recovery, clear_corp_action_alert
-from signals_notify import send_reference_report, send_coverage_report, _place_stop_loss_for_position
+from signals_notify import send_reference_report, send_coverage_report, _place_stop_loss_for_position, _coverage_mode
 
 if cfg.SOCKET_MODE:
 
@@ -146,6 +146,8 @@ if cfg.SOCKET_MODE:
             # if a *different* concurrent node on the same ticker still has a
             # pending row (see docs/backlog_cache.md's wl_id refactor entry).
             print(f"  [warn] {ticker} — no pending_buys row found, ignoring stale Filled confirmation")
+            db.log_coverage_event("stale_buy_button_guard", _coverage_mode(node.get('account')), ticker=ticker,
+                                   node_id=node['id'], result="guard_fired", detail="trail_buy_fill_price")
             client.chat_update(
                 channel=channel, ts=ts,
                 text=f"{ticker} — already resolved, this confirmation was ignored",
@@ -154,6 +156,12 @@ if cfg.SOCKET_MODE:
                                  f"this stale confirmation was *not* recorded."}}],
             )
             return
+
+        same_ticker_pendings = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
+        if len(same_ticker_pendings) > 1:
+            db.log_coverage_event("buy_buttons_resolve_correct_node", _coverage_mode(node.get('account')),
+                                   ticker=ticker, node_id=node['id'], result="resolved",
+                                   detail=f"{len(same_ticker_pendings)} pending for {ticker}")
 
         opened = db.open_position(node, signal_price, signal_time, fill_price, datetime.now(), shares=shares)
         db.clear_pending_buy_by_wl_id(node['id'])
@@ -168,6 +176,12 @@ if cfg.SOCKET_MODE:
                                  f"was *not* recorded (no duplicate created). {_existing_position_note(ticker, wl_id=node['id'])}"}}],
             )
             return
+
+        db.log_coverage_event("manual_buy_confirmation_account",
+                               _coverage_mode(node.get('account')) if node.get('account') else "unattributed",
+                               ticker=ticker, node_id=node['id'],
+                               result="opened" if node.get('account') else "no_account",
+                               detail=f"account={node.get('account')!r}")
 
         if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
             _place_stop_loss_for_position(node, ticker, signal_price)
@@ -221,6 +235,8 @@ if cfg.SOCKET_MODE:
             # the node's own wl_id, not ticker -- see handle_trail_buy_fill_
             # price's identical guard.
             print(f"  [warn] {ticker} — no pending_buys row found, ignoring stale Executed confirmation")
+            db.log_coverage_event("stale_buy_button_guard", _coverage_mode(node.get('account')), ticker=ticker,
+                                   node_id=node['id'], result="guard_fired", detail="entry_price")
             client.chat_update(
                 channel=channel, ts=ts,
                 text=f"{ticker} — already resolved, this confirmation was ignored",
@@ -229,6 +245,12 @@ if cfg.SOCKET_MODE:
                                  f"this stale confirmation was *not* recorded."}}],
             )
             return
+
+        same_ticker_pendings = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
+        if len(same_ticker_pendings) > 1:
+            db.log_coverage_event("buy_buttons_resolve_correct_node", _coverage_mode(node.get('account')),
+                                   ticker=ticker, node_id=node['id'], result="resolved",
+                                   detail=f"{len(same_ticker_pendings)} pending for {ticker}")
 
         opened = db.open_position(node, signal_price, signal_time, exec_price, now, shares=shares)
 
@@ -244,6 +266,12 @@ if cfg.SOCKET_MODE:
                                  f"was *not* recorded (no duplicate created). {_existing_position_note(ticker, wl_id=node['id'])}"}}],
             )
             return
+
+        db.log_coverage_event("manual_buy_confirmation_account",
+                               _coverage_mode(node.get('account')) if node.get('account') else "unattributed",
+                               ticker=ticker, node_id=node['id'],
+                               result="opened" if node.get('account') else "no_account",
+                               detail=f"account={node.get('account')!r}")
 
         note   = f"${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
         print(f"  Position opened via Slack: {ticker} at {note}")
@@ -389,6 +417,12 @@ if cfg.SOCKET_MODE:
                           "text": f"⚠️ *{ticker}* — a position was already open, this Manual Open "
                                   f"was *not* recorded (no duplicate created). {_existing_position_note(ticker, wl_id=node['id'])}"}}])
             return
+
+        db.log_coverage_event("manual_buy_confirmation_account",
+                               _coverage_mode(node.get('account')) if node.get('account') else "unattributed",
+                               ticker=ticker, node_id=node['id'],
+                               result="opened" if node.get('account') else "no_account",
+                               detail=f"account={node.get('account')!r} manual_open")
 
         note = f"${price:.4f}  {shares} shares"
         print(f"  Position manually opened via Slack: {ticker} at {note}")

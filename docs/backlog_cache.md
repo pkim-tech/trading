@@ -1,5 +1,34 @@
 # Backlog Cache
 
+## [live-trading][coverage] Resolved 2026-07-28 — closed 12 of 13 remaining `not-instrumented` rows in the accountability grid (38 rows, down from 39 — one dead row removed)
+User noticed the grid still had 13 `not-instrumented` rows after the 2026-07-27 evening widening and
+asked to close them. 10 got real new `log_coverage_event` instrumentation: `automated_sell_mode_skip`/
+`manual_sl_fallback_alert` (`signals_notify._attempt_automated_sell`), `exit_arm_latency`
+(`active_signals._scan_pinned_exit_arm`), `node_level_automation_pause`/
+`two_nodes_same_ticker_diff_accounts` (`schwab_safety.check_order`), `stale_buy_button_guard`/
+`buy_buttons_resolve_correct_node`/`manual_buy_confirmation_account` (the 3 BUY-confirmation Slack
+handlers), `buy_fill_reconciles_correct_node` (`signals_notify._reconcile_buy_fill`'s wl_id
+disambiguation). 1 was a free row (`oversell_guard_correct_position` → already-logged
+`sell_exceeds_position_blocked`, built 2026-07-24, never surfaced). 1 (`open_price_quality`) was
+wired to its own pre-existing `open_price_quality_log` table (92 real rows since 2026-07-22) via a
+new `compute_status` mechanism instead of duplicating into `coverage_events` — now `verified-live`.
+Removed `live_state_reconciliation_design`, a dead row explicitly superseded by the already-built
+`live_state_reconciliation_mismatch`. **`position_lock` deliberately left uninstrumented** (user's
+call after being asked directly) — proving lock contention passively would require changing
+`open_position`/`close_position`'s actual acquire pattern, a real behavior change to
+live-trading-critical dedup code, not a side-channel log like the other 12. Session-wrap Opus
+review of the diff (`active_signals.py`/`schwab_safety.py`/`signals_handlers.py`/`signals_notify.py`)
+found zero confirmed bugs across all 13 new call sites (scope, None-safety, control-flow order,
+`bad_results` semantics all checked out); one nit fixed same session —
+`manual_buy_confirmation_account`'s `no_account` rows now log `mode="unattributed"` (matching
+`gap_resize`'s existing precedent) instead of `_coverage_mode`'s misleading `"dry_run"` fallback.
+Full suite: 257 passed (unchanged count, new assertions not yet added — see residual below).
+Harness: 7/7. `signals_invariants.py`: 1 known accepted violation (UDOW), unchanged.
+`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` (AGQ,SOXL) both clean.
+**Residual, not done this session**: none of the 10 new call sites got a dedicated regression test
+asserting the coverage event itself (same gap already noted for several 2026-07-27 evening sites) —
+low priority, the sites are exercised implicitly by existing tests for their surrounding function.
+
 ## [live-trading][coverage] Resolved 2026-07-27 evening — widened the accountability grid from 32 to 39 rows, closing 5 real execution-logic gaps (not just guard logic)
 User reviewed the grid built earlier the same day and flagged it as guard-heavy and thin on "did the
 actual trade-flow step execute correctly." 2 rows added for free: `paper_entry_fill`/`paper_exit_fill`

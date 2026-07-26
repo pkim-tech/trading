@@ -564,7 +564,13 @@ def check_order(
             f"'{ticker}' is not assigned to account '{account}' "
             f"(assigned accounts: {sorted(ticker_accounts[ticker])})"
         )
+    if len(ticker_accounts[ticker]) > 1:
+        signals_db.log_coverage_event(
+            "two_nodes_same_ticker_diff_accounts", _mode, ticker=ticker, node_id=_node_id, result="allowed",
+            detail=f"account={account} of {sorted(ticker_accounts[ticker])}")
     if not node_automation_enabled(_node_id):
+        signals_db.log_coverage_event("node_level_automation_pause", _mode, ticker=ticker, node_id=_node_id,
+                                       result="blocked")
         raise SafetyViolation(f"node id={_node_id} for '{ticker}' has automation paused")
     if ticker not in AUTOMATION_ENABLED_TICKERS:
         raise SafetyViolation(

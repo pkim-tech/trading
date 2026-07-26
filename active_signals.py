@@ -320,6 +320,9 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
         bar = df_hourly.iloc[-1]
         cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
         log_poll(f"{pos['ticker']} pinned_exit_arm bar={last_bar_ts} cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
+        db.log_coverage_event("exit_arm_latency", _coverage_mode(pos.get('account')), ticker=pos['ticker'],
+                               position_id=pos.get('id'), node_id=pos.get('wl_id'), result="evaluated",
+                               detail=f"bar={last_bar_ts}")
         reason, target, just_activated_trailing = check_sell_condition(
             pos, cp, datetime.now(), at_bar_close=True, low=low, high=high, open_price=op, df_hourly=df_hourly)
         if just_activated_trailing:

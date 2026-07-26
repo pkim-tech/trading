@@ -13,6 +13,8 @@ check_mechanism per row:
   'scenario_expectations' -- proven (if at all) via a daily trade_lifecycle check in
                              coverage_deviations, not a raw coverage_events firing.
   'offline_only'          -- by design has no live component (kernel/parity scripts).
+  'open_price_quality_log' -- proven via the dedicated open_price_quality_log table
+                             (its own logging path, not coverage_events).
   'none'                  -- no code hook exists at all yet; can't be derived, only
                              a manual TODO until something is built to log it.
 
@@ -75,11 +77,12 @@ REGISTRY = [
                       'blocked', 'rejected'],
          notes="Needs a real overnight gap past trail_buy_pct while daemon is live."),
     dict(id='exit_arm_latency',
-         scenario="Exit-arm latency scan (pinned)",
+         scenario="Exit-arm latency scan (pinned) actually evaluates a newly-closed bar",
          code_path="_scan_pinned_exit_arm",
          offline_coverage="live_sim_harness.py::scenario_pinned_exit_arm",
-         check_mechanism='none', scenario_key=None,
-         notes="No dedicated coverage_events hook exists for this scan itself."),
+         check_mechanism='coverage_events', scenario_key='exit_arm_latency',
+         notes="Instrumented 2026-07-28 -- logs each time the scan evaluates a genuinely new bar "
+               "(not the skip-no-new-bar branch) for an automation-scoped open position."),
     dict(id='kernel_fill_parity',
          scenario="Trailing-buy/-stop fill resolution parity vs backtest kernel",
          code_path="kernel + live sizing",
@@ -89,9 +92,12 @@ REGISTRY = [
     dict(id='open_price_quality',
          scenario="Open-price quality (real open vs. what live code captured)",
          code_path="_scan_pinned_entry logging -> open_price_quality_log",
-         offline_coverage="scripts/verify_open_price_quality.py (script exists, no data yet)",
-         check_mechanism='none', scenario_key=None,
-         notes="Needs real trading-day data in open_price_quality_log, can't be backfilled."),
+         offline_coverage="scripts/verify_open_price_quality.py",
+         check_mechanism='open_price_quality_log', scenario_key=None,
+         notes="Wired 2026-07-28 to the real open_price_quality_log table (92 real rows since "
+               "2026-07-22) -- this data was already being collected, it just wasn't recognized by "
+               "compute_status, which only knew about the coverage_events/scenario_expectations/ "
+               "offline_only mechanisms."),
     dict(id='cash_check',
          scenario="Cash-balance check blocks an order correctly",
          code_path="schwab_client.get_account_balance + schwab_safety.check_order",
@@ -118,18 +124,13 @@ REGISTRY = [
          offline_coverage="Unit tests (test_schwab_safety.py)",
          check_mechanism='coverage_events', scenario_key='dup_order_window_blocked',
          notes="Only exercised in unit tests so far, not against real order timing."),
-    dict(id='live_state_reconciliation_design',
-         scenario="Live-state reconciliation (position/order-book mismatch detection)",
-         code_path="not built",
-         offline_coverage="N/A",
-         check_mechanism='none', scenario_key=None,
-         notes="Superseded -- see live_state_reconciliation_mismatch below, which is built."),
     dict(id='automated_sell_mode_skip',
          scenario="Automated sell correctly skipped for a non-live-mode node's position",
          code_path="signals_notify._attempt_automated_sell mode check",
          offline_coverage="2 unit tests (test_schwab_automation.py)",
-         check_mechanism='none', scenario_key=None,
-         notes="No ticker has ever hit this scenario live (automation-scope tickers only run mode='live')."),
+         check_mechanism='coverage_events', scenario_key='automated_sell_mode_skip',
+         notes="Instrumented 2026-07-28. No ticker has ever hit this scenario live (automation-scope "
+               "tickers only run mode='live') -- expect wired-never-fired until that changes."),
     dict(id='live_state_reconciliation_mismatch',
          scenario="Live-state reconciliation detects and alerts on a real mismatch",
          code_path="signals_notify.check_live_state_reconciliation, schwab_client.get_real_position",
@@ -156,15 +157,20 @@ REGISTRY = [
                   "post-SL-cancel",
          code_path="signals_notify._attempt_automated_sell",
          offline_coverage="1 unit test (test_schwab_automation.py)",
-         check_mechanism='none', scenario_key=None,
-         notes="Deliberately no auto-recovery (user's call) -- needs a real failed placement to confirm "
-               "the alert text/price are useful in practice."),
+         check_mechanism='coverage_events', scenario_key='manual_sl_fallback_alert',
+         notes="Instrumented 2026-07-28. Deliberately no auto-recovery (user's call) -- needs a real "
+               "failed placement to confirm the alert text/price are useful in practice."),
     dict(id='position_lock',
          scenario="Poll loop and Slack handler can't double-open/double-close the same position",
          code_path="signals_db._position_lock around open_position/close_position",
          offline_coverage="3 unit tests (test_db_roundtrip.py)",
          check_mechanism='none', scenario_key=None,
-         notes="Race window is narrow and never observed causing a real duplicate."),
+         notes="Deliberately left uninstrumented 2026-07-28 -- proving lock contention passively "
+               "requires switching open_position/close_position from `with _position_lock` to an "
+               "explicit non-blocking-then-blocking acquire, a real change to live-trading-critical "
+               "dedup locking code, not a side-channel log addition like the other 12 rows. Race "
+               "window is narrow and never observed causing a real duplicate; revisit deliberately, "
+               "not as a drive-by."),
     dict(id='dup_order_retry_after_failure',
          scenario="Duplicate-order retry after a real rejected/failed order isn't wrongly blocked",
          code_path="schwab_safety._broker_confirms_order",
@@ -190,52 +196,63 @@ REGISTRY = [
                     "signals_handlers.handle_entry_price/handle_trail_buy_fill_price/handle_manual_open_price",
          offline_coverage="tests/test_coverage_check.py covers the node-identity plumbing, nothing exercises "
                            "the actual button->modal->handler chain end-to-end",
-         check_mechanism='none', scenario_key=None,
-         notes="Real bug found+fixed 2026-07-25 (both Slack button payloads omitted account/id). Not yet "
-               "observed against a real Slack button click."),
+         check_mechanism='coverage_events', scenario_key='manual_buy_confirmation_account',
+         bad_results=['no_account'],
+         notes="Instrumented 2026-07-28 at all 3 confirmation handlers. Real bug found+fixed 2026-07-25 "
+               "(both Slack button payloads omitted account/id). Not yet observed against a real Slack "
+               "button click."),
     dict(id='stale_buy_button_guard',
          scenario="Stale/duplicate Executed or Filled button tap doesn't open a phantom position",
          code_path="signals_handlers.handle_entry_price/handle_trail_buy_fill_price (pending_buys-existence guard)",
          offline_coverage="None yet -- guard logic not directly unit-tested",
-         check_mechanism='none', scenario_key=None,
-         notes="Known latent gap: assumes every rendered Executed button has a backing pending_buys row, "
-               "which breaks for a live TrailingExit ticker outside SCHWAB_AUTOMATION_TICKERS."),
+         check_mechanism='coverage_events', scenario_key='stale_buy_button_guard',
+         notes="Instrumented 2026-07-28. Known latent gap: assumes every rendered Executed button has a "
+               "backing pending_buys row, which breaks for a live TrailingExit ticker outside "
+               "SCHWAB_AUTOMATION_TICKERS."),
     dict(id='two_nodes_same_ticker_diff_accounts',
          scenario="Two concurrent live nodes on the same ticker in different accounts can both place real orders",
          code_path="schwab_safety._live_ticker_accounts/check_order (ticker->set-of-accounts)",
          offline_coverage="Unit tests updated for the new error message, no test exercises 2 real concurrent nodes",
-         check_mechanism='none', scenario_key=None,
-         notes="Built as part of the wl_id refactor (2026-07-25/26) -- never yet exercised with a real "
-               "second node on an already-live ticker."),
+         check_mechanism='coverage_events', scenario_key='two_nodes_same_ticker_diff_accounts',
+         notes="Instrumented 2026-07-28, fires only when 2+ accounts are genuinely registered for the same "
+               "live ticker. Built as part of the wl_id refactor (2026-07-25/26) -- never yet exercised "
+               "with a real second node on an already-live ticker."),
     dict(id='buy_buttons_resolve_correct_node',
          scenario="BUY-side Slack buttons resolve the correct node when 2+ nodes share a ticker",
          code_path="signals_handlers.py (6 BUY handlers match/clear pending_buys by wl_id)",
          offline_coverage="None -- no test simulates 2 concurrent pending_buys rows for the same ticker",
-         check_mechanism='none', scenario_key=None,
-         notes="SELL-side already did this correctly via position_id."),
+         check_mechanism='coverage_events', scenario_key='buy_buttons_resolve_correct_node',
+         notes="Instrumented 2026-07-28 in handle_entry_price/handle_trail_buy_fill_price, fires only when "
+               "2+ pending buys exist for the ticker at click time. SELL-side already did this correctly "
+               "via position_id."),
     dict(id='buy_fill_reconciles_correct_node',
          scenario="A real broker BUY fill reconciles against the correct node's pending_buys row when 2+ "
                   "are pending for the same ticker",
          code_path="signals_notify._reconcile_buy_fill (wl_id param, falls back to alert if ambiguous)",
          offline_coverage="None -- no test simulates 2 concurrent real pending buys for the same ticker",
-         check_mechanism='none', scenario_key=None,
-         notes="drain_fill_queue's stream entry point passes its best-effort ticker+account-derived node id."),
+         check_mechanism='coverage_events', scenario_key='buy_fill_reconciles_correct_node',
+         bad_results=['no_match'],
+         notes="Instrumented 2026-07-28, fires only when 2+ pendings exist for the ticker at fill time. "
+               "drain_fill_queue's stream entry point passes its best-effort ticker+account-derived node id."),
     dict(id='node_level_automation_pause',
          scenario="Node-level automation pause blocks real orders for just that node, not sibling nodes "
                   "on the same ticker",
          code_path="schwab_safety.pause_node_automation, node_automation_enabled",
          offline_coverage="None yet",
-         check_mechanism='none', scenario_key=None,
-         notes="No Slack button wired to it yet (console/script-only). Known limitation: fuzzy node lookup "
-               "fails open (not closed) for 2 nodes sharing both ticker AND account."),
+         check_mechanism='coverage_events', scenario_key='node_level_automation_pause',
+         notes="Instrumented 2026-07-28 (blocked branch only). No Slack button wired to it yet "
+               "(console/script-only). Known limitation: fuzzy node lookup fails open (not closed) for "
+               "2 nodes sharing both ticker AND account."),
     dict(id='oversell_guard_correct_position',
          scenario="check_order's oversell guard resolves the right position when 2 live nodes share a "
                   "ticker in different accounts",
          code_path="signals_db.get_open_position_for_account",
          offline_coverage="None yet",
-         check_mechanism='none', scenario_key=None,
-         notes="Found by 2nd Opus review round 2026-07-26 (ticker-only lookup could resolve wrong account's "
-               "position). Fixed same session, not yet observed against a real 2-account-same-ticker SELL."),
+         check_mechanism='coverage_events', scenario_key='sell_exceeds_position_blocked',
+         notes="Free row 2026-07-28: schwab_safety.py already logs sell_exceeds_position_blocked (built "
+               "2026-07-24 alongside the oversell fix) -- it just never had a registry row. 'blocked' is "
+               "the correct/good outcome (no bad_results). Found by 2nd Opus review round 2026-07-26 "
+               "(ticker-only lookup could resolve wrong account's position)."),
     dict(id='dry_run_buy_synthesis',
          scenario="A dry_run=True account's trailing-buy/market-buy order synthesizes a real fill "
                   "(bounce-fill or immediate) since no real broker fill event will ever arrive",
@@ -339,6 +356,14 @@ def compute_status(row):
     mech = row['check_mechanism']
     if mech == 'offline_only':
         return 'offline-only', 'No live component by design.'
+    if mech == 'open_price_quality_log':
+        with db._conn() as c:
+            r = c.execute(
+                "SELECT COUNT(*) n, MAX(ts) last_ts FROM open_price_quality_log"
+            ).fetchone()
+        if r['n'] > 0:
+            return 'verified-live', f"{r['n']}x real open-price capture, last {r['last_ts']}"
+        return 'wired-never-fired', 'open_price_quality_log table exists but has no rows yet.'
     if mech == 'none' or row['scenario_key'] is None:
         return 'not-instrumented', 'No log_coverage_event call exists for this path yet.'
 

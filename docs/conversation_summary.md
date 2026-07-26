@@ -4245,3 +4245,56 @@ unconditionally, since the report isn't scoped to any one account's dry_run flag
 ### Verification
 Full suite: 257 passed (was 250 at session start). `scripts/live_sim_harness.py`: 7/7.
 `signals_invariants.py`: 1 known accepted violation (UDOW), unchanged.
+
+---
+
+## 2026-07-28 — Closed 12 of 13 remaining `not-instrumented` rows in the Trade-Flow Accountability Grid
+
+### What we did
+User noticed the Coverage grid still showed a lot of `not-instrumented` rows after the 2026-07-27
+evening widening. Went through the remaining 13 one by one:
+
+- 10 got real new `log_coverage_event` instrumentation at previously-uninstrumented sites:
+  `automated_sell_mode_skip`/`manual_sl_fallback_alert` (`signals_notify._attempt_automated_sell`),
+  `exit_arm_latency` (`active_signals._scan_pinned_exit_arm`), `node_level_automation_pause`/
+  `two_nodes_same_ticker_diff_accounts` (`schwab_safety.check_order`), `stale_buy_button_guard`/
+  `buy_buttons_resolve_correct_node`/`manual_buy_confirmation_account` (the 3 BUY-confirmation
+  Slack handlers), `buy_fill_reconciles_correct_node` (`signals_notify._reconcile_buy_fill`'s
+  wl_id disambiguation, only fires when 2+ nodes are genuinely pending for one ticker).
+- 1 free row: `oversell_guard_correct_position` wired to `schwab_safety.py`'s already-logged
+  `sell_exceeds_position_blocked` (built 2026-07-24, never had a registry row).
+- 1 row (`open_price_quality`) wired to its own pre-existing `open_price_quality_log` table (92
+  real rows since 2026-07-22) via a new `compute_status` mechanism, instead of duplicating into
+  `coverage_events` — now `verified-live`.
+- Removed `live_state_reconciliation_design`, a dead row explicitly superseded by the already-built
+  `live_state_reconciliation_mismatch`.
+- **`position_lock` deliberately left uninstrumented** — asked the user directly rather than
+  guessing, since proving contention passively would mean changing `open_position`/
+  `close_position`'s actual acquire pattern (live-trading-critical dedup code), not a side-channel
+  log like the other 12. User confirmed: leave deferred.
+
+Grid is now 38 rows (was 39 — one dead row removed), with `position_lock` the only genuinely
+uninstrumented row left.
+
+**Session-wrap Opus review** (required — `active_signals.py`/`signals_notify.py`/
+`schwab_safety.py` changed) traced all 13 new call sites and found zero confirmed bugs: scope,
+None-safety, control-flow order, and `bad_results` semantics all checked out. One nit found and
+fixed same session: `manual_buy_confirmation_account`'s `no_account` rows were logging
+`mode="dry_run"` (via `_coverage_mode`'s conservative fallback for an unrecognized/missing
+account) instead of the more accurate `mode="unattributed"` — matching the precedent
+`check_gap_resize` already set for this exact "no real account to attribute to" case.
+
+### Docs updated
+- `docs/live_test_coverage.md`: 2026-07-28 pointer note (13→1 not-instrumented, what was added/why,
+  what was deliberately skipped).
+- `docs/backlog_cache.md`: resolved entry at top, including the review outcome, the one fix, and
+  the residual (no dedicated regression test yet for the 10 new call sites — low priority, sites
+  are exercised implicitly).
+
+### Verification
+Full suite: 257 passed (unchanged count — no new dedicated tests added this session, existing
+tests exercise the surrounding functions the new log calls sit inside). `scripts/live_sim_harness.py`:
+7/7 (re-run after the mode-label nit fix). `signals_invariants.py`: 1 known accepted violation
+(UDOW), unchanged. `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py`
+(AGQ,SOXL): both clean, no new mismatch — `active_signals.py`'s only change was a side-channel log
+call, no entry/exit logic touched.

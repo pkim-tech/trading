@@ -78,6 +78,9 @@ def _attempt_automated_sell(pos, current_price):
         return False
     node = db.get_watch_list_node_by_id(pos.get('wl_id'))
     if node is None or node.get('mode') != 'live':
+        db.log_coverage_event("automated_sell_mode_skip", _coverage_mode(pos.get('account')), ticker=ticker,
+                               position_id=pos.get('id'), node_id=pos.get('wl_id'), result="skipped",
+                               detail=f"node_mode={node.get('mode') if node else None!r}")
         return False
     if not schwab_safety.node_automation_enabled(pos.get('wl_id')):
         return False
@@ -128,6 +131,8 @@ def _attempt_automated_sell(pos, current_price):
             sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos.get('stop_loss')
             sl_price = pos['signal_price'] * (1 - sl_pct / 100) if sl_pct else None
             price_note = f"place stop-loss SELL {shares} @ ~${sl_price:.2f}" if sl_price else "place a stop-loss SELL manually"
+            db.log_coverage_event("manual_sl_fallback_alert", _mode, ticker=ticker, position_id=pos.get('id'),
+                                   node_id=pos.get('wl_id'), result="alerted", detail=price_note)
             _post_message(
                 f"🚨 *{ticker}* ({account}) UNPROTECTED — {price_note}\n"
                 f"(auto trailing-sell failed after cancelling stop-loss {sl_order_id}: {e})"
@@ -1203,6 +1208,14 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
         return
     if wl_id is not None:
         matched = [p for p in pendings if p['node']['id'] == wl_id]
+        if len(pendings) > 1:
+            # Real disambiguation scenario: 2+ nodes have a resting pending
+            # buy for this ticker at once -- did wl_id resolve the right one.
+            _mode = _coverage_mode(pendings[0]['node'].get('account'))
+            db.log_coverage_event(
+                "buy_fill_reconciles_correct_node", _mode, ticker=ticker, node_id=wl_id,
+                result="resolved" if matched else "no_match",
+                detail=f"{len(pendings)} pending, wl_ids={[p['node']['id'] for p in pendings]}")
         if not matched:
             # The hinted node has no resting pending row (already resolved by
             # another path, or a stale hint) -- reconciling against a

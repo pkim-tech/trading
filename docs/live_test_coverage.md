@@ -44,6 +44,33 @@ narrative reference, but don't trust its `Status` column over the grid's live co
 Raised same session, not yet built: filters, direct links to the underlying tests, and row
 grouping by feature area (see `docs/backlog_cache.md`).
 
+**2026-07-28: closed 12 of the 13 remaining `not-instrumented` rows** (grid now 38, was 39 — one
+dead row removed). 10 new real `log_coverage_event` sites: `automated_sell_mode_skip`
+(`signals_notify._attempt_automated_sell` mode-mismatch guard), `manual_sl_fallback_alert` (same
+function's post-cancel-failure UNPROTECTED alert), `exit_arm_latency`
+(`active_signals._scan_pinned_exit_arm`), `node_level_automation_pause` and
+`two_nodes_same_ticker_diff_accounts` (`schwab_safety.check_order`), `stale_buy_button_guard` and
+`buy_buttons_resolve_correct_node` (`signals_handlers.handle_entry_price`/
+`handle_trail_buy_fill_price`), `manual_buy_confirmation_account` (all 3 BUY-confirmation
+handlers), `buy_fill_reconciles_correct_node` (`signals_notify._reconcile_buy_fill`'s wl_id
+disambiguation, only fires when 2+ nodes are genuinely pending for the same ticker). 1 free row:
+`oversell_guard_correct_position` wired to `schwab_safety.py`'s already-logged
+`sell_exceeds_position_blocked` event (built 2026-07-24, never had a registry row). 1 row
+(`open_price_quality`) wired to its own pre-existing `open_price_quality_log` table (92 real rows
+since 2026-07-22) via a new `compute_status` mechanism, rather than duplicating into
+`coverage_events` — it's now `verified-live`. Removed `live_state_reconciliation_design`, a dead
+row explicitly superseded by the already-built `live_state_reconciliation_mismatch`.
+**Deliberately left uninstrumented, user's call**: `position_lock` — proving contention passively
+would require changing `open_position`/`close_position` from `with _position_lock` to an explicit
+non-blocking-then-blocking acquire, a real behavior change to live-trading-critical dedup code, not
+a side-channel log addition like the other 12. Session-wrap Opus review of the diff found zero
+confirmed bugs; one nit fixed same session — `manual_buy_confirmation_account`'s `no_account` rows
+now log `mode="unattributed"` (matching `gap_resize`'s existing precedent for this exact case)
+instead of `_coverage_mode`'s misleading `"dry_run"` fallback. Full suite: 257 passed (unchanged
+count). Harness: 7/7. `signals_invariants.py`: 1 known accepted violation (UDOW), unchanged.
+`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` (AGQ,SOXL) both clean, no
+new mismatch — only a side-channel log call was added to `active_signals.py`.
+
 **2026-07-27 evening: grid widened from 32 to 39 rows** after the user flagged it was guard-heavy
 and thin on execution logic. 2 rows (`paper_entry_fill`/`paper_exit_fill`) needed no new
 instrumentation — `paper_trading.py` already logs `entry_fill`/`exit_fill` under `mode='paper'`,
