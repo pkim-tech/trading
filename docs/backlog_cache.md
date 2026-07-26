@@ -1,5 +1,64 @@
 # Backlog Cache
 
+## [live-trading][coverage] Resolved 2026-07-27 — `coverage_deviations` rows are now permanent record ("ticket model"), never deleted
+Per user's explicit framing: an exception/deviation is an artifact of something that happened, like a
+Jira ticket — once created, it should never vanish, only ever be explained. `clear_deviation_if_resolved`
+(`signals_db.py`) changed from `DELETE` to auto-`UPDATE` (`reason='Auto-resolved: ...'`,
+`reason_by='system'`) for a same-day unexplained deviation that a later re-check finds met — the row
+stays, tagged as system-resolved rather than human-explained. Also cleared the 4 stale unexplained
+XLF/VOO/IWM/QQQ rows (ids 7-10, open since 2026-07-24, root-caused by the dry_run fill synthesis gap
+already fixed 2026-07-26) by explaining them directly.
+**Regression found+fixed same session** (session-wrap Opus review): the auto-resolve change alone would
+have let a genuine NEW same-day deviation silently inherit the stale system reason and vanish from
+`get_deviations(unexplained_only=True)` — `record_deviation` now clears a `reason_by='system'` reason
+(never a human one) whenever it refreshes an existing row, so a system auto-resolution yields to real
+new evidence instead of masking it. New regression test
+(`test_record_deviation_clears_system_reason_on_new_deviation`).
+
+## [live-trading][coverage] Open, raised 2026-07-27 — Trade-Flow Test Accountability Grid (`pages/14_Coverage.py`, backed by `scripts/coverage_registry.py`) needs filters + direct links to underlying tests
+Built 2026-07-27: a 32-row registry of real trade-flow logic branches with status computed live
+from `coverage_events`/`coverage_deviations` (never hand-typed) — see `docs/conversation_summary.md`'s
+2026-07-27 entry for the full build/rationale (why two competing coverage systems already existed,
+why Opus review alone isn't sufficient accountability). Real result at build time: 25 of 32 branches
+(not-instrumented + wired-never-fired + attempt-failed) have zero live proof of working.
+**Not yet built, raised same session**: the grid is a flat 32-row table with no way to narrow it down
+or jump to the actual evidence:
+1. **Filters** — by status (e.g. show only `not-instrumented`/`wired-never-fired`, the real gaps),
+   by `check_mechanism`, or by free-text search over `code_path`/`scenario`.
+2. **Links to underlying tests** — each row's `offline_coverage` field is free text naming a test file/
+   function (e.g. `test_schwab_safety.py`) or a script (`live_sim_harness.py::scenario_x`), but there's
+   no clickable/copyable path to actually go run or open it. Should resolve to something actionable —
+   at minimum the real file path, ideally a button that runs the specific pytest node id or harness
+   scenario and shows pass/fail inline.
+Not scoped: exact filter UI (Streamlit multiselect/selectbox), whether test-links resolve to file paths
+only or something more interactive. Registry itself (`scripts/coverage_registry.py`) is stable and
+correct as of this session (250 tests passing) — this item is purely about surfacing/navigating it
+better, not fixing its computation logic. **Its computation logic did need real fixing, twice, before
+reaching that state**: two accuracy bugs caught during initial build (a `scenario_key` collision
+between `paper_trading.py` and the dry_run-sim code sharing `entry_fill`/`exit_fill`; a blocked-vs-
+succeeded conflation for `sl_placement`/`top_up`), then a required session-wrap Opus review of the
+same-session `signals_db.py` change found 3 more CONFIRMED bugs, most severe being **inverted logic**:
+the `scenario_expectations` check-mechanism branch fed unexplained-deviation rows (failures) into the
+same good/bad bucketing as `coverage_events`, so an unexplained (currently failing) scenario rendered
+green "verified-live" and a clean day with zero rows rendered red — backwards for an accountability
+tool. Also found: the same-session `clear_deviation_if_resolved` DELETE→UPDATE change (see the
+sticky-deviation entry below) let a genuine new same-day deviation inherit a stale system-authored
+"auto-resolved" reason and vanish from the unexplained-deviations report; and `bad_results` only
+listed one of several real failure result strings per scenario (`sl_placement`/`top_up`/`gap_resize`
+each emit 2-4 distinct failure results, not one). All 3 fixed same session, 6 new regression tests
+added, full suite 250 passed (was 244), harness 7/7, `signals_invariants.py` clean (1 known accepted
+UDOW violation, unchanged). This is exactly the failure mode the grid was built to guard against in
+the first place — a real, live example of why the user wanted evidence-based accountability instead
+of trusting AI review alone.
+3. **Row grouping** — raised same session, after adding heatmap row-coloring (`STATUS_COLOR`/`_heat_row`
+   in `pages/14_Coverage.py`): the 32 rows currently render as one flat list sorted worst-status-first,
+   with no grouping by feature area (entry/exit/guards/reconciliation/multi-node) or by which real module
+   implements them (`schwab_safety.py` vs `signals_notify.py` vs `active_signals.py`). A logical grouping
+   would make the heatmap easier to scan for "which whole area is weak" rather than reading 32
+   individual rows. Not scoped: grouping key (by `code_path`'s module, by a new manually-tagged
+   `feature_area` field on each `REGISTRY` row, or by `check_mechanism`), whether groups are collapsible
+   sections or just a sort/header break within the same table.
+
 ## [live-trading][coverage] Resolved 2026-07-26 — `live_sim_harness.py` gained `scenario_dry_run_sim_cycle`, closing a coverage gap in testing the dry_run fill-synthesis logic itself (neither `live_sim.py`'s REPL nor the unit tests drove it end-to-end through the real daemon wiring). Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
 
 ## [live-trading][coverage] Resolved 2026-07-26 — dry_run fill synthesis built: a dry_run account's trailing/market-buy order now closes the loop against real price data instead of stalling forever. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.

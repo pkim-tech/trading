@@ -4127,3 +4127,72 @@ Harness: 7/7 scenarios passed (~2s). Full suite: 244 passed, unchanged from sess
 ### Next
 Still true from last session: the dry_run fill-synthesis daemon logic itself hasn't been observed
 against a real restart/live signal window yet -- next natural checkpoint is Monday 2026-07-27.
+
+---
+
+## 2026-07-27 — Made coverage_deviations sticky (ticket model), built the Trade-Flow Test Accountability Grid, caught+fixed real inverted-logic bug in it via session-wrap Opus review
+
+### What we did
+Started from the Coverage Compass GUI: found 4 stale unexplained deviations (XLF/VOO/IWM/QQQ,
+open since 2026-07-24, root-caused by the already-fixed dry_run fill synthesis gap) and explained
+them. This surfaced a design question: `signals_db.clear_deviation_if_resolved` deleted a same-day
+deviation row once a re-check found it met — the user pushed back hard on this, framing a deviation
+as a permanent artifact ("like a Jira ticket") that should never be silently destroyed, only ever
+explained. Changed `clear_deviation_if_resolved` from DELETE to auto-UPDATE (system-authored reason,
+row stays). Traced the original unconditional-delete design back to an Opus review suggestion from
+2026-07-25 that the user had never actually signed off on — used as a concrete example of why "Opus
+review is not fully reliable" and why it never reviewed the project's first 3 weeks of code, only
+incremental diffs since review became a habit.
+
+That distrust motivated the session's main build: the user wants to *force* creation of a real test
+accountability grid — evidence-based, not review-opinion-based — so they can see comprehensively
+what's been tested and what's regressed. Discovered along the way that `docs/live_test_coverage.md`
+already was this enumeration (32 rows, Scenario/Code path/Offline coverage/Status/Notes) but its
+`Status` column was hand-typed and had already gone stale once (caught 2026-07-25). Built
+`scripts/coverage_registry.py`: same 32 logic branches, but `compute_status()` derives status live
+from real `coverage_events`/`coverage_deviations` queries every time — never hand-typed. Wired into
+`pages/14_Coverage.py` as a new "Trade-Flow Test Accountability Grid" section, later given
+heatmap-style row coloring (red=gap, green=verified) per the user's ask, skipping the full dataviz
+skill process since this is an internal Streamlit table, not a shipped chart.
+
+Real result: 25 of 32 branches (not-instrumented + wired-never-fired + attempt-failed) have zero
+live proof of working. Backlogged (not built): filters, direct links to underlying tests, row
+grouping by feature area.
+
+**Session-wrap Opus review** (required — `signals_db.py` changed) found 3 CONFIRMED bugs, most
+severe: `compute_status`'s `scenario_expectations` branch was **inverted** — it fed unexplained
+(failing) deviation rows into the same good/bad bucketing as coverage_events, so an unexplained
+failure rendered green "verified-live" and a clean day with zero rows rendered red. Also found: the
+DELETE→UPDATE change let a genuine new same-day deviation silently inherit a stale system-authored
+reason and vanish from the unexplained-deviations report (fixed by having `record_deviation` clear a
+`reason_by='system'` reason, never a human one, when refreshing an existing row); and `bad_results`
+only listed one of several real failure result strings per scenario (`sl_placement`/`top_up`/
+`gap_resize` each emit 2-4 distinct failures). All 3 fixed same session, verified myself (not just
+trusting the review) by re-running the registry CLI and confirming `pinned_entry_trigger`/
+`market_buy_placement` correctly flipped from the wrong "verified-live" to correct "wired-never-fired".
+Added a new `deviation-unexplained` status (worst tier) plus 6 regression tests targeting these exact
+failure modes.
+
+### Docs updated
+- `docs/backlog_cache.md`: sticky-deviations resolved entry (top), accountability-grid open entry
+  with filters/test-links/grouping asks, updated with the full review-and-fix narrative.
+- `docs/live_test_coverage.md`: pointer note — the registry is now the live-computed source of truth
+  for `Status`, this file's prose/code-path columns remain the richer narrative reference.
+- `CLAUDE.md`: new Key Files entry for `scripts/coverage_registry.py`.
+- New memory: `feedback_deviation_as_ticket_model.md` (user's mental model for exception/deviation
+  records — permanent once explained, like a ticket).
+
+### Verification
+Full suite: 250 passed (was 244 at session start). `scripts/live_sim_harness.py`: 7/7.
+`signals_invariants.py`: 1 known accepted violation (UDOW), unchanged. Streamlit restarted, Coverage
+page confirmed rendering (200) with the corrected grid.
+
+### Next
+- Monday 2026-07-27 (today, if market hours remain): still the natural checkpoint for observing
+  dry_run fill synthesis against a real restart/live signal window (carried from last session).
+- Accountability grid follow-ups (not built): filters, direct test links, row grouping by feature
+  area — see `docs/backlog_cache.md`.
+- 25 of 32 real trade-flow logic branches still have zero live proof of working — the substantive
+  gap the grid now makes visible; picking these off (starting with the never-fired safety guards
+  like `same_day_block`, the `dup_order_*` guards, `gap_resize`) is the real next-session work, not
+  further grid tooling.

@@ -1132,24 +1132,38 @@ def get_scenario_expectations(expected_frequency=None, active_only=True):
 def record_deviation(check_date, scenario_key, expected_outcome, actual_summary, ticker=None,
                       node_id=None, mode=None):
     """Upsert a deviation row for this (check_date, scenario_key, node_id, ticker, mode).
-    Leaves an existing reason in place if the row already exists (re-running the daily
-    check shouldn't clobber a reason someone already attached) but refreshes
-    actual_summary/ts so the row reflects the latest observation. See
-    add_scenario_expectation for why this is an explicit COALESCE-based
-    check-then-upsert rather than a UNIQUE-backed ON CONFLICT."""
+    Leaves a HUMAN-authored reason in place if the row already exists (re-running the
+    daily check shouldn't clobber a reason a person already attached) but refreshes
+    actual_summary/ts so the row reflects the latest observation. A SYSTEM-authored
+    reason (from clear_deviation_if_resolved's auto-resolution) is different: it's not
+    testimony about this specific new observation, just a note that an earlier
+    same-day deviation resolved itself -- if the scenario deviates again the same day,
+    that auto-resolution note must be cleared back to unexplained, or a genuine new
+    failure would silently hide behind a stale "auto-resolved" reason and vanish from
+    get_deviations(unexplained_only=True) (found by Opus review, 2026-07-27, the same
+    session clear_deviation_if_resolved switched from delete to auto-explain). See
+    add_scenario_expectation for why this is an explicit COALESCE-based check-then-
+    upsert rather than a UNIQUE-backed ON CONFLICT."""
     with _conn() as c:
         existing = c.execute("""
-            SELECT id FROM coverage_deviations
+            SELECT id, reason_by FROM coverage_deviations
             WHERE check_date = ? AND scenario_key = ?
               AND COALESCE(node_id, -1) = COALESCE(?, -1)
               AND COALESCE(ticker, '') = COALESCE(?, '')
               AND COALESCE(mode, '') = COALESCE(?, '')
         """, (check_date, scenario_key, node_id, ticker, mode)).fetchone()
         if existing:
-            c.execute("""
-                UPDATE coverage_deviations SET actual_summary=?, ts=datetime('now')
-                WHERE id=?
-            """, (actual_summary, existing[0]))
+            if existing['reason_by'] == 'system':
+                c.execute("""
+                    UPDATE coverage_deviations
+                    SET actual_summary=?, ts=datetime('now'), reason=NULL, reason_by=NULL, reason_ts=NULL
+                    WHERE id=?
+                """, (actual_summary, existing['id']))
+            else:
+                c.execute("""
+                    UPDATE coverage_deviations SET actual_summary=?, ts=datetime('now')
+                    WHERE id=?
+                """, (actual_summary, existing['id']))
         else:
             c.execute("""
                 INSERT INTO coverage_deviations
@@ -1160,22 +1174,23 @@ def record_deviation(check_date, scenario_key, expected_outcome, actual_summary,
 
 
 def clear_deviation_if_resolved(check_date, scenario_key, ticker=None, node_id=None, mode=None):
-    """Deletes a same-day UNEXPLAINED deviation row for this (scenario_key,
-    node_id, ticker, mode) if one exists -- called when a re-check finds the
-    expectation now met. Without this, a scenario that deviated earlier in the
-    day (e.g. a trade that hadn't closed yet) and later becomes genuinely met
-    would leave a stale, permanently-unexplained deviation row behind even
-    though nothing is actually wrong anymore -- the exact false-positive noise
-    the "no unexplained failure" contract is supposed to prevent, not
-    manufacture. Only deletes when reason IS NULL -- a row a human already
-    explained is real historical record (something did deviate and someone
-    looked at it), not noise, and must never be silently destroyed just
-    because the scenario happens to be met on a later check the same day (see
-    record_deviation's identical "never clobber a reason" rule). No-op if no
-    matching unexplained row exists (the common case on a first, clean run)."""
+    """Auto-explains (never deletes) a same-day UNEXPLAINED deviation row for
+    this (scenario_key, node_id, ticker, mode) if one exists -- called when a
+    re-check finds the expectation now met. Every deviation row is a permanent
+    record, like a ticket, once it exists -- an unexplained row that resolves
+    on its own still gets a system-authored reason instead of vanishing, so
+    there's no gap in the historical record of what happened (2026-07-27,
+    replacing the prior delete-based behavior per user's explicit call: a
+    deviation is an artifact of something that happened, not a transient flag
+    to be erased once convenient). Only touches rows where reason IS NULL --
+    a row a human already explained is untouched (see record_deviation's
+    identical "never clobber a reason" rule). No-op if no matching
+    unexplained row exists (the common case on a first, clean run)."""
     with _conn() as c:
         c.execute("""
-            DELETE FROM coverage_deviations
+            UPDATE coverage_deviations
+            SET reason = 'Auto-resolved: scenario was met on a later same-day check.',
+                reason_by = 'system', reason_ts = datetime('now')
             WHERE check_date = ? AND scenario_key = ? AND reason IS NULL
               AND COALESCE(node_id, -1) = COALESCE(?, -1)
               AND COALESCE(ticker, '') = COALESCE(?, '')

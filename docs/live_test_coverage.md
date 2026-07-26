@@ -34,6 +34,16 @@ also tracks scenarios that aren't logging-instrumented yet, e.g. open-price-qual
 file's Status column to Verified once a query confirms a real (non-paper, ideally non-dry_run)
 observation, same as before.
 
+**2026-07-27: `scripts/coverage_registry.py` + `pages/14_Coverage.py`'s "Trade-Flow Test
+Accountability Grid" is now the live-computed version of this table** — same 32 logic branches,
+but `Status` is derived from a real query against `coverage_events`/`coverage_deviations` every
+page load, never hand-typed, so it can't silently go stale the way this file's `Status` column
+did (caught stale 2026-07-25, see the note below). Treat the Streamlit grid as authoritative for
+current status; this file's prose/`Code path`/`Offline coverage` columns are still the richer
+narrative reference, but don't trust its `Status` column over the grid's live computation.
+Raised same session, not yet built: filters, direct links to the underlying tests, and row
+grouping by feature area (see `docs/backlog_cache.md`).
+
 **2026-07-25: reconciled against real `coverage_matrix.py` output** (in prep for the Monday
 2026-07-27 unattended `soxl_ira` window) — several rows below were stale ("Not started" despite a
 real event already existing). 6 rows updated with real evidence: SL-sync placement and top-up both

@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import signals_config
 import signals_db as db
 from scripts.coverage_check import _check_trade_lifecycle
+from scripts.coverage_registry import compute_status
 
 TICKER = 'TEST_CANARY'
 
@@ -95,6 +96,25 @@ def test_record_deviation_rerun_preserves_existing_reason(isolated_db):
     row = db.get_deviations()[0]
     assert row['reason'] == 'already explained'
     assert row['actual_summary'] == 'got Y again'
+
+
+def test_record_deviation_clears_system_reason_on_new_deviation(isolated_db):
+    """Opus review, 2026-07-27: a system-authored auto-resolution (from
+    clear_deviation_if_resolved) is not testimony about a NEW failure -- if the
+    scenario deviates again the same day, the stale system reason must be cleared
+    back to unexplained, or the genuine new failure would silently hide behind it
+    and vanish from get_deviations(unexplained_only=True)."""
+    db.record_deviation('2026-07-24', 'sk_f', 'expected X', 'got Y', ticker=TICKER)
+    db.clear_deviation_if_resolved('2026-07-24', 'sk_f', ticker=TICKER)
+    row = db.get_deviations()[0]
+    assert row['reason_by'] == 'system'
+
+    db.record_deviation('2026-07-24', 'sk_f', 'expected X', 'got Y again -- real new failure', ticker=TICKER)
+    row = db.get_deviations()[0]
+    assert row['reason'] is None
+    assert row['reason_by'] is None
+    assert row['actual_summary'] == 'got Y again -- real new failure'
+    assert len(db.get_deviations(unexplained_only=True)) == 1
 
 
 def _add_closed_trade(exit_reason, entry_time, exit_time):
@@ -470,7 +490,9 @@ def test_send_coverage_report_clears_stale_deviation_once_met(isolated_db, monke
     """Opus review, 2026-07-25: a scenario that deviated earlier in the day
     (no trade yet) and is genuinely met by the time of a later re-check must
     not still be reported as ✗ UNEXPLAINED -- the report contradicting the
-    check it just ran."""
+    check it just ran. 2026-07-27: the once-stale row is no longer deleted --
+    it's auto-explained and kept as permanent record (deviations are treated
+    like tickets, not transient flags)."""
     import signals_notify
     captured = {}
     monkeypatch.setattr(signals_notify, '_post_message',
@@ -488,7 +510,9 @@ def test_send_coverage_report_clears_stale_deviation_once_met(isolated_db, monke
     signals_notify.send_coverage_report(check_date)  # second tap: now met
     assert 'UNEXPLAINED' not in captured['text']
     assert '✓' in captured['text']
-    assert db.get_deviations() == []  # stale row cleared, not left behind
+    rows = db.get_deviations()
+    assert len(rows) == 1  # row kept, not deleted
+    assert rows[0]['reason']  # auto-explained, not left unexplained
 
 
 def test_clear_deviation_if_resolved_preserves_explained_row(isolated_db):
@@ -505,3 +529,60 @@ def test_clear_deviation_if_resolved_preserves_explained_row(isolated_db):
     rows = db.get_deviations()
     assert len(rows) == 1
     assert rows[0]['reason'] == 'known transient issue'
+
+
+def test_compute_status_scenario_expectations_unexplained_is_worst(isolated_db):
+    """Opus review, 2026-07-27 (CONFIRMED, most severe finding): the original
+    compute_status fed unexplained-deviation rows into the same good/bad
+    bucketing as coverage_events, so an unexplained (currently failing)
+    scenario rendered green 'verified-live' -- exactly backwards for an
+    accountability tool. An unexplained deviation must be the worst status."""
+    db.record_deviation('2026-07-24', 'sk_reg1', 'expected X', 'got Y', ticker=TICKER)
+    row = dict(check_mechanism='scenario_expectations', scenario_key='sk_reg1')
+    status, detail = compute_status(row)
+    assert status == 'deviation-unexplained'
+
+
+def test_compute_status_scenario_expectations_system_resolved_is_verified(isolated_db):
+    """A same-day auto-resolution (deviated then met) is genuine positive
+    evidence -- the scenario really did pass, just not on the first check."""
+    db.record_deviation('2026-07-24', 'sk_reg2', 'expected X', 'got Y', ticker=TICKER)
+    db.clear_deviation_if_resolved('2026-07-24', 'sk_reg2', ticker=TICKER)
+    row = dict(check_mechanism='scenario_expectations', scenario_key='sk_reg2')
+    status, detail = compute_status(row)
+    assert status == 'verified-live'
+
+
+def test_compute_status_scenario_expectations_human_explained_is_not_verified(isolated_db):
+    """A human-explained historical deviation proves a failure happened and was
+    looked at -- it does NOT prove the scenario currently behaves correctly, so
+    this must not render as verified-live."""
+    db.record_deviation('2026-07-24', 'sk_reg3', 'expected X', 'got Y', ticker=TICKER)
+    dev_id = db.get_deviations()[0]['id']
+    db.explain_deviation(dev_id, 'known one-off issue')
+    row = dict(check_mechanism='scenario_expectations', scenario_key='sk_reg3')
+    status, detail = compute_status(row)
+    assert status == 'wired-never-fired'
+
+
+def test_compute_status_scenario_expectations_no_history_is_not_verified(isolated_db):
+    """No coverage_deviations rows at all is ambiguous (could mean 'always
+    passed silently' or 'daily check never ran') -- must not default to
+    verified-live without positive evidence."""
+    row = dict(check_mechanism='scenario_expectations', scenario_key='sk_reg_never_seen')
+    status, detail = compute_status(row)
+    assert status == 'wired-never-fired'
+
+
+def test_compute_status_bad_results_downgrades_verified(isolated_db):
+    """A real live event whose only result is in bad_results (e.g. a blocked
+    SL placement) must not render as verified-live -- it's evidence of a
+    failure, not proof the path works."""
+    db.log_coverage_event('sk_reg4', 'live', result='blocked')
+    row = dict(check_mechanism='coverage_events', scenario_key='sk_reg4', bad_results=['blocked'])
+    status, detail = compute_status(row)
+    assert status == 'live-attempt-failed'
+
+    db.log_coverage_event('sk_reg4', 'live', result='placed')
+    status, detail = compute_status(row)
+    assert status == 'verified-live'

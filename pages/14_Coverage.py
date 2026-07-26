@@ -9,9 +9,37 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.coverage_check import CHECKERS  # pure dict of checker functions, no side effects/Slack config
+from scripts.coverage_registry import REGISTRY, compute_status, STATUS_ORDER
 
 DB_PATH = "./cache/live/trading_live.db"
 MODES = ["paper", "dry_run", "live", "unattributed"]
+STATUS_LABEL = {
+    'deviation-unexplained': '🟥 UNEXPLAINED deviation (real, unresolved failure)',
+    'not-instrumented': '⬜ Not instrumented', 'wired-never-fired': '🟥 Wired, never fired',
+    'live-attempt-failed': '🟥 Live attempt, no good outcome',
+    'dry_run-attempt-failed': '🟥 Dry-run attempt, no good outcome',
+    'paper-attempt-failed': '🟥 Paper attempt, no good outcome',
+    'paper-only': '🟨 Paper only', 'dry_run-only': '🟧 Dry-run only',
+    'offline-only': '⬛ Offline-only (by design)', 'verified-live': '🟩 Verified live',
+}
+# Heatmap row-background per status -- worst (red) to best (green), matching STATUS_LABEL's emoji.
+STATUS_COLOR = {
+    STATUS_LABEL['deviation-unexplained']:   '#e6736e',
+    STATUS_LABEL['not-instrumented']:        '#e2e2e2',
+    STATUS_LABEL['wired-never-fired']:       '#f5b7b1',
+    STATUS_LABEL['live-attempt-failed']:     '#f5b7b1',
+    STATUS_LABEL['dry_run-attempt-failed']:  '#f5b7b1',
+    STATUS_LABEL['paper-attempt-failed']:    '#f5b7b1',
+    STATUS_LABEL['paper-only']:              '#fdebd0',
+    STATUS_LABEL['dry_run-only']:            '#fce4ba',
+    STATUS_LABEL['offline-only']:            '#cfcfcf',
+    STATUS_LABEL['verified-live']:           '#c9e8c4',
+}
+
+
+def _heat_row(row):
+    color = STATUS_COLOR.get(row['Status'], '')
+    return [f'background-color: {color}; color: #111'] * len(row)
 
 st.set_page_config(page_title="Coverage", layout="wide")
 st.title("Coverage Compass")
@@ -19,6 +47,47 @@ st.caption(
     "Expected-vs-actual scenario tracking. Any deviation from a documented expectation "
     "must carry a reason -- an unexplained deviation is itself the actionable finding."
 )
+
+
+@st.cache_data(ttl=30)
+def load_accountability_grid():
+    rows = []
+    for r in REGISTRY:
+        status, detail = compute_status(r)
+        rows.append({
+            "_order": STATUS_ORDER[status],
+            "Status": STATUS_LABEL[status],
+            "Scenario": r['scenario'],
+            "Code path": r['code_path'],
+            "Offline coverage": r['offline_coverage'],
+            "Live evidence": detail,
+            "Notes": r['notes'],
+        })
+    rows.sort(key=lambda r: r["_order"])
+    for r in rows:
+        del r["_order"]
+    return rows
+
+
+# --- Section 0: trade-flow test accountability grid ---
+st.header("Trade-Flow Test Accountability Grid")
+st.caption(
+    "Every real logic branch that needs to be proven correct in paper/dry_run/live, computed live "
+    "from coverage_events/coverage_deviations -- never hand-typed, so it can't silently go stale. "
+    "Worst-status-first: Not instrumented / Wired-never-fired are the real gaps."
+)
+grid_rows = load_accountability_grid()
+grid_counts = defaultdict(int)
+for r in grid_rows:
+    grid_counts[r["Status"]] += 1
+st.write(" &nbsp;&nbsp; ".join(f"{k}: **{v}**" for k, v in
+         sorted(grid_counts.items(), key=lambda kv: STATUS_ORDER[
+             [s for s, lbl in STATUS_LABEL.items() if lbl == kv[0]][0]])))
+grid_df = pd.DataFrame(grid_rows)
+st.dataframe(grid_df.style.apply(_heat_row, axis=1), hide_index=True,
+             height=35 * (len(grid_rows) + 1) + 10)
+
+st.divider()
 
 
 @st.cache_data(ttl=30)
@@ -96,6 +165,31 @@ else:
                 if st.form_submit_button("Explain") and reason.strip():
                     explain(d["id"], reason.strip())
                     st.rerun()
+
+st.divider()
+
+# --- Section 1b: deviation history (explained + unexplained) ---
+st.header("Deviation History")
+history = load_deviations(unexplained_only=False)
+if not history:
+    st.info("No deviations recorded yet.")
+else:
+    history_rows = [
+        {
+            "ID":       d["id"],
+            "Date":     d["check_date"],
+            "Scenario": d["scenario_key"],
+            "Ticker":   d["ticker"] or node_labels.get(d["node_id"], ""),
+            "Mode":     d["mode"] or "",
+            "Expected": d["expected_outcome"],
+            "Actual":   d["actual_summary"],
+            "Reason":   d["reason"] or "(unexplained)",
+            "By":       "🤖 system (auto)" if d["reason_by"] == "system" else (d["reason_by"] or ""),
+            "Explained at": d["reason_ts"] or "",
+        }
+        for d in history
+    ]
+    st.dataframe(pd.DataFrame(history_rows), hide_index=True, height=35 * (min(len(history_rows), 15) + 1) + 10)
 
 st.divider()
 
