@@ -20,7 +20,7 @@ from signals_charts import _chart_buy, _chart_sell, _upload_chart
 from signals_blocks import _post_message, _post_chunked, _build_buy_blocks, _build_sell_blocks
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
-    buy_order_sizing, log_poll, _pos_key,
+    buy_order_sizing, log_poll, _pos_key, mode_tag,
 )
 # scripts/ has no __init__.py but is still importable as a Python 3 implicit
 # namespace package as long as repo root is on sys.path (true whenever this
@@ -134,7 +134,7 @@ def _attempt_automated_sell(pos, current_price):
             db.log_coverage_event("manual_sl_fallback_alert", _mode, ticker=ticker, position_id=pos.get('id'),
                                    node_id=pos.get('wl_id'), result="alerted", detail=price_note)
             _post_message(
-                f"🚨 *{ticker}* ({account}) UNPROTECTED — {price_note}\n"
+                f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — {price_note}\n"
                 f"(auto trailing-sell failed after cancelling stop-loss {sl_order_id}: {e})"
             )
         elif not isinstance(e, schwab_safety.SafetyViolation):
@@ -221,7 +221,7 @@ def alert_stale_price_exit_suppressed(pos):
         return
     _STALE_PRICE_ALERTED[key] = time.time()
     _post_message(
-        f"⚠️ *{ticker}* ({account}) exit check skipped this poll — no fresh price available\n"
+        f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) exit check skipped this poll — no fresh price available\n"
         f"(`_current_price` returned None: stale/missing same-day data; position remains open, "
         f"unmonitored until the next successful refresh)"
     )
@@ -278,10 +278,10 @@ def check_live_state_reconciliation(open_positions):
         if expected_shares is not None and real_shares != expected_shares:
             _alert_reconcile_mismatch(
                 pos, "shares",
-                f"⚠️ *{ticker}* live-state mismatch: `open_positions` tracks {expected_shares:g} "
-                f"shares, broker shows {real_shares:g} — broker is ground truth; suggested fix: "
-                f"verify no unexpected fill/manual trade explains the gap, then correct "
-                f"`open_positions.shares` to {real_shares:g}"
+                f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) live-state mismatch: `open_positions` tracks "
+                f"{expected_shares:g} shares, broker shows {real_shares:g} — broker is ground "
+                f"truth; suggested fix: verify no unexpected fill/manual trade explains the gap, "
+                f"then correct `open_positions.shares` to {real_shares:g}"
             )
 
         state = pos.get('trail_state') or {}
@@ -294,16 +294,16 @@ def check_live_state_reconciliation(open_positions):
         if state.get('trailing') and state.get('order_placed') and not has_sell_order:
             _alert_reconcile_mismatch(
                 pos, "missing_trailing_sell",
-                f"⚠️ *{ticker}* live-state mismatch: trailing-sell marked placed but no resting "
-                f"SELL order found at the broker — position may be unprotected; suggested fix: "
-                f"place a trailing-sell order for {expected_shares:g} shares now"
+                f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) live-state mismatch: trailing-sell marked placed but "
+                f"no resting SELL order found at the broker — position may be unprotected; "
+                f"suggested fix: place a trailing-sell order for {expected_shares:g} shares now"
             )
         elif not state.get('trailing') and pos.get('sl_order_id') and not has_sell_order:
             _alert_reconcile_mismatch(
                 pos, "missing_sl",
-                f"⚠️ *{ticker}* live-state mismatch: SL order id {pos['sl_order_id']} is recorded "
-                f"but no resting SELL order found at the broker — position may be unprotected; "
-                f"suggested fix: place a stop-loss order for {expected_shares:g} shares now"
+                f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) live-state mismatch: SL order id {pos['sl_order_id']} "
+                f"is recorded but no resting SELL order found at the broker — position may be "
+                f"unprotected; suggested fix: place a stop-loss order for {expected_shares:g} shares now"
             )
 
 
@@ -365,7 +365,7 @@ def _place_stop_loss_for_position(node, ticker, signal_price):
         db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                                node_id=node.get('id'), result="blocked", detail=str(e))
         _post_message(
-            f"🚨 *{ticker}* ({account}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
+            f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
             f"(stop-loss placement blocked: {e})"
         )
         return
@@ -373,7 +373,7 @@ def _place_stop_loss_for_position(node, ticker, signal_price):
         db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                                node_id=node.get('id'), result="failed_unexpectedly", detail=str(e))
         _post_message(
-            f"🚨 *{ticker}* ({account}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
+            f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
             f"(stop-loss placement failed unexpectedly: {e})"
         )
         return
@@ -775,9 +775,10 @@ TRAIL_REMINDER_MINUTES = 15
 
 def _trailing_order_blocks(pos, current_price, reminder_num=0):
     ticker    = pos['ticker']
+    account   = pos.get('account') or 'unmapped'
     ep        = pos['entry_price']
     pct       = (current_price - ep) / ep * 100
-    header    = f"⚠️ *{ticker}* — STILL PENDING (reminder #{reminder_num})" if reminder_num else f"🎯 *{ticker}* — TRAILING ACTIVATED — action needed"
+    header    = f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — STILL PENDING (reminder #{reminder_num})" if reminder_num else f"🎯 *{ticker}* ({account} · {mode_tag(account)}) — TRAILING ACTIVATED — action needed"
     if reminder_num:
         text = (
             f"{header}\n"
@@ -899,6 +900,7 @@ def _exit_pending_blocks(pos, exit_pending, reminder_num):
     same 'Exited'/'Skipped' buttons (sell_exited/sell_skipped) as the original
     alert rather than inventing new action_ids."""
     ticker        = pos['ticker']
+    account       = pos.get('account') or 'unmapped'
     ep            = pos['entry_price']
     reason        = exit_pending['reason']
     current_price = exit_pending['current_price']
@@ -918,7 +920,7 @@ def _exit_pending_blocks(pos, exit_pending, reminder_num):
             f"price, or Skip if it turns out the exit condition no longer applies."
         )
     text = (
-        f"⚠️ *{ticker}* — EXIT NOT CONFIRMED (reminder #{reminder_num})\n"
+        f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — EXIT NOT CONFIRMED (reminder #{reminder_num})\n"
         f"{reason_labels[reason]}  |  entry `${ep:.2f}`  |  signal `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
         f"{status_line}"
     )
@@ -1026,11 +1028,12 @@ def _trailing_buy_status(pending):
 def _pending_buy_blocks(pending, reminder_num):
     ticker = pending['ticker']
     node = pending['node']
+    account = node.get('account') or 'unmapped'
     placed = pending['order_placed']
     met, trigger = _trailing_buy_status(pending)
 
     if placed:
-        header = f"⚠️ *{ticker}* — FILL NOT CONFIRMED (reminder #{reminder_num})"
+        header = f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — FILL NOT CONFIRMED (reminder #{reminder_num})"
         trigger_str = f"  |  bounce trigger `${trigger:.2f}`" if trigger is not None else ""
         text = (
             f"{header}\n"
@@ -1039,7 +1042,7 @@ def _pending_buy_blocks(pending, reminder_num):
             f"order was live, or Cancelled if the order didn't go through."
         )
     else:
-        header = f"⚠️ *{ticker}* — ORDER NOT CONFIRMED PLACED (reminder #{reminder_num})"
+        header = f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — ORDER NOT CONFIRMED PLACED (reminder #{reminder_num})"
         text = (
             f"{header}\n"
             f"BUY signal fired but no confirmation the trailing buy order was placed at the broker.\n"

@@ -4548,3 +4548,77 @@ updated.
   fixed — user said flag-only).
 - `scripts/premarket_prep.py`/`scripts/gap_scan.py` are new and only smoke-tested off-hours
   (Sunday) — first real trading-morning run will be the actual validation.
+
+---
+
+## 2026-07-26 — Real incident: phantom order on a non-trading day; alert mode-tagging; incident log; backlog_cache.md hygiene pass
+
+### What we did
+Session started with `go`, then pivoted into a real live-trading incident found mid-investigation
+of the coverage accountability grid. `sl_placement` showed 2 real failed attempts; the second
+(ERY, 2026-07-26, post-`daily_order_cap`-fix) was new and unexplained. Traced it: `soxl_ira`'s real
+broker position for ERY was 0 shares, but our `open_positions` table showed a 2-share position
+"entered" that morning — a Sunday. Root cause, confirmed by reading the code: `active_signals.
+_in_window()` (every signal-window/open_check/reminder gate) compares only `(now.hour, now.minute)`,
+no weekday check. The 9:31-9:40 ET `open_check` window ran normally against stale Friday-cached data,
+placed a real `TRAILING_STOP` BUY order for ERY at the broker, and a fill-detection path recorded a
+phantom fill without confirming against the broker. The follow-on SL placement was correctly
+`REJECTED` by Schwab, but that failure never alerted to Slack — found by the user manually checking,
+not by anything paging them. Blast radius confirmed contained to ERY alone (checked every account's
+real order history for the day) — everything else affected (e.g. duplicate QQQ `pending_buys` rows)
+was `dry_run`/research noise from the same root cause.
+
+Cleanup (backed up `trading_live.db` first, twice): cancelled the real resting order (confirmed
+`CANCELED` via post-cancel poll, not just the HTTP response); removed the phantom `open_positions`
+row via `close_position()` with no `exit_price` (no fabricated exit/P&L); `trade_log` marked with an
+`ERROR_PHANTOM_FILL_NO_MARKET_OPEN` `exit_reason` directly, per the user's explicit call not to treat
+it as a normal close. Also closed out EDC's real 423-share manual-unwind position (not part of v5,
+user tracks it in their own spreadsheet) the same way, at the user's request.
+
+**New**: `signals_db.trading_incidents` ticket-model log (mirrors `coverage_deviations` — never
+deleted, `resolved_ts` NULL means open) + `scripts/trading_incidents.py` CLI. Today's incident logged
+as row #1, left open (cleanup done, root cause — the missing trading-day gate — is not; logged as an
+elevated-priority open backlog item, not yet built).
+
+**Every Slack alert now tags `(account · LIVE/DRY-RUN)`** in its header instead of nothing or a bare
+account name — found live when the user couldn't tell at a glance whether a QQQ "FILL NOT CONFIRMED"
+reminder was real risk (it wasn't). New shared `signals_helpers.mode_tag(account)`, wired into all
+`check_live_state_reconciliation` mismatch alerts, `alert_stale_price_exit_suppressed`, both
+UNPROTECTED alerts, the trailing-order/exit-pending/pending-buy reminders, and the original BUY/SELL
+signal alerts (closing a backlog gap open since 2026-07-24). Background Opus review found 2 real
+issues, both fixed: the most-urgent "EXIT NOT CONFIRMED" alert had declared the `account` local but
+never actually added the tag to its header (half-applied edit); and `mode_tag`'s unknown/`None`-
+account fallback wrongly defaulted to the reassuring `DRY-RUN` label (wrong failure direction for a
+real-money NULL-account position) — changed to a deliberately alarming `UNKNOWN`, plus an
+`or 'unmapped'` display guard added to the 4 sites that would otherwise have rendered a literal `None`.
+
+Discussed (not built): a deliberate, isolated "simulate a trading day" tool to exercise real
+order-placement code on purpose (distinct from today's accidental case) — closest existing building
+block is `scripts/live_sim.py`, which only isolates the DB, not `schwab_client`/`schwab_safety`.
+
+**`docs/backlog_cache.md` hygiene pass** (user noticed session-start context was ~100k tokens):
+1983 → 1443 lines. 24 "Resolved" entries with long, undigested narrative shrunk to one-line pointers;
+13 of those had no existing full-detail record anywhere and were migrated verbatim into
+`docs/deep_backlog.md` first (account cash/buying-power check, run_loop fault tolerance, the CRITICAL
+trailing-arm clobber fix, live-state reconciliation check, the coverage_deviations ticket model, and
+8 others). The rest already had a `docs/deep_backlog.md`/`docs/research_log.md`/`docs/design.md`
+pointer sitting unused in their body and just needed shrinking.
+
+### State
+Full suite: 291 passed. `live_sim_harness.py`: 7/7. `signals_invariants.py`: clean (0 known
+violations — UDOW's was resolved a prior session). `docs/backlog_cache.md`/`docs/deep_backlog.md`/
+`CLAUDE.md` updated.
+
+### Next
+- **The actual root cause is still open, elevated priority**: no trading-day/market-calendar gate
+  anywhere in the daemon. `_previous_trading_day()` (used only by the 7am coverage report) is the one
+  place this project already reasons about weekdays — never applied to the real scan/order-placement
+  gate. Needs a `now.weekday() >= 5` guard (at minimum) wrapping the window checks in the main poll
+  loop before next weekend.
+- Daemon needs a restart to pick up this session's `signals_notify.py`/`signals_blocks.py`/
+  `signals_helpers.py`/`signals_db.py` changes.
+- The deliberate "simulate a trading day against a real test account" idea is a real, separate
+  follow-on worth scoping — not started.
+- `docs/backlog_cache.md`'s hygiene convention (shrink a resolved entry to a one-liner once its full
+  detail lives in `deep_backlog.md`) had been silently drifting for weeks before this session's pass —
+  worth checking again in a few sessions rather than assuming it'll self-correct.

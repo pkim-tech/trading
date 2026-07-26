@@ -616,6 +616,30 @@ def ensure_tables():
             """)
             c.commit()
 
+        # trading_incidents: ticket-model log of real live-trading incidents
+        # (a bug that actually fired against real order-placement code, not a
+        # coverage gap or a "wired-never-fired" row) -- e.g. the 2026-07-26
+        # phantom ERY fill on a non-trading day. Never deleted; resolved_ts
+        # NULL means still open. Distinct from coverage_deviations (daily
+        # scenario-expectation misses) and backlog_cache.md (planning/design
+        # notes) -- this is specifically "something real and bad happened."
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS trading_incidents (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              TEXT NOT NULL DEFAULT (datetime('now')),
+                title           TEXT NOT NULL,
+                detail          TEXT NOT NULL,
+                ticker          TEXT,
+                account         TEXT,
+                node_id         INTEGER REFERENCES watch_list(id),
+                real_money_impact INTEGER NOT NULL DEFAULT 0,
+                resolution      TEXT,
+                resolved_by     TEXT,
+                resolved_ts     TEXT
+            )
+        """)
+        c.commit()
+
         # coverage_snoozes: a time-bounded, human-authored acknowledgment that a
         # known condition (e.g. UDOW's deliberately-seeded stale test position)
         # should stop generating both the coverage_events row and the Slack alert
@@ -1261,6 +1285,34 @@ def get_deviations(unexplained_only=False, check_date=None, limit=500):
     params.append(limit)
     with _conn() as c:
         return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
+def log_incident(title, detail, ticker=None, account=None, node_id=None, real_money_impact=False):
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO trading_incidents (title, detail, ticker, account, node_id, real_money_impact)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (title, detail, ticker, account, node_id, 1 if real_money_impact else 0))
+        c.commit()
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def resolve_incident(incident_id, resolution, resolved_by='user'):
+    with _conn() as c:
+        c.execute("""
+            UPDATE trading_incidents SET resolution = ?, resolved_by = ?, resolved_ts = datetime('now')
+            WHERE id = ?
+        """, (resolution, resolved_by, incident_id))
+        c.commit()
+
+
+def get_incidents(open_only=False, limit=200):
+    q = "SELECT * FROM trading_incidents"
+    if open_only:
+        q += " WHERE resolved_ts IS NULL"
+    q += " ORDER BY id DESC LIMIT ?"
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, (limit,)).fetchall()]
 
 
 def snooze_coverage(scenario_key, snoozed_until, reason, ticker=None, account=None,

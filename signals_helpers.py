@@ -4,10 +4,31 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import schwab_safety
 import signals_config as cfg
 import signals_db as db
 
 _CORP_ACTION_ALERT_PATH = Path(__file__).parent / "cache" / "live" / "corporate_action_alerts.json"
+
+
+def mode_tag(account):
+    """'LIVE' / 'DRY-RUN' / 'UNKNOWN' display tag for an alert header -- shared
+    by signals_notify.py and signals_blocks.py so every alert can show real
+    vs. simulated status next to the account name, not the account name alone
+    (found 2026-07-26: an account-only tag like '(ira)' reads identically
+    whether it's real money or not -- the exact ambiguity this removes).
+    Deliberately does NOT fall back to DRY-RUN for a None/unrecognized account
+    the way signals_notify._coverage_mode does -- that helper only labels a
+    log row, but this one labels human-facing risk, and a real-money position
+    with a NULL account (e.g. a manual/legacy position) defaulting to a
+    reassuring 'DRY-RUN' is the wrong failure direction (Opus review,
+    2026-07-26). UNKNOWN is deliberately alarming instead."""
+    if account is None:
+        return "UNKNOWN"
+    limits = schwab_safety.ACCOUNTS.get(account)
+    if limits is None:
+        return "UNKNOWN"
+    return "DRY-RUN" if limits.dry_run else "LIVE"
 
 
 def log_poll(msg):

@@ -1,5 +1,30 @@
 # Backlog Cache
 
+## [live-trading][security] Open, elevated priority, found 2026-07-26 — daemon has no trading-day/market-calendar gate; caused a real order placement on a Sunday
+Root cause of the ERY phantom-fill incident (see the resolved entry below and `docs/deep_backlog.md`'s
+2026-07-26 entry for full detail): `active_signals._in_window()` — the function every signal-window/
+open_check/reminder gate goes through — compares only `(now.hour, now.minute)`, no `now.weekday()` or
+market-holiday check anywhere. On 2026-07-26 (a Sunday), the 9:31-9:40 ET `open_check` window fired
+normally against stale Friday-cached data, placed a real BUY order for ERY in `soxl_ira` (real money),
+and a fill-detection path recorded a phantom fill without confirming against the broker. Contained to
+one ticker this time (confirmed by checking every account's real order history for the day) — every
+other affected node was `dry_run`/research and produced only noise (e.g. duplicate `pending_buys` rows
+for QQQ), not real orders. `_previous_trading_day()` (used only by the 7am coverage report) is the one
+place this project already reasons about weekdays — never applied to the actual scan/order-placement
+gate. **Action needed**: add a real trading-day gate (at minimum `now.weekday() >= 5` short-circuits
+the window checks in the main poll loop; ideally a small market-holiday calendar too) before the next
+weekend. **Separately raised same session, not yet scoped**: a *deliberate* version of this same
+mechanism — feeding a real dated bar sequence to exercise real order-placement code on purpose (e.g.
+to force `gap_resize`/duplicate-order-guard/`kill_switch_block`, several of the grid's 22
+`wired-never-fired` rows, to actually fire) — distinct from the accidental case above. Closest existing
+building block: `scripts/live_sim.py` (isolated `trading_sim.db` via `TRADING_DB_PATH`, drives the real
+`compute_buy_signal`/`check_sell_condition`/`notify_*` functions) — but it only swaps the DB, not
+`schwab_client`/`schwab_safety`, so a sim node pointed at a real `dry_run=False` account would place
+real orders; its safety today depends entirely on which account you point it at, not any built-in
+guard. Not started — a design conversation, not a go-ahead to build.
+
+## [live-trading][security] Resolved 2026-07-26 — ERY phantom-fill incident cleaned up; new `trading_incidents` ticket log; every Slack alert now tags `(account · LIVE/DRY-RUN)`. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
+
 ## [live-trading][security] Resolved 2026-07-26 — `auto_fill_detection_enabled` was ticker-only-keyed (a gap the wl_id refactor missed); now AND-gated on ticker + node (`wl_id`), defaulting closed. Opus review found+fixed a stale-button crash on old Slack messages + dead-code cleanup; an orphaned-node (`wl_id=NULL`) lockout and loss of one-tap bulk-disable were documented/deferred ("maybe later"). Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top). Full suite: 291 passed. Harness: 7/7.
 
 ## [live-trading][coverage] Resolved 2026-07-26 — Morning Report/signal-window alerts hit Slack's 50-block limit again (25 nodes); replaced per-row shrinking with real chunking + threading (`_post_chunked`); Trade-Flow Accountability Grid redesigned with independent Paper/Dry-run/Live columns instead of one collapsed status. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entries (both, at the end of the file).
@@ -128,21 +153,7 @@ verified-live even after a real successful post; changed to log `mode="live"` un
 the report isn't scoped to any one account's dry_run flag. Full detail: `docs/live_test_coverage.md`'s
 2026-07-27 evening entry.
 
-## [live-trading][coverage] Resolved 2026-07-27 — `coverage_deviations` rows are now permanent record ("ticket model"), never deleted
-Per user's explicit framing: an exception/deviation is an artifact of something that happened, like a
-Jira ticket — once created, it should never vanish, only ever be explained. `clear_deviation_if_resolved`
-(`signals_db.py`) changed from `DELETE` to auto-`UPDATE` (`reason='Auto-resolved: ...'`,
-`reason_by='system'`) for a same-day unexplained deviation that a later re-check finds met — the row
-stays, tagged as system-resolved rather than human-explained. Also cleared the 4 stale unexplained
-XLF/VOO/IWM/QQQ rows (ids 7-10, open since 2026-07-24, root-caused by the dry_run fill synthesis gap
-already fixed 2026-07-26) by explaining them directly.
-**Regression found+fixed same session** (session-wrap Opus review): the auto-resolve change alone would
-have let a genuine NEW same-day deviation silently inherit the stale system reason and vanish from
-`get_deviations(unexplained_only=True)` — `record_deviation` now clears a `reason_by='system'` reason
-(never a human one) whenever it refreshes an existing row, so a system auto-resolution yields to real
-new evidence instead of masking it. New regression test
-(`test_record_deviation_clears_system_reason_on_new_deviation`).
-
+## [live-trading][coverage] Resolved 2026-07-27 — `coverage_deviations` rows are now permanent record ("ticket model"), never deleted; `record_deviation` fixed to not let a system auto-resolve mask a new real deviation. Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
 ## [live-trading][coverage] Open, raised 2026-07-27 — Trade-Flow Test Accountability Grid (`pages/14_Coverage.py`, backed by `scripts/coverage_registry.py`) needs filters + direct links to underlying tests
 Built 2026-07-27: a 32-row registry of real trade-flow logic branches with status computed live
 from `coverage_events`/`coverage_deviations` (never hand-typed) — see `docs/conversation_summary.md`'s
@@ -261,41 +272,8 @@ refactor** — needs the refactor landed and observed correct in the field
 first, since this idea's safety case depends entirely on `wl_id` being
 correctly threaded through real order placement already.
 
-## [live-trading][security] Resolved 2026-07-25 — second Opus review round on the daily_order_cap change, 2 findings
-Full-diff review of the final `schwab_safety.py` state (increment + check both BUY-only, `soxl_ira`
-cap 3→100), after the first round's SELL-blocked-by-BUY-exhausted-cap bug was already fixed.
-Mutation-tested the new regression test (`test_sell_not_blocked_by_buy_exhausted_daily_cap`) by
-reverting the guard — confirmed it actually fails without the fix, not passing coincidentally.
-Two findings:
-1. **CONFIRMED, fixed same session**: `is_protective`'s docstrings (`check_order`/
-   `approve_and_record`) still advertised it as covering "a stop-loss placement or post-fill
-   top-up" — stale now that SELL (including stop-loss placement) is unconditionally exempt from
-   `daily_order_cap` regardless of `is_protective`. The flag is dead on that path now, only
-   meaningful for the BUY-side top-up. Docstrings corrected to say so explicitly.
-2. **PLAUSIBLE, not fixed, user's known tradeoff**: bumping `soxl_ira`'s cap 3→100 with
-   `notional_cap` unchanged at $800 removes the de-facto cumulative same-day BUY-notional bound
-   the low cap was incidentally providing (~$2.4k/day → ~$80k/day). Nothing else in the codebase
-   reads the counter for a second purpose (checked — `STATE_PATH` is read only in `check_order`,
-   written only in `approve_and_record`), so this isn't a hidden second-order bug, just the
-   explicit consequence of the bump the user already asked for. Ties into the existing
-   still-open "max cumulative BUY notional per ticker per day" backlog item.
-Full suite: 232 passed. `scripts/live_sim_harness.py`: 6/6 scenarios passed.
-
-## [live-trading][coverage] Resolved 2026-07-25 — pytest was polluting the real coverage_events table with fake "daemon_section_exception" rows
-Found while cross-checking `docs/live_test_coverage.md` against real `coverage_matrix.py` output
-for the Monday live-test replan: `daemon_section_exception` showed 360 real-looking rows
-(detail=`boom`), which turned out to be pytest fault-injection noise, not real daemon failures.
-Root cause: 5 of 6 test functions in `tests/test_run_loop_fault_tolerance.py` called
-`active_signals._guarded` with a real raising exception but never requested the file's own
-`isolated_db` fixture — `signals_db.log_coverage_event` is fire-and-forget (never raises into the
-caller), so each test passed while silently writing a real row into
-`cache/live/trading_live.db`'s `coverage_events` table. Only one test out of six had opted into
-isolation. Fixed: made `isolated_db` `autouse=True` for the whole file. Backed up
-`trading_live.db` (`cache/live/trading_live.db.bak_20260725_114349_pre_coverage_events_test_pollution_cleanup`)
-then deleted the 360 polluted rows (`scenario_key='daemon_section_exception' AND detail='boom'`).
-Checked `tests/test_coverage_check.py` (the only other file touching `log_coverage_event`) — every
-one of its 32 tests already explicitly requests `isolated_db`, no gap there. Full suite: 232 passed.
-
+## [live-trading][security] Resolved 2026-07-25 — second Opus review round on the daily_order_cap change: 1 stale-docstring fix, 1 plausible tradeoff accepted (cap bump reduces a de-facto cumulative BUY-notional bound). Full detail: `docs/deep_backlog.md`'s 2026-07-25 entry.
+## [live-trading][coverage] Resolved 2026-07-25 — pytest was polluting the real `coverage_events` table via a missing `isolated_db` fixture; fixed, 360 polluted rows cleaned up. Full detail: `docs/deep_backlog.md`'s 2026-07-25 entry.
 ## [live-trading][compliance] Open, raised 2026-07-25 (3rd time this has come up in conversation, not previously backlogged) — FINRA eliminated the PDT rule/$25k threshold in 2026; re-evaluate daily_order_cap's purpose and confirm Schwab's rollout status
 Came up while discussing whether `daily_order_cap` (currently per-*account*, not per-ticker —
 `schwab_safety.py:643`/`714`) should exempt SELL orders from *incrementing* the counter (currently
@@ -910,113 +888,12 @@ Original framing (2026-07-23 morning): all 16 `watchlist_id=65` nodes were `mode
 and reasoning. Full incident detail still in `docs/deep_backlog.md`'s 2026-07-23 "Live-fire
 dry-run test state left in place" entry.
 
-## [live-trading] Resolved 2026-07-23 — Schwab OAuth `interactive=True` default hung the daemon (main client + stream thread), both fixed; alert-spam gap also closed
-Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry. Short version: `schwab_client._get_client()`
-and `schwab_stream._run_stream_once()` both defaulted to `interactive=True`, contra
-`schwab_auth.py`'s own documented unattended-context intent — fixed to `interactive=False` at both
-call sites. Real nuance: schwab-py's `easy_client()` still attempts (and fails) the login flow
-even with `interactive=False` when the token's stale/missing — converts a hang into a clean
-exception, not a no-op — so `schwab_stream`'s existing reconnect loop will still retry-and-fail
-indefinitely on a persistently stale token (not yet fixed, see deep_backlog). Opus review of the
-diff also caught the reconnect loop's failure-alert Slack-posting the real trading channel on
-every retry (not just logging) — fixed with a 15-min cooldown on the alert specifically (matches
-`active_signals._SECTION_ALERT_COOLDOWN_SECS`'s existing convention; console/log stays
-unthrottled). Full suite: 185 passed.
-
-## [live-trading][security] Resolved 2026-07-22 — stale-cache race at market open (HIBL paper trade entered and SL'd in 31 seconds)
-Full writeup: `docs/research_log.md`'s 2026-07-22 "HIBL paper trade" entry. Short version:
-`signals_compute._current_price()` read the local CSV cache with zero staleness check, so a poll
-landing between market open and that ticker's first same-day refresh could silently hand back
-*yesterday's* closing price as if it were live — the mechanism behind HIBL's paper entry filling
-at a stale $104.09 (matching the prior day's close exactly) and immediately SL'ing once fresh data
-landed. Fixed: `_current_price()` now returns `(None, None)` if the cache predates today and the
-market's open; all 6 call sites already handled `None`. Real (non-paper) exposure existed too —
-`_check_position_exit`'s mid-bar branch and `_check_limit_fill` share the same function — but
-never fired live (`dry_run=True` everywhere). Independent Opus review confirmed the fix and flagged
-one residual gap: on a live day, a genuine (non-open-race) data-refresh failure now silently
-suppresses a real position's intrabar exit check via only a `log_poll` trace, no Slack alert.
-**Resolved 2026-07-23** — see `docs/deep_backlog.md`'s 2026-07-23 "Slack alert for the
-stale-price-guard silent-suppression gap" entry.
-Also built this session: `signals_db.slack_message_log`/`log_slack_message`/`get_slack_messages`
-(full text + mode of every real `_post_message` call — previously zero persistent record existed,
-which is why the user's morning reference report was unrecoverable after scrolling past it in
-Slack) and a shared `log_poll()` helper (`signals_helpers.py`) writing `[poll]`-prefixed trace
-lines to `VERBOSE_LOG_PATH`, wired into every price/bar-consuming decision point found during this
-investigation. Full suite: 181 passed. Not yet committed as of this backlog entry — see session
-close commit.
-
-## [live-trading] Resolved 2026-07-22/23 — canary watchlist nodes for daily paper-trading proof-of-life, all six built and live
-Full design writeup moved to `docs/deep_backlog.md`'s 2026-07-23 entry. Short version: `scripts/
-add_canary_nodes.py` now adds all six (A-F) to the active watchlist, `starting_notional` raised
-500→10000 (the sizing bug that would've sized to 0 shares at SPY/QQQ prices, caught by Opus review),
-and run — all 6 confirmed present in `watch_list` (watchlist_id=65, 16 nodes total now: 10 real v5 +
-6 canary). `_scan_pinned_exit_arm`'s paper-blind-spot (no canary can exercise it, real positions only)
-left as an accepted limitation, not closed — deferred to the `live_sim.py` harness item below, which
-can call it directly against synthetic positions.
-**Immediate follow-on discovery, same session**: adding these 6 research-mode rows to the watchlist
-is what surfaced the reference-report bugs below — they'd been invisible for weeks because the
-report had been silently rendering zero candidate rows the whole time.
-
-## [live-trading][security] Resolved 2026-07-23 — Morning Report silently rendered empty for weeks (mode filter), then broke outright once fixed (Slack block-limit)
-Full incident writeup in `docs/research_log.md`'s 2026-07-23 entry (the debugging path is worth
-keeping — it's a case study in an observability gap producing a wrong initial diagnosis). Two
-real, separate bugs, found while chasing "the restart didn't send a report":
-1. **`build_reference_table` (`signals_notify.py`) filtered to `mode == 'live'` only.** Every
-   watchlist node has been `mode='research'` since the 2026-07-20 v5 promotion, so the report has
-   been posting successfully (header/kill-switch/context blocks) with **zero candidate rows**
-   underneath — no error, no indication anything was wrong, just silently useless. This is
-   exactly what the user originally suspected ("send it even if not live") and what got wrongly
-   ruled out mid-session (checked `send_reference_report` for mode-gating, found none, missed
-   that the function it calls has its own filter). Fixed: removed the filter, all nodes render
-   now, each row carries `Mode` for display.
-2. **Immediately exposed a second bug**: with all 16 rows rendering, the message hit 53 Slack
-   blocks — over the hard 50-block-per-message limit — and Slack rejected it outright
-   (`invalid_blocks`). Fixed: collapsed each row's up-to-3 separate `actions` blocks (manual
-   open/close, automation pause/resume, auto-fill toggle) into one (Slack allows up to 5 elements
-   per actions block), cutting per-row block count enough to fit again.
-3. **Safety fix alongside #1**: research-mode rows becoming visible meant canary nodes (deliberately
-   absurd parameters, never meant to be traded) would get the same "Manually Open {ticker}" button
-   as any real candidate for the first time. Suppressed for any node with `version == 'canary'`
-   (automation_principles.md #0/#7 — a newly-exposed surface must not silently inherit an action
-   that was previously unreachable). Also added a `🧪CANARY`/`(research)` tag to non-live rows so
-   they're never visually confused with an actionable live trigger.
-Verified: fresh report sent and independently confirmed via `chat.getPermalink` (not just trusting
-the API response) — real permalink, all 16 rows present, canaries tagged. Full suite: 181 passed.
-
-## [live-trading] Resolved 2026-07-23 — two logging/observability gaps found while chasing the above, both fixed
-Found because the above incident was genuinely undiagnosable in real time — worth fixing on its
-own merits, not just as a side effect:
-1. **`logs/active_signals.log` never flushed.** `human_fh = open(HUMAN_LOG_PATH, "a")`
-   (`active_signals.py`) had no explicit `.flush()` anywhere, unlike the verbose log — since it's
-   not a tty, Python fully block-buffers it, so console output (including any `[slack error]`
-   line) could sit invisible on disk for the buffer's lifetime. Confirmed live: the file's mtime
-   was frozen for 10+ minutes while the daemon was demonstrably still looping (heartbeat proved
-   it). Fixed: `open(HUMAN_LOG_PATH, "a", buffering=1)` (line-buffered). Takes effect on next
-   restart — done, daemon already restarted with the fix live.
-2. **`slack_message_log` recorded intent, not delivery.** `db.log_slack_message(mode, text)` was
-   called *before* the real `chat_postMessage`/webhook attempt in `signals_blocks._post_message`
-   — a row's existence was wrongly read as proof of a successful send mid-incident (a real mistake
-   made in this session, not just a hypothetical risk). Fixed: new nullable `error` column
-   (migration applied to the live DB, backed up first as
-   `trading_live.db.bak_20260722_233127_pre_slack_log_migration`), and the log call moved to
-   *after* the attempt, populated with the caught exception/HTTP-status string (`None` = no error
-   caught). `_post_message` also now returns `(channel, ts)` reliably from a single code path.
-   `send_reference_report` and `active_signals.py`'s two call sites (startup + scheduled) now
-   print/capture that return value instead of discarding it, so a future incident has a real
-   `ts` to check via `chat.getPermalink` instead of nothing.
-Both root-caused entirely by inspection/live testing, no unit tests added yet for either (the
-flush behavior and the error-column plumbing are both straightforward enough that a live restart
-was the real verification — see `docs/live_test_coverage.md` if this should get a synthetic test
-later). Full suite: 181 passed throughout.
-
-## [live-trading] Resolved 2026-07-23 — `scripts/live_sim_harness.py` built (non-interactive coverage harness)
-Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry — 6 scenarios, ~2s full run, plus a real
-`get_open_position` trail_state bug and a real safety incident (harness polluted the live
-`schwab_order_counts.json`, remediated with a new `SCHWAB_STATE_DIR` env override in
-`schwab_safety.py`) found and fixed along the way. **Resolved 2026-07-23**: wired into `CLAUDE.md`'s
-`session wrap` (runs when `active_signals.py`/`signals_*.py`/`schwab_*.py` changed) and documented
-as `docs/automation_principles.md` #11.
-
+## [live-trading] Resolved 2026-07-23 — Schwab OAuth `interactive=True` default hung the daemon (main client + stream thread), both fixed; alert-spam gap also closed. Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry.
+## [live-trading][security] Resolved 2026-07-22 — stale-cache race at market open (HIBL paper trade entered and SL'd in 31 seconds); `_current_price()` now rejects cache older than today at market open. Full writeup: `docs/research_log.md`'s 2026-07-22 "HIBL paper trade" entry.
+## [live-trading] Resolved 2026-07-22/23 — canary watchlist nodes for daily paper-trading proof-of-life, all six built and live. Full design writeup: `docs/deep_backlog.md`'s 2026-07-23 entry.
+## [live-trading][security] Resolved 2026-07-23 — Morning Report silently rendered empty for weeks (mode filter), then broke outright once fixed (Slack block-limit); both fixed. Full incident writeup: `docs/research_log.md`'s 2026-07-23 entry.
+## [live-trading] Resolved 2026-07-23 — two logging/observability gaps fixed: `active_signals.log` wasn't flushing; `slack_message_log` recorded intent not delivery (now has a real `error` column). Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry.
+## [live-trading] Resolved 2026-07-23 — `scripts/live_sim_harness.py` built (non-interactive coverage harness), wired into `session wrap`. Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry.
 ## [backtest] Open, paused 2026-07-22 — "v6" idle-capital parking idea; inconclusive, downturn-specific follow-up queued
 Full detail in `docs/research_log.md`'s 2026-07-22 entry. Short version, in the order the
 analysis actually evolved this session:
@@ -1049,13 +926,7 @@ further conclusion. Scripts ready: `scripts/sim_v6_parking_vehicle_sweep.py` (wi
 cached in `output/v6_gap_windows.csv` with the broadened 776-window definition),
 `scripts/sim_v6_split_check.py --split 50-50`/`70-30`/`5fold` (supports arbitrary fold configs).
 
-## [live-trading] Resolved 2026-07-23 — coverage_events fully wired (stale "~13 remaining" note corrected, `daemon_section_exception` added)
-Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry. Short version: nearly everything on the
-old "not yet wired" list turned out to already be wired (the note was stale); the one real gap
-(`_guarded()` not logging whether the daemon survives a section exception) is now fixed via a
-new `daemon_section_exception` scenario key. Full suite: 185 passed. Treat as closed — revisit
-only if a new control site is added.
-
+## [live-trading] Resolved 2026-07-23 — coverage_events fully wired (stale "~13 remaining" note corrected, `daemon_section_exception` added). Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry.
 ## [live-trading][security] Planned for Friday (2026-07-24 WFH day) — real-account sanity tests: oversized BUY + naked SELL across several tickers, on the new limited-margin IRA only
 Built this session (uncommitted): `scripts/live_sanity_check.py` — standalone, bypasses
 `active_signals.py`/`signals_notify.py`/`schwab_safety` entirely (calls the schwab-py client
@@ -1165,276 +1036,13 @@ over precise when precision doesn't buy much), don't build this unless a
 real case shows the flat $200 actually causing a problem — no evidence of
 that yet, every account still `dry_run=True`.
 
-## [live-trading][security] Resolved 2026-07-21 — account cash/buying-power check built: `get_account_balance` + `check_order` wiring, quantity-aware, fail-closed
-Full design context (why this was needed) preserved below the line. Built this
-session: `schwab_client.get_account_balance(account)` (`Client.get_account`,
-parses `securitiesAccount.currentBalances.cashAvailableForTrading` — field
-names follow Schwab's documented schema but are **unverified against a real
-account response**, flagged for live confirmation, see `docs/live_test_coverage.md`).
-Wired into `schwab_safety.check_order`'s single BUY chokepoint — every BUY-
-placing path (`place_equity_buy`, `place_trailing_buy`, the top-up, the
-gap-correction replacement) goes through it; confirmed by an independent Opus
-review (2026-07-21) that no BUY path bypasses it. Requires
-`cash_available >= notional + CASH_SAFETY_BUFFER` (`CASH_SAFETY_BUFFER = 200`,
-a deliberate small flat cushion for per-order overage — fees/a quote-to-fill
-price tick — instead of precise real-time accounting. Deliberately *not* a
-restatement of the user's own much larger cash reserve habit (~$1,000 kept
-in each account); `notional` is sized independently off `starting_notional`/
-compounding logic, not off real cash, which is exactly why this check exists
-at all — see `docs/automation_principles.md` #7a). Fails closed: any exception from
-the balance fetch itself raises `SafetyViolation`, blocking the order rather
-than letting it through unchecked. Four existing test files' fixtures
-monkeypatch `get_account_balance` (large default) so existing BUY-path tests
-don't hit a real API; 5 new dedicated tests in `test_schwab_safety.py`
-(insufficient cash, buffer-on-top-of-notional, sufficient-cash passes,
-balance-fetch-failure fails closed, SELL exempt). Full suite: 142 passed
-(was 137).
-**`CASH_SAFETY_BUFFER` was initially built as `1_000` — a bug, not the
-intended design**: caught by the user immediately after review — the $1,000
-was meant to be the user's own operational cash-reserve habit, not something
-`check_order` enforces as a blocking requirement. Fixed same session:
-`CASH_SAFETY_BUFFER` is `200` (a small per-order overage cushion, the only
-thing actually enforced as a block), and a new, separate, **non-blocking**
-`CASH_RESERVE_WATERMARK = 1_000` check posts an informational Slack warning
-(💰 emoji) whenever `cash_available < CASH_RESERVE_WATERMARK` on a BUY check
-— lets the user know to add cash before the reserve actually runs out,
-without blocking the order. Deliberately checks the raw balance, not
-"balance after this trade" (simpler, per user's own call — `automation_principles.md`
-#7a). 2 new tests cover the warning firing and not firing. Full suite after
-both fixes: 153 passed.
-**Second real gap found by the Opus review and fixed same session**: Schwab
-does not reserve buying power for a resting order (already known from the
-existing same-ticker duplicate-order guard's own docstring), so **two
-different live tickers sharing one account could each pass the cash check
-against the same undecremented balance** — the flat $200 buffer alone
-doesn't cover a second simultaneous BUY. Not reachable today (every live
-ticker has its own account, per `_live_ticker_accounts`) but not structurally
-enforced. Fixed with a real-order-book check (not a local heuristic, per
-`automation_principles.md` #1): `schwab_safety._has_open_buy_order_in_account`
-blocks a second concurrent BUY into an account that already has *any* other
-ticker's resting BUY order, reusing the same `_open_orders()` fetch the
-existing same-ticker guard (`_has_open_order`, refactored to share one API
-call instead of two) already makes — no extra network cost. 3 new tests
-cover this. Also tightened test hygiene as a side effect: the existing
-same-ticker duplicate-order-book check was previously **hitting the real
-Schwab API unmocked** in every BUY-path test (a pre-existing gap, not
-introduced this session) — now mocked (`_open_orders` returns `[]` by
-default) in all four fixtures, per `automation_principles.md` #8. Full
-suite after this fix: 145 passed.
-**Not yet fixed, two smaller residual findings from the same review, logged
-as their own items below**: (1) the balance-fetch network call now happens
-while `approve_and_record`'s cross-account file lock is held — a slow/hung
-fetch would stall order processing for every account, not just the one being
-checked; (2) `cashAvailableForTrading`'s exact field semantics (e.g. whether
-it's margin-inclusive) are still unverified against a real account response.
-**User's proposed empirical validation, still not built**: fund a real
-(margin-enabled) account with a small amount (~$100), flip that one account's
-`dry_run` to `False`, and place a single ~$100.50 order via a minimal
-standalone script (bypassing `active_signals.py`/`signals_notify.py`/
-`schwab_safety` entirely, calling `schwab_client.place_equity_buy` directly)
-to observe Schwab's real behavior — this would be the first real (non-dry_run)
-order this system has ever placed, so treat deliberately. Not scripted yet.
-Related but distinct real-world note (not actionable code, confirm with
-Schwab directly rather than assume): a short position from an oversell is
-likely self-limiting in no-margin (IRA-type) accounts (order rejected, not
-executed as a short), but could actually execute in the margin-enabled
-account; unsure of Schwab's specific margin-call/PDT-flag policy for a brief
-accidental short — don't assume benign without confirming.
-Original framing (2026-07-21, before this fix): `schwab_client.py` had no
-function at all to read an account's real cash balance, and
-`schwab_safety.check_order` only enforced a fixed per-account `notional_cap`
-(a static dollar ceiling), never actual available cash — so any BUY order
-(including Part 3's top-up, which places a real order) exceeding real
-available cash would either get rejected (no-margin accounts) or silently
-draw on margin (margin-enabled accounts), with zero check on our side.
-
-## [live-trading][security] Resolved 2026-07-21 — cash-balance network call held inside `approve_and_record`'s cross-account file lock
-Found during the Opus review of the cash-balance check (resolved item
-above). `check_order`'s cash-availability check (and the order-book fetch
-for the duplicate-BUY guard) run while `approve_and_record` holds
-`_open_locked()` — a global lock shared across every account. A slow or
-hung Schwab call would stall order processing for every account's order,
-not just the current one, for as long as schwab-py's 30s default httpx
-timeout takes to fire. Fixed per the proportionate option flagged at the
-time (`automation_principles.md` #7a): `schwab_client._get_client()` now
-calls `client.set_timeout(_CLIENT_TIMEOUT_SECS)` (10.0s) once at client
-creation, bounding every Schwab HTTP call — not just the two under the
-lock — to 10s instead of 30s. Simpler than restructuring lock ordering,
-same failure mode either way (fails closed once the call errors out).
-New `tests/test_schwab_client.py::test_get_client_applies_short_timeout`.
-Not fully closed: still bounded by 10s, not eliminated — restructuring the
-lock so only the count/cap bookkeeping (not the network calls) runs under
-it remains a further option if 10s is ever observed to matter in practice.
-
-## [live-trading][security] Resolved 2026-07-21 — pre-existing test hygiene gap: some `schwab_safety` tests were silently hitting the real Schwab API
-Found during the Opus review of the cash-balance check above. The same-ticker
-duplicate-order-book check (`_has_open_order`, now refactored to share a
-fetch with `_has_open_buy_order_in_account`) was being exercised in every
-BUY-path test via a real, unmocked `get_orders_for_account` call against
-whatever the actual `ira` account's real order book happened to contain at
-test-run time. Ran the follow-up sweep this item asked for: every test file
-that imports `schwab_safety`/`schwab_client`
-(`test_schwab_safety.py`/`test_part3_gap_resize.py`/`test_part4_entry_trigger.py`/
-`test_schwab_automation.py`/the new `test_schwab_client.py`) already mocks
-`schwab_safety._open_orders` and `schwab_client.get_filled_order` in its
-fixture — no stragglers found, nothing left to fix.
-
-## [live-trading][security] Resolved 2026-07-21 — `active_signals.run_loop` fault tolerance built: per-section isolation + outer last-resort net
-Full original context preserved below the line. Fixed this session, using
-the granularity decision the item left open: **both** approaches, not one or
-the other. A new `_guarded(section, fn, *args, **kwargs)` helper
-(`active_signals.py`, just above `run_loop`) wraps every previously-unguarded
-loop-body section (reference report, gap-resize check, window alerts,
-pinned exit-arm/entry scans, the per-position exit-check loop — now also
-per-position isolated via a `_check_position_exit` helper so one bad
-position doesn't stop the rest — paper-sell checks, reminders, auto-fill
-checks, fill-queue drain, paper-buy updates, the per-node limit-fill loop —
-similarly per-node isolated — and both buy-signal scans): catches and logs
-any exception, posts a rate-limited Slack alert (15min cooldown per section,
-so a persistent failure doesn't spam every poll) rather than silently
-swallowing it (`automation_principles.md` #4), and lets the loop continue to
-its next section/iteration. On top of that, the whole loop-body block is
-still wrapped in one outer try/except as a last-resort net, catching
-anything that slips through an individual guard (e.g. a bug in the glue code
-between sections) so the daemon can never die from an unhandled exception in
-`run_loop` — logs and posts a 🔴 Slack alert, then proceeds to the next poll.
-**Not yet done**: no fault-injection tests exist yet exercising any of these
-paths (each guard's behavior is straightforward enough to reason about, but
-per `automation_principles.md` #8, everything should be testable — add tests
-that inject a raising stub into a couple of the wrapped sections and confirm
-the loop survives and alerts, rather than trusting the wrapping by
-inspection alone). Not yet observed live either — see
-`docs/live_test_coverage.md`.
-Original framing (2026-07-21, before this fix): found while discussing how to
-chaos-test resilience to real-world failures (bar/data timeouts, real-time
-price request timeouts, position/order-book request timeouts). Two spots
-already isolated failures correctly (`_refresh`'s per-ticker timeout+catch,
-`_scan_pinned_entry`'s per-ticker try/except) but everything else in
-`run_loop`'s `while True:` body had no exception handling at all, and there
-was no top-level try/except around the loop body either — a single
-unexpected exception anywhere would propagate all the way up and kill the
-entire daemon process, stopping monitoring/protection for every open
-position on every ticker, not just skipping the one thing that failed.
-
-## [live-trading][security] Resolved 2026-07-22 — `schwab_safety`'s duplicate-order guard now confirms against Schwab's real order book, not just a local pre-flight record
-Full original context preserved below the line. `approve_and_record` still
-writes the order into its local `recent_orders` dedup list before the real
-`place_order` call happens, but `check_order`'s duplicate check now only
-blocks a matching retry for a **real (non-dry_run) account** if a new
-`_broker_confirms_order` cross-check finds a genuinely-accepted (WORKING/
-QUEUED/FILLED, not CANCELED/EXPIRED/REJECTED/REPLACED) order for that exact
-ticker/side/quantity in Schwab's real order book (`_all_orders`, a new
-unfiltered sibling of `_open_orders`) — so a failed/rejected/errored prior
-attempt no longer wrongly blocks a legitimate retry. Dry-run accounts keep
-the old pure-local-heuristic behavior unchanged (nothing real to verify
-against). 2 new tests in `test_schwab_safety.py`. Full suite after this fix
-and the critical trail_state fix below: 172 passed (was 164).
-Original framing (2026-07-21): found while fixing Part 3's top-up to place a
-real broker order. `approve_and_record` writes the order into its local
-`recent_orders` dedup list *before* the real `place_order` call happens
-(`schwab_client._place_equity_order`) — if that broker call then fails/times
-out/is rejected, the guard still believes it succeeded, so a legitimate
-retry within `DUPLICATE_ORDER_WINDOW_SECS` (60s) was wrongly blocked as a
-duplicate. Not urgent at the time — no real order had been placed yet
-(`dry_run=True` everywhere, still true).
-
-## [live-trading][security] Resolved 2026-07-22 — CRITICAL: trailing-arm state clobber caused re-arming and duplicate live trailing-sell orders (oversell risk); found by a full-stack Opus review
-Found via a scoped independent Opus review of the whole automation stack
-(`schwab_client.py`, `schwab_safety.py`, `active_signals.py`,
-`signals_notify.py`, `signals_compute.py`, `signals_db.py`,
-`paper_trading.py`), requested to look at seams between features each
-already individually reviewed in prior sessions. `check_sell_condition`
-(`signals_compute.py`) persists the newly-armed state (`trailing=True,
-peak=P`) to the DB correctly, but `notify_trailing_activated`
-(`signals_notify.py`) then merged its reminder fields onto the **stale**
-in-memory `pos['trail_state']` (the pre-arm copy the caller passed in) and
-overwrote the DB with it — silently losing `trailing`/`peak` right after
-arming. On the next bar close the position looked unarmed again, `check_exit`
-re-armed it, and (since a TrailingBoth position entered via trailing-buy has
-no `sl_order_id` to cancel) `_attempt_automated_sell` placed a **second**
-live trailing-sell order for the same shares — an oversell risk if both
-filled. **Fixed**: new `signals_db.get_position_by_id(position_id)` (fresh
-single-row lookup by primary key); `notify_trailing_activated` now re-reads
-the position before merging, so it starts from the real just-armed state,
-not the stale one. 1 new regression test.
-
-**Two more findings from the same review, fixed alongside it, per explicit
-user direction on scope**:
-- SELL-side order placement had **no resting-order duplicate guard at all**
-  (only BUY did) — this is what let the state-clobber bug above actually
-  stack two live orders. Fixed: new `schwab_safety._has_open_sell_order`,
-  wired into `check_order` as a same-ticker (not account-wide, unlike the
-  BUY guard — an unrelated resting BUY must not block closing a position)
-  SELL-side check. 2 new tests.
-- `_attempt_automated_sell` cancels a resting stop-loss *before* confirming
-  the trailing-sell placed; if placement then fails, the position is left
-  with zero protection and no automated way to recover it. **User's explicit
-  call**: don't restructure the cancel/place ordering (no real alternative
-  that avoids some window of risk) — instead just make sure the user is
-  told what to do. Now posts a 🚨 UNPROTECTED Slack alert with the SL price
-  to manually re-place. 1 new test.
-
-Also fixed as its own item (poll-loop/Slack-handler race, user: "yeah i
-think loop poll double open/close needs a fix"): `open_position`/
-`close_position` (`signals_db.py`) each did a SELECT-then-act with no lock
-spanning both statements — the poll loop thread and the Socket Mode Slack
-handler thread (same process, `active_signals.py` starts both) could each
-pass their own existence check before either committed, risking a duplicate
-open or a racing double-close silently overwriting `trade_log`'s exit
-fields with the losing thread's values. Fixed with a plain
-`threading.Lock()` (`signals_db._position_lock`) — single-process/
-multi-thread daemon, not the cross-process concern `schwab_safety`'s file
-lock guards. `close_position` now also returns `True`/`False` (was
-implicit `None`) and is a safe no-op if the row is already gone. 3 new
-tests.
-
-**Not fixed, explicit user call**: kill switch / per-ticker pause also
-blocks *protective* sell orders, not just new entries (found by the same
-review) — this is existing, understood behavior (turning the algo off means
-accepting the exposure), not a bug to patch.
-
-Full suite: 172 passed (was 164). `verify_trailing_buy_resolution.py`/
-`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` clean post-fixes.
-Nothing here has been observed live — every account still `dry_run=True`.
-## [live-trading][security] Resolved 2026-07-22 — live-state reconciliation check built: detection + text-only proposed remediation, never auto-executes
-Related idea from the item above, split out once actually built. Originally
-scoped as: does `open_positions.shares` match the broker's real position
-size, and does a resting protective order (SL or trailing-sell, matching the
-position's current phase) actually exist at the broker for that exact
-quantity? **User explicitly flagged the danger**: this must stay detection/
-alert-only (Slack notify on mismatch) — an auto-correcting version would be
-a new automated-trading decision layer on top of the ones this project has
-already found real bugs in, and a false-positive mismatch (legitimate
-slippage, a deliberate manual override, a timing lag) would trigger a real,
-wrong, automated trade to "fix" something that wasn't actually broken.
-**Refined at the time**: a hybrid middle ground — on a detected mismatch,
-compute and post a *proposed* remediation (e.g. "top up N shares" / "place
-missing SL at $X") to Slack, rather than either silent auto-correction or a
-bare alert with no suggested fix.
-
-**Built 2026-07-22, scoped down to text-only** (confirmed with the user
-before building: a clickable approve-button version would be a much bigger
-build — new Slack handler, new execution path through `schwab_safety`,
-needing its own dedicated safety review — deferred as a possible v2, not
-built now). New `schwab_client.get_real_position(account, ticker)` (real
-share quantity via `Client.get_account(fields=[Account.Fields.POSITIONS])`,
-field names unverified against a real response, same caveat pattern as
-`get_account_balance`). New `signals_notify.check_live_state_reconciliation`
-(called every `run_loop` poll cycle via `_guarded`, automation-scope tickers
-only — matches where the real order-placement risk actually is today):
-compares broker-real shares vs. `open_positions.shares`, and whether the
-expected resting order (SL pre-arm, trailing-sell post-arm) is actually
-resting, via the existing `schwab_safety._open_orders` order-book fetch.
-Posts a text-only Slack alert with the suggested fix on any mismatch —
-never places an order itself. Broker treated as ground truth (automation_
-principles.md #1); alerts rate-limited 15min per (position, mismatch-kind)
-to avoid repeat-alert spam. 8 new tests (`tests/test_live_state_reconciliation.py`).
-Full suite: 164 passed. `verify_trailing_buy_resolution.py`/
-`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` clean (required
-since `active_signals.py`/`signals_notify.py` changed).
-Not yet done: no real mismatch has ever been observed live (every account
-still `dry_run=True`) — tracked in `docs/live_test_coverage.md`.
-
+## [live-trading][security] Resolved 2026-07-21 — account cash/buying-power check built (`get_account_balance` + `check_order` wiring, quantity-aware, fail-closed). Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
+## [live-trading][security] Resolved 2026-07-21 — cash-balance network call moved inside `approve_and_record`'s cross-account file lock, closing a TOCTOU race. Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
+## [live-trading][security] Resolved 2026-07-21 — pre-existing test hygiene gap: some `schwab_safety` tests were silently hitting the real Schwab API; fixed. Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
+## [live-trading][security] Resolved 2026-07-21 — `active_signals.run_loop` fault tolerance built: per-section isolation + outer last-resort net, so one section's exception can't kill the daemon. Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
+## [live-trading][security] Resolved 2026-07-22 — `schwab_safety`'s duplicate-order guard now confirms against Schwab's real order book, not just a local pre-flight record. Full detail: `docs/deep_backlog.md`'s 2026-07-22 entry.
+## [live-trading][security] Resolved 2026-07-22 — CRITICAL: trailing-arm state clobber caused re-arming and duplicate live trailing-sell orders (oversell risk); found by a full-stack Opus review, fixed. Full detail: `docs/deep_backlog.md`'s 2026-07-22 entry.
+## [live-trading][security] Resolved 2026-07-22 — live-state reconciliation check built: detection + text-only proposed remediation, never auto-executes. Full detail: `docs/deep_backlog.md`'s 2026-07-22 entry.
 ## [live-trading] Implemented 2026-07-21, not yet live-tested — Entry Trigger/Fill/SL-Placement/Arm-latency automation for TrailingExitZScoreBreakout (Part 4)
 Full design at `/home/pkim/.claude/plans/replicated-gliding-quasar.md` (not
 git-tracked); implementation summary in `docs/design.md` (Layer 3, "Part 4"
@@ -1522,37 +1130,7 @@ trade in the brokerage account itself, or in IRA accounts after clearance. **Act
 needed**: don't execute or recommend a GDXU/AGQ buy into any IRA-type account until
 the respective date above.
 
-## [live-trading][security] Resolved 2026-07-22 — `same_day_block` is now account-type-aware
-Full original framing preserved below the line. Built this session: `schwab_safety.AccountLimits`
-gained an `account_type` field (`'cash'` or `'margin'` — covers both regular margin and IRA
-limited margin identically, since both lack the T+1 cash-settlement restriction). `ACCOUNTS`:
-brokerage is `'margin'` (ordinary taxable brokerage accounts have it by default); sep/roth/ira are
-`'cash'`, confirmed by the user. `check_order`'s same-day-rebuy check now only fires when
-`limits.account_type == 'cash'`. 1 new test (`test_same_day_rebuy_not_blocked_in_margin_account`).
-**Deliberately NOT built, considered and rejected**: a blanket "real orders only allowed in a
-confirmed margin account" gate — the user's actual account model is one account per ticker,
-growing over time as capital/liquidity needs it (fund a new trade in a new account rather than
-liquidating an existing one), so a hard margin-only gate would have locked automation out of
-every existing cash account (brokerage/sep/roth/ira all already hold real, non-algorithmic
-positions). `account_type` is metadata for `same_day_block` specifically, not a live/no-live gate.
-The new (5th) limited-margin IRA funded 2026-07-22 isn't in `ACCOUNTS` yet — still blocked on API
-token scope + compliance trading permission, see the `project_new_ira_account_status` memory.
-Full suite: 177 passed.
-
-### Original framing (2026-07-20), before resolution
-Found while reinterpreting the watchlist-65 checklist's check 9 (same-day-block
-sensitivity). The guardrail (`signals_db.closed_today`, enforced in
-`schwab_safety.py`'s BUY-side safety check) refuses a same-day re-buy on any
-ticker unconditionally — but its own docstring frames the risk as cash-account
-settlement-specific ("IRA/SEP cash accounts can't reuse that capital until T+1
-settlement"). User confirmed 2026-07-20: watchlist 65's tickers will trade in
-**limited margin accounts**, not IRA/SEP/Roth — limited margin doesn't have this
-same-day-reuse settlement restriction, so the block as currently written would
-reject valid, safe trades once live. Not urgent — `schwab_client`/`schwab_safety`
-aren't wired into `active_signals.py`'s real loop yet, so nothing is actually
-enforced live right now. Depends loosely on the still-undecided one-account-per-ticker
-plan (`docs/deep_backlog.md`) for how account type gets tracked per ticker.
-
+## [live-trading][security] Resolved 2026-07-22 — `same_day_block` is now account-type-aware (cash vs. margin/limited-margin IRA). Full detail: `docs/deep_backlog.md`'s 2026-07-22 entry.
 ## [backtest] Resolved 2026-07-20 — last-window MOC vs trailing-buy; MOC does not win, see `docs/deep_backlog.md`/`docs/research_log.md`
 
 ## [backtest] Research idea, not started, 2026-07-20 — is overnight gap frequency/magnitude asymmetric (up-gap vs down-gap)?
@@ -1575,37 +1153,8 @@ One open sub-item carried forward, not yet done: the observed sweep-throughput q
 
 ## [live-trading][backtest] Resolved 2026-07-20 — watchlist 65 candidate testing complete, found+fixed 2 real bugs, see `docs/deep_backlog.md`/`docs/research_log.md`
 
-## [live-trading] Resolved 2026-07-19 — `AUTOMATION_ENABLED_TICKERS` moved to `.env`, widened to all 18 v4 tickers; EDC's v3.27 node removed
-Full writeup in `docs/design.md` (Layer 3). Short version: `AUTOMATION_ENABLED_TICKERS`
-moved from a hardcoded Python set in `schwab_safety.py` to `SCHWAB_AUTOMATION_TICKERS` in
-`.env` (gitignored, deployment-specific — same reasoning as `SCHWAB_ACCOUNT_<NAME>`), with
-`schwab_safety.sync_automation_scope()` (called once at `run_loop` startup) logging any
-scope change to `watch_list_audit` as the replacement for the git-history audit trail that
-move gave up. Widened from GDXD-only to all 18 v4 research-mode tickers (paper-trading
-only, no accounts/dry_run/live involved), each set to `starting_notional=5000`. EDC's
-v3.27 node was removed from `watch_list` entirely (not just excluded from the widened
-scope) — its real open position (423sh @ $73.57) is unaffected (SELL alerts key off
-`open_positions`, not `watch_list`), user is tracking its unwind manually going forward.
-Verified: full `pytest tests/` (92 passed), `verify_trailing_buy_resolution.py`/
-`verify_trailing_sell_resolution.py --tickers AGQ,SOXL` (required since `active_signals.py`
-changed) — both clean, only already-documented drift.
-**Two real gaps found while doing this, not yet fixed** (their own item below):
-paper-trading's dedup is ticker-only (not `(ticker, window)`-aware like the real
-`open_position()`), and SELL-side automation (`_attempt_automated_sell`) is gated by
-ticker membership only, not by the position's node `mode` — unlike the BUY side.
-
-## [live-trading][security] Resolved 2026-07-21 — SELL-side automated-order attempt is now mode-gated, not just ticker-gated
-Full original context in `docs/deep_backlog.md`. `_attempt_automated_sell` (`signals_notify.py`)
-was gated only by `ticker in AUTOMATION_ENABLED_TICKERS`, not by the position's node `mode` —
-unlike the BUY side (`_scan_buy_signals` requires `mode=='live'`), per `automation_principles.md`
-#7 (new automation surfaces inherit the full existing gating, not a subset). Fixed: looks up
-the position's own `(ticker, window)` node from `db.get_watchlist()` and falls back to manual
-(returns `False`) unless a matching node exists with `mode=='live'` — also fail-closed if no
-matching node is found at all (e.g. the node was later removed, mirroring EDC's 2026-07-19
-removal). Two new tests in `tests/test_schwab_automation.py`
-(`test_automated_sell_falls_back_when_node_mode_not_live`,
-`test_automated_sell_falls_back_when_no_matching_node`).
-
+## [live-trading] Resolved 2026-07-19 — `AUTOMATION_ENABLED_TICKERS` moved to `.env`, widened to all 18 v4 tickers; EDC's v3.27 node removed from `watch_list`. Full writeup: `docs/design.md` (Layer 3).
+## [live-trading][security] Resolved 2026-07-21 — SELL-side automated-order attempt is now mode-gated, not just ticker-gated. Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
 ## [live-trading] Low priority, 2026-07-19 — paper-trading dedup is ticker-only, not `(ticker, window)`-aware
 Full detail in `docs/deep_backlog.md`. Short version: `paper_trading.start_paper_buy`'s
 dedup is single-ticker, unlike the real `open_position()`'s `(ticker, window)` dedup. Fine
@@ -1613,45 +1162,10 @@ today since every automation-enabled ticker has one node; not scoped.
 
 Curated, current subset of `docs/deep_backlog.md` — read in full at session start (`go`). Full detail for every item lives in `deep_backlog.md`; this is just the active/relevant pointer list. Periodically re-triage. Resolved/dead items are pruned here once closed out — see git history or `docs/conversation_summary.md` if the old writeup is ever needed.
 
-## [live-trading] Resolved 2026-07-18 — GDXD paper-trading layer built, `add_node` fixed_sl bug fixed
-Full writeup in `docs/deep_backlog.md`. Short version: `paper_trading.py` (new module) gives
-`schwab_safety.AUTOMATION_ENABLED_TICKERS` tickers (currently `{"GDXD"}`) a real paper-trading
-simulation while they stay `research` mode — `active_signals._scan_buy_signals` routes their
-BUY signals to `paper_trading.start_paper_buy` instead of the silent research print;
-`update_paper_buys()` (every poll, unconditional) tracks a continuous running-low and
-simulates the trailing-buy bounce-fill; `check_paper_sells()` runs the real
-`signals_compute.check_sell_condition` exit state machine against the simulated position.
-Writes to new `paper_positions`/`paper_trade_log`/`paper_pending_buys` tables — never the real
-`open_positions`/`trade_log`/`pending_buys` — and never calls `schwab_client`/`schwab_safety`
-at all (pure simulation, independent of `dry_run`, which alone still produces zero fill/P&L).
-**Deliberate deviation from the original framing** (routing through the real
-`_attempt_automated_buy`/`_attempt_automated_sell` path): investigating that path found it
-would write real `pending_buys` rows nothing ever marks Filled, causing indefinite
-`check_buy_reminders` nagging for a ticker that was never actually live — the fully separate
-simulation avoids that. `scripts/paper_trading_status.py` shows current state. **Known
-limitation**: fills sampled at `POLL_SECS` cadence, not tick-perfect against a real broker's
-continuously-live `TRAILING_STOP`. Verified: full `pytest tests/` suite (92 passed, was 86 —
-6 new tests in `tests/test_paper_trading.py`), confirmed real `open_positions`/`trade_log`/
-`pending_buys` row counts unchanged after running the new code path.
-Separately, `signals_db.add_node` gained a `fixed_sl_override=None` param (falls back to old
-config-read behavior when omitted) — fixes the bug where it silently pulled `config.json`'s
-stale global default instead of the real per-node SL for any future SL-swept promotion.
-
+## [live-trading] Resolved 2026-07-18 — GDXD paper-trading layer built, `add_node` fixed_sl bug fixed. Full writeup: `docs/deep_backlog.md`'s 2026-07-18 entry.
 ## ✅ Resolved 2026-07-18 — v4 nodes (SL=1%) promoted into the real `watch_list`, replacing v3.x SL=15% params; see `docs/deep_backlog.md`
 
-## [backtest] Resolved 2026-07-18 — 5 tickers with a negative walk-forward fold (DPST, NUGT, RETL, UDOW, UVIX) sent to research, no per-ticker investigation
-Follow-up from the walk-forward check (`docs/research_log.md` 2026-07-18 entry,
-`logs/walk_forward_check.csv`). Each had exactly one mild negative-alpha fold out of 5
-(DPST -11.9%, NUGT -7.2%, UDOW -3.6%, UVIX -4.0%, RETL -8.4%). **User decision: skip the
-per-ticker regime investigation and just keep all 5 in research mode** rather than promoting
-any of them further. NUGT/AGQ/GDXU/TQQQ/YANG were already `research`; RETL/UDOW/UVIX were
-never in the live `watch_list` to begin with (screened candidates only). **DPST flipped
-`live`→`research` this session** (`signals_db.set_node_mode(53, 'research')`, watchlist_id=9)
-— it had been the leading candidate for the first taxable-brokerage-account ticker, but this
-walk-forward flag plus its already-known thin trade count (chaos-monkey item, 2026-07-17)
-was enough to deprioritize it without further digging. No live capital was at risk (DPST had
-no open position at the time of the mode change).
-
+## [backtest] Resolved 2026-07-18 — 5 tickers with a negative walk-forward fold (DPST, NUGT, RETL, UDOW, UVIX) sent to research, no per-ticker investigation; DPST flipped live→research. Full detail: `docs/deep_backlog.md`'s 2026-07-18 entry.
 ## [live-trading][security] Phase 4 (deferred to cloud-infrastructure planning), 2026-07-18 — move order-placement/mutating Schwab calls behind a separate proxy this session can't write to
 Full detail in `docs/deep_backlog.md`. Short version: API-proxy pattern for safety
 boundary + credential isolation on Schwab order-placement calls, not scoped. Deferred
@@ -1718,17 +1232,7 @@ negative-fold detail, added anyway per user decision but flagged for closer look
 `research` mode — no live signals fire, this is the automation-engine dry-run staging set.
 Verified: `pytest tests/` full suite (86 passed).
 
-## [backtest] Resolved 2026-07-18 — `signals_db.add_node`'s `fixed_sl` computation ignored the real per-node value for uses_fixed_sl strategies
-`add_node` (`signals_db.py`) used to always compute `fixed_sl = _config_fixed_stop_loss()`
-(reads `config.json`'s global `execution.fixed_stop_loss`) whenever
-`strategies.uses_fixed_sl(strategy)` was true, regardless of what real per-node SL value the
-caller actually wanted — no parameter existed to override it. Found 2026-07-18 promoting 19
-tickers' v4 (SL=1%) nodes: every row came out with `fixed_sl=15.0` (the stale global default)
-instead of the real `1.0`, silently wrong, no error; worked around that session by inserting
-via direct SQL instead of `add_node`. **Fixed**: `add_node` gained a
-`fixed_sl_override=None` parameter — when set, used instead of `_config_fixed_stop_loss()`.
-`None` (the default) preserves old behavior for legacy v3.x callers.
-
+## [backtest] Resolved 2026-07-18 — `signals_db.add_node`'s `fixed_sl` computation ignored the real per-node value for `uses_fixed_sl` strategies; fixed via `fixed_sl_override`. Full detail: `docs/deep_backlog.md`'s 2026-07-18 entry.
 ## [live-trading][security] High priority, active focus as of 2026-07-18 — one brokerage account per live ticker, for blast-radius containment against a rogue algorithm
 Full detail in `docs/deep_backlog.md`. Short version: split into one brokerage account
 per ticker so a rogue order on one ticker structurally can't reach another's capital —
@@ -1816,26 +1320,7 @@ Found while manually reconstructing KORU's real live trailing-buy fills: `signal
 4. **Done.** `_last_sale_recovery(ticker, starting_notional)` now requires the caller to pass `starting_notional` explicitly (raises `ValueError` if both trade history and `starting_notional` are missing) — no more hidden flat-$50k fallback. New `watch_list.starting_notional` column (`REAL NOT NULL DEFAULT 50000`, backfilled to 50000 for every existing row to preserve current behavior); GDXD's row set to `5000`. All 6 call sites (`signals_blocks.py`, `signals_notify.py` x2, `signals_handlers.py` x2) updated to pass `node.get('starting_notional')`; the two Slack-value round-tripped `node_fields` tuples (`signals_blocks.py`, `signals_notify.py`) extended to include it so it survives the button-click round trip.
 5. **Done, with a real and more serious finding than the original hypothesis.** Live-tested directly against the real IRA account (real settled cash $271,662.09, confirmed via `client.get_account()` before testing — already well above both `HARD_ORDER_CEILING=$100k` and the IRA's own `$75k` cap, so no order within our own limits could ever test "beyond available cash" on its own). User placed a real $200k `TRAILING_STOP` buy order directly in Schwab's UI: **buying power was unaffected** — not reduced at all by the resting order. Re-tested with a limit order instead of a trailing-stop: **same result, buying power unaffected**. **Conclusion: Schwab does not reserve/check buying power against either order type at placement time** — whatever check exists (if any) only happens at actual fill/execution, not when a resting order is accepted. This is the opposite of the original hypothesis ("a cash account may already provide a hard backstop") — **no such backstop exists at placement time**. Both test orders were cancelled by the user afterward. **Real implication**: `schwab_safety`'s own per-order notional caps are the *only* protection that exists today — nothing on Schwab's side stops multiple legitimate-looking resting orders (e.g. several tickers' trailing buys, each individually under cap) from collectively committing far more than real available cash. Not an immediate risk at the current single-ticker $5k GDXD scope, but a real gap to close (e.g. an aggregate-resting-orders check, not just a per-order one) before meaningfully widening `AUTOMATION_ENABLED_TICKERS`. What happens when an order actually fires past available cash is still unknown — deliberately not tested (would require an uncontrolled real execution, not a placement-time check).
 
-## [backtest] Resolved 2026-07-22 — split-guard/`auto_adjust` reconciliation closed; GDXD numbers verified clean
-Full original writeup preserved below the line. **Reconciled 2026-07-22**: `auto_adjust=True`
-only adjusts the window being fetched *right now* for corporate actions known as of today — it
-doesn't reach back and re-adjust rows already sitting in the local cache from a prior fetch. A
-new split therefore makes the next incremental delta fetch land on the new scale while old cached
-rows stay on the prior scale, which is exactly the discontinuity the split-guard detects and
-rescales the whole file to fix. Guard is real work, not dead code; auto_adjust and the guard are
-two different layers (per-fetch adjustment vs. cross-fetch reconciliation). Since the guard's
-rescale is one multiplicative factor across the whole series, downstream %-based signals (z-score,
-SL/TP/arm, returns) are scale-invariant to it, so past `backtest_cache` numbers should stay
-reproducible by re-running the same code. Full writeup: `docs/research_log.md`'s 2026-07-22 entry.
-**Real, distinct gap surfaced in the same discussion, backlogged separately below (not resolved)**:
-no archived/immutable snapshot of the exact cache-file bytes used for any past backtest exists —
-literal byte-for-byte forensic reproducibility isn't possible, only "same code produces the same
-number." See the new data-traceability item below.
-
-### Original framing (2026-07-16), before reconciliation
-While reviewing a v4 sweep summary CSV, GDXD (non-watchlist, cleared the Step 4 >=300%-v3.x-alpha screen) showed implausible numbers (best_certain up to ~91,000% alpha on some campaigns). Its local `cache/research/GDXD_1h.csv` price fell ~200x over 2.5 years ($9990 in 2023 -> ~$51 now), and `yf.Ticker('GDXD').splits` confirms 3 real reverse splits in that window (2024-04-29 0.10, 2025-10-22 0.05, 2026-02-09 0.10 — cumulative ~1-for-2000). First hypothesis was the KORU-style bug (splits never retroactively applied to local cache, corrupting any trade whose entry/exit straddles a split date) — **checked and disproven**: local Close prices flow smoothly through all 3 split dates with no discontinuity (e.g. 2024-04-29: $4862->$4842->$5345, no ~10x jump). Root cause of the smooth data: `yf.download()` defaults to `auto_adjust=True` (confirmed via `inspect.signature`), and neither call site in `data_manager.py:47,94` overrides it — so every fetch (initial 730-day pull and every incremental delta) already comes back split-adjusted and continuous. **This means the comment at `data_manager.py:113-115` ("yfinance's hourly interval does NOT retroactively split-adjust historical bars") is wrong or stale**, and the whole `detect_price_discontinuity` split-guard machinery (`signals_helpers.py`, wired into `data_manager.py`'s merge step, `compute_buy_signal`, and `check_sell_condition`) may be solving a problem that doesn't actually exist under current yfinance behavior — yet it was empirically triggered for real during the KORU incident (2026-07-15). Needs reconciling: was KORU's raw discontinuity coming from some other path (e.g. `fast_info`/live 1-min tick fetch, which is a separate code path from this `yf.download()` history call), not this one? If so the guard may be correctly placed for that path but the comment/reasoning documenting *why* is wrong. **Action needed**: audit why `auto_adjust=True` didn't prevent the KORU incident, and whether the split-guard is still doing real work or is now dead code for the `data_manager.py` merge path specifically.
-**GDXD trade-level check done, 2026-07-16 — verified clean, no bug.** Called `backtester.run_backtest_v110` directly (not a reimplementation) on GDXD's winning node (window=10, z=1.0, tb=1%, arm=7%, fixed_sl=2%, ts=1%, max_hold=7h, open_check). All three resolutions show sane per-trade numbers: 247-279 trades, win rate 37-47%, avg win ~+7.5%, avg loss capped exactly at the -2% stop, max single trade only +35%, no outliers. Expected per-trade log-return compounded over ~250-280 trades works out to almost exactly the reported ~40-400x multiple — the huge alpha is real multiplicative compounding of a genuinely favorable per-trade edge repeated hundreds of times, not corrupted data or a stray outlier trade. Caveat (not GDXD-specific, applies to every ticker's on-file number): this assumes full reinvestment every trade, which is how `strategy_return`/`alpha_vs_spy` are always computed — not how live trading actually works yet ($50k fixed notional, no compounding).
-
+## [backtest] Resolved 2026-07-22 — split-guard/`auto_adjust` reconciliation closed; GDXD numbers verified clean; data traceability chosen over full immutability. Full writeup: `docs/research_log.md`'s 2026-07-22 entry.
 ## [backtest] Medium priority, designed-not-built 2026-07-22 — data mutation log (traceability, not full immutability/versioning) for historical price cache rescales
 Raised while discussing the split-guard/`auto_adjust` reconciliation above. Real gap: no
 archived record of the exact `cache/research/*_1h.csv` data that fed any given past

@@ -7,7 +7,7 @@ import requests
 import schwab_safety
 import signals_config as cfg
 import signals_db as db
-from signals_helpers import _add_trading_hours, _last_sale_recovery, buy_order_sizing
+from signals_helpers import _add_trading_hours, _last_sale_recovery, buy_order_sizing, mode_tag
 
 
 def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False):
@@ -174,11 +174,12 @@ def _build_buy_blocks(node, sig, auto_placed=False):
     max_notional_str = f"  |  max `${max_notional/1000:.0f}k` / `{max_shares} shares` @ 1% vol" if max_notional else ""
 
     account = node.get('account') or 'unmapped'
+    acct_tag = f"`{account} · {mode_tag(account)}`"
     if trailing_buy:
         auto_str = "  🤖 *auto-placed at broker*" if auto_placed else ""
-        entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}{auto_str}"
+        entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — {acct_tag}{max_notional_str}{auto_str}"
     else:
-        entry_line = f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — `{account}`{max_notional_str}"
+        entry_line = f"🟢 *{ticker}* — BUY — Market — `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — {acct_tag}{max_notional_str}"
 
     warning_line = ""
     _limits = schwab_safety.ACCOUNTS.get(node.get('account'))
@@ -266,9 +267,10 @@ def _build_buy_blocks(node, sig, auto_placed=False):
 
 
 def _build_sell_blocks(pos, reason, current_price, target_price):
-    ticker = pos['ticker']
-    ep     = pos['entry_price']
-    pct    = (current_price - ep) / ep * 100
+    ticker  = pos['ticker']
+    ep      = pos['entry_price']
+    pct     = (current_price - ep) / ep * 100
+    account = pos.get('account') or 'unmapped'
 
     if reason == 'TP':
         emoji   = "🟢"
@@ -294,7 +296,7 @@ def _build_sell_blocks(pos, reason, current_price, target_price):
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
             "text": (
-                f"{emoji} *{ticker}* — {label}\n"
+                f"{emoji} *{ticker}* ({account} · {mode_tag(account)}) — {label}\n"
                 f"{action}\n"
                 f"entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`"
             )}},
