@@ -1,5 +1,7 @@
 # Backlog Cache
 
+## [live-trading][security] Resolved 2026-07-26 — `auto_fill_detection_enabled` was ticker-only-keyed (a gap the wl_id refactor missed); now AND-gated on ticker + node (`wl_id`), defaulting closed. Opus review found+fixed a stale-button crash on old Slack messages + dead-code cleanup; an orphaned-node (`wl_id=NULL`) lockout and loss of one-tap bulk-disable were documented/deferred ("maybe later"). Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top). Full suite: 291 passed. Harness: 7/7.
+
 ## [live-trading][coverage] Resolved 2026-07-26 — Morning Report/signal-window alerts hit Slack's 50-block limit again (25 nodes); replaced per-row shrinking with real chunking + threading (`_post_chunked`); Trade-Flow Accountability Grid redesigned with independent Paper/Dry-run/Live columns instead of one collapsed status. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entries (both, at the end of the file).
 Opus review found+fixed 4 issues in the chunking fix (most severe: a chunk-2+ post failure was
 invisible to `morning_report_delivery`'s coverage event, now correctly reads as partial delivery).

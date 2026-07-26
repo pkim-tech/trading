@@ -1444,9 +1444,10 @@ def check_auto_fills(open_positions):
             continue
         if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
             continue
-        if not schwab_safety.auto_fill_detection_enabled(ticker):
-            continue
         node = pending['node']
+        if not (schwab_safety.auto_fill_detection_enabled(ticker)
+                and schwab_safety.node_auto_fill_detection_enabled(node.get('id'))):
+            continue
         account = node.get('account')
         if not account:
             continue
@@ -1459,7 +1460,8 @@ def check_auto_fills(open_positions):
         ticker = pos['ticker']
         if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
             continue
-        if not schwab_safety.auto_fill_detection_enabled(ticker):
+        if not (schwab_safety.auto_fill_detection_enabled(ticker)
+                and schwab_safety.node_auto_fill_detection_enabled(pos.get('wl_id'))):
             continue
         state = pos.get('trail_state') or {}
         exit_pending = state.get('exit_pending')
@@ -1596,14 +1598,25 @@ def _ticker_block(row):
             # defaults off (see schwab_safety.AUTO_FILL_DETECTION_PATH comment): placement
             # automation is proven via this session's dry-run testing, fill detection isn't
             # exercised against a real fill yet.
-            fill_detection_on = schwab_safety.auto_fill_detection_enabled(ticker)
-            elements.append(
-                {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Disable {ticker} Auto-Fill Detection"},
-                 "style": "danger", "action_id": "disable_auto_fill_detection", "value": ticker}
-                if fill_detection_on else
-                {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Enable {ticker} Auto-Fill Detection"},
-                 "action_id": "enable_auto_fill_detection", "value": ticker}
-            )
+            # node-scoped (not ticker-only) -- see schwab_safety.node_auto_fill_detection_enabled's
+            # docstring: this was the ticker-only-keying gap the 2026-07-25/26 wl_id refactor
+            # missed. Every row here is built from a real watch_list node (build_reference_table),
+            # so wl_id is always resolvable; still guarded rather than assumed, since a NULL-wl_id
+            # open position (a watch_list row deleted out from under it, e.g. EDC id=15) would
+            # never render a row/button here at all and should fail closed, not toggle every node
+            # sharing the ticker.
+            wl_id = node.get('id') if node else None
+            if wl_id is not None:
+                fill_detection_on = (schwab_safety.auto_fill_detection_enabled(ticker)
+                                      and schwab_safety.node_auto_fill_detection_enabled(wl_id))
+                fd_value = json.dumps({"ticker": ticker, "wl_id": wl_id})
+                elements.append(
+                    {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Disable {ticker} Auto-Fill Detection"},
+                     "style": "danger", "action_id": "disable_auto_fill_detection", "value": fd_value}
+                    if fill_detection_on else
+                    {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Enable {ticker} Auto-Fill Detection"},
+                     "action_id": "enable_auto_fill_detection", "value": fd_value}
+                )
 
         if elements:
             blocks.append({"type": "actions", "elements": elements})

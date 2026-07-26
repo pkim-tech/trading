@@ -32,6 +32,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'KILL_SWITCH_PATH', tmp_path / "schwab_kill_switch.json")
     monkeypatch.setattr(schwab_safety, 'TICKER_AUTOMATION_PATH', tmp_path / "schwab_ticker_automation.json")
     monkeypatch.setattr(schwab_safety, 'AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_auto_fill_detection.json")
+    monkeypatch.setattr(schwab_safety, 'NODE_AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_node_auto_fill_detection.json")
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
     monkeypatch.setattr(schwab_safety, '_now', lambda: _IN_WINDOW_TIME)
     monkeypatch.setattr(schwab_client, '_post_message', lambda *a, **kw: (None, None))
@@ -298,6 +299,7 @@ def test_check_auto_fills_records_buy_fill_when_enabled(env, monkeypatch):
     signals_notify.notify_buy_signal(_node(), _sig())
     assert _pending()['order_placed'] == 1
     schwab_safety.enable_auto_fill_detection(TICKER)
+    schwab_safety.enable_node_auto_fill_detection(_node()['id'])
 
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side: {'price': 51.0, 'quantity': 100})
@@ -311,6 +313,28 @@ def test_check_auto_fills_records_buy_fill_when_enabled(env, monkeypatch):
     # entry_price stays 51.0 since the top-up fills at the same price.
     assert pos['shares'] == 980
     assert [p for p in signals_db.get_pending_buys() if p['ticker'] == TICKER] == []
+
+
+def test_node_auto_fill_detection_does_not_leak_to_sibling_node_same_ticker(env):
+    """The exact gap this feature was missing after the wl_id refactor: enabling
+    fill-detection from one node's Slack row must not silently enable it for a
+    different node sharing the same ticker (e.g. DPST/GDXU's live+research pairing)."""
+    node_a_id, node_b_id = 101, 202
+    schwab_safety.enable_auto_fill_detection(TICKER)
+    schwab_safety.enable_node_auto_fill_detection(node_a_id)
+
+    assert schwab_safety.node_auto_fill_detection_enabled(node_a_id) is True
+    assert schwab_safety.node_auto_fill_detection_enabled(node_b_id) is False
+    # ticker-level alone (the old, buggy gate) is on, proving the node-level
+    # layer is what's actually protecting node B here, not a ticker-wide off-switch.
+    assert schwab_safety.auto_fill_detection_enabled(TICKER) is True
+
+
+def test_node_auto_fill_detection_none_id_defaults_closed(env):
+    """Unresolvable node identity must not silently grant fill-detection trust
+    -- opposite fail-direction from node_automation_enabled's pause gate."""
+    schwab_safety.enable_auto_fill_detection(TICKER)
+    assert schwab_safety.node_auto_fill_detection_enabled(None) is False
 
 
 def test_check_auto_fills_records_sell_fill_when_enabled(env, monkeypatch):
@@ -327,6 +351,7 @@ def test_check_auto_fills_records_sell_fill_when_enabled(env, monkeypatch):
     }
     signals_db.update_position_trail_state(pos['id'], state)
     schwab_safety.enable_auto_fill_detection(TICKER)
+    schwab_safety.enable_node_auto_fill_detection(pos['wl_id'])
 
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side: {'price': 53.5, 'quantity': 100})

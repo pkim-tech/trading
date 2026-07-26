@@ -1,5 +1,47 @@
 # Backlog
 
+## ✅ [live-trading][security] Resolved 2026-07-26 — `auto_fill_detection_enabled` was ticker-only-keyed, a gap the 2026-07-25/26 wl_id refactor was supposed to close but missed
+**Found while investigating why a real SPY position sat unconfirmed for 2 days** (a deliberate
+standing `soxl_ira` test position, not a bug) and discussing why exit confirmation isn't
+automated — surfaced that `check_auto_fills`'s real auto-fill-detection path
+(`schwab_safety.auto_fill_detection_enabled`, off by default, toggled via a Slack button) was
+keyed purely on the ticker string, with no account/node scoping at all. Enabling it "for SPY"
+would have silently applied to *any* node with that ticker in *any* account — not just the one
+you actually trust. This is exactly the same bug class the wl_id refactor (`docs/deep_backlog.md`'s
+2026-07-25/26 entry) fixed for `ticker_automation_enabled`/`pause_ticker_automation` via an
+additive `node_automation_enabled` AND-gate, but `auto_fill_detection_enabled` itself was never
+touched by that refactor — it slipped through.
+
+**Fix**: added `schwab_safety.node_auto_fill_detection_enabled(node_id)` /
+`enable_node_auto_fill_detection` / `disable_node_auto_fill_detection` — mirrors the
+`node_automation_enabled` additive-layer pattern, but with the **default direction inverted**:
+defaults False (including `node_id=None`), since this flag *grants* extra automation trust
+rather than *restricting* it — missing node identity must not silently grant it, the opposite
+fail-direction from the pause mechanism's fail-open default. Real gate is now
+`auto_fill_detection_enabled(ticker) AND node_auto_fill_detection_enabled(wl_id)` at both
+`check_auto_fills` call sites (buy-side via `node['id']`, sell-side via `pos['wl_id']`). The
+Slack enable/disable buttons (`signals_notify._ticker_block`) now carry `{ticker, wl_id}` JSON
+instead of a bare ticker string; `signals_handlers.py`'s two handlers parse it and toggle the
+node-scoped flag (enable also sets the ticker-level flag; disable only clears the node-level
+flag, so a sibling node's separate enablement survives). 2 new regression tests prove the exact
+leak is closed (sibling node stays unaffected; `None` node_id defaults closed).
+
+**Opus review same session found 4 issues, fixed the 2 real ones**: (1) CONFIRMED, fixed —
+every already-posted reference report has old buttons carrying a bare ticker string, not JSON;
+reports stay clickable indefinitely, so the new handlers' unguarded `json.loads` would have
+crashed silently on any stale tap. Added a try/except in both handlers posting "stale button,
+resend the report" rather than falling back to ticker-only enable (which would reintroduce the
+leak). (2) CONFIRMED, cleaned up — a `_pos.wl_id` fallback in `_ticker_block` was dead code
+(every row is built from a real watchlist node, so `wl_id` is always resolvable there directly).
+(3) Documented, not fixed — a position whose `watch_list` node was later deleted (`wl_id=NULL`,
+real example: EDC id=15, the 2026-07-19 manual-unwind row) can never get this feature enabled,
+since it renders no reference-table row at all; not live-reachable today (EDC isn't in
+`SCHWAB_AUTOMATION_TICKERS`) and fails in the safe direction. (4) Flagged, deferred by user
+("maybe later") — disabling the ticker-level flag now has no UI caller, so there's no more
+one-tap "kill it for every node on this ticker"; disabling N enabled sibling nodes now takes N
+taps. Full suite: 291 passed (was 289). `live_sim_harness.py`: 7/7. `signals_invariants.py`:
+clean.
+
 ## ✅ [live-trading][coverage] Resolved 2026-07-26 — `live_sim_harness.py` gained `scenario_dry_run_sim_cycle`, closing a coverage gap in the dry_run fill-synthesis testing itself
 **Problem, found while deciding how to verify the previous session's dry_run fill-synthesis
 work over a weekend (markets closed, no real signal windows to observe)**: neither

@@ -391,6 +391,65 @@ def disable_auto_fill_detection(ticker: str):
     AUTO_FILL_DETECTION_PATH.write_text(json.dumps(state))
 
 
+NODE_AUTO_FILL_DETECTION_PATH = _STATE_DIR / "schwab_node_auto_fill_detection.json"
+
+
+def node_auto_fill_detection_enabled(node_id) -> bool:
+    """Node-scoped sibling of auto_fill_detection_enabled -- this ticker-only
+    flag was missed by the 2026-07-25/26 wl_id refactor (unlike
+    ticker_automation_enabled, which got node_automation_enabled as an
+    AND-gated additive layer). Without this, enabling fill-detection from one
+    node's Slack row (e.g. a soxl_ira position) would silently also auto-detect
+    fills for any other node sharing the same ticker (e.g. DPST/GDXU's
+    live+research pairing) that was never actually vetted for it.
+    Defaults False (node_id=None included) -- opposite direction from
+    node_automation_enabled's fail-open default, since this flag *grants* extra
+    trust rather than restricting it; missing node identity must not silently
+    grant it. Real gate is `auto_fill_detection_enabled(ticker) AND
+    node_auto_fill_detection_enabled(wl_id)` -- both layers must explicitly
+    agree."""
+    if node_id is None:
+        return False
+    if NODE_AUTO_FILL_DETECTION_PATH.exists():
+        try:
+            state = json.loads(NODE_AUTO_FILL_DETECTION_PATH.read_text())
+            if str(node_id) in state:
+                return bool(state[str(node_id)])
+        except (json.JSONDecodeError, OSError):
+            pass
+    return False
+
+
+def enable_node_auto_fill_detection(node_id):
+    """Called by the Slack per-node 'Enable Auto-Fill Detection' button handler
+    -- also ensures the ticker-level flag is on, since the real gate is an AND
+    of both layers and this is the only UI entry point that sets either."""
+    NODE_AUTO_FILL_DETECTION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {}
+    if NODE_AUTO_FILL_DETECTION_PATH.exists():
+        try:
+            state = json.loads(NODE_AUTO_FILL_DETECTION_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    state[str(node_id)] = True
+    NODE_AUTO_FILL_DETECTION_PATH.write_text(json.dumps(state))
+
+
+def disable_node_auto_fill_detection(node_id):
+    """Only clears this node's flag -- deliberately does not touch the
+    ticker-level flag, so disabling one node doesn't affect a sibling node on
+    the same ticker that's separately enabled."""
+    NODE_AUTO_FILL_DETECTION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {}
+    if NODE_AUTO_FILL_DETECTION_PATH.exists():
+        try:
+            state = json.loads(NODE_AUTO_FILL_DETECTION_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    state[str(node_id)] = False
+    NODE_AUTO_FILL_DETECTION_PATH.write_text(json.dumps(state))
+
+
 def _open_locked():
     """Opens STATE_PATH for read+write under an exclusive flock, creating it
     first if needed. Caller must close() when done (releases the lock)."""

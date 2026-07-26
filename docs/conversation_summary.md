@@ -4493,3 +4493,58 @@ process kill/restart), left for the user to do directly.
 - `docs/deep_backlog.md`: 2 new resolved entries (chunking fix, per-mode grid redesign), appended
   at the end.
 - `docs/backlog_cache.md`: one-line pointer resolved entry at the top.
+
+---
+
+## 2026-07-26 — Pre-market prep tooling + auto-fill-detection node-scoping fix
+
+### What we did
+Started with a "what pre-market prep/testing do we need" question, which turned into two new
+read-only scripts: `scripts/premarket_prep.py` (daemon check + per-live-node action list —
+stage limit order / resting trailing-buy / held / waiting — plus a gap-check that reuses
+`check_gap_resize`'s exact trigger math and price source) and `scripts/gap_scan.py` (scans the
+624-ticker research universe for real overnight gaps via two batched yfinance calls).
+
+Discussion then explored how to get daily confidence in the sell-side/gap-resize mechanics
+without real capital or manual clicking — a synthetic `is_dry_run_sim` reseed idea was raised,
+then correctly rejected by the user: it only proves internal signal math, not the real
+order/confirmation pipeline, and `soxl_ira`'s SPY/SH pair already exists specifically to absorb
+that real-money testing cost, so building a workaround around it was the wrong move. Diagnosed
+a live noise complaint (SPY nagging every ~15 min since 2026-07-24) as a real, already-fired
+`TRAILING STOP` sitting unconfirmed — confirmed via `get_real_position` that real shares are
+still held — and confirmed with the user this is deliberate standing test inventory, not a bug.
+
+That "why do I need to confirm it" thread surfaced a real finding: `check_auto_fills` already
+has a working auto-fill-detection path (`schwab_safety.auto_fill_detection_enabled`) that could
+resolve this without manual confirmation, but it was **ticker-only-keyed** — a gap the
+2026-07-25/26 wl_id refactor was supposed to close but missed entirely. Fixed: added
+`node_auto_fill_detection_enabled`/`enable_node_auto_fill_detection`/
+`disable_node_auto_fill_detection` (defaults closed, inverted fail-direction from the sibling
+`node_automation_enabled` pause mechanism, since this flag grants trust rather than restricting
+it). Real gate is now `auto_fill_detection_enabled(ticker) AND
+node_auto_fill_detection_enabled(wl_id)` at both `check_auto_fills` call sites; the Slack
+enable/disable buttons and handlers now carry/parse `{ticker, wl_id}` instead of a bare ticker.
+2 new regression tests prove the leak is closed.
+
+Opus review of the diff found 4 issues, fixed the 2 real ones: an unguarded `json.loads` in
+both Slack handlers would have crashed on any already-posted (bare-ticker-valued) button —
+fixed with a stale-button guard that explicitly does not fall back to ticker-only enable; and a
+dead `_pos.wl_id` fallback in `_ticker_block` was simplified away. Two lower-priority items
+documented/deferred: a `wl_id=NULL` orphaned position (real example: EDC id=15) can never
+enable this feature (safe direction, not live-reachable today), and disabling the ticker-level
+flag has no UI caller anymore, so bulk-disabling N sibling nodes now takes N taps (user: "maybe
+later").
+
+### State
+Full suite: 291 passed (was 289 at session start). `live_sim_harness.py`: 7/7.
+`signals_invariants.py`: clean. `docs/design.md`/`docs/deep_backlog.md`/`docs/backlog_cache.md`
+updated.
+
+### Next
+- Real gap_resize test still blocked on a genuine resting trailing-buy order on `soxl_ira`
+  (none exists right now) — per the still-open 2026-07-24 backlog item, needs one placed and
+  confirmed before the cancel+replace path can be exercised for real.
+- Morning Report still has no weekend/non-trading-day gate (found this session, flagged, not
+  fixed — user said flag-only).
+- `scripts/premarket_prep.py`/`scripts/gap_scan.py` are new and only smoke-tested off-hours
+  (Sunday) — first real trading-morning run will be the actual validation.

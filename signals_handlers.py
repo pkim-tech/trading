@@ -520,19 +520,42 @@ if cfg.SOCKET_MODE:
     @cfg.bolt_app.action("enable_auto_fill_detection")
     def handle_enable_auto_fill_detection(ack, body, client):
         ack()
-        ticker = body['actions'][0]['value']
+        raw = body['actions'][0]['value']
+        try:
+            payload = json.loads(raw)
+            ticker, wl_id = payload['ticker'], payload['wl_id']
+        except (json.JSONDecodeError, KeyError, TypeError):
+            # A reference report posted before this node-scoped change carries a
+            # bare ticker string, not JSON -- reports stay clickable indefinitely,
+            # so this button will keep showing up. Don't fall back to ticker-only
+            # enable (that's the exact leak this change fixed); just ask for a
+            # fresh report instead.
+            _post_message(f"⚠️ Stale auto-fill-detection button ({raw!r}) — resend the reference report and use the new one")
+            return
         user = body.get('user', {}).get('username', 'someone')
+        # Node-scoped (schwab_safety.node_auto_fill_detection_enabled) -- ticker-level
+        # is just the coarse "possible at all" switch; enabling always also sets it,
+        # but the real per-node grant is the node-level flag, set only for wl_id.
         schwab_safety.enable_auto_fill_detection(ticker)
-        _post_message(f"🤖 {ticker} auto-fill detection ENABLED by {user} — fills will be auto-recorded, no Filled/Exited click needed")
+        schwab_safety.enable_node_auto_fill_detection(wl_id)
+        _post_message(f"🤖 {ticker} (node {wl_id}) auto-fill detection ENABLED by {user} — fills will be auto-recorded, no Filled/Exited click needed")
         send_reference_report(db.get_watchlist())
 
     @cfg.bolt_app.action("disable_auto_fill_detection")
     def handle_disable_auto_fill_detection(ack, body, client):
         ack()
-        ticker = body['actions'][0]['value']
+        raw = body['actions'][0]['value']
+        try:
+            payload = json.loads(raw)
+            ticker, wl_id = payload['ticker'], payload['wl_id']
+        except (json.JSONDecodeError, KeyError, TypeError):
+            _post_message(f"⚠️ Stale auto-fill-detection button ({raw!r}) — resend the reference report and use the new one")
+            return
         user = body.get('user', {}).get('username', 'someone')
-        schwab_safety.disable_auto_fill_detection(ticker)
-        _post_message(f"🤖 {ticker} auto-fill detection DISABLED by {user} — back to manual Filled/Exited confirmation")
+        # Only clears this node's flag -- a sibling node on the same ticker that's
+        # separately enabled is untouched (schwab_safety.disable_node_auto_fill_detection).
+        schwab_safety.disable_node_auto_fill_detection(wl_id)
+        _post_message(f"🤖 {ticker} (node {wl_id}) auto-fill detection DISABLED by {user} — back to manual Filled/Exited confirmation")
         send_reference_report(db.get_watchlist())
 
     @cfg.bolt_app.action("apply_corp_action_correction")
