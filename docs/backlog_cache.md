@@ -1,5 +1,41 @@
 # Backlog Cache
 
+## [live-trading][coverage] Resolved 2026-07-28 (later) — daily coverage report ("like pytest, but with the market") now runs inside the live daemon at 7am, checking the previous trading day
+Grew out of a conversation mapping every Trade-Flow Accountability Grid row to which canary/live
+node should exercise it Monday, once the daemon (down since before this session) restarts. Landed
+on a design where a real regression becomes a sticky ticket that keeps re-alerting until a human
+explains it or a later genuine pass auto-resolves it — reusing the existing
+`scenario_expectations`/`coverage_deviations` contract (already built 2026-07-24, already audited)
+rather than inventing a parallel system. New `coverage_event` check method
+(`scripts/coverage_check.py::_check_coverage_event`) extends that contract from the 6 canary
+`trade_lifecycle` scenarios to the grid's `coverage_events`-backed rows. `active_signals.py`'s
+existing 7:00am `_REFERENCE_TIMES` slot now also calls `send_coverage_report(previous_trading_day)`
+— a real go/no-go gate before the trading day starts, not a same-day check (which would be
+checking a day that hasn't traded yet).
+**Two Opus review rounds (first-pass + session-wrap) found and fixed 4 CONFIRMED bugs total**: (1)
+UTC-vs-ET date mismatch in the new checker (`date(ts)` vs a local-computed check_date, offsetting
+the window ~4-5h — confirmed against 212 real misdated `coverage_events` rows), fixed via
+`date(ts, 'localtime')`; (2) a daemon restart any time after 7am (the normal case, since this
+project restarts after most edits) would silently skip that day's check forever — no ticket, no
+alert, indistinguishable from a clean day in a sticky-ticket model — fixed with an unconditional
+startup call mirroring the existing reference-report pattern; (3) the initial seed marked all 14
+grid `coverage_events` rows `expected_frequency='daily'`, but replaying real history showed 12 are
+trade-conditional (near-zero all-time events) and would have minted 11-14 tickets every single
+day, burying the real signal — fixed by trimming; (4) round 2 caught that `cash_check`, one of the
+two rows round-1's fix kept as daily, was itself trade-conditional (fired 1 of 3 real days) —
+demoted too, leaving only `live_state_reconciliation_mismatch` (itself caveated: depends on UDOW's
+known accepted stale-position violation persisting) as the sole daily row; also fixed
+`_check_coverage_event` missing ticker/node_id scoping (same bug class as an earlier
+`_check_trade_lifecycle` fix), zero live impact yet but defensive before any per-ticker scenario is
+seeded. Full detail: `docs/live_test_coverage.md`'s 2026-07-28 (later) entry. Full suite: 269
+passed (was 257). Harness: 7/7. `signals_invariants.py`: 1 known accepted violation (UDOW),
+unchanged.
+**Deliberately deferred/dropped during the same conversation, not built**: `two_nodes_same_ticker_diff_accounts`
+test setup (would have needed either repurposing DPST's dedicated paper-vs-real comparison node or
+a not-yet-built per-node `dry_run` override — user judged it disproportionate effort for a
+fail-open guard at current scale, and noted SOXL will likely end up in >1 account organically
+soon anyway, which will exercise it for real).
+
 ## [live-trading][coverage] Resolved 2026-07-28 — closed 12 of 13 remaining `not-instrumented` rows in the accountability grid (38 rows, down from 39 — one dead row removed)
 User noticed the grid still had 13 `not-instrumented` rows after the 2026-07-27 evening widening and
 asked to close them. 10 got real new `log_coverage_event` instrumentation: `automated_sell_mode_skip`/

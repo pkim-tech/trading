@@ -91,7 +91,7 @@ from signals_notify import (
     check_live_state_reconciliation, alert_stale_price_exit_suppressed,
     _ticker_block, _send_window_alert, _coverage_mode,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
-    send_reference_report,
+    send_reference_report, send_coverage_report,
     update_dry_run_buys, check_dry_run_sim_sells,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
@@ -136,6 +136,19 @@ _PINNED_OPEN_TIMES = {(9, 30), (14, 30)}
 # moments an action is most likely to be required. Also fires unconditionally
 # on daemon startup/restart, independent of this schedule.
 _REFERENCE_TIMES = [(7, 0), (9, 20), (15, 20)]
+
+# Coverage report only fires at the 7am slot -- it's the "ready to run" gate
+# checking the previous trading day's results before today's signal windows
+# open, not a same-day check (which would be checking a day that hasn't
+# traded yet). _previous_trading_day walks back over a weekend (no holiday
+# calendar, same simplicity level as scripts/live_sim.py's identical pattern)
+# so a Monday morning run checks Friday, not a trivially-weekend-skipped
+# Sunday.
+def _previous_trading_day(today):
+    d = today - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime('%Y-%m-%d')
 
 
 def _reminders_active(now):
@@ -440,6 +453,23 @@ def run_loop(tickers: set = None):
     print(f"  [slack] startup reference report: channel={_ref_channel} ts={_ref_ts}"
           f"{' (no confirmed post -- check for a prior [slack error] line)' if not _ref_channel else ''}")
 
+    # Unconditional at startup, same reasoning as the reference report above:
+    # reference_alerted is pre-seeded below with every _REFERENCE_TIMES slot
+    # already past "today" marked done, which means the (7,0)-gated coverage-
+    # report block further down in the loop will never fire today if the
+    # daemon (re)starts any time after 7am -- the normal case, since this
+    # project restarts the daemon after most source edits. Without this call,
+    # that day's coverage check would be silently skipped entirely: no
+    # deviation rows, no Slack post, nothing recording that the check didn't
+    # run -- indistinguishable from a clean day in a sticky-ticket model
+    # (Opus review finding, this session).
+    try:
+        _cov_channel, _cov_ts = send_coverage_report(_previous_trading_day(datetime.now()))
+        print(f"  [slack] startup coverage report: channel={_cov_channel} ts={_cov_ts}"
+              f"{' (no confirmed post -- check for a prior [slack error] line)' if not _cov_channel else ''}")
+    except Exception as e:
+        print(f"  [error] startup coverage report failed: {e}")
+
     buy_alerted:        set[tuple] = set()
     sell_alerted:       set[tuple] = set()  # (position_id, bar_ts) — dedups within a bar, not across bars
     paper_sell_alerted: set[tuple] = set()  # same shape, separate set — paper position ids aren't real ones
@@ -506,6 +536,14 @@ def run_loop(tickers: set = None):
                         print(f"  [slack] {rlabel} reference report: channel={rc} ts={rts}"
                               f"{' (no confirmed post -- check for a prior [slack error] line)' if not rc else ''}")
                     _guarded(f"reference_report[{rlabel}]", _send_reference)
+
+                    if (rh, rm) == (7, 0):
+                        def _send_coverage():
+                            check_date = _previous_trading_day(now)
+                            cc, cts = send_coverage_report(check_date)
+                            print(f"  [slack] {rlabel} coverage report ({check_date}): channel={cc} ts={cts}"
+                                  f"{' (no confirmed post -- check for a prior [slack error] line)' if not cc else ''}")
+                        _guarded("coverage_report[07:00]", _send_coverage)
 
             gap_h0, gap_m0, gap_h1, gap_m1 = _GAP_CHECK_WINDOW
             if (gap_h0, gap_m0) <= (now.hour, now.minute) <= (gap_h1, gap_m1) and today not in gap_check_alerted:

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import signals_config
 import signals_db as db
-from scripts.coverage_check import _check_trade_lifecycle
+from scripts.coverage_check import _check_trade_lifecycle, _check_coverage_event, run_check
 from scripts.coverage_registry import compute_status
 
 TICKER = 'TEST_CANARY'
@@ -586,3 +586,135 @@ def test_compute_status_bad_results_downgrades_verified(isolated_db):
     db.log_coverage_event('sk_reg4', 'live', result='placed')
     status, detail = compute_status(row)
     assert status == 'verified-live'
+
+
+def test_check_coverage_event_met_when_good_result_fires_today(isolated_db):
+    check_date = datetime.now().strftime('%Y-%m-%d')
+    db.log_coverage_event('cov_daily_a', 'live', result='placed')
+    scenario = dict(scenario_key='cov_daily_a', check_params='{}')
+    met, summary = _check_coverage_event(scenario, check_date)
+    assert met is True
+    assert '1x event' in summary
+
+
+def test_check_coverage_event_not_met_when_no_events_today(isolated_db):
+    check_date = datetime.now().strftime('%Y-%m-%d')
+    scenario = dict(scenario_key='cov_daily_missing', check_params='{}')
+    met, summary = _check_coverage_event(scenario, check_date)
+    assert met is False
+    assert 'no coverage_events' in summary
+
+
+def test_check_coverage_event_not_met_when_only_bad_results_fire(isolated_db):
+    check_date = datetime.now().strftime('%Y-%m-%d')
+    db.log_coverage_event('cov_daily_b', 'live', result='blocked')
+    scenario = dict(scenario_key='cov_daily_b',
+                     check_params='{"bad_results": ["blocked"]}')
+    met, summary = _check_coverage_event(scenario, check_date)
+    assert met is False
+    assert 'all bad_results' in summary
+
+
+def test_check_coverage_event_respects_mode_filter(isolated_db):
+    check_date = datetime.now().strftime('%Y-%m-%d')
+    db.log_coverage_event('cov_daily_c', 'paper', result='market_filled')
+    scenario = dict(scenario_key='cov_daily_c', mode='dry_run', check_params='{}')
+    met, summary = _check_coverage_event(scenario, check_date)
+    assert met is False  # only a paper event exists, dry_run filter excludes it
+
+    db.log_coverage_event('cov_daily_c', 'dry_run', result='market_filled')
+    met, summary = _check_coverage_event(scenario, check_date)
+    assert met is True
+
+
+def test_check_coverage_event_mode_filter_isolates_shared_scenario_key(isolated_db):
+    """entry_fill/exit_fill are logged by both the dry_run-sim path and
+    paper_trading.py under the same scenario_key -- a daily-expected row for
+    one mode must not be satisfied by the other mode's events."""
+    check_date = datetime.now().strftime('%Y-%m-%d')
+    db.log_coverage_event('entry_fill', 'paper', result='market_filled')
+    dry_run_row = dict(scenario_key='entry_fill', mode='dry_run', check_params='{}')
+    met, _ = _check_coverage_event(dry_run_row, check_date)
+    assert met is False
+
+
+def test_check_coverage_event_scopes_to_ticker_and_node_id(isolated_db):
+    """Same bug class as _check_trade_lifecycle's node_id disambiguation --
+    a scenario carrying a specific ticker/node_id must not be satisfied by a
+    different ticker's/node's event under the same scenario_key."""
+    check_date = datetime.now().strftime('%Y-%m-%d')
+    db.log_coverage_event('cov_daily_g', 'live', ticker='OTHER', node_id=999, result='placed')
+    scenario = dict(scenario_key='cov_daily_g', ticker='TARGET', node_id=42, check_params='{}')
+    met, summary = _check_coverage_event(scenario, check_date)
+    assert met is False
+
+    db.log_coverage_event('cov_daily_g', 'live', ticker='TARGET', node_id=42, result='placed')
+    met, summary = _check_coverage_event(scenario, check_date)
+    assert met is True
+
+
+def test_check_coverage_event_ignores_events_from_other_days(isolated_db):
+    check_date = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+    db.log_coverage_event('cov_daily_d', 'live', result='placed')  # logged "today", not check_date
+    scenario = dict(scenario_key='cov_daily_d', check_params='{}')
+    met, summary = _check_coverage_event(scenario, check_date)
+    assert met is False
+
+
+def test_check_coverage_event_uses_local_not_utc_date():
+    """Real regression guard: coverage_events.ts is stored as SQLite
+    datetime('now') (UTC). A UTC timestamp early in the ET day (e.g. 01:00
+    UTC == 20:00 ET the *previous* day) must be attributed to the ET date,
+    not the UTC date -- a plain date(ts) comparison would misdate it and
+    silently fail to find the event (confirmed live: 212 of 1799 real rows
+    fell on the wrong side of this exact boundary before the fix). This
+    test doesn't use the isolated_db/log_coverage_event fixture path because
+    that always stamps ts=UTC-now() -- it inserts a fixed cross-boundary
+    timestamp directly to make the UTC/ET disagreement deterministic
+    regardless of what time the suite happens to run."""
+    import os
+    import tempfile
+    import signals_config
+    tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tmp_db.close()
+    orig = signals_config.DB_PATH
+    signals_config.DB_PATH = Path(tmp_db.name)
+    try:
+        db.ensure_tables()
+        with db._conn() as c:
+            # 2026-07-25 01:00 UTC == 2026-07-24 ~20:00-21:00 ET (EDT, UTC-4)
+            c.execute("INSERT INTO coverage_events (ts, scenario_key, mode, result) "
+                       "VALUES ('2026-07-25 01:00:00', 'cov_tz', 'live', 'placed')")
+            c.commit()
+        scenario = dict(scenario_key='cov_tz', check_params='{}')
+        met, summary = _check_coverage_event(scenario, '2026-07-24')
+        assert met is True, f"UTC 2026-07-25 01:00 should attribute to ET 2026-07-24: {summary}"
+        met, summary = _check_coverage_event(scenario, '2026-07-25')
+        assert met is False, f"must not also match the UTC calendar date: {summary}"
+    finally:
+        signals_config.DB_PATH = orig
+        os.unlink(tmp_db.name)
+
+
+def test_run_check_records_deviation_for_missing_daily_coverage_event(isolated_db):
+    check_date = '2026-07-24'  # a Friday
+    db.add_scenario_expectation(
+        scenario_key='cov_daily_e', expected_outcome='fires daily', expected_frequency='daily',
+        check_method='coverage_event', check_params='{}')
+    results = run_check(check_date)
+    assert any(r['scenario_key'] == 'cov_daily_e' and r['status'] == 'deviated' for r in results)
+    deviations = db.get_deviations(check_date=check_date, unexplained_only=True)
+    assert any(d['scenario_key'] == 'cov_daily_e' for d in deviations)
+
+
+def test_run_check_marks_met_for_present_daily_coverage_event(isolated_db):
+    check_date = '2026-07-24'  # a Friday
+    with db._conn() as c:
+        c.execute("INSERT INTO coverage_events (ts, scenario_key, mode, result) VALUES (?, ?, ?, ?)",
+                   (f"{check_date} 10:00:00", 'cov_daily_f', 'live', 'placed'))
+        c.commit()
+    db.add_scenario_expectation(
+        scenario_key='cov_daily_f', expected_outcome='fires daily', expected_frequency='daily',
+        check_method='coverage_event', check_params='{}')
+    results = run_check(check_date)
+    assert any(r['scenario_key'] == 'cov_daily_f' and r['status'] == 'met' for r in results)

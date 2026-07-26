@@ -66,8 +66,67 @@ def _check_trade_lifecycle(scenario, check_date):
     return False, f"exit_reason={reason}, expected one of {expect_reasons}"
 
 
+def _check_coverage_event(scenario, check_date):
+    """Returns (met: bool, actual_summary: str) for a 'coverage_event' scenario
+    -- the daily-firing counterpart to scenario_registry.compute_status(),
+    scoped to a single day instead of all-time. scenario['scenario_key'] is
+    the real coverage_events.scenario_key (reused directly, not a separate
+    field) -- check_params optionally carries mode_filter/bad_results, same
+    shape as scripts/coverage_registry.py's REGISTRY rows, so a row's
+    daily-check definition never has to be kept in sync by hand with its
+    REGISTRY entry (see seed_daily_coverage_expectations.py)."""
+    params = json.loads(scenario['check_params'] or '{}')
+    # mode_filter comes from the real scenario_expectations.mode column, not
+    # check_params -- it must be part of add_scenario_expectation's dedup key
+    # (scenario_key, node_id, ticker, mode) so two rows sharing one
+    # coverage_events scenario_key under different modes (e.g. entry_fill
+    # logged by both the dry_run-sim path and paper_trading.py) don't
+    # silently collide/overwrite each other, same bug class as add_node's
+    # take_profit=NULL dedup gap.
+    mode_filter = scenario.get('mode')
+    bad_results = set(params.get('bad_results', []))
+    # coverage_events.ts defaults to SQLite datetime('now') -- UTC -- while
+    # check_date (from _previous_trading_day) and trade_log's entry_time/
+    # exit_time (used by _check_trade_lifecycle) are both real ET wall-clock
+    # values written by application code. date(ts) alone would compare a UTC
+    # date against an ET date, offsetting the checked window by ~4-5 hours --
+    # confirmed against real data: 212 of 1799 existing coverage_events rows
+    # have date(ts) != date(ts, 'localtime'). date(ts, 'localtime') converts
+    # to the server's local zone (America/New_York) before comparing, keeping
+    # this consistent with the other checker.
+    q = "SELECT result, COUNT(*) n FROM coverage_events WHERE scenario_key = ? AND date(ts, 'localtime') = ?"
+    args = [scenario['scenario_key'], check_date]
+    if mode_filter:
+        q += " AND mode = ?"
+        args.append(mode_filter)
+    # ticker/node_id scoping, same bug class already fixed for
+    # _check_trade_lifecycle's node_id disambiguation above -- zero live
+    # impact today since every seeded coverage_event scenario has ticker=
+    # node_id=None, but a future per-ticker scenario would otherwise be
+    # silently satisfied by a different ticker's/node's event under the same
+    # scenario_key (caught by session-wrap Opus review before any such
+    # scenario was actually seeded).
+    if scenario.get('ticker'):
+        q += " AND ticker = ?"
+        args.append(scenario['ticker'])
+    if scenario.get('node_id') is not None:
+        q += " AND node_id = ?"
+        args.append(scenario['node_id'])
+    q += " GROUP BY result"
+    with db._conn() as c:
+        rows = c.execute(q, args).fetchall()
+    if not rows:
+        return False, f"no coverage_events for {scenario['scenario_key']!r} on {check_date}"
+    total = sum(r['n'] for r in rows)
+    good = sum(r['n'] for r in rows if r['result'] not in bad_results)
+    if good > 0:
+        return True, f"{total}x event(s), {good} good, last result set {[r['result'] for r in rows]}"
+    return False, f"{total}x event(s), all bad_results {sorted(bad_results)}: {[r['result'] for r in rows]}"
+
+
 CHECKERS = {
     'trade_lifecycle': _check_trade_lifecycle,
+    'coverage_event': _check_coverage_event,
 }
 
 

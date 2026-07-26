@@ -273,3 +273,15 @@ def test_close_position_is_idempotent_against_a_second_racing_call(db):
     # the second racing call's different price/reason.
     assert trade_row['exit_price'] == 95.0
     assert trade_row['exit_reason'] == 'SL'
+
+
+def test_previous_trading_day_walks_back_over_weekend():
+    """Monday's 7am coverage check must look at Friday's results, not a
+    trivially-weekend-skipped Sunday."""
+    monday = datetime(2026, 7, 27, 7, 0)  # a real Monday
+    assert A._previous_trading_day(monday) == '2026-07-24'  # Friday
+
+
+def test_previous_trading_day_normal_weekday():
+    tuesday = datetime(2026, 7, 28, 7, 0)
+    assert A._previous_trading_day(tuesday) == '2026-07-27'  # Monday

@@ -4298,3 +4298,70 @@ tests exercise the surrounding functions the new log calls sit inside). `scripts
 (UDOW), unchanged. `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py`
 (AGQ,SOXL): both clean, no new mismatch — `active_signals.py`'s only change was a side-channel log
 call, no entry/exit logic touched.
+
+---
+
+## 2026-07-28 (later) — Daily coverage report ("pytest, but with the market") built and wired into the live daemon's 7am slot
+
+### What we did
+Started from a walkthrough of the just-widened Trade-Flow Accountability Grid: mapped every row
+to which canary/live node should exercise it once the daemon (down since before this session)
+restarts. Confirmed paper trading needs no separate work (aligned to live signal detection
+already). Iterated on the design for making dry_run/canary and real-live activity actually
+exercise the grid automatically, converging on the user's framing: a daily test-suite run against
+real market state, where a real regression stays a sticky, human-must-explain ticket until fixed
+or genuinely resolved — never silently clears.
+
+Considered and explicitly dropped a `two_nodes_same_ticker_diff_accounts` test setup (would have
+needed repurposing DPST's dedicated paper-vs-real comparison node, or a not-yet-built per-node
+`dry_run` override) — judged disproportionate for a fail-open guard at current scale; SOXL will
+likely end up in >1 account organically soon, which will exercise it for real instead.
+
+Landed on reusing the existing `scenario_expectations`/`coverage_deviations` sticky-ticket
+contract (already built/audited 2026-07-24) rather than a new table or script: added a
+`coverage_event` check method to `scripts/coverage_check.py`, seeded 14 accountability-grid rows
+via new `scripts/seed_daily_coverage_expectations.py` (pulling scenario_key/bad_results/mode
+straight from `coverage_registry.py`'s REGISTRY, never hand-duplicated), and hooked
+`send_coverage_report(previous_trading_day)` into `active_signals.py`'s existing 7:00am
+`_REFERENCE_TIMES` slot.
+
+**Two rounds of Opus review (first-pass + session-wrap) found and fixed 4 CONFIRMED bugs**:
+1. UTC-vs-ET date mismatch in the new checker (`date(ts)` vs a local-computed check_date) —
+   confirmed against 212 real misdated `coverage_events` rows; fixed via `date(ts, 'localtime')`.
+2. A daemon restart any time after 7am (the normal case) would silently skip that day's check
+   forever — fixed with an unconditional startup call mirroring the existing reference-report
+   pattern.
+3. The initial seed marked all 14 rows `expected_frequency='daily'`, but 12 are trade-conditional
+   (near-zero all-time events) and would have minted 11-14 tickets every single day — fixed by
+   trimming.
+4. Round 2 caught that `cash_check`, one of the two rows round-1 kept as daily, was itself
+   trade-conditional (fired 1 of 3 real days) — demoted too, leaving only
+   `live_state_reconciliation_mismatch` as the sole daily row (itself caveated: depends on UDOW's
+   known accepted stale-position violation persisting — flagged for revisit). Also fixed
+   `_check_coverage_event` missing ticker/node_id scoping (same bug class as an earlier
+   `_check_trade_lifecycle` fix) — zero live impact yet, fixed defensively.
+
+A manual dry run of the new checker against real production data (`--date 2026-07-24`) created 11
+real `coverage_deviations` rows from before the fixes; all explained (batch) as artifacts of that
+manual test run, not real failures, once the daemon-downtime cause was confirmed.
+
+### Docs updated
+- `docs/live_test_coverage.md`: 2026-07-28 (later) pointer entry, full bug list.
+- `docs/backlog_cache.md`: resolved entry at top, same detail, plus the dropped
+  `two_nodes_same_ticker_diff_accounts` test-setup note.
+
+### Verification
+Full suite: 269 passed (was 257, +12 new tests). `scripts/live_sim_harness.py`: 7/7.
+`signals_invariants.py`: 1 known accepted violation (UDOW), unchanged.
+`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` (AGQ,SOXL): both clean,
+no new mismatch. Real dry run against 2026-07-24 production data: 0 unexplained deviations after
+the fixes (was 11 before).
+
+### Next session / open threads
+- Daemon (`active_signals.py`) is still down — user plans to restart it Sunday night, deliberately
+  ahead of Monday's open, to catch any startup issue with a buffer.
+- `live_state_reconciliation_mismatch`'s daily-reliability caveat (depends on the UDOW accepted
+  violation) — revisit demoting it to `occasional` once that backlog item closes.
+- `two_nodes_same_ticker_diff_accounts`/`buy_buttons_resolve_correct_node` remain accepted gaps in
+  the accountability grid, same treatment as `position_lock` — no dedicated test node, expected to
+  get exercised organically as account usage grows.

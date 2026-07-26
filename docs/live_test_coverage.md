@@ -71,6 +71,40 @@ count). Harness: 7/7. `signals_invariants.py`: 1 known accepted violation (UDOW)
 `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` (AGQ,SOXL) both clean, no
 new mismatch — only a side-channel log call was added to `active_signals.py`.
 
+**2026-07-28 (later): daily coverage report now runs automatically inside the live daemon** — a
+new `coverage_event` check method (`scripts/coverage_check.py::_check_coverage_event`) extends
+the existing `scenario_expectations`/`coverage_deviations` "ticket" contract (previously only the
+6 canary `trade_lifecycle` scenarios) to the accountability grid's `coverage_events`-backed rows.
+`active_signals.py`'s existing 7:00am `_REFERENCE_TIMES` slot now also calls
+`send_coverage_report(previous_trading_day)` — the user's framing: "like pytest, but with the
+market" — a daily go/no-go gate before the trading day starts, checking the prior trading day's
+results, with any real regression becoming a sticky ticket that stays open until a human explains
+it or a later day's genuine pass auto-resolves it (same contract as the existing sticky-deviation
+model, never silent). **Two rounds of Opus review** (first-pass + session-wrap) found and fixed 4
+CONFIRMED bugs total: (1) the new checker compared `date(ts)` (UTC, SQLite default) against a
+local-ET-computed check_date, offsetting the daily window by ~4-5h — confirmed against real data
+(212 of 1799 existing `coverage_events` rows fell on the wrong side); fixed to
+`date(ts, 'localtime')`. (2) the 7:00 slot's per-loop gating meant a daemon restart any time after
+7am (the normal case, since this project restarts after most source edits) would silently skip
+that day's check forever — no ticket, no alert, indistinguishable from a clean day; fixed by
+adding an unconditional startup call mirroring the existing reference-report pattern. (3) the
+initial seed (`scripts/seed_daily_coverage_expectations.py`) marked all 14 accountability-grid
+`coverage_events` rows `expected_frequency='daily'`, but replaying real history showed 12 of them
+are trade-conditional (zero-or-near-zero all-time events) and would have minted 11-14 sticky
+tickets every single day, burying the one real signal; fixed by trimming
+`DAILY_EXPECTED_IDS` down. (4) **round 2 caught that `cash_check` (one of the two rows fix-3 kept
+as "daily")  was itself trade-conditional** — it fired on only 1 of 3 real instrumented days,
+since it's logged only inside a real BUY-attempt branch — so it was demoted to `occasional` too,
+leaving just `live_state_reconciliation_mismatch` (itself caveated: its "daily" reliability
+currently depends entirely on UDOW's known accepted stale-position violation persisting — flagged
+in the seed script for revisit when that's cleaned up) as the sole `DAILY_EXPECTED_IDS` row. Also
+fixed same round: `_check_coverage_event` didn't scope by ticker/node_id (same bug class already
+fixed once for `_check_trade_lifecycle`'s node_id disambiguation) — zero live impact today since
+every seeded row has ticker=node_id=None, but fixed defensively before any per-ticker scenario is
+seeded. Full suite: 269 passed (was 257). Harness: 7/7. `signals_invariants.py`: 1 known accepted
+violation (UDOW), unchanged. `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py`
+(AGQ,SOXL) both clean.
+
 **2026-07-27 evening: grid widened from 32 to 39 rows** after the user flagged it was guard-heavy
 and thin on execution logic. 2 rows (`paper_entry_fill`/`paper_exit_fill`) needed no new
 instrumentation — `paper_trading.py` already logs `entry_fill`/`exit_fill` under `mode='paper'`,
