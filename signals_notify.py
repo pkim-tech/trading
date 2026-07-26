@@ -176,7 +176,16 @@ def _alert_reconcile_mismatch(pos, kind, text):
     """Posts a reconciliation mismatch alert, rate-limited per (position,
     mismatch-kind) so an already-alerted, still-unresolved mismatch doesn't
     repost every poll cycle (same pattern as active_signals._guarded's
-    per-section cooldown)."""
+    per-section cooldown). Checked against coverage_snoozes first -- a known,
+    human-acknowledged condition (e.g. UDOW's deliberately-seeded stale test
+    position) skips both the coverage_events log and the Slack alert entirely
+    while snoozed, rather than just the alert, so the accountability grid's
+    daily/all-time counts aren't inflated by a condition someone already
+    explained. Time-bounded by design: the snooze expires and resumes
+    alerting rather than silencing the scenario forever."""
+    if db.is_snoozed("reconciliation_mismatch", ticker=pos.get('ticker'),
+                      account=pos.get('account'), node_id=pos.get('wl_id'), kind=kind):
+        return
     db.log_coverage_event(
         "reconciliation_mismatch", _coverage_mode(pos.get('account')),
         ticker=pos.get('ticker'), position_id=pos.get('id'),

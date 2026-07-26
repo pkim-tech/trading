@@ -142,3 +142,52 @@ def test_fetch_failure_skips_position_without_raising(env, monkeypatch):
     monkeypatch.setattr(schwab_client, 'get_real_position', _raise)
     signals_notify.check_live_state_reconciliation([pos])  # must not raise
     assert env == []
+
+
+def test_snoozed_ticker_suppresses_both_alert_and_coverage_event(env, monkeypatch):
+    pos = _open_pos(shares=100)
+    signals_db.snooze_coverage('reconciliation_mismatch', '2099-01-01 00:00:00',
+                                'known accepted test position', ticker=TICKER)
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 80.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    signals_notify.check_live_state_reconciliation([pos])
+    assert env == []
+    assert signals_db.get_coverage_events(scenario_key='reconciliation_mismatch') == []
+
+
+def test_snoozed_different_ticker_does_not_suppress(env, monkeypatch):
+    pos = _open_pos(shares=100)
+    signals_db.snooze_coverage('reconciliation_mismatch', '2099-01-01 00:00:00',
+                                'unrelated ticker', ticker='SOME_OTHER_TICKER')
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 80.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    signals_notify.check_live_state_reconciliation([pos])
+    assert len(env) == 1
+    assert len(signals_db.get_coverage_events(scenario_key='reconciliation_mismatch')) == 1
+
+
+def test_expired_snooze_does_not_suppress(env, monkeypatch):
+    pos = _open_pos(shares=100)
+    signals_db.snooze_coverage('reconciliation_mismatch', '2000-01-01 00:00:00',
+                                'already expired', ticker=TICKER)
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 80.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    signals_notify.check_live_state_reconciliation([pos])
+    assert len(env) == 1
+
+
+def test_snooze_scoped_to_one_kind_does_not_suppress_missing_sl(env, monkeypatch):
+    """A snooze scoped to kind='shares' (the documented UDOW use case) must
+    not also silence missing_sl -- a real position may be unprotected at the
+    broker, a materially more severe alert than a known share-count drift
+    (found by session-wrap Opus review, 2026-07-28)."""
+    pos = _open_pos(shares=100)
+    signals_db.set_sl_order_id(TICKER, 12345)
+    pos = signals_db.get_open_position(TICKER)
+    signals_db.snooze_coverage('reconciliation_mismatch', '2099-01-01 00:00:00',
+                                'known share drift only', ticker=TICKER, kind='shares')
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 100.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])  # no resting SELL order
+    signals_notify.check_live_state_reconciliation([pos])
+    assert len(env) == 1
+    assert 'SL' in env[0] or 'stop' in env[0].lower()

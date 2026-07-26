@@ -4365,3 +4365,78 @@ the fixes (was 11 before).
 - `two_nodes_same_ticker_diff_accounts`/`buy_buttons_resolve_correct_node` remain accepted gaps in
   the accountability grid, same treatment as `position_lock` — no dedicated test node, expected to
   get exercised organically as account usage grows.
+
+---
+
+## 2026-07-28 (evening) — Coverage snoozes built; UDOW's stale test position retroactively cleaned up
+
+### What we did
+Started from checking what coverage gaps remained after last session's daily coverage report
+build — confirmed the daemon is still down (`daemon_status.py`), then walked the accountability
+grid (`scripts/coverage_registry.py`): 2 real `live-attempt-failed` gaps (`post_fill_topup`,
+`sl_sync_placement`, both bad-outcome-only), 27 rows just quiet since the daemon's been down, and
+a real dry_run gap — `dry_run_buy_synthesis`/`dry_run_sim_close` have zero real firings ever,
+confirmed via direct query (0 rows tagged `is_dry_run_sim=1` in `open_positions`/`trade_log`
+despite the feature being built 2026-07-26).
+
+Investigating `reconciliation_mismatch` noise (1753 events) traced to UDOW's known accepted
+`signals_invariants.py` violation firing on every poll — plus a real gap found along the way:
+`check_live_state_reconciliation` has no weekday/market-hours gate, so it (and its logging) also
+fires on weekends if the daemon's up, on top of the known-bug noise.
+
+User proposed two fixes: move the deliberate test-fixture ticker off the real watchlist, and add
+a snooze mechanism for known-noisy alerts. Landed on building the snooze first (suppress both the
+Slack alert and the `coverage_events` log while active, time-bounded with auto-resume — not
+indefinite, unlike the `coverage_deviations` ticket model). New `signals_db.coverage_snoozes`
+table + `snooze_coverage()`/`is_snoozed()`/`get_active_snoozes()`, wired into
+`signals_notify._alert_reconcile_mismatch`, new `scripts/snooze_coverage.py` CLI, plus a fix to
+`scripts/coverage_check.py`'s daily `run_check` so a snoozed scenario is skipped, not deviated.
+
+**Two rounds of Opus review found and fixed 4 CONFIRMED bugs**: (1) UTC-vs-local-time mismatch in
+the snooze-expiry comparison (`datetime('now')` vs the CLI's local-ET `snoozed_until`), same trap
+class as the earlier daily-report date bug — fixed to `datetime('now','localtime')`. (2) the
+`run_check` snooze-skip logic itself needed adding (first pass hadn't wired it in yet) — otherwise
+`reconciliation_mismatch`, the sole `DAILY_EXPECTED_IDS` row, would mint a false unexplained
+deviation ticket every day it's snoozed. (3) **round 2 caught a snooze had no `kind` scope** —
+`_alert_reconcile_mismatch` fires for 3 distinct kinds (`shares`/`missing_sl`/
+`missing_trailing_sell`), so a bare ticker-scoped snooze (the documented UDOW use case) would have
+also silenced `missing_sl`/`missing_trailing_sell` — a materially more severe "position may be
+unprotected at the broker" alert class than the share-count drift actually being acknowledged.
+Fixed via a new nullable `kind` column threaded through the same wildcard-match pattern. (4)
+`scripts/snooze_coverage.py` never called `db.ensure_tables()` — would crash against a DB
+predating this feature. 8 new regression tests across 3 test files.
+
+**Separately, with explicit user go-ahead**: UDOW's real `open_positions` row (id 16, account
+`ira`, opened 2026-07-23) was a stale artifact predating the 2026-07-26 dry-run-fill-synthesis
+feature, so it was never tagged `is_dry_run_sim` and had been sitting open as a "real-looking"
+position (dry_run account, so no real broker order ever backed it) — the actual root cause of both
+the known `signals_invariants.py` violation and a chunk of the reconciliation-mismatch noise.
+Backed up `trading_live.db` first, then retroactively tagged `is_dry_run_sim=1` on both
+`open_positions`/`trade_log` and closed it via `signals_db.close_position()` at a real current
+market price ($68.17), `exit_reason='DRY_RUN_RETROACTIVE_CLEANUP'`. `signals_invariants.py` now
+reports fully clean (0 violations, not the usual "1 known accepted"). UDOW's `research`-mode node
+(id 93) is unblocked to run purely through paper trading going forward, with no lingering real
+position artifact.
+
+### Docs updated
+- `docs/live_test_coverage.md`: 2026-07-28 (evening) entry, full bug list + UDOW cleanup detail.
+- `docs/backlog_cache.md`: resolved entry at top, same detail.
+
+### Verification
+Full suite: 278 passed (was 269, +9 new tests: 5 reconciliation/snooze tests, 2 coverage_check
+tests, 3 new CLI tests — one file, `tests/test_snooze_coverage_cli.py`, new this session). Harness
+(`live_sim_harness.py`): 7/7. `signals_invariants.py`: 0 violations (was 1 known accepted, now
+genuinely resolved). Real UDOW verification: confirmed zero `open_positions`/`paper_positions`
+rows for UDOW post-cleanup.
+
+### Still open / not done this session
+- The other proposed fix from the same discussion — moving the deliberate test-fixture ticker
+  permanently off the real watchlist (so a future test artifact doesn't share space with a real
+  trading candidate) — was not built; only the snooze + UDOW cleanup landed.
+- `check_live_state_reconciliation` still has no weekday/market-hours gate (found this session,
+  not fixed) — will keep logging/firing on weekends if the daemon is up then.
+- The 2 real `live-attempt-failed` accountability-grid rows (`post_fill_topup`, `sl_sync_placement`
+  — fired for real but never with a good outcome) are still open, not investigated this session.
+- `dry_run_buy_synthesis`/`dry_run_sim_close` still show zero real firings ever — worth watching
+  once the daemon restarts and a dry_run node gets a real BUY signal.
+- Daemon is still down as of end of session.

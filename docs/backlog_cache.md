@@ -1,5 +1,32 @@
 # Backlog Cache
 
+## [live-trading][coverage] Resolved 2026-07-28 (evening) — coverage snoozes built (time-bounded acknowledgment for a known noisy scenario); UDOW's stale test position retroactively cleaned up
+Grew out of reviewing `reconciliation_mismatch`'s 1753 real events, all attributable to UDOW's
+deliberately-seeded stale test position (the one known accepted `signals_invariants.py`
+violation) — noise on top of an already-understood issue, not a new finding each poll. New
+`signals_db.coverage_snoozes` table + `snooze_coverage()`/`is_snoozed()`/`get_active_snoozes()`,
+wired into `signals_notify._alert_reconcile_mismatch`: suppresses both the Slack alert and the
+`coverage_events` log while an active snooze matches (scoped via nullable `ticker`/`account`/
+`node_id`/`kind`), auto-expiring rather than silencing forever. New `scripts/snooze_coverage.py`
+CLI. `scripts/coverage_check.py`'s daily `run_check` now skips (not deviates) a snoozed scenario,
+since `reconciliation_mismatch` is the sole `DAILY_EXPECTED_IDS` row and would otherwise mint a
+false ticket every day it's snoozed.
+**Two Opus review rounds found and fixed 4 CONFIRMED bugs**: UTC-vs-local-time mismatch in the
+expiry comparison (same trap class as the 2026-07-28 daily-report fix); the daily-check skip logic
+itself (first version would still have deviated); **a snooze had no `kind` scope**, so a bare
+ticker snooze (the documented UDOW use case) would have also silenced `missing_sl`/
+`missing_trailing_sell` — a materially more severe "position may be unprotected at the broker"
+alert class, not just the share-count drift being acknowledged — fixed via a new nullable `kind`
+column; and the CLI never called `db.ensure_tables()`, so it would crash against a DB predating
+this feature. Full detail: `docs/live_test_coverage.md`'s 2026-07-28 (evening) entry. Full suite:
+278 passed (was 269). Harness: 7/7.
+**Separately, same session: UDOW's real `open_positions` row (id 16, `ira`, opened 2026-07-23,
+predates the dry-run-fill-synthesis feature) was backed up then retroactively closed** — tagged
+`is_dry_run_sim=1` on both `open_positions`/`trade_log`, closed via `signals_db.close_position()`
+at a real current price, `exit_reason='DRY_RUN_RETROACTIVE_CLEANUP'`. `signals_invariants.py`'s
+previously-accepted UDOW violation is now genuinely resolved (confirmed clean), not just accepted.
+UDOW's `research`-mode node is unblocked to run purely through paper trading going forward.
+
 ## [live-trading][coverage] Resolved 2026-07-28 (later) — daily coverage report ("like pytest, but with the market") now runs inside the live daemon at 7am, checking the previous trading day
 Grew out of a conversation mapping every Trade-Flow Accountability Grid row to which canary/live
 node should exercise it Monday, once the daemon (down since before this session) restarts. Landed

@@ -71,6 +71,44 @@ count). Harness: 7/7. `signals_invariants.py`: 1 known accepted violation (UDOW)
 `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` (AGQ,SOXL) both clean, no
 new mismatch — only a side-channel log call was added to `active_signals.py`.
 
+**2026-07-28 (evening): `coverage_snoozes` built — a time-bounded human acknowledgment for a known
+scenario, replacing raw event volume as the only way to deal with a noisy known condition.** Grew
+directly out of discussing `live_state_reconciliation_mismatch`'s 1753 real events for UDOW's
+deliberately-seeded stale test position — noise on top of a known/accepted issue, not a new
+finding each time. New `signals_db.coverage_snoozes` table (`scenario_key` + nullable
+`ticker`/`account`/`node_id`/`kind` wildcard scoping, `snoozed_until`, `reason`) +
+`snooze_coverage()`/`is_snoozed()`/`get_active_snoozes()`, wired into
+`signals_notify._alert_reconcile_mismatch` — suppresses both the Slack alert and the
+`coverage_events` log while active (not just the alert), and auto-expires rather than silencing a
+scenario forever. New `scripts/snooze_coverage.py` CLI. **`scripts/coverage_check.py`'s `run_check`
+also skips (not deviates) a snoozed scenario** — otherwise `reconciliation_mismatch`, the sole
+`DAILY_EXPECTED_IDS` row, would mint a false unexplained `coverage_deviations` ticket every day
+it's snoozed.
+**Two Opus review rounds (first-pass + session-wrap) found and fixed 4 CONFIRMED bugs**: (1)
+`is_snoozed`/`get_active_snoozes` compared `snoozed_until` (written in local ET time by the CLI)
+against SQLite's UTC `datetime('now')` — same bug class as the daily-report's UTC/localtime trap
+above — fixed to `datetime('now','localtime')`. (2) the `run_check` skip check as originally
+written would have minted the false deviation ticket described above; fixed by checking
+`get_active_snoozes` before calling the real checker. (3) **round 2 caught a snooze had no `kind`
+scope** — `_alert_reconcile_mismatch` fires for 3 distinct kinds (`shares`/`missing_sl`/
+`missing_trailing_sell`), and a bare ticker-scoped snooze (the documented UDOW use case) would
+have also silenced `missing_sl`/`missing_trailing_sell` — "this position may be unprotected at the
+broker," a materially more severe alert than the share-count drift actually being acknowledged;
+fixed by adding a nullable `kind` column, threaded through the same wildcard-match pattern. (4)
+`scripts/snooze_coverage.py` never called `db.ensure_tables()`, so it would crash against any DB
+predating this feature. Also fixed. 8 new regression tests. Full suite: 278 passed (was 269).
+Harness: 7/7. `signals_invariants.py`: clean (0 violations — see below, not the usual "1 known
+accepted UDOW violation").
+**Separately, same session: UDOW's stale test position itself was retroactively cleaned up**, not
+just made snoozable — `open_positions` id 16 (`ira`, 740sh, opened 2026-07-23, predates the
+2026-07-26 dry-run-fill-synthesis feature so was never tagged `is_dry_run_sim`) was manually backed
+up then tagged `is_dry_run_sim=1` on both `open_positions`/`trade_log` and closed via
+`signals_db.close_position()` at a real current market price ($68.17), `exit_reason=
+'DRY_RUN_RETROACTIVE_CLEANUP'`. `signals_invariants.py`'s previously-accepted UDOW violation
+(research-mode ticker with a real open position still automation-scoped) is now genuinely
+resolved, not just accepted — confirmed clean. UDOW's `research`-mode node (id 93) is unblocked to
+run purely through paper trading going forward.
+
 **2026-07-28 (later): daily coverage report now runs automatically inside the live daemon** — a
 new `coverage_event` check method (`scripts/coverage_check.py::_check_coverage_event`) extends
 the existing `scenario_expectations`/`coverage_deviations` "ticket" contract (previously only the

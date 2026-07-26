@@ -616,6 +616,45 @@ def ensure_tables():
             """)
             c.commit()
 
+        # coverage_snoozes: a time-bounded, human-authored acknowledgment that a
+        # known condition (e.g. UDOW's deliberately-seeded stale test position)
+        # should stop generating both the coverage_events row and the Slack alert
+        # for a scenario_key, scoped as narrowly or broadly as the caller wants via
+        # nullable ticker/account/node_id (NULL = wildcard, matches any value).
+        # Deliberately time-bounded (snoozed_until, not indefinite) -- unlike the
+        # coverage_deviations ticket model (silence only ends when a human explains
+        # it), a snooze re-alerts automatically on expiry so a silently-changed
+        # underlying condition doesn't stay quiet forever just because someone
+        # muted it once. is_snoozed() is the read path every alert/log call site
+        # should check before firing.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS coverage_snoozes (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                scenario_key   TEXT NOT NULL,
+                ticker         TEXT,
+                account        TEXT,
+                node_id        INTEGER REFERENCES watch_list(id),
+                kind           TEXT,
+                snoozed_until  TEXT NOT NULL,
+                reason         TEXT NOT NULL,
+                snoozed_by     TEXT NOT NULL DEFAULT 'user',
+                created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        c.commit()
+        # kind (e.g. reconciliation_mismatch's "shares"/"missing_sl"/
+        # "missing_trailing_sell") -- without this, a snooze scoped only to
+        # scenario_key+ticker (the documented UDOW share-count-drift use case)
+        # would also silently silence missing_sl/missing_trailing_sell for
+        # that ticker, which mean "a real position may be unprotected at the
+        # broker" -- a materially different, more severe class of alert than
+        # the one actually being acknowledged. NULL = wildcard, same as the
+        # other scope columns (found by session-wrap Opus review, 2026-07-28).
+        cs_cols = {r[1] for r in c.execute("PRAGMA table_info(coverage_snoozes)").fetchall()}
+        if 'kind' not in cs_cols:
+            c.execute("ALTER TABLE coverage_snoozes ADD COLUMN kind TEXT")
+            c.commit()
+
         # slack_message_log: full text of every real _post_message call (live,
         # sim, and webhook/socket alike) -- a message that scrolls past or gets
         # lost in Slack itself (e.g. the morning reference report) is otherwise
@@ -1220,6 +1259,60 @@ def get_deviations(unexplained_only=False, check_date=None, limit=500):
         q += " WHERE " + " AND ".join(clauses)
     q += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
+def snooze_coverage(scenario_key, snoozed_until, reason, ticker=None, account=None,
+                     node_id=None, kind=None, snoozed_by='user'):
+    """Records an acknowledgment that scenario_key should stop generating both
+    its coverage_events row and its Slack alert until snoozed_until (a
+    'YYYY-MM-DD HH:MM:SS' local-time string, matching SQLite's own
+    datetime('now','localtime') format for a correct '>' comparison) for the
+    given scope. Any of ticker/account/node_id/kind left None is a wildcard
+    for that field, not "must be NULL" -- e.g.
+    snooze_coverage('reconciliation_mismatch', until, reason, ticker='UDOW')
+    silences UDOW across every account/node/kind, while adding
+    kind='shares' too would narrow it to just the share-count-mismatch alert,
+    leaving missing_sl/missing_trailing_sell (which mean a real position may
+    be unprotected at the broker) still alerting for that same ticker. No
+    dedup/upsert -- each call is its own record, consistent with
+    coverage_deviations treating history as append-only."""
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO coverage_snoozes
+                (scenario_key, ticker, account, node_id, kind, snoozed_until, reason, snoozed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (scenario_key, ticker, account, node_id, kind, snoozed_until, reason, snoozed_by))
+        c.commit()
+
+
+def is_snoozed(scenario_key, ticker=None, account=None, node_id=None, kind=None):
+    """True if any active (not yet expired) coverage_snoozes row matches this
+    firing. A snooze row's own ticker/account/node_id/kind are wildcards when
+    NULL -- a row scoped only to ticker='UDOW' matches regardless of
+    account/node_id/kind passed here, but a row additionally scoped to
+    kind='shares' only matches a firing whose kind is exactly 'shares'."""
+    with _conn() as c:
+        row = c.execute("""
+            SELECT 1 FROM coverage_snoozes
+            WHERE scenario_key = ? AND snoozed_until > datetime('now', 'localtime')
+              AND (ticker IS NULL OR ticker = ?)
+              AND (account IS NULL OR account = ?)
+              AND (node_id IS NULL OR node_id = ?)
+              AND (kind IS NULL OR kind = ?)
+            LIMIT 1
+        """, (scenario_key, ticker, account, node_id, kind)).fetchone()
+        return row is not None
+
+
+def get_active_snoozes(scenario_key=None):
+    q = "SELECT * FROM coverage_snoozes WHERE snoozed_until > datetime('now', 'localtime')"
+    params = []
+    if scenario_key:
+        q += " AND scenario_key = ?"
+        params.append(scenario_key)
+    q += " ORDER BY id DESC"
     with _conn() as c:
         return [dict(r) for r in c.execute(q, params).fetchall()]
 

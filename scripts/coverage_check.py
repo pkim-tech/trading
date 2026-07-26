@@ -162,6 +162,23 @@ def run_check(check_date):
         # up by scenario_key alone would silently collapse two distinct rows
         # (found by Opus review, 2026-07-25).
         base = dict(scenario_key=s['scenario_key'], ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
+        # A scenario currently under an active coverage_snoozes row (see
+        # signals_db.snooze_coverage) is treated as not-checked today, not
+        # deviated -- a snooze can be scoped narrower than this expectation
+        # (e.g. ticker='UDOW' vs a ticker-less global expectation), so this
+        # deliberately checks for ANY active snooze on the scenario_key
+        # rather than trying to match scope, matching the conservative
+        # direction (skip, never silently mint a false ticket) found by
+        # Opus review 2026-07-28: reconciliation_mismatch is the sole
+        # DAILY_EXPECTED_IDS scenario and would otherwise mint an unexplained
+        # coverage_deviations ticket every single day it's snoozed.
+        active_snoozes = db.get_active_snoozes(s['scenario_key'])
+        if active_snoozes:
+            snooze = active_snoozes[0]
+            summary = f"snoozed until {snooze['snoozed_until']} ({snooze['reason']})"
+            print(f"  ~ {s['scenario_key']:26s} {s['ticker'] or '':6s} {summary}")
+            results.append(dict(base, status='skipped', summary=summary))
+            continue
         checker = CHECKERS.get(s['check_method'])
         if checker is None:
             print(f"  ? {s['scenario_key']:26s} {s['ticker'] or '':6s} unknown check_method={s['check_method']!r}, skipped")

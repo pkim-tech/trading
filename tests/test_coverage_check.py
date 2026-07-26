@@ -398,6 +398,35 @@ def test_pending_buy_node_account_stays_pinned_to_signal_time_snapshot(isolated_
     assert pending['node']['account'] == 'brokerage'  # pinned, NOT 'ira'
 
 
+def test_snooze_coverage_uses_local_time_not_utc(isolated_db):
+    """snooze_coverage's caller (scripts/snooze_coverage.py) computes
+    snoozed_until from datetime.now() -- ET wall-clock, local time -- so
+    is_snoozed must compare against datetime('now','localtime'), not UTC
+    datetime('now'), or a snooze written for a few hours from now would
+    already read as expired (found by Opus review, 2026-07-28 -- the same
+    UTC-vs-local trap already documented at coverage_check.py's date(ts,
+    'localtime') fix)."""
+    soon = (datetime.now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+    db.snooze_coverage('some_scenario', soon, 'test', ticker=TICKER)
+    assert db.is_snoozed('some_scenario', ticker=TICKER) is True
+
+
+def test_run_check_skips_snoozed_scenario_instead_of_deviating(isolated_db):
+    """A scenario under an active coverage_snoozes row must not mint a
+    coverage_deviations ticket just because it's silenced -- found by Opus
+    review 2026-07-28: reconciliation_mismatch is the sole daily-checked
+    scenario driven entirely by UDOW's known test position, so snoozing it
+    would otherwise mint an unexplained deviation every single day."""
+    db.add_scenario_expectation('sk_snoozed', 'expected happy path', 'daily', 'coverage_event',
+                                 check_params='{"bad_results": []}')
+    future = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+    db.snooze_coverage('sk_snoozed', future, 'known accepted condition')
+    results = run_check('2026-07-24')
+    assert results[0]['status'] == 'skipped'
+    assert 'snoozed' in results[0]['summary']
+    assert db.get_deviations() == []
+
+
 def test_send_coverage_report_surfaces_unexplained_deviation(isolated_db, monkeypatch):
     """signals_notify.send_coverage_report is piece #7 of the coverage-system
     reframe (Slack-callable report) -- it must run the real check live (not
