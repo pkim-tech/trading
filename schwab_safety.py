@@ -10,6 +10,7 @@ starts every account in dry_run=True until these are reviewed and explicitly
 turned off per account.
 """
 import fcntl
+import functools
 import json
 import os
 import time
@@ -18,6 +19,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+import pandas_market_calendars as mcal
 
 import signals_db
 
@@ -69,6 +71,23 @@ AUTO_FILL_DETECTION_PATH = _STATE_DIR / "schwab_auto_fill_detection.json"
 # of the ambient open-check poll window this mirrors.
 _SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]
 _OPEN_CHECK_WINDOWS = [(9, 30, 9, 40), (14, 30, 14, 40)]
+
+_NYSE_CAL = mcal.get_calendar('NYSE')
+
+
+@functools.lru_cache(maxsize=8)
+def _is_trading_day(date_str):
+    """NYSE trading-day gate (weekends + market holidays) -- mirrors
+    active_signals._is_trading_day (duplicated, not imported, for the same
+    circular-import reason _SIGNAL_WINDOWS/_OPEN_CHECK_WINDOWS above are
+    mirrored). This is the real chokepoint for it: active_signals.py's own
+    gate only covers the daemon's two scan paths (_in_window, _scan_pinned_
+    entry) -- a manual Slack "Manually Open" BUY or check_gap_resize's
+    cancel+replace both route through check_order without ever touching
+    those. Root-caused the 2026-07-26 ERY phantom-fill incident: no
+    order-placement path checked weekday/holiday status anywhere, only
+    (hour, minute) (Opus review finding, same session)."""
+    return not _NYSE_CAL.schedule(start_date=date_str, end_date=date_str).empty
 
 # Duplicate-submit guard: a second order for the same account+ticker+side+
 # (approximately the same) quantity within this window is almost certainly a
@@ -715,6 +734,16 @@ def check_order(
             raise SafetyViolation(
                 f"SELL {quantity:g} {ticker} exceeds the {pos['shares']:g} shares on file for "
                 f"'{account}' -- refusing a would-be short"
+            )
+
+    # Trading-day gate, BUY only, unconditional (including gap-correction --
+    # an overnight gap only exists ahead of a real trading day, so there's no
+    # legitimate reason to exempt it the way the window gate below does).
+    if side == "BUY":
+        now = _now()
+        if not _is_trading_day(now.strftime('%Y-%m-%d')):
+            raise SafetyViolation(
+                f"BUY blocked -- {now.strftime('%Y-%m-%d')} is not an NYSE trading day"
             )
 
     # Signal-window time gate, BUY only (see _SIGNAL_WINDOWS comment above).

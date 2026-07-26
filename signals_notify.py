@@ -1918,6 +1918,22 @@ def send_reference_report(watchlist):
             {"type": "button", "text": {"type": "plain_text", "text": "🧭 Coverage Report"}, "action_id": "send_coverage_report"},
         ]})
 
+    # Account/mode/ticker reference -- one line per (account, mode-category) so
+    # at a glance it's clear which accounts have real money on the line vs.
+    # dry_run/research-only, before scrolling into the per-ticker detail below.
+    fixed_blocks.append({"type": "divider"})
+    groups: dict = {}
+    for node in watchlist:
+        account = node.get('account') or 'unmapped'
+        category = 'RESEARCH' if node.get('mode') != 'live' else mode_tag(account)
+        groups.setdefault((account, category), []).append(node['ticker'])
+    summary_lines = [
+        f"*{account}* — {category}: {', '.join(sorted(set(tickers)))}"
+        for (account, category), tickers in sorted(groups.items())
+    ]
+    fixed_blocks.append({"type": "section", "text": {"type": "mrkdwn",
+        "text": "\n".join(summary_lines) if summary_lines else "No watchlist nodes."}})
+
     # Each row's own blocks (section + optional actions) are one atomic unit --
     # 25 nodes and growing already broke a fixed per-row block-count budget
     # twice (2026-07-22, 2026-07-29), so this report chunks across multiple

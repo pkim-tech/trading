@@ -36,8 +36,11 @@ import sys
 import time
 import threading
 import contextlib
+import functools
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
+
+import pandas_market_calendars as mcal
 
 from data_manager import fetch_live_data_smart
 import strategies
@@ -158,7 +161,21 @@ def _reminders_active(now):
     return (9, 0) <= (now.hour, now.minute) <= (16, 0)
 
 
+_NYSE_CAL = mcal.get_calendar('NYSE')
+
+
+@functools.lru_cache(maxsize=8)
+def _is_trading_day(date_str):
+    """NYSE trading-day gate (weekends + market holidays). Root-caused the
+    2026-07-26 ERY phantom-fill incident: _in_window previously checked only
+    (hour, minute), so a signal window fired normally on a Sunday against
+    stale cached data and placed a real order."""
+    return not _NYSE_CAL.schedule(start_date=date_str, end_date=date_str).empty
+
+
 def _in_window(now, windows):
+    if not _is_trading_day(now.strftime('%Y-%m-%d')):
+        return False
     t = (now.hour, now.minute)
     for h0, m0, h1, m1 in windows:
         if (h0, m0) <= t <= (h1, m1):
@@ -272,16 +289,25 @@ def _scan_pinned_entry(target_h, target_m, watchlist, buy_alerted, open_position
     kernel's literal bar Open exactly; a live quote at 10:30/15:30) instead of
     relying on ambient POLL_SECS-cadence polling, for automation-enabled
     open_check nodes only. Delegates to _scan_buy_signals via price_overrides so
-    there's one alert code path for both ambient and pinned checks."""
+    there's one alert code path for both ambient and pinned checks.
+
+    Returns (summaries, failed_tickers) -- a ticker whose price fetch raised is
+    excluded from this call's _scan_buy_signals entirely (not passed through to
+    fall back on compute_buy_signal's ambient yfinance price), and reported back
+    in failed_tickers so the caller can retry just that ticker at the real
+    Schwab price instead of silently committing at a degraded one (Opus review,
+    2026-07-26 -- the retry loop below only helps if a fetch failure doesn't
+    fire an order on attempt 1 in the first place)."""
     nodes = [n for n in watchlist
              if n.get('entry_timing') == 'open_check' and n['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS]
     if not nodes:
-        return []
+        return [], set()
     is_open_check = (target_h, target_m) in _PINNED_OPEN_TIMES
     price_overrides = {}
+    failed_tickers = set()
     for node in nodes:
         ticker = node['ticker']
-        if ticker in price_overrides:
+        if ticker in price_overrides or ticker in failed_tickers:
             continue
         try:
             if is_open_check:
@@ -291,11 +317,14 @@ def _scan_pinned_entry(target_h, target_m, watchlist, buy_alerted, open_position
         except Exception as e:
             print(f"  [pinned] {ticker} price fetch failed at {target_h:02d}:{target_m:02d}: {e}")
             log_poll(f"{ticker} pinned_entry target={target_h:02d}:{target_m:02d} FETCH FAILED: {e}")
+            failed_tickers.add(ticker)
             continue
         price_overrides[ticker] = price
         log_poll(f"{ticker} pinned_entry target={target_h:02d}:{target_m:02d} price={price:.4f} is_true_open={is_true_open}")
         db.log_open_price_quality(ticker, target_h, target_m, price, is_true_open)
-    return _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=price_overrides)
+    ready_nodes = [n for n in nodes if n['ticker'] not in failed_tickers]
+    summaries = _scan_buy_signals(ready_nodes, buy_alerted, open_position_keys, price_overrides=price_overrides)
+    return summaries, failed_tickers
 
 
 def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
@@ -605,10 +634,58 @@ def run_loop(tickers: set = None):
                 if (now.hour, now.minute) >= (ph, pm) and pkey not in pinned_bar_alerted:
                     pinned_bar_alerted.add(pkey)
                     _guarded("pinned_exit_arm", _scan_pinned_exit_arm, open_positions, sell_alerted, last_seen_bar)
-                    if (ph, pm) in _PINNED_ENTRY_TIMES:
-                        summaries += _guarded(
-                            "pinned_entry", _scan_pinned_entry, ph, pm, watchlist, buy_alerted, open_position_keys
-                        ) or []
+                    if (ph, pm) in _PINNED_ENTRY_TIMES and _is_trading_day(today):
+                        # This is a second, independent BUY entry point that never
+                        # routed through _in_window (which only gates the ambient
+                        # POLL_SECS-cadence scan) -- it's plausibly the actual path
+                        # the 2026-07-26 ERY Sunday order took, since it's restricted
+                        # to AUTOMATION_ENABLED_TICKERS (real-order-eligible) and was
+                        # gated only on (hour, minute) plus a dedup set that clears on
+                        # every calendar date, weekends included (Opus review finding).
+                        # Up to 3 attempts, 5s apart, retrying ONLY tickers whose price
+                        # fetch actually failed (a transient schwab_client.get_session_
+                        # open_price/get_current_price error) -- _scan_pinned_entry
+                        # excludes a failed ticker from its own _scan_buy_signals call
+                        # rather than falling through to an ambient/degraded price, so
+                        # a successful retry is the only way that ticker ever alerts.
+                        # open_position_keys is re-read fresh before every attempt
+                        # (NOT the stale once-per-loop-iteration snapshot) -- an
+                        # earlier version of this retry reused the stale snapshot
+                        # across all 3 attempts, which could place a second real BUY
+                        # order for a node whose same-day-unlock branch (line ~263)
+                        # only sees a just-filled position as "already held" once
+                        # open_position_keys is refreshed (Opus review, 2026-07-26).
+                        retry_nodes = watchlist
+                        for attempt in range(3):
+                            fresh_open_position_keys = (
+                                {_pos_key(p) for p in get_open_positions()}
+                                | {_pos_key(p) for p in get_open_positions(paper=True)}
+                            )
+                            res = _guarded(
+                                "pinned_entry", _scan_pinned_entry, ph, pm, retry_nodes,
+                                buy_alerted, fresh_open_position_keys
+                            )
+                            result, failed_tickers = res if res is not None else ([], set())
+                            summaries += result
+                            if not failed_tickers or attempt == 2:
+                                break
+                            retry_nodes = [n for n in retry_nodes if n['ticker'] in failed_tickers]
+                            time.sleep(5)
+                        if failed_tickers:
+                            # A ticker whose price fetch failed all 3 attempts is
+                            # silently skipped for this bar otherwise -- no BUY
+                            # alert is possible without a real price, but that
+                            # miss must still surface somewhere (automation_
+                            # principles.md #4), not just a log_poll line (Opus
+                            # review, 2026-07-26).
+                            try:
+                                _post_message(
+                                    f"⚠️ pinned_entry: price fetch failed 3x for "
+                                    f"{', '.join(sorted(failed_tickers))} at {ph:02d}:{pm:02d} ET "
+                                    f"— entry check skipped this bar"
+                                )
+                            except Exception:
+                                pass  # a Slack posting failure must not crash the poll loop
 
             def _check_position_exit(pos):
                 df_hourly, _ = _load_cache(pos['ticker'])

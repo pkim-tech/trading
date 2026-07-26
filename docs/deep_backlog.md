@@ -1,5 +1,69 @@
 # Backlog
 
+## ✅ [live-trading][security] Resolved 2026-07-26 — NYSE trading-day gate built and hardened after a real review round caught the fix's own retry logic double-ordering; closes the ERY-incident root cause below
+Closes the root cause left open by the ERY phantom-fill incident (see the entry directly below).
+Added `pandas_market_calendars` (NYSE calendar, weekends + real market holidays, not just a
+`weekday() >= 5` check) and wired it in at two layers:
+
+1. **Daemon scan gates** (`active_signals.py`): `_in_window()` — the chokepoint for both the ambient
+   `_SIGNAL_WINDOWS`/`_OPEN_CHECK_WINDOWS` scan and, transitively, everything that calls it — now
+   returns `False` on a non-trading day via a new `functools.lru_cache`-wrapped `_is_trading_day
+   (date_str)`. A second, independent BUY entry point was found the same session and initially missed:
+   `_scan_pinned_entry` (fired from the `_PINNED_BAR_TIMES` loop at 9:30/10:30/14:30/15:30, restricted
+   to `AUTOMATION_ENABLED_TICKERS` — the real-order-eligible set) never routed through `_in_window` at
+   all, gated only on `(hour, minute)` plus a dedup set that clears every calendar date including
+   weekends — plausibly the actual path the real Sunday ERY order took. Gated the same way at its call
+   site.
+2. **`schwab_safety.check_order`** (the real chokepoint every order-placement path routes through via
+   `approve_and_record` — manual Slack BUY confirmations, gap-correction replacement orders, automated
+   pinned/ambient BUYs alike): gained its own `_is_trading_day` (duplicated, not imported, same reason
+   `_SIGNAL_WINDOWS`/`_OPEN_CHECK_WINDOWS` are already mirrored there — avoids a circular import) and an
+   unconditional BUY-side check, deliberately *not* exempted for `is_gap_correction` (unlike the
+   existing signal-window gate, which is). Manually confirmed:
+   `schwab_safety.check_order('soxl_ira', 'ERY', 2, 50.0, 'BUY')` now raises `SafetyViolation` when
+   `_now()` is patched to the real incident Sunday.
+
+**A retry (3 attempts, 5s apart) was added to `_scan_pinned_entry`'s call site same session**, to cover
+a transient Schwab price-fetch failure it can hit at exactly 9:30/14:30 — but the first version
+introduced a real HIGH-severity bug of its own, caught by an Opus review round before it ever reached
+the daemon: `open_position_keys` was a stale once-per-loop-iteration snapshot shared across all 3
+retry attempts, so `_scan_buy_signals`'s same-day-unlock branch (the buy→sell→buy-same-day allowance,
+~8% of SOXL's backtested trades) could see a position that had *just filled on attempt 1* as still
+`not already_held` on attempt 2 — placing a second real BUY order for the same signal. The same review
+round also found the retry didn't even fix the failure it targeted (`_scan_pinned_entry` still passed a
+fetch-failed ticker through to `_scan_buy_signals` with no price override, so it fired at an ambient
+non-Schwab price on attempt 1 regardless of the retry) and that it was writing 3 biased
+`log_open_price_quality` rows per ticker per bar, inflating the `true_open_rate` metric
+`verify_open_price_quality.py` uses to gate paper→real promotion decisions. **Fixed same session**:
+`_scan_pinned_entry` now returns `(summaries, failed_tickers)`, excludes any fetch-failed ticker from
+that attempt's `_scan_buy_signals` call entirely (no ambient-price fallback possible), and the call site
+now re-reads `open_position_keys` fresh from the DB before every attempt and only retries tickers still
+in `failed_tickers` (a ticker that succeeds is permanently dropped from later attempts) — closing the
+duplicate-order race structurally, not just by luck of timing, and making `log_open_price_quality`
+exactly-once per ticker per bar regardless of how many attempts it took. A ticker that still fails all 3
+attempts now posts a Slack alert (previously a silent `log_poll` line only) instead of vanishing for
+the bar with no signal anyone could see.
+
+**Two independent review rounds** (an initial Opus pass that found the HIGH bug above, then a second
+verification pass split between Opus and Sonnet in parallel to compare detection — a live workflow test
+of `[[feedback_dual_model_review_comparison]]`) — **both models independently confirmed all 4 fixes
+genuinely close their targeted findings, no new bugs**. Opus additionally surfaced 3 LOW/INFO items
+Sonnet's pass didn't: a fetch-fail-3x-in-a-row ticker was silently skipped (fixed, Slack alert added,
+see above); the retry only covers per-ticker price-fetch failures, not a `_scan_pinned_entry`-level
+exception (by design — `_guarded` swallowing an exception there correctly disables the retry rather
+than looping blind); and `scripts/live_sanity_check.py` calls `schwab_client.place_order` directly,
+outside `check_order` and thus outside the new gate too — deliberate (manual, typed per-ticker
+confirmation tool), not a regression.
+
+**Deliberately not built same session** (raised in the original incident backlog item, still open, see
+`docs/backlog_cache.md`): a *deliberate* version of the same mechanism — feeding a real dated bar
+sequence to exercise real order-placement code on purpose (to force `gap_resize`/duplicate-order-guard/
+`kill_switch_block`, several of the coverage grid's `wired-never-fired` rows, to actually fire) —
+distinct from today's accidental case. Not started, a design conversation only.
+
+Full suite: 291 passed. `live_sim_harness.py`: 7/7. `signals_invariants.py`: clean.
+`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` (AGQ, SOXL): both clean.
+
 ## ✅ [live-trading][security] Resolved 2026-07-26 — real incident: daemon placed a real order on a non-trading day (Sunday) against stale cached data; phantom fill traced, cleaned up, and a ticket-model incident log built
 **What happened**: `active_signals.py`'s `open_check` window (9:31-9:40 ET) ran normally on Sunday
 2026-07-26 against the local price cache, which still held Friday 2026-07-24's last bar (nothing
@@ -17,8 +81,8 @@ against a fixed range. It has no `now.weekday()` (or market-holiday) check anywh
 identically `True` on a Sunday as on any weekday. `_previous_trading_day()` (used only by the 7am
 coverage report to pick which prior day to grade) is the one place this project *does* walk back over
 weekends — that capability was just never applied to the actual signal-scanning/order-placement gate.
-**This is still open** — see the "Open, elevated priority" entry in `docs/backlog_cache.md`; nothing
-in this session added a trading-day gate, only cleaned up its one real consequence.
+**Root cause since fixed** — see the entry directly above (same date, later in this session): a real
+NYSE trading-day gate now guards both daemon scan paths and `schwab_safety.check_order` itself.
 
 **Blast radius, confirmed by checking every account's real order history for the day**: contained to
 ERY alone. `ira` (holding the other 15 watchlist-65 nodes) is `dry_run=True` so nothing there ever

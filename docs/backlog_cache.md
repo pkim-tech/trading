@@ -1,27 +1,16 @@
 # Backlog Cache
 
-## [live-trading][security] Open, elevated priority, found 2026-07-26 — daemon has no trading-day/market-calendar gate; caused a real order placement on a Sunday
-Root cause of the ERY phantom-fill incident (see the resolved entry below and `docs/deep_backlog.md`'s
-2026-07-26 entry for full detail): `active_signals._in_window()` — the function every signal-window/
-open_check/reminder gate goes through — compares only `(now.hour, now.minute)`, no `now.weekday()` or
-market-holiday check anywhere. On 2026-07-26 (a Sunday), the 9:31-9:40 ET `open_check` window fired
-normally against stale Friday-cached data, placed a real BUY order for ERY in `soxl_ira` (real money),
-and a fill-detection path recorded a phantom fill without confirming against the broker. Contained to
-one ticker this time (confirmed by checking every account's real order history for the day) — every
-other affected node was `dry_run`/research and produced only noise (e.g. duplicate `pending_buys` rows
-for QQQ), not real orders. `_previous_trading_day()` (used only by the 7am coverage report) is the one
-place this project already reasons about weekdays — never applied to the actual scan/order-placement
-gate. **Action needed**: add a real trading-day gate (at minimum `now.weekday() >= 5` short-circuits
-the window checks in the main poll loop; ideally a small market-holiday calendar too) before the next
-weekend. **Separately raised same session, not yet scoped**: a *deliberate* version of this same
-mechanism — feeding a real dated bar sequence to exercise real order-placement code on purpose (e.g.
-to force `gap_resize`/duplicate-order-guard/`kill_switch_block`, several of the grid's 22
-`wired-never-fired` rows, to actually fire) — distinct from the accidental case above. Closest existing
-building block: `scripts/live_sim.py` (isolated `trading_sim.db` via `TRADING_DB_PATH`, drives the real
-`compute_buy_signal`/`check_sell_condition`/`notify_*` functions) — but it only swaps the DB, not
-`schwab_client`/`schwab_safety`, so a sim node pointed at a real `dry_run=False` account would place
-real orders; its safety today depends entirely on which account you point it at, not any built-in
-guard. Not started — a design conversation, not a go-ahead to build.
+## [live-trading][security] Resolved 2026-07-26 — NYSE trading-day gate built (`pandas_market_calendars`), guarding both daemon scan paths and `schwab_safety.check_order` itself; a retry added to the fix introduced and then closed its own HIGH duplicate-BUY bug, caught by review before reaching the daemon. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
+
+## [live-trading] Idea, raised 2026-07-26, not scoped — a *deliberate* version of the trading-day-gate incident: feed a real dated bar sequence to exercise real order-placement code on purpose
+Distinct from the accidental Sunday-order incident (now fixed, see the resolved entry above) — this is
+about intentionally forcing rarely-exercised order-placement branches (`gap_resize`/duplicate-order-
+guard/`kill_switch_block`, several of the coverage grid's `wired-never-fired` rows) to actually fire, on
+purpose, for real coverage. Closest existing building block: `scripts/live_sim.py` (isolated
+`trading_sim.db` via `TRADING_DB_PATH`, drives the real `compute_buy_signal`/`check_sell_condition`/
+`notify_*` functions) — but it only swaps the DB, not `schwab_client`/`schwab_safety`, so a sim node
+pointed at a real `dry_run=False` account would place real orders; its safety today depends entirely on
+which account you point it at, not any built-in guard. Not started — a design conversation only.
 
 ## [live-trading][security] Resolved 2026-07-26 — ERY phantom-fill incident cleaned up; new `trading_incidents` ticket log; every Slack alert now tags `(account · LIVE/DRY-RUN)`. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
 

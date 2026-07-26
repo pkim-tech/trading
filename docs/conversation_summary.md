@@ -4622,3 +4622,61 @@ violations — UDOW's was resolved a prior session). `docs/backlog_cache.md`/`do
 - `docs/backlog_cache.md`'s hygiene convention (shrink a resolved entry to a one-liner once its full
   detail lives in `deep_backlog.md`) had been silently drifting for weeks before this session's pass —
   worth checking again in a few sessions rather than assuming it'll self-correct.
+
+---
+
+## 2026-07-26 (later) — NYSE trading-day gate built and hardened; review round caught its own retry logic double-ordering before it shipped
+
+### What we did
+Picked up the top backlog item from the ERY Sunday phantom-fill incident (earlier same session):
+`active_signals._in_window()` had no weekday/holiday awareness at all. Installed
+`pandas_market_calendars` (real NYSE calendar, not just `weekday() >= 5`) and wired a new
+`_is_trading_day(date_str)` in at two layers: the daemon's `_in_window()` scan chokepoint, and
+`schwab_safety.check_order` itself — the real chokepoint every order-placement path (manual Slack
+buttons, gap-correction, automated pinned/ambient BUYs) routes through via `approve_and_record`.
+
+An Opus review of the first version found a second, independent BUY entry point that had been missed
+entirely: `_scan_pinned_entry` (fired from `_PINNED_BAR_TIMES` at 9:30/10:30/14:30/15:30, restricted to
+`AUTOMATION_ENABLED_TICKERS`) never routed through `_in_window` at all — plausibly the actual path the
+real Sunday ERY order took. Fixed by gating its call site the same way.
+
+Added a 3x/5s retry to `_scan_pinned_entry`'s call site to cover a transient Schwab price-fetch failure
+at exactly 9:30/14:30. A second Opus review round caught that this retry introduced a real HIGH-severity
+bug of its own: `open_position_keys` was a stale once-per-loop-iteration snapshot shared across all 3
+attempts, so the same-day-unlock branch in `_scan_buy_signals` (the buy→sell→buy-same-day allowance)
+could see a position that had just filled on attempt 1 as still `not already_held` on attempt 2 —
+placing a second real BUY order for the same signal. Same round also found the retry didn't even fix
+the failure it targeted (a fetch-failed ticker still fell through to an ambient non-Schwab price on
+attempt 1 regardless) and that it was writing 3 biased `log_open_price_quality` rows per ticker per bar,
+distorting the `true_open_rate` metric that gates paper→real promotion decisions.
+
+Fixed all three: `_scan_pinned_entry` now returns `(summaries, failed_tickers)` and excludes any
+fetch-failed ticker from that attempt's `_scan_buy_signals` call entirely; the call site re-reads
+`open_position_keys` fresh from the DB before every attempt and only retries tickers still in
+`failed_tickers` (a succeeding ticker is permanently dropped from later attempts) — closing the
+duplicate-order race structurally, and making the quality-log write exactly-once per ticker per bar.
+A ticker that still fails all 3 attempts now posts a Slack alert instead of vanishing silently.
+
+Verified the fix with a second review round split between Opus and Sonnet in parallel (first live test
+of a standing preference to compare detection between the two) — both independently confirmed all 4
+fixes close cleanly with no new bugs; Opus additionally caught 3 LOW/INFO items Sonnet's pass didn't
+(the silent-skip-on-triple-fetch-failure item above, now fixed; two others accepted as-is/by-design).
+
+Separately, added a small Morning Report addition per user request: an `Account | Mode | Tickers`
+summary block (`ira`/`soxl_ira` × RESEARCH/DRY-RUN/LIVE) at the top of `send_reference_report`, before
+the per-ticker detail — reviewed clean, no issues found in either round.
+
+### State
+- `docs/backlog_cache.md`'s elevated-priority trading-day-gate item is now resolved; the separately-
+  raised "deliberate simulate a trading day" idea (force `gap_resize`/`kill_switch_block`/etc. to fire
+  on purpose) is still open, unstarted, not scoped.
+- Full suite: 291 passed. `live_sim_harness.py`: 7/7. `signals_invariants.py`: clean.
+  `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` (AGQ, SOXL): both clean.
+- Manually confirmed `schwab_safety.check_order('soxl_ira', 'ERY', 2, 50.0, 'BUY')` now raises
+  `SafetyViolation` when `_now()` is patched to the real incident Sunday.
+- New dependency: `pandas_market_calendars` (added to `requirements.txt`).
+
+### Next
+- No specific next-session action queued — the fix closes the elevated-priority item cleanly. The
+  unstarted "deliberate trading-day simulation" idea (see backlog) is the natural adjacent follow-up
+  whenever coverage-grid gaps around `gap_resize`/duplicate-order-guard/`kill_switch_block` come up again.
