@@ -161,6 +161,22 @@ def test_reconcile_buy_fill_is_idempotent(env, monkeypatch):
     assert pos_after_second['shares'] == shares_after_first
 
 
+def test_reconcile_buy_fill_logs_coverage_event(env, monkeypatch):
+    _seed_pending_order(monkeypatch)
+    signals_notify._reconcile_buy_fill(TICKER, 51.0, 100)
+    events = signals_db.get_coverage_events(scenario_key="buy_fill_reconciled")
+    assert len(events) == 1
+    assert events[0]['result'] == "opened"
+    assert events[0]['ticker'] == TICKER
+    assert "shares=100" in events[0]['detail']
+
+    # A second reconcile for the same already-cleared fill must not log again --
+    # open_position returns falsy and the function returns early before the log call.
+    signals_notify._reconcile_buy_fill(TICKER, 51.0, 100)
+    events = signals_db.get_coverage_events(scenario_key="buy_fill_reconciled")
+    assert len(events) == 1
+
+
 def test_reconcile_fill_notifies_only_on_overspend(env, monkeypatch):
     _seed_pending_order(monkeypatch)
     posted = []

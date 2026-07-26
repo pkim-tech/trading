@@ -1,5 +1,32 @@
 # Backlog Cache
 
+## [live-trading][coverage] Resolved 2026-07-27 evening — widened the accountability grid from 32 to 39 rows, closing 5 real execution-logic gaps (not just guard logic)
+User reviewed the grid built earlier the same day and flagged it as guard-heavy and thin on "did the
+actual trade-flow step execute correctly." 2 rows added for free: `paper_entry_fill`/`paper_exit_fill`
+— `paper_trading.py` already logs `entry_fill`/`exit_fill` under `mode='paper'` (built 2026-07-18),
+it just never had a registry row surfacing it, despite paper trading being the *only* live validation
+for all 10 real v5 watchlist tickers today. 5 more needed real new `log_coverage_event` instrumentation,
+none of which existed before this session: `kill_switch_block` (does the kill switch actually block a
+real order when engaged — `schwab_safety.check_order`), `automated_sell_execution` (does
+`_attempt_automated_sell` actually place a real order, not just correctly guard/block —
+`signals_notify.py`), `time_exit_trigger` (does a real position's TIME-based exit fire the SELL alert
+— `notify_sell_signal`), `buy_fill_reconciled` (does a real detected fill open the position with
+correct shares/price, distinct from the existing node-identity-disambiguation row — `_reconcile_buy_fill`),
+`morning_report_delivery` (does the report actually post to Slack, not just get built — this exact
+report silently posted with zero rows for weeks once already, 2026-07-23, with nothing tracking
+delivery). 5 new regression tests (`test_schwab_safety.py`, `test_schwab_automation.py` x3,
+`test_part3_gap_resize.py`, new `test_reference_report_coverage.py`). Full suite: 257 passed (was
+250). `live_sim_harness.py`: 7/7. `signals_invariants.py`: 1 known accepted violation (UDOW),
+unchanged. **Session-wrap Opus review of the real diff (`schwab_safety.py`/`signals_notify.py`)
+found zero CONFIRMED bugs** — all 5 new log sites traced as genuinely non-load-bearing (kill-switch
+fail-closed intact, `_mode` scoping correct across every early return, no new None-format risk,
+`_post_message`'s `(channel, ts)` shape preserved on every path). One real nit found and fixed same
+session: `send_reference_report` was logging via `_coverage_mode(None)`, which always falls back to
+`"dry_run"` — this would have made `morning_report_delivery` permanently unable to render as
+verified-live even after a real successful post; changed to log `mode="live"` unconditionally since
+the report isn't scoped to any one account's dry_run flag. Full detail: `docs/live_test_coverage.md`'s
+2026-07-27 evening entry.
+
 ## [live-trading][coverage] Resolved 2026-07-27 — `coverage_deviations` rows are now permanent record ("ticket model"), never deleted
 Per user's explicit framing: an exception/deviation is an artifact of something that happened, like a
 Jira ticket — once created, it should never vanish, only ever be explained. `clear_deviation_if_resolved`

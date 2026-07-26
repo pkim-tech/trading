@@ -82,6 +82,7 @@ def _attempt_automated_sell(pos, current_price):
     if not schwab_safety.node_automation_enabled(pos.get('wl_id')):
         return False
     account = pos.get('account')
+    _mode = _coverage_mode(account)
     shares = pos.get('shares')
     trail_sell_pct = pos.get('trail_sell_pct')
     if not shares or not trail_sell_pct:
@@ -91,6 +92,8 @@ def _attempt_automated_sell(pos, current_price):
         try:
             _, cancel_status = schwab_client.cancel_order(account, ticker, sl_order_id)
         except Exception as e:
+            db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
+                                   node_id=pos.get('wl_id'), result="cancel_failed", detail=str(e))
             _post_message(f"⚠️ {ticker} failed to cancel resting stop-loss {sl_order_id} before "
                           f"arming trailing-sell: {e} — falling back to manual")
             return False
@@ -100,6 +103,8 @@ def _attempt_automated_sell(pos, current_price):
             # already sold and a new sell here would be a real oversell attempt;
             # if unconfirmed, we can't tell either way. Fail safe: fall back to
             # manual instead of guessing (found via Opus review, 2026-07-24).
+            db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
+                                   node_id=pos.get('wl_id'), result="cancel_unconfirmed", detail=repr(cancel_status))
             _post_message(
                 f"⚠️ {ticker} stop-loss {sl_order_id} cancel not confirmed CANCELED "
                 f"(real status: {cancel_status!r}) — refusing to place a new trailing-sell "
@@ -115,6 +120,10 @@ def _attempt_automated_sell(pos, current_price):
         # so surface the SL price the user would need to manually re-enter at
         # the broker rather than leaving them to recompute it (found via
         # Opus review, 2026-07-22).
+        db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'),
+                               result="blocked" if isinstance(e, schwab_safety.SafetyViolation) else "failed_unexpectedly",
+                               detail=str(e))
         if sl_order_id:
             sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos.get('stop_loss')
             sl_price = pos['signal_price'] * (1 - sl_pct / 100) if sl_pct else None
@@ -126,6 +135,9 @@ def _attempt_automated_sell(pos, current_price):
         elif not isinstance(e, schwab_safety.SafetyViolation):
             _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual")
         return False
+    db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
+                           node_id=pos.get('wl_id'), result="placed",
+                           detail=f"shares={shares} trail_sell_pct={trail_sell_pct}")
     return True
 
 
@@ -680,6 +692,11 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     entry_time = pos['entry_time']
     pct        = (current_price - ep) / ep * 100
 
+    if reason == 'TIME':
+        db.log_coverage_event("time_exit_trigger", _coverage_mode(pos.get('account')), ticker=ticker,
+                               position_id=pos.get('id'), node_id=pos.get('wl_id'), result="alert_fired",
+                               detail=f"target={target_price:.4f}")
+
     reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT', 'TRAIL': 'TRAILING STOP'}
 
     sep = '=' * 62
@@ -1212,6 +1229,9 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
     if not opened:
         return
     drift_pct = (fill_price - signal_price) / signal_price * 100
+    db.log_coverage_event("buy_fill_reconciled", _coverage_mode(node.get('account')), ticker=ticker,
+                           node_id=node['id'], result="opened",
+                           detail=f"shares={filled_shares:g} price={fill_price:.4f} drift={drift_pct:+.2f}%")
     _post_message(f"🤖 {ticker} — auto-detected fill at ${fill_price:.4f}  "
                   f"(drift: {drift_pct:+.2f}%)  {filled_shares:g} shares")
     _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=is_gap_correction)
@@ -1888,4 +1908,12 @@ def send_reference_report(watchlist):
             emoji = _proximity_emoji(r['Proximity'])
             print(f"  {emoji} {r['Ticker']:<6} {r['Version']}  now=${r['Now']:>7.2f}  trigger=${r['Next Trigger $']:>7.2f}  ({r['Proximity']:+.1f}%)  z={r['Z']:>+5.2f}  [{r['Strategy']}]")
 
-    return _post_message(f"Morning Report — {now_str}", blocks=blocks)
+    channel, ts = _post_message(f"Morning Report — {now_str}", blocks=blocks)
+    # "live" unconditionally, not _coverage_mode(account) -- this report isn't
+    # scoped to any one account's dry_run flag, and _coverage_mode(None) always
+    # falls back to "dry_run", which would make this scenario permanently
+    # unable to render as verified-live even after a real successful post
+    # (found by Opus review, 2026-07-27).
+    db.log_coverage_event("morning_report_delivery", "live", result="sent" if (channel and ts) else "no_delivery_confirmation",
+                           detail=f"held={len(held_rows)} candidates={len(flat_rows)}")
+    return channel, ts

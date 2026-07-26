@@ -484,6 +484,16 @@ def test_kill_switch_blocks_everything(env, monkeypatch):
         schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
 
 
+def test_kill_switch_block_logs_coverage_event(env, monkeypatch):
+    monkeypatch.setenv('SCHWAB_KILL_SWITCH', '1')
+    with pytest.raises(schwab_safety.SafetyViolation):
+        schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    events = signals_db.get_coverage_events(scenario_key="kill_switch_block")
+    assert len(events) == 1
+    assert events[0]['result'] == "blocked"
+    assert events[0]['ticker'] == TICKER
+
+
 def test_kill_switch_persists_across_calls(env):
     assert schwab_safety.kill_switch_engaged() is False
     schwab_safety.engage_kill_switch(reason="test stop")

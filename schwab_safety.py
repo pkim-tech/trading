@@ -532,6 +532,10 @@ def check_order(
     case and for is_protective's other callers, not removed to avoid
     unnecessarily changing call sites.)"""
     if kill_switch_engaged():
+        _limits = ACCOUNTS.get(account)
+        _mode = "live" if (_limits and not _limits.dry_run) else "dry_run"
+        signals_db.log_coverage_event("kill_switch_block", _mode, ticker=ticker, result="blocked",
+                                       detail=kill_switch_reason())
         raise SafetyViolation(f"global kill switch engaged ({kill_switch_reason()})")
 
     limits = ACCOUNTS.get(account)

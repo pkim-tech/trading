@@ -254,6 +254,76 @@ REGISTRY = [
          notes="Opus review found _scan_pinned_exit_arm initially missed the skip guard -- fixed, "
                "regression-tested. NOTE: exit_fill is also logged by paper_trading.py under mode='paper' "
                "-- mode_filter isolates this row's own dry_run path."),
+    # --- Added 2026-07-27 evening: execution-logic gaps, not just guard logic ---
+    # (raised directly by the user reviewing this grid -- the registry was
+    # guard-heavy and thin on "did the actual trade-flow step execute
+    # correctly." First 2 rows needed no new instrumentation -- paper_trading.py
+    # already logs entry_fill/exit_fill under mode='paper', just never got a
+    # registry row surfacing it. The other 5 needed a real log_coverage_event
+    # call added at a previously-uninstrumented site.)
+    dict(id='paper_entry_fill',
+         scenario="Paper-trading bounce-fill/market-fill simulation opens a position",
+         code_path="paper_trading.start_paper_market_buy, paper_trading.update_paper_buys",
+         offline_coverage="Exercised implicitly by any paper-mode ticker running live; no dedicated unit test",
+         check_mechanism='coverage_events', scenario_key='entry_fill', mode_filter='paper',
+         notes="Already instrumented (2026-07-18 build) -- just never had a REGISTRY row. This is the "
+               "only live validation for all 10 real v5 watchlist tickers today (mode='research')."),
+    dict(id='paper_exit_fill',
+         scenario="Paper-trading simulated position closes on a real exit signal (SL/TP/TIME/TRAIL)",
+         code_path="paper_trading.check_paper_sells",
+         offline_coverage="Exercised implicitly by any paper-mode ticker running live; no dedicated unit test",
+         check_mechanism='coverage_events', scenario_key='exit_fill', mode_filter='paper',
+         notes="Already instrumented (2026-07-18 build) -- just never had a REGISTRY row."),
+    dict(id='kill_switch_block',
+         scenario="Global kill switch actually blocks a real order attempt when engaged",
+         code_path="schwab_safety.check_order (top of function, before account/limits resolved)",
+         offline_coverage="No dedicated unit test found for this exact branch",
+         check_mechanism='coverage_events', scenario_key='kill_switch_block',
+         notes="New instrumentation, 2026-07-27 evening. 'blocked' is the correct/good outcome for this "
+               "guard (no bad_results)."),
+    dict(id='automated_sell_execution',
+         scenario="Automated trailing-sell actually places a real broker order (not just correctly "
+                  "blocked/deferred)",
+         code_path="signals_notify._attempt_automated_sell",
+         offline_coverage="test_schwab_automation.py exercises the function; no assertion on the new "
+                           "coverage event yet",
+         check_mechanism='coverage_events', scenario_key='automated_sell_execution',
+         bad_results=['cancel_failed', 'cancel_unconfirmed', 'failed_unexpectedly'],
+         notes="New instrumentation, 2026-07-27 evening -- previously zero coverage_events hook existed "
+               "for whether this function's real order placement (as opposed to its guard logic) ever "
+               "succeeds. 'blocked' (a SafetyViolation) is left out of bad_results deliberately -- it's "
+               "the correct outcome when a real guard fires, not a failure of this scenario."),
+    dict(id='time_exit_trigger',
+         scenario="A real (non-paper/dry_run-sim) position's TIME-based exit (max_hold_hours) fires "
+                  "the SELL alert",
+         code_path="signals_notify.notify_sell_signal (reason=='TIME' branch)",
+         offline_coverage="signals_compute.check_sell_condition has kernel-parity coverage via "
+                           "kernel_fill_parity; the live alert-firing side was untested",
+         check_mechanism='coverage_events', scenario_key='time_exit_trigger',
+         notes="New instrumentation, 2026-07-27 evening. Only fires the alert -- doesn't confirm the "
+               "position actually gets closed (that's a manual Slack-button step for a real position, "
+               "same gap as manual_buy_confirmation_account)."),
+    dict(id='buy_fill_reconciled',
+         scenario="A real detected BUY fill opens the position with the correct shares/price (not just "
+                  "the correct node identity)",
+         code_path="signals_notify._reconcile_buy_fill (after db.open_position succeeds)",
+         offline_coverage="test_part3_gap_resize.py exercises the function; no assertion on the new "
+                           "coverage event yet",
+         check_mechanism='coverage_events', scenario_key='buy_fill_reconciled',
+         notes="New instrumentation, 2026-07-27 evening -- distinct from buy_fill_reconciles_correct_node "
+               "above, which is about resolving the right node when 2+ are pending, not the fill math "
+               "itself."),
+    dict(id='morning_report_delivery',
+         scenario="The Morning Report actually posts to Slack (not just gets built)",
+         code_path="signals_notify.send_reference_report (via _post_message's channel/ts return)",
+         offline_coverage="No dedicated unit test found for this exact branch",
+         check_mechanism='coverage_events', scenario_key='morning_report_delivery',
+         bad_results=['no_delivery_confirmation'],
+         notes="New instrumentation, 2026-07-27 evening -- the report silently posted with zero candidate "
+               "rows for weeks (fixed 2026-07-23) with nothing tracking delivery itself; this closes that "
+               "class of gap going forward. 'no_delivery_confirmation' covers both a real send failure and "
+               "any non-Socket-Mode delivery path (webhook/console) that can't confirm delivery -- "
+               "deliberately not counted as proof of success."),
 ]
 
 

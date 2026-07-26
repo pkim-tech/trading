@@ -4196,3 +4196,52 @@ page confirmed rendering (200) with the corrected grid.
   gap the grid now makes visible; picking these off (starting with the never-fired safety guards
   like `same_day_block`, the `dup_order_*` guards, `gap_resize`) is the real next-session work, not
   further grid tooling.
+
+---
+
+## 2026-07-27 evening — Widened the Trade-Flow Accountability Grid from 32 to 39 rows, closing 5 real execution-logic gaps (not just guard logic)
+
+### What we did
+User reviewed the accountability grid built earlier the same day and pushed back: it was
+guard-heavy and thin on "did the actual trade-flow step execute correctly," and asked for real
+scenarios plus real instrumentation, not just descriptive rows.
+
+Found 2 rows that needed no new code: `paper_entry_fill`/`paper_exit_fill` — `paper_trading.py`
+already logs `entry_fill`/`exit_fill` under `mode='paper'` (built 2026-07-18), it simply never had
+a registry row surfacing it, despite paper trading being the only live validation for all 10 real
+v5 watchlist tickers today.
+
+Added real new `log_coverage_event` instrumentation at 5 previously-uninstrumented sites:
+- `kill_switch_block` — `schwab_safety.check_order`, does the kill switch actually block a real
+  order when engaged.
+- `automated_sell_execution` — `signals_notify._attempt_automated_sell`, does the function actually
+  place a real order (not just correctly guard/block).
+- `time_exit_trigger` — `signals_notify.notify_sell_signal`, does a real position's TIME-based exit
+  fire the SELL alert.
+- `buy_fill_reconciled` — `signals_notify._reconcile_buy_fill`, does a real detected fill open the
+  position with correct shares/price (distinct from the existing node-identity-disambiguation row).
+- `morning_report_delivery` — `signals_notify.send_reference_report`, does the report actually post
+  to Slack, not just get built (this exact report silently posted with zero rows for weeks once
+  already, 2026-07-23, with nothing tracking delivery).
+
+5 new regression tests: `test_schwab_safety.py` (kill switch), `test_schwab_automation.py` x3
+(automated sell, TIME exit x2), `test_part3_gap_resize.py` (buy-fill reconciliation), and a new
+`tests/test_reference_report_coverage.py` (Morning Report delivery).
+
+**Session-wrap Opus review** (required — `schwab_safety.py`/`signals_notify.py` changed) traced
+every new log site through its callers and found zero CONFIRMED bugs — all 5 are genuinely
+side-channel and cannot alter real control flow (kill-switch fail-closed intact, `_attempt_
+automated_sell`'s `_mode` scoping correct across every early return, no new None-format risk that
+didn't already exist, `_post_message`'s `(channel, ts)` shape preserved on every path). One real
+nit found and fixed same session: `send_reference_report` logged via `_coverage_mode(None)`, which
+always falls back to `"dry_run"` — this would have permanently prevented `morning_report_delivery`
+from ever rendering as verified-live even after a real successful post. Changed to log `mode="live"`
+unconditionally, since the report isn't scoped to any one account's dry_run flag.
+
+### Docs updated
+- `docs/live_test_coverage.md`: 2026-07-27 evening pointer note (32→39 rows, what was added, why).
+- `docs/backlog_cache.md`: resolved entry at top, including the review outcome and the one fix.
+
+### Verification
+Full suite: 257 passed (was 250 at session start). `scripts/live_sim_harness.py`: 7/7.
+`signals_invariants.py`: 1 known accepted violation (UDOW), unchanged.

@@ -117,6 +117,22 @@ def test_automated_sell_placed_and_marks_order_placed(env):
     assert updated['trail_state'].get('order_placed') is True
 
 
+def test_automated_sell_placed_logs_coverage_event(env):
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    signals_notify.notify_trailing_activated(pos, current_price=52.0)
+    events = signals_db.get_coverage_events(scenario_key="automated_sell_execution")
+    assert len(events) == 1
+    assert events[0]['result'] == "placed"
+    assert events[0]['ticker'] == TICKER
+
+
 def test_automated_sell_falls_back_outside_scope(env, monkeypatch):
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', set())
     node = _node()
@@ -208,6 +224,36 @@ def test_automated_sell_notifies_sl_price_when_trailing_sell_fails_after_sl_canc
     # pos['fixed_sl'] (config.json's fixed_stop_loss), not node['stop_loss'].
     expected_sl_price = 50.0 * (1 - pos['fixed_sl'] / 100)
     assert f"${expected_sl_price:.2f}" in unprotected_msgs[0]
+
+
+def test_notify_sell_signal_time_exit_logs_coverage_event(env):
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    signals_notify.notify_sell_signal(pos, 'TIME', current_price=51.0, target_price=51.0)
+    events = signals_db.get_coverage_events(scenario_key="time_exit_trigger")
+    assert len(events) == 1
+    assert events[0]['result'] == "alert_fired"
+    assert events[0]['ticker'] == TICKER
+
+
+def test_notify_sell_signal_non_time_reason_does_not_log_time_exit_event(env):
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    signals_notify.notify_sell_signal(pos, 'SL', current_price=48.0, target_price=48.0)
+    events = signals_db.get_coverage_events(scenario_key="time_exit_trigger")
+    assert len(events) == 0
 
 
 def test_automated_sell_falls_back_when_no_matching_node(env):

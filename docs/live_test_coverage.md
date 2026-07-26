@@ -44,6 +44,19 @@ narrative reference, but don't trust its `Status` column over the grid's live co
 Raised same session, not yet built: filters, direct links to the underlying tests, and row
 grouping by feature area (see `docs/backlog_cache.md`).
 
+**2026-07-27 evening: grid widened from 32 to 39 rows** after the user flagged it was guard-heavy
+and thin on execution logic. 2 rows (`paper_entry_fill`/`paper_exit_fill`) needed no new
+instrumentation — `paper_trading.py` already logs `entry_fill`/`exit_fill` under `mode='paper'`,
+they'd simply never gotten a registry row. 5 more needed a real `log_coverage_event` call added at
+a previously-uninstrumented site: `kill_switch_block` (`schwab_safety.check_order`),
+`automated_sell_execution` (`signals_notify._attempt_automated_sell`), `time_exit_trigger`
+(`signals_notify.notify_sell_signal`, `reason=='TIME'` branch), `buy_fill_reconciled`
+(`signals_notify._reconcile_buy_fill`, the fill/sizing math itself, distinct from the existing
+node-identity-disambiguation row), and `morning_report_delivery` (`signals_notify.
+send_reference_report`, whether the report actually posts, not just gets built — this broke
+silently for weeks once already, 2026-07-23, with nothing tracking delivery). 5 new regression
+tests added, full suite 257 passed (was 250), harness 7/7.
+
 **2026-07-25: reconciled against real `coverage_matrix.py` output** (in prep for the Monday
 2026-07-27 unattended `soxl_ira` window) — several rows below were stale ("Not started" despite a
 real event already existing). 6 rows updated with real evidence: SL-sync placement and top-up both
