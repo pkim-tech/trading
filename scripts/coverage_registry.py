@@ -453,6 +453,92 @@ STATUS_ORDER = {
     'paper-only': 2, 'dry_run-only': 3, 'offline-only': 4, 'verified-live': 5,
 }
 
+MODES = ('paper', 'dry_run', 'live')
+
+
+def compute_mode_statuses(row):
+    """Returns {mode: (status_key, detail)} for mode in ('paper','dry_run','live')
+    -- the per-mode breakdown compute_status() deliberately collapses into one
+    overall status (priority live > dry_run > paper), which hides real gaps: a
+    scenario with genuine live events but zero paper/dry_run ones reads as fully
+    green with no way to eyeball which modes actually have evidence (raised by
+    the user, 2026-07-26). status_key is one of: 'not-applicable' (mechanism has
+    no per-mode meaning, or this REGISTRY row's mode_filter excludes this mode by
+    design), 'wired-never-fired', 'deviation-unexplained', 'attempt-failed',
+    'verified'."""
+    mech = row['check_mechanism']
+
+    if mech in ('none', 'offline_only'):
+        label = 'not-instrumented' if mech == 'none' else 'offline-only'
+        return {m: (label, '') for m in MODES}
+
+    if mech == 'open_price_quality_log':
+        # Not mode-scoped at all (the log table has no mode column) -- mirror
+        # the one overall result across all three columns rather than guessing
+        # a split that doesn't exist in the data.
+        status, detail = compute_status(row)
+        return {m: (status, detail) for m in MODES}
+
+    if mech == 'scenario_expectations':
+        result = {}
+        with db._conn() as c:
+            for m in MODES:
+                unexplained = c.execute(
+                    "SELECT COUNT(*) n, MAX(ts) last_ts FROM coverage_deviations "
+                    "WHERE scenario_key = ? AND mode = ? AND reason IS NULL",
+                    (row['scenario_key'], m)).fetchone()
+                if unexplained['n'] > 0:
+                    result[m] = ('deviation-unexplained',
+                                 f"{unexplained['n']}x unexplained, last {unexplained['last_ts']}")
+                    continue
+                system_resolved = c.execute(
+                    "SELECT COUNT(*) n, MAX(ts) last_ts FROM coverage_deviations "
+                    "WHERE scenario_key = ? AND mode = ? AND reason_by = 'system'",
+                    (row['scenario_key'], m)).fetchone()
+                if system_resolved['n'] > 0:
+                    result[m] = ('verified',
+                                 f"{system_resolved['n']}x auto-resolved, last {system_resolved['last_ts']}")
+                    continue
+                any_row = c.execute(
+                    "SELECT COUNT(*) n FROM coverage_deviations WHERE scenario_key = ? AND mode = ?",
+                    (row['scenario_key'], m)).fetchone()
+                result[m] = ('wired-never-fired',
+                             "Only human-explained deviation(s), doesn't prove current correctness."
+                             if any_row['n'] > 0 else "No deviation history for this mode.")
+        return result
+
+    # mech == 'coverage_events'
+    mode_filter = row.get('mode_filter')
+    bad_results = set(row.get('bad_results', []))
+    with db._conn() as c:
+        rows = c.execute(
+            "SELECT mode, result, COUNT(*) n, MAX(ts) last_ts FROM coverage_events "
+            "WHERE scenario_key = ? GROUP BY mode, result", (row['scenario_key'],)
+        ).fetchall()
+    by_mode = {}
+    for r in rows:
+        m = by_mode.setdefault(r['mode'], {'n': 0, 'last_ts': None, 'good_n': 0})
+        m['n'] += r['n']
+        m['last_ts'] = max(filter(None, [m['last_ts'], r['last_ts']]), default=None)
+        if r['result'] not in bad_results:
+            m['good_n'] += r['n']
+
+    result = {}
+    for m in MODES:
+        if mode_filter and m != mode_filter:
+            result[m] = ('not-applicable', "This scenario is scoped to a different mode by design.")
+            continue
+        if m not in by_mode:
+            result[m] = ('wired-never-fired', 'No real event logged for this mode.')
+            continue
+        info = by_mode[m]
+        if info['good_n'] > 0:
+            result[m] = ('verified', f"{info['n']}x, last {info['last_ts']}")
+        else:
+            result[m] = ('attempt-failed',
+                          f"{info['n']}x, all bad_results ({bad_results}), last {info['last_ts']}")
+    return result
+
 if __name__ == '__main__':
     rows = []
     for r in REGISTRY:

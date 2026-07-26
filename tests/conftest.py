@@ -21,7 +21,7 @@ def _no_real_slack_posts(monkeypatch):
     signals_blocks import _post_message` (a direct name import), so each
     holds its own reference -- patching signals_blocks._post_message alone
     does not affect any of them; each must be patched individually."""
-    noop = lambda text, blocks=None: (None, None)
+    noop = lambda text, blocks=None, thread_ts=None, reply_broadcast=False: (None, None)
     import signals_blocks
     monkeypatch.setattr(signals_blocks, '_post_message', noop)
     for modname in (

@@ -9,7 +9,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.coverage_check import CHECKERS  # pure dict of checker functions, no side effects/Slack config
-from scripts.coverage_registry import REGISTRY, compute_status, STATUS_ORDER
+from scripts.coverage_registry import REGISTRY, compute_status, compute_mode_statuses, STATUS_ORDER, MODES as GRID_MODES
 
 DB_PATH = "./cache/live/trading_live.db"
 MODES = ["paper", "dry_run", "live", "unattributed"]
@@ -36,10 +36,45 @@ STATUS_COLOR = {
     STATUS_LABEL['verified-live']:           '#c9e8c4',
 }
 
+# Per-mode-cell emoji/color -- keyed by compute_mode_statuses()'s raw status_key
+# (distinct from STATUS_LABEL above, which is keyed by compute_status()'s overall
+# label string). 'not-applicable' (this REGISTRY row's mode_filter excludes the
+# mode, or the mechanism isn't mode-scoped at all) is deliberately a light neutral
+# color, not red -- it isn't a gap, it's "doesn't apply here by design."
+MODE_EMOJI = {
+    'verified': '🟩', 'verified-live': '🟩',
+    'attempt-failed': '🟥', 'deviation-unexplained': '🟥',
+    'wired-never-fired': '⬜',
+    'not-applicable': '▪️',
+    'not-instrumented': '⬛', 'offline-only': '⬛',
+}
+MODE_CELL_COLOR = {
+    'verified': '#c9e8c4', 'verified-live': '#c9e8c4',
+    'attempt-failed': '#f5b7b1', 'deviation-unexplained': '#e6736e',
+    'wired-never-fired': '#f5b7b1',
+    'not-applicable': '#f0f0f0',
+    'not-instrumented': '#e2e2e2', 'offline-only': '#cfcfcf',
+}
+MODE_COL_LABEL = {'paper': 'Paper', 'dry_run': 'Dry-run', 'live': 'Live'}
 
-def _heat_row(row):
-    color = STATUS_COLOR.get(row['Status'], '')
-    return [f'background-color: {color}; color: #111'] * len(row)
+
+def _heat_row_and_mode_cells(row):
+    """Row-wide color from the overall Status for every column except the 3
+    per-mode columns, which get their own independent color from that row's
+    real per-mode evidence -- a row can be overall 'verified-live' while still
+    showing e.g. Paper as never-fired, which a single whole-row color would hide."""
+    idx = row.name
+    mode_info = grid_mode_status[idx]
+    overall_color = STATUS_COLOR.get(row['Status'], '')
+    styles = []
+    for col in row.index:
+        if col in MODE_COL_LABEL.values():
+            mode = [k for k, v in MODE_COL_LABEL.items() if v == col][0]
+            status_key = mode_info[mode][0]
+            styles.append(f'background-color: {MODE_CELL_COLOR.get(status_key, "")}; color: #111')
+        else:
+            styles.append(f'background-color: {overall_color}; color: #111')
+    return styles
 
 st.set_page_config(page_title="Coverage", layout="wide")
 st.title("Coverage Compass")
@@ -52,21 +87,30 @@ st.caption(
 @st.cache_data(ttl=30)
 def load_accountability_grid():
     rows = []
+    mode_status_by_row = []
     for r in REGISTRY:
         status, detail = compute_status(r)
+        mode_statuses = compute_mode_statuses(r)
+        mode_status_by_row.append(mode_statuses)
+        compact = " ".join(f"{m[0].upper()}{MODE_EMOJI.get(mode_statuses[m][0], '?')}" for m in GRID_MODES)
         rows.append({
             "_order": STATUS_ORDER[status],
             "Status": STATUS_LABEL[status],
+            "P/D/L": compact,
             "Scenario": r['scenario'],
+            "Paper": f"{MODE_EMOJI.get(mode_statuses['paper'][0], '?')} {mode_statuses['paper'][1]}".strip(),
+            "Dry-run": f"{MODE_EMOJI.get(mode_statuses['dry_run'][0], '?')} {mode_statuses['dry_run'][1]}".strip(),
+            "Live": f"{MODE_EMOJI.get(mode_statuses['live'][0], '?')} {mode_statuses['live'][1]}".strip(),
             "Code path": r['code_path'],
             "Offline coverage": r['offline_coverage'],
-            "Live evidence": detail,
             "Notes": r['notes'],
         })
-    rows.sort(key=lambda r: r["_order"])
+    order = sorted(range(len(rows)), key=lambda i: rows[i]["_order"])
+    rows = [rows[i] for i in order]
+    mode_status_by_row = [mode_status_by_row[i] for i in order]
     for r in rows:
         del r["_order"]
-    return rows
+    return rows, mode_status_by_row
 
 
 # --- Section 0: trade-flow test accountability grid ---
@@ -74,17 +118,18 @@ st.header("Trade-Flow Test Accountability Grid")
 st.caption(
     "Every real logic branch that needs to be proven correct in paper/dry_run/live, computed live "
     "from coverage_events/coverage_deviations -- never hand-typed, so it can't silently go stale. "
-    "Worst-status-first: Not instrumented / Wired-never-fired are the real gaps."
+    "Worst-status-first: Not instrumented / Wired-never-fired are the real gaps. Paper/Dry-run/Live "
+    "columns are colored independently per cell -- 'P/D/L' is the same thing compressed to one glance."
 )
-grid_rows = load_accountability_grid()
+grid_rows, grid_mode_status = load_accountability_grid()
 grid_counts = defaultdict(int)
 for r in grid_rows:
     grid_counts[r["Status"]] += 1
 st.write(" &nbsp;&nbsp; ".join(f"{k}: **{v}**" for k, v in
          sorted(grid_counts.items(), key=lambda kv: STATUS_ORDER[
              [s for s, lbl in STATUS_LABEL.items() if lbl == kv[0]][0]])))
-grid_df = pd.DataFrame(grid_rows)
-st.dataframe(grid_df.style.apply(_heat_row, axis=1), hide_index=True,
+grid_df = pd.DataFrame(grid_rows).reset_index(drop=True)
+st.dataframe(grid_df.style.apply(_heat_row_and_mode_cells, axis=1), hide_index=True,
              height=35 * (len(grid_rows) + 1) + 10)
 
 st.divider()

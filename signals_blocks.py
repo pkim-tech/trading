@@ -10,7 +10,7 @@ import signals_db as db
 from signals_helpers import _add_trading_hours, _last_sale_recovery, buy_order_sizing
 
 
-def _post_message(text, blocks=None):
+def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False):
     """Returns (channel, ts) when posted via the Socket Mode client (None, None
     otherwise) so callers can track a message for later reminder/supersede."""
     if cfg.SIM_MODE:
@@ -29,7 +29,10 @@ def _post_message(text, blocks=None):
     channel, ts, error = None, None, None
     if cfg.SOCKET_MODE:
         try:
-            resp = cfg.bolt_app.client.chat_postMessage(channel=cfg.SLACK_CHANNEL, text=text, blocks=blocks)
+            kwargs = {'thread_ts': thread_ts} if thread_ts else {}
+            if thread_ts and reply_broadcast:
+                kwargs['reply_broadcast'] = True
+            resp = cfg.bolt_app.client.chat_postMessage(channel=cfg.SLACK_CHANNEL, text=text, blocks=blocks, **kwargs)
             channel, ts = resp['channel'], resp['ts']
         except Exception as e:
             error = str(e)
@@ -38,6 +41,10 @@ def _post_message(text, blocks=None):
         payload = {'text': text}
         if blocks:
             payload['blocks'] = blocks
+        if thread_ts:
+            payload['thread_ts'] = thread_ts
+            if reply_broadcast:
+                payload['reply_broadcast'] = True
         try:
             r = requests.post(cfg.SLACK_HOOK, json=payload, timeout=5)
             if not r.ok:
@@ -50,6 +57,42 @@ def _post_message(text, blocks=None):
     # -- see log_slack_message's docstring for why this ordering matters.
     db.log_slack_message(log_mode, text, error=error)
     return channel, ts
+
+
+_SLACK_MAX_BLOCKS = 50
+
+
+def _post_chunked(text, fixed_blocks, units, max_blocks=_SLACK_MAX_BLOCKS):
+    """Posts a message built from a growing, unbounded list of per-row block
+    groups (`units`, each an atomic list of 1+ blocks that must stay together)
+    without ever risking Slack's hard 50-block-per-message limit -- the watchlist
+    has already broken a fixed per-row block-count budget twice (2026-07-22,
+    2026-07-29) as it grew, so this chunks instead of re-shrinking again.
+    `fixed_blocks` (header/controls) ride in the first chunk only. Overflow
+    chunks post as thread replies to the first message, broadcast to the
+    channel (`reply_broadcast`) so a reader still gets a mobile notification
+    for the overflow content, not just the first chunk (2026-07-26, Opus
+    review flagged silent-overflow as a mobile-readability regression).
+    Returns (channel, ts) of the first message -- ts comes back None if ANY
+    chunk (including the first) failed to confirm delivery, so a caller
+    checking `channel and ts` can't mistake a partial post for a full one
+    (2026-07-26, Opus review: a chunk-2+ failure was previously invisible to
+    the morning_report_delivery coverage event)."""
+    chunks, current = [], list(fixed_blocks)
+    for unit in units:
+        if current and len(current) + len(unit) > max_blocks:
+            chunks.append(current)
+            current = []
+        current.extend(unit)
+    if current or not chunks:
+        chunks.append(current)
+
+    channel, ts = _post_message(text, blocks=chunks[0])
+    all_delivered = bool(channel and ts)
+    for chunk in chunks[1:]:
+        _, chunk_ts = _post_message(f"{text} (cont.)", blocks=chunk, thread_ts=ts, reply_broadcast=True)
+        all_delivered = all_delivered and bool(chunk_ts)
+    return channel, (ts if all_delivered else None)
 
 
 def _fields_block(fields: dict):

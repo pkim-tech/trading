@@ -4440,3 +4440,56 @@ rows for UDOW post-cleanup.
 - `dry_run_buy_synthesis`/`dry_run_sim_close` still show zero real firings ever — worth watching
   once the daemon restarts and a dry_run node gets a real BUY signal.
 - Daemon is still down as of end of session.
+
+---
+
+## 2026-07-26 — Morning Report chunking fix (50-block limit again); Accountability Grid now shows Paper/Dry-run/Live independently
+
+### What we did
+Started the daemon back up (confirmed picked up all live-trading-source edits since last
+restart), then hit a real recurrence: the Morning Report's `invalid_blocks` 50-block Slack
+limit, first fixed 2026-07-22 by shrinking per-row block count, broke again now that the
+watchlist has grown to 25 nodes. Rather than shrinking again (a fix with an expiration date),
+built `signals_blocks._post_chunked` — greedily packs per-row block groups into <=50-block
+chunks, posts overflow as broadcast Slack thread replies (new `thread_ts`/`reply_broadcast`
+params on `_post_message`) so the report reads as one thing and still triggers mobile
+notifications. `send_reference_report` and `_send_window_alert` (the 10:25/15:25 ET signal-window
+alert, which had the identical bug, unconverted) both now use it.
+
+Session-wrap Opus review of the diff found 4 real issues, all fixed: a chunk-2+ post failure was
+invisible to the `morning_report_delivery` coverage event (now correctly reads as partial, not
+"sent"); `_send_window_alert` was never converted (same bug, arguably more load-bearing, no daily
+backstop); overflow chunks were mobile-notification-silent (fixed via `reply_broadcast`); and the
+original tests only proved the chunker's synthetic-block logic, not that real `_ticker_block`
+output actually chunks at scale (added an integration test with 60 synthetic rows through the
+real path).
+
+Separately, cleaned up 5 real `coverage_events` rows my own test-script invocations had written
+into the live `trading_live.db` (not real daemon/button-triggered events) — same pollution class
+as the 2026-07-25 pytest incident. Backed up the DB first; confirmed with the user this was raw
+event-log cleanup, not the sticky `coverage_deviations` ticket model (never delete those).
+
+Then redesigned the Trade-Flow Accountability Grid: `compute_status()` picks one overall status
+per scenario (live > dry_run > paper priority), which hid real gaps — a scenario verified live
+with zero paper evidence read as fully green. New `compute_mode_statuses()` computes each mode
+independently (respecting `mode_filter`-scoped rows as `not-applicable` rather than a false gap).
+`pages/14_Coverage.py` gained 3 new independently-colored Paper/Dry-run/Live columns plus a
+compact `P/D/L` glance column, alongside the existing whole-row `Status` column. Confirmed live:
+`dry_run_buy_synthesis` now shows real dry_run evidence (2 events) — closes the "never fired"
+gap flagged at the start of this session. Also found and fixed: the running Streamlit process
+(since 2026-07-25) was serving stale pre-2026-07-28 registry logic — a browser hard refresh alone
+didn't pick up the fix, needed an actual process restart (Streamlit's file-watcher doesn't
+reliably reload changes in imported-but-not-page modules).
+
+Full suite: 289 passed (was 277 at session start). `live_sim_harness.py`: 7/7.
+`signals_invariants.py`: 0 known violations (UDOW's stale position was closed last session).
+
+### Residual
+Daemon is stale again as of session end (predates this session's final `signals_notify.py`/
+`signals_blocks.py` fixes) — restarting it was blocked by the auto-mode classifier (a live-daemon
+process kill/restart), left for the user to do directly.
+
+### Docs updated
+- `docs/deep_backlog.md`: 2 new resolved entries (chunking fix, per-mode grid redesign), appended
+  at the end.
+- `docs/backlog_cache.md`: one-line pointer resolved entry at the top.

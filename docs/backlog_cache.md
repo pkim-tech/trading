@@ -1,5 +1,12 @@
 # Backlog Cache
 
+## [live-trading][coverage] Resolved 2026-07-26 — Morning Report/signal-window alerts hit Slack's 50-block limit again (25 nodes); replaced per-row shrinking with real chunking + threading (`_post_chunked`); Trade-Flow Accountability Grid redesigned with independent Paper/Dry-run/Live columns instead of one collapsed status. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entries (both, at the end of the file).
+Opus review found+fixed 4 issues in the chunking fix (most severe: a chunk-2+ post failure was
+invisible to `morning_report_delivery`'s coverage event, now correctly reads as partial delivery).
+`dry_run_buy_synthesis` confirmed live (2x real dry_run events) via the new per-mode grid columns —
+closes the "zero real firings ever" gap flagged at the start of this session. Full suite: 289 passed
+(was 277). `live_sim_harness.py`: 7/7. `signals_invariants.py`: 0 known violations.
+
 ## [live-trading][coverage] Resolved 2026-07-28 (evening) — coverage snoozes built (time-bounded acknowledgment for a known noisy scenario); UDOW's stale test position retroactively cleaned up
 Grew out of reviewing `reconciliation_mismatch`'s 1753 real events, all attributable to UDOW's
 deliberately-seeded stale test position (the one known accepted `signals_invariants.py`

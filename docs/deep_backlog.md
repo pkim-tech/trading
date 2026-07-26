@@ -1257,3 +1257,61 @@ code change. Verified before dropping: `paper_trading.py`'s dedup is `wl_id`-key
 ticker-keyed, and `active_signals.py`'s `open_position_keys` (line 530-531) already merges real +
 paper positions, so the two nodes don't collide. Item 3 (`account=None` gap on 15/24 `mode='live'`
 nodes) remains open, still targeted for Monday 2026-07-27.
+
+## ✅ Resolved 2026-07-26 — Morning Report / signal-window Slack alerts hit the 50-block limit again (25 nodes, up from 16 at the 2026-07-22 fix); replaced per-row block-shrinking with real chunking
+The 2026-07-22 fix (collapsing 3 `actions` blocks/row into 1) bought headroom, not a permanent fix
+— the watchlist grew from 16 to 25 nodes and the Morning Report hit Slack's `invalid_blocks` 50-block
+cap again (confirmed in `logs/active_signals.log`). Rather than shrinking per-row block count again
+(a fix with an expiration date), built `signals_blocks._post_chunked(text, fixed_blocks, units,
+max_blocks=50)`: greedily packs per-row block groups into <=50-block chunks, posts the first chunk
+normally and any overflow chunks as Slack thread replies (new `thread_ts`/`reply_broadcast` params on
+`_post_message`) so the report still reads as one thing and overflow still triggers a mobile
+notification. `signals_notify.send_reference_report` and `_send_window_alert` (the 10:25/15:25 ET
+HIGH ALERT) both rewritten to build a list of row-units and call `_post_chunked` instead of
+concatenating one flat `blocks` list.
+**Session-wrap Opus review of the real diff (`signals_blocks.py`/`signals_notify.py`) found 4
+CONFIRMED issues, all fixed same session**: (1) most severe — a chunk-2+ Slack post failure was
+invisible to `log_coverage_event("morning_report_delivery", ...)`, which read only the first chunk's
+`(channel, ts)` and would log "sent" even if the Buy Candidates section silently never posted; fixed
+by having `_post_chunked` track delivery across every chunk and return `ts=None` if any chunk failed,
+so `channel and ts` truthy-checks at call sites correctly read partial delivery as not-fully-sent. (2)
+`_send_window_alert` (the signal-window HIGH ALERT, arguably more load-bearing than the morning
+report — no daily backstop if it silently fails) was never converted and had the identical unbounded
+50-block bug left in place; converted to `_post_chunked` too. (3) overflow thread replies were
+mobile-notification-silent (no `reply_broadcast`) — fixed by adding `reply_broadcast=True` on every
+chunk after the first, consistent with the project's standing "every alert must render cleanly on
+mobile" convention. (4) test gap — the original tests only exercised `_post_chunked` with synthetic
+block lists, nothing proved real `_ticker_block` output actually chunks correctly at scale; added
+`test_send_reference_report_actually_chunks_a_large_watchlist` (60 synthetic rows through the real
+`build_reference_table`→`_ticker_block`→`_post_chunked` path). 2 more regression tests target
+the partial-failure detection itself. Also separately: my own test-script invocations while verifying
+this fix live wrote 5 real `morning_report_delivery` rows into `cache/live/trading_live.db`'s
+`coverage_events` table (not real daemon/button-triggered events) — same pollution class as the
+2026-07-25 pytest incident; backed up the DB and deleted the 5 rows after confirming with the user
+this wasn't the sticky `coverage_deviations` ticket model (raw event log, not a deviation record).
+Full suite: 289 passed (was 277 at session start). `live_sim_harness.py`: 7/7. `signals_invariants.py`:
+0 known violations (UDOW's stale test position was retroactively closed last session).
+
+## ✅ Resolved 2026-07-26 — Trade-Flow Accountability Grid redesigned to show per-mode (Paper/Dry-run/Live) status independently, not one collapsed overall status
+`compute_status()` (`scripts/coverage_registry.py`) picks one overall status per scenario in
+priority order (live > dry_run > paper) and returns as soon as any mode has real events — so a
+scenario with genuine live evidence *and* zero paper evidence rendered as fully green
+`verified-live`, with no way to eyeball which modes actually have proof (raised directly by the
+user reviewing the grid). New `compute_mode_statuses(row)` computes each of paper/dry_run/live
+independently: for `coverage_events`-mechanism rows, buckets by real mode with the same
+good/bad-results logic as `compute_status`; for a row scoped via `mode_filter` (e.g.
+`dry_run_buy_synthesis`, which disambiguates a `scenario_key` shared with `paper_trading.py`), the
+other two modes report `not-applicable` rather than a false gap; for `scenario_expectations`-
+mechanism rows, queries `coverage_deviations` (which carries its own `mode` column) per mode instead
+of across all modes at once; `offline_only`/`open_price_quality_log`/`none` mechanisms (not
+mode-scoped by nature) mirror the same status across all three columns. `pages/14_Coverage.py`'s
+main grid gained 3 new independently-colored columns (Paper/Dry-run/Live, each its own cell
+background via a new `_heat_row_and_mode_cells` styling function) plus a compact `P/D/L` one-glance
+column (e.g. `P🟩 D⬜ L🟥`), while keeping the existing whole-row-colored `Status` column for the
+existing sort order. Confirmed live: `dry_run_buy_synthesis` now shows real `verified` dry_run
+evidence (2 real events, 2026-07-26) — closes the "zero real firings ever" gap flagged at the start
+of this same session. Also fixed same session: the Streamlit process itself (running since 2026-07-25)
+was serving stale pre-2026-07-28 `coverage_registry.py` logic (Streamlit's file-watcher doesn't
+reliably reload changes in imported-but-not-page modules) — a browser hard-refresh alone didn't fix
+it, needed a process restart. 5 new regression tests in `tests/test_coverage_check.py`. Full suite:
+289 passed (combined with the chunking fix above, same session).

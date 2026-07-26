@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import signals_config
 import signals_db as db
 from scripts.coverage_check import _check_trade_lifecycle, _check_coverage_event, run_check
-from scripts.coverage_registry import compute_status
+from scripts.coverage_registry import compute_status, compute_mode_statuses
 
 TICKER = 'TEST_CANARY'
 
@@ -632,6 +632,63 @@ def test_check_coverage_event_not_met_when_no_events_today(isolated_db):
     met, summary = _check_coverage_event(scenario, check_date)
     assert met is False
     assert 'no coverage_events' in summary
+
+
+def test_compute_mode_statuses_splits_independently_per_mode(isolated_db):
+    """compute_status collapses to one overall status (live > dry_run > paper
+    priority) -- this hides a real gap: a scenario verified live can still have
+    zero paper evidence. compute_mode_statuses (added 2026-07-26, user request)
+    must show each mode's own real status instead of one aggregate winning."""
+    db.log_coverage_event('sk_mode1', 'live', result='placed')
+    row = dict(check_mechanism='coverage_events', scenario_key='sk_mode1')
+    modes = compute_mode_statuses(row)
+    assert modes['live'][0] == 'verified'
+    assert modes['paper'][0] == 'wired-never-fired'
+    assert modes['dry_run'][0] == 'wired-never-fired'
+
+
+def test_compute_mode_statuses_respects_mode_filter(isolated_db):
+    """A REGISTRY row with mode_filter='dry_run' (e.g. dry_run_buy_synthesis,
+    disambiguating a scenario_key shared with paper_trading.py) must show the
+    other two modes as 'not-applicable', not 'wired-never-fired' -- they were
+    never supposed to fire for this specific row."""
+    db.log_coverage_event('sk_mode2', 'dry_run', result='filled')
+    row = dict(check_mechanism='coverage_events', scenario_key='sk_mode2', mode_filter='dry_run')
+    modes = compute_mode_statuses(row)
+    assert modes['dry_run'][0] == 'verified'
+    assert modes['paper'][0] == 'not-applicable'
+    assert modes['live'][0] == 'not-applicable'
+
+
+def test_compute_mode_statuses_bad_results_is_attempt_failed_per_mode(isolated_db):
+    db.log_coverage_event('sk_mode3', 'live', result='blocked')
+    db.log_coverage_event('sk_mode3', 'paper', result='placed')
+    row = dict(check_mechanism='coverage_events', scenario_key='sk_mode3', bad_results=['blocked'])
+    modes = compute_mode_statuses(row)
+    assert modes['live'][0] == 'attempt-failed'
+    assert modes['paper'][0] == 'verified'
+
+
+def test_compute_mode_statuses_scenario_expectations_scoped_by_mode(isolated_db):
+    """coverage_deviations rows carry their own mode column -- an unexplained
+    deviation logged under mode='live' must not bleed into the paper/dry_run
+    columns for the same scenario_key."""
+    db.record_deviation('2026-07-24', 'sk_mode4', 'expected X', 'got Y', mode='live')
+    row = dict(check_mechanism='scenario_expectations', scenario_key='sk_mode4')
+    modes = compute_mode_statuses(row)
+    assert modes['live'][0] == 'deviation-unexplained'
+    assert modes['paper'][0] == 'wired-never-fired'
+    assert modes['dry_run'][0] == 'wired-never-fired'
+
+
+def test_compute_mode_statuses_offline_and_not_instrumented_are_uniform(isolated_db):
+    offline_row = dict(check_mechanism='offline_only', scenario_key=None)
+    modes = compute_mode_statuses(offline_row)
+    assert all(v[0] == 'offline-only' for v in modes.values())
+
+    none_row = dict(check_mechanism='none', scenario_key=None)
+    modes = compute_mode_statuses(none_row)
+    assert all(v[0] == 'not-instrumented' for v in modes.values())
 
 
 def test_check_coverage_event_not_met_when_only_bad_results_fire(isolated_db):

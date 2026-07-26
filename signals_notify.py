@@ -17,7 +17,7 @@ import schwab_safety
 import schwab_client
 import schwab_stream
 from signals_charts import _chart_buy, _chart_sell, _upload_chart
-from signals_blocks import _post_message, _build_buy_blocks, _build_sell_blocks
+from signals_blocks import _post_message, _post_chunked, _build_buy_blocks, _build_sell_blocks
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
     buy_order_sizing, log_poll, _pos_key,
@@ -1624,10 +1624,12 @@ def _send_window_alert(label, watchlist):
     if not hot:
         _post_message(header)
         return
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": header}}, {"type": "divider"}]
-    for r in hot:
-        blocks += _ticker_block(r)
-    _post_message(header, blocks=blocks)
+    # Same unbounded-block risk as the Morning Report (2026-07-26 fix) -- a
+    # broad selloff can push most of a 25+-node watchlist within 5% of trigger
+    # at once, so this chunks too instead of assuming "hot rows only" bounds it.
+    fixed_blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": header}}, {"type": "divider"}]
+    units = [_ticker_block(r) for r in hot]
+    _post_chunked(header, fixed_blocks, units)
 
 
 _REF_TABLE_COLS = [
@@ -1881,36 +1883,42 @@ def send_reference_report(watchlist):
     held_rows = sorted([r for r in rows if r['Held']], key=sort_key)
     flat_rows = sorted([r for r in rows if not r['Held']], key=sort_key)
 
-    blocks = [
+    fixed_blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"Morning Report — {now_str}"}},
     ]
     stopped = schwab_safety.kill_switch_engaged()
-    blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+    fixed_blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
         "text": f"{'🛑 Automated engine STOPPED' if stopped else '▶️ Automated engine running'}"}]})
     if cfg.INTERACTIVE:
-        blocks.append({"type": "actions", "elements": [
+        fixed_blocks.append({"type": "actions", "elements": [
             {"type": "button", "text": {"type": "plain_text", "text": "▶️ Start Engine"}, "style": "primary",
              "action_id": "start_engine"} if stopped else
             {"type": "button", "text": {"type": "plain_text", "text": "🛑 Stop Engine"}, "style": "danger",
              "action_id": "stop_engine"},
         ]})
     if cfg.INTERACTIVE:
-        blocks.append({"type": "actions", "elements": [
+        fixed_blocks.append({"type": "actions", "elements": [
             {"type": "button", "text": {"type": "plain_text", "text": "🔄 Resend Report"}, "action_id": "resend_ref_table"},
             {"type": "button", "text": {"type": "plain_text", "text": "🧭 Coverage Report"}, "action_id": "send_coverage_report"},
         ]})
 
+    # Each row's own blocks (section + optional actions) are one atomic unit --
+    # 25 nodes and growing already broke a fixed per-row block-count budget
+    # twice (2026-07-22, 2026-07-29), so this report chunks across multiple
+    # Slack messages (threaded under the first) instead of trying to keep
+    # shrinking the per-row block count to fit one message forever.
+    units = []
     if held_rows:
-        blocks.append({"type": "header", "text": {"type": "plain_text", "text": "Open Positions"}})
+        units.append([{"type": "header", "text": {"type": "plain_text", "text": "Open Positions"}}])
         for r in held_rows:
-            blocks += _ticker_block(r)
+            units.append(_ticker_block(r))
     else:
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "No open positions."}]})
+        units.append([{"type": "context", "elements": [{"type": "mrkdwn", "text": "No open positions."}]}])
 
-    blocks.append({"type": "divider"})
-    blocks.append({"type": "header", "text": {"type": "plain_text", "text": "Buy Candidates"}})
+    units.append([{"type": "divider"}])
+    units.append([{"type": "header", "text": {"type": "plain_text", "text": "Buy Candidates"}}])
     for r in flat_rows:
-        blocks += _ticker_block(r)
+        units.append(_ticker_block(r))
         proximity = r.get('Proximity')
         if isinstance(proximity, (int, float)) and proximity < 5:
             chart = _chart_buy(r['_node'], r['_sig'])
@@ -1930,7 +1938,7 @@ def send_reference_report(watchlist):
             emoji = _proximity_emoji(r['Proximity'])
             print(f"  {emoji} {r['Ticker']:<6} {r['Version']}  now=${r['Now']:>7.2f}  trigger=${r['Next Trigger $']:>7.2f}  ({r['Proximity']:+.1f}%)  z={r['Z']:>+5.2f}  [{r['Strategy']}]")
 
-    channel, ts = _post_message(f"Morning Report — {now_str}", blocks=blocks)
+    channel, ts = _post_chunked(f"Morning Report — {now_str}", fixed_blocks, units)
     # "live" unconditionally, not _coverage_mode(account) -- this report isn't
     # scoped to any one account's dry_run flag, and _coverage_mode(None) always
     # falls back to "dry_run", which would make this scenario permanently
