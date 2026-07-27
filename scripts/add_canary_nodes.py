@@ -5,9 +5,11 @@ actually working. Parameters are deliberately extreme so each canary should
 complete its full expected lifecycle every trading day; if it doesn't, that's
 the alert -- something in the polling/caching/timing pipeline broke.
 
-SPY/QQQ/IWM/DIA/VOO/XLF chosen because they're liquid, already have cached
+IVV/QQQ/IWM/DIA/VOO/XLF chosen because they're liquid, already have cached
 data, and aren't used by any real watchlist/research node -- paper-trading
 dedup is ticker-only, so sharing a ticker with a real node would collide.
+(Originally SPY instead of IVV -- renamed once SPY became a real soxl_test
+live node, for exactly this collision reason.)
 
 `starting_notional=10000` (not the original 500): at SPY/QQQ/etc's real
 price (~$400-700+), 500 sizes to 0 shares (`int(500 // price)`) and the
@@ -19,6 +21,13 @@ can exercise it; canary exit-arm timing only covers `check_paper_sells`'
 bar-close path. The pinned-scan-specific gap is left to the `live_sim.py`
 harness (which can call `_scan_pinned_exit_arm` directly against synthetic
 positions), not canaries.
+
+`mode='live', account='ira'` (not the original `mode='research'`) -- matches the later
+promotion to a real daily dry_run proof-of-life test (`ira` stays `dry_run=True`, so this
+never places a real order). Restored 2026-07-27 after the original 6 nodes were
+accidentally deleted alongside unrelated soxl_test scratch nodes during a live-watchlist
+cleanup -- re-running this script gives new node_ids, so scenario_expectations.node_id
+needs relinking by ticker afterward (see the 2026-07-27 restoration in docs/backlog_cache.md).
 
 Run once: python scripts/add_canary_nodes.py
 """
@@ -34,10 +43,10 @@ WATCHLIST_ID = db.get_active_watchlist_id()
 # Canary A: full happy-path -- BUY -> bounce-fill -> arm -> trailing-sell,
 # all same day. SL=30% is practically unreachable; everything else hair-trigger.
 db.add_node(
-    ticker='SPY', strategy='TrailingBothZScoreBreakout', version='canary',
+    ticker='IVV', strategy='TrailingBothZScoreBreakout', version='canary',
     window=5, take_profit=0.1, stop_loss=0, max_hold_hours=48,
     label='CANARY-full-lifecycle', z_score_threshold=0.1,
-    watchlist_id=WATCHLIST_ID, mode='research',
+    watchlist_id=WATCHLIST_ID, mode='live', account='ira',
     trail_buy_pct=0.1, trail_pct=0.1, entry_timing='close',
     starting_notional=10000, fixed_sl_override=30,
 )
@@ -48,7 +57,7 @@ db.add_node(
     ticker='QQQ', strategy='TrailingBothZScoreBreakout', version='canary',
     window=5, take_profit=10, stop_loss=0, max_hold_hours=48,
     label='CANARY-early-SL', z_score_threshold=0.1,
-    watchlist_id=WATCHLIST_ID, mode='research',
+    watchlist_id=WATCHLIST_ID, mode='live', account='ira',
     trail_buy_pct=0.1, trail_pct=0.1, entry_timing='close',
     starting_notional=10000, fixed_sl_override=0.1,
 )
@@ -60,7 +69,7 @@ db.add_node(
     ticker='IWM', strategy='TrailingBothZScoreBreakout', version='canary',
     window=5, take_profit=0.1, stop_loss=0, max_hold_hours=48,
     label='CANARY-pinned-entry', z_score_threshold=0.1,
-    watchlist_id=WATCHLIST_ID, mode='research',
+    watchlist_id=WATCHLIST_ID, mode='live', account='ira',
     trail_buy_pct=0.1, trail_pct=0.1, entry_timing='open_check',
     starting_notional=10000, fixed_sl_override=30,
 )
@@ -73,7 +82,7 @@ db.add_node(
     ticker='DIA', strategy='TrailingBothZScoreBreakout', version='canary',
     window=5, take_profit=0.1, stop_loss=0, max_hold_hours=48,
     label='CANARY-overnight-carry', z_score_threshold=0.1,
-    watchlist_id=WATCHLIST_ID, mode='research',
+    watchlist_id=WATCHLIST_ID, mode='live', account='ira',
     trail_buy_pct=5.0, trail_pct=0.1, entry_timing='close',
     starting_notional=10000, fixed_sl_override=30,
 )
@@ -86,7 +95,7 @@ db.add_node(
     ticker='VOO', strategy='TrailingExitZScoreBreakout', version='canary',
     window=5, take_profit=0.1, stop_loss=0, max_hold_hours=24,
     label='CANARY-market-buy-exit', z_score_threshold=0.1,
-    watchlist_id=WATCHLIST_ID, mode='research',
+    watchlist_id=WATCHLIST_ID, mode='live', account='ira',
     trail_pct=0.1, entry_timing='close',
     starting_notional=10000, fixed_sl_override=90,
 )
@@ -97,7 +106,7 @@ db.add_node(
     ticker='XLF', strategy='TrailingBothZScoreBreakout', version='canary',
     window=5, take_profit=50, stop_loss=0, max_hold_hours=2,
     label='CANARY-time-exit', z_score_threshold=0.1,
-    watchlist_id=WATCHLIST_ID, mode='research',
+    watchlist_id=WATCHLIST_ID, mode='live', account='ira',
     trail_buy_pct=0.1, trail_pct=0.1, entry_timing='close',
     starting_notional=10000, fixed_sl_override=50,
 )

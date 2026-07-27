@@ -46,9 +46,13 @@ _last_alert_at = 0.0
 
 def _parse_activity_message(msg: dict):
     """Best-effort extraction of (account, ticker, side, fill_price,
-    filled_shares) from an ACCT_ACTIVITY stream message. Returns None if the
-    message isn't a recognizable order-fill event -- unrecognized shapes are
-    silently skipped, not raised, since the slow poll path is the safety net."""
+    filled_shares, order_id) from an ACCT_ACTIVITY stream message. Returns
+    None if the message isn't a recognizable order-fill event -- unrecognized
+    shapes are silently skipped, not raised, since the slow poll path is the
+    safety net. order_id (may be None if the message shape lacks it) lets the
+    caller re-confirm via schwab_client.get_filled_order's exact-order lookup
+    instead of its fuzzy ticker+side fallback -- see that function's docstring
+    for why the fuzzy fallback is a real hazard (2026-07-27 GDXU incident)."""
     try:
         content = msg.get("content", [{}])[0]
         if content.get("2") not in ("OrderFill", "ExecutionActivity"):
@@ -63,9 +67,10 @@ def _parse_activity_message(msg: dict):
         side = leg.get("instruction")
         fill_price = data.get("averageFillPrice") or leg.get("price")
         filled_shares = data.get("filledQuantity") or leg.get("quantity")
+        order_id = data.get("orderId") or data.get("order_id")
         if not (ticker and side and fill_price and filled_shares):
             return None
-        return account, ticker, side, float(fill_price), float(filled_shares)
+        return account, ticker, side, float(fill_price), float(filled_shares), order_id
     except Exception:
         return None
 

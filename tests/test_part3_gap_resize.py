@@ -93,8 +93,8 @@ def test_gap_resize_no_action_when_trigger_not_cleared(env, monkeypatch):
     _seed_pending_order(monkeypatch)
     # signal_price=50.0, trail_buy_pct=1.0 -> trigger = 50.5; quote below that
     monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 50.2)
-    monkeypatch.setattr(schwab_client, 'cancel_order',
-                         lambda *a, **kw: pytest.fail("cancel_order should not be called"))
+    monkeypatch.setattr(schwab_client, 'replace_equity_order_with_market',
+                         lambda *a, **kw: pytest.fail("replace_equity_order_with_market should not be called"))
     monkeypatch.setattr(schwab_client, 'place_equity_buy',
                          lambda *a, **kw: pytest.fail("place_equity_buy should not be called"))
 
@@ -106,23 +106,27 @@ def test_gap_resize_no_action_when_trigger_not_cleared(env, monkeypatch):
 
 
 def test_gap_resize_replaces_order_when_trigger_cleared(env, monkeypatch):
+    """check_gap_resize now atomically replaces the resting trailing-buy with
+    a market buy (schwab_client.replace_equity_order_with_market -- a single
+    broker call) instead of a separate cancel_order + place_equity_buy, closing
+    the window where a confirmed cancel could be followed by a failed/blocked
+    new placement (found 2026-07-27)."""
     _seed_pending_order(monkeypatch, order_id=555)
-    cancelled = []
+    replace_calls = []
 
-    def _fake_cancel(account, ticker, order_id):
-        cancelled.append(order_id)
-        return object(), 'CANCELED'
+    def _fake_replace(account, ticker, order_id, side, qty, price, is_gap_correction=False, is_protective=False):
+        replace_calls.append((order_id, side, qty))
+        return object(), 999
 
     monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 52.0)
-    monkeypatch.setattr(schwab_client, 'cancel_order', _fake_cancel)
-    monkeypatch.setattr(schwab_client, 'place_equity_buy',
-                         lambda account, ticker, qty, price, is_gap_correction=False, is_protective=False: (object(), 999))
+    monkeypatch.setattr(schwab_client, 'replace_equity_order_with_market', _fake_replace)
     monkeypatch.setattr(schwab_client, 'get_filled_order',
-                         lambda account, ticker, side: {'price': 52.0, 'quantity': 900})
+                         lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 900})
 
     signals_notify.check_gap_resize()
 
-    assert cancelled == [555]
+    assert replace_calls[0][0] == 555
+    assert replace_calls[0][1] == "BUY"
     pos = signals_db.get_open_position(TICKER)
     assert pos is not None
     assert pos['entry_price'] == 52.0
@@ -135,36 +139,34 @@ def test_gap_resize_is_idempotent_against_restart_reentry(env, monkeypatch):
     act twice on the same row today via its own persisted gap_resize_date marker
     (docs/backlog_cache.md, 2026-07-26 finding, fixed 2026-07-27)."""
     _seed_pending_order(monkeypatch, order_id=555)
-    cancel_calls = []
+    replace_calls = []
 
-    def _fake_cancel(account, ticker, order_id):
-        cancel_calls.append(order_id)
-        return object(), 'CANCELED'
+    def _fake_replace(*a, **kw):
+        replace_calls.append(a[2])  # order_id positional arg
+        raise RuntimeError("simulated crash mid-replace")
 
     monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 52.0)
-    monkeypatch.setattr(schwab_client, 'cancel_order', _fake_cancel)
-    monkeypatch.setattr(schwab_client, 'place_equity_buy',
-                         lambda *a, **kw: (_ for _ in ()).throw(
-                             RuntimeError("simulated crash after cancel, before replacement lands")))
+    monkeypatch.setattr(schwab_client, 'replace_equity_order_with_market', _fake_replace)
 
-    with pytest.raises(RuntimeError):
-        signals_notify.check_gap_resize()
-    assert cancel_calls == [555]
+    # replace_failed is caught inside check_gap_resize (not re-raised), so this
+    # no longer crashes the caller -- assert the persisted gate still took effect.
+    signals_notify.check_gap_resize()
+    assert replace_calls == [555]
     assert _pending()['gap_resize_date'] == datetime.now().strftime('%Y-%m-%d')
 
     # Simulate the restart re-entering check_gap_resize the same day.
     signals_notify.check_gap_resize()
-    assert cancel_calls == [555]  # unchanged -- second call was a no-op
+    assert replace_calls == [555]  # unchanged -- second call was a no-op
     assert _pending()['order_id'] == 555  # row untouched, still resolvable by a human
 
 
 def test_gap_resize_dry_run_leaves_pending_row_intact(env, monkeypatch):
-    """dry_run (place_equity_buy returns (None, None)) -- no real fill will ever
-    appear, so check_gap_resize must not poll forever or crash."""
+    """dry_run (replace_equity_order_with_market returns (None, None)) -- no
+    real fill will ever appear, so check_gap_resize must not poll forever or
+    crash."""
     _seed_pending_order(monkeypatch, order_id=555)
     monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 52.0)
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda *a, **kw: (object(), 'CANCELED'))
-    monkeypatch.setattr(schwab_client, 'place_equity_buy', lambda *a, **kw: (None, None))
+    monkeypatch.setattr(schwab_client, 'replace_equity_order_with_market', lambda *a, **kw: (None, None))
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda *a, **kw: pytest.fail("should not poll for a fill in dry_run"))
 
@@ -322,8 +324,8 @@ def test_drain_fill_queue_reconciles_queued_fill(env, monkeypatch):
     (which a message like this deliberately mismatches, to prove it's ignored)."""
     _seed_pending_order(monkeypatch)
     monkeypatch.setattr(schwab_client, 'get_filled_order',
-                         lambda account, ticker, side: {'price': 52.0, 'quantity': 150})
-    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100))
+                         lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})
+    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
 
     signals_notify.drain_fill_queue()
 
@@ -337,7 +339,7 @@ def test_drain_fill_queue_reconciles_queued_fill(env, monkeypatch):
 
 def test_drain_fill_queue_ignores_sell_events(env, monkeypatch):
     _seed_pending_order(monkeypatch)
-    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'SELL', 51.0, 100))
+    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'SELL', 51.0, 100, 999))
 
     signals_notify.drain_fill_queue()
 
@@ -352,9 +354,9 @@ def test_drain_fill_queue_no_op_when_order_not_yet_settled(env, monkeypatch):
     window, drain_fill_queue must leave the pending buy alone for the slow
     check_auto_fills poll to catch later, not act on an unconfirmed fill."""
     _seed_pending_order(monkeypatch)
-    monkeypatch.setattr(schwab_client, 'get_filled_order', lambda account, ticker, side: None)
+    monkeypatch.setattr(schwab_client, 'get_filled_order', lambda account, ticker, side, order_id=None: None)
     monkeypatch.setattr(signals_notify.time, 'sleep', lambda secs: None)
-    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100))
+    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
 
     signals_notify.drain_fill_queue()
 

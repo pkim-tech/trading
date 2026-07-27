@@ -229,7 +229,7 @@ def test_buy_order_sizing_applies_market_pad(env):
 
 def test_notify_buy_signal_market_path_adds_pending_buy_and_protects(env, monkeypatch):
     monkeypatch.setattr(schwab_client, 'get_filled_order',
-                         lambda account, ticker, side: {'price': 49.5, 'quantity': 100})
+                         lambda account, ticker, side, order_id=None: {'price': 49.5, 'quantity': 100})
     signals_notify.notify_buy_signal(_node(), _sig())
     # pending_buys row cleared by the synchronous _reconcile_buy_fill path;
     # position should be open and protected.
@@ -280,7 +280,7 @@ def test_place_stop_loss_blocked_by_kill_switch(env, monkeypatch):
 def test_sync_confirm_and_protect_places_sl_on_fill(env, monkeypatch):
     signals_db.add_pending_buy(_node(), _sig(), channel=None, ts=None)
     monkeypatch.setattr(schwab_client, 'get_filled_order',
-                         lambda account, ticker, side: {'price': 49.0, 'quantity': 100})
+                         lambda account, ticker, side, order_id=None: {'price': 49.0, 'quantity': 100})
     placed_calls = []
     monkeypatch.setattr(schwab_client, 'place_stop_loss',
                          lambda account, ticker, qty, stop_price: (placed_calls.append((qty, stop_price)) or (object(), 999)))
@@ -300,7 +300,7 @@ def test_sync_confirm_and_protect_places_sl_on_fill(env, monkeypatch):
 
 def test_sync_confirm_and_protect_alerts_on_timeout(env, monkeypatch):
     signals_db.add_pending_buy(_node(), _sig(), channel=None, ts=None)
-    monkeypatch.setattr(schwab_client, 'get_filled_order', lambda account, ticker, side: None)
+    monkeypatch.setattr(schwab_client, 'get_filled_order', lambda account, ticker, side, order_id=None: None)
     alerts = []
     monkeypatch.setattr(signals_notify, '_post_message', lambda msg, *a, **kw: alerts.append(msg) or (None, None))
     signals_notify._sync_confirm_and_protect(TICKER, _node())
@@ -312,7 +312,13 @@ def test_sync_confirm_and_protect_alerts_on_timeout(env, monkeypatch):
 # Arm-transition handoff: cancel resting SL before placing trailing-sell
 # ---------------------------------------------------------------------------
 
-def test_attempt_automated_sell_cancels_sl_order_id_first(env, monkeypatch):
+def test_attempt_automated_sell_replaces_sl_order_id_atomically(env, monkeypatch):
+    """When a resting SL exists, _attempt_automated_sell now swaps it for the
+    trailing-sell via a single atomic schwab_client.replace_order_with_trailing_sell
+    call (cancel-old + create-new as one broker call), not a separate
+    cancel_order + place_trailing_sell (found 2026-07-27 -- closes the window
+    where a confirmed cancel could be followed by a failed/blocked new
+    placement, leaving nothing resting in between)."""
     node = _node()
     now = datetime.now()
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
@@ -323,21 +329,17 @@ def test_attempt_automated_sell_cancels_sl_order_id_first(env, monkeypatch):
         c.commit()
     pos = signals_db.get_open_position(TICKER)
 
-    cancelled = []
-
-    def _fake_cancel(account, ticker, order_id):
-        cancelled.append(order_id)
-        return object(), 'CANCELED'
-
-    monkeypatch.setattr(schwab_client, 'cancel_order', _fake_cancel)
-    placed = []
+    replaced = []
+    monkeypatch.setattr(schwab_client, 'replace_order_with_trailing_sell',
+                         lambda *a, **kw: replaced.append(a) or (object(), 888))
     monkeypatch.setattr(schwab_client, 'place_trailing_sell',
-                         lambda *a, **kw: placed.append(a) or (object(), 888))
+                         lambda *a, **kw: pytest.fail("place_trailing_sell should not be called when an SL exists"))
 
-    result = signals_notify._attempt_automated_sell(pos, current_price=52.0)
+    result, order_id = signals_notify._attempt_automated_sell(pos, current_price=52.0)
     assert result is True
-    assert cancelled == [777]
-    assert len(placed) == 1
+    assert order_id == 888
+    assert len(replaced) == 1
+    assert replaced[0][2] == 777  # order_id positional arg
 
 
 def test_attempt_automated_sell_skips_cancel_when_no_sl_order_id(env, monkeypatch):
@@ -350,13 +352,13 @@ def test_attempt_automated_sell_skips_cancel_when_no_sl_order_id(env, monkeypatc
         c.commit()
     pos = signals_db.get_open_position(TICKER)
 
-    cancel_calls = []
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda *a, **kw: cancel_calls.append(a))
+    monkeypatch.setattr(schwab_client, 'replace_order_with_trailing_sell',
+                         lambda *a, **kw: pytest.fail("replace_order_with_trailing_sell should not be called without an SL"))
     monkeypatch.setattr(schwab_client, 'place_trailing_sell', lambda *a, **kw: (object(), 888))
 
-    result = signals_notify._attempt_automated_sell(pos, current_price=52.0)
+    result, order_id = signals_notify._attempt_automated_sell(pos, current_price=52.0)
     assert result is True
-    assert cancel_calls == []
+    assert order_id == 888
 
 
 # ---------------------------------------------------------------------------

@@ -213,9 +213,8 @@ def test_automated_sell_notifies_sl_price_when_trailing_sell_fails_after_sl_canc
         return (None, None)
 
     monkeypatch.setattr(signals_notify, '_post_message', _capture)
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: (object(), 'CANCELED'))
     monkeypatch.setattr(
-        schwab_client, 'place_trailing_sell',
+        schwab_client, 'replace_order_with_trailing_sell',
         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("order rejected")),
     )
     signals_notify.notify_trailing_activated(pos, current_price=52.0)
@@ -294,7 +293,7 @@ def test_check_auto_fills_noop_when_toggle_off(env, monkeypatch):
     assert _pending()['order_placed'] == 1
 
     monkeypatch.setattr(schwab_client, 'get_filled_order',
-                         lambda account, ticker, side: {'price': 51.0, 'quantity': 100})
+                         lambda account, ticker, side, order_id=None: {'price': 51.0, 'quantity': 100})
     signals_notify.check_auto_fills(signals_db.get_open_positions())
 
     # still pending -- toggle is off, so no auto-detected fill should have landed
@@ -309,7 +308,7 @@ def test_check_auto_fills_records_buy_fill_when_enabled(env, monkeypatch):
     schwab_safety.enable_node_auto_fill_detection(_node()['id'])
 
     monkeypatch.setattr(schwab_client, 'get_filled_order',
-                         lambda account, ticker, side: {'price': 51.0, 'quantity': 100})
+                         lambda account, ticker, side, order_id=None: {'price': 51.0, 'quantity': 100})
     signals_notify.check_auto_fills(signals_db.get_open_positions())
 
     pos = signals_db.get_open_position(TICKER)
@@ -361,7 +360,7 @@ def test_check_auto_fills_records_sell_fill_when_enabled(env, monkeypatch):
     schwab_safety.enable_node_auto_fill_detection(pos['wl_id'])
 
     monkeypatch.setattr(schwab_client, 'get_filled_order',
-                         lambda account, ticker, side: {'price': 53.5, 'quantity': 100})
+                         lambda account, ticker, side, order_id=None: {'price': 53.5, 'quantity': 100})
     signals_notify.check_auto_fills(signals_db.get_open_positions())
 
     assert signals_db.get_open_positions() == []

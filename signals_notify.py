@@ -56,11 +56,14 @@ def _attempt_automated_buy(node, sizing):
 def _attempt_automated_sell(pos, current_price):
     """Sell-side mirror of _attempt_automated_buy -- places the trailing-sell
     order via schwab_client for a pilot-scope ticker instead of waiting on the
-    'Order Placed' button. Returns False on any block/failure (falls back to
-    the manual flow). If a STOP order is already resting from entry
-    (pos['sl_order_id'], Part 4 Section 6), cancels it first -- otherwise both
-    orders would be live simultaneously for the same shares (oversell attempt
-    or rejected order).
+    'Order Placed' button. Returns (False, None) on any block/failure (falls
+    back to the manual flow), or (True, order_id) on success -- the caller
+    persists order_id so a later fill can be confirmed by exact-order lookup
+    (schwab_client.get_filled_order's order_id mode) instead of ever guessing
+    from a fuzzy ticker+side match. If a STOP order is already resting from
+    entry (pos['sl_order_id'], Part 4 Section 6), cancels it first -- otherwise
+    both orders would be live simultaneously for the same shares (oversell
+    attempt or rejected order).
 
     Gated on both ticker scope AND the position's own node mode=='live'
     (automation_principles.md #7) -- the BUY side (_scan_buy_signals) already
@@ -75,54 +78,39 @@ def _attempt_automated_sell(pos, current_price):
     backlog_cache.md's wl_id refactor entry)."""
     ticker = pos['ticker']
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
-        return False
+        return False, None
     node = db.get_watch_list_node_by_id(pos.get('wl_id'))
     if node is None or node.get('mode') != 'live':
         db.log_coverage_event("automated_sell_mode_skip", _coverage_mode(pos.get('account')), ticker=ticker,
                                position_id=pos.get('id'), node_id=pos.get('wl_id'), result="skipped",
                                detail=f"node_mode={node.get('mode') if node else None!r}")
-        return False
+        return False, None
     if not schwab_safety.node_automation_enabled(pos.get('wl_id')):
-        return False
+        return False, None
     account = pos.get('account')
     _mode = _coverage_mode(account)
     shares = pos.get('shares')
     trail_sell_pct = pos.get('trail_sell_pct')
     if not shares or not trail_sell_pct:
-        return False
+        return False, None
     sl_order_id = pos.get('sl_order_id')
-    if sl_order_id:
-        try:
-            _, cancel_status = schwab_client.cancel_order(account, ticker, sl_order_id)
-        except Exception as e:
-            db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
-                                   node_id=pos.get('wl_id'), result="cancel_failed", detail=str(e))
-            _post_message(f"⚠️ {ticker} failed to cancel resting stop-loss {sl_order_id} before "
-                          f"arming trailing-sell: {e} — falling back to manual")
-            return False
-        if cancel_status != "CANCELED":
-            # Don't place a new trailing-sell without confirmed proof the old SL
-            # is gone -- if it actually FILLED (not CANCELED), the shares are
-            # already sold and a new sell here would be a real oversell attempt;
-            # if unconfirmed, we can't tell either way. Fail safe: fall back to
-            # manual instead of guessing (found via Opus review, 2026-07-24).
-            db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
-                                   node_id=pos.get('wl_id'), result="cancel_unconfirmed", detail=repr(cancel_status))
-            _post_message(
-                f"⚠️ {ticker} stop-loss {sl_order_id} cancel not confirmed CANCELED "
-                f"(real status: {cancel_status!r}) — refusing to place a new trailing-sell "
-                f"without proof the old order is gone; falling back to manual"
-            )
-            return False
     try:
-        schwab_client.place_trailing_sell(account, ticker, shares, current_price, trail_sell_pct)
+        if sl_order_id:
+            # Atomic replace (cancel-old + create-new as a single broker call)
+            # instead of a separate cancel_order + place_trailing_sell -- closes
+            # the window where a confirmed cancel could be followed by a failed/
+            # blocked new placement, leaving nothing resting at the broker in
+            # between (found 2026-07-27, raised directly by the user).
+            _, exit_order_id = schwab_client.replace_order_with_trailing_sell(
+                account, ticker, sl_order_id, shares, current_price, trail_sell_pct)
+        else:
+            _, exit_order_id = schwab_client.place_trailing_sell(account, ticker, shares, current_price, trail_sell_pct)
     except Exception as e:
-        # If a resting SL was already cancelled above, the position is now
-        # genuinely unprotected -- there's no safe automatic recovery here
-        # (re-placing the same SL could itself hit the same block/failure),
-        # so surface the SL price the user would need to manually re-enter at
-        # the broker rather than leaving them to recompute it (found via
-        # Opus review, 2026-07-22).
+        # A failed replace/placement here is the same "genuinely unprotected"
+        # case as before -- there's no safe automatic recovery (re-placing the
+        # same SL could itself hit the same block/failure), so surface the SL
+        # price the user would need to manually re-enter at the broker rather
+        # than leaving them to recompute it (found via Opus review, 2026-07-22).
         db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                                node_id=pos.get('wl_id'),
                                result="blocked" if isinstance(e, schwab_safety.SafetyViolation) else "failed_unexpectedly",
@@ -135,15 +123,98 @@ def _attempt_automated_sell(pos, current_price):
                                    node_id=pos.get('wl_id'), result="alerted", detail=price_note)
             _post_message(
                 f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — {price_note}\n"
-                f"(auto trailing-sell failed after cancelling stop-loss {sl_order_id}: {e})"
+                f"(auto trailing-sell replace of stop-loss {sl_order_id} failed: {e})"
             )
         elif not isinstance(e, schwab_safety.SafetyViolation):
             _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual")
-        return False
+        return False, None
     db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed",
                            detail=f"shares={shares} trail_sell_pct={trail_sell_pct}")
-    return True
+    return True, exit_order_id
+
+
+def _attempt_automated_exit_sell(pos, reason, current_price):
+    """Places a real MARKET sell for a TP/SL/TIME exit signal, mirroring what
+    the backtest kernel assumes happens: an exact bar-close exit fill, not a
+    further wait for a trailing pullback. Distinct from _attempt_automated_sell
+    (TRAIL reason only, places a TRAILING order at the earlier arm event) --
+    before this, TP/SL/TIME exits had NO automated path at all and always
+    waited on a manual Exited/Skipped tap, unlike the strategy's own
+    assumption of an automatic exit (found 2026-07-27, real: SH's TIME exit
+    sat unmanaged for hours in live trading).
+
+    For reason=='TRAIL', a trailing-sell order was already placed at the
+    earlier arm event (notify_trailing_activated) -- this returns that
+    existing order_id instead of placing a second, redundant order for the
+    same shares.
+
+    Also reuses an already-placed, still-unresolved TP/SL/TIME exit order
+    from an EARLIER bar, if one exists (state['exit_pending']['order_id']) --
+    without this, sell_alerted's dedup only covers the bar the order was
+    placed on (active_signals.py's (position_id, bar_ts) key changes every
+    new bar), so a still-true TIME/SL condition on the next bar would
+    otherwise place a SECOND real market sell for the same shares before the
+    first is confirmed filled (found by Sonnet review, 2026-07-27).
+
+    Returns the real order_id on success, or None (falls back to manual) on
+    any block/scope-miss/failure -- same guards as _attempt_automated_sell
+    (ticker automation scope, node.mode=='live', node_automation_enabled)."""
+    ticker = pos['ticker']
+    state = pos.get('trail_state') or {}
+    pending_order_id = (state.get('exit_pending') or {}).get('order_id')
+    if pending_order_id is not None:
+        return pending_order_id
+    if reason == 'TRAIL':
+        return state.get('exit_order_id')
+    if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        return None
+    node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+    if node is None or node.get('mode') != 'live':
+        db.log_coverage_event("automated_sell_mode_skip", _coverage_mode(pos.get('account')), ticker=ticker,
+                               position_id=pos.get('id'), node_id=pos.get('wl_id'), result="skipped",
+                               detail=f"node_mode={node.get('mode') if node else None!r} reason={reason}")
+        return None
+    if not schwab_safety.node_automation_enabled(pos.get('wl_id')):
+        return None
+    account = pos.get('account')
+    _mode = _coverage_mode(account)
+    shares = pos.get('shares')
+    if not shares:
+        return None
+    sl_order_id = pos.get('sl_order_id')
+    try:
+        if sl_order_id:
+            # Atomic replace instead of cancel_order + place_equity_sell -- same
+            # rationale as _attempt_automated_sell's TRAIL-side fix: closes the
+            # window where a confirmed cancel could be followed by a failed/
+            # blocked new placement, leaving nothing resting at the broker in
+            # between (found 2026-07-27, raised directly by the user).
+            _, order_id = schwab_client.replace_equity_order_with_market(
+                account, ticker, sl_order_id, "SELL", shares, current_price)
+        else:
+            _, order_id = schwab_client.place_equity_sell(account, ticker, shares, current_price)
+    except Exception as e:
+        db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'),
+                               result="blocked" if isinstance(e, schwab_safety.SafetyViolation) else "failed_unexpectedly",
+                               detail=f"reason={reason}: {e}")
+        if sl_order_id:
+            sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos.get('stop_loss')
+            sl_price = pos['signal_price'] * (1 - sl_pct / 100) if sl_pct else None
+            price_note = f"place stop-loss SELL {shares} @ ~${sl_price:.2f}" if sl_price else "place a stop-loss SELL manually"
+            db.log_coverage_event("manual_sl_fallback_alert", _mode, ticker=ticker, position_id=pos.get('id'),
+                                   node_id=pos.get('wl_id'), result="alerted", detail=price_note)
+            _post_message(
+                f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — {price_note}\n"
+                f"(auto {reason} exit replace of stop-loss {sl_order_id} failed: {e})"
+            )
+        elif not isinstance(e, schwab_safety.SafetyViolation):
+            _post_message(f"⚠️ {ticker} automated {reason} exit placement failed unexpectedly: {e} — falling back to manual")
+        return None
+    db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
+                           node_id=pos.get('wl_id'), result="placed", detail=f"reason={reason} shares={shares}")
+    return order_id
 
 
 _RECONCILE_ALERTED: dict[str, float] = {}
@@ -383,7 +454,7 @@ def _place_stop_loss_for_position(node, ticker, signal_price):
         db.set_sl_order_id_by_position(pos['id'], sl_order_id)
 
 
-def _sync_confirm_and_protect(ticker, node):
+def _sync_confirm_and_protect(ticker, node, order_id=None):
     """Synchronous fast-confirm step (Part 4, Section 6), run immediately after
     an automated market buy is placed -- ~70-80% of this strategy's trades exit
     via SL, the primary defense mechanism, so a freshly-opened position needs a
@@ -396,11 +467,17 @@ def _sync_confirm_and_protect(ticker, node):
     On timeout (rare -- API/exchange hiccup), fires an urgent Slack alert
     instead of silently deferring -- the position will still get protected
     once the async pipeline eventually confirms the fill and re-triggers this,
-    but a human should know about the gap in the meantime."""
+    but a human should know about the gap in the meantime.
+
+    order_id (the real id returned by _attempt_automated_market_buy) is passed
+    through to get_filled_order's exact-order lookup -- without it, a slow
+    fill here could fall through to the fuzzy ticker+side fallback and match a
+    stale unrelated prior fill for the same ticker+account (2026-07-27 GDXU
+    incident's exact root cause)."""
     account = node.get('account')
     ticker_label = ticker
     for _ in range(_SL_FAST_CONFIRM_ATTEMPTS):
-        fill = schwab_client.get_filled_order(account, ticker, 'BUY')
+        fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=order_id)
         if fill is not None:
             break
         time.sleep(_SL_FAST_CONFIRM_INTERVAL_SECS)
@@ -617,7 +694,7 @@ def notify_buy_signal(node, sig):
                 # synchronous fast-confirm poll and, on a hit, opens/tops-up/
                 # protects the position directly (via _reconcile_buy_fill),
                 # rather than waiting on the async pending_buys reminder flow.
-                _sync_confirm_and_protect(ticker, node)
+                _sync_confirm_and_protect(ticker, node, order_id)
 
     if market_buy_eligible and auto_placed:
         print(f"  {ticker} market buy order auto-placed — fill confirmation and SL placement "
@@ -713,6 +790,39 @@ def notify_sell_signal(pos, reason, current_price, target_price):
 
     reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT', 'TRAIL': 'TRAILING STOP'}
 
+    # Attempt automated execution before ever posting the manual alert -- for
+    # TRAIL this reuses the order already resting from the earlier arm event;
+    # for TP/SL/TIME this places a real market sell now, mirroring the
+    # backtest kernel's own exact-bar-close exit assumption (previously these
+    # 3 reasons had NO automated path at all, found 2026-07-27 real: SH's
+    # TIME exit sat unmanaged for hours). A short bounded poll (same pattern
+    # as check_gap_resize) checks for an immediate fill via the exact
+    # order_id -- if confirmed, close now and skip the manual alert entirely;
+    # a real fill confirmed by order_id is unambiguous (we know exactly which
+    # order it is and its full share count), so no human tap is needed.
+    order_id = _attempt_automated_exit_sell(pos, reason, current_price)
+    filled = None
+    if order_id is not None:
+        account = pos.get('account')
+        for _ in range(_GAP_FILL_POLL_ATTEMPTS):
+            filled = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=order_id)
+            if filled is not None:
+                break
+            time.sleep(_GAP_FILL_POLL_INTERVAL_SECS)
+
+    if filled is not None:
+        actual_pnl = (filled['price'] - ep) / ep * 100
+        closed = db.close_position(pos['id'], exit_signal_price=current_price, exit_price=filled['price'],
+                                    exit_time=datetime.now(), exit_reason=reason)
+        if closed:
+            db.log_coverage_event("automated_exit_confirmed", _coverage_mode(pos.get('account')), ticker=ticker,
+                                   position_id=pos.get('id'), node_id=pos.get('wl_id'), result="closed",
+                                   detail=f"reason={reason} price={filled['price']:.4f}")
+            _post_message(f"🤖 {ticker} — {reason_labels[reason]} auto-closed at ${filled['price']:.4f}  "
+                          f"(P&L: {(filled['price']-ep)/ep*100:+.2f}%)")
+            print(f"  Auto-closed via confirmed broker fill @ ${filled['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
+        return
+
     sep = '=' * 62
     print(f"\n{sep}")
     print(f"  SELL SIGNAL  {ticker}  — {reason_labels[reason]}")
@@ -729,12 +839,16 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     # Tracks the exit as unresolved until Exited/Skipped -- unlike a placed trailing-buy
     # (waiting on a broker fill we can't detect), a stalled SELL confirmation means an
     # already-open position with real capital sitting unmanaged, arguably more urgent to
-    # nag about than the buy side.
+    # nag about than the buy side. order_id (None if out of automation scope) lets
+    # check_own_sell_fills keep rechecking the exact real order every poll cycle and
+    # auto-close the moment it's confirmed FILLED -- the manual tap below is only the
+    # fallback path, not the sole way this ever resolves.
     state = dict(pos.get('trail_state') or {})
     state['exit_pending'] = {
         'reason': reason, 'current_price': current_price, 'target_price': target_price,
         'reminder_channel': channel, 'reminder_ts': ts, 'reminder_count': 0,
         'last_reminder_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'order_id': order_id,
     }
     db.update_position_trail_state(pos['id'], state)
 
@@ -824,7 +938,7 @@ def _supersede_message(channel, ts, ticker):
 
 def notify_trailing_activated(pos, current_price):
     ticker = pos['ticker']
-    auto_placed = _attempt_automated_sell(pos, current_price)
+    auto_placed, exit_order_id = _attempt_automated_sell(pos, current_price)
     if auto_placed:
         channel, ts = _post_message(
             f"🤖 {ticker} trailing stop activated — order auto-placed at the broker",
@@ -856,6 +970,7 @@ def notify_trailing_activated(pos, current_price):
     state['last_reminder_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if auto_placed:
         state['order_placed'] = True
+        state['exit_order_id'] = exit_order_id
     db.update_position_trail_state(pos['id'], state)
 
 
@@ -944,6 +1059,48 @@ def _exit_pending_blocks(pos, exit_pending, reminder_num):
             {"type": "mrkdwn", "text": "No interactive buttons — type the exit price into the terminal running the daemon when filled."}
         ]})
     return blocks
+
+
+def check_own_sell_fills(open_positions):
+    """Every poll cycle, rechecks any unresolved exit_pending that has a known
+    order_id (an order WE placed via _attempt_automated_exit_sell/an earlier
+    TRAIL arm) -- if Schwab now confirms that exact order FILLED, closes the
+    position automatically. Deliberately unconditional, NOT gated behind
+    schwab_safety.auto_fill_detection_enabled (that opt-in toggle is for
+    detecting a fill on an order we did NOT place ourselves, an inherently
+    fuzzier signal) -- once we hold the specific order_id and Schwab confirms
+    it FILLED, there's no ambiguity left to gate on. The manual Exited/Skipped
+    tap in check_exit_reminders remains as the fallback for tickers outside
+    automation scope (order_id is None there) or if this exact-order lookup
+    itself ever fails."""
+    for pos in open_positions:
+        state = pos.get('trail_state') or {}
+        exit_pending = state.get('exit_pending')
+        if not exit_pending:
+            continue
+        order_id = exit_pending.get('order_id')
+        if order_id is None:
+            continue
+        account = pos.get('account')
+        if not account:
+            continue
+        ticker = pos['ticker']
+        fill = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=order_id)
+        if fill is None:
+            continue
+        actual_pnl = (fill['price'] - pos['entry_price']) / pos['entry_price'] * 100
+        closed = db.close_position(pos['id'], exit_signal_price=exit_pending['current_price'],
+                                    exit_price=fill['price'], exit_time=datetime.now(),
+                                    exit_reason=exit_pending['reason'])
+        if not closed:
+            # Already closed this same cycle by check_auto_fills (opt-in, same
+            # order_id) reading the same stale open_positions snapshot -- avoid a
+            # duplicate/misleading Slack post for a close that already happened.
+            continue
+        db.log_coverage_event("automated_exit_confirmed", _coverage_mode(account), ticker=ticker,
+                              position_id=pos.get('id'), node_id=pos.get('wl_id'), result="closed",
+                              detail=f"reason={exit_pending['reason']} price={fill['price']:.4f} via_recheck=1")
+        _post_message(f"🤖 {ticker} — auto-detected exit fill at ${fill['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
 
 
 def check_exit_reminders(open_positions):
@@ -1322,45 +1479,30 @@ def check_gap_resize():
         if current_price < buy_trigger:
             continue
 
-        # From here on we're about to act (cancel + possibly replace) -- claim
-        # the row for today before touching the broker, so a restart mid-attempt
-        # can't re-enter and act on it again (see the persisted-guard docstring
+        # From here on we're about to act (replace/place) -- claim the row for
+        # today before touching the broker, so a restart mid-attempt can't
+        # re-enter and act on it again (see the persisted-guard docstring
         # note above).
         db.mark_gap_resize_attempted(pending['id'], today)
 
         order_id = pending.get('order_id')
-        if order_id:
-            try:
-                _, cancel_status = schwab_client.cancel_order(account, ticker, order_id)
-            except Exception as e:
-                db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
-                                       node_id=node.get('id'), result="cancel_failed", detail=str(e))
-                _post_message(f"⚠️ {ticker} gap-correction cancel failed: {e} — leaving resting order in place")
-                continue
-            if cancel_status != "CANCELED":
-                # Don't place a replacement MARKET order without confirmed proof
-                # the original trailing-buy is gone -- proceeding here risks a
-                # real double-order (both the original and the replacement fill)
-                # if the cancel didn't actually take effect. Leave the pending_buys
-                # row in place so a stray fill of the original order is still
-                # reconciled normally (found via Opus review, 2026-07-24).
-                db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
-                                       node_id=node.get('id'), result="cancel_unconfirmed", detail=f"status={cancel_status!r}")
-                _post_message(
-                    f"⚠️ {ticker} gap-correction cancel not confirmed CANCELED "
-                    f"(real status: {cancel_status!r}) — refusing to place a replacement order; "
-                    f"leaving resting order/pending row as-is"
-                )
-                continue
-
         target_notional = _last_sale_recovery(node)
         padded_price = current_price * (1 + _GAP_RESIZE_PAD_PCT / 100)
         shares = int(target_notional // padded_price)
         _post_message(f"🌅 {ticker} — overnight gap cleared trigger (${current_price:.4f} vs "
                       f"${buy_trigger:.4f}); replacing with a MARKET order for {shares} shares")
         try:
-            _, new_order_id = schwab_client.place_equity_buy(
-                account, ticker, shares, current_price, is_gap_correction=True)
+            if order_id:
+                # Atomic replace (cancel-old + create-new as a single broker
+                # call) instead of a separate cancel_order + place_equity_buy --
+                # closes the window where a confirmed cancel could be followed
+                # by a failed/blocked new placement, leaving no order resting at
+                # all in between (found 2026-07-27, raised directly by the user).
+                _, new_order_id = schwab_client.replace_equity_order_with_market(
+                    account, ticker, order_id, "BUY", shares, current_price, is_gap_correction=True)
+            else:
+                _, new_order_id = schwab_client.place_equity_buy(
+                    account, ticker, shares, current_price, is_gap_correction=True)
         except schwab_safety.SafetyViolation as e:
             db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                    node_id=node.get('id'), result="blocked", detail=str(e))
@@ -1372,6 +1514,11 @@ def check_gap_resize():
             _post_message(f"🚫 {ticker} gap-correction MARKET order was rejected by Schwab: {e}")
             db.clear_pending_buy_by_wl_id(node['id'])
             continue
+        except Exception as e:
+            db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
+                                   node_id=node.get('id'), result="replace_failed", detail=str(e))
+            _post_message(f"⚠️ {ticker} gap-correction replace failed: {e} — leaving resting order/pending row as-is")
+            continue
         db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                node_id=node.get('id'), result="replaced", detail=f"shares={shares} price={current_price:.4f}")
         db.set_pending_buy_order_id_by_wl_id(node['id'], new_order_id)
@@ -1381,7 +1528,7 @@ def check_gap_resize():
             continue
 
         for _ in range(_GAP_FILL_POLL_ATTEMPTS):
-            fill = schwab_client.get_filled_order(account, ticker, 'BUY')
+            fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=new_order_id)
             if fill is not None:
                 break
             time.sleep(_GAP_FILL_POLL_INTERVAL_SECS)
@@ -1416,7 +1563,7 @@ def drain_fill_queue():
     cached record)."""
     while True:
         try:
-            account, ticker, side, _stream_price, _stream_shares = schwab_stream.FILL_QUEUE.get_nowait()
+            account, ticker, side, _stream_price, _stream_shares, order_id = schwab_stream.FILL_QUEUE.get_nowait()
         except Exception:
             break
         if side != 'BUY':
@@ -1425,7 +1572,7 @@ def drain_fill_queue():
         _node_id = _node['id'] if _node else None
         fill = None
         for _ in range(_GAP_FILL_POLL_ATTEMPTS):
-            fill = schwab_client.get_filled_order(account, ticker, 'BUY')
+            fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=order_id)
             if fill is not None:
                 break
             time.sleep(_GAP_FILL_POLL_INTERVAL_SECS)
@@ -1466,7 +1613,7 @@ def check_auto_fills(open_positions):
         account = node.get('account')
         if not account:
             continue
-        fill = schwab_client.get_filled_order(account, ticker, 'BUY')
+        fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=pending.get('order_id'))
         if fill is None:
             continue
         _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'])
@@ -1485,13 +1632,15 @@ def check_auto_fills(open_positions):
         account = pos.get('account')
         if not account:
             continue
-        fill = schwab_client.get_filled_order(account, ticker, 'SELL')
+        fill = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=exit_pending.get('order_id'))
         if fill is None:
             continue
         actual_pnl = (fill['price'] - pos['entry_price']) / pos['entry_price'] * 100
-        db.close_position(pos['id'], exit_signal_price=exit_pending['current_price'],
-                           exit_price=fill['price'], exit_time=datetime.now(),
-                           exit_reason=exit_pending['reason'])
+        closed = db.close_position(pos['id'], exit_signal_price=exit_pending['current_price'],
+                                    exit_price=fill['price'], exit_time=datetime.now(),
+                                    exit_reason=exit_pending['reason'])
+        if not closed:
+            continue
         _post_message(f"🤖 {ticker} — auto-detected exit fill at ${fill['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
 
 

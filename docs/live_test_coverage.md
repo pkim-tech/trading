@@ -1,5 +1,51 @@
 # Live Test Coverage Ledger
 
+## Runbook: staging a real-order live test scenario
+Written 2026-07-27 after having to reconstruct this from `deep_backlog.md`/`conversation_summary.md`
+mid-session instead of it being documented directly — don't let this happen again.
+
+**The 3 core scenarios, and what each needs:**
+1. **Entry (gap-resize or fresh buy)** — needs a ticker with NO open position. Exercises
+   `_scan_buy_signals`/`check_gap_resize` → `_attempt_automated_buy`/`_attempt_automated_market_buy`
+   → `_sync_confirm_and_protect` → real SL placement.
+2. **TIME-exit** — needs an OPEN position with a short `max_hold_hours` (e.g. 3 bars) so it exits
+   again quickly once entered, rather than waiting on a real multi-day hold. Exercises
+   `notify_sell_signal(reason='TIME')` → `_attempt_automated_exit_sell` → real market sell.
+3. **TRAIL-exit** — needs an OPEN position that's already past its take-profit arm threshold
+   (`trail_state.trailing=True`, `peak` set). Exercises `notify_trailing_activated`/
+   `_attempt_automated_sell` (arm-time trailing-sell placement) and, once it fires,
+   `_attempt_automated_exit_sell`'s TRAIL branch (reuses the resting order via `exit_order_id`,
+   never places a second one).
+
+**Minimum ticker count: 2, not 3.** Entry + TIME-exit CAN share one ticker (short `max_hold_hours`
+means it buys, then exits again a few bars later, repeatably) — but TRAIL-exit always needs its
+OWN separate open position, since arming requires the take-profit condition, not a hold-time
+timeout. A single ticker cannot be mid-TIME-exit-cycle and mid-TRAIL-arm at the same time.
+
+**Current allocation (soxl_test group, `soxl_ira`, 2026-07-27):** GDXU = TRAIL-exit (position
+open, armed via a rigged `peak`, real trailing-sell resting). SH = TIME-exit (position open,
+`max_hold_hours` bumped to fire ~next day; a real SL is placed far out-of-the-money so it's
+protected without pre-empting the TIME-exit). SPY = flat, available for a fresh entry test.
+
+**Placing a real order outside a signal window (the "direct bypass"):** `schwab_safety.check_order`
+blocks any real order outside the 4 signal windows — for a deliberately-staged test (not an organic
+signal), the ONLY way around this is to skip `schwab_client.py`'s wrapper functions entirely and call
+the raw `schwab-py` client directly — a genuine bypass, not a flag, skipping `schwab_safety.
+approve_and_record` and EVERY guard behind it (cash check, notional cap, daily/burst order caps,
+duplicate-order guard, kill switch).
+
+**Use `scripts/stage_live_test_order.py`, not a one-off manual script**, so this doesn't have to be
+re-derived by hand each time. It prints the real cash balance/notional check, today's real order
+count for the account, any recent order for the same ticker+side (duplicate check), and kill-switch
+state before asking for a typed confirmation — the same checks `schwab_safety` would normally do
+automatically, surfaced for a human to verify since none of them run in this path:
+```
+.venv/bin/python scripts/stage_live_test_order.py --account soxl_ira --ticker SPY \
+    --side BUY --order-type TRAILING --quantity 2 --trail-pct 1.0
+```
+Logs to `coverage_events` (`scenario_key="staged_live_test"`) same as everything else.
+
+
 Standing record of every scenario/code-path in the live-trading automation engine that needs
 to be exercised against the *real* live daemon (not just an offline replay or unit test) —
 see `automation_principles.md` #10. A row only moves to Verified once actually observed

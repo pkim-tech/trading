@@ -1,5 +1,28 @@
 # Backlog Cache
 
+## [live-trading][security] Resolved 2026-07-27 (night) — GDXU stale-fill incident fixed (order_id-exact matching everywhere, replaces the fuzzy "most recent fill" hazard); automated TP/SL/TIME exits built; cancel+place replaced with atomic `replace_order`; 6 canary nodes restored after accidental deletion. Full detail: `docs/deep_backlog.md`'s 2026-07-27 (night) entry (top).
+New tooling from real session friction: `scripts/audit_live_test_candidates.py`, `scripts/stage_live_test_order.py`, `docs/live_test_coverage.md`'s new runbook section. Full suite 302 passed, harness 7/7, invariants clean, 2 independent Sonnet review rounds.
+
+## [live-trading][security] Accepted residual risk, 2026-07-27 — `_submit_replace_with_retry`'s retry can fire a second `replace_order` against an already-replaced order_id
+Built same session: `check_gap_resize`, `_attempt_automated_sell`, and `_attempt_automated_exit_sell`
+were rewritten to use schwab-py's `replace_order` (atomic cancel-old+create-new) instead of a
+separate `cancel_order` + `place_*` two-step, closing a real failure window the user identified
+(a confirmed cancel followed by a failed/blocked new placement left nothing resting at the broker
+in between). A second-round Sonnet review of that rewrite found a real residual gap in the fix
+itself: `replace_order` targets one specific `order_id` (unlike a fresh placement) -- if attempt 1's
+request actually lands at the broker (old order canceled, new one created) but the client-side
+response handling then raises (timeout, malformed response after a real success), the retry loop
+fires a SECOND `replace_order` against an order_id that's already dead. That call fails cleanly, so
+the caller's final exception looks identical to "nothing happened at all" -- but a real, untracked
+new order may already be resting. Every caller's UNPROTECTED/manual-fallback Slack messaging
+currently asserts more certainty than this actually establishes (e.g. "place a stop-loss manually,
+this position is unprotected" when an untracked order may already be live). **Accepted, not fixed,
+by explicit user call** (narrow window: client-side failure right after a real broker success,
+layered on top of an already-rare retry case) -- documented in `_submit_replace_with_retry`'s
+docstring. Real fix, if revisited: before retrying, check the target order_id's live status at the
+broker; if it's already gone (not "still resting"), stop retrying and raise a distinct "ambiguous,
+check broker directly" signal instead of the current confident UNPROTECTED alert.
+
 ## [live-trading][security] Resolved 2026-07-26 (evening) — BUY-signal duplicate-alert fix: `pending_wl_ids` now actually enforced + new broker-truth check (`_real_order_or_position_exists`) before firing a fresh live BUY alert
 Root cause of a real same-day incident: the pre-trading-day-gate daemon restarted mid-Sunday,
 which reset the in-memory `buy_alerted` set (the only guard against re-firing a node's BUY

@@ -75,6 +75,36 @@ def _submit_order_with_retry(account_hash, order):
     raise last_exc
 
 
+def _submit_replace_with_retry(account_hash, order_id, order):
+    """Same retry shape as _submit_order_with_retry, for schwab-py's
+    replace_order (cancel-old + create-new as a single broker call).
+
+    Known residual risk, accepted 2026-07-27 (see docs/backlog_cache.md):
+    replace_order targets one specific order_id, unlike a fresh placement --
+    if attempt 1's request actually lands at the broker (old order canceled,
+    new one created) but the client-side response handling then raises
+    (timeout, malformed response after a real success), a retry fires a
+    SECOND replace_order against an order_id that's already dead. That call
+    fails cleanly, so the caller's final exception looks identical to
+    "nothing happened at all," when a real, untracked new order may already
+    be resting. Every caller's UNPROTECTED/manual-fallback messaging
+    currently assumes this ambiguity away. Not fixed here (Sonnet review
+    found it, user's call to accept and backlog rather than fix same
+    session) -- a real fix would check the target order_id's live status
+    before retrying rather than retrying blind."""
+    last_exc = None
+    for attempt in range(_ORDER_SUBMIT_RETRY_ATTEMPTS):
+        try:
+            r = _get_client().replace_order(account_hash, order_id, order)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_exc = e
+            if attempt < _ORDER_SUBMIT_RETRY_ATTEMPTS - 1:
+                time.sleep(_ORDER_SUBMIT_RETRY_INTERVAL_SECS)
+    raise last_exc
+
+
 # Order placement/cancellation are asynchronous -- the initial HTTP response only
 # means "received," not the final verdict. Confirmed live 2026-07-24: an oversized
 # BUY returned HTTP 201 (no exception) but resolved REJECTED ~0.3-0.7s later; a
@@ -176,6 +206,11 @@ def _resolve_account_hashes() -> dict:
     return _account_hashes
 
 
+def _build_market_order(side: str, ticker: str, quantity: int):
+    order_fn = equity_orders.equity_buy_market if side == "BUY" else equity_orders.equity_sell_market
+    return order_fn(ticker, quantity)
+
+
 def _place_equity_order(
     side: str, account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
     is_protective: bool = False,
@@ -197,14 +232,61 @@ def _place_equity_order(
         return None, None
 
     account_hash = _resolve_account_hashes()[account]
-    order_fn = equity_orders.equity_buy_market if side == "BUY" else equity_orders.equity_sell_market
-    order = order_fn(ticker, quantity)
+    order = _build_market_order(side, ticker, quantity)
     r = _submit_order_with_retry(account_hash, order)
     order_id = Utils(_get_client(), account_hash).extract_order_id(r)
     _post_order_confirmation(
         side, account_hash, order_id, ticker, account,
         f"✅ {side} {quantity} {ticker} in {account} submitted to Schwab (~${quantity * price:,.0f})")
     return r, order_id
+
+
+def replace_equity_order_with_market(
+    account: str, ticker: str, order_id: int, side: str, quantity: int, price: float,
+    is_gap_correction: bool = False, is_protective: bool = False,
+):
+    """Atomically replaces a resting order (e.g. a protective STOP) with a
+    plain MARKET order of the given side/quantity, via schwab-py's
+    replace_order -- a single broker call (cancel-old + create-new) instead
+    of two independent calls (cancel_order then place_equity_buy/sell).
+
+    Closes a real failure window the two-call version has: a confirmed
+    cancel followed by a failed/blocked new placement leaves nothing
+    resting at the broker in between, genuinely unprotected/unmanaged --
+    the existing manual_sl_fallback_alert path exists specifically to catch
+    this after the fact, but a single atomic call removes the gap instead
+    (found 2026-07-27, raised directly by the user while reviewing the
+    SH TIME-exit and check_gap_resize cancel+place patterns).
+
+    Used by check_gap_resize (BUY side -- swaps an overnight-gapped
+    trailing-buy for a market buy) and _attempt_automated_exit_sell (SELL
+    side -- swaps a resting protective SL for a market sell exit on a
+    TP/SL/TIME signal). Returns (response, new_order_id); dry_run returns
+    (None, None) and leaves the existing resting order untouched."""
+    try:
+        dry_run = schwab_safety.approve_and_record(
+            account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
+            is_protective=is_protective)
+    except schwab_safety.SafetyViolation as e:
+        _post_message(f"\U0001F6AB BLOCKED replace {order_id} with MARKET {side} {quantity} {ticker} in {account}: {e}")
+        raise
+
+    if dry_run:
+        msg = (f"[DRY RUN] would replace order {order_id} with MARKET {side} {quantity} {ticker} "
+               f"in {account} (~${quantity * price:,.0f})")
+        _post_message(msg)
+        print(msg)
+        return None, None
+
+    account_hash = _resolve_account_hashes()[account]
+    order = _build_market_order(side, ticker, quantity)
+    r = _submit_replace_with_retry(account_hash, order_id, order)
+    new_order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+    _post_order_confirmation(
+        f"REPLACE->MARKET {side}", account_hash, new_order_id, ticker, account,
+        f"✅ Replaced order {order_id} with MARKET {side} {quantity} {ticker} in {account} "
+        f"(~${quantity * price:,.0f})")
+    return r, new_order_id
 
 
 def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
@@ -215,6 +297,21 @@ def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_
 
 def place_equity_sell(account: str, ticker: str, quantity: int, price: float):
     return _place_equity_order("SELL", account, ticker, quantity, price)
+
+
+def _build_trailing_order(side: str, link_basis: StopPriceLinkBasis, ticker: str, quantity: int, trail_pct: float):
+    order = OrderBuilder()
+    order.set_order_type(OrderType.TRAILING_STOP)
+    order.set_session(Session.NORMAL)
+    order.set_duration(Duration.GOOD_TILL_CANCEL)
+    order.set_order_strategy_type(OrderStrategyType.SINGLE)
+    order.set_stop_price_link_basis(link_basis)
+    order.set_stop_price_link_type(StopPriceLinkType.PERCENT)
+    order.set_stop_price_offset(trail_pct)
+    order.add_equity_leg(
+        EquityInstruction.BUY if side == "BUY" else EquityInstruction.SELL, ticker, quantity
+    )
+    return order
 
 
 def _place_trailing_order(
@@ -243,18 +340,7 @@ def _place_trailing_order(
         return None, None
 
     account_hash = _resolve_account_hashes()[account]
-    order = OrderBuilder()
-    order.set_order_type(OrderType.TRAILING_STOP)
-    order.set_session(Session.NORMAL)
-    order.set_duration(Duration.GOOD_TILL_CANCEL)
-    order.set_order_strategy_type(OrderStrategyType.SINGLE)
-    order.set_stop_price_link_basis(link_basis)
-    order.set_stop_price_link_type(StopPriceLinkType.PERCENT)
-    order.set_stop_price_offset(trail_pct)
-    order.add_equity_leg(
-        EquityInstruction.BUY if side == "BUY" else EquityInstruction.SELL, ticker, quantity
-    )
-
+    order = _build_trailing_order(side, link_basis, ticker, quantity, trail_pct)
     r = _submit_order_with_retry(account_hash, order)
     order_id = Utils(_get_client(), account_hash).extract_order_id(r)
     _post_order_confirmation(
@@ -264,28 +350,102 @@ def _place_trailing_order(
     return r, order_id
 
 
+def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, quantity: int, price: float, trail_pct: float):
+    """Same atomic-replace idea as replace_equity_order_with_market, for the
+    TRAIL arm-time swap: a resting protective SL becomes a TRAILING_STOP
+    SELL, as a single broker call instead of cancel_order + place_trailing_sell.
+    Used by _attempt_automated_sell. Returns (response, new_order_id);
+    dry_run returns (None, None) and leaves the existing resting order
+    untouched."""
+    try:
+        dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, "SELL")
+    except schwab_safety.SafetyViolation as e:
+        _post_message(f"\U0001F6AB BLOCKED replace {order_id} with TRAILING SELL {quantity} {ticker} "
+                      f"in {account} (trail={trail_pct}%): {e}")
+        raise
+
+    if dry_run:
+        msg = (f"[DRY RUN] would replace order {order_id} with TRAILING SELL {quantity} {ticker} "
+               f"in {account} (trail={trail_pct}%, ~${quantity * price:,.0f})")
+        _post_message(msg)
+        print(msg)
+        return None, None
+
+    account_hash = _resolve_account_hashes()[account]
+    order = _build_trailing_order("SELL", StopPriceLinkBasis.BID, ticker, quantity, trail_pct)
+    r = _submit_replace_with_retry(account_hash, order_id, order)
+    new_order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+    _post_order_confirmation(
+        "REPLACE->TRAILING SELL", account_hash, new_order_id, ticker, account,
+        f"✅ Replaced order {order_id} with TRAILING SELL {quantity} {ticker} in {account} "
+        f"(trail={trail_pct}%, ~${quantity * price:,.0f})")
+    return r, new_order_id
+
+
 def place_trailing_buy(account: str, ticker: str, quantity: int, price: float, trail_pct: float):
     """trail_pct is the bounce-above-running-low trigger (matches the node's
     trail_buy_pct). ASK-linked, since a buy naturally references the ask."""
     return _place_trailing_order("BUY", StopPriceLinkBasis.ASK, account, ticker, quantity, price, trail_pct)
 
 
-def get_filled_order(account: str, ticker: str, side: str):
-    """Best-effort poll of Schwab's live order book for the most recent FILLED
-    order matching ticker+side -- used by signals_notify.check_auto_fills to
-    auto-record a fill without a human clicking Filled/Exited. Field names
-    (orderActivityCollection/executionLegs) follow Schwab's documented order
-    schema but are unverified against a real fill response -- confirm against
-    one real (dry_run=False) fill before trusting this for anything beyond the
-    opt-in auto-fill-detection toggle, which defaults off. Returns
-    {'price': float, 'quantity': float} or None if no matching fill is found."""
+def _order_fill(o):
+    """Extracts {'price', 'quantity'} from a single order dict if it's FILLED
+    with at least one execution leg, else None."""
+    if o.get("status") != "FILLED":
+        return None
+    exec_legs = [
+        el for activity in o.get("orderActivityCollection", [])
+        for el in activity.get("executionLegs", [])
+    ]
+    if not exec_legs:
+        return None
+    total_qty = sum(el.get("quantity", 0) for el in exec_legs)
+    if not total_qty:
+        return None
+    vwap = sum(el.get("price", 0) * el.get("quantity", 0) for el in exec_legs) / total_qty
+    return {"price": vwap, "quantity": total_qty}
+
+
+def get_filled_order(account: str, ticker: str, side: str, order_id: int = None):
+    """Poll of Schwab's live order book for a FILLED order matching ticker+side.
+
+    When order_id is given (every call site that placed the order itself
+    should pass it), looks up that EXACT order only -- returns its fill if
+    FILLED, else None. This is the only safe mode: a market order placed
+    pre-market (e.g. check_gap_resize's 9:15-9:29 ET window) won't actually
+    fill until the 9:30 open, and during that gap this must return None, not
+    substitute a different, older FILLED order for the same ticker+side.
+
+    order_id=None falls back to the old best-effort "most recent FILLED
+    order for this ticker+side" heuristic, kept only for call sites with no
+    specific order to check (e.g. an unattributed stream event). This mode
+    is a real, known hazard -- a stale unrelated fill (a prior trade, days
+    old) can be returned as if it were the order just placed, since nothing
+    here scopes by date or ties the result to a specific placement. Found
+    2026-07-27: this exact hazard corrupted a real GDXU reconciliation
+    (matched a 2026-07-24 closed trade instead of recognizing the real
+    replacement order hadn't filled yet), leaving the position's real
+    stop-loss unplaced. Always prefer passing order_id.
+
+    Field names (orderActivityCollection/executionLegs) follow Schwab's
+    documented order schema. Returns {'price': float, 'quantity': float} or
+    None if no matching fill is found."""
     account_hash = _resolve_account_hashes()[account]
     r = _get_client().get_orders_for_account(account_hash)
     r.raise_for_status()
+    orders = r.json()
+
+    if order_id is not None:
+        for o in orders:
+            if o.get("orderId") == order_id:
+                return _order_fill(o)
+        return None
+
     instruction = EquityInstruction.BUY if side == "BUY" else EquityInstruction.SELL
     candidates = []
-    for o in r.json():
-        if o.get("status") != "FILLED":
+    for o in orders:
+        fill = _order_fill(o)
+        if fill is None:
             continue
         legs = o.get("orderLegCollection", [])
         matches = any(
@@ -295,22 +455,11 @@ def get_filled_order(account: str, ticker: str, side: str):
         )
         if not matches:
             continue
-        exec_legs = [
-            el for activity in o.get("orderActivityCollection", [])
-            for el in activity.get("executionLegs", [])
-        ]
-        if not exec_legs:
-            continue
-        total_qty = sum(el.get("quantity", 0) for el in exec_legs)
-        if not total_qty:
-            continue
-        vwap = sum(el.get("price", 0) * el.get("quantity", 0) for el in exec_legs) / total_qty
-        candidates.append((o.get("closeTime") or o.get("enteredTime") or "", vwap, total_qty))
+        candidates.append((o.get("closeTime") or o.get("enteredTime") or "", fill))
     if not candidates:
         return None
     candidates.sort(key=lambda c: c[0])
-    _, price, qty = candidates[-1]
-    return {"price": price, "quantity": qty}
+    return candidates[-1][1]
 
 
 def place_trailing_sell(account: str, ticker: str, quantity: int, price: float, trail_pct: float):
@@ -324,11 +473,13 @@ def place_trailing_sell(account: str, ticker: str, quantity: int, price: float, 
 
 
 def cancel_order(account: str, ticker: str, order_id: int):
-    """Cancels a still-resting order -- used by signals_notify.check_gap_resize
-    (Part 3, branch B) to pull a stale trailing-buy order once an overnight
-    gap has already cleared its trigger, before replacing it with a plain
-    MARKET order; and by _attempt_automated_sell to pull a resting SL before
-    arming a trailing-sell. No approve_and_record gate -- this isn't a new
+    """Cancels a still-resting order with no replacement. Not currently called
+    by any real order-swap path -- check_gap_resize, _attempt_automated_sell,
+    and _attempt_automated_exit_sell were all migrated 2026-07-27 to
+    replace_equity_order_with_market/replace_order_with_trailing_sell (a
+    single atomic broker call instead of a separate cancel + place). Kept for
+    a genuine cancel-with-no-replacement case (none exists in this codebase
+    yet) or manual/REPL use. No approve_and_record gate -- this isn't a new
     placement, just withdrawing one already approved.
 
     Returns (response, confirmed_status) -- confirmed_status is 'CANCELED' only

@@ -89,7 +89,7 @@ from signals_notify import (
     notify_buy_signal, notify_limit_fill, notify_sell_signal,
     TRAIL_REMINDER_MINUTES, _trailing_order_blocks, _supersede_message,
     notify_trailing_activated, check_trailing_reminders,
-    EXIT_REMINDER_MINUTES, _exit_pending_blocks, check_exit_reminders,
+    EXIT_REMINDER_MINUTES, _exit_pending_blocks, check_exit_reminders, check_own_sell_fills,
     BUY_REMINDER_MINUTES, _trailing_buy_status, _pending_buy_blocks, check_buy_reminders,
     check_auto_fills, check_gap_resize, drain_fill_queue,
     check_live_state_reconciliation, alert_stale_price_exit_suppressed,
@@ -801,6 +801,12 @@ def run_loop(tickers: set = None):
             # resting at the broker, and auto-fill-detection is opt-in per ticker anyway
             # (schwab_safety.auto_fill_detection_enabled, off by default).
             _guarded("auto_fills", check_auto_fills, open_positions)
+
+            # Unconditional (not opt-in, not gated to market hours) -- unlike
+            # check_auto_fills above, this only ever rechecks an order_id we placed
+            # ourselves, so there's no ambiguity to gate on: once Schwab confirms
+            # that exact order FILLED, close the position, no manual tap required.
+            _guarded("own_sell_fills", check_own_sell_fills, open_positions)
 
             # Fast-path fill reconciliation (Part 3, branch C) -- cheap, non-blocking
             # drain of whatever schwab_stream's account-activity websocket has queued

@@ -4851,3 +4851,69 @@ Full suite: 302 passed. `signals_invariants.py`: clean, 0 known violations. Daem
 and stale (predates last night's `signals_notify.py` edit) — none of this session's changes are live
 until restarted; the GDXU gap-resize test and SH TIME-exit test from the prior session are still
 pending that restart.
+
+---
+
+## 2026-07-27 (night) — GDXU stale-fill incident root-caused and fixed; automated TP/SL/TIME exits built; cancel+place replaced with atomic replace_order; 6 canary nodes restored after accidental deletion
+
+### What happened
+Started by reviewing the day's 3 staged live tests (SPY TRAIL-exit, SH TIME-exit, GDXU
+gap-resize). Found GDXU's real position corrupted: DB said 3 shares @ $80.805, broker said 2 @
+$83.76, real stop-loss REJECTED, unprotected ~12h. Root cause: `schwab_client.get_filled_order`
+had no way to target a specific order — it returned "the most recent FILLED order matching
+ticker+side," which matched a stale 3-day-old fill instead of correctly reporting "not filled yet"
+when the real replacement order (placed pre-market, normal ~15min wait for the 9:30 open) hadn't
+landed by the time the poll gave up.
+
+Fixed: `get_filled_order` gained an `order_id` exact-match mode, threaded through every real call
+site (`check_gap_resize`, `check_auto_fills` both branches, `drain_fill_queue`,
+`_sync_confirm_and_protect`). Separately found and fixed: TP/SL/TIME exits had zero automated
+path (only TRAIL-arm did) — new `_attempt_automated_exit_sell` places a real market sell for all
+three. New `check_own_sell_fills` auto-closes a position once its own known order_id is confirmed
+FILLED, no manual tap required, unconditional (not gated behind the opt-in
+`auto_fill_detection_enabled`, since it only ever confirms an order we placed ourselves).
+
+User-directed design review led to a bigger rewrite: `check_gap_resize`/`_attempt_automated_sell`/
+`_attempt_automated_exit_sell`'s cancel-then-place pattern left a real window (confirmed cancel +
+failed new placement = nothing resting). Rewrote all three to use schwab-py's atomic `replace_order`
+via new `schwab_client.replace_equity_order_with_market`/`replace_order_with_trailing_sell`.
+`cancel_order` is now dead code. One residual risk accepted (not fixed, user's explicit call): the
+retry wrapper can still fire a second `replace_order` against an order_id the first (client-failed,
+broker-succeeded) attempt already replaced — documented in the docstring and backlogged.
+
+Two independent Sonnet review rounds (not Opus, per standing preference) on the real diff — all
+CONFIRMED findings fixed same session, including a HIGH cross-bar duplicate-real-order risk for
+TP/SL/TIME (no guard against a second order if the first wasn't confirmed filled by the next bar).
+
+Real state cleanup: GDXU corrected to real broker state, a real trailing-sell placed manually
+(0.3%, matching SPY's tight test params) with `trail_state` seeded armed to exercise the new
+confirm-and-close path fast. SPY's real trailing-sell had actually already FILLED at 09:46 ET that
+morning (+0.70% P&L) but sat invisible in the DB for hours (its order_id predated tonight's fix) —
+retroactively closed. SH's `max_hold_hours` bumped 11→18 and given a real deliberately-far
+out-of-the-money stop-loss (it had carried zero protection since 2026-07-23, a real gap the user
+caught, unrelated to tonight's other fixes).
+
+Separately: the 6 canary proof-of-life nodes (IVV/QQQ/IWM/DIA/VOO/XLF) turned out to have been
+accidentally deleted (not just narrowed) during an earlier live-watchlist scope cleanup that was
+only supposed to remove disposable one-day soxl_test scratch nodes. Restored via a corrected
+`scripts/add_canary_nodes.py` (SPY→IVV, since SPY is now the real soxl_test live node;
+mode='live'/account='ira' baked into the script) with `scenario_expectations.node_id` relinked and
+`SCHWAB_AUTOMATION_TICKERS` (.env) widened back to include all 6 — missing this caused a fresh
+`signals_invariants.py` violation, caught and fixed before wrap.
+
+### Tooling built from real friction
+User explicitly called out that investigation/staging kept happening as one-off `python -c`
+queries and orders instead of durable, rerunnable scripts (~20 ad-hoc queries in one session).
+Built `scripts/audit_live_test_candidates.py` (real broker+DB state + scenario-fit verdict for a
+set of candidate tickers, one command) and `scripts/stage_live_test_order.py` (the repeatable
+direct-broker-bypass tool for staging a real order outside a signal window, printing the manual
+cash/notional/duplicate-order/kill-switch checks `schwab_safety` would normally do automatically).
+Both documented in `docs/live_test_coverage.md`'s new "Runbook: staging a real-order live test
+scenario" section. 2 new memory entries saved (a reference pointer to the runbook, and a feedback
+note to persist reusable techniques immediately when they come up) after having to re-derive a
+bypass mechanism that was already documented in an earlier session with no memory pointer to it.
+
+### Verification
+Full suite: 302 passed. `live_sim_harness.py`: 7/7. `signals_invariants.py`: clean.
+`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`: no
+mismatches. Daemon killed by user, needs restart tomorrow before any of tonight's fixes are live.
