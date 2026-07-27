@@ -344,6 +344,14 @@ def ensure_tables():
             # signals_notify.update_dry_run_buys) -- a real trailing-buy order's
             # running low is tracked by the broker itself, not this table.
             c.execute("ALTER TABLE pending_buys ADD COLUMN running_low REAL")
+        if 'gap_resize_date' not in pb_cols:
+            # Persisted idempotency guard for check_gap_resize -- a daemon restart
+            # inside active_signals._GAP_CHECK_WINDOW resets the in-memory
+            # gap_check_alerted set, which would otherwise let the same resting
+            # order be cancelled/replaced twice (docs/backlog_cache.md, 2026-07-26).
+            # Set once a row's gap condition is confirmed and acted on for the day,
+            # checked before any cancel/replace attempt -- survives a restart.
+            c.execute("ALTER TABLE pending_buys ADD COLUMN gap_resize_date TEXT")
 
         # paper_positions/paper_trade_log -- schema-identical mirrors of open_positions/
         # trade_log for schwab_safety.AUTOMATION_ENABLED_TICKERS tickers running in research
@@ -1599,6 +1607,19 @@ def set_pending_buy_order_id(ticker, order_id):
 def set_pending_buy_order_id_by_wl_id(wl_id, order_id):
     with _conn() as c:
         c.execute("UPDATE pending_buys SET order_id=? WHERE wl_id=?", (order_id, wl_id))
+        c.commit()
+
+
+def mark_gap_resize_attempted(pending_id, date_str):
+    """Persisted idempotency guard -- see ensure_tables' gap_resize_date comment.
+    Called once check_gap_resize has confirmed a row's gap condition and is about
+    to cancel/replace its resting order, before doing so, so a restart mid-attempt
+    can't re-enter and act on the same row twice today. Keyed on pending_buys.id
+    (always present) rather than wl_id -- a NULL wl_id would make a wl_id-keyed
+    UPDATE match zero rows and silently fail to persist the guard (found via
+    Opus review, 2026-07-27)."""
+    with _conn() as c:
+        c.execute("UPDATE pending_buys SET gap_resize_date=? WHERE id=?", (date_str, pending_id))
         c.commit()
 
 

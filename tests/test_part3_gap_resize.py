@@ -129,6 +129,35 @@ def test_gap_resize_replaces_order_when_trigger_cleared(env, monkeypatch):
     assert [p for p in signals_db.get_pending_buys() if p['ticker'] == TICKER] == []
 
 
+def test_gap_resize_is_idempotent_against_restart_reentry(env, monkeypatch):
+    """A daemon restart inside active_signals._GAP_CHECK_WINDOW resets the
+    caller's in-memory once-daily gate -- check_gap_resize must still refuse to
+    act twice on the same row today via its own persisted gap_resize_date marker
+    (docs/backlog_cache.md, 2026-07-26 finding, fixed 2026-07-27)."""
+    _seed_pending_order(monkeypatch, order_id=555)
+    cancel_calls = []
+
+    def _fake_cancel(account, ticker, order_id):
+        cancel_calls.append(order_id)
+        return object(), 'CANCELED'
+
+    monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 52.0)
+    monkeypatch.setattr(schwab_client, 'cancel_order', _fake_cancel)
+    monkeypatch.setattr(schwab_client, 'place_equity_buy',
+                         lambda *a, **kw: (_ for _ in ()).throw(
+                             RuntimeError("simulated crash after cancel, before replacement lands")))
+
+    with pytest.raises(RuntimeError):
+        signals_notify.check_gap_resize()
+    assert cancel_calls == [555]
+    assert _pending()['gap_resize_date'] == datetime.now().strftime('%Y-%m-%d')
+
+    # Simulate the restart re-entering check_gap_resize the same day.
+    signals_notify.check_gap_resize()
+    assert cancel_calls == [555]  # unchanged -- second call was a no-op
+    assert _pending()['order_id'] == 555  # row untouched, still resolvable by a human
+
+
 def test_gap_resize_dry_run_leaves_pending_row_intact(env, monkeypatch):
     """dry_run (place_equity_buy returns (None, None)) -- no real fill will ever
     appear, so check_gap_resize must not poll forever or crash."""

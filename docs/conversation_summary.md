@@ -4777,3 +4777,42 @@ Also open: reduce watchlist 65 live nodes to SPY/SH/GDXU/DPST; SPY's real pendin
 exit needs a human decision; 3 real-order test scripts planned (gap_resize/trailing-sell/max-hold)
 not built; broader ask to strip non-essential tickers from research/watchlist/.env, not scoped.
 See docs/backlog_cache.md for full detail on all of the above.
+
+---
+
+## 2026-07-27 — Reconciled the duplicate-BUY incident against broker truth, placed SPY's real exit, cut watchlist 65 to 4 live nodes, staged 2 real-order tests, fixed `check_gap_resize`'s restart-duplication bug
+
+### What happened
+Picked up where the prior session left off (daemon stopped, real DB mess from the duplicate-BUY-alert
+incident unreconciled). Confirmed via `schwab_client.get_real_position`/`schwab_safety._open_orders`
+that all 8 duplicate `pending_buys` rows (LABU real money `soxl_ira`; DIA/IWM/QQQ canary `ira`) had zero
+real broker exposure behind them — cleared. Placed SPY's genuinely-armed real trailing-sell (order id
+1007336072974, resting at Schwab). Full suite confirmed at 301 passed before further changes.
+
+Reduced watchlist 65's live-mode nodes from 15 down to the user's chosen 4 (SPY, SH, GDXU #108, DPST) —
+the other 11 (6 canary proof-of-life nodes + 5 `soxl_test` nodes) were deleted outright per the user's
+call, not demoted to research (avoids paper-trading noise on tickers moved on from). VOO/IVV's open
+`is_dry_run_sim` positions were retroactively closed first so nothing was left dangling.
+
+Staged 2 of the 3 previously-planned real-order tests for the next daemon restart: SH's TIME-exit
+(`max_hold_hours` shortened to 11, `trail_sell_pct` bumped to an unfillable 50%) and GDXU's gap-resize
+(a real 5-share trailing-buy placed via direct bypass of the signal-window gate, `pending_buys` row
+rigged with `running_low=$1` to force a gap-through at tomorrow's 9:15 window). The SPY trailing-sell
+trigger test is considered already covered by the real exit placed above.
+
+Fixed `check_gap_resize`'s restart-duplication bug (flagged in the prior session, same shape as that
+session's BUY-duplicate fix): a persisted `pending_buys.gap_resize_date` marker now survives a daemon
+restart mid-`_GAP_CHECK_WINDOW`, closing the real double-order risk this staged GDXU test would
+otherwise be exposed to. Opus review found 2 LOW issues (marker keyed on nullable `wl_id` instead of
+the always-present row id; regression test didn't assert persistence), both fixed same session.
+
+### State
+Full suite: 302 passed (was 301). `live_sim_harness.py`: 7/7 including `scenario_gap_resize`.
+`signals_invariants.py`: clean, 0 known violations (the previously-accepted UDOW violation is
+separately resolved per the 2026-07-28 entry already on file). Daemon is still stopped — restart is
+needed before either the SH or GDXU staged test can actually fire. Real money is now committed to a
+resting GDXU trailing-buy order (~$425 notional) awaiting tomorrow's gap-resize test.
+Open: 3 MEDIUM findings from the prior session's BUY-duplicate Opus review still unfixed (any-side
+order/position check can block on unrelated manual holdings; untimed broker HTTP calls in pinned-entry
+path; gate excludes tickers outside `AUTOMATION_ENABLED_TICKERS`). Broader ask to strip non-essential
+tickers from research universe/watchlist/`.env` still unscoped. See `docs/backlog_cache.md` for detail.

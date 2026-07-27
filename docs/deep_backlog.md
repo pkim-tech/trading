@@ -1,5 +1,69 @@
 # Backlog
 
+## ✅ [live-trading][security] Resolved 2026-07-27 — reconciled the 2026-07-26 duplicate-BUY incident's real DB mess against broker truth (zero exposure found), placed SPY's real pending trailing-sell, reduced watchlist 65 to 4 live nodes, and fixed `check_gap_resize`'s restart-duplication bug
+
+**Reconciliation**: confirmed via `schwab_client.get_real_position`/`schwab_safety._open_orders` that
+none of the 8 duplicate `pending_buys` rows from the prior session's incident (LABU ids 32/38 — real
+money, `soxl_ira`, `dry_run=False`; DIA 16/28/35/40, IWM 34/39, QQQ 37/41 — canary, `ira`, `dry_run=True`)
+had resulted in any real resting order or position — LABU showed 0 shares/0 orders despite 25+ reminders
+nagging for an order that never actually reached the broker. All 8 rows cleared via
+`signals_db.clear_pending_buy_by_wl_id`. Zero real risk, purely stale DB state.
+
+**SPY's pending real exit**: the genuinely-armed `trail_state.exit_pending` (reason=TRAIL, pending since
+Friday, 46+ unactioned reminders) was placed for real — `signals_notify._attempt_automated_sell` called
+directly against position id 17 (`soxl_ira`), resulting in a real resting `TRAILING_STOP` SELL order
+(order id 1007336072974) confirmed `AWAITING_STOP_CONDITION` at the broker for the 3 real SPY shares.
+
+**Watchlist 65 live-mode reduction**: user's call — collapse live-mode nodes down to just SPY, SH, GDXU
+(#108, the "safety net #2" gap-resize test node — user confirmed keeping it over the ambiguous "2nd GDXU
+node" backlog phrasing), and DPST (the real-money volunteer). The other 11 live nodes (DIA/ERX/ERY/GDXD/
+IVV/IWM/LABD/LABU/QQQ/VOO/XLF — 6 of them the 2026-07-23 canary proof-of-life nodes, 5 the `soxl_test`
+one-day test nodes) were **deleted outright** via `signals_db.remove_node`, not demoted to research —
+user's explicit call, since a research-mode node would just generate paper-trading noise for tickers
+that have been moved on from. VOO and IVV had open `is_dry_run_sim=1` positions (ids 24/26) tied to their
+nodes via `wl_id`; both were retroactively closed (`signals_db.close_position`, tagged
+`DRY_RUN_RETROACTIVE_CLEANUP`, same pattern as the 2026-07-28 UDOW cleanup) before their nodes were
+removed, so nothing was left dangling. Confirmed post-cleanup: `mode='live'` nodes in watchlist 65 are
+exactly [136 DPST, 108 GDXU, 135 SH, 134 SPY].
+
+**3 real-order tests staged for the next daemon restart** (per the plan in the prior session's backlog
+entry): (1) **SPY trailing-sell trigger** — effectively already exercised for real via the exit-pending
+placement above, no separate forced test needed. (2) **SH TIME-exit test** — node #135/position #18 both
+persisted with `max_hold_hours=11` (down from 48; real held bars were 7 at staging time) and
+`trail_sell_pct=50%` (up from 0.3%, so the real trailing-sell order this forces will trail 50% below peak
+— practically unfillable, letting the real order-placement path get proven without risking an actual
+sale of the real 50 shares). No revert needed — SH is a purpose-built test node (`version='soxl_test'`,
+label "soxl_ira live-sell test"), not a real long-term trading config. (3) **GDXU gap-resize test** — a
+real `TRAILING_STOP` BUY order (5 shares, ~$425 at $85, order id 1007336073086) was placed via a direct
+bypass of `schwab_safety`'s signal-window gate (same pattern as the 2026-07-23/24 real-order tests,
+run only after explicit user confirmation each step, since the auto-mode classifier blocks this kind of
+action without it), backdated conceptually to "as if it had been placed Friday." A `pending_buys` row
+(id 42, wl_id 108) was rigged with `running_low=$1.00` so the computed buy-trigger (~$1.003) is
+guaranteed below the real price, forcing `check_gap_resize()` to treat it as a genuine overnight gap at
+the next 9:15-9:29 ET window — expected to cancel the resting order and replace it with a real MARKET
+buy sized fresh off whatever GDXU's live price is at that time (target notional $500, node's
+`starting_notional`, padded 5%), opening a real ~$425-450 position. Requires the daemon to actually be
+running by 9:15 ET or nothing fires.
+
+**`check_gap_resize` restart-duplication bug, fixed**: flagged in the prior session (identical risk
+shape to the BUY-duplicate-alert bug fixed that session) — a daemon restart inside the ~15min
+`_GAP_CHECK_WINDOW` resets the in-memory `gap_check_alerted` once-daily gate, letting a second
+invocation re-attempt cancel/replace on an already-in-flight or already-completed row (real double-order
+risk). Fixed with a persisted per-row guard: new `pending_buys.gap_resize_date` column (nullable TEXT),
+set via `signals_db.mark_gap_resize_attempted(pending_id, date_str)` immediately after
+`check_gap_resize` confirms a row's gap condition and before any cancel/replace broker call — a
+restarted re-entry sees the row already claimed for today and skips it. New regression test
+(`test_gap_resize_is_idempotent_against_restart_reentry`) proves the guard survives a mid-flight crash
+(cancel succeeds, replacement call raises) by re-invoking `check_gap_resize()` and asserting no second
+cancel call. **Opus review found 2 LOW issues, both fixed same session**: the marker was originally
+keyed on `wl_id`, which silently no-ops (matches zero rows) if `wl_id` is ever NULL — rekeyed to
+`pending_buys.id` (always present); the regression test only asserted call counts, not that the marker
+was actually persisted (could pass vacuously under a future change) — added an explicit
+`gap_resize_date` assertion. Full suite: 302 passed (was 301). `live_sim_harness.py`: 7/7, including
+`scenario_gap_resize`. `signals_invariants.py`: clean (0 known violations — the previously-accepted
+UDOW violation is separately resolved as of the 2026-07-28 entry above).
+
+
 ## ✅ [live-trading][coverage] Resolved 2026-07-26 — re-triaged the 22 `wired-never-fired` coverage-grid rows: split policy-internal from broker-interacting, closed 20/22 with real test proof, added a derived `offline_proof` axis to the registry
 
 **Origin**: earlier same session, raised the idea of a *deliberate* trading-day-gate-style harness to

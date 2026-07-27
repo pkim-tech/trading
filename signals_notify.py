@@ -1279,11 +1279,17 @@ def check_gap_resize():
     resting order's original sizing is still a valid bound (running_low is
     non-increasing). Self-contained: polls for the replacement's own fill and
     reconciles it immediately rather than deferring to the next check_auto_fills
-    cycle. Call once per day (active_signals._GAP_CHECK_WINDOW's once-daily-fire
-    pattern) -- not idempotent against being called mid-flight twice for the same
-    order (it would attempt to cancel an already-cancelled order)."""
+    cycle. Persisted per-row via pending_buys.gap_resize_date -- a daemon restart
+    inside active_signals._GAP_CHECK_WINDOW resets the caller's in-memory
+    once-daily gate, but this function still won't act on the same row twice in
+    one day, since the marker survives the restart (fixed 2026-07-27; previously
+    relied solely on the caller's in-memory gate and would re-attempt cancel/
+    replace on a restarted second invocation)."""
+    today = datetime.now().strftime('%Y-%m-%d')
     for pending in db.get_pending_buys():
         if not pending['order_placed']:
+            continue
+        if pending.get('gap_resize_date') == today:
             continue
         ticker = pending['ticker']
         node = pending['node']
@@ -1315,6 +1321,12 @@ def check_gap_resize():
             continue
         if current_price < buy_trigger:
             continue
+
+        # From here on we're about to act (cancel + possibly replace) -- claim
+        # the row for today before touching the broker, so a restart mid-attempt
+        # can't re-enter and act on it again (see the persisted-guard docstring
+        # note above).
+        db.mark_gap_resize_attempted(pending['id'], today)
 
         order_id = pending.get('order_id')
         if order_id:
