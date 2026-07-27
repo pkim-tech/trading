@@ -1,5 +1,80 @@
 # Backlog Cache
 
+## [live-trading][security] Resolved 2026-07-26 (evening) — BUY-signal duplicate-alert fix: `pending_wl_ids` now actually enforced + new broker-truth check (`_real_order_or_position_exists`) before firing a fresh live BUY alert
+Root cause of a real same-day incident: the pre-trading-day-gate daemon restarted mid-Sunday,
+which reset the in-memory `buy_alerted` set (the only guard against re-firing a node's BUY
+alert) — `pending_wl_ids` was already computed in `_scan_buy_signals` but never actually checked
+before firing, so it created duplicate `pending_buys` rows (DIA/IWM/QQQ — canary/dry_run `ira`;
+LABU — real money `soxl_ira`, `dry_run=False`) on top of already-unresolved rows from
+2026-07-24 that nobody had tapped Filled/Skipped on. Fixed in `active_signals.py`: `_scan_buy_signals`
+now skips firing if `node['id'] in pending_wl_ids`, plus a new `_real_order_or_position_exists(node, ticker)`
+helper adds a real broker-truth check (`schwab_safety._has_open_order` + `schwab_client.get_real_position`)
+for genuinely live (non-dry_run) automation-scoped accounts, catching drift the DB alone can't see.
+Full suite: 301 passed. **Opus review: 2 HIGH fixed same session** — suppression now posts Slack +
+`log_coverage_event("dup_buy_alert_suppressed",...)` instead of a silent print; `buy_alerted.discard`
+on suppression so a same-day-cleared condition can still re-alert (was stuck till tomorrow). Also
+caught+fixed while implementing: `mode_tag` wasn't imported in `active_signals.py` and collided with
+an existing local variable of the same name later in `_scan_buy_signals` (Python scoping would have
+made it an UnboundLocalError) — imported as `_account_mode_tag` instead. Import + targeted tests
+verified clean; full suite not re-run this session (budget). **3 MEDIUM still open, not fixed**:
+`_has_open_order`(any-side)/`get_real_position` can permanently block on an unrelated manual
+order/holding, no expiry; 2 untimed broker HTTP calls added to the pinned-entry critical path; gate
+excludes tickers outside `AUTOMATION_ENABLED_TICKERS`, leaving live TrailingExit-outside-scope nodes
+with zero protection. No test coverage for the new gate yet.
+**Real DB mess from the incident, not yet cleaned up**: duplicate `pending_buys` rows still sitting in
+`cache/live/trading_live.db` for DIA (ids 35/40), IWM (34/39), QQQ (37/41), LABU (32/38, real,
+`order_placed=0`, 25+ reminders nagging with no resting order ever confirmed). Need to reconcile
+against real broker state (especially LABU/soxl_ira) before next restart.
+**Also found, not yet fixed — same restart-duplication bug class**: `check_gap_resize`
+(`signals_notify.py:1272`) has the identical shape of risk, already flagged in its own docstring
+("not idempotent against being called mid-flight twice for the same order") — if the daemon restarts
+inside the ~15min `_GAP_CHECK_WINDOW` on a day it's actively resizing a real gapped-through order,
+`gap_check_alerted` (in-memory) forgets it ran, and a second invocation could cancel a just-placed
+real MARKET order (still resting) purely due to restart timing. Lower likelihood than the BUY case
+(narrow window vs. any restart) but same fix shape applies: persist a per-`pending_buys`-row
+"gap-resize already attempted today" marker instead of relying on the in-memory `gap_check_alerted` set.
+**Reviewed and found NOT to be a real risk** (verified this session, don't re-litigate): `check_auto_fills`/
+`drain_fill_queue` (dedup is the DB state itself, restart-safe by design); the real automated-sell
+trigger `notify_trailing_activated`/`_attempt_automated_sell` (gated by persisted `trail_state`
+transition, not an in-memory set); `sell_alerted`/`limit_fill_alerted`/`window_alerted` resetting on
+restart (only causes duplicate Slack reminders, not duplicate broker orders — already-documented,
+accepted residual).
+
+## [live-trading] Open, raised 2026-07-26 (evening) — broader ask: strip all non-essential tickers from research universe, watchlist, and `.env` (`SCHWAB_AUTOMATION_TICKERS`) too, not just live-mode. Scope/list not discussed yet.
+
+## [live-trading] Open, raised 2026-07-26 (evening) — reduce watchlist 65 live-mode nodes down to just SPY, SH, GDXU, DPST
+User's call: only these 4 need to stay `mode='live'` right now. Everything else currently live
+(LABU, DIA, ERY, IVV, VOO, QQQ, IWM, XLF, GDXD, LABD, ERX, the 2nd GDXU node) should move back to
+`research`/paper. Not yet drafted/actioned — need to confirm exact node list and account handling
+(some of these are canary nodes on `ira`, some are `soxl_test` on `soxl_ira`) before flipping modes.
+
+## [live-trading] Open, raised 2026-07-26 (evening) — SPY's real trailing-stop exit still pending, needs a human decision
+SPY's open position (id 17, wl_id 134, `soxl_ira`) has a genuine, currently-active `trail_state.
+exit_pending` (`reason='TRAIL'`), reminders since Friday (46 trail-order-placed reminders + 9 exit
+reminders as of this session) — confirmed real via `logs/active_signals.log`'s recurring
+`SELL SIGNAL SPY — TRAILING STOP` lines through Friday's real trading, not a stale artifact. Never
+auto-placed (`_attempt_automated_sell` predates instrumentation, and this position's trailing armed
+2026-07-24, before the coverage event for it existed). Needs a real decision: place the trailing-sell
+manually and tap Filled, or a deliberate call to let it ride.
+
+## [live-trading] Open, raised 2026-07-26 (evening) — 3 deliberate real-order tests planned, not yet built
+Plan discussed this session, deliberately deferred ("for tomorrow" / low-priority, run ~weekly or
+after platform changes): (1) **gap_resize** — fresh node (GDXD, no existing position/pending-buy),
+place a real resting trailing-buy with trigger deliberately set to $1 so any real price guarantees a
+"gapped through" condition, sized off *real current price* (not the $1 trigger) to stay under
+`soxl_ira`'s $800 `notional_cap`; call `check_gap_resize()` directly, no need to wait for a real
+pre-market gap since the $1 trigger forces it. (2) **trailing-sell order trigger** — SPY's existing
+position, nudge `arm_sell_pct` (not `entry_price`, which would trip `detect_price_discontinuity`'s
+corporate-action freeze) so real current price already qualifies as armed, forcing a real
+`_attempt_automated_sell` call. (3) **max-hold (TIME) exit** — SH's existing position, shorten
+`max_hold_hours` so real elapsed hold already exceeds it, forcing a real TIME-exit SELL. Confirmed:
+SELL orders aren't bound by the $800 `notional_cap` (BUY-only since 2026-07-24 evening), so SPY's 3
+shares (~$2.2k)/SH's 50 shares (~$1.7k) are both fine for (2)/(3). Design agreed: a standalone script
+(same pattern as `scripts/live_sanity_check.py`) monkeypatching/overriding only `_is_trading_day` for
+the duration of its own run — daemon's real gate untouched, all other `schwab_safety.check_order`
+guards (`notional_cap`, `HARD_ORDER_CEILING`, `daily_order_cap`, duplicate-order guards) stay live.
+Not drafted yet.
+
 ## [live-trading][security] Resolved 2026-07-26 — NYSE trading-day gate built (`pandas_market_calendars`), guarding both daemon scan paths and `schwab_safety.check_order` itself; a retry added to the fix introduced and then closed its own HIGH duplicate-BUY bug, caught by review before reaching the daemon. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
 
 ## [live-trading][coverage] Resolved 2026-07-26 — re-triaged the 22 `wired-never-fired` coverage-grid rows instead of building a stub-broker harness; 20/22 already had (or now have) real offline test proof, only 2 genuinely need a real order

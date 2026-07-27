@@ -83,6 +83,7 @@ from signals_blocks import (
 )
 from signals_helpers import (
     _add_trading_hours, _proximity_emoji, _last_sale_recovery, _phase_emoji, log_poll, _pos_key,
+    mode_tag as _account_mode_tag,
 )
 from signals_notify import (
     notify_buy_signal, notify_limit_fill, notify_sell_signal,
@@ -208,6 +209,33 @@ def _sleep_until_next_cycle(now):
     time.sleep(min(POLL_SECS, max(1, _seconds_until_next_pinned_target(now))))
 
 
+def _real_order_or_position_exists(node, ticker):
+    """True if a real broker order or held position already exists for this
+    ticker/account -- checked right before firing a fresh BUY signal alert so
+    a node with an already-unresolved pending buy the DB lost track of (or an
+    already-held position the DB doesn't know about) doesn't get a duplicate
+    alert. Broker-truth, not local state -- same rationale as schwab_safety.
+    _all_orders ("local tracking could drift or miss an order placed outside
+    our own code"). Only meaningful for a genuinely real (dry_run=False)
+    account -- a dry_run/paper/canary node never places a real order or holds
+    a real position, so there's nothing to check at the broker; those rely on
+    the pending_wl_ids DB check alone (see _scan_buy_signals)."""
+    account = node.get('account')
+    if not account or ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        return False
+    limits = schwab_safety.ACCOUNTS.get(account)
+    if limits is None or limits.dry_run:
+        return False
+    try:
+        orders = schwab_safety._open_orders(account)
+        if schwab_safety._has_open_order(orders, ticker):
+            return True
+        return schwab_client.get_real_position(account, ticker) > 0
+    except Exception as e:
+        print(f"  [warn] {ticker} broker dedupe check failed: {e} — falling back to DB-only check")
+        return False
+
+
 def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=None):
     """Runs compute_buy_signal over `nodes` and fires notify_buy_signal on new BUYs.
     Shared by the open-check/close-window ambient polls and the pinned single-shot
@@ -269,7 +297,26 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
             if already_held:
                 print(f"  [skip] BUY {sig['ticker']} z={sig['z_score']:+.2f} — position already open, no alert")
             elif node.get('mode', 'live') == 'live':
-                notify_buy_signal(node, sig)
+                # pending_wl_ids alone would have prevented the 2026-07-26 DIA/IWM/
+                # QQQ/LABU duplicate-pending-buy incident (a restarted daemon forgot
+                # buy_alerted and re-fired a fresh alert/pending_buys row on top of an
+                # already-unresolved one) -- it was computed above but never actually
+                # checked here. _real_order_or_position_exists adds a broker-truth
+                # check on top for real accounts, catching drift pending_wl_ids can't
+                # (e.g. a resting order or held position the DB lost track of).
+                already_pending = node['id'] in pending_wl_ids or _real_order_or_position_exists(node, sig['ticker'])
+                if already_pending:
+                    # Don't burn today's alert slot on a suppressed signal (Opus review,
+                    # 2026-07-26) -- if the resting order/position clears later today,
+                    # the node must still be able to alert same-day, not wait for
+                    # tomorrow's buy_alerted reset.
+                    buy_alerted.discard(alert_key)
+                    db.log_coverage_event("dup_buy_alert_suppressed", _coverage_mode(node.get('account')),
+                                           ticker=sig['ticker'], node_id=node['id'], result="suppressed")
+                    _post_message(f"🔇 {sig['ticker']} ({node.get('account')} · {_account_mode_tag(node.get('account'))}) "
+                                  f"BUY signal suppressed — already pending/resting at broker or in pending_buys")
+                else:
+                    notify_buy_signal(node, sig)
             elif sig['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS:
                 paper_trading.start_paper_buy(node, sig)
                 print(f"  [paper] BUY: {node['ticker']} z={sig['z_score']:+.2f} (paper-trading)")

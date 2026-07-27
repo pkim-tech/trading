@@ -4747,3 +4747,33 @@ the bugs above); several previously-inflated rows (`sl_placement`, `gap_resize`,
 - Minor documented-not-fixed items from the review: a skipped `test_signals_handlers.py` run (no
   Slack creds in `.env`) would still count as full proof rather than being flagged conditional; the
   event-assertion regex only matches the keyword-arg call form (fine today, every call site uses it).
+
+---
+
+## 2026-07-26 (late) — Found+fixed a live duplicate-BUY-alert bug; Opus review found 2 HIGH gaps in the fix, both closed same session
+
+### What happened
+Traced a real incident: the stale pre-trading-day-gate daemon restarted Sunday, reset in-memory
+`buy_alerted`, and re-fired BUY alerts/pending_buys rows on top of already-unresolved 2026-07-24
+rows for DIA/IWM/QQQ/LABU (real money, soxl_ira). Root cause: `pending_wl_ids` was computed in
+`_scan_buy_signals` but never enforced before firing a fresh alert.
+
+### Fix
+`active_signals.py`: new `_real_order_or_position_exists()` (broker-truth check via
+`schwab_safety._has_open_order`/`schwab_client.get_real_position` for real accounts) +
+`pending_wl_ids` now actually gates firing. Opus review (background) found 2 HIGH gaps in the
+first version, both fixed: suppression was silent (no Slack/coverage_event) so the 4 stale rows
+would permanently mute those nodes; `buy_alerted.add()` ran before the gate, burning the daily
+alert slot even when suppressed. Also fixed a `mode_tag` import/scoping collision found while
+wiring the fix. 3 MEDIUM findings backlogged, not fixed (any-side order/position check can block
+on an unrelated manual order/holding; untimed broker calls in pinned-entry path; gate misses
+tickers outside AUTOMATION_ENABLED_TICKERS).
+
+### State
+Targeted tests + import clean. Full suite not re-run this session (budget). Daemon is stopped
+(killed mid-session, stale vs. today's trading-day-gate commit) — needs manual restart by user.
+Real DB cleanup still pending: duplicate pending_buys rows (DIA/IWM/QQQ/LABU) unresolved.
+Also open: reduce watchlist 65 live nodes to SPY/SH/GDXU/DPST; SPY's real pending trailing-sell
+exit needs a human decision; 3 real-order test scripts planned (gap_resize/trailing-sell/max-hold)
+not built; broader ask to strip non-essential tickers from research/watchlist/.env, not scoped.
+See docs/backlog_cache.md for full detail on all of the above.
