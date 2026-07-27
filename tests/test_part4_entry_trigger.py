@@ -35,6 +35,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'STATE_PATH', tmp_path / "schwab_order_counts.json")
     monkeypatch.setattr(schwab_safety, 'KILL_SWITCH_PATH', tmp_path / "schwab_kill_switch.json")
     monkeypatch.setattr(schwab_safety, 'TICKER_AUTOMATION_PATH', tmp_path / "schwab_ticker_automation.json")
+    monkeypatch.setattr(schwab_safety, 'NODE_AUTOMATION_PATH', tmp_path / "schwab_node_automation.json")
     monkeypatch.setattr(schwab_safety, 'AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_auto_fill_detection.json")
     monkeypatch.setattr(schwab_safety, 'NODE_AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_node_auto_fill_detection.json")
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
@@ -385,6 +386,9 @@ def test_scan_pinned_exit_arm_dedups_against_sell_alerted(env, monkeypatch):
     active_signals._scan_pinned_exit_arm([pos], sell_alerted, last_seen_bar)
     assert len(notify_calls) == 1  # SL breach (43 vs entry 50, fixed_sl=5%)
     assert (pos['id'], df.index[-1]) in sell_alerted
+    events = signals_db.get_coverage_events(scenario_key="exit_arm_latency")
+    assert len(events) == 1
+    assert events[0]['result'] == "evaluated"
 
     # A second call for the same bar must not re-fire.
     active_signals._scan_pinned_exit_arm([pos], sell_alerted, last_seen_bar)

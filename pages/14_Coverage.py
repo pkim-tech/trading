@@ -9,7 +9,11 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.coverage_check import CHECKERS  # pure dict of checker functions, no side effects/Slack config
-from scripts.coverage_registry import REGISTRY, compute_status, compute_mode_statuses, STATUS_ORDER, MODES as GRID_MODES
+from scripts.coverage_registry import (
+    REGISTRY, compute_status, compute_mode_statuses, offline_proof_for, STATUS_ORDER, MODES as GRID_MODES,
+)
+
+OFFLINE_PROOF_EMOJI = {'event-asserted': '✅', 'behavior-only': '🟡', 'none': '⬜'}
 
 DB_PATH = "./cache/live/trading_live.db"
 MODES = ["paper", "dry_run", "live", "unattributed"]
@@ -93,6 +97,7 @@ def load_accountability_grid():
         mode_statuses = compute_mode_statuses(r)
         mode_status_by_row.append(mode_statuses)
         compact = " ".join(f"{m[0].upper()}{MODE_EMOJI.get(mode_statuses[m][0], '?')}" for m in GRID_MODES)
+        proof, proof_detail = offline_proof_for(r.get('scenario_key'), r.get('mode_filter'))
         rows.append({
             "_order": STATUS_ORDER[status],
             "Status": STATUS_LABEL[status],
@@ -101,6 +106,7 @@ def load_accountability_grid():
             "Paper": f"{MODE_EMOJI.get(mode_statuses['paper'][0], '?')} {mode_statuses['paper'][1]}".strip(),
             "Dry-run": f"{MODE_EMOJI.get(mode_statuses['dry_run'][0], '?')} {mode_statuses['dry_run'][1]}".strip(),
             "Live": f"{MODE_EMOJI.get(mode_statuses['live'][0], '?')} {mode_statuses['live'][1]}".strip(),
+            "Offline proof": f"{OFFLINE_PROOF_EMOJI.get(proof, '?')} {proof_detail}".strip(),
             "Code path": r['code_path'],
             "Offline coverage": r['offline_coverage'],
             "Notes": r['notes'],

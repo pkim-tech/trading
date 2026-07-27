@@ -19,7 +19,27 @@ check_mechanism per row:
                              a manual TODO until something is built to log it.
 
 Run directly for a plain-text report: .venv/bin/python scripts/coverage_registry.py
+
+offline_proof (added 2026-07-26, see docs/backlog_cache.md's re-triage entry) is a
+second, orthogonal axis to status -- status above answers "is there LIVE proof this
+branch works," which is correctly 'wired-never-fired' for a scenario that's only
+ever exercised in pytest (isolated_db fixture keeps pytest from ever touching real
+coverage_events, by design, since pytest polluting that table was itself a real
+2026-07-25 incident). offline_proof answers the *other* question -- "is there ANY
+proof, live or offline" -- so a policy-internal branch (decided entirely by our own
+code, no broker round-trip) with a real event-asserting unit test doesn't read as
+having zero coverage of any kind. Derived by grepping tests/*.py fresh every run,
+same "never hand-typed" discipline as compute_status -- a hand-maintained
+scenario_key -> test-name mapping would rot exactly like docs/live_test_coverage.md
+did. Deliberately conservative: only a real `get_coverage_events(scenario_key=...)`
+call in a test counts as 'event-asserted' (proof the log_coverage_event line itself
+is wired, not just that the surrounding behavior works); the scenario_key string
+appearing anywhere else in a test file counts as 'behavior-only' (some test likely
+exercises this code path, but the log call itself could be deleted and nothing
+would catch it); no mention at all is 'none'. status stays the single source of
+truth for "verified-live" et al -- offline_proof never substitutes for it.
 """
+import re
 import sys
 from pathlib import Path
 
@@ -28,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import signals_db as db
 
 DB_PATH = "./cache/live/trading_live.db"
+_TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
 
 REGISTRY = [
     dict(id='pinned_entry_trigger',
@@ -344,6 +365,108 @@ REGISTRY = [
 ]
 
 
+_EVENT_ASSERTED_RE = re.compile(r'get_coverage_events\(\s*scenario_key\s*=\s*["\'](\w+)["\']')
+
+# Files that exercise the coverage/scenario_expectations *infrastructure itself*
+# (signals_db plumbing, coverage_check.py's checker logic) using scenario_key
+# strings as arbitrary fixture data ('sl_placement', 'entry_fill', etc. reused
+# purely as test values), not to prove any real production code path. Found by
+# Opus review 2026-07-26: test_coverage_check.py:356 calls
+# db.log_coverage_event('sl_placement', ...) directly and then asserts it right
+# back via get_coverage_events -- matching this file made sl_placement (a real
+# SL-order-placement branch with a documented, unresolved live-attempt-failed
+# history) render as false 'event-asserted' proof. A structural file-purpose
+# exclusion, not a per-scenario_key hand-typed mapping -- if a new meta/infra
+# test file is added later that reuses real scenario_key strings as fixture
+# data, add it here too.
+_INFRA_TEST_FILES = {'test_coverage_check.py'}
+
+
+def _quoted(key):
+    return re.compile(r'["\']' + re.escape(key) + r'["\']')
+
+
+_OFFLINE_PROOF_CACHE = None
+
+
+def _scan_offline_proof():
+    """Greps every tests/test_*.py file once (memoized per process -- test files
+    don't change mid-run) and returns (event_asserted, mentioned) -- sets of
+    scenario_key strings. See module docstring for what each means.
+
+    Both 'event-asserted' and 'mentioned' require an exact quoted match
+    ('key' or "key"), not a bare substring -- found by Opus review 2026-07-26
+    that a raw `key in text` check false-matched a prefix collision
+    (sl_placement inside sl_placement_fast_confirm_timeout) and unquoted
+    mentions (a module docstring naming another test file's filename, e.g.
+    'tests/test_part3_gap_resize.py' matching scenario_key gap_resize)."""
+    global _OFFLINE_PROOF_CACHE
+    if _OFFLINE_PROOF_CACHE is not None:
+        return _OFFLINE_PROOF_CACHE
+    all_keys = {r['scenario_key'] for r in REGISTRY if r.get('scenario_key')}
+    event_asserted, mentioned = set(), set()
+    if not _TESTS_DIR.is_dir():
+        _OFFLINE_PROOF_CACHE = (event_asserted, mentioned)
+        return _OFFLINE_PROOF_CACHE
+    for path in sorted(_TESTS_DIR.glob("test_*.py")):
+        if path.name in _INFRA_TEST_FILES:
+            continue
+        text = path.read_text()
+        for m in _EVENT_ASSERTED_RE.finditer(text):
+            if m.group(1) in all_keys:
+                event_asserted.add(m.group(1))
+        for key in all_keys:
+            if _quoted(key).search(text):
+                mentioned.add(key)
+    _OFFLINE_PROOF_CACHE = (event_asserted, mentioned)
+    return _OFFLINE_PROOF_CACHE
+
+
+def offline_proof_for(scenario_key, mode_filter=None):
+    """Returns (proof_str, detail_str) for one scenario_key -- 'event-asserted',
+    'behavior-only', or 'none'. See module docstring for the distinction.
+
+    mode_filter (pass the REGISTRY row's mode_filter, e.g. 'dry_run'/'paper')
+    guards against the documented scenario_key collision (entry_fill/exit_fill
+    logged by both paper_trading.py under mode='paper' and the dry_run-fill-
+    synthesis code under mode='dry_run', see the dry_run_buy_synthesis/
+    paper_entry_fill REGISTRY rows) -- without it, a test proving only the
+    paper path would also light up the dry_run row as proven. Requires the
+    mode_filter word to appear quoted in the same test file as a light,
+    derived (not hand-typed) disambiguator; not perfect -- see docs/backlog_cache.md."""
+    if scenario_key is None:
+        return 'none', 'No scenario_key to search test files for.'
+    event_asserted, mentioned = _scan_offline_proof()
+    if mode_filter and scenario_key in (event_asserted | mentioned) and not _mode_filter_match(scenario_key, mode_filter):
+        return 'none', (f"Matched only in a test file that doesn't also reference mode_filter="
+                         f"{mode_filter!r} -- likely proving a different mode's use of this shared "
+                         f"scenario_key (see the docstring's entry_fill/exit_fill collision note).")
+    if scenario_key in event_asserted:
+        return 'event-asserted', 'A test asserts get_coverage_events() for this scenario_key.'
+    if scenario_key in mentioned:
+        return 'behavior-only', ('This scenario_key appears in a test file, but no test asserts '
+                                  'the coverage event itself -- the log_coverage_event call could be '
+                                  'deleted and the test would still pass.')
+    return 'none', 'This scenario_key does not appear in any tests/test_*.py file.'
+
+
+def _mode_filter_match(scenario_key, mode_filter):
+    """For a mode_filter-scoped row, only credit a match found in a test file
+    that also mentions the mode_filter word (quoted, or in the filename) --
+    see offline_proof_for's docstring."""
+    if not _TESTS_DIR.is_dir():
+        return False
+    for path in sorted(_TESTS_DIR.glob("test_*.py")):
+        if path.name in _INFRA_TEST_FILES:
+            continue
+        text = path.read_text()
+        if not (_EVENT_ASSERTED_RE.search(text) and scenario_key in text) and not _quoted(scenario_key).search(text):
+            continue
+        if mode_filter in path.name or _quoted(mode_filter).search(text):
+            return True
+    return False
+
+
 def compute_status(row):
     """Returns (status_str, detail_str) computed live from real DB rows -- never
     a hand-typed field. status_str is one of: 'not-instrumented', 'offline-only',
@@ -543,11 +666,16 @@ if __name__ == '__main__':
     rows = []
     for r in REGISTRY:
         status, detail = compute_status(r)
-        rows.append((STATUS_ORDER[status], status, r['id'], detail))
+        proof, _ = offline_proof_for(r.get('scenario_key'), r.get('mode_filter'))
+        rows.append((STATUS_ORDER[status], status, r['id'], detail, proof))
     rows.sort()
-    for _, status, rid, detail in rows:
-        print(f"{status:18s} {rid:35s} {detail}")
+    for _, status, rid, detail, proof in rows:
+        print(f"{status:18s} {proof:15s} {rid:35s} {detail}")
     counts = {}
-    for _, status, _, _ in rows:
+    for _, status, _, _, _ in rows:
         counts[status] = counts.get(status, 0) + 1
     print(f"\n{len(REGISTRY)} rows total: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    proof_counts = {}
+    for _, _, _, _, proof in rows:
+        proof_counts[proof] = proof_counts.get(proof, 0) + 1
+    print("offline_proof: " + ", ".join(f"{k}={v}" for k, v in proof_counts.items()))

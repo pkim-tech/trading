@@ -32,6 +32,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'STATE_PATH', tmp_path / "schwab_order_counts.json")
     monkeypatch.setattr(schwab_safety, 'KILL_SWITCH_PATH', tmp_path / "schwab_kill_switch.json")
     monkeypatch.setattr(schwab_safety, 'TICKER_AUTOMATION_PATH', tmp_path / "schwab_ticker_automation.json")
+    monkeypatch.setattr(schwab_safety, 'NODE_AUTOMATION_PATH', tmp_path / "schwab_node_automation.json")
     monkeypatch.setattr(schwab_safety, 'AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_auto_fill_detection.json")
     monkeypatch.setattr(schwab_safety, 'NODE_AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_node_auto_fill_detection.json")
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
@@ -178,6 +179,32 @@ def test_reconcile_buy_fill_logs_coverage_event(env, monkeypatch):
     assert len(events) == 1
 
 
+def test_reconcile_buy_fill_resolves_correct_sibling_node(env, monkeypatch):
+    """Real disambiguation scenario (docs/backlog_cache.md's wl_id refactor
+    entry): 2+ nodes have a resting pending buy for the same ticker at once --
+    wl_id must resolve the fill to the node that actually requested it, not
+    silently guess/attribute it to whichever pending row comes back first."""
+    _seed_pending_order(monkeypatch)
+    node_a = _node()
+    signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test_sibling', window=20,
+                         take_profit=7, stop_loss=5, max_hold_hours=7, mode='live',
+                         trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000, account='ira')
+    node_b = [n for n in signals_db.get_watchlist() if n['ticker'] == TICKER and n['version'] == 'test_sibling'][0]
+    signals_db.add_pending_buy(node_b, _sig(), channel='C1', ts='999.1')
+
+    signals_notify._reconcile_buy_fill(TICKER, 51.0, 100, wl_id=node_a['id'])
+
+    events = signals_db.get_coverage_events(scenario_key="buy_fill_reconciles_correct_node")
+    assert len(events) == 1
+    assert events[0]['result'] == "resolved"
+    assert events[0]['node_id'] == node_a['id']
+
+    # node_a's fill must not have consumed node_b's still-resting pending row.
+    remaining = [p for p in signals_db.get_pending_buys() if p['ticker'] == TICKER]
+    assert len(remaining) == 1
+    assert remaining[0]['node']['id'] == node_b['id']
+
+
 def test_reconcile_fill_notifies_only_on_overspend(env, monkeypatch):
     _seed_pending_order(monkeypatch)
     posted = []
@@ -274,6 +301,9 @@ def test_drain_fill_queue_reconciles_queued_fill(env, monkeypatch):
     pos = signals_db.get_open_position(TICKER)
     assert pos is not None
     assert pos['entry_price'] == 52.0  # from get_filled_order, not the queued (mismatched) 51.0
+    events = signals_db.get_coverage_events(scenario_key="fast_path_fill_reconciliation")
+    assert len(events) == 1
+    assert events[0]['result'] == "confirmed_via_poll"
 
 
 def test_drain_fill_queue_ignores_sell_events(env, monkeypatch):
@@ -301,3 +331,6 @@ def test_drain_fill_queue_no_op_when_order_not_yet_settled(env, monkeypatch):
 
     assert _pending()['order_placed'] == 1
     assert signals_db.get_open_position(TICKER) is None
+    events = signals_db.get_coverage_events(scenario_key="fast_path_fill_reconciliation")
+    assert len(events) == 1
+    assert events[0]['result'] == "stream_event_not_yet_confirmed_filled"

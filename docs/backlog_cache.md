@@ -2,15 +2,33 @@
 
 ## [live-trading][security] Resolved 2026-07-26 — NYSE trading-day gate built (`pandas_market_calendars`), guarding both daemon scan paths and `schwab_safety.check_order` itself; a retry added to the fix introduced and then closed its own HIGH duplicate-BUY bug, caught by review before reaching the daemon. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
 
-## [live-trading] Idea, raised 2026-07-26, not scoped — a *deliberate* version of the trading-day-gate incident: feed a real dated bar sequence to exercise real order-placement code on purpose
-Distinct from the accidental Sunday-order incident (now fixed, see the resolved entry above) — this is
-about intentionally forcing rarely-exercised order-placement branches (`gap_resize`/duplicate-order-
-guard/`kill_switch_block`, several of the coverage grid's `wired-never-fired` rows) to actually fire, on
-purpose, for real coverage. Closest existing building block: `scripts/live_sim.py` (isolated
-`trading_sim.db` via `TRADING_DB_PATH`, drives the real `compute_buy_signal`/`check_sell_condition`/
-`notify_*` functions) — but it only swaps the DB, not `schwab_client`/`schwab_safety`, so a sim node
-pointed at a real `dry_run=False` account would place real orders; its safety today depends entirely on
-which account you point it at, not any built-in guard. Not started — a design conversation only.
+## [live-trading][coverage] Resolved 2026-07-26 — re-triaged the 22 `wired-never-fired` coverage-grid rows instead of building a stub-broker harness; 20/22 already had (or now have) real offline test proof, only 2 genuinely need a real order
+Grew out of the "deliberate trading-day-gate-style simulation" idea (raised earlier same session, see
+`docs/deep_backlog.md`'s 2026-07-26 entry for the full split/re-triage writeup) — an Opus design review
+found that most `wired-never-fired` rows are **policy-internal** (decided entirely inside our own code,
+no real broker round-trip needed to prove correct) rather than broker-interacting, so a stub-broker
+harness was the wrong tool for most of them. Only `gap_resize` and `automated_sell_execution` genuinely
+need a real order against Schwab to prove the broker agrees with our assumption — still open, needs a
+deliberate real order on `soxl_ira`'s small-notional path, not scoped/scheduled.
+For the other 20: added `get_coverage_events(scenario_key=...)` assertions to ~9 existing tests that
+only proved behavior, not the logging itself; wrote brand-new tests for 3 rows with zero test coverage
+at all (`node_level_automation_pause`, `two_nodes_same_ticker_diff_accounts`, a sibling-node fill-
+reconciliation case for `buy_fill_reconciles_correct_node`); and built `signals_handlers.py`'s first-ever
+test file (`tests/test_signals_handlers.py`) for 3 Slack-handler scenarios that had none. New
+`offline_proof_for()` in `scripts/coverage_registry.py` derives (greps `tests/test_*.py` fresh every
+run, never hand-typed) a second, orthogonal "is there ANY proof, live or offline" axis, surfaced as a
+new "Offline proof" column in `pages/14_Coverage.py` — `status` still means "live proof" only.
+An Opus review of this diff found and fixed real accuracy bugs in the derivation itself (same failure
+class as this registry's two prior accuracy bugs): a plumbing test file (`test_coverage_check.py`) that
+reuses real scenario_key strings as generic fixture data was making `sl_placement` (a real, still-
+unresolved SL-placement gap) render as false "proven" — excluded that file from the scan. Also fixed a
+raw-substring-match bug (`sl_placement` false-matching inside `sl_placement_fast_confirm_timeout`, and
+an unquoted docstring filename mention false-matching `gap_resize`) by requiring exact quoted-string
+matches, and added a `mode_filter`-aware check for the `entry_fill`/`exit_fill` paper-vs-dry_run
+collision. Also found and fixed a mis-scoped test (`test_node_level_automation_pause_does_not_block_
+other_nodes` never actually created a second node) — split into a real cross-account isolation test and
+a test pinning down the documented same-ticker-same-account ambiguity as an accepted known limitation.
+Full suite: 301 passed (was 291). Harness: 7/7. `signals_invariants.py`: clean.
 
 ## [live-trading][security] Resolved 2026-07-26 — ERY phantom-fill incident cleaned up; new `trading_incidents` ticket log; every Slack alert now tags `(account · LIVE/DRY-RUN)`. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
 

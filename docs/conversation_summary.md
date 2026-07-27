@@ -4680,3 +4680,70 @@ the per-ticker detail — reviewed clean, no issues found in either round.
 - No specific next-session action queued — the fix closes the elevated-priority item cleanly. The
   unstarted "deliberate trading-day simulation" idea (see backlog) is the natural adjacent follow-up
   whenever coverage-grid gaps around `gap_resize`/duplicate-order-guard/`kill_switch_block` come up again.
+
+---
+
+## 2026-07-26 (later) — Re-triaged the coverage-grid's 22 `wired-never-fired` rows; closed 20/22 with real test proof; added a derived `offline_proof` axis, then had Opus catch and fix real bugs in the derivation itself
+
+### What we did
+Started from a backlog idea (deliberately forcing rare order-placement branches like `gap_resize`/
+`kill_switch_block` to fire, for coverage credit). Got an independent Opus design opinion before
+building anything: a stub-broker harness for all 22 `wired-never-fired` rows was the wrong shape --
+only `gap_resize` and `automated_sell_execution` genuinely need a real broker round-trip to prove
+Schwab agrees with our assumption; the other 20 are policy-internal (decided entirely by our own
+code/state) and should be proven by real, event-asserting unit tests instead.
+
+Re-triaged those 20: real count turned out to be 3 already event-asserted, ~8 behavior-only (existing
+tests proved the guard fires but never asserted the `log_coverage_event` call itself), ~6 with zero
+test coverage at all -- `signals_handlers.py` had no test file whatsoever. Closed the gap:
+- Added `get_coverage_events(scenario_key=...)` assertions to ~9 existing tests across
+  `test_schwab_safety.py`/`test_schwab_automation.py`/`test_part3_gap_resize.py`/`test_part4_entry_trigger.py`.
+- Wrote 3 brand-new tests for zero-coverage rows (`node_level_automation_pause`,
+  `two_nodes_same_ticker_diff_accounts`, a sibling-node fill-reconciliation test).
+- Built `signals_handlers.py`'s first-ever test file (`tests/test_signals_handlers.py`), calling the
+  real Bolt handler functions directly (bypassing Bolt dispatch, mirroring how `live_sim.py` already
+  works around the same real-buttons-can't-be-tested-this-way constraint).
+
+Added `offline_proof_for()` to `scripts/coverage_registry.py` -- a second, orthogonal axis to the
+existing `status` field, derived by grepping `tests/test_*.py` fresh every run (never hand-typed):
+`'event-asserted'` / `'behavior-only'` / `'none'`. Surfaced as a new "Offline proof" column in
+`pages/14_Coverage.py` (verified the page loads clean via a headless Streamlit smoke test).
+
+An Opus review of the diff (unprompted scrutiny given this registry's two prior accuracy bugs) found
+and fixed real bugs in the new derivation logic itself, before it shipped:
+- **HIGH**: `tests/test_coverage_check.py` reuses real scenario_key strings as arbitrary fixture data
+  to test the coverage-infrastructure plumbing itself -- this made `sl_placement` (a real, still-
+  unresolved SL-placement gap) render as false "proven." Fixed by excluding that file from the scan.
+- **MEDIUM-HIGH**: raw substring matching false-matched a prefix collision (`sl_placement` inside
+  `sl_placement_fast_confirm_timeout`) and an unquoted docstring filename mention. Fixed with exact
+  quoted-string matching.
+- **MEDIUM**: the `entry_fill`/`exit_fill` paper-vs-dry_run scenario_key collision (already handled on
+  the `status` axis via `mode_filter`) was reintroduced on the new axis. Fixed: `offline_proof_for()`
+  now takes `mode_filter` too.
+- **LOW-MEDIUM**: a test named `..._does_not_block_other_nodes` never actually created a second node.
+  Renamed to what it really tests, and added two real sibling-node tests (one proving cross-account
+  isolation, one pinning down `schwab_safety.check_order`'s documented same-account-ambiguity
+  limitation as an accepted, tracked gap).
+- Two LOW fixes: missing `NODE_AUTOMATION_PATH` fixture isolation in 3 test files, and a redundant
+  per-row rescan (added a per-process memo cache).
+
+Re-ran the report after the fixes: `behavior-only` dropped from 7 to 0 (all were false positives from
+the bugs above); several previously-inflated rows (`sl_placement`, `gap_resize`, `cash_check`,
+`trailing_arm_reread`, `second_ticker_one_account`, paper/dry_run entry/exit fills) now correctly show
+`'none'` -- less flattering, more honest.
+
+### State
+- Full suite: 301 passed (was 291 at session start). `live_sim_harness.py`: 7/7.
+  `signals_invariants.py`: clean.
+- No `active_signals.py`/`signals_*.py`/`schwab_*.py`/backtest-kernel production code touched this
+  session -- only test files, `scripts/coverage_registry.py`, `pages/14_Coverage.py`. No mandatory
+  session-wrap Opus round applied, but one was run anyway given the diff's real risk (this registry's
+  history of accuracy bugs) -- findings above.
+- `docs/backlog_cache.md`/`docs/deep_backlog.md`/`CLAUDE.md`'s Key Files entry updated with full detail.
+
+### Next
+- The 2 broker-interacting rows (`gap_resize`, `automated_sell_execution`) still need a deliberate
+  real order on `soxl_ira`'s small-notional path to close -- not scoped/scheduled.
+- Minor documented-not-fixed items from the review: a skipped `test_signals_handlers.py` run (no
+  Slack creds in `.env`) would still count as full proof rather than being flagged conditional; the
+  event-assertion regex only matches the keyword-arg call form (fine today, every call site uses it).

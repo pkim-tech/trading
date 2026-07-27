@@ -1,5 +1,107 @@
 # Backlog
 
+## ✅ [live-trading][coverage] Resolved 2026-07-26 — re-triaged the 22 `wired-never-fired` coverage-grid rows: split policy-internal from broker-interacting, closed 20/22 with real test proof, added a derived `offline_proof` axis to the registry
+
+**Origin**: earlier same session, raised the idea of a *deliberate* trading-day-gate-style harness to
+force rarely-exercised order-placement branches (`gap_resize`, duplicate-order-guard, `kill_switch_block`,
+several `wired-never-fired` grid rows) to fire on purpose. Two designs were floated (point `live_sim.py`
+at a real `dry_run=True` account, vs. build a fully isolated stub `schwab_client`). An independent Opus
+design review pushed back on both: option A (`dry_run=True`) short-circuits *before* the real broker
+call, so it can't prove `gap_resize`'s actual question (does Schwab honor our cancel+replace) and it
+pollutes the same ledgers meant to represent real trading history; option B (a stub broker) can only ever
+confirm our code does what we already believe, not what Schwab actually does — recording stub firings as
+`coverage_events` credit would be "counterfeit proof" the same way option A is "contaminated proof."
+
+**Real recommendation**: split the 22 rows by what actually needs proving, not build one harness for all
+of them.
+- **Broker-interacting** (2 rows: `gap_resize`, `automated_sell_execution`) — the real question is
+  whether Schwab agrees with our assumption, which no stub can settle. Still open — needs a deliberate
+  real order on `soxl_ira`'s small-notional path, not scoped/scheduled this session.
+- **Policy-internal** (the other 20) — decided entirely inside our own code/state (`schwab_safety.
+  check_order`'s guards, Slack-handler dedup logic, scan-loop bar-close detection), zero broker
+  dependency. Initially assumed most already had solid offline test coverage; a follow-up check found
+  the real split was **3 event-asserting tests / ~8 behavior-only / ~6 with no test at all** (not the
+  optimistic "most already covered" first guess) — `signals_handlers.py` in particular had zero test
+  file whatsoever.
+
+**Built to close the policy-internal gap**:
+1. Added `signals_db.get_coverage_events(scenario_key=...)` assertions to ~9 existing tests across
+   `tests/test_schwab_safety.py`, `tests/test_schwab_automation.py`, `tests/test_part3_gap_resize.py`,
+   `tests/test_part4_entry_trigger.py` that previously only proved the underlying behavior (e.g. "duplicate
+   order raises `SafetyViolation`") without asserting the `log_coverage_event` call itself — meaning the
+   logging line could be silently deleted and the test would still pass.
+2. Wrote 3 brand-new tests for rows with zero coverage at all: `test_node_level_automation_pause_blocks_
+   order` + two sibling-node tests (`test_schwab_safety.py`), and a sibling-node fill-reconciliation
+   disambiguation test for `buy_fill_reconciles_correct_node` (`test_part3_gap_resize.py`).
+3. New `tests/test_signals_handlers.py` — `signals_handlers.py`'s first-ever test file. Calls the real
+   `handle_entry_price` Bolt handler function directly (bypassing Bolt's dispatch, since real interactive
+   buttons can't be tested that way — real clicks route to whichever process holds the Socket Mode
+   connection) with a hand-constructed `body`/`client`, mirroring how `scripts/live_sim.py` already
+   exercises real handler logic without a live connection. Covers `stale_buy_button_guard`,
+   `buy_buttons_resolve_correct_node`, `manual_buy_confirmation_account` (including the `no_account` ->
+   `unattributed` mode branch). Skips gracefully if `cfg.SOCKET_MODE` was False at import time (the
+   handler functions are only defined inside `if cfg.SOCKET_MODE:`).
+
+**New `offline_proof_for()` in `scripts/coverage_registry.py`** — a second, orthogonal axis to the
+existing `status` field. `status` correctly answers "is there LIVE proof this works" (a policy-internal
+branch only ever exercised in pytest's isolated DB is genuinely `wired-never-fired` by that definition —
+pytest is deliberately barred from touching real `coverage_events`, since pytest polluting that table was
+itself a real 2026-07-25 incident). `offline_proof_for()` answers "is there ANY proof, live or offline" —
+`'event-asserted'` (a test asserts the actual `get_coverage_events()` call), `'behavior-only'` (the
+scenario_key appears in a test but nothing asserts the log call itself), or `'none'`. Derived by grepping
+`tests/test_*.py` fresh every run (memoized per process), same "never hand-typed" discipline as
+`compute_status()` — a hand-maintained scenario_key -> test-name mapping would rot the way
+`docs/live_test_coverage.md` did. Surfaced as a new "Offline proof" column in `pages/14_Coverage.py`
+(verified the page loads clean via a headless Streamlit smoke test). `status` remains the single source
+of truth for "verified-live" et al — `offline_proof` never substitutes for it.
+
+**Opus review of this diff found and fixed real accuracy bugs in the derivation itself** — the same
+failure class as this registry's two prior accuracy bugs (a scenario_key collision, and an inverted-logic
+bug where unexplained failures once rendered as "verified-live"):
+1. **HIGH** — `tests/test_coverage_check.py` (which tests the coverage/`scenario_expectations`
+   *infrastructure itself*) reuses real scenario_key strings as arbitrary fixture data —
+   `test_log_coverage_event_stores_node_id` calls `db.log_coverage_event('sl_placement', ...)` directly
+   and asserts it right back, which made `sl_placement` (a real, still-unresolved `live-attempt-failed`
+   SL-placement gap) render as false `'event-asserted'` proof. Fixed by excluding that file from the
+   scan — a structural file-purpose exclusion (documented in code), not a per-scenario_key hand-typed
+   mapping.
+2. **MEDIUM-HIGH** — the original `key in text` substring check false-matched a prefix collision
+   (`sl_placement` inside `sl_placement_fast_confirm_timeout`) and an unquoted docstring mention (one
+   test file's module docstring naming `tests/test_part3_gap_resize.py` by filename, false-matching
+   `gap_resize`). Fixed by requiring an exact quoted-string match (`'key'`/`"key"`).
+3. **MEDIUM** — `entry_fill`/`exit_fill` are logged by both `paper_trading.py` (`mode='paper'`) and the
+   dry_run-fill-synthesis code (`mode='dry_run'`) — the exact collision `bad_results`/`mode_filter`
+   already exist to disambiguate on the `status` axis, re-introduced on the new `offline_proof` axis
+   since it originally took only the bare scenario_key. Fixed: `offline_proof_for()` now also takes
+   `mode_filter` and only credits a match found in a test file that also references that mode.
+4. **LOW-MEDIUM** — `test_node_level_automation_pause_does_not_block_other_nodes` never actually created
+   a second node (it paused then immediately resumed the *same* node), so node-level pause *scoping* was
+   unproven despite the test's name. Renamed to `test_node_automation_resume_unblocks` (what it actually
+   tests) and added two real tests: `test_node_level_automation_pause_does_not_block_sibling_node_other_
+   account` (a genuine cross-account sibling node), and `test_node_level_automation_pause_no_op_for_
+   ambiguous_sibling_same_account`, which pins down `schwab_safety.check_order`'s own documented `KNOWN
+   LIMITATION` comment (a same-ticker-same-account ambiguous node lookup makes a node-level pause
+   silently a no-op) as an accepted, tracked gap rather than an untested blind spot.
+5. **LOW** — `tests/test_schwab_automation.py`/`test_part3_gap_resize.py`/`test_part4_entry_trigger.py`
+   patched `TICKER_AUTOMATION_PATH` in their `env` fixture but not `NODE_AUTOMATION_PATH` — harmless
+   today (the real state file doesn't exist), but a latent risk if a real production node id is ever
+   paused. Added the same override `test_schwab_safety.py` already had.
+6. **LOW** — `_scan_offline_proof()` was re-grepping all test files once per registry row (38 rescans of
+   31 files per report). Added a module-level memo cache (safe within one process — test files don't
+   change mid-run).
+Two lower-severity findings were left as documented limitations rather than fixed (not currently causing
+a wrong result): a test that would be silently skipped in a creds-less CI environment still counts as
+full proof rather than being detected as conditional; the event-assertion regex only matches the
+keyword-argument call form (every current call site uses it).
+
+**Result**: re-ran the CLI report after the fixes — the `behavior-only` bucket dropped from 7 to 0 (all
+7 prior hits were false positives from the bugs above), and several previously-inflated rows
+(`sl_placement`, `gap_resize`, `cash_check`, `trailing_arm_reread`, `second_ticker_one_account`, the
+paper/dry_run entry/exit fills) now correctly show `'none'` — a less flattering but honest picture.
+Full suite: 301 passed (was 291 at session start). `live_sim_harness.py`: 7/7. `signals_invariants.py`:
+clean. No `active_signals.py`/`signals_*.py`/`schwab_*.py`/backtest-kernel production code was touched —
+only test files, `scripts/coverage_registry.py`, and `pages/14_Coverage.py`.
+
 ## ✅ [live-trading][security] Resolved 2026-07-26 — NYSE trading-day gate built and hardened after a real review round caught the fix's own retry logic double-ordering; closes the ERY-incident root cause below
 Closes the root cause left open by the ERY phantom-fill incident (see the entry directly below).
 Added `pandas_market_calendars` (NYSE calendar, weekends + real market holidays, not just a

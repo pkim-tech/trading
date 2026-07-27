@@ -31,6 +31,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'STATE_PATH', tmp_path / "schwab_order_counts.json")
     monkeypatch.setattr(schwab_safety, 'KILL_SWITCH_PATH', tmp_path / "schwab_kill_switch.json")
     monkeypatch.setattr(schwab_safety, 'TICKER_AUTOMATION_PATH', tmp_path / "schwab_ticker_automation.json")
+    monkeypatch.setattr(schwab_safety, 'NODE_AUTOMATION_PATH', tmp_path / "schwab_node_automation.json")
     monkeypatch.setattr(schwab_safety, 'AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_auto_fill_detection.json")
     monkeypatch.setattr(schwab_safety, 'NODE_AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_node_auto_fill_detection.json")
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
@@ -163,6 +164,9 @@ def test_automated_sell_falls_back_when_node_mode_not_live(env):
     signals_notify.notify_trailing_activated(pos, current_price=52.0)
     updated = [p for p in signals_db.get_open_positions() if p['ticker'] == TICKER][0]
     assert not updated['trail_state'].get('order_placed')
+    events = signals_db.get_coverage_events(scenario_key="automated_sell_mode_skip")
+    assert len(events) == 1
+    assert events[0]['result'] == "skipped"
 
 
 def test_notify_trailing_activated_preserves_armed_state_written_by_check_sell_condition(env):
@@ -225,6 +229,9 @@ def test_automated_sell_notifies_sl_price_when_trailing_sell_fails_after_sl_canc
     # pos['fixed_sl'] (config.json's fixed_stop_loss), not node['stop_loss'].
     expected_sl_price = 50.0 * (1 - pos['fixed_sl'] / 100)
     assert f"${expected_sl_price:.2f}" in unprotected_msgs[0]
+    events = signals_db.get_coverage_events(scenario_key="manual_sl_fallback_alert")
+    assert len(events) == 1
+    assert events[0]['result'] == "alerted"
 
 
 def test_notify_sell_signal_time_exit_logs_coverage_event(env):
