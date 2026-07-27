@@ -1124,6 +1124,23 @@ def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, node_i
         pass
 
 
+def dup_alert_suppressed_today(node_id):
+    """True if dup_buy_alert_suppressed already fired for this node today (local
+    time -- same date(ts,'localtime') pattern used elsewhere to avoid the
+    UTC-vs-ET offset bug class). Throttles the repeat Slack suppression message
+    to once/day for a node whose broker-truth block never clears (e.g. an
+    unrelated manual order/holding) without changing the block itself -- the
+    dedupe check keeps re-evaluating broker truth every poll regardless."""
+    with _conn() as c:
+        row = c.execute("""
+            SELECT 1 FROM coverage_events
+            WHERE node_id = ? AND scenario_key = 'dup_buy_alert_suppressed'
+              AND date(ts, 'localtime') = date('now', 'localtime')
+            LIMIT 1
+        """, (node_id,)).fetchone()
+    return row is not None
+
+
 def get_coverage_events(scenario_key=None, mode=None, strategy_type=None, limit=500):
     q = "SELECT * FROM coverage_events"
     clauses, params = [], []

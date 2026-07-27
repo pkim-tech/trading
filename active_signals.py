@@ -226,11 +226,20 @@ def _real_order_or_position_exists(node, ticker):
     limits = schwab_safety.ACCOUNTS.get(account)
     if limits is None or limits.dry_run:
         return False
-    try:
+
+    def _check():
         orders = schwab_safety._open_orders(account)
         if schwab_safety._has_open_order(orders, ticker):
             return True
         return schwab_client.get_real_position(account, ticker) > 0
+
+    try:
+        # Bounded well under the client's own 10s socket timeout -- this is an
+        # optional dedupe check on the timing-critical pinned-entry path (Opus
+        # review, 2026-07-27), not a required one; a slow/hung broker call here
+        # should fall through to the existing DB-only fallback, not stall the scan.
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(_check).result(timeout=5.0)
     except Exception as e:
         print(f"  [warn] {ticker} broker dedupe check failed: {e} — falling back to DB-only check")
         return False
@@ -311,10 +320,15 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                     # the node must still be able to alert same-day, not wait for
                     # tomorrow's buy_alerted reset.
                     buy_alerted.discard(alert_key)
+                    # Throttle the Slack message (not the block itself) to once/day --
+                    # an unrelated manual order/position that never clears would
+                    # otherwise re-alert every poll indefinitely (Opus review, 2026-07-27).
+                    already_alerted_today = db.dup_alert_suppressed_today(node['id'])
                     db.log_coverage_event("dup_buy_alert_suppressed", _coverage_mode(node.get('account')),
                                            ticker=sig['ticker'], node_id=node['id'], result="suppressed")
-                    _post_message(f"🔇 {sig['ticker']} ({node.get('account')} · {_account_mode_tag(node.get('account'))}) "
-                                  f"BUY signal suppressed — already pending/resting at broker or in pending_buys")
+                    if not already_alerted_today:
+                        _post_message(f"🔇 {sig['ticker']} ({node.get('account')} · {_account_mode_tag(node.get('account'))}) "
+                                      f"BUY signal suppressed — already pending/resting at broker or in pending_buys")
                 else:
                     notify_buy_signal(node, sig)
             elif sig['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS:

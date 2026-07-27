@@ -4816,3 +4816,38 @@ Open: 3 MEDIUM findings from the prior session's BUY-duplicate Opus review still
 order/position check can block on unrelated manual holdings; untimed broker HTTP calls in pinned-entry
 path; gate excludes tickers outside `AUTOMATION_ENABLED_TICKERS`). Broader ask to strip non-essential
 tickers from research universe/watchlist/`.env` still unscoped. See `docs/backlog_cache.md` for detail.
+
+---
+
+## 2026-07-27 (later) — Closed 2 of 3 MEDIUM gaps from Sunday's duplicate-BUY-alert fix; trimmed SCHWAB_AUTOMATION_TICKERS to the live watchlist
+
+### What happened
+Picked up the prior session's 3 open MEDIUM findings from the duplicate-BUY-alert fix. Fixed 2:
+`_real_order_or_position_exists` (the broker-truth dedupe check on the pinned-entry critical path)
+now bounds its `_open_orders`/`get_real_position` calls to a 5s timeout via
+`ThreadPoolExecutor(max_workers=1).result(timeout=5.0)` — was unbounded, falls back to `False`
+(proceed with alert, existing behavior) on timeout, same as any other exception. Separately, the
+repeat Slack suppression message (previously fired every poll while `already_pending` stayed true)
+is now throttled to once/calendar-day per node via new `signals_db.dup_alert_suppressed_today`
+(`date(ts,'localtime')` comparison, avoiding the UTC-vs-ET mismatch class this project has hit
+before) — the block itself and its coverage-event logging are unchanged, only the Slack spam is
+throttled.
+
+Trimmed `.env`'s `SCHWAB_AUTOMATION_TICKERS` from 29 tickers down to the 12 actually on watchlist 65
+(AGQ,DPST,GDXU,HIBL,KORU,NUGT,SH,SOXL,SPY,UDOW,USD,YANG) — the other 17 were leftovers from deleted
+canary/soxl_test nodes with no signal ever routed to them. This closes the 3rd MEDIUM finding (gate
+excluding tickers outside automation scope) for the live watchlist, and partially resolves the
+broader 2026-07-26 (evening) ask to strip non-essential tickers everywhere (research
+universe/`trading_universe.db` scope still untouched, still open if wanted).
+
+### Review note
+Started an Opus review agent against this diff (per the session-wrap convention for
+`active_signals.py` changes); the user killed it mid-run for session-budget reasons and said to use
+Sonnet instead of Opus for review going forward — saved to memory. This diff was **not**
+independently reviewed before being committed.
+
+### State
+Full suite: 302 passed. `signals_invariants.py`: clean, 0 known violations. Daemon is still stopped
+and stale (predates last night's `signals_notify.py` edit) — none of this session's changes are live
+until restarted; the GDXU gap-resize test and SH TIME-exit test from the prior session are still
+pending that restart.

@@ -1,5 +1,29 @@
 # Backlog
 
+## ✅ [live-trading][security] Resolved 2026-07-27 (later) — closed 2 of 3 MEDIUM gaps from the duplicate-BUY-alert fix (bounded broker-truth timeout, once/day suppression throttle); trimmed `SCHWAB_AUTOMATION_TICKERS` from 29 to the 12 tickers actually on watchlist 65
+`active_signals._real_order_or_position_exists` (the broker-truth dedupe check on the pinned-entry
+critical path) now runs the `_open_orders`/`get_real_position` calls inside a
+`ThreadPoolExecutor(max_workers=1).result(timeout=5.0)` instead of unbounded — falls back to `False`
+(proceed with the alert, existing behavior) on timeout, same as any other exception. Bound sits under
+the schwab-py client's own 10s socket timeout (`_CLIENT_TIMEOUT_SECS`), not a replacement for it.
+Separately, the repeat Slack suppression message (fired every poll while `already_pending` stays true)
+is now throttled to once/calendar-day per node via new `signals_db.dup_alert_suppressed_today(node_id)`
+(`date(ts,'localtime') = date('now','localtime')` against `coverage_events`, avoiding the UTC-vs-ET
+mismatch bug class this project has hit before) — checked *before* logging the current poll's own
+event so it can't self-match. The block itself (buy_alerted.discard, coverage_event logging) is
+unchanged; it still re-checks broker truth every poll and self-heals once the condition clears — only
+the Slack spam is throttled, not the safety behavior. Third MEDIUM finding (gate excludes tickers
+outside `AUTOMATION_ENABLED_TICKERS`) is now moot for the live watchlist: `.env`'s
+`SCHWAB_AUTOMATION_TICKERS` was trimmed from 29 tickers (many leftover from deleted canary/soxl_test
+nodes) down to the 12 actually on watchlist 65 (AGQ,DPST,GDXU,HIBL,KORU,NUGT,SH,SOXL,SPY,UDOW,USD,YANG)
+— every live node's ticker is now in scope. `sync_automation_scope()` will log the `.env` change to
+`watch_list_audit` on the next daemon restart (not yet restarted). Full suite: 302 passed.
+`signals_invariants.py`: clean. **Opus review of this diff was started then killed by the user
+(budget/session-limit reasons) before returning a verdict — not independently reviewed.** Residual:
+if reviewing this later, check the ThreadPoolExecutor-per-call pattern (new executor spawned each
+call rather than shared) for resource overhead under sustained polling, and confirm the
+`dup_alert_suppressed_today` check-then-log ordering holds under concurrent pinned-entry scans.
+
 ## ✅ [live-trading][security] Resolved 2026-07-27 — reconciled the 2026-07-26 duplicate-BUY incident's real DB mess against broker truth (zero exposure found), placed SPY's real pending trailing-sell, reduced watchlist 65 to 4 live nodes, and fixed `check_gap_resize`'s restart-duplication bug
 
 **Reconciliation**: confirmed via `schwab_client.get_real_position`/`schwab_safety._open_orders` that

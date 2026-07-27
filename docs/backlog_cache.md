@@ -16,11 +16,12 @@ on suppression so a same-day-cleared condition can still re-alert (was stuck til
 caught+fixed while implementing: `mode_tag` wasn't imported in `active_signals.py` and collided with
 an existing local variable of the same name later in `_scan_buy_signals` (Python scoping would have
 made it an UnboundLocalError) — imported as `_account_mode_tag` instead. Import + targeted tests
-verified clean; full suite not re-run this session (budget). **3 MEDIUM still open, not fixed**:
-`_has_open_order`(any-side)/`get_real_position` can permanently block on an unrelated manual
-order/holding, no expiry; 2 untimed broker HTTP calls added to the pinned-entry critical path; gate
-excludes tickers outside `AUTOMATION_ENABLED_TICKERS`, leaving live TrailingExit-outside-scope nodes
-with zero protection. No test coverage for the new gate yet.
+verified clean; full suite not re-run this session (budget). **3 MEDIUM findings — 2 closed 2026-07-27 (later)**: bounded the broker-truth check to a 5s timeout
+(was unbounded), throttled the repeat Slack suppression message to once/day per node (block itself
+unchanged), and trimmed `SCHWAB_AUTOMATION_TICKERS` to the 12 tickers actually on watchlist 65
+(closing the scope-gap finding for the live watchlist). Full detail: `docs/deep_backlog.md`'s
+2026-07-27 (later) entry. **Opus review of that fix was started then killed by the user before
+returning a verdict — not independently reviewed.** No test coverage for the new gate yet.
 **Real DB mess from the incident — reconciled and cleared 2026-07-27** (zero real broker exposure found
 behind any of the 8 duplicate rows). **`check_gap_resize`'s same-bug-class restart-duplication risk —
 fixed 2026-07-27** (persisted per-row guard). Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry (top).
@@ -31,7 +32,7 @@ transition, not an in-memory set); `sell_alerted`/`limit_fill_alerted`/`window_a
 restart (only causes duplicate Slack reminders, not duplicate broker orders — already-documented,
 accepted residual).
 
-## [live-trading] Open, raised 2026-07-26 (evening) — broader ask: strip all non-essential tickers from research universe, watchlist, and `.env` (`SCHWAB_AUTOMATION_TICKERS`) too, not just live-mode. Scope/list not discussed yet.
+## [live-trading] Partially resolved 2026-07-27 (later) — `.env`'s `SCHWAB_AUTOMATION_TICKERS` trimmed from 29 to the 12 tickers on watchlist 65. Research universe/`trading_universe.db` scope not touched — still open if that broader trim is wanted.
 
 ## [live-trading][security] Resolved 2026-07-27 — watchlist 65 live-mode nodes reduced to SPY/SH/GDXU(#108)/DPST; 11 other live nodes deleted (not demoted), 2 dry_run_sim positions (VOO/IVV) retroactively closed first. Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
 
