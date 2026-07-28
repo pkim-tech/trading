@@ -71,17 +71,21 @@ accepted residual).
 
 ## [live-trading][security] Resolved 2026-07-27 — SPY's real pending trailing-stop exit placed for real (order id 1007336072974, resting `AWAITING_STOP_CONDITION`, `soxl_ira`). Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
 
-## [live-trading] Open, raised 2026-07-26 (evening), staged 2026-07-27 — 2 of the 3 planned real-order tests are now staged and pending the next daemon restart (SPY's already done for real, see above)
-(2) **SH TIME-exit** — node #135/position #18 persisted with `max_hold_hours=11` (real held bars were
-7 at staging) and `trail_sell_pct=50%` (unfillable trail, so the forced real trailing-sell order can't
-actually execute against the real 50 shares). Fires once the daemon's running and held bars reach 11.
-(3) **GDXU gap-resize** — a real 5-share `TRAILING_STOP` BUY (order id 1007336073086, ~$425) placed via
-direct bypass of the signal-window gate; `pending_buys` row (id 42, wl_id 108) rigged with
-`running_low=$1` to force `check_gap_resize()` to treat it as gapped-through at tomorrow's 9:15-9:29 ET
-window — expected to cancel the resting order and replace it with a real market buy sized fresh off
-whatever GDXU's live price is then (~$425-450, node's $500 target notional, 5% pad). Both require the
-daemon to actually be running by the relevant time. Full detail: `docs/deep_backlog.md`'s 2026-07-27
-entry.
+## [live-trading] Open, raised 2026-07-26 (evening), staged 2026-07-27 — 3 of 3 planned real-order tests now progressing; daemon currently down, blocking the remaining 2 from resolving
+**GDXU gap-resize — confirmed live 2026-07-27 09:15 ET**: `check_gap_resize` correctly detected the
+rigged gapped-through condition, canceled the resting `TRAILING_STOP` buy, and replaced it with a
+real market buy (2 shares @ $84.52) — `coverage_matrix.py --scenario gap_resize --ticker GDXU
+--detail` confirms `result=replaced`. This closes the 2nd of the 2 coverage-grid rows
+(`gap_resize`/`automated_sell_execution`) that genuinely needed a real broker round-trip (see the
+2026-07-26 `wired-never-fired` re-triage entry below). GDXU has now taken over the **TRAIL-exit**
+role (armed, real 0.3%-trail trailing-sell resting, `exit_order_id` tracked) — needs the daemon
+running for `check_own_sell_fills` to confirm the fill and auto-close.
+**SH TIME-exit** — node #135/position #18, `max_hold_hours` bumped to fire ~next day (real held bars
+were 7 at last check). Needs the daemon running to reach the trigger and exercise
+`_attempt_automated_exit_sell`/`check_own_sell_fills`'s TIME-reason path.
+**SPY** — already resolved for real (trailing-sell filled 09:46 ET, retroactively closed with the
+real fill data; now flat, available as a fresh entry candidate).
+Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
 
 ## [live-trading][security] Resolved 2026-07-26 — NYSE trading-day gate built (`pandas_market_calendars`), guarding both daemon scan paths and `schwab_safety.check_order` itself; a retry added to the fix introduced and then closed its own HIGH duplicate-BUY bug, caught by review before reaching the daemon. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
 

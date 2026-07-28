@@ -98,10 +98,15 @@ unrelated fill from **3 days earlier** instead of correctly returning "not fille
    clean.
 
 **Real state cleanup, same session**: GDXU corrected to real broker state (2 shares @ $83.76), no
-stop-loss placed (deliberate — it's taking over SPY's TRAIL-exit test role instead), a real
-trailing-sell placed manually (0.3%, matching SPY's tight test params) with `trail_state` seeded
-armed (`peak=100`, forcing the exit condition true) so it exercises the new confirm-and-close path
-fast. **SPY's real trailing-sell had actually already FILLED at 09:46 ET that morning** (+0.70%
+stop-loss placed — not a test-specific choice, this is the normal armed-state invariant
+(`signals_notify._attempt_automated_sell` cancels any resting `sl_order_id` via atomic
+`replace_order` when placing the trailing-sell, since both orders live simultaneously would risk an
+oversell/rejected order — see its docstring). GDXU is taking over SPY's TRAIL-exit test role, and a
+real trailing-sell was placed manually (0.3%, matching SPY's tight test params) with `trail_state`
+seeded armed and `exit_order_id` set to the real resting order — the `peak` value only mattered at
+the arm decision (deciding whether to place the order in the first place) and is inert once the
+order is actually resting at the broker, so it exercises the new confirm-and-close path fast.
+**SPY's real trailing-sell had actually already FILLED at 09:46 ET that morning** (+0.70%
 P&L) but sat invisible in the DB as still-open for hours, nagging reminders the whole time — its
 `order_id` predated tonight's fix and was never captured; retroactively closed with the real fill
 data once found. SH's `max_hold_hours` bumped 11→18 (retimed to fire ~same time the next day, now

@@ -4974,3 +4974,64 @@ The shared `last_seen_bar` dict (passed to all 4 loops) keys primarily on `wl_id
 handle a same-`wl_id` position reopen, or two loops (real + paper) checking the same `wl_id`
 concurrently, cleanly — flagged by review as a pre-existing exposure, not introduced by this fix,
 not yet reproduced live. Low priority.
+
+---
+
+## 2026-07-27 (night, 3rd session) — Reviewed/verified live-test-ticker state, corrected a doc-record mistake about SL/trailing-sell rationale, confirmed GDXU's gap-resize test fired for real
+
+### What happened
+Session-start review (`scripts/audit_live_test_candidates.py --tickers SPY SH GDXU`) of the 3 staged
+real-order live tests found: SPY flat (test already resolved, consistent with the prior session's
+close), SH mid-flight on TIME-exit (14/18 held bars), GDXU mid-flight on TRAIL-exit (armed,
+`trail_state.trailing=True`, real trailing-sell order resting).
+
+Walked through the mechanics of each test scenario with the user (entry/gap-resize, TIME-exit,
+TRAIL-exit — per `docs/live_test_coverage.md`'s runbook) and the expected post-trigger flow
+(`_attempt_automated_exit_sell` → `check_own_sell_fills` polling the exact `order_id` → auto-close +
+Slack `🤖 auto-detected exit fill` + `automated_exit_confirmed` coverage event, no manual tap needed).
+
+**Doc correction made mid-conversation**: initially mischaracterized GDXU's "no SL placed" state as a
+deliberate test-scoping choice ("skipping SL to test TRAIL-exit specifically") — user corrected this:
+it's the normal system invariant (`_attempt_automated_sell` cancels any resting SL via `replace_order`
+when placing a trailing-sell, since both can't rest simultaneously for the same shares). Fixed the
+record in `docs/deep_backlog.md`'s 2026-07-27 (night) entry. Also removed a stray `peak=100` reference
+from the same entry after the user pointed out `peak` only matters at the arm decision (deciding
+whether to place the trailing-sell order) and is inert once the order is actually resting at the
+broker — the real fill is entirely the broker's own trailing-stop mechanism against real price,
+confirmed via `check_own_sell_fills` polling `get_filled_order(order_id=...)`, not our DB's `peak`
+field.
+
+Confirmed via `scripts/coverage_matrix.py --scenario gap_resize --ticker GDXU --detail` that GDXU's
+**gap-resize test fired for real** at 09:15 ET today: `check_gap_resize` canceled the resting
+`TRAILING_STOP` buy and replaced it with a real market buy (2 shares @ $84.52), `result=replaced`.
+This closes the 2nd of the 2 coverage-grid rows (`gap_resize`/`automated_sell_execution`) flagged
+2026-07-26 as genuinely needing a real broker round-trip to prove (not provable via
+`live_sim_harness.py`/unit tests alone, since they depend on whether the broker agrees with our
+assumption, not just our own decision logic).
+
+Discussed and deliberately left `_GAP_CHECK_WINDOW=(9,15,9,29)` unchanged — user raised whether the
+14-min pre-open window is too wide (using an early, if real-time, quote rather than one closer to the
+9:30 open); tradeoff identified (narrower window = less decision-to-execution drift, but higher risk
+of missing the check entirely if the daemon's poll timing lags in a tighter band) — user's call to
+leave as-is.
+
+Confirmed via `ps aux`/`scripts/daemon_status.py`: **daemon not running** as of session end — user
+plans to restart it in the morning. SH and GDXU's remaining tests (TIME-exit confirmation, TRAIL-exit
+confirmation) are blocked on that restart.
+
+### Backlog hygiene
+Updated `docs/backlog_cache.md`'s staged-tests entry (was "2 of 3 staged, pending restart") to reflect
+GDXU's gap-resize having actually fired live and GDXU now being in the TRAIL-exit phase instead.
+
+### Deferred, not acted on
+User raised a hypothetical (SL already breached but automated exit fails to confirm — should the
+system alert to liquidate manually?) — confirmed `notify_sell_signal`'s existing fallback already
+covers this (SL uses the same `_attempt_automated_exit_sell` → poll → manual-Slack-alert-on-failure
+path as every other exit reason), no code change needed. User asked to "wait and see if that happens"
+rather than dig further into whether the SL-breach *detection* path itself has any gap distinct from
+the exit-execution path — flagged as worth a closer look only if it actually recurs live.
+
+### No code changes this session
+Docs-only session (`docs/deep_backlog.md`, `docs/backlog_cache.md`). No `active_signals.py`/
+`signals_*.py`/`schwab_*.py`/backtest-kernel changes, so no review agent or `live_sim_harness.py` run
+per the `session wrap` gate.
