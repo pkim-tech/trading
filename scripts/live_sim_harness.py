@@ -69,6 +69,7 @@ import signals_config as cfg  # noqa: E402
 import signals_compute as compute  # noqa: E402
 import signals_db as db  # noqa: E402
 import signals_notify as notify  # noqa: E402
+from signals_helpers import _pos_key  # noqa: E402
 import schwab_client  # noqa: E402
 import schwab_safety  # noqa: E402
 
@@ -161,9 +162,17 @@ def scenario_pinned_exit_arm(posted):
         {'Open': [100.0], 'Close': [104.0], 'Low': [99.5], 'High': [105.0]},
         index=pd.to_datetime(['2026-01-02 10:30:00']),
     )
+    # Seed last_seen_bar to the entry bar first -- a real poll immediately
+    # after open_position would already mark that bar as seen (2026-07-27
+    # fix: a position's first-ever check must never be graded as 'a bar just
+    # closed' against a bar that could contain pre-entry price history, so
+    # it's deferred instead of firing on a fresh {}). This arm check then
+    # correctly reads as a genuinely new bar closing.
+    pos_now = db.get_open_position(ticker)
+    last_seen_bar = {_pos_key(pos_now): pd.Timestamp('2026-01-02 09:30:00')}
     with patch.object(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {ticker}), \
          patch.object(A, '_load_cache', lambda t, _df=df: (_df, None) if t == ticker else (None, None)):
-        A._scan_pinned_exit_arm(db.get_open_positions(), set(), {})
+        A._scan_pinned_exit_arm(db.get_open_positions(), set(), last_seen_bar)
     pos = db.get_open_position(ticker)
     # Both fields, not just 'trailing' -- the 2026-07-22 clobber bug dropped
     # 'peak' alongside 'trailing' (a merge onto a stale pre-arm copy), so
@@ -297,8 +306,15 @@ def scenario_dry_run_sim_cycle(posted):
         {'Open': [95.0], 'Close': [80.0], 'Low': [78.0], 'High': [96.0]},
         index=pd.to_datetime(['2026-01-02 10:30:00']),
     )
+    # Seed last_seen_bar to the entry bar first -- a real poll immediately after
+    # update_dry_run_buys opens the position would already mark that bar as seen
+    # (2026-07-27 fix: a position's first-ever check must never be graded as
+    # 'a bar just closed' against a bar that could contain pre-entry price
+    # history, so it's deferred instead of firing on last_seen_bar={}). This
+    # SL-breach check then correctly reads as a genuinely new bar closing.
+    last_seen_bar = {_pos_key(pos): pd.Timestamp('2026-01-02 09:30:00')}
     with patch.object(A, '_load_cache', lambda t, _df=df: (_df, None) if t == ticker else (None, None)):
-        notify.check_dry_run_sim_sells({}, set(), A._load_cache)
+        notify.check_dry_run_sim_sells(last_seen_bar, set(), A._load_cache)
 
     assert db.get_open_position(ticker) is None, "expected the synthesized position to close on SL breach"
     today = datetime.now().strftime('%Y-%m-%d')

@@ -20,7 +20,7 @@ from signals_charts import _chart_buy, _chart_sell, _upload_chart
 from signals_blocks import _post_message, _post_chunked, _build_buy_blocks, _build_sell_blocks
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
-    buy_order_sizing, log_poll, _pos_key, mode_tag,
+    buy_order_sizing, log_poll, mode_tag, resolve_at_bar_close,
 )
 # scripts/ has no __init__.py but is still importable as a Python 3 implicit
 # namespace package as long as repo root is on sys.path (true whenever this
@@ -599,9 +599,8 @@ def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
         last_bar_ts = df_hourly.index[-1]
         if (pos['id'], last_bar_ts) in dry_run_sell_alerted:
             continue
-        at_bar_close = last_seen_bar.get(_pos_key(pos)) != last_bar_ts
+        at_bar_close = resolve_at_bar_close(pos, last_bar_ts, last_seen_bar)
         if at_bar_close:
-            last_seen_bar[_pos_key(pos)] = last_bar_ts
             bar = df_hourly.iloc[-1]
             cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
         else:

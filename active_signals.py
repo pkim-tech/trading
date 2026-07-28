@@ -83,7 +83,7 @@ from signals_blocks import (
 )
 from signals_helpers import (
     _add_trading_hours, _proximity_emoji, _last_sale_recovery, _phase_emoji, log_poll, _pos_key,
-    mode_tag as _account_mode_tag,
+    resolve_at_bar_close, mode_tag as _account_mode_tag,
 )
 from signals_notify import (
     notify_buy_signal, notify_limit_fill, notify_sell_signal,
@@ -416,10 +416,13 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
         last_bar_ts = df_hourly.index[-1]
         if (pos['id'], last_bar_ts) in sell_alerted:
             continue
-        if last_seen_bar.get(_pos_key(pos)) == last_bar_ts:
-            log_poll(f"{pos['ticker']} pinned_exit_arm bar={last_bar_ts} matches last_seen -- SKIPPED (no new bar)")
-            continue  # no new bar since the last check -- nothing to react to early
-        last_seen_bar[_pos_key(pos)] = last_bar_ts
+        if not resolve_at_bar_close(pos, last_bar_ts, last_seen_bar):
+            # Either no new bar since the last check, or this is the position's
+            # first-ever check (just seeded, deferred to the next genuinely
+            # new bar so it isn't graded against pre-entry bar history --
+            # 2026-07-27 fix, see resolve_at_bar_close docstring).
+            log_poll(f"{pos['ticker']} pinned_exit_arm bar={last_bar_ts} -- SKIPPED (no new bar)")
+            continue
         bar = df_hourly.iloc[-1]
         cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
         log_poll(f"{pos['ticker']} pinned_exit_arm bar={last_bar_ts} cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
@@ -755,9 +758,8 @@ def run_loop(tickers: set = None):
                 last_bar_ts = df_hourly.index[-1]
                 if (pos['id'], last_bar_ts) in sell_alerted:
                     return
-                at_bar_close = last_seen_bar.get(_pos_key(pos)) != last_bar_ts
+                at_bar_close = resolve_at_bar_close(pos, last_bar_ts, last_seen_bar)
                 if at_bar_close:
-                    last_seen_bar[_pos_key(pos)] = last_bar_ts
                     bar = df_hourly.iloc[-1]
                     cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
                 else:

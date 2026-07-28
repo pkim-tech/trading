@@ -380,7 +380,13 @@ def test_scan_pinned_exit_arm_dedups_against_sell_alerted(env, monkeypatch):
     monkeypatch.setattr(active_signals, '_load_cache', lambda ticker: (df, None))
 
     sell_alerted = set()
-    last_seen_bar = {}
+    # Seed last_seen_bar to the entry bar first -- a real poll immediately
+    # after open_position would already mark that bar as seen (2026-07-27
+    # fix: a position's first-ever check must never be graded as 'a bar just
+    # closed' against a bar that could contain pre-entry price history, so
+    # it's deferred instead of firing on a fresh {}). This SL-breach bar then
+    # correctly reads as a genuinely new bar closing.
+    last_seen_bar = {active_signals._pos_key(pos): pd.Timestamp('2026-07-15 08:30:00')}
     notify_calls = []
     monkeypatch.setattr(active_signals, 'notify_sell_signal',
                          lambda p, reason, cp, target: notify_calls.append(reason))

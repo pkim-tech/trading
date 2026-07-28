@@ -1,5 +1,57 @@
 # Backlog
 
+## ✅ [live-trading][security] Resolved 2026-07-27 (night, 2nd session) — `at_bar_close` bookkeeping bug caused false near-instant SL exits in paper trading; same bug found unfixed in the real automation-scoped `_scan_pinned_exit_arm` path
+
+**The incident**: investigating a paper-trading losing streak (0/6 win rate, several exits within
+30-60s of entry). A USD trade entered at $80.27 was recorded as an exact -3.00% SL loss 32 seconds
+later — but real 1-min Yahoo data showed live price was actually ~$80.50 at that moment, nowhere
+near the stop.
+
+**Root cause**: the exit-check loops (`active_signals.py`'s real ambient loop, `_scan_pinned_exit_arm`,
+`paper_trading.check_paper_sells`, `signals_notify.check_dry_run_sim_sells`) each decided
+`at_bar_close` via `last_seen_bar.get(pos_key) != last_bar_ts`. For a freshly-opened position with
+no prior `last_seen_bar` entry, this is always `None != last_bar_ts` → `True` — so a position's very
+first check, even 30s after entry, was graded against the *entire* current hourly bar's real
+Low/Open, which can include real price action from *before* the position existed. Confirmed against
+the USD trade: the bar's genuine $77.49 low happened at 10:41, 19 minutes before the 11:00:18 entry,
+but got attributed to the position anyway, producing an exact-match SL fill.
+
+Separately clarified during the investigation (not itself a bug, ruled out as the cause): `_current_price()`
+doesn't call Schwab or a live yfinance quote — it reads the hourly-bar CSV cache's last Close, which
+`data_manager.fetch_live_data_smart` deliberately refreshes at most once per calendar hour (a guard
+clause meant for the backfill/resweep pathway, reused by the live daemon's collector) — so intra-hour
+"current price" can be up to ~59 min stale. Verified this doesn't corrupt the *completed*-bar OHLC
+once the hour rolls over (matched real 1-min data exactly), so it wasn't load-bearing for this
+incident and didn't need a separate fix — the user confirmed exact intrabar timing isn't required,
+only correct bar attribution.
+
+**Fix**: new `signals_helpers.resolve_at_bar_close(pos, last_bar_ts, last_seen_bar)` — seeds a
+never-seen position as already-seen and returns `at_bar_close=False`, deferring the real bar-close
+evaluation to the next genuinely new bar instead of misclassifying the first poll. Applied to the
+real ambient loop, `paper_trading.py`, and `signals_notify.py`. A Sonnet review round then found the
+identical bug, unfixed, in a 4th site the initial pass missed: `_scan_pinned_exit_arm` (the fast
+~2s-latency arm-check path, scoped to real `AUTOMATION_ENABLED_TICKERS` positions — higher-stakes
+than the other three, since `just_activated_trailing` there drives real automated sell-order
+placement) had its own hand-rolled version of the same bug, hardcoding `at_bar_close=True`
+unconditionally on a position's first check. Fixed the same way.
+
+Four existing tests/harness scenarios (`test_check_paper_sells_closes_on_sl_and_writes_paper_trade_log`,
+`scenario_pinned_exit_arm`, `scenario_dry_run_sim_cycle`, `test_scan_pinned_exit_arm_dedups_against_sell_alerted`)
+had been passing a fresh empty `last_seen_bar` and relying on the old (buggy) immediate bar-close
+grading — updated to seed `last_seen_bar` with the entry bar first, matching what a real poll
+sequence would actually do. New regression test added:
+`test_check_paper_sells_first_poll_ignores_pre_entry_bar_low`.
+
+Full suite: 303 passed (was 302). Harness: 7/7. `signals_invariants.py`: clean (0 known violations).
+
+**Deferred, not a new regression (flagged by review, not yet closed)**: the shared `last_seen_bar`
+dict (passed to all 4 loops) keys primarily on `wl_id` — a position closed then reopened on the same
+`wl_id` inherits the old position's stale entry, so the "never seen" seeding branch won't trigger for
+it (same pre-existing exposure the old code also had). Also: a `wl_id` with both a live real position
+and a paper position running concurrently (the documented UDOW/DPST pattern) has whichever loop
+checks it first "consume" the seed on the other's behalf. Neither reproduced live yet; low priority
+given how rarely a `wl_id` is reopened same-session.
+
 ## ✅ [live-trading][security] Resolved 2026-07-27 (night) — GDXU stale-fill incident root-caused and fixed (order_id-exact matching everywhere); automated TP/SL/TIME exits built; cancel+place replaced with atomic replace_order; canaries restored after accidental deletion
 
 **The incident**: reviewing the day's 3 staged live tests (SPY TRAIL-exit, SH TIME-exit, GDXU

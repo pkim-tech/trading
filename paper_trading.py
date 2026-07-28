@@ -16,7 +16,7 @@ from datetime import datetime
 import signals_db as db
 from signals_compute import _current_price, check_sell_condition
 from signals_blocks import _post_message
-from signals_helpers import buy_order_sizing, log_poll, _pos_key
+from signals_helpers import buy_order_sizing, log_poll, resolve_at_bar_close
 
 
 def start_paper_buy(node, sig):
@@ -108,9 +108,8 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
         last_bar_ts = df_hourly.index[-1]
         if (pos['id'], last_bar_ts) in paper_sell_alerted:
             continue
-        at_bar_close = last_seen_bar.get(_pos_key(pos)) != last_bar_ts
+        at_bar_close = resolve_at_bar_close(pos, last_bar_ts, last_seen_bar)
         if at_bar_close:
-            last_seen_bar[_pos_key(pos)] = last_bar_ts
             bar = df_hourly.iloc[-1]
             cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
         else:

@@ -142,6 +142,25 @@ def _pos_key(pos):
     return pos['wl_id'] if pos.get('wl_id') is not None else (pos['ticker'], pos['window'])
 
 
+def resolve_at_bar_close(pos, last_bar_ts, last_seen_bar):
+    """Shared at_bar_close bookkeeping for the three exit-check loops (real,
+    paper, dry_run_sim). A position with no last_seen_bar entry yet is either
+    (a) pre-existing at daemon startup, already seeded by _seed_last_seen_bar,
+    or (b) opened just now, this run -- case (b) must NOT be graded as 'a bar
+    just closed', since the current (possibly still-forming, or already
+    partially-elapsed) bar's Low/Open can include real price action from
+    before the position existed. Seed it as already-seen and defer the first
+    real bar-close evaluation to the next genuinely new bar instead."""
+    pos_key = _pos_key(pos)
+    if pos_key not in last_seen_bar:
+        last_seen_bar[pos_key] = last_bar_ts
+        return False
+    at_bar_close = last_seen_bar[pos_key] != last_bar_ts
+    if at_bar_close:
+        last_seen_bar[pos_key] = last_bar_ts
+    return at_bar_close
+
+
 def _existing_position_note(ticker, wl_id=None):
     """Formats the already-open position for a duplicate-attempt warning, so the
     user doesn't have to go run scripts/open_positions_status.py separately.

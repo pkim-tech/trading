@@ -113,6 +113,46 @@ def test_check_paper_sells_closes_on_sl_and_writes_paper_trade_log(monkeypatch, 
     assert row['pnl_pct'] < 0
 
 
+def test_check_paper_sells_first_poll_ignores_pre_entry_bar_low(monkeypatch, isolated_db):
+    """Regression test for a real incident (2026-07-27): a freshly-opened
+    position's first check_paper_sells call must NOT be graded as 'a bar just
+    closed' using the current hourly bar's own Low -- that bar may contain a
+    real price dip that happened BEFORE the position was even entered, which
+    has nothing to do with the position's actual post-entry price path. Here
+    the current bar's real Low ($90) is well past the 1% fixed_sl from a $100
+    entry, but the live current_price ($99.80) never came close to it -- a
+    fresh position must not be closed on that first check."""
+    import pandas as pd
+    from tests.conftest import CACHE_DIR, _synthetic_timestamps
+
+    timestamps = _synthetic_timestamps(90)
+    closes = [100.0] * len(timestamps)
+    df = pd.DataFrame({
+        'Open': closes, 'High': closes, 'Low': closes, 'Close': closes,
+    }, index=timestamps)
+    df.index.name = 'Datetime'
+    # Current (still-forming) bar: a real dip to $90 happened earlier in this
+    # bar, well before the position was entered.
+    df.loc[df.index[-1], ['Open', 'High', 'Low', 'Close']] = [100.0, 100.0, 90.0, 99.5]
+    df.to_csv(CACHE_DIR / f"{TICKER}_1h.csv")
+
+    node = _node()
+    signal_time = datetime.now() - timedelta(hours=1)
+    db.open_position(node, signal_price=100.0, signal_time=signal_time,
+                      entry_price=100.0, entry_time=datetime.now(), shares=50, paper=True)
+    pos = db.get_open_positions(paper=True)[0]
+
+    monkeypatch.setattr(paper_trading, '_current_price', lambda t: (99.80, None))
+
+    from signals_compute import _load_cache
+    last_seen_bar = {}
+    paper_trading.check_paper_sells(last_seen_bar, set(), _load_cache)
+
+    open_positions = db.get_open_positions(paper=True)
+    assert len(open_positions) == 1, "fresh position must not be closed against pre-entry bar history"
+    assert pos['wl_id'] in last_seen_bar, "current bar must be seeded as already-seen"
+
+
 def test_real_open_positions_untouched_by_paper_flow(monkeypatch, isolated_db):
     paper_trading.start_paper_buy(_node(), _sig(100.0))
     monkeypatch.setattr(paper_trading, '_current_price', lambda t: (90.0, None))

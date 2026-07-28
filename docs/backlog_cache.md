@@ -1,5 +1,15 @@
 # Backlog Cache
 
+> **Reminder (to Claude, added 2026-07-27)**: keep entries here to 1-2 lines — a one-line pointer
+> to `docs/deep_backlog.md`'s full-detail entry, plus a second line only for something genuinely
+> still-open. The full incident writeup (root cause, fix, review findings, test counts) belongs in
+> `deep_backlog.md`, not here, and NOT inline in `CLAUDE.md` either — CLAUDE.md should stay a
+> living reference, not an ever-growing changelog. Caught live after this got violated twice in
+> one sitting (once here, once in CLAUDE.md) before being fixed.
+
+## [live-trading][security] Resolved 2026-07-27 (night, 2nd session) — `at_bar_close` bookkeeping bug caused false near-instant SL exits (paper trading, and unfixed in real `_scan_pinned_exit_arm` until a review round caught it). Full detail: `docs/deep_backlog.md`'s 2026-07-27 (night, 2nd session) entry (top).
+**Deferred, not a new regression**: shared `last_seen_bar` dict doesn't handle a same-`wl_id` reopen or concurrent real+paper nodes cleanly — see deep_backlog entry.
+
 ## [live-trading][security] Resolved 2026-07-27 (night) — GDXU stale-fill incident fixed (order_id-exact matching everywhere, replaces the fuzzy "most recent fill" hazard); automated TP/SL/TIME exits built; cancel+place replaced with atomic `replace_order`; 6 canary nodes restored after accidental deletion. Full detail: `docs/deep_backlog.md`'s 2026-07-27 (night) entry (top).
 New tooling from real session friction: `scripts/audit_live_test_candidates.py`, `scripts/stage_live_test_order.py`, `docs/live_test_coverage.md`'s new runbook section. Full suite 302 passed, harness 7/7, invariants clean, 2 independent Sonnet review rounds.
 

@@ -4917,3 +4917,60 @@ bypass mechanism that was already documented in an earlier session with no memor
 Full suite: 302 passed. `live_sim_harness.py`: 7/7. `signals_invariants.py`: clean.
 `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`: no
 mismatches. Daemon killed by user, needs restart tomorrow before any of tonight's fixes are live.
+
+---
+
+## 2026-07-27 (night, 2nd session) — Root-caused false SL exits in paper trading (`at_bar_close` bookkeeping bug), fixed across all 4 exit-check loops including the real automation-scoped path; caught and corrected a doc-hygiene regression (CLAUDE.md/backlog_cache.md growing full incident writeups instead of staying one-line pointers)
+
+### What happened
+Started from the user noticing paper trading "didn't do so great" and asking to compare its
+behavior against backtest/live-sim expectations. Investigation of a 0/6 win-rate losing streak
+(several trades exiting within 30-60s of entry) led to the real root cause: `check_paper_sells`
+(and the equivalent real/dry_run loops) decide `at_bar_close` via `last_seen_bar.get(pos_key) !=
+last_bar_ts`. For a freshly-opened position with no prior `last_seen_bar` entry, this always
+evaluates to `True`, so a position's very first check — even 30 seconds after entry — was graded
+against the *entire* current hourly bar's real Low/Open, which can include real price action from
+*before* the position existed. Verified conclusively against real 1-minute Yahoo data on a USD
+trade: a genuine $77.49 low happened 19 minutes before the position's 11:00:18 entry, but got
+attributed to the position anyway, producing an exact-match false SL exit.
+
+Also chased and ruled out a secondary hypothesis along the way: `_current_price()` reads the
+hourly-bar CSV cache's last Close (not Schwab, not a live yfinance quote), and
+`data_manager.fetch_live_data_smart` deliberately skips re-fetching Yahoo more than once per
+calendar hour (a guard meant for the backfill pathway, reused by the live daemon's collector) — so
+intra-hour "current price" can be up to ~59 min stale. Confirmed this does NOT corrupt the
+*completed*-bar OHLC once the hour rolls over (matched real 1-min data exactly), and the user
+confirmed exact intrabar timing isn't required — only correct bar attribution — so this was a real
+but non-load-bearing finding, not a second bug needing a fix.
+
+**Fix**: new `signals_helpers.resolve_at_bar_close()` seeds a never-seen position as already-seen
+and defers its real bar-close evaluation to the next genuinely new bar. Applied to the real ambient
+loop and paper/dry_run_sim loops first; a Sonnet review round then caught the identical bug,
+unfixed, in a 4th site the initial pass missed — `_scan_pinned_exit_arm`, the fast ~2s-latency
+arm-check path scoped to real `AUTOMATION_ENABLED_TICKERS` positions, higher-stakes than the other
+three since it drives real automated sell-order placement. Fixed the same way. Four existing
+tests/harness scenarios that had been passing a fresh empty `last_seen_bar` (relying on the old
+buggy immediate-grading behavior) were updated to seed the entry bar first, matching what a real
+poll sequence does; one new regression test added. Full suite: 303 passed (was 302). Harness: 7/7.
+`signals_invariants.py`: clean (0 known violations — UDOW's previously-accepted violation was
+already resolved in an earlier session).
+
+### Doc-hygiene correction, same session
+While writing up the fix, defaulted to full inline narratives in both CLAUDE.md and
+`docs/backlog_cache.md` — the user caught this immediately (CLAUDE.md "getting longer and longer,"
+then flagged the same mistake in backlog_cache.md). Corrected: full writeup now lives only in
+`docs/deep_backlog.md`; CLAUDE.md and `backlog_cache.md` both shrunk to one-line pointers, matching
+the project's own already-documented convention that got violated. Added a standing reminder
+comment to `backlog_cache.md`'s header, plus a new memory (`feedback_lean_doc_pointers`) to avoid
+repeating this pattern in future sessions.
+
+### Negative test
+Confirmed DPST's research-mode paper node (id 87) has zero paper-trading activity, matching its
+live sibling (id 136) also being quiet — correctly wired into `SCHWAB_AUTOMATION_TICKERS`, just
+never received a BUY signal. Not a bug.
+
+### Deferred, not fixed this session
+The shared `last_seen_bar` dict (passed to all 4 loops) keys primarily on `wl_id` and doesn't
+handle a same-`wl_id` position reopen, or two loops (real + paper) checking the same `wl_id`
+concurrently, cleanly — flagged by review as a pre-existing exposure, not introduced by this fix,
+not yet reproduced live. Low priority.
