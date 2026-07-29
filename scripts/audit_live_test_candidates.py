@@ -74,12 +74,28 @@ def _resolve_live_node(ticker):
 
 def audit_one(ticker):
     print(f"\n=== {ticker} ===")
-    pos = db.get_open_position(ticker)
-    account = pos.get("account") if pos else None
+    # Node-scoped throughout (wl_id, not bare ticker) -- db.get_open_position(
+    # ticker) resolves ambiguously ("whichever position has the latest
+    # entry_time") once 2+ nodes exist for a ticker, which is now the normal
+    # case (GDXU/DPST/RETL all have 2+ nodes). Resolving the node first via
+    # _resolve_live_node (already ambiguity-safe, fixed 2026-07-28) and then
+    # looking up by wl_id closes that gap (found by the user, 2026-07-29).
+    node, ambiguous = _resolve_live_node(ticker)
+    if node is None:
+        if ambiguous:
+            modes = ", ".join(f"{r['account']}/{r['mode']}" for r in ambiguous)
+            print(f"  verdict: ambiguous -- {len(ambiguous)} nodes ({modes}), none uniquely mode='live'")
+        else:
+            print("  verdict: no watch_list node -- not a candidate")
+        return
 
-    if account is None:
-        node, ambiguous = _resolve_live_node(ticker)
-        account = node.get("account") if node else None
+    # Real/dry_run wins on a collision (shouldn't happen for one node -- it's
+    # either mode='live' with a real position or mode='research' with a
+    # paper one, never both -- but real state should never be shadowed).
+    real_pos = db.get_open_position_by_wl_id(node['id'])
+    pos = real_pos or db.get_open_position_by_wl_id(node['id'], paper=True)
+    is_paper = real_pos is None and pos is not None
+    account = node.get("account")
 
     real_shares = None
     resting = []
@@ -103,14 +119,6 @@ def audit_one(ticker):
 
     if pos is None:
         print("  DB position: none (flat)")
-        node, ambiguous = _resolve_live_node(ticker)
-        if node is None:
-            if ambiguous:
-                modes = ", ".join(f"{r['account']}/{r['mode']}" for r in ambiguous)
-                print(f"  verdict: ambiguous -- {len(ambiguous)} nodes ({modes}), none uniquely mode='live'")
-            else:
-                print("  verdict: no watch_list node -- not a candidate")
-            return
         sig = a.compute_buy_signal(node)
         if sig is None:
             print("  verdict: no signal data available -- can't assess entry candidacy")
@@ -123,9 +131,11 @@ def audit_one(ticker):
         return
 
     db_shares = pos.get("shares")
-    mismatch = real_shares is not None and db_shares is not None and abs(real_shares - db_shares) > 1e-6
-    print(f"  DB position: {db_shares:g} shares @ ${pos['entry_price']:.4f}  "
+    tag = " [PAPER]" if is_paper else ""
+    print(f"  DB position{tag}: {db_shares:g} shares @ ${pos['entry_price']:.4f}  "
           f"(entered {pos['entry_time']})")
+    mismatch = (not is_paper and real_shares is not None and db_shares is not None
+                and abs(real_shares - db_shares) > 1e-6)
     if mismatch:
         print(f"  \U000026A0️  MISMATCH: DB says {db_shares:g}, broker says {real_shares:g}")
 
