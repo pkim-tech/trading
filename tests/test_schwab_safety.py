@@ -322,6 +322,24 @@ def test_replace_does_not_self_block_on_the_order_it_is_replacing(env, monkeypat
     assert len(events) == 0
 
 
+def test_trailing_sell_replace_does_not_self_block_on_the_order_it_is_replacing(env, monkeypatch):
+    # Same fix, other call site: replace_order_with_trailing_sell is the
+    # TRAIL-arm swap (_attempt_automated_sell replacing a resting SL with a
+    # TRAILING_STOP SELL). GDXU's real 07-27 arm event never actually
+    # exercised this path -- it was staged manually via
+    # stage_live_test_order.py, which bypasses schwab_safety entirely -- so
+    # this fix had no test and no live proof until now.
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
+        {"status": "WORKING", "orderId": 999, "orderLegCollection": [
+            {"instruction": "SELL", "instrument": {"symbol": TICKER}}
+        ]}
+    ])
+    result = schwab_client.replace_order_with_trailing_sell('ira', TICKER, 999, 5, 50.0, 0.3)
+    assert result == (None, None)  # dry_run short-circuit, not a SafetyViolation
+    events = signals_db.get_coverage_events(scenario_key="dup_sell_order_blocked")
+    assert len(events) == 0
+
+
 def test_replace_still_blocks_on_a_different_resting_sell_order(env, monkeypatch):
     # exclude_order_id must be exact -- a genuinely different resting SELL
     # order (not the one being replaced) still must block, same as before.
