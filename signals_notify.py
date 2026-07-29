@@ -1822,8 +1822,18 @@ def build_reference_table(watchlist):
     # Keyed on wl_id, not ticker -- a ticker-keyed dict would silently mask one
     # node's position/pending row behind another's if 2+ nodes share a ticker
     # (see docs/backlog_cache.md's wl_id refactor entry).
-    positions = {p['wl_id']: p for p in db.get_open_positions()}
-    pending_buys = {p['node']['id']: p for p in db.get_pending_buys()}
+    # Paper positions/pending-buys merged in too (2026-07-28 fix) -- this used
+    # to only read open_positions/pending_buys (the real+dry_run tables), so
+    # every research-mode node's Phase bubbles rendered flat/all-grey even
+    # with a real open paper position (found live: SOXL, 463 shares, entered
+    # hours earlier, showed 0/4 bubbles). Real/dry_run rows win on a wl_id
+    # collision (shouldn't happen -- a node is either mode='live' with a real
+    # position or mode='research' with a paper one, never both -- but real
+    # state should never be shadowed by paper state regardless).
+    positions = {p['wl_id']: p for p in db.get_open_positions(paper=True)}
+    positions.update({p['wl_id']: p for p in db.get_open_positions()})
+    pending_buys = {p['node']['id']: p for p in db.get_paper_pending_buys()}
+    pending_buys.update({p['node']['id']: p for p in db.get_pending_buys()})
     rows = []
     # 2026-07-22 fix: this used to filter to mode=='live' only -- silently
     # correct while every node really was live, but once the whole watchlist
