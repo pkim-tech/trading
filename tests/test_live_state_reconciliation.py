@@ -191,3 +191,20 @@ def test_snooze_scoped_to_one_kind_does_not_suppress_missing_sl(env, monkeypatch
     signals_notify.check_live_state_reconciliation([pos])
     assert len(env) == 1
     assert 'SL' in env[0] or 'stop' in env[0].lower()
+
+
+def test_no_false_mismatch_for_a_position_already_closed_this_cycle(env, monkeypatch):
+    """Real 2026-07-28 bug: open_positions is a snapshot taken once at the top
+    of active_signals.py's poll loop. If an earlier step in the *same* cycle
+    (_check_position_exit) closes a position before check_live_state_
+    reconciliation runs, this function used to compare the broker's correct
+    post-close state against the caller's stale in-memory row, producing a
+    false mismatch. Found live: GDXU's real TRAIL close produced a false
+    "shares"/"missing_trailing_sell" alert 6 seconds after a correct exit."""
+    pos = _open_pos(shares=100)
+    signals_db.close_position(pos['id'], exit_signal_price=55.0, exit_price=55.0,
+                               exit_time=datetime.now(), exit_reason='TRAIL')
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 0.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    signals_notify.check_live_state_reconciliation([pos])  # still the stale, now-closed row
+    assert env == []

@@ -334,6 +334,17 @@ def check_live_state_reconciliation(open_positions):
         if not account:
             continue
         _node_id = pos.get('wl_id')
+        # Re-check the position is still actually open before comparing --
+        # `open_positions` (the caller's arg) is a snapshot taken once at the
+        # top of this poll cycle; an earlier step in the *same* cycle
+        # (_check_position_exit) can close a position before this function
+        # runs, leaving a stale in-memory row here. Found live 2026-07-28:
+        # GDXU's real TRAIL close at 13:30:09 produced a false "shares"/
+        # "missing_trailing_sell" mismatch 6 seconds later, comparing the
+        # broker's correct post-close state (0 shares, no order) against this
+        # cycle's stale belief that the position was still open.
+        if _node_id is not None and db.get_open_position_by_wl_id(_node_id) is None:
+            continue
         try:
             real_shares = schwab_client.get_real_position(account, ticker)
             orders = schwab_safety._open_orders(account)
