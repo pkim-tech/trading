@@ -7,6 +7,49 @@
 > living reference, not an ever-growing changelog. Caught live after this got violated twice in
 > one sitting (once here, once in CLAUDE.md) before being fixed.
 
+## [live-trading][security] Resolved 2026-07-28 (night) — resting-order dup guards self-blocked their own replace calls; SH's automated exit was stuck for 4 real days. Full detail: `docs/deep_backlog.md`'s 2026-07-28 (night) entry (top).
+**Still open from the same session**: Morning Report ignores `paper_positions`; `check_live_state_reconciliation` uses a stale in-cycle snapshot; `gap_resize`'s BUY-side anomaly unexplained (diagnostic logging added); GDXU's TRAIL-arm fix has no live proof (staged test bypassed the guard entirely); accountability-grid re-triage under a corrected "timing-dependent" filter, not yet built.
+
+## [live-trading][coverage] Open, raised 2026-07-28 — 2026-07-27's coverage check showed all 6 `canary_*` scenarios failing (IVV/QQQ/IWM/DIA/VOO/XLF); confirmed via `audit_live_test_candidates.py` this is a real no-entry day, not a pipeline bug (all 6 flat, none near their entry trigger). Two follow-ups: (1) all 6 still `expected_frequency='daily'` in `scenario_expectations` — same overly-optimistic assumption already fixed for 12 other grid rows 2026-07-28 (later), likely to keep minting false deviations on any day the entry dislocation doesn't happen; (2) each of the 6 `canary_*` rows appears **twice** in `scenario_expectations` (duplicate-seed/dedup gap, not yet investigated for double-counting impact on `coverage_check.py`'s output).
+**Checked trade_log history for all 6 (2026-07-28)**: IWM/DIA/XLF have **never entered even once**
+since being added 2026-07-23 — zero rows ever. VOO/IVV each entered once (2026-07-26) but never got a
+natural exit — both were retroactively force-closed (`DRY_RUN_RETROACTIVE_CLEANUP`) during the
+2026-07-27 watchlist cleanup, so `canary_market_buy_exit`/`canary_full_lifecycle` have never actually
+been validated end-to-end, only interrupted. Only QQQ (`canary_early_sl`) has ever completed its
+designed lifecycle naturally (entered and SL-exited 37s later, 2026-07-26) — the only one of the 6
+canaries actually proven working as designed so far.
+**Manually seeded 2026-07-28 08:21 ET**: `scripts/seed_canary_positions.py` directly inserted
+`is_dry_run_sim=1` `open_positions` rows for IVV/IWM/DIA/VOO/XLF (1 share each, entered at real
+current price) so their designed exit lifecycle can actually be exercised today instead of waiting on
+a real z-score entry. QQQ left untouched (already proven). Expect today's coverage check for these 5
+to reflect this manual seed, not an organic entry — don't misread it as a natural signal firing.
+
+## [live-trading][coverage] Open, raised 2026-07-28 — two live-alert wording/staleness bugs found reviewing GDXU's TRAIL-exit test, not fixed yet
+(1) `_build_sell_blocks` (`signals_blocks.py:278`/`290`) hardcodes "Cancel Stop Loss order — Sell
+All (Market)" for TP/TRAIL alerts regardless of whether an SL order actually rests — for GDXU
+(`trail_state.trailing=True`, `sl_order_id=None`, confirmed correct: SL genuinely was cancelled and
+replaced by the resting trailing-sell) this reads as an instruction to cancel an order that doesn't
+exist. Engine state itself is correct; only the alert text is stale (predates automated exits).
+(2) `_current_price()` (`signals_compute.py:41`)'s staleness guard only fires for the specific
+market-open-transition case (weekday, past 9:30am, cached row predates today) — overnight/after-hours
+it silently replays the last cached hourly close as if live, which is what produced GDXU's "current
+$81.92" overnight alert. SH didn't exhibit this only because its exit (TIME) is bar-count-based, not
+price-dependent — unrelated immunity, not evidence the bug isn't real.
+(3) **Bigger than wording**: for a TRAIL reason on an automation-scoped position, `notify_sell_signal`
+falls through to the manual SELL-alert/Exited-Skipped-buttons path whenever its own 15s fill-confirm
+poll (`_GAP_FILL_POLL_ATTEMPTS`x`_GAP_FILL_POLL_INTERVAL_SECS`) doesn't return a fill — which is the
+*normal* case for a resting trailing-stop (can take far longer than 15s to actually trigger). There is
+no manual action available once the trailing-sell order is already resting (`check_own_sell_fills`
+polls it and auto-closes on fill) — the alert asks for action that doesn't exist, and `sell_alerted`
+keys on bar-close so it'll keep re-firing every subsequent bar until it's actually filled. **User's
+refinement**: don't just suppress this unconditionally — there's a real edge case worth keeping an
+alert for (trailing-sell order resting a long time / expected to have triggered by now but the
+position is still open, e.g. broker-side issue). Real fix should distinguish "routine still-waiting,
+nothing wrong, no action" (suppress) from "should have filled by now and hasn't" (keep an informational
+alert, phrased like "trail sell triggered but position still open?" — not the current "cancel SL/sell
+all manually" action framing, since there's still no manual action to take, just a flag that something
+may be off and worth a human look).
+
 ## [live-trading][security] Resolved 2026-07-27 (night, 2nd session) — `at_bar_close` bookkeeping bug caused false near-instant SL exits (paper trading, and unfixed in real `_scan_pinned_exit_arm` until a review round caught it). Full detail: `docs/deep_backlog.md`'s 2026-07-27 (night, 2nd session) entry (top).
 **Deferred, not a new regression**: shared `last_seen_bar` dict doesn't handle a same-`wl_id` reopen or concurrent real+paper nodes cleanly — see deep_backlog entry.
 

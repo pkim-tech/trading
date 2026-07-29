@@ -521,7 +521,30 @@ def _open_orders(account: str) -> list:
     return [o for o in _all_orders(account) if o.get("status") not in _OPEN_ORDER_STATUSES_EXCLUDED]
 
 
-def _has_open_order(orders: list, ticker: str) -> bool:
+def _log_guard_input(account, ticker, side, orders, replacing_order_id):
+    """Logs the raw resting-order snapshot a dup-order guard is about to
+    decide against -- every guard branch below already logs its *outcome*
+    (coverage_events), but never the broker state that outcome was decided
+    from. Found 2026-07-28: GDXU's real 07-27 gap_resize BUY replace should
+    have hit the same self-block SH's SELL replace did (a resting order for
+    the same ticker existed 8 real hours before the check), and didn't --
+    with no record of what _open_orders() actually returned at that moment,
+    it's unexplainable after the fact. Temporary/cheap diagnostic, safe to
+    remove once the next staged gap-resize test either reproduces or clears
+    this. Import kept local/lazy to avoid a schwab_safety<->signals_config
+    import-order dependency at module load time."""
+    try:
+        import signals_config as cfg
+        snapshot = [{"orderId": o.get("orderId"), "status": o.get("status"),
+                     "orderType": o.get("orderType")} for o in orders]
+        with open(cfg.VERBOSE_LOG_PATH, "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [guard_input] {side} {ticker} "
+                    f"account={account} replacing_order_id={replacing_order_id} orders={snapshot}\n")
+    except Exception:
+        pass
+
+
+def _has_open_order(orders: list, ticker: str, exclude_order_id: int | None = None) -> bool:
     """True if any resting order in `orders` (see _open_orders) is for this
     ticker, regardless of side.
     Deliberately ticker(+account)-keyed, not wl_id-keyed, and not part of the
@@ -530,8 +553,15 @@ def _has_open_order(orders: list, ticker: str) -> bool:
     constraint: two live nodes on the same ticker in the *same* account still
     cannot both hold resting orders, regardless of that refactor (two live
     nodes on the same ticker in *different* accounts is fine -- see
-    _live_ticker_accounts)."""
+    _live_ticker_accounts).
+    exclude_order_id skips the exact order a replace_order call is about to
+    swap out -- without this, an atomic-replace call (which checks before the
+    old order is actually gone) always sees its own target order as "already
+    resting" and self-blocks (found 2026-07-28, real: SH's TIME/SL exit was
+    permanently blocked by its own protective SL order for 4 days)."""
     for o in orders:
+        if exclude_order_id is not None and o.get("orderId") == exclude_order_id:
+            continue
         legs = o.get("orderLegCollection", [])
         if any(leg.get("instrument", {}).get("symbol") == ticker for leg in legs):
             return True
@@ -555,13 +585,18 @@ def _has_open_buy_order_in_account(orders: list, ticker: str) -> str | None:
     return None
 
 
-def _has_open_sell_order(orders: list, ticker: str) -> bool:
+def _has_open_sell_order(orders: list, ticker: str, exclude_order_id: int | None = None) -> bool:
     """True if any resting SELL order for this exact ticker already exists.
     Unlike _has_open_order (any side blocks a second BUY), this only matches
     same-side (SELL) orders -- an unrelated resting BUY for this ticker must
     not block closing a position, same asymmetry the module already applies
-    elsewhere (same-day-block, notional-cap exemption) for SELL."""
+    elsewhere (same-day-block, notional-cap exemption) for SELL.
+    exclude_order_id -- see _has_open_order's docstring; same rationale,
+    for the SELL-side replace calls (_attempt_automated_exit_sell's SL/TIME
+    exit, _attempt_automated_sell's TRAIL arm)."""
     for o in orders:
+        if exclude_order_id is not None and o.get("orderId") == exclude_order_id:
+            continue
         for leg in o.get("orderLegCollection", []):
             if leg.get("instruction") == "SELL" and leg.get("instrument", {}).get("symbol") == ticker:
                 return True
@@ -592,7 +627,7 @@ def _broker_confirms_order(orders: list, ticker: str, side: str, quantity: int) 
 
 def check_order(
     account: str, ticker: str, quantity: int, price: float, side: str, counts: dict | None = None,
-    is_gap_correction: bool = False, is_protective: bool = False,
+    is_gap_correction: bool = False, is_protective: bool = False, replacing_order_id: int | None = None,
 ) -> None:
     """Raises SafetyViolation if the order should not proceed. `counts`, if
     given, is used for the daily-cap/burst-cap/duplicate checks instead of
@@ -608,7 +643,15 @@ def check_order(
     unconditionally exempt from this cap regardless of is_protective, so this
     flag no longer does anything on that path; kept for the BUY-side top-up
     case and for is_protective's other callers, not removed to avoid
-    unnecessarily changing call sites.)"""
+    unnecessarily changing call sites.)
+    replacing_order_id: the real broker order_id an atomic replace_order call
+    is about to swap out (see schwab_client.replace_equity_order_with_market /
+    replace_order_with_trailing_sell). Excluded from the resting-order dup
+    checks below -- without this, a replace call always sees its own target
+    order still resting (the cancel hasn't happened yet at check time) and
+    self-blocks every single attempt. Found 2026-07-28: SH's automated SL/
+    TIME exit was blocked 100% of the time for 4 real days by its own
+    protective SL order for exactly this reason."""
     if kill_switch_engaged():
         _limits = ACCOUNTS.get(account)
         _mode = "live" if (_limits and not _limits.dry_run) else "dry_run"
@@ -681,7 +724,8 @@ def check_order(
 
     if side == "BUY":
         orders = _open_orders(account)
-        if _has_open_order(orders, ticker):
+        _log_guard_input(account, ticker, "BUY", orders, replacing_order_id)
+        if _has_open_order(orders, ticker, exclude_order_id=replacing_order_id):
             signals_db.log_coverage_event("dup_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_same_ticker")
             raise SafetyViolation(
                 f"'{ticker}' already has an open/working order in '{account}' -- refusing a second "
@@ -710,7 +754,8 @@ def check_order(
     # ticker must not block closing a position.
     if side == "SELL":
         orders = _open_orders(account)
-        if _has_open_sell_order(orders, ticker):
+        _log_guard_input(account, ticker, "SELL", orders, replacing_order_id)
+        if _has_open_sell_order(orders, ticker, exclude_order_id=replacing_order_id):
             signals_db.log_coverage_event("dup_sell_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked")
             raise SafetyViolation(
                 f"'{ticker}' already has a resting SELL order in '{account}' -- refusing a second "
@@ -888,7 +933,7 @@ def check_order(
 
 def approve_and_record(
     account: str, ticker: str, quantity: int, price: float, side: str, is_gap_correction: bool = False,
-    is_protective: bool = False,
+    is_protective: bool = False, replacing_order_id: int | None = None,
 ) -> bool:
     """Call immediately before placing a real order. Raises SafetyViolation if
     blocked; otherwise records the order against the daily cap, the global
@@ -900,11 +945,15 @@ def approve_and_record(
     is_protective bypasses only the daily_order_cap check, for a post-fill
     top-up BUY -- see check_order's docstring (SELL, including a stop-loss
     placement, is unconditionally exempt from this cap since 2026-07-25
-    regardless of is_protective)."""
+    regardless of is_protective).
+    replacing_order_id -- see check_order's docstring; threaded through by
+    replace_equity_order_with_market/replace_order_with_trailing_sell so an
+    atomic replace call doesn't self-block on the exact order it's replacing."""
     with _open_locked() as f:
         counts = json.loads(f.read() or "{}")
         check_order(account, ticker, quantity, price, side, counts=counts,
-                    is_gap_correction=is_gap_correction, is_protective=is_protective)
+                    is_gap_correction=is_gap_correction, is_protective=is_protective,
+                    replacing_order_id=replacing_order_id)
         key = str(date.today())
         today = counts.setdefault(key, {})
         if side == "BUY":

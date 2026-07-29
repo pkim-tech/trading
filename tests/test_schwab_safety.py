@@ -304,6 +304,36 @@ def test_second_sell_order_for_same_ticker_blocked(env, monkeypatch):
     assert events[0]['result'] == "blocked"
 
 
+def test_replace_does_not_self_block_on_the_order_it_is_replacing(env, monkeypatch):
+    # Real 2026-07-28 incident: _attempt_automated_exit_sell replaces a
+    # resting protective SL with a market SELL via replace_equity_order_with_
+    # market, passing the SL's own order_id as the replace target. Before this
+    # fix, check_order's resting-SELL guard saw that same order still resting
+    # (the cancel hasn't happened yet at check time) and blocked every single
+    # attempt -- SH's TIME/SL exit was stuck behind this for 4 real days.
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
+        {"status": "WORKING", "orderId": 999, "orderLegCollection": [
+            {"instruction": "SELL", "instrument": {"symbol": TICKER}}
+        ]}
+    ])
+    result = schwab_client.replace_equity_order_with_market('ira', TICKER, 999, "SELL", 5, 50.0)
+    assert result == (None, None)  # dry_run short-circuit, not a SafetyViolation
+    events = signals_db.get_coverage_events(scenario_key="dup_sell_order_blocked")
+    assert len(events) == 0
+
+
+def test_replace_still_blocks_on_a_different_resting_sell_order(env, monkeypatch):
+    # exclude_order_id must be exact -- a genuinely different resting SELL
+    # order (not the one being replaced) still must block, same as before.
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
+        {"status": "WORKING", "orderId": 111, "orderLegCollection": [
+            {"instruction": "SELL", "instrument": {"symbol": TICKER}}
+        ]}
+    ])
+    with pytest.raises(schwab_safety.SafetyViolation, match="resting SELL order"):
+        schwab_client.replace_equity_order_with_market('ira', TICKER, 999, "SELL", 5, 50.0)
+
+
 def test_resting_buy_for_same_ticker_does_not_block_sell(env, monkeypatch):
     # An unrelated resting BUY for this ticker must not block closing a
     # position -- only a same-side (SELL) match should.
@@ -597,3 +627,39 @@ def test_disabled_account_blocked(env, monkeypatch):
 def test_unknown_account_blocked(env):
     with pytest.raises(schwab_safety.SafetyViolation, match="not in the allowlist"):
         schwab_client.place_equity_buy('made_up_account', TICKER, 5, 50.0)
+
+
+def test_no_hand_rolled_cancel_then_place_order_swap():
+    # Static regression guard, not a runtime check: schwab_client.cancel_order()
+    # must stay uncalled from anywhere in the codebase except its own def. Every
+    # real order-swap path (check_gap_resize, _attempt_automated_sell,
+    # _attempt_automated_exit_sell) was migrated 2026-07-27 to the atomic
+    # replace_equity_order_with_market/replace_order_with_trailing_sell helpers,
+    # which correctly exclude the order being replaced from schwab_safety's
+    # resting-order dup guards (see test_replace_does_not_self_block_on_the_
+    # order_it_is_replacing above -- fixed 2026-07-28 after that guard self-
+    # blocked SH's exit for 4 real days). A hand-rolled cancel_order() + place_*
+    # two-call swap anywhere else would silently reopen the same bug class (and
+    # the separate atomicity gap the 2026-07-27 fix closed), so this fails fast
+    # on the source itself rather than waiting for it to be found live again.
+    import re
+    root = Path(__file__).parent.parent
+    for py_file in root.glob("*.py"):
+        text = py_file.read_text()
+        # negative lookbehind for '.' excludes the schwab-py library's own
+        # client.cancel_order(...) call inside our wrapper -- only unqualified
+        # calls to *our* cancel_order() are in scope here.
+        calls = [m.start() for m in re.finditer(r"(?<!\.)\bcancel_order\(", text)]
+        if py_file.name == "schwab_client.py":
+            # exactly one: the def itself
+            defs = [m.start() for m in re.finditer(r"def cancel_order\(", text)]
+            assert len(calls) == len(defs), (
+                f"schwab_client.cancel_order() is called outside its own definition "
+                f"-- verify it's not being used for a hand-rolled cancel+place swap"
+            )
+        else:
+            assert not calls, (
+                f"{py_file.name} calls cancel_order() directly -- real order swaps "
+                f"must go through replace_equity_order_with_market/"
+                f"replace_order_with_trailing_sell instead"
+            )

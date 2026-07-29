@@ -1,5 +1,68 @@
 # Backlog
 
+## ✅ [live-trading][security] Resolved 2026-07-28 (night) — resting-order dup guards self-blocked their own atomic-replace calls; SH's automated SL/TIME exit was stuck behind this for 4 real days
+
+**The incident**: `scripts/audit_live_test_candidates.py --tickers SPY SH GDXU` (fixed this session --
+`get_watch_list_node`'s deliberate ambiguous-match-returns-None behavior was silently reporting GDXU
+as "no candidate" once it had 2 nodes; the script now resolves the `mode='live'` node explicitly, or
+reports the ambiguity instead of hiding it) showed SH's real position (50 shares, `soxl_ira`) as
+"TIME-exit OVERDUE — should have fired already." `coverage_events` showed `automated_exit_execution`
+and `dup_sell_order_blocked` both `blocked`, repeating every bar close since 2026-07-24 (4 real days),
+falling back every time to a manual Exited/Skipped Slack alert nobody had tapped.
+
+**Root cause**: `_attempt_automated_exit_sell` (signals_notify.py) replaces the resting protective SL
+with a market SELL via `schwab_client.replace_equity_order_with_market(..., order_id=sl_order_id)` --
+an atomic broker call (built 2026-07-27 specifically to avoid a cancel-then-place gap). But
+`approve_and_record` → `check_order`'s resting-SELL guard (`_has_open_sell_order`, built 2026-07-22 for
+a different scenario: blocking a genuinely duplicate second live order) checks the account's *current*
+resting orders *before* the replace call reaches the broker -- so it always sees the SL order it's
+about to replace as "already resting" and blocks itself, unconditionally, every single attempt. Same
+bug shape existed in `replace_order_with_trailing_sell` (the TRAIL-arm SL→trailing-sell swap) and
+`check_gap_resize`'s BUY-side replace, both of which also call `approve_and_record` without excluding
+the order being replaced.
+
+**Fix**: `check_order`/`approve_and_record` gained a `replacing_order_id` parameter; `_has_open_order`/
+`_has_open_sell_order` now accept `exclude_order_id` and skip that exact order when scanning resting
+orders. `replace_equity_order_with_market`/`replace_order_with_trailing_sell` (schwab_client.py) now
+pass their own `order_id` through automatically -- not an opt-in flag callers can forget, since it's
+baked into the two blessed replace helpers themselves. New tests:
+`test_replace_does_not_self_block_on_the_order_it_is_replacing`,
+`test_replace_still_blocks_on_a_different_resting_sell_order` (confirms exclusion is exact, not
+blanket), and `test_no_hand_rolled_cancel_then_place_order_swap` (static source-scan regression guard
+-- `cancel_order()` must stay uncalled anywhere except its own definition, so a future hand-rolled
+cancel+place swap outside the two blessed replace helpers can't quietly reintroduce this bug class).
+Full suite: 306 passed (was 305).
+
+**Also added, diagnostic-only**: `schwab_safety._log_guard_input` logs the raw `_open_orders()`
+snapshot to `active_signals_verbose.log` right before both the BUY and SELL dup-order guard checks --
+every guard branch already logged its *outcome* (`coverage_events`), never the broker state it decided
+against. Built after finding a second, still-unresolved anomaly: GDXU's real 2026-07-27 09:15
+`gap_resize` BUY-side replace (`check_gap_resize` → `replace_equity_order_with_market`, same guard
+family, pre-fix code) should have hit the identical self-block SH's SELL replace did -- a resting
+`TRAILING_STOP` BUY order for GDXU had existed 8 real hours before that check -- and didn't, with no
+record of why. Not explainable from existing logs; needs the next real/staged gap-resize test to
+observe directly, which the new diagnostic line will now capture.
+
+**Separately found, not part of this fix, still open**:
+- GDXU's arm-time trailing-sell (07-27 22:28:16, `automated_sell_execution` "placed") was staged
+  manually via `scripts/stage_live_test_order.py`, which bypasses `schwab_client.py`/`schwab_safety.py`
+  entirely -- it never actually exercised `replace_order_with_trailing_sell`'s guard fix, so that path
+  has no live proof yet, only the analogous unit test.
+- Morning Report (`build_reference_table`, signals_notify.py:1825) only reads `open_positions`/
+  `pending_buys`, never `paper_positions`/`paper_pending_buys` -- every research-mode node with an open
+  paper position (e.g. SOXL, 463 shares, real open paper trade) renders as flat/all-grey Phase bubbles.
+  Not yet fixed.
+- `check_live_state_reconciliation` compares against the poll-cycle-start `open_positions` snapshot,
+  not a fresh read -- a position closed earlier in the *same* cycle (GDXU's TRAIL close today) still
+  gets compared as if open, producing a false `reconciliation_mismatch` (`shares`,
+  `missing_trailing_sell`) 6 seconds after a correct, real close. Not yet fixed.
+- Full re-triage of the accountability grid's "policy-internal, no broker round-trip needed" rows
+  (2026-07-26 call) under a corrected filter ("does correctness depend on real order-lifecycle timing,"
+  not "does it call the broker API") reclassified ~12 rows as needing a stateful fake-order-book test
+  fixture instead of static mocks, plus flagged `time_exit_trigger`/`morning_report_delivery` as
+  presence-based "verified" statuses that don't actually confirm correctness (same failure mode as
+  `dup_sell_order_blocked` rendering green while recording this exact bug 6 times). Not yet built.
+
 ## ✅ [live-trading][security] Resolved 2026-07-27 (night, 2nd session) — `at_bar_close` bookkeeping bug caused false near-instant SL exits in paper trading; same bug found unfixed in the real automation-scoped `_scan_pinned_exit_arm` path
 
 **The incident**: investigating a paper-trading losing streak (0/6 win rate, several exits within

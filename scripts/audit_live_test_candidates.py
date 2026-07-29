@@ -52,13 +52,33 @@ def _resting_orders(orders):
     return [o for o in orders if o["status"] in ("WORKING", "AWAITING_STOP_CONDITION", "QUEUED", "ACCEPTED", "PENDING_ACTIVATION")]
 
 
+def _resolve_live_node(ticker):
+    """get_watch_list_node returns None on ambiguity by design (see its
+    docstring) -- fine for its real callers, but this script needs a specific
+    node to audit. Prefer the mode='live' row when a ticker has more than
+    one (e.g. a live + research pairing like GDXU); report ambiguity
+    explicitly rather than silently returning nothing."""
+    with db._conn() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM watch_list WHERE ticker = ? AND watchlist_id = ?",
+            (ticker, db.get_active_watchlist_id())).fetchall()]
+    if not rows:
+        return None, None
+    live_rows = [r for r in rows if r.get("mode") == "live"]
+    if len(live_rows) == 1:
+        return live_rows[0], None
+    if len(rows) == 1:
+        return rows[0], None
+    return None, rows
+
+
 def audit_one(ticker):
     print(f"\n=== {ticker} ===")
     pos = db.get_open_position(ticker)
     account = pos.get("account") if pos else None
 
     if account is None:
-        node = db.get_watch_list_node(ticker=ticker)
+        node, ambiguous = _resolve_live_node(ticker)
         account = node.get("account") if node else None
 
     real_shares = None
@@ -83,9 +103,13 @@ def audit_one(ticker):
 
     if pos is None:
         print("  DB position: none (flat)")
-        node = db.get_watch_list_node(ticker=ticker)
+        node, ambiguous = _resolve_live_node(ticker)
         if node is None:
-            print("  verdict: no watch_list node -- not a candidate")
+            if ambiguous:
+                modes = ", ".join(f"{r['account']}/{r['mode']}" for r in ambiguous)
+                print(f"  verdict: ambiguous -- {len(ambiguous)} nodes ({modes}), none uniquely mode='live'")
+            else:
+                print("  verdict: no watch_list node -- not a candidate")
             return
         sig = a.compute_buy_signal(node)
         if sig is None:

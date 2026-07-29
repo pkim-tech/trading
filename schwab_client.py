@@ -266,7 +266,7 @@ def replace_equity_order_with_market(
     try:
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
-            is_protective=is_protective)
+            is_protective=is_protective, replacing_order_id=order_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with MARKET {side} {quantity} {ticker} in {account}: {e}")
         raise
@@ -358,7 +358,8 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
     dry_run returns (None, None) and leaves the existing resting order
     untouched."""
     try:
-        dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, "SELL")
+        dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, "SELL",
+                                                     replacing_order_id=order_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with TRAILING SELL {quantity} {ticker} "
                       f"in {account} (trail={trail_pct}%): {e}")
