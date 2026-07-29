@@ -260,7 +260,7 @@ def _alert_reconcile_mismatch(pos, kind, text):
     db.log_coverage_event(
         "reconciliation_mismatch", _coverage_mode(pos.get('account')),
         ticker=pos.get('ticker'), position_id=pos.get('id'),
-        node_id=pos.get('wl_id'), result=kind
+        node_id=pos.get('wl_id'), result=kind, detail=text
     )
     key = f"{pos['id']}:{kind}"
     last = _RECONCILE_ALERTED.get(key, 0)

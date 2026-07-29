@@ -208,3 +208,19 @@ def test_no_false_mismatch_for_a_position_already_closed_this_cycle(env, monkeyp
     monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
     signals_notify.check_live_state_reconciliation([pos])  # still the stale, now-closed row
     assert env == []
+
+
+def test_reconciliation_mismatch_event_records_the_real_numbers(env, monkeypatch):
+    # Found 2026-07-28: every reconciliation_mismatch coverage_event's detail
+    # field was empty -- confirming a suspected day's worth of GDXU/SPY
+    # mismatches (1899 events, all detail='') was attributable to a known,
+    # already-fixed incident relied on timing correlation alone, not the
+    # actual numbers. detail now carries the same text the Slack alert gets,
+    # so a future investigation doesn't have to guess.
+    pos = _open_pos(shares=100)
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 80.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    signals_notify.check_live_state_reconciliation([pos])
+    events = signals_db.get_coverage_events(scenario_key="reconciliation_mismatch")
+    assert len(events) == 1
+    assert '80' in events[0]['detail'] and '100' in events[0]['detail']
