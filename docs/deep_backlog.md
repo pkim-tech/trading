@@ -1,5 +1,85 @@
 # Backlog
 
+## ✅ [live-trading][security] Resolved 2026-07-29 — SH's TIME-while-armed stuck-exit bug fixed; fake-broker test tier built; running_low staleness for real trailing-buys fixed; canary A-F design restored
+
+**The incident**: SH (real position, `soxl_ira`) sat with an automated exit stuck for hours despite
+being past `max_hold_hours`. `trail_state.trailing=True` (armed, a resting trailing-sell order live at
+the broker) — `_attempt_automated_exit_sell` (`signals_notify.py`) treated any `TRAIL`-reason exit as
+"already handled by the resting order, nothing to do," passively waiting on it forever. But the reason
+was actually hold-time expiry, not a genuine trail-stop breach — `strategies.py`'s trailing-exit branch
+(shared byte-identical across `TrailingExitZScoreBreakout`/`LimitOrderTrailingExit`/
+`TrailingBothZScoreBreakout`) collapses both cases into the same WIN/LOSS reason, further collapsed to
+`'TRAIL'` by `signals_compute.py`, so the two cases were indistinguishable downstream.
+
+**Fix**: a new `state['exit_forced_by_hold_time']` marker set in all 3 strategy classes' trailing-exit
+branch (only when hold-time, not breach, is the actual trigger — a same-bar breach wins if both fire).
+`_attempt_automated_exit_sell` now checks this flag and force-replaces the resting order with a market
+exit instead of waiting. Zero backtest-kernel impact — `check_exit` (where the flag is set) is only
+ever called from `signals_compute.py:249`, never `backtester.py`'s numba kernel or
+`run_optimization_sweep.py`. Verified via a new regression test in `tests/fake_broker_sh_scenario.py`
+that went RED (proved the bug) → GREEN (proved the fix), plus a direct
+`strategies.TrailingBothZScoreBreakout().check_exit()` unit assertion to rule out the test silently
+bypassing the fixed code path.
+
+**Also fixed same session**:
+- `check_gap_resize`'s `running_low` staleness for real (non-dry_run) trailing-buy orders — it was only
+  ever tracked via `update_dry_run_buys`, so a real pending order resting for hours had it frozen at
+  `signal_price` forever. New `signals_notify.update_real_pending_buys_running_low` (wired into the
+  main poll loop), using `schwab_client.get_current_price` (real-time, matching `check_gap_resize`'s own
+  source — not the cached-hourly source `update_dry_run_buys` deliberately uses for simulation
+  consistency). The only prior "proof" this worked was a rigged test with `running_low` hand-set to
+  $1.00 — this had genuinely never been proven working for a real order before.
+- `check_buy_reminders`/`check_trailing_reminders` nagging Slack for `dry_run`/`is_dry_run_sim`
+  positions that resolve automatically — both now skip those positions.
+- 7 canary-pair nodes added 2026-07-29 morning (FAZ/SPXU/TWM/QID/SDOW/JNUG/JDST) were accidentally all
+  built with one identical generic config instead of mirroring their intended A-F counterpart (the
+  original 6-canary design, `docs/deep_backlog.md`'s 2026-07-23 entry — traced via git log, which had
+  zero commits mentioning the 7 new nodes, and `docs/conversation_summary.md`'s 2026-07-25 entry, the
+  actual source of the "inverse-pair watchlist" idea). Fixed: SPXU/QID/TWM/SDOW/FAZ now exactly mirror
+  IVV/QQQ/IWM/DIA/XLF; JNUG converted `TrailingBothZScoreBreakout`→`TrailingExitZScoreBreakout` to take
+  the missing E-scenario (VOO's market-buy-exit test). JDST left without a paired purpose — see
+  `docs/backlog_cache.md`.
+- `scripts/audit_live_test_candidates.py`'s share-count MISMATCH check false-positived on every
+  `is_dry_run_sim` position (real broker legitimately shows 0 shares by design) — now excluded, tagged
+  `[DRY-RUN-SIM]`.
+
+**New infrastructure**:
+- `tests/fake_broker.py` — a stateful in-memory fake Schwab broker (patches
+  `schwab_client._get_client()`) that runs real production order-placement code (`schwab_client.py`/
+  `schwab_safety.py`) against a controlled, evolving order book, instead of mocking individual function
+  calls. Built because the old per-function-mock style let the SH bug (and the 2026-07-28 self-block
+  bug before it) hide behind a fully green suite. 6 scenario test files
+  (`tests/test_fake_broker_{sh,retl,trail_exit,topup,gap_resize}_scenario.py` +
+  `tests/test_fake_broker_sh_scenario.py`), all GREEN, each asserting full pre/post state including
+  `coverage_events`. `scripts/fake_broker_sandbox.py` — interactive REPL for ad hoc exploration
+  (stubs `_post_message` itself; an earlier ad hoc `python -c` debug script that didn't stub it leaked
+  one real Slack message about a synthetic test ticker — zero financial impact, confirmed via a full
+  `schwab_safety._all_orders` scan, but caused the project's "no python -c" hard rule).
+- `schwab_safety._log_pre_action_state_verification`, wired into `check_order`'s BUY/SELL branches —
+  compares real broker position vs. local DB belief at the exact moment a real order is considered,
+  logging a `coverage_events` row (`pre_action_state_verification`, result `match`/`mismatch`/
+  `fetch_failed`). Deliberately detection-only per the user's explicit phased-rollout request ("start
+  with alert on discrepancies... once we've logged enough events we can choose the right level of
+  tolerance") — does not block any order yet.
+- `signals_db.staged_test_config` table + `scripts/audit_live_test_candidates.py --staged` — tracks
+  "what should this staged live-test node's config be" per node (dedup on `wl_id`), diffing expected vs.
+  real current config.
+- `signals_invariants.py` gained 2 checks: `check_starting_notional_within_account_notional_cap`
+  (found and fixed real violations: SH/RETL/SPY all had `starting_notional` far exceeding `soxl_ira`'s
+  real $800 notional_cap — RETL's mismatch had caused a real 454-share top-up attempt, only accidentally
+  stopped by a signal-window gate) and `check_open_position_config_matches_live_node` (flags a live
+  position's snapshotted `max_hold_hours`/`fixed_sl` diverging from its node's current config —
+  informational, not a hard rule, since a deliberate one-sided edit is a legitimate real use case).
+- `scripts/list_scripts.py` — mechanical index of every `scripts/*.py` module docstring (check before
+  writing a new script, given 78+ scripts now exist).
+
+**Review**: independent Sonnet review agent (per `feedback_use_sonnet_not_opus.md`, overriding
+CLAUDE.md's literal "opus" text) against the real diff of all 7 changed live-trading files plus the new
+fake_broker test tier — **zero CONFIRMED bugs**, 3 minor nitpicks all fixed (stale docstring on
+`update_pending_buy_running_low`, no-call-site note added to `replace_order_with_stop_loss`, `!=` →
+`abs()` float comparison in the new invariant check). Full suite: 321 passed (was ~306). Harness: 7/7.
+Invariants: clean.
+
 ## ✅ [live-trading][security] Resolved 2026-07-28 (night) — resting-order dup guards self-blocked their own atomic-replace calls; SH's automated SL/TIME exit was stuck behind this for 4 real days
 
 **The incident**: `scripts/audit_live_test_candidates.py --tickers SPY SH GDXU` (fixed this session --

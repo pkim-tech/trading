@@ -7,6 +7,19 @@
 > living reference, not an ever-growing changelog. Caught live after this got violated twice in
 > one sitting (once here, once in CLAUDE.md) before being fixed.
 
+## [live-trading][security] Resolved 2026-07-29 — 2 of the 3 deferred design items from 2026-07-28 (night) built: stateful fake order-book test fixture (`tests/fake_broker.py`) and pre-action live-state verification (`schwab_safety._log_pre_action_state_verification`, detection-only). Full detail: `docs/deep_backlog.md`'s 2026-07-29 entry.
+**Still open**: node-level auto-pause circuit breaker (3rd item, not started); pre-action verification's tolerance/blocking policy (currently pure logging — decide once real `coverage_events` data accumulates, per user's explicit phased-rollout call).
+
+## [live-trading][coverage] Open, raised 2026-07-29 — JDST has no defined test purpose
+Was slated to pair with JNUG for Cluster A (two-accounts-same-ticker coverage), but JNUG was
+converted to mirror VOO's E-scenario (TrailingExit market-buy) instead, leaving JDST orphaned.
+Cluster A itself is blocked anyway (no second usable `mode=live`+`dry_run=True` account — `ira` is
+the only one). User: "we'll get there eventually," not urgent.
+
+## [live-trading] Open, raised 2026-07-29 — GDXD missing from the active watchlist entirely
+Deleted earlier in the project (its `v4` node removed), never restored. Flagged only, no user
+direction yet to add it back.
+
 ## [live-trading][security] Resolved 2026-07-28 (night) — resting-order dup guards self-blocked their own replace calls; SH's automated exit was stuck for 4 real days. Full detail: `docs/deep_backlog.md`'s 2026-07-28 (night) entry (top).
 **Still open from the same session**: Morning Report ignores `paper_positions`; `check_live_state_reconciliation` uses a stale in-cycle snapshot; `gap_resize`'s BUY-side anomaly unexplained (diagnostic logging added); GDXU's TRAIL-arm fix has no live proof (staged test bypassed the guard entirely); accountability-grid re-triage under a corrected "timing-dependent" filter, not yet built.
 

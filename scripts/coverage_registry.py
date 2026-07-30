@@ -51,6 +51,20 @@ DB_PATH = "./cache/live/trading_live.db"
 _TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
 
 REGISTRY = [
+    dict(id='pre_action_state_verification',
+         scenario="Real broker position compared against local DB belief at the exact moment "
+                  "a real order is about to be considered",
+         code_path="schwab_safety.check_order (_log_pre_action_state_verification)",
+         offline_coverage="tests/test_schwab_safety.py: test_pre_action_state_verification_"
+                           "logs_match/logs_mismatch/fetch_failure_does_not_block",
+         check_mechanism='coverage_events', scenario_key='pre_action_state_verification',
+         bad_results=[],
+         notes="Built 2026-07-29 (deferred from the 2026-07-28 fix session's design list). "
+               "Deliberately detection-only, not blocking -- logs 'match'/'mismatch'/"
+               "'fetch_failed' on every real BUY/SELL check_order call, so a real tolerance/"
+               "blocking policy can be set from actual data instead of a guess. bad_results "
+               "left empty since 'mismatch' is the interesting signal to review, not "
+               "necessarily a failure of this check itself."),
     dict(id='pinned_entry_trigger',
          scenario="Pinned entry trigger fires at the right bar/price",
          code_path="active_signals._scan_pinned_entry",
@@ -467,6 +481,61 @@ def _mode_filter_match(scenario_key, mode_filter):
     return False
 
 
+# Test files built on tests/fake_broker.py -- a stronger evidence tier than
+# offline_proof_for()'s general 'event-asserted', since these drive the real
+# schwab_client.py/schwab_safety.py code against a stateful, evolving fake
+# order book (place -> hours pass -> a later decision reads the still-resting
+# order -> a guard reacts), not a single mocked function call returning a
+# canned value. Built 2026-07-29 directly because that static-mock style let
+# real bugs (the resting-order self-block bug, the TIME-while-armed bug) hide
+# behind a fully green suite -- see docs/backlog_cache.md's 2026-07-28 (night)
+# stateful-fake-order-book-fixture entry, and tests/fake_broker.py's docstring.
+_FAKE_VENUE_CACHE = None
+
+
+def _scan_fake_venue_proof():
+    """Mirrors _scan_offline_proof(), scoped to only files that actually use
+    the fake_broker fixture (grep for the import, not just any test_*.py)."""
+    global _FAKE_VENUE_CACHE
+    if _FAKE_VENUE_CACHE is not None:
+        return _FAKE_VENUE_CACHE
+    all_keys = {r['scenario_key'] for r in REGISTRY if r.get('scenario_key')}
+    event_asserted, mentioned = set(), set()
+    if not _TESTS_DIR.is_dir():
+        _FAKE_VENUE_CACHE = (event_asserted, mentioned)
+        return _FAKE_VENUE_CACHE
+    for path in sorted(_TESTS_DIR.glob("test_*.py")):
+        text = path.read_text()
+        if 'fake_broker' not in text:
+            continue
+        for m in _EVENT_ASSERTED_RE.finditer(text):
+            if m.group(1) in all_keys:
+                event_asserted.add(m.group(1))
+        for key in all_keys:
+            if _quoted(key).search(text):
+                mentioned.add(key)
+    _FAKE_VENUE_CACHE = (event_asserted, mentioned)
+    return _FAKE_VENUE_CACHE
+
+
+def fake_venue_proof_for(scenario_key):
+    """Returns (proof_str, detail_str) -- 'event-asserted', 'behavior-only', or
+    'none' -- same three-tier shape as offline_proof_for(), but scoped to only
+    tests/fake_broker.py-based tests. No mode_filter handling: fake-broker
+    scenarios test real (non-dry_run) order-placement code directly, which
+    doesn't share the paper/dry_run scenario_key-collision problem
+    offline_proof_for's mode_filter exists to solve."""
+    if scenario_key is None:
+        return 'none', 'No scenario_key to search fake_broker test files for.'
+    event_asserted, mentioned = _scan_fake_venue_proof()
+    if scenario_key in event_asserted:
+        return 'event-asserted', 'A fake_broker test asserts get_coverage_events() for this scenario_key.'
+    if scenario_key in mentioned:
+        return 'behavior-only', ('This scenario_key appears in a fake_broker test, but no assertion '
+                                  'checks the coverage event itself.')
+    return 'none', 'No fake_broker-based test exercises this scenario_key yet.'
+
+
 def compute_status(row):
     """Returns (status_str, detail_str) computed live from real DB rows -- never
     a hand-typed field. status_str is one of: 'not-instrumented', 'offline-only',
@@ -667,15 +736,20 @@ if __name__ == '__main__':
     for r in REGISTRY:
         status, detail = compute_status(r)
         proof, _ = offline_proof_for(r.get('scenario_key'), r.get('mode_filter'))
-        rows.append((STATUS_ORDER[status], status, r['id'], detail, proof))
+        fake_venue, _ = fake_venue_proof_for(r.get('scenario_key'))
+        rows.append((STATUS_ORDER[status], status, r['id'], detail, proof, fake_venue))
     rows.sort()
-    for _, status, rid, detail, proof in rows:
-        print(f"{status:18s} {proof:15s} {rid:35s} {detail}")
+    for _, status, rid, detail, proof, fake_venue in rows:
+        print(f"{status:18s} {proof:15s} {fake_venue:15s} {rid:35s} {detail}")
     counts = {}
-    for _, status, _, _, _ in rows:
+    for _, status, _, _, _, _ in rows:
         counts[status] = counts.get(status, 0) + 1
     print(f"\n{len(REGISTRY)} rows total: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
     proof_counts = {}
-    for _, _, _, _, proof in rows:
+    for _, _, _, _, proof, _ in rows:
         proof_counts[proof] = proof_counts.get(proof, 0) + 1
     print("offline_proof: " + ", ".join(f"{k}={v}" for k, v in proof_counts.items()))
+    fake_venue_counts = {}
+    for _, _, _, _, _, fake_venue in rows:
+        fake_venue_counts[fake_venue] = fake_venue_counts.get(fake_venue, 0) + 1
+    print("fake_venue_proof: " + ", ".join(f"{k}={v}" for k, v in fake_venue_counts.items()))

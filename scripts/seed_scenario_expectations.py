@@ -10,6 +10,14 @@ docs/backlog_cache.md). Re-run is safe: add_scenario_expectation upserts on
 (scenario_key, ticker).
 
 Run once (or after any canary redesign): .venv/bin/python scripts/seed_scenario_expectations.py
+
+Fixed 2026-07-29: expect_exit_reason lists used to say ["WIN", "LOSS"] for the
+trailing-stop-exit canaries -- those are strategies.check_exit's *internal*
+labels, but signals_compute.py collapses both into 'TRAIL' before it's ever
+written to trade_log.exit_reason (reason in ('WIN','LOSS') -> 'TRAIL'). The
+real column value is always 'TRAIL', never 'WIN'/'LOSS', so these three
+scenarios could never pass as originally written -- caught via 3 real
+unexplained coverage_deviations (ids 41-43, 2026-07-28).
 """
 import sys
 from pathlib import Path
@@ -24,7 +32,7 @@ SCENARIOS = [
         expected_outcome="Full happy path same day: entry -> bounce-fill -> arm -> trailing-sell "
                           "(fixed_sl=30% unreachable, arm/trail thresholds hair-trigger at 0.1%).",
         expected_frequency='daily', check_method='trade_lifecycle',
-        check_params='{"expect_exit_reason": ["WIN", "LOSS"]}',
+        check_params='{"expect_exit_reason": ["TRAIL"]}',
     ),
     dict(
         scenario_key='canary_early_sl', ticker='QQQ', strategy_type='TrailingBothZScoreBreakout',
@@ -40,7 +48,7 @@ SCENARIOS = [
                           "entry path. Entry-mechanism itself is not separately verified by this "
                           "check (known MVP limitation) -- only that a same-day trade closed.",
         expected_frequency='daily', check_method='trade_lifecycle',
-        check_params='{"expect_exit_reason": ["WIN", "LOSS"]}',
+        check_params='{"expect_exit_reason": ["TRAIL"]}',
     ),
     dict(
         scenario_key='canary_overnight_carry', ticker='DIA', strategy_type='TrailingBothZScoreBreakout',
@@ -62,7 +70,7 @@ SCENARIOS = [
                           "itself not separately verified by this check (known MVP limitation) -- "
                           "only that a same-day trade closed.",
         expected_frequency='daily', check_method='trade_lifecycle',
-        check_params='{"expect_exit_reason": ["SL", "TIME", "WIN", "LOSS"]}',
+        check_params='{"expect_exit_reason": ["SL", "TIME", "TRAIL"]}',
     ),
     dict(
         scenario_key='canary_time_exit', ticker='XLF', strategy_type='TrailingBothZScoreBreakout',

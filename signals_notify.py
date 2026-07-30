@@ -147,7 +147,13 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     For reason=='TRAIL', a trailing-sell order was already placed at the
     earlier arm event (notify_trailing_activated) -- this returns that
     existing order_id instead of placing a second, redundant order for the
-    same shares.
+    same shares. EXCEPT when state['exit_forced_by_hold_time'] is set
+    (strategies.py: hold-time expired while armed, not a genuine trail-stop
+    breach) -- the resting trailing-sell order is nowhere near its actual
+    trigger in that case, so it must be force-replaced with a market sell
+    just like TP/SL/TIME, not passively polled (found live 2026-07-29, SH:
+    stuck for hours waiting on a 50%-wide trail order that was never going
+    to fire on its own before the natural hold-time deadline).
 
     Also reuses an already-placed, still-unresolved TP/SL/TIME exit order
     from an EARLIER bar, if one exists (state['exit_pending']['order_id']) --
@@ -165,7 +171,8 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     pending_order_id = (state.get('exit_pending') or {}).get('order_id')
     if pending_order_id is not None:
         return pending_order_id
-    if reason == 'TRAIL':
+    hold_time_forced = bool(state.get('exit_forced_by_hold_time'))
+    if reason == 'TRAIL' and not hold_time_forced:
         return state.get('exit_order_id')
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         return None
@@ -182,16 +189,22 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     shares = pos.get('shares')
     if not shares:
         return None
-    sl_order_id = pos.get('sl_order_id')
+    # For a hold-time-forced TRAIL exit, the real resting order is the
+    # trailing-sell placed at arm time (exit_order_id) -- sl_order_id is
+    # already stale/dead, replaced by that trailing-sell back when the
+    # position armed. Every other reason (TP/SL/TIME) still resolves to the
+    # protective SL, as before.
+    resting_order_id = state.get('exit_order_id') if (reason == 'TRAIL' and hold_time_forced) else pos.get('sl_order_id')
+    resting_order_label = "trailing-sell" if (reason == 'TRAIL' and hold_time_forced) else "stop-loss"
     try:
-        if sl_order_id:
+        if resting_order_id:
             # Atomic replace instead of cancel_order + place_equity_sell -- same
             # rationale as _attempt_automated_sell's TRAIL-side fix: closes the
             # window where a confirmed cancel could be followed by a failed/
             # blocked new placement, leaving nothing resting at the broker in
             # between (found 2026-07-27, raised directly by the user).
             _, order_id = schwab_client.replace_equity_order_with_market(
-                account, ticker, sl_order_id, "SELL", shares, current_price)
+                account, ticker, resting_order_id, "SELL", shares, current_price)
         else:
             _, order_id = schwab_client.place_equity_sell(account, ticker, shares, current_price)
     except Exception as e:
@@ -199,7 +212,7 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
                                node_id=pos.get('wl_id'),
                                result="blocked" if isinstance(e, schwab_safety.SafetyViolation) else "failed_unexpectedly",
                                detail=f"reason={reason}: {e}")
-        if sl_order_id:
+        if resting_order_id:
             sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos.get('stop_loss')
             sl_price = pos['signal_price'] * (1 - sl_pct / 100) if sl_pct else None
             price_note = f"place stop-loss SELL {shares} @ ~${sl_price:.2f}" if sl_price else "place a stop-loss SELL manually"
@@ -207,7 +220,7 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
                                    node_id=pos.get('wl_id'), result="alerted", detail=price_note)
             _post_message(
                 f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — {price_note}\n"
-                f"(auto {reason} exit replace of stop-loss {sl_order_id} failed: {e})"
+                f"(auto {reason} exit replace of {resting_order_label} {resting_order_id} failed: {e})"
             )
         elif not isinstance(e, schwab_safety.SafetyViolation):
             _post_message(f"⚠️ {ticker} automated {reason} exit placement failed unexpectedly: {e} — falling back to manual")
@@ -501,6 +514,57 @@ def _sync_confirm_and_protect(ticker, node, order_id=None):
                       f"confirmed by the auto-fill poll or account-activity stream.")
         return
     _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'])
+
+
+def update_real_pending_buys_running_low():
+    """Tracks pending_buys.running_low for a REAL (non-dry_run) resting
+    trailing-buy -- mirrors update_dry_run_buys' tracking logic below, but
+    deliberately WITHOUT any fill synthesis: a real fill is detected via
+    check_auto_fills/drain_fill_queue, never here.
+
+    Exists because check_gap_resize reads running_low assuming it reflects
+    real-time price tracking, but before this function, running_low was only
+    ever updated for dry_run accounts (update_dry_run_buys' own tracking,
+    below) -- a real trailing-buy resting for hours had running_low frozen at
+    its original signal_price the entire time, producing a stale buy_trigger
+    for check_gap_resize's overnight-gap correction to check against. Found
+    live 2026-07-29 (RETL): confirmed via docs/deep_backlog.md that the one
+    real historical gap_resize firing (GDXU, 2026-07-27) was a deliberately
+    rigged test (running_low manually set to $1.00) -- never an honest test
+    of this tracking actually working for a real order. Called every poll,
+    same unconditional cadence as update_dry_run_buys.
+
+    Uses schwab_client.get_current_price (real-time Schwab quote), NOT
+    signals_compute._current_price (cached hourly bar close, updated once/hour)
+    -- matching check_gap_resize's own price source is the whole point, since
+    the point of tracking between polls is capturing intra-hour movement an
+    hourly cache wouldn't show anyway. update_dry_run_buys uses the cached
+    price deliberately, for consistency with the rest of its simulation --
+    that reasoning doesn't apply here, this is real-order tracking meant to
+    feed a real-time check."""
+    for pb in db.get_pending_buys():
+        wl_id = pb.get('wl_id')
+        if not wl_id:
+            continue
+        node = db.get_watch_list_node_by_id(wl_id)
+        if node is None or node.get('mode') != 'live':
+            continue
+        account = node.get('account')
+        limits = schwab_safety.ACCOUNTS.get(account)
+        if not limits or limits.dry_run:
+            continue  # dry_run accounts are already covered by update_dry_run_buys
+        if not db._is_trailing_buy(node):
+            continue  # a market-buy-eligible node has no bounce/running-low concept
+        ticker = pb['ticker']
+        try:
+            price = schwab_client.get_current_price(ticker)
+        except Exception:
+            continue
+        if price is None:
+            continue
+        running_low = min(pb['running_low'] or pb['signal_price'], price)
+        if running_low != pb['running_low']:
+            db.update_pending_buy_running_low(wl_id, running_low)
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1054,13 @@ def check_trailing_reminders(open_positions):
     stop between polls is a real risk if price moves fast."""
     now = datetime.now()
     for pos in open_positions:
+        # A dry_run-sim position's arm event never places a real order (see
+        # check_dry_run_sim_sells) -- order_placed can never become True for
+        # it, so without this it would nag "confirm order placed" forever
+        # for something with nothing real to confirm (same bug class as
+        # check_buy_reminders, found live 2026-07-29).
+        if pos.get('is_dry_run_sim'):
+            continue
         state = pos.get('trail_state') or {}
         if not state.get('trailing') or state.get('order_placed'):
             continue
@@ -1261,6 +1332,17 @@ def check_buy_reminders():
     wording/buttons for this phase)."""
     now = datetime.now()
     for pending in db.get_pending_buys():
+        # A dry_run account's pending buy is resolved entirely by
+        # update_dry_run_buys' own synthesis, independent of any human
+        # action -- nagging "Confirm Filled / Missed It / Cancelled" here is
+        # meaningless (there's no real order at the broker to confirm) and
+        # was pure noise until the synthesis resolved it on its own anyway.
+        # Found live 2026-07-29 (FAZ): 14 reminders over ~2 hours, all before
+        # a fill that happened automatically regardless of any of them.
+        account = pending['node'].get('account')
+        limits = schwab_safety.ACCOUNTS.get(account)
+        if limits and limits.dry_run:
+            continue
         last_at = datetime.strptime(pending['last_reminder_at'], '%Y-%m-%d %H:%M:%S')
         if (now - last_at).total_seconds() < BUY_REMINDER_MINUTES * 60:
             continue

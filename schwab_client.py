@@ -573,6 +573,53 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float)
     return r, order_id
 
 
+def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quantity: int, stop_price: float):
+    """Atomically replaces a resting order with a new fixed-price STOP order
+    (a re-priced SL) -- same atomic-replace rationale as
+    replace_equity_order_with_market/replace_order_with_trailing_sell: a
+    separate cancel_order + place_stop_loss two-step would leave nothing
+    resting at the broker in the window between a confirmed cancel and a
+    failed/blocked new placement. Returns (response, new_order_id); dry_run
+    returns (None, None) and leaves the existing resting order untouched.
+
+    Not currently wired into any automated call site -- added 2026-07-29 as
+    reusable infra for manually re-pricing a resting SL (used directly, once,
+    to fix RETL's stop from a stale-signal_price-anchored price to a correct
+    one). Intentional, not dead code; a future automated re-pricing path
+    could call this the same way check_gap_resize/notify_trailing_activated
+    call their siblings."""
+    try:
+        dry_run = schwab_safety.approve_and_record(
+            account, ticker, quantity, stop_price, "SELL", is_protective=True, replacing_order_id=order_id)
+    except schwab_safety.SafetyViolation as e:
+        _post_message(f"\U0001F6AB BLOCKED replace {order_id} with STOP LOSS {quantity} {ticker} "
+                      f"in {account} @ ${stop_price:.4f}: {e}")
+        raise
+
+    if dry_run:
+        msg = (f"[DRY RUN] would replace order {order_id} with STOP LOSS {quantity} {ticker} "
+               f"in {account} @ ${stop_price:.4f}")
+        _post_message(msg)
+        print(msg)
+        return None, None
+
+    account_hash = _resolve_account_hashes()[account]
+    order = OrderBuilder()
+    order.set_order_type(OrderType.STOP)
+    order.set_session(Session.NORMAL)
+    order.set_duration(Duration.GOOD_TILL_CANCEL)
+    order.set_order_strategy_type(OrderStrategyType.SINGLE)
+    order.set_stop_price(f"{stop_price:.2f}")
+    order.add_equity_leg(EquityInstruction.SELL, ticker, quantity)
+
+    r = _submit_replace_with_retry(account_hash, order_id, order)
+    new_order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+    _post_order_confirmation(
+        "REPLACE->STOP LOSS", account_hash, new_order_id, ticker, account,
+        f"✅ Replaced order {order_id} with STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.2f}")
+    return r, new_order_id
+
+
 def get_account_balance(account: str) -> float:
     """Real available cash for the account, read fresh (never cached) --
     Client.get_account, securitiesAccount.currentBalances. Confirmed 2026-07-23

@@ -515,6 +515,40 @@ def _all_orders(account: str) -> list:
     return r.json()
 
 
+def _log_pre_action_state_verification(account, ticker, node_id, mode, side, local_shares):
+    """Detection-only pre-action live-state check (2026-07-29 backlog item,
+    deferred from the 2026-07-28 fix session): compares the real broker
+    position against what our own DB believes, at the exact moment a real
+    order is about to be considered -- not a periodic post-hoc reconciliation
+    (check_live_state_reconciliation already does that), but the actual
+    decision point. Deliberately does NOT block or raise on a mismatch yet --
+    same phased-rollout reasoning as check_live_state_reconciliation's
+    original design: log real data first, decide on a tolerance/blocking
+    policy once there's evidence of what mismatches actually look like in
+    practice, rather than guess. local_shares is the caller's own belief
+    (None if it has none) -- comparison, not a authority check; the broker is
+    always ground truth (automation_principles.md #1).
+    Never raises past a fetch failure into the real order-approval flow --
+    this is observability, not a gate, so a network blip here must not be
+    able to block a legitimate real order."""
+    try:
+        import schwab_client  # local import: schwab_client imports this module at load time
+        real_shares = schwab_client.get_real_position(account, ticker)
+    except Exception as e:
+        signals_db.log_coverage_event(
+            "pre_action_state_verification", mode, ticker=ticker, node_id=node_id,
+            result="fetch_failed", detail=f"side={side}: {e}")
+        return
+    if local_shares is None:
+        matched = real_shares == 0
+    else:
+        matched = abs(real_shares - local_shares) < 1e-6
+    signals_db.log_coverage_event(
+        "pre_action_state_verification", mode, ticker=ticker, node_id=node_id,
+        result="match" if matched else "mismatch",
+        detail=f"side={side} real_shares={real_shares:g} local_shares={local_shares}")
+
+
 def _open_orders(account: str) -> list:
     """Non-terminal orders only, for the concurrent-resting-order guards
     below (_has_open_order / _has_open_buy_order_in_account)."""
@@ -723,6 +757,10 @@ def check_order(
         )
 
     if side == "BUY":
+        _local_pos = signals_db.get_open_position_for_account(ticker, account)
+        _log_pre_action_state_verification(
+            account, ticker, _node_id, _mode, "BUY",
+            _local_pos['shares'] if _local_pos else None)
         orders = _open_orders(account)
         _log_guard_input(account, ticker, "BUY", orders, replacing_order_id)
         if _has_open_order(orders, ticker, exclude_order_id=replacing_order_id):
@@ -753,6 +791,10 @@ def check_order(
     # not account-wide like the BUY guard: an unrelated resting BUY for this
     # ticker must not block closing a position.
     if side == "SELL":
+        _presell_pos = signals_db.get_open_position_for_account(ticker, account)
+        _log_pre_action_state_verification(
+            account, ticker, _node_id, _mode, "SELL",
+            _presell_pos['shares'] if _presell_pos else None)
         orders = _open_orders(account)
         _log_guard_input(account, ticker, "SELL", orders, replacing_order_id)
         if _has_open_sell_order(orders, ticker, exclude_order_id=replacing_order_id):
@@ -770,7 +812,7 @@ def check_order(
         # does catch our own inflated-share-count bugs (e.g. a top-up that
         # recorded shares before the real fill was confirmed) before they
         # reach the broker as a would-be short.
-        pos = signals_db.get_open_position_for_account(ticker, account)
+        pos = _presell_pos
         if pos and quantity > pos['shares'] * 1.001:  # tolerance for float share counts
             signals_db.log_coverage_event(
                 "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked",

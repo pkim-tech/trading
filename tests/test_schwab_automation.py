@@ -4,7 +4,7 @@ detection toggle. Mirrors tests/test_schwab_safety.py's isolated-DB style: no
 real Schwab API calls (dry_run stays True) and no real Slack posts."""
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -364,3 +364,49 @@ def test_check_auto_fills_records_sell_fill_when_enabled(env, monkeypatch):
     signals_notify.check_auto_fills(signals_db.get_open_positions())
 
     assert signals_db.get_open_positions() == []
+
+
+def test_check_buy_reminders_skips_dry_run_account(env, monkeypatch):
+    """A dry_run account's pending buy is resolved entirely by
+    update_dry_run_buys' own synthesis -- check_buy_reminders nagging
+    'Confirm Filled/Missed It/Cancelled' is meaningless noise for it (no real
+    order exists to confirm). TICKER's node is on account='ira', which is
+    real dry_run=True config (not monkeypatched here -- exercising the actual
+    account lookup). Found live 2026-07-29 (FAZ): 14 spurious reminders over
+    ~2 hours, all before a fill that resolved automatically regardless."""
+    signals_notify.notify_buy_signal(_node(), _sig())
+    old_time = (datetime.now() - timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S')
+    with signals_db._conn() as c:
+        c.execute("UPDATE pending_buys SET last_reminder_at=? WHERE ticker=?", (old_time, TICKER))
+        c.commit()
+
+    posted = []
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda *a, **kw: (posted.append(a), (None, None))[1])
+    signals_notify.check_buy_reminders()
+
+    assert posted == [], f"expected no reminder posted for a dry_run pending buy, got: {posted}"
+    pending = _pending()
+    assert pending['reminder_count'] == 0, "reminder_count should not have incremented"
+
+
+def test_check_trailing_reminders_skips_dry_run_sim_position(env, monkeypatch):
+    """Mirrors test_check_buy_reminders_skips_dry_run_account for the sell
+    side: a dry_run-sim position's arm event never places a real order (see
+    check_dry_run_sim_sells), so order_placed can never become True -- without
+    the is_dry_run_sim skip, this would nag 'confirm order placed' forever."""
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100, is_dry_run_sim=True)
+    pos = signals_db.get_open_position(TICKER)
+    old_time = (now - timedelta(minutes=60)).strftime('%Y-%m-%d %H:%M:%S')
+    state = {'trailing': True, 'peak': 52.0, 'last_reminder_at': old_time}
+    signals_db.update_position_trail_state(pos['id'], state)
+
+    posted = []
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda *a, **kw: (posted.append(a), (None, None))[1])
+    signals_notify.check_trailing_reminders(signals_db.get_open_positions())
+
+    assert posted == [], f"expected no reminder posted for a dry_run-sim armed position, got: {posted}"

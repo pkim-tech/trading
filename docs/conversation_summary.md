@@ -5035,3 +5035,51 @@ the exit-execution path — flagged as worth a closer look only if it actually r
 Docs-only session (`docs/deep_backlog.md`, `docs/backlog_cache.md`). No `active_signals.py`/
 `signals_*.py`/`schwab_*.py`/backtest-kernel changes, so no review agent or `live_sim_harness.py` run
 per the `session wrap` gate.
+
+---
+
+## 2026-07-29 — SH stuck-exit bug fixed, fake-broker test tier built, canary A-F design restored
+
+Root-caused and fixed a real stuck live position: SH's automated exit sat idle for hours because
+`strategies.py`'s trailing-exit branch collapses "genuine trail-stop breach" and "hold-time expired
+while armed" into the same reason, so `_attempt_automated_exit_sell` passively waited on the resting
+order forever instead of forcing a market exit. Fixed via a new `exit_forced_by_hold_time` marker
+(all 3 trailing-exit strategy classes) + a force-replace check in `signals_notify.py`. Zero backtest
+impact (`check_exit` is live-only). Verified via a new RED→GREEN regression test.
+
+Built `tests/fake_broker.py`, a stateful in-memory fake Schwab broker that runs real production
+order-placement code against a controlled order book instead of per-function mocks — explicitly
+requested after the user noted live testing is too slow and this class of bug (both this one and the
+2026-07-28 self-block bug) had hidden behind a fully-green mocked suite. 6 scenario tests, all GREEN.
+
+Also fixed: `running_low` staleness in `check_gap_resize` for real (non-dry_run) trailing-buy orders
+(previously only tracked for dry_run accounts — genuinely never proven working for a real order
+before tonight); dry_run/`is_dry_run_sim` reminder spam in Slack; a config mismatch that caused RETL to
+attempt a 454-share top-up (starting_notional $5,000 vs. real account cap $800 — SH/SPY had the same
+bug, all fixed to $800, and a new invariant check now catches recurrence).
+
+Traced and restored the original 6-canary A-F design intent (via git log + `docs/conversation_summary.md`)
+after discovering 7 newly-added inverse-pair canary nodes (FAZ/SPXU/TWM/QID/SDOW/JNUG/JDST) had all
+been created with identical generic config instead of mirroring their intended counterpart. 5 fixed to
+mirror correctly, JNUG converted to take the missing E-scenario (TrailingExit market-buy-exit, mirroring
+VOO). JDST left without a defined purpose — open, low priority (blocked on no second usable dry_run
+account for its originally-intended Cluster A pairing).
+
+Built the detection-only "pre-action live-state verification" feature per the user's explicit phased
+rollout ask (`schwab_safety._log_pre_action_state_verification`, logs match/mismatch to
+`coverage_events` before every real BUY/SELL, never blocks) — tolerance/blocking policy deferred until
+real data accumulates.
+
+Session wrap: independent Sonnet review agent found zero CONFIRMED bugs across all changed
+live-trading files (3 minor nitpicks fixed). Full suite 321 passed, `live_sim_harness.py` 7/7,
+invariants clean.
+
+**Real user friction this session, now backed by memory updates**: repeated instruction to never run
+throwaway `python -c` against live/broker code (one such script leaked a real but harmless Slack
+message about a synthetic ticker); repeated ask to check in before large exploratory work; a running
+theme of verifying full live/DB/broker state in one pass before diagnosing, rather than one field at a
+time.
+
+**Still open**: JDST's purpose; GDXD missing from the active watchlist (not restored, no user
+direction); node-level auto-pause circuit breaker (3rd deferred design item from 2026-07-28, not
+started); pre-action-verification's tolerance/blocking policy decision.

@@ -144,6 +144,22 @@ class TrailingExitZScoreBreakout(BaseStrategy):
             if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
                 exit_px = trail_stop if ctx['low'] <= trail_stop else ctx['current_price']
                 reason = 'WIN' if exit_px > ep else 'LOSS'
+                # Distinguishes a genuine trail-stop breach from hold-time
+                # expiring while still armed -- both collapse to the same
+                # WIN/LOSS reason (kept as-is for backtest parity with
+                # backtester.py's identical dual-condition check), but live
+                # order execution needs to tell them apart: a genuine breach
+                # means a resting trailing-sell order is already correctly
+                # tracking this and should just be polled for its fill; a
+                # hold-time-forced exit means that resting order is still far
+                # from its trigger and must be force-replaced with a market
+                # sell instead (found live 2026-07-29, SH: held 28h/24h while
+                # armed with a 50%-wide trail, stuck waiting on an order that
+                # was nowhere near firing). state is live-code-only
+                # bookkeeping, never consumed by the numba kernel, so this
+                # carries zero backtest blast radius.
+                if ctx['low'] > trail_stop:
+                    state['exit_forced_by_hold_time'] = True
                 return reason, exit_px, state
             return None, None, state
 
@@ -239,6 +255,22 @@ class LimitOrderTrailingExit(LimitOrderZScoreBreakout):
             if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
                 exit_px = trail_stop if ctx['low'] <= trail_stop else ctx['current_price']
                 reason = 'WIN' if exit_px > ep else 'LOSS'
+                # Distinguishes a genuine trail-stop breach from hold-time
+                # expiring while still armed -- both collapse to the same
+                # WIN/LOSS reason (kept as-is for backtest parity with
+                # backtester.py's identical dual-condition check), but live
+                # order execution needs to tell them apart: a genuine breach
+                # means a resting trailing-sell order is already correctly
+                # tracking this and should just be polled for its fill; a
+                # hold-time-forced exit means that resting order is still far
+                # from its trigger and must be force-replaced with a market
+                # sell instead (found live 2026-07-29, SH: held 28h/24h while
+                # armed with a 50%-wide trail, stuck waiting on an order that
+                # was nowhere near firing). state is live-code-only
+                # bookkeeping, never consumed by the numba kernel, so this
+                # carries zero backtest blast radius.
+                if ctx['low'] > trail_stop:
+                    state['exit_forced_by_hold_time'] = True
                 return reason, exit_px, state
             return None, None, state
 
@@ -323,6 +355,22 @@ class TrailingBothZScoreBreakout(TrailingBuyZScoreBreakout):
             if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
                 exit_px = trail_stop if ctx['low'] <= trail_stop else ctx['current_price']
                 reason = 'WIN' if exit_px > ep else 'LOSS'
+                # Distinguishes a genuine trail-stop breach from hold-time
+                # expiring while still armed -- both collapse to the same
+                # WIN/LOSS reason (kept as-is for backtest parity with
+                # backtester.py's identical dual-condition check), but live
+                # order execution needs to tell them apart: a genuine breach
+                # means a resting trailing-sell order is already correctly
+                # tracking this and should just be polled for its fill; a
+                # hold-time-forced exit means that resting order is still far
+                # from its trigger and must be force-replaced with a market
+                # sell instead (found live 2026-07-29, SH: held 28h/24h while
+                # armed with a 50%-wide trail, stuck waiting on an order that
+                # was nowhere near firing). state is live-code-only
+                # bookkeeping, never consumed by the numba kernel, so this
+                # carries zero backtest blast radius.
+                if ctx['low'] > trail_stop:
+                    state['exit_forced_by_hold_time'] = True
                 return reason, exit_px, state
             return None, None, state
 

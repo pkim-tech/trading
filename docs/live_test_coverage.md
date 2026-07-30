@@ -22,10 +22,57 @@ means it buys, then exits again a few bars later, repeatably) — but TRAIL-exit
 OWN separate open position, since arming requires the take-profit condition, not a hold-time
 timeout. A single ticker cannot be mid-TIME-exit-cycle and mid-TRAIL-arm at the same time.
 
-**Current allocation (soxl_test group, `soxl_ira`, 2026-07-27):** GDXU = TRAIL-exit (position
-open, armed via a rigged `peak`, real trailing-sell resting). SH = TIME-exit (position open,
-`max_hold_hours` bumped to fire ~next day; a real SL is placed far out-of-the-money so it's
-protected without pre-empting the TIME-exit). SPY = flat, available for a fresh entry test.
+**State checklist, not a fixed target.** For a given open position, the thing worth tracking is
+its *current* state, not "what it should be" — both a resting SL (STOP) order and a resting TRAIL
+(TRAILING_STOP) order are valid states to test from; `max_hold_hours` is a tunable knob (short to
+force TIME soon, longer to let it land at a chosen time), not a value with one correct setting.
+Before touching a live position, pull all of this in one pass (`scripts/audit_live_test_candidates.py
+--tickers X Y Z`, plus the position's full `trail_state` dict and `get_coverage_events` history —
+see `[[feedback_verify_full_state_before_acting]]`), not one field at a time:
+- real broker shares + every resting order (type/side/qty/status/id)
+- DB position: shares, entry_price, `max_hold_hours` vs real held bars
+- full `trail_state` (not just the field that looks relevant — a stale `exit_pending` left over
+  from a since-changed condition renders as "exit still pending" even when nothing really is)
+- `sl_order_id` / `exit_order_id` vs the real resting order's id (should match)
+- recent `coverage_events` for that position_id (shows exactly why an automated attempt did or
+  didn't fire, e.g. a dup-order-guard block)
+
+**Current allocation (soxl_test group, `soxl_ira`), verified 2026-07-29:**
+- **RETL** (node id 143, `label='2026-07-28 gap_resize live test node'`): entry/gap-resize test
+  (BUY side). Real resting `TRAILING_STOP BUY` order #1007372207387, price already ~14.6% past
+  the trigger ($10.20 vs $8.90). `pending_buys` row (id 44) has `order_placed=1`,
+  `gap_resize_date=None` — `check_gap_resize` (data-driven, scans every `order_placed` pending-buy
+  row, not a hardcoded ticker list) will act on it at the next 9:15 ET window: cancel the resting
+  trailing-buy, replace with a real market BUY.
+- **SH** (position id 18): TIME-exit test. `max_hold_hours=24` on both node and position
+  (deliberately set to land midday, not forced). Real STOP order #1007353937138 resting,
+  matches `sl_order_id`. Held 21h/24h at last check — not yet due. The actual test: once TIME
+  trips, does `_attempt_automated_exit_sell` correctly cancel/replace that resting STOP into a
+  real market SELL (the exact path fixed 2026-07-28 night, never yet proven live). A stale
+  `exit_pending(reason=TIME, order_id=null)` was left over from before `max_hold_hours` was
+  last adjusted — clear it with `scripts/clear_stale_exit_pending.py --position-id 18` (refuses
+  to clear if TIME has genuinely tripped in the meantime).
+- **GDXU**: TRAIL-exit test — **completed for real 2026-07-28 09:30:09** (`trade_log` id 24,
+  `exit_reason=TRAIL`, real fill $78.275, confirms the arm→trailing-sell→auto-close path end to
+  end). Now flat, no resting orders — available as a 2nd entry-test candidate.
+- **SPY**: flat, no resting orders — entry-test candidate.
+
+**Required setup step when using the direct bypass:** a bypass-staged order skips `schwab_client.py`'s
+wrapper entirely, so it never goes through the normal BUY-alert Slack flow — there is no "Trailing Buy
+Order Placed" → "Filled" button sequence to fall back on. The ONLY thing that will ever reconcile a
+bypass-staged fill is `check_auto_fills` (runs every poll cycle unconditionally, no code change
+needed), which is gated off by default per ticker+node. Before staging, enable both flags or the fill
+will sit orphaned indefinitely (real incident, RETL, 2026-07-29 — filled at 9:30 ET, undetected for
+9+ hours):
+```
+.venv/bin/python -c "
+import schwab_safety as ss
+ss.enable_auto_fill_detection('TICKER')
+ss.enable_node_auto_fill_detection(NODE_ID)
+"
+```
+Note: `enable_node_auto_fill_detection`'s docstring claims it also sets the ticker-level flag —
+it doesn't (real bug, found 2026-07-29, not yet fixed in code). Set both explicitly until that's fixed.
 
 **Placing a real order outside a signal window (the "direct bypass"):** `schwab_safety.check_order`
 blocks any real order outside the 4 signal windows — for a deliberately-staged test (not an organic

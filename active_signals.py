@@ -96,7 +96,7 @@ from signals_notify import (
     _ticker_block, _send_window_alert, _coverage_mode,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report, send_coverage_report,
-    update_dry_run_buys, check_dry_run_sim_sells,
+    update_dry_run_buys, update_real_pending_buys_running_low, check_dry_run_sim_sells,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
@@ -820,6 +820,7 @@ def run_loop(tickers: set = None):
             # simulated trailing buy can bounce-fill any time after the signal fires.
             _guarded("paper_update_buys", paper_trading.update_paper_buys)
             _guarded("dry_run_update_buys", update_dry_run_buys)
+            _guarded("real_pending_buys_running_low", update_real_pending_buys_running_low)
 
             if not watchlist:
                 print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")

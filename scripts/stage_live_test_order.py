@@ -35,8 +35,11 @@ from schwab.orders.common import (
 )
 from schwab.utils import Utils
 
+from datetime import datetime
+
 import schwab_auth
 import schwab_safety
+import signals_config as cfg
 import signals_db as db
 from schwab_client import get_current_price, _resolve_account_hashes
 
@@ -140,6 +143,26 @@ def main():
     print(f"  submitted -- order_id={order_id}")
     db.log_coverage_event("staged_live_test", "live", ticker=args.ticker, result="placed",
                            detail=f"side={args.side} type={args.order_type} qty={args.quantity} order_id={order_id} {detail}")
+
+    # A bypass-staged TRAILING BUY places the real order but, without this,
+    # creates no pending_buys row -- nothing in the normal daemon machinery
+    # (update_real_pending_buys_running_low, check_gap_resize, check_auto_fills)
+    # has anything to track or reconcile against, so the real fill would sit
+    # invisible until manually reconciled by hand. Found live 2026-07-29
+    # (RETL) -- the exact gap this closes, so future staged tests don't repeat it.
+    if args.order_type == "TRAILING" and args.side == "BUY":
+        node = db.get_watch_list_node(ticker=args.ticker, account=args.account, watchlist_id=False)
+        if node is None:
+            print(f"  [warn] no watch_list node found for {args.ticker}/{args.account} -- "
+                  f"pending_buys row NOT created, this order won't be tracked by the daemon "
+                  f"(running_low, gap_resize, fill reconciliation) until reconciled manually.")
+        else:
+            sig = {"current_price": price, "last_bar": datetime.now()}
+            db.add_pending_buy(node, sig, channel=cfg.SLACK_CHANNEL_ID, ts="", order_id=order_id)
+            db.mark_pending_buy_placed_by_wl_id(node["id"])
+            print(f"  pending_buys row created (wl_id={node['id']}) -- will be tracked by "
+                  f"update_real_pending_buys_running_low / check_gap_resize / check_auto_fills "
+                  f"once the daemon is running.")
 
 
 if __name__ == "__main__":

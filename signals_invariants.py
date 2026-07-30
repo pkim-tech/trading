@@ -120,11 +120,83 @@ def check_brokerage_not_live_with_unresolved_leverage_gap():
     return violations
 
 
+def check_starting_notional_within_account_notional_cap():
+    """A mode='live' node's starting_notional must not exceed its real
+    account's notional_cap (schwab_safety.ACCOUNTS).
+
+    Depends on this: signals_helpers._last_sale_recovery (real position
+    sizing) and signals_notify._reconcile_fill's post-fill top-up both target
+    starting_notional as the position size to reach -- if that target is
+    structurally larger than the account's real notional_cap, every entry/
+    top-up attempt for the node is either guaranteed to be blocked outright or
+    silently under-filled relative to what the node's own config claims it
+    should hold. Found live 2026-07-29: RETL's node had starting_notional=
+    $5000 in account 'soxl_ira', whose real notional_cap is $800 -- a real
+    fill of 50 shares (~$495) triggered a 454-share top-up attempt that was
+    only stopped by a signal-window gate firing first, not by anything
+    catching the underlying config mismatch itself."""
+    violations = []
+    for node in db.get_watchlist():
+        if node['mode'] != 'live':
+            continue
+        account = node.get('account')
+        starting_notional = node.get('starting_notional')
+        if not account or not starting_notional:
+            continue
+        limits = schwab_safety.ACCOUNTS.get(account)
+        if limits is not None and starting_notional > limits.notional_cap:
+            violations.append(
+                f"{node['ticker']} (wl_id={node['id']}) starting_notional=${starting_notional:,.0f} "
+                f"exceeds account {account!r}'s real notional_cap=${limits.notional_cap:,.0f} -- "
+                f"every entry/top-up attempt for this node is structurally oversized for its account."
+            )
+    return violations
+
+
+def check_open_position_config_matches_live_node():
+    """An open position's snapshotted max_hold_hours/fixed_sl should match its
+    node's current live watch_list config, unless deliberately diverged.
+
+    Depends on this: an already-open position's real exit-check logic
+    (signals_compute.check_sell_condition) reads pos['max_hold_hours']/
+    pos['fixed_sl'] -- the value baked onto the position row at entry time
+    (or last manually updated), NOT whatever the node's live config currently
+    says (open_position() only snapshots once, at entry). Editing a node's
+    config after it has an open position silently does nothing to that
+    position unless the position row is *also* updated -- found live
+    2026-07-29 (SH, twice): a node's max_hold_hours was changed without
+    touching the open position, so the real exit-check kept running on the
+    stale snapshotted value with no indication anything was out of sync.
+    Informational, not necessarily wrong -- a deliberate mid-flight config
+    change to only the node (for future entries) or only the position (a
+    manual one-off override) is a legitimate, real use case this project
+    does on purpose. The point is visibility, not a hard rule."""
+    violations = []
+    for pos in db.get_open_positions():
+        node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+        if node is None:
+            continue
+        for field in ('max_hold_hours', 'fixed_sl'):
+            pos_val, node_val = pos.get(field), node.get(field)
+            # abs()-based, not != -- a raw float != can false-positive on pure
+            # representation differences (e.g. 1 vs 1.0000000001), found by
+            # session-wrap review 2026-07-29.
+            if pos_val is not None and node_val is not None and abs(float(pos_val) - float(node_val)) > 1e-9:
+                violations.append(
+                    f"{pos['ticker']} (position id={pos['id']}, wl_id={node['id']}) {field}: "
+                    f"position snapshot={pos_val} vs node's current live config={node_val} -- "
+                    f"the open position's real exit-check still runs on the snapshotted value."
+                )
+    return violations
+
+
 CHECKS = [
     check_live_trailing_exit_automation_scope,
     check_research_mode_ticker_with_open_position_in_automation_scope,
     check_live_node_missing_account,
     check_brokerage_not_live_with_unresolved_leverage_gap,
+    check_starting_notional_within_account_notional_cap,
+    check_open_position_config_matches_live_node,
 ]
 
 

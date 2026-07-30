@@ -681,3 +681,41 @@ def test_no_hand_rolled_cancel_then_place_order_swap():
                 f"must go through replace_equity_order_with_market/"
                 f"replace_order_with_trailing_sell instead"
             )
+
+
+def test_pre_action_state_verification_logs_match(env, monkeypatch):
+    """Real broker position matches local DB (both empty) -- logs 'match',
+    doesn't block. Deliberately detection-only, per the 2026-07-29 backlog
+    item's phased-rollout design (log first, decide on tolerance/blocking
+    once there's real data)."""
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 0.0)
+    schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # dry_run, never reaches the broker
+    events = signals_db.get_coverage_events(scenario_key='pre_action_state_verification')
+    matches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'match']
+    assert matches, f"expected a 'match' event, got: {events}"
+
+
+def test_pre_action_state_verification_logs_mismatch(env, monkeypatch):
+    """Real broker shows shares held, but local DB has no open_positions row
+    for this ticker/account -- logs 'mismatch', still doesn't block (the
+    whole point of the phased rollout)."""
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 42.0)
+    result = schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    assert result == (None, None), "still dry_run, must not block on a mismatch yet"
+    events = signals_db.get_coverage_events(scenario_key='pre_action_state_verification')
+    mismatches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'mismatch']
+    assert mismatches, f"expected a 'mismatch' event, got: {events}"
+    assert 'real_shares=42' in mismatches[0]['detail']
+
+
+def test_pre_action_state_verification_fetch_failure_does_not_block(env, monkeypatch):
+    """A broken/erroring real-position fetch must never block a real order --
+    this is observability, not a gate."""
+    def _raise(account, ticker):
+        raise RuntimeError("simulated network failure")
+    monkeypatch.setattr(schwab_client, 'get_real_position', _raise)
+    result = schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    assert result == (None, None)
+    events = signals_db.get_coverage_events(scenario_key='pre_action_state_verification')
+    failed = [e for e in events if e['ticker'] == TICKER and e['result'] == 'fetch_failed']
+    assert failed, f"expected a 'fetch_failed' event, got: {events}"

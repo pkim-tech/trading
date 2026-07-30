@@ -572,6 +572,34 @@ def ensure_tables():
             c.execute("UPDATE scenario_expectations SET updated_at = created_at WHERE updated_at IS NULL")
             c.commit()
 
+        # staged_test_config: the "what should this staged live test's config be"
+        # mapping, structured instead of re-explained in conversation every time
+        # (found needed live 2026-07-29 -- SH/RETL/GDXU's staged-test setup got
+        # verbally re-derived and hand-checked repeatedly across one long
+        # session instead of being queryable). One row per node currently
+        # serving a deliberate live-test role; expected_config is a JSON dict
+        # of the fields that role requires (e.g. {"arm_sell_pct": 0.3,
+        # "fixed_sl": 50, "trail_sell_pct": 50, "max_hold_hours": 31}) --
+        # scripts/audit_live_test_candidates.py's --staged flag diffs this
+        # against the real current node/position config, the same MISMATCH
+        # pattern already used there for fixed_sl-vs-real-order-price. UNIQUE
+        # on wl_id is safe here (unlike scenario_expectations) since wl_id is
+        # NOT NULL -- no nullable-column dedup gotcha.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS staged_test_config (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                wl_id           INTEGER NOT NULL REFERENCES watch_list(id),
+                ticker          TEXT NOT NULL,
+                scenario_role   TEXT NOT NULL,
+                expected_config TEXT NOT NULL,
+                notes           TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                UNIQUE(wl_id)
+            )
+        """)
+        c.commit()
+
         # coverage_deviations: one row per (check_date, scenario_key, node_id/ticker, mode)
         # where a daily expectation wasn't met. `reason` starts NULL --
         # unexplained -- until explain_deviation() fills it in. A row with
@@ -1202,6 +1230,47 @@ def add_scenario_expectation(scenario_key, expected_outcome, expected_frequency,
         c.commit()
 
 
+def set_staged_test_config(wl_id, ticker, scenario_role, expected_config: dict, notes=None):
+    """Insert-or-update the structured 'what should this staged live test's
+    config be' row for a node -- see ensure_tables' staged_test_config
+    comment. expected_config is stored as JSON; pass a plain dict."""
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    config_json = json.dumps(expected_config)
+    with _conn() as c:
+        existing = c.execute("SELECT id FROM staged_test_config WHERE wl_id = ?", (wl_id,)).fetchone()
+        if existing:
+            c.execute("""
+                UPDATE staged_test_config SET
+                    ticker=?, scenario_role=?, expected_config=?, notes=?, updated_at=?
+                WHERE wl_id=?
+            """, (ticker, scenario_role, config_json, notes, now_str, wl_id))
+        else:
+            c.execute("""
+                INSERT INTO staged_test_config
+                    (wl_id, ticker, scenario_role, expected_config, notes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (wl_id, ticker, scenario_role, config_json, notes, now_str, now_str))
+        c.commit()
+
+
+def get_staged_test_configs():
+    """Every currently-active staged-live-test row, expected_config parsed
+    back into a dict."""
+    with _conn() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM staged_test_config ORDER BY id").fetchall()]
+    for r in rows:
+        r['expected_config'] = json.loads(r['expected_config'])
+    return rows
+
+
+def clear_staged_test_config(wl_id):
+    """Removes a node's staged-test row once that test has concluded (fixed
+    and confirmed live, or abandoned) -- not meant to accumulate forever."""
+    with _conn() as c:
+        c.execute("DELETE FROM staged_test_config WHERE wl_id = ?", (wl_id,))
+        c.commit()
+
+
 def get_scenario_expectations(expected_frequency=None, active_only=True):
     q = "SELECT * FROM scenario_expectations"
     clauses, params = [], []
@@ -1641,9 +1710,12 @@ def mark_gap_resize_attempted(pending_id, date_str):
 
 
 def update_pending_buy_running_low(wl_id, running_low):
-    """Mirrors update_paper_pending_buy_running_low -- only ever called for a
-    dry_run-account trailing buy (signals_notify.update_dry_run_buys), since a
-    real trailing-buy order's running low is tracked by the broker itself."""
+    """Mirrors update_paper_pending_buy_running_low. Called by both
+    signals_notify.update_dry_run_buys (dry_run accounts) and
+    update_real_pending_buys_running_low (real accounts, added 2026-07-29 --
+    the broker tracks a real trailing-buy's running low itself, but
+    check_gap_resize reads this column assuming it's live-tracked, so a real
+    account needs its own copy updated too)."""
     with _conn() as c:
         c.execute("UPDATE pending_buys SET running_low=? WHERE wl_id=?", (running_low, wl_id))
         c.commit()
