@@ -161,17 +161,31 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     placed on (active_signals.py's (position_id, bar_ts) key changes every
     new bar), so a still-true TIME/SL condition on the next bar would
     otherwise place a SECOND real market sell for the same shares before the
-    first is confirmed filled (found by Sonnet review, 2026-07-27).
+    first is confirmed filled (found by Sonnet review, 2026-07-27). EXCEPT
+    when the pending order is still the original arm-time resting trailing-sell
+    and hold_time_forced has since become true (found live 2026-07-30, SH:
+    the reuse-guard above returned that stale order unconditionally, so the
+    hold_time_forced branch below was never reached even after it was
+    correctly set to True -- the 2026-07-29 fix only ever worked the first
+    time a hold-time-forced exit fired on a position with no exit_pending yet)
+    -- reusing it there would just repeat the exact bug this branch exists to
+    fix. Every other reason (TP/SL/TIME) and the genuine-breach TRAIL case
+    (hold_time_forced still False) are unaffected -- this only changes
+    behavior for the narrow TRAIL+hold_time_forced+not-yet-replaced case.
 
     Returns the real order_id on success, or None (falls back to manual) on
     any block/scope-miss/failure -- same guards as _attempt_automated_sell
     (ticker automation scope, node.mode=='live', node_automation_enabled)."""
     ticker = pos['ticker']
     state = pos.get('trail_state') or {}
-    pending_order_id = (state.get('exit_pending') or {}).get('order_id')
-    if pending_order_id is not None:
-        return pending_order_id
+    exit_pending = state.get('exit_pending') or {}
+    pending_order_id = exit_pending.get('order_id')
     hold_time_forced = bool(state.get('exit_forced_by_hold_time'))
+    still_unreplaced_trail_order = (
+        reason == 'TRAIL' and hold_time_forced and pending_order_id == state.get('exit_order_id')
+    )
+    if pending_order_id is not None and not still_unreplaced_trail_order:
+        return pending_order_id
     if reason == 'TRAIL' and not hold_time_forced:
         return state.get('exit_order_id')
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:

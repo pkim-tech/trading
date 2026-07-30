@@ -1,5 +1,145 @@
 # Backlog
 
+## [live-trading][security] Open, raised 2026-07-30 (evening) — `enable_node_auto_fill_detection(node_id)`'s docstring claims a ticker-level side effect it doesn't perform
+
+**Found while wiring LABD's node 152 for the scenario-1 real-fill test** (see the sibling 2026-07-30
+evening entry below for the full test context). `schwab_safety.py`'s
+`enable_node_auto_fill_detection(node_id)` docstring reads: *"also ensures the ticker-level flag is
+on, since the real gate is an AND of both layers and this is the only UI entry point that sets
+either."* The function body only ever writes `NODE_AUTO_FILL_DETECTION_PATH` — it takes no `ticker`
+argument at all, so it structurally cannot set the ticker-level flag (`AUTO_FILL_DETECTION_PATH`,
+toggled separately via `enable_auto_fill_detection(ticker)`). Confirmed live: calling
+`enable_node_auto_fill_detection(152)` alone left `auto_fill_detection_enabled('LABD')` returning
+`False` — had to call `enable_auto_fill_detection('LABD')` separately to actually satisfy
+`check_auto_fills`'s real gate (`auto_fill_detection_enabled(ticker) AND
+node_auto_fill_detection_enabled(wl_id)`).
+
+**Checked same session — not a live bug**: `signals_handlers.py:539-540`'s real Slack handler
+(`handle_enable_auto_fill_detection`) already calls both `schwab_safety.enable_auto_fill_detection(ticker)`
+and `schwab_safety.enable_node_auto_fill_detection(wl_id)` explicitly — it doesn't rely on the false
+claim, so every node enabled via that button has been working correctly. The docstring is simply
+stale/wrong (claims a side effect the function doesn't have), not a functional gap. **Fix**: correct
+the docstring (drop the "also ensures the ticker-level flag is on" claim, or actually move that call
+inside the function and simplify the Slack handler to one call — either is fine, low priority,
+cosmetic/documentation-accuracy only).
+
+## [live-trading][security] Open, raised 2026-07-30 (evening) — SH stuck in TRAIL exit_pending again; `_attempt_automated_exit_sell`'s check order defeats the 2026-07-29 hold-time-forced fix
+
+**Real incident**: SH (node #135, `soxl_test`/`soxl_ira`, position #18, LIVE) entered 2026-07-24 07:38
+@ $33.52, armed TRAIL at peak $33.94 with a real trailing-sell order resting at the broker
+(`exit_order_id=1007377078300`, `trail_sell_pct=50%` — a test-tier config, trigger ≈$17, essentially
+never going to fill on price alone). Hold time (bar-count, not wall-clock — `_bars_held()` in
+`signals_compute.py:187` counts trading-hour bars since the signal bar) crossed `max_hold_hours=31`
+around 2026-07-30 midday. `check_exit_reminders` has nagged 3x (`EXIT_REMINDER_MINUTES` cadence)
+with no automated resolution and no manual tap.
+
+**Root cause**: `_attempt_automated_exit_sell` (`signals_notify.py:171-176`) checks
+`exit_pending.order_id` (the 2026-07-27 "reuse an already-placed order from an earlier bar" dedup
+guard) *before* checking `state.get('exit_forced_by_hold_time')` (the 2026-07-29 "TIME-while-armed"
+fix, built for this exact ticker's exact prior incident):
+```python
+pending_order_id = (state.get('exit_pending') or {}).get('order_id')
+if pending_order_id is not None:
+    return pending_order_id                    # returns unconditionally, always
+hold_time_forced = bool(state.get('exit_forced_by_hold_time'))
+if reason == 'TRAIL' and not hold_time_forced:
+    return state.get('exit_order_id')          # never reached once exit_pending exists
+```
+Once `exit_pending.order_id` is set (from whichever bar first produced a TRAIL reason — genuine
+breach or an earlier hold-time-forced firing), every subsequent poll returns that same stale
+order_id regardless of `hold_time_forced`'s value. The 2026-07-29 fix only works the very first time
+a hold-time-forced exit fires on a position where `exit_pending` doesn't already exist — it's
+silently defeated on any position (like SH, again) where an exit was already pending from an earlier
+bar. **Fix**: check `hold_time_forced` before the `pending_order_id` early-return, so a hold-time-
+forced condition always forces the market-replace path even if an exit was already pending.
+
+**Verified live via `signals_compute.check_sell_condition` called directly against SH's real position
+this session** (bars_held=33 vs max=31, low=$33.46 far above the ~$17 trail trigger) — confirmed
+`exit_forced_by_hold_time` was `False` in the stored `trail_state` before, and the call set it `True`
+after, proving the flag itself was never set true on any earlier poll (i.e. this is genuinely the
+first time hold time was exceeded on this position, not a repeat of the 2026-07-29 incident's exact
+mechanism — a *related* gap in the same fix, not the same bug recurring unfixed).
+
+**Process note**: that `check_sell_condition` call was **not read-only** — it unconditionally
+persists `new_state` to the DB whenever it differs from what's stored (`signals_compute.py:272-273`),
+same as production. Calling it directly against a live position for diagnostic purposes was an
+unapproved live-state write (caught and flagged by the user immediately) — `exit_forced_by_hold_time`
+is now `True` in SH's real `trail_state` where it wasn't before. Left in place (the value is factually
+correct — hold time genuinely is exceeded), not reverted, per user's call. **Lesson: no
+`signals_compute`/`signals_notify` function should be assumed side-effect-free without checking first
+— several of them write to the live DB internally as a matter of course, not just when called from
+the daemon's own loop.**
+
+**Decided 2026-07-30 evening**: leave the live position untouched overnight ("we try again tomorrow"
+— no manual close, no code fix applied yet, no further diagnostic calls against it). Fix the
+precedence bug the same night, separately from the live position. **Also wanted, not built yet**: a
+coverage-check scenario (`scenario_expectations`/`coverage_check.py`, or a new
+`signals_invariants.py` check) that detects this exact pattern going forward — a position with
+`exit_forced_by_hold_time=True` in `trail_state` but no corresponding `automated_exit_execution`
+force-replace event ever logged for it, so a future recurrence surfaces automatically instead of
+needing a user to notice repeated Slack reminders. Not scoped (coverage_events-based vs. a direct
+trail_state query, daily vs. informational tier) — captured here only.
+
+**Full 4-scenario exit test matrix, documented 2026-07-30 evening** (armed = `trail_state.trailing`
+reached True via TP-threshold clearing before the exit fired; unarmed = exit fired straight from a
+resting protective SL, TP/arm threshold never reached):
+
+| # | Scenario | Live proof | Offline (pytest) proof |
+|---|---|---|---|
+| 1 | Not armed, SL sell | none | none — closest is `test_schwab_automation.py::test_automated_sell_notifies_sl_price_when_trailing_sell_fails_after_sl_cancel`, a *failure*-path test, not a clean unarmed-SL-breach auto-close |
+| 2 | Not armed, TIME sell | **RETL, 2026-07-30, clean** (armed via `sl_placement` real SL only, `time_exit_trigger` → `automated_exit_execution` → `automated_exit_confirmed`, no manual tap) | `test_fake_broker_sh_scenario.py::test_unarmed_position_past_max_hold_replaces_resting_sl_with_market_exit` — passes, accurately mirrors the real path |
+| 3 | Armed, genuine trail breach | **GDXU, 2026-07-28** (trade_log id 24, exit_reason=TRAIL, filled $78.275) | `test_fake_broker_trail_exit_scenario.py::test_genuine_trail_breach_auto_closes_via_resting_order_fill` — passes |
+| 4 | Armed, hold-time-forced exit | **SH, stuck (this entry)** | `test_fake_broker_sh_scenario.py::test_armed_position_past_max_hold_gets_forced_market_exit` — **passes but doesn't catch the real bug**: it calls `notify_sell_signal` fresh (no pre-existing `exit_pending`), so it never exercises the reuse-guard that's actually at fault. Needs rewriting to pre-seed `exit_pending.order_id` (pointing at the still-unreplaced arm-time trailing order) before calling `notify_sell_signal`, matching SH's real precondition. |
+
+**Fix scoping, confirmed safe for RETL/scenario 2 and scenario 1 (2026-07-30 evening)**: the reuse-check
+at `signals_notify.py:171-173` is correct and required for every reason (TP/SL/TIME/TRAIL alike) —
+once a market sell is placed, poll that same order_id, don't place a second one next bar. The
+narrow, correct fix only bypasses reuse when `reason=='TRAIL'`, `exit_forced_by_hold_time` is True,
+AND the pending order_id still equals the original arm-time `exit_order_id` (i.e. it was never
+actually replaced with a market sell):
+```python
+exit_pending = state.get('exit_pending') or {}
+pending_order_id = exit_pending.get('order_id')
+hold_time_forced = bool(state.get('exit_forced_by_hold_time'))
+still_unreplaced_trail_order = (
+    reason == 'TRAIL' and hold_time_forced and pending_order_id == state.get('exit_order_id')
+)
+if pending_order_id is not None and not still_unreplaced_trail_order:
+    return pending_order_id
+if reason == 'TRAIL' and not hold_time_forced:
+    return state.get('exit_order_id')
+```
+Scenario 1 (SL) and scenario 2 (TIME — RETL) never reach the TRAIL-specific branch at all, so this
+change has zero effect on either. Scenario 3 (genuine breach) keeps reusing correctly (`pending_order_id
+== exit_order_id` but `hold_time_forced` is False there). Only scenario 4's exact failure mode changes.
+
+**Plan agreed 2026-07-30 evening**: fix the code tonight (scoped as above). Tomorrow: retest SH for
+scenario 4 (with the fix applied), stage two new tickers for scenarios 1 and 3, keep RETL parked
+(already resolved, no new trade needed) for scenario 2. **Next Tuesday (2026-08-04): run all 4
+scenarios together as one block** once each has been individually proven. Rewrite
+`test_armed_position_past_max_hold_gets_forced_market_exit` per the gap noted above before then, so
+scenario 4 has real offline proof too, not just a passing-but-blind test.
+
+**Fix applied and session-wrap Opus review completed 2026-07-30 evening — no CONFIRMED bugs.**
+Reviewer independently walked all 4 logic paths (genuine breach, TP/SL/TIME, hold-time-forced with
+stale order, hold-time-forced already-replaced) against the real code and confirmed each behaves
+correctly; None/false-match edge cases are inert by construction. 3 PLAUSIBLE items surfaced, all
+**pre-existing, not introduced by this fix** — not blocking, captured for later:
+1. **One-poll latency**: `active_signals.py`'s `_check_position_exit` passes the stale in-memory
+   `pos` to `notify_sell_signal` — `check_sell_condition` persists `exit_forced_by_hold_time` to the
+   DB but doesn't refresh `pos['trail_state']` in the same call, so the force-replace only actually
+   fires on the *next* poll after the flag is set, not the same one. Harmless (this fix is what
+   makes it converge at all), but a `db.get_position_by_id` re-read (matching the 2026-07-22
+   `notify_trailing_activated` precedent) would remove the extra poll.
+2. **dry_run infinite-retry**: `replace_equity_order_with_market` returns `(None, None)` for a
+   dry_run node, so `exit_pending['order_id']` stays `None` and every reason (not just TRAIL)
+   re-attempts the "replace" every poll forever, never converging.
+3. **Failed-replace retry against a dead id**: if a real replace call raises after already
+   canceling the old order at the broker, `state['exit_order_id']` still points at the now-dead
+   order — subsequent polls retry against it and could repeat UNPROTECTED alerts.
+Not scoped/prioritized yet — same class of gap as the already-accepted residual risk in
+`_submit_replace_with_retry` (see the 2026-07-27 backlog entry), consider bundling.
+
 ## [live-trading][coverage] Open, raised 2026-07-30 — break `reconciliation_mismatch` out per-node
 
 **Context**: session built two new "state report" tables (2026-07-30) — a 12-row canary_* table in

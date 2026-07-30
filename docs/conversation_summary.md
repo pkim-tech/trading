@@ -5212,3 +5212,67 @@ exercise real code paths same as any other grid row — two coverage systems cur
 by side with no established mapping. Also open: per-node `reconciliation_mismatch` breakout
 (scope not decided — 5 soxl_ira nodes vs. those + 13 canary nodes vs. leave the single global
 row), and the SPXU/QID/SDOW/JNUG `max_hold_hours` mirror-config question above.
+
+---
+
+## 2026-07-30 (evening) — SH's stuck-exit bug fixed for real (reuse-guard precedence); 2 new live tests staged (LABD/ERY); Schwab refresh token expired mid-session
+
+Investigated "SH did not sell out" — a live `soxl_ira` position (node #135) stuck in `TRAIL`/
+`exit_pending` for days, nagging reminders with no automated resolution. Root cause: the
+2026-07-29 "TIME-while-armed" fix (`exit_forced_by_hold_time`) only ever worked the *first* time
+hold-time expired on a position with no `exit_pending` yet — `_attempt_automated_exit_sell`'s
+reuse-existing-order guard (added 2026-07-27, correct and necessary for every reason) checked
+`exit_pending.order_id` and returned unconditionally *before* ever checking `hold_time_forced`,
+so any position that already had an `exit_pending` (SH's case) would keep reusing the stale
+resting trail order forever, regardless of the flag. Diagnosing this live also produced two
+process lessons: (1) `signals_compute.check_sell_condition` is not read-only — it persists state
+internally, and I called it directly against SH's live position without approval, setting
+`exit_forced_by_hold_time=True` for real; left in place (factually correct) rather than reverted,
+per user's call. (2) `max_hold_hours` is bar-count, not wall-clock hours (`_bars_held()` counts
+market-hours bars) — an early misdiagnosis assumed real elapsed time.
+
+**Fix applied and reviewed**: `_attempt_automated_exit_sell` now only bypasses the reuse-guard when
+`reason=='TRAIL'`, `exit_forced_by_hold_time` is True, AND the pending order_id still equals the
+original arm-time `exit_order_id` (i.e. never yet replaced) — scoped to zero effect on TP/SL/TIME
+reasons and genuine TRAIL breaches. Session-wrap Opus review confirmed no CONFIRMED bugs across all
+4 logic paths; 3 PLAUSIBLE pre-existing gaps noted (one-poll latency from a stale `pos` snapshot,
+dry_run infinite-retry, failed-replace-retry-against-dead-id) — not blocking, filed in
+`docs/deep_backlog.md`. `tests/test_fake_broker_sh_scenario.py`'s existing test for this exact
+scenario passes but doesn't actually exercise the bug (no pre-seeded `exit_pending`) — flagged to
+rewrite before the next full-block test run. Full suite: 25 targeted tests pass, `live_sim_harness.py`
+7/7, `signals_invariants.py`: 1 new accepted violation (SH's `open_positions.max_hold_hours=38` vs
+`watch_list`'s `31` — deliberate, see below).
+
+**Documented the real 4-scenario exit test matrix** (not-armed/SL, not-armed/TIME, armed/genuine-
+trail, armed/hold-time-forced) in `docs/deep_backlog.md` and `docs/live_test_coverage.md`: scenario 2
+(RETL) resolved cleanly live today with zero manual taps; scenario 3 (GDXU, 2026-07-28) already has
+both live and offline proof, contrary to an initial assumption it still needed retesting.
+
+**Two new live tests staged for tomorrow**: LABD (node 152, scenario 1: `arm_sell_pct=50%`/
+`fixed_sl=0.3%`, won't arm, tight SL) and ERY (node 153, scenario 3: `arm_sell_pct=0.3%`/
+`trail_sell_pct=0.3%`, mirrors GDXU's real design) — both bought manually (1 share each, real
+fills). Rather than seed `open_positions` directly, wired both through the real auto-fill-detection
+pipeline (real order_ids in a `pending_buys` row, both tickers added to `SCHWAB_AUTOMATION_TICKERS`,
+both ticker+node auto-fill-detection flags enabled) so the daemon's own `check_auto_fills` →
+`_reconcile_buy_fill` → `_place_stop_loss_for_position` places the real protective SL itself once
+restarted — proving the full entry-to-SL-placement pipeline, not just the exit side. Found a real
+(non-blocking, docs-only) bug along the way: `enable_node_auto_fill_detection()`'s docstring claims
+it also sets the ticker-level flag; it doesn't (checked the real Slack handler — it already calls
+both functions separately, so no live impact, just a stale docstring).
+
+**SH's retest rescheduled to land during market hours**: `open_positions.max_hold_hours` bumped
+31→38 (one full trading day's worth of bars) so the hold-time trigger lands ~2026-07-31 11:30 ET
+instead of firing the instant the daemon restarts after-hours; `exit_forced_by_hold_time` and
+`exit_pending` cleared back to a clean armed-and-waiting state to match.
+
+**Schwab's refresh token expired mid-session** (real, not the earlier intermittent race) — daemon
+restart failed with a real "could not locate runnable browser" error on `schwab_stream.py`. User
+needs to run `schwab_oauth_setup.py` interactively (real browser, can't be done from this WSL
+session) before anything above can actually execute. Reinforces the standing plan: do the Schwab
+reauth proactively Sunday night or Monday morning, not mid-week, to avoid exactly this scramble.
+
+**Process note, logged for future sessions**: a fresh side-script `schwab_client` call earlier in
+the session collided with the daemon's own token refresh and failed with the same browser-auth
+error (before the token fully expired) — confirmed real, but transient at the time. Any manual
+schwab_client invocation from a side process while the daemon is live carries this risk; prefer
+read-only checks or let the running daemon's own poll cycle do the work instead.

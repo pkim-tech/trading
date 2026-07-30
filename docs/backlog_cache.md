@@ -7,6 +7,14 @@
 > living reference, not an ever-growing changelog. Caught live after this got violated twice in
 > one sitting (once here, once in CLAUDE.md) before being fixed.
 
+## [live-trading][security] Open, raised 2026-07-30 evening — SH stuck again: `_attempt_automated_exit_sell`'s reuse-existing-order check short-circuits before the hold-time-forced check, defeating the 2026-07-29 fix
+Full detail: `docs/deep_backlog.md`'s 2026-07-30 (evening) entry. **Fix planned tonight.** Also add a
+coverage-check scenario to catch this pattern going forward (a position with `exit_forced_by_hold_time=True`
+but no corresponding force-replace ever happening) — not built yet, captured here only.
+
+## [live-trading][docs] Open, raised 2026-07-30 evening — `enable_node_auto_fill_detection(node_id)`'s docstring claims a side effect it doesn't perform (docs-only, checked: not a live bug, the real Slack handler already calls both functions)
+Full detail: `docs/deep_backlog.md`'s 2026-07-30 (evening) entry. Cheap docstring/cosmetic fix, low priority.
+
 ## [live-trading][coverage] Open, raised 2026-07-30 — should canary scenario_expectations tests appear on the Trade-Flow Accountability Grid?
 User pushback on a claim from a prior session: the canary_* scenarios (`scenario_expectations`/
 `coverage_check.py`) exercise real code blocks (`_scan_pinned_entry`, `_attempt_automated_sell`,
