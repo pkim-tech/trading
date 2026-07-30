@@ -1,5 +1,98 @@
 # Backlog
 
+## ✅ [live-trading][security] Resolved 2026-07-29 — node-level circuit breaker built (monitor-only), the 3rd of 3 deferred design items from 2026-07-28 night
+
+**What**: `schwab_safety.record_node_streak(ticker, account, kind, hit, node_id=None)` tracks two
+independent consecutive-streak counters per watch_list node: `order_failures` (a real placement attempt
+raised `SafetyViolation` or failed at/after the broker) and `reconciliation_mismatches` (a live-state
+reconciliation poll found the broker disagreeing with DB belief for the node's open position). Once a
+streak crosses `NODE_BREAKER_THRESHOLD` (3, user's explicit call) and wasn't already tripped, it logs a
+`node_circuit_breaker_tripped` `coverage_events` row and posts one Slack alert — but never calls the
+existing `pause_node_automation()` itself. Deliberately monitor-only, same phased-rollout rationale as
+`_log_pre_action_state_verification` (2026-07-29, earlier the same day): build the detection first,
+decide an auto-pause policy later once real trip data exists. A clean attempt/poll resets the streak to
+0 and clears any prior trip, so a later real regression can re-alert.
+
+**Wiring**: `order_failures` is fed from all 6 of `schwab_client.py`'s real order-placement functions
+(`_place_equity_order`, `replace_equity_order_with_market`, `_place_trailing_order`,
+`replace_order_with_trailing_sell`, `place_stop_loss`, `replace_order_with_stop_loss` — the initial
+version wired only the first 4, missing exactly the "protective SL placement repeatedly failing" case
+the breaker is most worth having; caught by the 2026-07-30 session-wrap Opus review, see below) — a
+hit on the `SafetyViolation` except path, a hit on any exception
+from the real broker submission/confirm step, a reset on a dry_run pass-through or a confirmed real
+success. `reconciliation_mismatches` is fed from `signals_notify.check_live_state_reconciliation`, one
+hit/clean call per position per poll (not per mismatch-kind, so 3 mismatches found in a single poll
+don't themselves read as a 3-poll streak), respecting the existing coverage-snooze suppression
+(`_alert_reconcile_mismatch` now returns True/False so the caller can tell a real mismatch from a
+snoozed one).
+
+**Session-wrap Sonnet review found and fixed 2 CONFIRMED bugs** in the first version: (1) the
+`order_failures` streak's `hit=False` reset fired unconditionally right after `approve_and_record`
+succeeded, **before** the real broker submission was even attempted — so a genuine string of real
+broker-rejection failures could never actually accumulate past 1 (reset-then-1 every attempt); only the
+pure pre-submission `SafetyViolation` path could build a real streak. Fixed by moving the reset to fire
+only after a confirmed clean outcome (the `dry_run` early-return, or after a successful real
+submission/confirm). (2) `record_node_streak`'s state-file write (`NODE_BREAKER_PATH.write_text`) had no
+exception handling at all, unlike its sibling `NODE_AUTOMATION_PATH`/`TICKER_AUTOMATION_PATH` functions
+in the same file — since this call sits unconditionally in the real order-placement control flow (not
+behind a try/except in `schwab_client.py`), a write failure (disk full, a concurrent-write race between
+the poll loop and the Slack-handler thread — the same known-unlocked pattern the sibling functions
+already have) could have propagated up and aborted an otherwise-approved, legitimate real order. Fixed
+by wrapping the whole function body in the same fire-and-forget try/except contract `log_coverage_event`/
+`get_watch_list_node` already use.
+
+New tests: `tests/test_schwab_safety.py` (4, `order_failures` streak via dry_run `SafetyViolation`
+paths), `tests/test_live_state_reconciliation.py` (3, `reconciliation_mismatches` streak including the
+snooze-respecting case), and a new `tests/test_node_circuit_breaker.py` (2, built specifically to close
+the gap the review found — exercises the real "approve_and_record succeeds, then the broker submission
+itself fails/succeeds" path against `tests/fake_broker.py`'s real order-placement code on the one real
+`dry_run=False` account, `soxl_ira`, not a dry_run shortcut). New `scripts/coverage_registry.py` row
+(`node_circuit_breaker`). Full suite: 330 passed (was 321). `signals_invariants.py`: clean.
+
+**Not built / open**: the tolerance/blocking policy for when (if ever) a trip should escalate beyond
+monitor-only — deliberately deferred, same as `pre_action_state_verification`'s policy question.
+
+**Follow-up, 2026-07-30 — end-of-day report + a real bug the report surfaced**: `signals_notify.
+build_phased_monitors_report(check_date)` reports both features' `coverage_events` for a given day plus
+the current live breaker streak state, wired into `active_signals.py` at a new `_EOD_REPORT_TIME =
+(16, 5)` slot (5 min after market close, once/day, mirroring `_GAP_CHECK_WINDOW`'s scheduling shape) —
+deliberately log-only per explicit user call (`print()`, captured in `logs/active_signals.log`, no
+Slack — this is an after-the-fact review artifact, not a daily notification). `scripts/
+phased_monitors_report.py` is the same logic as an on-demand CLI. An Opus review of the diff (account
+upgraded this session, reverting the 2026-07-27 Sonnet-only budget rule) found and fixed 3 CONFIRMED
+bugs: (1) most severe — `check_live_state_reconciliation`'s `expected_shares is None` branch
+unconditionally called `record_node_streak(hit=False)` even though nothing was actually checked that
+poll (the share compare and both protective-order checks are all gated on `expected_shares is not
+None`), silently resetting (and un-tripping) a genuine in-progress `reconciliation_mismatches` streak
+on any poll where shares happened to be unknown — fixed to just skip recording for that poll; (2) the
+new `eod_report_alerted` set was pre-seeded "already done" on startup if past 16:05, unlike
+`reference_alerted`/`gap_check_alerted` where that pre-seed is justified by an unconditional startup
+call or a bounded window covering the same ground — nothing covered a restart after 16:05 here, so
+that day's report would be silently lost with no trace; fixed by removing the pre-seed (the report is
+a read-only, idempotent log print, so firing once on the next loop iteration after a late restart is
+strictly better than losing it); (3) valid-but-non-dict JSON in the breaker state file (e.g. truncated
+to a bare `3`) raised `AttributeError` outside the existing `JSONDecodeError`/`OSError` handling — fixed
+by validating `isinstance(state, dict)`. 2 new regression tests target these exact failure modes (a
+3rd finding, about `schwab_client.py`'s try-block boundary around order confirmation, was investigated
+and found not to be a real bug on closer read — `_confirm_order_status`/`_post_message` both already
+swallow their own exceptions internally, so the only exceptions that can actually propagate through that
+block are genuine failures: `extract_order_id` failing or a confirmed `OrderRejected`). Full suite: 337
+passed (was 330). `signals_invariants.py`: clean.
+
+**Session-wrap consolidated Opus review (full session diff, all pieces together), 2026-07-30**: found 1
+more CONFIRMED bug the piecemeal reviews above missed by reviewing each piece in isolation —
+`order_failures` was only wired into 4 of `schwab_client.py`'s 6 real order-placement functions,
+missing `place_stop_loss` (genuinely live, reached from `_place_stop_loss_for_position`) and
+`replace_order_with_stop_loss` (reusable infra, not yet auto-called but real). This meant 3 consecutive
+failed/blocked SL placements for a node — arguably the single scenario the breaker is most worth
+having, since it's "position left unprotected" — would never trip. Fixed by wiring both the same
+4-call pattern (SafetyViolation hit=True, dry_run hit=False, submission-exception hit=True, success
+hit=False) already used by the other 4. Also fixed the resulting "all 4" doc-wording inaccuracy in
+`CLAUDE.md`/`scripts/coverage_registry.py` (now correctly "all 6"). Full end-to-end walkthrough of the
+other pieces (all 4 originally-wired functions' hit/reset sequencing, every exit path of
+`check_live_state_reconciliation`, the EOD scheduling block in the context of the full `run_loop`) came
+back clean — no further findings. Full suite still 337 passed after the fix (verified before and after).
+
 ## ✅ [live-trading][security] Resolved 2026-07-29 — SH's TIME-while-armed stuck-exit bug fixed; fake-broker test tier built; running_low staleness for real trailing-buys fixed; canary A-F design restored
 
 **The incident**: SH (real position, `soxl_ira`) sat with an automated exit stuck for hours despite

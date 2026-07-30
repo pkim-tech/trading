@@ -376,6 +376,38 @@ REGISTRY = [
                "class of gap going forward. 'no_delivery_confirmation' covers both a real send failure and "
                "any non-Socket-Mode delivery path (webhook/console) that can't confirm delivery -- "
                "deliberately not counted as proof of success."),
+    dict(id='node_circuit_breaker',
+         scenario="Node-level circuit breaker trips on 3 consecutive real order failures/blocks or "
+                  "3 consecutive live-state reconciliation mismatches for the same node",
+         code_path="schwab_safety.record_node_streak (called from schwab_client.py's 6 real placement "
+                    "functions, incl. place_stop_loss/replace_order_with_stop_loss -- missing from the "
+                    "first version, caught by the 2026-07-30 session-wrap review -- and "
+                    "signals_notify.check_live_state_reconciliation)",
+         offline_coverage="tests/test_schwab_safety.py: test_order_failure_streak_trips_circuit_breaker_"
+                           "after_threshold/does_not_trip_below_threshold/resets_on_a_clean_attempt/"
+                           "noop_for_unresolvable_node; tests/test_live_state_reconciliation.py: "
+                           "test_reconciliation_mismatch_streak_trips_breaker_after_threshold/"
+                           "resets_on_a_clean_poll; test_snoozed_mismatch_does_not_feed_the_breaker_streak; "
+                           "tests/test_node_circuit_breaker.py (fake_broker-driven: a real post-approval "
+                           "broker submission failure/success against tests/fake_broker.py, not a dry_run "
+                           "or mocked-function shortcut)",
+         check_mechanism='coverage_events', scenario_key='node_circuit_breaker_tripped',
+         bad_results=[],
+         notes="Built 2026-07-29 (the 3rd of 3 deferred design items from 2026-07-28 night, monitor-only "
+               "per explicit user call -- same phased-rollout rationale as pre_action_state_verification: "
+               "logs+alerts on a trip, never calls pause_node_automation() itself. bad_results left empty "
+               "since 'tripped' is the interesting signal to review, not a failure of the check itself. "
+               "A same-session Sonnet review round found and fixed 2 CONFIRMED bugs in the first version: "
+               "(1) the order_failures streak's hit=False reset fired unconditionally right after "
+               "approve_and_record succeeded, BEFORE the real broker submission was attempted -- so a "
+               "genuine broker-rejection streak could never accumulate, only pure pre-submission "
+               "SafetyViolation blocks could; fixed by moving the reset to fire only after a confirmed "
+               "clean outcome (dry_run pass-through or real submission success); (2) record_node_streak's "
+               "state-file write had no exception handling, unlike its sibling NODE_AUTOMATION_PATH/ "
+               "TICKER_AUTOMATION_PATH functions -- since this call sits unconditionally in the real "
+               "order-placement control flow, a write failure (disk full, a concurrent-write race) could "
+               "have propagated up and aborted an otherwise-approved real order; fixed by wrapping the "
+               "whole function body in the same fire-and-forget try/except contract as log_coverage_event."),
 ]
 
 

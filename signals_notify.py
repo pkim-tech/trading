@@ -266,10 +266,16 @@ def _alert_reconcile_mismatch(pos, kind, text):
     while snoozed, rather than just the alert, so the accountability grid's
     daily/all-time counts aren't inflated by a condition someone already
     explained. Time-bounded by design: the snooze expires and resumes
-    alerting rather than silencing the scenario forever."""
+    alerting rather than silencing the scenario forever.
+
+    Returns True if this was a real (non-snoozed) mismatch -- used by
+    check_live_state_reconciliation to feed the node-level circuit breaker's
+    reconciliation_mismatches streak, which should reflect true state, not
+    alert-cooldown noise, but should still respect a human-acknowledged
+    snooze the same way the alert/log do."""
     if db.is_snoozed("reconciliation_mismatch", ticker=pos.get('ticker'),
                       account=pos.get('account'), node_id=pos.get('wl_id'), kind=kind):
-        return
+        return False
     db.log_coverage_event(
         "reconciliation_mismatch", _coverage_mode(pos.get('account')),
         ticker=pos.get('ticker'), position_id=pos.get('id'),
@@ -278,9 +284,10 @@ def _alert_reconcile_mismatch(pos, kind, text):
     key = f"{pos['id']}:{kind}"
     last = _RECONCILE_ALERTED.get(key, 0)
     if time.time() - last < _RECONCILE_COOLDOWN_SECS:
-        return
+        return True
     _RECONCILE_ALERTED[key] = time.time()
     _post_message(text)
+    return True
 
 
 _STALE_PRICE_ALERTED: dict[str, float] = {}
@@ -321,6 +328,12 @@ def check_live_state_reconciliation(open_positions):
         position size)
       - missing protective order (expected resting SL pre-arm, or resting
         trailing-sell post-arm, isn't actually resting at the broker)
+
+    Each position also feeds schwab_safety.record_node_streak's
+    reconciliation_mismatches streak (2026-07-29, monitor-only node-level
+    circuit breaker) -- one hit/clean call per position per poll, not per
+    mismatch-kind, so 3 mismatches found in a single poll don't themselves
+    count as a 3-poll streak.
 
     Deliberately detection/alert-only -- never executes a remediation itself,
     matches the explicit user call that an auto-correcting version would be a
@@ -369,9 +382,10 @@ def check_live_state_reconciliation(open_positions):
             print(f"  [reconcile] {ticker}: fetch failed, skipping this cycle: {e}")
             continue
 
+        mismatch_found = False
         expected_shares = pos.get('shares')
         if expected_shares is not None and real_shares != expected_shares:
-            _alert_reconcile_mismatch(
+            mismatch_found |= _alert_reconcile_mismatch(
                 pos, "shares",
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) live-state mismatch: `open_positions` tracks "
                 f"{expected_shares:g} shares, broker shows {real_shares:g} — broker is ground "
@@ -385,21 +399,32 @@ def check_live_state_reconciliation(open_positions):
             for o in orders for leg in o.get('orderLegCollection', [])
         )
         if expected_shares is None:
+            # Nothing was actually checked for this position this poll (the
+            # share compare above is skipped, and so are the protective-order
+            # checks below) -- must not record a streak outcome either way.
+            # Found by Opus review 2026-07-30: mismatch_found is unconditionally
+            # False in this branch (the only check that could have set it is
+            # gated on expected_shares is not None), so this used to always
+            # record a fabricated hit=False "clean poll," silently resetting
+            # (and un-tripping) a genuine in-progress mismatch streak on any
+            # poll where shares happened to be unknown.
             continue
         if state.get('trailing') and state.get('order_placed') and not has_sell_order:
-            _alert_reconcile_mismatch(
+            mismatch_found |= _alert_reconcile_mismatch(
                 pos, "missing_trailing_sell",
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) live-state mismatch: trailing-sell marked placed but "
                 f"no resting SELL order found at the broker — position may be unprotected; "
                 f"suggested fix: place a trailing-sell order for {expected_shares:g} shares now"
             )
         elif not state.get('trailing') and pos.get('sl_order_id') and not has_sell_order:
-            _alert_reconcile_mismatch(
+            mismatch_found |= _alert_reconcile_mismatch(
                 pos, "missing_sl",
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) live-state mismatch: SL order id {pos['sl_order_id']} "
                 f"is recorded but no resting SELL order found at the broker — position may be "
                 f"unprotected; suggested fix: place a stop-loss order for {expected_shares:g} shares now"
             )
+        schwab_safety.record_node_streak(
+            ticker, account, "reconciliation_mismatches", hit=mismatch_found, node_id=_node_id)
 
 
 def _attempt_automated_market_buy(node, sizing):
@@ -2146,6 +2171,80 @@ def send_coverage_report(check_date=None):
         lines.append(f"{status}  {r['scenario_key']}  ({r['ticker'] or ''})")
 
     return _post_message("\n".join(lines))
+
+
+def build_phased_monitors_report(check_date):
+    """End-of-day plain-text report for the two monitor-only, detection-first
+    checks built 2026-07-29 -- schwab_safety._log_pre_action_state_verification
+    and schwab_safety.record_node_streak (the node-level circuit breaker).
+    Both are deliberately pure logging/alerting with their tolerance/blocking
+    policy explicitly deferred until real data accumulates -- this is that
+    data. check_date is a 'YYYY-MM-DD' string, compared against
+    date(ts, 'localtime') (same convention as coverage_check.py's
+    _check_coverage_event, avoiding the UTC-vs-ET offset bug class).
+
+    Log-only by design (2026-07-30 user call): run_loop prints the returned
+    string to stdout at the daily EOD slot -- captured in
+    logs/active_signals.log the same way every other daemon print already is
+    -- rather than posting to Slack, since this is meant as an after-the-fact
+    review artifact, not a daily notification."""
+    lines = [f"=== Phased monitors report: {check_date} ==="]
+
+    with db._conn() as c:
+        pav_rows = [dict(r) for r in c.execute(
+            "SELECT * FROM coverage_events WHERE scenario_key = 'pre_action_state_verification' "
+            "AND date(ts, 'localtime') = ? ORDER BY ts", (check_date,)
+        ).fetchall()]
+    lines.append("\n-- pre_action_state_verification --")
+    if not pav_rows:
+        lines.append("No events (no real BUY/SELL was considered).")
+    else:
+        counts = {}
+        for r in pav_rows:
+            counts[r['result']] = counts.get(r['result'], 0) + 1
+        lines.append(f"{len(pav_rows)} total: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+        for r in pav_rows:
+            if r['result'] != 'match':
+                lines.append(f"  [{r['ts']}] {r['ticker']} node={r['node_id']} result={r['result']} -- {r['detail']}")
+
+    with db._conn() as c:
+        trip_rows = [dict(r) for r in c.execute(
+            "SELECT * FROM coverage_events WHERE scenario_key = 'node_circuit_breaker_tripped' "
+            "AND date(ts, 'localtime') = ? ORDER BY ts", (check_date,)
+        ).fetchall()]
+    lines.append("\n-- node_circuit_breaker_tripped --")
+    if not trip_rows:
+        lines.append("No trips.")
+    else:
+        for r in trip_rows:
+            lines.append(f"  [{r['ts']}] {r['ticker']} node={r['node_id']} mode={r['mode']} -- {r['detail']}")
+
+    lines.append("\n-- current live streak state (not date-scoped) --")
+    if not schwab_safety.NODE_BREAKER_PATH.exists():
+        lines.append("No breaker state file yet.")
+    else:
+        try:
+            state = json.loads(schwab_safety.NODE_BREAKER_PATH.read_text())
+            if not isinstance(state, dict):
+                raise ValueError(f"expected a dict, got {type(state).__name__}")
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            state = None
+            lines.append(f"Could not read breaker state file: {e}")
+        if state is not None:
+            any_nonzero = False
+            for node_id, node_state in state.items():
+                node = db.get_watch_list_node_by_id(int(node_id))
+                label = f"{node['ticker']} ({node.get('account')})" if node else f"node id={node_id} (not found)"
+                for kind in ("order_failures", "reconciliation_mismatches"):
+                    streak = node_state.get(f"{kind}_streak", 0)
+                    if streak:
+                        any_nonzero = True
+                        flag = " [TRIPPED]" if node_state.get(f"{kind}_tripped") else ""
+                        lines.append(f"  {label}: {kind} streak={streak}/{schwab_safety.NODE_BREAKER_THRESHOLD}{flag}")
+            if not any_nonzero:
+                lines.append("Every tracked node is at a clean 0 streak on both counters.")
+
+    return "\n".join(lines)
 
 
 def send_reference_report(watchlist):

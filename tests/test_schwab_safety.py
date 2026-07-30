@@ -35,6 +35,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'KILL_SWITCH_PATH', tmp_path / "schwab_kill_switch.json")
     monkeypatch.setattr(schwab_safety, 'TICKER_AUTOMATION_PATH', tmp_path / "schwab_ticker_automation.json")
     monkeypatch.setattr(schwab_safety, 'NODE_AUTOMATION_PATH', tmp_path / "schwab_node_automation.json")
+    monkeypatch.setattr(schwab_safety, 'NODE_BREAKER_PATH', tmp_path / "schwab_node_breaker_state.json")
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
     monkeypatch.setattr(schwab_safety, '_now', lambda: _IN_WINDOW_TIME)
     monkeypatch.setattr(schwab_client, '_post_message', lambda *a, **kw: (None, None))
@@ -201,6 +202,57 @@ def test_node_automation_resume_unblocks(env):
     schwab_safety.resume_node_automation(node['id'])
     result = schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
     assert result == (None, None)  # dry_run -- not blocked once resumed
+
+
+def test_order_failure_streak_trips_circuit_breaker_after_threshold(env, monkeypatch):
+    # Node-level circuit breaker (monitor-only, docs/backlog_cache.md's
+    # "node-level auto-pause circuit breaker" item): 3 consecutive real
+    # order-placement failures/blocks for the same node should log a
+    # node_circuit_breaker_tripped event and post one Slack alert -- but
+    # never actually pause the node (still resolvable/orderable afterward).
+    monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 7, 15, 12, 0))  # outside signal window
+    for _ in range(3):
+        with pytest.raises(schwab_safety.SafetyViolation, match="outside signal windows"):
+            schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    trips = signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped')
+    assert len(trips) == 1
+    assert trips[0]['ticker'] == TICKER
+    assert trips[0]['result'] == 'tripped'
+    assert 'order_failures' in trips[0]['detail']
+    node = _get_node()
+    assert schwab_safety.node_automation_enabled(node['id'])  # monitor-only -- never paused
+
+
+def test_order_failure_streak_does_not_trip_below_threshold(env, monkeypatch):
+    monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 7, 15, 12, 0))
+    for _ in range(2):
+        with pytest.raises(schwab_safety.SafetyViolation):
+            schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    assert signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped') == []
+
+
+def test_order_failure_streak_resets_on_a_clean_attempt(env, monkeypatch):
+    monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 7, 15, 12, 0))
+    for _ in range(2):
+        with pytest.raises(schwab_safety.SafetyViolation):
+            schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    monkeypatch.setattr(schwab_safety, '_now', lambda: _IN_WINDOW_TIME)  # clean attempt, in-window
+    schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 7, 15, 12, 0))
+    for _ in range(2):
+        with pytest.raises(schwab_safety.SafetyViolation):
+            schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    assert signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped') == []
+
+
+def test_order_failure_streak_noop_for_unresolvable_node(env, monkeypatch):
+    # ticker+account that resolves no real watch_list node (wrong-account
+    # blocks resolve before node lookup would even matter) -- must not raise.
+    monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 7, 15, 12, 0))
+    for _ in range(3):
+        with pytest.raises(schwab_safety.SafetyViolation):
+            schwab_client.place_equity_buy('brokerage', TICKER, 5, 50.0)
+    assert signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped') == []
 
 
 def test_node_level_automation_pause_does_not_block_sibling_node_other_account(env):
@@ -589,6 +641,36 @@ def test_protective_stop_loss_bypasses_exhausted_daily_cap(env, monkeypatch):
         schwab_client.place_equity_buy('ira', TICKER, 50, 50.0)  # qty far outside dup-order tolerance
     result = schwab_client.place_stop_loss('ira', TICKER, 20, 45.0)  # qty far outside dup-order tolerance
     assert result == (None, None)  # dry_run -- not blocked
+
+
+def test_stop_loss_placement_feeds_the_order_failures_breaker_streak(env, monkeypatch):
+    # Session-wrap Opus review, 2026-07-30: place_stop_loss/replace_order_with_
+    # stop_loss were the 2 of schwab_client.py's 6 real order-placement
+    # functions NOT wired into record_node_streak in the original version --
+    # meaning 3 consecutive failed/blocked SL placements (a position left
+    # unprotected, arguably the scenario the breaker is most worth having)
+    # would never trip. Confirms both are now wired the same way as the other 4.
+    # SL is a SELL order, not gated by the BUY-only signal-window check.
+    # Keep account='ira' (matches the real node, so record_node_streak's
+    # ticker+account node lookup still resolves) but disable it -- a
+    # repeatable, side-agnostic block.
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'enabled', False)
+    for _ in range(3):
+        with pytest.raises(schwab_safety.SafetyViolation, match="is disabled"):
+            schwab_client.place_stop_loss('ira', TICKER, 5, 45.0)
+    trips = signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped')
+    assert len(trips) == 1
+    assert 'order_failures' in trips[0]['detail']
+
+
+def test_replace_with_stop_loss_feeds_the_order_failures_breaker_streak(env, monkeypatch):
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'enabled', False)
+    for _ in range(3):
+        with pytest.raises(schwab_safety.SafetyViolation, match="is disabled"):
+            schwab_client.replace_order_with_stop_loss('ira', TICKER, 12345, 5, 45.0)
+    trips = signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped')
+    assert len(trips) == 1
+    assert 'order_failures' in trips[0]['detail']
 
 
 def test_protective_top_up_bypasses_exhausted_daily_cap(env, monkeypatch):

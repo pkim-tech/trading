@@ -5083,3 +5083,55 @@ time.
 **Still open**: JDST's purpose; GDXD missing from the active watchlist (not restored, no user
 direction); node-level auto-pause circuit breaker (3rd deferred design item from 2026-07-28, not
 started); pre-action-verification's tolerance/blocking policy decision.
+
+---
+
+## 2026-07-30 — Node-level circuit breaker + end-of-day phased-monitors report, monitor-only
+
+Built the node-level circuit breaker (monitor-only, the 3rd of 3 deferred design items from
+2026-07-28 night — the other 2, `tests/fake_broker.py` and `_log_pre_action_state_verification`,
+landed 2026-07-29). `schwab_safety.record_node_streak(ticker, account, kind, hit, node_id=None)`
+tracks two independent consecutive-streak counters per `watch_list` node — `order_failures` and
+`reconciliation_mismatches` — and once a streak crosses `NODE_BREAKER_THRESHOLD` (3, user's call),
+logs `node_circuit_breaker_tripped` to `coverage_events` and posts one Slack alert, but never calls
+the existing `pause_node_automation()`. `order_failures` is fed from all 6 of `schwab_client.py`'s
+real order-placement functions; `reconciliation_mismatches` from `signals_notify.
+check_live_state_reconciliation`, one hit/clean call per position per poll, respecting existing
+coverage-snoozes.
+
+Built an end-of-day report on top of it: `signals_notify.build_phased_monitors_report(check_date)`
+summarizes both this feature and yesterday's `pre_action_state_verification` for a given day, plus
+the current live streak state. Wired into `active_signals.py` at a new daily `_EOD_REPORT_TIME =
+(16, 5)` slot — deliberately log-only (`print()`, captured in `logs/active_signals.log`), not Slack,
+per explicit user call: this is an after-the-fact review artifact, not a daily notification.
+`scripts/phased_monitors_report.py` is the same logic as an on-demand CLI.
+
+**Three review rounds, each catching real bugs** (account was upgraded mid-session, reverting the
+2026-07-27 Sonnet-only budget rule back to Opus for `session wrap`):
+1. Sonnet review of the circuit breaker's first version: the `order_failures` reset fired before a
+   real broker submission was even attempted (so a genuine broker-rejection streak could never
+   accumulate), and the state-file write had no exception handling despite sitting unconditionally in
+   the real order-placement control flow. Both fixed; closed with a new `tests/
+   test_node_circuit_breaker.py` exercising a real post-approval broker failure/success against
+   `tests/fake_broker.py`.
+2. Opus review of the EOD-report piece: `check_live_state_reconciliation`'s `expected_shares is None`
+   branch was unconditionally recording a fabricated "clean" streak reset even though nothing was
+   actually checked that poll — silently wiping a genuine in-progress mismatch streak; the new
+   `eod_report_alerted` scheduling set was pre-seeded "already done" on a late restart unlike its
+   siblings, silently losing that day's report with no trace; and non-dict JSON in the breaker state
+   file could crash the report outside existing exception handling. All 3 fixed.
+3. Session-wrap consolidated Opus review of the full diff: found `order_failures` was only wired into
+   4 of `schwab_client.py`'s 6 real order-placement functions, missing `place_stop_loss`/
+   `replace_order_with_stop_loss` — exactly the "position left unprotected" scenario the breaker is
+   most worth having. Fixed (same 4-call pattern as the other 4), plus corrected the resulting "all 4"
+   wording in `CLAUDE.md`/`docs/deep_backlog.md`/`scripts/coverage_registry.py`. Full end-to-end
+   walkthrough of every other piece came back clean.
+
+Full suite: 339 passed (was 321 at session start). `live_sim_harness.py`: 7/7. `signals_invariants.py`:
+clean. `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` (AGQ, SOXL): clean, no
+mismatches.
+
+**Not built / open**: the tolerance/blocking policy for whether either monitor-only check should ever
+escalate beyond logging+alerting — deliberately deferred until real trip/mismatch data accumulates.
+JDST's undefined purpose and GDXD's watchlist absence (both from 2026-07-29) remain open, untouched
+this session.

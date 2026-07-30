@@ -27,6 +27,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))
     monkeypatch.setattr(signals_config, 'RESEARCH_DB_PATH', tmp_path / "no_such_research.db")
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
+    monkeypatch.setattr(schwab_safety, 'NODE_BREAKER_PATH', tmp_path / "schwab_node_breaker_state.json")
     posted = []
     monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: posted.append(a[0] if a else kw.get('text')))
     signals_notify._RECONCILE_ALERTED.clear()
@@ -208,6 +209,84 @@ def test_no_false_mismatch_for_a_position_already_closed_this_cycle(env, monkeyp
     monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
     signals_notify.check_live_state_reconciliation([pos])  # still the stale, now-closed row
     assert env == []
+
+
+def test_reconciliation_mismatch_streak_trips_breaker_after_threshold(env, monkeypatch):
+    # Node-level circuit breaker (monitor-only, docs/backlog_cache.md's
+    # "node-level auto-pause circuit breaker" item): 3 consecutive
+    # reconciliation-mismatch polls for the same node should log a
+    # node_circuit_breaker_tripped event, without pausing anything.
+    pos = _open_pos(shares=100)
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 80.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    for _ in range(3):
+        signals_notify._RECONCILE_ALERTED.clear()  # bypass the 15-min alert cooldown between polls
+        signals_notify.check_live_state_reconciliation([pos])
+    trips = signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped')
+    assert len(trips) == 1
+    assert trips[0]['ticker'] == TICKER
+    assert 'reconciliation_mismatches' in trips[0]['detail']
+
+
+def test_reconciliation_mismatch_streak_resets_on_a_clean_poll(env, monkeypatch):
+    pos = _open_pos(shares=100)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 80.0)
+    signals_notify._RECONCILE_ALERTED.clear()
+    signals_notify.check_live_state_reconciliation([pos])
+    signals_notify._RECONCILE_ALERTED.clear()
+    signals_notify.check_live_state_reconciliation([pos])
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 100.0)  # clean poll
+    signals_notify.check_live_state_reconciliation([pos])
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 80.0)
+    signals_notify._RECONCILE_ALERTED.clear()
+    signals_notify.check_live_state_reconciliation([pos])
+    signals_notify._RECONCILE_ALERTED.clear()
+    signals_notify.check_live_state_reconciliation([pos])
+    assert signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped') == []
+
+
+def test_a_position_with_unknown_shares_does_not_reset_an_in_progress_streak(env, monkeypatch):
+    # Opus review, 2026-07-30: check_live_state_reconciliation's expected_shares
+    # is None branch used to unconditionally call record_node_streak(hit=False)
+    # -- nothing was actually checked for that poll (the shares compare above
+    # is gated on expected_shares is not None, and the protective-order checks
+    # below never run either), so this was recording a fabricated "clean poll"
+    # that silently wiped a genuine in-progress mismatch streak. Fixed to just
+    # `continue` without recording anything for that poll.
+    pos = _open_pos(shares=100)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 80.0)
+    for _ in range(2):
+        signals_notify._RECONCILE_ALERTED.clear()
+        signals_notify.check_live_state_reconciliation([pos])
+
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET shares = NULL WHERE id = ?", (pos['id'],))
+        c.commit()
+    unknown_shares_pos = signals_db.get_open_position(TICKER)
+    signals_notify.check_live_state_reconciliation([unknown_shares_pos])
+    assert signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped') == []
+
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET shares = 100 WHERE id = ?", (pos['id'],))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    signals_notify._RECONCILE_ALERTED.clear()
+    signals_notify.check_live_state_reconciliation([pos])  # the 3rd real mismatch -- should trip
+    trips = signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped')
+    assert len(trips) == 1
+
+
+def test_snoozed_mismatch_does_not_feed_the_breaker_streak(env, monkeypatch):
+    pos = _open_pos(shares=100)
+    signals_db.snooze_coverage('reconciliation_mismatch', '2099-01-01 00:00:00',
+                                'known accepted test position', ticker=TICKER)
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 80.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    for _ in range(3):
+        signals_notify.check_live_state_reconciliation([pos])
+    assert signals_db.get_coverage_events(scenario_key='node_circuit_breaker_tripped') == []
 
 
 def test_reconciliation_mismatch_event_records_the_real_numbers(env, monkeypatch):

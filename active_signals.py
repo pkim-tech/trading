@@ -95,7 +95,7 @@ from signals_notify import (
     check_live_state_reconciliation, alert_stale_price_exit_suppressed,
     _ticker_block, _send_window_alert, _coverage_mode,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
-    send_reference_report, send_coverage_report,
+    send_reference_report, send_coverage_report, build_phased_monitors_report,
     update_dry_run_buys, update_real_pending_buys_running_low, check_dry_run_sim_sells,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
@@ -140,6 +140,16 @@ _PINNED_OPEN_TIMES = {(9, 30), (14, 30)}
 # moments an action is most likely to be required. Also fires unconditionally
 # on daemon startup/restart, independent of this schedule.
 _REFERENCE_TIMES = [(7, 0), (9, 20), (15, 20)]
+
+# End-of-day phased-monitors report (2026-07-30) -- 5 min after the 16:00
+# market close, checking TODAY (unlike the 7am coverage report, which checks
+# the previous trading day) since pre_action_state_verification/the node
+# circuit breaker only accumulate real data during today's own trading.
+# Log-only by explicit user call: printed to stdout (captured in
+# logs/active_signals.log the same way every other daemon print already is),
+# not posted to Slack -- an after-the-fact review artifact, not a daily
+# notification.
+_EOD_REPORT_TIME = (16, 5)
 
 # Coverage report only fires at the 7am slot -- it's the "ready to run" gate
 # checking the previous trading day's results before today's signal windows
@@ -590,6 +600,15 @@ def run_loop(tickers: set = None):
     }
     _gap_h1, _gap_m1 = _GAP_CHECK_WINDOW[2], _GAP_CHECK_WINDOW[3]
     gap_check_alerted: set[str] = {last_date} if (_now0.hour, _now0.minute) >= (_gap_h1, _gap_m1) else set()
+    # Deliberately NOT pre-seeded like gap_check_alerted/reference_alerted above
+    # -- those are pre-seeded because an unconditional startup call (the
+    # reference report) or a bounded window (the gap check) already covers a
+    # restart after that slot, so re-running would be redundant/wrong. Nothing
+    # covers a restart after 16:05 the same way (Opus review, 2026-07-30) --
+    # this report is a read-only, idempotent log print (no Slack, no side
+    # effects), so letting it fire once on the very next loop iteration after
+    # a late restart is strictly better than silently losing that day's report.
+    eod_report_alerted: set[str] = set()
     pinned_bar_alerted: set[tuple] = {
         (last_date, h, m) for h, m, s in _PINNED_BAR_TIMES
         if (_now0.hour, _now0.minute) >= (h, m)
@@ -613,6 +632,7 @@ def run_loop(tickers: set = None):
                 reference_alerted.clear()
                 gap_check_alerted.clear()
                 pinned_bar_alerted.clear()
+                eod_report_alerted.clear()
                 last_date = today
 
             for rh, rm in _REFERENCE_TIMES:
@@ -642,6 +662,13 @@ def run_loop(tickers: set = None):
             if (gap_h0, gap_m0) <= (now.hour, now.minute) <= (gap_h1, gap_m1) and today not in gap_check_alerted:
                 gap_check_alerted.add(today)
                 _guarded("gap_resize", check_gap_resize)
+
+            if (now.hour, now.minute) >= _EOD_REPORT_TIME and today not in eod_report_alerted:
+                eod_report_alerted.add(today)
+
+                def _print_eod_report():
+                    print(build_phased_monitors_report(today))
+                _guarded("eod_phased_monitors_report", _print_eod_report)
 
             watchlist = get_watchlist()
             if tickers:

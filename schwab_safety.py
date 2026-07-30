@@ -370,6 +370,86 @@ def resume_node_automation(node_id):
     NODE_AUTOMATION_PATH.write_text(json.dumps(state))
 
 
+NODE_BREAKER_PATH = _STATE_DIR / "schwab_node_breaker_state.json"
+NODE_BREAKER_THRESHOLD = 3
+
+
+def record_node_streak(ticker: str, account: str, kind: str, hit: bool, node_id=None):
+    """Monitor-only node-level circuit breaker (docs/backlog_cache.md's
+    'node-level auto-pause circuit breaker' item, the 3rd of 3 deferred
+    design items from 2026-07-28 night). Tracks a consecutive hit/clean
+    streak per (node, kind) and, once a streak crosses NODE_BREAKER_THRESHOLD,
+    logs a coverage_event and posts one Slack alert -- but never calls
+    pause_node_automation() itself. Deliberately phased: same rationale as
+    _log_pre_action_state_verification (build the detection first, decide an
+    auto-pause policy later once real trip data exists).
+
+    kind is 'order_failures' (a real placement attempt raised SafetyViolation
+    or failed at/after the broker) or 'reconciliation_mismatches' (a live-state
+    reconciliation poll found the broker disagreeing with DB belief for this
+    node's open position). hit=True extends the streak; hit=False (a clean
+    attempt/poll) resets it to 0 and clears any prior trip, so a later real
+    regression can re-alert instead of being permanently silenced by one old
+    trip.
+
+    node_id, if the caller already has it (e.g. an open position's wl_id),
+    is used directly -- more precise than re-deriving it. Otherwise resolved
+    via the same best-effort ticker+account lookup check_order uses, and
+    silently no-ops if ambiguous/unresolvable, the same limitation
+    node_automation_enabled already has.
+
+    Fire-and-forget, like log_coverage_event/get_watch_list_node -- this is a
+    pure side-channel monitor sitting directly in schwab_client.py's real
+    order-placement control flow (an unconditional call between the safety
+    check and the dry_run branch), so a state-file write failure (disk full,
+    a concurrent-write race with the poll loop/Slack-handler thread, same
+    unlocked-file pattern as NODE_AUTOMATION_PATH/TICKER_AUTOMATION_PATH)
+    must never propagate and abort an otherwise-approved real order."""
+    try:
+        if node_id is None:
+            node = signals_db.get_watch_list_node(ticker=ticker, account=account)
+            node_id = node['id'] if node else None
+        if node_id is None:
+            return
+        state = {}
+        if NODE_BREAKER_PATH.exists():
+            try:
+                state = json.loads(NODE_BREAKER_PATH.read_text())
+            except (json.JSONDecodeError, OSError):
+                state = {}
+        node_state = state.setdefault(str(node_id), {})
+        count_key = f"{kind}_streak"
+        tripped_key = f"{kind}_tripped"
+        just_tripped = False
+        if hit:
+            node_state[count_key] = node_state.get(count_key, 0) + 1
+            if node_state[count_key] >= NODE_BREAKER_THRESHOLD and not node_state.get(tripped_key):
+                node_state[tripped_key] = True
+                just_tripped = True
+        else:
+            node_state[count_key] = 0
+            node_state[tripped_key] = False
+        NODE_BREAKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        NODE_BREAKER_PATH.write_text(json.dumps(state))
+
+        if just_tripped:
+            limits = ACCOUNTS.get(account)
+            _mode = "live" if (limits and not limits.dry_run) else "dry_run"
+            signals_db.log_coverage_event(
+                "node_circuit_breaker_tripped", _mode, ticker=ticker, node_id=node_id,
+                result="tripped", detail=f"kind={kind} streak={node_state[count_key]}"
+            )
+            import schwab_client  # local import: schwab_client imports this module at load time
+            from signals_helpers import mode_tag  # local import: signals_helpers imports this module at load time
+            schwab_client._post_message(
+                f"\U0001F6A8 *{ticker}* ({account} · {mode_tag(account)}) node id={node_id} circuit breaker "
+                f"TRIPPED: {node_state[count_key]} consecutive {kind.replace('_', ' ')} — "
+                f"monitor-only, automation NOT paused. Worth a look before it repeats."
+            )
+    except Exception:
+        pass
+
+
 def auto_fill_detection_enabled(ticker: str) -> bool:
     """False unless a persisted per-ticker override has explicitly enabled it --
     opposite default from ticker_automation_enabled (see AUTO_FILL_DETECTION_PATH

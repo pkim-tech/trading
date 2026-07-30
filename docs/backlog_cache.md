@@ -7,8 +7,8 @@
 > living reference, not an ever-growing changelog. Caught live after this got violated twice in
 > one sitting (once here, once in CLAUDE.md) before being fixed.
 
-## [live-trading][security] Resolved 2026-07-29 — 2 of the 3 deferred design items from 2026-07-28 (night) built: stateful fake order-book test fixture (`tests/fake_broker.py`) and pre-action live-state verification (`schwab_safety._log_pre_action_state_verification`, detection-only). Full detail: `docs/deep_backlog.md`'s 2026-07-29 entry.
-**Still open**: node-level auto-pause circuit breaker (3rd item, not started); pre-action verification's tolerance/blocking policy (currently pure logging — decide once real `coverage_events` data accumulates, per user's explicit phased-rollout call).
+## [live-trading][security] Resolved 2026-07-29 — all 3 deferred design items from 2026-07-28 (night) now built: stateful fake order-book test fixture (`tests/fake_broker.py`), pre-action live-state verification (`schwab_safety._log_pre_action_state_verification`, detection-only), and a node-level circuit breaker (`schwab_safety.record_node_streak`, monitor-only). Full detail: `docs/deep_backlog.md`'s 2026-07-29 entries (top two).
+**Still open**: both new checks' tolerance/blocking policy (currently pure logging/alerting — decide once real trip data accumulates, per user's explicit phased-rollout call).
 
 ## [live-trading][coverage] Open, raised 2026-07-29 — JDST has no defined test purpose
 Was slated to pair with JNUG for Cluster A (two-accounts-same-ticker coverage), but JNUG was
