@@ -58,11 +58,20 @@ from scripts.coverage_registry import REGISTRY
 # Demoted from an earlier version of this script that had it in
 # DAILY_EXPECTED_IDS on that wrong premise.
 #
-# CAVEAT, not yet acted on: live_state_reconciliation_mismatch's own "daily"
-# reliability is itself driven entirely by UDOW's deliberately-seeded stale
+# Fixed 2026-07-30: the caveat below came true -- UDOW's stale test position
+# (the sole reason live_state_reconciliation_mismatch was empirically daily)
+# was retroactively closed 2026-07-28 evening, and it produced zero
+# coverage_events on 2026-07-29, correctly, since there's no longer a daily
+# mismatch generator. Demoted from DAILY_EXPECTED_IDS -- seeded below with
+# freq='informational' (still checked/printed every day, just never mints a
+# ticket) instead of OCCASIONAL_IDS (which wouldn't be checked/shown at all)
+# since the user wants to keep seeing this row's status daily.
+#
+# CAVEAT (historical, now resolved): live_state_reconciliation_mismatch's own
+# "daily" reliability was driven entirely by UDOW's deliberately-seeded stale
 # fake position (the known accepted signals_invariants violation) -- the day
-# that test position is cleaned up, this row becomes trade-conditional too
-# and would need demoting the same way. Revisit when that backlog item closes.
+# that test position was cleaned up, this row became trade-conditional too
+# and needed demoting the same way.
 #
 # The rest stay tracked by the Trade-Flow Accountability Grid's all-time
 # compute_status() (pages/14_Coverage.py) instead -- "has this ever worked,"
@@ -71,7 +80,13 @@ from scripts.coverage_registry import REGISTRY
 # scripts/coverage_matrix.py, don't assume from the code path alone -- that's
 # exactly the mistake that put cash_check here originally) shows it firing
 # reliably.
-DAILY_EXPECTED_IDS = [
+DAILY_EXPECTED_IDS = []
+
+# Checked and printed every day like DAILY_EXPECTED_IDS, but a miss never
+# mints a coverage_deviations ticket -- for rows whose own trigger condition
+# is trade-conditional, so the user still wants daily visibility without a
+# false ticket on a day the condition simply didn't fire.
+INFORMATIONAL_IDS = [
     'live_state_reconciliation_mismatch',
 ]
 
@@ -94,7 +109,7 @@ OCCASIONAL_IDS = [
 if __name__ == '__main__':
     db.ensure_tables()
     by_id = {r['id']: r for r in REGISTRY}
-    for freq, ids in (('daily', DAILY_EXPECTED_IDS), ('occasional', OCCASIONAL_IDS)):
+    for freq, ids in (('daily', DAILY_EXPECTED_IDS), ('informational', INFORMATIONAL_IDS), ('occasional', OCCASIONAL_IDS)):
         for rid in ids:
             row = by_id[rid]
             assert row['check_mechanism'] == 'coverage_events', (

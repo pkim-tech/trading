@@ -18,6 +18,18 @@ written to trade_log.exit_reason (reason in ('WIN','LOSS') -> 'TRAIL'). The
 real column value is always 'TRAIL', never 'WIN'/'LOSS', so these three
 scenarios could never pass as originally written -- caught via 3 real
 unexplained coverage_deviations (ids 41-43, 2026-07-28).
+
+Fixed 2026-07-30: canary_pinned_entry (IWM) and canary_time_exit (XLF) demoted
+from 'daily' to 'informational' -- unlike the other 4 canaries (arm/trail
+thresholds set hair-trigger so entry+exit fires essentially every session),
+IWM's entry-to-exit cycle can legitimately span >1 day (real hold reaching
+30+h against a 48h max) and XLF's own entry trigger isn't guaranteed daily
+(only 1 closed trade in its history) -- both were manufacturing a real
+UNEXPLAINED ticket on every day the condition didn't happen to fire, even
+though nothing was actually wrong. 'informational' (not 'occasional') so the
+row is still checked and printed daily -- the user wants to keep seeing its
+status every day, just without it minting a ticket. Flagged in
+docs/backlog_cache.md 2026-07-28, closed here.
 """
 import sys
 from pathlib import Path
@@ -47,7 +59,7 @@ SCENARIOS = [
                           "exercises _scan_pinned_entry + open_price_quality_log, not the bar-close "
                           "entry path. Entry-mechanism itself is not separately verified by this "
                           "check (known MVP limitation) -- only that a same-day trade closed.",
-        expected_frequency='daily', check_method='trade_lifecycle',
+        expected_frequency='informational', check_method='trade_lifecycle',
         check_params='{"expect_exit_reason": ["TRAIL"]}',
     ),
     dict(
@@ -76,7 +88,54 @@ SCENARIOS = [
         scenario_key='canary_time_exit', ticker='XLF', strategy_type='TrailingBothZScoreBreakout',
         expected_outcome="Arm (take_profit=50%) and SL both practically unreachable, "
                           "max_hold_hours=2 -- the only exit path left open is TIME.",
+        expected_frequency='informational', check_method='trade_lifecycle',
+        check_params='{"expect_exit_reason": ["TIME"]}',
+    ),
+    # Added 2026-07-30: the 6 real inverse-side mirror nodes (7 ira nodes
+    # added 2026-07-29 minus JDST, which has no defined role -- see
+    # scripts/list_canary_nodes.py / docs/backlog_cache.md's open JDST item)
+    # never got their own scenario_expectations rows, so they never showed up
+    # in the daily coverage report even though they're designed to exercise
+    # the exact same A-F scenario as their counterpart, just on the inverse
+    # ticker. Same scenario_key as the counterpart (dedup key includes
+    # ticker, so this is two rows testing one scenario_key, same pattern
+    # already used elsewhere) -- same expected_frequency/check_params as the
+    # counterpart too, since the design intent (hair-trigger vs
+    # trade-conditional) is identical, just mirrored.
+    dict(
+        scenario_key='canary_full_lifecycle', ticker='SPXU', strategy_type='TrailingBothZScoreBreakout',
+        expected_outcome="A mirrored (inverse side): full happy path same day, same design as IVV.",
         expected_frequency='daily', check_method='trade_lifecycle',
+        check_params='{"expect_exit_reason": ["TRAIL"]}',
+    ),
+    dict(
+        scenario_key='canary_early_sl', ticker='QID', strategy_type='TrailingBothZScoreBreakout',
+        expected_outcome="B mirrored (inverse side): early-SL path same day, same design as QQQ.",
+        expected_frequency='daily', check_method='trade_lifecycle',
+        check_params='{"expect_exit_reason": ["SL"]}',
+    ),
+    dict(
+        scenario_key='canary_pinned_entry', ticker='TWM', strategy_type='TrailingBothZScoreBreakout',
+        expected_outcome="C mirrored (inverse side): pinned/open_check entry, same design as IWM.",
+        expected_frequency='informational', check_method='trade_lifecycle',
+        check_params='{"expect_exit_reason": ["TRAIL"]}',
+    ),
+    dict(
+        scenario_key='canary_overnight_carry', ticker='SDOW', strategy_type='TrailingBothZScoreBreakout',
+        expected_outcome="D mirrored (inverse side): overnight carry, same design as DIA.",
+        expected_frequency='daily', check_method='trade_lifecycle',
+        check_params='{"expect_pending_carryover": true}',
+    ),
+    dict(
+        scenario_key='canary_market_buy_exit', ticker='JNUG', strategy_type='TrailingExitZScoreBreakout',
+        expected_outcome="E mirrored: TrailingExit immediate market-buy path, same design as VOO.",
+        expected_frequency='daily', check_method='trade_lifecycle',
+        check_params='{"expect_exit_reason": ["SL", "TIME", "TRAIL"]}',
+    ),
+    dict(
+        scenario_key='canary_time_exit', ticker='FAZ', strategy_type='TrailingBothZScoreBreakout',
+        expected_outcome="F mirrored (inverse side): TIME-only exit, same design as XLF.",
+        expected_frequency='informational', check_method='trade_lifecycle',
         check_params='{"expect_exit_reason": ["TIME"]}',
     ),
 ]

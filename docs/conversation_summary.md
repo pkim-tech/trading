@@ -5135,3 +5135,80 @@ mismatches.
 escalate beyond logging+alerting — deliberately deferred until real trip/mismatch data accumulates.
 JDST's undefined purpose and GDXD's watchlist absence (both from 2026-07-29) remain open, untouched
 this session.
+
+---
+
+## 2026-07-30 (later) — Coverage report split into readiness (7am) vs outcome (16:05 EOD)
+
+Reworked the daily coverage/readiness system after the user pushed back hard on a 7am report
+that showed yesterday's trade outcomes instead of "is this ready to go right now" — the core
+correction: start-of-day answers readiness, end-of-day answers outcomes, matching the user's
+explicit framing that the night session is both "how did our tests do" and "are we staged for
+tomorrow."
+
+**New `expected_frequency='informational'` scenario tier** (`signals_db.scenario_expectations`,
+alongside `daily`/`occasional`/`regression-only`): checked and printed every day like `daily`,
+but a miss never mints a `coverage_deviations` ticket. Demoted `canary_pinned_entry`(IWM),
+`canary_time_exit`(XLF), and `reconciliation_mismatch` to this tier — all three are
+trade-conditional (IWM's entry-to-exit cycle can span >1 day; XLF and reconciliation_mismatch's
+own trigger conditions don't fire daily, the latter's prior "daily" reliability having been an
+artifact of UDOW's now-cleaned-up stale test position) and were manufacturing a real ticket on
+every day the condition simply didn't happen. `scripts/coverage_check.py::run_check` now queries
+`['daily','informational']` and tags informational misses `ticket_eligible=False` instead of
+calling `record_deviation`; `signals_notify.send_coverage_report` respects that flag.
+
+**6 new canary scenario_expectations rows** for the `ira` inverse-mirror nodes added 2026-07-29
+(SPXU/QID/TWM/SDOW/FAZ/JNUG) that never got their own rows despite mirroring the original 6
+canary designs (same `scenario_key` as their counterpart, disambiguated by `ticker`). Along the
+way, found a real config gap: all 4 daily-tier mirrors (SPXU/QID/SDOW/JNUG) have
+`max_hold_hours=2` instead of matching their counterpart's 48/48/48/24 — CLAUDE.md's "exactly
+mirrors" claim is only true for the trigger-relevant fields. Not yet resolved — flagged to the
+user, answer pending.
+
+**New readiness layer**: `signals_invariants.check_staged_config_matches_expected()` (DB-only,
+no broker call) diffs every `staged_test_config` row's `expected_config` against the real live
+`watch_list` node's current values. New `scripts/seed_baseline_config.py` seeds a
+`baseline_config` row for every `mode='live'` node lacking one (15 nodes: all 13 `ira`
+canary/mirror nodes + SPY + DPST), skipping the 3 already-designed test roles (SH/RETL/GDXU) so
+a rerun can't launder real drift into a new "expected" baseline. New
+`signals_invariants.print_all_live_node_state()` prints a per-node ✓/✗ table for both real-money
+tiers (`soxl_ira`: SH/RETL/GDXU/DPST/SPY; `ira`: the 13 canary/mirror nodes) — built after the
+user asked "where are my canaries?" when the first version only covered `soxl_ira`.
+
+**`active_signals.py` scheduling rework**: the outcome check (`send_coverage_report`) moved off
+the 7am slot into the existing 16:05 EOD slot, now checking `today` instead of
+`_previous_trading_day(now)`. The 7am/startup path is readiness-only: `signals_invariants.run_all()`
++ `print_all_live_node_state()`, both now also called unconditionally at daemon startup — a real
+gap found mid-session (the live-node-state report wasn't in the startup path, so a same-day
+restart after 7am, the norm here, silently skipped it entirely; confirmed via `daemon_status.py`
+against the day's actual 07:19 restart). The EOD slot runs both halves: the outcome check and a
+readiness re-check, per the user's explicit two-part framing.
+
+**`signals_notify.build_reference_table`'s console print fix**: previously showed only `Version`,
+which can't distinguish a `mode='live'` node from a `mode='research'` node sharing one version
+(DPST has both, both `version='v5'`) — found live when the user couldn't tell how many real live
+nodes existed from the log alone ("I thought we had 4 nodes in live, only shows 2"). Now shows
+`Version (Mode/Account)`.
+
+**Session-wrap Opus review of the full diff found 1 HIGH + 5 lower issues, all fixed except one
+accepted self-healing no-op**: most severe — the EOD block's two new Slack-posting pieces
+inherited `eod_report_alerted`'s deliberately-un-pre-seeded status (correct for its original
+log-only, idempotent purpose) but that premise silently broke once Slack posts were added, so
+every daemon restart after 16:05 would have double-posted to Slack; fixed via a separate
+pre-seeded `eod_slack_alerted` set plus a startup catch-up call. Also fixed: `pages/14_Coverage.py`
+was rendering an informational miss as false-green "met" (absence of a deviation row isn't
+evidence for that tier); the new EOD outcome check's trading-day gate was weekday-only, missing
+market holidays (widened to a full NYSE-calendar check in both `coverage_check.py` and
+`signals_notify.py`); `check_staged_config_matches_expected`/`staged_config_status` silently
+skipped a field gone `None` instead of reporting real drift, and a non-numeric `expected_config`
+value would have crashed all of `run_all()` (both closed via a new shared
+`_config_field_mismatch` helper, which also tightened the drift tolerance from `0.01` to `1e-9`
+to catch real ~0.1-magnitude staged values). Full suite: 339 passed (was 321). Harness: 7/7.
+`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`: clean.
+
+**Backlogged, not built this session** (per explicit "park this in the backlog"): whether canary
+`scenario_expectations` tests should surface on the Trade-Flow Accountability Grid, since they
+exercise real code paths same as any other grid row — two coverage systems currently exist side
+by side with no established mapping. Also open: per-node `reconciliation_mismatch` breakout
+(scope not decided — 5 soxl_ira nodes vs. those + 13 canary nodes vs. leave the single global
+row), and the SPXU/QID/SDOW/JNUG `max_hold_hours` mirror-config question above.

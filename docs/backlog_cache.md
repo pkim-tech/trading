@@ -7,6 +7,24 @@
 > living reference, not an ever-growing changelog. Caught live after this got violated twice in
 > one sitting (once here, once in CLAUDE.md) before being fixed.
 
+## [live-trading][coverage] Open, raised 2026-07-30 — should canary scenario_expectations tests appear on the Trade-Flow Accountability Grid?
+User pushback on a claim from a prior session: the canary_* scenarios (`scenario_expectations`/
+`coverage_check.py`) exercise real code blocks (`_scan_pinned_entry`, `_attempt_automated_sell`,
+etc.) same as any other trade-flow branch, so why don't they show up in
+`scripts/coverage_registry.py`'s Trade-Flow Accountability Grid (`pages/14_Coverage.py`)? Two
+coverage systems currently exist side by side (the grid's all-time `compute_status()`/
+`offline_proof_for()` vs. the canary/reconciliation daily expected-vs-actual system) with no
+established mapping between them. Not investigated this session, just captured per user's explicit
+"park this in the backlog."
+
+## [live-trading][coverage] Open, raised 2026-07-30 — break `reconciliation_mismatch` out per-node instead of one global (ticker=None) row
+`check_live_state_reconciliation` already logs `ticker`/`node_id` on every `coverage_events` row
+(`signals_notify.py:279`), so the data exists -- just needs one `scenario_expectations` row per node
+(`expected_frequency='informational'`, `check_method='coverage_event'`, ticker+node_id set) instead of
+today's single aggregate row. Scope not decided: the 5 soxl_ira live nodes (SH/RETL/GDXU/DPST/SPY),
+those + all 13 canary/ira nodes, or leave the global row as-is. Full detail: `docs/deep_backlog.md`'s
+2026-07-30 entry.
+
 ## [live-trading][security] Resolved 2026-07-29 — all 3 deferred design items from 2026-07-28 (night) now built: stateful fake order-book test fixture (`tests/fake_broker.py`), pre-action live-state verification (`schwab_safety._log_pre_action_state_verification`, detection-only), and a node-level circuit breaker (`schwab_safety.record_node_streak`, monitor-only). Full detail: `docs/deep_backlog.md`'s 2026-07-29 entries (top two).
 **Still open**: both new checks' tolerance/blocking policy (currently pure logging/alerting — decide once real trip data accumulates, per user's explicit phased-rollout call).
 

@@ -22,7 +22,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas_market_calendars as mcal
+
 import signals_db as db
+
+_NYSE_CAL = mcal.get_calendar('NYSE')
+
+
+def _is_trading_day(check_date):
+    """NYSE trading-day gate (weekends + market holidays) -- self-contained
+    here rather than importing active_signals._is_trading_day, which would be
+    a circular import (active_signals imports send_coverage_report, which
+    calls this module). Same reasoning as the weekend-only guard this
+    replaces (2026-07-25 Opus review): a market holiday is just as trivially,
+    permanently false for a 'trade closed today' expectation as a weekend --
+    checking it would manufacture real unexplained deviation tickets for
+    every 'daily' scenario (8 as of 2026-07-30) with no real signal behind
+    them (found by Opus review, 2026-07-30 -- the weekday()>=5 check alone
+    doesn't catch a weekday market holiday)."""
+    return not _NYSE_CAL.schedule(start_date=check_date, end_date=check_date).empty
 
 
 def _check_trade_lifecycle(scenario, check_date):
@@ -139,17 +157,26 @@ def run_check(check_date):
     deviated earlier the same day and is now met has its stale deviation row
     cleared here, not left behind as a contradiction."""
     db.ensure_tables()
-    if datetime.strptime(check_date, '%Y-%m-%d').weekday() >= 5:
+    if not _is_trading_day(check_date):
         # A 'trade closed today' expectation is trivially, permanently false on
         # a day the market never opened -- checking it would just manufacture a
         # real, permanent unexplained deviation row for no reason (found live,
         # 2026-07-25 Opus review: exactly this happened via the Slack report
-        # button). Applies to both the CLI and any caller of run_check.
-        print(f"{check_date} is a weekend, no trading day to check.")
+        # button; widened from weekend-only to the full NYSE calendar 2026-07-30
+        # after a second Opus review noted a weekday market holiday has the
+        # identical failure mode). Applies to both the CLI and any caller of
+        # run_check.
+        print(f"{check_date} is not a trading day (weekend or market holiday), nothing to check.")
         return []
-    scenarios = db.get_scenario_expectations(expected_frequency='daily')
+    # 'informational' scenarios are checked and printed every day right
+    # alongside 'daily' ones -- the difference is ticket-eligibility, not
+    # visibility (2026-07-30: a scenario whose own trigger condition is
+    # trade-conditional, e.g. canary_pinned_entry, shouldn't mint a ticket
+    # just because the condition didn't fire today, but the user still wants
+    # to see its status every day, not have it silently disappear).
+    scenarios = db.get_scenario_expectations(expected_frequency=['daily', 'informational'])
     if not scenarios:
-        print("No daily scenario_expectations rows -- run scripts/seed_scenario_expectations.py first.")
+        print("No daily/informational scenario_expectations rows -- run scripts/seed_scenario_expectations.py first.")
         return []
 
     results = []
@@ -185,11 +212,19 @@ def run_check(check_date):
             results.append(dict(base, status='skipped', summary=f"unknown check_method={s['check_method']!r}"))
             continue
         met, actual_summary = checker(s, check_date)
+        informational = s['expected_frequency'] == 'informational'
         if met:
             db.clear_deviation_if_resolved(check_date, s['scenario_key'],
                                             ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
             print(f"  ✓ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
             results.append(dict(base, status='met', summary=actual_summary))
+        elif informational:
+            # Never mints a coverage_deviations ticket -- the condition simply
+            # not firing today is expected some days, not a failure. Still
+            # printed with the same ✗ glyph so the report stays visually
+            # honest about "didn't happen," just without the ticket teeth.
+            print(f"  ✗ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}  (informational, no ticket)")
+            results.append(dict(base, status='deviated', ticket_eligible=False, summary=actual_summary))
         else:
             db.record_deviation(check_date, s['scenario_key'], s['expected_outcome'], actual_summary,
                                  ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))

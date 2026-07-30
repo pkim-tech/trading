@@ -1192,7 +1192,14 @@ def get_coverage_events(scenario_key=None, mode=None, strategy_type=None, limit=
 def add_scenario_expectation(scenario_key, expected_outcome, expected_frequency, check_method,
                               ticker=None, node_id=None, mode=None, strategy_type=None, check_params=None):
     """Insert-or-update one row of the structured designed-scenario mapping.
-    expected_frequency: 'daily' / 'occasional' / 'regression-only'.
+    expected_frequency: 'daily' (checked every trading day, a miss is a real
+    ticket needing a human) / 'informational' (checked and printed every
+    trading day same as 'daily', but a miss never records a coverage_deviations
+    ticket -- for a scenario whose underlying trigger condition is itself
+    trade-conditional, so "didn't happen today" is expected some days, not a
+    failure -- e.g. canary_pinned_entry/canary_time_exit/reconciliation_mismatch,
+    2026-07-30) / 'occasional' (not checked by the daily cron at all) /
+    'regression-only'.
     check_method: 'coverage_event' (verify via coverage_events scenario_key) or
     'trade_lifecycle' (verify via a real trade_log/open_positions row today).
     check_params is a free-form JSON string interpreted by coverage_check.py
@@ -1272,11 +1279,16 @@ def clear_staged_test_config(wl_id):
 
 
 def get_scenario_expectations(expected_frequency=None, active_only=True):
+    """expected_frequency accepts a single value or a list/tuple of values."""
     q = "SELECT * FROM scenario_expectations"
     clauses, params = [], []
     if expected_frequency:
-        clauses.append("expected_frequency = ?")
-        params.append(expected_frequency)
+        if isinstance(expected_frequency, (list, tuple)):
+            clauses.append(f"expected_frequency IN ({','.join('?' * len(expected_frequency))})")
+            params.extend(expected_frequency)
+        else:
+            clauses.append("expected_frequency = ?")
+            params.append(expected_frequency)
     if active_only:
         clauses.append("active = 1")
     if clauses:

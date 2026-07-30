@@ -190,6 +190,114 @@ def check_open_position_config_matches_live_node():
     return violations
 
 
+def _config_field_mismatch(field, expected, actual):
+    """Returns a mismatch string, or None if the field matches. actual=None
+    is real drift, reported not skipped (see check_staged_config_matches_
+    expected's docstring). A non-numeric expected_config value (staged_
+    test_config.expected_config is a free-form dict -- set_staged_test_config
+    accepts anything JSON-serializable) is reported as its own mismatch
+    instead of raising ValueError and taking down the rest of run_all(),
+    which has no per-check try/except (found by Opus review, 2026-07-30)."""
+    if actual is None:
+        return f"{field}: expected {expected}, actual None (field missing)"
+    try:
+        drifted = abs(float(actual) - float(expected)) > 1e-9
+    except (TypeError, ValueError):
+        return f"{field}: expected {expected!r}, actual {actual!r} (non-numeric, could not compare)"
+    return f"{field}: expected {expected}, actual {actual}" if drifted else None
+
+
+def check_staged_config_matches_expected():
+    """Every staged_test_config row's expected_config must still match its
+    node's real current watch_list values -- "is this node still committed
+    and staged correctly to trigger the way it's supposed to?"
+
+    Covers the whole live watchlist as of 2026-07-30 (scripts/
+    seed_baseline_config.py snapshots a 'baseline_config' row for every
+    mode='live' node not already covered by one of the 3 deliberately-
+    designed test roles, e.g. SH/RETL/GDXU) -- not just those 3. A mismatch
+    here means the node's real config silently drifted from what was
+    committed/intended (an accidental edit, a migration side-effect, a stale
+    manual DB patch), independent of whether the strategy has actually
+    triggered today -- distinct from (and a precondition for) whether a
+    trade fires, which coverage_check.py's trade_lifecycle checks track
+    separately as informational-only, not a deviation ticket. DB-only
+    (no broker call), safe to run every poll/every day, unlike
+    scripts/audit_live_test_candidates.py which also hits the real broker
+    for resting orders."""
+    violations = []
+    for row in db.get_staged_test_configs():
+        node = db.get_watch_list_node_by_id(row['wl_id'])
+        if node is None:
+            violations.append(
+                f"staged_test_config wl_id={row['wl_id']} ({row['ticker']}, "
+                f"role={row['scenario_role']}) references a node that no longer exists."
+            )
+            continue
+        mismatches = []
+        for field, expected in row['expected_config'].items():
+            m = _config_field_mismatch(field, expected, node.get(field))
+            if m:
+                mismatches.append(m)
+        if mismatches:
+            violations.append(
+                f"{node['ticker']} (wl_id={node['id']}, role={row['scenario_role']}) "
+                f"config drifted from its committed baseline: {'; '.join(mismatches)}."
+            )
+    return violations
+
+
+def staged_config_status(account=None):
+    """One row per staged_test_config node (✓/✗, not just failures) -- a
+    state report for the real live-tier nodes, mirroring coverage_check.py's
+    canary_* block, not just an aggregate violation count. Built 2026-07-30
+    after the user asked for SH/GDXU/RETL/SPY/DPST (the real soxl_ira live
+    nodes) to be visible the same way the canaries are, distinct from (and
+    lighter than) audit_live_test_candidates.py's --staged mode, which also
+    hits the real broker for resting orders -- this is DB-only, config-drift
+    only, safe to print every day.
+
+    Returns a list of dicts: ok, ticker, account, role, summary."""
+    rows = []
+    for row in db.get_staged_test_configs():
+        node = db.get_watch_list_node_by_id(row['wl_id'])
+        if node is None:
+            rows.append(dict(ok=False, ticker=row['ticker'], account=None,
+                              role=row['scenario_role'], summary="node no longer exists"))
+            continue
+        if account and node.get('account') != account:
+            continue
+        mismatches = []
+        for field, expected in row['expected_config'].items():
+            m = _config_field_mismatch(field, expected, node.get(field))
+            if m:
+                mismatches.append(m)
+        rows.append(dict(
+            ok=not mismatches, ticker=node['ticker'], account=node.get('account'),
+            role=row['scenario_role'],
+            summary="; ".join(mismatches) if mismatches else "matches committed baseline",
+        ))
+    return rows
+
+
+def print_staged_config_status(account=None):
+    label = f" ({account})" if account else ""
+    print(f"Live node state{label}\n")
+    for r in staged_config_status(account=account):
+        glyph = "✓" if r['ok'] else "✗"
+        print(f"  {glyph} live_config  {r['ticker']:<6} ({r['account']})  [{r['role']}]  {r['summary']}")
+
+
+def print_all_live_node_state():
+    """Both real-money live tiers -- soxl_ira (SH/RETL/GDXU/DPST/SPY) and ira
+    (the 13 canary/mirror nodes) -- as two back-to-back tables, one call site
+    for every caller that wants the full readiness picture (daemon startup,
+    the 7am/EOD daily slots, and this module's own CLI)."""
+    print_staged_config_status(account='soxl_ira')
+    print()
+    print_staged_config_status(account='ira')
+
+
 CHECKS = [
     check_live_trailing_exit_automation_scope,
     check_research_mode_ticker_with_open_position_in_automation_scope,
@@ -197,6 +305,7 @@ CHECKS = [
     check_brokerage_not_live_with_unresolved_leverage_gap,
     check_starting_notional_within_account_notional_cap,
     check_open_position_config_matches_live_node,
+    check_staged_config_matches_expected,
 ]
 
 
@@ -209,6 +318,8 @@ def run_all():
 
 if __name__ == "__main__":
     import sys
+    print_all_live_node_state()
+    print()
     found = run_all()
     if found:
         print(f"{len(found)} invariant violation(s):")

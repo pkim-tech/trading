@@ -26,7 +26,7 @@ from signals_helpers import (
 # namespace package as long as repo root is on sys.path (true whenever this
 # module is reached via active_signals.py, run from repo root) -- same
 # import tests/test_coverage_check.py already uses.
-from scripts.coverage_check import run_check as _coverage_run_check
+from scripts.coverage_check import run_check as _coverage_run_check, _is_trading_day as _coverage_is_trading_day
 
 
 def _attempt_automated_buy(node, sizing):
@@ -2129,8 +2129,11 @@ def send_coverage_report(check_date=None):
     risk of manufacturing permanent false-positive deviation rows (confirmed
     live: this bug produced exactly that on a Saturday before this fix)."""
     check_date = check_date or datetime.now().strftime('%Y-%m-%d')
-    if datetime.strptime(check_date, '%Y-%m-%d').weekday() >= 5:
-        return _post_message(f"Coverage Report — {check_date} is a weekend, no trading day to check.")
+    # Widened from weekend-only to the full NYSE calendar 2026-07-30 (Opus
+    # review) -- a weekday market holiday has the identical "trivially,
+    # permanently false" failure mode this guard exists to prevent.
+    if not _coverage_is_trading_day(check_date):
+        return _post_message(f"Coverage Report — {check_date} is not a trading day (weekend or market holiday), no trading day to check.")
 
     try:
         db.ensure_tables()
@@ -2150,7 +2153,14 @@ def send_coverage_report(check_date=None):
     reasons = {_key(d): d['reason'] for d in db.get_deviations(check_date=check_date)}
 
     lines = [f"*Coverage Report — {check_date}*"]
-    unexplained = [r for r in results if r['status'] == 'deviated' and not reasons.get(_key(r))]
+    # ticket_eligible defaults True (absent for 'met'/'skipped' rows, and for
+    # every 'deviated' row except the 'informational'-frequency ones -- see
+    # scripts/coverage_check.py::run_check, 2026-07-30) -- an informational
+    # miss never records a coverage_deviations row, so it must never render
+    # as UNEXPLAINED here either, or the report would contradict its own
+    # no-ticket-minted behavior.
+    unexplained = [r for r in results if r['status'] == 'deviated'
+                   and r.get('ticket_eligible', True) and not reasons.get(_key(r))]
     if unexplained:
         lines.append(f":red_circle: {len(unexplained)} UNEXPLAINED deviation(s):")
         for r in unexplained:
@@ -2164,6 +2174,8 @@ def send_coverage_report(check_date=None):
             status = "✓"
         elif r['status'] == 'skipped':
             status = "?  not checked"
+        elif not r.get('ticket_eligible', True):
+            status = "✗ (informational, no ticket)"
         elif reasons.get(_key(r)):
             status = "✗ (explained)"
         else:
@@ -2320,17 +2332,29 @@ def send_reference_report(watchlist):
                 _upload_chart(chart, f"{r['Ticker']}_morning.png", f"{r['Ticker']} `{r['Version']}`  z={r['Z']:+.2f}")
 
     # Console output
+    def _tag(r):
+        # Version alone doesn't distinguish live from research -- two nodes
+        # for the same ticker can share one version (e.g. DPST's deliberate
+        # live+research pairing, both version='v5') and render as visually
+        # identical lines with no way to tell which one is real money. Unlike
+        # the Slack block builder (_ticker_block), this console print
+        # previously showed Version only -- found live 2026-07-30 (user
+        # expected 4 identifiable live nodes, only 3 were visually
+        # distinguishable from their research siblings).
+        extra = [x for x in (r.get('Mode'), r.get('Account')) if x]
+        return f"{r['Version']} ({'/'.join(extra)})" if extra else (r['Version'] or '')
+
     print(f"Morning Report — {now_str}")
     if held_rows:
         print("  Open positions:")
         for r in held_rows:
-            print(f"    {r['Ticker']:<6} {r['Version']}  hold={r['Hold']}  now=${r['Now']:.2f}  {r['Next Action']}")
+            print(f"    {r['Ticker']:<6} {_tag(r)}  hold={r['Hold']}  now=${r['Now']:.2f}  {r['Next Action']}")
     for r in flat_rows:
         if r['Next Action'] == 'NO_DATA':
-            print(f"  {r['Ticker']:<6} {r['Version']}  NO_DATA  [{r['Strategy']}]")
+            print(f"  {r['Ticker']:<6} {_tag(r)}  NO_DATA  [{r['Strategy']}]")
         else:
             emoji = _proximity_emoji(r['Proximity'])
-            print(f"  {emoji} {r['Ticker']:<6} {r['Version']}  now=${r['Now']:>7.2f}  trigger=${r['Next Trigger $']:>7.2f}  ({r['Proximity']:+.1f}%)  z={r['Z']:>+5.2f}  [{r['Strategy']}]")
+            print(f"  {emoji} {r['Ticker']:<6} {_tag(r)}  now=${r['Now']:>7.2f}  trigger=${r['Next Trigger $']:>7.2f}  ({r['Proximity']:+.1f}%)  z={r['Z']:>+5.2f}  [{r['Strategy']}]")
 
     channel, ts = _post_chunked(f"Morning Report — {now_str}", fixed_blocks, units)
     # "live" unconditionally, not _coverage_mode(account) -- this report isn't

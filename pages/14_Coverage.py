@@ -262,14 +262,25 @@ rows = []
 for s in expectations:
     key = (s["scenario_key"], s["ticker"] or "", s["node_id"], s["mode"] or "")
     dev = today_deviations.get(key)
-    if s["expected_frequency"] != "daily":
-        # coverage_check.py's run_check only evaluates 'daily' scenarios --
-        # rendering these as "met" (just because no deviation row exists)
-        # would be a guess, not an observation (found by Opus review, 2026-07-25).
+    if s["expected_frequency"] not in ("daily", "informational"):
+        # coverage_check.py's run_check only evaluates 'daily'/'informational'
+        # scenarios -- rendering others as "met" (just because no deviation
+        # row exists) would be a guess, not an observation (found by Opus
+        # review, 2026-07-25).
         status = "— not daily-checked"
         actual = reason = ""
     elif s["check_method"] not in CHECKERS:
         status = "?  unknown check_method"
+        actual = reason = ""
+    elif s["expected_frequency"] == "informational" and dev is None:
+        # 'informational' rows ARE checked every day (2026-07-30), but a miss
+        # deliberately never records a coverage_deviations row (no ticket) --
+        # so unlike 'daily' rows, "no deviation row" here is NOT evidence of
+        # "met." Rendering this as green "met" would be a guess dressed up as
+        # an observation, the exact failure mode the branch above already
+        # guards against for non-daily rows -- found by Opus review, 2026-07-30
+        # (this branch previously fell through to "✓ met").
+        status = "ℹ️  informational (checked daily, no ticket on miss -- see EOD log)"
         actual = reason = ""
     elif dev is None:
         status = "✓ met"

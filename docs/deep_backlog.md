@@ -1,5 +1,34 @@
 # Backlog
 
+## [live-trading][coverage] Open, raised 2026-07-30 — break `reconciliation_mismatch` out per-node
+
+**Context**: session built two new "state report" tables (2026-07-30) — a 12-row canary_* table in
+`scripts/coverage_check.py`'s daily output (6 A-F designs x normal/inverse side) and a 5-row
+`signals_invariants.print_staged_config_status(account='soxl_ira')` table for the real soxl_ira live
+nodes (SH/RETL/GDXU/DPST/SPY), each checking config-drift against a committed baseline
+(`staged_test_config.expected_config`). `reconciliation_mismatch` sits outside both — it's the one
+row seeded by `scripts/seed_daily_coverage_expectations.py` (not `seed_scenario_expectations.py`),
+with `ticker=None`/`node_id=None`, aggregating every node's real broker-vs-DB reconciliation check
+(`signals_notify.check_live_state_reconciliation`) into one daily yes/no across the whole live
+watchlist. User asked "where's the mismatch row" expecting per-node granularity like the other two
+tables; this is unchanged pre-existing behavior (the global scope predates this session — only
+`expected_frequency` was changed today, daily -> informational, once UDOW's stale test position that
+made it empirically daily was retroactively closed 2026-07-28 evening).
+
+**What it would take**: `check_live_state_reconciliation` already logs real `ticker`/`node_id` on
+every `coverage_events` row it writes (`signals_notify.py:279` — `db.log_coverage_event(
+"reconciliation_mismatch", _coverage_mode(pos.get('account')), ticker=pos.get('ticker'), ...)`), and
+`scripts/coverage_check.py::_check_coverage_event` already supports ticker/node_id-scoped queries
+(added 2026-07-26 for exactly this future case, never exercised until now). So no new check-logic
+code is needed — just new `scenario_expectations` rows, one per node to track individually:
+`scenario_key='reconciliation_mismatch'`, `check_method='coverage_event'`,
+`expected_frequency='informational'` (trade-conditional — a node only gets checked on a day it has a
+real open position), `ticker=<ticker>`, `node_id=<wl_id>`.
+
+**Not decided**: scope. Options raised: (1) the 5 soxl_ira live nodes only, matching the
+`print_staged_config_status` table's scope; (2) those 5 + all 13 canary/ira nodes, giving both state
+tables a matching reconciliation column; (3) leave the single global row as-is. Not started.
+
 ## ✅ [live-trading][security] Resolved 2026-07-29 — node-level circuit breaker built (monitor-only), the 3rd of 3 deferred design items from 2026-07-28 night
 
 **What**: `schwab_safety.record_node_streak(ticker, account, kind, hit, node_id=None)` tracks two

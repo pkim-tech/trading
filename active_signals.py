@@ -513,6 +513,42 @@ def run_loop(tickers: set = None):
         except Exception:
             pass  # a Slack posting failure must not prevent daemon startup
 
+    # Same reasoning as run_all() above -- reference_alerted (below) pre-seeds
+    # every _REFERENCE_TIMES slot already past "today" as done, so the 7am-gated
+    # live_node_state block further down would silently never fire today if the
+    # daemon (re)starts any time after 7am, the normal case here. Found live
+    # 2026-07-30: today's actual restart (07:19) would have skipped this report
+    # entirely without this unconditional call.
+    _guarded("live_node_state[startup]", signals_invariants.print_all_live_node_state)
+
+    # 2026-07-30 Opus review finding (HIGH): the EOD block's Slack-posting half
+    # (outcome coverage report + the EOD invariants alert) needs the same
+    # startup-catchup + pre-seed pairing reference_alerted/gap_check_alerted
+    # already use below -- without it, every daemon restart after 16:05 (this
+    # project restarts constantly) would re-post both to Slack, since the
+    # un-pre-seeded eod_report_alerted's "no side effects" premise stopped
+    # being true the moment Slack-posting calls were added to that block.
+    # build_phased_monitors_report/print_all_live_node_state stay un-pre-seeded
+    # below (genuinely idempotent log prints, no Slack) -- only these two.
+    if (datetime.now().hour, datetime.now().minute) >= _EOD_REPORT_TIME:
+        _eod_today = datetime.now().strftime('%Y-%m-%d')
+
+        def _startup_eod_coverage():
+            cc, cts = send_coverage_report(_eod_today)
+            print(f"  [slack] startup EOD coverage report ({_eod_today}): channel={cc} ts={cts}"
+                  f"{' (no confirmed post -- check for a prior [slack error] line)' if not cc else ''}")
+        _guarded("coverage_report[EOD:startup]", _startup_eod_coverage)
+
+        def _startup_eod_invariants():
+            violations = signals_invariants.run_all()
+            if violations:
+                msg = "\n".join(f"- {v}" for v in violations)
+                print(f"[invariants] {len(violations)} violation(s) at EOD (startup):\n{msg}")
+                _post_message(f"⚠️ Config invariant violation(s) ({_eod_today}, EOD check):\n{msg}")
+            else:
+                print("[invariants] EOD (startup): all invariants hold.")
+        _guarded("invariants[EOD:startup]", _startup_eod_invariants)
+
     # buffering=1 (line-buffered) -- without it this file object block-buffers
     # since it's not a tty, so console output (including any Slack post error)
     # can sit invisible on disk for a long time; found 2026-07-22 debugging a
@@ -556,22 +592,17 @@ def run_loop(tickers: set = None):
     print(f"  [slack] startup reference report: channel={_ref_channel} ts={_ref_ts}"
           f"{' (no confirmed post -- check for a prior [slack error] line)' if not _ref_channel else ''}")
 
-    # Unconditional at startup, same reasoning as the reference report above:
-    # reference_alerted is pre-seeded below with every _REFERENCE_TIMES slot
-    # already past "today" marked done, which means the (7,0)-gated coverage-
-    # report block further down in the loop will never fire today if the
-    # daemon (re)starts any time after 7am -- the normal case, since this
-    # project restarts the daemon after most source edits. Without this call,
-    # that day's coverage check would be silently skipped entirely: no
-    # deviation rows, no Slack post, nothing recording that the check didn't
-    # run -- indistinguishable from a clean day in a sticky-ticket model
-    # (Opus review finding, this session).
-    try:
-        _cov_channel, _cov_ts = send_coverage_report(_previous_trading_day(datetime.now()))
-        print(f"  [slack] startup coverage report: channel={_cov_channel} ts={_cov_ts}"
-              f"{' (no confirmed post -- check for a prior [slack error] line)' if not _cov_channel else ''}")
-    except Exception as e:
-        print(f"  [error] startup coverage report failed: {e}")
+    # 2026-07-30: the trade-outcome coverage check (send_coverage_report --
+    # "did yesterday's designed trade actually close") moved off the 7am
+    # start-of-day slot entirely and into the 16:05 EOD slot below, checking
+    # *today's* date once the trading day is actually over -- a start-of-day
+    # report answering "is this ready to go right now" has no business
+    # showing yesterday's outcome, per the user's explicit correction. No
+    # startup catch-up call needed here the way the old 7am version required
+    # one: eod_report_alerted (below) is deliberately NOT pre-seeded, so a
+    # restart any time after 16:05 still fires the EOD block once on the next
+    # loop iteration, same restart-safety property the old 7am design needed
+    # this call to fake.
 
     buy_alerted:        set[tuple] = set()
     sell_alerted:       set[tuple] = set()  # (position_id, bar_ts) — dedups within a bar, not across bars
@@ -604,11 +635,18 @@ def run_loop(tickers: set = None):
     # -- those are pre-seeded because an unconditional startup call (the
     # reference report) or a bounded window (the gap check) already covers a
     # restart after that slot, so re-running would be redundant/wrong. Nothing
-    # covers a restart after 16:05 the same way (Opus review, 2026-07-30) --
-    # this report is a read-only, idempotent log print (no Slack, no side
-    # effects), so letting it fire once on the very next loop iteration after
-    # a late restart is strictly better than silently losing that day's report.
+    # covers a restart after 16:05 the same way for THIS set -- fine here,
+    # since eod_report_alerted only gates the read-only, idempotent log prints
+    # (build_phased_monitors_report/live_node_state), so letting it fire once
+    # on the very next loop iteration after a late restart is strictly better
+    # than silently losing that day's report.
     eod_report_alerted: set[str] = set()
+    # Separate from eod_report_alerted above -- this one gates the two
+    # Slack-posting EOD pieces (outcome coverage report + invariants alert),
+    # which DO need pre-seeding (an unconditional startup call above already
+    # covered them if the daemon started after 16:05) -- see the Opus review
+    # comment above the startup call for why (2026-07-30).
+    eod_slack_alerted: set[str] = {last_date} if (_now0.hour, _now0.minute) >= _EOD_REPORT_TIME else set()
     pinned_bar_alerted: set[tuple] = {
         (last_date, h, m) for h, m, s in _PINNED_BAR_TIMES
         if (_now0.hour, _now0.minute) >= (h, m)
@@ -651,12 +689,30 @@ def run_loop(tickers: set = None):
                     _guarded(f"reference_report[{rlabel}]", _send_reference)
 
                     if (rh, rm) == (7, 0):
-                        def _send_coverage():
-                            check_date = _previous_trading_day(now)
-                            cc, cts = send_coverage_report(check_date)
-                            print(f"  [slack] {rlabel} coverage report ({check_date}): channel={cc} ts={cts}"
-                                  f"{' (no confirmed post -- check for a prior [slack error] line)' if not cc else ''}")
-                        _guarded("coverage_report[07:00]", _send_coverage)
+                        # "Are we prepared for today?" -- signals_invariants.run_all()
+                        # previously only ran once, at daemon startup, so a daemon that
+                        # has been running for days (the normal case) never re-checked
+                        # config state again. Re-running it here every real trading day
+                        # at 07:00 makes it a genuine start-of-day check across the whole
+                        # live watchlist (config-invariant checks +
+                        # check_staged_config_matches_expected's committed-baseline diff,
+                        # 2026-07-30), not just a one-time startup diagnostic.
+                        def _check_invariants():
+                            violations = signals_invariants.run_all()
+                            if violations:
+                                msg = "\n".join(f"- {v}" for v in violations)
+                                print(f"[invariants] {len(violations)} violation(s) at {rlabel}:\n{msg}")
+                                _post_message(f"⚠️ Config invariant violation(s) ({today}):\n{msg}")
+                            else:
+                                print(f"[invariants] {rlabel}: all invariants hold.")
+                        _guarded("invariants[07:00]", _check_invariants)
+
+                        # Per-node state report for the real soxl_ira live tier
+                        # (SH/RETL/GDXU/SPY/DPST) and the 13 ira/canary nodes --
+                        # console/log-only (same as build_phased_monitors_report),
+                        # not Slack -- a config-drift ✗ here doesn't need a page,
+                        # just visibility at start of day.
+                        _guarded("live_node_state[07:00]", signals_invariants.print_all_live_node_state)
 
             gap_h0, gap_m0, gap_h1, gap_m1 = _GAP_CHECK_WINDOW
             if (gap_h0, gap_m0) <= (now.hour, now.minute) <= (gap_h1, gap_m1) and today not in gap_check_alerted:
@@ -669,6 +725,44 @@ def run_loop(tickers: set = None):
                 def _print_eod_report():
                     print(build_phased_monitors_report(today))
                 _guarded("eod_phased_monitors_report", _print_eod_report)
+                _guarded("live_node_state[EOD]", signals_invariants.print_all_live_node_state)
+
+            # Separate gate from eod_report_alerted above (pre-seeded, unlike
+            # it -- see eod_slack_alerted's definition) since these two post
+            # to Slack: a duplicate log print is harmless, a duplicate Slack
+            # message on every restart after 16:05 is not.
+            if (now.hour, now.minute) >= _EOD_REPORT_TIME and today not in eod_slack_alerted:
+                eod_slack_alerted.add(today)
+
+                # Moved here 2026-07-30 from the 7am slot -- "did today's
+                # designed canary/reconciliation scenario actually play out"
+                # is an outcome question, answerable only once the trading
+                # day is over, not a start-of-day readiness question. Checks
+                # `today`, not the previous trading day, since by 16:05 the
+                # day's trading is effectively done.
+                def _send_coverage():
+                    cc, cts = send_coverage_report(today)
+                    print(f"  [slack] EOD coverage report ({today}): channel={cc} ts={cts}"
+                          f"{' (no confirmed post -- check for a prior [slack error] line)' if not cc else ''}")
+                _guarded("coverage_report[EOD]", _send_coverage)
+
+                # 2026-07-30: the EOD slot mirrors the 7am one, not just "how
+                # did today's tests do" -- user's explicit framing is the
+                # night session is BOTH "how did our tests do" (outcome check
+                # above) AND "are we ready to go, are things staged to test
+                # for the following day" (readiness check, same as 7am).
+                # Re-running the same readiness checks here catches a
+                # same-day config drift (a manual DB edit, a mid-day node
+                # add/change) before the *next* morning's report would.
+                def _check_invariants_eod():
+                    violations = signals_invariants.run_all()
+                    if violations:
+                        msg = "\n".join(f"- {v}" for v in violations)
+                        print(f"[invariants] {len(violations)} violation(s) at EOD:\n{msg}")
+                        _post_message(f"⚠️ Config invariant violation(s) ({today}, EOD check):\n{msg}")
+                    else:
+                        print("[invariants] EOD: all invariants hold.")
+                _guarded("invariants[EOD]", _check_invariants_eod)
 
             watchlist = get_watchlist()
             if tickers:
