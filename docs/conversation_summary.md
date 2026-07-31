@@ -5365,3 +5365,105 @@ Test suite: 362 passed (was 349 at session start). `signals_invariants.py`: 2 kn
 violations (SH's pre-existing drift, ERY's new drift from tonight's deliberate widening).
 `scripts/live_sim_harness.py`: 7/7. `verify_trailing_buy_resolution.py`/
 `verify_trailing_sell_resolution.py --tickers AGQ,SOXL`: clean, no new mismatches.
+
+---
+
+## 2026-07-31 (night) — Closed 8 of 13 items from the exit/arm/entry audit, then a fresh Opus trace review of that work found 8 more real defects (1 real-money), all fixed same session
+
+User said "just fix it all" against the 13 items the earlier 2026-07-31 audit had confirmed and left
+open. Worked through them one at a time, each with its own regression test and a full-suite pass
+before moving to the next, rather than batching changes.
+
+**8 items fixed:**
+1. **[HIGHEST] Live entry-abandon timeout, built.** New `signals_notify.check_entry_abandon()`
+   (+ a paper-trading equivalent in `paper_trading.update_paper_buys()`) mirrors the backtest kernel's
+   `wait_bars >= max_hours_to_hold` — a trailing-buy that never bounces is now cancelled (real orders)
+   or cleared (dry_run/paper, nothing real resting) instead of resting/waiting forever and silently
+   blocking every other BUY in that account.
+2. `sl_order_id` (the `open_positions` DB column) now gets refreshed after ANY atomic order replace,
+   not just the hold-time-forced TRAIL case fixed in the earlier audit — was going stale/pointing at a
+   dead order after every other replace path.
+3. Oversell guard's fail-open branch (`schwab_safety.check_order`'s SELL bound) now fails closed when
+   no local position row is found. A prior session's fix attempt broke ~14 tests and was reverted; a
+   dedicated investigation this session confirmed those were guard-isolation tests never meant to seed
+   a position (a test-fixture gap, not a real production exposure) — fixed the tests by seeding a
+   position, not by loosening the new guard.
+4. `running_low` bounded against a single anomalous extended-hours price print (max 20%/poll drop) —
+   was unbounded (`min(...)`, never self-corrects), risking a false "gap cleared trigger" real market
+   BUY off one bad tick.
+5. `drain_fill_queue` (the fast websocket fill path) now respects the opt-in auto-fill-detection gate
+   — was bypassing it entirely, auto-reconciling any fill regardless of whether the ticker/node had
+   opted in.
+6. Added a `shares >= 1` guard before any real BUY placement attempt — was reaching the broker, getting
+   rejected, and dinging the node circuit breaker + posting a misleading "blocked" alert for nothing.
+7. Fixed a race where the ambient 10:25-:29/15:25-:29 pre-close poll could fire on a degraded price and
+   permanently pre-empt the more accurate pinned 10:30/15:30 check a few minutes later.
+8. Closed a theoretical (ordering-protected, not previously reachable) stale-snapshot race in the
+   ambient exit-check loop, for consistency with the same pattern fixed elsewhere in the earlier audit.
+
+Confirmed as **intentional design, not a bug**, after asking directly: BUY-shaped guards (kill switch,
+automation pause) also blocking SELL — user's answer: "i prefer an off switch for everything - what if
+the algo is going rogue and tries to trade a non algo node?" A genuine full-stop against a
+malfunctioning algo, including its exits, matters more than a SELL carve-out. Saved as a memory
+(`project_kill_switch_blocks_everything`).
+
+**Attempted and reverted**: live bounce-fill tracking's bar-Close-vs-Low/High directional bias — the
+correct fix broke 8 existing tests (all control simulated price via a `_current_price` monkeypatch,
+would need synthetic-CSV-level control instead), a bigger rewrite than this documented low-severity,
+dry-run/paper-only bias warrants. Left open.
+
+**Then, per the user's request, an independent Opus review agent (no session context) traced all 7
+production changes through their real call chains** — same style as the original audit, hunting
+specifically for composition bugs, races, and fail-open mistakes. Found 8 real defects, all fixed:
+
+- **HIGH, real money**: `check_entry_abandon`'s cancel branch didn't account for the manual "Trailing
+  Buy Order Placed" Slack flow, which sets `order_placed=True` but never captures a broker order id —
+  for a real account, this fell through to clearing the local row and posting a false "resting order
+  cancelled" message while a real GTC order stayed live at the broker with zero local tracking left
+  (and broke the later manual-fill-confirmation handler's guard, which needs that row to still exist).
+  Fixed: distinguishes this case via the account's real `dry_run` flag, alerts instead of silently
+  clearing, fails closed on an unrecognized account.
+- MEDIUM-HIGH: the same function read the live `watch_list` node instead of the pinned pending-buy
+  snapshot, contradicting this module's own established convention — could retarget a real cancel at
+  the wrong account after a later config edit. Fixed to use the pinned snapshot like every sibling
+  function already does.
+- MEDIUM: the ambient/pinned race fix's own exclusion (item 7 above) removed ambient coverage as a
+  fallback whenever the pinned check itself didn't run (a restart landing after :30 skips it entirely
+  by design, per the existing `pinned_bar_alerted` pre-seeding pattern) — left affected nodes with zero
+  BUY coverage for the rest of that window. Fixed: only exclude before the pinned moment, not the
+  whole window.
+- MEDIUM: paper's abandon check ran before the bounce-fill check, inverting the kernel's real per-bar
+  order — could abandon a position on the exact bar it would otherwise have filled. Reordering this
+  exposed a second bug (a stale/unavailable price could `continue` past the abandon check entirely);
+  fixed both.
+- MEDIUM: the paper sizing "fix" from item 1 (original list) was actually less accurate than what it
+  replaced — reverted to the original flat formula with the corrected reasoning now documented (the
+  real end state after a post-fill top-up converges to a flat notional/price regardless of any
+  signal-time padding).
+- LOW-MED: the paper abandon alert could never fire (read a field never captured in the pending-buy
+  snapshot) — fixed to re-read the live node, same pattern the adjacent fill-alert code already uses.
+- LOW-MED (pre-existing, not introduced this session, fixed while touching the adjacent code): paper's
+  market-buy sizing path still queried real `trade_log` — live-reachable for the deliberate DPST
+  live+research pairing. Fixed with the same explicit-notional override used for the trailing-buy path.
+- LOW: `drain_fill_queue`'s new opt-in-gate check (item 5 above) resolved the node via a fuzzy
+  ticker+account lookup its own neighboring comment says must never gate a real action. Fixed to
+  resolve by exact order_id match against the real pending_buys row instead.
+
+4 other claims in the review brief were traced and found NOT to be real issues (documented in
+`deep_backlog.md`). Full suite: 386 passed (381 after the first 7 fixes, 371 after the very first
+[HIGHEST] item, 362 at the session's start). `scripts/live_sim_harness.py`: 7/7 throughout.
+`signals_invariants.py`: 2 known/accepted violations (SH/ERY position-snapshot-vs-live-config drift
+from the prior session), unchanged.
+
+Docs updated: `docs/deep_backlog.md` (three new 2026-07-31 entries at top), `docs/backlog_cache.md`
+(condensed to reflect what's resolved vs. still open), `CLAUDE.md` (existing 2026-07-31 bullet
+extended with pointers, not a new inline changelog block).
+
+**Still open, all deliberately deferred**: paper sizing doesn't compound off its own prior paper
+trades; live bounce-fill Close-vs-Low/High bias (attempted, reverted); a dry-run-account false
+"auto-placed" circuit-breaker claim (conditional, unconfirmed live); the 1-3% `fixed_sl` sizing
+research question (not a code defect).
+
+Code changes not yet committed — 12 files (`active_signals.py`, `paper_trading.py`,
+`schwab_safety.py`, `signals_helpers.py`, `signals_notify.py`, plus test files) sitting as
+uncommitted working-tree changes, pending explicit user confirmation to commit.
