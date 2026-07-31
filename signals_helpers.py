@@ -217,7 +217,7 @@ def _last_sale_recovery(node):
 DEFAULT_MARKET_ENTRY_PAD_PCT = 1.0
 
 
-def buy_order_sizing(node, sig, pad_pct=1.0, market_pad_pct=DEFAULT_MARKET_ENTRY_PAD_PCT):
+def buy_order_sizing(node, sig, pad_pct=1.0, market_pad_pct=DEFAULT_MARKET_ENTRY_PAD_PCT, target_notional=None):
     """Worst-case trailing-buy sizing: a real trailing-buy order fills once price
     bounces trail_buy_pct% off a running low that can fall further before that, so
     the fill price is unbounded relative to the signal-time price. Sizing off
@@ -230,10 +230,23 @@ def buy_order_sizing(node, sig, pad_pct=1.0, market_pad_pct=DEFAULT_MARKET_ENTRY
     own, smaller market_pad_pct (Part 4, Section 3) -- a market order fills near
     the signal-time price, not an unbounded bounce, so it needs less padding than
     the trailing-buy branch. Shared by _build_buy_blocks and the
-    automated-placement path so there's one sizing formula, not two."""
+    automated-placement path so there's one sizing formula, not two.
+
+    target_notional defaults to _last_sale_recovery(node) (real trade_log
+    compounding) -- callers whose fills never land in trade_log (paper_trading,
+    which writes paper_trade_log instead) must pass an explicit override, since
+    _last_sale_recovery would otherwise either silently fall back to
+    starting_notional every time (a research-mode node with no matching real
+    history, the common case) or, worse, pick up an unrelated REAL trade's
+    proceeds if this exact (ticker, strategy, version, window, account) tuple
+    ever also had genuine live history -- paper P&L must compound off its own
+    simulated trades only, never real ones (found in the 2026-07-31 audit's
+    still-open list, while aligning paper_trading's sizing formula with this
+    one)."""
     ticker = sig['ticker']
     price = sig['current_price']
-    target_notional = _last_sale_recovery(node)
+    if target_notional is None:
+        target_notional = _last_sale_recovery(node)
     trailing_buy = db._is_trailing_buy(node)
     trail_buy_pct = node.get('trail_buy_pct') or 0.0
     if trailing_buy:

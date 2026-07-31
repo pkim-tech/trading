@@ -147,3 +147,75 @@ def test_gap_resize_catches_correction_once_running_low_is_tracked(env, fake_bro
     assert any(e['result'] == 'replaced' for e in gap_events), (
         f"expected a gap_resize coverage_event with result='replaced', got: {gap_events}"
     )
+
+
+def test_running_low_bounded_against_a_single_anomalous_print(env, fake_broker):
+    """Regression test for the extended-hours contamination fix (2026-07-31
+    audit, left open): a single wild/erroneous print (e.g. a thin
+    extended-hours odd-lot trade at a fraction of the real price) must not
+    permanently crater running_low -- only a bounded (_MAX_RUNNING_LOW_DROP_PCT)
+    step is trusted per poll, converging over a few polls instead of adopting
+    the bad print outright."""
+    node = _node()
+    signal_price = 10.15
+    order_id = fake_broker.seed_resting_order(
+        'soxl_ira', TICKER, 'TRAILING_STOP', 'BUY', 50, trail_offset=1.0)
+    sig = {'current_price': signal_price, 'last_bar': datetime(2026, 7, 29, 0, 4, 58)}
+    signals_db.add_pending_buy(node, sig, channel='C0TEST', ts='1234.5', order_id=order_id)
+    signals_db.mark_pending_buy_placed_by_wl_id(node['id'])
+
+    # A single anomalous print at $1.00 (~90% below signal_price) -- clearly
+    # not a real tradeable price for this ticker.
+    fake_broker.set_quote(TICKER, last=1.00, bid=1.00, ask=1.01)
+    signals_notify.update_real_pending_buys_running_low()
+    tracked = [p for p in signals_db.get_pending_buys() if p['ticker'] == TICKER][0]
+    expected_floor = signal_price * (1 - signals_notify._MAX_RUNNING_LOW_DROP_PCT / 100)
+    assert tracked['running_low'] == pytest.approx(expected_floor), (
+        f"expected running_low bounded to the {signals_notify._MAX_RUNNING_LOW_DROP_PCT}% floor "
+        f"({expected_floor}), got {tracked['running_low']} -- a single bad print was adopted outright"
+    )
+
+    # If the bad print immediately reverts, running_low should not have been
+    # permanently cratered to $1.00 -- only the bounded floor above.
+    fake_broker.set_quote(TICKER, last=10.10, bid=10.10, ask=10.11)
+    signals_notify.update_real_pending_buys_running_low()
+    tracked_after = [p for p in signals_db.get_pending_buys() if p['ticker'] == TICKER][0]
+    assert tracked_after['running_low'] == pytest.approx(expected_floor), (
+        "running_low should stay at the bounded floor once set (min() never rises), "
+        "confirming the earlier bad print wasn't discarded silently but wasn't fully "
+        "adopted either"
+    )
+
+
+def test_gap_resize_places_a_fresh_market_buy_when_no_order_id_on_file(env, fake_broker):
+    """gap_resize_fresh use case (found by scripts/fake_broker_coverage_matrix.py,
+    2026-07-31): the scenario above always seeds a resting order first, so
+    check_gap_resize's REPLACE branch (order_id truthy) is well covered but
+    its fresh-placement fallback (no order_id at all, e.g. a manually-placed
+    trailing buy the daemon never captured an id for) had never actually been
+    driven through fake_broker despite check_gap_resize being called by name
+    in that scenario (a grep-only coverage check would false-positive here)."""
+    node = _node()
+    signal_price = 10.15
+    sig = {'current_price': signal_price, 'last_bar': datetime(2026, 7, 29, 0, 4, 58)}
+    signals_db.add_pending_buy(node, sig, channel='C0TEST', ts='1234.5', order_id=None)
+    signals_db.mark_pending_buy_placed_by_wl_id(node['id'])
+    pending = [p for p in signals_db.get_pending_buys() if p['ticker'] == TICKER][0]
+    assert pending['order_id'] is None
+
+    fake_broker.set_quote(TICKER, last=10.50, bid=10.50, ask=10.51)  # clears the 1% trigger
+
+    signals_notify.check_gap_resize()
+
+    # >= 1, not exactly 1 -- the initial market-buy fill can undersize
+    # slightly, triggering a real 2nd post-fill top-up market buy
+    # (_reconcile_fill), itself a real, correct, already-covered scenario.
+    market_buys = [o for o in fake_broker.orders.values()
+                    if o['orderLegCollection'][0]['instrument']['symbol'] == TICKER
+                    and o['orderType'] == 'MARKET'
+                    and o['orderLegCollection'][0]['instruction'] == 'BUY']
+    assert len(market_buys) >= 1
+    assert all(o['status'] == 'FILLED' for o in market_buys)
+    assert signals_db.get_pending_buys() == []
+    events = signals_db.get_coverage_events(scenario_key='gap_resize')
+    assert any(e['result'] == 'replaced' for e in events)

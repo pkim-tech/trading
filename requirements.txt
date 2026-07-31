@@ -15,3 +15,4 @@ tqdm
 slack_bolt
 schwab-py
 pandas_market_calendars
+hypothesis  # property-based testing, added 2026-07-31 for paper_trading's fill/abandon ordering

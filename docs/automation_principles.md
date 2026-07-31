@@ -196,3 +196,53 @@ internal plumbing (e.g. a coverage/audit table), not just user-facing ones.
 **Why**: user's explicit standing instruction, 2026-07-24 late night, raised while building the
 `scenario_expectations`/`coverage_deviations`/`node_id` migration — "I need the reference pages,"
 i.e. a page is the actual deliverable, not an optional nice-to-have layered on after the schema work.
+
+## 17. Independent code review is non-deterministic — pair it with a deterministic test for state-machine-shaped bugs
+Two independent review passes over the same diff can each catch things the other misses (confirmed
+directly, 2026-07-31: a first review found a HIGH real-money bug a second, later review round didn't
+re-flag, and vice versa for smaller findings). For a bug whose root cause is a missed branch in a
+small state space (a handful of boolean/enum fields combining into a decision), review alone is a
+probabilistic net, not a proof. Where the state space is small enough to enumerate by hand, write a
+real parametrized truth-table test (one test, every cell, the expected outcome asserted per cell) —
+not scattered individually-named scenario tests that happen to cover most of the same cells, which
+reads as coverage but isn't a systematic artifact. Where the space is too large to hand-enumerate,
+use property-based testing (`hypothesis`) asserting the real invariant instead of individual examples.
+To verify a test actually catches what it claims to, temporarily reintroduce the historical bug
+(mutation testing) and confirm the test goes red before trusting it.
+**Why**: `check_entry_abandon`'s real-money bug (an order could be silently orphaned while the code
+claimed it was cancelled) was a missed cell in a 3-axis, 8-cell state space — found by review, but
+the regression tests written for it were hand-named scenarios, not the actual truth table, until a
+later gap-check caught the shortfall. `scripts/mutation_test_entry_abandon.py` and
+`tests/test_entry_abandon_truth_table.py`/`tests/test_paper_trading_properties.py` are the reusable
+patterns this principle generalizes from.
+
+## 18. A shared test fixture needs its own coverage audit — "the fixture exists" isn't "the fixture is exercised"
+A stateful test double (`tests/fake_broker.py`) can have a real bug in a code path no existing test
+has ever actually reached — passing tests prove nothing about a method nothing calls. Before trusting
+a shared fixture as a safety net for a class of bugs, build an evidence-derived matrix (grep the real
+test files fresh every run, the same "never hand-typed" discipline as `coverage_registry.py`) of every
+real use case the fixture is meant to cover, and confirm each one is genuinely reached — not just that
+the surrounding orchestration function is called by name. A single entrypoint can hide 2+ genuinely
+different branches (a replace-path and a fresh-placement fallback sharing one function); grep-only
+detection will false-positive on the untested branch, so a real "was this specific branch reached"
+check requires reading the test, not just matching the function name.
+**Why**: `fake_broker.py`'s `cancel_order` had its arguments in the wrong order relative to the real
+schwab-py client, making every call to it a silent no-op — undiscovered for the fixture's whole
+lifetime because no existing test had ever called `cancel_order` (every other real order-placement
+path had migrated to atomic `replace_order` first). `scripts/fake_broker_coverage_matrix.py` (built
+2026-07-31) is the reusable pattern: found 6 of 11 real broker-mutating use cases uncovered, 2 of
+those grep false positives caught only by manually reading the test and confirming which branch it
+actually reaches.
+
+## 19. A new automated order-placement scenario gets a fake_broker test in the same session it's built, not later
+When a new production code path is added that mutates a real broker order (a new `schwab_client`
+call site, or a new reachable use case through an existing one — e.g. a new exit reason, a new
+guard-fallback branch), add it to `scripts/fake_broker_coverage_matrix.py`'s `USE_CASES` table and
+write its fake_broker scenario test then, not as a later batch-reconciliation audit. The matrix is
+only a real accountability tool if it's kept current at the point of change — otherwise the exact
+gap it was built to close (real order-mutating code with no fixture-driven proof it behaves
+correctly) silently reopens every time the codebase grows.
+**Why**: user's explicit instruction, 2026-07-31 evening, given directly after confirming the
+matrix-x-truth-table exhaustive fake_broker plan for that weekend — without this, the same "11 use
+cases existed in production, only some were ever covered" gap `scripts/fake_broker_coverage_matrix.py`
+was built to close would just reopen gradually as new scenarios get added.

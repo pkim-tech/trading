@@ -1,5 +1,329 @@
 # Backlog
 
+## [live-trading][security] Resolved 2026-07-31 (session wrap, final review) — a 3rd independent review of the complete production diff found 3 more real issues, all fixed
+
+**Context**: required by `docs/automation_principles.md` #12/CLAUDE.md's `session wrap` procedure --
+one more independent Opus pass over the complete production diff (`active_signals.py`,
+`paper_trading.py`, `schwab_client.py`, `schwab_safety.py`, `signals_helpers.py`,
+`signals_notify.py`) before the session's first real commit. Re-verified all 6 of the prior review
+round's fixes (all correct) and independently re-confirmed the oversell guard, `_check_position_exit`
+re-fetch, and `running_low` clamp direction from scratch rather than trusting the earlier conclusions.
+Found 3 new issues, all real, all fixed:
+
+1. **MEDIUM: the `sl_order_id` writeback fix (prior review round, item 2) wasn't guarded against the
+   new order id itself being `None`.** `extract_order_id` can legitimately return `None` on a real
+   broker success (e.g. a missing Location header) -- both writeback call sites
+   (`_attempt_automated_sell`, `_attempt_automated_exit_sell`) would then overwrite a real, valid
+   `sl_order_id` with `NULL`. Consequence: the `missing_sl` reconciliation check (gated on
+   `sl_order_id` truthy) goes silent, and a later hold-time-forced exit's `resting_order_id` resolves
+   to `None`, falling through to a fresh `place_equity_sell` that the resting-order dup guard then
+   rejects with **no alert at all** (both branches of the except block false) -- strictly worse than
+   the pre-fix behavior, which at least kept the dead old id and produced a loud UNPROTECTED alert.
+   Fixed with the same `is not None` guard `_place_stop_loss_for_position` already uses 600 lines
+   away. 2 new regression tests (`test_schwab_automation.py`).
+
+2. **LOW-MEDIUM: `check_entry_abandon` could cancel a real MARKET order `check_gap_resize` placed
+   seconds earlier in the same poll iteration.** `check_gap_resize` converts a trailing-buy pending
+   row into a MARKET order and writes the new order id back onto the same `pending_buys` row, but the
+   node is still `_is_trailing_buy` and `check_entry_abandon` (which runs later in the same `run_loop`
+   iteration) had no exclusion for a row gap-resize had just touched. Real failure shape: a daemon
+   restart right as `bars_held` crosses `max_hold_hours` -- gap-resize correctly detects the cleared
+   trigger and places a real pre-open market buy that can't fill before 9:30, `check_entry_abandon`
+   then cancels that brand-new order in the same iteration and falsely posts "never bounced ... entry
+   abandoned" when the trigger genuinely cleared moments earlier. Fixed: skips any row with
+   `gap_resize_date == today` (the same persisted idempotency marker `check_gap_resize` already
+   writes). 1 new regression test.
+
+3. **LOW: `scripts/coverage_registry.py`'s `fast_path_fill_reconciliation` row had no `bad_results`,**
+   but `drain_fill_queue`'s new opt-in gate (prior review round) logs two new non-proving results
+   (`outside_automation_scope`, `auto_fill_detection_disabled`) that will be the *common* real outcome
+   once this fires live (auto-fill detection is off by default) -- without `bad_results`,
+   `compute_status` would render the row `verified-live` off events that only prove the gate fired,
+   not that the real poll-reconfirm path ran. Added those two plus `stream_event_not_yet_confirmed_filled`.
+
+**3 observations documented (docstring notes added, not code changes)**: a real account with
+`order_placed=False, order_id=None` is indistinguishable from "user placed it manually but never
+tapped the confirm button" -- `order_placed` is this system's only local signal for that, no fix
+possible without a real broker order-book check this function deliberately doesn't do; the
+`raced_fill` branch deliberately bypasses the `auto_fill_detection_enabled` opt-in gate (a real,
+order-id-exact-confirmed fill must never be silently dropped, unlike `drain_fill_queue`'s ambiguous
+ticker+account match); `bars_held < node['max_hold_hours']` now uses `.get(...) or float('inf')`
+matching the paper twin's defensive pattern, closing a theoretical `None`-crashes-the-whole-loop gap.
+
+Full suite: 414 passed (was 411 before this round's fixes/tests). `scripts/live_sim_harness.py`: 7/7.
+`signals_invariants.py`: 2 known/accepted violations, unchanged.
+`scripts/mutation_test_entry_abandon.py`: still 5/5.
+
+## [live-trading][testing] Resolved 2026-07-31 (same day, 4th follow-up) — a real parametrized truth table + a hypothesis property test + full fake_broker use-case coverage (6 gaps closed, accountability matrix built)
+
+**Context**: reviewing the 3rd follow-up's own summary against what was actually promised (the
+original 4-item deterministic-testing proposal) surfaced a real gap: `check_entry_abandon`'s
+`(dry_run, order_placed, order_id)` state space was covered by 8 separately-named scenario tests,
+not the actual parametrized truth-table artifact discussed -- and a proposed `hypothesis` property
+test for `paper_trading.update_paper_buys`' fill/abandon ordering (the bigger, harder-to-hand-
+enumerate permutation space) had been described but never built. Both fixed same session, plus a
+full fake_broker use-case audit the user specifically requested.
+
+1. **Real parametrized truth table for `check_entry_abandon`.** `tests/test_entry_abandon_truth_table.py`
+   (new): one `@pytest.mark.parametrize`-driven test enumerating every `(limits, order_placed,
+   order_id)` cell mechanically, asserting the correct outcome (cancel/alert/clear) per cell in one
+   place -- distinct from the scattered hand-named scenario tests, which cover most of the same
+   cells but don't exist as a single systematic artifact.
+
+2. **`hypothesis` property test for `paper_trading.update_paper_buys`.** New dependency
+   (`hypothesis`, added to `requirements.txt`) -- `tests/test_paper_trading_properties.py` generates
+   150 random `(price, running_low, trail_buy_pct, bars_held, max_hold_hours)` combinations per run
+   and asserts the real invariant the historical ordering bug violated: a genuine bounce must always
+   fill, even on the exact poll a position is also overdue (matches the kernel's real per-bar
+   priority); fill and abandon are mutually exclusive outcomes for any single poll. Verified the test
+   actually catches the bug it's built for by temporarily reintroducing the abandon-before-fill
+   ordering and confirming the property test fails (found the counterexample
+   price=51.0/running_low=50.0/trail_buy_pct=1.0/bars_held=1/max_hold_hours=1 -- a genuine 2%
+   bounce on the exact bar the position also turns overdue), then cleanly restored.
+
+3. **`scripts/fake_broker_coverage_matrix.py`** (new): an accountability matrix in the same spirit as
+   `scripts/coverage_registry.py` -- never hand-typed opinion, re-derives from real test files every
+   run. Enumerates every real broker-mutating USE CASE (11 total, one per genuinely distinct decision
+   path, not one per `schwab_client` function -- several of those are called from 2-3 different
+   scenarios each) and whether a `tests/test_fake_broker_*.py` scenario actually drives real
+   production code through it. First run: **5/11 covered**. Two of the apparent "covers" were grep
+   false positives caught by manual verification (documented inline in the script, since grep alone
+   can't distinguish two branches sharing one entrypoint name): `test_fake_broker_sh_scenario.py`/
+   `test_fake_broker_trail_exit_scenario.py` always seed an SL first, so the exit's fresh-placement
+   fallback was never reached; `test_fake_broker_gap_resize_scenario.py` always seeds a resting
+   order, so gap-resize's fresh-placement fallback was never reached either.
+
+4. **All 6 gaps closed, 11/11 now covered**, each with a new fake_broker scenario test asserting on
+   the fake broker's own resulting order state (not a mocked return value):
+   - `tests/test_fake_broker_entry_scenario.py` -- trailing-buy entry (`_attempt_automated_buy` ->
+     `place_trailing_buy`, the live-default strategy's own entry mechanism, previously zero coverage
+     of any kind) and market-buy entry (`_attempt_automated_market_buy` -> `place_equity_buy`, plus
+     its `_sync_confirm_and_protect` SL-placement path).
+   - `tests/test_fake_broker_arm_scenario.py` -- the arm transition (`notify_trailing_activated` ->
+     `_attempt_automated_sell`), previously zero coverage: replacing an existing resting SL with a
+     real trailing-sell, and a fresh trailing-sell placement when there's no SL to replace. Confirms
+     the 2026-07-31 `sl_order_id` writeback fix (3rd follow-up, item 2) works against real broker
+     state, and clarified (via a wrong test assertion, fixed) that a fresh placement correctly
+     tracks its order id in `trail_state.exit_order_id`, not `open_positions.sl_order_id` (nothing
+     existed there to update).
+   - `tests/test_fake_broker_exit_fresh_scenario.py` -- exit with no resting order to replace (fresh
+     `place_equity_sell`), verified via a real immediate fill correctly closing the position.
+   - `tests/test_fake_broker_gap_resize_scenario.py` (extended) -- gap-resize with no `order_id` on
+     file (fresh `place_equity_buy`).
+
+Full suite: 399 passed (was 392 after the 3rd follow-up). `scripts/live_sim_harness.py`: 7/7.
+`signals_invariants.py`: 2 known/accepted violations, unchanged.
+`scripts/fake_broker_coverage_matrix.py`: 11/11.
+
+New `docs/heap.md` (per user request) -- ultra-short-term scratch capture, a corollary to
+`backlog_cache.md` for mid-session "by the way" thoughts that shouldn't pollute the real backlog
+until they're either built or dropped.
+
+## [live-trading][testing] Resolved 2026-07-31 (same day, 3rd follow-up) — a second independent review found 6 more findings (fixed), then deterministic testing (mutation testing + fake_broker) built for check_entry_abandon, which itself found a real latent bug in the shared fake_broker.py fixture
+
+**Context**: after the 2nd follow-up (below) closed 8 defects found by review, a second review round
+verified those 8 fixes were correct (no new regressions) but found 6 further findings in the *new*
+code the fixes added. All 6 fixed same session:
+
+1. **MEDIUM**: three `check_entry_abandon` branches that leave the `pending_buys` row in place
+   (`unrecognized_account`, `no_order_id_on_file`, `cancel_failed`) had no alert throttling --
+   `bars_held` only grows once past `max_hold_hours`, so a real stuck position would re-alert on
+   every single poll forever, burying real trade alerts. Fixed with a new
+   `_ENTRY_ABANDON_ALERTED`/`_ENTRY_ABANDON_ALERT_COOLDOWN_SECS` (15 min), matching the existing
+   `_RECONCILE_ALERTED` pattern this module already uses elsewhere for the identical reason.
+2. **MEDIUM**: `entry_abandon_timeout` -- the first-ever production caller of a real broker
+   `cancel_order` -- had no row in `scripts/coverage_registry.py`'s trade-flow accountability grid
+   and no entry in `docs/live_test_coverage.md`. Both added.
+3. **LOW**: `schwab_client.cancel_order`'s docstring still claimed "not currently called by any real
+   path... none exists in this codebase yet" -- now false. Corrected.
+4. **LOW**: the new alerts used bare `(account)` instead of the standing `mode_tag(account)`
+   (LIVE/DRY-RUN) convention, and the terminal "abandoned" message unconditionally claimed "resting
+   order cancelled" even on the dry_run path, where nothing was ever real. Fixed: all alerts now use
+   `mode_tag`; a new `did_cancel` flag distinguishes a real confirmed cancel from every path that
+   reaches the terminal branch with nothing real to cancel (dry_run, or no order ever placed).
+5. **LOW**: the ambient/pinned-check cutoff (`(h0, m0+5)`) was hardcoded rather than derived from
+   `_PINNED_ENTRY_TIMES` -- correct today, silently wrong if `_SIGNAL_WINDOWS`/`_PINNED_BAR_TIMES` is
+   ever retimed independently. Fixed to derive the cutoff from the real pinned-time set.
+6. **INFO**: `drain_fill_queue`'s new order_id-match node resolution compared across a JSON boundary
+   with no type coercion -- `pending_buys.order_id` has INTEGER affinity, the stream side is raw
+   JSON; a numeric-string `orderId` would silently fail to match (fails safe to the slow poll, but
+   pointless latency). Fixed with explicit `int()` coercion on both sides.
+
+**Then, per explicit user request, built two forms of deterministic testing** (an alternative to
+relying on independent code review, which is non-deterministic -- two review passes can catch
+different things) for `check_entry_abandon` specifically, since that's where the real-money bug was:
+
+- **`scripts/mutation_test_entry_abandon.py`** (new): reverts one specific historical/current bug in
+  `check_entry_abandon` at a time (temporarily rewriting `signals_notify.py`'s real source text),
+  runs the exact regression test paired with that bug, asserts it fails (the mutant is "killed"),
+  then restores the original text. 5 mutations covering the real-money no-order-id bug, the
+  live-node-vs-pinned-snapshot bug, the unrecognized-account fail-closed guard, the FILLED-race
+  reconciliation, and the unconfirmed-cancel fail-closed retry. **5/5 mutants killed** -- the test
+  suite would have caught all five if they were reintroduced. Found one real test-coverage gap
+  while scoping this (no existing test covered the `limits is None` branch at all) -- added
+  `test_unrecognized_account_fails_closed_and_alerts` before including it as a mutation target.
+  Distinct from `sim_chaos_monkey.py` (simulates a human missing real signals, a strategy-robustness
+  question) -- this operates on the source code itself, a test-suite-quality question.
+- **`tests/test_fake_broker_entry_abandon_scenario.py`** (new): drives `check_entry_abandon` against
+  `tests/fake_broker.py`'s stateful simulated order book instead of a mocked function return value --
+  asserts the *broker's own order state* actually changed (CANCELED), not just that `cancel_order`
+  was called. **This immediately found a real, previously-undiscovered bug in the shared fake_broker.py
+  fixture itself**: `FakeBroker.cancel_order`'s parameters were `(account_hash, order_id)`, but the
+  real schwab-py client (and every real call site, `schwab_client.py:530`) calls it
+  `cancel_order(order_id, account_hash)` -- order_id first. With the swapped signature, every prior
+  call silently did nothing (looked up a hash string that's never a real dict key), and no test had
+  ever caught it because no existing fake_broker test asserted on post-cancel broker state -- every
+  other real order-placement path in this codebase was migrated to atomic `replace_order` before this
+  session, so `cancel_order` had simply never been exercised through fake_broker until now. Fixed the
+  parameter order; also added a missing `FakeBroker.get_order` method (needed by
+  `schwab_client._confirm_order_status`'s real post-cancel poll, previously absent entirely -- any
+  caller reaching it would silently get `None`/unconfirmed via a swallowed `AttributeError`). 2
+  scenario tests: a real cancel that actually flips the broker's order status, and a real bounce-fill
+  racing the cancel that gets reconciled into a real position instead of discarded.
+
+Full suite: 392 passed (was 389 after the 6 findings, 386 before them). `scripts/live_sim_harness.py`:
+7/7. `signals_invariants.py`: 2 known/accepted violations, unchanged.
+
+## [live-trading][security] Resolved 2026-07-31 (same day, 2nd follow-up) — independent Opus trace review of the follow-up session below found 8 real defects in that work (1 real-money), all fixed
+
+**Method**: rather than trust the follow-up session's own tests, a fresh Opus agent with no session context traced each of its 7 changes through their real call chains by hand (same style as the original audit two entries below), specifically hunting for composition bugs, races, and fail-open/fail-closed mistakes. Confirmed 8 defects; 4 other claims in the review brief were investigated and found NOT to be real issues (documented at the end). All 8 fixed same session, each with new/updated regression tests. Full suite: 386 passed (was 381). `scripts/live_sim_harness.py`: 7/7. `signals_invariants.py`: 2 known/accepted violations, unchanged.
+
+1. **HIGH, real money: `check_entry_abandon` could orphan a real resting order while claiming it was cancelled.** The cancel branch required `order_id` truthy, but the manual "Trailing Buy Order Placed" Slack flow (`signals_handlers.handle_trail_buy_order_placed`) sets `pending_buys.order_placed=True` and never captures a broker order id (the user places it directly at Schwab, we never see the id returned) -- indistinguishable by `(order_placed, order_id)` alone from an automated dry_run placement, which also leaves `order_id=None`. For a REAL account's manual placement, the old code fell straight through to `db.clear_pending_buy_by_wl_id` + a "resting order cancelled" Slack message -- nothing was actually cancelled, and clearing the row also broke `handle_trail_buy_fill_price`'s stale-button guard, which needs that exact row to accept a later manual fill confirmation. Real failure shape: DPST (real, `soxl_ira`) BUY fires, automated placement declines (any of several reachable `SafetyViolation`s), user manually places + taps "Order Placed", 8 bars later the real still-resting order gets silently orphaned with zero local tracking and a false "cancelled" claim -- the exact leak this function exists to fix, now with the local record destroyed too. Fixed: distinguishes real-account-manual-placement (`not limits.dry_run and order_placed and not order_id` -- alert, leave the row untouched, require manual handling) from a dry_run account (safe to clear regardless, nothing real was ever placed) via the account's real `dry_run` flag, and fails closed (alert, don't touch) on an unrecognized account. 4 new tests.
+
+2. **MEDIUM-HIGH: read the live `watch_list` node instead of the pinned pending-buy snapshot.** `check_entry_abandon` did `db.get_watch_list_node_by_id(wl_id)` for account/max_hold_hours, contradicting this module's own established convention (see the `_fresh_node` removal note: "a real resting order's account is a physical fact fixed at placement, not whatever watch_list says now") that every other `pending_buys` consumer (`check_gap_resize`, `check_auto_fills`, `_reconcile_buy_fill`) already follows. A later account edit on the node (a real, used pattern in this project) would silently retarget a real `cancel_order` call at the wrong account, or make a real non-dry_run order's cancel branch skip entirely if the node's account was edited to a dry_run one. Fixed: reads `pb['node']` (the signal-time snapshot already embedded in every pending_buys row) throughout, matching every sibling function. 1 new test (edits the live node's account after placement, confirms the cancel still targets the original account).
+
+3. **MEDIUM: the ambient-scan exclusion (item 7 below) removed the only fallback when the pinned check itself didn't run.** `pinned_bar_alerted` is deliberately pre-seeded at daemon startup for any bar-time already past `now` (automation_principles.md #15), so a restart landing at e.g. 10:33 skips the 10:30 pinned entry check entirely for that day. The whole-window exclusion added by item 7 left an affected open_check+automation node with literally zero BUY coverage for the rest of that window (10:33-10:40), where before the fix the ambient scan would still have covered it at a degraded price. Same gap, smaller, when the pinned check's own price fetch fails all 3 retries. Fixed: `_ambient_buy_scan_nodes` now only excludes these nodes before the window's pinned moment (:25-:29); from :30 onward the ambient scan resumes as a fallback, since by then the pinned check has already had its one chance to win the dedup key first. 2 new tests (exclusion before :30, inclusion after).
+
+4. **MEDIUM: paper's entry-abandon check ran before the bounce-fill check, inverting the kernel's real per-bar order.** The kernel (`backtester.py`'s `_simulate_trail_both`) checks the fill first and only falls through to the `wait_bars >= max_hours_to_hold` abandon on a bar that didn't fill; the first version of `paper_trading.update_paper_buys` checked abandon first, so a poll where price had already bounced past the trigger on the exact bar `max_hold_hours` was reached would abandon instead of fill -- paper P&L would then systematically drop marginal, latest-bounce entries. Fixed by reordering (fill check first, abandon only as a fallback) -- while fixing this, also found and fixed a second-order bug it exposed: the reordering initially let a stale/unavailable price (`_current_price`'s 90min staleness guard, common after a long enough wait) `continue` past the abandon check entirely via an early `if price is None: continue`, permanently un-abandoning an overdue position whenever fresh price data wasn't available. Now computes bars-held eligibility unconditionally (cached data only, doesn't need live price) before branching on price availability. 1 existing test's failure surfaced this during the fix itself.
+
+5. **MEDIUM: the paper sizing "fix" (item 10 below) was less accurate than what it replaced, not more.** `buy_order_sizing`'s worst-case pad (`trail_buy_pct + pad_pct`) exists because a REAL order is sized before its fill price is known; paper already knows the fill price when it fills, and the real end state after `_reconcile_fill`'s post-fill top-up converges to `target_notional / fill_price` regardless of the initial pad -- so re-applying the pad at paper's fill time (which item 10 did) undersized paper positions relative to what a real position actually ends up holding, the opposite of the intended alignment. The ORIGINAL flat `starting_notional // price` formula (which item 10 replaced) was already the correct match to the real post-topup end state. Reverted to the flat formula, now with the (correct) rationale documented in place. Both of item 10's tests updated; 1 rewritten to make the real-end-state argument explicit instead of asserting parity with `buy_order_sizing`.
+
+6. **LOW-MED: the paper abandon Slack alert could never fire.** `node` inside the abandon branch is the frozen `pending_buys.node_json` signal-time snapshot, and `paper_alert_verbose` isn't one of the fields captured in `_PENDING_BUY_NODE_KEYS` -- so `node.get('paper_alert_verbose')` was always `None`/falsy regardless of the real node's setting. The fill-alert path 40 lines below already re-reads the live node for exactly this reason (a 2026-07-26 Opus review fix for the identical bug shape); the new abandon branch reintroduced it. Fixed the same way (re-read via `db.get_watch_list_node_by_id`).
+
+7. **LOW-MED, pre-existing (not introduced this session, fixed while touching the adjacent code): `start_paper_market_buy` still sizes off real `trade_log`.** Item 10's new `target_notional` override on `buy_order_sizing` was applied to the trailing-buy fill path but not the sibling market-buy path, which still calls `buy_order_sizing(node, sig)` with no override -- falling through to `_last_sale_recovery`'s real `trade_log` query. Paper fills never land in `trade_log` (`paper_trade_log` instead), so this is live-reachable today for the deliberate DPST live+research pairing (CLAUDE.md): if the paired nodes ever matched on `(ticker, strategy, version, window, account)`, the research node's paper sizing could pick up the live node's real trade proceeds. Fixed with the same `target_notional=starting_notional` override.
+
+8. **LOW: `drain_fill_queue`'s new opt-in gate (item 5 below) resolved the node via a lookup its own neighboring comment says must never gate a real action.** The gate used `db.get_watch_list_node(ticker=ticker, account=account)` -- a fuzzy, ambiguity-prone lookup whose docstring already establishes (and this same function's `_reconcile_buy_fill` call, a few lines below, already respects) that it's "enrichment/logging, never a gate on a real action." Since `node_auto_fill_detection_enabled(None)` defaults closed, a fuzzy-match failure would silently drop the fast path for a genuinely opted-in node (fails closed to the slower `check_auto_fills` poll, so a latency regression rather than a safety hole, but a real self-contradiction). Fixed: resolves the node by exact `order_id` match against the real `pending_buys` row instead (the stream event already carries the real order_id). 1 new test (seeds a second node sharing the same ticker+account with detection OFF, proving the fix doesn't fall back to the wrong one).
+
+**Investigated, found NOT to be real issues** (the review agent verified from real call-chain tracing, not assumption):
+- The `shares >= 1` guard (item 6 below) doesn't fully prevent a 0-share BUY signal from entering the manual Slack pipeline -- true, but pre-existing (predates this session), not introduced by the guard itself.
+- The oversell guard fix (item 3 below) -- traced every real non-test SELL-side `schwab_client` caller; all resolve `account` from the same `open_positions` row the guard's own lookup reads, so no real path is wrongly blocked.
+- `sl_order_id` writeback (item 2 below) -- a single-column UPDATE with no read-modify-write, no clobber race against the Slack-handler thread.
+- `_check_position_exit`'s re-fetch (item 8 below) -- `resolve_at_bar_close`/`sell_alerted` key off in-memory state and `pos['id']`, unaffected by the re-fetch.
+
+## [live-trading][security] Resolved 2026-07-31 (same day, follow-up session) — 8 of the 13 items left open by the exit/arm/entry audit above, now fixed
+
+**Scope**: closed the prioritized open list from the audit below, one at a time, each with its own
+regression test and a full-suite run before moving to the next. Full suite: 381 passed (was 362 at
+the start of the audit below, 371 after the [HIGHEST] item). `scripts/live_sim_harness.py`: 7/7.
+`signals_invariants.py`: 2 known/accepted violations (SH's `max_hold_hours` snapshot drift, ERY's
+`fixed_sl` snapshot drift from the widening the prior session — both position-row-vs-live-node-config
+drift, the same accepted pattern as before), unchanged.
+
+1. **[HIGHEST] Live entry-abandon timeout, built.** New `signals_notify.check_entry_abandon()`
+   (wired into `active_signals.run_loop` alongside the other pending-buy trackers) mirrors the
+   backtest kernel's `wait_bars >= max_hours_to_hold` (`backtester.py`'s `_simulate_trail_buy`/
+   `_simulate_trail_both`): once `compute._bars_held(signal_time) >= node['max_hold_hours']`, cancels
+   the real resting order (`schwab_client.cancel_order`) and clears the `pending_buys` row -- no
+   trade recorded, matching the kernel's cancel-and-forget semantics. Handles a real race (the cancel
+   lands the same instant a genuine bounce-fill does) by reconciling the fill instead of abandoning
+   it, and fails closed (leaves the row, retries next poll) on an unconfirmed cancel. A parallel
+   branch inside `paper_trading.update_paper_buys()` covers paper rows (no real order to cancel, just
+   clears the row) -- paper trailing buys previously waited forever too, silently missing the
+   "gives up on entry" outcome the kernel models. 9 new tests (`tests/test_entry_abandon.py`).
+
+2. **`sl_order_id` staleness after any atomic replace, fixed.** Only the hold-time-forced TRAIL case
+   (via `trail_state.exit_order_id`) was refreshed after the 2026-07-31 audit above; the
+   `open_positions.sl_order_id` DB column itself was never updated after ANY replace --
+   `_attempt_automated_sell` (arm-time SL-to-trailing-sell swap) and `_attempt_automated_exit_sell`
+   (TP/SL/TIME exit's SL-to-market-sell swap) both now call `db.set_sl_order_id_by_position` with the
+   new order id whenever the just-replaced order was the one tracked as `sl_order_id`. Without this,
+   a later reader of `pos['sl_order_id']` (a re-arm attempt, the TRAIL+hold_time_forced SL fallback,
+   the manual "cancel the existing stop-loss" reminder text) could reference a dead order id. 2 new
+   tests (`tests/test_schwab_automation.py`).
+
+3. **Oversell guard's fail-open branch, fixed after dedicated investigation.** The prior session's
+   fix attempt broke ~14 tests and was reverted rather than same-night-patched. A background
+   investigation agent confirmed the dominant cause: those tests are guard-isolation tests
+   (`tests/test_schwab_safety.py` and others) that exercise OTHER `check_order` guards -- kill switch,
+   cash check, signal window, duplicate-order, notional cap, hard ceiling, daily/burst caps -- via a
+   SELL call with no `open_positions` row ever seeded, since seeding one was never their point. Every
+   real production SELL call site was confirmed to resolve a position via `get_open_position_by_wl_id`/
+   `get_position_by_id` *before* ever reaching `schwab_client`, with the same `account` value flowing
+   straight through to `check_order`'s own separate `get_open_position_for_account` lookup -- so a
+   real position should always be found there. Verified against the real `trading_live.db`: zero
+   `open_positions` rows with a NULL/empty `account` (the one plausible legacy-data gap) before
+   shipping. Fixed: `check_order`'s SELL branch now raises `SafetyViolation` outright when no local
+   position is found (`if pos is None: raise ...`), instead of silently skipping the quantity bound.
+   All 14 affected tests fixed by seeding a real position (`_seed_position()` helper,
+   `tests/test_schwab_safety.py`) rather than by loosening the new guard -- matches
+   `automation_principles.md` #6 (fix the guard/test, don't poke a bypass hole). 1 new dedicated
+   regression test (`test_sell_blocked_when_no_local_position_on_file`) proves the fail-closed
+   behavior itself, seeding nothing at all.
+
+4. **`running_low` extended-hours contamination, bounded.** `update_real_pending_buys_running_low`
+   deliberately uses `schwab_client.get_current_price`'s extended-hours-preferring quote (needed to
+   track a genuine overnight/pre-market fall ahead of `check_gap_resize`'s pre-open check -- confirmed
+   by `tests/test_fake_broker_gap_resize_scenario.py`'s existing Phase 1 test, which this fix had to
+   preserve exactly), but a single thin/anomalous extended-hours print could previously crater
+   `running_low` permanently (it's `min(...)`, never self-corrects). New
+   `_MAX_RUNNING_LOW_DROP_PCT = 20.0` caps a single poll's drop; a genuine large real move still
+   reaches its true low within a couple of polls (each capped step compounds), so real gap coverage
+   is preserved. New test proves both the bound and that a reverting bad print doesn't get undone
+   (the capped floor sticks, `min()` never rises) -- `tests/test_fake_broker_gap_resize_scenario.py`.
+
+5. **`drain_fill_queue` opt-in gate bypass, fixed.** The fast websocket fill-detection path
+   auto-reconciled any real fill unconditionally, bypassing `auto_fill_detection_enabled`/
+   `node_auto_fill_detection_enabled` -- the exact opt-in gate the slower `check_auto_fills` poll
+   already respected. Now checks both before calling `_reconcile_buy_fill`, logging
+   `auto_fill_detection_disabled`/`outside_automation_scope` coverage events on skip. 3 existing
+   `tests/test_part3_gap_resize.py` tests updated to explicitly opt in (`_enable_auto_fill_detection()`
+   helper); 1 new test proves the gate itself (fill queued, nothing reconciled, pending row untouched).
+
+6. **`shares >= 1` guard on the real BUY path, added.** `_attempt_automated_buy`/
+   `_attempt_automated_market_buy` now check `sizing['shares'] < 1` before ever calling
+   `schwab_client.place_trailing_buy`/`place_equity_buy` -- previously a too-small notional/price
+   combo reached the broker call, got rejected, and both dinged the node circuit breaker's
+   `order_failures` streak and posted a "blocked"-shaped alert that misleadingly implied a safety
+   guard fired rather than "nothing to actually buy". New `automated_buy_execution`/
+   `shares_too_small` coverage event; 1 new test (`tests/test_schwab_automation.py`).
+
+7. **Ambient-scan-pre-empts-pinned-check race, fixed.** `_SIGNAL_WINDOWS` (10:25-10:40/15:25-15:40)
+   starts 5 minutes before the pinned 10:30/15:30 check (`_scan_pinned_entry`) -- an ambient poll
+   landing in that `:25-:29` gap could fire a BUY on the ambient scan's degraded yfinance price
+   before the more accurate pinned check (Schwab's true session quote) ran, permanently winning the
+   shared `buy_alerted` dedup key for that node/bar. New `active_signals._ambient_buy_scan_nodes()`
+   excludes exactly the population `_scan_pinned_entry` exclusively owns (`entry_timing=='open_check'
+   and ticker in AUTOMATION_ENABLED_TICKERS`) from the main ambient scan -- matches
+   `_scan_pinned_entry`'s own docstring, which already establishes these nodes should never fall
+   through to an ambient price, including on a pinned-fetch failure. 3 new tests
+   (`tests/test_part4_entry_trigger.py`) confirm the exclusion and that non-open_check/non-automation
+   nodes are unaffected (still ambient-covered, since they have no pinned alternative).
+
+8. **Theoretical stale-snapshot race in the ambient exit loop, closed defensively.** `active_signals.
+   _check_position_exit` (the per-position closure inside `run_loop`'s ambient exit-check loop) called
+   `check_sell_condition` against the once-per-poll-cycle `open_positions` snapshot, not a fresh
+   re-fetch -- the same stale-snapshot-then-clobber pattern already fixed elsewhere in the audit
+   below, here "not practically reachable" only because of call ordering, not an explicit re-fetch.
+   Now re-fetches via `db.get_position_by_id(pos['id'])` at the top, returning early (nothing to
+   check) if the position was closed concurrently since the snapshot was taken.
+
+**Deliberately not built, confirmed intentional design (not a bug):** BUY-shaped `check_order`
+guards (kill switch, automation pause) also blocking SELL -- asked directly, user's answer: "i prefer
+an off switch for everything - what if the algo is going rogue and tries to trade a non algo node?"
+A genuine full-stop against a malfunctioning algo, including its exits, was judged more important
+than exempting SELL. See `[[project_kill_switch_blocks_everything]]` memory.
+
+**Attempted, reverted (not shipped):** live bounce-fill tracking's bar-Close-instead-of-Low/High bias
+(`update_dry_run_buys`/`paper_trading.update_paper_buys`) -- switching to the cached bar's Low/High
+broke 8 existing tests that all control simulated price via a `_current_price` monkeypatch, since
+those tests would then need synthetic-CSV-level control instead. A bigger rewrite than this
+documented low-severity (dry-run/paper simulation accuracy only, no real broker exposure) bias
+warrants -- reverted cleanly, left open.
+
+**Deliberately scoped out, not attempted this session:** the dry-run-account false "auto-placed"
+circuit-breaker claim (conditional on a specific precondition, not confirmed currently live) and the
+1-3% `fixed_sl` sizing research question (not a code defect).
+
 ## [live-trading][security] Resolved 2026-07-31 — full exit/arm/entry execution-path audit: 9 real bugs found and fixed (one real-money, one live-incident-during-the-session), 13 more confirmed and left open
 
 **Scope and method**: rather than a diff review, this was a series of manual execution-path
@@ -176,7 +500,11 @@ the docstring (drop the "also ensures the ticker-level flag is on" claim, or act
 inside the function and simplify the Slack handler to one call — either is fine, low priority,
 cosmetic/documentation-accuracy only).
 
-## [live-trading][security] Open, raised 2026-07-30 (evening) — SH stuck in TRAIL exit_pending again; `_attempt_automated_exit_sell`'s check order defeats the 2026-07-29 hold-time-forced fix
+## [live-trading][security] ✅ Resolved 2026-07-31 — SH stuck in TRAIL exit_pending again; `_attempt_automated_exit_sell`'s check order defeats the 2026-07-29 hold-time-forced fix
+**Confirmed resolved by the 2026-07-31 exit/arm/entry audit's fix #7** (`hold_time_replaced` flag,
+checked before the `exit_pending.order_id` early-return, replacing the equality-comparison
+discriminator this entry originally proposed) — `signals_notify.py`'s `still_unreplaced_trail_order`
+now correctly re-derives from `hold_time_replaced`, not `pending_order_id == exit_order_id`.
 
 **Real incident**: SH (node #135, `soxl_test`/`soxl_ira`, position #18, LIVE) entered 2026-07-24 07:38
 @ $33.52, armed TRAIL at peak $33.94 with a real trailing-sell order resting at the broker

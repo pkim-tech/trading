@@ -66,6 +66,7 @@ def test_buy_outside_signal_window_blocked(env, monkeypatch):
 
 
 def test_sell_outside_signal_window_not_blocked(env, monkeypatch):
+    _seed_position()
     monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 7, 15, 12, 0))
     result = schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
     assert result == (None, None)  # dry_run -- not blocked by the time gate
@@ -82,6 +83,7 @@ def test_trailing_buy_goes_through_same_safety_checks(env):
 
 
 def test_trailing_sell_dry_run_blocks_real_api_call(env):
+    _seed_position()
     result = schwab_client.place_trailing_sell('ira', TICKER, 5, 50.0, trail_pct=15.0)
     assert result == (None, None)
 
@@ -93,6 +95,24 @@ def test_trailing_sell_goes_through_same_safety_checks(env):
 
 def _get_node():
     return [n for n in signals_db.get_watchlist() if n['ticker'] == TICKER][0]
+
+
+def _seed_position(shares=1_000_000):
+    """Seeds a real open_positions row big enough to never trip the oversell
+    guard (schwab_safety.check_order's SELL branch, fail-closed as of
+    2026-07-31) -- for tests exercising some OTHER guard via a SELL call,
+    where the position size itself isn't under test. Tests that ARE testing
+    the oversell bound (test_sell_exceeding_real_position_blocked,
+    test_sell_within_real_position_allowed, test_same_day_sell_after_buy_not_blocked)
+    seed their own specific share count instead."""
+    from datetime import datetime
+    node = _get_node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=shares)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.commit()
 
 
 def test_same_day_rebuy_blocked_after_earlier_sale(env):
@@ -309,6 +329,7 @@ def test_duplicate_order_within_window_blocked(env):
 
 
 def test_duplicate_guard_is_per_side(env):
+    _seed_position()
     schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
     # opposite side isn't a duplicate -- should not raise
     schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
@@ -363,6 +384,7 @@ def test_replace_does_not_self_block_on_the_order_it_is_replacing(env, monkeypat
     # fix, check_order's resting-SELL guard saw that same order still resting
     # (the cancel hasn't happened yet at check time) and blocked every single
     # attempt -- SH's TIME/SL exit was stuck behind this for 4 real days.
+    _seed_position()
     monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
         {"status": "WORKING", "orderId": 999, "orderLegCollection": [
             {"instruction": "SELL", "instrument": {"symbol": TICKER}}
@@ -381,6 +403,7 @@ def test_trailing_sell_replace_does_not_self_block_on_the_order_it_is_replacing(
     # exercised this path -- it was staged manually via
     # stage_live_test_order.py, which bypasses schwab_safety entirely -- so
     # this fix had no test and no live proof until now.
+    _seed_position()
     monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
         {"status": "WORKING", "orderId": 999, "orderLegCollection": [
             {"instruction": "SELL", "instrument": {"symbol": TICKER}}
@@ -407,6 +430,7 @@ def test_replace_still_blocks_on_a_different_resting_sell_order(env, monkeypatch
 def test_resting_buy_for_same_ticker_does_not_block_sell(env, monkeypatch):
     # An unrelated resting BUY for this ticker must not block closing a
     # position -- only a same-side (SELL) match should.
+    _seed_position()
     monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
         {"status": "WORKING", "orderLegCollection": [
             {"instruction": "BUY", "instrument": {"symbol": TICKER}}
@@ -459,6 +483,7 @@ def test_notional_cap_does_not_block_sell(env):
     blocked because its notional exceeded soxl_ira's $800 BUY-sizing cap --
     notional_cap bounds new risk-adding exposure, not closing an existing
     position, so SELL must not be gated by it."""
+    _seed_position()
     cap = schwab_safety.ACCOUNTS['ira'].notional_cap
     result = schwab_client.place_equity_sell('ira', TICKER, 1, cap + 1)
     assert result == (None, None)  # dry_run -- not blocked
@@ -467,6 +492,7 @@ def test_notional_cap_does_not_block_sell(env):
 def test_hard_ceiling_still_blocks_sell(env):
     """notional_cap is exempt for SELL, but the absolute HARD_ORDER_CEILING
     sanity backstop must still apply to both sides."""
+    _seed_position()
     with pytest.raises(schwab_safety.SafetyViolation, match="exceeds hard ceiling"):
         schwab_client.place_equity_sell('ira', TICKER, 1, schwab_safety.HARD_ORDER_CEILING + 1)
 
@@ -492,6 +518,21 @@ def test_sell_within_real_position_allowed(env):
                               entry_price=50.0, entry_time=_IN_WINDOW_TIME, shares=5)
     result = schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
     assert result == (None, None)  # dry_run -- not blocked
+
+
+def test_sell_blocked_when_no_local_position_on_file(env):
+    """Regression test for the oversell guard's fail-open branch (2026-07-31
+    audit, left open; fixed 2026-07-31 later session after investigation
+    confirmed the 14 prior test failures were a test-fixture gap, not a real
+    production exposure -- see schwab_safety.check_order's SELL branch
+    comment). No open_position seeded here at all -- the guard used to only
+    apply its bound when a position row was found, silently allowing an
+    unbounded SELL through with none on file."""
+    with pytest.raises(schwab_safety.SafetyViolation, match="no open position on file"):
+        schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
+    events = signals_db.get_coverage_events(scenario_key="sell_exceeds_position_blocked")
+    assert len(events) == 1
+    assert events[0]['result'] == "blocked_no_position"
 
 
 def test_insufficient_cash_blocked(env, monkeypatch):
@@ -525,6 +566,7 @@ def test_balance_fetch_failure_fails_closed(env, monkeypatch):
 
 
 def test_cash_check_not_applied_to_sell(env, monkeypatch):
+    _seed_position()
     monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 0.0)
     result = schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
     assert result == (None, None)  # SELL doesn't need buying power, not blocked
@@ -612,6 +654,7 @@ def test_sell_does_not_increment_daily_cap(env, monkeypatch):
     consume the same shared daily_order_cap pool as BUYs, so unrelated exits
     could starve a later entry's budget. SELLs must no longer count at all --
     matches the precedent already set for notional_cap (BUY-only)."""
+    _seed_position()
     monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
     schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
     schwab_client.place_equity_sell('ira', TICKER, 6, 50.0)  # different qty avoids dup-order block
@@ -625,6 +668,7 @@ def test_sell_not_blocked_by_buy_exhausted_daily_cap(env, monkeypatch):
     _attempt_automated_sell cancels the resting stop-loss before placing the
     trailing-sell, so a blocked sell here would leave a position unprotected.
     The check must be BUY-only too."""
+    _seed_position()
     monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
     schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # exhaust the cap
     schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)  # must not be blocked
@@ -635,6 +679,7 @@ def test_protective_stop_loss_bypasses_exhausted_daily_cap(env, monkeypatch):
     an already-exhausted daily_order_cap from unrelated earlier entries,
     leaving a brand-new fill unprotected. place_stop_loss must succeed
     (is_protective=True) even once the account's cap is fully spent."""
+    _seed_position()
     monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
     schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # exhaust the cap
     with pytest.raises(schwab_safety.SafetyViolation, match="daily order cap"):
@@ -683,6 +728,7 @@ def test_protective_top_up_bypasses_exhausted_daily_cap(env, monkeypatch):
 
 
 def test_global_burst_cap_blocked(env, monkeypatch):
+    _seed_position()
     monkeypatch.setattr(schwab_safety, 'GLOBAL_ORDERS_PER_MINUTE', 1)
     schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
     with pytest.raises(schwab_safety.SafetyViolation, match="global burst cap"):

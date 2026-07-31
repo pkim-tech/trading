@@ -249,6 +249,102 @@ def test_notify_sell_signal_time_exit_logs_coverage_event(env):
     assert events[0]['ticker'] == TICKER
 
 
+def test_automated_sell_replace_updates_stale_sl_order_id(env, monkeypatch):
+    """Regression test for the sl_order_id-never-cleared-after-replace bug
+    (2026-07-31 audit, left open): once the arm-time trailing-sell replace
+    succeeds, open_positions.sl_order_id must be updated to the new resting
+    order, not left pointing at the now-dead original SL forever."""
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    monkeypatch.setattr(schwab_client, 'replace_order_with_trailing_sell', lambda *a, **kw: (None, 987))
+    signals_notify.notify_trailing_activated(pos, current_price=52.0)
+    updated = signals_db.get_open_position(TICKER)
+    assert updated['sl_order_id'] == 987
+
+
+def test_automated_exit_sell_replace_updates_stale_sl_order_id(env, monkeypatch):
+    """Same regression, via the TP/SL/TIME exit path (_attempt_automated_exit_sell)
+    instead of the TRAIL arm path -- a genuine (never-armed) TIME exit replaces
+    the resting SL with a market sell; sl_order_id must track the new order."""
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    monkeypatch.setattr(schwab_client, 'replace_equity_order_with_market', lambda *a, **kw: (None, 555))
+    signals_notify.notify_sell_signal(pos, 'TIME', current_price=51.0, target_price=51.0)
+    updated = signals_db.get_open_position(TICKER)
+    assert updated['sl_order_id'] == 555
+
+
+def test_automated_sell_replace_does_not_erase_sl_order_id_when_new_id_unextractable(env, monkeypatch):
+    """Regression test for a review finding: a real successful replace can
+    still return order_id=None (e.g. extract_order_id finds no Location
+    header) -- the sl_order_id writeback must not overwrite a real, valid
+    existing sl_order_id with None in that case, which would silence the
+    missing_sl reconciliation check (gated on sl_order_id truthy) and drop
+    the hold-time-forced exit fallback to None."""
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    monkeypatch.setattr(schwab_client, 'replace_order_with_trailing_sell', lambda *a, **kw: (None, None))
+    signals_notify.notify_trailing_activated(pos, current_price=52.0)
+    updated = signals_db.get_open_position(TICKER)
+    assert updated['sl_order_id'] == 12345  # unchanged, not erased to None
+
+
+def test_automated_exit_sell_replace_does_not_erase_sl_order_id_when_new_id_unextractable(env, monkeypatch):
+    """Same regression, via the TP/SL/TIME exit path."""
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    monkeypatch.setattr(schwab_client, 'replace_equity_order_with_market', lambda *a, **kw: (None, None))
+    signals_notify.notify_sell_signal(pos, 'TIME', current_price=51.0, target_price=51.0)
+    updated = signals_db.get_open_position(TICKER)
+    assert updated['sl_order_id'] == 12345  # unchanged, not erased to None
+
+
+def test_automated_buy_skips_placement_when_shares_size_to_zero(env, monkeypatch):
+    """Regression test for the missing shares>=1 guard (2026-07-31 audit, left
+    open): a too-small notional/price combo sizing to 0 shares must not reach
+    the real broker call at all (which would reject it, but only after
+    dinging the node circuit breaker's order_failures streak and posting a
+    misleading 'blocked'-shaped alert)."""
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET starting_notional = 1 WHERE ticker = ?", (TICKER,))
+        c.commit()
+
+    def _boom(*a, **kw):
+        raise AssertionError("place_trailing_buy must not be called when shares < 1")
+    monkeypatch.setattr(schwab_client, 'place_trailing_buy', _boom)
+
+    signals_notify.notify_buy_signal(_node(), _sig())
+    pending = _pending()
+    assert pending['order_placed'] == 0
+    events = signals_db.get_coverage_events(scenario_key="automated_buy_execution")
+    assert len(events) == 1
+    assert events[0]['result'] == "shares_too_small"
+
+
 def test_notify_sell_signal_non_time_reason_does_not_log_time_exit_event(env):
     node = _node()
     now = datetime.now()

@@ -97,6 +97,7 @@ from signals_notify import (
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report, send_coverage_report, build_phased_monitors_report,
     update_dry_run_buys, update_real_pending_buys_running_low, check_dry_run_sim_sells,
+    check_entry_abandon,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
@@ -196,6 +197,55 @@ def _in_window(now, windows):
 
 def _in_buy_window(now):
     return _in_window(now, _SIGNAL_WINDOWS)
+
+
+def _ambient_buy_scan_nodes(watchlist, now):
+    """Watchlist nodes eligible for the main ambient (_SIGNAL_WINDOWS,
+    POLL_SECS-cadence) BUY scan -- excludes open_check + automation-enabled
+    nodes ONLY before the window's pinned moment (10:30/15:30,
+    _scan_pinned_entry), which fetches a precise Schwab session price instead
+    of this scan's degraded ambient yfinance fallback. _SIGNAL_WINDOWS starts
+    at :25, five minutes before the :30 pinned moment -- an ambient poll
+    landing in that :25-:29 gap used to be able to fire first (setting the
+    shared buy_alerted dedup key) on the worse price, permanently pre-empting
+    the more accurate pinned check once it ran a few minutes later (found in
+    the 2026-07-31 audit's still-open list).
+
+    Deliberately NOT excluded for the rest of the window (:30-:40) -- an
+    earlier version excluded these nodes for the whole window, which removed
+    the ambient scan's role as a fallback when the pinned check didn't
+    actually run for this bar (either its own price fetch failed all 3
+    retries, or -- more commonly -- `pinned_bar_alerted` was pre-seeded at
+    startup for any bar-time already past `now` when the daemon started,
+    per automation_principles.md #15, so a restart landing at e.g. 10:33
+    skips the 10:30 pinned check entirely and previously left the node with
+    literally zero BUY coverage until the next window). By :30 the pinned
+    check has already had its one chance to run first and win the dedup key
+    for this bar -- ambient scanning after that point can only ever add
+    fallback coverage, never pre-empt anything, so there's no reason to keep
+    excluding these nodes past that moment (found via review before landing).
+
+    The pre-pinned-check cutoff is derived from _PINNED_ENTRY_TIMES (the real
+    pinned moments), not a hardcoded +5 minute offset -- a second review
+    round flagged the hardcoded version as correct today but silently wrong
+    (either re-opening the pre-emption hole, or over-excluding) if
+    _SIGNAL_WINDOWS or _PINNED_BAR_TIMES/_PINNED_ENTRY_TIMES is ever retimed
+    independently, given how much of this file's own comment weight is
+    about exactly this class of drift."""
+    before_pinned_check = False
+    for h0, m0, h1, m1 in _SIGNAL_WINDOWS:
+        if not ((h0, m0) <= (now.hour, now.minute) <= (h1, m1)):
+            continue
+        pinned_in_window = [t for t in _PINNED_ENTRY_TIMES if (h0, m0) <= t <= (h1, m1)]
+        before_pinned_check = bool(pinned_in_window) and (now.hour, now.minute) < min(pinned_in_window)
+        break
+    if not before_pinned_check:
+        return watchlist
+    return [
+        n for n in watchlist
+        if not (n.get('entry_timing') == 'open_check'
+                and n['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS)
+    ]
 
 
 def _seconds_until_next_pinned_target(now):
@@ -881,6 +931,24 @@ def run_loop(tickers: set = None):
                                 pass  # a Slack posting failure must not crash the poll loop
 
             def _check_position_exit(pos):
+                # Re-fetch fresh before check_sell_condition -- pos here is still
+                # the once-per-poll-cycle open_positions snapshot (top of this
+                # iteration), and check_sell_condition itself internally merges/
+                # persists trail_state, so calling it against a stale snapshot
+                # risks clobbering a real concurrent update (the Slack-handler-
+                # thread race the SH stuck-exit bug family is built from). Not
+                # practically reachable today -- this call always runs before any
+                # writer inside the same poll iteration touches this position,
+                # and the notify_sell_signal call further down already re-fetches
+                # its own fresh copy -- but closing it here removes the last
+                # instance of this pattern that relies on ordering instead of an
+                # explicit re-fetch (found in the 2026-07-31 audit's still-open
+                # list). A None return means the position was closed concurrently
+                # since the snapshot was taken -- nothing left to check.
+                fresh_pos = db.get_position_by_id(pos['id'])
+                if fresh_pos is None:
+                    return
+                pos = fresh_pos
                 df_hourly, _ = _load_cache(pos['ticker'])
                 if df_hourly is None or df_hourly.empty:
                     return
@@ -966,6 +1034,7 @@ def run_loop(tickers: set = None):
             _guarded("paper_update_buys", paper_trading.update_paper_buys)
             _guarded("dry_run_update_buys", update_dry_run_buys)
             _guarded("real_pending_buys_running_low", update_real_pending_buys_running_low)
+            _guarded("check_entry_abandon", check_entry_abandon)
 
             if not watchlist:
                 print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")
@@ -1005,7 +1074,8 @@ def run_loop(tickers: set = None):
                     ) or []
             if in_window:
                 summaries += _guarded(
-                    "scan_buy_signals", _scan_buy_signals, watchlist, buy_alerted, open_position_keys
+                    "scan_buy_signals", _scan_buy_signals, _ambient_buy_scan_nodes(watchlist, now),
+                    buy_alerted, open_position_keys
                 ) or []
             elif not in_open_check_window:
                 summaries.append(f"outside signal window — next: 10:25 or 14:55 ET")

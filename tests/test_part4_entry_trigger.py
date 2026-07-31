@@ -182,6 +182,53 @@ def test_scan_pinned_entry_skips_non_open_check_and_non_automation(env, monkeypa
 
 
 # ---------------------------------------------------------------------------
+# _ambient_buy_scan_nodes
+# ---------------------------------------------------------------------------
+
+def test_ambient_buy_scan_excludes_open_check_automation_enabled_nodes_before_pinned_check(env):
+    """Regression test for the ambient-pre-empts-pinned-check bug (2026-07-31
+    audit, left open): _SIGNAL_WINDOWS (10:25-10:40) starts 5 minutes before
+    the pinned 10:30 check -- an ambient poll landing in that :25-:29 gap
+    used to be able to fire a BUY on a degraded price before the more
+    accurate pinned check ran, permanently winning the shared buy_alerted
+    dedup. The fixture node is entry_timing='open_check' and TICKER is in
+    AUTOMATION_ENABLED_TICKERS -- exactly the population the pinned check
+    exclusively owns before its own :30 moment."""
+    watchlist = signals_db.get_watchlist()
+    before = datetime(2026, 7, 15, 10, 27)
+    assert active_signals._ambient_buy_scan_nodes(watchlist, before) == []
+
+
+def test_ambient_buy_scan_keeps_open_check_nodes_after_pinned_check_as_fallback(env):
+    """Regression test for a review finding on the fix above: excluding these
+    nodes for the WHOLE window (not just the pre-:30 gap) removed the
+    ambient scan's role as a fallback when the pinned check didn't actually
+    run for this bar -- e.g. a daemon restart after :30 skips the pinned
+    check entirely (pinned_bar_alerted is pre-seeded for any bar-time
+    already past at startup, automation_principles.md #15), which used to
+    leave the node with zero BUY coverage for the rest of the window."""
+    watchlist = signals_db.get_watchlist()
+    after = datetime(2026, 7, 15, 10, 33)
+    result = active_signals._ambient_buy_scan_nodes(watchlist, after)
+    assert [n['ticker'] for n in result] == [TICKER]
+
+
+def test_ambient_buy_scan_keeps_close_entry_timing_nodes(env):
+    watchlist = [dict(n, entry_timing='close') for n in signals_db.get_watchlist()]
+    before = datetime(2026, 7, 15, 10, 27)
+    result = active_signals._ambient_buy_scan_nodes(watchlist, before)
+    assert [n['ticker'] for n in result] == [TICKER]
+
+
+def test_ambient_buy_scan_keeps_open_check_nodes_outside_automation_scope(env, monkeypatch):
+    monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', set())
+    watchlist = signals_db.get_watchlist()
+    before = datetime(2026, 7, 15, 10, 27)
+    result = active_signals._ambient_buy_scan_nodes(watchlist, before)
+    assert [n['ticker'] for n in result] == [TICKER]
+
+
+# ---------------------------------------------------------------------------
 # _attempt_automated_market_buy
 # ---------------------------------------------------------------------------
 
@@ -263,6 +310,15 @@ def test_notify_buy_signal_market_path_pending_buy_kept_when_auto_placement_bloc
 # ---------------------------------------------------------------------------
 
 def test_place_stop_loss_dry_run(env):
+    # A stop-loss is a SELL order -- schwab_safety.check_order's oversell
+    # guard (fail-closed as of 2026-07-31) needs a real local position on
+    # file to check the quantity against.
+    now = datetime.now()
+    signals_db.open_position(_node(), signal_price=47.5, signal_time=now, entry_price=47.5,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.commit()
     r, order_id = schwab_client.place_stop_loss('ira', TICKER, 100, 47.5)
     assert (r, order_id) == (None, None)
 

@@ -7,42 +7,97 @@
 > living reference, not an ever-growing changelog. Caught live after this got violated twice in
 > one sitting (once here, once in CLAUDE.md) before being fixed.
 
-## [live-trading][security] Resolved 2026-07-31 — full exit/arm/entry execution-path audit: 9 real bugs fixed (1 real-money, 1 live incident), 13 more confirmed and left open
-Full detail: `docs/deep_backlog.md`'s 2026-07-31 entry (top). SH's stuck-exit bug (this item's
-original subject) is now fixed for real, along with the real-money SL-anchor bug and a live incident
-(LABD's rejected stop → real market-sell fallback) found and fixed during the same session.
-**Still open, prioritized:**
-- **[HIGHEST]** No live equivalent of the kernel's entry-abandon timeout — a trailing-buy that never
-  bounces rests as a real GTC order forever, silently blocking every other BUY in that account.
-- `sl_order_id` never cleared after ANY atomic replace (only the hold-time-forced TRAIL case was
-  fixed) — same stuck-exit/false-alert symptom class, reachable via other replace paths too.
-- Oversell guard's fail-open branch on a missing local position row — a first fix attempt broke 14
-  tests and was reverted; needs real investigation into why so many real code paths reach `check_order`
-  without a position row, not a same-night patch.
-- `running_low` contaminated by extended-hours price prints → can trigger a spurious real market BUY
-  via `check_gap_resize`.
-- `drain_fill_queue` (websocket fast path) bypasses the opt-in auto-fill-detection safety gate
-  entirely — real fills route straight to position-opening + real order placement regardless.
-- No `shares >= 1` guard on the real BUY path (broker rejects, but dings the circuit breaker + posts
-  a misleading alert).
-- Ambient pre-close poll (10:25-10:29) can pre-empt the more accurate pinned bar-close check.
-- Paper trailing-buy sizing uses a third, different formula than both real and dry-run — paper P&L
-  is what feeds go-live decisions.
-- Live bounce-fill tracking uses bar Close instead of Low/High (documented directional bias, low
-  severity — the real broker order tracks continuously regardless).
-- Dry-run-account false "auto-placed" claim that can trip the node circuit breaker — conditional on
-  a specific precondition, not confirmed currently live.
-- BUY-shaped `schwab_safety.check_order` guards (kill switch, automation pause) also block SELL by
-  design today — fine while the node circuit breaker is monitor-only, needs a deliberate policy
-  decision before it's ever allowed to actually pause automation.
-- Theoretical (not practically reachable, protected by ordering not freshness) stale-snapshot race
-  in the ambient exit loop.
-- Research question, not a bug: is 1-3% fixed_sl correctly sized for 3x-leveraged tickers in a
-  high-volatility regime? Raised while investigating v5's real 0/25 paper-trading SL streak
-  (confirmed real market conditions, not a code defect — see deep_backlog entry).
+## [live-trading][security] Resolved 2026-07-31 (session wrap) — a 3rd independent review of the complete production diff found 3 more real issues before commit, all fixed
+Full detail: `docs/deep_backlog.md`'s same-day entry (top). A `sl_order_id` writeback guard against a
+`None` new order id (real: could silently erase a valid protective order's tracking), a race between
+`check_entry_abandon` and `check_gap_resize` in the same poll iteration (could cancel a real market
+order minutes after gap-resize correctly placed it), and a `coverage_registry.py` accuracy gap. Full
+suite: 414 passed. This was the final review round before the session's first commit.
 
-## [live-trading][docs] Open, raised 2026-07-30 evening — `enable_node_auto_fill_detection(node_id)`'s docstring claims a side effect it doesn't perform (docs-only, checked: not a live bug, the real Slack handler already calls both functions)
-Full detail: `docs/deep_backlog.md`'s 2026-07-30 (evening) entry. Cheap docstring/cosmetic fix, low priority.
+## [live-trading][testing] Open, raised 2026-07-31 evening — make fake_broker exhaustive per use case (state-axis truth table x use-case matrix), planned for this weekend
+**The delta from today's state**: `scripts/fake_broker_coverage_matrix.py` (built 2026-07-31, see
+`deep_backlog.md`'s same-day entry) proves each of the 11 real broker-mutating use cases has *at
+least one* fake_broker scenario reaching it — but each only has ONE scenario, not the full state
+permutation the way `tests/test_entry_abandon_truth_table.py` does for `check_entry_abandon`
+specifically (12 cells, one parametrized test). The idea (user's, confirmed to build): combine the
+two techniques deliberately — cross each use case in the matrix with its own real state axes, run
+every cell through fake_broker, so the fixture simulates every real variation of every real use case
+end-to-end, not 11 hand-picked happy(-ish) paths.
+
+**Rough per-use-case axis sketch** (not final, needs verifying against real code before building):
+- `trailing_buy_entry` / `market_buy_entry`: ticker in automation scope (Y/N), kill switch engaged
+  (Y/N), account dry_run (Y/N), `shares<1` (Y/N), inside signal window (Y/N) — market-buy adds
+  SL-placement-after-fill succeeds/fails/rejected-and-retried.
+- `post_fill_topup`: underspend amount (none/small/large), placement blocked/succeeds.
+- `sl_placement_post_fill`: already covers entry_price-vs-signal_price anchoring; add
+  already-breached-at-retry-time (the LABD incident shape) vs not.
+- `trailing_sell_arm_replace` / `trailing_sell_arm_fresh`: `sl_order_id` present/absent, replace/
+  placement succeeds/fails.
+- `exit_replace_resting` / `exit_fresh_market_sell`: reason ∈ {TP, SL, TIME, TRAIL-hold-forced},
+  resting_order_id present/absent, replace/placement succeeds/fails/rejected.
+- `gap_resize_replace` / `gap_resize_fresh`: order_id present/absent, trigger cleared, replace/
+  placement succeeds/fails/rejected.
+- `entry_abandon_cancel`: already fully done (`test_entry_abandon_truth_table.py`'s 12 cells) — the
+  reference pattern for the rest.
+
+**Scope warning, raised same conversation**: fully crossing this could be 40-60+ test cases instead
+of today's 11 — worth deciding whether every axis combination is truly meaningful (some may be
+structurally unreachable, like `check_entry_abandon`'s discovery that `order_id` present + real
+account + `order_placed=False` is unreachable except via `check_gap_resize`) before generating the
+full cross product. Not started — planned for this weekend.
+
+## [live-trading][security] Resolved 2026-07-31 — full exit/arm/entry execution-path audit (9 bugs) + same-day follow-up pass (8 more) + a same-day independent review of that follow-up (8 more, 1 real-money)
+Full detail: `docs/deep_backlog.md`'s three 2026-07-31 entries (top). First pass fixed SH's stuck-exit
+bug for real, the real-money SL-anchor bug, and a live incident (LABD's rejected stop → real
+market-sell fallback). Follow-up pass same day built the entry-abandon timeout (was [HIGHEST]),
+fixed `sl_order_id` staleness after any replace (not just hold-time-forced TRAIL), fixed the oversell
+guard's fail-open branch (after a dedicated investigation found the prior 14-test-breakage was a
+test-fixture gap, not a real exposure), bounded `running_low` against a single anomalous
+extended-hours print, gated `drain_fill_queue` on the opt-in auto-fill-detection flag, added a
+`shares >= 1` guard on the real BUY path, fixed the ambient-scan-pre-empts-pinned-check race, and
+closed the theoretical stale-snapshot gap in the ambient exit loop. Confirmed as intentional design,
+not a bug: BUY-shaped guards (kill switch, automation pause) also blocking SELL — user's explicit
+call, a genuine off-switch against a rogue algo, no SELL carve-out planned. **A fresh, independent
+Opus trace review of that follow-up pass (no session context) then found 8 more real defects in it**,
+including a HIGH real-money one (the new entry-abandon timeout could orphan a real resting order
+while falsely claiming it was cancelled, for the manual-placement case) and a MEDIUM one (the ambient/
+pinned race fix's own exclusion removed the only fallback coverage when a restart skipped the pinned
+check) — all 8 fixed same session, each with new regression tests. **A second review round then
+verified those 8 fixes were correct and found 6 more findings in the new code they added** (alert
+spam risk, a missing coverage-registry row, a stale docstring, `mode_tag`/messaging polish, a
+hardcoded offset, a JSON type-coercion gap) — all fixed. **Then, per user request, deterministic
+testing was built for `check_entry_abandon` specifically** (an alternative to relying on review,
+which is non-deterministic): `scripts/mutation_test_entry_abandon.py` reverts 5 real historical bugs
+in that function one at a time and confirms the test suite actually catches each (5/5 killed), and a
+new `tests/test_fake_broker_entry_abandon_scenario.py` drives it against a stateful simulated broker
+instead of mocked return values — which immediately found and fixed a real, previously-undiscovered
+bug in the shared `tests/fake_broker.py` fixture itself (`cancel_order`'s arguments were in the wrong
+order, silently a no-op every time it was ever called; never caught because no existing test had
+reached it). **A follow-up gap check found the deterministic-testing proposal was only half-delivered
+— a real parametrized truth table and a hypothesis property test were promised but never built** —
+both built same session: `tests/test_entry_abandon_truth_table.py` (12-cell parametrized truth table)
+and `tests/test_paper_trading_properties.py` (hypothesis, new dependency, 150 random examples,
+verified it actually catches the historical ordering bug by temporarily reintroducing it). **Then,
+per explicit user request, a full fake_broker use-case audit**: `scripts/fake_broker_coverage_matrix.py`
+(new, evidence-derived like `coverage_registry.py`) found 5/11 real broker-mutating use cases covered
+(2 grep false positives caught by manual verification) — all 6 gaps closed with new scenario tests
+(trailing-buy entry, market-buy entry, arm-transition replace, arm-transition fresh, exit fresh
+placement, gap-resize fresh placement), now 11/11. Full suite: 411 passed (399 before the truth-table file's
+12 tests were added).
+**Still open (5, all deliberately deferred as lower-value or out of scope this session):**
+- Paper trailing-buy sizing uses a third, different formula than real/dry-run — **fixed for the
+  padding formula itself (2026-07-31)**, but paper P&L still doesn't compound off its own prior paper
+  trades (uses flat `starting_notional`) the way real/dry-run compound off `trade_log` — a separate,
+  not-yet-built feature.
+- Live bounce-fill tracking uses bar Close instead of Low/High — **attempted, reverted same session**:
+  the correct fix broke 8 tests that all monkeypatch price via `_current_price`, a bigger rewrite than
+  this documented low-severity, dry-run/paper-only directional bias warrants. Still open.
+- Dry-run-account false "auto-placed" claim that can trip the node circuit breaker — conditional on a
+  specific precondition, not confirmed currently live. Not attempted (explicitly scoped out).
+- Research question, not a bug: is 1-3% fixed_sl correctly sized for 3x-leveraged tickers in a
+  high-volatility regime? (explicitly scoped out, not a code fix).
+
+## [live-trading][docs] Resolved 2026-07-31 — `enable_node_auto_fill_detection(node_id)`'s docstring corrected (dropped the false "also sets the ticker-level flag" claim). Full detail: `docs/deep_backlog.md`'s 2026-07-30 (evening) entry.
 
 ## [live-trading][coverage] Open, raised 2026-07-30 — should canary scenario_expectations tests appear on the Trade-Flow Accountability Grid?
 User pushback on a claim from a prior session: the canary_* scenarios (`scenario_expectations`/

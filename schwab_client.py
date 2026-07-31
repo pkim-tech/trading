@@ -502,14 +502,20 @@ def place_trailing_sell(account: str, ticker: str, quantity: int, price: float, 
 
 
 def cancel_order(account: str, ticker: str, order_id: int):
-    """Cancels a still-resting order with no replacement. Not currently called
-    by any real order-swap path -- check_gap_resize, _attempt_automated_sell,
-    and _attempt_automated_exit_sell were all migrated 2026-07-27 to
-    replace_equity_order_with_market/replace_order_with_trailing_sell (a
-    single atomic broker call instead of a separate cancel + place). Kept for
-    a genuine cancel-with-no-replacement case (none exists in this codebase
-    yet) or manual/REPL use. No approve_and_record gate -- this isn't a new
-    placement, just withdrawing one already approved.
+    """Cancels a still-resting order with no replacement. check_gap_resize,
+    _attempt_automated_sell, and _attempt_automated_exit_sell were all
+    migrated 2026-07-27 to replace_equity_order_with_market/
+    replace_order_with_trailing_sell (a single atomic broker call instead of
+    a separate cancel + place), so none of those call this. The genuine
+    cancel-with-no-replacement case now exists: signals_notify.
+    check_entry_abandon (2026-07-31) calls this directly -- a trailing-buy
+    that never bounces is abandoned outright, not replaced with anything.
+    Also used for manual/REPL use. No approve_and_record gate -- this isn't a
+    new placement, just withdrawing one already approved. No
+    record_node_streak wiring either (unlike the six real placement
+    functions) -- a failed cancel isn't a failed placement, so it
+    deliberately doesn't feed the node circuit breaker's order_failures
+    streak.
 
     Returns (response, confirmed_status) -- confirmed_status is 'CANCELED' only
     if the post-cancel poll actually confirmed it; None means unconfirmed

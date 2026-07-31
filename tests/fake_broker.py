@@ -159,6 +159,23 @@ class FakeBroker:
         account = self._account_for_hash(account_hash)
         return FakeResponse([o for o in self.orders.values() if o['account'] == account])
 
+    def get_order(self, order_id, account_hash):
+        """Single-order-by-id lookup -- schwab_client._confirm_order_status's
+        real client call, used by every real placement/cancel confirmation
+        poll (place_stop_loss, cancel_order, etc.). Missing until 2026-07-31
+        (added while building a fake_broker scenario test for
+        check_entry_abandon): any caller reaching _confirm_order_status
+        against this fixture before now hit an AttributeError, silently
+        swallowed by that function's broad except-Exception-and-retry, so it
+        always returned None ('unconfirmed') rather than the order's real
+        fake status -- correctness-neutral for callers that already treat
+        None as fail-closed, but meant no fake_broker test could actually
+        prove a real cancel/placement confirmation succeeded."""
+        o = self.orders.get(order_id)
+        if o is None:
+            return FakeResponse({}, order_id=None)
+        return FakeResponse(dict(o))
+
     def place_order(self, account_hash, order):
         account = self._account_for_hash(account_hash)
         order_id = next(self._id_counter)
@@ -178,7 +195,21 @@ class FakeBroker:
         self._maybe_immediate_fill(self.orders[new_id])
         return FakeResponse(None, order_id=new_id)
 
-    def cancel_order(self, account_hash, order_id):
+    def cancel_order(self, order_id, account_hash):
+        # Parameter order matches the real schwab-py client's cancel_order
+        # (order_id, account_hash) -- schwab_client.py calls it that way
+        # (`_get_client().cancel_order(order_id, account_hash)`), unlike
+        # place_order/replace_order which take account_hash first. This was
+        # swapped until 2026-07-31 (found while building the first fake_broker
+        # test to actually call cancel_order): with the wrong order, the real
+        # order_id argument silently landed in this method's `account_hash`
+        # parameter and vice versa, so `self.orders.get(order_id)` looked up
+        # a hash string that's never a dict key -- every prior cancel_order
+        # call against this fixture was a silent, undetected no-op. No
+        # existing test caught it because none had asserted on the broker's
+        # own post-cancel order state before now, only on cancel_order having
+        # been called (a mocked-return-value assertion, which doesn't care
+        # about argument order at all).
         o = self.orders.get(order_id)
         if o is not None and o['status'] not in _TERMINAL_STATUSES:
             o['status'] = 'CANCELED'

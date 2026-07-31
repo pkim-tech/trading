@@ -41,6 +41,17 @@ def _attempt_automated_buy(node, sizing):
     ticker = node['ticker']
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         return False, None
+    if sizing['shares'] < 1:
+        # A too-small notional/price combo sizes to 0 shares -- without this,
+        # the real broker call would reject it, but only after dinging the
+        # node circuit breaker's order_failures streak and posting a
+        # "blocked"-shaped alert that misleadingly implies a safety guard
+        # fired rather than "there's nothing to actually buy" (found in the
+        # 2026-07-31 audit's still-open list).
+        db.log_coverage_event("automated_buy_execution", _coverage_mode(node.get('account')), ticker=ticker,
+                               node_id=node.get('id'), result="shares_too_small",
+                               detail=f"shares={sizing['shares']} price={sizing.get('price')}")
+        return False, None
     account = node.get('account')
     try:
         _, order_id = schwab_client.place_trailing_buy(
@@ -131,6 +142,26 @@ def _attempt_automated_sell(pos, current_price):
     db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed",
                            detail=f"shares={shares} trail_sell_pct={trail_sell_pct}")
+    if sl_order_id and exit_order_id is not None:
+        # sl_order_id (open_positions column, distinct from trail_state.exit_order_id)
+        # is now dead -- replaced by this trailing-sell. Point it at the new order so
+        # any later reader (a fresh replace attempt via this same function on re-arm,
+        # the manual "cancel the existing stop-loss order" reminder text, the TRAIL+
+        # hold_time_forced fallback in _attempt_automated_exit_sell) sees what's
+        # actually resting instead of a dead order id -- same stuck-exit/false-alert
+        # bug class as the exit_order_id staleness fixed 2026-07-31, just via this
+        # replace path instead (found in the 2026-07-31 audit's "still open" list).
+        # `exit_order_id is not None` guard added after a later review: extract_order_id
+        # can legitimately return None on a real success (e.g. a missing Location
+        # header) -- without the guard, a real successful replace with an unextractable
+        # id would erase the previous (valid, still-real) sl_order_id, silencing the
+        # missing_sl reconciliation check (gated on sl_order_id truthy) and dropping
+        # resting_order_id to None for a later hold-time-forced exit, which then hits
+        # the fresh place_equity_sell path and gets rejected by the resting-order dup
+        # guard with no alert at all (the except block's both branches false). Matches
+        # the established pattern already used 600 lines away in
+        # _place_stop_loss_for_position (`if sl_order_id is not None:`).
+        db.set_sl_order_id_by_position(pos['id'], exit_order_id)
     return True, exit_order_id
 
 
@@ -270,6 +301,16 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
         return None
     db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed", detail=f"reason={reason} shares={shares}")
+    if resting_order_id and resting_order_id == pos.get('sl_order_id') and order_id is not None:
+        # Same staleness fix as _attempt_automated_sell's success path: whatever
+        # was actually replaced here (a genuine TP/SL/TIME exit's SL, or the
+        # TRAIL+hold_time_forced fallback that resolved to the original SL
+        # because the arm-time trailing-sell placement itself had failed) is
+        # now dead -- point sl_order_id at the real order that's resting now
+        # instead of leaving it pointing at a dead order id forever.
+        # `order_id is not None` guard added after a later review -- see the
+        # matching comment in _attempt_automated_sell's success path for why.
+        db.set_sl_order_id_by_position(pos['id'], order_id)
     if reason == 'TRAIL' and hold_time_forced:
         # The just-replaced order (trailing-sell or, on the failed-placement
         # fallback above, the original SL) is now dead -- point exit_order_id
@@ -538,6 +579,12 @@ def _attempt_automated_market_buy(node, sizing):
     ticker = node['ticker']
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         return False, None
+    if sizing['shares'] < 1:
+        # Same guard as _attempt_automated_buy -- see that function's comment.
+        db.log_coverage_event("automated_buy_execution", _coverage_mode(node.get('account')), ticker=ticker,
+                               node_id=node.get('id'), result="shares_too_small",
+                               detail=f"shares={sizing['shares']} price={sizing.get('price')}")
+        return False, None
     account = node.get('account')
     try:
         _, order_id = schwab_client.place_equity_buy(account, ticker, sizing['shares'], sizing['price'])
@@ -755,6 +802,9 @@ def _sync_confirm_and_protect(ticker, node, order_id=None):
     _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'])
 
 
+_MAX_RUNNING_LOW_DROP_PCT = 20.0  # see update_real_pending_buys_running_low's docstring
+
+
 def update_real_pending_buys_running_low():
     """Tracks pending_buys.running_low for a REAL (non-dry_run) resting
     trailing-buy -- mirrors update_dry_run_buys' tracking logic below, but
@@ -780,7 +830,30 @@ def update_real_pending_buys_running_low():
     hourly cache wouldn't show anyway. update_dry_run_buys uses the cached
     price deliberately, for consistency with the rest of its simulation --
     that reasoning doesn't apply here, this is real-order tracking meant to
-    feed a real-time check."""
+    feed a real-time check.
+
+    Sanity-bounds each update against implausible single-print moves --
+    get_current_price prefers `quote.extended.lastPrice` (deliberately, so
+    this function can track a genuine overnight/pre-market price fall ahead
+    of check_gap_resize's pre-open check, see e.g.
+    tests/test_fake_broker_gap_resize_scenario.py's Phase 1), but extended
+    hours are thin/wide-spread enough that a single anomalous print (bad
+    tick, one illiquid odd-lot trade) can otherwise permanently ratchet
+    running_low down to a price nothing real ever confirmed -- running_low is
+    monotonically non-increasing (`min(...)`), so a bad print never
+    self-corrects even if the very next quote reverts. A false-low running_low
+    produces an artificially low buy_trigger for check_gap_resize to compare
+    the real opening print against, firing a real, unwarranted MARKET buy.
+    Found in the 2026-07-31 audit's still-open list. Bound: a single poll may
+    not lower running_low by more than _MAX_RUNNING_LOW_DROP_PCT in one step
+    (generous -- comfortably above any real single-poll move for a real
+    ticker at the default 5-min POLL_SECS cadence, automation_principles.md
+    #7a's cheap-static-buffer preference over precisely modeling which prints
+    are real). A genuine large overnight fall still reaches its true low
+    within a couple of polls (each capped step compounds), so real gap
+    coverage is preserved -- only a single wild/erroneous print's full
+    magnitude is ever rejected outright, and even that print still pulls
+    running_low down by the capped amount rather than being ignored entirely."""
     for pb in db.get_pending_buys():
         wl_id = pb.get('wl_id')
         if not wl_id:
@@ -801,9 +874,217 @@ def update_real_pending_buys_running_low():
             continue
         if price is None:
             continue
-        running_low = min(pb['running_low'] or pb['signal_price'], price)
+        current = pb['running_low'] or pb['signal_price']
+        floor = current * (1 - _MAX_RUNNING_LOW_DROP_PCT / 100)
+        running_low = max(min(current, price), floor)
         if running_low != pb['running_low']:
             db.update_pending_buy_running_low(wl_id, running_low)
+
+
+_ENTRY_ABANDON_ALERTED: dict[str, float] = {}
+_ENTRY_ABANDON_ALERT_COOLDOWN_SECS = 900  # 15 min -- matches _RECONCILE_COOLDOWN_SECS elsewhere
+
+
+def _throttled_entry_abandon_alert(wl_id, kind, text):
+    """Rate-limits the three check_entry_abandon branches that leave the
+    pending_buys row in place (unrecognized_account, no_order_id_on_file,
+    cancel_failed) -- bars_held only ever grows once max_hold_hours is
+    crossed, so without this each re-enters and reposts on every single poll
+    forever, burying real trade alerts (found by review: this module already
+    has the right pattern for exactly this, _RECONCILE_ALERTED/
+    _RECONCILE_COOLDOWN_SECS above, just not applied here). Keyed per
+    (wl_id, kind) so a genuinely different condition on the same row still
+    alerts immediately rather than being silenced by an unrelated cooldown."""
+    key = f"{wl_id}:{kind}"
+    last = _ENTRY_ABANDON_ALERTED.get(key, 0)
+    if time.time() - last < _ENTRY_ABANDON_ALERT_COOLDOWN_SECS:
+        return
+    _ENTRY_ABANDON_ALERTED[key] = time.time()
+    _post_message(text)
+
+
+def check_entry_abandon():
+    """Live equivalent of the backtest kernel's entry-abandon timeout
+    (backtester.py's `wait_bars >= max_hours_to_hold` in
+    `_simulate_trail_buy`/`_simulate_trail_both`, all four resolutions):
+    without this, a trailing buy that never bounces has no timeout live at
+    all -- the real broker order rests GOOD_TILL_CANCEL forever
+    (schwab_client._build_trailing_order), and schwab_safety._has_open_order/
+    _has_open_buy_order_in_account then permanently block every other real
+    BUY attempt on that ticker (or account, for the account-wide guard) since
+    they see it as still-open. Found in the 2026-07-31 exit/arm/entry audit,
+    [HIGHEST] of the items left open that session.
+
+    Mirrors the kernel's threshold exactly: reuses `max_hold_hours` (the same
+    value used for the in-position TIME exit) and trading-hour-bar counting
+    (`compute._bars_held`), not wall-clock hours -- a wait spanning a night
+    or weekend must not count faster than the kernel's own hourly-bar loop
+    would. Kernel semantics on abandon are cancel-and-forget (no trade
+    recorded, not a fallback market buy) -- matched here for every
+    population (real live orders, dry_run rows with no real order, and paper
+    rows via check_paper_entry_abandon below), since a market-buy-node's
+    pending row never has a bounce phase to abandon (skipped via
+    db._is_trailing_buy). Called unconditionally every poll, same cadence as
+    the other pending_buys trackers.
+
+    Reads account/max_hold_hours from pb['node'] (the signal-time pinned
+    snapshot), not a live re-fetch of the watch_list row -- a real resting
+    order's account is a physical fact fixed at placement, matching the
+    established convention this module already follows for every other
+    pending_buys consumer (check_gap_resize, check_auto_fills,
+    _reconcile_buy_fill -- see the _fresh_node removal note above). Re-
+    fetching live would let a later account edit on the node silently steer
+    a real cancel_order call at the wrong account, or make a real
+    dry_run=False order's cancel branch skip a live re-fetch entirely if the
+    node's account was edited to a dry_run one in the meantime (caught by
+    review before landing).
+
+    Only ever cancels a real order when `order_id` is on file. The manual
+    "Trailing Buy Order Placed" Slack flow sets order_placed=True but never
+    captures a broker order id (the user places it directly at Schwab, we
+    never see the id) -- for that case, `order_placed and not order_id`,
+    this function alerts and leaves the row untouched rather than clearing
+    it with a false "resting order cancelled" claim: a real order may still
+    be resting with no local record at all, and clearing pending_buys here
+    would also break handle_trail_buy_fill_price's stale-button guard, which
+    needs this exact row to still exist to accept a later manual fill
+    confirmation (caught by review before landing -- the first version of
+    this function silently orphaned exactly this case).
+
+    Known residual gap, flagged by a later review, not fixed: for a real
+    account with `order_placed=False, order_id=None`, this function assumes
+    nothing was ever placed and clears the row -- indistinguishable from "the
+    user placed it manually at the broker but never tapped Trailing Buy Order
+    Placed," which would silently drop tracking of a real still-resting
+    order. `order_placed` is this system's only signal for "the button was
+    tapped," so there's no way to detect that specific case from local state
+    alone without a real broker order-book check, which this function
+    deliberately doesn't do (see automation_principles.md #2 -- fail closed
+    only where the ambiguity can actually be detected)."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    for pb in db.get_pending_buys():
+        wl_id = pb.get('wl_id')
+        if not wl_id:
+            continue
+        node = pb['node']
+        if not db._is_trailing_buy(node):
+            continue
+        if pb.get('gap_resize_date') == today:
+            # check_gap_resize (run earlier in the same run_loop iteration,
+            # active_signals.py) may have JUST replaced this row's resting
+            # trailing-buy with a real MARKET order minutes/seconds ago,
+            # writing the new order_id back onto this same pending_buys row
+            # -- the node is still _is_trailing_buy, so without this guard a
+            # daemon restart landing right at the bars_held>=max_hold_hours
+            # threshold could have check_entry_abandon cancel that brand-new
+            # market order in the very same iteration, falsely posting
+            # "trailing buy never bounced ... entry abandoned" when the
+            # trigger genuinely cleared moments earlier (found by review).
+            continue
+        ticker = pb['ticker']
+        df_hourly, _ = compute._load_cache(ticker)
+        signal_time = datetime.strptime(pb['signal_time'], '%Y-%m-%d %H:%M:%S')
+        bars_held = compute._bars_held(df_hourly, signal_time)
+        if bars_held < (node.get('max_hold_hours') or float('inf')):
+            continue
+        account = node.get('account')
+        mode = _coverage_mode(account)
+        order_id = pb.get('order_id')
+        limits = schwab_safety.ACCOUNTS.get(account) if account else None
+        if limits is None:
+            # Unrecognized/missing account -- can't tell whether a real order
+            # might be resting (dry_run status unknown), so can't tell
+            # whether clearing this row is safe. Fail closed (automation_
+            # principles.md #2): alert, don't touch the row.
+            db.log_coverage_event("entry_abandon_timeout", mode, ticker=ticker, node_id=wl_id,
+                                   result="unrecognized_account")
+            _throttled_entry_abandon_alert(
+                wl_id, "unrecognized_account",
+                f"⏱️⚠️ *{ticker}* ({account!r} · {mode_tag(account)}) — trailing buy past its "
+                f"{node['max_hold_hours']}h hold-time limit, but this account isn't recognized — cannot "
+                f"determine whether a real order needs cancelling. Verify manually.")
+            continue
+        if not limits.dry_run and pb.get('order_placed') and not order_id:
+            # Real (non-dry_run) account: order_placed=True with no order_id
+            # is the manual "Trailing Buy Order Placed" Slack flow (the user
+            # places it directly at Schwab -- we never capture its id), not a
+            # dry_run placement (schwab_client's dry_run short-circuit is
+            # indistinguishable from this by order_id alone, hence the
+            # `not limits.dry_run` guard here). A real order may be resting
+            # at the broker with no way to target a cancel_order call at it
+            # -- surface it for manual handling instead of silently dropping
+            # tracking (found by review: the first version of this function
+            # cleared the row here with a false "resting order cancelled"
+            # claim, permanently orphaning a real GTC order and breaking
+            # handle_trail_buy_fill_price's later stale-button guard, which
+            # needs this exact row to still exist to accept a manual fill).
+            db.log_coverage_event("entry_abandon_timeout", mode, ticker=ticker, node_id=wl_id,
+                                   result="no_order_id_on_file")
+            _throttled_entry_abandon_alert(
+                wl_id, "no_order_id_on_file",
+                f"⏱️⚠️ *{ticker}* ({account} · {mode_tag(account)}) — trailing buy has been resting past "
+                f"its {node['max_hold_hours']}h hold-time limit, but no broker order id is on file "
+                f"(placed manually) — cannot auto-cancel. Cancel it manually at the broker if it's still "
+                f"resting, and tap Skip on the reminder once confirmed.")
+            continue
+        did_cancel = False
+        if order_id and not limits.dry_run:
+            try:
+                _, status = schwab_client.cancel_order(account, ticker, order_id)
+            except Exception as e:
+                db.log_coverage_event("entry_abandon_timeout", mode, ticker=ticker, node_id=wl_id,
+                                       result="cancel_failed", detail=str(e))
+                _throttled_entry_abandon_alert(
+                    wl_id, "cancel_failed",
+                    f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — entry-abandon timeout hit "
+                    f"({bars_held}/{node['max_hold_hours']}h) but the cancel request itself failed ({e}) "
+                    f"— resting order may still be live, verify and cancel manually.")
+                continue
+            if status == 'FILLED':
+                # Raced a real bounce-fill landing the instant we tried to cancel --
+                # reconcile it as a genuine fill (automation_principles.md #1: never
+                # discard real broker truth), don't abandon it. Deliberately calls
+                # _reconcile_buy_fill unconditionally, bypassing the auto_fill_
+                # detection_enabled/node_auto_fill_detection_enabled opt-in gate
+                # drain_fill_queue respects (flagged by a later review as the one
+                # fill path that ignores it) -- the alternative here is dropping
+                # tracking of a real, order-id-exact-confirmed fill entirely, which
+                # is worse than a real position opening without the opt-in toggle
+                # having been set. Not the same risk drain_fill_queue's gate guards
+                # against (an ambiguous/best-effort ticker+account match).
+                db.log_coverage_event("entry_abandon_timeout", mode, ticker=ticker, node_id=wl_id,
+                                       result="raced_fill")
+                fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=order_id)
+                if fill:
+                    _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=wl_id)
+                else:
+                    _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — entry-abandon "
+                                  f"cancel found status FILLED but the fill lookup itself failed — "
+                                  f"verify and reconcile manually.")
+                continue
+            if status != 'CANCELED':
+                # Unconfirmed cancel -- fail closed (automation_principles.md #2):
+                # leave the local row in place and retry next poll rather than
+                # dropping tracking of a real order that may still be resting.
+                db.log_coverage_event("entry_abandon_timeout", mode, ticker=ticker, node_id=wl_id,
+                                       result="cancel_unconfirmed")
+                continue
+            did_cancel = True
+        db.clear_pending_buy_by_wl_id(wl_id)
+        db.log_coverage_event("entry_abandon_timeout", mode, ticker=ticker, node_id=wl_id,
+                               result="abandoned",
+                               detail=f"bars_held={bars_held} max={node['max_hold_hours']}")
+        # did_cancel distinguishes a real confirmed cancel_order call from
+        # every other path that reaches here with nothing real to cancel
+        # (dry_run, or order_placed=False/no order ever placed) -- the
+        # original message unconditionally claimed "resting order cancelled"
+        # even on the dry_run path, where nothing was ever real (found by
+        # review; this is a coverage_events-visible daily occurrence today,
+        # DIA/SDOW on the dry_run `ira` account).
+        cancelled_note = "resting order cancelled" if did_cancel else "no real order existed to cancel"
+        _post_message(f"⏱️ *{ticker}* ({account} · {mode_tag(account)}) — trailing buy never bounced "
+                      f"within {node['max_hold_hours']}h — entry abandoned, {cancelled_note}. "
+                      f"No position opened.")
 
 
 # ---------------------------------------------------------------------------
@@ -1978,8 +2259,48 @@ def drain_fill_queue():
             break
         if side != 'BUY':
             continue
-        _node = db.get_watch_list_node(ticker=ticker, account=account)
-        _node_id = _node['id'] if _node else None
+        # Resolved by exact order_id match against the real pending_buys row
+        # (order_id-exact matching, same precedent as the GDXU stale-fill
+        # incident fix), NOT the fuzzy ticker+account db.get_watch_list_node
+        # lookup a first version of this gate used -- that lookup's own
+        # documented contract is "enrichment/logging, never a gate on a real
+        # action" (see the comment a few lines below, at the
+        # _reconcile_buy_fill call), so gating the opt-in auto-fill-detection
+        # check on it could silently drop the fast path for a genuinely
+        # opted-in node whenever the fuzzy match failed to resolve (found by
+        # review before landing). Falls back to None (same as before) only
+        # when no pending row matches this exact order_id at all.
+        # Coerced to int on both sides before comparing -- pending_buys.order_id
+        # has INTEGER affinity and is written from schwab-py's extract_order_id
+        # (an int), but the stream side is raw JSON (schwab_stream.py); if
+        # Schwab ever emits orderId as a numeric string, a bare `==` would
+        # silently fail to match and drop the fast path for an opted-in node
+        # (fails safe to the slow check_auto_fills poll, but pointless
+        # latency -- found by review).
+        try:
+            _order_id_int = int(order_id) if order_id is not None else None
+        except (TypeError, ValueError):
+            _order_id_int = None
+        _matching_pending = next(
+            (p for p in db.get_pending_buys() if p.get('order_id') is not None
+             and int(p['order_id']) == _order_id_int), None) if _order_id_int is not None else None
+        _node_id = _matching_pending['node']['id'] if _matching_pending else None
+        # Same opt-in gate as check_auto_fills (the slow-poll fallback) --
+        # without this, the fast websocket path auto-reconciled any real fill
+        # regardless of auto_fill_detection_enabled/node_auto_fill_detection_enabled,
+        # bypassing the whole point of that toggle (a human must opt a ticker/
+        # node in before the daemon auto-records a fill instead of waiting for
+        # the manual "Filled" Slack button). Found in the 2026-07-31 audit's
+        # still-open list.
+        if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            db.log_coverage_event("fast_path_fill_reconciliation", _coverage_mode(account), ticker=ticker,
+                                   node_id=_node_id, result="outside_automation_scope")
+            continue
+        if not (schwab_safety.auto_fill_detection_enabled(ticker)
+                and schwab_safety.node_auto_fill_detection_enabled(_node_id)):
+            db.log_coverage_event("fast_path_fill_reconciliation", _coverage_mode(account), ticker=ticker,
+                                   node_id=_node_id, result="auto_fill_detection_disabled")
+            continue
         fill = None
         for _ in range(_GAP_FILL_POLL_ATTEMPTS):
             fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=order_id)

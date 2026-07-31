@@ -81,6 +81,11 @@ def test_update_paper_buys_fills_on_bounce_and_opens_paper_position(monkeypatch,
     assert len(positions) == 1
     pos = positions[0]
     assert pos['entry_price'] == 95.0
+    # Flat starting_notional/fill_price -- deliberately NOT buy_order_sizing's
+    # worst-case pad (2026-07-31, reverted after review: the fill price is
+    # already known here, and this flat formula matches what a real position
+    # actually ends up holding after _reconcile_fill's post-fill top-up,
+    # unlike the padded formula which would undersize it).
     assert pos['shares'] == int(5000 // 95.0)
     assert pos['trade_log_id'] is not None
 
@@ -105,6 +110,30 @@ def test_bounce_fill_hold_time_anchors_to_fill_not_stale_signal_time(monkeypatch
         f"pos['signal_time']={pos['signal_time']} should be ~now, not the stale "
         f"original signal time ({stale_signal_time})"
     )
+
+
+def test_paper_bounce_fill_sizing_matches_real_post_topup_end_state(monkeypatch, isolated_db):
+    """Regression test for the third, looser paper sizing formula (2026-07-31
+    audit, left open, then further corrected same day after review): a real
+    trailing-buy position is sized off buy_order_sizing's worst-case pad at
+    SIGNAL time (fill price unknown), then topped up post-fill
+    (_reconcile_fill, signals_notify.py) until shares*fill_price converges
+    on target_notional -- so the real end state a real position lands on is
+    simply target_notional // fill_price, with no pad. Paper already knows
+    the fill price when it fills (no signal-time uncertainty to pad against),
+    so it should size directly to that same end state instead of re-applying
+    the signal-time pad (which would UNDERsize it relative to what a real
+    position actually ends up holding -- the opposite of the intended
+    alignment, caught by review before landing)."""
+    node = _node()
+    paper_trading.start_paper_buy(node, _sig(100.0))
+    monkeypatch.setattr(paper_trading, '_current_price', lambda t: (90.0, None))
+    paper_trading.update_paper_buys()
+    monkeypatch.setattr(paper_trading, '_current_price', lambda t: (95.0, None))
+    paper_trading.update_paper_buys()
+
+    pos = db.get_open_positions(paper=True)[0]
+    assert pos['shares'] == int(node['starting_notional'] // 95.0)
 
 
 def test_check_paper_sells_closes_on_sl_and_writes_paper_trade_log(monkeypatch, isolated_db):

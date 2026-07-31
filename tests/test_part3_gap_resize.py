@@ -318,11 +318,17 @@ def test_reconcile_buy_fill_places_sl_for_trailing_both_node(env, monkeypatch):
 # drain_fill_queue -- fast path
 # ---------------------------------------------------------------------------
 
+def _enable_auto_fill_detection():
+    schwab_safety.enable_auto_fill_detection(TICKER)
+    schwab_safety.enable_node_auto_fill_detection(_node()['id'])
+
+
 def test_drain_fill_queue_reconciles_queued_fill(env, monkeypatch):
     """The stream event is only a wake-up signal -- the real price/quantity
     must come from get_filled_order's aggregated poll, not the queued values
     (which a message like this deliberately mismatches, to prove it's ignored)."""
-    _seed_pending_order(monkeypatch)
+    _seed_pending_order(monkeypatch, order_id=999)
+    _enable_auto_fill_detection()
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})
     schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
@@ -338,7 +344,8 @@ def test_drain_fill_queue_reconciles_queued_fill(env, monkeypatch):
 
 
 def test_drain_fill_queue_ignores_sell_events(env, monkeypatch):
-    _seed_pending_order(monkeypatch)
+    _seed_pending_order(monkeypatch, order_id=999)
+    _enable_auto_fill_detection()
     schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'SELL', 51.0, 100, 999))
 
     signals_notify.drain_fill_queue()
@@ -353,7 +360,8 @@ def test_drain_fill_queue_no_op_when_order_not_yet_settled(env, monkeypatch):
     get_filled_order never reports the order as FILLED within the poll
     window, drain_fill_queue must leave the pending buy alone for the slow
     check_auto_fills poll to catch later, not act on an unconfirmed fill."""
-    _seed_pending_order(monkeypatch)
+    _seed_pending_order(monkeypatch, order_id=999)
+    _enable_auto_fill_detection()
     monkeypatch.setattr(schwab_client, 'get_filled_order', lambda account, ticker, side, order_id=None: None)
     monkeypatch.setattr(signals_notify.time, 'sleep', lambda secs: None)
     schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
@@ -365,3 +373,85 @@ def test_drain_fill_queue_no_op_when_order_not_yet_settled(env, monkeypatch):
     events = signals_db.get_coverage_events(scenario_key="fast_path_fill_reconciliation")
     assert len(events) == 1
     assert events[0]['result'] == "stream_event_not_yet_confirmed_filled"
+
+
+def test_drain_fill_queue_does_not_auto_reconcile_when_auto_fill_detection_disabled(env, monkeypatch):
+    """Regression test for the opt-in-gate bypass (2026-07-31 audit, left
+    open): drain_fill_queue (the fast websocket path) used to reconcile any
+    real fill unconditionally, regardless of auto_fill_detection_enabled/
+    node_auto_fill_detection_enabled -- the exact opt-in gate check_auto_fills
+    (the slow-poll fallback) already respects. Default-off (neither flag
+    enabled here), matching what a real never-opted-in ticker/node looks
+    like."""
+    _seed_pending_order(monkeypatch, order_id=999)
+    monkeypatch.setattr(schwab_client, 'get_filled_order',
+                         lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})
+    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
+
+    signals_notify.drain_fill_queue()
+
+    assert signals_db.get_open_position(TICKER) is None
+    assert _pending()['order_placed'] == 1  # pending row untouched -- manual "Filled" tap still required
+    events = signals_db.get_coverage_events(scenario_key="fast_path_fill_reconciliation")
+    assert len(events) == 1
+    assert events[0]['result'] == "auto_fill_detection_disabled"
+
+
+def test_drain_fill_queue_resolves_node_by_order_id_not_fuzzy_ticker_account_lookup(env, monkeypatch):
+    """Regression test for a review finding: the opt-in gate above must
+    resolve the pending buy's real node by exact order_id match against
+    pending_buys, not db.get_watch_list_node(ticker=, account=) -- that
+    lookup's own documented contract is "enrichment/logging, never a gate on
+    a real action" (same rationale _reconcile_buy_fill's wl_id disambiguation
+    comment gives a few lines below), and gating the auto-fill-detection
+    check on it could silently drop the fast path for a genuinely opted-in
+    node whenever a second node shares the same ticker+account (the fuzzy
+    lookup can't disambiguate) or simply resolves to a different node than
+    the one that actually has the pending row. Seeds a SECOND node for the
+    same ticker+account with auto-fill-detection left OFF, so a fuzzy
+    ticker+account match landing on the wrong node would wrongly fail the
+    gate."""
+    node = _node()
+    _enable_auto_fill_detection()
+    # Second node, same ticker+account, auto-fill-detection deliberately NOT
+    # enabled for it -- if the fuzzy ticker+account lookup resolved to this
+    # one instead of the real pending buy's node, the gate would wrongly fail.
+    signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test2', window=25, take_profit=8,
+                         stop_loss=6, max_hold_hours=9, mode='live',
+                         trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000)
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ? AND version = 'test2'", (TICKER,))
+        c.commit()
+
+    _seed_pending_order(monkeypatch, order_id=999)
+    monkeypatch.setattr(schwab_client, 'get_filled_order',
+                         lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})
+    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
+
+    signals_notify.drain_fill_queue()
+
+    assert signals_db.get_open_position(TICKER) is not None
+    events = signals_db.get_coverage_events(scenario_key="fast_path_fill_reconciliation")
+    assert any(e['result'] == 'confirmed_via_poll' and e['node_id'] == node['id'] for e in events)
+
+
+def test_drain_fill_queue_matches_order_id_across_int_string_type_mismatch(env, monkeypatch):
+    """Regression test for a review finding: pending_buys.order_id is written
+    as an int (schwab-py's extract_order_id), but the stream event's orderId
+    comes off raw JSON -- if Schwab ever emits it as a numeric string, a bare
+    `==` comparison would silently fail to match, dropping the fast path for
+    a genuinely opted-in node (fails safe to the slow check_auto_fills poll,
+    but defeats the whole point of the fast path). Queues the stream event's
+    order_id as a STRING while the real pending_buys row holds an int."""
+    node = _node()
+    _enable_auto_fill_detection()
+    _seed_pending_order(monkeypatch, order_id=999)
+    monkeypatch.setattr(schwab_client, 'get_filled_order',
+                         lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})
+    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, '999'))  # string, not int
+
+    signals_notify.drain_fill_queue()
+
+    assert signals_db.get_open_position(TICKER) is not None
+    events = signals_db.get_coverage_events(scenario_key="fast_path_fill_reconciliation")
+    assert any(e['result'] == 'confirmed_via_poll' and e['node_id'] == node['id'] for e in events)

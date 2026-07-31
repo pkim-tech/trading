@@ -5467,3 +5467,91 @@ research question (not a code defect).
 Code changes not yet committed — 12 files (`active_signals.py`, `paper_trading.py`,
 `schwab_safety.py`, `signals_helpers.py`, `signals_notify.py`, plus test files) sitting as
 uncommitted working-tree changes, pending explicit user confirmation to commit.
+
+---
+
+## 2026-07-31 (later night) — Session wrap: review round 2 fixed, deterministic testing gap-checked and completed, fake_broker brought to 11/11 real use-case coverage
+
+Continuation of the same-day "just fix it all" session (see the immediately-preceding session_cache
+entry for rounds 1-2: the original 8 exit/arm/entry backlog items, and the first independent review's
+8 defects incl. a HIGH real-money one in the new `check_entry_abandon`). This entry covers everything
+since.
+
+**Review round 2** (a second independent Opus pass, verifying round 1's 8 fixes and hunting fresh):
+confirmed all 8 correct, found 6 more findings in the *new* code they added — none real-money, all
+fixed: unthrottled repeat alerts on 3 `check_entry_abandon` branches (new `_ENTRY_ABANDON_ALERTED`
+cooldown dict, matching the existing `_RECONCILE_ALERTED` pattern), `entry_abandon_timeout` missing
+from `scripts/coverage_registry.py`/`docs/live_test_coverage.md` (added), a stale `cancel_order`
+docstring (corrected), inconsistent `mode_tag`/messaging (fixed, incl. a dry_run path that falsely
+claimed "resting order cancelled" when nothing was ever real), a hardcoded pinned-check time offset
+in `active_signals._ambient_buy_scan_nodes` (now derived from `_PINNED_ENTRY_TIMES`), and an
+int-coercion gap on `drain_fill_queue`'s order_id match across a JSON boundary (fixed).
+
+**Gap-check on my own deterministic-testing proposal**: reviewing my own prior summary against what
+I'd actually proposed (4 items: fake_broker, an exhaustive truth table, mutation testing, kernel-
+parity scripts) found 2 shortfalls — the truth table was described but only delivered as scattered
+hand-named scenario tests, not the real parametrized artifact; a `hypothesis` property test proposed
+for `paper_trading.update_paper_buys`' fill/abandon ordering was never built at all. Both built:
+`tests/test_entry_abandon_truth_table.py` (12-cell parametrized table, one test) and
+`tests/test_paper_trading_properties.py` (`hypothesis`, new dependency, 150 random examples per run,
+verified against the real historical ordering bug by temporarily reintroducing it and confirming the
+property test goes red).
+
+**fake_broker use-case audit, per explicit user request**: built
+`scripts/fake_broker_coverage_matrix.py` (evidence-derived, same philosophy as `coverage_registry.py`)
+enumerating every real broker-mutating use case (11 total — one per genuinely distinct decision path,
+not one per `schwab_client` function, several of which serve 2-3 different scenarios each). First run:
+5/11 covered, 2 of those grep false positives (an entrypoint shared by a well-tested replace branch
+and a never-reached fresh-placement fallback) caught only by manually reading the tests. Closed all 6
+gaps: `tests/test_fake_broker_entry_scenario.py` (trailing-buy entry — the live-default strategy's own
+entry mechanism, previously zero coverage of any kind — and market-buy entry),
+`tests/test_fake_broker_arm_scenario.py` (the arm transition, also previously zero coverage: SL→
+trailing-sell replace, and fresh trailing-sell placement), `tests/test_fake_broker_exit_fresh_scenario.py`
+(exit with no resting order), and an addition to `tests/test_fake_broker_gap_resize_scenario.py`
+(gap-resize with no order_id on file). Now 11/11. Building the entry-scenario test also caught a real,
+previously-undiscovered bug in the shared `tests/fake_broker.py` fixture itself:
+`cancel_order`'s arguments were in the wrong order relative to the real schwab-py client, making every
+call to it a silent no-op for the fixture's entire lifetime (never caught because no existing test had
+ever called it — every other real order path had migrated to atomic `replace_order` first). Fixed,
+plus added a missing `FakeBroker.get_order` method needed for real post-cancel confirmation polling.
+
+**Three new standing principles added to `docs/automation_principles.md`** (#17-19), generalizing
+what this session actually established as durable practice (not narrative — the doc's existing
+format, rule + Why): independent review is non-deterministic, pair it with a parametrized truth
+table or `hypothesis` property test for state-machine-shaped bugs and verify via mutation testing
+that the test actually catches what it claims to (#17); a shared test fixture needs its own coverage
+audit, since passing tests prove nothing about a fixture method nothing calls, and a shared
+entrypoint can hide an untested branch that grep-only detection will false-positive on (#18, the
+`fake_broker.cancel_order` bug as the concrete example); a new automated order-placement scenario
+gets its `fake_broker_coverage_matrix.py` row and scenario test in the same session it's built, not
+a later batch audit (#19, user's explicit instruction).
+
+New `docs/heap.md` (per user request) — ultra-short-term scratch capture, disposable, a corollary to
+`backlog_cache.md` for mid-session ideas not yet ready for the real backlog. New backlog item (this
+weekend): combine the accountability matrix and the parametrized-truth-table technique into one —
+cross each of the 11 fake_broker use cases with its own real state axes (not just one scenario per
+use case), full sketch of the per-use-case axes written into `backlog_cache.md`.
+
+**Final (3rd) independent review, required before the session's first commit**: verified all 6 of
+the prior round's fixes correct, found 3 more real issues — a `sl_order_id` writeback guard missing
+against the new order id itself being `None` (could silently erase a valid protective order's
+tracking on a real successful replace), a race where `check_entry_abandon` could cancel a real market
+order `check_gap_resize` had placed seconds earlier in the same poll iteration, and a
+`coverage_registry.py` `bad_results` gap. All fixed, 3 new regression tests, plus 3 cheap docstring
+notes for genuine-but-unfixable ambiguities the review also flagged.
+
+**Final state**: 414 tests passing (was 362 at the very start of the "just fix it all" session).
+`scripts/live_sim_harness.py`: 7/7. `signals_invariants.py`: 2 known/accepted violations (SH/ERY
+position-snapshot-vs-live-config drift, pre-existing, unrelated to this session), unchanged.
+`scripts/fake_broker_coverage_matrix.py`: 11/11. `scripts/mutation_test_entry_abandon.py`: 5/5.
+`verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`: both
+clean. Three independent review rounds total ran across the session before this commit.
+
+Docs updated throughout: `docs/deep_backlog.md` (5 new 2026-07-31 entries, newest first),
+`docs/backlog_cache.md` (condensed pointers + 1 new open item), `CLAUDE.md` (existing 2026-07-31
+bullet extended, not a new inline changelog block), `docs/live_test_coverage.md`,
+`docs/automation_principles.md` (+3 principles), `scripts/coverage_registry.py`, `requirements.txt`
+(`hypothesis` added).
+
+Live daemon: restarted mid-session onto this code, confirmed clean (no tracebacks, Morning Report
+posted, invariants ran normally) — left running by the user before this wrap.

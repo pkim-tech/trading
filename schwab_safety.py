@@ -520,9 +520,10 @@ def node_auto_fill_detection_enabled(node_id) -> bool:
 
 
 def enable_node_auto_fill_detection(node_id):
-    """Called by the Slack per-node 'Enable Auto-Fill Detection' button handler
-    -- also ensures the ticker-level flag is on, since the real gate is an AND
-    of both layers and this is the only UI entry point that sets either."""
+    """Called by the Slack per-node 'Enable Auto-Fill Detection' button handler.
+    Only sets the node-level flag -- the real gate is an AND of this and the
+    ticker-level flag (enable_auto_fill_detection), which the caller must set
+    separately (signals_handlers.handle_enable_auto_fill_detection does both)."""
     NODE_AUTO_FILL_DETECTION_PATH.parent.mkdir(parents=True, exist_ok=True)
     state = {}
     if NODE_AUTO_FILL_DETECTION_PATH.exists():
@@ -893,7 +894,35 @@ def check_order(
         # recorded shares before the real fill was confirmed) before they
         # reach the broker as a would-be short.
         pos = _presell_pos
-        if pos and quantity > pos['shares'] * 1.001:  # tolerance for float share counts
+        # Fail closed when no local position row is found at all (automation_
+        # principles.md #2) -- this branch used to only ever fire when `pos`
+        # was truthy, silently skipping the bound entirely with no local
+        # position on file, the exact "fail-open on a missing local position
+        # row" gap flagged in the 2026-07-31 audit's still-open list. A first
+        # fix attempt broke ~14 tests; investigation (2026-07-31, later
+        # session) found those were all guard-isolation tests exercising
+        # OTHER check_order guards (kill switch, cash, window, dup-order) via
+        # a SELL call with no position ever seeded -- a test-fixture gap, not
+        # evidence this guard is unsafe in production (every real SELL call
+        # site resolves a position via get_open_position_by_wl_id/
+        # get_position_by_id before ever reaching schwab_client, and the same
+        # account value flows straight through, so a live position should
+        # always be found here). Verified against the real trading_live.db:
+        # zero open_positions rows with a NULL/empty account (the one
+        # plausible legacy-data gap) as of this fix. gap_resize's MARKET-buy
+        # replacement path is exempt (is_gap_correction doesn't apply to SELL
+        # here -- N/A, this branch is SELL-only) -- no other legitimate
+        # no-position SELL path was found.
+        if pos is None:
+            signals_db.log_coverage_event(
+                "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_no_position",
+                detail=f"quantity={quantity:g}"
+            )
+            raise SafetyViolation(
+                f"SELL {quantity:g} {ticker} in '{account}' -- no open position on file for this "
+                f"(ticker, account), refusing to guess a bound and place an unverified SELL"
+            )
+        if quantity > pos['shares'] * 1.001:  # tolerance for float share counts
             signals_db.log_coverage_event(
                 "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked",
                 detail=f"quantity={quantity:g} held={pos['shares']:g}"

@@ -14,7 +14,7 @@ are sampled at POLL_SECS cadence, not tick-perfect against a real broker.
 from datetime import datetime
 
 import signals_db as db
-from signals_compute import _current_price, check_sell_condition
+from signals_compute import _current_price, _load_cache, _bars_held, check_sell_condition
 from signals_blocks import _post_message
 from signals_helpers import buy_order_sizing, log_poll, resolve_at_bar_close
 
@@ -47,7 +47,16 @@ def start_paper_market_buy(node, sig):
     ticker = sig['ticker']
     if db.get_open_position_by_wl_id(node['id'], paper=True):
         return
-    sizing = buy_order_sizing(node, sig)
+    # Explicit target_notional (starting_notional) -- buy_order_sizing's
+    # default (_last_sale_recovery) queries the real trade_log, which paper
+    # fills never land in (paper_trade_log instead); without this override a
+    # research node sharing (ticker, strategy, version, window, account) with
+    # a real live node (the deliberate DPST live+research pairing, see
+    # CLAUDE.md) could size a paper position off unrelated real trade
+    # proceeds. Found by review while fixing the identical hazard in the
+    # trailing-buy sizing path below -- pre-existing here, not introduced
+    # this session, but the same fix applies.
+    sizing = buy_order_sizing(node, sig, target_notional=node.get('starting_notional') or 50000)
     if sizing['shares'] < 1:
         return
     db.open_position(node, sig['current_price'], sig['last_bar'], sig['current_price'], datetime.now(),
@@ -60,18 +69,65 @@ def start_paper_market_buy(node, sig):
 
 def update_paper_buys():
     """Called unconditionally every poll (not gated to signal windows) -- a real
-    trailing buy can fill any time after the signal fires."""
+    trailing buy can fill any time after the signal fires.
+
+    Also enforces the same entry-abandon timeout as signals_notify.
+    check_entry_abandon (see that docstring for the kernel-parity rationale)
+    -- a paper trailing buy that never bounces has no real broker order to
+    leak, but would otherwise wait forever and never produce the closed
+    trade/P&L data paper trading exists to generate, silently understating
+    how often this strategy shape simply gives up on an entry. Checked AFTER
+    the bounce-fill check below, matching the kernel's own per-bar order
+    (backtester.py's _simulate_trail_both: check the fill first, only fall
+    through to `wait_bars >= max_hours_to_hold` if this bar didn't fill) --
+    an earlier version checked abandon first, which could abandon a pending
+    buy on the exact poll it would otherwise have filled (found by review
+    before landing)."""
     for pb in db.get_paper_pending_buys():
         ticker = pb['ticker']
         node = pb['node']
+        wl_id = node.get('id')
         price, _ = _current_price(ticker)
+        # Abandon-eligibility (bars_held) only needs cached bar history, not
+        # a fresh live price -- computed regardless of whether price below
+        # is available, so a stale/unavailable price (compute._current_price's
+        # 90min staleness guard) can't silently swallow an overdue abandon by
+        # continuing past it before the check ever runs (found by review: an
+        # earlier version's `if price is None: continue` sat before the
+        # abandon check, meaning a position resting past max_hold_hours with
+        # no fresh price data -- easily true after a long enough wait --
+        # would never actually get abandoned).
+        overdue = bool(wl_id) and _bars_held(
+            _load_cache(ticker)[0], datetime.strptime(pb['signal_time'], '%Y-%m-%d %H:%M:%S')
+        ) >= (node.get('max_hold_hours') or float('inf'))
         if price is None:
+            if overdue:
+                db.clear_paper_pending_buy(wl_id)
+                db.log_coverage_event("entry_abandon_timeout", "paper", ticker=ticker, node_id=wl_id,
+                                       result="abandoned", detail=f"max={node.get('max_hold_hours')} price_unavailable=1")
+                live_node = db.get_watch_list_node_by_id(wl_id)
+                if live_node and live_node.get('paper_alert_verbose'):
+                    _post_message(f"🧪⏱️ {ticker} — paper trailing buy never bounced within "
+                                  f"{node.get('max_hold_hours')}h — entry abandoned.")
             continue
         running_low = min(pb['running_low'], price)
         trail_buy_pct = node.get('trail_buy_pct') or 0.0
         trigger = running_low * (1 + trail_buy_pct / 100)
         log_poll(f"{ticker} paper_update_buys price={price:.4f} running_low={running_low:.4f} trigger={trigger:.4f}")
         if price > running_low and price >= trigger:
+            # Flat starting_notional/price -- deliberately NOT buy_order_sizing's
+            # worst-case padded formula (trail_buy_pct+pad_pct), even though
+            # real/dry-run both use it at signal/placement time. That padding
+            # exists because a REAL order is sized before the fill price is
+            # known; here the fill price is already known, and the real
+            # position's true end state (after _reconcile_fill's post-fill
+            # top-up buy, signals_notify.py) converges to
+            # target_notional/fill_price regardless of the initial pad -- this
+            # flat formula already matches that real end state directly
+            # (confirmed via review: applying the pad here, as a first
+            # version of this fix did, would have undersized paper positions
+            # relative to what a real position actually ends up holding,
+            # the opposite of the intended alignment).
             starting_notional = node.get('starting_notional') or 50000
             shares = int(starting_notional // price)
             if shares < 1:
@@ -93,7 +149,23 @@ def update_paper_buys():
             live_node = db.get_watch_list_node_by_id(node['id']) if node.get('id') else None
             if live_node and live_node.get('paper_alert_verbose'):
                 _post_message(f"🧪 PAPER BUY FILLED — {ticker}  {shares}sh @ ${price:.4f}")
-        elif running_low != pb['running_low']:
+            continue
+        if overdue:
+            db.clear_paper_pending_buy(wl_id)
+            db.log_coverage_event("entry_abandon_timeout", "paper", ticker=ticker, node_id=wl_id,
+                                   result="abandoned", detail=f"max={node.get('max_hold_hours')}")
+            # Re-read live, same rationale as the fill-alert path above --
+            # node here is the frozen signal-time snapshot, which never
+            # carries paper_alert_verbose at all (not in
+            # _PENDING_BUY_NODE_KEYS), so node.get('paper_alert_verbose') was
+            # always None/falsy in a first version of this fix (found by
+            # review before landing).
+            live_node = db.get_watch_list_node_by_id(wl_id)
+            if live_node and live_node.get('paper_alert_verbose'):
+                _post_message(f"🧪⏱️ {ticker} — paper trailing buy never bounced within "
+                              f"{node.get('max_hold_hours')}h — entry abandoned.")
+            continue
+        if running_low != pb['running_low']:
             db.update_paper_pending_buy_running_low(pb['id'], running_low)
 
 

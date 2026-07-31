@@ -118,6 +118,18 @@ REGISTRY = [
          check_mechanism='coverage_events', scenario_key='exit_arm_latency',
          notes="Instrumented 2026-07-28 -- logs each time the scan evaluates a genuinely new bar "
                "(not the skip-no-new-bar branch) for an automation-scoped open position."),
+    dict(id='entry_abandon_timeout',
+         scenario="A trailing-buy that never bounces is abandoned (real order cancelled or local "
+                  "row cleared) once max_hold_hours elapses, instead of resting forever",
+         code_path="signals_notify.check_entry_abandon; paper_trading.update_paper_buys (paper leg)",
+         offline_coverage="tests/test_entry_abandon.py",
+         check_mechanism='coverage_events', scenario_key='entry_abandon_timeout',
+         bad_results=['unrecognized_account', 'no_order_id_on_file', 'cancel_failed', 'cancel_unconfirmed'],
+         notes="Built 2026-07-31 (was the [HIGHEST] item in that session's exit/arm/entry audit). "
+               "First-ever production caller of schwab_client.cancel_order -- a real broker mutation, "
+               "not yet observed against a genuinely resting real (non-dry_run) order live. As of "
+               "build time, DIA/SDOW (dry_run 'ira') are the only real pending rows exercising the "
+               "no-real-order-to-cancel path."),
     dict(id='kernel_fill_parity',
          scenario="Trailing-buy/-stop fill resolution parity vs backtest kernel",
          code_path="kernel + live sizing",
@@ -215,9 +227,17 @@ REGISTRY = [
     dict(id='fast_path_fill_reconciliation',
          scenario="Fast-path (websocket) fill reconciliation doesn't act on a partial/in-flight execution",
          code_path="signals_notify.drain_fill_queue (re-confirms via get_filled_order poll)",
-         offline_coverage="3 unit tests (test_part3_gap_resize.py)",
+         offline_coverage="5 unit tests (test_part3_gap_resize.py)",
          check_mechanism='coverage_events', scenario_key='fast_path_fill_reconciliation',
-         notes="Needs a real multi-execution fill to confirm the poll-reconfirm path in practice."),
+         bad_results=['outside_automation_scope', 'auto_fill_detection_disabled',
+                      'stream_event_not_yet_confirmed_filled'],
+         notes="Needs a real multi-execution fill to confirm the poll-reconfirm path in practice. "
+               "bad_results added 2026-07-31 (review finding): auto_fill_detection is off by default, "
+               "so outside_automation_scope/auto_fill_detection_disabled will be the COMMON real "
+               "result once this scenario starts firing live -- without listing them, compute_status "
+               "would render this row verified-live off events that only prove the opt-in gate fired, "
+               "not that the real poll-reconfirm path ran (the same sl_placement/top_up blocked-vs-"
+               "succeeded conflation this registry was built to catch)."),
     dict(id='same_day_block',
          scenario="same_day_block skips correctly for margin accounts, still blocks cash accounts",
          code_path="schwab_safety.check_order (AccountLimits.account_type)",
