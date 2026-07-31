@@ -1,17 +1,18 @@
 """Second fake_broker scenario -- reproduces the RETL SL-anchored-to-stale-
-signal_price finding (2026-07-29): _place_stop_loss_for_position anchors the
-real stop-loss to pending_buys.signal_price (the original trigger reference),
-not the real fill price. That's an intentional design choice for the normal
-case (matches the backtest's zero-slippage assumption) -- but when a real
-order rests for hours before filling and the real fill drifts far from the
-stale signal_price, the resulting stop can land in a nonsensical place
-relative to the real entry (RETL: signal_price=$10.15, real fill=$9.905, the
-computed 1%-below-signal_price stop landed at $10.05 -- ABOVE the real entry).
+signal_price finding (2026-07-29): _place_stop_loss_for_position used to
+anchor the real stop-loss to pending_buys.signal_price (the original trigger
+reference), not the real fill price. When a real order rests for hours
+before filling and the real fill drifts far from the stale signal_price, the
+resulting stop could land in a nonsensical place relative to the real entry
+(RETL: signal_price=$10.15, real fill=$9.905, the computed 1%-below-
+signal_price stop landed at $10.05 -- ABOVE the real entry).
 
-This test doesn't assert a fix (none was decided) -- it pins down the exact,
-current, real behavior with full pre/post state, so a future change to this
-formula has a concrete regression test to run against instead of re-deriving
-this from scratch."""
+Fixed 2026-07-31 (independently rediscovered and confirmed via a fresh
+execution-path walkthrough): _place_stop_loss_for_position now anchors to
+pos['entry_price'] (the real fill), matching exactly what strategies.py's
+own check_exit already uses for the SL comparison -- correct for every
+strategy, not just the market-buy ones where signal_price and entry_price
+happen to coincide. This test now asserts the FIXED behavior."""
 import sys
 import tempfile
 from datetime import datetime
@@ -68,7 +69,7 @@ def _node():
     return [n for n in signals_db.get_watchlist() if n['ticker'] == TICKER][0]
 
 
-def test_sl_anchored_to_stale_signal_price_lands_above_real_entry(env, fake_broker, monkeypatch):
+def test_sl_anchored_to_real_entry_lands_below_it(env, fake_broker, monkeypatch):
     node = _node()
     signal_price = 10.15   # frozen reference from when the order was staged
     real_fill_price = 9.905  # real fill, hours later, well below signal_price
@@ -97,6 +98,21 @@ def test_sl_anchored_to_stale_signal_price_lands_above_real_entry(env, fake_brok
     assert pos['entry_price'] == real_fill_price
     assert pos['shares'] == 50.0
 
+    # Hold-time origin fix (2026-07-31): pos['signal_time'] must reflect the
+    # real fill moment, not the pending buy's original signal_time
+    # (2026-07-29 00:04:58, hours/days stale by the time this test runs) --
+    # _bars_held counts hold time from this field, and the backtest kernel's
+    # real basis for a trailing-buy fill is the fill bar, not the signal bar
+    # (the wait itself is tracked separately and never charged against hold
+    # time). Before the fix, a position opened this way would already show
+    # as having been held for however long the real order sat waiting to
+    # bounce -- causing premature TIME exits.
+    stored_signal_time = datetime.strptime(pos['signal_time'], '%Y-%m-%d %H:%M:%S')
+    assert (datetime.now() - stored_signal_time).total_seconds() < 60, (
+        f"pos['signal_time']={pos['signal_time']} should be ~now (the real fill moment), "
+        f"not the stale pending-buy signal_time (2026-07-29 00:04:58)"
+    )
+
     resting = [o for o in fake_broker.orders.values()
                if o['orderLegCollection'][0]['instrument']['symbol'] == TICKER
                and o['orderType'] == 'STOP']
@@ -108,16 +124,16 @@ def test_sl_anchored_to_stale_signal_price_lands_above_real_entry(env, fake_brok
     real_stop_price = float(stop_order['stopPrice'])  # OrderBuilder formats to a
                                                         # 2-decimal string, matching
                                                         # the real order seen live tonight
-    expected_stop = signal_price * (1 - node['fixed_sl'] / 100)  # current (unfixed) formula
+    expected_stop = real_fill_price * (1 - node['fixed_sl'] / 100)  # fixed formula: anchored to the real fill
     assert real_stop_price == pytest.approx(expected_stop, abs=0.01)
 
-    # The actual finding: this stop is ABOVE the real entry, not below it --
-    # backwards for downside protection on a long position.
-    assert real_stop_price > pos['entry_price'], (
-        f"real finding reproduced: stop ${real_stop_price:.4f} is ABOVE "
-        f"real entry ${pos['entry_price']:.4f} (anchored to stale signal_price "
-        f"${signal_price:.4f} instead of the real fill) -- meaningless as "
-        f"downside protection from the actual entry."
+    # The fix: this stop is correctly BELOW the real entry -- genuine
+    # downside protection, unlike the pre-fix behavior (anchored to the
+    # stale signal_price, which could land the stop above the real entry).
+    assert real_stop_price < pos['entry_price'], (
+        f"stop ${real_stop_price:.4f} should be BELOW real entry ${pos['entry_price']:.4f} "
+        f"-- anchoring to signal_price (${signal_price:.4f}) instead of the real fill "
+        f"would be meaningless as downside protection from the actual entry."
     )
 
     fill_events = signals_db.get_coverage_events(scenario_key='buy_fill_reconciled')

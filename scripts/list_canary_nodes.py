@@ -4,11 +4,16 @@ recalled from memory.
 
 Includes a 'pair' / 'testing' column: the original 6 canaries (IVV, QQQ, IWM,
 DIA, VOO, XLF) were each deliberately paired with an inverse-exposure
-counterpart added 2026-07-29 (FAZ/SPXU/TWM/QID/SDOW), plus a standalone
-long/short pair on gold miners (JNUG/JDST) -- so regardless of which
+counterpart added 2026-07-29 (FAZ/SPXU/TWM/QID/SDOW) -- so regardless of which
 direction the market moves on a given day, at least one side of each pair
-should get real signal activity. This mapping is deliberate design intent,
-not derived from data, so it's a hand-maintained table here (like
+should get real signal activity. Confirmed for real 2026-07-30: IVV/QQQ/DIA/VOO
+all closed up and got no entry, while their true inverse pairs (SPXU/QID/SDOW)
+closed down and correctly triggered. JNUG's "pairs_with VOO" label was removed
+2026-07-31 -- JNUG (2x gold miners) has no real price relationship to VOO
+(S&P 500), so it isn't actually an inverse pair the way the others are; it only
+shares the E-scenario's strategy/mechanism (TrailingExit immediate market-buy),
+not a price correlation. This mapping is deliberate design intent, not derived
+from data, so it's a hand-maintained table here (like
 seed_scenario_expectations.py's SCENARIOS) -- update it if the pairing ever
 changes.
 
@@ -38,9 +43,12 @@ PAIRS = {
     'SDOW': ('DIA', 'D mirrored: overnight carry, inverse side'),
     'XLF':  ('FAZ', 'F: TIME-only exit (arm+SL both unreachable)'),
     'FAZ':  ('XLF', 'F mirrored: TIME-only exit, inverse side'),
-    'JNUG': ('VOO', 'E mirrored: TrailingExit immediate market-buy path (2026-07-29 fix -- '
-                     'was the missing 6th A-F mirror, converted from generic TrailingBoth)'),
-    'JDST': ('?', 'no longer paired -- JNUG became the E-mirror instead of JDST\'s original '
+    'JNUG': ('none', 'E scenario: TrailingExit immediate market-buy path (2026-07-29 fix -- '
+                      'was the missing 6th A-F mirror, converted from generic TrailingBoth). '
+                      'Not a real inverse pair with VOO/anything -- JNUG (2x gold miners) has no '
+                      'price relationship to the index-tracking canaries; "pairs_with VOO" label '
+                      'removed 2026-07-31 after real data showed it moving independently.'),
+    'JDST': ('?', 'no longer paired -- JNUG became the E-scenario instead of JDST\'s original '
                   'gold-miner-inverse role; purpose still open'),
 }
 

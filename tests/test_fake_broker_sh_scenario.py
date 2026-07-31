@@ -195,3 +195,170 @@ def test_unarmed_position_past_max_hold_replaces_resting_sl_with_market_exit(env
     time_exit_events = signals_db.get_coverage_events(scenario_key='time_exit_trigger')
     assert any(e['ticker'] == TICKER for e in time_exit_events), \
         "notify_sell_signal(reason='TIME') should log the time_exit_trigger coverage event"
+
+
+def test_armed_position_past_max_hold_with_failed_arm_placement_still_exits(env, fake_broker, monkeypatch):
+    """A third valid armed/hold-time-forced setup, distinct from the first
+    test above: arming (trailing=True) succeeded, but the arm-time trailing-
+    sell PLACEMENT failed (broker exception / SafetyViolation / automation
+    paused) -- signals_compute.check_sell_condition persists 'trailing' state
+    independently of whether _attempt_automated_sell's order placement itself
+    succeeded, so this is a real reachable state: armed, order_placed=False,
+    exit_order_id=None, and the ORIGINAL protective SL still resting at the
+    broker (the atomic replace never ran).
+
+    Before the signals_notify.py:211 fix (found live via execution-path
+    walkthrough, 2026-07-31), resting_order_id resolved to None here (only
+    exit_order_id was ever checked for reason='TRAIL'), so
+    _attempt_automated_exit_sell placed a fresh, un-linked market sell with no
+    replacing_order_id -- schwab_safety's resting-SELL guard then saw the
+    still-live SL and raised SafetyViolation on every attempt, permanently
+    self-blocking the hold-time-forced exit exactly like the original SH
+    incidents, just through a different precondition."""
+    node = _node()
+    entry_time = datetime(2026, 7, 24, 7, 38, 38)
+    signals_db.open_position(node, signal_price=33.52, signal_time=entry_time,
+                              entry_price=33.52, entry_time=entry_time, shares=50)
+    pos = signals_db.get_open_position(TICKER)
+
+    fake_broker.set_quote(TICKER, last=33.61, bid=33.60, ask=33.62)
+    # The original protective SL, still resting -- the arm-time replace never
+    # happened because placement failed.
+    sl_order_id = fake_broker.seed_resting_order(
+        'soxl_ira', TICKER, 'STOP', 'SELL', 50, stop_price=16.76)  # far OTM, matches SH's real design
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET sl_order_id=? WHERE id=?", (sl_order_id, pos['id']))
+        c.commit()
+
+    import strategies
+    strat = strategies.TrailingBothZScoreBreakout(window=99, trail_pct=0.5)
+    check_reason, check_price, check_state = strat.check_exit({
+        'current_price': 33.61, 'open': 33.61, 'low': 33.60, 'high': 33.62,
+        'entry_price': 33.52, 'take_profit': 0.003, 'stop_loss': 0.5,
+        'max_hours_to_hold': 24, 'hours_held': 28, 'at_bar_close': True,
+        'state': {'trailing': True, 'peak': 33.72},
+    })
+    assert check_state.get('exit_forced_by_hold_time') is True
+
+    # Armed, but the arm-time order placement failed -- no order_placed, no
+    # exit_order_id (matches notify_trailing_activated's real persisted state
+    # on a failed _attempt_automated_sell).
+    armed_state = {
+        'trailing': True, 'peak': 33.72,
+        'exit_forced_by_hold_time': check_state['exit_forced_by_hold_time'],
+    }
+    signals_db.update_position_trail_state(pos['id'], armed_state)
+    pos = signals_db.get_open_position(TICKER)
+    assert pos['trail_state'].get('exit_order_id') is None
+    assert pos['sl_order_id'] == sl_order_id
+
+    signals_notify.notify_sell_signal(pos, 'TRAIL', current_price=33.61, target_price=33.61)
+
+    old_sl = fake_broker.orders[sl_order_id]
+    assert old_sl['status'] == 'REPLACED', (
+        f"expected the still-live SL to be replaced (not left resting while a "
+        f"second, unlinked order gets blocked), got status={old_sl['status']}"
+    )
+    ticker_orders = [o for o in fake_broker.orders.values()
+                      if o['orderLegCollection'][0]['instrument']['symbol'] == TICKER]
+    market_sells = [o for o in ticker_orders if o['orderType'] == 'MARKET']
+    assert market_sells, (
+        f"expected a forced MARKET sell replacing the still-live SL, found: "
+        f"{[(o['orderId'], o['orderType'], o['status']) for o in ticker_orders]} "
+        "-- resting_order_id must fall back to sl_order_id when exit_order_id "
+        "is None, or this self-blocks forever against the still-resting SL"
+    )
+
+
+def test_hold_time_forced_exit_does_not_re_replace_on_a_later_bar(env, fake_broker, monkeypatch):
+    """Regression test for a composition bug introduced (and caught before
+    landing) 2026-07-31: the exit_order_id-refresh fix and the
+    still_unreplaced_trail_order reuse guard both read/write exit_order_id,
+    which made the guard permanently True after the very first replace (since
+    exit_pending['order_id'] and the freshly-refreshed exit_order_id become
+    equal) -- causing _attempt_automated_exit_sell to re-issue a brand new
+    replace_equity_order_with_market against the SAME still-resting market
+    sell on every subsequent bar, forever, until it happened to fill. Fixed
+    via a dedicated `hold_time_replaced` flag instead of reusing
+    exit_order_id as its own proof-of-replacement. This only reproduces when
+    the first replace's fill ISN'T confirmed within notify_sell_signal's
+    bounded poll (the real-world case this mechanism exists for at all) --
+    fake_broker's default same-tick MARKET fill would mask it, so this test
+    disables that auto-fill to model an order still genuinely resting.
+
+    Also advances schwab_safety's real wall-clock time between the two calls
+    -- without this, schwab_safety's UNRELATED 60s duplicate-order-fingerprint
+    guard (same side/ticker/quantity within DUPLICATE_ORDER_WINDOW_SECS)
+    coincidentally blocks a second same-second replace attempt regardless of
+    whether the still_unreplaced_trail_order bug is present, producing a
+    false pass either way (confirmed by hand: this test passed against the
+    deliberately-reintroduced buggy comparison-based guard until this fix,
+    because both calls landed within the same wall-clock second). Real bars
+    are an hour apart, so bridging that window here is the faithful setup,
+    not a workaround for the test alone."""
+    monkeypatch.setattr(fake_broker, '_maybe_immediate_fill', lambda o: None)
+    import schwab_safety
+    _clock = {'t': 1_800_000_000.0}
+    monkeypatch.setattr(schwab_safety.time, 'time', lambda: _clock['t'])
+
+    node = _node()
+    entry_time = datetime(2026, 7, 24, 7, 38, 38)
+    signals_db.open_position(node, signal_price=33.52, signal_time=entry_time,
+                              entry_price=33.52, entry_time=entry_time, shares=50)
+    pos = signals_db.get_open_position(TICKER)
+
+    fake_broker.set_quote(TICKER, last=33.61, bid=33.60, ask=33.62)
+    exit_order_id = fake_broker.seed_resting_order(
+        'soxl_ira', TICKER, 'TRAILING_STOP', 'SELL', 50, trail_offset=50.0)
+
+    armed_state = {
+        'trailing': True, 'peak': 33.72, 'order_placed': True,
+        'exit_order_id': exit_order_id, 'exit_forced_by_hold_time': True,
+    }
+    signals_db.update_position_trail_state(pos['id'], armed_state)
+    pos = signals_db.get_open_position(TICKER)
+
+    def _ticker_orders():
+        return [o for o in fake_broker.orders.values()
+                if o['orderLegCollection'][0]['instrument']['symbol'] == TICKER]
+
+    def _market_sells():
+        return [o for o in _ticker_orders() if o['orderType'] == 'MARKET']
+
+    # Bar 1: force-replace fires, order isn't (in this test) confirmed
+    # filled -- exit_pending gets set, exit_order_id refreshed, and the new
+    # hold_time_replaced flag set.
+    signals_notify.notify_sell_signal(pos, 'TRAIL', current_price=33.61, target_price=33.61)
+    first_pass_market_sells = _market_sells()
+    assert len(first_pass_market_sells) == 1, (
+        f"expected exactly one MARKET sell after the first forced replace, "
+        f"found {len(first_pass_market_sells)}: {[o['orderId'] for o in first_pass_market_sells]}"
+    )
+    first_order_id = first_pass_market_sells[0]['orderId']
+
+    pos_after_bar1 = signals_db.get_open_position(TICKER)
+    assert pos_after_bar1['trail_state'].get('hold_time_replaced') is True
+    assert pos_after_bar1['trail_state'].get('exit_order_id') == first_order_id
+    assert pos_after_bar1['trail_state'].get('exit_pending', {}).get('order_id') == first_order_id
+
+    # Bar 2: condition is still true (still armed, still hold-time-forced,
+    # still no confirmed fill) -- this must reuse the existing pending order,
+    # NOT place a second replace against the still-resting market sell.
+    # Advance well past DUPLICATE_ORDER_WINDOW_SECS (60s) and real bar
+    # spacing (1h) so only still_unreplaced_trail_order's own logic is under
+    # test, not an unrelated guard incidentally blocking a same-second retry.
+    _clock['t'] += 3600
+    signals_notify.notify_sell_signal(pos_after_bar1, 'TRAIL', current_price=33.61, target_price=33.61)
+
+    second_pass_market_sells = _market_sells()
+    assert len(second_pass_market_sells) == 1, (
+        f"expected NO additional MARKET sell on a second bar with the condition still true, "
+        f"but found {len(second_pass_market_sells)}: "
+        f"{[(o['orderId'], o['status']) for o in second_pass_market_sells]} -- "
+        "the still_unreplaced_trail_order guard is re-firing every bar instead of "
+        "correctly recognizing the order was already replaced once"
+    )
+    assert second_pass_market_sells[0]['orderId'] == first_order_id, (
+        "the single resting MARKET sell must still be the SAME order from bar 1, "
+        "not a second one that replaced it"
+    )

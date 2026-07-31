@@ -85,6 +85,28 @@ def test_update_paper_buys_fills_on_bounce_and_opens_paper_position(monkeypatch,
     assert pos['trade_log_id'] is not None
 
 
+def test_bounce_fill_hold_time_anchors_to_fill_not_stale_signal_time(monkeypatch, isolated_db):
+    """Hold-time origin fix (2026-07-31): a bounce-fill that happens hours
+    after the original signal must NOT carry that wait against the
+    position's hold-time budget -- pos['signal_time'] (what _bars_held
+    counts from) should reflect the real fill moment, matching the backtest
+    kernel's entry_bar/held=0-at-fill semantics, not the original signal."""
+    stale_signal_time = datetime.now() - timedelta(hours=5)
+    sig = {'ticker': TICKER, 'current_price': 100.0, 'z_score': -2.5, 'last_bar': stale_signal_time}
+    paper_trading.start_paper_buy(_node(), sig)
+    monkeypatch.setattr(paper_trading, '_current_price', lambda t: (90.0, None))
+    paper_trading.update_paper_buys()
+    monkeypatch.setattr(paper_trading, '_current_price', lambda t: (95.0, None))
+    paper_trading.update_paper_buys()
+
+    pos = db.get_open_positions(paper=True)[0]
+    stored_signal_time = datetime.strptime(pos['signal_time'], '%Y-%m-%d %H:%M:%S')
+    assert (datetime.now() - stored_signal_time).total_seconds() < 60, (
+        f"pos['signal_time']={pos['signal_time']} should be ~now, not the stale "
+        f"original signal time ({stale_signal_time})"
+    )
+
+
 def test_check_paper_sells_closes_on_sl_and_writes_paper_trade_log(monkeypatch, isolated_db):
     node = _node()
     signal_time = datetime.now() - timedelta(hours=1)

@@ -5276,3 +5276,92 @@ the session collided with the daemon's own token refresh and failed with the sam
 error (before the token fully expired) — confirmed real, but transient at the time. Any manual
 schwab_client invocation from a side process while the daemon is live carries this risk; prefer
 read-only checks or let the running daemon's own poll cycle do the work instead.
+
+---
+
+## 2026-07-31 — Full exit/arm/entry execution-path audit: 9 bugs fixed (1 real-money, 1 live incident), 13 confirmed and left open
+
+Extended session tracing the live-trading execution path by hand (Opus agents given real call
+chains, told to trace rather than scan) across three areas in sequence — exit/sell, the arming
+transition, and buy/entry — rather than reviewing diffs. Started from re-verifying the 2026-07-29
+SH stuck-exit fix and finding it hadn't actually held.
+
+**Exit/sell (found via 3 passes: kernel-parity, execution-correctness, fresh context-free re-walk,
+plus a dedicated integration re-check):**
+- The original SH bug, fixed for real this time: `notify_sell_signal`'s two call sites now re-fetch
+  the position fresh before acting, instead of using the pre-`check_sell_condition` snapshot.
+- `_current_price`'s staleness guard changed from same-calendar-day to a straight bar-age check
+  (90min) — the date-only version missed the real GDXU overnight-stale-price incident shape.
+- `check_exit_reminders`/`check_trailing_reminders`/`check_live_state_reconciliation` all had the
+  identical stale-snapshot-then-clobber bug as the original SH incident, just via different
+  triggers — all three now re-fetch fresh before writing.
+- Mid-bar `peak` contamination in `strategies.py` (all 3 trailing-exit classes) was corrupting the
+  2026-07-20 gap-through-trigger fix's "peak confirmed through the prior bar" invariant — fixed to
+  only persist `peak` at real bar-close, verified directly against `backtester.py`'s actual kernel
+  loop (zero blast radius, state-only).
+- `resting_order_id` missing an SL fallback when arm-time placement failed — a third precondition
+  of the SH bug family, self-blocking forever against the still-live original SL.
+- `exit_order_id` refresh + a new `hold_time_replaced` flag (replacing an equality check that had
+  gone permanently-true once that field started being refreshed — caught by the integration
+  re-check specifically asking whether the individual fixes composed together).
+
+**Arming:**
+- Reconciliation blind spot — a crash between arming-persist and order-placement left
+  `trailing=True`/`order_placed` unset permanently invisible to every monitor. New check gated on
+  `last_reminder_at` being absent (the true "never ran at all" signature, not `order_placed` alone,
+  which also matches the normal awaiting-manual-confirmation state — caught by review).
+- Manual arm Slack alert was missing share count, trail %, and a cancel-existing-stop instruction.
+
+**Buy/entry (found via the exit walkthrough, since `_place_stop_loss_for_position` is shared code):**
+- **Real-money bug**: the real Schwab stop-loss order was anchored to `signal_price`, not
+  `entry_price` — correct only for market-buy strategies. For the trailing-buy strategies (the live
+  default, all 10 v5 nodes, the real-money DPST node), this could place the real stop *above*
+  market whenever price fell before the bounce. Fixed to anchor to `pos['entry_price']` universally,
+  matching `strategies.py`'s own SL check exactly.
+- Hold-time origin: the trailing-buy bounce-fill wait was silently eating into the position's
+  hold-time budget (the kernel tracks it separately and never charges it against `held`) — fixed
+  across all 4 real/paper/dry-run fill paths, anchoring to the real fill moment instead of the
+  stale original signal time. Deliberately not applied to the manual-catch-up backdating flow.
+- SL placement retry + market-sell fallback, built live during a real incident: LABD's stop was
+  REJECTED by Schwab (stale fill reconciled hours late, market had already crossed the tight
+  target). New logic re-checks the real current price on retry; if already crossed, exits via a
+  real market sell instead of retrying a doomed resting order — deliberately mirrors the kernel's
+  own gap-through-trigger SL logic. First version of this fix had its own bug (market-sell fallback
+  placed a real order but recorded nothing) — caught by review before it could bite twice, though
+  it had already fired live once on LABD; fixed to record `exit_pending` and alert.
+
+**Real live-account actions taken directly (not through the reviewed code path, verified against
+broker state after):** ERY's `fixed_sl` widened 0.3%→50% (matching SH's wide/inert-by-design
+pattern — ERY tests a genuine TRAIL breach, and 0.3% sat at the same tightness as `arm_sell_pct`,
+risking a premature SL before arming could happen) and its real resting stop replaced
+$10.55→$5.29 via the existing `replace_order_with_stop_loss` infra. LABD's real market-sell order
+(placed live before the `exit_pending` fix landed) was manually backfilled into `trail_state` so
+the daemon's unchanged fill-detection can close it normally.
+
+**Separately, same session**: explained and cleared 4 unexplained `coverage_deviations`
+(VOO/DIA/QQQ/IVV) with real hourly-bar confirmation the broad market was up that day (mean-reversion
+canaries correctly saw no dislocation; their true inverse pairs correctly triggered). Removed
+JNUG's `pairs_with VOO` label (confirmed independently moving, no real price relationship).
+Investigated a striking v5 paper-trading result (25/25 closed trades, 0 wins) — independently
+verified all 25 SL breaches against raw historical bars from scratch, zero mismatches; confirmed
+real, severe 3-day drawdown (SOXL: -8.55%/-2.53%/-14.50%), not a code defect.
+
+**Still open (13 items, see `docs/backlog_cache.md` for the full prioritized list)**: worst is no
+live equivalent of the kernel's entry-abandon timeout (a never-bouncing trailing-buy rests as a
+real GTC order forever, silently blocking every other BUY in that account). Also: `sl_order_id`
+never cleared after any atomic replace (only the hold-time-forced case was fixed); the oversell
+guard's fail-open branch (a first fix attempt broke 14 tests, reverted, needs real investigation);
+`running_low` extended-hours contamination; `drain_fill_queue` bypassing the opt-in auto-fill gate;
+no zero-share guard on the real BUY path; ambient-poll pre-empting the pinned check; paper sizing
+using a third formula; a dry-run false-alert/circuit-breaker chain; BUY-shaped guards also blocking
+SELL by design (fine while the circuit breaker stays monitor-only); a theoretical stale-snapshot
+race in the ambient exit loop; and a real research question (is 1-3% SL correctly sized for
+3x-leveraged tickers in high volatility).
+
+Every fix independently Opus-reviewed (several twice), plus a final session-wrap review of the full
+combined diff (checked cross-fix composition, confirmed zero `backtester.py` kernel blast radius,
+verified both real live-account writes against actual broker state) — zero further issues found.
+Test suite: 362 passed (was 349 at session start). `signals_invariants.py`: 2 known/accepted
+violations (SH's pre-existing drift, ERY's new drift from tonight's deliberate widening).
+`scripts/live_sim_harness.py`: 7/7. `verify_trailing_buy_resolution.py`/
+`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`: clean, no new mismatches.

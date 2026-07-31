@@ -444,7 +444,15 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
         if just_activated_trailing:
             notify_trailing_activated(pos, cp)
         if reason:
-            notify_sell_signal(pos, reason, cp, target)
+            # check_sell_condition already persisted the updated trail_state
+            # (e.g. exit_forced_by_hold_time) to the DB -- pos here is still
+            # the pre-call in-memory copy. Re-fetch fresh so notify_sell_signal/
+            # _attempt_automated_exit_sell see it, not a stale copy that would
+            # otherwise get written straight back to the DB (clobbering the
+            # just-persisted update -- found live 2026-07-31, defeated the
+            # 2026-07-29/30 SH hold-time-forced fixes).
+            fresh_pos = db.get_position_by_id(pos['id']) or pos
+            notify_sell_signal(fresh_pos, reason, cp, target)
             sell_alerted.add((pos['id'], last_bar_ts))
 
 
@@ -886,7 +894,19 @@ def run_loop(tickers: set = None):
                 else:
                     cp, _ = _current_price(pos['ticker'])
                     if cp is None:
-                        alert_stale_price_exit_suppressed(pos)
+                        # Widening _current_price's staleness guard to an age
+                        # check (2026-07-31) means it now legitimately returns
+                        # None almost every off-hours poll -- there's nothing
+                        # actionable about that overnight/weekend, so only
+                        # alert during real trading hours (found live: would
+                        # otherwise repost every 15min, all night/weekend, per
+                        # open position). NOT _reminders_active's 9:00 window --
+                        # the day's first bar isn't even fresh yet until ~9:35
+                        # (9:30 bar + poll/refresh lag), so reusing that window
+                        # verbatim would still fire 2-3 pure-noise alerts every
+                        # trading morning (Opus review, 2026-07-31).
+                        if _is_trading_day(today) and (9, 35) <= (now.hour, now.minute) <= (16, 0):
+                            alert_stale_price_exit_suppressed(pos)
                         return
                     low = high = op = cp
                 log_poll(f"{pos['ticker']} exit_check bar={last_bar_ts} at_bar_close={at_bar_close} "
@@ -896,7 +916,11 @@ def run_loop(tickers: set = None):
                 if just_activated_trailing:
                     notify_trailing_activated(pos, cp)
                 if reason:
-                    notify_sell_signal(pos, reason, cp, target)
+                    # See the matching comment in _scan_pinned_exit_arm above --
+                    # re-fetch fresh so this call sees check_sell_condition's
+                    # just-persisted trail_state, not the stale pre-call pos.
+                    fresh_pos = db.get_position_by_id(pos['id']) or pos
+                    notify_sell_signal(fresh_pos, reason, cp, target)
                     sell_alerted.add((pos['id'], last_bar_ts))
 
             for pos in open_positions:

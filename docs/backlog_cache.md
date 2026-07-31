@@ -7,10 +7,39 @@
 > living reference, not an ever-growing changelog. Caught live after this got violated twice in
 > one sitting (once here, once in CLAUDE.md) before being fixed.
 
-## [live-trading][security] Open, raised 2026-07-30 evening — SH stuck again: `_attempt_automated_exit_sell`'s reuse-existing-order check short-circuits before the hold-time-forced check, defeating the 2026-07-29 fix
-Full detail: `docs/deep_backlog.md`'s 2026-07-30 (evening) entry. **Fix planned tonight.** Also add a
-coverage-check scenario to catch this pattern going forward (a position with `exit_forced_by_hold_time=True`
-but no corresponding force-replace ever happening) — not built yet, captured here only.
+## [live-trading][security] Resolved 2026-07-31 — full exit/arm/entry execution-path audit: 9 real bugs fixed (1 real-money, 1 live incident), 13 more confirmed and left open
+Full detail: `docs/deep_backlog.md`'s 2026-07-31 entry (top). SH's stuck-exit bug (this item's
+original subject) is now fixed for real, along with the real-money SL-anchor bug and a live incident
+(LABD's rejected stop → real market-sell fallback) found and fixed during the same session.
+**Still open, prioritized:**
+- **[HIGHEST]** No live equivalent of the kernel's entry-abandon timeout — a trailing-buy that never
+  bounces rests as a real GTC order forever, silently blocking every other BUY in that account.
+- `sl_order_id` never cleared after ANY atomic replace (only the hold-time-forced TRAIL case was
+  fixed) — same stuck-exit/false-alert symptom class, reachable via other replace paths too.
+- Oversell guard's fail-open branch on a missing local position row — a first fix attempt broke 14
+  tests and was reverted; needs real investigation into why so many real code paths reach `check_order`
+  without a position row, not a same-night patch.
+- `running_low` contaminated by extended-hours price prints → can trigger a spurious real market BUY
+  via `check_gap_resize`.
+- `drain_fill_queue` (websocket fast path) bypasses the opt-in auto-fill-detection safety gate
+  entirely — real fills route straight to position-opening + real order placement regardless.
+- No `shares >= 1` guard on the real BUY path (broker rejects, but dings the circuit breaker + posts
+  a misleading alert).
+- Ambient pre-close poll (10:25-10:29) can pre-empt the more accurate pinned bar-close check.
+- Paper trailing-buy sizing uses a third, different formula than both real and dry-run — paper P&L
+  is what feeds go-live decisions.
+- Live bounce-fill tracking uses bar Close instead of Low/High (documented directional bias, low
+  severity — the real broker order tracks continuously regardless).
+- Dry-run-account false "auto-placed" claim that can trip the node circuit breaker — conditional on
+  a specific precondition, not confirmed currently live.
+- BUY-shaped `schwab_safety.check_order` guards (kill switch, automation pause) also block SELL by
+  design today — fine while the node circuit breaker is monitor-only, needs a deliberate policy
+  decision before it's ever allowed to actually pause automation.
+- Theoretical (not practically reachable, protected by ordering not freshness) stale-snapshot race
+  in the ambient exit loop.
+- Research question, not a bug: is 1-3% fixed_sl correctly sized for 3x-leveraged tickers in a
+  high-volatility regime? Raised while investigating v5's real 0/25 paper-trading SL streak
+  (confirmed real market conditions, not a code defect — see deep_backlog entry).
 
 ## [live-trading][docs] Open, raised 2026-07-30 evening — `enable_node_auto_fill_detection(node_id)`'s docstring claims a side effect it doesn't perform (docs-only, checked: not a live bug, the real Slack handler already calls both functions)
 Full detail: `docs/deep_backlog.md`'s 2026-07-30 (evening) entry. Cheap docstring/cosmetic fix, low priority.

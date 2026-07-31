@@ -5,7 +5,7 @@ SMA/Std indicator cache), and sell-condition checking.
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, time as _time
+from datetime import datetime, timedelta
 
 import pandas as pd
 import yfinance as yf
@@ -35,16 +35,28 @@ def _load_cache(ticker):
     return df, df_daily
 
 
-_MARKET_OPEN = _time(9, 30)
+_STALE_PRICE_MAX_AGE = timedelta(minutes=90)
 
 
 def _current_price(ticker):
-    """Returns (None, None) if the cache's last row predates today and the
-    market's already open -- a real gap found 2026-07-22 (HIBL paper trade):
-    a poll landing between market open and that ticker's first same-day
+    """Returns (None, None) if the cache's last row is older than
+    _STALE_PRICE_MAX_AGE -- a real gap found 2026-07-22 (HIBL paper trade): a
+    poll landing between market open and that ticker's first same-day
     refresh would otherwise hand back yesterday's stale close as if it were
     live, letting a trailing-buy bounce-fill (or a real SL/trailing-sell
-    check) act on a price that was never actually available at that moment."""
+    check) act on a price that was never actually available at that moment.
+    Originally a same-calendar-day check gated to weekday + post-9:30am
+    only; that missed two real cases: an overnight/weekend poll (any day of
+    week, any time) silently replaying a prior-day close as current, AND a
+    same-day-but-hours-old bar (e.g. the day's last 15:30 bar, checked at
+    11pm the same day, still passes a date-only check) -- the exact shape of
+    the GDXU overnight "current $81.92" alert, 2026-07-28, which a same-day
+    check alone doesn't actually catch. Widened 2026-07-31 to a straight age
+    check instead, catching both. Bars are hourly and the daemon polls every
+    ~5min, so 90min gives room for minor collector lag without masking a
+    real staleness gap. Off-hours callers already handle a None return by
+    skipping that poll's exit check (see alert_stale_price_exit_suppressed,
+    itself gated to market hours only so this doesn't spam Slack all night)."""
     df, _ = _load_cache(ticker)
     if df is None:
         return None, None
@@ -53,7 +65,7 @@ def _current_price(ticker):
         return None, None
     last_ts = df.index[-1]
     now = datetime.now()
-    if last_ts.date() < now.date() and now.weekday() < 5 and now.time() >= _MARKET_OPEN:
+    if now - last_ts > _STALE_PRICE_MAX_AGE:
         log_poll(f"{ticker} _current_price STALE bar={last_ts} now={now:%Y-%m-%d %H:%M:%S} -> skipped")
         return None, None
     price = float(prices.iloc[-1])

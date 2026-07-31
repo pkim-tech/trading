@@ -291,11 +291,12 @@ def test_sync_confirm_and_protect_places_sl_on_fill(env, monkeypatch):
     assert len(placed_calls) == 1
     qty, stop_price = placed_calls[0]
     assert qty == pos['shares']
-    # fixed_sl=5.0 off the trigger/signal price (50.0 from _sig()), not the
-    # real fill price (49.0) -- anchoring to the trigger reproduces the
-    # backtest's stop_price = entry_price * (1 - sl%), where entry_price IS
-    # the trigger with zero fill slippage modeled.
-    assert stop_price == pytest.approx(50.0 * 0.95)
+    # fixed_sl=5.0 off the REAL fill price (49.0), not the stale trigger/
+    # signal price (50.0 from _sig()) -- matches strategies.py's own SL
+    # check (stop_price = entry_price * (1 - sl%)), correct for every
+    # strategy, not just the ones where signal price and fill price happen
+    # to coincide (fixed 2026-07-31, see _place_stop_loss_for_position).
+    assert stop_price == pytest.approx(49.0 * 0.95)
 
 
 def test_sync_confirm_and_protect_alerts_on_timeout(env, monkeypatch):
@@ -306,6 +307,136 @@ def test_sync_confirm_and_protect_alerts_on_timeout(env, monkeypatch):
     signals_notify._sync_confirm_and_protect(TICKER, _node())
     assert signals_db.get_open_position(TICKER) is None
     assert any('UNPROTECTED' in m for m in alerts)
+
+
+# ---------------------------------------------------------------------------
+# _place_stop_loss_for_position -- retry-on-rejection (2026-07-31, real
+# incident: LABD's stop was REJECTED by Schwab because real time had passed
+# between the recorded fill and the actual placement attempt, and the market
+# had already crossed the tight target)
+# ---------------------------------------------------------------------------
+
+def _open_pos(entry_price=49.0, shares=100):
+    node = _node()
+    now = datetime.now()
+    signals_db.open_position(node, entry_price, now, entry_price, now, shares=shares)
+    return signals_db.get_open_position(TICKER)
+
+
+def test_sl_placement_retries_and_succeeds_when_not_yet_breached(env, monkeypatch):
+    """First placement attempt fails with a generic (non-SafetyViolation)
+    exception; the market hasn't actually crossed the target stop, so the
+    retry should try the SAME resting STOP order again, not fall back to a
+    market sell."""
+    _open_pos(entry_price=49.0)
+    calls = {'stop_loss': 0, 'market_sell': 0}
+
+    def _place_stop_loss(account, ticker, qty, stop_price):
+        calls['stop_loss'] += 1
+        if calls['stop_loss'] == 1:
+            raise RuntimeError("STOP LOSS TEST_PART4 order 111 was REJECTED")
+        return (object(), 222)
+
+    monkeypatch.setattr(schwab_client, 'place_stop_loss', _place_stop_loss)
+    monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 49.5)  # above stop_price (46.55) -- not breached
+    monkeypatch.setattr(schwab_client, 'place_equity_sell',
+                         lambda account, ticker, qty, price: (calls.__setitem__('market_sell', calls['market_sell'] + 1), (object(), 333))[1])
+
+    signals_notify._place_stop_loss_for_position(_node(), TICKER)
+
+    assert calls['stop_loss'] == 2, "expected exactly one retry of the resting STOP order"
+    assert calls['market_sell'] == 0, "should not have fallen back to a market sell -- price never crossed the target"
+    pos = signals_db.get_open_position(TICKER)
+    assert pos['sl_order_id'] == 222
+
+
+def test_sl_placement_falls_back_to_market_sell_when_price_already_breached(env, monkeypatch):
+    """First placement attempt fails; a fresh price check shows the market
+    has ALREADY crossed the target stop (the real LABD shape) -- retrying
+    the same resting STOP would just fail again for the same reason, so this
+    should exit via a real market sell instead, matching the kernel's own
+    gap-through-trigger logic (exit at the real achievable price, not the
+    stale theoretical stop)."""
+    pos = _open_pos(entry_price=49.0)  # fixed_sl=5.0 -> stop_price = 46.55
+    calls = {'stop_loss': 0, 'market_sell': 0}
+
+    def _place_stop_loss(account, ticker, qty, stop_price):
+        calls['stop_loss'] += 1
+        raise RuntimeError("REJECTED")
+
+    monkeypatch.setattr(schwab_client, 'place_stop_loss', _place_stop_loss)
+
+    def _place_equity_sell(account, ticker, qty, price):
+        calls['market_sell'] += 1
+        return (object(), 444)
+
+    monkeypatch.setattr(schwab_client, 'place_equity_sell', _place_equity_sell)
+    monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 46.0)  # below stop_price (46.55) -- already breached
+
+    signals_notify._place_stop_loss_for_position(_node(), TICKER)
+
+    assert calls['stop_loss'] == 1, "should not retry the resting STOP once price is confirmed already through it"
+    assert calls['market_sell'] == 1, "should fall back to a real market sell at the current (already-breached) price"
+    events = signals_db.get_coverage_events(scenario_key='sl_placement')
+    assert any(e['result'] == 'placed_as_market_already_breached' for e in events if e['ticker'] == TICKER)
+
+    # The real gap this test originally missed (caught by review, 2026-07-31):
+    # placing the market sell isn't enough on its own -- without a recorded
+    # exit_pending pointing at the real order_id, check_own_sell_fills can
+    # never find this order to confirm its fill and close the position, the
+    # DB believes the position is open forever, and the NEXT genuine exit
+    # signal would place a second real SELL for shares that no longer exist.
+    reopened = signals_db.get_open_position(TICKER)
+    exit_pending = reopened['trail_state'].get('exit_pending')
+    assert exit_pending is not None, "market-sell fallback must record exit_pending so the fill can be detected"
+    assert exit_pending['order_id'] == 444
+    assert exit_pending['reason'] == 'SL'
+
+
+def test_sl_placement_gives_up_after_max_retries_and_alerts_unprotected(env, monkeypatch):
+    _open_pos(entry_price=49.0)
+
+    def _place_stop_loss(account, ticker, qty, stop_price):
+        raise RuntimeError("REJECTED")
+
+    monkeypatch.setattr(schwab_client, 'place_stop_loss', _place_stop_loss)
+    monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 49.5)  # never breached -> always retries the STOP
+    alerts = []
+    monkeypatch.setattr(signals_notify, '_post_message', lambda msg, *a, **kw: alerts.append(msg) or (None, None))
+
+    signals_notify._place_stop_loss_for_position(_node(), TICKER)
+
+    assert any('UNPROTECTED' in m and 'attempts' in m for m in alerts), (
+        f"expected an UNPROTECTED alert citing the retry attempts after exhausting them, got: {alerts}"
+    )
+    pos = signals_db.get_open_position(TICKER)
+    assert pos['sl_order_id'] is None
+
+
+def test_sl_placement_retry_stops_cleanly_if_already_protected(env, monkeypatch):
+    """If a retry attempt hits SafetyViolation (something is already resting
+    -- e.g. a concurrent placement, or the earlier failure actually
+    succeeded broker-side despite a client-side error), this must stop
+    quietly rather than alert UNPROTECTED or keep retrying -- the position
+    genuinely IS protected."""
+    _open_pos(entry_price=49.0)
+    calls = {'stop_loss': 0}
+
+    def _place_stop_loss(account, ticker, qty, stop_price):
+        calls['stop_loss'] += 1
+        if calls['stop_loss'] == 1:
+            raise RuntimeError("REJECTED")
+        raise schwab_safety.SafetyViolation("already has a resting SELL order")
+
+    monkeypatch.setattr(schwab_client, 'place_stop_loss', _place_stop_loss)
+    monkeypatch.setattr(schwab_client, 'get_current_price', lambda ticker: 49.5)  # not breached -> retries the STOP path
+    alerts = []
+    monkeypatch.setattr(signals_notify, '_post_message', lambda msg, *a, **kw: alerts.append(msg) or (None, None))
+
+    signals_notify._place_stop_loss_for_position(_node(), TICKER)
+
+    assert calls['stop_loss'] == 2
+    assert alerts == [], f"should not alert UNPROTECTED when a retry confirms something is already resting, got: {alerts}"
 
 
 # ---------------------------------------------------------------------------

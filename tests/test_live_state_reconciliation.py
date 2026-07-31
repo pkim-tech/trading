@@ -126,6 +126,57 @@ def test_alerts_on_missing_trailing_sell_order(env, monkeypatch):
     assert 'trailing-sell' in env[0]
 
 
+def test_alerts_when_armed_but_order_placed_never_confirmed_even_with_sell_order_resting(env, monkeypatch):
+    """Regression test for the reconciliation blind spot found via the
+    arming-logic walkthrough, 2026-07-31: check_sell_condition persists
+    trailing=True independently of whether notify_trailing_activated ever
+    actually ran (a daemon crash/restart in that window leaves this state
+    permanently -- just_activated_trailing can never re-fire once
+    trailing=True is already on file). The old check required
+    order_placed=True to fire the missing_trailing_sell branch at all, so
+    trailing=True + order_placed unset fell through both mismatch branches
+    silently, forever. Confirmed here even with a resting SELL order present
+    (the old original SL, still fully intact since the crash happened before
+    any atomic replace was even attempted) -- has_sell_order alone can't
+    distinguish "still protected by the old SL" from "genuinely
+    unprotected", so this must alert regardless, since the stuck state
+    itself (not just protection) is the actionable problem."""
+    pos = _open_pos(shares=100)
+    signals_db.set_sl_order_id(TICKER, 12345)  # the original SL, still resting
+    signals_db.update_position_trail_state(pos['id'], {'trailing': True})  # order_placed never set
+    pos = [p for p in signals_db.get_open_positions() if p['ticker'] == TICKER][0]
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 100.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [{
+        'orderLegCollection': [{'instruction': 'SELL', 'instrument': {'symbol': TICKER}}],
+    }])  # the old SL genuinely still resting
+    signals_notify.check_live_state_reconciliation([pos])
+    assert len(env) == 1
+    assert 'never confirmed' in env[0] or 'armed' in env[0].lower()
+
+
+def test_no_false_positive_for_normal_awaiting_manual_confirmation(env, monkeypatch):
+    """The armed_order_never_confirmed check above must NOT fire for the
+    normal, expected case: a non-live-mode/paused node where
+    _attempt_automated_sell legitimately declined and notify_trailing_activated
+    posted the manual arm alert instead of auto-placing -- that path DOES set
+    last_reminder_at unconditionally (regardless of auto_placed), so its
+    presence is what distinguishes this from the real crash-window gap.
+    Confirmed reachable false-positive without the last_reminder_at gate
+    (Opus review, 2026-07-31): every poll would otherwise re-flag this
+    completely normal state and feed a streak hit toward the node circuit
+    breaker."""
+    pos = _open_pos(shares=100)
+    signals_db.update_position_trail_state(pos['id'], {
+        'trailing': True, 'reminder_channel': 'C1', 'reminder_ts': '1.0',
+        'reminder_count': 0, 'last_reminder_at': '2026-07-31 10:00:00',
+    })  # order_placed still unset -- awaiting a human tap, not a crash
+    pos = [p for p in signals_db.get_open_positions() if p['ticker'] == TICKER][0]
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 100.0)
+    monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
+    signals_notify.check_live_state_reconciliation([pos])
+    assert env == [], f"expected no alert for the normal awaiting-manual-confirmation state, got: {env}"
+
+
 def test_no_alert_outside_automation_scope(env, monkeypatch):
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', set())
     pos = _open_pos(shares=100)

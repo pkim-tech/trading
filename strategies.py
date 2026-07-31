@@ -138,9 +138,27 @@ class TrailingExitZScoreBreakout(BaseStrategy):
             if op <= trail_stop_gap:
                 reason = 'WIN' if op > ep else 'LOSS'
                 return reason, op, state
+            # Compute the running peak for THIS check -- still needed so a
+            # mid-bar poll can detect a genuine breach in real time, not just
+            # at bar close (in practice, live's mid-bar caller passes
+            # high == low == current_price, so this mainly matters for
+            # comparing against `prior_peak`; a real resting broker
+            # TRAILING_STOP order is the actual continuous tracker, this is
+            # just local bookkeeping to notice a breach before the next bar
+            # closes) -- but only persist it into `state` at bar close. The
+            # 2026-07-20 gap-through fix depends on
+            # `prior_peak` reflecting only what was confirmed through the
+            # PRIOR closed bar; a mid-bar poll writing this bar's own
+            # still-forming high into state['peak'] would corrupt that
+            # invariant, so the next bar-close gap check compares its Open
+            # against a trail level that only existed because of this same
+            # bar's own intrabar movement -- incoherent, since the Open
+            # occurs before that movement happened (found live via
+            # execution-path walkthrough, 2026-07-31).
             peak = max(prior_peak, ctx['high'])
-            state['peak'] = peak
             trail_stop = peak * (1 - trail_pct)
+            if ctx.get('at_bar_close', True):
+                state['peak'] = peak
             if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
                 exit_px = trail_stop if ctx['low'] <= trail_stop else ctx['current_price']
                 reason = 'WIN' if exit_px > ep else 'LOSS'
@@ -249,9 +267,27 @@ class LimitOrderTrailingExit(LimitOrderZScoreBreakout):
             if op <= trail_stop_gap:
                 reason = 'WIN' if op > ep else 'LOSS'
                 return reason, op, state
+            # Compute the running peak for THIS check -- still needed so a
+            # mid-bar poll can detect a genuine breach in real time, not just
+            # at bar close (in practice, live's mid-bar caller passes
+            # high == low == current_price, so this mainly matters for
+            # comparing against `prior_peak`; a real resting broker
+            # TRAILING_STOP order is the actual continuous tracker, this is
+            # just local bookkeeping to notice a breach before the next bar
+            # closes) -- but only persist it into `state` at bar close. The
+            # 2026-07-20 gap-through fix depends on
+            # `prior_peak` reflecting only what was confirmed through the
+            # PRIOR closed bar; a mid-bar poll writing this bar's own
+            # still-forming high into state['peak'] would corrupt that
+            # invariant, so the next bar-close gap check compares its Open
+            # against a trail level that only existed because of this same
+            # bar's own intrabar movement -- incoherent, since the Open
+            # occurs before that movement happened (found live via
+            # execution-path walkthrough, 2026-07-31).
             peak = max(prior_peak, ctx['high'])
-            state['peak'] = peak
             trail_stop = peak * (1 - trail_pct)
+            if ctx.get('at_bar_close', True):
+                state['peak'] = peak
             if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
                 exit_px = trail_stop if ctx['low'] <= trail_stop else ctx['current_price']
                 reason = 'WIN' if exit_px > ep else 'LOSS'
@@ -349,9 +385,27 @@ class TrailingBothZScoreBreakout(TrailingBuyZScoreBreakout):
             if op <= trail_stop_gap:
                 reason = 'WIN' if op > ep else 'LOSS'
                 return reason, op, state
+            # Compute the running peak for THIS check -- still needed so a
+            # mid-bar poll can detect a genuine breach in real time, not just
+            # at bar close (in practice, live's mid-bar caller passes
+            # high == low == current_price, so this mainly matters for
+            # comparing against `prior_peak`; a real resting broker
+            # TRAILING_STOP order is the actual continuous tracker, this is
+            # just local bookkeeping to notice a breach before the next bar
+            # closes) -- but only persist it into `state` at bar close. The
+            # 2026-07-20 gap-through fix depends on
+            # `prior_peak` reflecting only what was confirmed through the
+            # PRIOR closed bar; a mid-bar poll writing this bar's own
+            # still-forming high into state['peak'] would corrupt that
+            # invariant, so the next bar-close gap check compares its Open
+            # against a trail level that only existed because of this same
+            # bar's own intrabar movement -- incoherent, since the Open
+            # occurs before that movement happened (found live via
+            # execution-path walkthrough, 2026-07-31).
             peak = max(prior_peak, ctx['high'])
-            state['peak'] = peak
             trail_stop = peak * (1 - trail_pct)
+            if ctx.get('at_bar_close', True):
+                state['peak'] = peak
             if ctx['low'] <= trail_stop or ctx['hours_held'] >= ctx['max_hours_to_hold']:
                 exit_px = trail_stop if ctx['low'] <= trail_stop else ctx['current_price']
                 reason = 'WIN' if exit_px > ep else 'LOSS'

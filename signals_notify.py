@@ -181,8 +181,20 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     exit_pending = state.get('exit_pending') or {}
     pending_order_id = exit_pending.get('order_id')
     hold_time_forced = bool(state.get('exit_forced_by_hold_time'))
+    # Discriminator is a dedicated flag (hold_time_replaced), NOT
+    # pending_order_id == exit_order_id -- that equality check broke once
+    # the code below started refreshing exit_order_id to match the new
+    # market-sell id after a successful replace (2026-07-31 fix for a stale
+    # exit_order_id after force-replace). Reusing exit_order_id as both "the
+    # order to replace" and "proof a replace already happened" made the two
+    # concepts collide: after the very first replace they're always equal
+    # again, so this guard would stay permanently True and re-issue a fresh
+    # replace_equity_order_with_market against the same live order every bar
+    # until fill (found via integration re-check, 2026-07-31 -- introduced by
+    # the exit_order_id fix itself, caught before landing). A dedicated flag
+    # can't collide with the field it's supposed to gate.
     still_unreplaced_trail_order = (
-        reason == 'TRAIL' and hold_time_forced and pending_order_id == state.get('exit_order_id')
+        reason == 'TRAIL' and hold_time_forced and not state.get('hold_time_replaced')
     )
     if pending_order_id is not None and not still_unreplaced_trail_order:
         return pending_order_id
@@ -203,13 +215,30 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     shares = pos.get('shares')
     if not shares:
         return None
-    # For a hold-time-forced TRAIL exit, the real resting order is the
-    # trailing-sell placed at arm time (exit_order_id) -- sl_order_id is
-    # already stale/dead, replaced by that trailing-sell back when the
-    # position armed. Every other reason (TP/SL/TIME) still resolves to the
-    # protective SL, as before.
-    resting_order_id = state.get('exit_order_id') if (reason == 'TRAIL' and hold_time_forced) else pos.get('sl_order_id')
-    resting_order_label = "trailing-sell" if (reason == 'TRAIL' and hold_time_forced) else "stop-loss"
+    # For a hold-time-forced TRAIL exit, the real resting order is normally
+    # the trailing-sell placed at arm time (exit_order_id) -- sl_order_id is
+    # stale/dead in that case, replaced by the trailing-sell when the
+    # position armed. But arming (state['trailing']=True) is persisted
+    # independently of whether that trailing-sell placement actually
+    # succeeded (signals_compute.check_sell_condition writes 'trailing'
+    # before notify_trailing_activated ever runs) -- if _attempt_automated_sell
+    # failed (broker exception, SafetyViolation, automation paused/disabled),
+    # exit_order_id was never set and the ORIGINAL SL is still the thing
+    # actually resting at the broker. Without this fallback, resting_order_id
+    # would resolve to None here, sending a fresh place_equity_sell with no
+    # replacing_order_id -- which schwab_safety's resting-SELL guard then
+    # blocks forever against that still-live SL, permanently self-blocking
+    # the hold-time-forced exit (found live via execution-path walkthrough,
+    # 2026-07-31 -- same stuck-exit symptom as the 2026-07-29/30 SH incidents,
+    # through yet another door). Every other reason (TP/SL/TIME) always
+    # resolves to the protective SL, as before.
+    resting_order_id = pos.get('sl_order_id')
+    if reason == 'TRAIL' and hold_time_forced and state.get('exit_order_id'):
+        resting_order_id = state.get('exit_order_id')
+    resting_order_label = (
+        "trailing-sell" if (reason == 'TRAIL' and hold_time_forced and resting_order_id == state.get('exit_order_id'))
+        else "stop-loss"
+    )
     try:
         if resting_order_id:
             # Atomic replace instead of cancel_order + place_equity_sell -- same
@@ -241,6 +270,19 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
         return None
     db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed", detail=f"reason={reason} shares={shares}")
+    if reason == 'TRAIL' and hold_time_forced:
+        # The just-replaced order (trailing-sell or, on the failed-placement
+        # fallback above, the original SL) is now dead -- point exit_order_id
+        # at the real order that's actually resting/placed now. Without this,
+        # exit_order_id keeps pointing at a dead order forever; if a human
+        # later taps "Skip" on the exit reminder (clearing exit_pending but
+        # leaving trailing/exit_forced_by_hold_time set), the NEXT forced-exit
+        # attempt would try to replace that same dead order again and fail
+        # (found via execution-path walkthrough, 2026-07-31).
+        new_state = dict(state)
+        new_state['exit_order_id'] = order_id
+        new_state['hold_time_replaced'] = True
+        db.update_position_trail_state(pos['id'], new_state)
     return order_id
 
 
@@ -373,18 +415,25 @@ def check_live_state_reconciliation(open_positions):
         account = pos.get('account')
         if not account:
             continue
-        _node_id = pos.get('wl_id')
-        # Re-check the position is still actually open before comparing --
-        # `open_positions` (the caller's arg) is a snapshot taken once at the
-        # top of this poll cycle; an earlier step in the *same* cycle
-        # (_check_position_exit) can close a position before this function
-        # runs, leaving a stale in-memory row here. Found live 2026-07-28:
-        # GDXU's real TRAIL close at 13:30:09 produced a false "shares"/
-        # "missing_trailing_sell" mismatch 6 seconds later, comparing the
-        # broker's correct post-close state (0 shares, no order) against this
-        # cycle's stale belief that the position was still open.
-        if _node_id is not None and db.get_open_position_by_wl_id(_node_id) is None:
+        # Re-fetch fresh before comparing -- `open_positions` (the caller's
+        # arg) is a snapshot taken once at the top of this poll cycle; an
+        # earlier step in the *same* cycle (_check_position_exit) can close
+        # or update a position before this function runs, leaving a stale
+        # in-memory row here. Found live 2026-07-28: GDXU's real TRAIL close
+        # at 13:30:09 produced a false "shares"/"missing_trailing_sell"
+        # mismatch 6 seconds later, comparing the broker's correct post-close
+        # state (0 shares, no order) against this cycle's stale belief that
+        # the position was still open -- the original fix (2026-07-28) only
+        # re-checked openness via wl_id (skipping legacy wl_id-less rows
+        # entirely) and then discarded the fresh row, still comparing against
+        # the stale `pos` below. Widened 2026-07-31 (execution-path
+        # walkthrough) to use db.get_position_by_id (works with or without
+        # wl_id) and to actually use the fetched row for every comparison
+        # that follows, closing both gaps at once.
+        pos = db.get_position_by_id(pos['id'])
+        if pos is None:
             continue
+        _node_id = pos.get('wl_id')
         try:
             real_shares = schwab_client.get_real_position(account, ticker)
             orders = schwab_safety._open_orders(account)
@@ -423,7 +472,46 @@ def check_live_state_reconciliation(open_positions):
             # (and un-tripping) a genuine in-progress mismatch streak on any
             # poll where shares happened to be unknown.
             continue
-        if state.get('trailing') and state.get('order_placed') and not has_sell_order:
+        if state.get('trailing') and not state.get('order_placed') and not state.get('last_reminder_at'):
+            # Armed (trailing=True, persisted by check_sell_condition) but
+            # order_placed never got set AND last_reminder_at is absent --
+            # the real signature of "notify_trailing_activated never ran at
+            # all" (daemon crashed/restarted in the window between the two,
+            # an unrecoverable gap: just_activated_trailing can never re-fire
+            # once trailing=True is already persisted). NOT gated on
+            # order_placed alone: that also matches the normal, expected
+            # awaiting-manual-confirmation state (a non-live-mode/paused
+            # node, where _attempt_automated_sell legitimately declines and
+            # notify_trailing_activated posts the manual alert instead of
+            # auto-placing) -- but that path DOES set last_reminder_at
+            # unconditionally (signals_notify.py's notify_trailing_activated,
+            # `state['last_reminder_at'] = ...` runs regardless of
+            # auto_placed), so gating on its absence correctly excludes it.
+            # Confirmed reachable false-positive without this gate (Opus
+            # review, 2026-07-31): every poll would re-flag the normal
+            # pending-manual-confirmation window and feed a streak hit,
+            # tripping the node circuit breaker within ~3 polls of any
+            # legitimate arm awaiting a human tap. The arm-time order might
+            # exist or might not either way (has_sell_order can't distinguish
+            # "old SL still resting, untouched" from "genuinely unprotected",
+            # since a crash before the atomic replace even started leaves the
+            # old SL fully intact) -- so this still alerts regardless of
+            # has_sell_order rather than trying to infer safety from broker
+            # state alone (found via arming-logic walkthrough, 2026-07-31:
+            # the prior version of this check required order_placed=True to
+            # fire at all, so this exact stuck state fell through both
+            # branches here and was invisible everywhere else too --
+            # check_trailing_reminders also can't recover it, since it bails
+            # on this same missing last_reminder_at).
+            mismatch_found |= _alert_reconcile_mismatch(
+                pos, "armed_order_never_confirmed",
+                f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) live-state mismatch: armed (trailing stop active) "
+                f"but no trailing-sell order was ever confirmed placed — "
+                f"{'a resting SELL order was found (likely the original stop-loss, still intact)' if has_sell_order else 'NO resting SELL order was found at all'}; "
+                f"suggested fix: check the broker directly and either manually place a trailing-sell "
+                f"for {expected_shares:g} shares or confirm the existing resting order is adequate"
+            )
+        elif state.get('trailing') and state.get('order_placed') and not has_sell_order:
             mismatch_found |= _alert_reconcile_mismatch(
                 pos, "missing_trailing_sell",
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) live-state mismatch: trailing-sell marked placed but "
@@ -463,9 +551,11 @@ def _attempt_automated_market_buy(node, sizing):
 
 _SL_FAST_CONFIRM_ATTEMPTS = 5
 _SL_FAST_CONFIRM_INTERVAL_SECS = 2
+_SL_PLACEMENT_RETRY_ATTEMPTS = 3
+_SL_PLACEMENT_RETRY_DELAY_SECS = 2
 
 
-def _place_stop_loss_for_position(node, ticker, signal_price):
+def _place_stop_loss_for_position(node, ticker):
     """Places the real resting STOP order for a freshly-opened automated
     position -- market-buy (Part 4, Section 6) or trailing-buy (extended
     2026-07-24, called from both _reconcile_buy_fill's auto-fill path and
@@ -473,18 +563,29 @@ def _place_stop_loss_for_position(node, ticker, signal_price):
     Reads the final share count back off open_positions (post any top-up
     _reconcile_fill already applied for market-buy fills) so the stop covers
     the whole position, not just a provisional quantity.
-    Anchored to signal_price (the trigger price), not the real fill price --
-    the backtest kernel computes stop_price = entry_price * (1 - sl%) where
-    entry_price IS the trigger (op/cp), with zero fill slippage modeled.
-    Anchoring to the real fill price instead would let market-order slippage
-    silently loosen or tighten the stop relative to what the backtest assumed
-    for that trade -- worst case, a real fill better than the trigger produces
-    a looser live stop than the backtest's, so a gap that would have exited
-    the backtest position could leave the live position open through a larger
-    drawdown than modeled. Looks the position up by node['id'] (wl_id), not
-    ticker -- ticker-only would size/anchor off a sibling node's position and
-    stamp its broker order id onto the wrong row if 2+ nodes share this ticker
-    (see docs/backlog_cache.md's wl_id refactor entry)."""
+    Anchored to pos['entry_price'] (the real fill), matching exactly what
+    strategies.py's own check_exit uses for the same SL comparison
+    (`stop_price = ctx['entry_price'] * (1 - stop_loss)`, strategies.py) --
+    ALWAYS true regardless of strategy, unlike this function's old basis
+    (signal_price, the passed-in trigger price). That used to be defended as
+    backtest parity ("the kernel computes stop_price = entry_price * (1 -
+    sl%) where entry_price IS the trigger"), which only actually holds for
+    the market-buy strategies (entry ~= signal bar close). For the
+    trailing-buy strategies (backtester._simulate_trail_both/_simulate_trail_buy),
+    the kernel's real entry_price is `running_low * (1 + trail_buy_pct)` (or
+    the gap-through Open) -- a materially different, LATER value than
+    signal_price whenever price kept falling before the bounce, which is the
+    normal case for this strategy. Anchoring the real broker stop to the
+    wrong, earlier signal_price could place it ABOVE the real entry price
+    (and even above market), either getting it rejected outright (leaving
+    the position with zero broker protection) or triggering immediately on
+    placement (found via a fresh execution-path walkthrough, 2026-07-31 --
+    contradicted CLAUDE.md's own claimed invariant, "Schwab stop order set at
+    the algo's exact fixed_sl price, no padding"). Looks the position up by
+    node['id'] (wl_id), not ticker -- ticker-only would size/anchor off a
+    sibling node's position and stamp its broker order id onto the wrong row
+    if 2+ nodes share this ticker (see docs/backlog_cache.md's wl_id refactor
+    entry)."""
     pos = db.get_open_position_by_wl_id(node['id'])
     if not pos or not pos.get('shares'):
         return
@@ -492,23 +593,122 @@ def _place_stop_loss_for_position(node, ticker, signal_price):
     sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos['stop_loss']
     if not sl_pct:
         return
-    stop_price = signal_price * (1 - sl_pct / 100)
+    stop_price = pos['entry_price'] * (1 - sl_pct / 100)
+    shares = int(pos['shares'])
     try:
-        _, sl_order_id = schwab_client.place_stop_loss(account, ticker, int(pos['shares']), stop_price)
+        _, sl_order_id = schwab_client.place_stop_loss(account, ticker, shares, stop_price)
     except schwab_safety.SafetyViolation as e:
+        # Not retried -- a policy block (kill switch, paused automation, an
+        # existing SL/SELL order already resting) won't resolve differently
+        # on a bare retry, matching _submit_order_with_retry's established
+        # convention elsewhere in this module.
         db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                                node_id=node.get('id'), result="blocked", detail=str(e))
         _post_message(
-            f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
+            f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — place stop-loss SELL {shares} @ ~${stop_price:.2f}\n"
             f"(stop-loss placement blocked: {e})"
         )
         return
     except Exception as e:
+        # A genuine broker rejection here (not a policy block) is commonly
+        # "the stop price must be on the correct side of the current bid/ask"
+        # -- i.e. real time has passed since entry_price was recorded (a fill
+        # reconciled hours late after a daemon restart, a thin/volatile
+        # ticker) and the market has already crossed the target. Retrying the
+        # SAME resting-STOP order would just fail again for the same reason.
+        # Self-correcting retry instead (found live 2026-07-31, LABD -- real
+        # incident, this exact rejection): re-check the real current price
+        # each attempt; if the market has already crossed the target stop
+        # (the position has effectively already breached its stop in real
+        # time), exit now via a real MARKET sell -- same principle as the
+        # exit-side gap-through-trigger fill this codebase already uses
+        # elsewhere -- instead of retrying a resting order doomed to reject
+        # again. If the market hasn't crossed it, just retry the resting
+        # STOP; the broker rejection may have been transient. Every attempt
+        # still goes through schwab_safety.check_order, whose own duplicate-
+        # order guard makes this safe against a race where something is
+        # already resting by the time a retry runs -- that attempt just
+        # SafetyViolation-blocks cleanly rather than double-placing.
+        last_error = e
+        for attempt in range(1, _SL_PLACEMENT_RETRY_ATTEMPTS):
+            time.sleep(_SL_PLACEMENT_RETRY_DELAY_SECS)
+            try:
+                current_price = schwab_client.get_current_price(ticker)
+            except Exception:
+                current_price = None
+            if current_price is not None and current_price <= stop_price:
+                try:
+                    _, market_order_id = schwab_client.place_equity_sell(account, ticker, shares, current_price)
+                except schwab_safety.SafetyViolation:
+                    db.log_coverage_event(
+                        "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
+                        node_id=node.get('id'), result="blocked_on_retry",
+                        detail="already protected by a resting order")
+                    return
+                except Exception as e2:
+                    last_error = e2
+                    continue
+                db.log_coverage_event(
+                    "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
+                    node_id=node.get('id'), result="placed_as_market_already_breached",
+                    detail=f"target_stop={stop_price:.4f} current_price={current_price:.4f} attempt={attempt}")
+                # Record exit_pending so check_own_sell_fills/check_exit_reminders
+                # can actually find and close this position once the market
+                # order fills -- without this, a real order was just placed
+                # (this WILL flatten the position) but nothing tracks it: no
+                # trade_log row, no P&L, the DB believes the position is still
+                # open indefinitely, reconciliation starts false-alerting a
+                # share-count mismatch, and the NEXT genuine exit signal would
+                # place a second real SELL for shares that no longer exist --
+                # a naked-short path, since nothing is resting anymore for the
+                # duplicate-order guard to catch (found live 2026-07-31, LABD --
+                # the market_order_id from this exact branch was previously
+                # discarded unused; confirmed live: the real order placed
+                # (1007409713143) went untracked until this fix). Also alerts,
+                # matching this project's standing convention that a real
+                # forced exit is never silent. Re-fetch fresh before building
+                # this write -- pos was fetched once at the top of this
+                # function, and several seconds (retry sleeps) may have
+                # passed since; a stale-snapshot overwrite here is the exact
+                # bug class fixed repeatedly elsewhere in this module tonight.
+                fresh_pos = db.get_position_by_id(pos['id']) or pos
+                new_state = dict(fresh_pos.get('trail_state') or {})
+                new_state['exit_pending'] = {
+                    'reason': 'SL', 'current_price': current_price, 'target_price': stop_price,
+                    'reminder_channel': None, 'reminder_ts': None, 'reminder_count': 0,
+                    'last_reminder_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'order_id': market_order_id,
+                }
+                db.update_position_trail_state(pos['id'], new_state)
+                _post_message(
+                    f"🤖 *{ticker}* ({account} · {mode_tag(account)}) SL already breached by the time it could be "
+                    f"placed — market SELL {shares} submitted @ ~${current_price:.2f} instead "
+                    f"(target stop was ${stop_price:.2f})"
+                )
+                return
+            try:
+                _, sl_order_id = schwab_client.place_stop_loss(account, ticker, shares, stop_price)
+            except schwab_safety.SafetyViolation:
+                db.log_coverage_event(
+                    "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
+                    node_id=node.get('id'), result="blocked_on_retry",
+                    detail="already protected by a resting order")
+                return
+            except Exception as e2:
+                last_error = e2
+                continue
+            db.log_coverage_event(
+                "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
+                node_id=node.get('id'), result="placed_on_retry",
+                detail=f"stop_price={stop_price:.4f} attempt={attempt}")
+            if sl_order_id is not None:
+                db.set_sl_order_id_by_position(pos['id'], sl_order_id)
+            return
         db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
-                               node_id=node.get('id'), result="failed_unexpectedly", detail=str(e))
+                               node_id=node.get('id'), result="failed_unexpectedly", detail=str(last_error))
         _post_message(
-            f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — place stop-loss SELL {int(pos['shares'])} @ ~${stop_price:.2f}\n"
-            f"(stop-loss placement failed unexpectedly: {e})"
+            f"🚨 *{ticker}* ({account} · {mode_tag(account)}) UNPROTECTED — place stop-loss SELL {shares} @ ~${stop_price:.2f}\n"
+            f"(stop-loss placement failed after {_SL_PLACEMENT_RETRY_ATTEMPTS} attempts: {last_error})"
         )
         return
     db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
@@ -678,7 +878,13 @@ def _fill_dry_run_buy(node, pb, price):
         print(f"  [dry-run-sim] {ticker} fill at ${price:.4f} too small to size a share — dropping pending buy")
         db.clear_pending_buy_by_wl_id(node['id'])
         return
-    opened = db.open_position(node, pb['signal_price'], pb['signal_time'], price, datetime.now(),
+    # hold-time origin: fill time for both signal_time and entry_time, not
+    # the pending buy's original signal_time -- same fix and rationale as
+    # _reconcile_buy_fill (2026-07-31). Harmless for a market-buy node (this
+    # function's other caller), since that fill happens near-immediately
+    # after the signal anyway.
+    fill_time = datetime.now()
+    opened = db.open_position(node, pb['signal_price'], fill_time, price, fill_time,
                                shares=shares, is_dry_run_sim=True)
     db.clear_pending_buy_by_wl_id(node['id'])
     if not opened:
@@ -956,7 +1162,18 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     # check_own_sell_fills keep rechecking the exact real order every poll cycle and
     # auto-close the moment it's confirmed FILLED -- the manual tap below is only the
     # fallback path, not the sole way this ever resolves.
-    state = dict(pos.get('trail_state') or {})
+    #
+    # Re-fetch fresh before reading trail_state -- _attempt_automated_exit_sell
+    # (called above, same function) may have just persisted a real update
+    # (exit_order_id, on a hold-time-forced force-replace) using its OWN pos
+    # snapshot; `pos` here is whatever the CALLER fetched before invoking
+    # notify_sell_signal, one step earlier still. Building this write from the
+    # stale copy would immediately overwrite that just-made update -- the
+    # exact same clobber pattern already fixed 3 times elsewhere this session,
+    # reintroduced by the exit_order_id fix itself and caught before landing
+    # (2026-07-31).
+    fresh_for_state = db.get_position_by_id(pos['id']) or pos
+    state = dict(fresh_for_state.get('trail_state') or {})
     state['exit_pending'] = {
         'reason': reason, 'current_price': current_price, 'target_price': target_price,
         'reminder_channel': channel, 'reminder_ts': ts, 'reminder_count': 0,
@@ -991,7 +1208,8 @@ def notify_sell_signal(pos, reason, current_price, target_price):
         except ValueError:
             print("  Invalid price — position kept open.")
     else:
-        state = dict(pos.get('trail_state') or {})
+        fresh_for_state = db.get_position_by_id(pos['id']) or pos
+        state = dict(fresh_for_state.get('trail_state') or {})
         state.pop('exit_pending', None)
         db.update_position_trail_state(pos['id'], state)
         print("  Skipped — position kept open.")
@@ -1005,18 +1223,36 @@ def _trailing_order_blocks(pos, current_price, reminder_num=0):
     account   = pos.get('account') or 'unmapped'
     ep        = pos['entry_price']
     pct       = (current_price - ep) / ep * 100
+    shares    = pos.get('shares')
+    trail_pct = pos.get('trail_sell_pct')
+    order_desc = (
+        f"SELL {shares:g} @ {trail_pct:g}% trail" if (shares and trail_pct)
+        else "SELL (shares/trail% unavailable — check the node config)"
+    )
+    # Mandatory for the automated path (_attempt_automated_sell uses an
+    # atomic replace specifically so the old SL is never left resting
+    # alongside a new trailing-sell -- both live simultaneously for the same
+    # shares is an oversell/rejected-order risk, per that function's own
+    # docstring). The manual alert never said this at all -- found via
+    # arming-logic walkthrough, 2026-07-31: a user following it literally
+    # ends up in exactly the state the automated path goes out of its way to
+    # prevent.
+    cancel_note = (
+        f" Cancel the existing stop-loss order ({pos['sl_order_id']}) first."
+        if pos.get('sl_order_id') else ""
+    )
     header    = f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — STILL PENDING (reminder #{reminder_num})" if reminder_num else f"🎯 *{ticker}* ({account} · {mode_tag(account)}) — TRAILING ACTIVATED — action needed"
     if reminder_num:
         text = (
             f"{header}\n"
-            f"entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
-            f"Trailing stop order not yet confirmed placed at the broker."
+            f"{order_desc}  |  entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
+            f"Trailing stop order not yet confirmed placed at the broker.{cancel_note}"
         )
     else:
         text = (
             f"{header}\n"
-            f"entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
-            f"Place the trailing stop order at the broker now."
+            f"{order_desc}  |  entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
+            f"Place the trailing stop order at the broker now.{cancel_note}"
         )
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
     if cfg.INTERACTIVE:
@@ -1099,6 +1335,21 @@ def check_trailing_reminders(open_positions):
         # for something with nothing real to confirm (same bug class as
         # check_buy_reminders, found live 2026-07-29).
         if pos.get('is_dry_run_sim'):
+            continue
+        # open_positions is a single snapshot taken once at the top of the
+        # poll cycle -- an earlier step in this SAME cycle (_check_position_exit,
+        # _scan_pinned_exit_arm) may have already persisted a newer trail_state
+        # (e.g. exit_forced_by_hold_time, a fresh exit_pending/order_id, an
+        # updated peak). Re-fetching before reading avoids rebuilding this
+        # write from that stale copy and clobbering the newer one -- same bug
+        # class as the SH stuck-exit incident (2026-07-29/30), found live via
+        # a full execution-path walkthrough 2026-07-31 rather than a diff
+        # review (this exact function was never touched by that earlier fix).
+        # A None re-fetch means another path closed this position earlier in
+        # the same cycle -- skip outright rather than falling back to the
+        # stale copy, so a just-closed position can't get a spurious reminder.
+        pos = db.get_position_by_id(pos['id'])
+        if pos is None:
             continue
         state = pos.get('trail_state') or {}
         if not state.get('trailing') or state.get('order_placed'):
@@ -1230,6 +1481,17 @@ def check_exit_reminders(open_positions):
     a stalled SELL confirmation is invisible until the user happens to remember."""
     now = datetime.now()
     for pos in open_positions:
+        # Same re-fetch rationale as check_trailing_reminders above -- this
+        # loop's open_positions is a stale, once-per-cycle snapshot, and an
+        # earlier step in the same poll cycle may have already persisted a
+        # newer trail_state (a just-force-replaced exit_pending/order_id,
+        # exit_forced_by_hold_time) that this read would otherwise miss and
+        # then clobber back to the old value. A None re-fetch means another
+        # path closed this position earlier in the same cycle -- skip outright
+        # rather than posting a spurious reminder off the stale copy.
+        pos = db.get_position_by_id(pos['id'])
+        if pos is None:
+            continue
         state = pos.get('trail_state') or {}
         exit_pending = state.get('exit_pending')
         if not exit_pending:
@@ -1535,9 +1797,26 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
     pending = pendings[0]
     node = pending['node']
     signal_price = pending['signal_price']
-    signal_time = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
     db.clear_pending_buy_by_wl_id(node['id'])
-    opened = db.open_position(node, signal_price, signal_time, fill_price, datetime.now(),
+    # hold-time origin: pass the real fill moment as BOTH signal_time and
+    # entry_time, not the pending buy's original (earlier) signal_time --
+    # _bars_held (signals_compute.py) counts hold time from pos['signal_time'],
+    # and the backtest kernel's real basis for a trailing-buy fill is the FILL
+    # bar (backtester.py's _simulate_trail_both/_simulate_trail_buy: `entry_bar
+    # = i; held = 0` at the bounce-fill, with the wait itself tracked
+    # separately via wait_bars and explicitly excluded from held). Passing the
+    # original signal_time here (as before) let the bounce-wait silently eat
+    # into the position's hold-time budget, causing premature TIME exits on
+    # any trailing-buy fill that took real time to bounce (found via a fresh
+    # execution-path walkthrough, 2026-07-31). This is deliberately NOT the
+    # same as the manual-catch-up backdating CLAUDE.md documents (a genuinely
+    # missed signal, caught up days later, which uses a different flow --
+    # handle_entry_price's immediate-entry confirmation) -- that case wants
+    # signal_time to reflect the true original dislocation; this case is the
+    # normal, expected, strategy-modeled bounce-wait, which the kernel itself
+    # never charges against hold time.
+    fill_time = datetime.now()
+    opened = db.open_position(node, signal_price, fill_time, fill_price, fill_time,
                                shares=filled_shares)
     if not opened:
         return
@@ -1549,7 +1828,7 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
                   f"(drift: {drift_pct:+.2f}%)  {filled_shares:g} shares")
     _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=is_gap_correction)
     if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
-        _place_stop_loss_for_position(node, ticker, signal_price)
+        _place_stop_loss_for_position(node, ticker)
 
 
 _GAP_RESIZE_PAD_PCT = 5.0

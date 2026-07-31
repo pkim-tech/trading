@@ -131,7 +131,6 @@ if cfg.SOCKET_MODE:
         ts           = meta['ts']
         node         = data['node']
         signal_price = data['signal_price']
-        signal_time  = datetime.strptime(data['signal_time'], '%Y-%m-%d %H:%M:%S')
         ticker       = node['ticker']
 
         fill_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
@@ -163,7 +162,13 @@ if cfg.SOCKET_MODE:
                                    ticker=ticker, node_id=node['id'], result="resolved",
                                    detail=f"{len(same_ticker_pendings)} pending for {ticker}")
 
-        opened = db.open_position(node, signal_price, signal_time, fill_price, datetime.now(), shares=shares)
+        # hold-time origin: pass the real fill moment (not the pending buy's
+        # original, earlier signal_time) for BOTH signal_time and entry_time --
+        # see the matching comment in signals_notify.py's _reconcile_buy_fill,
+        # this is the manual-confirmation twin of that same automated path
+        # (fixed 2026-07-31).
+        fill_time = datetime.now()
+        opened = db.open_position(node, signal_price, fill_time, fill_price, fill_time, shares=shares)
         db.clear_pending_buy_by_wl_id(node['id'])
 
         if not opened:
@@ -184,7 +189,7 @@ if cfg.SOCKET_MODE:
                                detail=f"account={node.get('account')!r}")
 
         if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
-            _place_stop_loss_for_position(node, ticker, signal_price)
+            _place_stop_loss_for_position(node, ticker)
 
         note = f"${fill_price:.4f}  (drift: {drift_pct:+.2f}%)  {shares} shares"
         print(f"  Trailing buy filled via Slack: {ticker} at {note}")

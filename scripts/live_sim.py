@@ -301,7 +301,11 @@ class SimShell(cmd.Cmd):
         if just_activated_trailing:
             A.notify_trailing_activated(pos, cp)
         if reason:
-            A.notify_sell_signal(pos, reason, cp, target)
+            # Mirrors the active_signals.py fix (2026-07-31) -- check_sell_condition
+            # already persisted the updated trail_state; re-fetch fresh so this
+            # sees it instead of the stale pre-call pos.
+            fresh_pos = A.db.get_position_by_id(pos['id']) or pos
+            A.notify_sell_signal(fresh_pos, reason, cp, target)
 
     def do_winalert(self, arg):
         "winalert LABEL -- fire the real signal-window ping, e.g. 'winalert 10:25'"

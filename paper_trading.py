@@ -78,7 +78,11 @@ def update_paper_buys():
                 print(f"  [paper] {ticker} bounce-fill at ${price:.4f} too small to size a share — dropping pending buy")
                 db.clear_paper_pending_buy(node['id'])
                 continue
-            db.open_position(node, pb['signal_price'], pb['signal_time'], price, datetime.now(),
+            # hold-time origin: fill time for both signal_time and entry_time,
+            # not the pending buy's original signal_time -- same fix and
+            # rationale as signals_notify._reconcile_buy_fill (2026-07-31).
+            fill_time = datetime.now()
+            db.open_position(node, pb['signal_price'], fill_time, price, fill_time,
                               shares=shares, paper=True)
             db.clear_paper_pending_buy(node['id'])
             db.log_coverage_event("entry_fill", "paper", ticker=ticker, node_id=node.get('id'), result="trailing_bounce_filled",
