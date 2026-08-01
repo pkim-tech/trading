@@ -5585,3 +5585,28 @@ Also built, separately: a fake-broker test proving a real Schwab `REJECTED` orde
 Full suite: 465 passed throughout (was 414 at session start). `signals_invariants.py` and `live_sim_harness.py` (7/7) both clean. Daemon still needs a restart to pick up tonight's changes — not restarted this session (user runs that themselves per standing convention).
 
 **Answer to "how close are we to trading material money," the actual question driving tonight's work:** two different numbers. Fake-venue test coverage (90%, would catch a regression) jumped tonight. Real-world proof (44% `verified-live`, has this code actually fired for real) did not move and can't be moved by more engineering — it only accumulates from the daemon running long enough for each of 14 `wired-never-fired` conditions to occur naturally, or a deliberately staged live test. That gap, plus 5 items from the 2026-07-31 audit and 12 deferred findings from the same session, are what's actually still between here and scaling up.
+
+---
+
+## 2026-08-01 (cont'd) — Real TIME/TRAIL mislabeling bug, second Opus review closes 10 more findings, JNUG/JDST properly fixed
+
+Continuation of the same session. User reviewed a real closed trade (SH, 2026-07-31, `exit_reason='TRAIL'`, pnl -0.19%) and pushed back on whether that label was right — it wasn't.
+
+**Real bug found via user scrutiny of actual trade data, not tooling:** `signals_compute.py` collapsed both a genuine trail-stop breach and hold-time expiring while armed into `exit_reason='TRAIL'` unconditionally. The `exit_forced_by_hold_time` flag (added 2026-07-29) only ever controlled the live *execution* mechanism (force-replace the resting order with a market sell), never what got reported to the human — so a position that simply timed out reported the same label as a real trail breach. Confirmed actively wrong: `signals_blocks.py`'s Slack builder said "🟢 trailing stop triggered" for the `TRAIL` reason, materially misleading for a timeout case.
+
+Fixed: `signals_compute.py` now reports `'TIME'` specifically for the hold-time-forced case. `signals_notify.py`'s `_attempt_automated_exit_sell` (~6 order-routing checks) simplified to key off `hold_time_forced` directly, since every check already tested it alongside `reason=='TRAIL'` and never trusted the string alone — except one check, deliberately kept as an explicit defensive guard (`reason=='TRAIL' and not hold_time_forced`) rather than assuming the two are now mutually exclusive in all callers. That defensive instinct paid off immediately: the first version of this fix (dropping the guard entirely) broke 3 existing tests, because they hand-construct `reason='TRAIL'` + `hold_time_forced=True` together to simulate the pre-fix collapse — an "invalid" combination post-fix that the restored guard correctly still handles. `scripts/verify_live_parity.py`'s backtest-parity classifier also needed updating (would have silently misclassified the new TIME+hold_time_forced case as a pre-activation timeout). New direct test proves the real production function's output, not just the downstream routing.
+
+**Second independent Opus review** (per session-wrap's required multiple rounds before fully trusting a real diff) — reviewed the first review's 8 fixes plus the JNUG/JDST canary work that happened after that review ran. Found 6 CONFIRMED + 4 PLAUSIBLE issues, all fixed:
+- **JDST itself still had `max_hold_hours=2`** — the exact defect the headline fix corrected for its siblings, missed because JDST has no `MIRROR` dict counterpart.
+- **The JNUG/JDST "revert" was label-deep only** — the earlier fix changed only `max_hold_hours` and the label text; JNUG still carried VOO's entire `TrailingExitZScoreBreakout` config. `watch_list_audit` proved both nodes were created 2026-07-29 as `TrailingBothZScoreBreakout` — genuinely reverted this time via a new one-time script (`scripts/fix_jnug_jdst_pair_config.py`) copying JDST's real config field-for-field onto JNUG.
+- Stale `daily_plan` rows from earlier testing (pre-fix pollution, and post-commit-but-pre-JNUG-fix rows describing a role JNUG no longer has) — cleared and rebuilt.
+- `position_lock`'s `bad_results` fix from the first review was itself incomplete (excluded only `already_closed`, not `acquired` — the dominant event, logged unconditionally with zero contention required). Fixed.
+- Met/deviation/informational counts still didn't sum once a scenario was snoozed. Fixed to include a 4th "snoozed" bucket.
+- The Canary section's scope didn't match the plan section's scope (control scenarios like `reconciliation_mismatch` counted in one, not the other). Split explicitly.
+- Canary `daily_plan` rows were write-only, never read back — exactly what let the JNUG staleness go undetected in the first place. Added a real stale-plan-vs-live-expectation check.
+- `close_position` logged a `'closed'` event before the close actually completed. Reordered.
+- `opened_today` wasn't `is_dry_run_sim`-filtered unlike its two neighbors. Filtered.
+
+Full suite: 466 passed (was 465 after the first commit). `live_sim_harness.py` 7/7, `signals_invariants.py` clean throughout. Committed as `96669d0` (10 files, 297 insertions), on top of the first commit `f3b9bab`.
+
+**Pattern worth naming**: this session's two independent Opus review rounds each caught real, non-overlapping bugs in the *other* round's or the *original* work's fixes — including one review catching that a "fix" for a previous review's finding was itself incomplete in the same way. Multiple independent rounds genuinely surfaced things a single pass didn't, consistent with this project's established multi-round review pattern from earlier sessions.
