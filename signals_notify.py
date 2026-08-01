@@ -175,16 +175,22 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     assumption of an automatic exit (found 2026-07-27, real: SH's TIME exit
     sat unmanaged for hours in live trading).
 
-    For reason=='TRAIL', a trailing-sell order was already placed at the
-    earlier arm event (notify_trailing_activated) -- this returns that
-    existing order_id instead of placing a second, redundant order for the
-    same shares. EXCEPT when state['exit_forced_by_hold_time'] is set
-    (strategies.py: hold-time expired while armed, not a genuine trail-stop
-    breach) -- the resting trailing-sell order is nowhere near its actual
-    trigger in that case, so it must be force-replaced with a market sell
-    just like TP/SL/TIME, not passively polled (found live 2026-07-29, SH:
+    For reason=='TRAIL' (a genuine trail-stop breach), a trailing-sell order
+    was already placed at the earlier arm event (notify_trailing_activated)
+    -- this returns that existing order_id instead of placing a second,
+    redundant order for the same shares. hold_time_forced (from
+    state['exit_forced_by_hold_time']) identifies the OTHER case -- hold-time
+    expired while armed, not a genuine breach; signals_compute.py reports
+    this as reason=='TIME', not 'TRAIL', since 2026-08-01 (previously both
+    collapsed to 'TRAIL', which every human-facing consumer -- Slack
+    messages, trade_log -- had no way to distinguish from a real breach).
+    The resting trailing-sell order is nowhere near its actual trigger in
+    this case, so it must be force-replaced with a market sell just like a
+    genuine TP/SL/TIME exit, not passively polled (found live 2026-07-29, SH:
     stuck for hours waiting on a 50%-wide trail order that was never going
-    to fire on its own before the natural hold-time deadline).
+    to fire on its own before the natural hold-time deadline). The checks
+    below key off hold_time_forced directly (not reason -- they always did,
+    reason=='TRAIL' was redundant alongside it even before this change).
 
     Also reuses an already-placed, still-unresolved TP/SL/TIME exit order
     from an EARLIER bar, if one exists (state['exit_pending']['order_id']) --
@@ -224,9 +230,15 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     # until fill (found via integration re-check, 2026-07-31 -- introduced by
     # the exit_order_id fix itself, caught before landing). A dedicated flag
     # can't collide with the field it's supposed to gate.
-    still_unreplaced_trail_order = (
-        reason == 'TRAIL' and hold_time_forced and not state.get('hold_time_replaced')
-    )
+    # 2026-08-01: signals_compute.py now reports 'TIME' (not 'TRAIL') for the
+    # hold-time-forced case, so in real calling code reason=='TRAIL' and
+    # hold_time_forced are mutually exclusive going forward. Kept explicit
+    # here anyway (not simplified to just `reason == 'TRAIL'`) as a defensive
+    # belt-and-suspenders check -- hold_time_forced is the authoritative
+    # signal either way, and this guards against any caller (including a
+    # test simulating the pre-fix collapse, or a future caller) passing an
+    # inconsistent combination.
+    still_unreplaced_trail_order = hold_time_forced and not state.get('hold_time_replaced')
     if pending_order_id is not None and not still_unreplaced_trail_order:
         return pending_order_id
     if reason == 'TRAIL' and not hold_time_forced:
@@ -264,10 +276,10 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     # through yet another door). Every other reason (TP/SL/TIME) always
     # resolves to the protective SL, as before.
     resting_order_id = pos.get('sl_order_id')
-    if reason == 'TRAIL' and hold_time_forced and state.get('exit_order_id'):
+    if hold_time_forced and state.get('exit_order_id'):
         resting_order_id = state.get('exit_order_id')
     resting_order_label = (
-        "trailing-sell" if (reason == 'TRAIL' and hold_time_forced and resting_order_id == state.get('exit_order_id'))
+        "trailing-sell" if (hold_time_forced and resting_order_id == state.get('exit_order_id'))
         else "stop-loss"
     )
     try:
@@ -311,7 +323,7 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
         # `order_id is not None` guard added after a later review -- see the
         # matching comment in _attempt_automated_sell's success path for why.
         db.set_sl_order_id_by_position(pos['id'], order_id)
-    if reason == 'TRAIL' and hold_time_forced:
+    if hold_time_forced:
         # The just-replaced order (trailing-sell or, on the failed-placement
         # fallback above, the original SL) is now dead -- point exit_order_id
         # at the real order that's actually resting/placed now. Without this,
@@ -2936,35 +2948,82 @@ def build_eod_scenario_review(check_date=None):
     except Exception as e:
         lines.append(f"\n_Code-path coverage_: ⚠️ failed to compute: {e}")
 
-    lines.append("\n_Canary_ (see Coverage Report for full detail):")
-    try:
-        canary_results = _coverage_run_check(check_date)
-        met = sum(1 for r in canary_results if r['status'] == 'met')
-        # 2026-08-01 Opus review finding: 'informational'-tier misses are
-        # never ticket_eligible, so the old met+deviated split silently
-        # excluded them from both counts -- a real run rendered "4/13 met, 6
-        # deviations" with the other 3 nowhere, visibly not summing to 13 and
-        # inviting the reader to assume the message itself was broken.
-        deviated = [r for r in canary_results if r['status'] == 'deviated' and r.get('ticket_eligible', True)]
-        informational_misses = [r for r in canary_results
-                                 if r['status'] == 'deviated' and not r.get('ticket_eligible', True)]
-        lines.append(f"  {met} met / {len(deviated)} deviation(s) / {len(informational_misses)} informational "
-                      f"of {len(canary_results)}")
-        for r in deviated:
-            lines.append(f"    ✗ {r['scenario_key']} ({r['ticker'] or 'n/a'}): {r['summary']}")
-    except Exception as e:
-        lines.append(f"  ⚠️ canary check failed to run: {e}")
-
     # Keyed by (category, ticker), not ticker alone -- 2026-08-01 Opus review
     # finding: a ticker-only key collapses canary/live/paper plan rows for the
     # same ticker (e.g. FAZ is both a canary scenario ticker and a real open
     # live position), so one category's plan row silently shadows another's.
+    # Moved above the canary block (2nd review finding: canary daily_plan rows
+    # were written every day but never read back -- exactly what let the
+    # JNUG staleness bug from earlier tonight go unnoticed) so the canary
+    # section below can use it too.
     prior_plan = {(row['category'], row['ticker']): row for row in db.get_daily_plan(check_date)}
+
+    lines.append("\n_Canary_ (see Coverage Report for full detail):")
+    try:
+        all_results = _coverage_run_check(check_date)
+        # 2026-08-01 2nd Opus review finding: this section used to report
+        # EVERY daily/informational scenario (including non-canary control
+        # scenarios like reconciliation_mismatch), while build_tomorrow_plan's
+        # own "_Canary_" count below filters to scenario_key.startswith
+        # ('canary_') -- two sections under the same heading disagreeing on
+        # scope with no explanation. Split explicitly: canary_results feeds
+        # the count that matches the plan's scope; any non-canary control
+        # scenario still gets its own line so nothing silently drops from
+        # visibility, just not folded into the canary total.
+        canary_results = [r for r in all_results if (r['scenario_key'] or '').startswith('canary_')]
+        other_results = [r for r in all_results if not (r['scenario_key'] or '').startswith('canary_')]
+        met = sum(1 for r in canary_results if r['status'] == 'met')
+        # 2026-08-01 Opus review finding: 'informational'-tier misses are
+        # never ticket_eligible, so the old met+deviated split silently
+        # excluded them from both counts. 2nd-review finding: a snoozed
+        # scenario (status='skipped') has the same problem -- also counted
+        # explicitly now so the four buckets always sum to the total.
+        deviated = [r for r in canary_results if r['status'] == 'deviated' and r.get('ticket_eligible', True)]
+        informational_misses = [r for r in canary_results
+                                 if r['status'] == 'deviated' and not r.get('ticket_eligible', True)]
+        skipped = [r for r in canary_results if r['status'] == 'skipped']
+        lines.append(f"  {met} met / {len(deviated)} deviation(s) / {len(informational_misses)} informational / "
+                      f"{len(skipped)} snoozed of {len(canary_results)}")
+        for r in deviated:
+            lines.append(f"    ✗ {r['scenario_key']} ({r['ticker'] or 'n/a'}): {r['summary']}")
+        for r in other_results:
+            status_glyph = "✓" if r['status'] == 'met' else ("~" if r['status'] == 'skipped' else "✗")
+            lines.append(f"  {status_glyph} [control] {r['scenario_key']}: {r.get('summary', r['status'])}")
+
+        # 2026-08-01 2nd Opus review finding: actually read back today's
+        # canary daily_plan rows (written this morning/last EOD run) and flag
+        # when the frozen plan text no longer matches the LIVE
+        # scenario_expectations text for that same ticker -- catches a config/
+        # expectation change that happened after the plan was built (exactly
+        # what let JNUG's stale "E mirrored" text sit undetected in the
+        # 2026-08-03 plan earlier tonight).
+        live_expected = {(s['scenario_key'], s['ticker']): s['expected_outcome']
+                          for s in db.get_scenario_expectations(active_only=True)}
+        stale_plans = []
+        for r in canary_results:
+            plan_row = prior_plan.get(('canary', r['ticker']))
+            if plan_row is None:
+                continue
+            live_text = live_expected.get((r['scenario_key'], r['ticker']))
+            if live_text is not None and plan_row['expected_outcome'] != live_text:
+                stale_plans.append(r['ticker'])
+        if stale_plans:
+            lines.append(f"  ⚠️ {len(stale_plans)} canary plan row(s) stale vs. current "
+                          f"scenario_expectations (config changed since the plan was built): "
+                          f"{', '.join(stale_plans)}")
+    except Exception as e:
+        lines.append(f"  ⚠️ canary check failed to run: {e}")
 
     try:
         for category, paper in (('live', False), ('paper', True)):
             closed = [t for t in db.get_trades_closed_on_date(check_date, paper=paper) if not t.get('is_dry_run_sim')]
-            opened_today = {t['ticker'] for t in db.get_trades_opened_on_date(check_date, paper=paper)}
+            # 2026-08-01 2nd Opus review finding: unlike its two neighbors
+            # (closed/still_open), this wasn't is_dry_run_sim-filtered -- a
+            # dry-run-sim entry today could mask a real carried-in position's
+            # unplanned close as a routine "new entry today", hiding exactly
+            # the anomalous case that annotation exists to surface.
+            opened_today = {t['ticker'] for t in db.get_trades_opened_on_date(check_date, paper=paper)
+                             if not t.get('is_dry_run_sim')}
             still_open = [p for p in db.get_open_positions(paper=paper)
                           if not p.get('is_dry_run_sim') and p['ticker'] not in {t['ticker'] for t in closed}]
             lines.append(f"\n_{category.capitalize()}_:")

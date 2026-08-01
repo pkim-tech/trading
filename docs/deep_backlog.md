@@ -1,5 +1,68 @@
 # Backlog
 
+## [live-trading] Resolved 2026-08-01 — hold-time-forced exits reported as `TRAIL` instead of `TIME`; second Opus review of the same-session diff found 8 more real bugs, all fixed
+
+**Found by the user directly, reviewing a real trade** (SH, closed 2026-07-31 via `exit_reason='TRAIL'`
+with pnl -0.19% — barely moved, nowhere near a real 50%-wide trail-stop breach). `signals_compute.py`'s
+`check_sell_condition` collapsed BOTH a genuine trail-stop breach AND hold-time expiring while armed
+into `reason='TRAIL'` unconditionally (`if reason in ('WIN','LOSS'): reason='TRAIL'`) — the
+`exit_forced_by_hold_time` flag (`strategies.py`) existed only to route the live *execution* mechanism
+correctly (force-replace with a market sell instead of passively polling a resting order nowhere near
+its trigger), never to change what got reported to the human. Confirmed via
+`signals_blocks.py`'s Slack message builder: the `'TRAIL'` branch says "🟢 trailing stop triggered"
+(actively wrong for a timeout), while the `else: # TIME` branch already said the correct thing
+("🔶 TIME EXIT... Change Stop Loss → Market Close order").
+
+**Fixed**: `signals_compute.py` now reports `'TIME'` (not `'TRAIL'`) when `exit_forced_by_hold_time` is
+set. `signals_notify.py`'s `_attempt_automated_exit_sell` — every one of its ~6 order-routing checks
+already tested `reason=='TRAIL' and hold_time_forced` together, never `hold_time_forced` alone — dropped
+the now-redundant `reason=='TRAIL'` half, keeping `hold_time_forced` as the sole authoritative
+discriminator (one check, the resting-order-reuse shortcut, deliberately kept `and not hold_time_forced`
+as an explicit defensive guard rather than assuming mutual exclusivity, per `automation_principles.md`
+#0 — this is what caught 3 test failures during implementation: the existing `tests/test_fake_broker_sh_scenario.py`
+tests hand-construct `reason='TRAIL'` + `hold_time_forced=True` together to simulate the pre-fix
+collapse, an "invalid" combination post-fix that the guard correctly still handles). `scripts/verify_live_parity.py`'s
+backtest-parity classifier updated to recover WIN/LOSS-by-sign for the new `reason=='TIME' and
+hold_time_forced` case too (previously only checked `reason=='TRAIL'`, would have silently
+misclassified as `TWIN`/`TLOSS`, wrong for a post-activation exit). New direct test
+(`test_check_sell_condition_reports_time_not_trail_for_hold_time_forced_exit`) proves the real
+production function outputs `'TIME'`, not just the downstream routing. Zero backtest blast radius —
+`backtester.py`/the numba kernel never reads `exit_forced_by_hold_time` or this reason string, this is
+live-code-only. Full suite 465+ passed, `live_sim_harness.py` 7/7, `signals_invariants.py` clean.
+
+**Second independent Opus review, same session** (per `session wrap`'s required 3+ rounds before fully
+trusting a real diff) — reviewed the FIRST review's 8 fixes plus the unreviewed JNUG/JDST canary work
+(see the entry below), found 6 more CONFIRMED + 4 PLAUSIBLE issues, all fixed:
+1. JDST itself still had `max_hold_hours=2` (the same defect the headline fix corrected for its
+   siblings) — never caught since JDST has no `MIRROR` counterpart. Fixed to 48h.
+2. The JNUG/JDST "revert" (see below) was label-deep only — JNUG still carried VOO's entire
+   `TrailingExitZScoreBreakout` config; `watch_list_audit` proved both were created 2026-07-29 as
+   `TrailingBothZScoreBreakout`. Fixed via a new one-time script,
+   `scripts/fix_jnug_jdst_pair_config.py`, copying JDST's real field-for-field config onto JNUG.
+3-4. Stale `daily_plan` rows (pre-fix pollution under `2026-08-01`; post-commit-but-pre-JNUG-fix rows
+   under `2026-08-03` still describing JNUG's old E-scenario role) — cleared/rebuilt.
+5. `position_lock`'s `bad_results` fix (from the first review) was itself incomplete — excluded only
+   `already_closed`, but `open_position` logs `result='acquired'` unconditionally on every call with
+   zero contention required, so the first real live position open still flipped the branch
+   verified-live off no real concurrency evidence. Fixed: `bad_results=['already_closed', 'acquired',
+   'closed']`, leaving only `skipped_duplicate` (genuine dedup-under-contention evidence).
+6. The met/deviation reconciliation fix (from the first review) still didn't sum once a scenario was
+   snoozed (`status='skipped'`, uncounted). Fixed: now reports met/deviations/informational/snoozed,
+   all four summing to the total.
+7 (plausible). The "Canary" section reported every daily/informational scenario including non-canary
+   control scenarios (e.g. `reconciliation_mismatch`), while the plan section below it filtered to
+   `canary_`-prefixed keys only — two sections under one heading silently disagreeing on scope. Split:
+   canary count matches the plan's scope; control scenarios get their own `[control]`-labeled lines.
+8 (plausible). Canary `daily_plan` rows were write-only, never read back — exactly what let the JNUG
+   staleness (finding 3 above) go undetected. Added a real check: today's canary plan row compared
+   against the LIVE `scenario_expectations` text for the same ticker, flagged if they've diverged.
+9 (plausible). `close_position` logged `result='closed'` BEFORE `log_trade_exit`/the `DELETE` ran — a
+   raise in either would leave a `'closed'` event on record for a close that never happened. Reordered
+   to log after both succeed.
+10 (plausible). `opened_today` (in the live/paper activity loop) wasn't `is_dry_run_sim`-filtered unlike
+   its two neighbors (`closed`/`still_open`) — could mask a real carried-in position's unplanned close
+   as a routine "new entry today". Filtered to match.
+
 ## [live-trading] Resolved 2026-08-01 — canary `max_hold_hours` mirror gap (4 nodes silently misconfigured since 2026-07-29), plus the nightly EOD review/plan cycle and a fake-venue test-coverage push
 
 **Context**: user asked for an evening review of live/canary/paper activity and a next-day plan,

@@ -213,7 +213,14 @@ REGISTRY = [
          offline_coverage="3 unit tests (test_db_roundtrip.py); tests/test_fake_broker_position_lock_scenario.py "
                            "(2026-08-01, concurrency test)",
          check_mechanism='coverage_events', scenario_key='position_lock',
-         bad_results=['already_closed'],
+         # 2026-08-01 2nd Opus review finding: excluding only 'already_closed' was
+         # incomplete -- 'acquired' fires unconditionally on EVERY open_position call
+         # (no contention required at all), so the very first real live position open
+         # flipped this branch verified-live off zero evidence of contention. 'closed'
+         # has the same problem, plus fires before the close actually completes (see
+         # the 'closed'-ordering note below) -- 'skipped_duplicate' is the only result
+         # that's actual evidence the lock did something under real contention.
+         bad_results=['already_closed', 'acquired', 'closed'],
          notes="Instrumented 2026-08-01 -- log_coverage_event calls added inside the already-locked "
                "block in open_position (acquired/skipped_duplicate) and close_position "
                "(closed/already_closed), observational only, doesn't change the lock's own acquire "

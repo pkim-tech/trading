@@ -2155,12 +2155,15 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
                                 detail="close_position")
             return False
         _mode = 'paper' if paper else ('dry_run' if row[4] else 'live')
-        log_coverage_event("position_lock", _mode, ticker=row[2], node_id=row[3], position_id=position_id,
-                            result="closed", detail="close_position")
         if exit_price is not None and row[0]:
             log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper)
         c.execute(f"DELETE FROM {positions_table} WHERE id = ?", (position_id,))
         c.commit()
+        # 2026-08-01 2nd Opus review finding: logged BEFORE log_trade_exit/DELETE
+        # ran, so a raise in either would leave a real 'closed' event on record
+        # for a close that never actually happened -- moved to after both succeed.
+        log_coverage_event("position_lock", _mode, ticker=row[2], node_id=row[3], position_id=position_id,
+                            result="closed", detail="close_position")
         return True
 
 

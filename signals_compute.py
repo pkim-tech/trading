@@ -280,7 +280,19 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
     })
     just_activated_trailing = bool(new_state.get('trailing')) and not old_state.get('trailing')
     if reason in ('WIN', 'LOSS'):
-        reason = 'TRAIL'
+        # 2026-08-01: a genuine trail-stop breach and hold-time expiring while
+        # armed used to both collapse to 'TRAIL' unconditionally -- correct
+        # for the live order-routing logic (which always also checked the
+        # separate exit_forced_by_hold_time flag, never trusted the reason
+        # string alone), but wrong for every human-facing consumer (Slack
+        # messages, trade_log), which had no way to tell a real trail breach
+        # from a timeout without reading trail_state directly. Now reports
+        # 'TIME' for the hold-time-forced case -- matches what actually
+        # happened, and every reason=='TRAIL' check in signals_notify.py's
+        # order-routing already reads hold_time_forced alongside it, so this
+        # doesn't change any real-money control flow (see the matching
+        # comments there, updated in the same change).
+        reason = 'TIME' if new_state.get('exit_forced_by_hold_time') else 'TRAIL'
     if new_state != old_state:
         db.update_position_trail_state(pos['id'], new_state, paper=paper)
     return reason, price, just_activated_trailing

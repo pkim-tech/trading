@@ -8,12 +8,20 @@ actually tracks that resting order's real state.
 
 Root cause under test: strategies.py's TrailingBothZScoreBreakout.check_exit
 collapses two different trailing-branch conditions (a genuine trail-stop
-breach, and hold-time expiring while armed) into the same WIN/LOSS reason,
-which signals_compute.py further collapses to 'TRAIL'. notify_sell_signal's
-automated-exit path can't tell them apart, so it always treats 'TRAIL' as
-"a resting trailing-sell order is already correctly tracking this, just poll
-it" -- correct for a genuine breach, wrong when the real trigger was hold-time
-expiry and the resting order (e.g. a wide 50% trail) is nowhere near firing."""
+breach, and hold-time expiring while armed) into the same WIN/LOSS reason.
+Before 2026-08-01, signals_compute.py further collapsed BOTH to 'TRAIL',
+indistinguishable from a genuine breach to any human-facing consumer (Slack
+messages, trade_log) -- fixed to report 'TIME' for the hold-time-forced case
+specifically (see the exit_forced_by_hold_time flag). The tests below still
+pass 'TRAIL' as the literal reason string to notify_sell_signal in several
+places -- this is intentional, not stale: _attempt_automated_exit_sell keeps
+an explicit `and not hold_time_forced` guard as defense-in-depth alongside
+the reason string (never trusted the string alone even before this fix), so
+these tests double as regression coverage for that guard working correctly
+regardless of what the caller's reason string says. See
+test_check_sell_condition_reports_time_not_trail_for_hold_time_forced_exit
+below for the real end-to-end proof that signals_compute.py itself now
+produces 'TIME', not 'TRAIL', for this case."""
 import sys
 import tempfile
 from datetime import datetime
@@ -362,3 +370,46 @@ def test_hold_time_forced_exit_does_not_re_replace_on_a_later_bar(env, fake_brok
         "the single resting MARKET sell must still be the SAME order from bar 1, "
         "not a second one that replaced it"
     )
+
+
+def test_check_sell_condition_reports_time_not_trail_for_hold_time_forced_exit(env):
+    """Direct proof that signals_compute.check_sell_condition -- the real
+    production function every live/paper/dry-run exit check calls, not just
+    strategies.py's raw check_exit -- reports reason='TIME' for a
+    hold-time-forced exit, not 'TRAIL'. This is the actual fix (2026-08-01);
+    every other test in this file exercises the downstream routing (which
+    was always robust to either string via the hold_time_forced flag), not
+    this label itself."""
+    import signals_compute
+    import pandas as pd
+
+    node = _node()
+    entry_time = datetime(2026, 7, 24, 7, 38, 38)
+    signals_db.open_position(node, signal_price=33.52, signal_time=entry_time,
+                              entry_price=33.52, entry_time=entry_time, shares=50)
+    pos = signals_db.get_open_position(TICKER)
+    signals_db.update_position_trail_state(pos['id'], {'trailing': True, 'peak': 33.72})
+    pos = signals_db.get_open_position(TICKER)
+
+    # _bars_held just counts df_hourly rows with index > signal_time -- no
+    # real cache file exists for this synthetic ticker, so pass a minimal
+    # synthetic frame directly (check_sell_condition accepts df_hourly as an
+    # override) with 30 hourly bars past signal_time, comfortably over
+    # max_hold_hours=24.
+    bars = pd.date_range(entry_time, periods=31, freq='h')[1:]
+    df_hourly = pd.DataFrame({'Open': 33.61, 'High': 33.62, 'Low': 33.60, 'Close': 33.61}, index=bars)
+
+    # Same real scenario as the first test above: armed, held well past
+    # max_hold_hours (24), low never crosses the 50%-wide trail_stop -- a
+    # genuine hold-time-forced exit, not a real breach.
+    reason, price, just_activated = signals_compute.check_sell_condition(
+        pos, current_price=33.61, now=datetime(2026, 7, 25, 15, 30, 0),
+        at_bar_close=True, low=33.60, high=33.62, open_price=33.61, df_hourly=df_hourly,
+    )
+    assert reason == 'TIME', (
+        f"expected 'TIME' for a hold-time-forced exit (armed, but low=33.60 "
+        f"never crossed the real trail_stop), got {reason!r} -- this is the "
+        f"actual regression this whole fix exists to prevent"
+    )
+    closed_pos = signals_db.get_open_position(TICKER)
+    assert closed_pos['trail_state'].get('exit_forced_by_hold_time') is True

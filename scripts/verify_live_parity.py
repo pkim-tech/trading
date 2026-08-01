@@ -108,14 +108,21 @@ def replay(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_p
                     hours_held = active_signals._bars_held(df_slice, signal_time)
                     pc = (price - entry_price) / entry_price
                     # check_sell_condition collapses the strategy's WIN/LOSS (trailing-stop
-                    # triggered) into a generic 'TRAIL' reason for Slack messaging — recover
-                    # the kernel's WIN/LOSS-by-sign labeling here instead of falling through
-                    # to TWIN/TLOSS, which is only correct for a pre-activation 'TIME' exit.
+                    # triggered) into 'TRAIL' for a genuine breach, or 'TIME' for hold-time
+                    # expiring while armed (2026-08-01 -- previously both collapsed to
+                    # 'TRAIL' unconditionally) -- recover the kernel's WIN/LOSS-by-sign
+                    # labeling for either case instead of falling through to TWIN/TLOSS,
+                    # which is only correct for a genuine pre-activation 'TIME' exit
+                    # (never armed at all, not this while-armed-but-timed-out case).
+                    # trail_state is already persisted by check_sell_condition above, so
+                    # re-fetch fresh rather than trusting the pre-call `pos` snapshot.
+                    fresh_pos = next(p for p in active_signals.get_open_positions() if p['id'] == position_id)
+                    hold_time_forced = bool((fresh_pos.get('trail_state') or {}).get('exit_forced_by_hold_time'))
                     if reason in ('TP', 'WIN'):
                         result = 'WIN'
                     elif reason in ('SL', 'LOSS'):
                         result = 'LOSS'
-                    elif reason == 'TRAIL':
+                    elif reason == 'TRAIL' or (reason == 'TIME' and hold_time_forced):
                         result = 'WIN' if pc > 0 else 'LOSS'
                     else:
                         result = 'TWIN' if pc > 0 else 'TLOSS'

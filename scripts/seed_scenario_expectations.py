@@ -135,7 +135,7 @@ SCENARIOS = [
         # still just a same-day-trade-happened check like every other
         # canary, not an actual bull/bear-symmetry check -- see
         # docs/backlog_cache.md's 2026-08-01 entry for that idea.
-        scenario_key='canary_bull_bear_pair', ticker='JNUG', strategy_type='TrailingExitZScoreBreakout',
+        scenario_key='canary_bull_bear_pair', ticker='JNUG', strategy_type='TrailingBothZScoreBreakout',
         expected_outcome="G: same-underlying (junior gold miners) bull/bear pair, bull side. Same "
                           "design as JDST.",
         expected_frequency='daily', check_method='trade_lifecycle',
