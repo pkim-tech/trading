@@ -176,13 +176,27 @@ def test_buy_buttons_resolve_correct_node_logs_coverage_and_opens_position(env, 
 
 
 def test_manual_buy_confirmation_account_logs_coverage_and_places_stop(env, fake_broker, monkeypatch):
-    """Test that handle_entry_price logs account attribution and places a STOP
-    order when the ticker is in AUTOMATION_ENABLED_TICKERS."""
-    node = _add_node(account='ira')
+    """Test that handle_entry_price logs account attribution and places a REAL
+    STOP order at fake_broker when the ticker is in AUTOMATION_ENABLED_TICKERS.
+
+    Fixed 2026-08-01 (paired independent+contextual review + fake_broker
+    test-quality audit): this test's original claim was true in intent but
+    false in practice -- handle_entry_price (the manual market-buy "Executed"
+    flow, used by TrailingExitZScoreBreakout, which every real live BUY entry
+    still goes through today regardless of automation scope, since only
+    post-fill housekeeping is automated) never actually called
+    _place_stop_loss_for_position, unlike its trailing-buy twin
+    handle_trail_buy_fill_price. Confirmed this wasn't caught by the
+    missing_sl reconciliation check either (it only fires for a stop that was
+    attempted and later found missing, not one never attempted at all).
+    signals_handlers.py's handle_entry_price now carries the same
+    AUTOMATION_ENABLED_TICKERS gate handle_trail_buy_fill_price already had --
+    this test verifies it for real against fake_broker."""
+    node = _add_node(account='soxl_ira')
     _pending(node)
 
     fake_broker.set_quote(TICKER, last=51.0, bid=50.9, ask=51.1)
-    fake_broker.set_cash_balance('ira', 50000.0)
+    fake_broker.set_cash_balance('soxl_ira', 50000.0)
 
     body = _entry_price_body(node, exec_price=51.0)
     signals_handlers.handle_entry_price(_ack, body, _FakeClient())
@@ -192,21 +206,35 @@ def test_manual_buy_confirmation_account_logs_coverage_and_places_stop(env, fake
     assert pos is not None
     assert pos['shares'] > 0
 
+    # --- assert: real STOP order reached the broker ---
+    stop_orders = [o for o in fake_broker.orders.values()
+                   if o['orderLegCollection'][0]['instrument']['symbol'] == TICKER
+                   and o['orderType'] == 'STOP']
+    assert len(stop_orders) == 1, (
+        f"expected exactly 1 STOP order to reach fake_broker, found {len(stop_orders)}"
+    )
+    assert stop_orders[0]['orderLegCollection'][0]['instruction'] == 'SELL'
+    assert stop_orders[0]['orderLegCollection'][0]['quantity'] == pos['shares']
+
     # Coverage event should fire with account attribution
     events = signals_db.get_coverage_events(scenario_key="manual_buy_confirmation_account")
     assert len(events) == 1
     assert events[0]['result'] == "opened"
-    assert events[0]['detail'] == "account='ira'"
+    assert events[0]['detail'] == "account='soxl_ira'"
 
 
 
 def test_buy_fill_reconciles_correct_node_with_multiple_pending(env, fake_broker, monkeypatch):
     """Test that _reconcile_buy_fill correctly disambiguates between multiple
     pending buys for the same ticker using the wl_id hint, opening a position
-    for the correct node and placing its STOP order. This is the 4th scenario_key."""
-    node_a = _add_node(version='test_a', strategy='TrailingBothZScoreBreakout',
+    for the correct node and placing its STOP order. This is the 4th scenario_key.
+    Uses soxl_ira (dry_run=False) so the STOP placement below is verified
+    against real fake_broker state, not just a locally-recorded sl_order_id
+    (found 2026-08-01 paired-review, this test previously used the default
+    dry_run 'ira' account and made no fake_broker.orders assertion at all)."""
+    node_a = _add_node(version='test_a', account='soxl_ira', strategy='TrailingBothZScoreBreakout',
                        trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0)
-    node_b = _add_node(version='test_b', strategy='TrailingBothZScoreBreakout',
+    node_b = _add_node(version='test_b', account='soxl_ira', strategy='TrailingBothZScoreBreakout',
                        trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0)
 
     # Create pending buys for both nodes
@@ -219,7 +247,7 @@ def test_buy_fill_reconciles_correct_node_with_multiple_pending(env, fake_broker
     # Set up fake broker quotes and cash
     fill_price = 49.5
     fake_broker.set_quote(TICKER, last=fill_price, bid=fill_price, ask=fill_price + 0.01)
-    fake_broker.set_cash_balance(node_a.get('account') or 'ira', 50000.0)
+    fake_broker.set_cash_balance('soxl_ira', 50000.0)
 
     # Reconcile a fill against node_a specifically (via wl_id)
     filled_shares = 50.0
@@ -240,6 +268,15 @@ def test_buy_fill_reconciles_correct_node_with_multiple_pending(env, fake_broker
     assert pos_a is not None, "node_a should have an open position"
     assert pos_b is None, "node_b should NOT have an open position"
     assert pos_a['shares'] >= filled_shares
+
+    # --- assert: real STOP order for node_a's position reached the broker ---
+    stop_orders = [o for o in fake_broker.orders.values()
+                   if o['orderLegCollection'][0]['instrument']['symbol'] == TICKER
+                   and o['orderType'] == 'STOP']
+    assert len(stop_orders) == 1, (
+        f"expected exactly 1 STOP order to reach fake_broker, found {len(stop_orders)}"
+    )
+    assert stop_orders[0]['orderLegCollection'][0]['quantity'] == pos_a['shares']
 
     # node_a's pending row should be cleared; node_b's should still exist
     all_pending = signals_db.get_pending_buys()

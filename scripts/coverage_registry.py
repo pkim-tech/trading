@@ -557,10 +557,28 @@ def _mode_filter_match(scenario_key, mode_filter):
 # stateful-fake-order-book-fixture entry, and tests/fake_broker.py's docstring.
 _FAKE_VENUE_CACHE = None
 
+# A test file mentioning the string "fake_broker" (an import, a docstring, a
+# comment) used to be enough to count as fake-venue proof -- gamed 2026-08-01:
+# 2 real test files admitted in their own docstrings to importing fake_broker
+# for no reason other than to satisfy this exact check, the same false-green
+# shape as the already-fixed 2026-07-26 coverage_events text-scan bug, one
+# layer up. Now requires the fixture actually be injected into a test
+# function's signature (real pytest fixture usage), not just present in the
+# file's text.
+_FAKE_BROKER_FIXTURE_RE = re.compile(r'def\s+test_\w*\s*\(([^)]*)\)', re.DOTALL)
+
+
+def _uses_fake_broker_fixture(text):
+    return any(
+        re.search(r'\bfake_broker\b', params)
+        for params in _FAKE_BROKER_FIXTURE_RE.findall(text)
+    )
+
 
 def _scan_fake_venue_proof():
-    """Mirrors _scan_offline_proof(), scoped to only files that actually use
-    the fake_broker fixture (grep for the import, not just any test_*.py)."""
+    """Mirrors _scan_offline_proof(), scoped to only files where at least one
+    test function actually takes fake_broker as a fixture argument (real
+    usage), not just any file that mentions the string."""
     global _FAKE_VENUE_CACHE
     if _FAKE_VENUE_CACHE is not None:
         return _FAKE_VENUE_CACHE
@@ -571,7 +589,7 @@ def _scan_fake_venue_proof():
         return _FAKE_VENUE_CACHE
     for path in sorted(_TESTS_DIR.glob("test_*.py")):
         text = path.read_text()
-        if 'fake_broker' not in text:
+        if not _uses_fake_broker_fixture(text):
             continue
         for m in _EVENT_ASSERTED_RE.finditer(text):
             if m.group(1) in all_keys:

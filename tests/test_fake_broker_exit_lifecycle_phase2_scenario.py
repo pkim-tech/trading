@@ -101,8 +101,14 @@ def test_sl_sync_placement_places_real_stop_order(env, fake_broker):
     broker after a position opens (sync confirm path).
     """
     node = _add_node(TICKER, 'soxl_ira')
-    signal_price = 103.0
-    entry_price = 102.0
+    # signal_price and entry_price are deliberately far apart (>1%) so this
+    # test can actually distinguish the correct entry_price-anchored stop
+    # from the real 2026-07-31 bug (signal_price-anchored, docs/deep_backlog.md's
+    # 2026-07-31 entry -- could place the real stop above market on a
+    # trailing-buy entry) -- a tight rel/abs tolerance means nothing if the
+    # two candidate prices are within tolerance of each other.
+    signal_price = 110.0
+    entry_price = 100.0
     shares = 49
 
     # Open a position (seeded directly, matching existing test patterns)
@@ -113,7 +119,7 @@ def test_sl_sync_placement_places_real_stop_order(env, fake_broker):
     pos = signals_db.get_open_position(TICKER)
 
     # Set up broker quote/cash for the SL order
-    fake_broker.set_quote(TICKER, last=102.0, bid=102.0, ask=102.01)
+    fake_broker.set_quote(TICKER, last=entry_price, bid=entry_price, ask=entry_price + 0.01)
     fake_broker.set_cash_balance('soxl_ira', 100_000.0)
 
     # --- act: place stop-loss order ---
@@ -129,7 +135,10 @@ def test_sl_sync_placement_places_real_stop_order(env, fake_broker):
     stop_order = stop_orders[0]
     assert stop_order['orderLegCollection'][0]['instruction'] == 'SELL'
     assert stop_order['orderLegCollection'][0]['quantity'] == shares
-    assert float(stop_order['stopPrice']) == pytest.approx(entry_price * 0.99, rel=0.01)  # 1% SL
+    # abs (not rel) tolerance -- the whole point is distinguishing the correct
+    # entry_price*0.99=99.0 from the buggy signal_price*0.99=108.9; a rel
+    # tolerance scales with the very price that's in question.
+    assert float(stop_order['stopPrice']) == pytest.approx(entry_price * 0.99, abs=0.01)  # 1% SL
 
     # --- assert: coverage event fired ---
     events = signals_db.get_coverage_events(scenario_key='sl_placement')
@@ -184,6 +193,18 @@ def test_exit_arm_latency_evaluates_bar_close(env, fake_broker, monkeypatch):
     assert any(e['result'] == 'evaluated' for e in ticker_events), (
         f"expected 'exit_arm_latency' event with result='evaluated', "
         f"got: {[(e['result'], e.get('detail')) for e in ticker_events]}"
+    )
+
+    # --- assert the actual arm/exit DECISION, not just that evaluation
+    # happened (found 2026-08-01, paired review: previously only checked the
+    # coverage event fired, so an inverted arm decision would still pass) ---
+    # entry=101, the 15:30 bar closes at 103.0 (+1.98%), well under the
+    # node's 16% arm_sell_pct threshold -- correct behavior is NOT armed yet.
+    updated_pos = signals_db.get_open_position(TICKER)
+    trail_state = updated_pos.get('trail_state') or {}
+    assert not trail_state.get('trailing'), (
+        f"expected the position to remain unarmed at +1.98% gain (threshold "
+        f"16%), got trail_state={trail_state}"
     )
 
 
@@ -244,29 +265,41 @@ def test_manual_sl_fallback_alert_fires_when_sell_placement_fails(env, fake_brok
     """Scenario: manual_sl_fallback_alert
     When the resting SL is cancelled but the trailing-sell placement THEN fails,
     a manual-SL-price fallback alert fires (deliberately no auto-recovery).
+
+    Fixed 2026-08-01 (paired independent+contextual review): sl_order_id
+    previously pointed at a synthetic id (9999999999) never actually placed
+    at fake_broker, so the "cancel-then-fail" sequence this test is named
+    for never really happened -- it only proved the exception handler. Now
+    places a real STOP order first via _place_stop_loss_for_position, so
+    replace_order_with_trailing_sell (mocked below to fail, simulating a
+    broker-side rejection) targets a genuinely resting fake_broker order.
     """
     node = _add_node(TICKER, 'soxl_ira')
     signal_price = 100.0
     entry_price = 101.0
     shares = 50
 
-    # Open position with an existing sl_order_id (as if a stop was placed)
+    fake_broker.set_quote(TICKER, last=102.0, bid=102.0, ask=102.01)
+    fake_broker.set_cash_balance('soxl_ira', 100_000.0)
+
+    # Open position and place a REAL STOP order at fake_broker (not a
+    # synthetic id) so the resting order this test's name refers to actually
+    # exists to be replaced/fail against.
     signals_db.open_position(
         node, signal_price, SIGNAL_TIME, entry_price, SIGNAL_TIME, shares=shares
     )
     pos = signals_db.get_open_position(TICKER)
-    # Simulate that a STOP order exists at the broker
-    fake_sl_order_id = 9999999999
-    signals_db.set_sl_order_id_by_position(pos['id'], fake_sl_order_id)
-    # Re-fetch to get the updated sl_order_id
+    signals_notify._place_stop_loss_for_position(node, TICKER)
     pos = signals_db.get_open_position(TICKER)
-
-    fake_broker.set_quote(TICKER, last=102.0, bid=102.0, ask=102.01)
-    fake_broker.set_cash_balance('soxl_ira', 100_000.0)
+    real_stop_orders = [o for o in fake_broker.orders.values()
+                        if o['orderLegCollection'][0]['instrument']['symbol'] == TICKER
+                        and o['orderType'] == 'STOP']
+    assert len(real_stop_orders) == 1, "expected the real STOP placed above to be resting at fake_broker"
+    assert pos['sl_order_id'] is not None
 
     # Mock both place_trailing_sell and replace_order_with_trailing_sell to fail
     # (simulating a broker rejection). Since we have sl_order_id, it will call
-    # replace_order_with_trailing_sell.
+    # replace_order_with_trailing_sell against the real resting order above.
     def mock_place_fail(*args, **kwargs):
         raise Exception("Simulated trailing-sell placement failure at broker")
 

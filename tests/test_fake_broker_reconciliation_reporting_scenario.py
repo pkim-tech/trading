@@ -72,7 +72,16 @@ def _add_node(ticker, account, notional=5000):
 
 def test_reconciliation_detects_share_count_mismatch(env, fake_broker, monkeypatch):
     """Real share count at broker differs from local open_positions record --
-    check_live_state_reconciliation detects and logs the mismatch."""
+    check_live_state_reconciliation detects and logs the mismatch.
+
+    Fixed 2026-08-01 (paired independent+contextual review): previously
+    mocked get_real_position directly (the exact function under test),
+    making fake_broker's earlier BUY fill decorative -- the fixture's own
+    get_account() only summed filled BUYs, with no way to reflect a real
+    manual sale. fake_broker.py's position calc now also nets filled SELLs
+    (see its 2026-08-01 fix), so the manual sale below is a real SELL order
+    filled at the broker, exercising get_real_position's actual parsing
+    logic end-to-end instead of bypassing it."""
     node = _add_node(TICKER, 'soxl_ira', notional=50_000)
     fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
     fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
@@ -87,19 +96,15 @@ def test_reconciliation_detects_share_count_mismatch(env, fake_broker, monkeypat
     signals_db.open_position(node, signal_price=10.0, signal_time='2026-07-29 09:30:00',
                              entry_price=10.0, entry_time='2026-07-29 09:30:00', shares=50)
 
-    # Simulate a manual trade at the broker (e.g. user liquidated 10 shares):
-    # update the fake broker's order book, but NOT the local DB. Then
-    # reconciliation should catch it.
-    current_order = None
-    for o in fake_broker.orders.values():
-        if o['status'] == 'FILLED':
-            current_order = o
-            break
-    assert current_order is not None
-
-    # Simulate a manual sale: patch get_real_position to return 40 instead of 50.
-    monkeypatch.setattr(schwab_client, 'get_real_position',
-                        lambda account, ticker: 40 if ticker == TICKER else 0)
+    # Simulate a manual sale at the broker (e.g. user liquidated 10 shares)
+    # via a REAL sell order+fill at fake_broker -- the local DB is untouched,
+    # so reconciliation should catch the resulting 50-vs-40 mismatch.
+    r, sell_oid = schwab_client.place_equity_sell('soxl_ira', TICKER, 10, 10.0)
+    assert sell_oid is not None
+    fake_broker.force_fill(sell_oid, 10.0)
+    assert schwab_client.get_real_position('soxl_ira', TICKER) == 40, (
+        "sanity check: fake_broker's real position should reflect the manual sale"
+    )
 
     # Run reconciliation against the local 50-share belief vs broker's 40.
     open_positions = signals_db.get_open_positions()
@@ -131,10 +136,13 @@ def test_reconciliation_detects_missing_protective_order(env, fake_broker, monke
     trail_state = {'trailing': True, 'order_placed': True, 'peak': 10.5}
     signals_db.update_position_trail_state(pos_id, trail_state)
 
-    # Fake broker has no SELL order (simulate it was cancelled without updating local DB).
-    # get_real_position still shows 40 shares (good) but no SELL orders are resting.
-    monkeypatch.setattr(schwab_client, 'get_real_position',
-                        lambda account, ticker: 40 if ticker == TICKER else 0)
+    # Fake broker genuinely has no SELL order resting (never placed one --
+    # simulates a real trailing-sell that was cancelled without updating
+    # local DB). get_real_position naturally reflects the real 40-share BUY
+    # fill above -- no mock needed (fixed 2026-08-01, paired review: this
+    # previously mocked get_real_position even though the real fill already
+    # produced the exact right answer).
+    assert schwab_client.get_real_position('soxl_ira', TICKER) == 40
 
     # Run reconciliation.
     open_positions = signals_db.get_open_positions()
@@ -149,8 +157,12 @@ def test_reconciliation_detects_missing_protective_order(env, fake_broker, monke
 
 
 def test_morning_report_posts_to_slack_with_confirmation(env, fake_broker, monkeypatch):
-    """send_reference_report builds the report and POSTs it to Slack,
-    returning a real (channel, ts) confirmation tuple."""
+    """send_reference_report correctly classifies a successful Slack delivery
+    and returns the (channel, ts) confirmation it received.
+
+    Note (corrected 2026-08-01, paired review): this mocks _post_chunked, so
+    it proves the result-classification branch, not a real Slack POST --
+    the docstring previously overclaimed "POSTs to Slack."."""
     node = _add_node(TICKER, 'soxl_ira', notional=50_000)
     fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
 

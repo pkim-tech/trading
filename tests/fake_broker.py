@@ -155,17 +155,23 @@ class FakeBroker:
             try:
                 import schwab.client
                 if schwab.client.Client.Account.Fields.POSITIONS in fields:
-                    # Build positions list from filled BUY orders for this account
+                    # Net position from filled BUY/SELL orders for this account
+                    # -- SELL fills previously weren't subtracted at all, so a
+                    # test simulating a manual real-broker sale had no way to
+                    # reflect it here and had to monkeypatch get_real_position
+                    # directly instead, bypassing this fixture entirely (found
+                    # 2026-08-01, paired independent+contextual review).
                     positions = {}
                     for order in self.orders.values():
                         if order['account'] != account or order['status'] != 'FILLED':
                             continue
                         leg = order['orderLegCollection'][0]
-                        if leg['instruction'] != 'BUY':
-                            continue
                         ticker = leg['instrument']['symbol']
                         qty = leg['quantity']
-                        positions[ticker] = positions.get(ticker, 0) + qty
+                        if leg['instruction'] == 'BUY':
+                            positions[ticker] = positions.get(ticker, 0) + qty
+                        elif leg['instruction'] == 'SELL':
+                            positions[ticker] = positions.get(ticker, 0) - qty
 
                     response['securitiesAccount']['positions'] = [
                         {'instrument': {'symbol': ticker}, 'longQuantity': qty}

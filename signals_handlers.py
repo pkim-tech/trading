@@ -189,7 +189,22 @@ if cfg.SOCKET_MODE:
                                detail=f"account={node.get('account')!r}")
 
         if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
-            _place_stop_loss_for_position(node, ticker)
+            # _place_stop_loss_for_position already handles every broker-call
+            # failure it anticipates (SafetyViolation, generic Exception +
+            # retry, terminal alert) -- this catches anything unanticipated
+            # (e.g. a DB write failure) so it can never prevent the "Executed"/
+            # "Filled" confirmation below: the real position is already open
+            # at this point, and the user seeing that confirmation matters
+            # more than an SL-placement failure being silent (which it isn't
+            # anyway -- the position still shows up as unprotected via the
+            # missing_sl reconciliation check on the next poll, or the
+            # function's own UNPROTECTED alert on a caught failure). Found
+            # 2026-08-01, paired independent+contextual review of the
+            # handle_entry_price fix that added this call to a 2nd site.
+            try:
+                _place_stop_loss_for_position(node, ticker)
+            except Exception as e:
+                print(f"  [warn] {ticker} — unexpected error in _place_stop_loss_for_position: {e}")
 
         note = f"${fill_price:.4f}  (drift: {drift_pct:+.2f}%)  {shares} shares"
         print(f"  Trailing buy filled via Slack: {ticker} at {note}")
@@ -278,6 +293,16 @@ if cfg.SOCKET_MODE:
                                result="opened" if node.get('account') else "no_account",
                                detail=f"account={node.get('account')!r}")
 
+        # Mirrors handle_trail_buy_fill_price's identical gate (found missing
+        # here 2026-08-01, paired independent+contextual review + fake_broker
+        # test-quality audit): every real live BUY entry is still manually
+        # confirmed via Slack regardless of automation scope (only post-fill
+        # housekeeping is automated today), so this is the market-buy/
+        # TrailingExitZScoreBreakout twin of that trailing-buy path -- without
+        # it, an automation-scoped market-buy fill opened with no automated
+        # protective stop, and the missing_sl reconciliation check can't catch
+        # a stop that was never attempted (it only catches one that was
+        # attempted and later found missing at the broker).
         note   = f"${exec_price:.4f}  (drift: {drift_pct:+.2f}%)"
         print(f"  Position opened via Slack: {ticker} at {note}")
         client.chat_update(
@@ -286,6 +311,27 @@ if cfg.SOCKET_MODE:
             blocks=[{"type": "section", "text": {"type": "mrkdwn",
                      "text": f"*BUY {ticker}* — Executed at {note}"}}],
         )
+
+        if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            # Placed AFTER the "Executed" confirmation above, deliberately --
+            # handle_entry_price is also the manual catch-up/backdated-entry
+            # flow (a genuinely missed signal, confirmed days later, see the
+            # comment in _reconcile_buy_fill), where entry_price can already
+            # be well past its stop by confirmation time. In that case this
+            # call's own self-correcting branch fires a real forced market
+            # SELL + a separate "already breached" Slack alert -- reordered
+            # so the user always sees "your fill was recorded" before any
+            # forced-exit alert, not after (found 2026-08-01, paired
+            # independent+contextual review).
+            # _place_stop_loss_for_position already handles every broker-call
+            # failure it anticipates (SafetyViolation, generic Exception +
+            # retry, terminal alert) -- this catches anything unanticipated
+            # (e.g. a DB write failure) so it can't raise back into the
+            # handler after the confirmation has already been sent.
+            try:
+                _place_stop_loss_for_position(node, ticker)
+            except Exception as e:
+                print(f"  [warn] {ticker} — unexpected error in _place_stop_loss_for_position: {e}")
 
     @cfg.bolt_app.action("sell_exited")
     def handle_sell_exited(ack, body, client):

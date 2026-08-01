@@ -1,5 +1,62 @@
 # Backlog
 
+## [live-trading][security] Resolved 2026-08-01 (late) — `handle_entry_price` never auto-placed a protective stop for automation-scoped market-buy fills; found via a fake_broker test-quality audit, fixed with a new paired independent+contextual review pattern
+
+**Found while fixing the 13 fake_broker test-quality gaps flagged (but never fixed) two sessions
+earlier** (see this file's 2026-08-01 fake_broker-coverage entry) — `test_fake_broker_buy_button_
+handlers_scenario.py`'s `test_manual_buy_confirmation_account_logs_coverage_and_places_stop` claimed
+to prove `handle_entry_price` places a real STOP order, but made zero `fake_broker.orders` assertions
+and ran on the dry_run `ira` account. Investigating led to a real production gap, not just a test gap:
+`_place_stop_loss_for_position` (`signals_notify.py:617`) has exactly one call site in production code
+before this fix — `handle_trail_buy_fill_price` (the trailing-buy "Filled" confirmation handler).
+`handle_entry_price` (the market-buy "Executed" confirmation handler, used by `TrailingExitZScoreBreakout`
+tickers — YANG, VOO, IVV, QQQ, IWM, DIA, XLF, JNUG, all in `SCHWAB_AUTOMATION_TICKERS`) never called it,
+despite the identical `if ticker in AUTOMATION_ENABLED_TICKERS:` gate already existing on its sibling.
+**Real severity, clarified during the session**: every real live BUY entry today — automation-scoped or
+not — is still manually confirmed via Slack (only post-fill housekeeping is automated), so this isn't
+legacy/bridge code; it's the actual live mechanism for every real market-buy fill right now. Also
+confirmed the existing `missing_sl` reconciliation check (`signals_notify.py:574`) can't catch this
+class of gap at all — it only fires when a stop was attempted and later found missing at the broker
+(gated on `pos.get('sl_order_id')` being truthy), not when one was never attempted.
+
+**Fixed**: added the identical gate + `_place_stop_loss_for_position(node, ticker)` call to
+`handle_entry_price`, placed after the "Executed" `chat_update` confirmation (not before, see below),
+wrapped in a bare `try/except` so nothing inside it can prevent that confirmation from being sent (the
+real position is already open by that point — the user seeing confirmation matters more than a
+silent-if-uncaught SL failure, which isn't silent anyway: it's covered by the function's own
+UNPROTECTED alert on a caught failure). The identical wrap was retrofitted onto
+`handle_trail_buy_fill_price`'s pre-existing call for parity, but that handler's message ordering was
+left untouched (already battle-tested since 2026-07-24, no identified need to reorder it).
+
+**New review pattern used this session, worth adopting going forward**: instead of a single independent
+Opus review, ran an independent cold reviewer + a contextual reviewer (given the "why," not just the
+diff) in parallel, then a rebuttal exchange between them. On the test-quality audit (13 files), this
+caught something a single cold pass got wrong (a false-positive oversell-guard finding, conceded on
+rebuttal after re-reading the actual `pytest.raises` assertion) and sharpened something it underscored
+(coverage-registry gaming scored as a direct recurrence of an already-fixed 2026-07-26 false-green bug
+class, not generic metric inflation). On this production diff, the contextual reviewer (given context
+the cold one lacked — that `handle_entry_price` is also the manual catch-up/backdated-entry flow, see
+`_reconcile_buy_fill`'s comment) caught a real ordering issue the cold reviewer missed entirely: a
+catch-up entry confirmed days late could already be past its stop, triggering `_place_stop_loss_for_
+position`'s self-correcting forced-market-SELL branch — which, before this fix, would have posted its
+alert *before* the "Executed" confirmation, since the SL call ran first. Fixed by moving the SL-placement
+call to after the confirmation message in `handle_entry_price` specifically.
+
+**Also fixed in the same session** (the fake_broker test-quality audit's other 7 findings, now closed,
+not just reviewed): `coverage_registry.py`'s `_scan_fake_venue_proof` now requires an actual `fake_broker`
+pytest-fixture argument in a test signature, not just the substring "fake_broker" anywhere in the file
+— 2 files were found gaming the old check by importing it for no functional reason; honest headline
+dropped from a false 37/41 to a real 36/41. `tests/fake_broker.py`'s `get_account()` position calc now
+nets filled SELL orders against BUYs (previously only summed BUYs, so a test simulating a real manual
+sale had to bypass the fixture with a mock instead). An SL-tolerance test tightened to `abs=0.01` +
+widened price split, mutation-tested against the real 2026-07-31 SL-anchor bug (now correctly fails on
+revert). A `manual_sl_fallback_alert` test now places a real STOP first so its named "cancel-then-fail"
+scenario actually happens. An `exit_arm_latency` test now asserts the real arm/exit decision, not just
+that an event fired. Two reconciliation tests now use real fake_broker fills instead of mocking
+`get_real_position` (the function under test). Full suite: 466 passed. `signals_invariants.py` clean.
+`live_sim_harness.py` 7/7. Two independent Opus review rounds (cold + contextual) of the production diff
+found no confirmed defects beyond the exception-safety/ordering issues already described and fixed above.
+
 ## [live-trading] Resolved 2026-08-01 — hold-time-forced exits reported as `TRAIL` instead of `TIME`; second Opus review of the same-session diff found 8 more real bugs, all fixed
 
 **Found by the user directly, reviewing a real trade** (SH, closed 2026-07-31 via `exit_reason='TRAIL'`

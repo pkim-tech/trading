@@ -8,9 +8,15 @@ controlled fake-broker tests:
 
 Uses the same fake_broker fixture + isolated DB pattern as the other scenario tests.
 For dry_run branches (1,3,4), uses account 'ira' (dry_run=True in schwab_safety.ACCOUNTS)
-since that's the real precondition. Even though dry_run orders never reach fake_broker,
-the file still imports it so coverage_registry.py counts this as genuine fake-venue
-infrastructure ('fake_broker' in text check).
+since that's the real precondition -- schwab_client short-circuits before ever
+reaching fake_broker for these specific dry_run scenarios, by design (that's
+the exact behavior being proven). daemon_exception_survival is the only
+scenario in this file with no broker interaction at all and doesn't take the
+fake_broker fixture; the other 4 test functions do take it as a real pytest
+fixture argument (see scripts/coverage_registry.py's _uses_fake_broker_fixture,
+which requires actual fixture injection, not just the string "fake_broker"
+appearing in this file -- fixed 2026-08-01 after 2 test files in this same
+commit were found gaming the older, weaker text-scan check).
 """
 import sys
 import tempfile
@@ -220,6 +226,14 @@ def test_dry_run_buy_synthesis_skip_duplicate_position(env, fake_broker, monkeyp
     # Verify pending buy was cleared (same as success path)
     pending = signals_db.get_pending_buys()
     assert all(p['ticker'] != TICKER for p in pending), "pending buy should be cleared even on duplicate"
+
+    # Verify no duplicate entry_fill event was logged for this skip (docstring
+    # claim previously had no matching assertion -- fixed 2026-08-01)
+    events = signals_db.get_coverage_events(scenario_key='entry_fill', mode='dry_run')
+    ticker_events = [e for e in events if e['ticker'] == TICKER]
+    assert len(ticker_events) == 0, (
+        f"expected no entry_fill event for the skipped duplicate, got: {ticker_events}"
+    )
 
 
 # =============================================================================

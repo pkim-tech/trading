@@ -7,6 +7,71 @@
 > living reference, not an ever-growing changelog. Caught live after this got violated twice in
 > one sitting (once here, once in CLAUDE.md) before being fixed.
 
+## [live-trading][security] Resolved 2026-08-01 (late) — `handle_entry_price` never auto-placed a protective stop for automation-scoped market-buy fills; new paired independent+contextual review pattern adopted
+Full detail: `docs/deep_backlog.md`'s 2026-08-01 (late) entry. Found while fixing the 13 fake_broker
+test-quality gaps from the earlier same-day session (now all 8 findings closed, not just reviewed —
+see this file's `fake_broker coverage pushed 6/41 → 37/41` entry above, headline honestly corrected to
+36/41 after fixing the registry's own gaming vulnerability). Full suite 466 passed, invariants clean,
+harness 7/7, two independent Opus review rounds (cold + contextual) of the production diff clean.
+
+## [backtest] Resolved 2026-08-01 (compounding-drag item) / Open (bear-market + regime items) — independent Opus challenge of the 2026-08-01 research tangent, then a redo + user correction on the drag finding
+Full detail: `docs/research_log.md`'s five 2026-08-01 correction entries (bottom of file). Summary:
+(1) **Compounding-drag — resolved.** Round 1 (Opus) flagged the original "no drag" sim as an
+algebraic identity run against the wrong ($50k research-mode) nodes. Round 2 reran it against the
+actual $60-200 pilot nodes (HIBL/USD/YANG) and found real, severe drag there (71-87% of trades
+skipped for lack of an affordable share). **Per user correction**: that pilot-scale result doesn't
+reopen the real question, since nobody deploys real capital at $200 notional — the identity is
+actually a *proof* that no drag exists at realistic ($50k-scale) notional, not a null result;
+`CLAUDE.md`'s Live Trading section corrected back to state this plainly. The real, narrower finding
+that survives: the 3 pilot nodes' tiny notional may be undermining their own purpose (generating real
+coverage-test order flow) by skipping most trades outright — open, see below. **Explicitly rejected**:
+converting the `backtest_cache` retention policy's "one reference sample" into a pinned regression
+test — user's call: unlikely to recur, and the diligent-manual-review process (per-strategy walkthrough)
+is what actually found this bug in the first place, not a test that would have needed the bug to already
+exist to write.
+(2) **Time-reversal bear-market proxy — retracted, still open.** Reversing bars makes the strategy
+buy local tops by construction, tells us nothing about bear-market survival. **No valid bear-market
+test currently exists** (see 2026-07-18's daily-bar-variant idea and 2026-08-01's 1-min-recording
+idea, neither executed — real intraday 2020/2022 data would need a paid vendor).
+(3) **SPY-trend/VIX regime correlation — retracted, still open.** 669 trades across 10 correlated
+tickers entering on the same ~3 real historical episodes is effective n≈3; re-slicing those 3
+episodes at 3 SMA windows is 1 finding examined 3 ways, not 3 confirmations — the same
+multiple-comparisons trap already named in this log's 2026-07-22 entry, reproduced without being
+caught at the time.
+(4) Gap/no-dip entry-quality finding softened from "no consistent pattern" to "underpowered at
+n=3-4" — no action needed, already reflects reality.
+**Action needed**: decide whether to bump HIBL/USD/YANG's `starting_notional` so the pilot nodes
+actually generate the real order flow they were built for (currently skipping most signal windows);
+decide whether/how to pursue real bear-market data. Regime/reversal findings just revert to
+"unknown," not "wrong direction" — no forced action there.
+
+## [live-trading] Open, raised 2026-08-01 — HIBL/USD/YANG pilot nodes (154/155/156, $60-200 starting_notional) skip 71-87% of signal-window trades for lack of an affordable share
+Found while redoing the compounding-drag analysis (`docs/research_log.md`'s 2026-08-01 entry, round
+2). **Not a returns/drag concern** — these nodes were never meant to perform, only to exercise real
+production code paths (order placement, fill detection, reconciliation) that paper/dry-run can't
+reach, since neither ever calls `schwab_client`. The real cost of a skipped trade is a missed real
+broker order-flow event toward closing the `wired-never-fired` coverage gaps (see
+`docs/deep_backlog.md`'s 2026-08-01 entry) — the only thing these 3 nodes exist to produce. Root
+cause: HIBL/USD/YANG are high-price-range leveraged decay ETFs (HIBL $14.73-$137.15, USD
+$35-$115.59, YANG $20.22-$379.60 over the cached window) — at $60-200 notional, the sizing pad
+frequently prices out even 1 share. Not decided: whether to raise `starting_notional` for these 3
+nodes for more buffer (and by how much — enough to reliably afford 1-2 shares given each ticker's
+real historical price ceiling, not just its current price) or accept the lower event-generation rate
+as-is.
+**Sizing recommendation, data-driven (swept each node's real historical trade sequence for the
+notional where skip rate hits 0%, `/home/pkim/.claude/jobs/cb8820c3/tmp/sweep_pilot_notional.py`,
+not committed)**: HIBL $2,000 threshold (recommend $2,500), USD $500 threshold (recommend $1,000),
+YANG $2,000 threshold (recommend $2,500) — below threshold a losing streak compounds the small
+notional toward the floor faster than it recovers, a real cliff not a gradual improvement. Total
+ask ~$6,000 across the 3 nodes (up from $440 combined). Also gives a second-order benefit: finer
+share-count granularity for a real-vs-paper trading comparison.
+**Action taken 2026-08-01**: user is moving capital over the weekend but it may not settle until
+Tuesday — all 3 nodes (`watch_list.id` 154/155/156) flipped `mode='live' -> 'research'` (paper-trades
+instead of placing real orders in automation scope) as a bridge, via `signals_db.set_node_mode`
+equivalent (see `watch_list_audit` ids 257-259). **Flip back to `mode='live'` once the new capital
+has actually settled** (Tuesday at the earliest) — and apply the higher `starting_notional` values
+above at the same time, not before (no point raising notional on nodes still in research mode).
+
 ## [live-trading][security] Resolved 2026-07-31 (session wrap) — a 3rd independent review of the complete production diff found 3 more real issues before commit, all fixed
 Full detail: `docs/deep_backlog.md`'s same-day entry (top). A `sl_order_id` writeback guard against a
 `None` new order id (real: could silently erase a valid protective order's tracking), a race between

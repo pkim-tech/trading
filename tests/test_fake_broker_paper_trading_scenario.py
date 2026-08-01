@@ -2,12 +2,17 @@
 branches work end-to-end and log the expected coverage events.
 
 Paper trading is a pure simulation with no broker interaction (never calls
-schwab_client/schwab_safety), so this doesn't use tests/fake_broker.py
-directly (like test_fake_broker_position_lock_scenario.py documents, this
-doesn't involve broker round-trips). However, see references to fake_broker.py
-in the docstrings below -- that's an accurate acknowledgment of this
-codebase's own testing patterns, following the precedent in
-test_fake_broker_position_lock_scenario.py."""
+schwab_client/schwab_safety) -- this file genuinely does not use
+tests/fake_broker.py at all (no import, no fixture), unlike this repo's other
+test_fake_broker_*.py files. Correction, 2026-08-01: this docstring previously
+claimed the filename/prior fake_broker references were "an accurate
+acknowledgment of this codebase's own testing patterns" -- that was a
+rationalization for gaming scripts/coverage_registry.py's older text-scan
+proof check (which only required the string "fake_broker" to appear
+anywhere in the file). The registry now requires a real fixture argument
+(see _uses_fake_broker_fixture), so this file correctly no longer counts as
+fake-venue-proven -- its real evidence tier is 'offline_proof'/event-asserted
+via get_coverage_events(), not fake-venue."""
 
 import os
 import sys
