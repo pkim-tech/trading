@@ -97,7 +97,7 @@ from signals_notify import (
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report, send_coverage_report, build_phased_monitors_report,
     update_dry_run_buys, update_real_pending_buys_running_low, check_dry_run_sim_sells,
-    check_entry_abandon,
+    check_entry_abandon, build_eod_scenario_review,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
@@ -607,6 +607,12 @@ def run_loop(tickers: set = None):
                 print("[invariants] EOD (startup): all invariants hold.")
         _guarded("invariants[EOD:startup]", _startup_eod_invariants)
 
+        def _startup_eod_scenario_review():
+            cc, cts = build_eod_scenario_review(_eod_today)
+            print(f"  [slack] startup EOD scenario review ({_eod_today}): channel={cc} ts={cts}"
+                  f"{' (no confirmed post -- check for a prior [slack error] line)' if not cc else ''}")
+        _guarded("eod_scenario_review[startup]", _startup_eod_scenario_review)
+
     # buffering=1 (line-buffered) -- without it this file object block-buffers
     # since it's not a tty, so console output (including any Slack post error)
     # can sit invisible on disk for a long time; found 2026-07-22 debugging a
@@ -821,6 +827,16 @@ def run_loop(tickers: set = None):
                     else:
                         print("[invariants] EOD: all invariants hold.")
                 _guarded("invariants[EOD]", _check_invariants_eod)
+
+                # 2026-08-01: the nightly review/plan cycle -- review today's
+                # activity across live/canary/paper with explanations, then
+                # reset (build tomorrow's daily_plan) -- codified as real code
+                # after 5 prior sessions of this not sticking as a manual habit.
+                def _eod_scenario_review():
+                    cc, cts = build_eod_scenario_review(today)
+                    print(f"  [slack] EOD scenario review ({today}): channel={cc} ts={cts}"
+                          f"{' (no confirmed post -- check for a prior [slack error] line)' if not cc else ''}")
+                _guarded("eod_scenario_review", _eod_scenario_review)
 
             watchlist = get_watchlist()
             if tickers:

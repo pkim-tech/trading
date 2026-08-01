@@ -572,6 +572,35 @@ def ensure_tables():
             c.execute("UPDATE scenario_expectations SET updated_at = created_at WHERE updated_at IS NULL")
             c.commit()
 
+        # daily_plan: the EOD scenario review's "what do we expect to happen
+        # tomorrow" snapshot, built fresh each EOD (2026-08-01) so the next
+        # day's review has something concrete to diff real activity against,
+        # across all three tiers (canary/live/paper) -- not just canary, which
+        # scenario_expectations already covers on its own via a fixed, static
+        # definition. category='canary' rows are a same-day copy of the
+        # relevant scenario_expectations row (kept here too, not just
+        # referenced by id, so a plan is a frozen point-in-time snapshot even
+        # if scenario_expectations changes later); category='live'/'paper'
+        # rows are derived from whatever position is open at plan-build time
+        # (its real fixed_sl/arm_sell_pct/trail_sell_pct/max_hold_hours), so
+        # they're only as good as "what's open right now" -- a position that
+        # opens fresh tomorrow has no plan row for tomorrow, by construction.
+        # No UNIQUE constraint -- same reasoning as scenario_expectations
+        # (nullable ticker/node_id), dedup is the caller's job (clear_daily_plan
+        # before rebuilding, not an upsert).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_plan (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_date         TEXT NOT NULL,
+                category          TEXT NOT NULL,
+                ticker            TEXT,
+                node_id           INTEGER REFERENCES watch_list(id),
+                expected_outcome  TEXT NOT NULL,
+                created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        c.commit()
+
         # staged_test_config: the "what should this staged live test's config be"
         # mapping, structured instead of re-explained in conversation every time
         # (found needed live 2026-07-29 -- SH/RETL/GDXU's staged-test setup got
@@ -1278,6 +1307,34 @@ def clear_staged_test_config(wl_id):
         c.commit()
 
 
+def add_daily_plan_row(plan_date, category, expected_outcome, ticker=None, node_id=None):
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO daily_plan (plan_date, category, ticker, node_id, expected_outcome)
+            VALUES (?, ?, ?, ?, ?)
+        """, (plan_date, category, ticker, node_id, expected_outcome))
+        c.commit()
+
+
+def get_daily_plan(plan_date, category=None):
+    q = "SELECT * FROM daily_plan WHERE plan_date = ?"
+    params = [plan_date]
+    if category:
+        q += " AND category = ?"
+        params.append(category)
+    q += " ORDER BY category, ticker"
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
+def clear_daily_plan(plan_date):
+    """Called before rebuilding a day's plan so a re-run (e.g. daemon restart
+    after the EOD slot) replaces rather than duplicates that day's rows."""
+    with _conn() as c:
+        c.execute("DELETE FROM daily_plan WHERE plan_date = ?", (plan_date,))
+        c.commit()
+
+
 def get_scenario_expectations(expected_frequency=None, active_only=True):
     """expected_frequency accepts a single value or a list/tuple of values."""
     q = "SELECT * FROM scenario_expectations"
@@ -1532,6 +1589,28 @@ def get_pending_buys_for_ticker_on_date(ticker, check_date, strategy=None, versi
             continue
         out.append(r)
     return out
+
+
+def get_trades_closed_on_date(check_date, paper=False):
+    """All trade_log/paper_trade_log rows that exited on check_date (YYYY-MM-DD),
+    across every ticker -- the all-tickers counterpart to
+    get_closed_trades_for_ticker_on_date, used by the EOD scenario review to
+    summarize the whole day's live/paper activity, not one ticker at a time."""
+    _, trades_table = _pos_tables(paper)
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM {trades_table} WHERE date(exit_time) = ? ORDER BY exit_time", (check_date,)
+        ).fetchall()]
+
+
+def get_trades_opened_on_date(check_date, paper=False):
+    """Same shape as get_trades_closed_on_date but keyed off entry_time --
+    used to catch same-day entries that are still open (no exit yet)."""
+    _, trades_table = _pos_tables(paper)
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM {trades_table} WHERE date(entry_time) = ? ORDER BY entry_time", (check_date,)
+        ).fetchall()]
 
 
 def log_slack_message(mode, text, error=None):
@@ -1908,6 +1987,14 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
     exclusive with paper (a dry_run node is always mode='live', never research)."""
     positions_table, _ = _pos_tables(paper)
     with _position_lock, _conn() as c:
+        # position_lock instrumentation (2026-08-01): proves the lock is
+        # actually acquired around the check-then-insert below, not just that
+        # the surrounding code runs -- a concurrency test can seed 2 threads
+        # racing this same node and assert only one ever logs "opened" while
+        # the other logs "skipped_duplicate", never both racing past the
+        # existing-row check unlocked.
+        log_coverage_event("position_lock", 'paper' if paper else ('dry_run' if is_dry_run_sim else 'live'),
+                            ticker=node['ticker'], node_id=node.get('id'), result="acquired", detail="open_position")
         # OR (wl_id IS NULL AND ticker=? AND window=?): a legacy position
         # predating the wl_id migration (or one the backfill couldn't
         # uniquely resolve, e.g. duplicated across watchlists) has wl_id=NULL
@@ -1922,6 +2009,9 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
         ).fetchone()
         if existing:
             print(f"  [warn] {'paper ' if paper else ''}position already open for {node['ticker']} wl_id={node['id']} — skipping duplicate")
+            log_coverage_event("position_lock", 'paper' if paper else ('dry_run' if is_dry_run_sim else 'live'),
+                                ticker=node['ticker'], node_id=node.get('id'), result="skipped_duplicate",
+                                detail="open_position")
             return False
         sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
         entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
@@ -2046,10 +2136,27 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
     positions_table, _ = _pos_tables(paper)
     with _position_lock, _conn() as c:
         row = c.execute(
-            f"SELECT trade_log_id, entry_price FROM {positions_table} WHERE id = ?", (position_id,)
+            f"SELECT trade_log_id, entry_price, ticker, wl_id, is_dry_run_sim FROM {positions_table} WHERE id = ?",
+            (position_id,)
         ).fetchone()
+        # position_lock instrumentation (2026-08-01), mirrors open_position()'s
+        # -- proves the lock genuinely serializes a concurrent close attempt
+        # against the same row, not just that the surrounding code runs.
+        # Mode must reflect is_dry_run_sim like open_position() already does
+        # (2026-08-01 Opus review finding) -- without it, a synthetic
+        # dry-run-sim close (e.g. the FAZ canary) logs mode='live', letting a
+        # purely synthetic event count toward the real-world readiness number.
         if row is None:
+            # No is_dry_run_sim to key off for an already-gone row -- 'live'
+            # here is a display default only, not a claim about mode, and
+            # this branch is excluded from bad_results-based readiness
+            # scoring at the registry level regardless (see coverage_registry.py).
+            log_coverage_event("position_lock", 'live', position_id=position_id, result="already_closed",
+                                detail="close_position")
             return False
+        _mode = 'paper' if paper else ('dry_run' if row[4] else 'live')
+        log_coverage_event("position_lock", _mode, ticker=row[2], node_id=row[3], position_id=position_id,
+                            result="closed", detail="close_position")
         if exit_price is not None and row[0]:
             log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper)
         c.execute(f"DELETE FROM {positions_table} WHERE id = ?", (position_id,))

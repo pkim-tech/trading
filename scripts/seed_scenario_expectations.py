@@ -127,8 +127,23 @@ SCENARIOS = [
         check_params='{"expect_pending_carryover": true}',
     ),
     dict(
-        scenario_key='canary_market_buy_exit', ticker='JNUG', strategy_type='TrailingExitZScoreBreakout',
-        expected_outcome="E mirrored: TrailingExit immediate market-buy path, same design as VOO.",
+        # 2026-08-01: replaces the old 'canary_market_buy_exit'/JNUG row (JNUG
+        # was briefly, mistakenly treated as VOO's E-scenario mirror
+        # 2026-07-29 through 2026-08-01) -- restored to its real original
+        # design, a same-underlying (junior gold miners) bull/bear pair with
+        # JDST. No correlation-verification logic exists yet, so this is
+        # still just a same-day-trade-happened check like every other
+        # canary, not an actual bull/bear-symmetry check -- see
+        # docs/backlog_cache.md's 2026-08-01 entry for that idea.
+        scenario_key='canary_bull_bear_pair', ticker='JNUG', strategy_type='TrailingExitZScoreBreakout',
+        expected_outcome="G: same-underlying (junior gold miners) bull/bear pair, bull side. Same "
+                          "design as JDST.",
+        expected_frequency='daily', check_method='trade_lifecycle',
+        check_params='{"expect_exit_reason": ["SL", "TIME", "TRAIL"]}',
+    ),
+    dict(
+        scenario_key='canary_bull_bear_pair', ticker='JDST', strategy_type='TrailingBothZScoreBreakout',
+        expected_outcome="G mirrored: same-underlying bull/bear pair, bear side. Same design as JNUG.",
         expected_frequency='daily', check_method='trade_lifecycle',
         check_params='{"expect_exit_reason": ["SL", "TIME", "TRAIL"]}',
     ),

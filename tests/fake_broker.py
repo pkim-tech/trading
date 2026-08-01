@@ -144,9 +144,38 @@ class FakeBroker:
             {'accountNumber': h, 'hashValue': h} for h in self.account_hashes.values()
         ])
 
-    def get_account(self, account_hash):
-        cash = self.cash_balances.get(self._account_for_hash(account_hash), 1_000_000.0)
-        return FakeResponse({'securitiesAccount': {'currentBalances': {'availableFunds': cash}}})
+    def get_account(self, account_hash, fields=None):
+        account = self._account_for_hash(account_hash)
+        cash = self.cash_balances.get(account, 1_000_000.0)
+        response = {'securitiesAccount': {'currentBalances': {'availableFunds': cash}}}
+
+        # If fields parameter is provided and includes POSITIONS, add positions
+        if fields is not None:
+            # Import here to avoid circular dependency issues
+            try:
+                import schwab.client
+                if schwab.client.Client.Account.Fields.POSITIONS in fields:
+                    # Build positions list from filled BUY orders for this account
+                    positions = {}
+                    for order in self.orders.values():
+                        if order['account'] != account or order['status'] != 'FILLED':
+                            continue
+                        leg = order['orderLegCollection'][0]
+                        if leg['instruction'] != 'BUY':
+                            continue
+                        ticker = leg['instrument']['symbol']
+                        qty = leg['quantity']
+                        positions[ticker] = positions.get(ticker, 0) + qty
+
+                    response['securitiesAccount']['positions'] = [
+                        {'instrument': {'symbol': ticker}, 'longQuantity': qty}
+                        for ticker, qty in positions.items()
+                    ]
+            except (ImportError, AttributeError):
+                # If schwab isn't available or fields don't match, just return cash-only response
+                pass
+
+        return FakeResponse(response)
 
     def get_quote(self, ticker):
         q = self.quotes.get(ticker, {'lastPrice': 0.0, 'bidPrice': 0.0, 'askPrice': 0.0})

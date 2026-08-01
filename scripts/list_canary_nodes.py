@@ -8,12 +8,20 @@ counterpart added 2026-07-29 (FAZ/SPXU/TWM/QID/SDOW) -- so regardless of which
 direction the market moves on a given day, at least one side of each pair
 should get real signal activity. Confirmed for real 2026-07-30: IVV/QQQ/DIA/VOO
 all closed up and got no entry, while their true inverse pairs (SPXU/QID/SDOW)
-closed down and correctly triggered. JNUG's "pairs_with VOO" label was removed
-2026-07-31 -- JNUG (2x gold miners) has no real price relationship to VOO
-(S&P 500), so it isn't actually an inverse pair the way the others are; it only
-shares the E-scenario's strategy/mechanism (TrailingExit immediate market-buy),
-not a price correlation. This mapping is deliberate design intent, not derived
-from data, so it's a hand-maintained table here (like
+closed down and correctly triggered. VOO's E-scenario (TrailingExit immediate
+market-buy) has no symmetry partner -- unlike A-D, it never needed one; VOO
+alone tests the mechanism. JNUG/JDST are a separate, 7th "G" pairing
+(2026-08-01, restoring their original 2026-07-28 design after a brief and
+since-reverted 2026-07-29 detour where JNUG was mistakenly treated as VOO's
+E-scenario mirror): unlike every other pair here (unrelated-sector
+instruments that merely happen to be inverse *products*), JNUG/JDST are both
+2x leveraged ETFs on the *same underlying* (junior gold miners index) in
+opposite directions -- a genuine same-underlying bull/bear pair, not just a
+portfolio-skew inverse. No correlation-verification logic exists yet (see
+docs/backlog_cache.md's 2026-08-01 entry) -- today's fix only restored their
+config/labels, both are monitored the same simple way (a same-day trade
+happened) as every other canary for now. This mapping is deliberate design
+intent, not derived from data, so it's a hand-maintained table here (like
 seed_scenario_expectations.py's SCENARIOS) -- update it if the pairing ever
 changes.
 
@@ -33,8 +41,8 @@ import signals_db as db
 # each pair exercise the same mechanism regardless of market direction.
 PAIRS = {
     'IVV':  ('SPXU', 'A: full happy path (entry->bounce-fill->arm->trail-sell)'),
-    'VOO':  ('SPXU', 'E: TrailingExit immediate market-buy path (2nd proxy for A)'),
-    'SPXU': ('IVV/VOO', 'A mirrored: full happy path, inverse side'),
+    'VOO':  ('none', 'E: TrailingExit immediate market-buy path (no symmetry partner needed)'),
+    'SPXU': ('IVV', 'A mirrored: full happy path, inverse side'),
     'QQQ':  ('QID', 'B: early-SL path'),
     'QID':  ('QQQ', 'B mirrored: early-SL path, inverse side'),
     'IWM':  ('TWM', 'C: pinned/open_check entry mechanism'),
@@ -43,13 +51,15 @@ PAIRS = {
     'SDOW': ('DIA', 'D mirrored: overnight carry, inverse side'),
     'XLF':  ('FAZ', 'F: TIME-only exit (arm+SL both unreachable)'),
     'FAZ':  ('XLF', 'F mirrored: TIME-only exit, inverse side'),
-    'JNUG': ('none', 'E scenario: TrailingExit immediate market-buy path (2026-07-29 fix -- '
-                      'was the missing 6th A-F mirror, converted from generic TrailingBoth). '
-                      'Not a real inverse pair with VOO/anything -- JNUG (2x gold miners) has no '
-                      'price relationship to the index-tracking canaries; "pairs_with VOO" label '
-                      'removed 2026-07-31 after real data showed it moving independently.'),
-    'JDST': ('?', 'no longer paired -- JNUG became the E-scenario instead of JDST\'s original '
-                  'gold-miner-inverse role; purpose still open'),
+    'JNUG': ('JDST', 'G: same-underlying (junior gold miners) 2x bull/bear pair -- distinct from '
+                      'the A-F pairs, which are unrelated-sector instruments that merely happen to '
+                      'be inverse products; JNUG/JDST are literal opposite-direction leverage on the '
+                      'same index. Restored 2026-08-01 to this original 2026-07-28 design after a '
+                      'brief, since-reverted detour treating it as VOO\'s E-scenario mirror. No '
+                      'correlation-check logic yet -- monitored the same simple way as every other '
+                      'canary for now (see docs/backlog_cache.md).'),
+    'JDST': ('JNUG', 'G mirrored: same-underlying bull/bear pair, bear side. Purpose restored '
+                      '2026-08-01 -- was orphaned since 2026-07-29 when JNUG got reassigned.'),
 }
 
 with db._conn() as c:

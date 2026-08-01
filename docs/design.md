@@ -615,3 +615,23 @@ Separately, same session: 6 canary proof-of-life nodes (`IVV`/`QQQ`/`IWM`/`DIA`/
   5. LOW-MEDIUM — the same helper also closes a latent crash risk: a non-numeric `expected_config` value would have raised `ValueError` and taken down the rest of `run_all()` (no per-check isolation) — now caught and reported as its own mismatch instead.
   6. LOW — tolerance was `> 0.01` against real staged values as small as `0.1` (`arm_sell_pct`/`trail_sell_pct`/`fixed_sl` on several canary nodes), which could hide a 10% parameter drift; tightened to `1e-9` (matching the sibling check) as part of the same helper.
   Accepted as a self-healing non-issue, not fixed: an exit recorded after 16:05 now mints a same-day ticket that the old 7am-next-day timing would have caught cleanly — heals itself via `clear_deviation_if_resolved` on the next real check, which (per finding 1's fix) now actually happens reliably.
+
+**Addendum (2026-08-01) — the EOD slot now also runs a full nightly review/plan cycle, and `daily_plan` is a new table.**
+`signals_notify.build_eod_scenario_review(check_date)` runs alongside the existing outcome-check
+piece in the same 16:05 slot (both the live-loop trigger and the startup catch-up path, same
+`eod_slack_alerted` pre-seed guard as the pieces above so a restart after 16:05 doesn't double-post).
+Posts one Slack message: a readiness headline (`verified/total (%)` pulled live from
+`scripts/coverage_registry.py`'s per-branch status), the canary check (reuses `coverage_check.py`),
+real live + paper activity today (closed trades and still-open positions, diffed against the prior
+day's `daily_plan` row when one exists), then `build_tomorrow_plan(check_date)`'s output appended
+inline. `daily_plan` (new table, `signals_db.py`) holds one row per `(plan_date, category, ticker)`
+— `category='canary'` rows are a same-day copy of the relevant `scenario_expectations` row (frozen
+snapshot, not a live reference, so a plan stays accurate even if `scenario_expectations` changes
+later); `category='live'`/`'paper'` rows are derived from whatever position is open at plan-build
+time (`_position_trigger_summary`: real `fixed_sl`/`arm_sell_pct`/`trail_sell_pct`/`max_hold_hours`
+on the position, not the node — a position carries its own entry-time snapshot of these, not a live
+node reference). Deliberately doesn't predict new entries — a position that hasn't opened yet gets no
+plan row, since a mean-reversion signal isn't predictable a day ahead. Built directly in response to
+the user's actual question ("how close are we to trading material money" / "what critical code paths
+haven't been tested") — the readiness headline is the direct answer, recomputed fresh every EOD run
+so it's never stale by more than one trading day.

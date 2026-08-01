@@ -210,14 +210,20 @@ REGISTRY = [
     dict(id='position_lock',
          scenario="Poll loop and Slack handler can't double-open/double-close the same position",
          code_path="signals_db._position_lock around open_position/close_position",
-         offline_coverage="3 unit tests (test_db_roundtrip.py)",
-         check_mechanism='none', scenario_key=None,
-         notes="Deliberately left uninstrumented 2026-07-28 -- proving lock contention passively "
-               "requires switching open_position/close_position from `with _position_lock` to an "
-               "explicit non-blocking-then-blocking acquire, a real change to live-trading-critical "
-               "dedup locking code, not a side-channel log addition like the other 12 rows. Race "
-               "window is narrow and never observed causing a real duplicate; revisit deliberately, "
-               "not as a drive-by."),
+         offline_coverage="3 unit tests (test_db_roundtrip.py); tests/test_fake_broker_position_lock_scenario.py "
+                           "(2026-08-01, concurrency test)",
+         check_mechanism='coverage_events', scenario_key='position_lock',
+         bad_results=['already_closed'],
+         notes="Instrumented 2026-08-01 -- log_coverage_event calls added inside the already-locked "
+               "block in open_position (acquired/skipped_duplicate) and close_position "
+               "(closed/already_closed), observational only, doesn't change the lock's own acquire "
+               "semantics (the 2026-07-28 note's stated reason for deferring this). This proves the "
+               "locked block executes on every call -- it does NOT by itself prove real concurrent "
+               "contention was exercised (a single uncontended open/close looks identical in these "
+               "events to one that raced); the dedicated concurrency test above is what actually "
+               "proves serialization. 'already_closed' is excluded via bad_results since it's a "
+               "benign no-op (a routine double-call finding nothing to close) with zero lock "
+               "contention, not evidence the lock protected anything (Opus review, 2026-08-01)."),
     dict(id='dup_order_retry_after_failure',
          scenario="Duplicate-order retry after a real rejected/failed order isn't wrongly blocked",
          code_path="schwab_safety._broker_confirms_order",

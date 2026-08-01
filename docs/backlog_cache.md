@@ -1701,3 +1701,30 @@ longer-history version of the same `TrailingBothZScoreBreakout` node. Wouldn't d
 validate what's currently live; would need its own design/build/validation cycle.
 **Action needed**: not scoped, not started — logged as a real idea worth a future focused
 session, not urgent.
+
+## [live-trading] Open question, 2026-08-01 — is a production-path oversell/rejection test even constructible?
+Real Schwab rejection of a naked-sell/oversized-buy was confirmed live 2026-07-23 (bypass calls,
+see that entry above), and the production path's own handling of a real `OrderRejected` (falls back
+to manual, clean state, correct alert) is now confirmed via `tests/test_fake_broker_order_rejected_scenario.py`
+(2026-08-01, fake-broker-driven, not a live order). What's still untested: whether either of
+`live_sanity_check.py`'s two designed rejection scenarios (naked_sell, oversized_buy) would ever
+actually *reach* Schwab if routed through the real production wrappers (`schwab_client.place_equity_sell`/
+`place_equity_buy`) instead of the raw bypass -- both scenarios look like exactly what our own
+`schwab_safety.check_order` guards (oversell-position check, cash check) are built to block *before*
+ever reaching the broker, so a production-path version of these specific tests would likely just
+re-prove our own guards fire (already covered by fake-broker tests), not reach Schwab's real check at
+all. Reaching Schwab's real rejection *through* the production path needs a scenario our own guards
+wouldn't already catch -- narrow by design, no concrete one identified yet. Not urgent; revisit if a
+real candidate scenario comes to mind.
+
+## [live-trading] Idea, not built, 2026-08-01 — real correlation-verification logic for the new JNUG/JDST "G" canary pair
+JNUG/JDST (2x junior-gold-miner bull/bear) are the only canary pair that's a genuine same-underlying
+inverse relationship (every other A-F pair is an unrelated-sector instrument that merely happens to be
+an inverse product). Today's fix (docs/deep_backlog.md's 2026-08-01 entry) only restored their real
+config/labels/scenario_expectations row (`canary_bull_bear_pair`) -- monitored the same simple
+same-day-trade-happened way as every other canary. Not yet built: an actual check that JNUG and JDST's
+real z-scores/signals move in the expected opposite direction on the same day (a genuine correlation/
+sanity check on the signal computation itself, not just "did a mechanism fire"), which would need a new
+`check_method` in `scripts/coverage_check.py` (today's only mechanisms are `trade_lifecycle` and
+`coverage_event`) comparing both tickers' real trade_log/signal rows for the same day. Not urgent --
+a real future feature idea, not a bug.

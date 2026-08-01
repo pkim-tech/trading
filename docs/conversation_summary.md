@@ -5555,3 +5555,33 @@ bullet extended, not a new inline changelog block), `docs/live_test_coverage.md`
 
 Live daemon: restarted mid-session onto this code, confirmed clean (no tracebacks, Morning Report
 posted, invariants ran normally) — left running by the user before this wrap.
+
+---
+
+## 2026-08-01 — Nightly review/plan cycle built, 90% fake-venue test coverage, 3 real live-config bugs found and fixed
+
+Started as an evening review of live/canary/paper state; ended up building the recurring nightly cycle the user had wanted for 5 prior sessions, closing a real test-coverage gap, and fixing 3 real bugs in live canary config (one via an independent Opus review that caught 8 more issues in the same-session work before commit).
+
+**Nightly EOD review/plan cycle, built per explicit request** — `signals_notify.build_eod_scenario_review`/`build_tomorrow_plan`, wired into `active_signals.py`'s 16:05 ET EOD slot (both the live-loop trigger and the startup catch-up path, same restart-safety pre-seed pattern as the neighboring EOD calls). Posts one Slack message: a readiness headline (`verified/total (%)` from `scripts/coverage_registry.py`, computed live), the canary scenario check, real live+paper activity today (diffed against the prior day's plan), and tomorrow's plan (new `daily_plan` table — canary rows are a frozen copy of `scenario_expectations`; live/paper rows compute each open position's real SL/arm/trail/TIME triggers from its own config, not the node).
+
+**Fake-venue (`tests/fake_broker.py`-driven) test coverage: 6/41 → 37/41 tracked branches.** Built via a mix of direct work and 9 parallel Haiku background agents (each independently verified in the main tree afterward, not trusted as-reported — 2 needed real fixes: one agent's paper-trading test had a genuine `at_bar_close` seeding bug, one agent's file never made it out of its isolated worktree and had to be copied over manually). Remaining 3 branches are legitimate: 1 offline-only by design, 2 have real proof via other tests but use a check mechanism (`scenario_expectations`/`open_price_quality_log`) the registry's own proof-scanner structurally can't detect (regex-matches only `get_coverage_events()` calls) — a known blind spot in the detector, not a real gap.
+
+**Real bugs found and fixed:**
+1. `mirror_canary_pair_config.py` never mirrored `max_hold_hours` — 4 canary nodes (SPXU/QID/TWM/SDOW) silently ran with the wrong hold-time (2h instead of 48h) since 2026-07-29, explaining 2 of 6 "unexplained" canary deviations from 2026-07-31 once the entry-abandon timeout started reusing that field as its cancel threshold. Fixed for all 4 + the script patched.
+2. Same investigation, found while under Opus review: JNUG had been left out of the fix's `MIRROR` dict, still carrying the wrong value against VOO. Further investigation found JNUG's own `label` field revealed a deeper issue — it wasn't supposed to be VOO's mirror at all. Its original 2026-07-28 design was pairing with JDST as a genuine same-underlying (junior gold miners 2x) bull/bear pair, orphaned when JNUG got reassigned 2026-07-29. Restored: JNUG reverted out of the VOO/E-scenario mirroring, both nodes relabeled, a new `canary_bull_bear_pair` scenario_expectations entry added for daily monitoring. The more ambitious "verify they actually move in correlated-opposite directions" check is real future work, not built tonight — logged to backlog.
+3. CLAUDE.md had a stale claim that SELL-side automation was "not mode-gated, not yet fixed" — a dedicated test proved it actually was fixed in commit `f256fc4`, doc just never updated.
+
+**Independent Opus review (required by session-wrap protocol) found 8 CONFIRMED real bugs in tonight's own new code, all fixed before commit:**
+- `build_tomorrow_plan` was called with today's date instead of tomorrow's — the entire plan-vs-actual diff, the whole point of the cycle, was silently dead on arrival.
+- `close_position` logged dry-run-sim closes as `mode='live'`, and the `position_lock` registry row had no `bad_results` — together these meant the readiness number (the one used to decide when to trade material money) could flip green off a synthetic close or an uncontended no-op, not real concurrent proof.
+- The live/paper activity loop and plan-building call had no fault isolation — one bad `trade_log` row could silently kill the entire EOD Slack post, canary results included.
+- The Slack message (~7KB/69 lines against real data) had its unbounded per-branch detail list ahead of the actionable live/paper/plan content — exactly the shape that already caused a real Slack truncation incident (Morning Report, 2026-07-23). Capped and moved to the tail.
+- `prior_plan` was keyed by ticker alone, collapsing canary/live/paper plan rows for a shared ticker (FAZ is both).
+- Canary met/deviation counts didn't reconcile (informational misses counted in neither number).
+- An unplanned same-day close of a carried-in position rendered with no annotation at all — the most anomalous case looked identical to a routine one.
+
+Also built, separately: a fake-broker test proving a real Schwab `REJECTED` order (confirmed live 2026-07-23 for naked-sell/oversell, but only ever via a bypass test) is handled correctly through the actual production chain end-to-end — falls back to manual, no state corruption. Investigated a TOCTOU oversell-guard race (real but narrower than first framed — the approval step is already serialized via a real OS flock; the residual gap is market orders specifically, not resting trailing-stops); deprioritized given Schwab's own rejection is a confirmed real backstop and the code already handles a rejection correctly — logged to backlog rather than built.
+
+Full suite: 465 passed throughout (was 414 at session start). `signals_invariants.py` and `live_sim_harness.py` (7/7) both clean. Daemon still needs a restart to pick up tonight's changes — not restarted this session (user runs that themselves per standing convention).
+
+**Answer to "how close are we to trading material money," the actual question driving tonight's work:** two different numbers. Fake-venue test coverage (90%, would catch a regression) jumped tonight. Real-world proof (44% `verified-live`, has this code actually fired for real) did not move and can't be moved by more engineering — it only accumulates from the daemon running long enough for each of 14 `wired-never-fired` conditions to occur naturally, or a deliberately staged live test. That gap, plus 5 items from the 2026-07-31 audit and 12 deferred findings from the same session, are what's actually still between here and scaling up.

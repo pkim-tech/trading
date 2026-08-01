@@ -1,5 +1,55 @@
 # Backlog
 
+## [live-trading] Resolved 2026-08-01 — canary `max_hold_hours` mirror gap (4 nodes silently misconfigured since 2026-07-29), plus the nightly EOD review/plan cycle and a fake-venue test-coverage push
+
+**Context**: user asked for an evening review of live/canary/paper activity and a next-day plan,
+after 5 prior sessions of this not sticking as a manual habit. Built as real code instead:
+`signals_notify.build_eod_scenario_review`/`build_tomorrow_plan`, wired into `active_signals.py`'s
+16:05 ET EOD slot (both the live-loop trigger and the startup catch-up path). Posts one Slack message
+covering (1) a readiness headline (`verified/total (%)` from `scripts/coverage_registry.py`'s
+live-computed per-branch status), (2) the canary scenario check, (3) real live + paper activity
+today, (4) tomorrow's plan (new `daily_plan` table: canary rows copy `scenario_expectations`, live/
+paper rows compute each open position's real SL/arm/trail/TIME triggers from its own config).
+
+**Real bug found and fixed while investigating why 6 canary scenarios showed unexplained deviations
+on 2026-07-31**: `scripts/mirror_canary_pair_config.py` (the script that gave SPXU/QID/TWM/SDOW/FAZ
+the same hair-trigger design as their A-F counterparts, 2026-07-29) never included `max_hold_hours`
+in its mirrored-fields list. SPXU/QID/TWM/SDOW silently carried the generic-config default (2h,
+F-scenario's own value) instead of their real design value (48h) for 3 days -- harmless until the
+2026-07-31 entry-abandon timeout started reusing `max_hold_hours` as its cancel threshold, at which
+point it made SDOW's `canary_overnight_carry` scenario structurally unable to ever pass (a 2h
+"resting order" cancel fires long before "overnight" can happen) and forced SPXU's
+`canary_full_lifecycle` into a TIME exit instead of its designed TRAIL. Fixed: all 4 nodes corrected
+to 48h; the mirror script patched to include `max_hold_hours` so this can't regress. All 6 of that
+day's unexplained `coverage_deviations` rows explained (3 broad-market-uptrend, this bug for the
+other 3, including DIA's own miss which was purely the former).
+
+**Fake-venue (`tests/fake_broker.py`-driven) test-coverage push, same session**: went from 6/41 to
+37/41 tracked branches (`scripts/coverage_registry.py`) having a real fake-broker regression test,
+not just production-observed behavior. The remaining 3 are legitimate: `kernel_fill_parity` is
+offline-only by design; `market_buy_placement`/`open_price_quality` both have real proof via other
+tests (`tests/test_fake_broker_pinned_entry_scenario.py`) but use a different check mechanism
+(`scenario_expectations`/`open_price_quality_log`, not `coverage_events`) that the registry's own
+proof-scanner (`_EVENT_ASSERTED_RE`, regex-matches only `get_coverage_events(scenario_key=...)`)
+structurally can't detect -- a known blind spot in the detector itself, not a real gap. Also closed:
+`position_lock` (previously zero instrumentation at all, `check_mechanism='none'` -- deliberately
+deferred 2026-07-28 as "not a side-channel log addition" -- added observational
+`log_coverage_event` calls inside the already-locked block in `open_position`/`close_position`,
+doesn't touch the lock's own acquire semantics; new concurrency test, 20 threads racing
+open/close, proves the lock genuinely serializes) and a new end-to-end proof that a real Schwab
+`REJECTED` order (confirmed live 2026-07-23 for naked-sell/oversell, but only via a
+`schwab_client`-bypass test until now) is handled correctly through the actual production chain
+(`_attempt_automated_sell` -> `schwab_client.place_trailing_sell` -> `OrderRejected` -> clean
+fallback, no state corruption) -- `tests/test_fake_broker_order_rejected_scenario.py`.
+
+**Readiness, for the record**: fake-venue test coverage (90%, 37/41) answers "would a regression get
+caught," not "how close to trading material money" -- the separate, unchanged-by-this-session number
+is real-world proof (44%, 18/41 `verified-live`), which only moves via the daemon actually running
+long enough for each of the 14 `wired-never-fired` conditions to occur naturally, or a deliberately
+staged live test. See `docs/backlog_cache.md`'s 2026-08-01 entries for what's still open (a TOCTOU
+oversell-guard race, deprioritized given Schwab's own rejection is a confirmed real backstop; a
+still-unconstructed production-path rejection test; the accumulation plan for the 14 branches).
+
 ## [live-trading][security] Resolved 2026-07-31 (session wrap, final review) — a 3rd independent review of the complete production diff found 3 more real issues, all fixed
 
 **Context**: required by `docs/automation_principles.md` #12/CLAUDE.md's `session wrap` procedure --

@@ -2799,6 +2799,221 @@ def send_coverage_report(check_date=None):
     return _post_message("\n".join(lines))
 
 
+def _next_trading_day(after_date):
+    """Small lookahead (10 calendar days is comfortably more than the longest
+    real holiday gap) rather than importing active_signals'/schwab_safety's
+    own _NYSE_CAL module-level instances, which would be a circular import
+    (active_signals imports this module)."""
+    import pandas_market_calendars as mcal
+    from datetime import timedelta
+    cal = mcal.get_calendar('NYSE')
+    start = datetime.strptime(after_date, '%Y-%m-%d') + timedelta(days=1)
+    sched = cal.schedule(start_date=start.strftime('%Y-%m-%d'),
+                          end_date=(start + timedelta(days=10)).strftime('%Y-%m-%d'))
+    return sched.index[0].strftime('%Y-%m-%d')
+
+
+def _position_trigger_summary(pos):
+    """Plain-text description of what would close this position next, from
+    its own real config columns -- not a prediction of *whether* it fires,
+    just what to watch for. Assumes a long entry (every live strategy here
+    buys the dip), matching strategies.py's own SL/arm/trail direction."""
+    entry = pos['entry_price']
+    parts = [f"entry ${entry:.2f} ({pos['entry_time']})"]
+    if pos.get('fixed_sl'):
+        sl_price = entry * (1 - pos['fixed_sl'] / 100)
+        parts.append(f"SL @ ${sl_price:.2f} ({pos['fixed_sl']}%)")
+    trail_state = pos.get('trail_state') or {}
+    if trail_state.get('trailing'):
+        peak = trail_state.get('peak')
+        trail_pct = pos.get('trail_sell_pct')
+        if peak and trail_pct:
+            trail_price = peak * (1 - trail_pct / 100)
+            parts.append(f"ARMED, trailing {trail_pct}% off peak ${peak:.2f} -> stop ${trail_price:.2f}")
+        else:
+            parts.append("ARMED, trailing")
+    elif pos.get('arm_sell_pct'):
+        arm_price = entry * (1 + pos['arm_sell_pct'] / 100)
+        parts.append(f"arms @ ${arm_price:.2f} ({pos['arm_sell_pct']}%) then trails {pos.get('trail_sell_pct') or '?'}%")
+    if pos.get('max_hold_hours'):
+        parts.append(f"forced TIME exit after {pos['max_hold_hours']}h from entry")
+    return " | ".join(parts)
+
+
+def build_tomorrow_plan(next_date=None):
+    """Writes signals_db.daily_plan rows for the next trading day and returns
+    the formatted text -- the 'reset the whole thing for the next day' half
+    of the nightly cycle (2026-08-01, user's explicit design). Three
+    categories, matching how the user actually reviews the account:
+      - canary: a same-day copy of the static scenario_expectations rows
+        (deterministic by design, doesn't depend on today's activity).
+      - live: real (is_dry_run_sim=0) open positions carrying into tomorrow,
+        with their real SL/arm/trail/TIME triggers.
+      - paper: paper_positions carrying into tomorrow, same trigger shape.
+    A position that hasn't opened yet has no plan row -- this only plans
+    around what's already on the books, not predicted new entries (mean
+    reversion signals aren't predictable a day ahead)."""
+    check_date = datetime.now().strftime('%Y-%m-%d')
+    next_date = next_date or _next_trading_day(check_date)
+    db.clear_daily_plan(next_date)
+
+    lines = [f"*Tomorrow's Plan — {next_date}*"]
+
+    canary_scenarios = [s for s in db.get_scenario_expectations(active_only=True)
+                         if (s['scenario_key'] or '').startswith('canary_')]
+    lines.append(f"\n_Canary_ ({len(canary_scenarios)} scenarios):")
+    for s in canary_scenarios:
+        db.add_daily_plan_row(next_date, 'canary', s['expected_outcome'],
+                               ticker=s['ticker'], node_id=s.get('node_id'))
+        lines.append(f"  • {s['ticker']}: {s['expected_outcome']}")
+
+    for category, paper in (('live', False), ('paper', True)):
+        positions = [p for p in db.get_open_positions(paper=paper) if not p.get('is_dry_run_sim')]
+        lines.append(f"\n_{category.capitalize()}_ ({len(positions)} open position(s) carrying in):")
+        if not positions:
+            lines.append("  (none)")
+        for p in positions:
+            summary = _position_trigger_summary(p)
+            db.add_daily_plan_row(next_date, category, summary,
+                                   ticker=p['ticker'], node_id=p.get('wl_id'))
+            lines.append(f"  • {p['ticker']}: {summary}")
+
+    return "\n".join(lines)
+
+
+def build_eod_scenario_review(check_date=None):
+    """The 'review what happened today, explain it, across live/canary/paper'
+    half of the nightly cycle (2026-08-01, user's explicit design, after 5
+    prior sessions of this not sticking as a repeatable habit -- codified
+    here as real code + a CLAUDE.md session command, not just conversation).
+
+    Canary reuses coverage_check.py's existing scenario_expectations-based
+    check (already the right shape). Live/paper have no per-ticker designed
+    expectation the way canary does -- a real/paper position's entry depends
+    on today's actual z-score crossing, not a predictable schedule -- so
+    these sections report real activity (opened/closed today, still open)
+    rather than expected-vs-actual, diffed against yesterday's daily_plan
+    row for that ticker when one exists (so a position planned to carry
+    overnight that instead closed, or vice versa, is visible)."""
+    check_date = check_date or datetime.now().strftime('%Y-%m-%d')
+    if not _coverage_is_trading_day(check_date):
+        return _post_message(f"EOD Scenario Review — {check_date} is not a trading day, nothing to review.")
+
+    lines = [f"*EOD Scenario Review — {check_date}*"]
+
+    # Readiness headline (2026-08-01, user's actual question: "how close are
+    # we" to trading material money) -- a single go/no-go-style number up
+    # top, detail below. Computed live from scripts/coverage_registry.py
+    # (already tracks real coverage_events/coverage_deviations/fake_broker
+    # proof per branch, no separate tracking needed) so "how close" is never
+    # staler than one trading day, and every day's post to slack_message_log
+    # doubles as a durable trend history without a new table.
+    # 2026-08-01 Opus review finding: this list is unbounded (grows with
+    # REGISTRY) and used to render immediately below the headline, ahead of
+    # the live/paper activity and tomorrow's plan -- against real data the
+    # whole message ran ~7KB/69 lines, and if Slack ever truncates a long
+    # single-text post (as it did to the Morning Report via a hard block
+    # limit, 2026-07-23), what gets cut is the tail: the only actionable
+    # content. Capped here and the detailed listing moved below the
+    # canary/live/paper/plan sections so a truncation risks losing the least
+    # essential part first.
+    _READINESS_DETAIL_CAP = 10
+    untested = []
+    try:
+        from scripts.coverage_registry import REGISTRY, compute_status
+        counts = {}
+        for r in REGISTRY:
+            status, detail = compute_status(r)
+            counts[status] = counts.get(status, 0) + 1
+            if status in ('not-instrumented', 'wired-never-fired', 'deviation-unexplained', 'live-attempt-failed'):
+                untested.append((r['id'], status, detail))
+        verified = counts.get('verified-live', 0)
+        total = len(REGISTRY)
+        pct = 100 * verified / total if total else 0
+        lines.append(f":large_yellow_circle: *Readiness: {verified}/{total} ({pct:.0f}%) critical "
+                      f"code paths verified-live.* {len(untested)} still need real proof before scaling up.")
+        lines.append(f"_Code-path coverage_: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    except Exception as e:
+        lines.append(f"\n_Code-path coverage_: ⚠️ failed to compute: {e}")
+
+    lines.append("\n_Canary_ (see Coverage Report for full detail):")
+    try:
+        canary_results = _coverage_run_check(check_date)
+        met = sum(1 for r in canary_results if r['status'] == 'met')
+        # 2026-08-01 Opus review finding: 'informational'-tier misses are
+        # never ticket_eligible, so the old met+deviated split silently
+        # excluded them from both counts -- a real run rendered "4/13 met, 6
+        # deviations" with the other 3 nowhere, visibly not summing to 13 and
+        # inviting the reader to assume the message itself was broken.
+        deviated = [r for r in canary_results if r['status'] == 'deviated' and r.get('ticket_eligible', True)]
+        informational_misses = [r for r in canary_results
+                                 if r['status'] == 'deviated' and not r.get('ticket_eligible', True)]
+        lines.append(f"  {met} met / {len(deviated)} deviation(s) / {len(informational_misses)} informational "
+                      f"of {len(canary_results)}")
+        for r in deviated:
+            lines.append(f"    ✗ {r['scenario_key']} ({r['ticker'] or 'n/a'}): {r['summary']}")
+    except Exception as e:
+        lines.append(f"  ⚠️ canary check failed to run: {e}")
+
+    # Keyed by (category, ticker), not ticker alone -- 2026-08-01 Opus review
+    # finding: a ticker-only key collapses canary/live/paper plan rows for the
+    # same ticker (e.g. FAZ is both a canary scenario ticker and a real open
+    # live position), so one category's plan row silently shadows another's.
+    prior_plan = {(row['category'], row['ticker']): row for row in db.get_daily_plan(check_date)}
+
+    try:
+        for category, paper in (('live', False), ('paper', True)):
+            closed = [t for t in db.get_trades_closed_on_date(check_date, paper=paper) if not t.get('is_dry_run_sim')]
+            opened_today = {t['ticker'] for t in db.get_trades_opened_on_date(check_date, paper=paper)}
+            still_open = [p for p in db.get_open_positions(paper=paper)
+                          if not p.get('is_dry_run_sim') and p['ticker'] not in {t['ticker'] for t in closed}]
+            lines.append(f"\n_{category.capitalize()}_:")
+            if not closed and not still_open:
+                lines.append("  (no activity today)")
+            for t in closed:
+                planned = prior_plan.get((category, t['ticker']))
+                if planned:
+                    note = " (per plan)"
+                elif t['ticker'] in opened_today:
+                    note = " (no plan row -- new entry today)"
+                else:
+                    # 2026-08-01 Opus review finding (PLAUSIBLE): this is the
+                    # most anomalous case -- a position that carried in from a
+                    # prior day, was never on a plan, and closed today -- and
+                    # it used to render with no annotation at all, identical
+                    # to a routine planned close.
+                    note = " (no plan row -- carried in unplanned)"
+                pnl = t.get('pnl_pct')
+                pnl_str = f"{pnl:.2f}%" if pnl is not None else "n/a"
+                lines.append(f"  ✓ {t['ticker']} closed {t['exit_reason']} pnl={pnl_str}{note}")
+            for p in still_open:
+                planned = prior_plan.get((category, p['ticker']))
+                note = " (per plan, carrying overnight)" if planned else " (no plan row for today)"
+                lines.append(f"  ~ {p['ticker']} still open{note}: {_position_trigger_summary(p)}")
+    except Exception as e:
+        lines.append(f"\n⚠️ live/paper activity section failed: {e}")
+
+    try:
+        # 2026-08-01 Opus review finding: the review is FOR check_date, but the
+        # plan being built is for the NEXT trading day -- the old call passed
+        # check_date straight through as next_date, so the plan overwrote
+        # itself under today's date every single day and the whole
+        # plan-vs-actual diff (tomorrow's review reading today's plan) never
+        # had anything to find. _next_trading_day was dead code on this path.
+        lines.append("\n" + build_tomorrow_plan(_next_trading_day(check_date)))
+    except Exception as e:
+        lines.append(f"\n⚠️ tomorrow's plan failed to build: {e}")
+
+    if untested:
+        shown = untested[:_READINESS_DETAIL_CAP]
+        lines.append(f"\n_{len(untested)} blocking readiness (top {len(shown)}, "
+                      f"see `scripts/coverage_registry.py` for the rest):_")
+        for rid, status, detail in shown:
+            lines.append(f"  ✗ [{status}] {rid}: {detail}")
+
+    return _post_message("\n".join(lines))
+
+
 def build_phased_monitors_report(check_date):
     """End-of-day plain-text report for the two monitor-only, detection-first
     checks built 2026-07-29 -- schwab_safety._log_pre_action_state_verification
