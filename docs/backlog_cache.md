@@ -14,37 +14,11 @@ Full detail: `docs/deep_backlog.md`'s same-day entry (top). A `sl_order_id` writ
 order minutes after gap-resize correctly placed it), and a `coverage_registry.py` accuracy gap. Full
 suite: 414 passed. This was the final review round before the session's first commit.
 
-## [live-trading][testing] Open, raised 2026-07-31 evening — make fake_broker exhaustive per use case (state-axis truth table x use-case matrix), planned for this weekend
-**The delta from today's state**: `scripts/fake_broker_coverage_matrix.py` (built 2026-07-31, see
-`deep_backlog.md`'s same-day entry) proves each of the 11 real broker-mutating use cases has *at
-least one* fake_broker scenario reaching it — but each only has ONE scenario, not the full state
-permutation the way `tests/test_entry_abandon_truth_table.py` does for `check_entry_abandon`
-specifically (12 cells, one parametrized test). The idea (user's, confirmed to build): combine the
-two techniques deliberately — cross each use case in the matrix with its own real state axes, run
-every cell through fake_broker, so the fixture simulates every real variation of every real use case
-end-to-end, not 11 hand-picked happy(-ish) paths.
-
-**Rough per-use-case axis sketch** (not final, needs verifying against real code before building):
-- `trailing_buy_entry` / `market_buy_entry`: ticker in automation scope (Y/N), kill switch engaged
-  (Y/N), account dry_run (Y/N), `shares<1` (Y/N), inside signal window (Y/N) — market-buy adds
-  SL-placement-after-fill succeeds/fails/rejected-and-retried.
-- `post_fill_topup`: underspend amount (none/small/large), placement blocked/succeeds.
-- `sl_placement_post_fill`: already covers entry_price-vs-signal_price anchoring; add
-  already-breached-at-retry-time (the LABD incident shape) vs not.
-- `trailing_sell_arm_replace` / `trailing_sell_arm_fresh`: `sl_order_id` present/absent, replace/
-  placement succeeds/fails.
-- `exit_replace_resting` / `exit_fresh_market_sell`: reason ∈ {TP, SL, TIME, TRAIL-hold-forced},
-  resting_order_id present/absent, replace/placement succeeds/fails/rejected.
-- `gap_resize_replace` / `gap_resize_fresh`: order_id present/absent, trigger cleared, replace/
-  placement succeeds/fails/rejected.
-- `entry_abandon_cancel`: already fully done (`test_entry_abandon_truth_table.py`'s 12 cells) — the
-  reference pattern for the rest.
-
-**Scope warning, raised same conversation**: fully crossing this could be 40-60+ test cases instead
-of today's 11 — worth deciding whether every axis combination is truly meaningful (some may be
-structurally unreachable, like `check_entry_abandon`'s discovery that `order_id` present + real
-account + `order_placed=False` is unreachable except via `check_gap_resize`) before generating the
-full cross product. Not started — planned for this weekend.
+## [live-trading][testing] Resolved 2026-08-01 — fake_broker coverage pushed 6/41 → 37/41 tracked branches with a real regression test
+Not the full state-axis cross-product originally scoped (the 40-60+ combo idea below was not built),
+but the substance of the item — real gaps closed. Full detail: commit `f3b9bab`, `docs/deep_backlog.md`'s
+2026-08-01 entry. Remaining 4/41 uncovered branches not enumerated — check `fake_broker_coverage_matrix.py`
+output if picked back up.
 
 ## [live-trading][security] Resolved 2026-07-31 — full exit/arm/entry execution-path audit (9 bugs) + same-day follow-up pass (8 more) + a same-day independent review of that follow-up (8 more, 1 real-money)
 Full detail: `docs/deep_backlog.md`'s three 2026-07-31 entries (top). First pass fixed SH's stuck-exit
@@ -120,15 +94,15 @@ those + all 13 canary/ira nodes, or leave the global row as-is. Full detail: `do
 ## [live-trading][security] Resolved 2026-07-29 — all 3 deferred design items from 2026-07-28 (night) now built: stateful fake order-book test fixture (`tests/fake_broker.py`), pre-action live-state verification (`schwab_safety._log_pre_action_state_verification`, detection-only), and a node-level circuit breaker (`schwab_safety.record_node_streak`, monitor-only). Full detail: `docs/deep_backlog.md`'s 2026-07-29 entries (top two).
 **Still open**: both new checks' tolerance/blocking policy (currently pure logging/alerting — decide once real trip data accumulates, per user's explicit phased-rollout call).
 
-## [live-trading][coverage] Open, raised 2026-07-29 — JDST has no defined test purpose
-Was slated to pair with JNUG for Cluster A (two-accounts-same-ticker coverage), but JNUG was
-converted to mirror VOO's E-scenario (TrailingExit market-buy) instead, leaving JDST orphaned.
-Cluster A itself is blocked anyway (no second usable `mode=live`+`dry_run=True` account — `ira` is
-the only one). User: "we'll get there eventually," not urgent.
+## [live-trading][coverage] Resolved 2026-08-01 — JDST re-paired with JNUG as a same-underlying bull/bear pair (new `canary_bull_bear_pair` scenario), not VOO's E-scenario mirror
+Full detail: commit `f3b9bab`, `docs/deep_backlog.md`'s 2026-08-01 entry.
 
-## [live-trading] Open, raised 2026-07-29 — GDXD missing from the active watchlist entirely
-Deleted earlier in the project (its `v4` node removed), never restored. Flagged only, no user
-direction yet to add it back.
+## [live-trading] Superseded 2026-08-01 — GDXD's old $5k-pilot-node role has no live successor plan; DPST now fills the "small real-money live volunteer" slot instead
+GDXD's `v4` node was deleted 2026-07-20 after the kernel gap-fix flipped its backtest to CLIFF
+(-37.8% alpha) — not restorable as-is, and no longer the open question (was previously listed here
+as "missing, no direction yet"). DPST (`mode='live'`, `soxl_ira`, `starting_notional=800`, added
+2026-07-25/26) is the actual current small-notional live-money ticker. GDXD itself remains only in
+the `soxl_test` regression group, not the main watchlist — not treated as an open gap anymore.
 
 ## [live-trading][security] Resolved 2026-07-28 (night) — resting-order dup guards self-blocked their own replace calls; SH's automated exit was stuck for 4 real days. Full detail: `docs/deep_backlog.md`'s 2026-07-28 (night) entry (top).
 **Still open from the same session**: Morning Report ignores `paper_positions`; `check_live_state_reconciliation` uses a stale in-cycle snapshot; `gap_resize`'s BUY-side anomaly unexplained (diagnostic logging added); GDXU's TRAIL-arm fix has no live proof (staged test bypassed the guard entirely); accountability-grid re-triage under a corrected "timing-dependent" filter, not yet built.
@@ -1728,3 +1702,79 @@ sanity check on the signal computation itself, not just "did a mechanism fire"),
 `check_method` in `scripts/coverage_check.py` (today's only mechanisms are `trade_lifecycle` and
 `coverage_event`) comparing both tickers' real trade_log/signal rows for the same day. Not urgent --
 a real future feature idea, not a bug.
+
+## [backtest] Idea, not scoped, 2026-08-01 — FFT-based cycle detection to inform z-score window selection / regime structure
+Raised in passing (someone mentioned FFT to the user, flagged as a "background topic," not urgent).
+Hypothesis: decomposing a ticker's price series into dominant cycle frequencies might explain why some
+tickers respond better than others to the current `window` sweep (10/20, chosen empirically, not derived
+from any actual cyclical structure), and/or could feed regime detection alongside the 2026-08-01 SPY-trend/
+VIX finding (`docs/research_log.md`) — both are approaches to characterizing market structure beyond raw
+z-score reversion. Not scoped: which library/method (scipy FFT, wavelet transform), which tickers, or
+whether this feeds window selection directly vs. a new regime signal. Purely a research idea for now.
+
+## [data] Idea, not scoped, 2026-08-01 — start recording our own 1-minute bars now, so a future "we need historical data" request never hits an expired retention window again
+Direct motivation: tonight's real-bear-market-coverage investigation found `yfinance` hourly data is
+capped at ~2 years back from fetch time (why the cache tops out ~2023-07 even today), and Schwab's own
+`get_price_history` intraday retention is *worse* — empirically tested live, cuts off between 250-300
+days back (~8-10 months), not the ~2 years assumed. Both windows have already permanently rolled past
+2020/2022 — no vendor we currently have access to can backfill those periods at real intraday
+resolution; a real historical vendor (Massive/Polygon $29-79/mo, Databento pay-per-use) is the only path
+for the past, discussed same session (`docs/research_log.md`, not yet acted on).
+**The idea**: if we'd been recording 1-minute bars ourselves since inception, this specific problem
+(needing data from a period that's already outside every free/current vendor's rolling window) would
+never recur for anything that happens *from now on* — including whatever the next real bear market
+turns out to be. Also finer-grained than the current hourly cache, which could reduce/eliminate the
+possible/pessimistic/certain fill-ambiguity the kernel currently has to guess around for trailing-buy/
+trailing-sell resolution.
+**Scope, per user (2026-08-01)**: the ~53 tickers that could realistically go into the strategy (the
+real candidate universe), not the full ~1,448-ticker research universe used for broad scans like the v6
+idle-capital-parking sweep.
+Not scoped: exact 53-ticker list (needs pulling from wherever candidate screening currently tracks it),
+storage growth/retention policy over years, whether this hooks into the existing `data_collector.py`/
+`data_manager.py` pipeline or is a separate always-on process, and whether Schwab's or another source's
+minute feed is the right one to record from continuously.
+
+## [backtest][data] In progress, 2026-08-01 (evening) — prune `backtest_cache` to island-only, uniformly, for every ticker/version; execution started, not yet completed
+Full reasoning: `docs/conversation_summary.md`'s 2026-08-01 (evening) entry. General, repeatable
+policy, not a v4-specific one-off: **a stored backtest result inherits the trust level of the code
+that produced it — if that code is later found buggy, the stored output is disposable, and the only
+things worth keeping are (1) the ability to recompute with current code (always intact regardless,
+depends on `backtester.py` + raw price CSVs, never on `backtest_cache` rows) and (2) one reference
+sample documenting the bug's before/after magnitude** (e.g. GDXD's v4 +1442.2%→v5 -37.8% CLIFF, or
+SOXL's fragile 27,673%-robust_alpha v4 node vs. its v5 possible/certain range of 794.2%-5,772.6%).
+Applies symmetrically to any future version (if a bug were ever found in the island-search/cliff-
+safety logic itself, v5 would become exactly as disposable as v4 is now). Also: `cache/research/` is
+already documented (`CLAUDE.md` Runtime Artifacts) as "regenerable research data", explicitly
+distinct from `cache/live/` (the real trade record) — this whole DB was always meant to be disposable
+scratch space; only `cache/live/` carries the never-delete weight, and stays architecturally separate
+from `cache/research/` on purpose (so a heavy in-progress sweep never contends with the live daemon's
+DB performance) — unaffected by this pruning either way.
+**Final scope (went through several drafts same session before landing here — "full grid top 10" →
+"full grid top10/island top20/top-node universe" → this)**: **no full-grid tier at all, for anyone.**
+An island (~50 nodes: best `robust_alpha` node ± 2 nearest distinct `take_profit`/`stop_loss` values,
+±24h `max_hold_hours`) for all 53 candidate tickers combined is only ~1-5 MB — negligible next to the
+65 GB full DB (167,502,634 rows) — so gating island-keeping behind any ticker-count cutoff was pure
+unnecessary complexity. Full grids only bought the ability to explore *beyond* the island's
+neighborhood, which is realistically "re-run a fresh sweep" territory anyway (always possible
+regardless of what's kept, per the recompute point above) — islands are already the same granularity
+the project's own cliff-safety checking uses as its bar for "is this node robust." Applies uniformly:
+watchlist tickers and candidates alike, all versions alike.
+**Real numbers found querying this before finalizing**: 167,502,634 total rows, 53 distinct tickers,
+65 GB DB size; per-watchlist-ticker row counts range ~4.5M (UDOW) to ~19.8M (SOXL) — confirms
+`backtest_cache` is genuinely too large to query normally (basic aggregate queries and even
+`PRAGMA integrity_check` routinely time out at 2+ minutes), independent of the disk-space argument —
+a database this unwieldy to query isn't serving its purpose regardless of space.
+**Execution status, 2026-08-01 evening**: `scripts/prune_backtest_cache.py` built (three modes:
+`--dry-run` report-only, `--build` writes a fresh `trading_universe_pruned.db` leaving the original
+fully untouched, `--swap` moves the original aside with a timestamp — never deletes it outright — and
+renames the pruned DB into place). A full pre-prune snapshot was set aside first, permanently, outside
+the daily backup rotation: `cache/research/permanent_archive/trading_universe_pre_prune_20260801.db`
+(the redundant duplicate from an initial `cp`-not-`mv` mistake was cleaned up; only one 65GB archive
+copy exists). User's stated intent for that archive: keep it a few months as a safety net, probably
+delete it once confidence builds that it's genuinely never needed again — unless a new strategy
+variant (e.g. a "v6") makes the old comparison data relevant again.
+`--dry-run` was running as of this session's context handoff (multiple minutes of CPU time, not
+stuck — this table is just this slow for everything). **Next session: check
+`/home/pkim/.claude/jobs/cb8820c3/tmp/prune_dryrun2.log` for the dry-run's finished output (or just
+re-run `--dry-run` if that job/log no longer exists), review the keep/drop counts, then run `--build`,
+inspect the result, then `--swap` only once satisfied.**
