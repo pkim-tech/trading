@@ -842,6 +842,34 @@ def check_order(
         _log_pre_action_state_verification(
             account, ticker, _node_id, _mode, "BUY",
             _local_pos['shares'] if _local_pos else None)
+        # Existing-position guard (2026-08-02): closes the real gap confirmed
+        # 2026-07-24 -- Schwab doesn't decrement account balance for a resting
+        # order (two real resting TRAILING_STOP BUYs left get_account_balance
+        # completely unchanged), so notional_cap (per-order) and the cash check
+        # (reads that same undecremented balance) can't by themselves stop a
+        # second real BUY from being approved for a ticker this account
+        # already holds -- the resting-order guards below only cover the
+        # window before the first order fills, not after. is_protective is the
+        # one sanctioned exception: _reconcile_fill's post-fill top-up is
+        # completing THIS SAME position's sizing, not adding a new one.
+        # KNOWN LIMITATION (found by review, 2026-08-02, same shape as the
+        # _node_id ambiguity noted above): get_open_position_for_account is
+        # ticker+account-keyed, not wl_id-keyed, so if 2 live nodes ever
+        # shared a ticker+account, this would wrongly block the SECOND node's
+        # genuine first entry as if it were a duplicate of the first node's
+        # position. Not reachable today (verified: no such pairing exists on
+        # the live watchlist) -- fixing it properly needs the same wl_id-
+        # threaded-through-schwab_client plumbing already flagged as a
+        # separate follow-up, not done here.
+        if _local_pos and not is_protective:
+            signals_db.log_coverage_event(
+                "buy_blocked_position_exists", _mode, ticker=ticker, node_id=_node_id, result="blocked",
+                detail=f"account={account} held_shares={_local_pos['shares']:g}"
+            )
+            raise SafetyViolation(
+                f"'{ticker}' already has an open position ({_local_pos['shares']:g} shares) in "
+                f"'{account}' -- refusing a second real BUY (not a protective top-up)"
+            )
         orders = _open_orders(account)
         _log_guard_input(account, ticker, "BUY", orders, replacing_order_id)
         if _has_open_order(orders, ticker, exclude_order_id=replacing_order_id):

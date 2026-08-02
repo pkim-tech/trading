@@ -5748,3 +5748,66 @@ logging the real account number) and `pages/14_Coverage.py`'s new `fake_broker p
 
 Checklist: `check_backlog_cache_lean.py` clean, `signals_invariants.py` clean (all live nodes match
 committed baseline), `live_sim_harness.py` 7/7. Full suite: 499 passed (495 + 4 new), no regressions.
+
+---
+
+## 2026-08-02 (later) — Existing-position BUY guard + TRAIL-exit reminder spam fixed, both closed a real gap and both had a real defect caught by review before landing
+
+Continued straight from the earlier 2026-08-02 session's coverage-grid triage. Walked through the
+remaining open backlog items with the user and picked the highest-value one that was actually
+actionable today (not blocked on market hours, a second account, or the planned Slack rework):
+the confirmed-but-undesigned "double-buy" gap from 2026-07-24.
+
+**Design conversation, not straight to code.** Started at a much heavier "cumulative same-day BUY
+notional cap" approach — dynamic caps anchored to `_last_sale_recovery`, real-time cash-availability
+subtraction, realized-vs-approval-notional accounting. The user pushed back at each layer ("this
+feels like overkill," "even 1.1x might be dangerous," "cumulative is wrong too" — because a
+cumulative-for-the-day counter would wrongly block a legitimate second, unrelated same-day entry in
+a margin account after an earlier position had already closed) until landing on the actually-correct
+framing: this is a state question, not a math problem. Do we already hold this ticker in this
+account? If so, block, unless it's the sanctioned top-up. Also worked through the real distinction
+between accounts with genuine margin headroom (where the software gap matters) vs. `soxl_ira`'s thin
+real balance today (where the broker itself would likely reject a genuine double-buy for insufficient
+funds) — this guard is prerequisite work for a future margin account going live, not urgent for
+today's actual exposure.
+
+**Fix 1 — existing-position BUY guard** (`schwab_safety.py` `check_order`): blocks a second real BUY
+when `get_open_position_for_account(ticker, account)` already returns a position, unless
+`is_protective=True` (the `_reconcile_fill` top-up path). Closes the gap confirmed live 2026-07-24
+(two real resting `TRAILING_STOP` BUYs left `get_account_balance` completely unchanged, so
+`notional_cap`/the cash check can't stop a second BUY once the first has filled — the existing
+resting-order dup guards only cover the window before a fill). New
+`tests/test_fake_broker_buy_blocked_position_exists_scenario.py` (2 scenarios). Fixing this surfaced
+5 pre-existing `test_schwab_safety.py` tests that were seeding a leftover open position before an
+unrelated BUY call meant to test cap/burst-cap logic in isolation — fixed by reordering each test's
+`_seed_position()` call and adding a `_clear_position()` helper (raw DELETE, not `close_position()`,
+to avoid tripping `same_day_block` for the cash-type `ira` account).
+
+**Fix 2 — TRAIL-exit reminder spam.** Investigated the older 2026-07-28 GDXU backlog item (3
+sub-issues: wrong "Cancel Stop Loss" wording, a price-staleness gap, alerts asking for
+action that doesn't exist) and found 2 of 3 already fixed as a side effect of separate 2026-08-01
+work (`_exit_order_resting`, built for the Skip-button fix) — nobody had deliberately closed this
+item, it just happened to get fixed along the way. The 3rd sub-issue (frequency — a confirmed-resting
+TRAIL exit re-pinging every hour and every 15 minutes) was genuinely unfixed. User's ask, once walked
+through plainly rather than left as a design abstraction: no ping for expected behavior, the one
+useful notification is already the arm-time "trailing stop activated" message. Fixed by suppressing
+the routine post in both `notify_sell_signal` and `check_exit_reminders` until
+`_exit_pending_blocks`' existing `reminder_num>=3` escalation threshold (~45min) is reached.
+
+**Independent Opus cold review (no session context) of both fixes found 3 real defects, all fixed
+same session** — most severe: `check_exit_reminders` only runs 9:00-16:00, so suppressing near that
+window's close (or outside it) could leave a real open position with zero Slack visibility until
+9:00 the next trading day (confirmed up to ~17.75h, not the intended ~45min-max), fixed via a new
+`_trail_alert_should_post_now` time-of-day gate that fails toward posting. Also found: the new BUY
+guard is ticker+account-keyed not node-keyed (latent, no such pairing exists on the live watchlist,
+documented rather than fixed — mirrors an existing `_node_id` ambiguity limitation in the same
+function); and `notify_sell_signal` was resetting reminder escalation progress on every bar re-fire.
+**A bug was introduced while fixing the time-of-day gate** (the condition in `check_exit_reminders`
+was accidentally inverted) and caught immediately by the new regression tests written for the fix,
+not by a second review round — real evidence for testing every review-driven fix rather than trusting
+it by inspection alone. Per the user's request mid-session, `CLAUDE.md`'s `session wrap` process now
+explicitly calls for summarizing Opus findings to the user before starting fixes, not just diving in.
+
+**Full suite: 507 passed** (was 496 at session start). `live_sim_harness.py`: 7/7 passed. Both
+`schwab_safety.py`/`signals_notify.py` changed, so the full session-wrap review/harness sequence ran
+per `CLAUDE.md`.

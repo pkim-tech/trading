@@ -1,5 +1,94 @@
 # Backlog
 
+## [live-trading][security] Resolved 2026-08-02 — existing-position BUY guard closes the real double-buy gap confirmed 2026-07-24
+Confirmed live 2026-07-24: two real resting `TRAILING_STOP` BUYs (GDXD 5sh, GDXU 3sh) left
+`get_account_balance('soxl_ira')` completely unchanged before and after — Schwab doesn't reserve
+buying power for a resting order. Consequence: `notional_cap` (checked per-order) and the real
+cash-availability check (reads that same undecremented balance) can't by themselves stop a second
+real BUY from being approved for a ticker the account already holds, once the first order has
+*filled* (the existing resting-order dup guards, `_has_open_order`/`_has_open_buy_order_in_account`,
+only cover the window before a fill — they check the live broker order book, which a filled order no
+longer appears in). Design conversation started at a much heavier "cumulative same-day BUY notional"
+approach (dynamic caps, cash-availability subtraction, realized-vs-approval-notional accounting) before
+landing on the much simpler correct framing: this is a state question, not a math problem. Do we
+already hold this ticker in this account? If so, block, unless it's the sanctioned top-up.
+
+**Fix** (`schwab_safety.py` `check_order`, BUY branch, ~line 840): if
+`signals_db.get_open_position_for_account(ticker, account)` returns a position, block the BUY with
+`SafetyViolation`, unless `is_protective=True` (the `_reconcile_fill` top-up path completing that
+same position's sizing). Reuses `_local_pos`, already fetched a few lines earlier for
+`_log_pre_action_state_verification` — no new broker calls. Logs `buy_blocked_position_exists` to
+`coverage_events`, registered in the Accountability Grid with `fake_venue_proof` from the new test.
+
+**Tests**: `tests/test_fake_broker_buy_blocked_position_exists_scenario.py` (2 scenarios: genuine
+2nd BUY blocked; `is_protective` top-up still allowed through despite the open position). Fixing this
+also surfaced 5 pre-existing `test_schwab_safety.py` tests that were seeding a leftover open position
+(`_seed_position()`, built to satisfy the SELL-side oversell guard) *before* an unrelated BUY call
+meant to test cap/burst-cap logic in isolation — the new guard correctly caught those BUYs as if they
+were real duplicates. Fixed by reordering each test's `_seed_position()` call to occur only right
+before the SELL/SL leg that actually needs it, and adding a `_clear_position()` helper (raw DELETE,
+not `close_position()`, to avoid tripping `same_day_block` for the cash-type `ira` account) for the one
+test where a real position needed to exist for an earlier SELL and then NOT exist for a later BUY.
+Full suite: 505 passed (was 496 pre-session).
+
+## [live-trading][coverage] Resolved 2026-08-02 — TRAIL-exit reminder spam: routine "still resting, no action needed" alert now suppressed until it's genuinely been waiting too long
+Prior state (already partially fixed by earlier 2026-08-01 sessions, see below): a TRAIL exit whose
+automated trailing-sell order is confirmed still resting at the broker — completely normal, the order
+will fill on its own — used to re-post a "SELL SIGNAL" alert every hourly bar close
+(`notify_sell_signal`, `sell_alerted` dedups within a bar, not across bars) AND every
+`EXIT_REMINDER_MINUTES` (15) via `check_exit_reminders`, for as long as the order stayed resting. The
+2026-07-28 GDXU incident's wording/staleness bugs (hardcoded "Cancel Stop Loss order" text, a
+`_current_price()` staleness gap) were already fixed as a side effect of separate 2026-08-01 work
+(`_exit_order_resting`, built for the Skip-button fix) — investigated this session and found already
+resolved, not by anyone deliberately closing this item. `_exit_pending_blocks` (the reminder-loop
+message builder) already had a `reminder_num>=3` escalation distinguishing "routine, just waiting" from
+"should have filled by now" wording (Opus review, 2026-08-01) — but it still POSTED on every reminder
+cycle regardless, just with safer wording. User's ask, once the bug was explained plainly: don't ping at
+all for expected behavior — the one useful notification is already the arm-time "trailing stop
+activated" message; only ping again if something's actually stuck.
+
+**Fix**: `notify_sell_signal` (`signals_notify.py` ~line 1532) now skips the initial Slack post
+entirely when `reason == 'TRAIL' and resting is True` (still tracks `exit_pending` with
+`channel/ts=None` so `check_own_sell_fills` keeps polling for the real fill and
+`check_exit_reminders`'s elapsed-time gate still works). `check_exit_reminders`
+(`signals_notify.py` ~line 1917) skips posting reminders #1 and #2 the same way (re-checking
+`_exit_order_resting` fresh each cycle, not trusting a stale flag) but still advances
+`reminder_count`/`last_reminder_at` so the existing `reminder_num>=3` escalation still fires on
+schedule (~45 min) if the order genuinely hasn't filled by then. TP/SL/TIME reminders are untouched.
+
+**Independent Opus review (cold, no session context) found 3 real defects in the first draft, all
+fixed same session**, most severe first:
+1. **HIGH**: `check_exit_reminders` only runs 9:00-16:00 (`active_signals._reminders_active`) —
+   suppressing near that window's close, or outside it entirely, could leave a real open position
+   with zero Slack visibility until reminders resume at 9:00 the next trading day (up to ~17.75h,
+   not the intended ~45min-max escalation window). Fixed via new `_trail_alert_should_post_now`
+   (checks time-of-day, fails toward posting if outside the window or within `3×EXIT_REMINDER_MINUTES`
+   of its 16:00 cutoff), gating both the initial suppression in `notify_sell_signal` and the reminder
+   suppression in `check_exit_reminders`.
+2. **MEDIUM**: the new BUY guard (separate entry above) is ticker+account-keyed, not node-keyed — a
+   2nd live node sharing a ticker+account would have its genuine first entry wrongly blocked. Latent
+   today (no such pairing exists on the live watchlist), mirrors an already-documented `_node_id`
+   ambiguity limitation in the same function — documented in a matching comment rather than
+   engineering the deeper wl_id-threading fix (already a separate flagged follow-up), not fixed.
+3. **LOW**: `notify_sell_signal` unconditionally overwrote `exit_pending` (resetting `reminder_count`
+   to 0) every time it re-fired on a new bar close (`sell_alerted` dedups per-bar, not across bars) —
+   could silently discard `check_exit_reminders`' escalation progress. Fixed: when an identical
+   still-tracked TRAIL `exit_pending` already exists (same reason + order_id) and suppression applies,
+   `notify_sell_signal` now leaves `trail_state` untouched entirely rather than rebuilding it.
+
+A bug was introduced *while fixing finding #1* (the time-of-day gate condition in
+`check_exit_reminders` was inverted — `and _trail_alert_should_post_now(now)` instead of
+`and not ...`) and caught immediately by the new regression tests written for the fix, not by a
+second review round — direct evidence for testing every review-driven fix rather than trusting it
+by inspection alone.
+
+**Tests**: `tests/test_trail_exit_reminder_suppression.py`, 6 tests (grew from 4 during the review
+fix-up) — initial alert suppressed when confirmed resting; a TIME exit is NOT suppressed (sanity
+check the suppression is TRAIL-only); reminders #1-#2 suppressed then #3 escalates and posts;
+suppression doesn't mask a status change (order no longer confirmed resting posts immediately,
+doesn't wait for #3); too-close-to-cutoff forces posting instead of suppressing; reminder_count is
+preserved (not reset) across a bar re-fire. Full suite: 507 passed.
+
 ## [live-trading][coverage] Open, raised 2026-08-02 — `manual_buy_confirmation_account` has never fired for a real live BUY; the manual-confirmation Slack path is currently fully unexercised in production
 Investigated as one of the 3 "suspicious" `wired-never-fired` Accountability Grid rows flagged 2026-08-01.
 Traced every real (`is_dry_run_sim=0`) BUY fill on file (GDXU, ERY, LABD, RETL) via `coverage_events`:

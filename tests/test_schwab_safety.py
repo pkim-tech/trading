@@ -133,6 +133,19 @@ def _seed_position(shares=1_000_000):
         c.commit()
 
 
+def _clear_position():
+    """Removes the row _seed_position() created, for a test that needs a real
+    position on file for an earlier SELL (oversell guard) but then makes an
+    unrelated BUY afterward that must NOT trip the 2026-08-02
+    buy_blocked_position_exists guard. Deliberately a raw DELETE, not
+    close_position() -- the latter would write a real trade_log exit and
+    trip same_day_block (cash account) for the very next BUY these tests
+    need to succeed, which isn't what any of them are testing."""
+    with signals_db._conn() as c:
+        c.execute("DELETE FROM open_positions WHERE ticker=?", (TICKER,))
+        c.commit()
+
+
 def test_same_day_rebuy_blocked_after_earlier_sale(env):
     from datetime import datetime, timedelta
     node = _get_node()
@@ -347,8 +360,8 @@ def test_duplicate_order_within_window_blocked(env):
 
 
 def test_duplicate_guard_is_per_side(env):
-    _seed_position()
     schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    _seed_position()  # needed for the SELL's oversell bound, not the BUY above
     # opposite side isn't a duplicate -- should not raise
     schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
 
@@ -676,6 +689,7 @@ def test_sell_does_not_increment_daily_cap(env, monkeypatch):
     monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
     schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
     schwab_client.place_equity_sell('ira', TICKER, 6, 50.0)  # different qty avoids dup-order block
+    _clear_position()  # this BUY tests cap accounting, not the existing-position guard
     schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # still allowed -- cap untouched by SELLs
 
 
@@ -686,9 +700,9 @@ def test_sell_not_blocked_by_buy_exhausted_daily_cap(env, monkeypatch):
     _attempt_automated_sell cancels the resting stop-loss before placing the
     trailing-sell, so a blocked sell here would leave a position unprotected.
     The check must be BUY-only too."""
-    _seed_position()
     monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
     schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # exhaust the cap
+    _seed_position()  # needed for the SELL's oversell bound, not the BUY above
     schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)  # must not be blocked
 
 
@@ -697,11 +711,11 @@ def test_protective_stop_loss_bypasses_exhausted_daily_cap(env, monkeypatch):
     an already-exhausted daily_order_cap from unrelated earlier entries,
     leaving a brand-new fill unprotected. place_stop_loss must succeed
     (is_protective=True) even once the account's cap is fully spent."""
-    _seed_position()
     monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'daily_order_cap', 1)
     schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # exhaust the cap
     with pytest.raises(schwab_safety.SafetyViolation, match="daily order cap"):
         schwab_client.place_equity_buy('ira', TICKER, 50, 50.0)  # qty far outside dup-order tolerance
+    _seed_position()  # needed for the SL's oversell bound, not the BUYs above
     result = schwab_client.place_stop_loss('ira', TICKER, 20, 45.0)  # qty far outside dup-order tolerance
     assert result == (None, None)  # dry_run -- not blocked
 
@@ -746,9 +760,9 @@ def test_protective_top_up_bypasses_exhausted_daily_cap(env, monkeypatch):
 
 
 def test_global_burst_cap_blocked(env, monkeypatch):
-    _seed_position()
     monkeypatch.setattr(schwab_safety, 'GLOBAL_ORDERS_PER_MINUTE', 1)
     schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
+    _seed_position()  # needed for the SELL's oversell bound, not the BUY above
     with pytest.raises(schwab_safety.SafetyViolation, match="global burst cap"):
         schwab_client.place_equity_sell('ira', TICKER, 5, 50.0)
 

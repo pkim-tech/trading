@@ -171,6 +171,19 @@ REGISTRY = [
          offline_coverage="Unit tests (test_schwab_safety.py)",
          check_mechanism='coverage_events', scenario_key='dup_order_window_blocked',
          notes="Only exercised in unit tests so far, not against real order timing."),
+    dict(id='buy_blocked_position_exists',
+         scenario="A second real BUY for a ticker this account already holds is blocked, unless it's "
+                  "the sanctioned post-fill top-up",
+         code_path="schwab_safety.check_order (BUY branch, existing-position guard)",
+         offline_coverage="tests/test_fake_broker_buy_blocked_position_exists_scenario.py (2026-08-02, "
+                           "both directions: genuine 2nd BUY blocked, is_protective top-up still allowed)",
+         check_mechanism='coverage_events', scenario_key='buy_blocked_position_exists',
+         notes="Added 2026-08-02, closing the gap confirmed live 2026-07-24: two real resting "
+               "TRAILING_STOP BUYs left get_account_balance completely unchanged, so notional_cap "
+               "(per-order) and the cash check (reads that same undecremented balance) couldn't stop a "
+               "second real BUY once the first had already filled (the resting-order dup guards only "
+               "cover the window before a fill). Not yet observed live -- no real double-buy attempt "
+               "has occurred against this guard."),
     dict(id='automated_sell_mode_skip',
          scenario="Automated sell correctly skipped for a non-live-mode node's position",
          code_path="signals_notify._attempt_automated_sell mode check",

@@ -1530,19 +1530,7 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     print(sep)
 
     resting = _exit_order_resting(pos, reason, order_id)
-    channel, ts = _post_message(
-        f"SELL SIGNAL — {ticker}  {reason_labels[reason]}  ${current_price:.4f}  ({pct:+.2f}%)",
-        _build_sell_blocks(pos, reason, current_price, target_price, resting_confirmed=resting is True),
-    )
 
-    # Tracks the exit as unresolved until Exited/Skipped -- unlike a placed trailing-buy
-    # (waiting on a broker fill we can't detect), a stalled SELL confirmation means an
-    # already-open position with real capital sitting unmanaged, arguably more urgent to
-    # nag about than the buy side. order_id (None if out of automation scope) lets
-    # check_own_sell_fills keep rechecking the exact real order every poll cycle and
-    # auto-close the moment it's confirmed FILLED -- the manual tap below is only the
-    # fallback path, not the sole way this ever resolves.
-    #
     # Re-fetch fresh before reading trail_state -- _attempt_automated_exit_sell
     # (called above, same function) may have just persisted a real update
     # (exit_order_id, on a hold-time-forced force-replace) using its OWN pos
@@ -1554,6 +1542,59 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     # (2026-07-31).
     fresh_for_state = db.get_position_by_id(pos['id']) or pos
     state = dict(fresh_for_state.get('trail_state') or {})
+    existing_exit_pending = state.get('exit_pending')
+
+    # Routine-wait suppression (2026-08-02): a TRAIL exit with a confirmed-
+    # still-resting automated order is expected behavior -- the broker will
+    # fill it on its own, there's no action to take, and notify_trailing_
+    # activated already told the user this order is live at arm time. Posting
+    # a second "SELL SIGNAL" alert here that just repeats "still resting, no
+    # action needed" trains the user to ignore these.
+    #
+    # _trail_alert_should_post_now guards against a real gap a cold review
+    # caught 2026-08-02: check_exit_reminders only runs 9:00-16:00
+    # (active_signals._reminders_active) -- suppressing this near that
+    # window's close, or outside it entirely, could leave a real open
+    # position with ZERO Slack visibility until reminders resume at 9:00 the
+    # next trading day (confirmed: up to ~17.75h), instead of the intended
+    # ~45min-max escalation window. Fails toward posting.
+    #
+    # already_tracked guards a second real gap the same review found: if this
+    # exact still-resting TRAIL exit already has an exit_pending row (this is
+    # a re-fire on a new bar close, sell_alerted dedups per-bar not
+    # across-bars, so the SELL condition gets rechecked and this function
+    # re-entered every hour it stays unresolved), overwriting exit_pending
+    # below would reset reminder_count/last_reminder_at back to 0 every hour,
+    # silently discarding whatever escalation progress check_exit_reminders
+    # had already made -- in the worst case (a reminder cadence that divides
+    # evenly into the bar interval) preventing the reminder_num>=3 escalation
+    # from ever completing. When already tracked, skip touching trail_state
+    # entirely and let check_exit_reminders own the escalation clock.
+    already_tracked = (
+        existing_exit_pending is not None
+        and existing_exit_pending.get('reason') == reason
+        and existing_exit_pending.get('order_id') == order_id
+    )
+    suppress = reason == 'TRAIL' and resting is True and not _trail_alert_should_post_now()
+    if suppress and already_tracked:
+        print(f"  TRAIL exit routine (already tracked, resting) -- alert suppressed, state preserved")
+        return
+    if suppress:
+        channel, ts = None, None
+        print(f"  TRAIL exit routine (order already resting) -- alert suppressed")
+    else:
+        channel, ts = _post_message(
+            f"SELL SIGNAL — {ticker}  {reason_labels[reason]}  ${current_price:.4f}  ({pct:+.2f}%)",
+            _build_sell_blocks(pos, reason, current_price, target_price, resting_confirmed=resting is True),
+        )
+
+    # Tracks the exit as unresolved until Exited/Skipped -- unlike a placed trailing-buy
+    # (waiting on a broker fill we can't detect), a stalled SELL confirmation means an
+    # already-open position with real capital sitting unmanaged, arguably more urgent to
+    # nag about than the buy side. order_id (None if out of automation scope) lets
+    # check_own_sell_fills keep rechecking the exact real order every poll cycle and
+    # auto-close the moment it's confirmed FILLED -- the manual tap below is only the
+    # fallback path, not the sole way this ever resolves.
     state['exit_pending'] = {
         'reason': reason, 'current_price': current_price, 'target_price': target_price,
         'reminder_channel': channel, 'reminder_ts': ts, 'reminder_count': 0,
@@ -1759,6 +1800,23 @@ def check_trailing_reminders(open_positions):
 EXIT_REMINDER_MINUTES = 15
 
 
+def _trail_alert_should_post_now(now=None):
+    """Whether time-of-day makes it unsafe to suppress the routine TRAIL
+    still-resting alert. check_exit_reminders (the escalation path this
+    suppression relies on) only runs 9:00-16:00 (active_signals.
+    _reminders_active) -- outside that window, or too close to its 16:00
+    cutoff for reminder_num to reach the 3-cycle escalation threshold
+    (3 x EXIT_REMINDER_MINUTES) before it goes quiet for the night,
+    suppressing here would leave a real open position with zero Slack
+    visibility until reminders resume at 9:00 the next trading day (found by
+    review, 2026-08-02: up to ~17.75h of silence). Fails toward posting."""
+    now = now or datetime.now()
+    if not (9, 0) <= (now.hour, now.minute) <= (16, 0):
+        return True
+    minutes_until_cutoff = (16 * 60) - (now.hour * 60 + now.minute)
+    return minutes_until_cutoff < 3 * EXIT_REMINDER_MINUTES
+
+
 def _exit_pending_blocks(pos, exit_pending, reminder_num):
     """Mirrors _trailing_order_blocks for the sell side. A stalled SELL
     confirmation means an already-open position with real capital sitting
@@ -1905,7 +1963,22 @@ def check_exit_reminders(open_positions):
     """Nags every EXIT_REMINDER_MINUTES until a fired SELL signal is confirmed
     Exited or Skipped ('4r' in the buy/sell lifecycle numbering) -- mirrors
     check_trailing_reminders' supersede-not-edit-in-place pattern. Without this,
-    a stalled SELL confirmation is invisible until the user happens to remember."""
+    a stalled SELL confirmation is invisible until the user happens to remember.
+
+    Routine-wait suppression (2026-08-02): a TRAIL exit_pending with a
+    confirmed-still-resting automated order is expected behavior -- the
+    broker will fill it on its own and there's no action to take, so the
+    first 2 reminder cycles are skipped (no Slack post) rather than repeating
+    "still resting, no action needed" every 15 minutes. _exit_pending_blocks'
+    own reminder_num>=3 escalation (routine stops being the likely
+    explanation once a real order has rested 45+ minutes without filling)
+    still fires normally -- this only silences the reminders before that
+    threshold, it doesn't change the threshold itself. Only TRAIL is
+    suppressed; TP/SL/TIME reminders (which genuinely may need a manual tap)
+    are unaffected. Also gated by _trail_alert_should_post_now (this function
+    only runs 9:00-16:00 to begin with, but too close to that 16:00 cutoff
+    for reminder_num to reach 3 before reminders go quiet for the night still
+    fails toward posting -- found by review, 2026-08-02)."""
     now = datetime.now()
     for pos in open_positions:
         # Same re-fetch rationale as check_trailing_reminders above -- this
@@ -1929,8 +2002,21 @@ def check_exit_reminders(open_positions):
         last_at = datetime.strptime(last_at_str, '%Y-%m-%d %H:%M:%S')
         if (now - last_at).total_seconds() < EXIT_REMINDER_MINUTES * 60:
             continue
-        _supersede_message(exit_pending.get('reminder_channel'), exit_pending.get('reminder_ts'), pos['ticker'])
         reminder_num = exit_pending.get('reminder_count', 0) + 1
+        reason = exit_pending['reason']
+        if reason == 'TRAIL' and reminder_num < 3 and not _trail_alert_should_post_now(now):
+            # Fresh check every cycle, not a trust of a stale flag -- same
+            # rationale as _exit_pending_blocks' own resting recheck.
+            resting = _exit_order_resting(pos, reason, exit_pending.get('order_id'))
+            if resting:
+                new_state = dict(state)
+                new_exit_pending = dict(exit_pending)
+                new_exit_pending['reminder_count']   = reminder_num
+                new_exit_pending['last_reminder_at'] = now.strftime('%Y-%m-%d %H:%M:%S')
+                new_state['exit_pending'] = new_exit_pending
+                db.update_position_trail_state(pos['id'], new_state)
+                continue
+        _supersede_message(exit_pending.get('reminder_channel'), exit_pending.get('reminder_ts'), pos['ticker'])
         blocks = _exit_pending_blocks(pos, exit_pending, reminder_num)
         channel, ts = _post_message(
             f"{pos['ticker']} exit — still not confirmed (reminder #{reminder_num})", blocks=blocks)
