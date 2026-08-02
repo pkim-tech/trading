@@ -5683,3 +5683,68 @@ Also added a "Test Fixtures & Coverage-Proof Techniques" reference table to `doc
 - **MEDIUM**: piece 4's `SIM_MODE` fail-safe `os.environ.setdefault` sat at module-import scope, so any `import active_signals` (the file's own documented library-reuse pattern, used by 11+ scripts) silently disabled the fail-safe — reproducing the exact incident the change existed to prevent, through the library-import path instead of a bare script. Verified empirically before and after. Fixed: gated behind `if __name__ == '__main__':`, since Python sets `__name__` before any of a module's top-level code (imports included) runs.
 
 Full suite: 495 passed (was 466 at session start). `signals_invariants.py`: clean. `live_sim_harness.py`: 7/7. `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py --tickers AGQ,SOXL`: both clean, matching expected drift.
+
+---
+
+## 2026-08-02 — session wrap completed: Skip-button real-order-cancel fix landed after a paired review caught a HIGH regression in its own first draft
+
+Picked up uncommitted work carried from the prior session's incomplete wrap (code changes existed for
+`signals_handlers.py`/`schwab_stream.py`/`pages/14_Coverage.py`, `docs/backlog_cache.md`/`deep_backlog.md`
+already described them as "Resolved," but no commit, no Opus review, no harness run, no session_cache
+entry existed — the docs had gotten ahead of the actual process).
+
+**Ran the required review for `signals_handlers.py`/`schwab_stream.py` changes**: a cold independent
+Opus review plus a contextual one (the paired pattern), run in parallel. Both converged on real issues
+in the Skip-button fix (`handle_sell_skipped`, meant to cancel a real resting exit order instead of just
+abandoning local tracking of it, per the prior session's deferred finding). The contextual review's
+top finding was HIGH and structural, not cosmetic: for a genuine TRAIL breach (not hold-time-forced),
+the "resting order" `exit_pending.order_id` points at is the SAME order placed at the earlier arm event —
+the position's ONLY live protection (arming already replaced the stop-loss with it). The first draft of
+the fix cancelled it unconditionally on Skip, which would leave the position with zero broker protection
+while the alert itself says "no action needed." Verified directly against `_attempt_automated_exit_sell`
+(`signals_notify.py:251-252`) before accepting the finding, not just taken on the review's word. Also
+confirmed: `exit_order_id` left stale after a cancel (next forced-exit attempt would retry a dead order
+and fail); a confirmed `FILLED` status mishandled by both reviewers via two different real trigger paths
+(a race during the cancel call, and the order already being FILLED before Skip was tapped), either way
+silently disarming `check_own_sell_fills`' fill-reconciliation polling; and `exit_pending` popped
+unconditionally even on a failed/unconfirmed cancel, recreating the exact bug the fix was meant to close
+on the unhappy path.
+
+**Rewrote the handler with the correct scope**: cancellation now only applies to a genuinely fresh exit
+order (TP/SL/TIME, or a hold-time-forced TRAIL replace) — the standing arm-time trailing-sell is left
+untouched on Skip, which only clears that alert's own reminder tracking. `exit_pending` is dropped only
+on a confirmed `CANCELED`; a `FILLED` (confirmed via the cancel response, or discovered via a direct
+`get_order_status` check when `_exit_order_resting` reports terminal-but-unspecified) leaves `exit_pending`
+in place so the existing `check_own_sell_fills` poller reconciles the real close with the real fill price,
+rather than the handler guessing. A successful hold-time-forced cancel additionally clears
+`exit_order_id`/`hold_time_replaced` so the next forced-exit attempt doesn't retry a dead order. `pos` is
+now re-fetched immediately before the write (the stale-snapshot clobber class this exact region has been
+bitten by repeatedly — `_exit_order_resting`'s broker round-trip can take seconds).
+
+**New test coverage**: `tests/test_fake_broker_sell_skipped_scenario.py` (4 scenarios) — zero prior
+coverage existed for this handler (the cold reviewer flagged this explicitly). Covers: Skip on a genuine
+TRAIL breach must NOT cancel the standing protection (the primary regression guard for today's finding);
+Skip on a fresh TIME exit does cancel the real order; a filled order leaves `exit_pending` in place for
+reconciliation instead of falsely claiming "position kept open"; a hold-time-forced TRAIL cancel clears
+`exit_order_id`/`hold_time_replaced` correctly.
+
+**User surfaced a good design question mid-session**: doesn't a generic real-time reconciliation check
+already cover this? Answer, given directly rather than assumed: not quite — `check_live_state_reconciliation`
+is periodic/after-the-fact (broker-vs-DB mismatch detection), `_log_pre_action_state_verification` is
+synchronous but only wired into new-order placement (`check_order`'s BUY/SELL gate), never cancellations.
+`_exit_order_resting` (built 2026-08-01) is the actual synchronous "is this really still resting" check,
+and today's fix reuses it correctly — but the specific gap (is this order the position's ONLY protection,
+not just whether local/broker state agree) is a decision-time judgment none of the existing reconciliation
+infrastructure was built to catch. Flagged as worth a backlog note, not fixed further this session.
+
+**User's stated expectation**: this whole Skip/Exited manual-confirmation flow may be redone as part of a
+broader Slack-interface rework once v5 moves toward no manual step at all (ties to the
+`manual_buy_confirmation_account` open item from earlier today) — landed the fix anyway since it's a live
+real-money gap today and that redesign isn't scheduled.
+
+Also carried from the incomplete prior wrap, unchanged: `schwab_stream.py`'s raw ACCT_ACTIVITY message
+logging (diagnostic, gitignored logs, flagged by both reviewers as low-risk/acceptable-temporary despite
+logging the real account number) and `pages/14_Coverage.py`'s new `fake_broker proof` column.
+
+Checklist: `check_backlog_cache_lean.py` clean, `signals_invariants.py` clean (all live nodes match
+committed baseline), `live_sim_harness.py` 7/7. Full suite: 499 passed (495 + 4 new), no regressions.

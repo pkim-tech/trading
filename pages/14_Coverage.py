@@ -10,7 +10,8 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.coverage_check import CHECKERS  # pure dict of checker functions, no side effects/Slack config
 from scripts.coverage_registry import (
-    REGISTRY, compute_status, compute_mode_statuses, offline_proof_for, STATUS_ORDER, MODES as GRID_MODES,
+    REGISTRY, compute_status, compute_mode_statuses, offline_proof_for, fake_venue_proof_for,
+    STATUS_ORDER, MODES as GRID_MODES,
 )
 
 OFFLINE_PROOF_EMOJI = {'event-asserted': '✅', 'behavior-only': '🟡', 'none': '⬜'}
@@ -98,6 +99,7 @@ def load_accountability_grid():
         mode_status_by_row.append(mode_statuses)
         compact = " ".join(f"{m[0].upper()}{MODE_EMOJI.get(mode_statuses[m][0], '?')}" for m in GRID_MODES)
         proof, proof_detail = offline_proof_for(r.get('scenario_key'), r.get('mode_filter'))
+        fake_venue, fake_venue_detail = fake_venue_proof_for(r.get('scenario_key'))
         rows.append({
             "_order": STATUS_ORDER[status],
             "Status": STATUS_LABEL[status],
@@ -107,6 +109,7 @@ def load_accountability_grid():
             "Dry-run": f"{MODE_EMOJI.get(mode_statuses['dry_run'][0], '?')} {mode_statuses['dry_run'][1]}".strip(),
             "Live": f"{MODE_EMOJI.get(mode_statuses['live'][0], '?')} {mode_statuses['live'][1]}".strip(),
             "Offline proof": f"{OFFLINE_PROOF_EMOJI.get(proof, '?')} {proof_detail}".strip(),
+            "fake_broker proof": f"{OFFLINE_PROOF_EMOJI.get(fake_venue, '?')} {fake_venue_detail}".strip(),
             "Code path": r['code_path'],
             "Offline coverage": r['offline_coverage'],
             "Notes": r['notes'],

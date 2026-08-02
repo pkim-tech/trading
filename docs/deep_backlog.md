@@ -1,5 +1,46 @@
 # Backlog
 
+## [live-trading][coverage] Open, raised 2026-08-02 — `manual_buy_confirmation_account` has never fired for a real live BUY; the manual-confirmation Slack path is currently fully unexercised in production
+Investigated as one of the 3 "suspicious" `wired-never-fired` Accountability Grid rows flagged 2026-08-01.
+Traced every real (`is_dry_run_sim=0`) BUY fill on file (GDXU, ERY, LABD, RETL) via `coverage_events`:
+all four resolved through `buy_fill_reconciled` (auto-fill-detection opt-in poll, or GDXU's dedicated
+gap-resize test node's `gap_resize` path) — never through `handle_entry_price`/`handle_trail_buy_fill_
+price`/`handle_manual_open` (the three Slack button handlers that log this scenario_key). DPST (id 136,
+`soxl_ira`, the one node with `auto_fill_detection_enabled=False` that's actually `mode='live'`) has zero
+rows in `trade_log`/`open_positions`/`pending_buys` — no signal has fired for it yet, so it's never had
+the chance either. **HIBL/USD/YANG (ids 154/155/156) are additional real-money volunteers with auto-fill-
+detection disabled, but are currently `mode='research'`** (bridged back pending the $5k funding settling,
+see the 2026-08-01 (late) pilot-notional entry) — not live yet, so don't currently count.
+**Real consequence, narrower than it first looked**: `_reconcile_buy_fill` (the automatic path) already
+calls `_place_stop_loss_for_position` itself (`signals_notify.py:2258`) — so for any ticker on the
+automatic path, SL placement is already exercised there, independent of whether `handle_entry_price`'s
+own copy of that call has ever fired for real. The manual-confirmation path only matters for a ticker
+*not* opted into auto-fill-detection, which per the user (2026-08-02) isn't the direction v5 is headed —
+the goal is full automation with no manual Slack step at all, so this is really a "does the manual path
+even need to keep existing" question, filed under **Slack interface improvements**, not a live coverage
+risk to chase down. CLAUDE.md's "every real live BUY entry today still requires manual Slack confirmation"
+line is stale for any auto-fill-detection-opted-in ticker and should be corrected next time that section
+is touched.
+
+## [live-trading][coverage] Open, raised 2026-08-02 — `fast_path_fill_reconciliation` has never fired; account-activity stream reconnects cleanly now, but its message-shape parsing is still unverified against a real fill
+Investigated as one of the 3 "suspicious" `wired-never-fired` Accountability Grid rows flagged 2026-08-01.
+`logs/active_signals.log` shows 4 stream disconnects: 2026-07-23 ~08:57 ET and 2026-07-30 ~17:08 ET were
+both `could not locate runnable browser` (the known weekly Schwab-token-expiry pattern, confirmed by the
+user — same cadence as the existing Sunday-reauth habit, self-resolves on reauth, not a real bug here).
+2026-07-31 ~21:04 ET and 2026-08-01 ~21:04 ET were ordinary clean-ish disconnects (`no close frame
+received or sent`, `received 1000 (OK); then sent 1000 (OK)`) — the stream is authenticating and
+reconnecting fine now. **The real open question isn't connectivity, it's that `schwab_stream.
+_parse_activity_message`'s ACCT_ACTIVITY field-shape parsing is explicitly self-documented in its own
+module docstring as "unverified against a real fill event"** — no real Schwab fill message has ever been
+confirmed to actually parse into a `FILL_QUEUE` event, let alone reach `drain_fill_queue`. Low urgency:
+`check_auto_fills`'s 5-min poll fallback is unconditional and already does the reconciliation regardless,
+so this is a latency-only gap today, not a correctness one.
+**Diagnostic logging added 2026-08-02** (`schwab_stream._handle_activity_message`): every raw ACCT_ACTIVITY
+message is now printed to `logs/active_signals.log` unconditionally, plus whether it parsed into a fill
+event or not — self-diagnosing the next time a real fill happens on an auto-fill-detection-enabled ticker
+(ERY/LABD/RETL today), no special trigger needed. Remove the logging once the shape's been confirmed
+correct against a real fill. 3 stream tests still pass (`tests/test_*stream*`).
+
 ## [live-trading][security] Resolved 2026-08-01 (late) — `handle_entry_price` never auto-placed a protective stop for automation-scoped market-buy fills; found via a fake_broker test-quality audit, fixed with a new paired independent+contextual review pattern
 
 **Found while fixing the 13 fake_broker test-quality gaps flagged (but never fixed) two sessions
@@ -4560,7 +4601,7 @@ storage growth/retention policy over years, whether this hooks into the existing
 `data_manager.py` pipeline or is a separate always-on process, and whether Schwab's or another source's
 minute feed is the right one to record from continuously.
 
-## [backtest][data] In progress, 2026-08-01 (evening) — prune `backtest_cache` to island-only, uniformly, for every ticker/version; execution started, not yet completed
+## [backtest][data] Resolved 2026-08-02 — prune `backtest_cache` to island-only, uniformly, for every ticker/version
 Full reasoning: `docs/conversation_summary.md`'s 2026-08-01 (evening) entry. General, repeatable
 policy, not a v4-specific one-off: **a stored backtest result inherits the trust level of the code
 that produced it — if that code is later found buggy, the stored output is disposable, and the only
@@ -4599,29 +4640,61 @@ the daily backup rotation: `cache/research/permanent_archive/trading_universe_pr
 copy exists). User's stated intent for that archive: keep it a few months as a safety net, probably
 delete it once confidence builds that it's genuinely never needed again — unless a new strategy
 variant (e.g. a "v6") makes the old comparison data relevant again.
-`--dry-run` was running as of this session's context handoff (multiple minutes of CPU time, not
-stuck — this table is just this slow for everything). **Next session: check
-`/home/pkim/.claude/jobs/cb8820c3/tmp/prune_dryrun2.log` for the dry-run's finished output (or just
-re-run `--dry-run` if that job/log no longer exists), review the keep/drop counts, then run `--build`,
-inspect the result, then `--swap` only once satisfied.**
+**Completed 2026-08-02**: `--dry-run` confirmed 493,720 of 167,502,634 rows to keep (0.2948%). `--build`
+took ~37 min (recomputes the same keep-set from scratch, same slow-table cost as the dry-run) and wrote
+a clean `trading_universe_pruned.db` — `PRAGMA integrity_check` ok, all 53 tickers present, spot-checked
+SOXL's per-strategy/version alpha values against the pre-prune numbers documented above (sane, non-zero).
+`--swap` moved the original 65GB DB aside to `cache/research/trading_universe.db.pre_prune_20260802_
+013426` (not deleted, per the script's design) and put the pruned 256MB DB in its place as `trading_
+universe.db`. The separate permanent archive copy (`cache/research/permanent_archive/trading_universe_
+pre_prune_20260801.db`, full 65GB) is the one the user intends to keep for months as the real safety net
+— the `.pre_prune_20260802_013426` swap-aside copy is redundant with it and can be deleted once the
+pruned DB has been used for a while without issue.
 
-## [live-trading] Open, raised 2026-08-01 — two gaps deferred from the TP/TRAIL alert-wording fix: broker_stop_price never cleared after a replace, and Skip abandons tracking of a real resting order
-Both found by the same Opus review that caught the fixes above; deliberately not fixed in that
-session (touches `_attempt_automated_sell`/`_attempt_automated_exit_sell`, which carry ~15 documented
+## [live-trading][security] Resolved 2026-08-02 — both gaps deferred from the TP/TRAIL alert-wording fix closed: broker_stop_price clearing, and Skip no longer abandons a real resting order
+Both found by the same Opus review that caught the alert-wording fixes; deliberately deferred at the
+time (touches `_attempt_automated_sell`/`_attempt_automated_exit_sell`, which carry ~15 documented
 regressions in their own comments — judged too risky to modify further without dedicated scoping).
-**(1) `broker_stop_price` staleness, now more load-bearing than when first found**: nothing ever
-clears it once written (`signals_notify.py`'s two `set_broker_stop_price_by_position` call sites in
-`_place_stop_loss_for_position`). After `_attempt_automated_sell` (arm) or `_attempt_automated_exit_sell`
-(TP/SL/TIME exit) replaces the real stop-loss order, the stale price stays on the position row.
-`stop_status()`'s `'known'` branch (built same session) reads it directly, so a replaced position's SL
-alert/reminder can claim "Broker stop-loss on file @ $X — should auto-fill there, no action needed"
-for an order that no longer exists. Real fix: clear it (set NULL) at both replace sites, or check
-`sl_order_id`/`trail_state.order_placed` before trusting it.
-**(2) `handle_sell_skipped` (`signals_handlers.py:364-367`) pops `exit_pending` (dropping `order_id`)
-without cancelling anything at the broker.** The new resting-order reminder text simultaneously says
-an order is resting AND offers "Skip if the exit condition no longer applies" — tapping Skip abandons
-local tracking of a real live order with nothing left polling it. Real fix: either cancel the real
-order on Skip, or don't offer Skip at all when `_exit_order_resting()` confirms `True`.
+**(1) `broker_stop_price` staleness — found already resolved on investigation, backlog was stale.**
+Turned out to have been fixed the same day (2026-08-01, commit `9b2f22f`) by the session-wrap Opus
+review's own HIGH finding — `set_broker_stop_price_by_position` now accepts `None` and is called at
+both replace sites (`signals_notify.py:171`, `:343`) right after a real replace succeeds. This backlog
+item just hadn't been updated to reflect that; no code change needed here, only doc cleanup.
+**(2) `handle_sell_skipped` (`signals_handlers.py`) now cancels a real resting FRESH exit order before
+dropping local tracking**, instead of just popping `exit_pending` (and its `order_id`) with nothing left
+polling it. **The first version of this fix (committed to working tree, never landed) unconditionally
+cancelled whatever order `exit_pending.order_id` pointed at — a paired independent+contextual Opus
+review (2026-08-02) confirmed this was itself a HIGH real-money regression**: for a genuine TRAIL breach
+(not hold-time-forced), `_attempt_automated_exit_sell` reuses the SAME order placed at the earlier arm
+event (`signals_notify.py:251-252`) — the position's ONLY live protection, since arming already replaced
+the stop-loss with it (confirmed by reading `_attempt_automated_exit_sell`/`notify_trailing_activated`
+directly, not just taking the review's word for it). Cancelling it on Skip would leave the position with
+zero broker protection while the alert simultaneously says "no action needed." The review also caught:
+`exit_order_id` left stale after a cancel (next bar's forced-exit attempt would try to replace an
+already-dead order and fail — the exact pre-existing risk `_attempt_automated_exit_sell`'s own comments
+already flagged, reached through this new door); a confirmed `FILLED` status mishandled two ways (via a
+race during the cancel call, and via the order already being FILLED before Skip was even tapped) with
+`exit_pending` dropped either way, silently disarming `check_own_sell_fills`' polling reconciliation; and
+`exit_pending` popped unconditionally even on a failed/unconfirmed cancel, recreating the exact "live
+order with nothing polling it" bug the fix was meant to close, just on the unhappy path.
+
+**Rewritten, correctly scoped:** cancellation now only applies to a genuinely FRESH exit order (TP/SL/
+TIME, or a hold-time-forced TRAIL replace) — a standing arm-time trailing-sell (genuine TRAIL breach) is
+left untouched, Skip only clears that alert's own reminder tracking. `exit_pending` is only dropped on a
+confirmed `CANCELED`; a confirmed/discovered `FILLED` leaves it in place so `check_own_sell_fills`'
+existing polling reconciles the real close with the real fill price instead of this handler guessing; an
+unconfirmed/failed cancel also leaves it in place. A successful hold-time-forced cancel additionally
+clears `exit_order_id`/`hold_time_replaced` so the next forced-exit attempt doesn't retry a dead order.
+`pos` is re-fetched immediately before the write (the stale-snapshot clobber class this region has been
+bitten by repeatedly — `_exit_order_resting`'s broker round-trip can take seconds). New
+`tests/test_fake_broker_sell_skipped_scenario.py` (4 scenarios, zero prior coverage existed for this
+handler) pins all four branches, including the TRAIL-protection-must-not-cancel case as the primary
+regression guard. Full suite: 499 passed, no regressions.
+
+**User's expectation, 2026-08-02**: this whole Skip/Exited manual-confirmation flow may be redone as
+part of a broader Slack-interface rework once v5 moves toward no manual step at all (see the
+`manual_buy_confirmation_account` entry above) — landed anyway since it's a live real-money gap today
+and the redesign isn't scheduled.
 
 ## ✅ [live-trading][coverage] Resolved 2026-08-01 (evening) — GDXU TRAIL-exit alert wording bug closed, 2 review rounds
 Original finding (2026-07-28): `_build_sell_blocks`'s TP/TRAIL branches hardcoded "Cancel Stop Loss

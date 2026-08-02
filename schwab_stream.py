@@ -76,9 +76,18 @@ def _parse_activity_message(msg: dict):
 
 
 def _handle_activity_message(msg: dict):
+    # Raw-message logging (2026-08-02): _parse_activity_message's field shape
+    # is still unverified against a real Schwab payload -- this makes the next
+    # real fill on an auto-fill-detection-enabled ticker self-diagnosing via
+    # logs/active_signals.log instead of silent guesswork. Remove once the
+    # shape has been confirmed correct against a real fill.
+    print(f"[schwab_stream] raw ACCT_ACTIVITY message: {msg}")
     event = _parse_activity_message(msg)
     if event is not None:
+        print(f"[schwab_stream] parsed fill event: {event}")
         FILL_QUEUE.put(event)
+    else:
+        print("[schwab_stream] message did not parse as a recognizable order-fill event")
 
 
 async def _run_stream_once():

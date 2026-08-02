@@ -7,10 +7,12 @@ from datetime import datetime
 import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
+import schwab_client
 import schwab_safety
 from signals_blocks import _post_message, _price_input_block, _shares_input_block
 from signals_helpers import _existing_position_note, _last_sale_recovery, clear_corp_action_alert
-from signals_notify import send_reference_report, send_coverage_report, _place_stop_loss_for_position, _coverage_mode
+from signals_notify import (send_reference_report, send_coverage_report, _place_stop_loss_for_position,
+                             _coverage_mode, _exit_order_resting)
 
 if cfg.SOCKET_MODE:
 
@@ -360,16 +362,89 @@ if cfg.SOCKET_MODE:
         ts      = body['message']['ts']
         ticker  = data['ticker']
         position_id = data.get('position_id')
-        pos = next((p for p in db.get_open_positions() if p['id'] == position_id), None)
+        # Re-fetch fresh, not the stale open_positions snapshot -- same clobber
+        # class documented throughout this fragile region (e.g. signals_notify.py
+        # :1546-1554): a broker round-trip (cancel_order, below) can take seconds,
+        # during which the poll loop may persist a newer trail_state that this
+        # write would otherwise silently overwrite.
+        pos = db.get_position_by_id(position_id)
+        cancel_note = ""
         if pos:
             state = dict(pos.get('trail_state') or {})
-            state.pop('exit_pending', None)
+            exit_pending = state.get('exit_pending') or {}
+            order_id = exit_pending.get('order_id')
+            reason = exit_pending.get('reason', data.get('reason'))
+            hold_time_forced = bool(state.get('exit_forced_by_hold_time'))
+            # A genuine TRAIL breach (not hold-time-forced) reuses the SAME
+            # order placed at the earlier arm event (signals_notify.py's
+            # _attempt_automated_exit_sell, reason=='TRAIL' branch) -- it's the
+            # position's ONLY live protection, not a fresh order placed in
+            # response to this specific alert (arming already replaced the
+            # stop-loss with it). Cancelling it on Skip would leave the
+            # position with zero broker protection while the alert claims "no
+            # action needed" -- confirmed via paired Opus review, 2026-08-02.
+            # Skip here only clears this alert's own reminder tracking; the
+            # standing trailing-sell keeps resting untouched, exactly as
+            # before this fix existed.
+            is_standing_trail_protection = (reason == 'TRAIL' and not hold_time_forced)
+            if order_id is not None and not is_standing_trail_protection:
+                # Checked (not assumed) via the broker's real status, same as
+                # every other _exit_order_resting caller; attempted whenever
+                # status isn't confirmed terminal (True or None), not just True
+                # -- an unconfirmed cancel against an already-filled/rejected
+                # order is a safe no-op at the broker, but a skipped cancel
+                # against a genuinely resting one leaves it live indefinitely.
+                resting = _exit_order_resting(pos, reason, order_id)
+                if resting is not False:
+                    try:
+                        _, confirmed = schwab_client.cancel_order(pos.get('account'), ticker, order_id)
+                    except Exception as e:
+                        confirmed = None
+                        cancel_note = f" — ⚠️ cancel FAILED: {e} (order may still be resting, check broker)"
+                    if confirmed == "CANCELED":
+                        cancel_note = " — resting exit order cancelled"
+                        state.pop('exit_pending', None)
+                        if hold_time_forced:
+                            # The just-cancelled order is what exit_order_id/
+                            # resting_order_id resolves to for the NEXT forced-
+                            # exit attempt (signals_notify.py:286-287) -- left
+                            # stale, that attempt would try to replace an
+                            # already-cancelled order and fail. Clearing lets
+                            # it fall back to placing a fresh order instead.
+                            state.pop('exit_order_id', None)
+                            state['hold_time_replaced'] = False
+                    elif confirmed == "FILLED":
+                        # The order actually filled (a real race against the
+                        # cancel, or it had already filled) -- leave exit_pending
+                        # in place so check_own_sell_fills' existing polling
+                        # reconciles the real close with the real fill price on
+                        # the next cycle, instead of this handler guessing.
+                        cancel_note = " — order had already FILLED, position will reconcile automatically"
+                    elif not cancel_note:
+                        # Unconfirmed (poll failed) or some other non-terminal
+                        # status -- leave exit_pending in place so
+                        # check_own_sell_fills/check_exit_reminders keep
+                        # watching the real order instead of abandoning it.
+                        cancel_note = " — cancel requested, unconfirmed at broker (still being watched)"
+                else:
+                    # _exit_order_resting confirmed a terminal status but only
+                    # as a bool -- FILLED is terminal too, and check_own_sell_fills
+                    # can only reconcile it if exit_pending (with this order_id)
+                    # is still there for it to find. Get the real status before
+                    # deciding whether to pop.
+                    real_status = schwab_client.get_order_status(pos.get('account'), order_id)
+                    if real_status == "FILLED":
+                        cancel_note = " — order had already FILLED, position will reconcile automatically"
+                    else:
+                        state.pop('exit_pending', None)
+            else:
+                state.pop('exit_pending', None)
             db.update_position_trail_state(pos['id'], state)
         client.chat_update(
             channel=channel, ts=ts,
-            text=f"SELL {ticker} — Skipped (position kept open)",
+            text=f"SELL {ticker} — Skipped (position kept open){cancel_note}",
             blocks=[{"type": "section", "text": {"type": "mrkdwn",
-                     "text": f"*SELL {ticker}* — Skipped (position kept open)"}}],
+                     "text": f"*SELL {ticker}* — Skipped (position kept open){cancel_note}"}}],
         )
 
     @cfg.bolt_app.action("trail_order_placed")

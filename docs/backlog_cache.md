@@ -13,8 +13,8 @@ Full detail: `docs/deep_backlog.md`'s entry. HIGH: `broker_stop_price` (piece 1)
 ## [live-trading][security] Resolved 2026-08-01 — real live-trading bug found via the Accountability Grid: post-fill top-up BUYs were blocked 100% of the time outside signal windows
 Full detail: `docs/deep_backlog.md`'s entry. `is_protective` now exempts the signal-window gate, matching `is_gap_correction`'s existing exemption. 2 confirmed real failures on file (RETL, LABD).
 
-## [live-trading][coverage] Open, raised 2026-08-01 — 14 Accountability Grid rows still wired-never-fired; 3 flagged suspicious, not yet investigated
-Full detail: `docs/deep_backlog.md`'s entry. `automated_sell_mode_skip`/`fast_path_fill_reconciliation`/`manual_buy_confirmation_account` should plausibly have fired by now — natural next-session starting point.
+## [live-trading][coverage] Investigated 2026-08-02 — the 3 suspicious wired-never-fired rows explained; 2 real open items filed, 11 still unstarted
+Full detail: `docs/deep_backlog.md`'s two 2026-08-02 entries. `automated_sell_mode_skip`: legitimately rare, no bug. `fast_path_fill_reconciliation`: stream reconnects fine (07-23/07-30 disconnects were the known weekly token-expiry pattern), but its message parsing is still unverified against a real fill. `manual_buy_confirmation_account`: every real fill so far used the automatic path (which already places SL independently); filed under Slack-interface-improvements, not a coverage risk, since v5's direction is toward no manual step at all. 11 of the original 14 `wired-never-fired` rows still not investigated.
 
 ## [live-trading][security] Resolved 2026-08-01 (evening) — real incident: an ad hoc test call posted a real Slack message; SIM_MODE flipped to a fail-safe default
 Full detail: `docs/deep_backlog.md`'s 2026-08-01 (evening) entry / `CLAUDE.md`'s Live Trading section. Real daemon launch command unchanged — `active_signals.py` now forces SIM_MODE=0 for itself before `signals_config` is even imported.
@@ -31,8 +31,8 @@ Full detail: `docs/deep_backlog.md`'s 2026-08-01 entry. Async-confirmation gap w
 ## [live-trading][coverage] Resolved 2026-08-01 — GDXU TRAIL-exit alert wording: TP/TRAIL/TIME sell alerts no longer claim "Cancel Stop Loss order" for a position already managed by a resting automated exit order
 Full detail: `docs/deep_backlog.md`'s 2026-08-01 (evening) entry. 2 review rounds (Opus) found and fixed a HIGH gap (order_id presence isn't proof of a resting order) and 2 MEDIUM gaps before landing.
 
-## [live-trading] Open, raised 2026-08-01 — broker_stop_price never cleared after a replace; Skip abandons tracking of a real resting order
-Both deferred from the alert-wording fix above (touches fragile `_attempt_automated_sell`/`_attempt_automated_exit_sell`). Full detail: `docs/deep_backlog.md`'s 2026-08-01 entry.
+## [live-trading][security] Resolved 2026-08-02 — broker_stop_price clearing (already fixed 2026-08-01) + Skip now cancels a real resting FRESH exit order, but never the standing TRAIL protection
+Full detail: `docs/deep_backlog.md`'s 2026-08-02 entry. Paired review caught a HIGH regression in the first draft (would've cancelled a position's only protection); rewritten + tested. Full suite: 499 passed.
 
 ## [live-trading][security] Resolved 2026-08-01 (late) — `handle_entry_price` never auto-placed a protective stop for automation-scoped market-buy fills; new paired independent+contextual review pattern adopted
 Full detail: `docs/deep_backlog.md`'s 2026-08-01 (late) entry.
@@ -396,5 +396,5 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 ## [data] Idea, not scoped, 2026-08-01 — start recording our own 1-minute bars now, so a future "we need historical data" request never hits an expired retention window again
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
-## [backtest][data] In progress, 2026-08-01 (evening) — prune `backtest_cache` to island-only, uniformly, for every ticker/version; execution started, not yet completed
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+## [backtest][data] Resolved 2026-08-02 — `backtest_cache` pruned to island-only (65GB → 256MB, 493,720 of 167.5M rows kept); original moved aside, not deleted
+Full detail: `docs/deep_backlog.md`'s 2026-08-02 entry. Integrity-checked, spot-checked against pre-prune numbers.
