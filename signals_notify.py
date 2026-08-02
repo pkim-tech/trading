@@ -20,7 +20,7 @@ from signals_charts import _chart_buy, _chart_sell, _upload_chart
 from signals_blocks import _post_message, _post_chunked, _build_buy_blocks, _build_sell_blocks
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
-    buy_order_sizing, log_poll, mode_tag, resolve_at_bar_close,
+    buy_order_sizing, log_poll, mode_tag, resolve_at_bar_close, stop_status,
 )
 # scripts/ has no __init__.py but is still importable as a Python 3 implicit
 # namespace package as long as repo root is on sys.path (true whenever this
@@ -162,6 +162,13 @@ def _attempt_automated_sell(pos, current_price):
         # the established pattern already used 600 lines away in
         # _place_stop_loss_for_position (`if sl_order_id is not None:`).
         db.set_sl_order_id_by_position(pos['id'], exit_order_id)
+        # The stop-loss this price described is gone -- replaced by the
+        # trailing-sell above. Left uncleared, stop_status() would report
+        # 'known' off a dead price (Opus review, 2026-08-01: a real SL alert
+        # firing after this point would falsely say "broker stop on file, no
+        # action needed" for a position actually protected by an unconfirmed
+        # resting order, not the stop it describes).
+        db.set_broker_stop_price_by_position(pos['id'], None)
     return True, exit_order_id
 
 
@@ -323,6 +330,17 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
         # `order_id is not None` guard added after a later review -- see the
         # matching comment in _attempt_automated_sell's success path for why.
         db.set_sl_order_id_by_position(pos['id'], order_id)
+    if resting_order_id and resting_order_id == pos.get('sl_order_id'):
+        # The real stop-loss order broker_stop_price describes is gone
+        # regardless of whether the new order_id was extractable (unlike the
+        # sl_order_id repoint above, which specifically needs a valid new id
+        # to avoid pointing at nothing -- this just needs to stop claiming an
+        # already-replaced stop is still resting). Opus review, 2026-08-01:
+        # left uncleared, stop_status() would report 'known' off a dead
+        # price, and the SL alert/reminder would falsely say "no action
+        # needed" for a position now protected only by an unconfirmed
+        # market-sell exit.
+        db.set_broker_stop_price_by_position(pos['id'], None)
     if hold_time_forced:
         # The just-replaced order (trailing-sell or, on the failed-placement
         # fallback above, the original SL) is now dead -- point exit_order_id
@@ -649,6 +667,16 @@ def _place_stop_loss_for_position(node, ticker):
     if not pos or not pos.get('shares'):
         return
     account = node.get('account')
+    # place_stop_loss short-circuits and returns (None, None) for a dry_run
+    # account, with no exception -- so "placement succeeded" (no exception,
+    # sl_placement result="placed"/"placed_on_retry") is true for BOTH a
+    # real success AND a dry-run no-op. Recording broker_stop_price for a
+    # dry-run account would falsely claim a real broker stop exists (found
+    # while wiring this write, 2026-08-01 -- would have contradicted
+    # stop_status's dedicated 'dry-run' branch, itself added after an Opus
+    # review caught the first version of this feature rendering a false
+    # placement-failure alarm for every dry-run account).
+    _dry_run_account = getattr(schwab_safety.ACCOUNTS.get(account), 'dry_run', False)
     sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos['stop_loss']
     if not sl_pct:
         return
@@ -760,6 +788,18 @@ def _place_stop_loss_for_position(node, ticker):
                 "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                 node_id=node.get('id'), result="placed_on_retry",
                 detail=f"stop_price={stop_price:.4f} attempt={attempt}")
+            # broker_stop_price is written unconditionally (unlike sl_order_id
+            # just below, gated on extract_order_id succeeding) -- placement
+            # is already confirmed successful at this point (no exception,
+            # coverage event above logged "placed_on_retry"), so the price is
+            # a known fact regardless of whether the order id happened to be
+            # extractable. Gating both writes on the same sl_order_id check
+            # was itself a bug (Opus review, 2026-08-01): a real success with
+            # an unextractable id would have suppressed broker_stop_price too,
+            # rendering the new 'automation-pending' alert as a false
+            # placement-failure claim for a genuinely-protected position.
+            if not _dry_run_account:
+                db.set_broker_stop_price_by_position(pos['id'], stop_price)
             if sl_order_id is not None:
                 db.set_sl_order_id_by_position(pos['id'], sl_order_id)
             return
@@ -772,6 +812,8 @@ def _place_stop_loss_for_position(node, ticker):
         return
     db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                            node_id=node.get('id'), result="placed", detail=f"stop_price={stop_price:.4f}")
+    if not _dry_run_account:
+        db.set_broker_stop_price_by_position(pos['id'], stop_price)
     if sl_order_id is not None:
         db.set_sl_order_id_by_position(pos['id'], sl_order_id)
 
@@ -1389,6 +1431,50 @@ def notify_limit_fill(node, current_price, lower_band):
     _post_message(f"LIMIT FILLED — {ticker} at ${lower_band:.2f}", blocks=blocks)
 
 
+def _exit_order_resting(pos, reason, order_id):
+    """Tri-state: True (a real order is confirmed genuinely still open/
+    resting at the broker), False (broker confirms it's not -- terminal in
+    any sense: rejected, canceled, expired, filled, or replaced), None (no
+    order_id to check, or the status check itself was unconfirmed). Callers
+    must treat None the same as False for alert purposes -- fail toward the
+    cautious "may be unmanaged" message, not the reassuring one.
+
+    Fixes a real gap an Opus review found in the first version of this
+    change, 2026-08-01: a stored order_id's mere presence used to be trusted
+    as proof of a resting order, indistinguishable from a REJECTED one (a
+    real failure mode -- see LABD's rejected stop, 2026-07-31) -- now
+    actually checked via schwab_client.get_order_status. Gated on
+    schwab_safety._OPEN_ORDER_STATUSES_EXCLUDED (the same 5-status "not
+    genuinely open" set the resting-order duplicate guard already uses), not
+    schwab_client._ORDER_TERMINAL_BAD_STATUSES (only 3 statuses, built for a
+    different question -- right-after-placement rejection detection, where
+    FILLED is deliberately handled as its own separate case rather than
+    folded into "bad"). Using the narrower set here would have reported
+    'confirmed resting' for an order that had actually already FILLED or
+    been REPLACED (a second review round caught this before it shipped).
+
+    A second review round also found the original TRAIL fallback (trusting
+    trail_state['order_placed'] when order_id is None, meant to cover
+    _attempt_automated_sell's exit_order_id legitimately being None on a
+    real automated placement success) was unsafe as written: order_placed is
+    ALSO set by signals_handlers.handle_trail_order_placed, a MANUAL Slack
+    button tap with no broker verification at all -- there's no stored
+    provenance distinguishing which path set it, so trusting it here would
+    reintroduce the exact 'trust an unverified flag instead of the broker'
+    pattern this function exists to eliminate, just through a different
+    door. Removed rather than fixed with a schema change under time
+    pressure -- the narrow sub-case it targeted (unextractable order id on a
+    real automated TRAIL placement) reverts to the pre-2026-08-01 cautious
+    text, same as before this session; see docs/backlog_cache.md."""
+    if order_id is None:
+        return None
+    account = pos.get('account')
+    status = schwab_client.get_order_status(account, order_id)
+    if status is None:
+        return None
+    return status not in schwab_safety._OPEN_ORDER_STATUSES_EXCLUDED
+
+
 def notify_sell_signal(pos, reason, current_price, target_price):
     ticker     = pos['ticker']
     ep         = pos['entry_price']
@@ -1443,9 +1529,10 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     print(f"  Entered: {entry_time}")
     print(sep)
 
+    resting = _exit_order_resting(pos, reason, order_id)
     channel, ts = _post_message(
         f"SELL SIGNAL — {ticker}  {reason_labels[reason]}  ${current_price:.4f}  ({pct:+.2f}%)",
-        _build_sell_blocks(pos, reason, current_price, target_price),
+        _build_sell_blocks(pos, reason, current_price, target_price, resting_confirmed=resting is True),
     )
 
     # Tracks the exit as unresolved until Exited/Skipped -- unlike a placed trailing-buy
@@ -1686,18 +1773,65 @@ def _exit_pending_blocks(pos, exit_pending, reminder_num):
     target_price  = exit_pending['target_price']
     pct           = (current_price - ep) / ep * 100
     reason_labels = {'TP': 'TAKE PROFIT', 'SL': 'STOP LOSS', 'TIME': 'TIME EXIT', 'TRAIL': 'TRAILING STOP'}
-    bsp = pos.get('broker_stop_price')
 
-    if reason == 'SL' and bsp:
-        status_line = (
-            f"Protected by broker stop-loss on file @ `${bsp:.2f}` — should auto-fill there without "
-            f"action from you. Confirm here once you see the fill in your account."
-        )
+    if reason == 'SL':
+        status, bsp = stop_status(pos)
+        if status == 'known':
+            status_line = (
+                f"Protected by broker stop-loss on file @ `${bsp:.2f}` — should auto-fill there without "
+                f"action from you. Confirm here once you see the fill in your account."
+            )
+        elif status == 'automation-pending':
+            status_line = (
+                f"⚠️ No broker stop on file — this may be a placement failure. Position may still be "
+                f"open and unmanaged. Confirm Exited with the real fill price, or Skip if the exit "
+                f"condition no longer applies."
+            )
+        elif status == 'dry-run':
+            status_line = (
+                f"Dry-run account — no real stop was ever placed. Confirm Exited with the real fill "
+                f"price, or Skip if the exit condition no longer applies."
+            )
+        else:
+            status_line = (
+                f"No automated stop tracked for this position (manual). Confirm Exited with the real "
+                f"fill price, or Skip if the exit condition no longer applies."
+            )
     else:
-        status_line = (
-            f"Position may still be open and unmanaged at the broker. Confirm Exited with the real fill "
-            f"price, or Skip if it turns out the exit condition no longer applies."
-        )
+        # Fresh check every time this fires, not a trust of the order_id
+        # stored when the original alert was built -- that id's PRESENCE
+        # doesn't prove the order is still resting (a REJECTED/CANCELED
+        # order looks identical by id alone), and this is exactly the
+        # repeated-reminder path where trusting a stale assumption is most
+        # dangerous (Opus review, 2026-08-01: the first version of this
+        # reminder dropped the "unless this persists" hedge the original
+        # alert had, making the MOST reassuring message land on the MOST
+        # suspicious path -- a real order that's been resting long enough to
+        # trigger 2+ reminders and still hasn't filled).
+        resting = _exit_order_resting(pos, reason, exit_pending.get('order_id'))
+        if resting and reminder_num >= 3:
+            # Escalated: routine "just waiting" stops being the likely
+            # explanation once a real order has rested through several
+            # reminder cycles (45+ min at the default 15-min cadence) without
+            # filling -- distinguishes "nothing wrong, no action" from
+            # "should have filled by now and hasn't," the original 2026-07-28
+            # design intent for this case, not just wording.
+            status_line = (
+                f"⚠️ Automated exit order still resting after {reminder_num} reminders — should have "
+                f"filled by now. Worth a look at the broker directly. Confirm Exited if you see a real "
+                f"fill, or Skip if the exit condition no longer applies."
+            )
+        elif resting:
+            status_line = (
+                f"🤖 Automated exit order resting @ `${target_price:.2f}` — should fill shortly. Confirm "
+                f"Exited only if you've independently verified a real fill, or Skip if the exit condition "
+                f"no longer applies."
+            )
+        else:
+            status_line = (
+                f"Position may still be open and unmanaged at the broker. Confirm Exited with the real fill "
+                f"price, or Skip if it turns out the exit condition no longer applies."
+            )
     text = (
         f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — EXIT NOT CONFIRMED (reminder #{reminder_num})\n"
         f"{reason_labels[reason]}  |  entry `${ep:.2f}`  |  signal `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
@@ -2986,9 +3120,35 @@ def build_eod_scenario_review(check_date=None):
                       f"{len(skipped)} snoozed of {len(canary_results)}")
         for r in deviated:
             lines.append(f"    ✗ {r['scenario_key']} ({r['ticker'] or 'n/a'}): {r['summary']}")
+        # Grouped by scenario_key, not one line per raw result (2026-08-01,
+        # after reconciliation_mismatch went from 1 global row to 20 per-node
+        # rows -- see docs/backlog_cache.md's 2026-07-30 per-node breakout
+        # entry): a single-row control scenario still reads identically to
+        # before (one line), but a per-node one no longer floods this report
+        # with 20 lines every EOD run for what's routine informational
+        # status. Individual per-ticker lines only appear for a genuine
+        # ticket-eligible deviation (a real problem) -- matches the canary
+        # section's own met/deviation/informational/snoozed summary pattern
+        # immediately above, instead of introducing a second, inconsistent
+        # reporting shape for control scenarios specifically.
+        other_by_key = {}
         for r in other_results:
-            status_glyph = "✓" if r['status'] == 'met' else ("~" if r['status'] == 'skipped' else "✗")
-            lines.append(f"  {status_glyph} [control] {r['scenario_key']}: {r.get('summary', r['status'])}")
+            other_by_key.setdefault(r['scenario_key'], []).append(r)
+        for key, group in sorted(other_by_key.items()):
+            met_n = sum(1 for r in group if r['status'] == 'met')
+            skipped_n = sum(1 for r in group if r['status'] == 'skipped')
+            real_deviations = [r for r in group if r['status'] == 'deviated' and r.get('ticket_eligible', True)]
+            info_misses_n = sum(1 for r in group
+                                 if r['status'] == 'deviated' and not r.get('ticket_eligible', True))
+            if len(group) == 1:
+                r = group[0]
+                status_glyph = "✓" if r['status'] == 'met' else ("~" if r['status'] == 'skipped' else "✗")
+                lines.append(f"  {status_glyph} [control] {key}: {r.get('summary', r['status'])}")
+            else:
+                lines.append(f"  [control] {key}: {met_n} met / {len(real_deviations)} deviation(s) / "
+                              f"{info_misses_n} informational / {skipped_n} snoozed of {len(group)}")
+            for r in real_deviations:
+                lines.append(f"    ✗ {key} ({r['ticker'] or 'n/a'}): {r['summary']}")
 
         # 2026-08-01 2nd Opus review finding: actually read back today's
         # canary daily_plan rows (written this morning/last EOD run) and flag

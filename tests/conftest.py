@@ -20,10 +20,22 @@ def _no_real_slack_posts(monkeypatch):
     message to the real Slack channel. Every module below did `from
     signals_blocks import _post_message` (a direct name import), so each
     holds its own reference -- patching signals_blocks._post_message alone
-    does not affect any of them; each must be patched individually."""
+    does not affect any of them; each must be patched individually.
+
+    Also forces cfg.INTERACTIVE = True (2026-08-01, found live: SIM_MODE's
+    default flipped to fail-safe-ON the same session, which made
+    INTERACTIVE = SOCKET_MODE and not SIM_MODE compute False in the test
+    environment -- several tests exercise code paths gated on INTERACTIVE
+    that fall back to a console typed-input prompt when it's False, which
+    tries to read real stdin under pytest and crashes. Tests should exercise
+    the interactive/button-driven branch regardless of what SIM_MODE
+    happens to default to in this environment -- that's a real-daemon
+    launch-time concern, not a test concern)."""
     noop = lambda text, blocks=None, thread_ts=None, reply_broadcast=False: (None, None)
     import signals_blocks
+    import signals_config as cfg
     monkeypatch.setattr(signals_blocks, '_post_message', noop)
+    monkeypatch.setattr(cfg, 'INTERACTIVE', True)
     for modname in (
         'paper_trading', 'schwab_client', 'schwab_stream',
         'signals_notify', 'signals_compute', 'signals_handlers',
@@ -32,6 +44,8 @@ def _no_real_slack_posts(monkeypatch):
         mod = __import__(modname)
         if hasattr(mod, '_post_message'):
             monkeypatch.setattr(mod, '_post_message', noop)
+        if hasattr(mod, 'cfg') and hasattr(mod.cfg, 'INTERACTIVE'):
+            monkeypatch.setattr(mod.cfg, 'INTERACTIVE', True)
 
 
 def _synthetic_timestamps(days=90):

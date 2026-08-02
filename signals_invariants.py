@@ -298,6 +298,39 @@ def print_all_live_node_state():
     print_staged_config_status(account='ira')
 
 
+def check_sim_mode_off_for_real_daemon():
+    """SIM_MODE must be False for a genuine active_signals.py run_loop
+    startup. Deliberately NOT in CHECKS/run_all() -- that function also runs
+    standalone (`.venv/bin/python signals_invariants.py`, the pre-commit
+    checklist item), where SIM_MODE=1 is the correct, expected default and
+    would false-positive here on every routine pre-commit run. Called
+    directly, once, only from run_loop()'s own startup instead.
+
+    SIM_MODE=1 is the fail-safe default (2026-08-01, after a real incident:
+    an ad hoc test call posted a real unprefixed message to the live
+    channel) -- active_signals.py's own entrypoint forces it back to '0' via
+    os.environ.setdefault before signals_config is even imported, so this
+    should never actually fire for a genuine daemon startup. If it does,
+    something bypassed that -- e.g. SIM_MODE=1 was already exported in the
+    shell before `python active_signals.py run` (setdefault leaves an
+    existing value untouched by design), silently turning the real daemon
+    into a no-op simulator: every alert gets a misleading 🧪 SIM MODE prefix,
+    and INTERACTIVE becomes False, disabling every real Slack button
+    (Executed/Filled/Order Placed/Exited/Skipped) -- a severe, silent
+    operational failure, not merely noisy."""
+    import signals_config as cfg
+    if cfg.SIM_MODE:
+        return [
+            "signals_config.SIM_MODE is True during a real daemon startup -- every "
+            "Slack alert will be misleadingly prefixed 🧪 SIM MODE and every "
+            "interactive button will be disabled. SIM_MODE=1 was likely already "
+            "exported in the shell before `python active_signals.py run` -- "
+            "os.environ.setdefault('SIM_MODE','0') only applies when nothing "
+            "already set it. Unset SIM_MODE and restart the daemon."
+        ]
+    return []
+
+
 CHECKS = [
     check_live_trailing_exit_automation_scope,
     check_research_mode_ticker_with_open_position_in_automation_scope,

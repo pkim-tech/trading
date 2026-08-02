@@ -51,7 +51,19 @@ SLACK_CHANNEL   = os.environ.get("SLACK_CHANNEL", "")
 SOCKET_MODE     = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNEL)
 
 SLACK_CHANNEL_ID = ""
-SIM_MODE         = os.environ.get("SIM_MODE") == "1"
+# Fail-safe default, flipped 2026-08-01: SIM_MODE is ON unless explicitly set
+# to "0" -- previously defaulted OFF (opt-in safety), which meant any ad hoc
+# dev/test invocation of Slack-posting code that forgot to export SIM_MODE=1
+# would post real, unprefixed messages to the live channel (found live: a
+# one-off test call to build_eod_scenario_review posted a real EOD report
+# outside its normal schedule). The real daemon (active_signals.py run_loop)
+# must now explicitly set SIM_MODE=0 to go live -- see the "How to Run"
+# section of CLAUDE.md for the exact launch command, and
+# signals_invariants.check_sim_mode_off_for_real_daemon(), which alerts
+# loudly if the real daemon ever actually starts with this still True
+# (should never legitimately happen -- SIM_MODE is for scripts/live_sim.py's
+# isolated-DB REPL, not the persistent production process).
+SIM_MODE         = os.environ.get("SIM_MODE", "1") != "0"
 SIM_SCENARIO     = os.environ.get("SIM_SCENARIO", "")
 # Interactive buttons/reminders require the process's own Socket Mode connection to be
 # the one Slack delivers the click to. The sim never starts a SocketModeHandler (only

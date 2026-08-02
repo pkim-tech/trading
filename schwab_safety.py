@@ -947,7 +947,23 @@ def check_order(
     # order is a cancel+replace of an already-approved pending buy, running in
     # the pre-open _GAP_CHECK_WINDOW deliberately outside the normal signal
     # windows; every other guard below still applies.
-    if side == "BUY" and not is_gap_correction:
+    # Also skipped for is_protective (2026-08-01, real live bug found via the
+    # Trade-Flow Accountability Grid: the post-fill top-up BUY in
+    # signals_notify._reconcile_fill is is_protective=True, and its
+    # is_gap_correction passthrough only covers the ONE narrow case where the
+    # triggering fill itself came from check_gap_resize -- the general case
+    # (any normal trailing-buy fill landing outside the narrow signal windows,
+    # which is routine: a resting order can fill hours after the signal
+    # fired) was still gated, so the top-up was structurally blocked for
+    # exactly the delayed-fill case it exists to handle. Confirmed live: both
+    # real non-daily-cap top_up failures on file (RETL 2026-07-29 18:57, LABD
+    # 2026-07-31 00:19) were this exact rejection -- 100% real-world failure
+    # rate, caught only because the Accountability Grid flagged this scenario
+    # as 'live-attempt-failed' (fired for real, never with a good outcome),
+    # not by any test. A top-up isn't a fresh signal-driven entry -- it's
+    # completing an already-approved one, same reasoning already applied to
+    # is_gap_correction above.
+    if side == "BUY" and not is_gap_correction and not is_protective:
         now = _now()
         t = (now.hour, now.minute)
         all_windows = _SIGNAL_WINDOWS + _OPEN_CHECK_WINDOWS

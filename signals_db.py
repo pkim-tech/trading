@@ -2092,6 +2092,25 @@ def set_sl_order_id_by_position(position_id, sl_order_id):
         c.commit()
 
 
+def set_broker_stop_price_by_position(position_id, broker_stop_price):
+    """Position-id-scoped -- unlike the legacy ticker-keyed set_broker_stop_price
+    (never actually called in production), which would misattribute the price
+    to the wrong node's position whenever 2+ nodes share a ticker, the same bug
+    class already fixed elsewhere via the wl_id refactor (see
+    set_sl_order_id_by_position). broker_stop_price=None clears it -- must be
+    called whenever the real stop it describes is replaced (an arm-time
+    trailing-sell, a TP/SL/TIME market-sell exit), or stop_status() reports a
+    stale 'known' price for a stop that no longer exists (Opus review,
+    2026-08-01, found this live path: an SL alert would say "broker stop on
+    file, no action needed" for a position whose stop was actually just
+    replaced by an unconfirmed market sell)."""
+    price = None if broker_stop_price is None else float(broker_stop_price)
+    with _conn() as c:
+        c.execute("UPDATE open_positions SET broker_stop_price = ? WHERE id = ?",
+                   (price, position_id))
+        c.commit()
+
+
 def log_open_price_quality(ticker, target_h, target_m, price, is_true_open):
     with _conn() as c:
         c.execute(

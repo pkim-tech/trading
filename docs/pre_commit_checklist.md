@@ -8,6 +8,9 @@ Used by `feature wrap` and `session wrap` before committing.
 - [ ] No runtime artifacts staged (`cache/`, `logs/`, `output/`, `active_phase_grid.json`, `current_test.json`)
 - [ ] `docs/design.md` reflects any architectural changes made this session
 - [ ] `docs/backlog_cache.md`/`docs/deep_backlog.md` updated if new issues or ideas surfaced
+- [ ] `.venv/bin/python scripts/check_backlog_cache_lean.py` — flags any `backlog_cache.md` entry
+      over 2 lines (detection only; fix by relocating the full writeup to `deep_backlog.md` and
+      leaving a one-line pointer, not by running a script unattended — see that script's docstring)
 - [ ] `readme.md` updated if layer behavior changed
 - [ ] Staged files reviewed — nothing unexpected included
 - [ ] `.venv/bin/python signals_invariants.py` — config-invariant sanity check (currently: every

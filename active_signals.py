@@ -31,6 +31,27 @@ compatibility with existing `from active_signals import X` / `import
 active_signals as a; a.X` callers (scripts/, pages/, tests/) and keeps only
 the daemon main loop and CLI dispatch.
 """
+import os
+# Must run before signals_config (or anything importing it) is imported --
+# SIM_MODE/INTERACTIVE/the Bolt app singleton are computed at module-import
+# time there, and signals_config now defaults SIM_MODE to "1" (fail-safe,
+# 2026-08-01, after a real incident: an ad hoc test invocation that forgot to
+# export SIM_MODE posted a real, unprefixed message to the live channel).
+# Gated on __name__ == '__main__' (Python sets this before any of the
+# module's top-level code runs, imports included, so it's safe to check this
+# early) -- NOT unconditional at module scope. This file's own docstring
+# above documents it as also being imported as a library by 11+ scripts
+# (`from active_signals import X`), and a bare module-scope setdefault would
+# have silently disabled the fail-safe default for every one of them too
+# (Opus review, 2026-08-01, verified empirically: `import active_signals`
+# alone flips SIM_MODE to False) -- reproducing the exact incident this
+# change exists to prevent, just through the library-import path instead of
+# a bare script. Only `python active_signals.py [run|list|add|remove|
+# positions]` (a real direct invocation) should opt back into real posting;
+# os.environ.setdefault leaves an already-exported SIM_MODE=1 (deliberate
+# sim run of this same file, if that's ever wanted) untouched either way.
+if __name__ == '__main__':
+    os.environ.setdefault('SIM_MODE', '0')
 
 import sys
 import time
@@ -554,6 +575,23 @@ def _guarded(section: str, fn, *args, **kwargs):
 def run_loop(tickers: set = None):
     ensure_tables()
     schwab_safety.sync_automation_scope()
+
+    # SIM_MODE must be off for a genuine daemon run (see os.environ.setdefault
+    # at the top of this file, and signals_config's fail-safe SIM_MODE default,
+    # 2026-08-01). Not part of signals_invariants.run_all() below -- that
+    # function also runs standalone via the pre-commit checklist, where
+    # SIM_MODE=1 is correct/expected and would false-positive there. Checked
+    # directly, once, here instead -- non-blocking (alerted, not fatal) since
+    # a misconfigured SIM_MODE, while a severe operational problem, isn't a
+    # crash-worthy one.
+    _sim_mode_violations = _guarded("sim_mode_check", signals_invariants.check_sim_mode_off_for_real_daemon)
+    if _sim_mode_violations:
+        _msg = "\n".join(f"- {v}" for v in _sim_mode_violations)
+        print(f"[sim_mode] {_msg}")
+        try:
+            _post_message(f"🚨 {_msg}")
+        except Exception:
+            pass  # a Slack posting failure must not prevent daemon startup
 
     # Config-invariant checks (signals_invariants.py) -- non-blocking, alerted
     # loudly rather than silently: a violation means some other code's

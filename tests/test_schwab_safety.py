@@ -72,6 +72,24 @@ def test_sell_outside_signal_window_not_blocked(env, monkeypatch):
     assert result == (None, None)  # dry_run -- not blocked by the time gate
 
 
+def test_protective_buy_bypasses_signal_window_gate(env, monkeypatch):
+    """Real live bug, found 2026-08-01 via the Trade-Flow Accountability Grid:
+    a post-fill top-up BUY (is_protective=True) is completing an
+    already-approved entry's sizing, not initiating a fresh signal-driven
+    one -- same reasoning already applied to is_gap_correction. Before this
+    fix, any top-up for a fill landing outside the narrow signal windows
+    (routine for a resting trailing-buy order, which can fill hours after
+    the signal fired) was unconditionally blocked. Confirmed live: both real
+    non-daily-cap top_up failures on file (RETL 2026-07-29 18:57, LABD
+    2026-07-31 00:19) were exactly this rejection -- a 100% real-world
+    failure rate for the top-up mechanism outside signal windows."""
+    monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 7, 29, 18, 57))
+    with pytest.raises(schwab_safety.SafetyViolation, match="outside signal windows"):
+        schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)  # non-protective still blocked
+    result = schwab_client.place_equity_buy('ira', TICKER, 5, 50.0, is_protective=True)
+    assert result == (None, None)  # dry_run -- not blocked by the time gate
+
+
 def test_trailing_buy_dry_run_blocks_real_api_call(env):
     result = schwab_client.place_trailing_buy('ira', TICKER, 5, 50.0, trail_pct=1.0)
     assert result == (None, None)

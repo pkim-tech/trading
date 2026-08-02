@@ -635,3 +635,28 @@ plan row, since a mean-reversion signal isn't predictable a day ahead. Built dir
 the user's actual question ("how close are we to trading material money" / "what critical code paths
 haven't been tested") — the readiness headline is the direct answer, recomputed fresh every EOD run
 so it's never stale by more than one trading day.
+
+## Test Fixtures & Coverage-Proof Techniques (reference, added 2026-08-01)
+
+Several distinct testing/coverage systems exist in this codebase, built at different times for
+different real gaps. They are deliberately **not unified into one system** — each answers a genuinely
+different question, and past sessions have specifically avoided collapsing them (e.g. the Trade-Flow
+Grid and the canary system were kept separate on purpose, see the `docs/backlog_cache.md`/`deep_backlog.md`
+2026-07-27 entries). This section is a map of what exists and what each one is actually for, so that
+doesn't need re-deriving in conversation.
+
+| System | Answers | Scope | Key files |
+|---|---|---|---|
+| **Trade-Flow Accountability Grid** | "Has this real logic branch ever fired, live/dry-run/paper, ever?" — an all-time evidence log. | Project-wide (32-41+ rows, one per real trade-flow branch) | `scripts/coverage_registry.py`, `pages/14_Coverage.py` |
+| **Canary/scenario system** | "Did today's expected behavior actually happen?" — daily operational monitoring, ticket-model (unexplained deviation = actionable). | Project-wide, day-scoped | `signals_db.scenario_expectations`/`coverage_deviations`, `scripts/coverage_check.py` |
+| **`offline_proof_for()`** | "Is there ANY test proof this branch works, live or not?" — greps `tests/test_*.py` fresh every run for a real assertion vs. a passing mention. The connective tissue between the Grid and the techniques below. | Per Grid row | `scripts/coverage_registry.py::offline_proof_for` |
+| **`fake_broker` fixture** | Drives real (non-dry_run) order-placement code against a stateful, evolving fake order book — not a per-call mock. Built because per-function mocking let real sequence bugs (place → hours pass → a later guard misreads the still-resting order) hide behind green tests. | Integration-style tests for any real broker-mutating code path | `tests/fake_broker.py`, `tests/test_fake_broker_*.py` |
+| **Truth tables** | Systematic enumeration of one function's full state space in a single parametrized test, instead of scattered hand-named examples that may not cover every cell. | One function at a time (built for `check_entry_abandon`'s 12-cell `(account, order_placed, order_id)` space) | `tests/test_entry_abandon_truth_table.py` |
+| **Hypothesis property tests** | Asserts an invariant holds across a *searched* space too large to hand-enumerate (used when a truth table's cell count would explode — `update_paper_buys`' 5-axis space vs. `check_entry_abandon`'s 3-axis one). | One function/invariant at a time | `tests/test_paper_trading_properties.py` |
+| **Mutation testing** | "Would the test suite actually catch this *specific, real* historical bug if reintroduced?" — reverts one real fix at a time, confirms the paired test fails, then restores it. Answers a different question than coverage (which only proves a line executed, not that a wrong value would be caught). | One function/bug at a time (built for `check_entry_abandon`'s 5 historical bugs) | `scripts/mutation_test_entry_abandon.py` |
+
+**When to reach for which**: coverage_events + the Grid for "is this proven in the real system at all";
+canaries for "is today's expected behavior actually happening"; fake_broker for any new test that
+exercises real order-placement sequencing; a truth table when a function's state space is small and
+enumerable; hypothesis when it isn't; mutation testing when a past real bug needs a regression test
+whose bite is itself verified, not assumed.

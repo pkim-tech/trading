@@ -159,6 +159,30 @@ def _confirm_order_status(account_hash, order_id):
     return last_status
 
 
+def get_order_status(account, order_id):
+    """Single, non-retrying status check for a real order well after
+    placement -- deliberately NOT _confirm_order_status (that function's
+    4x0.5s retry loop exists to catch a status that hasn't settled yet right
+    after submission; here the order may have been resting for minutes or
+    hours, so a stale non-terminal read isn't going to change on a quick
+    retry, and this runs inside the main poll loop across many positions
+    where burning ~1.5s per check adds up). Returns the status string, or
+    None if the single call fails (network error, etc.) -- treat None as
+    'unconfirmed,' not as any particular status; callers should fail toward
+    the cautious/manual path on None, not the reassuring one (found
+    2026-08-01: the TP/TRAIL automated-exit alert used to trust a stored
+    order_id's mere presence as proof an order was still resting, which is
+    also true of a REJECTED/CANCELED order -- this closes that gap by
+    actually checking)."""
+    try:
+        account_hash = _resolve_account_hashes()[account]
+        r = _get_client().get_order(order_id, account_hash)
+        r.raise_for_status()
+        return r.json().get("status")
+    except Exception:
+        return None
+
+
 def _post_order_confirmation(label, account_hash, order_id, ticker, account, submitted_msg):
     """Shared by every real placement call site: polls the real status and posts
     an accurate Slack message instead of always claiming success. A confirmed

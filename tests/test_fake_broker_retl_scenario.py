@@ -139,3 +139,9 @@ def test_sl_anchored_to_real_entry_lands_below_it(env, fake_broker, monkeypatch)
     fill_events = signals_db.get_coverage_events(scenario_key='buy_fill_reconciled')
     assert any(e['ticker'] == TICKER for e in fill_events), \
         "_reconcile_buy_fill should log the buy_fill_reconciled coverage event"
+
+    # broker_stop_price wiring (2026-08-01): a real automated SL placement
+    # should record the price it actually placed at, so the SL alert can
+    # trust it instead of falling back to a generic guess.
+    pos_after = signals_db.get_open_position(TICKER)
+    assert pos_after['broker_stop_price'] == pytest.approx(real_stop_price, abs=0.01)

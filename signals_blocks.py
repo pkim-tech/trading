@@ -7,7 +7,7 @@ import requests
 import schwab_safety
 import signals_config as cfg
 import signals_db as db
-from signals_helpers import _add_trading_hours, _last_sale_recovery, buy_order_sizing, mode_tag
+from signals_helpers import _add_trading_hours, _last_sale_recovery, buy_order_sizing, mode_tag, stop_status
 
 
 def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False):
@@ -266,7 +266,14 @@ def _build_buy_blocks(node, sig, auto_placed=False):
     return blocks
 
 
-def _build_sell_blocks(pos, reason, current_price, target_price):
+def _build_sell_blocks(pos, reason, current_price, target_price, resting_confirmed=False):
+    """resting_confirmed: True only when the caller has actually checked the
+    real broker order status and confirmed it's still resting (not just that
+    an order_id happens to be non-None -- a REJECTED/CANCELED order looks the
+    same as a resting one by id alone; see signals_notify._exit_order_resting,
+    the only real caller of this with resting_confirmed=True). False/default
+    covers both "no automated order" and "unconfirmed" -- fails toward the
+    cautious manual-action text in both cases (Opus review, 2026-08-01)."""
     ticker  = pos['ticker']
     ep      = pos['entry_price']
     pct     = (current_price - ep) / ep * 100
@@ -275,23 +282,51 @@ def _build_sell_blocks(pos, reason, current_price, target_price):
     if reason == 'TP':
         emoji   = "🟢"
         label   = "TAKE PROFIT"
-        action  = f"Cancel Stop Loss order — Sell All (Market) @ `${current_price:.2f}`"
+        if resting_confirmed:
+            action = f"🤖 Automated exit order resting @ `${current_price:.2f}` — should fill shortly, no action needed unless this persists."
+        else:
+            action = f"Cancel Stop Loss order — Sell All (Market) @ `${current_price:.2f}`"
     elif reason == 'SL':
         emoji   = "🔴"
         label   = "STOP LOSS HIT"
-        bsp = pos.get('broker_stop_price')
-        if bsp:
+        status, bsp = stop_status(pos)
+        if status == 'known':
             action = f"Broker stop-loss on file @ `${bsp:.2f}` — should auto-fill there, no action needed. Confirm once you see the fill in your account."
+        elif status == 'automation-pending':
+            action = f"⚠️ Should have auto-filled @ `${target_price:.2f}` but no broker stop is on file — check account, this may be a placement failure."
+        elif status == 'dry-run':
+            action = f"Expected SL trigger ≈ `${target_price:.2f}` (dry-run account — no real stop is ever placed)."
         else:
-            action = f"Check account — Stop Loss order should have auto-filled @ `${target_price:.2f}`"
+            action = f"Expected SL trigger ≈ `${target_price:.2f}` — no automated stop tracked for this position, verify/stage it yourself at the broker."
     elif reason == 'TRAIL':
         emoji   = "🟢"
         label   = "TRAILING STOP"
-        action  = f"Cancel Stop Loss order — Sell All (Market), trailing stop triggered @ `${target_price:.2f}`"
+        if resting_confirmed:
+            # The stop-loss is already gone by this point -- arming replaces it
+            # with a resting trailing-sell order (_attempt_automated_sell), and
+            # this alert only fires when that order hasn't confirmed a fill
+            # within the short poll window, which is the NORMAL case for a
+            # trailing-stop (can take far longer than the poll to trigger),
+            # not evidence anything is wrong (found 2026-07-28, GDXU). No
+            # manual action exists here -- check_own_sell_fills keeps polling
+            # the same order_id and auto-closes on fill.
+            action = f"🤖 Trailing-sell order resting @ `${target_price:.2f}` — should fill shortly, no action needed unless this persists."
+        else:
+            action = f"Cancel Stop Loss order — Sell All (Market), trailing stop triggered @ `${target_price:.2f}`"
     else:  # TIME
         emoji   = "🔶"
         label   = "TIME EXIT"
-        action  = f"Change Stop Loss → Market Close order (exit by EOD)"
+        if resting_confirmed:
+            # TIME exits route through the same _attempt_automated_exit_sell
+            # market-sell path as TP -- the old unconditional "Change Stop
+            # Loss -> Market Close" text told the user to modify an order
+            # that was already replaced by a real market sell (Opus review,
+            # 2026-08-01: this reason was originally left on the pre-fix
+            # text, contradicting its own now-reason-agnostic 15-min
+            # reminder).
+            action = f"🤖 Automated exit order resting @ `${current_price:.2f}` — should fill shortly, no action needed unless this persists."
+        else:
+            action = f"Change Stop Loss → Market Close order (exit by EOD)"
 
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",

@@ -31,6 +31,46 @@ def mode_tag(account):
     return "DRY-RUN" if limits.dry_run else "LIVE"
 
 
+def stop_status(pos):
+    """Distinguishes what broker_stop_price actually tells us for a given
+    position, since None is ambiguous between several very different
+    situations (found 2026-08-01 reviewing the SL alert's fallback text,
+    which guessed 'should have auto-filled' regardless of which case
+    applied):
+    - 'known': broker_stop_price is on file (our own code placed it and
+      recorded it via set_broker_stop_price_by_position) -- trustworthy.
+    - 'automation-pending': the ticker is in AUTOMATION_ENABLED_TICKERS, the
+      account is real (not dry_run), but no price is on file yet -- a real
+      anomaly worth an actionable/urgent alert (placement may have failed or
+      not run yet).
+    - 'dry-run': the account is dry_run -- schwab_client.place_stop_loss
+      short-circuits and never places anything for these, so
+      broker_stop_price can structurally never be recorded regardless of
+      automation scope. Not an anomaly; must not render as one (Opus review,
+      2026-08-01 -- the first version of this function ignored dry_run
+      entirely and rendered a permanent false "placement failure" alarm for
+      every manually-confirmed position in the 4 of 5 accounts that are
+      dry_run).
+    - 'manual': a real (non-dry_run) account, position never automation-
+      scoped -- no automated stop was ever supposed to exist here, so
+      there's nothing to detect a failure against; the alert should say
+      "verify yourself," not imply automation should have handled it.
+    Deliberately does NOT poll the broker or infer 'known' from anything
+    other than our own recorded placement -- see docs/backlog_cache.md's
+    2026-08-01 SL-alert entry for why (self-healing off broker-observed
+    state risks masking a real problem, same failure class already found in
+    coverage_deviations' auto-resolve bug)."""
+    bsp = pos.get('broker_stop_price')
+    if bsp:
+        return 'known', bsp
+    limits = schwab_safety.ACCOUNTS.get(pos.get('account'))
+    if limits is not None and limits.dry_run:
+        return 'dry-run', None
+    if pos.get('ticker') in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        return 'automation-pending', None
+    return 'manual', None
+
+
 def log_poll(msg):
     """Appends one [poll] trace line to VERBOSE_LOG_PATH -- every price/bar a
     live-trading decision point actually used, kept out of the human-readable
