@@ -13,6 +13,9 @@
 > genuinely new backlog item is raised, add a 1-2 line entry here directly (no full-detail
 > writeup needed unless/until it resolves).
 
+## [backtest] Research idea, raised 2026-08-03, evolved same night — NEW strategy paradigm: paired-ticker concurrent/additive capital allocation using a real matched leveraged inverse, explicitly NOT a v5 variant
+Full writeup: `docs/deep_backlog.md`'s 2026-08-03 (paired-capital) entry. Short version: idle-capital-reuse framing tested and superseded (not a hedge — AGQ/ZSL best at 1.56x multiplier, but SOXL/SOXS revealed the real gap: no concurrent offset during a real gap event). User wants a true concurrent/additive rebuild instead (both legs funded+held simultaneously, balanced sizing) — not started.
+
 ## [backtest] Research idea, found 2026-08-03, narrowed same day — the 14:30 daily signal window fires ~3x more entry signals than the 9:30 window, across nearly every v5 watchlist ticker
 Side finding from the entry-timing-seasonality check (`docs/research_log.md`'s 2026-08-03 entry). Directional intraday drift is now ruled out as the explanation (same-day follow-up entry: no real 9:30-to-14:30 price drift on any of the 10 tickers). Leading unverified explanation: cumulative opportunity — more elapsed trading time by the 6th bar than the 1st for any large-enough move (either direction) to breach the lower band, not a directional bias. Not yet tested directly (would need e.g. comparing intraday range/volatility by bar number).
 

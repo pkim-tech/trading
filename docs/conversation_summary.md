@@ -5986,3 +5986,56 @@ regime-structure half split off and re-opened. None of the new scripts or doc up
 `docs/conversation_summary.md` gets committed by this session-close step, per convention; the rest is
 still sitting as uncommitted working-tree changes and needs an explicit commit next session (or now,
 if asked).
+
+---
+
+## 2026-08-03 (later still) — Paired-ticker capital allocation research: idle-capital reuse tested and superseded by a concurrent/additive hedge framing
+
+Picked up from the earlier FFT/rhythm session close. User proposed using a ticker's real matched
+leveraged inverse (SOXL/SOXS, QID/QLD, GDXU/GDXD, etc.) to put idle capital to work while a primary
+v5 node's position is closed.
+
+**Static holding, rejected**: `scripts/sim_v6_inverse_parking.py` held the inverse for the whole idle
+window — wrecked by leveraged-ETF decay on rare month-plus gaps (GDXD -87% compounded despite a 65%
+per-window win rate). Not what the user meant anyway once clarified: they wanted the inverse actively
+traded on its own signal rules, only during idle time.
+
+**Idle-capital multiplier framing**: built 3 variants — strict zero-overlap (`sim_v6_inverse_secondary_trade.py`),
+forced-exit-on-primary-reentry (`sim_constrained_inverse_pair.py`), and aggressive-flip
+(`sim_paired_flip_strategy.py`, has a bug fixed mid-session but not yet cleanly rerun end-to-end).
+Widened the candidate pool beyond true inverse pairs per the user's "we just want filler" note
+(`sim_v6_filler_scan.py`, 12-ticker pool). Built a real joint-capital merge (`sim_v6_joint_capital.py`)
+that compounds primary's own trades + filler's non-overlapping trades into one chronological curve,
+tested both role assignments (which ticker is primary vs. filler) per the user's own suggestion.
+Real results: AGQ-primary/ZSL-filler is the standout (1.56x multiplier on total compounded gain);
+GDXU/GDXD works both directions (1.09x/1.27x); NUGT/DUST fails either way (DUST has no cliff-safe
+node at any fixed_sl, win rates 0.5-14%). Ran a live (non-cached) grid search for SOXS since it had
+zero v5 data, found a reasonably clustered node (w20/z1.5/sl2), but SOXL/SOXS failed both directions
+(0.51x/0.97x) — traced to a real ~11.6% weekend gap in the underlying that SOXL had already exited
+before, so SOXS's matching loss had no concurrent SOXL gain to offset it.
+
+That SOXL/SOXS trace became the pivot: the idle-capital-multiplier framing is NOT a hedge — primary
+and filler never overlap in time by construction, so a bad filler loss during a real gap event is
+never cushioned by a concurrent primary gain. User confirmed they actually want an **additive/
+concurrent** structure instead: both legs funded and held simultaneously (separate capital, not idle
+reuse), sized close to balanced rather than skewed toward one side (the "11×2 < 5×5" square-maximizes-
+area intuition — worth confirming the optimal split empirically, not assuming 50/50). Explicitly not
+a v5 variant; needs its own version tag once built for real.
+
+Also resolved a side question: KORU's historical real inverse (KORZ, Direxion Daily South Korea Bear)
+is delisted — confirmed via yfinance, no live pairing available for that ticker.
+
+**Status**: no concurrent-capital backtest built yet — this is real design/build work queued for next
+session, not something to prototype further ad hoc. Full detail in `docs/deep_backlog.md`'s 2026-08-03
+(paired-capital) entry; short pointer in `docs/backlog_cache.md`.
+
+**Housekeeping**: 6 new research scripts this session (`sim_v6_inverse_parking.py`,
+`sim_v6_inverse_secondary_trade.py`, `sim_v6_inverse_overlap_check.py`, `sim_constrained_inverse_pair.py`,
+`sim_v6_filler_scan.py`, `sim_v6_joint_capital.py`, `sim_paired_flip_strategy.py` — 7 actually).
+`docs/research_log.md` and `docs/backlog_cache.md`/`deep_backlog.md` updated; none of
+`active_signals.py`/`signals_*.py`/`schwab_*.py`/`backtester.py`/`strategies.py`/
+`run_optimization_sweep.py` were touched this session, so no Opus kernel review was needed per the
+session-wrap gate. `signals_invariants.py` and `check_backlog_cache_lean.py` both clean after the
+lean-cache fixup. User reported losing the Claude Code session UI mid-conversation — this close is
+running from the background job's transcript so the work isn't lost; recovering from disk as the
+user put it.
