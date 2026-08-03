@@ -5930,3 +5930,59 @@ specifically, since it's canary-scoped not DPST/ERY-scoped), `buy_fill_reconcile
 Full suite not re-run in full (only the 4 directly-touched fake_broker tests + `signals_invariants.py`
 + `check_backlog_cache_lean.py`) — no `active_signals.py`/`signals_*.py`/`schwab_*.py`/kernel
 module changed this session, so no Opus review was triggered per `session wrap`'s own gate.
+
+---
+
+## 2026-08-03 (later) — FFT/rhythm-for-entry-timing research thread: methodology mismatch caught by review, pivoted to time-of-day, found a real-but-mixed effect, then walk-forward-validated it down to 2 real candidates
+
+Started from "can FFT help identify signals better" — aimed first at explaining the empirically-chosen
+`window` parameter (10 vs 20). Built `scripts/fft_cycle_analysis.py`, found no significant spectral
+cycle in any of the 10 v5 watchlist tickers' returns (permutation-null p=0.076-0.837). Had an
+independent Opus review the methodology before trusting the negative result — it confirmed no bug,
+proved the pipeline works (found the real, known 3.5-bar intraday volatility seasonality as a
+positive control), but flagged the real problem: a rolling z-score exploits mean-reversion *speed*,
+not periodicity, so FFT peak-hunting was structurally incapable of answering the original question
+either way. Logged as refuted (for the tested framing) in `docs/research_log.md`, backlog updated.
+
+User then asked a different, sharper question: can rhythm decide entry timing directly? Tested two
+framings, both negative even after applying the review's fixes (Welch's method, block-bootstrap null
+instead of the anti-conservative iid-shuffle one, targeted multi-day band) — no v5 ticker shows a
+real repeating price wave (`scripts/multiday_cycle_entry_test.py`).
+
+Pivoted to a non-FFT idea instead: does the *time of day* a signal fires matter (live trading treats
+the 9:30 and 14:30 daily signal windows as equally trustworthy, never tested)? `scripts/
+entry_timing_seasonality.py` on the 10 v5 tickers found nothing significant — but the user correctly
+flagged a selection-bias concern (these 10 already survived a resweep for overall alpha, and their
+params were already optimized, potentially absorbing any such effect). Re-ran against the broader
+18-ticker v4 universe (`--watchlist-id 57`, added as a flag rather than a new script) and found a
+real, statistically significant pooled effect (p<0.0001) with 6 individual tickers flagged, mixed
+direction (some tickers prefer morning, some afternoon) — not a universal rule.
+
+Chased one side-thread: UVIX's afternoon trades were net losers on average — checked whether that
+was a stock-split/data artifact (it wasn't; UVIX genuinely decayed ~150x over 3 years, real
+structural volatility-ETF decay, confirmed via a raw bar-by-bar >15%-move scan) and confirmed
+removing UVIX doesn't change the pooled significance. Also ruled out one hypothesis
+directly: does price systematically fall through the day, explaining why the 14:30 window fires ~3x
+more BUY signals than 9:30? No — `scripts/intraday_drift_check.py` found no real net drift (mean
++0.048%, essentially a coin flip); that volume imbalance is unexplained, likely just cumulative
+opportunity by the later bar, not investigated further.
+
+Finished with a walk-forward validation (`scripts/entry_timing_walkforward_check.py`, chronological
+2-fold split, same convention as the existing `walk_forward_check.py`) on the 3 strongest candidates
+(GDXD, UVIX, DPST). GDXD and UVIX's morning-preference holds up consistently in both halves — real,
+validated findings. DPST's does NOT hold up (reverses direction in the second half) — correctly
+caught before it could have been mistakenly applied to DPST's real live-money node. Net actionable
+result: **nothing changes in live trading today** — GDXD/UVIX are research-mode-only, not live, and
+DPST's version of the effect didn't survive validation. Parked as a validated-but-not-yet-actionable
+finding for future work (e.g. if either ticker is ever promoted, or as a check to run on future
+candidates). Full detail in `docs/research_log.md`'s six 2026-08-03 entries; open items in
+`docs/backlog_cache.md` (signal-volume-imbalance mechanism still unexplained).
+
+**Housekeeping**: 5 new research scripts this session (`fft_cycle_analysis.py`,
+`entry_timing_seasonality.py`, `multiday_cycle_entry_test.py`, `intraday_drift_check.py`,
+`entry_timing_walkforward_check.py`), plus the FFT-cycle-detection backlog item closed and its
+regime-structure half split off and re-opened. None of the new scripts or doc updates (`research_log.md`,
+`backlog_cache.md`, `backlog_resolved_recent.md`, `deep_backlog.md`) are committed yet — only
+`docs/conversation_summary.md` gets committed by this session-close step, per convention; the rest is
+still sitting as uncommitted working-tree changes and needs an explicit commit next session (or now,
+if asked).
