@@ -5811,3 +5811,40 @@ explicitly calls for summarizing Opus findings to the user before starting fixes
 **Full suite: 507 passed** (was 496 at session start). `live_sim_harness.py`: 7/7 passed. Both
 `schwab_safety.py`/`signals_notify.py` changed, so the full session-wrap review/harness sequence ran
 per `CLAUDE.md`.
+
+---
+
+## 2026-08-02 (evening) — backlog_cache.md split into open-only + rolling resolved-recent; real wash-sale violation found and mitigated
+
+**Backlog restructuring.** `docs/backlog_cache.md` had grown to 408 lines, ~35 of them pure
+duplicates of already-permanent `deep_backlog.md` entries. User asked to cut the noise but wasn't
+sure which "open" items had quietly aged out either. Spawned an agent to triage all ~55
+open-looking headers against `deep_backlog.md`, `CLAUDE.md`, git log, and live DB/code state,
+classifying each `STILL_OPEN` / `ACTUALLY_RESOLVED` / `STALE_LOW_VALUE` / `UNCLEAR` with evidence.
+Result: `docs/backlog_cache.md` now holds open items only (166 lines, cut 8 items confirmed
+already-resolved-but-never-removed plus ~35 pure duplicates); new `docs/backlog_resolved_recent.md`
+holds a rolling ~7-day window of resolved one-liners for session-handoff context, meant to be
+pruned of anything older each time an item resolves (permanent record stays in `deep_backlog.md`
+regardless). `CLAUDE.md`'s `go` command and Research Log section updated to read/maintain both
+files; resolved items now get fully removed from `backlog_cache.md`, not just shrunk to a pointer.
+A few items were flagged `UNCLEAR` rather than silently dropped (2 real-order-test items, whether
+Part 3/4 automation has been directly live-confirmed) — worth a deliberate look, not a guess.
+
+**Real wash-sale violation found while reviewing the restructured backlog.** The active
+2026-07-20 hold ("don't buy GDXU/AGQ in any IRA-type account before wash-sale clearance,
+2026-08-05/06") turned out to have already been violated: `watch_list` node 108
+(`soxl_test`/GDXU gap-resize test, `mode='live'`, `account='soxl_ira'`, `dry_run=False`, added
+2026-07-24 — the same day as the first violation, with nobody cross-checking it against the
+active hold) placed 2 real GDXU buys inside the window (3 shares 2026-07-24, 2 shares 2026-07-27,
+both closed at a loss). User confirmed `soxl_ira` is a real retirement IRA, so per Rev. Rul.
+2008-5 the original 2026-07-06 brokerage-account GDXU loss is now permanently disallowed —
+already happened, not reversible, flagged for the user's tax preparer. Root cause: the hold was a
+documentation-only convention with zero code-level enforcement, and it lived in a backlog file
+that (pre-restructuring) was easy to skim past. Mitigation done: node 108 flipped `live` ->
+`research` (`signals_db.set_node_mode`, `watch_list_audit` id 260) to stop further real orders
+through the 2026-08-05 clearance date; logged as `trading_incidents` id 2 with full detail. User
+declined a CLAUDE.md hard-stop callout for this class of hold when offered. AGQ checked separately
+— no repurchase found anywhere, that side of the hold is clean.
+
+Full suite not run (no live-trading code touched this session — `signals_invariants.py` and the
+backlog-lean checker both pass clean). Nothing else changed.

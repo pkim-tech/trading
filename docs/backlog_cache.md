@@ -1,389 +1,151 @@
 # Backlog Cache
 
-> **Reminder (to Claude, added 2026-07-27)**: keep entries here to 1-2 lines — a one-line pointer
-> to `docs/deep_backlog.md`'s full-detail entry, plus a second line only for something genuinely
-> still-open. The full incident writeup (root cause, fix, review findings, test counts) belongs in
-> `deep_backlog.md`, not here, and NOT inline in `CLAUDE.md` either — CLAUDE.md should stay a
-> living reference, not an ever-growing changelog. Caught live after this got violated twice in
-> one sitting (once here, once in CLAUDE.md) before being fixed.
-
-## [live-trading][security] Resolved 2026-08-02 — existing-position BUY guard closes the real double-buy gap confirmed 2026-07-24
-Full detail: `docs/deep_backlog.md`'s entry. `check_order` now blocks a 2nd real BUY when a position already exists for (ticker, account), unless `is_protective` (top-up). Ticker+account-keyed (not node-keyed) is a documented, currently-latent limitation. Full suite: 507 passed.
-
-## [live-trading][coverage] Resolved 2026-08-02 — TRAIL-exit reminder spam fixed: routine "still resting" alert suppressed until reminder #3 (~45min), only the arm-time ping and eventual fill/escalation alerts remain
-Full detail: `docs/deep_backlog.md`'s entry. Cold Opus review found+fixed a HIGH gap (could've gone silent up to ~17.75h near/outside the 9-16 reminder window) plus 2 lower issues before landing.
-Full detail: `docs/deep_backlog.md`'s entry. GDXU's original 2026-07-28 wording/staleness bugs were already fixed as a side effect of separate 2026-08-01 work; this closes the remaining frequency ask.
-
-## [live-trading][security] Resolved 2026-08-01 (session-wrap review) — final whole-diff Opus review of all 5 session pieces together found 2 real cross-piece bugs
-Full detail: `docs/deep_backlog.md`'s entry. HIGH: `broker_stop_price` (piece 1) went live but was never cleared on replace, a real alert-accuracy regression — fixed + tested. MEDIUM: `SIM_MODE` fail-safe (piece 4) was disabled by any library import of `active_signals` — fixed via `__name__ == '__main__'` gating.
-
-## [live-trading][security] Resolved 2026-08-01 — real live-trading bug found via the Accountability Grid: post-fill top-up BUYs were blocked 100% of the time outside signal windows
-Full detail: `docs/deep_backlog.md`'s entry. `is_protective` now exempts the signal-window gate, matching `is_gap_correction`'s existing exemption. 2 confirmed real failures on file (RETL, LABD).
+> **Open items only.** Resolved items live permanently in `docs/deep_backlog.md`; a rolling
+> window of recently-resolved one-liners (for session-handoff context) lives in
+> `docs/backlog_resolved_recent.md`, pruned to entries from roughly the last week — anything
+> older is fully covered by `deep_backlog.md` and doesn't need re-reading here. `go` reads this
+> file plus `backlog_resolved_recent.md` in full each session; keep both lean.
+>
+> **Maintenance**: when an item here resolves — (1) add/update the full-detail entry in
+> `deep_backlog.md` (unchanged convention), (2) prepend a one-liner to
+> `backlog_resolved_recent.md`, (3) drop entries from `backlog_resolved_recent.md` older than
+> ~7 days (already permanent in `deep_backlog.md`), (4) remove the item from this file. When a
+> genuinely new backlog item is raised, add a 1-2 line entry here directly (no full-detail
+> writeup needed unless/until it resolves).
 
 ## [live-trading][coverage] Investigated 2026-08-02 — the 3 suspicious wired-never-fired rows explained; 2 real open items filed; remaining 14 triaged by staging feasibility, none actionable today
-Full detail: `docs/deep_backlog.md`'s two 2026-08-02 entries. `automated_sell_mode_skip`: legitimately rare, no bug. `fast_path_fill_reconciliation`: stream reconnects fine (07-23/07-30 disconnects were the known weekly token-expiry pattern), but its message parsing is still unverified against a real fill. `manual_buy_confirmation_account`: every real fill so far used the automatic path (which already places SL independently); filed under Slack-interface-improvements, not a coverage risk, since v5's direction is toward no manual step at all. Of the 14 `wired-never-fired` rows: 4 (`kill_switch_block`, `node_level_automation_pause`, `stale_buy_button_guard`, `automated_sell_mode_skip`) need staging **during market hours** — blocked while not WFH; 4 (`buy_buttons_resolve_correct_node`, `buy_fill_reconciles_correct_node`, `oversell_guard_correct_position`, `two_nodes_same_ticker_diff_accounts`) need a 2nd live node on an already-live ticker in a different account — blocked on only having one real (`soxl_ira`) account; 1 (`manual_buy_confirmation_account`) deferred to the planned Slack-interface rearchitecture; 1 (`market_buy_placement`) needs no staging at all — DPST (`wl_id=136`, `TrailingExitZScoreBreakout`, `soxl_ira`) is already the correctly-configured live node for it, just hasn't hit a real signal yet; remaining 4 (`fast_path_fill_reconciliation`, `dup_order_no_false_block`, `position_lock`, `pinned_entry_trigger`) aren't realistically stageable and are left as-is.
-
-## [live-trading][security] Resolved 2026-08-01 (evening) — real incident: an ad hoc test call posted a real Slack message; SIM_MODE flipped to a fail-safe default
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 (evening) entry / `CLAUDE.md`'s Live Trading section. Real daemon launch command unchanged — `active_signals.py` now forces SIM_MODE=0 for itself before `signals_config` is even imported.
-
-## [live-trading][coverage] Resolved 2026-08-01 — reconciliation_mismatch broken out per-node (20 rows, was 1 global)
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 entry. Also found+fixed a real regression while validating: the EOD Slack report would have posted 20 lines/day instead of 1; grouped into a summary line.
+Full detail: `docs/deep_backlog.md`'s two 2026-08-02 entries. Of the 14 `wired-never-fired` rows: 4 need staging during market hours (blocked while not WFH), 4 need a 2nd live node on a different account (blocked, only one real account), 1 deferred to the planned Slack rearchitecture, 1 (`market_buy_placement`) just needs DPST to hit a real signal, 4 aren't realistically stageable.
 
 ## [backtest][live-trading] Open, raised 2026-08-01 — formalize/write down the pattern separating manual-fill execution reality from automated/backtest-assumed fills
 Currently scattered across `docs/operational_limits.md`'s Phase 1/2 marker and `sim_chaos_monkey.py`; not yet scoped where it should actually live.
 
-## [live-trading][security] Resolved (retroactively confirmed 2026-08-01) — 2026-07-23 night soxl_ira live-order testing findings, all closed within days
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 entry. Async-confirmation gap was fixed 2026-07-24 (`fda9b2a`); left marked `Open` for a week past its actual resolution.
-
-## [live-trading][coverage] Resolved 2026-08-01 — GDXU TRAIL-exit alert wording: TP/TRAIL/TIME sell alerts no longer claim "Cancel Stop Loss order" for a position already managed by a resting automated exit order
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 (evening) entry. 2 review rounds (Opus) found and fixed a HIGH gap (order_id presence isn't proof of a resting order) and 2 MEDIUM gaps before landing.
-
-## [live-trading][security] Resolved 2026-08-02 — broker_stop_price clearing (already fixed 2026-08-01) + Skip now cancels a real resting FRESH exit order, but never the standing TRAIL protection
-Full detail: `docs/deep_backlog.md`'s 2026-08-02 entry. Paired review caught a HIGH regression in the first draft (would've cancelled a position's only protection); rewritten + tested. Full suite: 499 passed.
-
-## [live-trading][security] Resolved 2026-08-01 (late) — `handle_entry_price` never auto-placed a protective stop for automation-scoped market-buy fills; new paired independent+contextual review pattern adopted
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 (late) entry.
-
-## [backtest] Resolved 2026-08-01 (compounding-drag item) / Open (bear-market + regime items) — independent Opus challenge of the 2026-08-01 research tangent, then a redo + user correction on the drag finding
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+## [backtest] Open (bear-market + regime items) — from the 2026-08-01 research tangent's independent Opus challenge
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by title: "independent Opus challenge of the 2026-08-01 research tangent"). Compounding-drag item itself is resolved.
 
 ## [live-trading] Open, raised 2026-08-01 — HIBL/USD/YANG pilot nodes (154/155/156, $60-200 starting_notional) skip 71-87% of signal-window trades for lack of an affordable share
 The real cost of a skipped trade is a missed real broker order-flow event toward closing the `wired-never-fired` coverage gaps (see `docs/deep_backlog.md`'s 2026-08-01 entry) — the only thing these 3 nodes exist to produce.
 
-## [live-trading][security] Resolved 2026-07-31 (session wrap) — a 3rd independent review of the complete production diff found 3 more real issues before commit, all fixed
-Full detail: `docs/deep_backlog.md`'s same-day entry (top).
-
-## [live-trading][testing] Resolved 2026-08-01 — fake_broker coverage pushed 6/41 → 37/41 tracked branches with a real regression test
-Full detail: commit `f3b9bab`, `docs/deep_backlog.md`'s 2026-08-01 entry.
-
-## [live-trading][security] Resolved 2026-07-31 — full exit/arm/entry execution-path audit (9 bugs) + same-day follow-up pass (8 more) + a same-day independent review of that follow-up (8 more, 1 real-money)
-Full detail: `docs/deep_backlog.md`'s three 2026-07-31 entries (top).
-
-## [live-trading][docs] Resolved 2026-07-31 — `enable_node_auto_fill_detection(node_id)`'s docstring corrected (dropped the false "also sets the ticker-level flag" claim). Full detail: `docs/deep_backlog.md`'s 2026-07-30 (evening) entry.
-
 ## [live-trading][coverage] Open, raised 2026-07-30 — should canary scenario_expectations tests appear on the Trade-Flow Accountability Grid?
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Resolved 2026-07-29 — all 3 deferred design items from 2026-07-28 (night) now built: stateful fake order-book test fixture (`tests/fake_broker.py`), pre-action live-state verification (`schwab_safety._log_pre_action_state_verification`, detection-only), and a node-level circuit breaker (`schwab_safety.record_node_streak`, monitor-only). Full detail: `docs/deep_backlog.md`'s 2026-07-29 entries (top two).
-
-## [live-trading][coverage] Resolved 2026-08-01 — JDST re-paired with JNUG as a same-underlying bull/bear pair (new `canary_bull_bear_pair` scenario), not VOO's E-scenario mirror
-Full detail: commit `f3b9bab`, `docs/deep_backlog.md`'s 2026-08-01 entry.
-
-## [live-trading] Superseded 2026-08-01 — GDXD's old $5k-pilot-node role has no live successor plan; DPST now fills the "small real-money live volunteer" slot instead
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Resolved 2026-07-28 (night) — resting-order dup guards self-blocked their own replace calls; SH's automated exit was stuck for 4 real days. Full detail: `docs/deep_backlog.md`'s 2026-07-28 (night) entry (top).
-
-## [live-trading][coverage] Partially resolved 2026-08-01 — the 07-27 canary_* duplicate-row concern was already inert; cleaned up
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 entry. Root cause: a `mode` column added mid-migration (07-25) broke the dedup key; the old rows were already `active=0` and excluded everywhere — never a live bug. 1 follow-up still open (see entry).
-
-## [live-trading][coverage] Open, raised 2026-07-28 — two live-alert wording/staleness bugs found reviewing GDXU's TRAIL-exit test, not fixed yet
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Resolved 2026-07-27 (night, 2nd session) — `at_bar_close` bookkeeping bug caused false near-instant SL exits (paper trading, and unfixed in real `_scan_pinned_exit_arm` until a review round caught it). Full detail: `docs/deep_backlog.md`'s 2026-07-27 (night, 2nd session) entry (top).
-
-## [live-trading][security] Resolved 2026-07-27 (night) — GDXU stale-fill incident fixed (order_id-exact matching everywhere, replaces the fuzzy "most recent fill" hazard); automated TP/SL/TIME exits built; cancel+place replaced with atomic `replace_order`; 6 canary nodes restored after accidental deletion. Full detail: `docs/deep_backlog.md`'s 2026-07-27 (night) entry (top).
 
 ## [live-trading][security] Accepted residual risk, 2026-07-27 — `_submit_replace_with_retry`'s retry can fire a second `replace_order` against an already-replaced order_id
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
-## [live-trading][security] Resolved 2026-07-26 (evening) — BUY-signal duplicate-alert fix: `pending_wl_ids` now actually enforced + new broker-truth check (`_real_order_or_position_exists`) before firing a fresh live BUY alert
-Full detail: `docs/deep_backlog.md`'s 2026-07-27 (later) entry.
-
 ## [live-trading] Partially resolved 2026-07-27 (later) — `.env`'s `SCHWAB_AUTOMATION_TICKERS` trimmed from 29 to the 12 tickers on watchlist 65. Research universe/`trading_universe.db` scope not touched — still open if that broader trim is wanted.
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Resolved 2026-07-27 — watchlist 65 live-mode nodes reduced to SPY/SH/GDXU(#108)/DPST; 11 other live nodes deleted (not demoted), 2 dry_run_sim positions (VOO/IVV) retroactively closed first. Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
-
-## [live-trading][security] Resolved 2026-07-27 — SPY's real pending trailing-stop exit placed for real (order id 1007336072974, resting `AWAITING_STOP_CONDITION`, `soxl_ira`). Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
 
 ## [live-trading] Open, raised 2026-07-26 (evening), staged 2026-07-27 — 3 of 3 planned real-order tests now progressing; daemon currently down, blocking the remaining 2 from resolving
-Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
-
-## [live-trading][security] Resolved 2026-07-26 — NYSE trading-day gate built (`pandas_market_calendars`), guarding both daemon scan paths and `schwab_safety.check_order` itself; a retry added to the fix introduced and then closed its own HIGH duplicate-BUY bug, caught by review before reaching the daemon. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
-
-## [live-trading][coverage] Resolved 2026-07-26 — re-triaged the 22 `wired-never-fired` coverage-grid rows instead of building a stub-broker harness; 20/22 already had (or now have) real offline test proof, only 2 genuinely need a real order
-Grew out of the "deliberate trading-day-gate-style simulation" idea (raised earlier same session, see `docs/deep_backlog.md`'s 2026-07-26 entry for the full split/re-triage writeup) — an Opus design review found that most `wired-never-fired` rows are **policy-internal** (decided entirely inside our own code, no real broker round-trip needed to prove correct) rather than broker-interacting, so a stub-broker harness was the wrong tool for most of them.
-
-## [live-trading][security] Resolved 2026-07-26 — ERY phantom-fill incident cleaned up; new `trading_incidents` ticket log; every Slack alert now tags `(account · LIVE/DRY-RUN)`. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
-
-## [live-trading][security] Resolved 2026-07-26 — `auto_fill_detection_enabled` was ticker-only-keyed (a gap the wl_id refactor missed); now AND-gated on ticker + node (`wl_id`), defaulting closed. Opus review found+fixed a stale-button crash on old Slack messages + dead-code cleanup; an orphaned-node (`wl_id=NULL`) lockout and loss of one-tap bulk-disable were documented/deferred ("maybe later"). Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top). Full suite: 291 passed. Harness: 7/7.
-
-## [live-trading][coverage] Resolved 2026-07-26 — Morning Report/signal-window alerts hit Slack's 50-block limit again (25 nodes); replaced per-row shrinking with real chunking + threading (`_post_chunked`); Trade-Flow Accountability Grid redesigned with independent Paper/Dry-run/Live columns instead of one collapsed status. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entries (both, at the end of the file).
-
-## [live-trading][coverage] Resolved 2026-07-28 (evening) — coverage snoozes built (time-bounded acknowledgment for a known noisy scenario); UDOW's stale test position retroactively cleaned up
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][coverage] Resolved 2026-07-28 (later) — daily coverage report ("like pytest, but with the market") now runs inside the live daemon at 7am, checking the previous trading day
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][coverage] Resolved 2026-07-28 — closed 12 of 13 remaining `not-instrumented` rows in the accountability grid (38 rows, down from 39 — one dead row removed)
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][coverage] Resolved 2026-07-27 evening — widened the accountability grid from 32 to 39 rows, closing 5 real execution-logic gaps (not just guard logic)
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][coverage] Resolved 2026-07-27 — `coverage_deviations` rows are now permanent record ("ticket model"), never deleted; `record_deviation` fixed to not let a system auto-resolve mask a new real deviation. Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
+Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry. Status of the remaining 2 unconfirmed as of last check — verify before assuming still blocked.
 
 ## [live-trading][coverage] Open, raised 2026-07-27 — Trade-Flow Test Accountability Grid (`pages/14_Coverage.py`, backed by `scripts/coverage_registry.py`) needs filters + direct links to underlying tests
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
-## [live-trading][coverage] Resolved 2026-07-26 — `live_sim_harness.py` gained `scenario_dry_run_sim_cycle`, closing a coverage gap in testing the dry_run fill-synthesis logic itself (neither `live_sim.py`'s REPL nor the unit tests drove it end-to-end through the real daemon wiring). Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry (top).
+## [live-trading][security] Idea, raised 2026-07-26, explicitly gated on the wl_id refactor landing and being observed correct first (that landed 2026-07-25/26) — per-node `dry_run` override, additive/OR-logic only, never replacing the account-level flag
+`docs/deep_backlog.md:3642` — deferred, user judged it disproportionate effort even with the gate satisfied. Full detail there.
 
-## [live-trading][coverage] Resolved 2026-07-26 — dry_run fill synthesis built: a dry_run account's trailing/market-buy order now closes the loop against real price data instead of stalling forever. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
-
-## [live-trading][security] Resolved 2026-07-26 — `signals_invariants.py` built: startup + pre-commit config-invariant checks, 4 checks live. Full detail: `CLAUDE.md`'s Key Files entry.
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Resolved 2026-07-26 — "run both" real+paper restructure dropped, two-node pattern already covers it. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
-
-## [live-trading][security] Resolved 2026-07-26 — session-wrap Opus review found+fixed an orphan-table forward hazard in the watch_list rebuild migration. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
-
-## [live-trading][security] Resolved 2026-07-26 — Opus review of paper_alert_verbose/account-dedup diff: HIGH duplicate-node idempotency bug in 2 live-setup scripts, plus a rebuild forward-hazard and a stale-snapshot alert gate, all fixed. Full detail: `docs/deep_backlog.md`'s 2026-07-26 entry.
-
-## [live-trading][security] Resolved 2026-07-25/26 — wl_id-keyed refactor implemented, reviewed (2 Opus rounds), landed. Full detail: `docs/deep_backlog.md`'s 2026-07-25/26 entry.
-
-## [live-trading][security] Idea, raised 2026-07-26, explicitly gated on the wl_id refactor above landing and being observed correct first — per-node `dry_run` override, additive/OR-logic only, never replacing the account-level flag
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Resolved 2026-07-25 — second Opus review round on the daily_order_cap change: 1 stale-docstring fix, 1 plausible tradeoff accepted (cap bump reduces a de-facto cumulative BUY-notional bound). Full detail: `docs/deep_backlog.md`'s 2026-07-25 entry.
-
-## [live-trading][coverage] Resolved 2026-07-25 — pytest was polluting the real `coverage_events` table via a missing `isolated_db` fixture; fixed, 360 polluted rows cleaned up. Full detail: `docs/deep_backlog.md`'s 2026-07-25 entry.
-
-## [live-trading][compliance] Open, raised 2026-07-25 (3rd time this has come up in conversation, not previously backlogged) — FINRA eliminated the PDT rule/$25k threshold in 2026; re-evaluate daily_order_cap's purpose and confirm Schwab's rollout status
+## [live-trading][compliance] Open, raised 2026-07-25 (3rd time this has come up in conversation) — FINRA eliminated the PDT rule/$25k threshold in 2026; re-evaluate daily_order_cap's purpose and confirm Schwab's rollout status
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [backtest][live-trading] Research idea, raised 2026-07-25 — monthly universe rescreen (recurring cadence) + a possible "v6" momentum-exhaustion-bounce strategy variant
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
-## [live-trading] Resolved 2026-07-25 — coverage-system "compass" v2: node_id/mode identity migration + six-round Opus review chain. Full detail: `docs/deep_backlog.md`'s 2026-07-25 entry.
-
-## [live-trading][security] Latent, found by Opus review round 6, 2026-07-25 -- stale-pending-buys guard could silently discard a real manual fill confirmation if a ticker is ever outside SCHWAB_AUTOMATION_TICKERS
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+## [live-trading][security] Latent, found by Opus review round 6, 2026-07-25 — stale-pending-buys guard could silently discard a real manual fill confirmation if a ticker is ever outside SCHWAB_AUTOMATION_TICKERS
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). `signals_invariants.py` monitors the config state that would trigger it but doesn't fix the underlying handler.
 
 ## [live-trading][security] Deferred, not currently reachable, found by Opus review 2026-07-24 evening — manual-"Filled" SL call is ticker-gated but not mode-gated
-Add a `node.get('mode', 'live') == 'live'` guard alongside the ticker check if/when that routing changes — see `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry for full context.
-
-## [live-trading][coverage] Resolved 2026-07-26 — dry_run fill synthesis built (see the 2026-07-26 resolved entry above), closing this gap: dry_run does NOT auto-complete without it, which is exactly why the synthesis exists.
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Add a `node.get('mode', 'live') == 'live'` guard alongside the ticker check if/when that routing changes — see `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry. Distinct from the 2026-08-01 `handle_entry_price` SL-placement fix (different code path) — still open.
 
 ## [live-trading][coverage] Minor, found 2026-07-24 ~evening via Opus review — record_deviation doesn't refresh expected_outcome on rerun
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Design note, raised 2026-07-24 ~16:20 ET — paper trading and dry_run test genuinely different things, not redundant with each other
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [live-trading] Idea, raised 2026-07-24 ~15:05 ET — open a new margin account strictly dedicated to one real production ticker; keep soxl_ira as the standing multi-ticker test account
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [live-trading][tax] Idea, raised 2026-07-24 ~15:10 ET — run SOXL in both `roth` and `soxl_ira`, but `roth` needs to become limited-margin first
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Resolved 2026-07-24 evening — `daily_order_cap` no longer starves SL-placement/top-up. Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry.
-
-## [live-trading][security] Resolved 2026-07-24 evening — `notional_cap` now BUY-only, real position-size check added for SELL. Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry.
-
-## [live-trading] Resolved 2026-07-25 — coverage-system reframe complete: Streamlit dashboard, strategy_type axis, structured expected-vs-actual, drill-down, Slack-callable report (all 7 pieces). Full detail: `docs/deep_backlog.md`'s 2026-07-25 entry.
-
-## [live-trading][security] Resolved 2026-07-24 evening — `last_seen_bar` now seeded from real current bar at startup. Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry. Residual: `sell_alerted`/`window_alerted`/`limit_fill_alerted` still restart-unsafe, deliberately not fixed (no clean persisted-state reconstruction) — see that entry.
+`roth` is still `dry_run=True`/cash-type as of last check — precondition still unmet.
 
 ## [live-trading] Open, raised 2026-07-24 ~10:55 ET — retry `check_gap_resize`'s cancel+replace test properly pre-market on a future day, not mid-day
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [live-trading] Open, found 2026-07-24 ~10:35 ET — real BUY/SELL Slack alerts carry no canary tag, unlike the Reference Report or paper-trading's console tag
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][backtest] Resolved 2026-07-24 evening — `buy_alerted` now unlocks after a genuine same-day close (real or paper), gated against resting pending buys. Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry.
-
-## [live-trading] Resolved (confirmed stale 2026-08-01) — paper trading is currently fully dormant system-wide
-Full detail: `docs/deep_backlog.md`'s entry. Resolved by the 2026-07-25 mode-flip back to `research`; verified 2026-08-01 (32 closed trades, 6 open positions, genuinely active).
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). Unconfirmed whether still true — verify before assuming.
 
 ## [live-trading] Far-backlog, raised 2026-07-25, deprioritized same day — v5 watchlist skews long-only, consider adding inverse counterparts
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Resolved 2026-07-24 evening — `_trailing_buy_status` now anchors to the real `signal_price` trigger instead of a cache-derived one. Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry.
-
-## [live-trading] Resolved 2026-07-24 evening — `TrailingBothZScoreBreakout` fills now get a real automated stop-loss (both auto-fill and manual-Filled paths). Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry. Live verification still planned for Monday 2026-07-27 per the original plan.
-
-## [live-trading] Resolved 2026-08-01 (evening) — SL Slack alert falls back to a generic "should have auto-filled" guess; split into known/automation-pending/dry-run/manual code paths
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 (evening) entry. Opus review of v1 caught 2 real bugs (dry-run false-alarm, a write-suppression gap), both fixed before commit. Full suite: 473 passed.
-
-## [live-trading][security] Resolved 2026-07-24 evening — `add_node`'s NULL-unsafe dedup fixed (explicit check-then-skip, includes `arm_sell_pct`/trail axes), existing duplicate rows cleaned up. Full detail: `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry.
-
-## [live-trading][security] Elevated priority 2026-07-24 morning — real evidence that neither notional_cap nor the cash check would catch a same-account double-buy
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Idea, raised 2026-07-24 morning — permanent canary tickers in the dormant `ira` account as a standing delayed-regression test
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Resolved 2026-07-26, confirmed stale 2026-08-01 — Morning Report block-limit failure regressed (23 nodes now)
-Full detail: `docs/deep_backlog.md`'s entry. Resolved via real chunking (`_post_chunked`), not the ticker-trim originally called for — confirmed present in code.
+Distinct from the canary `ira` account's 2026-07-29 inverse-pair additions (FAZ/SPXU/TWM/QID/SDOW/JNUG/JDST) — those are canary-only, the real v5 watchlist 65 skew is untouched. Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [live-trading] Open, raised 2026-07-24 morning — signal/reminder alerts don't show dry_run status, only real order-placement messages do
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Distinct from `mode_tag(account)` (2026-07-26), which only tags order-placement alerts. Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [live-trading] Open, raised 2026-07-24 morning, CORRECTED 2026-07-24 ~10:15 ET — split paper-trading/dry-run/live notifications into separate channels (or otherwise reduce chattiness)
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Explicitly still backlogged per CLAUDE.md's `paper_alert_verbose` note — deliberately not bundled into smaller fixes. Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [live-trading][security] Open, raised by session-wrap Opus review 2026-07-23 night — `availableFunds` is leverage-inclusive for a real margin account, unverified whether that's safe for `brokerage`
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Open, planning in progress 2026-07-23 night — Friday 2026-07-24 real-account test plan on the new limited-margin IRA
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). Monitored (not fixed) via one of `signals_invariants.py`'s 4 checks.
 
 ## [live-trading] Open, raised 2026-07-23 night — Schwab auth flow is "clunky", no cleaner unattended path designed yet
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Superseded 2026-07-23 night — "revert live-fire dry-run test state" (see item above)
-Full incident detail still in `docs/deep_backlog.md`'s 2026-07-23 "Live-fire dry-run test state left in place" entry.
-
-## [live-trading] Resolved 2026-07-23 — Schwab OAuth `interactive=True` default hung the daemon (main client + stream thread), both fixed; alert-spam gap also closed. Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry.
-
-## [live-trading][security] Resolved 2026-07-22 — stale-cache race at market open (HIBL paper trade entered and SL'd in 31 seconds); `_current_price()` now rejects cache older than today at market open. Full writeup: `docs/research_log.md`'s 2026-07-22 "HIBL paper trade" entry.
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Resolved 2026-07-22/23 — canary watchlist nodes for daily paper-trading proof-of-life, all six built and live. Full design writeup: `docs/deep_backlog.md`'s 2026-07-23 entry.
-
-## [live-trading][security] Resolved 2026-07-23 — Morning Report silently rendered empty for weeks (mode filter), then broke outright once fixed (Slack block-limit); both fixed. Full incident writeup: `docs/research_log.md`'s 2026-07-23 entry.
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Resolved 2026-07-23 — two logging/observability gaps fixed: `active_signals.log` wasn't flushing; `slack_message_log` recorded intent not delivery (now has a real `error` column). Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry.
-
-## [live-trading] Resolved 2026-07-23 — `scripts/live_sim_harness.py` built (non-interactive coverage harness), wired into `session wrap`. Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry.
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). Distinct from the already-fixed `interactive=True` hang bug.
 
 ## [backtest] Open, paused 2026-07-22 — "v6" idle-capital parking idea; inconclusive, downturn-specific follow-up queued
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Tested (`docs/research_log.md`'s 2026-07-22 entry): no robust fold-consistent edge found. Follow-up idea (check specifically during real SPY drawdown episodes — dates listed in CLAUDE.md) raised but not yet run.
 
-## [live-trading] Resolved 2026-07-23 — coverage_events fully wired (stale "~13 remaining" note corrected, `daemon_section_exception` added). Full detail: `docs/deep_backlog.md`'s 2026-07-23 entry.
-
-## [live-trading][security] Planned for Friday (2026-07-24 WFH day) — real-account sanity tests: oversized BUY + naked SELL across several tickers, on the new limited-margin IRA only
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+## [live-trading][security] Open — real-order sanity tests (oversized BUY, naked SELL) still not run
+`scripts/live_sanity_check.py` was built for this (2026-07-22) but has not yet been run against a real account. Originally scoped to a specific WFH day (2026-07-24, long past) — that framing is stale, the underlying test-run is not.
 
 ## [live-trading] Idea, raised 2026-07-22, not designed — small (10-share) real EDC pilot position, held ~1 month to shake out issues before scaling
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Note: EDC's node was fully removed from `watch_list` 2026-07-19 (its one open position is now hand-tracked via spreadsheet) — re-confirm this idea's premise still holds before acting on it.
 
 ## [live-trading][tax] Open question, raised 2026-07-22 — which ticker (SOXL vs AGQ) goes to the taxable brokerage account first; wash-sale cross-account mechanic needs one more confirmation
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Gated on the broader wash-sale/tax analysis item below, also still open.
 
 ## [live-trading][security] Not started, discussed at length 2026-07-22 — max cumulative BUY notional per ticker per day (backstop against a repeat-buy/runaway bug)
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+User wants to think it over before picking a final multiplier. Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [live-trading] Low priority, idea raised 2026-07-21 — should `CASH_SAFETY_BUFFER` scale with order size instead of staying a flat $200?
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
-## [live-trading][security] Resolved 2026-07-21 — account cash/buying-power check built (`get_account_balance` + `check_order` wiring, quantity-aware, fail-closed). Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
+## [live-trading] Implemented 2026-07-21, unclear if live-tested — Entry Trigger/Fill/SL-Placement/Arm-latency automation for TrailingExitZScoreBreakout (Part 4)
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). Extensive automation now exists and runs live (DPST, canary E-node) — verify whether this specific code path has been directly confirmed before treating as still-open.
 
-## [live-trading][security] Resolved 2026-07-21 — cash-balance network call moved inside `approve_and_record`'s cross-account file lock, closing a TOCTOU race. Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
-
-## [live-trading][security] Resolved 2026-07-21 — pre-existing test hygiene gap: some `schwab_safety` tests were silently hitting the real Schwab API; fixed. Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
-
-## [live-trading][security] Resolved 2026-07-21 — `active_signals.run_loop` fault tolerance built: per-section isolation + outer last-resort net, so one section's exception can't kill the daemon. Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
-
-## [live-trading][security] Resolved 2026-07-22 — `schwab_safety`'s duplicate-order guard now confirms against Schwab's real order book, not just a local pre-flight record. Full detail: `docs/deep_backlog.md`'s 2026-07-22 entry.
-
-## [live-trading][security] Resolved 2026-07-22 — CRITICAL: trailing-arm state clobber caused re-arming and duplicate live trailing-sell orders (oversell risk); found by a full-stack Opus review, fixed. Full detail: `docs/deep_backlog.md`'s 2026-07-22 entry.
-
-## [live-trading][security] Resolved 2026-07-22 — live-state reconciliation check built: detection + text-only proposed remediation, never auto-executes. Full detail: `docs/deep_backlog.md`'s 2026-07-22 entry.
-
-## [live-trading] Implemented 2026-07-21, not yet live-tested — Entry Trigger/Fill/SL-Placement/Arm-latency automation for TrailingExitZScoreBreakout (Part 4)
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Implemented 2026-07-21, not yet live-tested — trailing-buy budget adherence (Part 3: padded sizing + overnight gap guard + post-fill top-up)
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][backtest] Resolved 2026-07-21 — SOXL's watchlist-65 node stays TrailingBoth
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+## [live-trading] Implemented 2026-07-21, unclear if live-tested — trailing-buy budget adherence (Part 3: padded sizing + overnight gap guard + post-fill top-up)
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). CLAUDE.md's Position Sizing section describes the padded-sizing + top-up design as working correctly at real notional (mathematically forced) — may be de facto resolved, verify before further work here.
 
 ## [live-trading][tax] Active hold, set 2026-07-20 — don't buy GDXU/AGQ in any IRA-type account before their wash-sale clearance dates
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Resolved 2026-07-22 — `same_day_block` is now account-type-aware (cash vs. margin/limited-margin IRA). Full detail: `docs/deep_backlog.md`'s 2026-07-22 entry.
-
-## [backtest] Resolved 2026-07-20 — last-window MOC vs trailing-buy; MOC does not win, see `docs/deep_backlog.md`/`docs/research_log.md`
+**Still genuinely active**: clearance dates are 2026-08-05/2026-08-06 (confirmed via `docs/conversation_summary.md`) — today is 2026-08-02. Distinct from the unrelated, already-cleared 2026-07-07 wash-sale question.
 
 ## [backtest] Research idea, not started, 2026-07-20 — is overnight gap frequency/magnitude asymmetric (up-gap vs down-gap)?
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
-## [backtest] Resolved 2026-07-20 — full 18-ticker v5 resweep completed; see `docs/deep_backlog.md` and `docs/research_log.md`
-
-## [live-trading][backtest] Resolved 2026-07-20 — watchlist 65 candidate testing complete, found+fixed 2 real bugs, see `docs/deep_backlog.md`/`docs/research_log.md`
-
-## [live-trading] Resolved 2026-07-19 — `AUTOMATION_ENABLED_TICKERS` moved to `.env`, widened to all 18 v4 tickers; EDC's v3.27 node removed from `watch_list`. Full writeup: `docs/design.md` (Layer 3).
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Resolved 2026-07-21 — SELL-side automated-order attempt is now mode-gated, not just ticker-gated. Full detail: `docs/deep_backlog.md`'s 2026-07-21 entry.
-
 ## [live-trading] Low priority, 2026-07-19 — paper-trading dedup is ticker-only, not `(ticker, window)`-aware
 Full detail in `docs/deep_backlog.md`.
-
-## [live-trading] Resolved 2026-07-18 — GDXD paper-trading layer built, `add_node` fixed_sl bug fixed. Full writeup: `docs/deep_backlog.md`'s 2026-07-18 entry.
-
-## [backtest] Resolved 2026-07-18 — 5 tickers with a negative walk-forward fold (DPST, NUGT, RETL, UDOW, UVIX) sent to research, no per-ticker investigation; DPST flipped live→research. Full detail: `docs/deep_backlog.md`'s 2026-07-18 entry.
 
 ## [live-trading][security] Phase 4 (deferred to cloud-infrastructure planning), 2026-07-18 — move order-placement/mutating Schwab calls behind a separate proxy this session can't write to
 Full detail in `docs/deep_backlog.md`.
 
-## [backtest] Resolved 2026-07-18 — `signals_db.add_node`'s `fixed_sl` computation ignored the real per-node value for `uses_fixed_sl` strategies; fixed via `fixed_sl_override`. Full detail: `docs/deep_backlog.md`'s 2026-07-18 entry.
-
 ## [live-trading][security] High priority, active focus as of 2026-07-18 — one brokerage account per live ticker, for blast-radius containment against a rogue algorithm
-Full detail in `docs/deep_backlog.md`.
+Full detail in `docs/deep_backlog.md`. Confirmed still unbuilt: `ACCOUNTS` has only one non-dry-run account (`soxl_ira`), shared across many live tickers.
 
 ## [live-trading][tax] Deprioritized 2026-07-18, 2026-07-17 — wash-sale/tax analysis needed before promoting any ticker into the taxable brokerage account
-Full detail moved to `docs/deep_backlog.md` ("Deprioritized 2026-07-18" entry).
-
-## [live-trading][security] Resolved 2026-07-17 — same-day buy→sell block explored and deliberately NOT built
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Full detail moved to `docs/deep_backlog.md` ("Deprioritized 2026-07-18" entry). No ticker promoted to taxable brokerage yet — precondition still unmet.
 
 ## [live-trading][backtest] High priority (raised 2026-07-18) — dividend cash isn't credited into P&L/SL/arm tracking; material for DPST specifically
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
-## [backtest][live-trading] High priority, found+partially fixed 2026-07-19 — gap-through-trigger fill optimism: neither the backtest kernel nor live sizing ever modeled overnight gaps past trail_buy_pct
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] High priority, confirmed 2026-07-18 — trailing-buy order needs re-sizing as the trigger price moves, to actually use all budgeted capital
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [backtest][live-trading] High priority, 2026-07-16 — trailing-buy sizing formula spends money that isn't guaranteed to be there; backtest's compounding formula assumes it too
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [backtest] Resolved 2026-07-22 — split-guard/`auto_adjust` reconciliation closed; GDXD numbers verified clean; data traceability chosen over full immutability. Full writeup: `docs/research_log.md`'s 2026-07-22 entry.
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
 ## [backtest] Medium priority, designed-not-built 2026-07-22 — data mutation log (traceability, not full immutability/versioning) for historical price cache rescales
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [backtest] High priority, 2026-07-16 — execution-adherence robustness ("chaos monkey"), distinct from island/robust-alpha
-## ✅ Resolved 2026-07-17 — `entry_timing=open_check` live-actionable analog built; see `docs/deep_backlog.md`
+Note: `db_cache.log_data_mutation`/`get_data_mutations` was built 2026-07-22 per CLAUDE.md's Key Files — this item may already be resolved and just never closed out here; verify before treating as open.
 
 ## [backtest] Idea, not scoped, 2026-07-15 — eventually delete v3.x once v4 is a confirmed superset
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [backtest] Medium priority, 2026-07-15 (revised) — v4 sweep disk footprint: 11-ticker watchlist is fine, full 53-ticker universe is not
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [backtest] Resolved 2026-07-15 — Phase 3 (full mesh) adds no value in every campaign tested so far
-## ✅ Resolved 2026-07-15/19/20 — trailing-buy fill logic kernel-correctness fix, executed in full; see `docs/deep_backlog.md`
-
-## [live-trading] Mostly resolved 2026-07-15 — corporate-action (stock split) defense
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Resolved (was stale) 2026-07-15 — HIBL trailing-buy order
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] In progress, wiring done 2026-07-17 — Schwab API automation, dry-run cutover not started
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). Note: the 2026-08-02 `backtest_cache` pruning (65GB→256MB, island-only) changes storage economics but addresses post-hoc bloat, not necessarily peak-disk-during-a-full-universe-sweep — unclear if this fully resolves the original concern.
 
 ## [backtest] Medium priority, 2026-07-10 — same-bar arm/take-profit trigger not checked at entry
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). Distinct from the unrelated `at_bar_close` bookkeeping bug (fixed 2026-07-27).
 
 ## [backtest] Open question, 2026-07-09 (rescoped 2026-07-13, buffer question resolved 2026-07-14) — fixed_sl=15% itself still needs a real sweep
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [backtest] High priority, 2026-07-16 — need a proper delayed-entry simulation for the same-day-re-buy constraint, not just a trade-list filter
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [backtest] Resolved 2026-07-14 — trailing-buy re-entry timing after a same-day exit
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+`docs/deep_backlog.md:4601-4602` confirms still unbuilt — only the admittedly-wrong post-hoc filter method exists. `sim_delayed_sell.py` (2026-07-17) covers the exit-side mirror only, not this entry-side ask.
 
 ## [execution] Research question, 2026-07-15 — when would TWAP/VWAP order execution become worth considering
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
@@ -392,16 +154,13 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [live-trading] Open question, 2026-08-01 — is a production-path oversell/rejection test even constructible?
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). Related to the still-open `oversell_guard_correct_position` coverage row above (blocked on a 2nd live node/account).
 
 ## [live-trading] Idea, not built, 2026-08-01 — real correlation-verification logic for the new JNUG/JDST "G" canary pair
-Today's fix (docs/deep_backlog.md's 2026-08-01 entry) only restored their real config/labels/scenario_expectations row (`canary_bull_bear_pair`) -- monitored the same simple same-day-trade-happened way as every other canary.
+Today's fix (`docs/deep_backlog.md`'s 2026-08-01 entry) only restored their real config/labels/scenario_expectations row (`canary_bull_bear_pair`) — monitored the same simple same-day-trade-happened way as every other canary, no real correlation check built yet.
 
 ## [backtest] Idea, not scoped, 2026-08-01 — FFT-based cycle detection to inform z-score window selection / regime structure
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [data] Idea, not scoped, 2026-08-01 — start recording our own 1-minute bars now, so a future "we need historical data" request never hits an expired retention window again
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [backtest][data] Resolved 2026-08-02 — `backtest_cache` pruned to island-only (65GB → 256MB, 493,720 of 167.5M rows kept); original moved aside, not deleted
-Full detail: `docs/deep_backlog.md`'s 2026-08-02 entry. Integrity-checked, spot-checked against pre-prune numbers.
