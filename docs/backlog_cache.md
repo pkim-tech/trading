@@ -13,6 +13,9 @@
 > genuinely new backlog item is raised, add a 1-2 line entry here directly (no full-detail
 > writeup needed unless/until it resolves).
 
+## [backtest] Research idea, found 2026-08-03, narrowed same day — the 14:30 daily signal window fires ~3x more entry signals than the 9:30 window, across nearly every v5 watchlist ticker
+Side finding from the entry-timing-seasonality check (`docs/research_log.md`'s 2026-08-03 entry). Directional intraday drift is now ruled out as the explanation (same-day follow-up entry: no real 9:30-to-14:30 price drift on any of the 10 tickers). Leading unverified explanation: cumulative opportunity — more elapsed trading time by the 6th bar than the 1st for any large-enough move (either direction) to breach the lower band, not a directional bias. Not yet tested directly (would need e.g. comparing intraday range/volatility by bar number).
+
 ## [backtest] Research idea, raised 2026-08-02 — FFT/wavelet-based trend-extraction as a distinct strategy paradigm (not an enhancement to the existing z-score mean-reversion family)
 Evaluated a Gemini-proposed live spectral-filtering pipeline (STFT/CWT low-pass denoising → slope/crossing signal → VWAP/TWAP execution). Confirmed this describes a fundamentally different strategy (trend-following off a denoised price line, sub-minute tick-level execution) than what this system runs (hourly-bar z-score mean reversion, 2 fixed daily signal windows, manual/bridge-automation execution) — most of the doc's cold-start/microstructure/execution-routing content doesn't apply here at all. The one applicable piece (offline FFT cycle-period detection on historical hourly data) is already captured separately — see the existing FFT cycle-detection item below. This entry is specifically the "build a new denoised-trend strategy variant" idea — unscoped, would need its own backtest kernel path distinct from `strategies.py`'s current classes. Not just a stray idea: user confirmed 2026-08-02 the system may eventually run several distinct strategy paradigms in parallel, not just mean-reversion variants — so this is a real candidate for that, not automatically low priority.
 
@@ -162,8 +165,8 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 ## [live-trading] Idea, not built, 2026-08-01 — real correlation-verification logic for the new JNUG/JDST "G" canary pair
 Today's fix (`docs/deep_backlog.md`'s 2026-08-01 entry) only restored their real config/labels/scenario_expectations row (`canary_bull_bear_pair`) — monitored the same simple same-day-trade-happened way as every other canary, no real correlation check built yet.
 
-## [backtest] Idea, not scoped, 2026-08-01 — FFT-based cycle detection to inform z-score window selection / regime structure
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+## [backtest] Idea, not scoped, re-opened 2026-08-03 — rolling/time-varying FFT spectral power as a regime signal (alongside the 2026-08-01 SPY-trend/VIX finding)
+Split off from the now-closed "FFT cycle detection to inform window selection" item — that half was tested and refuted (`docs/research_log.md`'s 2026-08-03 entry: no significant fixed dominant cycle in any v5 ticker's returns). This half — whether *time-varying* spectral structure (not a single fixed cycle) says anything about regime — was never tested and is still open.
 
 ## [data] Idea, not scoped, 2026-08-01 — start recording our own 1-minute bars now, so a future "we need historical data" request never hits an expired retention window again
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).

@@ -1,5 +1,24 @@
 # Backlog
 
+## [backtest] Resolved 2026-08-03 — FFT-based cycle detection to inform z-score window selection: negative result, no significant periodicity found
+Full writeup (hypothesis/method/result) in `docs/research_log.md`'s 2026-08-03 entry — this is a
+research-narrative resolution, not an action record, so it lives there rather than being duplicated
+here. Short version: `scripts/fft_cycle_analysis.py` (new) tested all 10 real v5 watchlist tickers'
+hourly return series for a dominant FFT cycle, using a random-permutation null for significance (the
+correct baseline — a raw peak from `scipy.fft` isn't itself evidence of periodicity for a series this
+close to white noise). No ticker showed a significant peak (p=0.076-0.837, all above the 0.05 bar),
+and no correlation with the empirically-chosen `window` (10 vs 20). The price-level series *did* show
+"significant" ~350-480 bar peaks, but that's a known null-test artifact (linear detrending doesn't
+remove multi-month drift, and a full-shuffle null destroys all autocorrelation, not just
+periodicity) — not real cyclic structure, flagged as such rather than reported as a finding.
+Distinct from the still-open, unscoped 2026-08-02 idea of FFT/wavelet live spectral filtering as its
+own new strategy paradigm (see `docs/backlog_cache.md`) — that's a different, bigger question this
+result doesn't touch. Also note: the original 2026-08-01 item bundled a second half ("or... feed
+regime detection alongside the SPY-trend/VIX finding") that this experiment did not test — it only
+checked for a single fixed dominant cycle, not rolling/time-varying spectral power as a regime
+signal. That half is re-opened as its own line in `docs/backlog_cache.md` rather than treated as
+closed by this result.
+
 ## [live-trading][security] Resolved 2026-08-02 — existing-position BUY guard closes the real double-buy gap confirmed 2026-07-24
 Confirmed live 2026-07-24: two real resting `TRAILING_STOP` BUYs (GDXD 5sh, GDXU 3sh) left
 `get_account_balance('soxl_ira')` completely unchanged before and after — Schwab doesn't reserve
