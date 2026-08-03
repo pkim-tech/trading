@@ -4272,7 +4272,8 @@ further conclusion. Scripts ready: `scripts/sim_v6_parking_vehicle_sweep.py` (wi
 cached in `output/v6_gap_windows.csv` with the broadened 776-window definition),
 `scripts/sim_v6_split_check.py --split 50-50`/`70-30`/`5fold` (supports arbitrary fold configs).
 
-## [live-trading][security] Planned for Friday (2026-07-24 WFH day) — real-account sanity tests: oversized BUY + naked SELL across several tickers, on the new limited-margin IRA only
+## ✅ [live-trading][security] Planned for Friday (2026-07-24 WFH day), confirmed run 2026-07-23, closed out 2026-08-02 — real-account sanity tests: oversized BUY + naked SELL across several tickers, on the new limited-margin IRA (soxl_ira) only
+**Closed 2026-08-02**: this was mistakenly reopened in `backlog_cache.md` as "never run" — it was in fact run for real 2026-07-23 (a day early), logged to `coverage_events` as `sanity_oversized_buy`/`sanity_naked_sell`, both confirmed real Schwab rejections. Also reconfirmed independently 2026-08-02: naked-sell is structurally guaranteed to reject by account mechanics alone (IRA disallows shorting entirely; a normal SELL in a margin account without shares also just rejects — shorting requires an explicit distinct order type this code never issues), so there was never a live-only unknown there to begin with.
 Built this session (uncommitted): `scripts/live_sanity_check.py` — standalone, bypasses
 `active_signals.py`/`signals_notify.py`/`schwab_safety` entirely (calls the schwab-py client
 directly via account-suffix resolution, not nickname, since the new IRA isn't in
@@ -4644,7 +4645,8 @@ validate what's currently live; would need its own design/build/validation cycle
 **Action needed**: not scoped, not started — logged as a real idea worth a future focused
 session, not urgent.
 
-## [live-trading] Open question, 2026-08-01 — is a production-path oversell/rejection test even constructible?
+## ✅ [live-trading] Open question, 2026-08-01, closed 2026-08-02 — is a production-path oversell/rejection test even constructible?
+**Closed 2026-08-02**: no, and it doesn't need to be. User confirmed the underlying mechanism — a naked-sell can't reach Schwab as a real short in either account type (IRA disallows shorting outright; margin/brokerage requires an explicit distinct short-sell order type this code never issues), matching this entry's own reasoning below that our own guards would catch it first anyway. Not a live-only unknown, structurally settled.
 Real Schwab rejection of a naked-sell/oversized-buy was confirmed live 2026-07-23 (bypass calls,
 see that entry above), and the production path's own handling of a real `OrderRejected` (falls back
 to manual, clean state, correct alert) is now confirmed via `tests/test_fake_broker_order_rejected_scenario.py`

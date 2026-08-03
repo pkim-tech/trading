@@ -38,6 +38,22 @@ appearing anywhere else in a test file counts as 'behavior-only' (some test like
 exercises this code path, but the log call itself could be deleted and nothing
 would catch it); no mention at all is 'none'. status stays the single source of
 truth for "verified-live" et al -- offline_proof never substitutes for it.
+
+'scenario_expectations'-mechanism rows have a structural blind spot in the above:
+their real proof asserts against trade_log/pending_buys/fake_broker order state
+(e.g. tests/test_fake_broker_pinned_entry_scenario.py), never against
+get_coverage_events(scenario_key=...) -- there's no coverage_events call on that
+code path to assert at all, by design (see the mechanism table above). A code_path
+function-name match doesn't reliably fix it either: real tests correctly drive the
+real *entry point* (e.g. notify_buy_signal), not code_path's often-internal helper
+names, so a name-match would miss genuine proof too (confirmed empirically against
+test_fake_broker_entry_scenario.py's market_buy_placement coverage while fixing this,
+2026-08-03). Fixed via an explicit, self-declared marker instead: a test file whose
+module docstring contains `registry id 'some_id'` is asserting "this file's test(s)
+are real evidence for REGISTRY row `some_id`" -- see _REGISTRY_ID_MARKER_RE below.
+Deliberately opt-in/self-declared (matches every other proof tier's stance of "only
+count it if a human deliberately wired it," not an inferred heuristic) -- a test
+author adds it once, same effort as any other docstring note.
 """
 import re
 import sys
@@ -459,6 +475,15 @@ REGISTRY = [
 
 _EVENT_ASSERTED_RE = re.compile(r'get_coverage_events\(\s*scenario_key\s*=\s*["\'](\w+)["\']')
 
+# Self-declared proof marker for scenario_expectations-mechanism rows -- see the
+# module docstring's "structural blind spot" note. A test file's docstring
+# containing `registry id 'pinned_entry_trigger'` is a deliberate assertion by
+# the test's author, not an inferred match -- kept to REGISTRY 'id' (unique per
+# row) rather than 'scenario_key' (can be shared/ambiguous across modes, see the
+# mode_filter collision note below) for precision.
+_REGISTRY_ID_MARKER_RE = re.compile(r"registry id\s+['\"](\w+)['\"]")
+_REGISTRY_ID_TO_KEY = {r['id']: r['scenario_key'] for r in REGISTRY if r.get('scenario_key')}
+
 # Files that exercise the coverage/scenario_expectations *infrastructure itself*
 # (signals_db plumbing, coverage_check.py's checker logic) using scenario_key
 # strings as arbitrary fixture data ('sl_placement', 'entry_fill', etc. reused
@@ -507,6 +532,10 @@ def _scan_offline_proof():
         for m in _EVENT_ASSERTED_RE.finditer(text):
             if m.group(1) in all_keys:
                 event_asserted.add(m.group(1))
+        for m in _REGISTRY_ID_MARKER_RE.finditer(text):
+            key = _REGISTRY_ID_TO_KEY.get(m.group(1))
+            if key:
+                event_asserted.add(key)
         for key in all_keys:
             if _quoted(key).search(text):
                 mentioned.add(key)
@@ -607,6 +636,10 @@ def _scan_fake_venue_proof():
         for m in _EVENT_ASSERTED_RE.finditer(text):
             if m.group(1) in all_keys:
                 event_asserted.add(m.group(1))
+        for m in _REGISTRY_ID_MARKER_RE.finditer(text):
+            key = _REGISTRY_ID_TO_KEY.get(m.group(1))
+            if key:
+                event_asserted.add(key)
         for key in all_keys:
             if _quoted(key).search(text):
                 mentioned.add(key)

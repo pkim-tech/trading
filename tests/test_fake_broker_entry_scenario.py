@@ -7,7 +7,14 @@ own entry mechanism) and market-buy entry (_attempt_automated_market_buy ->
 place_equity_buy). Both previously only had per-function-mock tests
 (tests/test_part4_entry_trigger.py) -- this drives the real notify_buy_signal
 entrypoint against a stateful simulated order book instead, asserting on the
-fake broker's own resulting order state."""
+fake broker's own resulting order state.
+
+test_market_buy_entry_fills_and_protects_with_a_real_stop is real evidence for
+registry id 'market_buy_placement' (scripts/coverage_registry.py) -- it drives
+the real entry point rather than calling _attempt_automated_market_buy by name
+directly, so a code_path-name-match scanner would miss it; see that registry
+row's check_mechanism='scenario_expectations' note for why this marker
+convention exists instead of a get_coverage_events() assertion."""
 import sys
 import tempfile
 from datetime import datetime

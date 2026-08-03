@@ -7,6 +7,9 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][security] Closed 2026-08-02 (stale, not new work) — `live_sanity_check.py`'s oversized-BUY/naked-SELL tests were actually run 2026-07-23; and the related "is an oversell test constructible" question resolved to "no, structurally guaranteed by account mechanics"
+Both were mistakenly still open in `backlog_cache.md`. Full detail: `docs/deep_backlog.md`'s two entries (search "closed 2026-08-02").
+
 ## [live-trading][security] Resolved 2026-08-02 — existing-position BUY guard closes the real double-buy gap confirmed 2026-07-24
 Full detail: `docs/deep_backlog.md`'s entry. `check_order` now blocks a 2nd real BUY when a position already exists for (ticker, account), unless `is_protective` (top-up). Ticker+account-keyed (not node-keyed) is a documented, currently-latent limitation. Full suite: 507 passed.
 

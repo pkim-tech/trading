@@ -5848,3 +5848,85 @@ declined a CLAUDE.md hard-stop callout for this class of hold when offered. AGQ 
 
 Full suite not run (no live-trading code touched this session — `signals_invariants.py` and the
 backlog-lean checker both pass clean). Nothing else changed.
+
+---
+
+## 2026-08-03 — V5 go-live checklist built; fixed a real coverage-registry proof-scanner blind spot; staged an organic post_fill_topup re-confirmation test
+
+Evaluated two Gemini-authored external docs against this system's actual state (not blindly
+implementing either): a generic risk-architecture blueprint (watchdog auto-flatten, ATR-scaled
+sizing, loss-streak breaker) and an FFT/wavelet signal-processing pipeline. Both were largely
+inapplicable as proposed — watchdog auto-flatten was rejected outright (broker-side stops already
+cover the gap, cloud migration removes the root cause of the 2 real host-sleep incidents); ATR
+sizing and loss-streak breaker were captured as genuine research items in `backlog_cache.md`
+rather than built (ATR conflicts with the account model — capital is already maxed per ticker, no
+free sizing knob to scale; loss-streak has a real overfitting risk given the low live trade
+volume). The FFT doc described a fundamentally different strategy paradigm (live spectral
+filtering + tick-level execution) than this system runs — captured as a real "future distinct
+strategy" research item per the user's stated expectation that multiple strategy paradigms may
+run in parallel eventually (new memory: `project_multi_strategy_future.md`), not dismissed as out
+of scope.
+
+**Built the V5 strategy go-live checklist** (new lead bullet in `CLAUDE.md`'s Live Trading
+section) by directly querying `coverage_registry.py`/`trade_log`/`paper_trade_log` rather than
+trusting docs — caught two stale doc claims in the process (`live_sanity_check.py`'s oversized-
+BUY/naked-SELL tests were actually run for real 2026-07-23, not "never run"; the related "is an
+oversell test constructible" question resolves to "no, structurally guaranteed by account
+mechanics" — IRAs can't short at all, margin accounts require an explicit distinct short-sell
+order type this code never issues). Both closed out in `deep_backlog.md`/`backlog_resolved_recent.md`.
+
+Exit-side (SL/TRAIL/TIME) is fully live+paper confirmed for both live-default strategies —
+confirmed by reading `strategies.py` that `TrailingBothZScoreBreakout`/`TrailingExitZScoreBreakout`
+share byte-identical `check_exit` logic, so one strategy's live proof covers the other's exits too.
+TP doesn't apply to either (only arms the trailing-exit state, never itself a terminal exit
+reason). Caught a real historical labeling issue along the way: SH's 2026-07-31 `trade_log` row
+is stored `exit_reason='TRAIL'` but was actually the hold-time-forced TIME exit that motivated the
+2026-08-01 labeling fix — the fix wasn't retroactive, so pre-2026-08-01 `exit_reason` values
+aren't reliable ground truth on their own.
+
+Entry-side has 3 real open gaps, all missing live confirmation: `post_fill_topup` (fired live 3x
+pre-fix, 0 good outcomes, the 2026-08-01 fix never live-reconfirmed), `market_buy_placement`
+(DPST's actual real entry mechanism — never proven live), `pinned_entry_trigger` (the
+9:30:02/14:30:02 precise-timing entry check — real check is scoped to canary IWM/TWM specifically,
+not any node exercising the mechanism generally). All 3 now confirmed to have real fake-venue
+proof via `tests/test_fake_broker_*.py` — closing the gap required an actual fix, not just
+verification (see below). `buy_fill_reconciles_correct_node` is a 4th gap, structurally blocked
+(no two live nodes currently share a ticker), no plan.
+
+**Fixed a real bug in `scripts/coverage_registry.py`'s proof-scanner** while checking fake-venue
+coverage for the 3 entry gaps: `scenario_expectations`-mechanism rows (like `pinned_entry_trigger`)
+have no `get_coverage_events()` call to assert against by design, and a code-path-function-name
+match is also unreliable since real tests correctly call the entry point (`notify_buy_signal`) not
+`code_path`'s internal helper names — confirmed empirically, this would have missed
+`market_buy_placement`'s real, already-existing proof too. Wired up an existing-but-never-connected
+convention (`registry id 'some_id'` in a test docstring, already used once by whoever built
+`test_fake_broker_pinned_entry_scenario.py`) into both `offline_proof_for`/`fake_venue_proof_for`,
+fixed a whitespace bug in the regex (the existing marker wrapped across a line break), and
+retrofitted the marker into `test_fake_broker_entry_scenario.py` for `market_buy_placement` (real,
+accurate — that test does close the gap, just wasn't marked). Both rows now correctly show
+`event-asserted` fake-venue proof. 4 fake_broker tests re-run clean after the fix.
+
+**Staged a real, organic (not forced/faked) live re-confirmation of `post_fill_topup`** on SH
+(`soxl_ira`, wl_id 135): widened `trail_buy_pct` from 1%→5% (capital unchanged, $800) so the next
+real signal is likely to produce a large enough fill-price shortfall to trigger the top-up —
+explicitly not a manual "Manually Open" force and not faked price data, both raised and rejected
+during design (faking signal price would have meant corrupting SH's real shared price cache, worse
+than the manual-open alternative already rejected). Wrote this up as a new, reusable **"Staged
+real-order test protocol"** in `docs/design.md` (8-step procedure: flat-node check, bypass-vs-
+production-path decision, deliberate sizing, typed confirmation, distinct staged-vs-organic
+tagging, cleanup, documentation, user-always-places-the-order). Confirmed SH's `trail_buy_pct`
+change doesn't conflict with its separate pre-existing `staged_test_config` role
+(`time_exit_via_trail`, testing TIME-exit-while-armed via `max_hold_hours=31`) — different tracked
+fields, and the multi-day timescale of that test isn't sensitive to an entry-timing shift of a few
+hours.
+
+**Remaining open, tracked in `CLAUDE.md`'s new checklist**: `post_fill_topup` (SH, `trail_buy_pct`
+must be reverted to 1% once resolved), `market_buy_placement`/`pinned_entry_trigger` (DPST at
+4.50% from trigger closes both at once if it fires at the pinned 9:30:02/14:30:02 check; IWM at
+-0.59%/TWM at 3.17% are the actual candidates for the `pinned_entry_trigger` Grid checkbox
+specifically, since it's canary-scoped not DPST/ERY-scoped), `buy_fill_reconciles_correct_node`
+(blocked, no plan). Nothing else to do right now except watch for these signals.
+
+Full suite not re-run in full (only the 4 directly-touched fake_broker tests + `signals_invariants.py`
++ `check_backlog_cache_lean.py`) — no `active_signals.py`/`signals_*.py`/`schwab_*.py`/kernel
+module changed this session, so no Opus review was triggered per `session wrap`'s own gate.

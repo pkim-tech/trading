@@ -654,9 +654,39 @@ doesn't need re-deriving in conversation.
 | **Truth tables** | Systematic enumeration of one function's full state space in a single parametrized test, instead of scattered hand-named examples that may not cover every cell. | One function at a time (built for `check_entry_abandon`'s 12-cell `(account, order_placed, order_id)` space) | `tests/test_entry_abandon_truth_table.py` |
 | **Hypothesis property tests** | Asserts an invariant holds across a *searched* space too large to hand-enumerate (used when a truth table's cell count would explode — `update_paper_buys`' 5-axis space vs. `check_entry_abandon`'s 3-axis one). | One function/invariant at a time | `tests/test_paper_trading_properties.py` |
 | **Mutation testing** | "Would the test suite actually catch this *specific, real* historical bug if reintroduced?" — reverts one real fix at a time, confirms the paired test fails, then restores it. Answers a different question than coverage (which only proves a line executed, not that a wrong value would be caught). | One function/bug at a time (built for `check_entry_abandon`'s 5 historical bugs) | `scripts/mutation_test_entry_abandon.py` |
+| **Staged real-order test** | "Does this actually work against the real broker, when the natural signal timing is too unreliable/slow to wait for?" — a deliberate, forced real order, not a wait-and-observe. Answers what nothing else in this table can: fake_broker/hypothesis/truth-tables prove our own code's logic; canaries/the Grid prove what's *already* happened; this is the only technique that manufactures a real event on demand. Real capital risk, so it's the most tightly protocoled entry here — see below. | One scenario/account at a time, ad hoc scripts (e.g. `scripts/live_sanity_check.py`) | `docs/deep_backlog.md`'s 2026-07-23 test-day entry; protocol below |
 
 **When to reach for which**: coverage_events + the Grid for "is this proven in the real system at all";
 canaries for "is today's expected behavior actually happening"; fake_broker for any new test that
 exercises real order-placement sequencing; a truth table when a function's state space is small and
 enumerable; hypothesis when it isn't; mutation testing when a past real bug needs a regression test
-whose bite is itself verified, not assumed.
+whose bite is itself verified, not assumed; a staged real-order test only when none of the above can
+answer the question and waiting for a natural occurrence is impractically slow/unreliable (e.g. a
+sizing-dependent code path that real trade notional rarely triggers by chance).
+
+### Staged real-order test protocol (added 2026-08-02)
+Established after the 2026-07-23 sanity-check day and reused for the `post_fill_topup` live
+re-confirmation — the same shape each time, now written down instead of re-derived:
+
+1. **Pick a flat node/ticker** (no open real position) so the test can't collide with capital
+   already at risk. Confirm via `open_positions` immediately before staging, not from memory.
+2. **Choose bypass vs. production path deliberately.** Bypass (`schwab_client` direct, like
+   `live_sanity_check.py`) only proves Schwab's own behavior (order rejections, mechanics) — use
+   it for broker-behavior questions. Route through the real production path
+   (`schwab_safety.check_order` → `signals_notify`/`signals_handlers`) when the question is
+   whether *our* code does the right thing — a bypass test can't answer that.
+3. **Size deliberately to force the target condition**, not hope a natural signal produces it —
+   e.g. for a sizing-dependent gate, pick a size guaranteed to cross the threshold rather than
+   waiting on real notional to happen to land there.
+4. **Typed per-ticker confirmation, one-shot, never loops/retries** — same guard as
+   `live_sanity_check.py`, prevents a staged test from repeat-firing into a real duplicate order.
+5. **Tag the result as staged, not organic**, in whatever log captures it (e.g. a note in
+   `coverage_events.detail`) — a forced pass proves less than an organic one and must stay
+   distinguishable later, the same way `live_sanity_check.py`'s events were correctable-but-labeled
+   rather than silently blended into real signal-driven history.
+6. **Clean up after**: close any position opened, revert any temporary config change, confirm real
+   account state matches expectations before walking away.
+7. **Document the real result** — a `deep_backlog.md` entry always; `research_log.md` too if it's
+   a genuine finding, not just a fix confirmation.
+8. **The user always places the real order**, same convention as sweep campaigns and daemon
+   restarts — this session scopes/designs the test, never executes it.

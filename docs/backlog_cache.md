@@ -13,6 +13,15 @@
 > genuinely new backlog item is raised, add a 1-2 line entry here directly (no full-detail
 > writeup needed unless/until it resolves).
 
+## [backtest] Research idea, raised 2026-08-02 — FFT/wavelet-based trend-extraction as a distinct strategy paradigm (not an enhancement to the existing z-score mean-reversion family)
+Evaluated a Gemini-proposed live spectral-filtering pipeline (STFT/CWT low-pass denoising → slope/crossing signal → VWAP/TWAP execution). Confirmed this describes a fundamentally different strategy (trend-following off a denoised price line, sub-minute tick-level execution) than what this system runs (hourly-bar z-score mean reversion, 2 fixed daily signal windows, manual/bridge-automation execution) — most of the doc's cold-start/microstructure/execution-routing content doesn't apply here at all. The one applicable piece (offline FFT cycle-period detection on historical hourly data) is already captured separately — see the existing FFT cycle-detection item below. This entry is specifically the "build a new denoised-trend strategy variant" idea — unscoped, would need its own backtest kernel path distinct from `strategies.py`'s current classes. Not just a stray idea: user confirmed 2026-08-02 the system may eventually run several distinct strategy paradigms in parallel, not just mean-reversion variants — so this is a real candidate for that, not automatically low priority.
+
+## [backtest][live-trading] Research idea, raised 2026-08-02 — ATR/volatility-scaled position sizing, evaluated against a Gemini-proposed risk-architecture doc
+Real blocker, not just unscoped: `starting_notional` is already capital-constrained per account (one-account-per-ticker model, sized to available capital), not a free sizing knob — needs a design for what shrinks when vol is high (idle capital? fewer shares?) before this is even a backtest question. Two other modules from the same doc (watchdog auto-flatten, loss-streak circuit breaker) were evaluated and rejected/backlogged in the same conversation — see below and `docs/conversation_summary.md`.
+
+## [live-trading] Research idea, raised 2026-08-02 — loss-streak circuit breaker (same-day or cross-day), evaluated against the same Gemini risk-architecture doc
+User flagged real overfitting risk: current live footprint is only 4 nodes (SPY/SH/GDXU/DPST) across 2 signal windows/day, too little same-day trade volume for a same-day streak counter to mean anything, and a cross-day threshold would be tuned on a small live sample. Needs a "watch it, don't automate it" framing (alert-only) rather than an auto-pause, if pursued at all.
+
 ## [live-trading][coverage] Investigated 2026-08-02 — the 3 suspicious wired-never-fired rows explained; 2 real open items filed; remaining 14 triaged by staging feasibility, none actionable today
 Full detail: `docs/deep_backlog.md`'s two 2026-08-02 entries. Of the 14 `wired-never-fired` rows: 4 need staging during market hours (blocked while not WFH), 4 need a 2nd live node on a different account (blocked, only one real account), 1 deferred to the planned Slack rearchitecture, 1 (`market_buy_placement`) just needs DPST to hit a real signal, 4 aren't realistically stageable.
 
@@ -87,9 +96,6 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 ## [backtest] Open, paused 2026-07-22 — "v6" idle-capital parking idea; inconclusive, downturn-specific follow-up queued
 Tested (`docs/research_log.md`'s 2026-07-22 entry): no robust fold-consistent edge found. Follow-up idea (check specifically during real SPY drawdown episodes — dates listed in CLAUDE.md) raised but not yet run.
 
-## [live-trading][security] Open — real-order sanity tests (oversized BUY, naked SELL) still not run
-`scripts/live_sanity_check.py` was built for this (2026-07-22) but has not yet been run against a real account. Originally scoped to a specific WFH day (2026-07-24, long past) — that framing is stale, the underlying test-run is not.
-
 ## [live-trading] Idea, raised 2026-07-22, not designed — small (10-share) real EDC pilot position, held ~1 month to shake out issues before scaling
 Note: EDC's node was fully removed from `watch_list` 2026-07-19 (its one open position is now hand-tracked via spreadsheet) — re-confirm this idea's premise still holds before acting on it.
 
@@ -152,9 +158,6 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 
 ## [backtest] Idea, not scoped, 2026-07-18 — daily-bar strategy variant, for much longer backtest history / real bear-market regime coverage
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Open question, 2026-08-01 — is a production-path oversell/rejection test even constructible?
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). Related to the still-open `oversell_guard_correct_position` coverage row above (blocked on a 2nd live node/account).
 
 ## [live-trading] Idea, not built, 2026-08-01 — real correlation-verification logic for the new JNUG/JDST "G" canary pair
 Today's fix (`docs/deep_backlog.md`'s 2026-08-01 entry) only restored their real config/labels/scenario_expectations row (`canary_bull_bear_pair`) — monitored the same simple same-day-trade-happened way as every other canary, no real correlation check built yet.
