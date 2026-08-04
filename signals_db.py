@@ -10,6 +10,20 @@ from datetime import datetime
 import strategies
 import signals_config as cfg
 
+# Tickers refused in any IRA/Roth/SEP-type account by add_node -- typically
+# commodity-futures ETFs structured as K-1-issuing limited partnerships, which
+# can generate real UBTI/UBIT in a tax-advantaged account. See CLAUDE.md's
+# "Ticker exclusion, decided 2026-08-04" note. Confirm real K-1 status before
+# removing an entry here.
+# USO: commodity-futures ETF, presumed K-1 (never directly confirmed, backlog
+#   research candidate killed on this basis before ever being funded).
+# AGQ: confirmed K-1 (ProShares' own tax documentation, 2026-08-04) -- Section
+#   1256 commodity pool. Real v5 watchlist ticker; decided 2026-08-04 to run in
+#   taxable brokerage instead (no wash-sale rule + favorable 60/40 blended rate
+#   there), NOT in IRA/Roth/SEP (real UBTI/Form 990-T exposure). See
+#   docs/backlog_cache.md's 2026-08-04 AGQ entries for the full reasoning.
+TAX_ADVANTAGED_EXCLUDED_TICKERS = {"USO", "AGQ"}
+
 
 def _conn():
     c = sqlite3.connect(cfg.DB_PATH)
@@ -993,6 +1007,13 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
     fixed_sl_override: pass the real per-node SL (e.g. a v4 SL-sweep value) directly —
     without it, uses_fixed_sl strategies always fall back to config.json's stale global
     default, which is wrong for any node whose real SL differs from that default."""
+    if account and ticker.upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
+            kw in account.lower() for kw in ("ira", "roth", "sep")):
+        raise ValueError(
+            f"add_node refused: {ticker} is excluded from tax-advantaged accounts "
+            f"(account={account!r}) — see CLAUDE.md's 'Ticker exclusion, decided "
+            f"2026-08-04' note (K-1/UBTI risk). Confirm the ticker's real K-1 status "
+            f"before overriding.")
     if watchlist_id is None:
         watchlist_id = get_active_watchlist_id()
     if strategies.uses_fixed_sl(strategy):

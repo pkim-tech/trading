@@ -6106,3 +6106,90 @@ thin live confirmation) — no action taken, just an honest calibration check.
 this session (`/tmp/*.py`) were not committed (throwaway analysis, per the project's manual-review-over-
 regression-test convention for research work) — `output/*.csv` outputs are gitignored. `docs/backlog_cache.md`,
 `docs/deep_backlog.md`, `docs/backlog_resolved_recent.md`, `docs/research_log.md` all updated.
+
+---
+
+## 2026-08-04 — Portfolio de-risking marathon: bear-market simulation suite built, AGQ's K-1/UBTI status discovered and reverses its account placement, USO/AGQ both blocked from IRA at the code level
+
+Started from a portfolio-management question (de-risk given the rest of the portfolio is already
+aggressive; should profits get skimmed into SPY ahead of a downturn) and ran the full session on it —
+no kernel/strategy code touched until the very end.
+
+**Bear-market stress-test suite built from scratch** (`scripts/sim_bear_market_stress.py` and five
+follow-on scripts): synthetic daily-bar leveraged-ETF reconstruction from long-history 1x underlyings
+(since real hourly cache only goes back ~2-3 years, no real crash coverage) against 2008 GFC/2020
+COVID/2022 bear windows. Strategy protects hard on the way down vs buy-and-hold, but gives back most
+of the recovery leg — full-cycle combined verdict still favors the strategy in most cases (10/12 GFC,
+9/12 2022, mixed 6/12 COVID), so "stop and hold long" during a crash is not supported by the data.
+
+**Skim-and-reserve "insurance policy" overlay designed and real-tested** (`sim_skim_redeploy.py`,
+`sim_real_skim_reserve.py`, `sim_downturn_reinvest_vs_hold.py`, `sim_double_policy_multi.py`): landed
+on automated skim (10% new-high step / 20% fraction ratchet into SPY, day-1 activation) + manual
+redeploy (alert at both 80%/100% recovery, no universal best threshold found). A real bug was found
+and fixed mid-session — the "double" redeploy trigger initially fired on day 1 for every ticker
+(pre-decline flat bars trivially satisfied the recovery check), inflating early results; fixed with a
+has-declined-first gate. Broad multi-ticker/multi-reserve testing (SPY/QQQ/SSO/UPRO/QLD/TQQQ) found no
+reserve universally beats plain "hold" once the trigger is standardized — SOXL and AGQ are the two
+tickers where the mechanism clearly helps. Design spec'd in full but not implemented (no real capital
+deployed yet, user extending paper-trading validation deliberately).
+
+**Real year-by-year backtests** (not just multi-year aggregates) found a strong regime effect: SOXL
+strategy +84% (2024)/+492% (2025)/-40.8% (2026 YTD) vs buy-and-hold -5%/+49%/+142.8% same years — the
+strategy wins in choppy years, loses badly in trending ones, confirmed independently on SSO too
+(+47%/+41%/-0.4% vs +44%/+25%/+16%). Four separate attempts to find a predictive/regime signal (200-day
+z-score bucketing, monthly-return autocorrelation, seasonal/quarterly splits) all came back negative or
+too-thin-to-trust — no way found to know in advance which regime is coming.
+
+**Real out-of-sample check on SOXL** (`sim_out_of_sample_check.py`): a 50/50 chronological split
+independently re-derived the exact params already live in production, and the held-out test half still
+returned +173.5% (vs +305% in-sample) — real decay from overfitting, but not "no edge," confirming the
+backtested edge is directionally genuine.
+
+**Major finding, discovered very late in the session: AGQ is a K-1/Section 1256 commodity pool**
+(confirmed via ProShares' own tax documentation), not a standard '40-Act fund like SOXL. This means (a)
+AGQ carries real UBTI/Form 990-T exposure if held in an IRA/Roth/SEP (custodian debits the tax directly
+from IRA assets, automatically, once gross K-1 income crosses $1,000/year — very plausible given real
+trading activity), and (b) AGQ is *exempt* from the wash-sale rule and gets a favorable 60/40
+blended tax rate in a *taxable* account instead — the exact opposite of SOXL, and the opposite of what
+this session concluded earlier in the night. This reverses the account-placement plan: **SOXL → IRA/Roth,
+AGQ → brokerage** (not both to IRA/Roth as originally concluded). The earlier `sim_wash_sale_impact.py`
+AGQ numbers are wrong/superseded (real corrected AGQ 2026 YTD after-tax: +68.3%, not +57.7%, with zero
+wash-sale carry-forward drag). SOXL's wash-sale result stands unchanged. Checked the rest of the
+watchlist for the same blind spot: NUGT/JNUG/JDST (Direxion, confirmed RIC/1099, no K-1) and GDXU
+(MicroSectors ETN, different structure, no K-1) are both clean — AGQ is the one real outlier, not a
+sign of a broader pattern.
+
+**USO permanently blocked from IRA/Roth/SEP** (K-1/UBTI risk, same category as AGQ) — its earlier
+backlog research candidacy is closed. **Real code-level guard added** (not just a doc note, per user's
+explicit "you've forgotten before" pushback): `signals_db.TAX_ADVANTAGED_EXCLUDED_TICKERS = {"USO", "AGQ"}`,
+enforced in `add_node` (blocks direct-insert-with-account) and a new `signals_invariants.py` check,
+`check_tax_advantaged_excluded_tickers` (catches the raw-SQL-`UPDATE`-after-insert path that `add_node`'s
+own guard misses — found by an independent Opus review of the diff). That invariant check immediately
+found a real, live discrepancy: AGQ's actual watch_list node (id 86) is still configured `account='ira'`
+— left as-is deliberately (research/paper mode only, no real money, no brokerage account exists yet to
+move it to).
+
+**Also resolved/researched this session**: PDT rule is confirmed already gone (Schwab implemented FINRA's
+replacement 2026-06-04, not a future 90-day wait); Schwab's real margin requirement on leveraged ETFs is
+60-100% (well above the standard 25% Reg T minimum) — a real constraint on any "lever up in brokerage"
+plan; wash-sale rules confirmed to extend to a spouse's accounts (McWilliams v. Commissioner); options
+strategies confirmed available even in a limited-margin IRA up to spread level (protective puts/covered
+calls work in any IRA, spreads need limited margin) — four option-based alternatives to the reserve idea
+were raised and backlogged, not modeled. SSO/UPRO/QQQ/QLD/TQQQ all got real v5 cliff-safe backtest
+results — TQQQ is the standout (+312.7% return, +248.2% alpha) but remains awkward as a strategy ticker
+since it's already the user's existing long-hold bet elsewhere (a TQQQ→QLD passive-hold rotation idea was
+discussed, not decided, complicated by large unrealized gains already in TQQQ).
+
+**Independent Opus review** of the `signals_db.py` diff (required per session-wrap protocol) found 1
+HIGH (fixed — the invariants-check gap above), 1 MEDIUM (account-name substring matching fails open on
+future account types like `hsa`/`401k` — documented as a known limitation, not fixed, needs a larger
+refactor reading a real `tax_advantaged` flag off `schwab_safety.ACCOUNTS`), and 2 LOW (no regression
+test — not fixed; comment should mention AGQ — fixed). `live_sim_harness.py`: 7/7 scenarios pass.
+`signals_invariants.py`: 1 known/expected violation (the AGQ `ira` node above), all else clean.
+
+**Open for next session**: decide/build the actual AGQ brokerage node once that account exists; decide
+whether to fix the MEDIUM account-matching robustness gap or add the regression test the reviewer
+suggested; TQQQ→QLD rotation still just discussed, not decided; SPY/SSO/UPRO v5 sweep results now fully
+landed (all 6 of the original 6-ticker sweep are done) — see `docs/backlog_cache.md` for the full,
+still-open list (options ideas, muni-bond-as-reserve test abandoned mid-calculation, reserve overlay
+design not yet implemented).

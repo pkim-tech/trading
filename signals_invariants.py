@@ -96,6 +96,34 @@ def check_live_node_missing_account():
     return violations
 
 
+def check_tax_advantaged_excluded_tickers():
+    """No watch_list node for a TAX_ADVANTAGED_EXCLUDED_TICKERS ticker (e.g. USO --
+    see CLAUDE.md's "Ticker exclusion, decided 2026-08-04" note, K-1/UBTI risk)
+    should exist in an IRA/Roth/SEP-type account.
+
+    Depends on this: add_node's own guard (signals_db.py) only fires for callers
+    that pass account= at insert time -- the dominant real path (Streamlit UI
+    add-to-watchlist buttons, most scripts) creates the node first and assigns
+    account via a raw `UPDATE watch_list SET account=...` afterward, which
+    bypasses that guard entirely. This check catches that gap after the fact.
+    Same substring account-name classification as add_node's guard (correct for
+    today's real account names -- brokerage/sep/roth/ira/soxl_ira -- but would
+    fail open on a future name like 'hsa'/'401k'; see docs/backlog_cache.md).
+    """
+    violations = []
+    for node in db.get_watchlist():
+        ticker = (node.get('ticker') or '').upper()
+        account = node.get('account') or ''
+        if ticker in db.TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
+                kw in account.lower() for kw in ("ira", "roth", "sep")):
+            violations.append(
+                f"{ticker} (wl_id={node['id']}) is in account={account!r}, but "
+                f"is on the tax-advantaged exclusion list (K-1/UBTI risk) -- "
+                f"remove the node or move it to a taxable account."
+            )
+    return violations
+
+
 def check_brokerage_not_live_with_unresolved_leverage_gap():
     """The 'brokerage' account must stay dry_run=True until the availableFunds
     leverage-inclusive-cash gap is resolved.
@@ -335,6 +363,7 @@ CHECKS = [
     check_live_trailing_exit_automation_scope,
     check_research_mode_ticker_with_open_position_in_automation_scope,
     check_live_node_missing_account,
+    check_tax_advantaged_excluded_tickers,
     check_brokerage_not_live_with_unresolved_leverage_gap,
     check_starting_notional_within_account_notional_cap,
     check_open_position_config_matches_live_node,
