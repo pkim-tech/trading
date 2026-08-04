@@ -40,14 +40,19 @@ PROXIES = {
                           "approximate high-beta amplification -- rough, flagged"),
     "SH":    ("SPY",  -1, None),
     "SPY":   ("SPY",  1,  None),
+    "QQQ":   ("QQQ",  1,  None),
 }
 
 CRASHES = {
     # (crash_start, crash_bottom -- start/end of the decline leg, recovery_end -- real
     # date SPY reclaimed its prior all-time high)
-    "2008_gfc":   ("2007-10-01", "2009-03-09", "2013-03-31"),
-    "2020_covid": ("2020-01-01", "2020-03-23", "2020-08-31"),
-    "2022_bear":  ("2022-01-01", "2022-10-12", "2024-01-31"),
+    "2008_gfc":    ("2007-10-01", "2009-03-09", "2013-03-31"),
+    "2020_covid":  ("2020-01-01", "2020-03-23", "2020-08-31"),
+    "2022_bear":   ("2022-01-01", "2022-10-12", "2024-01-31"),
+    # S&P 500 peak -> bottom -> reclaimed its 2000 nominal high. NOTE: several proxies
+    # (SOXX launched 2001-07, SLV launched 2006-04) postdate this crash's decline leg --
+    # results for tickers using those proxies will be truncated/missing, flagged at runtime.
+    "2000_dotcom": ("2000-03-24", "2002-10-09", "2007-05-30"),
 }
 
 BARS_PER_DAY = 7  # 9:30..15:30 hourly bars -> convert max_hold_hours to trading days

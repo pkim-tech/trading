@@ -6193,3 +6193,71 @@ suggested; TQQQ→QLD rotation still just discussed, not decided; SPY/SSO/UPRO v
 landed (all 6 of the original 6-ticker sweep are done) — see `docs/backlog_cache.md` for the full,
 still-open list (options ideas, muni-bond-as-reserve test abandoned mid-calculation, reserve overlay
 design not yet implemented).
+
+---
+
+## 2026-08-04 (later) — TQQQ tax structure cleared, USO refuted as AGQ's reserve, dot-com/QQQ crash window added, wash-sale monitor scoped, Roth 5-year clock discussion
+
+Follow-on session to the earlier de-risking marathon — no live-trading source touched, all research
+scripts + docs.
+
+**TQQQ confirmed clean of K-1/UBTI risk** (standard '40 Act RIC/1099, tracks Nasdaq-100, not a
+commodity/currency/volatility ProShares product) — reopens IRA as a real placement option for it
+alongside its existing brokerage position. User's own reasoning holds: cross-account wash-sale risk
+on TQQQ is conditional (only triggers if the brokerage leg sells at a loss within 30 days), not
+absolute, so it's currently moot with no near-term plan to sell it there at a loss. Logged, not yet
+acted on (no IRA `watch_list` node added).
+
+**Best v5 nodes pulled for TQQQ/QLD/SSO/UPRO/SPY/USO** — only TQQQ (120 trades, 20.8% win rate,
++242.8% robust alpha) had a real signal-to-noise edge; the rest were too thin (16-72 trades) or
+too-low-win-rate (6-9%) to trust.
+
+**USO tested and rejected as AGQ's skim-reserve vehicle**: real full-history test showed USO beating
+SPY (+468% vs +361%), but that's just USO's own 2023-2026 bull run, not defensive quality. The real
+crash-window test (generalized `sim_downturn_reinvest_vs_hold.py` to take `--strategy-ticker`/
+arbitrary `--reserve-ticker`) showed USO badly underperforming SPY in 2008 GFC and going **negative**
+in 2020 COVID (oil crashed alongside equities that year) — confirms SPY stays the better default
+reserve. Closes the AGQ/USO reserve-pairing question.
+
+**Added a 2000 dot-com crash window** to `sim_bear_market_stress.py`'s `CRASHES` dict, prompted by an
+"AI bubble" stress-test question — 2022 bear was judged the closer real analog (valuation/multiple
+compression) vs. 2008 (systemic credit) or 2020 (exogenous V-shape), but dot-com is the truer
+tech-bubble-burst precedent. SOXL/AGQ's existing proxies (SOXX from 2001-07, SLV from 2006-04) don't
+cover the full window, so added QQQ directly (real data since 1999, no proxy needed) as the clean
+test: strategy -50.4% decline / +30.5% recovery / -35.2% combined vs. buy-and-hold -82.9%/+139.3%/
+-59.2% — same cushion-the-crash-give-back-the-recovery pattern as every other crash tested, net
+better than buy-and-hold overall.
+
+**Flagged a real untested failure mode**: most historical bears (1929-32, 2000-02, 2008) had a real
+failed bounce before the true bottom, unlike the single-leg-down synthetic crashes tested so far — the
+skim overlay's manual redeploy trigger could get faked out by one and redeploy capital right before a
+second leg down. Not built/tested (deferred, not blocking). **User's gut-call: proceed with skim
+regardless** ("sock away some winnings") since skim locks in gains independent of redeploy timing.
+
+**New backlog item: live wash-sale risk monitor** (detection/alerting only, not prevention) —
+distinct from the existing retrospective `sim_wash_sale_impact.py` simulator. Scoped specifically to
+SPY (real multi-account exposure via the skim/reserve mechanism itself) and TQQQ (existing brokerage
+position + a possible future IRA node). Not yet scoped further (hook point, per-instrument exclusion
+rules for AGQ's Section-1256 status, data source).
+
+**Extended personal-finance tangent on Roth IRA mechanics** (not logged to project docs, no code
+implications): 5-year clock is a single lifetime clock per person for Roth IRAs (doesn't reset on
+new-IRA-opening or Roth-to-Roth rollovers), but a Roth 401(k) has its own separate per-plan clock that
+does NOT carry over into a Roth IRA on rollover unless an older, already-qualifying Roth IRA already
+exists (confirmed the user has one — no gap on either side). Inherited-IRA mechanics also covered
+(no 10% penalty ever for beneficiaries, 10-year full-distribution window under SECURE Act, contributions
+always tax-free basis to heirs regardless of the 5-year clock). Basis-tracking gap acknowledged (user
+doesn't know historical Roth contribution totals, likely never filed Form 8606 since no conversions —
+consistent with a direct-contribution-only history) but judged low-stakes given a small balance and no
+near-term withdrawal plans.
+
+**Morning check**: daemon confirmed running (not stale), `signals_invariants.py` clean except the
+already-known AGQ/`ira` tax-exclusion violation (open item, unchanged). Confirmed via DB query that
+the 2026-08-03 HIBL/USD/YANG research→live flip (with the $5k `soxl_ira` funding) is already done and
+unchanged — user's question was about already-completed work, not a pending action.
+
+**Docs**: `docs/backlog_cache.md` (TQQQ item, wash-sale-monitor item, skim-reserve item relocated to
+`deep_backlog.md` to stay within the 2-line convention), `docs/research_log.md` (3 new entries: TQQQ
+tax structure, AGQ/USO reserve rejection — dot-com/QQQ result not logged as a separate entry, folded
+into this session-close summary instead since it was a single quick test, not a multi-step research
+thread).

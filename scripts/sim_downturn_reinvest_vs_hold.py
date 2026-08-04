@@ -1,33 +1,37 @@
-"""Starting from today's REAL skim-reserve split (computed from SOXL's actual 3-year
+"""Starting from today's REAL skim-reserve split (computed from a ticker's actual real
 trade history, see sim_real_skim_reserve.py), simulate a synthetic crash+recovery
 forward from here under two policies:
   - REINVEST: keep laddering the reserve back into the strategy as it draws down
     (the same skim_redeploy_overlay rule already used, redeploy_frac active).
-  - HOLD: leave the reserve fully parked in SPY/SSO for the whole crash+recovery
-    cycle, untouched (redeploy_frac=0) -- only the strategy-allocated capital is
-    exposed to the crash.
+  - HOLD: leave the reserve fully parked in the reserve ticker for the whole
+    crash+recovery cycle, untouched (redeploy_frac=0) -- only the strategy-allocated
+    capital is exposed to the crash.
 
 Same daily-bar synthetic-leveraged-ETF caveats as sim_bear_market_stress.py apply.
+Strategy tickers must have a proxy/leverage entry in sim_bear_market_stress.PROXIES.
+Reserve tickers either have an entry in RESERVE_PROXY_LEVERAGE (leveraged, needs
+synthesis) or are fetched directly at 1x (e.g. SPY, USO -- both have enough real
+yfinance history to cover all 3 crash windows without synthesis).
 
-Usage: .venv/bin/python scripts/sim_downturn_reinvest_vs_hold.py [--reserve-ticker SPY|SSO]
+Usage: .venv/bin/python scripts/sim_downturn_reinvest_vs_hold.py [--strategy-ticker SOXL]
+       [--reserve-ticker SPY|SSO|USO|...]
 """
 import argparse
 
 import numpy as np
 import pandas as pd
 
-from sim_bear_market_stress import CRASHES, fetch_underlying, run_strategy_daily, synthesize_leveraged
+from sim_bear_market_stress import CRASHES, PROXIES, fetch_underlying, run_strategy_daily, synthesize_leveraged
 from sim_real_skim_reserve import build_real_trades, daily_equity_from_trades, get_node, load_hourly
 from sim_skim_redeploy import skim_redeploy_overlay
 
-SOXL_PROXY, SOXL_LEVERAGE = "SOXX", 3
 RESERVE_PROXY_LEVERAGE = {"SPY": ("SPY", 1), "SSO": ("SPY", 2)}
 
 
-def real_current_split(reserve_ticker):
-    """Today's real w_strategy/w_reserve split from SOXL's actual 3-year history."""
-    node = get_node("SOXL", 65)
-    trades, timestamps = build_real_trades("SOXL", node)
+def real_current_split(strategy_ticker, reserve_ticker):
+    """Today's real w_strategy/w_reserve split from strategy_ticker's actual real history."""
+    node = get_node(strategy_ticker, 65)
+    trades, timestamps = build_real_trades(strategy_ticker, node)
     strat_equity = daily_equity_from_trades(trades, timestamps)
 
     reserve_h = load_hourly(reserve_ticker)
@@ -45,29 +49,38 @@ def real_current_split(reserve_ticker):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--reserve-ticker", default="SPY", choices=["SPY", "SSO"])
+    ap.add_argument("--strategy-ticker", default="SOXL")
+    ap.add_argument("--reserve-ticker", default="SPY")
     ap.add_argument("--skim-step", type=float, default=0.10)
     ap.add_argument("--skim-frac", type=float, default=0.20)
     ap.add_argument("--redeploy-step", type=float, default=0.15)
     ap.add_argument("--redeploy-frac", type=float, default=0.25)
     args = ap.parse_args()
 
-    w_strategy0, w_reserve0, current_total_naive = real_current_split(args.reserve_ticker)
-    print(f"Starting split (today, real): {w_strategy0:.1%} in strategy, {w_reserve0:.1%} in "
+    if args.strategy_ticker not in PROXIES:
+        raise SystemExit(f"no crash-proxy mapping for {args.strategy_ticker} in sim_bear_market_stress.PROXIES")
+    strat_proxy, strat_leverage, _ = PROXIES[args.strategy_ticker]
+
+    w_strategy0, w_reserve0, current_total_naive = real_current_split(args.strategy_ticker, args.reserve_ticker)
+    print(f"Starting split (today, real): {w_strategy0:.1%} in {args.strategy_ticker}, {w_reserve0:.1%} in "
           f"{args.reserve_ticker} reserve")
 
-    soxl_underlying = fetch_underlying(SOXL_PROXY)
-    soxl_synth = synthesize_leveraged(soxl_underlying, SOXL_LEVERAGE)
-    res_proxy, res_leverage = RESERVE_PROXY_LEVERAGE[args.reserve_ticker]
-    res_underlying = soxl_underlying if res_proxy == SOXL_PROXY else fetch_underlying(res_proxy)
-    res_synth = synthesize_leveraged(res_underlying, res_leverage)
+    strat_underlying = fetch_underlying(strat_proxy)
+    strat_synth = synthesize_leveraged(strat_underlying, strat_leverage)
+    if args.reserve_ticker in RESERVE_PROXY_LEVERAGE:
+        res_proxy, res_leverage = RESERVE_PROXY_LEVERAGE[args.reserve_ticker]
+        res_underlying = strat_underlying if res_proxy == strat_proxy else fetch_underlying(res_proxy)
+        res_synth = synthesize_leveraged(res_underlying, res_leverage)
+    else:
+        # 1x reserve ticker with its own real long history (e.g. USO) -- fetch directly, no synthesis
+        res_synth = fetch_underlying(args.reserve_ticker)
 
-    node = get_node("SOXL", 65)
+    node = get_node(args.strategy_ticker, 65)
     rows = []
     for crash, (start, bottom, recov_end) in CRASHES.items():
         start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(recov_end)
-        lookback_start = soxl_synth.index.searchsorted(start_ts) - node["window"] - 1
-        sim_bars = soxl_synth.iloc[max(0, lookback_start):soxl_synth.index.searchsorted(end_ts) + 1]
+        lookback_start = strat_synth.index.searchsorted(start_ts) - node["window"] - 1
+        sim_bars = strat_synth.iloc[max(0, lookback_start):strat_synth.index.searchsorted(end_ts) + 1]
         win_start_i = sim_bars.index.searchsorted(start_ts)
 
         params = {"window": node["window"], "z_score_threshold": node["z_score_threshold"],
