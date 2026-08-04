@@ -13,9 +13,6 @@
 > genuinely new backlog item is raised, add a 1-2 line entry here directly (no full-detail
 > writeup needed unless/until it resolves).
 
-## [backtest] Research idea, raised 2026-08-03, evolved same night — NEW strategy paradigm: paired-ticker concurrent/additive capital allocation using a real matched leveraged inverse, explicitly NOT a v5 variant
-Full writeup: `docs/deep_backlog.md`'s 2026-08-03 (paired-capital) entry. Short version: idle-capital-reuse framing tested and superseded (not a hedge — AGQ/ZSL best at 1.56x multiplier, but SOXL/SOXS revealed the real gap: no concurrent offset during a real gap event). User wants a true concurrent/additive rebuild instead (both legs funded+held simultaneously, balanced sizing) — not started.
-
 ## [backtest] Research idea, found 2026-08-03, narrowed same day — the 14:30 daily signal window fires ~3x more entry signals than the 9:30 window, across nearly every v5 watchlist ticker
 Side finding from the entry-timing-seasonality check (`docs/research_log.md`'s 2026-08-03 entry). Directional intraday drift is now ruled out as the explanation (same-day follow-up entry: no real 9:30-to-14:30 price drift on any of the 10 tickers). Leading unverified explanation: cumulative opportunity — more elapsed trading time by the 6th bar than the 1st for any large-enough move (either direction) to breach the lower band, not a directional bias. Not yet tested directly (would need e.g. comparing intraday range/volatility by bar number).
 
@@ -36,9 +33,6 @@ Currently scattered across `docs/operational_limits.md`'s Phase 1/2 marker and `
 
 ## [backtest] Open (bear-market + regime items) — from the 2026-08-01 research tangent's independent Opus challenge
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by title: "independent Opus challenge of the 2026-08-01 research tangent"). Compounding-drag item itself is resolved.
-
-## [live-trading] Open, raised 2026-08-01 — HIBL/USD/YANG pilot nodes (154/155/156, $60-200 starting_notional) skip 71-87% of signal-window trades for lack of an affordable share
-The real cost of a skipped trade is a missed real broker order-flow event toward closing the `wired-never-fired` coverage gaps (see `docs/deep_backlog.md`'s 2026-08-01 entry) — the only thing these 3 nodes exist to produce.
 
 ## [live-trading][coverage] Open, raised 2026-07-30 — should canary scenario_expectations tests appear on the Trade-Flow Accountability Grid?
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
@@ -173,3 +167,6 @@ Split off from the now-closed "FFT cycle detection to inform window selection" i
 
 ## [data] Idea, not scoped, 2026-08-01 — start recording our own 1-minute bars now, so a future "we need historical data" request never hits an expired retention window again
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+
+## [backtest] Research idea, found 2026-08-03 — USO (1x crude oil) showed a real, ad hoc-confirmed edge (+105.9% alpha, 52.2% win rate, 67 trades, w10/z1.5/sl3) in a 1x-ticker universe screen; not yet run through the real committed v5 sweep
+Full detail: `docs/research_log.md`'s 2026-08-03 (1x universe screen) entry. Only USO cleared positive alpha of 30 sector/commodity/international 1x candidates screened; SOXL+USO joint-capital test also showed a real (if noise-prone) 1.28x lift. Next step: `VERSION=v5 TICKERS="USO" FIXED_SLS="1 2 3" STRATEGIES="TrailingBothZScoreBreakout TrailingExitZScoreBreakout" ./scripts/run_sweep_queue.sh` (user-run, per convention) to get a real cliff-safety-checked node before trusting the ad hoc numbers.

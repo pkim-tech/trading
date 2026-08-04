@@ -7,6 +7,15 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading] Resolved 2026-08-03 — HIBL/USD/YANG flipped research→live with planned notional ($2,500/$1,000/$2,500); soxl_ira notional_cap raised 800→3000 to match
+Caught by `signals_invariants.py` before it could bite live — old $800 cap would've structurally blocked every entry for the resized nodes. Independent Opus review found 2 real follow-on points left open by user's call. Full detail: `docs/deep_backlog.md`'s 2026-08-03 entry.
+
+## [backtest] Resolved 2026-08-03 — SOXS added to real v5 backtest_cache; TrailingExitZScoreBreakout fixed_sl=2 is the cliff-safe winner (73 trades, 11.0% win rate, +113.0% alpha)
+`TrailingBothZScoreBreakout` has no cliff-safe node at any fixed_sl (an earlier mid-sweep read was from an incomplete Phase1-only pass). Full detail: `docs/deep_backlog.md`'s 2026-08-03 entry.
+
+## [backtest] Resolved 2026-08-03 — paired-ticker/idle-capital strategy paradigm refuted with real cross-checked evidence (90-pair matrix, mean~1.0, no consistent edge); framework abandoned
+Individual v5 nodes' own edges unaffected — only the combination mechanism was refuted. Full detail: `docs/research_log.md`'s 2026-08-03 entry, `docs/deep_backlog.md`'s pointer entry.
+
 ## [backtest] Resolved 2026-08-03 — FFT cycle detection to inform z-score window selection: negative result
 No significant periodicity found in any of the 10 v5 watchlist tickers' return series (permutation-null p=0.076-0.837, all above 0.05); no correlation with the empirically-chosen `window` (10 vs 20). Full detail: `docs/research_log.md`'s 2026-08-03 entry, `docs/deep_backlog.md`'s pointer entry. The regime-detection half of the original idea is re-opened separately in `docs/backlog_cache.md`.
 

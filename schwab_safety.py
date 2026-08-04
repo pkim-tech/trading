@@ -159,12 +159,16 @@ ACCOUNTS = {
     "sep":       AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  dry_run=True, account_type="cash"),
     "roth":      AccountLimits(enabled=True, notional_cap=50_000, daily_order_cap=10, dry_run=True, account_type="cash"),
     "ira":       AccountLimits(enabled=True, notional_cap=75_000, daily_order_cap=10, dry_run=True, account_type="cash"),
-    # New limited-margin IRA (2026-07-24 Friday test plan). Only ~$5k funded total,
-    # and two real positions already staged, so remaining buying power is small --
-    # notional_cap set conservatively low pending a real balance check.
+    # New limited-margin IRA (2026-07-24 Friday test plan).
     # dry_run=False 2026-07-24 -- the only account going live for today's real-order
     # test plan (docs/live_test_plan_2026-07-24.md). Every other account stays dry_run=True.
-    "soxl_ira":  AccountLimits(enabled=True, notional_cap=800,    daily_order_cap=100, dry_run=False, account_type="margin"),
+    # notional_cap raised 2026-08-03 800->3000 after a real $5k capital move brought the
+    # account to ~$9k+ available -- the old $800 figure (set conservatively pending a real
+    # balance check) was stale and would have structurally blocked every entry/top-up for
+    # the newly-resized HIBL/USD/YANG nodes ($2,500/$1,000/$2,500 starting_notional), caught
+    # by signals_invariants.py before it could bite live. $3,000 covers the largest single
+    # order (HIBL/YANG $2,500) with buffer, stays conservative relative to real balance.
+    "soxl_ira":  AccountLimits(enabled=True, notional_cap=3_000,  daily_order_cap=100, dry_run=False, account_type="margin"),
 }
 
 # Live-automation scope -- moved from a hardcoded Python literal to SCHWAB_AUTOMATION_TICKERS

@@ -6039,3 +6039,70 @@ session-wrap gate. `signals_invariants.py` and `check_backlog_cache_lean.py` bot
 lean-cache fixup. User reported losing the Claude Code session UI mid-conversation — this close is
 running from the background job's transcript so the work isn't lost; recovering from disk as the
 user put it.
+
+---
+
+## 2026-08-03 (evening) — Pairs paradigm decisively refuted via a 90-pair matrix; HIBL/USD/YANG go live with real funding; SOXS added to v5; USO found as a 1x standout
+
+Picked up from the earlier paired-capital session close. Ran the SOXL/GDXU/AGQ/NUGT idle-capital-multiplier
+framing further, then the user challenged the whole premise: is this different from just running two
+uncorrelated nodes? Agreed to test it properly rather than keep tuning.
+
+**The decisive test**: `/tmp/all_v5_pairs.py` computed the joint-capital multiplier for all 90 directional
+pairs among the 10 real v5 watchlist tickers (no inverse relationship needed at all). Result: mean 1.02,
+median 0.96, spread 0.27x-3.45x, 40/90 help vs 38/90 hurt — centered at "no effect," more variance than
+any of the "special" inverse pairs. 7 of the top 12 "mutually beneficial" pairs involved GDXU specifically,
+traced to its small standalone-return denominator mechanically amplifying ratio noise, not a real pairing
+property. Time-sliced SOXL/GDXU/AGQ/NUGT into 5 equal calendar periods to test luck-vs-consistency directly:
+most "1.0x" cells were literally zero-fit periods (no real interaction, not neutral); the one pair with real
+fits across all 5 periods (SOXL/AGQ) was consistently a mild *drag* (0.72-1.09x), the only genuinely
+time-consistent result found all session — and it's negative. SOXS's earlier 1.85x headline number traced to
+an n=2 real-period sample that didn't even agree with itself (2.10x then 0.74x), though verified the two
+sub-period multipliers do compose multiplicatively into the full-period figure.
+
+**Verdict: pairs paradigm closed.** No coordination mechanism between tickers showed a reliable payoff,
+inverse or otherwise — practical conclusion is to keep running nodes independently, as the live watchlist
+already does. Individual nodes' own backtested edges are unaffected; only the *combination* mechanism was
+refuted. Full writeup: `docs/research_log.md`'s two 2026-08-03 entries (pairs refutation + 1x universe screen).
+
+**Side investigations same session**: explained why DUST/ZSL/SOXS underperform standalone (-94% to -96.5%
+buy-and-hold — daily-reset leveraged decay against a strong secular bull in the underlying, same mechanism
+across gold miners/silver/semis) vs. their bullish twins (NUGT +65%, AGQ +111%, SOXL +367%). Screened 30
+non-leveraged 1x tickers (sector/index/commodity/international ETFs) for a cleaner mean-reversion candidate
+without the leveraged-decay confound — found **USO** (1x crude oil) as a real standout: +105.9% alpha vs SPY,
+52.2% win rate, 67 trades, robust across window 5-10 in a follow-up sensitivity check. Everything else in the
+1x screen came back negative alpha (too low-volatility for the z-score dislocation to trigger meaningfully).
+Not yet run through a real committed v5 sweep — flagged in `docs/backlog_cache.md`.
+
+**User ran the real SOXS v5 sweep to completion this session** (`run_sweep_queue.sh`, both strategies,
+`fixed_sl∈{1,2,3}`): `TrailingBothZScoreBreakout` has no cliff-safe node at any `fixed_sl` (an earlier
+mid-sweep check that looked cliff-safe was from an incomplete Phase1-only pass — don't trust intermediate
+sweep state); `TrailingExitZScoreBreakout` `fixed_sl=2` is cliff-safe: 73 trades, 11.0% win rate, +113.0%
+alpha.
+
+**A genuine live-trading fix landed mid-session**: continuing the 2026-08-01 pilot-node sizing plan, moved
+HIBL/USD/YANG from `research` to `live` mode in `soxl_ira` with the planned notional ($2,500/$1,000/$2,500),
+after the user moved $5k of new capital into the account (~$9k+ available now). `signals_invariants.py`
+caught a real problem before it could bite live: the new `starting_notional` values exceeded `soxl_ira`'s
+stale `notional_cap` of $800 (set "conservatively low pending a real balance check" back on 2026-07-24, that
+check never happened until now) — every entry/top-up attempt for the 3 resized nodes would have been
+structurally blocked. Raised `notional_cap` 800→3,000. Independent Opus review (isolated worktree) confirmed
+the fix but flagged two real follow-on points, both deliberately left open per user's call ("let's see what
+happens"): (1) real order sizing compounds off last-trade proceeds, not `starting_notional`, so one winning
+trade could re-approach the new $3,000 ceiling and re-trigger the same block, invisible to
+`signals_invariants.py`'s current check; (2) no aggregate cross-node exposure guard exists in
+`schwab_safety.py` at all — 9 live nodes now share `soxl_ira` with nominal-sum exposure ($10,200) exceeding
+the ~$9k real balance, a pre-existing gap now more relevant at the higher per-order cap. `live_sim_harness.py`:
+7/7 scenarios pass. `signals_invariants.py`: all invariants hold post-fix.
+
+**Session also covered**, more briefly: confirmed canary TWM/SPXU/JDST/DIA coverage deviations were all
+routine (no-signal days or trades-still-in-progress, none stuck); explained why manual Slack BUY
+confirmation is still required (entry *placement* isn't automated, only post-fill housekeeping is);
+discussed and validated a real "why are we so confident in v5" self-check (bull-market-only backtest window,
+optimized-not-validated numbers, thin samples on some nodes, a serious kernel bug found only 2 weeks ago,
+thin live confirmation) — no action taken, just an honest calibration check.
+
+**Housekeeping**: `schwab_safety.py` changed (`notional_cap` 800→3000) — committed. Ad hoc research scripts
+this session (`/tmp/*.py`) were not committed (throwaway analysis, per the project's manual-review-over-
+regression-test convention for research work) — `output/*.csv` outputs are gitignored. `docs/backlog_cache.md`,
+`docs/deep_backlog.md`, `docs/backlog_resolved_recent.md`, `docs/research_log.md` all updated.
