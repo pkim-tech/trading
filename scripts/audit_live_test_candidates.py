@@ -59,10 +59,16 @@ def _resolve_live_node(ticker):
     docstring) -- fine for its real callers, but this script needs a specific
     node to audit. Prefer the mode='live' row when a ticker has more than
     one (e.g. a live + research pairing like GDXU); report ambiguity
-    explicitly rather than silently returning nothing."""
+    explicitly rather than silently returning nothing.
+
+    Excludes paper_role='daily_sync' rows (the 2026-08-05 daily-track clones)
+    -- without this, every v5 ticker with a daily-track node now resolves
+    ambiguously (live-track research node vs. its daily-track sibling) even
+    though a daily-track node is never the right thing to audit via a plain
+    ticker lookup; it only ever gets addressed by its specific wl_id."""
     with db._conn() as c:
         rows = [dict(r) for r in c.execute(
-            "SELECT * FROM watch_list WHERE ticker = ? AND watchlist_id = ?",
+            "SELECT * FROM watch_list WHERE ticker = ? AND watchlist_id = ? AND paper_role IS NULL",
             (ticker, db.get_active_watchlist_id())).fetchall()]
     if not rows:
         return None, None
@@ -133,11 +139,14 @@ def audit_one(ticker, wl_id=None):
             print("  verdict: no watch_list node -- not a candidate")
         return
 
-    # Real/dry_run wins on a collision (shouldn't happen for one node -- it's
-    # either mode='live' with a real position or mode='research' with a
-    # paper one, never both -- but real state should never be shadowed).
-    real_pos = db.get_open_position_by_wl_id(node['id'])
-    pos = real_pos or db.get_open_position_by_wl_id(node['id'], paper=True)
+    # get_real_position_state (added 2026-08-05) replaces this script's own
+    # real/paper/pending assembly -- real wins on a collision (shouldn't
+    # happen for one node -- it's either mode='live' with a real position or
+    # mode='research' with a paper one, never both -- but real state should
+    # never be shadowed).
+    state = db.get_real_position_state(node['id'])
+    real_pos = state['real_position']
+    pos = real_pos or state['paper_position']
     is_paper = real_pos is None and pos is not None
     account = node.get("account")
 
@@ -177,12 +186,19 @@ def audit_one(ticker, wl_id=None):
         # on fill) -- checking pos alone here previously reported "flat" for a node
         # that's actually mid-entry, waiting on a broker fill (found 2026-08-04,
         # same blind spot as coverage_check.py's carryover-scoping bug above).
-        pending = db.get_pending_buy_by_wl_id(node['id'])
+        pending = state['pending_buy']
         if pending:
             print(f"  DB position: none (flat), but pending buy resting -- "
                   f"signal_price=${pending['signal_price']:.2f} signal_time={pending['signal_time']} "
                   f"order_placed={bool(pending['order_placed'])} order_id={pending.get('order_id')}")
             print("  verdict: entry in progress (pending buy) -- not a real entry candidate right now")
+            return
+        paper_pending = state['paper_pending_buy']
+        if paper_pending:
+            print(f"  DB position: none (flat), but a paper pending buy is resting -- "
+                  f"signal_price=${paper_pending['signal_price']:.2f} "
+                  f"signal_time={paper_pending['signal_time']}")
+            print("  verdict: entry in progress (paper pending buy) -- not a real entry candidate right now")
             return
         print("  DB position: none (flat)")
         sig = a.compute_buy_signal(node)

@@ -1110,11 +1110,20 @@ def get_watch_list_node(ticker, version=None, strategy=None, account=None, windo
     same-ticker row that either falsely disambiguates a real live node to a
     stale one, or makes an otherwise-unique live node look ambiguous. Pass
     watchlist_id=False to search across all watchlists deliberately (e.g. a
-    canary/test node not on the currently-active watchlist)."""
+    canary/test node not on the currently-active watchlist).
+
+    Always excludes paper_role='daily_sync' rows (the 2026-08-05 daily-track
+    clones) -- without this, every v5 ticker with a daily-track sibling
+    (same ticker/account/mode='research' as its live-track node) makes this
+    lookup ambiguous for BOTH nodes even when only one was actually meant,
+    including at real callers like schwab_safety.py's node-level circuit
+    breaker (found by paired Opus review, 2026-08-05). A daily-track node is
+    never the right match for a generic ticker+disambiguator lookup -- it's
+    only ever addressed by its explicit wl_id."""
     try:
         if watchlist_id is None:
             watchlist_id = get_active_watchlist_id()
-        q = "SELECT * FROM watch_list WHERE ticker = ?"
+        q = "SELECT * FROM watch_list WHERE ticker = ? AND paper_role IS NULL"
         params = [ticker]
         if watchlist_id:
             q += " AND watchlist_id = ?"
@@ -1181,7 +1190,7 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
     fixed_sl_override: pass the real per-node SL (e.g. a v4 SL-sweep value) directly —
     without it, uses_fixed_sl strategies always fall back to config.json's stale global
     default, which is wrong for any node whose real SL differs from that default."""
-    if account and ticker.upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
+    if mode == 'live' and account and ticker.upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
             kw in account.lower() for kw in ("ira", "roth", "sep")):
         raise ValueError(
             f"add_node refused: {ticker} is excluded from tax-advantaged accounts "
@@ -1291,10 +1300,22 @@ def remove_node(watch_id):
 
 
 def set_node_mode(watch_id, mode):
+    """add_node's tax-advantaged-account guard only fires at node CREATION time
+    (mode='live' + an excluded ticker + an ira/roth/sep account) -- a node
+    created mode='research' in that same account, then flipped live via this
+    function, bypassed it entirely (found by paired Opus review, 2026-08-05).
+    Mirrors add_node's exact check rather than re-deriving it."""
     with _conn() as c:
         row = c.execute(
-            "SELECT watchlist_id, ticker, mode FROM watch_list WHERE id = ?", (watch_id,)
+            "SELECT watchlist_id, ticker, mode, account FROM watch_list WHERE id = ?", (watch_id,)
         ).fetchone()
+        if row and mode == 'live' and row['account'] and row['ticker'].upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
+                kw in row['account'].lower() for kw in ("ira", "roth", "sep")):
+            raise ValueError(
+                f"set_node_mode refused: {row['ticker']} (wl_id={watch_id}) is excluded from "
+                f"tax-advantaged accounts (account={row['account']!r}) -- see CLAUDE.md's "
+                f"'Ticker exclusion, decided 2026-08-04' note (K-1/UBTI risk). Confirm the "
+                f"ticker's real K-1 status before overriding.")
         c.execute("UPDATE watch_list SET mode = ? WHERE id = ?", (mode, watch_id))
         if row:
             _log_audit(c, 'set_node_mode', watchlist_id=row['watchlist_id'], watch_id=watch_id,
@@ -1930,6 +1951,67 @@ def get_open_position_by_wl_id(wl_id, paper=False):
     return d
 
 
+def get_real_position_state(wl_id):
+    """Single node-scoped "what's actually going on with this node right now" call,
+    replacing the hand-rolled ticker-keyed state-assembly each of status_check.py/
+    audit_live_test_candidates.py and watchlist_status.py used to do independently.
+    That duplication is what let the same bug class (pending_buys invisible to
+    "flat" classification) exist in one of the two scripts after being fixed in the
+    other -- see docs/deep_backlog.md's 2026-08-04/2026-08-05 entries.
+
+    Deliberately wl_id-scoped, not ticker-scoped -- ticker alone is ambiguous once
+    2+ concurrent nodes share a ticker (the same root cause behind the wl_id
+    refactor). Callers that only have a ticker are still responsible for resolving
+    it to the right node first (e.g. audit_live_test_candidates._resolve_live_node);
+    that resolution policy (which node "is" a ticker's live/paper node) is
+    deliberately NOT folded in here, since it's a different concern from "given a
+    specific node, what's its real state."
+
+    Returns a dict: node, real_position, paper_position, pending_buy,
+    paper_pending_buy, status. `status` is one of:
+      'flat'          -- no position, no resting order, on either side
+      'pending_entry' -- a resting trailing-buy (real or paper), not yet filled
+      'holding'       -- a real open position
+      'holding_paper' -- a paper open position (covers both live-track and
+                         daily-track paper roles; see node['paper_role'] to
+                         distinguish further if a caller needs to)
+    A real and paper position/pending-buy are independent axes (a node can have
+    at most one of each kind at a time in normal operation) -- status reports
+    real over paper when both happen to be present, since real capital always
+    takes precedence for a human reading the summary.
+    """
+    node = get_watch_list_node_by_id(wl_id)
+    real_position = get_open_position_by_wl_id(wl_id, paper=False)
+    paper_position = get_open_position_by_wl_id(wl_id, paper=True)
+    pending_buy = get_pending_buy_by_wl_id(wl_id)
+    paper_pending_buy = get_paper_pending_buy(wl_id)
+
+    # real_position, then a REAL pending_buy, outrank anything paper -- a resting
+    # real order is committed capital and must never be shadowed by a paper
+    # position/pending-buy that happens to exist on the same node (the exact
+    # "real state shadowed" failure this function exists to eliminate; found by
+    # paired Opus review, 2026-08-05, contradicting this docstring's own rule).
+    if real_position is not None:
+        status = 'holding'
+    elif pending_buy is not None:
+        status = 'pending_entry'
+    elif paper_position is not None:
+        status = 'holding_paper'
+    elif paper_pending_buy is not None:
+        status = 'pending_entry'
+    else:
+        status = 'flat'
+
+    return {
+        'node': node,
+        'real_position': real_position,
+        'paper_position': paper_position,
+        'pending_buy': pending_buy,
+        'paper_pending_buy': paper_pending_buy,
+        'status': status,
+    }
+
+
 def get_trade_log_for_wl_id(wl_id, paper=False, limit=50):
     """wl_id-scoped trade_log/paper_trade_log history -- added 2026-08-05 for
     reconcile_daily_track_nodes' classification logic (does this node have a
@@ -2191,10 +2273,21 @@ def get_paper_pending_buys():
 def get_paper_pending_buy(wl_id):
     """wl_id-keyed -- only caller is paper_trading.py, which always has the
     node's id in scope; ticker alone would match another concurrent node's
-    pending row (see docs/backlog_cache.md's wl_id refactor entry)."""
+    pending row (see docs/backlog_cache.md's wl_id refactor entry).
+
+    Parses node_json into a 'node' key, matching get_paper_pending_buys and
+    get_pending_buy_by_wl_id -- this sibling function didn't do so, which
+    crashed get_real_position_state's callers (watchlist_status.py) the
+    moment a real paper_pending_buy row existed and got passed to
+    _trailing_buy_status, whose first line reads pending['node'] (found by
+    paired Opus review, 2026-08-05)."""
     with _conn() as c:
         row = c.execute("SELECT * FROM paper_pending_buys WHERE wl_id = ?", (wl_id,)).fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    r = dict(row)
+    r['node'] = json.loads(r['node_json'])
+    return r
 
 
 def clear_paper_pending_buy(wl_id):

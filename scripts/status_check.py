@@ -85,10 +85,19 @@ def _tickers_worth_checking():
     bug). Being in this list does not mean mode='live' -- audit_one's own
     output shows the real mode/account per ticker; don't infer it from
     inclusion here. Not hardcoded to any particular night's list, so this
-    stays useful as scope changes."""
+    stays useful as scope changes.
+
+    PLUS any node with a resting real or paper pending buy (bounce-fill wait
+    phase) and no open position yet -- the pending-buy-invisible-to-"flat"
+    fix landed in audit_one's classification (2026-08-05), but a pending-
+    buy-only node with mode='research' and no open position was never
+    reachable through this selector at all (found by paired Opus review,
+    2026-08-05)."""
     watchlist = db.get_watchlist()
     tickers = {n['ticker'] for n in watchlist if n['mode'] == 'live'}
     tickers |= {p['ticker'] for p in db.get_open_positions(paper=True)}
+    tickers |= {p['ticker'] for p in db.get_pending_buys()}
+    tickers |= {p['ticker'] for p in db.get_paper_pending_buys()}
     return sorted(tickers)
 
 

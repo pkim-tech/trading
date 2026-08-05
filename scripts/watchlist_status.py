@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import active_signals as a
+import signals_db as db
 
 _LIVE_WINDOWS = [((10, 25), (10, 40)), ((15, 25), (15, 40))]
 
@@ -35,7 +36,6 @@ def _in_live_window(ts):
 def print_status(watchlist_id=None):
     watchlist_id = watchlist_id or a.get_active_watchlist_id()
     wl = a.get_watchlist(watchlist_id)
-    pending_by_ticker = {p['ticker']: p for p in a.get_pending_buys()}
 
     rows = []
     for n in wl:
@@ -43,25 +43,49 @@ def print_status(watchlist_id=None):
         if sig is None:
             continue
         cur = sig['current_price']
-        pending = pending_by_ticker.get(n['ticker'])
+        # get_real_position_state (added 2026-08-05) is node-scoped -- the prior
+        # ticker-keyed pending_by_ticker dict silently misattributed a pending
+        # buy to whichever node happened to match the ticker string when 2+
+        # nodes share a ticker (real risk now that most tickers have a
+        # live-track + daily-track paper pair, plus real live/research pairs
+        # like GDXU/DPST). Real pending_buy for a live node, paper_pending_buy
+        # for a research node -- a node is never both.
+        state = db.get_real_position_state(n['id'])
+        # A resting REAL pending buy is real capital committed at the broker -- must
+        # never be visually indistinguishable from a paper one (found by paired Opus
+        # review, 2026-08-05: the prior version's ticker-keyed dict couldn't tell
+        # them apart at all). Real takes precedence when (in theory) both existed.
+        is_paper_pending = False
+        pending = state['pending_buy']
+        if pending is None:
+            pending = state['paper_pending_buy']
+            is_paper_pending = pending is not None
         if pending is not None:
             # z-score already crossed and a trailing-buy order is active/pending --
             # the number worth watching now is the bounce-above-running-low trigger,
             # not the (already-cleared, often much farther away) initial z trigger.
             _, tb_trigger = a._trailing_buy_status(pending)
             trigger = tb_trigger if tb_trigger is not None else sig['lower_band']
-            phase = 'trail-buy'
+            phase = 'trail-buy(paper)' if is_paper_pending else 'trail-buy'
         else:
             trigger = sig['lower_band']
             phase = 'z-cross'
         pct = (cur - trigger) / trigger * 100
-        rows.append((n['ticker'], phase, trigger, cur, pct, n.get('trail_buy_pct'), n.get('account'), n.get('mode')))
-    rows.sort(key=lambda r: r[4])
+        # role: daily-track clones (paper_role='daily_sync') would otherwise print as
+        # a byte-identical duplicate row of their live-track sibling -- same ticker/
+        # account/mode, no way to tell them apart (found by paired Opus review,
+        # 2026-08-05). id disambiguates unambiguously; role gives a human-readable tag.
+        role = n.get('paper_role') or '-'
+        rows.append((n['id'], n['ticker'], role, phase, trigger, cur, pct,
+                     n.get('trail_buy_pct'), n.get('account'), n.get('mode')))
+    rows.sort(key=lambda r: r[6])
 
     print(f"watchlist_id={watchlist_id}\n")
-    print(f"{'Ticker':<6} {'Phase':>9} {'Trigger':>10} {'Current':>10} {'%':>8} {'TrailBuy%':>10} {'Account':>10} {'Mode':>10}")
-    for t, phase, trig, cur, pct, tb, acc, mode in rows:
-        print(f"{t:<6} {phase:>9} {trig:>10.2f} {cur:>10.2f} {pct:>7.2f}% {str(tb):>10} {str(acc):>10} {str(mode):>10}")
+    print(f"{'Id':>5} {'Ticker':<6} {'Role':<11} {'Phase':>16} {'Trigger':>10} {'Current':>10} {'%':>8} "
+          f"{'TrailBuy%':>10} {'Account':>10} {'Mode':>10}")
+    for wl_id, t, role, phase, trig, cur, pct, tb, acc, mode in rows:
+        print(f"{wl_id:>5} {t:<6} {role:<11} {phase:>16} {trig:>10.2f} {cur:>10.2f} {pct:>7.2f}% "
+              f"{str(tb):>10} {str(acc):>10} {str(mode):>10}")
 
 
 def print_history(ticker, num_bars=7, watchlist_id=None):

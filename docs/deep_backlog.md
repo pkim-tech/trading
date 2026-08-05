@@ -1,5 +1,125 @@
 # Backlog
 
+## [live-trading][security] Resolved 2026-08-05 (session-wrap review) — paired Opus review (independent-cold + contextual + rebuttal exchange) of the get_real_position_state/mode-scoped-guard diff found 8 real issues, all fixed
+Required by CLAUDE.md's `session wrap` step 3a (active_signals.py/signals_db.py/signals_invariants.py
+all changed this session). Both reviewers converged strongly (4 of ~7 findings matched almost
+exactly before rebuttal); rebuttal exchange resolved the remaining differences (cold reviewer
+conceded a precedence bug it initially cleared; both stood firm on the AGQ-account finding after
+exchanging notes). All 8 fixed:
+1. **HIGH**: `signals_db.get_paper_pending_buy` never parsed `node_json` into a `'node'` key
+   (unlike its siblings `get_paper_pending_buys`/`get_pending_buy_by_wl_id`) — the moment any node
+   had a resting paper pending buy, `watchlist_status.py` would crash with `KeyError: 'node'` inside
+   `signals_notify._trailing_buy_status`. Fixed at the source.
+2. **MEDIUM**: `signals_db.set_node_mode` had no tax-advantaged-account guard — narrowing
+   `add_node`'s guard to `mode == 'live'` only (earlier this session) meant a node could be created
+   `mode='research'` in an excluded ticker + ira/roth/sep account, then flipped live via
+   `set_node_mode` with zero re-check. Added the identical guard to `set_node_mode`; also fixed
+   `scripts/set_watchlist_mode.py`, which bypassed both guards with a raw `UPDATE watch_list SET
+   mode=...` — now routes through `db.set_node_mode`. Verified live: calling
+   `set_node_mode(86, 'live')` (AGQ/ira) now raises `ValueError` and mutates nothing.
+3. **MEDIUM**: `scripts/add_daily_track_paper_nodes.py`'s `account=None` workaround for AGQ
+   directly contradicted the user's verbatim instruction ("override agq into the IRA account - we
+   won't put it to live testing there this is paper trade only") and was dead code once the guard
+   was mode-scoped (`mode="research"` would have passed `account="ira"` through fine). Reverted;
+   corrected the already-created `wl_id=157` row's `account` back to `'ira'`, matching its
+   live-track sibling `wl_id=86` exactly.
+4. **MEDIUM**: `scripts/watchlist_status.py` printed two byte-identical rows per v5 ticker
+   (live-track vs. its new daily-track sibling — same ticker/account/mode, no `id`/`paper_role`
+   column) and collapsed real vs. paper pending buys into one indistinguishable `'trail-buy'` phase
+   tag. Added `Id`/`Role` columns; a paper pending buy now renders as `'trail-buy(paper)'`, distinct
+   from a real one.
+5. **LOW**: `signals_db.get_watch_list_node` became ambiguous for 8 v5 tickers at `account='ira'`
+   once daily-track nodes existed (feeds `schwab_safety.py`'s node-level circuit breaker
+   attribution/automation-pause lookup, `schwab_safety.py:414,796`). Confirmed via direct query: all
+   newly-ambiguous pairs are research+research (paper-only) — zero real-order-path impact today —
+   but fixed defensively by excluding `paper_role='daily_sync'` rows from this lookup, same pattern
+   already applied to `_resolve_live_node`/`drought_detection_test.load_nodes` earlier this session.
+6. **LOW**: `get_real_position_state`'s status precedence contradicted its own docstring ("real
+   over paper when both are present") — a node with both a real `pending_buy` and a `paper_position`
+   returned `'holding_paper'`, hiding the real resting order. Fixed precedence: real position, then
+   real pending buy, both outrank anything paper.
+7. **LOW**: `scripts/status_check.py`'s ticker selector (`mode='live'` nodes + open paper positions
+   only) never surfaced a node whose only state was a resting pending buy (real or paper) with no
+   open position yet — so `audit_one`'s pending-buy classification fix (a prior session) could never
+   actually be reached for that case. Added pending-buy tickers to the selector.
+8. **Checked, confirmed safe (not a bug)**: the `paper_role IS NULL` filter pattern used across
+   `_resolve_live_node`/`load_nodes`/`get_watch_list_node` — verified `paper_role` is only ever
+   `NULL` or `'daily_sync'` today, no false exclusions.
+Full suite: 539 passed. `scripts/live_sim_harness.py`: 7/7 scenarios passed (rerun after all fixes).
+
+## [live-trading] Resolved 2026-08-05 — cosmetic gap closed: `active_signals.py`'s stale "outside signal window" time string now derives from `_SIGNAL_WINDOWS`
+Was hardcoded `f"outside signal window — next: 10:25 or 14:55 ET"` (`active_signals.py:1148`),
+which had drifted from the real `_SIGNAL_WINDOWS = [(10, 25, 10, 40), (15, 25, 15, 40)]` constant
+(second window is 15:25, not 14:55). Cosmetic only — doesn't affect actual trading logic, this
+message is a console/status-line print, not a Slack alert or a control-flow input. Fixed by
+building the string from `_SIGNAL_WINDOWS` directly: `" or ".join(f"{h0:02d}:{m0:02d}" for h0, m0,
+_, _ in _SIGNAL_WINDOWS)` → `"10:25 or 15:25"`. 3rd and final point-fix from the 2026-08-04
+very-late finding (see that date's entry below for (1) and (2)); the broader diagnosis — several
+scripts each reimplement their own ad hoc view of overlapping live state instead of sharing one
+canonical function — remains open, see `docs/backlog_cache.md`.
+
+## [live-trading][backtest] Resolved 2026-08-05 — piece 4: `scripts/paper_vs_backtest_reconcile.py` rebuilt to be `wl_id`-scoped and to report daily-track results from `daily_track_reconciliation_log` instead of re-deriving its own comparison
+The original script (2026-08-04 very late) matched paper trades to a backtest replay by ticker and
+entry date, recomputing its own win-rate/compounded-return comparison from `paper_trade_log` +
+`get_trades_and_bars`. Two gaps once daily-track landed the same day: (1) ticker-only matching would
+silently conflate live-track and daily-track paper trades for the same ticker now that both exist
+as separate `watch_list` nodes; (2) daily-track already gets a much richer, purpose-built nightly
+reconciliation (`paper_trading.reconcile_daily_track_nodes`, entry-miss and exit-wick
+Close-vs-Open/trailing-peak counterfactuals, TIME-forced exclusion) written to
+`daily_track_reconciliation_log` — recomputing a second, simpler comparison risked drifting from
+that judgment rather than reporting it.
+
+Rebuild: `get_paper_trades` now takes `wl_id` and queries `paper_trade_log WHERE wl_id = ?` (both
+`paper_trade_log` and `daily_track_reconciliation_log` gained `wl_id` in the same-day daily-track
+build). The script now runs two separate reports — `report_live_track` (unchanged comparison logic,
+just wl_id-scoped, since nothing else computes this for live-track) and `report_daily_track` (reads
+`db.get_daily_track_reconciliation_log(wl_id)`, filters to the date window, prints per-node action
+counts via `Counter`, and lists individual rows for a `FLAGGED_ACTIONS` set — `entry_miss_unexplained`,
+`exit_wick_unexplained`, `exit_bar_mismatch`, `ambiguous_position`, `no_backtest_data`,
+`replay_failed` — the genuinely-worth-a-look subset, distinct from `match`/`pending_skip`/
+`exit_early` which are either agreement or have no counterfactual to run).
+
+Also hardened while touching the same code path: `scripts/drought_detection_test.py::load_nodes`
+(shared by `drought_overlay_test.py`/`drought_buy_hold_test.py` too) was resolving a ticker's
+live-track node via `MIN(id) ... WHERE mode='research' GROUP BY ticker`, which only happened to
+avoid picking up the new daily-track clones because they were created later with higher ids —
+tightened to `AND paper_role IS NULL` explicitly rather than relying on that incidental ordering.
+
+Smoke-tested (`--tickers SOXL AGQ`): live-track report correctly shows real backtest/paper trade
+counts and flags; daily-track report correctly shows "no reconciliation log entries in window" for
+both (expected — the nightly reconcile job hasn't run yet against the just-created nodes). Full
+suite: 539 passed.
+
+## [live-trading] Resolved 2026-08-05 — daily-track paper nodes actually created against the live DB (ids 157-166); `ensure_tables()` migration run for the first time against `trading_live.db`; AGQ's K-1/UBTI account guard narrowed to real (`mode='live'`) orders only
+`scripts/add_daily_track_paper_nodes.py` (built 2026-08-05, run for real this session, after
+confirming the daemon was not running and backing up `trading_live.db`) hit two real gaps on first
+run, neither anticipated when the script was built/tested:
+
+1. **Migration never actually run against the live DB.** `signals_db.ensure_tables()`'s `paper_role`
+   column/UNIQUE-constraint migration (built alongside the daily-track design) had only been
+   exercised in tests — `PRAGMA table_info(watch_list)` on the real `cache/live/trading_live.db`
+   showed no `paper_role` column at all. Fixed by running `db.ensure_tables()` once directly; verified
+   the column and the widened `UNIQUE(..., paper_role)` constraint both landed.
+
+2. **AGQ's clone blocked by a real-money guard that doesn't distinguish paper from real.**
+   `signals_db.add_node` refuses to create a node for a `TAX_ADVANTAGED_EXCLUDED_TICKERS` ticker
+   (`{"USO", "AGQ"}`, K-1/UBTI risk — see the 2026-08-04 AGQ K-1 finding) in an account whose name
+   contains "ira"/"roth"/"sep". AGQ's existing live-track node carries `account='ira'` even though
+   it's `mode='research'` (paper-only, zero real capital, zero real UBTI exposure) — the guard fired
+   on the account string alone, with no mode check. User's call, mid-session: "override agq into the
+   IRA account - we won't put it to live testing there this is paper trade only" — i.e. fix the guard
+   itself to be mode-aware rather than route around it per-script. Both `signals_db.add_node`'s guard
+   and `signals_invariants.check_tax_advantaged_excluded_tickers` (which had an identical
+   mode-blind check and was flagging AGQ's pre-existing wl_id=86 node as a violation) now only fire
+   for `mode == 'live'`. `signals_invariants.py` confirmed clean after the fix ("All invariants
+   hold."). The daily-track clone script itself still special-cases `TAX_ADVANTAGED_EXCLUDED_TICKERS`
+   tickers to `account=None` when cloning (belt-and-suspenders, doesn't rely solely on the now-fixed
+   guard).
+
+Result: 10 daily-track nodes created (AGQ=157, DPST=158, GDXU=159, HIBL=160, KORU=161, NUGT=162,
+SOXL=163, UDOW=164, USD=165, YANG=166), one per v5-watchlist ticker, config-cloned from each
+ticker's live-track node. Full suite: 539 passed after all three fixes above.
+
 ## [live-trading][coverage] Resolved 2026-08-05 — "daily-track" paper trading built: a second paper node per v5 ticker isolating price-source timing, with a nightly PURE-OBSERVATION reconcile classifier (no auto-resync, no auto-halt — final design after a mid-session reversal)
 **What it is**: a second `watch_list` paper node per v5-watchlist ticker (`paper_role='daily_sync'`
 on the row), alongside the existing free-running "live-track" (unmodified, live-tick pricing).

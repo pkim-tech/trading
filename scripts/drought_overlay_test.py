@@ -72,6 +72,36 @@ def get_trades_and_bars(node):
     return real_trades, df_h
 
 
+def find_drought_windows(trades, df_h, confirm_days):
+    """Given a node's real signal trades (from get_trades_and_bars) and confirm_days
+    (how many no-signal trading days before the overlay enters), returns the list of
+    (entry_i, gap_end_i) windows eligible for a drought-overlay entry -- one per gap
+    between consecutive real signals long enough to actually confirm a drought.
+    gap_end_i is the next real signal bar, the overlay's backstop/handoff point.
+    Extracted 2026-08-05 from main()'s inline loop so scripts/drought_overlay_sweep.py
+    can reuse the identical window-finding logic across a confirm_days grid instead of
+    re-deriving it (this logic, not simulate_overlay, is what actually depends on
+    confirm_days -- simulate_overlay only needs a window's entry/backstop bars)."""
+    signal_bars = sorted(t["signal_i"] for t in trades)
+    exit_bars = {t["signal_i"]: t["exit_i"] for t in trades}
+    hours = df_h.index.hour
+    checkpoint_mask = (hours == TARGET_H0) | (hours == TARGET_H1)
+    checkpoint_bars = np.where(checkpoint_mask)[0]
+
+    windows = []
+    for k in range(len(signal_bars) - 1):
+        gap_start = exit_bars[signal_bars[k]]  # position closes, drought can begin
+        gap_end = signal_bars[k + 1]            # next real signal = backstop
+        eligible = checkpoint_bars[(checkpoint_bars > gap_start) & (checkpoint_bars < gap_end)]
+        if len(eligible) < confirm_days * 2:  # ~2 checkpoints/day
+            continue
+        entry_i = int(eligible[confirm_days * 2 - 1])
+        if entry_i + 1 >= gap_end:
+            continue
+        windows.append((entry_i, gap_end))
+    return windows
+
+
 def simulate_overlay(df_h, entry_i, backstop_i, fixed_sl_pct, arm_pct, trail_sell_pct):
     """Bar-by-bar exit simulation using the CORE STRATEGY'S OWN exit state machine
     (TrailingBothZScoreBreakout's arm-then-trail mechanic, mirrored from
@@ -140,22 +170,7 @@ def main():
         if len(trades) < 2:
             continue
 
-        signal_bars = sorted(t["signal_i"] for t in trades)
-        exit_bars = {t["signal_i"]: t["exit_i"] for t in trades}
-        hours = df_h.index.hour
-        checkpoint_mask = (hours == TARGET_H0) | (hours == TARGET_H1)
-        checkpoint_bars = np.where(checkpoint_mask)[0]
-
-        for k in range(len(signal_bars) - 1):
-            gap_start = exit_bars[signal_bars[k]]  # position closes, drought can begin
-            gap_end = signal_bars[k + 1]            # next real signal = backstop
-            eligible = checkpoint_bars[(checkpoint_bars > gap_start) & (checkpoint_bars < gap_end)]
-            if len(eligible) < args.confirm_days * 2:  # ~2 checkpoints/day
-                continue
-            entry_i = int(eligible[args.confirm_days * 2 - 1])
-            if entry_i + 1 >= gap_end:
-                continue
-
+        for entry_i, gap_end in find_drought_windows(trades, df_h, args.confirm_days):
             sl_pct = args.sl_pct if args.sl_pct is not None else node["fixed_sl"]
             arm_pct = args.arm_pct if args.arm_pct is not None else node["arm_pct"]
             trail_pct = args.trail_pct if args.trail_pct is not None else node["trail_sell_pct"]

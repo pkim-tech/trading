@@ -119,9 +119,15 @@ def check_live_node_missing_account():
 
 
 def check_tax_advantaged_excluded_tickers():
-    """No watch_list node for a TAX_ADVANTAGED_EXCLUDED_TICKERS ticker (e.g. USO --
-    see CLAUDE.md's "Ticker exclusion, decided 2026-08-04" note, K-1/UBTI risk)
-    should exist in an IRA/Roth/SEP-type account.
+    """No mode='live' watch_list node for a TAX_ADVANTAGED_EXCLUDED_TICKERS ticker
+    (e.g. USO -- see CLAUDE.md's "Ticker exclusion, decided 2026-08-04" note,
+    K-1/UBTI risk) should exist in an IRA/Roth/SEP-type account.
+
+    Scoped to mode='live' only -- the K-1/UBTI risk is real capital sitting in a
+    real IRA custodian account; a research/paper node tagged with the same
+    account string (e.g. AGQ's daily-track/live-track pair, account='ira',
+    mode='research') never places a real order and carries zero real tax
+    exposure, so it's not a violation of this invariant.
 
     Depends on this: add_node's own guard (signals_db.py) only fires for callers
     that pass account= at insert time -- the dominant real path (Streamlit UI
@@ -136,7 +142,7 @@ def check_tax_advantaged_excluded_tickers():
     for node in db.get_watchlist():
         ticker = (node.get('ticker') or '').upper()
         account = node.get('account') or ''
-        if ticker in db.TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
+        if node.get('mode') == 'live' and ticker in db.TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
                 kw in account.lower() for kw in ("ira", "roth", "sep")):
             violations.append(
                 f"{ticker} (wl_id={node['id']}) is in account={account!r}, but "

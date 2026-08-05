@@ -45,6 +45,14 @@ def main():
     for node in live_track_nodes:
         strategy = node["strategy"]
         take_profit = node["arm_sell_pct"] if strategy == "TrailingBothZScoreBreakout" else node["take_profit"]
+        # add_node's K-1/UBTI tax-advantaged-account guard (signals_db.py) is now
+        # scoped to mode='live' only (2026-08-05), so a research/paper clone -- this
+        # loop always passes mode="research" below -- passes through with its real
+        # account tag intact, matching the live-track sibling exactly. AGQ's account
+        # is deliberately NOT stripped: the user's explicit call was to keep the
+        # 'ira' tag on both nodes ("override agq into the IRA account - we won't put
+        # it to live testing there this is paper trade only"), not clone around it.
+        account = node.get("account")
         db.add_node(
             ticker=node["ticker"], strategy=strategy, version=node["version"], window=node["window"],
             take_profit=take_profit, stop_loss=node["stop_loss"], max_hold_hours=node["max_hold_hours"],
@@ -52,7 +60,7 @@ def main():
             z_score_threshold=node["z_score_threshold"], watchlist_id=node["watchlist_id"], mode="research",
             trail_buy_pct=node["trail_buy_pct"], trail_pct=node["trail_sell_pct"],
             entry_timing=node["entry_timing"], starting_notional=node["starting_notional"],
-            fixed_sl_override=node["fixed_sl"], account=node.get("account"), paper_role="daily_sync",
+            fixed_sl_override=node["fixed_sl"], account=account, paper_role="daily_sync",
         )
         print(f"  cloned {node['ticker']} ({strategy[:20]}) -> daily-track (daily_sync)")
 

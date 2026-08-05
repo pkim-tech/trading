@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import active_signals as a
+import signals_db as db
 
 
 def main():
@@ -35,9 +36,13 @@ def main():
             print(f"  no node for {ticker} on watchlist {watchlist_id} -- skipping")
             continue
         for r in rows:
-            conn.execute("UPDATE watch_list SET mode=? WHERE id=?", (mode, r['id']))
-            print(f"  {ticker} (id={r['id']}): {r['mode']} -> {mode}")
-    conn.commit()
+            # Routes through db.set_node_mode (not a raw UPDATE) so its tax-advantaged-
+            # account guard (K-1/UBTI risk, added 2026-08-05) applies here too.
+            try:
+                db.set_node_mode(r['id'], mode)
+                print(f"  {ticker} (id={r['id']}): {r['mode']} -> {mode}")
+            except ValueError as e:
+                print(f"  {ticker} (id={r['id']}): REFUSED -- {e}")
     conn.close()
 
 

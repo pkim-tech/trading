@@ -997,7 +997,20 @@ their own view of position/pending-buy state" architecture problem (`status_chec
 would also directly serve Account B's boundary-sync logic above, so these two backlog items should
 probably be scoped together, not solved twice.
 
-## SOXL drought-overlay parameter sweep (planned, added 2026-08-04 very late — not yet built)
+## SOXL drought-overlay parameter sweep (built 2026-08-05 — real gap found, not yet resolved)
+
+**Built**: `scripts/drought_overlay_sweep.py` implements the design below exactly (4 independent
+axes -- fixed_sl%, arm_pct%, trail_sell_pct%, confirm_days -- 1344 cells, pooled across the 10 v5
+watchlist tickers, grid-neighbor cliff-safety). Runs in ~9 seconds. Full result:
+`docs/research_log.md`'s 2026-08-05 (late) entry. **Real gap found, not resolved**: the best pooled
+cell is cliff-safe (grid-neighbor robustness holds) but is dominated by a single ticker's small
+sample (KORU, n=7, contributing the large majority of the pooled +448.8% figure) -- the same failure
+shape as the original SOXL-only 2-trade fragility this sweep was built to screen out, just not the
+axis grid-neighbor cliff-safety actually checks. Needs a concentration screen (max single-ticker
+share of pooled compounded return, or a minimum-net-positive-tickers-at-n>=X requirement) before any
+pooled cell can be trusted. Put-hedge design below stays blocked pending that fix.
+
+### Original design (2026-08-04 very late, superseded by the "Built" note above)
 
 **Motivation**: `scripts/drought_overlay_test.py` (2026-08-04 very late) tested the drought-overlay
 exit mechanics (fixed SL + arm-then-trail) reusing the core mean-reversion node's own tuned values
@@ -1060,3 +1073,44 @@ period). None of this amounts to an actual selection rule yet.
 Depends on the SOXL sweep above landing on real SL/arm/trail parameters first, since the put's strike
 distance and expiry should be chosen relative to the overlay's actual (swept, not guessed) risk
 profile, not the ad hoc parameters tested tonight.
+
+## Shared canonical position-state function (built 2026-08-05)
+
+**Motivation**: `docs/backlog_cache.md`'s 2026-08-04 finding — multiple scripts (`status_check.py`/
+`audit_live_test_candidates.py`, `coverage_check.py`, `watchlist_status.py`, `paper_trading_status.py`)
+each reimplemented their own ad hoc view of overlapping live state (open positions, pending buys,
+node config), so the same bug class (a resting pending buy invisible to "flat" classification) got
+fixed in one script (`audit_one`, 2026-08-05 earlier) without the identical gap in `watchlist_status.py`
+being touched at all. Prioritized first in the 2026-08-04 very-late session's explicit build order
+(shared state function -> SOXL sweep -> two-account paper trading), though built last since paper
+trading landed out of order.
+
+**Built**: `signals_db.get_real_position_state(wl_id)` — node-scoped (not ticker-scoped, since ticker
+alone is ambiguous once 2+ nodes share a ticker, the same root cause behind the earlier wl_id
+refactor). Returns `{node, real_position, paper_position, pending_buy, paper_pending_buy, status}`,
+where `status` is one of `'flat' | 'pending_entry' | 'holding' | 'holding_paper'` (real position takes
+precedence over paper when both happen to be present).
+
+**Scope, decided 2026-08-05**: swapped into `audit_one`/`status_check.py` (near drop-in — already
+node-scoped and paper-aware, just consolidates its own real/paper/pending assembly into one call) and
+`watchlist_status.py` (moderate rework — replaced a ticker-keyed `{ticker: pending}` dict with a
+per-node call, fixing its latent ambiguity bug as a side effect). `coverage_check.py` (inherently
+date-scoped/historical, not "current state") and `paper_trading_status.py` (an intentional unscoped
+table-dump view) were deliberately left unconverted — poor fit for a "what's this node's state right
+now" function, per design-time scoping discussion.
+
+**Node resolution left out of scope, deliberately**: `audit_live_test_candidates._resolve_live_node`
+(ticker -> node, preferring `mode='live'` on ambiguity) stays where it is, not folded into
+`signals_db.py` — `get_real_position_state` takes `wl_id`, so the caller is still responsible for
+picking the right node first. Same session, `_resolve_live_node`'s SQL gained `AND paper_role IS
+NULL` — the new daily-track clones (paper_role='daily_sync', same ticker/mode='research' as their
+live-track sibling) made every v5 ticker resolve ambiguously without it; a daily-track node is never
+the right thing to audit via a bare ticker lookup, only ever addressed by its specific wl_id.
+
+**Side fix, same session**: `add_node`'s tax-advantaged-account guard (`TAX_ADVANTAGED_EXCLUDED_
+TICKERS = {"USO", "AGQ"}`, K-1/UBTI real-money risk) and the matching `signals_invariants.check_tax_
+advantaged_excluded_tickers` daily check were both narrowed to only fire for `mode == 'live'` nodes —
+found live when AGQ's daily-track clone (paper-only, zero real capital) was blocked by a guard whose
+entire purpose is preventing real tax exposure. User's explicit call: "override agq into the IRA
+account - we won't put it to live testing there this is paper trade only" — fix the guard itself to
+be mode-aware, not route around it per-script.

@@ -1145,7 +1145,8 @@ def run_loop(tickers: set = None):
                     buy_alerted, open_position_keys
                 ) or []
             elif not in_open_check_window:
-                summaries.append(f"outside signal window — next: 10:25 or 14:55 ET")
+                windows = " or ".join(f"{h0:02d}:{m0:02d}" for h0, m0, _, _ in _SIGNAL_WINDOWS)
+                summaries.append(f"outside signal window — next: {windows} ET")
 
             if summaries:
                 print(f"[{now.strftime('%H:%M:%S')}] {' | '.join(summaries)}")

@@ -7,6 +7,18 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][security] Resolved 2026-08-05 (session-wrap review) — paired Opus review of the get_real_position_state/mode-scoped-guard diff found 8 real issues (1 HIGH crash bug, rest MEDIUM/LOW), all fixed
+Most serious: `watchlist_status.py` would crash (`KeyError: 'node'`) on any paper pending buy (`get_paper_pending_buy` never parsed `node_json`); `set_node_mode` had no tax-advantaged guard, reopening the K-1/UBTI gap the earlier mode-scoping was meant to close safely; AGQ's daily-track node had its `account` wrongly stripped, contradicting the user's explicit instruction. Full detail: `docs/deep_backlog.md`'s 2026-08-05 (session-wrap review) entry (top). Full suite: 539 passed; live_sim_harness: 7/7.
+
+## [live-trading][coverage] Resolved 2026-08-05 — the 10 daily-track paper nodes actually created against the live DB (ids 157-166); ensure_tables() migration run; AGQ's K-1/UBTI account guard fixed to only block real (mode='live') orders, not paper nodes
+`add_daily_track_paper_nodes.py` (built 2026-08-05, run for real this session) hit two real gaps: (1) `paper_role` column didn't exist yet in `cache/live/trading_live.db` -- `ensure_tables()`'s migration had never actually run against the live DB, only tested; run once, confirmed via `PRAGMA table_info`. (2) AGQ's clone was blocked by `add_node`'s tax-advantaged-account guard (`TAX_ADVANTAGED_EXCLUDED_TICKERS = {"USO", "AGQ"}`) because its live-track sibling carries `account='ira'` even though it's a paper-only research node with zero real capital/UBTI exposure -- the guard didn't distinguish paper from real. Fixed at the source (both `signals_db.add_node` and `signals_invariants.check_tax_advantaged_excluded_tickers` now scoped to `mode='live'` only), per user's explicit call ("we won't put it to live testing there, this is paper trade only") rather than a one-off script workaround. `scripts/drought_detection_test.py::load_nodes` also hardened to explicitly filter `paper_role IS NULL` (was relying on incidental MIN(id) ordering to avoid picking up the new daily-track clones). DB backed up before the run (`trading_live.db.bak_pre_dailytrack_*`). Full suite: 539 passed.
+
+## [live-trading][backtest] Resolved 2026-08-05 — piece 4: `scripts/paper_vs_backtest_reconcile.py` rebuilt to be `wl_id`-scoped and to report daily-track results from `daily_track_reconciliation_log` instead of re-deriving its own comparison
+Live-track side keeps its own backtest-vs-paper comparison (no other source computes it) but now queries `paper_trade_log` by `wl_id` instead of ticker, so live-track and daily-track paper trades for the same ticker no longer conflate. Daily-track side now just summarizes/reports the nightly reconcile job's own classifications (action counts per node, flagged rows for `*_unexplained`/`exit_bar_mismatch`/`ambiguous_position`/`no_backtest_data`/`replay_failed`) rather than recomputing a second, potentially-diverging judgment.
+
+## [live-trading] Resolved 2026-08-05 — cosmetic gap closed: `active_signals.py`'s "outside signal window" status message no longer hardcodes a stale time string, now derives from `_SIGNAL_WINDOWS`
+Was `"next: 10:25 or 14:55 ET"` (stale); now built dynamically (`"next: 10:25 or 15:25 ET"`, matching the real constant). 3rd and final point-fix from the 2026-08-04 very-late finding; the broader "shared canonical state function" diagnosis remains open (see `docs/backlog_cache.md`).
+
 ## [live-trading][coverage] Resolved 2026-08-05 — daily-track paper trading built: hourly-close signal pricing + a nightly reconcile classification engine (entry AND exit divergence, PURE OBSERVATION -- no auto-resync, no auto-halt, final design after the user reconsidered), node-cloning script; piece 4 (reconcile script rebuild) still open
 `compute_buy_signal` gates on new `paper_role='daily_sync'` node flag (opt-in, zero effect on existing nodes). `paper_trading.reconcile_daily_track_nodes` classifies actual vs. backtest-implied state at the bar level every night (anchored on the backtest's own most recent trade, not daily-track's history -- an earlier version anchored the other way and let stale history permanently mask new missed entries) and writes one full diagnostic row per node per night to new `daily_track_reconciliation_log` -- but never mutates daily-track's real state. User's final call, mid-session, after first landing an auto-resync-and-halt version: "reconcile as one action (how far are we) vs sync (prepare for next day)" -- auto-resyncing erases the natural divergence that's most interesting to study, and auto-halting would quiet nodes down exactly when something's happening. Action labels are descriptive (`entry_miss_explained`/`unexplained`, `exit_wick_explained`/`unexplained`, `exit_bar_mismatch`, `exit_early`, `ambiguous_position`, `match`, `pending_skip`), not imperative. Exits stay fully real/reactive (`check_paper_sells` unchanged, per the user: "exits on papertrading should be real and reconcile should figure out that it was a time price issue") -- a mid-bar exit is resolved to its real bar after the fact via `_bar_containing`. New `_close_alone_would_breach_trail` extends the wick-explainability counterfactual (previously SL-only) to trailing-stop exits, reconstructing the kernel's own peak-tracking using Close alone. `trade_log`/`paper_trade_log` gained `wl_id`, `signal_bar_time`, and `exit_bar_time` (all previously absent -- would have made live-track/daily-track trades indistinguishable, every organic trailing-buy fill unmatchable against a backtest bar, and every clean bar-close exit off-by-one -- found across three paired Opus review rounds). Also fixed: pending-buy state invisible to the reconcile, resync could double-count an already-closed trade, daily_sync could pick up yfinance's still-forming current-hour bar, staleness guard broke historical replay callers, a `numpy.bool_` identity-comparison bug (`is False` silently never matching). `tests/test_daily_track_paper.py` fully rewritten to the pure-observation design (24 tests, zero state-mutation assertions). No daily-track node created against the real live DB yet. Full detail: `docs/design.md`'s 2026-08-05 section.
 
@@ -98,35 +110,3 @@ Full detail: `docs/deep_backlog.md`'s three 2026-07-31 entries (top).
 ## [live-trading][security] Resolved 2026-07-29 — all 3 deferred design items from 2026-07-28 (night) now built: `tests/fake_broker.py`, `schwab_safety._log_pre_action_state_verification` (detection-only), `schwab_safety.record_node_streak` (monitor-only)
 Full detail: `docs/deep_backlog.md`'s 2026-07-29 entries (top two).
 
-## [live-trading][security] Resolved 2026-07-28 (night) — resting-order dup guards self-blocked their own replace calls; SH's automated exit was stuck for 4 real days
-Full detail: `docs/deep_backlog.md`'s 2026-07-28 (night) entry (top).
-
-## [live-trading][security] Resolved 2026-07-27 (night, 2nd session) — `at_bar_close` bookkeeping bug caused false near-instant SL exits
-Full detail: `docs/deep_backlog.md`'s 2026-07-27 (night, 2nd session) entry (top).
-
-## [live-trading][security] Resolved 2026-07-27 (night) — GDXU stale-fill incident fixed (order_id-exact matching everywhere); automated TP/SL/TIME exits built; cancel+place replaced with atomic `replace_order`; 6 canary nodes restored after accidental deletion
-Full detail: `docs/deep_backlog.md`'s 2026-07-27 (night) entry (top).
-
-## [live-trading][security] Resolved 2026-07-27 — watchlist 65 live-mode nodes reduced to SPY/SH/GDXU(#108)/DPST; 11 other live nodes deleted; 2 dry_run_sim positions retroactively closed first
-Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
-
-## [live-trading][security] Resolved 2026-07-27 — SPY's real pending trailing-stop exit placed for real (order id 1007336072974, resting, `soxl_ira`)
-Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
-
-## [live-trading][coverage] Resolved 2026-07-28 (evening) — coverage snoozes built (time-bounded acknowledgment for a known noisy scenario); UDOW's stale test position retroactively cleaned up
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry.
-
-## [live-trading][coverage] Resolved 2026-07-28 (later) — daily coverage report ("like pytest, but with the market") now runs inside the live daemon at 7am, checking the previous trading day
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry.
-
-## [live-trading][coverage] Resolved 2026-07-28 — closed 12 of 13 remaining `not-instrumented` rows in the accountability grid (38 rows, down from 39)
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry.
-
-## [live-trading][coverage] Resolved 2026-07-27 evening — widened the accountability grid from 32 to 39 rows, closing 5 real execution-logic gaps
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry.
-
-## [live-trading][coverage] Resolved 2026-07-27 — `coverage_deviations` rows are now permanent record ("ticket model"), never deleted
-Full detail: `docs/deep_backlog.md`'s 2026-07-27 entry.
-
-## [live-trading][security] Resolved 2026-07-25/26 — wl_id-keyed refactor implemented, reviewed (2 Opus rounds), landed
-Full detail: `docs/deep_backlog.md`'s 2026-07-25/26 entry.

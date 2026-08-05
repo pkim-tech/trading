@@ -6406,3 +6406,77 @@ state-mutation assertions by design), `tests/test_export_trades_arm_tracking.py`
 (`scripts/add_daily_track_paper_nodes.py` built/tested, confirm before running); piece 4
 (`scripts/paper_vs_backtest_reconcile.py`'s own rebuild) and the kernel's "waiting"/bounce-fill state
 visibility remain open, lower priority.
+
+---
+
+## 2026-08-05 (very late 2) — Shared canonical position-state function built, SOXL drought-overlay sweep run, daily-track nodes created for real; paired review found and fixed 8 real issues including a crash bug
+
+Picked up the still-open "shared canonical state function" item from the 2026-08-04 build order
+(shared state function -> SOXL sweep -> two-account paper trading — paper trading had landed out
+of order in an earlier session). Three real pieces of work this session, plus the required
+session-wrap paired review.
+
+**Daily-track nodes created for real**: `scripts/add_daily_track_paper_nodes.py` was run against
+the live DB for the first time (10 nodes, ids 157-166), after confirming the daemon wasn't running
+and backing up `trading_live.db`. Hit two real gaps: `ensure_tables()`'s `paper_role` migration had
+never actually run against the live DB (only tested), and AGQ's clone tripped `add_node`'s K-1/UBTI
+tax-advantaged-account guard because its live-track sibling already carries `account='ira'` even
+though it's paper-only. User's call, mid-session: "override agq into the IRA account - we won't put
+it to live testing there this is paper trade only" — fixed the guard itself (`add_node` and
+`signals_invariants.check_tax_advantaged_excluded_tickers`) to only fire for `mode='live'`, rather
+than routing around it per-script.
+
+**`signals_db.get_real_position_state(wl_id)` built** — a node-scoped `{node, real_position,
+paper_position, pending_buy, paper_pending_buy, status}` lookup, replacing hand-rolled state
+assembly duplicated across status/audit scripts (the root cause of a bug fixed in `audit_one` but
+not `watchlist_status.py` in an earlier session). Swapped into `audit_one`/`status_check.py` (near
+drop-in) and `watchlist_status.py` (moderate rework, fixed its latent ticker-keyed ambiguity as a
+side effect). `coverage_check.py` (date-scoped/historical) and `paper_trading_status.py`
+(intentional table-dump) were deliberately left unconverted, per design-time scoping discussion via
+AskUserQuestion. Piece 4 (`paper_vs_backtest_reconcile.py`) also rebuilt to be `wl_id`-scoped and to
+report daily-track results from `daily_track_reconciliation_log` instead of re-deriving its own
+comparison. Cosmetic gap closed alongside: `active_signals.py`'s stale "next: 10:25 or 14:55 ET"
+status string now derives from `_SIGNAL_WINDOWS` dynamically.
+
+**SOXL drought-overlay parameter sweep built and run** (`scripts/drought_overlay_sweep.py`) — real
+grid search per `docs/design.md`'s design (fixed_sl/arm_pct/trail_sell_pct/confirm_days as 4
+independent axes, 1344 cells, pooled across the 10 v5 watchlist tickers, grid-neighbor cliff-safety
+rather than the core kernel's fill-ambiguity resolutions — both scope calls made via
+AskUserQuestion). Runs in ~9 seconds, reusing `drought_overlay_test.py`'s real exit mechanics
+directly (`find_drought_windows` extracted and verified byte-identical). **Real finding, not a clean
+win**: the best pooled cell (confirm_days=20/sl=15/arm=15/trail=5, n=37, +448.8% compounded,
+cliff-safe) has much broader ticker participation than the original SOXL-only 2-trade result (7 of
+9 tickers net positive) — but is dominated by a single ticker (KORU, n=7) contributing the large
+majority of the pooled figure. Grid-neighbor cliff-safety catches parameter-instability overfitting
+but not ticker-concentration risk, the same failure shape the sweep was built to screen out, just
+not the axis it actually checks. Logged as a real, open follow-up (`docs/research_log.md`'s
+2026-08-05 (late) entry) — put-hedge design stays blocked on this landing. `docs/backlog_cache.md`
+updated to reflect "built, real gap found" rather than either "planned" or "resolved."
+
+**Session-wrap paired review (independent-cold + contextual + rebuttal exchange) found 8 real
+issues in the `get_real_position_state`/mode-scoped-guard diff, all fixed**, required since
+`active_signals.py`/`signals_db.py`/`signals_invariants.py` all changed. Both reviewers converged
+strongly before rebuttal (4 of ~7 findings matched almost exactly); the exchange resolved the rest
+(cold reviewer conceded a precedence bug it had initially cleared; both stood firm on the AGQ-account
+finding). Most serious: **HIGH** — `signals_db.get_paper_pending_buy` never parsed `node_json` into
+a `'node'` key (unlike its own siblings), so `watchlist_status.py` would crash with `KeyError:
+'node'` the moment any node had a resting paper pending buy — with 10 new daily-track paper nodes
+just added, this was likely to fire soon. Also fixed: **MEDIUM** — `set_node_mode` had no
+tax-advantaged guard, reopening the K-1/UBTI gap the earlier `mode='live'`-scoping was meant to
+close safely (a node could be created research-mode in an excluded account then flipped live with
+zero re-check); added the guard, and fixed `scripts/set_watchlist_mode.py`, which bypassed both
+guards with a raw SQL UPDATE. **MEDIUM** — the daily-track AGQ node's `account` had been wrongly
+stripped to `None` by a since-removed workaround, directly contradicting the user's explicit
+instruction to keep the `ira` tag; reverted, and the already-created `wl_id=157` row corrected back
+to `account='ira'`. **MEDIUM** — `watchlist_status.py` printed two byte-identical rows per v5
+ticker (live-track vs. daily-track, no way to tell them apart) and blurred real vs. paper pending
+buys into one indistinguishable phase tag; added `Id`/`Role` columns and a distinct `'trail-
+buy(paper)'` tag. **LOW** (x3) — `get_watch_list_node` became ambiguous for 8 v5 tickers, affecting
+`schwab_safety.py`'s node circuit breaker (confirmed zero real-order impact today via direct query,
+fixed defensively); `get_real_position_state`'s status precedence contradicted its own docstring
+(a real pending buy could be hidden by a paper position); `status_check.py`'s ticker selector never
+surfaced a pending-buy-only node. Full suite: 539 passed throughout (including after every fix
+batch). `scripts/live_sim_harness.py`: 7/7 scenarios passed, rerun after all fixes.
+
+Full detail: `docs/deep_backlog.md`'s 2026-08-05 (session-wrap review) entry (top) and the three
+other 2026-08-05 entries below it.

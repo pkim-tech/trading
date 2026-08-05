@@ -49,11 +49,16 @@ RECOVERY_THRESHOLD = 0.50
 
 
 def load_nodes(watchlist_id, tickers=None):
+    """paper_role IS NULL excludes the 2026-08-05 daily-track clones (same ticker/
+    mode='research', paper_role='daily_sync') -- without it, MIN(id) GROUP BY ticker
+    still happens to resolve to the original live-track node today only because
+    daily-track nodes were created later with higher ids; explicit is safer than
+    relying on that incidental ordering."""
     con = sqlite3.connect(LIVE_DB)
     q = """
         SELECT MIN(id), ticker, strategy, window, z_score_threshold, arm_sell_pct, take_profit,
                fixed_sl, trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing
-        FROM watch_list WHERE watchlist_id=? AND mode='research'
+        FROM watch_list WHERE watchlist_id=? AND mode='research' AND paper_role IS NULL
     """
     params = [watchlist_id]
     if tickers:
