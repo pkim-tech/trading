@@ -22,7 +22,7 @@ import pandas as pd
 from scipy.stats import fisher_exact, mannwhitneyu
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from backtester import prep_inputs
+from backtester import prep_inputs, OPEN
 import strategies
 from scripts.export_trades import (
     load_hourly,
@@ -37,15 +37,25 @@ TARGET_H0, TARGET_H1 = 9, 14  # the two live signal-window bar anchors
 def load_nodes(watchlist_id=65):
     con = sqlite3.connect(LIVE_DB)
     rows = con.execute("""
-        SELECT MIN(id), ticker, strategy, window, z_score_threshold, arm_sell_pct, fixed_sl,
-               trail_buy_pct, trail_sell_pct, max_hold_hours
+        SELECT MIN(id), ticker, strategy, window, z_score_threshold, arm_sell_pct, take_profit,
+               fixed_sl, trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing
         FROM watch_list WHERE watchlist_id=? AND mode='research'
         GROUP BY ticker
     """, (watchlist_id,)).fetchall()
     con.close()
-    cols = ["id", "ticker", "strategy", "window", "z", "arm_pct", "fixed_sl",
-            "trail_buy_pct", "trail_sell_pct", "max_hold_hours"]
-    return [dict(zip(cols, r)) for r in rows]
+    cols = ["id", "ticker", "strategy", "window", "z", "arm_sell_pct", "take_profit", "fixed_sl",
+            "trail_buy_pct", "trail_sell_pct", "max_hold_hours", "entry_timing"]
+    nodes = [dict(zip(cols, r)) for r in rows]
+    # take_profit holds the arm-sell threshold for TrailingExitZScoreBreakout nodes;
+    # arm_sell_pct holds it for TrailingBothZScoreBreakout (never both populated on
+    # the same row -- signals_db.py:983-988). Corrected 2026-08-04 -- this script
+    # previously hardcoded TP=disabled for every TrailingExit node and never passed
+    # open_check, both silently wrong for every real v5 node. See
+    # docs/research_log.md's 2026-08-04 correction entry -- this script's own
+    # 2026-08-03 published finding needs re-verification under the fix.
+    for n in nodes:
+        n["arm_pct"] = n["arm_sell_pct"] if n["strategy"] == "TrailingBothZScoreBreakout" else n["take_profit"]
+    return nodes
 
 
 def build_indicators(strategy_name, df_daily, window):
@@ -60,18 +70,19 @@ def get_trades(node):
     ind = build_indicators(node["strategy"], df_daily, node["window"])
     p = prep_inputs(df_h, ind)
 
+    open_check = node["entry_timing"] == "open_check"
     if node["strategy"] == "TrailingBothZScoreBreakout":
         trades = simulate_trail_both_annotated(
             p, node["arm_pct"] / 100.0, node["fixed_sl"] / 100.0, node["max_hold_hours"],
             node["trail_buy_pct"] / 100.0, node["trail_sell_pct"] / 100.0,
-            TARGET_H0, TARGET_H1, node["z"],
+            TARGET_H0, TARGET_H1, node["z"], open_check=open_check,
         )
     elif node["strategy"] == "TrailingExitZScoreBreakout":
         rng = np.random.default_rng(0)
         trades = simulate_trail_exit_chaos(
-            p, 1.0, node["fixed_sl"] / 100.0, node["max_hold_hours"],
+            p, node["arm_pct"] / 100.0, node["fixed_sl"] / 100.0, node["max_hold_hours"],
             node["trail_sell_pct"] / 100.0, TARGET_H0, TARGET_H1, node["z"],
-            rng, "drop", 0.0, "drop", 0.0,
+            rng, "drop", 0.0, "drop", 0.0, open_check=open_check,
         )
     else:
         raise ValueError(f"unhandled strategy {node['strategy']}")
@@ -79,7 +90,7 @@ def get_trades(node):
     timestamps = p["timestamps"]
     out = []
     for t in trades:
-        if t["signal_i"] is None:
+        if t["signal_i"] is None or t["result"] == OPEN:
             continue
         hour = timestamps[t["signal_i"]].hour
         out.append({"hour": hour, "ret": t["ret"], "win": t["ret"] > 0})

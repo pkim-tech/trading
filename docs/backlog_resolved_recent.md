@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][security] Resolved 2026-08-04 (very late) — HIBL/USD/YANG had no staged_test_config baseline row (zero config-drift protection since their 2026-08-03 live flip); seeded via scripts/seed_baseline_config.py, confirmed in signals_invariants.py. Added as required check 14 in docs/watchlist_candidate_checklist.md so it happens at promotion time going forward, not caught after the fact.
+
 ## [live-trading] Resolved 2026-08-03 — HIBL/USD/YANG flipped research→live with planned notional ($2,500/$1,000/$2,500); soxl_ira notional_cap raised 800→3000 to match
 Caught by `signals_invariants.py` before it could bite live — old $800 cap would've structurally blocked every entry for the resized nodes. Independent Opus review found 2 real follow-on points left open by user's call. Full detail: `docs/deep_backlog.md`'s 2026-08-03 entry.
 

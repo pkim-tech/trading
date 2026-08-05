@@ -1,9 +1,33 @@
 # Backlog
 
+## [live-trading][security] Resolved 2026-08-04 (very late) — HIBL/USD/YANG had zero config-drift protection since going live; seeded and closed
+Found during a routine live-check ("check live first, since that's real capital"): HIBL/USD/YANG
+(wl_id 154/155/156, flipped `mode='live'`/`account='soxl_ira'` on 2026-08-03 with real notional
+$2,500/$1,000/$2,500) had no `staged_test_config` row. That table is what
+`signals_invariants.check_staged_config_matches_expected`/`print_all_live_node_state` reads to
+catch a live node's real risk parameters (fixed_sl, z_score_threshold, trail_sell_pct, etc.)
+silently drifting from what was intended (bad manual DB edit, migration side-effect, stale
+copy-paste value) — a full day+ of real capital had **zero** protection from this, and
+`signals_invariants.py` ran clean the whole time because it only checks nodes that already have a
+baseline row, not "every live node." Not a drift that went undetected — a node with no baseline
+to compare against at all.
+**Fix**: ran `.venv/bin/python scripts/seed_baseline_config.py` (safe, only seeds `mode='live'`
+nodes missing a row, skipped the 20 already-staged) — seeded all 3, confirmed via
+`signals_invariants.py` showing `✓ live_config HIBL/USD/YANG (soxl_ira) [baseline_config] matches
+committed baseline`.
+**Process fix, not just a one-off patch**: added as check 14 (a required action, not just an
+analysis step) in `docs/watchlist_candidate_checklist.md` — "at the moment of promotion itself,
+not before," so the mode flip and the baseline seed happen together going forward instead of two
+separate steps that can silently fall apart. Deliberately NOT left in `docs/backlog_cache.md` —
+the user's explicit call: a standing operational requirement belongs in the durable go-live
+checklist, not a pointer list that gets trimmed. User feedback, logged to memory: "when I put on
+a REAL amount of capital, I don't want to hear 'oh I forgot to do that.'"
+
 ## [portfolio][design] Decided-in-principle 2026-08-04, raised 2026-08-03/04 evening — skim-and-reserve "insurance policy" overlay design, spec'd but not built
 Full design session: `scripts/sim_skim_redeploy.py`, `sim_real_skim_reserve.py`, `sim_downturn_reinvest_vs_hold.py`, `sim_double_policy_multi.py` (this session's research chain — real SOXL/AGQ trade histories + synthetic GFC/COVID/2022-bear crash reconstruction). Landed on a specific, real-money-ready design: **skim** (automated, activates day 1 of real capital — no delayed-cushion start) fires whenever a node's equity hits a new high ≥10% above the last skim reference, moves 20% of current strategy value into an SPY reserve, reference ratchets to each new high (never skims the same gain twice). **Redeploy** is deliberately manual, not automated — user gets alerted when the strategy's own equity crosses back above both 80% and 100% of its pre-decline peak (real testing found no universal best threshold: SOXL/SPY favored 80% in all 3 tested crashes, AGQ/SPY favored 100% in the one crash where it mattered) and decides when/how much to move back in. Reserve vehicle: SPY (tested against QQQ/SSO/UPRO/QLD/TQQQ — SPY tied for best win rate with none of the leveraged options' variance; USO tested and rejected as an AGQ-specific reserve candidate 2026-08-04, went negative in the 2020 COVID window — see `docs/research_log.md`). Scope: per-ticker/per-node, not portfolio-wide.
 **2026-08-04 follow-up**: a real, untested failure mode was flagged — most historical bear markets (1929-32, 2000-02, 2008) had a real bounce that failed before the true bottom, unlike the single-leg-down synthetic crashes tested so far; the manual redeploy trigger could get faked out by one of these and redeploy capital right before a second leg down. Not built/tested (user's call — deferred, not blocking). **User's gut-call, same day: proceed with the skim side regardless** ("sock away some winnings") — skim locks in real gains on new highs independent of what redeploy timing does later, so the untested redeploy-fakeout risk doesn't block starting to skim.
 Not yet implemented — no real capital deployed on SOXL/AGQ yet (user is deliberately extending paper-trading validation first). When built: needs real SPY buy/sell order-placement code (new path), persistent per-node skim/redeploy-reference state, and the standard live-trading-code review gate (Opus safety review + fake_broker tests) before running against real money.
+**2026-08-04 (later) — build requirement flagged**: since multiple live tickers now share one account (HIBL/USD/YANG all in `soxl_ira`), skim contributions from different nodes will land in the same physical SPY position — can't tell "whose" SPY it is from share count alone. Design: don't segregate shares; track a **per-node ledger balance** (e.g. `skim_reserve_balance` column per `watch_list` node) recording skimmed value per node against one pooled SPY holding. Redeploy for a given node sells `min(ledger_balance, needed)` of the shared position and credits that node. Tradeoff accepted: the pooled SPY's cost basis blends across nodes/times (average-cost, not per-node lots) — fine for parking gains, not for tax-lot precision, and this blending must stay isolated from AGQ's own Section-1256/K-1 basis treatment rather than bleeding across that boundary.
 
 ## [backtest] Open, raised 2026-08-03, evolved same session (paired-capital) — NEW strategy paradigm: paired-ticker capital allocation using a real matched leveraged inverse, explicitly NOT a v5 variant
 Started as "hold idle capital in the inverse while primary is flat" (rejected — leveraged-decay blowup on long idle windows, `docs/research_log.md`'s 2026-08-03 entry), evolved through several framings the same session:

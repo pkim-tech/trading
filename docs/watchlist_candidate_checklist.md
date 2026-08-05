@@ -192,6 +192,25 @@ specific window went negative for those five before treating them as validated.
 No re-sweep, no `backtest_cache` schema change — same "run the backtest once, slice the
 already-computed trade list" approach as check 4/10, just generalized from 2 windows to N.
 
+## 14. Config-drift baseline (REQUIRED ACTION, not just a check — do this at the moment of promotion, not before)
+Unlike checks 1-13 (analysis to decide *whether* to promote), this is a mandatory step
+*at* promotion time, immediately after flipping a node's `mode` to `live`: verify it has
+a `staged_test_config` row (`SELECT wl_id, ticker, scenario_role FROM staged_test_config
+WHERE wl_id=?`). If not, run `.venv/bin/python scripts/seed_baseline_config.py` (seeds
+every `mode='live'` node missing one — safe, skips nodes already staged, won't overwrite).
+
+Without this row, the node is invisible to `signals_invariants.py`'s daily config-drift
+check (`check_staged_config_matches_expected`/`print_all_live_node_state`) — the tripwire
+that catches a live node's real risk parameters (fixed_sl, z_score_threshold,
+trail_sell_pct, etc.) silently diverging from what was intended (a bad manual DB edit, a
+migration side-effect, a stale copy-paste value). A node with real capital and no baseline
+row isn't "less protected" — it has **zero** config-drift protection from the moment it
+goes live until someone happens to notice. **Found 2026-08-04 (very late)**: HIBL/USD/YANG
+(wl_id 154/155/156, flipped live 2026-08-03, ~$6,000 combined real notional) went a full
+day+ with no baseline row — `signals_invariants.py` ran clean the whole time because it
+only checks nodes that already have one, not "every live node." Don't rely on a clean
+`signals_invariants.py` run alone to mean full live coverage.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds
@@ -205,7 +224,9 @@ already-computed trade list" approach as check 4/10, just generalized from 2 win
   weak/inconsistent signal). Don't re-litigate without new information.
 
 ## When to run this
-- Before flipping any ticker `research`→`live`.
+- Checks 1-13: before flipping any ticker `research`→`live`.
+- **Check 14: at the moment of promotion itself, not before** — the flip and the baseline
+  seed should happen together, same session, so a live node is never left unprotected.
 - Whenever a live ticker's live behavior seems to be diverging from backtest expectations
   (the AGQ momentum discussion, 2026-07-12, is what prompted writing this down).
 - Not needed on every session — this is a promotion/investigation gate, not a routine poll.

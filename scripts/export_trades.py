@@ -888,7 +888,7 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
                                trail_pct, target_h0, target_h1, z_thresh,
                                rng, entry_miss_mode, entry_miss_rate,
                                exit_miss_mode, exit_miss_rate, max_delay_checks=3,
-                               open_check=False):
+                               open_check=False, trace=None):
     """Execution-adherence ("chaos monkey") mirror of backtester._simulate_trail
     (TrailingExitZScoreBreakout -- immediate market entry at the signal bar, no
     trailing-buy wait phase), same chaos-miss framework as
@@ -900,10 +900,24 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
     fix as the production kernel (Open-first check before the intrabar Low
     check on both SL and trailing-stop) -- the gap fill itself isn't missable,
     only whether the underlying trigger is noticed/acted on. open_check: mirrors
-    backtester._simulate_trail's open_check_entry_timing."""
+    backtester._simulate_trail's open_check_entry_timing.
+
+    trace: optional (start_ts, end_ts) pair (pandas-comparable) -- when set,
+    prints this exact loop's real decision at every bar in that window: an
+    IN_TRADE header line while a position is open (held/max_hold_hours,
+    trailing state -- NOT a per-check breakdown of the SL/gap/trailing-stop/
+    TIME exit legs themselves, those aren't individually traced yet), and the
+    full entry-check inputs/output (Open/Close vs. lower_band, open_check
+    routing, fired_signal, and the _resolve_miss accept/reject decision) at
+    every eligible bar. Built so "why didn't ticker X fire on date Y" traces
+    the real function every other script here calls, not a hand-copied
+    reimplementation that could itself be wrong (found to be a real risk
+    2026-08-04 -- a from-scratch debug loop disagreed with this function and
+    there was no way to tell which one was right)."""
     prices, highs, lows, opens, hours = p['prices'], p['highs'], p['lows'], p['opens'], p['hours']
     daily_idx, sma_arr, std_arr = p['daily_idx'], p['sma_arr'], p['std_arr']
     trend_arr, has_trend = p['trend_arr'], p['has_trend']
+    timestamps = p['timestamps']
 
     trades = []
     in_trade = trailing = False
@@ -916,8 +930,12 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
     n = len(prices)
     for i in range(n):
         cp, high, low, op = prices[i], highs[i], lows[i], opens[i]
+        _tr = trace is not None and trace[0] <= timestamps[i] <= trace[1]
 
         if in_trade:
+            if _tr:
+                print(f"  [trace] {timestamps[i]}  IN_TRADE (entered {timestamps[entry_bar]})  "
+                      f"held={held+1}/{max_hours_to_hold}  trailing={trailing}")
             held += 1
             if trailing:
                 trail_stop_gap = peak * (1.0 - trail_pct)
@@ -985,12 +1003,19 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
 
         h = hours[i]
         if h != target_h0 and h != target_h1:
+            if _tr:
+                print(f"  [trace] {timestamps[i]}  hour={h} not in (target_h0={target_h0}, "
+                      f"target_h1={target_h1}) -- skipped")
             continue
         di = daily_idx[i]
         if di < 0:
+            if _tr:
+                print(f"  [trace] {timestamps[i]}  daily_idx={di} (<0) -- skipped")
             continue
         sma, std = sma_arr[di], std_arr[di]
         if std == 0.0:
+            if _tr:
+                print(f"  [trace] {timestamps[i]}  std==0 -- skipped")
             continue
         lower_band = sma - std * z_thresh
         fired_signal = False
@@ -1006,8 +1031,15 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
                 fired_signal = True
                 fired_price = cp
                 fired_z = (cp - sma) / std
+        if _tr:
+            print(f"  [trace] {timestamps[i]}  hour={h}  Open={op:.4f} Close={cp:.4f}  "
+                  f"lower_band={lower_band:.4f}  open_check={open_check}  fired_signal={fired_signal}")
         if fired_signal:
-            if _resolve_miss(rng, entry_miss_mode, entry_miss_rate, entry_streak, max_delay_checks):
+            _acted = _resolve_miss(rng, entry_miss_mode, entry_miss_rate, entry_streak, max_delay_checks)
+            if _tr:
+                print(f"  [trace] {timestamps[i]}  _resolve_miss -> acted={_acted} "
+                      f"(entry_miss_rate={entry_miss_rate}, entry_streak={entry_streak})")
+            if _acted:
                 entry_streak = 0
                 entry_price = fired_price
                 tp_price = entry_price * (1.0 + take_profit)

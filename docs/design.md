@@ -690,3 +690,124 @@ re-confirmation — the same shape each time, now written down instead of re-der
    a genuine finding, not just a fix confirmation.
 8. **The user always places the real order**, same convention as sweep campaigns and daemon
    restarts — this session scopes/designs the test, never executes it.
+
+## Two-account paper trading (planned, added 2026-08-04 very late — not yet built)
+
+**Motivation**: a long investigation (`docs/research_log.md`'s 2026-08-04 very-late entry) found
+paper trading's real trade sequence diverging from a backtest replay for several tickers. Two real,
+distinct, non-bug causes were confirmed: (1) paper and a full-history backtest replay are two
+independently-sequenced single-position simulations, never synchronized at a common starting
+boundary — one small early divergence anywhere upstream cascades into a completely different trade
+sequence downstream, making "trades in calendar window X" comparisons invalid once any drift has
+occurred; (2) paper's real-time signal check (`signals_compute.compute_buy_signal`) uses a live
+1-minute yfinance tick for its current-price comparison, while the backtest uses the fixed hourly-bar
+Close — same SMA/Std indicator math (verified identical), different price input. Neither is a bug,
+but they mean today's single paper-trading track can't cleanly answer both "does real execution hold
+up" and "does live code correctly mirror the backtest kernel" at once.
+
+**Design**: run two paper-tracking nodes per ticker instead of one, distinguished by role, not by a
+literal separate broker account (paper trading never touches `schwab_client`/real accounts at all --
+`account` is just a label field for it). Confirmed safe to co-locate under the same `account` value:
+paper trading's dedup/position lookup is already `wl_id`-scoped end to end (`start_paper_buy`'s
+`get_open_position_by_wl_id`, `_scan_buy_signals`'s `already_held` check) -- the one `(ticker, window)`
+fallback in `active_signals.py` only fires for legacy pre-wl_id-migration rows with a NULL `wl_id`,
+never for two newly-created nodes. This also happens to be the first real test of
+`buy_fill_reconciles_correct_node` (coverage grid: "no live proof -- no two live nodes currently
+share a ticker"), safely, on the paper side.
+
+- **Account A (unmodified)**: today's existing paper-trading node/behavior. Never resets, accumulates
+  real trade history under real market conditions and real intraminute price ticks. This is the "does
+  the strategy actually hold up" signal -- divergence from backtest here is expected and is the point,
+  not a defect to chase.
+- **Account B (new)**: a second node per ticker that (a) uses the backtest's hourly-bar-close price
+  for its signal check instead of a live tick (needs a new mode in `paper_trading.py`/
+  `signals_compute.compute_buy_signal`), and (b) periodically resets to the backtest's real state
+  (needs a reset/resync mechanism, not yet designed -- open question: reset on what cadence, and does
+  "reset" mean re-seeding `paper_positions` to match a fresh backtest replay's current state, or
+  literally closing/reopening to force alignment). Any divergence remaining in Account B is then
+  provably attributable to price-availability timing alone, since the starting-boundary and
+  price-source variables are both controlled for.
+
+**Implementation pieces, not yet built or scoped in detail**:
+1. `paper_trading.py`/`signals_compute.compute_buy_signal`: an hourly-bar-close price mode, gated per
+   node (e.g. a new `watch_list` column or a role tag), for Account B's signal check.
+2. The Account B reset/resync mechanism itself -- cadence and exact semantics still open.
+3. A second `watch_list` node per ticker for Account B, `mode='research'`, same strategy/config as
+   Account A's node, tagged distinctly (role/label TBD) so reporting can tell them apart.
+4. `scripts/paper_vs_backtest_reconcile.py` needs a real rebuild before it's trustworthy for either
+   account: per-ticker, determine the correct synchronized starting boundary from real current state
+   (flat -> sync at today; holding a position -> sync in-trade at the real entry price/time) --
+   confirmed tonight this is a state-query/preparation concern, not reconciliation logic itself, and
+   should probably live in the still-not-yet-built shared "real current state" function discussed
+   below, not be re-derived inside the reconciliation script.
+
+**Related, still-open from the same investigation**: the broader "multiple scripts each reimplement
+their own view of position/pending-buy state" architecture problem (`status_check.py` missing
+`pending_buys` entirely, `coverage_check.py`'s `get_pending_buys_for_ticker_on_date` date-scoping bug)
+-- both found the same night, logged in `docs/backlog_cache.md`. A shared, canonical state function
+would also directly serve Account B's boundary-sync logic above, so these two backlog items should
+probably be scoped together, not solved twice.
+
+## SOXL drought-overlay parameter sweep (planned, added 2026-08-04 very late — not yet built)
+
+**Motivation**: `scripts/drought_overlay_test.py` (2026-08-04 very late) tested the drought-overlay
+exit mechanics (fixed SL + arm-then-trail) reusing the core mean-reversion node's own tuned values
+(fixed_sl=2%, arm_pct=30%, trail_sell_pct=1% for SOXL) -- values tuned for a completely different
+entry context (a z-band dip), not "buy into a presumed-stable rally." A coarse manual sweep (moving
+SL/trail together, 1% to 18%) showed wider is directionally better (pooled compounded went from
+-76.9% to +4.3%) but was never a real grid search -- SL/arm/trail were moved in lockstep, not
+explored as independent axes, and SOXL's one positive result was fragile (2 of 13 trades driving the
+whole outcome).
+
+**What a real sweep needs, following this project's established sweep discipline** (same shape as
+`.claude/skills/backtest-change-rollout/SKILL.md`, not a from-scratch method):
+1. **Independent axes**: fixed_sl%, arm_pct% (the trailing-stop arm threshold), trail_sell_pct%,
+   searched as a real 3D grid, not moved together. Confirm-days (how many no-signal days before the
+   overlay enters) is a plausible 4th axis, currently fixed at 10 -- worth including or explicitly
+   deciding to hold constant with a stated reason.
+2. **Cliff-safety check**: per this project's standard convention (`MIN(possible, pessimistic,
+   certain)`-style worst-neighbor robustness, not just best-cell alpha) -- the earlier finding that
+   SOXL's result was 2-trades-fragile is exactly the failure mode cliff-safety screening exists to
+   catch, and this parameter space hasn't been screened that way at all yet.
+3. **Larger sample before trusting any winner**: SOXL had only 13 historical drought-overlay
+   opportunities in the tested window. A real sweep should pool across all 10 v5 tickers (or at least
+   the tickers where the broad-index-vs-sector-commodity gap-risk split from tonight favors the
+   overlay, see the research log) for enough trades to distinguish a real edge from 2-trade luck, with
+   SOXL's own result reported both in isolation and pooled.
+4. **Reuses the real exit state machine already built tonight** (`simulate_overlay` in
+   `drought_overlay_test.py`, itself just `TrailingBothZScoreBreakout`'s own arm-then-trail mechanic
+   applied to a drought-confirmed entry) -- the sweep just needs to grid-call it with varying
+   fixed_sl/arm_pct/trail_sell_pct instead of the node's own fixed values, not a new simulator.
+
+## Put-hedge option-selection methodology (planned, added 2026-08-04 very late — not yet built)
+
+**Motivation**: tonight's rough Black-Scholes approximation (assumed IV from realized vol, since
+yfinance has no historical options data) gave directional 2-week ATM/10%-OTM premium estimates for
+several tickers, and established the real mechanism reason to prefer puts over stops (a stop can be
+gapped through, a put's payoff is capped/defined regardless) plus a real structural tailwind (implied
+vol tends to be cheap exactly when the drought-detector would fire, since it's a low-realized-vol
+period). None of this amounts to an actual selection rule yet.
+
+**Open questions a real methodology needs to answer**:
+1. **Strike selection**: ATM (full protection, expensive) vs. OTM (cheaper, but leaves an uncovered
+   gap between entry and strike). The real historical tail losses found tonight (AGQ -48% single day,
+   KORU -33.64% gap-blowout) need to be checked against candidate strikes directly -- an OTM strike
+   picked for cost reasons alone could still leave the worst historical gap partially uncovered.
+2. **Expiry selection**: tonight's overlay hold-time distribution (median 2 days, mean 5.2, max 33.8)
+   is right-skewed -- a single fixed expiry either overpays for the typical short hold or leaves the
+   rare long hold unprotected past expiry. Needs a real rule (e.g. tied to `max_hold_hours`, or a
+   rolling/laddered approach), not a single assumed value.
+3. **Real IV, not a realized-vol proxy**: `yfinance` does expose *live* option chains
+   (`yf.Ticker(t).option_chain(date)`) -- a real methodology should price against actual current
+   quotes when deciding whether to hedge right now, even though it can't backtest historical option
+   prices (no historical chain data exists anywhere accessible to this project).
+4. **Real cost-benefit rule**: tonight's comparison was worst-case tail loss vs. one premium figure,
+   eyeballed -- a real rule needs expected value (probability-weighted tail-loss reduction across all
+   historical drought-overlay trades, not just the worst one) against premium paid on *every* entry,
+   whether or not that entry would have hit the tail case.
+5. **Sizing**: contract count needs to match the overlay's real share count per entry, not a round
+   number.
+
+Depends on the SOXL sweep above landing on real SL/arm/trail parameters first, since the put's strike
+distance and expiry should be chosen relative to the overlay's actual (swept, not guessed) risk
+profile, not the ad hoc parameters tested tonight.
