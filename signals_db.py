@@ -174,6 +174,30 @@ def ensure_tables():
             # routine review, so its Slack alerts are noise by default. Flip to 1 for a
             # ticker when actually weighing a go-live decision on it.
             c.execute("ALTER TABLE watch_list ADD COLUMN paper_alert_verbose INTEGER NOT NULL DEFAULT 0")
+        if 'paper_role' not in wl_cols:
+            # NULL (default) = ordinary node -- either a real/live node or the existing
+            # free-running paper "live-track" (live-tick pricing, no reconciliation).
+            # 'daily_sync' tags the 2026-08-05 "daily-track" sibling: same ticker/
+            # strategy/config, but signal-checked against the last closed hourly bar's
+            # Close (see compute_buy_signal) instead of a live tick, and nightly
+            # CLASSIFIED against a fresh backtest replay -- paper_trading.
+            # reconcile_daily_track_nodes is pure observation (final design, corrected
+            # mid-session after an earlier reconcile-and-resync/halt version): it logs
+            # whether each night's state matches, and whether a mismatch is explainable
+            # by the Open-vs-Close price-source difference, but never opens/closes a
+            # position or halts the node itself. Isolates price-source timing as the
+            # variable under test against the backtest. See docs/design.md's
+            # "Two-account paper trading" section.
+            c.execute("ALTER TABLE watch_list ADD COLUMN paper_role TEXT")
+        if 'daily_sync_halted_at' not in wl_cols:
+            # NOT set by reconcile_daily_track_nodes (pure observation, no state
+            # mutation -- see paper_role above) -- this is inert scaffolding for a
+            # separate, not-yet-built "sync" tool (the user's framing, 2026-08-05:
+            # "reconcile as one action (how far are we) vs sync (prepare for next
+            # day)"). start_paper_buy/start_paper_market_buy still check it and skip
+            # entry when set, so a future sync tool has a real lever to pull, but
+            # nothing in the current codebase ever sets it.
+            c.execute("ALTER TABLE watch_list ADD COLUMN daily_sync_halted_at TEXT")
 
         # account wasn't part of the original UNIQUE constraint -- found 2026-07-26 while
         # adding a second real DPST node in a different account: two nodes with identical
@@ -215,6 +239,8 @@ def ensure_tables():
                     starting_notional  REAL NOT NULL DEFAULT 50000,
                     annotation         TEXT,
                     paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
+                    paper_role         TEXT,
+                    daily_sync_halted_at TEXT,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account)
@@ -224,6 +250,53 @@ def ensure_tables():
             # a hardcoded list here would silently drop any column added by the
             # ALTER ladder above within this same ensure_tables() call on a DB
             # that hasn't been rebuilt yet (found by Opus review 2026-07-26).
+            live_cols = ', '.join(r[1] for r in c.execute("PRAGMA table_info(watch_list)"))
+            c.execute(f"INSERT INTO watch_list_new ({live_cols}) SELECT {live_cols} FROM watch_list")
+            c.execute("DROP TABLE watch_list")
+            c.execute("ALTER TABLE watch_list_new RENAME TO watch_list")
+
+        # paper_role wasn't part of the UNIQUE constraint above (added later, 2026-08-05) --
+        # without this, a daily-track node (paper_role='daily_sync', identical ticker/strategy/
+        # config/account to its live-track sibling by design) would collide with it on insert. Same rebuild
+        # pattern as the account fix above (SQLite can't ALTER a UNIQUE constraint in place).
+        wl_schema_sql = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='watch_list'"
+        ).fetchone()[0]
+        if 'paper_role' not in wl_schema_sql.split('UNIQUE(')[-1]:
+            c.execute("DROP TABLE IF EXISTS watch_list_new")
+            c.executescript("""
+                CREATE TABLE watch_list_new (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    watchlist_id       INTEGER NOT NULL,
+                    mode               TEXT NOT NULL DEFAULT 'live',
+                    ticker             TEXT NOT NULL,
+                    strategy           TEXT NOT NULL,
+                    version            TEXT NOT NULL,
+                    window             INTEGER NOT NULL,
+                    take_profit        INTEGER,
+                    stop_loss          INTEGER NOT NULL,
+                    max_hold_hours     INTEGER NOT NULL,
+                    z_score_threshold  REAL NOT NULL DEFAULT 2.0,
+                    label              TEXT DEFAULT '',
+                    added_at           TEXT DEFAULT (datetime('now')),
+                    trail_sell_pct     REAL,
+                    fixed_sl           REAL,
+                    trail_buy_pct      REAL,
+                    arm_sell_pct       REAL,
+                    cached_avg_vol_10d REAL,
+                    account            TEXT,
+                    alpha              REAL,
+                    entry_timing       TEXT NOT NULL DEFAULT 'close',
+                    starting_notional  REAL NOT NULL DEFAULT 50000,
+                    annotation         TEXT,
+                    paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
+                    paper_role         TEXT,
+                    daily_sync_halted_at TEXT,
+                    UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
+                           stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
+                           trail_sell_pct, account, paper_role)
+                );
+            """)
             live_cols = ', '.join(r[1] for r in c.execute("PRAGMA table_info(watch_list)"))
             c.execute(f"INSERT INTO watch_list_new ({live_cols}) SELECT {live_cols} FROM watch_list")
             c.execute("DROP TABLE watch_list")
@@ -285,6 +358,18 @@ def ensure_tables():
             # the same ticker. Nullable: legacy rows opened before this migration are
             # backfilled best-effort below; new rows are always populated by open_position().
             c.execute("ALTER TABLE open_positions ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
+        if 'signal_bar_time' not in op_cols:
+            # signal_time itself is deliberately fill_time (wall-clock) for a trailing-buy
+            # position (2026-07-31 hold-time-origin fix -- correct for real hold-budget
+            # tracking) -- but that means it can't double as "which hourly bar detected the
+            # signal" for daily-track's reconcile (paper_trading.reconcile_daily_track_nodes),
+            # which needs the real bar. Nullable, populated only by
+            # paper_trading.update_paper_buys' bounce-fill completion (the one path where
+            # signal_time and the real signal bar diverge) from the pending buy's own
+            # signal_time, which IS bar-aligned (paper_pending_buys rows are written with
+            # sig['last_bar']). NULL for every other caller, where signal_time already is
+            # bar-aligned (found by Opus review, 2026-08-05).
+            c.execute("ALTER TABLE open_positions ADD COLUMN signal_bar_time TEXT")
 
         # trade_log
         c.execute("""
@@ -320,6 +405,33 @@ def ensure_tables():
             c.execute("ALTER TABLE trade_log ADD COLUMN account TEXT")
         if 'is_dry_run_sim' not in tl_cols:
             c.execute("ALTER TABLE trade_log ADD COLUMN is_dry_run_sim INTEGER NOT NULL DEFAULT 0")
+        if 'wl_id' not in tl_cols:
+            # log_trade_entry's INSERT is shared between trade_log and paper_trade_log via
+            # _pos_tables -- added here in lockstep with paper_trade_log's own wl_id add
+            # below so that one INSERT statement can populate it unconditionally for both.
+            c.execute("ALTER TABLE trade_log ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
+        if 'signal_bar_time' not in tl_cols:
+            # See open_positions.signal_bar_time -- trade_log/paper_trade_log need the same
+            # column (added lockstep, same shared-INSERT reason as wl_id above) so
+            # reconcile_daily_track_nodes' pre-resync "did daily-track already close a trade
+            # against this signal bar" check survives a position closing (open_positions rows
+            # are deleted on close; only trade_log/paper_trade_log persist). Found missing by
+            # a regression test, not a review round -- the open_positions/paper_positions add
+            # alone silently degraded back to the wall-clock signal_time fallback for any
+            # already-closed trade.
+            c.execute("ALTER TABLE trade_log ADD COLUMN signal_bar_time TEXT")
+        if 'exit_bar_time' not in tl_cols:
+            # Same rationale as signal_bar_time, for the exit side -- exit_time is wall-clock
+            # (datetime.now() at poll time), and for an at_bar_close exit specifically, that
+            # wall-clock moment is always chronologically inside the NEXT bar's window (bar N
+            # ends exactly when bar N+1 begins, and the poll detecting the close fires shortly
+            # after), so reconcile_daily_track_nodes' _bar_containing(exit_time) lookup
+            # misattributes every clean bar-close exit to the wrong bar -- confirmed by Opus
+            # review, 2026-08-05. paper_trading.check_paper_sells captures the real graded bar
+            # (last_bar_ts) explicitly for the at_bar_close branch; NULL for the mid-bar
+            # reactive branch, where exit_time's wall clock genuinely does fall inside the bar
+            # the trigger action occurred in and _bar_containing is the correct lookup.
+            c.execute("ALTER TABLE trade_log ADD COLUMN exit_bar_time TEXT")
 
         # pending_buys -- tracks a trailing-buy order from BUY alert until Executed/Skipped
         # is confirmed, so a stalled broker-side fill can be reminded on (mirrors trail_state
@@ -403,6 +515,10 @@ def ensure_tables():
             # open_position()'s shared INSERT works unchanged against either table;
             # a paper position is never also a dry-run-sim one.
             c.execute("ALTER TABLE paper_positions ADD COLUMN is_dry_run_sim INTEGER NOT NULL DEFAULT 0")
+        if 'signal_bar_time' not in pp_cols:
+            # See open_positions.signal_bar_time above -- same rationale, kept
+            # schema-identical for the same shared-INSERT reason as is_dry_run_sim.
+            c.execute("ALTER TABLE paper_positions ADD COLUMN signal_bar_time TEXT")
         c.execute("""
             CREATE TABLE IF NOT EXISTS paper_trade_log (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -433,6 +549,19 @@ def ensure_tables():
         if 'is_dry_run_sim' not in ptl_cols:
             # Always 0 -- see paper_positions.is_dry_run_sim above.
             c.execute("ALTER TABLE paper_trade_log ADD COLUMN is_dry_run_sim INTEGER NOT NULL DEFAULT 0")
+        if 'wl_id' not in ptl_cols:
+            # paper_positions already has wl_id; paper_trade_log never did -- harmless while
+            # every ticker had at most one paper node, but the 2026-08-05 daily-track design
+            # creates a live-track/daily-track pair that's identical in every OTHER column here
+            # (ticker/strategy/version/window/account) by construction. Without wl_id, every
+            # reader that queries this table by ticker (paper_vs_backtest_reconcile.py,
+            # paper_trading_status.py, paper_signal_intrabar_check.py) silently merges both
+            # tracks' trades into one stream (found by both Opus review passes, 2026-08-05).
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
+        if 'signal_bar_time' not in ptl_cols:
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN signal_bar_time TEXT")
+        if 'exit_bar_time' not in ptl_cols:
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN exit_bar_time TEXT")
         # paper_pending_buys -- lighter than pending_buys: no reminder machinery, since a
         # simulated fill is auto-detected every poll (paper_trading.update_paper_buys),
         # never confirmed by a human clicking a button.
@@ -450,6 +579,51 @@ def ensure_tables():
         ppb_cols = {r[1] for r in c.execute("PRAGMA table_info(paper_pending_buys)").fetchall()}
         if 'wl_id' not in ppb_cols:
             c.execute("ALTER TABLE paper_pending_buys ADD COLUMN wl_id INTEGER REFERENCES watch_list(id)")
+        # daily_track_reconciliation_log -- one row per daily-track node per nightly
+        # reconcile (paper_trading.reconcile_daily_track_nodes), full diagnostic snapshot
+        # of both sides (not just a match/mismatch boolean -- user's explicit call
+        # 2026-08-05: "logs would be terrible to query", and a bare verdict throws away
+        # exactly the interesting part, e.g. how close daily-track's z was to the
+        # backtest's even on a match). bar_match: whether the two sides agree on
+        # flat-vs-open AND, if both open, the exact same entry bar. explained_by_price:
+        # NULL if bar_match (nothing to explain) or uncomputable, else the counterfactual
+        # re-check's verdict. action is descriptive, not imperative -- reconcile never
+        # acts on any of these ('match', 'pending_skip', 'entry_miss_explained'/
+        # 'unexplained', 'exit_wick_explained'/'unexplained', 'exit_bar_mismatch',
+        # 'exit_early', 'ambiguous_position', 'no_backtest_data').
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_track_reconciliation_log (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                  TEXT NOT NULL DEFAULT (datetime('now')),
+                wl_id               INTEGER NOT NULL REFERENCES watch_list(id),
+                ticker              TEXT NOT NULL,
+                check_date          TEXT NOT NULL,
+                actual_state        TEXT NOT NULL,
+                actual_entry_price  REAL,
+                actual_entry_time   TEXT,
+                actual_signal_price REAL,
+                backtest_state      TEXT NOT NULL,
+                backtest_entry_price REAL,
+                backtest_entry_time TEXT,
+                backtest_signal_z   REAL,
+                backtest_lower_band REAL,
+                bar_match           INTEGER NOT NULL,
+                explained_by_price  INTEGER,
+                action              TEXT NOT NULL,
+                detail              TEXT,
+                actual_exit_time    TEXT,
+                backtest_exit_time  TEXT
+            )
+        """)
+        dtrl_cols = {r[1] for r in c.execute("PRAGMA table_info(daily_track_reconciliation_log)").fetchall()}
+        if 'actual_exit_time' not in dtrl_cols:
+            # Added 2026-08-05 alongside exit-side reconcile coverage -- exit comparisons
+            # (same-bar-exit check once entries already match) need their own queryable
+            # columns, not just prose in detail -- same "logs would be terrible to query"
+            # principle the whole table exists for.
+            c.execute("ALTER TABLE daily_track_reconciliation_log ADD COLUMN actual_exit_time TEXT")
+        if 'backtest_exit_time' not in dtrl_cols:
+            c.execute("ALTER TABLE daily_track_reconciliation_log ADD COLUMN backtest_exit_time TEXT")
         # open_price_quality_log -- Part 4 Deliverable 2: logs every pinned-check
         # get_session_open_price fetch (timestamp, ticker, target time, price,
         # is_true_open) so scripts/verify_open_price_quality.py can join it against
@@ -996,7 +1170,7 @@ def _is_trailing_buy(node):
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
              label='', z_score_threshold=2.0, watchlist_id=None, mode='live',
              trail_buy_pct=None, trail_pct=None, entry_timing='close', starting_notional=50000,
-             fixed_sl_override=None, account=None):
+             fixed_sl_override=None, account=None, paper_role=None):
     """trail_buy_pct/trail_pct: pass the real values directly for v3.x nodes (where
     backtest_cache has real named columns). Omit both for legacy v1.x/v2.x nodes —
     falls back to reinterpreting stop_loss the way it's always meant for the 4
@@ -1081,21 +1255,23 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
               AND COALESCE(trail_buy_pct, -1) = COALESCE(?, -1)
               AND COALESCE(trail_sell_pct, -1) = COALESCE(?, -1)
               AND COALESCE(account, '') = COALESCE(?, '')
+              AND COALESCE(paper_role, '') = COALESCE(?, '')
         """, (watchlist_id, ticker, strategy, version, int(window), stored_take_profit,
               int(stop_loss), int(max_hold_hours),
-              stored_arm_sell_pct, stored_trail_buy_pct, stored_trail_sell_pct, account)).fetchone()
+              stored_arm_sell_pct, stored_trail_buy_pct, stored_trail_sell_pct, account,
+              paper_role)).fetchone()
         if existing:
             return
         cur = c.execute("""
             INSERT INTO watch_list
                 (watchlist_id, mode, ticker, strategy, version, window, take_profit,
                  stop_loss, max_hold_hours, label, z_score_threshold, trail_sell_pct, fixed_sl,
-                 trail_buy_pct, arm_sell_pct, entry_timing, starting_notional, account)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_buy_pct, arm_sell_pct, entry_timing, starting_notional, account, paper_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (watchlist_id, mode, ticker, strategy, version, int(window), stored_take_profit,
               int(stop_loss), int(max_hold_hours), label, float(z_score_threshold),
               stored_trail_sell_pct, fixed_sl, stored_trail_buy_pct, stored_arm_sell_pct,
-              entry_timing, float(starting_notional), account))
+              entry_timing, float(starting_notional), account, paper_role))
         _log_audit(c, 'add_node', watchlist_id=watchlist_id, watch_id=cur.lastrowid,
                    ticker=ticker, detail=f"strategy={strategy} version={version} mode={mode}")
         c.commit()
@@ -1587,10 +1763,18 @@ def get_pending_buys_for_ticker_on_date(ticker, check_date, strategy=None, versi
     """See get_closed_trades_for_ticker_on_date for why ticker alone is
     ambiguous. pending_buys has no real strategy/version/window/account
     columns (they live inside node_json), so disambiguation is a Python-side
-    filter after the ticker/date SQL match, not a SQL WHERE clause."""
+    filter after the ticker/date SQL match, not a SQL WHERE clause.
+
+    signal_time <= check_date (not ==): a pending_buys row is deleted the
+    moment it resolves (clear_pending_buy*), so any row still present as of
+    check_date is still genuinely resting, regardless of which day it was
+    created -- a carryover scenario (e.g. canary_overnight_carry) is
+    specifically one whose signal_time is a PRIOR day. An exact-date match
+    produced a false "no pending_buys row" for every such scenario once the
+    order aged past its signal day (found 2026-08-04)."""
     with _conn() as c:
         rows = [dict(r) for r in c.execute("""
-            SELECT * FROM pending_buys WHERE ticker = ? AND date(signal_time) = ?
+            SELECT * FROM pending_buys WHERE ticker = ? AND date(signal_time) <= ?
             ORDER BY id DESC
         """, (ticker, check_date)).fetchall()]
     for r in rows:
@@ -1746,6 +1930,20 @@ def get_open_position_by_wl_id(wl_id, paper=False):
     return d
 
 
+def get_trade_log_for_wl_id(wl_id, paper=False, limit=50):
+    """wl_id-scoped trade_log/paper_trade_log history -- added 2026-08-05 for
+    reconcile_daily_track_nodes' classification logic (does this node have a
+    closed trade at the same signal bar the backtest is currently referencing?
+    used to distinguish 'flat, never entered' from 'flat, already handled').
+    Newest first."""
+    _, trades_table = _pos_tables(paper)
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM {trades_table} WHERE wl_id = ? ORDER BY entry_time DESC LIMIT ?",
+            (wl_id, limit)
+        ).fetchall()]
+
+
 def get_position_by_id(position_id, paper=False):
     """Fresh single-row lookup by primary key -- used where a caller holds a
     possibly-stale in-memory position dict (e.g. notify_trailing_activated
@@ -1840,6 +2038,68 @@ def get_pending_buys():
     for r in rows:
         r['node'] = json.loads(r['node_json'])
     return rows
+
+
+def get_pending_buy_by_wl_id(wl_id):
+    """Node-scoped single-row lookup -- the pending_buys counterpart to
+    get_open_position_by_wl_id, added 2026-08-05 so a still-resting trailing-buy
+    doesn't render as flat/no-activity in state-summary tools that only ever
+    checked open_positions (status_check.py/audit_live_test_candidates.py)."""
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        row = c.execute("SELECT * FROM pending_buys WHERE wl_id = ? ORDER BY id DESC LIMIT 1",
+                         (wl_id,)).fetchone()
+    if row is None:
+        return None
+    r = dict(row)
+    r['node'] = json.loads(r['node_json'])
+    return r
+
+
+def log_daily_track_reconciliation(wl_id, ticker, check_date, actual_state, backtest_state, bar_match,
+                                    action, actual_entry_price=None, actual_entry_time=None,
+                                    actual_signal_price=None, backtest_entry_price=None,
+                                    backtest_entry_time=None, backtest_signal_z=None,
+                                    backtest_lower_band=None, explained_by_price=None, detail=None,
+                                    actual_exit_time=None, backtest_exit_time=None):
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO daily_track_reconciliation_log
+                (wl_id, ticker, check_date, actual_state, actual_entry_price, actual_entry_time,
+                 actual_signal_price, backtest_state, backtest_entry_price, backtest_entry_time,
+                 backtest_signal_z, backtest_lower_band, bar_match, explained_by_price, action, detail,
+                 actual_exit_time, backtest_exit_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (wl_id, ticker, check_date, actual_state, actual_entry_price, actual_entry_time,
+              actual_signal_price, backtest_state, backtest_entry_price, backtest_entry_time,
+              backtest_signal_z, backtest_lower_band, 1 if bar_match else 0,
+              None if explained_by_price is None else (1 if explained_by_price else 0), action, detail,
+              actual_exit_time, backtest_exit_time))
+        c.commit()
+
+
+def get_daily_track_reconciliation_log(wl_id=None, limit=200):
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        if wl_id is not None:
+            rows = c.execute(
+                "SELECT * FROM daily_track_reconciliation_log WHERE wl_id = ? ORDER BY id DESC LIMIT ?",
+                (wl_id, limit)).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM daily_track_reconciliation_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_daily_sync_halted(wl_id, halted=True):
+    """Halts (or clears) a daily-track node's paper entry -- set when a nightly reconcile
+    finds an unexplained divergence (see reconcile_daily_track_nodes' docstring). Clearing
+    is a manual, deliberate action (no code path clears this automatically)."""
+    with _conn() as c:
+        c.execute("UPDATE watch_list SET daily_sync_halted_at = ? WHERE id = ?",
+                   (datetime.now().strftime('%Y-%m-%d %H:%M:%S') if halted else None, wl_id))
+        _log_audit(c, 'set_daily_sync_halted', watch_id=wl_id, detail=f"halted={halted}")
+        c.commit()
 
 
 def clear_pending_buy(ticker):
@@ -1996,7 +2256,7 @@ def closed_today(ticker, paper=False, node=None):
 
 
 def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False,
-                   is_dry_run_sim=False):
+                   is_dry_run_sim=False, signal_bar_time=None):
     """Returns True if a position was opened, False if skipped because one was
     already open for this node — callers that report success to Slack
     must check this, since a silent skip must not be reported as a fill.
@@ -2036,15 +2296,19 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             return False
         sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
         entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
+        signal_bar_time_str = (signal_bar_time.strftime('%Y-%m-%d %H:%M:%S')
+                                if hasattr(signal_bar_time, 'strftime') else signal_bar_time)
         trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares,
-                                        paper=paper, is_dry_run_sim=is_dry_run_sim)
+                                        paper=paper, is_dry_run_sim=is_dry_run_sim,
+                                        signal_bar_time=signal_bar_time)
         tp = node.get('take_profit')
         c.execute(f"""
             INSERT INTO {positions_table}
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, trade_log_id,
-                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares, account, wl_id, is_dry_run_sim)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares, account, wl_id, is_dry_run_sim,
+                 signal_bar_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
@@ -2054,6 +2318,7 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             node.get('trail_sell_pct'), node.get('fixed_sl'), node.get('trail_buy_pct'),
             node.get('arm_sell_pct'), float(shares) if shares is not None else None,
             node.get('account'), node.get('id'), 1 if is_dry_run_sim else 0,
+            signal_bar_time_str,
         ))
         c.commit()
         return True
@@ -2165,7 +2430,8 @@ def correct_entry_price(ticker, entry_price):
         c.commit()
 
 
-def close_position(position_id, exit_signal_price=None, exit_price=None, exit_time=None, exit_reason=None, paper=False):
+def close_position(position_id, exit_signal_price=None, exit_price=None, exit_time=None, exit_reason=None, paper=False,
+                    exit_bar_time=None):
     """Returns True if this call actually closed the position, False if it was
     already gone -- callers that report a close to Slack must check this,
     same shape as open_position()'s duplicate-skip return. Guarded by the
@@ -2196,7 +2462,8 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
             return False
         _mode = 'paper' if paper else ('dry_run' if row[4] else 'live')
         if exit_price is not None and row[0]:
-            log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper)
+            log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper,
+                            exit_bar_time=exit_bar_time)
         c.execute(f"DELETE FROM {positions_table} WHERE id = ?", (position_id,))
         c.commit()
         # 2026-08-01 2nd Opus review finding: logged BEFORE log_trade_exit/DELETE
@@ -2208,10 +2475,12 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
 
 
 def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False,
-                     is_dry_run_sim=False):
+                     is_dry_run_sim=False, signal_bar_time=None):
     _, trade_log_table = _pos_tables(paper)
     sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
     entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
+    signal_bar_time_str = (signal_bar_time.strftime('%Y-%m-%d %H:%M:%S')
+                            if hasattr(signal_bar_time, 'strftime') else signal_bar_time)
     entry_drift    = (entry_price - signal_price) / signal_price * 100
     tp = node.get('take_profit')
     with _conn() as c:
@@ -2219,8 +2488,8 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, sh
             INSERT INTO {trade_log_table}
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct, shares, account,
-                 is_dry_run_sim)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_dry_run_sim, wl_id, signal_bar_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
@@ -2228,22 +2497,26 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, sh
             float(signal_price), sig_time_str,
             float(entry_price), entry_time_str, entry_drift, node.get('arm_sell_pct'),
             float(shares) if shares is not None else None, node.get('account'), 1 if is_dry_run_sim else 0,
+            node.get('id'), signal_bar_time_str,
         ))
         c.commit()
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reason, entry_price, paper=False):
+def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reason, entry_price, paper=False,
+                    exit_bar_time=None):
     _, trade_log_table = _pos_tables(paper)
     exit_time_str = exit_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(exit_time, 'strftime') else exit_time
+    exit_bar_time_str = (exit_bar_time.strftime('%Y-%m-%d %H:%M:%S')
+                          if hasattr(exit_bar_time, 'strftime') else exit_bar_time)
     exit_drift    = (exit_price - exit_signal_price) / exit_signal_price * 100
     pnl           = (exit_price - entry_price) / entry_price * 100
     with _conn() as c:
         c.execute(f"""
             UPDATE {trade_log_table} SET
                 exit_signal_price = ?, exit_price = ?, exit_time = ?,
-                exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?
+                exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?, exit_bar_time = ?
             WHERE id = ?
         """, (float(exit_signal_price), float(exit_price), exit_time_str,
-              exit_drift, pnl, exit_reason, trade_id))
+              exit_drift, pnl, exit_reason, exit_bar_time_str, trade_id))
         c.commit()

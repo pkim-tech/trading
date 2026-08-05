@@ -173,6 +173,17 @@ def audit_one(ticker, wl_id=None):
         print("  resting order: none")
 
     if pos is None:
+        # A resting trailing-buy has no open_positions row yet (that's only created
+        # on fill) -- checking pos alone here previously reported "flat" for a node
+        # that's actually mid-entry, waiting on a broker fill (found 2026-08-04,
+        # same blind spot as coverage_check.py's carryover-scoping bug above).
+        pending = db.get_pending_buy_by_wl_id(node['id'])
+        if pending:
+            print(f"  DB position: none (flat), but pending buy resting -- "
+                  f"signal_price=${pending['signal_price']:.2f} signal_time={pending['signal_time']} "
+                  f"order_placed={bool(pending['order_placed'])} order_id={pending.get('order_id')}")
+            print("  verdict: entry in progress (pending buy) -- not a real entry candidate right now")
+            return
         print("  DB position: none (flat)")
         sig = a.compute_buy_signal(node)
         if sig is None:

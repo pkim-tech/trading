@@ -829,6 +829,19 @@ def run_loop(tickers: set = None):
                 _guarded("eod_phased_monitors_report", _print_eod_report)
                 _guarded("live_node_state[EOD]", signals_invariants.print_all_live_node_state)
 
+                # 2026-08-05: nightly reconcile for daily-track paper nodes (paper_role=
+                # 'daily_sync') -- log-only, no Slack, DB-only and idempotent (safe to
+                # duplicate on a restart-after-16:05, same reasoning as the other calls in
+                # this pre-seeded-but-not-Slack block). PURE OBSERVATION: classifies each
+                # node's actual state against a fresh backtest replay (match / explained
+                # divergence / unexplained divergence) and logs it in full
+                # (db.log_daily_track_reconciliation) -- never mutates daily-track's real
+                # paper state. See paper_trading.reconcile_daily_track_nodes.
+                def _reconcile_daily_track():
+                    n = paper_trading.reconcile_daily_track_nodes()
+                    print(f"  [paper] daily-track nightly reconcile: {n} divergence(s) classified")
+                _guarded("reconcile_daily_track_nodes", _reconcile_daily_track)
+
             # Separate gate from eod_report_alerted above (pre-seeded, unlike
             # it -- see eod_slack_alerted's definition) since these two post
             # to Slack: a duplicate log print is harmless, a duplicate Slack

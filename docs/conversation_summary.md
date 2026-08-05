@@ -6341,3 +6341,68 @@ being state-query, not reconciliation logic) -- queued as a real "shared canonic
 build item, prioritized first for next session per the user's explicit build-order answer
 (shared state function -> SOXL sweep -> two-account paper trading), including scoping how that
 function should report cleanly across live/dry-run/paper at the existing 4:05pm EOD slot.
+
+---
+
+## 2026-08-05 (very late) — Daily-track paper trading built and thoroughly corrected: pure-observation reconcile classifier (not resync-and-halt), 3 full paired-review rounds, 2 real live-check bugs closed
+
+Session's main thread: a second `watch_list` paper node per v5-watchlist ticker
+(`paper_role='daily_sync'`, "daily-track") alongside the existing free-running "live-track", isolating
+whether paper trading's price source (live tick vs. backtest's hourly-bar Close) explains its
+divergence from a backtest replay. `signals_compute.compute_buy_signal` gained a `daily_sync` branch
+forcing signal-check pricing to the last closed hourly bar's Close (with a staleness guard and a fix
+for yfinance's still-forming current-hour bar).
+
+**The design went through a real reversal, driven entirely by user pushback, not a bug report.** The
+first working version was a "reconcile-and-resync" engine (`paper_trading.reconcile_daily_track_nodes`,
+nightly EOD job): it auto-opened/closed daily-track's paper positions whenever a divergence from the
+backtest was proven explained by price, and halted a node's future entries when it couldn't explain
+one. After it was built and reviewed twice, the user reconsidered the whole premise: "i'm not sure i
+agree with halts... in fact letting it run might show up more interesting behaviors" → "no i think i
+didn't want to auto sync" → final framing, "reconcile as one action (how far are we) vs sync (prepare
+for next day)". Reasoning: auto-resyncing erases exactly the natural divergence that's most
+interesting to study over a long comparison window; auto-halting quiets a node down exactly when
+something is happening. The function was rewritten to be pure observation — it still runs the full
+comparison/counterfactual logic (bar-level entry match, exit-bar match, "would Close alone explain
+this" checks for entry misses and both SL and trailing-stop exit wicks) but never calls
+`open_position`/`close_position`/`set_daily_sync_halted`; it only classifies and logs one full
+diagnostic row per node per night to a new `daily_track_reconciliation_log` table. The
+`daily_sync_halted_at` schema/gate/invariant-check were deliberately left in place, inert, as
+scaffolding for a possible future separate "sync" tool.
+
+**Three full paired Opus review rounds (independent-cold + contextual), each against a real diff, each
+finding real bugs** — this is also why `CLAUDE.md`'s `session wrap` step 3a was rewritten this session
+to explicitly require the pair (it previously said "spawn an independent Opus review agent," singular,
+which the user caught mid-session: "why did you forget?" — the paired pattern lived only in a memory
+note, not in CLAUDE.md itself). Round 1 found the original reconcile-and-resync engine's nightly reset
+would force-close every position before it could ever complete a real multi-day trade (all v5 nodes
+have `max_hold_hours` 21-140h) — this is what triggered the pure-observation redesign discussion.
+Round 2 found the `'closed'` state permanently shadowed `'flat'` once a node had any trade history
+(fixed by anchoring the comparison on the backtest's own most recent trade instead of daily-track's);
+a real trailing-buy fill's `signal_time` is deliberately wall-clock, unresolvable to a bar index
+(fixed via a new `signal_bar_time` column); bar-close exits were off-by-one (fixed via a parallel
+`exit_bar_time` column); a `numpy.bool_` identity-comparison bug. Round 3 (on the final
+pure-observation design plus a new trailing-stop wick counterfactual, `_close_alone_would_breach_trail`)
+found an unarmed TIME-forced exit was misclassified as an explained SL wick — and the independent
+review found the deeper root cause: `scripts/export_trades.py::simulate_trail_exit_chaos` never
+tracked `arm_i` at all for the `TrailingExitZScoreBreakout` kernel mirror, silently misrouting every
+genuine trailing-stop exit for that whole strategy family. Fixed at the source (verified no other of
+its 13 consumer scripts reads the field). Also fixed: a documented-but-never-emitted `no_backtest_data`
+action, silent replay failures, several stale resync/halt-era comments, and 4 test assertions
+strengthened from `is not None` to exact value checks.
+
+Separately, two real live-check bugs from a prior session's finding were closed:
+`get_pending_buys_for_ticker_on_date`'s exact-date match (broke `canary_overnight_carry` for SDOW/DIA)
+fixed to `<=`, and `audit_one`/`status_check.py` never checking `pending_buys` (a resting trailing-buy
+showed as "flat") fixed via new `get_pending_buy_by_wl_id`. A cosmetic stale status-message time string
+from the same finding remains open.
+
+Full suite: 539 passed, 0 errors (also incidentally cleared 1 pre-existing unrelated collection error —
+`scripts/multiday_cycle_entry_test.py`'s `test_ticker_cycle` helper, not a real pytest test, renamed to
+`analyze_ticker_cycle`). Test coverage: `tests/test_daily_track_paper.py` (30 tests, zero
+state-mutation assertions by design), `tests/test_export_trades_arm_tracking.py` (4 new tests).
+
+**Not done**: no daily-track node created against the real live DB yet
+(`scripts/add_daily_track_paper_nodes.py` built/tested, confirm before running); piece 4
+(`scripts/paper_vs_backtest_reconcile.py`'s own rebuild) and the kernel's "waiting"/bounce-fill state
+visibility remain open, lower priority.

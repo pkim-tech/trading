@@ -923,6 +923,7 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
     in_trade = trailing = False
     entry_price = stop_price = tp_price = peak = 0.0
     entry_bar = held = 0
+    arm_bar = None
     signal_z = None
     entry_streak = 0
     exit_streak = 0
@@ -945,7 +946,7 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
                         exit_streak = 0
                         pc = (op - entry_price) / entry_price
                         trades.append(dict(signal_i=entry_bar, signal_z=signal_z, entry_i=entry_bar,
-                                            arm_i=None, exit_i=i, entry_p=entry_price, exit_p=op,
+                                            arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=op,
                                             held=held, result=WIN if pc > 0 else LOSS, ret=pc))
                         in_trade = trailing = False
                     else:
@@ -962,7 +963,7 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
                         exit_px = trail_stop if sl_hit else cp
                         pc = (exit_px - entry_price) / entry_price
                         trades.append(dict(signal_i=entry_bar, signal_z=signal_z, entry_i=entry_bar,
-                                            arm_i=None, exit_i=i, entry_p=entry_price, exit_p=exit_px,
+                                            arm_i=arm_bar, exit_i=i, entry_p=entry_price, exit_p=exit_px,
                                             held=held, result=WIN if pc > 0 else LOSS, ret=pc))
                         in_trade = trailing = False
                     else:
@@ -985,7 +986,7 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
                     exit_streak += 1
                 continue
             if cp >= tp_price:
-                trailing = True; peak = cp
+                trailing = True; peak = cp; arm_bar = i
                 continue
             if held >= max_hours_to_hold:
                 if _resolve_miss(rng, exit_miss_mode, exit_miss_rate, exit_streak, max_delay_checks):
@@ -1044,7 +1045,7 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
                 entry_price = fired_price
                 tp_price = entry_price * (1.0 + take_profit)
                 stop_price = entry_price * (1.0 - stop_loss)
-                entry_bar = i; held = 0
+                entry_bar = i; held = 0; arm_bar = None
                 signal_z = fired_z
                 in_trade = True; trailing = False
             else:
@@ -1056,7 +1057,7 @@ def simulate_trail_exit_chaos(p, take_profit, stop_loss, max_hours_to_hold,
         cp = prices[n - 1]
         pc = (cp - entry_price) / entry_price
         trades.append(dict(signal_i=entry_bar, signal_z=signal_z, entry_i=entry_bar,
-                            arm_i=None, exit_i=n - 1, entry_p=entry_price, exit_p=cp,
+                            arm_i=arm_bar, exit_i=n - 1, entry_p=entry_price, exit_p=cp,
                             held=held, result=OPEN, ret=pc))
 
     return trades

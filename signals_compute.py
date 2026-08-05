@@ -150,7 +150,40 @@ def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override
     # tripping the corporate-action discontinuity guard on every replayed signal.
     daily_closes = df_daily_prior['Close'].dropna()
     prev_close = float(daily_closes.iloc[-1]) if not daily_closes.empty else close_series.iloc[-1]
-    if price_override is not None:
+    if node.get('paper_role') == 'daily_sync':
+        # The whole point of a daily-track node is to isolate price-source
+        # timing as the only variable against a backtest replay -- it must never
+        # take a live intraminute tick (nor any caller-supplied price_override,
+        # which exists for a different purpose, the pinned real-broker-price
+        # path) and always use the same fixed hourly-bar Close the backtest
+        # kernel itself trades off of. See docs/design.md's "Two-account paper
+        # trading" section.
+        #
+        # Only a genuine live call (no as_of/df_hourly_override -- a historical
+        # replay already hands in whatever slice it means to use, as-is) needs
+        # the two guards below (found by Opus review, 2026-08-05: both were
+        # unconditional in the first version, silently breaking every replay
+        # caller -- scripts/verify_live_parity.py, watchlist_status.py -- for a
+        # daily_sync node).
+        is_live_call = as_of is None and df_hourly_override is None
+        if is_live_call:
+            now = datetime.now()
+            # yfinance's currently-updating hourly bar (this wall-clock hour) is
+            # still forming -- data_manager.fetch_live_data_smart never trims it,
+            # so trusting it as "the last CLOSED bar" during the back half of a
+            # signal window would make daily-track effectively a live tick again,
+            # defeating the whole point.
+            if (close_series.index[-1].hour == now.hour
+                    and close_series.index[-1].date() == now.date() and len(close_series) > 1):
+                close_series = close_series.iloc[:-1]
+                last_bar = close_series.index[-1]
+            # Same staleness guard as _current_price's live-tick path (2026-07-22
+            # HIBL gap) -- an unrefreshed cache would otherwise silently hand back
+            # an arbitrarily old Close as if it were today's bar.
+            if now - last_bar > _STALE_PRICE_MAX_AGE:
+                return None
+        current_price = float(close_series.iloc[-1])
+    elif price_override is not None:
         current_price = price_override
     else:
         try:

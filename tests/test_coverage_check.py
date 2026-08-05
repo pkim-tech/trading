@@ -175,6 +175,24 @@ def test_check_trade_lifecycle_pending_carryover_not_met_when_nothing_happened(i
     assert met is False
 
 
+def test_check_trade_lifecycle_pending_carryover_met_when_signal_predates_check_date(isolated_db):
+    """The real designed scenario: a resting trailing-buy signaled on a PRIOR
+    day, still pending as of check_date -- an exact date(signal_time)==check_date
+    match (the pre-2026-08-05 behavior) always missed this, since the row's
+    signal_time is never today's date for a genuine overnight carryover."""
+    yesterday = datetime.now() - timedelta(days=1)
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
+    sig = dict(current_price=100.0, last_bar=yesterday)
+    db.add_pending_buy(n, sig, channel='C123', ts='123.456')
+    check_date = datetime.now().date().isoformat()
+    scenario = dict(ticker=TICKER, check_params='{"expect_pending_carryover": true}')
+    met, summary = _check_trade_lifecycle(scenario, check_date)
+    assert met is True
+    assert 'pending_buys' in summary
+
+
 def test_check_trade_lifecycle_scopes_to_node_not_just_ticker(isolated_db):
     """Direct regression for the Opus-caught GDXU bug: two real nodes can share
     a ticker (differing account/version/window), and a scenario_expectations

@@ -75,6 +75,28 @@ def check_research_mode_ticker_with_open_position_in_automation_scope():
     return violations
 
 
+def check_daily_sync_halted_nodes():
+    """Surfaces any daily-track node (paper_role='daily_sync') with
+    daily_sync_halted_at set. paper_trading.reconcile_daily_track_nodes is
+    pure observation as of 2026-08-05 -- it classifies and logs every
+    divergence (db.log_daily_track_reconciliation) but never sets this itself
+    (the user's explicit call: reconcile answers "how far are we," a separate
+    "sync" action would be the one to pause/realign a node, not built yet).
+    This check exists for whenever that sync tooling lands and actually sets
+    the flag -- without it, a halted node could otherwise sit invisible for
+    weeks. See docs/design.md's "Two-account paper trading" section."""
+    violations = []
+    for node in db.get_watchlist():
+        if node.get('paper_role') == 'daily_sync' and node.get('daily_sync_halted_at'):
+            violations.append(
+                f"{node['ticker']} (wl_id={node['id']}) daily-track halted at "
+                f"{node['daily_sync_halted_at']} -- unexplained divergence from backtest replay, "
+                f"needs manual review (see daily_track_reconciliation_log), then "
+                f"db.set_daily_sync_halted(wl_id, halted=False) to clear."
+            )
+    return violations
+
+
 def check_live_node_missing_account():
     """No mode='live' node should have account=None.
 
@@ -362,6 +384,7 @@ def check_sim_mode_off_for_real_daemon():
 CHECKS = [
     check_live_trailing_exit_automation_scope,
     check_research_mode_ticker_with_open_position_in_automation_scope,
+    check_daily_sync_halted_nodes,
     check_live_node_missing_account,
     check_tax_advantaged_excluded_tickers,
     check_brokerage_not_live_with_unresolved_leverage_gap,

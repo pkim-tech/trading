@@ -691,7 +691,256 @@ re-confirmation — the same shape each time, now written down instead of re-der
 8. **The user always places the real order**, same convention as sweep campaigns and daemon
    restarts — this session scopes/designs the test, never executes it.
 
-## Two-account paper trading (planned, added 2026-08-04 very late — not yet built)
+## Two-track paper trading (built 2026-08-05 — real reconcile-and-resync engine, not the original design)
+
+**Renamed, 2026-08-05**: "Account A/B" below was never a literal second broker account (paper
+trading has none) — implemented as two `watch_list` nodes per ticker, same `account` label,
+distinguished by the new `paper_role` column. Renamed to avoid the misleading "account" framing:
+**live-track** (`paper_role` NULL — the existing free-running paper node, live-tick pricing) and
+**daily-track** (`paper_role='daily_sync'` — the new sibling, hourly-close pricing, nightly
+reconciled). "B-track"/"backtest_sync" appeared briefly in this session's first draft and are gone
+from the code; only pre-existing 2026-08-04 history (`research_log.md`/`conversation_summary.md`)
+still uses "Account A/B", left untouched per their append-only convention.
+
+**Corrected mid-build, 2026-08-05**: the first version of the nightly job (`reset_backtest_sync_nodes`)
+just force-closed every daily-track position at 16:05 ET regardless of state — user caught this as
+wrong before it ever ran for real: every v5 node's `max_hold_hours` is 21-140 (all multi-day), so a
+fixed nightly close would prevent daily-track from ever completing a real multi-day trade, making the
+whole comparison vacuous. Replaced with a real reconcile-and-resync engine (below) before any
+daily-track node was created against the live DB.
+
+**Built**: (1) `signals_compute.compute_buy_signal` — a `node.get('paper_role') == 'daily_sync'` node
+always prices its signal check off the last closed hourly bar's `Close`, overriding both the live
+yfinance tick and any caller-supplied `price_override` (e.g. the pinned real-broker-price path), with
+the same staleness guard `_current_price` already has (`_STALE_PRICE_MAX_AGE`, added after the
+contextual Opus review flagged its absence). (2) `paper_trading.reconcile_daily_track_nodes()` — nightly,
+wired into `active_signals.py`'s existing 16:05 ET EOD slot (log-only, no Slack, idempotent). For
+each daily-track node: get its actual paper state and a fresh backtest replay's implied current state
+(last raw trade if still `OPEN`, else flat) via `paper_trading._backtest_replay_for_node`. A match
+requires the SAME bar (`signal_i`), not just "both in a position today". On a mismatch, the only shape
+that's mechanistically explainable by price today is backtest-open/daily-track-flat — daily-track's
+Close-only check is a strict subset of the real kernel's open_check logic (Open first, Close
+fallback); a counterfactual re-check (would Close alone have fired at the backtest's signal bar?)
+distinguishes "yes, explained by the Open-vs-Close gap → resync daily-track to the backtest's implied
+entry" from "no, unexplained → halt via `db.set_daily_sync_halted`, surfaced by
+`signals_invariants.check_daily_sync_halted_nodes`". Every check (match/synced/halted) logs a full
+diagnostic snapshot (`daily_track_reconciliation_log` table, `db.log_daily_track_reconciliation`) —
+user's explicit call ("logs would be terrible to query") — not just a verdict. (3)
+`scripts/add_daily_track_paper_nodes.py` — clones each v5 live-track node's real, current config
+(filtered on `version=='v5'` specifically, not just ticker+mode — GDXU's `soxl_test` pilot node was
+briefly mis-included by the first draft, caught by both paired Opus reviews) into a daily-track
+sibling. `add_node` gained a `paper_role` param, included in both the Python-level dedup check and a
+`watch_list` schema rebuild adding `paper_role` to the real UNIQUE constraint (mirrors the 2026-07-26
+`account` fix — without it a daily-track node collides with its live-track sibling on insert, since
+every other field is identical by design). `paper_trade_log`/`trade_log` gained `wl_id` (previously
+absent from both — without it, live-track and daily-track trades were indistinguishable in history,
+the paired reviews' top finding) so `log_trade_entry` can attribute every row to its real node. Full
+test coverage: `tests/test_daily_track_paper.py`.
+
+**Fixed post-review, same session (a fresh paired Opus review round found these against the reconcile
+engine above)**: (1) the bar-match compared `actual['signal_time']` against the backtest's `signal_i` —
+but a real trailing-buy paper fill stores `signal_time=fill_time` (wall-clock, the deliberate
+2026-07-31 hold-budget-origin fix), so it could never resolve to a bar index and every organic
+TrailingBoth entry would halt on its first night. Fixed via a new nullable `signal_bar_time` column
+(`open_positions`/`paper_positions`/`trade_log`/`paper_trade_log`, `open_position`/`log_trade_entry`
+gained the param) populated only by `paper_trading.update_paper_buys`' bounce-fill completion, from
+the pending buy's own bar-aligned `signal_time`. (2) A resting paper pending buy (bounce-fill wait
+phase) was invisible to the reconcile (only `open_positions` was checked), causing a false halt on a
+pure fill-timing race — now checked first and skipped for the night (`action='pending_skip'`, no
+verdict) rather than judged. (3) The resync branch could reopen a position daily-track had already
+legitimately closed (exits aren't price-source-isolated, so "flat" doesn't always mean "missed it") —
+now checks `db.get_trade_log_for_wl_id` for a prior closed trade against the same signal bar before
+resyncing. (4) The `daily_sync` price path could pick up yfinance's still-forming current-hour bar
+(never trimmed by `data_manager.fetch_live_data_smart`), defeating the whole premise during the back
+half of a signal window — now drops the last row when its hour matches the current wall-clock hour, for
+live calls only. (5) The staleness guard applied unconditionally, breaking every historical-replay
+caller (`as_of`/`df_hourly_override` supplied) — now gated to live calls only. (6) Resync's synthetic
+position had `shares=None` and `signal_price=entry_p` (manufacturing a fake zero entry_drift) — now
+sized like a real bounce-fill and priced at the bar's actual Close. (7) No dedup on
+`daily_track_reconciliation_log` per (wl_id, check_date) — a restart after 16:05 would double-log; now
+a no-op if already reconciled today. Full regression coverage for all 7:
+`tests/test_daily_track_paper.py`.
+
+**Exit-side coverage added, same session** (user pushed back on the entry-only scope: "i feel like we
+want to have exit side covered?"). Initial instinct was to force daily-track's exit checks to bar-close
+only (matching the backtest's once-per-bar resolution exactly) — user pushed back on that too ("i think
+exits on papertrading should be real and reconcile should figure out that it was a time price issue"),
+which is the better design: `check_paper_sells` stays fully unchanged (real, reactive, mid-bar live-tick
+fallback intact for every node including daily-track), and the reconcile is what resolves a mid-bar exit
+after the fact. New `_bar_containing(df_h, ts)` (last cached bar at-or-before wall-clock `ts` — a
+different lookup than entries' `_bar_index_for`, which needs an exact match since a trailing-buy signal
+bar can lag its fill by many bars; an exit's wall-clock time, by contrast, always falls inside the same
+bar its trigger action occurred in) resolves which bar a real exit landed in, compared against the
+backtest replay's own `exit_i` for the same trade — same bar is a match regardless of the exact
+intrabar price (the same "explained by price resolution" framing as the entry side's Open-vs-Close
+case), different bars halt (no known price-source explanation once entries already match).
+`reconcile_daily_track_nodes` restructured: daily-track's actual state is now 'open' / 'closed' / 'flat'
+(previously just open/flat) — for 'open'/'closed', the backtest's trade for the SAME entry signal bar is
+found by searching the full trade history, not just the tail, so an already-resolved trade on both sides
+gets its exit compared too. daily-track closing early while the backtest replay still shows the trade
+open is logged only, never resynced (user's explicit call, same session — reopening would fabricate a
+duplicate of a trade that already really happened). New action values: `exit_diverged_no_action`
+(daily-track closed, backtest still open — log only) alongside the existing `match`/`synced`/`halted`/
+`pending_skip`/`skipped_already_closed`. `daily_track_reconciliation_log` gained `actual_exit_time`/
+`backtest_exit_time` columns (queryable, not just prose in `detail`). 3 new regression tests (exit match,
+exit-bar mismatch, daily-track-still-open-but-backtest-exited) in `tests/test_daily_track_paper.py` (17
+total).
+
+**Corrected after a second paired Opus review round, same session** — both reviews independently found
+the exit-side layer's first draft had 2 real bugs, plus the user pushed the design further:
+
+1. **`'closed'` state permanently shadowed `'flat'`** (contextual review, CONFIRMED) — the first version
+   anchored the actual/backtest comparison on daily-track's own most recent closed trade, with no recency
+   check. Once a node had ANY trade history, the entry-miss/resync path (the core feature, reviewed twice
+   already) became permanently unreachable, and a genuinely NEW missed signal at a later bar would
+   silently log `'match'` against the old, unrelated trade — actively hiding the exact divergence this
+   design exists to catch. **Fixed by re-anchoring the whole comparison on `bt_ref` (the backtest's own
+   most recent trade, `trades[-1]`, open or closed) instead of daily-track's history** — daily-track's
+   state is now determined by searching for ITS OWN record (open position or closed trade) matching
+   `bt_ref`'s specific signal bar, so old, unrelated history can never mask a new miss. New
+   `actual_state='open_different_trade'` for the (rare) case where daily-track holds something matching
+   neither the backtest's reference trade nor any resolvable flat/closed state — halts, unexplained.
+   Regression test: `test_reconcile_catches_new_missed_entry_after_old_closed_trade`.
+2. **Bar-close exits systematically off-by-one** (independent review, CONFIRMED, reproduced) —
+   `check_paper_sells` records `exit_time=datetime.now()` (wall-clock poll time). For an `at_bar_close`
+   exit specifically, that wall-clock moment always falls chronologically inside the NEXT bar's window
+   (bar N ends exactly when bar N+1 begins, and the poll detecting the close fires shortly after), so
+   `_bar_containing(exit_time)` misattributed every clean bar-close exit to the wrong bar — halting
+   daily-track nodes on precisely their most backtest-comparable exits. **Fixed with the same pattern as
+   entries' `signal_bar_time`**: new nullable `exit_bar_time` column (`trade_log`/`paper_trade_log`,
+   `close_position`/`log_trade_exit` gained the param), populated by `check_paper_sells` with the real
+   graded bar (`last_bar_ts`) on the `at_bar_close` branch, left `None` on the mid-bar reactive branch
+   (where wall-clock `exit_time` genuinely does fall inside the trigger bar, and `_bar_containing` is
+   correct). Reconcile prefers `exit_bar_time` (exact match) when present, falls back to
+   `_bar_containing` on wall-clock `exit_time` otherwise. Regression test:
+   `test_reconcile_exit_bar_close_uses_exit_bar_time_not_wallclock`.
+3. **User pushed the "open, backtest closed" halt further** — asked directly why the blind halt
+   couldn't also try to explain itself by price, the same discipline as entries. Confirmed valid (both
+   reviews flagged the blind halt as likely to fire on the single most common exit divergence: the
+   backtest's intrabar Low breaching a stop daily-track's `POLL_SECS`-cadence live-tick sampling never
+   saw). **Added a symmetric exit-side counterfactual**: new `_close_alone_would_breach_sl` — at the
+   backtest's exit bar, would the bar's Close ALONE (not the intrabar Low) also breach the fixed-SL
+   trigger? If not, wick-only, explained — resync by FORCE-CLOSING daily-track's position at the
+   backtest's implied exit (the same "sync back to the correct state for next day" principle as the
+   entry side, applied symmetrically). If Close alone would also breach (a real, persistent gap, not
+   just a wick) or the exit was trailing-armed (no reconstructable fixed threshold without peak-tracking
+   state not available from the trade dict alone — an acknowledged, undone limitation), unexplained —
+   halt. Regression tests: `test_reconcile_halts_when_daily_track_still_open_but_backtest_trail_exited`,
+   `test_reconcile_resyncs_wick_only_sl_exit`.
+4. **A `numpy.bool_` identity-comparison bug** (`explained is False` never matches a numpy array
+   comparison result, a different object from the Python singleton) was found and fixed live while
+   testing piece 3 above, before it ever reached review — compare by value (`breach is not None and not
+   breach`) instead.
+
+`tests/test_daily_track_paper.py` had 20 tests total at this point, including the two entry-miss
+resync tests, three original exit-side tests, and five new tests covering pieces 1-3 above plus a
+strengthened non-last-bar exit-match test (the independent review flagged the original as too weak to
+have caught the off-by-one itself, since it happened to use the frame's last row, which `searchsorted`
+trivially clamps to regardless of the bug).
+
+## Final redesign, same session: reconcile is pure observation, no resync, no halt
+
+After landing the reconcile-and-resync engine above, the user re-examined the whole premise mid-review:
+"i'm not sure i agree with halts - we can just review everything after hours?" then, after discussion,
+"no i think i didn't want to auto sync" and "in fact letting it run might show up more interesting
+behaviors." The reasoning: auto-resyncing (opening/closing positions whenever a divergence is proven
+"explained") erases exactly the natural drift that's most interesting to study over a long comparison
+window, and halting on unexplained divergence would quiet nodes down whenever something is actually
+happening -- the opposite of what a multi-week comparison is for. Final framing, the user's words:
+**"reconcile as one action (how far are we) vs sync (prepare for next day)"** -- two conceptually
+distinct operations. Reconcile (this session's scope) is now pure classification/logging; a "sync"
+action that would actually realign daily-track's state is a separate, not-yet-built concept for later.
+
+**What changed**: every `db.open_position`/`db.close_position`/`db.set_daily_sync_halted` call was
+removed from `reconcile_daily_track_nodes` — it now only computes and logs. Action labels were renamed
+from imperative (`synced`/`halted`) to descriptive (`entry_miss_explained`/`entry_miss_unexplained`,
+`exit_wick_explained`/`exit_wick_unexplained`, `exit_bar_mismatch`, `exit_early`, `ambiguous_position`,
+`no_backtest_data`, `match`, `pending_skip`) so the log reads as a classification, not a claim that
+something was done. `daily_sync_halted_at`'s schema, `set_daily_sync_halted`, the gate in
+`start_paper_buy`/`start_paper_market_buy`, and `signals_invariants.check_daily_sync_halted_nodes` were
+all left in place (harmless, inert — nothing sets the flag automatically anymore) as scaffolding for
+whenever a real "sync" tool is built.
+
+**The trailing-stop wick counterfactual (the earlier "fix #1" ask) was built as part of this same
+pass**, purely for richer classification, not action: new `_close_alone_would_breach_trail` reconstructs
+the peak the same way the kernel does (`backtester.py`/`scripts/export_trades.py`'s
+`simulate_trail_both_annotated`: peak starts at the arm bar's Close, then `max(peak, High)` each
+subsequent bar) but using only Close, from `arm_i` to `exit_i` — if that alone would also trigger an
+exit, not explained; if not, wick-only, explained. A TIME-forced-while-armed exit (`held >=
+max_hold_hours`) is checked first and always unexplained (a bar-count question, not a price one — no
+counterfactual applies). 6 new tests cover the trail-wick-explained, trail-wick-unexplained, and
+TIME-forced-while-armed cases, alongside the SL wick case's own explained/unexplained pair.
+
+`tests/test_daily_track_paper.py` was rewritten (not patched) to match: every test that previously
+asserted a position was opened/closed now asserts it was left UNCHANGED by the call. 24 tests total,
+covering the full classification matrix (both entry and exit sides, explained and unexplained, plus the
+pending/ambiguous/no-data edge states) with zero state-mutation assertions anywhere in the file.
+
+**Not built**: piece 4 (`scripts/paper_vs_backtest_reconcile.py`'s own rebuild to use `wl_id`-scoped
+queries and report reconciliation history) and the kernel's "waiting"/bounce-fill internal state (still
+invisible to the entry-side comparison — a lower-severity gap flagged by the contextual review, not yet
+addressed). No daily-track node has been created against the real live DB yet — `add_daily_track_paper_nodes.py`
+is built and tested but not yet run for real.
+
+## Final paired review of the pure-observation design, same session — 1 real bug found at two depths, plus a genuine shared-utility fix
+
+Both reviews independently confirmed the three core claims (zero state mutation in `reconcile_daily_track_nodes`,
+the `daily_sync_halted_at` gate is genuinely inert — `set_daily_sync_halted` has no production caller anywhere
+in the codebase, only tests — and the trailing-stop peak reconstruction is faithful to the kernel) and re-verified
+the full suite (533 passed). Findings:
+
+1. **[MEDIUM-HIGH, confirmed by both, at two depths] The `arm_i is None` discriminator misclassified
+   TIME-forced exits as SL wick-explained.** The contextual review caught the surface bug: `time_forced`
+   required `arm_i is not None`, so an UNARMED TIME exit (the kernel's TWIN/TLOSS result for a trade that
+   never armed) fell through to the SL counterfactual, found Close nowhere near the SL threshold, and logged
+   `exit_wick_explained` with an actively false "SL breach was wick-only" detail — silently hiding a real
+   bar-count divergence. **Fixed**: dropped `arm_i is not None` from the condition — `held >= max_hold_hours`
+   alone is a sufficient and correct TIME-forced signal regardless of arm state (the kernel's TWIN/TLOSS
+   result implies it by construction). The independent review went deeper and found the root cause was worse
+   than the surface symptom: `scripts/export_trades.py::simulate_trail_exit_chaos` (the kernel mirror for
+   `TrailingExitZScoreBreakout`) hardcoded `arm_i=None` in **every** trade dict it ever emitted, at all 5
+   `trades.append` sites, regardless of whether the trade genuinely armed (crossed take-profit into the
+   trailing-stop phase) — even though the real strategy (`strategies.py::TrailingExitZScoreBreakout`) has
+   the identical arm-then-trail state machine `TrailingBothZScoreBreakout` does. This meant every genuine
+   trailing-stop exit for this entire strategy family was misrouted to the SL counterfactual (wrong
+   threshold, not just a wrong label). **Fixed at the source**: added real `arm_bar` tracking to
+   `simulate_trail_exit_chaos` (mirroring the pattern already used in the other three `simulate_trail_*`
+   mirrors in the same file) — armed exits now correctly report `arm_i`, unarmed SL/TIME exits correctly
+   keep `arm_i=None`. Verified no other consumer of this function reads `arm_i` (13 scripts call it; none
+   reference the field), so this is purely additive. New `tests/test_export_trades_arm_tracking.py` (4
+   tests, deterministic constructed price paths, not random) proves genuine trailing exits, genuine SL
+   exits, unarmed TIME exits, and still-open armed trades all report the correct `arm_i` — the 2nd and 4th
+   would fail without the fix.
+2. **[LOW, confirmed] `no_backtest_data` was documented but never emitted** — the entry-miss branch's
+   "counterfactual literally can't be computed" case (no prior-day indicator row, or zero-Std day) fell
+   through to `entry_miss_unexplained` with an affirmative "would have fired on Close alone too" detail the
+   code never actually evaluated. Fixed: emits `no_backtest_data`/`explained_by_price=None` instead.
+3. **[LOW, confirmed] Silent replay failures** — a permanently-broken node (missing CSV, unhandled
+   strategy) only printed and skipped, invisible in the log every night. Fixed: logs `action='replay_failed'`.
+4. **[LOW, confirmed] Stale docstrings/comments still describing the abandoned resync-and-halt design** —
+   `signals_db.py`'s `paper_role`/`daily_sync_halted_at` migration comments, the `daily_track_reconciliation_log`
+   comment listing `'match'/'synced'/'halted'` as the action vocabulary, `get_trade_log_for_wl_id`'s
+   "pre-resync check" docstring, and `add_daily_track_paper_nodes.py`'s "nightly reconcile-and-resync"
+   line — all rewritten to describe the actual pure-observation behavior.
+5. **[LOW, test honesty, confirmed] Four "position unchanged" assertions only checked `is not None`**,
+   not the actual field values — would have passed even if reconcile mutated `entry_price`/`shares`.
+   Strengthened to assert the exact unchanged `entry_price`.
+6. **[MEDIUM, contextual judgment, resolved as "working as intended"]** The independent review flagged
+   that `open_check` daily-track nodes structurally can never fire an Open-leg entry live (the pinned
+   9:31-9:40 window's staleness guard rejects the check since the day's own bar hasn't closed/cached yet),
+   making every Open-leg `entry_miss_explained` a foregone conclusion rather than new information. On
+   reflection this is the CORRECT, intended consequence of isolating price-source timing as the one
+   variable under test — a Close-only node structurally cannot participate in an Open-leg entry, ever, by
+   construction, and that's exactly the point. Clarified in `reconcile_daily_track_nodes`' docstring rather
+   than "fixed" (a pinned-window exemption would reintroduce Open-vs-Close as a live variable, defeating
+   the isolation).
+
+Full suite after this round: still 533 passed (the `arm_i` fix and its 4 new tests are additive; the
+`test_ticker_cycle`→`analyze_ticker_cycle` rename earlier this session cleared what used to be 1
+pre-existing unrelated collection error, so this is genuinely 0 failures/errors, not 533-of-534).
+`tests/test_daily_track_paper.py` is now 30 tests.
+
+## Two-account paper trading (original design, added 2026-08-04 very late)
 
 **Motivation**: a long investigation (`docs/research_log.md`'s 2026-08-04 very-late entry) found
 paper trading's real trade sequence diverging from a backtest replay for several tickers. Two real,

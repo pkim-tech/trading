@@ -1,0 +1,66 @@
+"""Creates the paired 'daily-track' (paper_role='daily_sync') node for each v5
+watchlist ticker's existing 'live-track' research node -- the second half of the
+2026-08-05 two-track paper design (docs/design.md's "Two-account paper
+trading" section). Clones the real, current live-track node's config exactly
+(not a hardcoded param list -- config may have drifted since the original
+build_v5_watchlist.py promotion) rather than re-deriving it, so a daily-track
+node is only ever a config-identical sibling that differs solely in paper_role
+(which flips its signal-check price source to the last closed hourly bar's
+Close, see signals_compute.compute_buy_signal, and makes it subject to the
+nightly reconcile classification -- pure observation, no state mutation, see
+paper_trading.reconcile_daily_track_nodes).
+
+Filters on version=='v5' specifically, not just (ticker in V5_TICKERS, mode=
+'research', no paper_role) -- GDXU has a second research node (version=
+'soxl_test', a $500 regression-test pilot) that the looser filter would have
+also matched and cloned (found by both paired Opus reviews, 2026-08-05).
+
+Only clones a ticker's node once (existing check_then_skip already inside
+add_node handles a rerun no-op'ing cleanly).
+
+Usage:
+    .venv/bin/python scripts/add_daily_track_paper_nodes.py
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import signals_db as db
+
+V5_TICKERS = {"AGQ", "DPST", "GDXU", "HIBL", "KORU", "NUGT", "SOXL", "UDOW", "USD", "YANG"}
+
+
+def main():
+    watchlist = db.get_watchlist()
+    live_track_nodes = [
+        n for n in watchlist
+        if n["ticker"] in V5_TICKERS and n.get("mode") == "research" and n.get("version") == "v5"
+        and not n.get("paper_role")
+    ]
+    found = {n["ticker"] for n in live_track_nodes}
+    if len(live_track_nodes) != len(V5_TICKERS) or found != V5_TICKERS:
+        print(f"WARNING: expected {len(V5_TICKERS)} live-track nodes (version='v5'), found "
+              f"{len(live_track_nodes)}: {sorted(found)}. Missing: {sorted(V5_TICKERS - found)}")
+
+    for node in live_track_nodes:
+        strategy = node["strategy"]
+        take_profit = node["arm_sell_pct"] if strategy == "TrailingBothZScoreBreakout" else node["take_profit"]
+        db.add_node(
+            ticker=node["ticker"], strategy=strategy, version=node["version"], window=node["window"],
+            take_profit=take_profit, stop_loss=node["stop_loss"], max_hold_hours=node["max_hold_hours"],
+            label=f"{node.get('label') or ''} (daily-track)".strip(),
+            z_score_threshold=node["z_score_threshold"], watchlist_id=node["watchlist_id"], mode="research",
+            trail_buy_pct=node["trail_buy_pct"], trail_pct=node["trail_sell_pct"],
+            entry_timing=node["entry_timing"], starting_notional=node["starting_notional"],
+            fixed_sl_override=node["fixed_sl"], account=node.get("account"), paper_role="daily_sync",
+        )
+        print(f"  cloned {node['ticker']} ({strategy[:20]}) -> daily-track (daily_sync)")
+
+    print("\nDaily-track nodes now on watchlist:")
+    for row in db.get_watchlist():
+        if row.get("paper_role") == "daily_sync":
+            print(f"  id={row['id']:<4} {row['ticker']:<6} {row['strategy']}")
+
+
+if __name__ == "__main__":
+    main()

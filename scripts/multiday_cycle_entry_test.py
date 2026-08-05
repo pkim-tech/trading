@@ -70,7 +70,7 @@ def block_bootstrap_sample(x, rng, block_len):
     return np.concatenate(blocks)[:n]
 
 
-def test_ticker_cycle(returns):
+def analyze_ticker_cycle(returns):
     peak_period, peak_power, band_mean = welch_band_power(returns)
     if peak_period is None:
         return None
@@ -173,7 +173,7 @@ def main():
         close_col = "Adj Close" if "Adj Close" in df.columns else "Close"
         returns = np.diff(np.log(df[close_col].values))
 
-        cycle = test_ticker_cycle(returns)
+        cycle = analyze_ticker_cycle(returns)
         row = {"ticker": ticker, **(cycle or {})}
 
         if cycle and cycle["p_value"] < 0.05 and ticker in nodes:
