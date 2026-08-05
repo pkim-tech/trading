@@ -102,13 +102,20 @@ def find_drought_windows(trades, df_h, confirm_days):
     return windows
 
 
-def simulate_overlay(df_h, entry_i, backstop_i, fixed_sl_pct, arm_pct, trail_sell_pct):
+def simulate_overlay(df_h, entry_i, backstop_i, fixed_sl_pct, arm_pct, trail_sell_pct,
+                      exit_vol_gate=None, bar_vol_pctile=None):
     """Bar-by-bar exit simulation using the CORE STRATEGY'S OWN exit state machine
     (TrailingBothZScoreBreakout's arm-then-trail mechanic, mirrored from
     export_trades.simulate_trail_both_annotated's in_trade branch) -- not a new design.
     Fixed SL protects immediately from entry; once price runs up arm_pct%, the trailing
     stop arms and starts protecting the peak by trail_sell_pct% instead. Whichever fires
-    first wins. Same Open-first gap-through-trigger fill logic as the real kernel."""
+    first wins. Same Open-first gap-through-trigger fill logic as the real kernel.
+
+    exit_vol_gate/bar_vol_pctile (added 2026-08-06, per-ticker exit-vol-spike research --
+    see scripts/drought_overlay_sweep.py's run_ticker_sweep_exit_vol_gated): when both are
+    given, forces an early close at that bar's own Close (reason 'VOLSPIKE') the first bar
+    where the position is underwater (cp < entry_price) AND bar_vol_pctile[i] >= the gate.
+    Both default None -- zero behavior change for every existing caller."""
     opens, highs, lows, closes = (df_h["Open"].values, df_h["High"].values,
                                    df_h["Low"].values, df_h["Close"].values)
     entry_price = opens[entry_i + 1] if entry_i + 1 < len(opens) else closes[entry_i]
@@ -120,6 +127,10 @@ def simulate_overlay(df_h, entry_i, backstop_i, fixed_sl_pct, arm_pct, trail_sel
 
     for i in range(entry_bar + 1, backstop_i + 1):
         op, high, low, cp = opens[i], highs[i], lows[i], closes[i]
+        if exit_vol_gate is not None and cp < entry_price:
+            pct = bar_vol_pctile[i]
+            if not np.isnan(pct) and pct >= exit_vol_gate:
+                return {"exit_i": i, "exit_reason": "VOLSPIKE", "ret": cp / entry_price - 1.0}
         if trailing:
             trail_price = peak * (1 - trail_sell_pct / 100.0)
             if op <= trail_price:

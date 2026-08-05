@@ -42,6 +42,8 @@ labeling only, each still gets its own independent overlay sweep run.
 Usage: .venv/bin/python scripts/drought_overlay_sweep.py [--tickers ...] [--watchlist-id 65]
        [--top-n 15] [--csv]
        .venv/bin/python scripts/drought_overlay_sweep.py --big6 [--top-n 15] [--csv]
+       .venv/bin/python scripts/drought_overlay_sweep.py --per-ticker [--csv]
+       .venv/bin/python scripts/drought_overlay_sweep.py --exit-vol-tuning [--csv]
 """
 import argparse
 import sqlite3
@@ -310,6 +312,116 @@ def cliff_safety_5axis(cells, key):
     return min(neighbor_comps), len(neighbor_comps)
 
 
+def get_bar_vol_pctile_array(df_h, ivol_series):
+    """Per-bar vol percentile aligned to df_h's full index (forward-filled from
+    ivol_series's non-9:30 readings) -- unlike _entry_vol_pctile (one lookup per drought
+    entry), simulate_overlay's exit-side check needs O(1) per-bar-in-the-loop access, so
+    this precomputes the whole array once per ticker instead of searching per bar."""
+    ivol_full = ivol_series["ivol"].reindex(df_h.index, method="ffill")
+    hist_sorted = np.sort(ivol_series["ivol"].dropna().values)
+    if len(hist_sorted) == 0:
+        return np.full(len(df_h), np.nan)
+    pctile = np.searchsorted(hist_sorted, ivol_full.values, side="left") / len(hist_sorted)
+    pctile[ivol_full.isna().values] = np.nan
+    return pctile
+
+
+def run_ticker_sweep_exit_vol_gated(node, ivol_series):
+    """Returns {(confirm_days, exit_vol_gate, sl, arm, trail): [rets]} -- per-ticker mirror
+    of the pooled/uniform exit-vol-spike rule tested 2026-08-05 and found NET NEGATIVE
+    (rejected: killed 9 big TRAIL winners for every 2 losses it shrank, pooled win rate
+    14.7%->11.5%). Deferred to this session per the user's explicit request, to see whether
+    a per-ticker threshold survives the same winner-vs-loser trade-off that sank the pooled
+    version, or whether (like the entry gate) some tickers are genuinely helped and others
+    genuinely hurt. Reuses VOL_GATE_GRID's threshold values (same percentile-cutoff
+    semantics, just applied exit-side instead of entry-side) rather than a separate grid."""
+    trades, df_h = get_trades_and_bars(node)
+    if len(trades) < 2:
+        return {}
+    bar_vol_pctile = get_bar_vol_pctile_array(df_h, ivol_series)
+
+    cells = {}
+    for confirm_days in CONFIRM_DAYS_GRID:
+        windows = find_drought_windows(trades, df_h, confirm_days)
+        if not windows:
+            continue
+        for exit_vol_gate in VOL_GATE_GRID:
+            for sl, arm, trail in product(SL_GRID, ARM_GRID, TRAIL_GRID):
+                rets = [simulate_overlay(df_h, entry_i, gap_end, sl, arm, trail,
+                                          exit_vol_gate=exit_vol_gate,
+                                          bar_vol_pctile=bar_vol_pctile)["ret"]
+                        for entry_i, gap_end in windows]
+                cells[(confirm_days, exit_vol_gate, sl, arm, trail)] = rets
+    return cells
+
+
+def run_per_ticker_exit_vol_mode(nodes, top_n, write_csv):
+    """Independent 5-axis (confirm_days, exit_vol_gate, sl, arm, trail) sweep per ticker --
+    structurally identical to run_per_ticker_mode's entry-gate version (same
+    cliff_safety_5axis convention, same VOL_GATE_GRID values), just swapping which side of
+    the trade the vol gate acts on. No cross-ticker pooling -- same accepted overfitting
+    tradeoff as the entry-gate per-ticker mode."""
+    all_rows = []
+    winners = []
+    for node in nodes:
+        ticker = node["ticker"]
+        try:
+            ivol_series = get_ivol_series(ticker)
+            cells = run_ticker_sweep_exit_vol_gated(node, ivol_series)
+        except Exception as e:
+            print(f"{ticker}: failed ({e})")
+            continue
+        if not cells:
+            print(f"  {ticker}: no droughts found, skipped")
+            continue
+        print(f"  {ticker}: {len(cells)} cells computed")
+
+        rows = []
+        for key, rets in cells.items():
+            cd, evg, sl, arm, trail = key
+            worst_neighbor, n_neighbors = cliff_safety_5axis(cells, key)
+            comp = _compounded(rets)
+            rows.append({
+                "ticker": ticker, "confirm_days": cd, "exit_vol_gate": evg, "fixed_sl": sl,
+                "arm_pct": arm, "trail_sell_pct": trail, "n": len(rets),
+                "win_rate": (np.array(rets) > 0).mean() if rets else float("nan"),
+                "compounded_pct": comp * 100 if rets else float("nan"),
+                "worst_neighbor_compounded_pct": worst_neighbor * 100 if not np.isnan(worst_neighbor) else float("nan"),
+                "n_neighbors": n_neighbors,
+                "cliff_safe": bool(not np.isnan(worst_neighbor) and worst_neighbor > 0),
+            })
+        tdf = pd.DataFrame(rows).sort_values("compounded_pct", ascending=False)
+        all_rows.append(tdf)
+
+        safe = tdf[tdf["cliff_safe"]]
+        winner = safe.iloc[0] if not safe.empty else tdf.iloc[0]
+        winners.append(winner)
+
+        baseline = tdf[tdf["exit_vol_gate"].isna()]
+        baseline_best = baseline.sort_values("compounded_pct", ascending=False).iloc[0] if not baseline.empty else None
+        if baseline_best is not None:
+            print(f"    baseline (no exit gate) best compounded={baseline_best['compounded_pct']:.1f}%  "
+                  f"vs winner (exit_vol_gate={winner['exit_vol_gate']}) compounded={winner['compounded_pct']:.1f}%")
+
+    if not all_rows:
+        print("No droughts found for any ticker.")
+        return
+
+    full_df = pd.concat(all_rows, ignore_index=True)
+    pd.set_option("display.width", 220)
+
+    if write_csv:
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        full_df.to_csv(OUTPUT_DIR / "drought_overlay_sweep_exit_vol_5axis.csv", index=False)
+        print(f"\nWrote {OUTPUT_DIR / 'drought_overlay_sweep_exit_vol_5axis.csv'}")
+
+    print(f"\n--- Per-ticker exit-vol-gate winners (best cliff-safe, falling back to best-any) ---")
+    wdf = pd.DataFrame(winners)[["ticker", "confirm_days", "exit_vol_gate", "fixed_sl", "arm_pct",
+                                  "trail_sell_pct", "n", "win_rate", "compounded_pct",
+                                  "worst_neighbor_compounded_pct", "cliff_safe"]]
+    print(wdf.round(3).to_string(index=False))
+
+
 def run_per_ticker_mode(nodes, top_n, write_csv):
     """Independent 5-axis (confirm_days, vol_gate, sl, arm, trail) sweep per ticker --
     no pooling across tickers at all. Reports each ticker's own best cliff-safe (falling
@@ -379,11 +491,18 @@ def main():
                          help="SPY/SSO/UPRO/QQQ/QLD/TQQQ from backtest_cache instead of watch_list")
     parser.add_argument("--per-ticker", action="store_true",
                          help="independent 5-axis sweep per ticker (adds a vol-gate axis), no cross-ticker pooling")
+    parser.add_argument("--exit-vol-tuning", action="store_true",
+                         help="independent 5-axis sweep per ticker with the vol gate on the EXIT side "
+                              "instead of entry (early close while underwater + vol spike)")
     parser.add_argument("--top-n", type=int, default=15)
     parser.add_argument("--csv", action="store_true")
     args = parser.parse_args()
 
     nodes = load_big6_nodes(args.tickers) if args.big6 else load_nodes(args.watchlist_id, args.tickers)
+
+    if args.exit_vol_tuning:
+        run_per_ticker_exit_vol_mode(nodes, args.top_n, args.csv)
+        return
 
     if args.per_ticker:
         run_per_ticker_mode(nodes, args.top_n, args.csv)
