@@ -6480,3 +6480,61 @@ batch). `scripts/live_sim_harness.py`: 7/7 scenarios passed, rerun after all fix
 
 Full detail: `docs/deep_backlog.md`'s 2026-08-05 (session-wrap review) entry (top) and the three
 other 2026-08-05 entries below it.
+
+---
+
+## 2026-08-05 (very late 3) — Drought-overlay deep dive: intraday vol entry-gate found (real but ticker-dependent, unresolved overfitting risk), exit-side vol-spike rule tested and rejected, HANDOFF mechanism traced, per-ticker 5-axis sweep built
+
+Continuation of the SOXL-only drought-overlay fragility question. User asked for a much bigger
+sample first (widened to the 18-ticker v4 universe + a new `--big6` broad-index mode in
+`scripts/drought_overlay_sweep.py`), then a manual trade-by-trade audit of SOXL's specific
+losses, which led into a real methodological finding: **daily-close 5-day realized vol
+systematically masks intraday volatility** (it only samples 5 closes) -- rebuilding the vol
+measure as rolling stdev of hourly log returns, with the 9:30 bar excluded (a near-instantaneous
+overnight repricing, not accumulated intraday trading activity), sharpened the entry-side
+win-rate split from 57%/33% to a much cleaner 60%/14% (low-vol vs high-vol entries) across all 26
+real HANDOFF-exit trades. A parallel "declining vs rising drift during the drought" hypothesis
+was tested and found to add nothing on top (correlation ~0, vol doing all the discriminating
+work) -- underpowered sample caveat noted (only 5/26 droughts were declining).
+
+**Exit-side vol-spike rule tested and rejected**: exiting early when intraday vol spikes while
+underwater looked great on SOXL's 4 example trades (both real losses cut ~4x smaller) but broke
+badly at scale -- run across all 313 real drought windows, it also guillotined 9 trades that were
+going to be big TRAIL wins (+3.6% to +34.9%, cut to -0.15% to -2.5%), since the rule can't tell a
+capitulation dip before a recovery from the start of a real decline. Net: compounded improved
+(-92.7% -> -78.8%) but win rate got worse (14.7% -> 11.5%). **Do not adopt as designed.**
+
+**HANDOFF mechanism traced**: sells at the backstop bar's Open unconditionally once neither SL nor
+trail has fired. Checked whether it systematically sells right before the core strategy's own
+trade rallies (the intuitive worst-timing story) -- only 2/14 HANDOFF losses (14%) actually show
+that pattern; the dominant shape (12/14) is correlated continuation (the core trade's own next
+signal also loses). SOXL's 2025-10-22 trade is the one real "sold right before the recovery" case
+(overlay exited at 36.78, core trade rallied +31.4% to 49.89).
+
+**Per-ticker 5-axis sweep built** (`--per-ticker`, adds an intraday-vol-gate threshold as a 5th
+independent axis alongside confirm_days/sl/arm/trail, own cliff-safety per ticker, no
+cross-ticker pooling -- 8064 cells/ticker, deliberate overfitting risk accepted per the user's
+explicit call). Result: 5/10 tickers didn't need any gate (it only ever hurt them -- KORU lost 3
+of its biggest winners, +126.3%/+85.7%/+23.2%, cutting its own compounded 531.9% -> 105.4% at
+gate=0.6); 3 tickers (HIBL/SOXL/UDOW) were genuinely rescued by one specific threshold each
+(SOXL@0.6 confirmed clean via trade-by-trade check: exactly 5 losers removed, zero winners
+touched); YANG isn't rescued by any level; AGQ zeroes out entirely under any gate. Flagged live
+by the user as suspicious on its face: **KORU's per-ticker overlay result (n=16, +531.9%) now
+exceeds its own core strategy's real backtested return (378.7% compounded, 76 trades)** -- fewer
+trades outperforming the parent strategy is exactly the shape of an overfit result. Whether the
+vol-gated entry is a real per-ticker edge or an artifact of small-n fitting is **not resolved**.
+
+**Deferred to next session, explicit user request**: (1) out-of-sample validation of the
+per-ticker vol-gate choice (fit first-half/test second-half). (2) whether gate-helped tickers
+share a real structural property vs gate-hurt ones. (3) per-ticker exit-vol-spike research
+(today's version was pooled/uniform and rejected -- untried per-ticker). (4) HANDOFF/handover
+mechanics redesign -- transfer management into the core strategy's own state machine instead of
+sell-then-implicitly-rebuy at the backstop Open. (5) put-hedge cost/payoff modeling (rough
+Black-Scholes off the same intraday vol measure as an IV proxy) -- discussed, not built.
+Concentration-risk screen (2026-08-05 earlier finding) also still open, now compounded by the
+per-ticker overfitting question.
+
+No production/live-trading code touched this session -- entirely `scripts/drought_overlay_sweep.py`
+(research script: new `--big6` and `--per-ticker` modes) plus ad hoc analysis queries. No paired
+Opus review required (no `signals_*.py`/`schwab_*.py`/kernel module changes). Full detail:
+`docs/research_log.md`'s 2026-08-05 (very late 3) entry.
