@@ -14,9 +14,17 @@ are sampled at POLL_SECS cadence, not tick-perfect against a real broker.
 from datetime import datetime
 
 import signals_db as db
-from signals_compute import _current_price, _load_cache, _bars_held, check_sell_condition
+from signals_compute import _current_price, _load_cache, _bars_held, check_sell_condition, compute_buy_signal
 from signals_blocks import _post_message
 from signals_helpers import buy_order_sizing, log_poll, resolve_at_bar_close
+
+# Same checkpoint-bar hours the backtest's find_drought_windows uses
+# (scripts/drought_overlay_test.py's TARGET_H0/TARGET_H1) -- the 9:30 and
+# 14:30 hourly bars, matching the two real daily signal-check windows
+# (10:25-10:40 and 15:25-15:40 ET). Duplicated here (not imported) to avoid
+# pulling that research script's heavier transitive imports (backtester,
+# numba) into the live daemon's module graph for two constants.
+_DROUGHT_TARGET_H0, _DROUGHT_TARGET_H1 = 9, 14
 
 
 def start_paper_buy(node, sig):
@@ -69,6 +77,231 @@ def start_paper_market_buy(node, sig):
                            detail=f"shares={sizing['shares']} price={sig['current_price']:.4f}")
     if node.get('paper_alert_verbose'):
         _post_message(f"🧪 PAPER MARKET BUY — {ticker}  {sizing['shares']}sh @ ${sig['current_price']:.4f}")
+
+
+def _last_core_exit_time(wl_id):
+    """Most recent CLOSED core (position_source='core') paper_trade_log exit
+    for this node -- the drought overlay's "gap start", mirroring
+    find_drought_windows' own gap_start = exit_bars[signal_bars[k]]. Returns
+    None if this node has never closed a core trade yet (matching the
+    backtest: find_drought_windows only ever creates a window BETWEEN two
+    consecutive real trades, never before the first one)."""
+    with db._conn() as c:
+        row = c.execute(
+            "SELECT exit_time FROM paper_trade_log WHERE wl_id=? AND position_source='core' "
+            "AND exit_time IS NOT NULL ORDER BY exit_time DESC LIMIT 1",
+            (wl_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return datetime.strptime(row['exit_time'], '%Y-%m-%d %H:%M:%S')
+
+
+def _drought_trade_exists_for_gap(wl_id, gap_start_str):
+    """True if a drought_overlay trade already exists (open or closed) for
+    this exact gap -- identified by drought_gap_start, which is constant for
+    every entry attempt within the same gap (it only changes once a NEW core
+    trade closes). Checks BOTH paper_positions (still open) and
+    paper_trade_log (already closed) since a gap's one allowed trade could be
+    in either state."""
+    with db._conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM paper_positions WHERE wl_id=? AND position_source='drought_overlay' "
+            "AND drought_gap_start=? LIMIT 1",
+            (wl_id, gap_start_str)
+        ).fetchone()
+        if row is None:
+            row = c.execute(
+                "SELECT 1 FROM paper_trade_log WHERE wl_id=? AND position_source='drought_overlay' "
+                "AND drought_gap_start=? LIMIT 1",
+                (wl_id, gap_start_str)
+            ).fetchone()
+    return row is not None
+
+
+_IVOL_SERIES_CACHE = {}  # ticker -> (csv_mtime, ivol_dataframe)
+
+
+def _cached_ivol_series(ticker):
+    """Memoized wrapper around drought_overlay_sweep.get_ivol_series --
+    that function re-reads and recomputes the ticker's ENTIRE hourly CSV
+    from scratch on every call, with no caching of its own. Fine for a
+    one-shot research script; a real cost if called every poll for every
+    vol-gated node in the live daemon (found by an independent review of
+    the wiring diff, 2026-08-09). Keyed on the CSV's own mtime, so a real
+    intraday cache refresh still invalidates it -- never serves stale data."""
+    import os
+    path = f"cache/research/{ticker}_1h.csv"
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    cached = _IVOL_SERIES_CACHE.get(ticker)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    from scripts.drought_overlay_sweep import get_ivol_series
+    series = get_ivol_series(ticker)
+    _IVOL_SERIES_CACHE[ticker] = (mtime, series)
+    return series
+
+
+def check_paper_drought_entry(node):
+    """Confirms and enters a drought-overlay position for a
+    drought_overlay_enabled node whose core paper position has been flat for
+    at least drought_confirm_days -- the live equivalent of
+    drought_overlay_test.find_drought_windows, which defines a "drought
+    window" as confirm_days*2 checkpoint bars (9:30/14:30 hourly closes, the
+    same TARGET_H0/TARGET_H1 pair) elapsing after a real trade's exit before
+    the next real trade's signal. Live has no "next signal" to look ahead to
+    -- that's exactly what check_paper_drought_handoff (below) detects as it
+    happens, not a backstop this function can precompute.
+
+    MUST be called AFTER this node's own core buy-signal scan in the same
+    poll cycle (active_signals._scan_buy_signals or equivalent) -- if core's
+    real signal fires this same poll, its own pending-buy/position gets
+    created first, and the get_paper_pending_buy/get_open_position_by_wl_id
+    check below correctly sees that and skips, so core always wins ties
+    rather than this function racing it. Wired into active_signals.py,
+    2026-08-09, after a paired review of that wiring (docs/CLAUDE.md's
+    session-wrap mandate) found and fixed the ordering/gating issues noted
+    inline in run_loop where this is actually called."""
+    if not node.get('drought_overlay_enabled') or not node.get('drought_confirm_days'):
+        return
+    if node.get('mode', 'live') == 'live':
+        # Paper-only mechanism -- a live node sharing open_position_keys with
+        # its own paper drought row would silently suppress its REAL BUY
+        # alerts (already_held in _scan_buy_signals unions real+paper by
+        # wl_id) without ever placing a real order. Found by a paired review
+        # of the wiring diff, 2026-08-09.
+        return
+    if node.get('daily_sync_halted_at'):
+        return
+    wl_id, ticker = node['id'], node['ticker']
+    if db.get_open_position_by_wl_id(wl_id, paper=True) or db.get_paper_pending_buy(wl_id):
+        return
+    last_exit = _last_core_exit_time(wl_id)
+    if last_exit is None:
+        return
+    gap_start_str = last_exit.strftime('%Y-%m-%d %H:%M:%S')
+    if _drought_trade_exists_for_gap(wl_id, gap_start_str):
+        # Fire-once-per-gap -- the backtest's find_drought_windows makes
+        # exactly ONE trade per gap between consecutive core signals, even if
+        # that trade stops out early (there's real time left before the next
+        # core signal). Without this, the first version re-entered every poll
+        # for the rest of the gap once confirmed, since `last_exit`/`eligible`
+        # never move again until a NEW core trade closes (found by paired
+        # Opus review, 2026-08-09).
+        return
+    df_h, _ = _load_cache(ticker)
+    if df_h is None or df_h.empty:
+        return
+    hours = df_h.index.hour
+    checkpoint_mask = (hours == _DROUGHT_TARGET_H0) | (hours == _DROUGHT_TARGET_H1)
+    eligible = df_h.index[checkpoint_mask & (df_h.index > last_exit)]
+    confirm_days = node['drought_confirm_days']
+    if len(eligible) < confirm_days * 2:
+        return
+    vol_gate = node.get('drought_vol_gate')
+    vol_pctile = None
+    if vol_gate is not None:
+        # Local import -- see _DROUGHT_TARGET_H0's comment above, same reason
+        # (avoid loading drought_overlay_sweep's heavier research-script
+        # imports at daemon startup for a function only needed when this one
+        # node actually has a vol gate configured).
+        from scripts.drought_overlay_sweep import _entry_vol_pctile
+        ivol_series = _cached_ivol_series(ticker)
+        vol_pctile = _entry_vol_pctile(df_h.index[-1], ivol_series)
+        # A None reading (too early in history for a full lookback window)
+        # EXCLUDES the window, mirroring generate_drought_trades'
+        # _apply_vol_gate exactly ("gated.append if pctile is not None and
+        # pctile < vol_gate" -- unknown is never eligible). The first version
+        # of this check had the polarity backwards: `vol_pctile is not None
+        # and vol_pctile >= gate: return` let an unknown reading THROUGH
+        # instead of excluding it (found by cold Opus review, 2026-08-09).
+        if vol_pctile is None or vol_pctile >= vol_gate:
+            log_poll(f"{ticker} drought_entry gated: vol_pctile={vol_pctile} gate={vol_gate}")
+            return
+    # daily-track (paper_role='daily_sync') nodes price off the last closed
+    # hourly bar's Close, exactly like compute_buy_signal's own daily_sync
+    # branch and start_paper_buy/start_paper_market_buy's existing halt-check
+    # convention -- without this, a daily-track drought node would silently
+    # price off a live tick, the exact price-source confound the daily-track
+    # split exists to isolate (found by both review passes, 2026-08-09).
+    if node.get('paper_role') == 'daily_sync':
+        price = float(df_h['Close'].iloc[-1])
+    else:
+        price, _ = _current_price(ticker)
+    if price is None:
+        return
+    starting_notional = node.get('starting_notional') or 50000
+    shares = int(starting_notional // price)
+    if shares < 1:
+        return
+    now = datetime.now()
+    db.open_drought_overlay_position(node, price, now, price, now, confirm_days=confirm_days,
+                                      vol_gate=vol_gate, gap_start=gap_start_str,
+                                      vol_pctile=vol_pctile, shares=shares, paper=True)
+    db.log_coverage_event("drought_entry", "paper", ticker=ticker, node_id=wl_id, result="filled",
+                           detail=f"confirm_days={confirm_days} vol_pctile={vol_pctile} shares={shares}")
+    if node.get('paper_alert_verbose'):
+        _post_message(f"🧪🌵 PAPER DROUGHT ENTRY — {ticker}  {shares}sh @ ${price:.4f} "
+                       f"(confirm_days={confirm_days})")
+
+
+def check_paper_drought_handoff(node):
+    """Closes an open drought-overlay position the moment this node's own
+    core signal fires again -- the design's HANDOFF transition (docs/
+    design.md's 2026-08-07 state-machine section). Deliberately does NOT
+    open the core position itself -- it only clears the drought row so this
+    same poll's ordinary core buy-scan (start_paper_buy/start_paper_market_buy)
+    sees a flat position and enters normally right after.
+
+    MUST be called BEFORE every real core-entry path in the same poll cycle
+    -- not just the two _scan_buy_signals calls, but also _scan_pinned_entry
+    (the PRIMARY real entry path for every current drought candidate, all
+    entry_timing='open_check' + automation-enabled -- a paired review of the
+    wiring found this ordering violated at that third call site and it's now
+    fixed at all three in active_signals.py's run_loop). Opposite ordering
+    from check_paper_drought_entry above, and the resolution to the exact
+    race docs/design.md's truth-table section names ("a core position's real
+    entry signal firing on the exact same poll cycle a drought-overlay
+    HANDOFF check would also fire"): HANDOFF closes drought first, then
+    core's scan (running later in the same poll) opens fresh -- no cycle is
+    lost to the race either way. Wired into active_signals.py, 2026-08-09."""
+    wl_id = node['id']
+    if node.get('mode', 'live') == 'live':
+        # See check_paper_drought_entry's identical guard -- defense in
+        # depth here too, though a live node should never have an open
+        # drought position in the first place if the entry-side guard held.
+        return
+    pos = db.get_drought_overlay_position(wl_id, paper=True)
+    if pos is None:
+        return
+    sig = compute_buy_signal(node)
+    # CRITICAL fix (paired review, 2026-08-09, caught the moment this
+    # function was actually wired into the daemon): compute_buy_signal
+    # returns a real dict on almost EVERY poll (signal='HOLD' most of the
+    # time, 'BUY' only when the z-score condition actually fires) -- it's
+    # None only on a genuine data/discontinuity failure, never as "no
+    # signal." The first version's `if sig is None: return` therefore
+    # treated the ordinary HOLD case as a fired core signal and closed the
+    # drought position on virtually every poll inside a signal window,
+    # defeating the whole mechanism (combined with the once-per-gap guard,
+    # this would have permanently starved every drought gap of a second
+    # attempt). Every other real consumer of this function (_scan_buy_signals,
+    # active_signals.py) checks sig['signal'] == 'BUY' specifically --
+    # this one now does too.
+    if sig is None or sig['signal'] != 'BUY':
+        return
+    now = datetime.now()
+    price = sig['current_price']
+    db.close_position(pos['id'], exit_signal_price=price, exit_price=price, exit_time=now,
+                       exit_reason='HANDOFF', paper=True)
+    db.log_coverage_event("drought_handoff", "paper", ticker=node['ticker'], node_id=wl_id,
+                           result="closed", detail=f"price={price:.4f}")
+    if node.get('paper_alert_verbose'):
+        _post_message(f"🧪🔁 PAPER DROUGHT HANDOFF — {node['ticker']}  closed @ ${price:.4f}, "
+                       f"core signal active again")
 
 
 def update_paper_buys():
@@ -603,6 +836,556 @@ def reconcile_daily_track_nodes():
     return touched
 
 
+# ---------------------------------------------------------------------------
+# reconcile_overlay_nodes -- nightly pure-observation reconcile for the
+# drought/addon/skim paper mechanisms. Item 3.5 of docs/design.md's 2026-08-07
+# staged checklist: must exist before any staged real-order testing, same
+# reason reconcile_daily_track_nodes was built and trusted before core's own
+# live-vs-backtest parity claims were.
+#
+# Deliberately SIMPLER than reconcile_daily_track_nodes' bar-level
+# entry/exit price-explainability recheck (the "would Close alone have
+# fired this" counterfactual) -- that machinery is real, validated,
+# core-specific work, and re-deriving an equivalent for three different
+# mechanisms with three different backtest functions is real future scope,
+# not built here. What this DOES do, honestly: replay each mechanism's own
+# validated backtest function against real cached data through today, and
+# compare its most-recent-resolved-trade (or, for skim, its full implied
+# event count) against what paper actually recorded. A logic bug (wrong
+# entry, missed entry, wrong trade count) still shows up as 'unexplained' --
+# what's NOT caught here is the finer "was this specific divergence just
+# live-tick-vs-Close noise" question core's reconcile answers. Flagged as a
+# known, deliberate scope reduction, not a silent gap.
+# ---------------------------------------------------------------------------
+
+def _overlay_mode(node):
+    return 'daily_sync' if node.get('paper_role') == 'daily_sync' else 'paper'
+
+
+def _with_arm_pct(node):
+    """get_trades_and_bars/generate_drought_trades/generate_addon_trades all
+    read node['arm_pct'] and node['z'] directly (mirrors
+    drought_detection_test.load_nodes' own normalization) -- a raw
+    watch_list row has neither key as-is (arm_pct: TrailingBothZScoreBreakout
+    stores it in arm_sell_pct, everything else in take_profit, per
+    signals_db._tp_or_arm_pct; z: the real column is z_score_threshold).
+    Found live running reconcile_overlay_nodes for the first time -- both
+    replay functions raised KeyError until this normalization was added."""
+    node = dict(node)
+    node['arm_pct'] = node['arm_sell_pct'] if node['strategy'] == 'TrailingBothZScoreBreakout' else node['take_profit']
+    node['z'] = node['z_score_threshold']
+    return node
+
+
+def _reconcile_drought(node, check_date, mode):
+    from scripts.stacked_model.drought import generate_drought_trades
+    wl_id, ticker = node['id'], node['ticker']
+    node = _with_arm_pct(node)
+    common = dict(wl_id=wl_id, ticker=ticker, mechanism='drought', mode=mode, check_date=check_date)
+    try:
+        bt_trades, df_h = generate_drought_trades(
+            node, confirm_days=node.get('drought_confirm_days') or 10,
+            vol_gate=node.get('drought_vol_gate'), sl_pct=node.get('drought_sl_pct_override'),
+            arm_pct=node.get('drought_arm_pct_override'), trail_pct=node.get('drought_trail_pct_override'),
+        )
+    except Exception as e:
+        db.log_overlay_reconciliation(actual_state='unknown', backtest_state='replay_failed',
+                                       match=False, action='replay_failed', detail=str(e), **common)
+        return
+    if not bt_trades:
+        db.log_overlay_reconciliation(actual_state='n/a', backtest_state='no_drought_windows',
+                                       match=True, action='no_backtest_data',
+                                       detail='no fully-resolved drought window exists yet for this node',
+                                       **common)
+        return
+    bt_ref = bt_trades[-1]
+    bt_entry_time = df_h.index[bt_ref['entry_i']]
+    backtest_state = (f"entry_i={bt_ref['entry_i']} entry_time={bt_entry_time} "
+                       f"exit_reason={bt_ref['exit_reason']} ret={bt_ref['ret']:.4f}")
+    # Match by proximity to the backtest's entry timestamp, not an exact
+    # equality -- generate_drought_trades' entry_bar is the Open leg
+    # immediately after confirmation, which is the same real bar paper's own
+    # entry targets, but wall-clock float/string formatting differences
+    # between the two sides make an exact string match brittle.
+    with db._conn() as c:
+        row = c.execute(
+            "SELECT entry_time, exit_reason, pnl_pct FROM paper_trade_log WHERE wl_id=? "
+            "AND position_source='drought_overlay' ORDER BY entry_time DESC LIMIT 1",
+            (wl_id,)
+        ).fetchone()
+    if row is None:
+        db.log_overlay_reconciliation(
+            actual_state='flat', backtest_state=backtest_state, match=False, action='entry_miss_unexplained',
+            detail='backtest shows a resolved drought window with no matching paper trade at all',
+            **common)
+        return
+    actual_entry_time = datetime.strptime(row['entry_time'], '%Y-%m-%d %H:%M:%S')
+    same_window = abs((actual_entry_time - bt_entry_time).total_seconds()) < 3600 * 4
+    actual_state = f"entry_time={row['entry_time']} exit_reason={row['exit_reason']} pnl_pct={row['pnl_pct']}"
+    if same_window:
+        db.log_overlay_reconciliation(actual_state=actual_state, backtest_state=backtest_state,
+                                       match=True, action='match', **common)
+    else:
+        db.log_overlay_reconciliation(
+            actual_state=actual_state, backtest_state=backtest_state, match=False,
+            action='entry_bar_mismatch',
+            detail=f"paper's most recent drought trade entered at {row['entry_time']}, backtest's "
+                   f"most recent resolved window entered at {bt_entry_time} -- more than 4h apart",
+            **common)
+
+
+def _reconcile_addon(node, check_date, mode):
+    from scripts.stacked_model.add_on import generate_addon_trades
+    from scripts.drought_overlay_test import get_trades_and_bars
+    wl_id, ticker = node['id'], node['ticker']
+    node = _with_arm_pct(node)
+    common = dict(wl_id=wl_id, ticker=ticker, mechanism='addon', mode=mode, check_date=check_date)
+    try:
+        core_trades, df_h = get_trades_and_bars(node)
+        bt_addon_trades = generate_addon_trades(core_trades, df_h)
+    except Exception as e:
+        db.log_overlay_reconciliation(actual_state='unknown', backtest_state='replay_failed',
+                                       match=False, action='replay_failed', detail=str(e), **common)
+        return
+    if not bt_addon_trades:
+        db.log_overlay_reconciliation(actual_state='n/a', backtest_state='no_armed_core_trades',
+                                       match=True, action='no_backtest_data',
+                                       detail='no core trade in this node\'s history has ever armed', **common)
+        return
+    bt_ref = bt_addon_trades[-1]
+    bt_arm_time = df_h.index[bt_ref['entry_i']]  # add_on.py stores the arm bar in entry_i
+    backtest_state = f"arm_time={bt_arm_time} raw_ret={bt_ref['raw_ret']:.4f}"
+    with db._conn() as c:
+        row = c.execute(
+            "SELECT entry_time, exit_reason, pnl_pct, status FROM paper_addon_legs WHERE wl_id=? "
+            "ORDER BY entry_time DESC LIMIT 1", (wl_id,)
+        ).fetchone()
+    if row is None:
+        db.log_overlay_reconciliation(
+            actual_state='flat', backtest_state=backtest_state, match=False, action='entry_miss_unexplained',
+            detail='backtest shows a core trade that armed (add-on eligible) with no matching paper leg at all',
+            **common)
+        return
+    actual_entry_time = datetime.strptime(row['entry_time'], '%Y-%m-%d %H:%M:%S')
+    same_window = abs((actual_entry_time - bt_arm_time).total_seconds()) < 3600 * 4
+    actual_state = f"entry_time={row['entry_time']} status={row['status']} pnl_pct={row['pnl_pct']}"
+    action = 'match' if same_window else 'entry_bar_mismatch'
+    db.log_overlay_reconciliation(actual_state=actual_state, backtest_state=backtest_state,
+                                   match=same_window, action=action,
+                                   detail=None if same_window else
+                                   f"paper's most recent add-on leg opened at {row['entry_time']}, backtest's "
+                                   f"most recent armed core trade armed at {bt_arm_time} -- more than 4h apart",
+                                   **common)
+
+
+def _reconcile_skim(node, check_date, mode):
+    """Replays skim_only (NOT manual_redeploy_overlay) against the SAME
+    equity series check_paper_skim itself derives from real closed core
+    trades -- skim_only is the reference's own "skim math only, redeploy
+    structurally disabled" variant (skim_reserve.py's own docstring: "serves
+    as the upper bound... never redeployed"), which is the correct match to
+    what paper actually does: paper's redeploy is alert-only and NEVER
+    automatically moves money, unlike manual_redeploy_overlay, which
+    executes a real redeploy on a delay. Comparing against that function
+    instead would count real reference redeploys paper never performs,
+    making the skim count noisy for no reason. This is a genuine
+    self-consistency check of check_paper_skim's incremental per-trade-close
+    translation against the reference's own full-array loop, using real
+    accumulated trade history every night, not a synthetic curve."""
+    from scripts.stacked_model.skim_reserve import skim_only
+    wl_id, ticker = node['id'], node['ticker']
+    common = dict(wl_id=wl_id, ticker=ticker, mechanism='skim', mode=mode, check_date=check_date)
+    with db._conn() as c:
+        rows = c.execute(
+            "SELECT pnl_pct FROM paper_trade_log WHERE wl_id=? AND position_source='core' "
+            "AND pnl_pct IS NOT NULL ORDER BY exit_time", (wl_id,)
+        ).fetchall()
+    n = len(rows) + 1
+    if n < 3:
+        db.log_overlay_reconciliation(actual_state='n/a', backtest_state='insufficient_trade_history',
+                                       match=True, action='no_backtest_data',
+                                       detail=f"only {n - 1} closed core trades so far", **common)
+        return
+    import numpy as np
+    equity = np.ones(n)
+    for i, r in enumerate(rows):
+        equity[i + 1] = equity[i] * (1 + r['pnl_pct'] / 100.0)
+    skim_step = node.get('skim_step')
+    skim_frac = node.get('skim_frac')
+    kwargs = {}
+    if skim_step is not None:
+        kwargs['skim_step'] = skim_step
+    if skim_frac is not None:
+        kwargs['skim_frac'] = skim_frac
+    # Passing `equity` as BOTH strategy_equity and spy_equity is deliberate,
+    # not "the arg is unused" (an earlier comment here said that -- wrong,
+    # corrected by review, 2026-08-09: skim_redeploy_overlay's r_spy IS
+    # applied every step). Forcing r_spy == r_strat keeps reserve_frac_curve
+    # flat between skims, which is exactly what makes a plain np.diff(...)
+    # count clean skim events below -- any real SPY series would make the
+    # reserve fraction drift on its own between skims and corrupt the count.
+    _total_curve, reserve_frac_curve = skim_only(equity, equity, **kwargs)
+    bt_skim_count = int((np.diff(reserve_frac_curve) > 1e-9).sum())
+    with db._conn() as c:
+        actual_skim_count = c.execute(
+            "SELECT COUNT(*) AS n FROM skim_reserve_log WHERE wl_id=? AND action='skim'", (wl_id,)
+        ).fetchone()['n']
+    backtest_state = f"bt_skim_count={bt_skim_count}"
+    actual_state = f"actual_skim_count={actual_skim_count}"
+    match = bt_skim_count is None or bt_skim_count == actual_skim_count
+    db.log_overlay_reconciliation(
+        actual_state=actual_state, backtest_state=backtest_state, match=match,
+        action='match' if match else 'skim_count_mismatch',
+        detail=None if match else
+        f"reference implies {bt_skim_count} skims against this node's real trade history, "
+        f"paper's own incremental engine recorded {actual_skim_count}",
+        **common)
+
+
+def reconcile_overlay_nodes():
+    """Nightly pure-observation reconcile for every drought_overlay_enabled/
+    addon_enabled/skim_enabled node, across both live-track and daily-track
+    (paper_role='daily_sync') paper nodes. Never mutates any real state --
+    same reasoning as reconcile_daily_track_nodes: auto-correcting divergence
+    erases exactly the signal this comparison exists to produce. Idempotent
+    per (wl_id, mechanism, mode, check_date) via overlay_reconciliation_log's
+    UNIQUE constraint -- log_overlay_reconciliation uses INSERT OR REPLACE, so
+    a same-day rerun after a restart refreshes that night's row with the
+    latest result rather than duplicating it.
+
+    Each node/mechanism call below is individually try/excepted -- found by
+    a paired review (2026-08-09) that only the inner generate_*_trades replay
+    was guarded inside _reconcile_drought/_reconcile_addon (and _reconcile_
+    skim had no guard at all), so a malformed row on ONE node (a bad
+    _with_arm_pct lookup, an unparseable entry_time, etc.) would raise past
+    active_signals._guarded's single wrap around this whole function and
+    silently abort reconciliation for every node still left to check that
+    night. Same failure shape reconcile_daily_track_nodes already has
+    (not fixed here, out of scope) -- fixed here since it's new code.
+
+    KNOWN LIMITATION (documented, not silently glossed -- found by an
+    independent review, 2026-08-09): each _reconcile_* function replays its
+    backtest function over the node's ENTIRE cached price history and
+    compares against paper's own recorded state, with no "only compare from
+    when this mechanism was actually enabled" anchor. For a node enabled
+    mid-history (the common case -- these mechanisms attach to nodes that
+    have already been core-paper-trading for a while), this can produce a
+    persistent, not-self-resolving mismatch: the backtest's single
+    most-recent-ever resolved trade/window may predate enablement entirely,
+    with nothing in paper's own history to match it against.
+    check_paper_skim's own seeding (skim_ref/peak/strategy_value seeded from
+    real current equity on first call, not a flat 1.0/starting_notional
+    baseline) fixes the live mechanism's OWN behavior -- it no longer fires
+    one false giant skim capturing pre-enablement history -- but does not by
+    itself make _reconcile_skim's full-history comparison line up with
+    paper's enablement-onward one. A real fix needs a persisted
+    "mechanism enabled at" timestamp per node to anchor the backtest replay
+    window; not built this session (real schema work, deferred deliberately
+    rather than rushed at session-wrap)."""
+    check_date = datetime.now().strftime('%Y-%m-%d')
+    for node in db.get_watchlist():
+        mode = _overlay_mode(node)
+        if node.get('drought_overlay_enabled'):
+            try:
+                _reconcile_drought(node, check_date, mode)
+            except Exception as e:
+                print(f"  [warn] reconcile_overlay_nodes: drought check failed for {node['ticker']}: {e}")
+        if node.get('addon_enabled'):
+            try:
+                _reconcile_addon(node, check_date, mode)
+            except Exception as e:
+                print(f"  [warn] reconcile_overlay_nodes: addon check failed for {node['ticker']}: {e}")
+        if node.get('skim_enabled'):
+            try:
+                _reconcile_skim(node, check_date, mode)
+            except Exception as e:
+                print(f"  [warn] reconcile_overlay_nodes: skim check failed for {node['ticker']}: {e}")
+
+
+def check_paper_addon_trigger(node, pos, price, now):
+    """Opens a margin add-on-at-arm leg the moment a core paper position's
+    trailing-sell just armed -- hooks the SAME just_activated_trailing event
+    check_paper_sells already detects (mirrors notify_trailing_activated's
+    real-money equivalent), rather than inventing a separate detection path,
+    per docs/design.md's 2026-08-07 state machine ("TRIGGERED (core's
+    trail_state['trailing'] flips True)").
+
+    Sizes the leg to match the core position's CURRENT dollar value at this
+    same price (shares = pos['shares'] -- the add-on buys the same share
+    count at the same price the arm event fired at, which is exactly "100%
+    of the current position's market value" since both legs are priced
+    identically at this instant). Deliberately does NOT gate on account/
+    margin-eligibility here -- that is a real-order-placement concern for
+    the live wiring layer (AGQ's live node is the only one in a real margin
+    account; SOXL/KORU can't actually borrow), not something paper
+    simulation should hide behind. Paper trading shows what the mechanism
+    would do everywhere it's enabled; eligibility filtering happens once
+    real orders are involved."""
+    if not node.get('addon_enabled'):
+        return
+    if pos.get('position_source') != 'core':
+        # docs/design.md's truth-table scopes addon_leg to "core state: armed"
+        # only -- a drought_overlay position arming is not an add-on trigger
+        # (it's a different position, not the strategy's normal armed core
+        # trade the design validated the sizing math against).
+        return
+    if db.get_open_addon_leg_by_parent(pos['id'], paper=True):
+        return
+    leg_id = db.open_addon_leg(pos, shares=pos['shares'], entry_price=price, entry_time=now,
+                               paper=True, is_dry_run_sim=bool(pos.get('is_dry_run_sim')))
+    db.log_coverage_event("addon_entry_fill", "paper", ticker=pos['ticker'], node_id=pos.get('wl_id'),
+                           position_id=pos['id'], result="filled",
+                           detail=f"leg_id={leg_id} shares={pos['shares']} price={price:.4f}")
+    if node.get('paper_alert_verbose'):
+        _post_message(f"🧪➕ PAPER ADD-ON — {pos['ticker']}  {pos['shares']}sh @ ${price:.4f} (arm)")
+
+
+def close_paper_addon_leg_if_open(pos_id, ticker, wl_id, exit_price, exit_time, exit_reason, verbose):
+    """Closes a parent core position's add-on leg (if one is open) in
+    lockstep with the parent's own close -- per the design's state machine,
+    an add-on leg NEVER independently triggers its own SL/TRAIL check, it
+    only ever closes because its parent just did. Call this immediately
+    after db.close_position() for the parent, same reason/exit_price/
+    exit_time, every time (a no-op if no leg exists)."""
+    leg = db.get_open_addon_leg_by_parent(pos_id, paper=True)
+    if leg is None:
+        return
+    db.close_addon_leg(leg['id'], exit_price, exit_time, exit_reason, paper=True)
+    db.log_coverage_event("addon_exit_fill", "paper", ticker=ticker, node_id=wl_id,
+                           position_id=pos_id, result=exit_reason, detail=f"leg_id={leg['id']} price={exit_price:.4f}")
+    if verbose:
+        _post_message(f"🧪➕ PAPER ADD-ON CLOSED — {ticker}  {exit_reason} @ ${exit_price:.4f}")
+
+
+# Defaults applied when a node's own skim_step/skim_frac columns are NULL --
+# mirror scripts/stacked_model/skim_reserve.py's validated SKIM_STEP/SKIM_FRAC
+# module constants exactly (not duplicated as a hardcoded fallback so a
+# future re-validated default only needs changing in one place).
+def _skim_defaults():
+    from scripts.stacked_model.skim_reserve import SKIM_STEP, SKIM_FRAC, REDEPLOY_THRESHOLDS
+    return SKIM_STEP, SKIM_FRAC, REDEPLOY_THRESHOLDS
+
+
+def _paper_core_equity(wl_id):
+    """Compounded equity multiplier from every closed CORE paper trade for
+    this node, in exit order -- recomputed on demand rather than persisted,
+    mirroring skim_reserve.daily_equity_from_trades' own definition (realized
+    trade returns compounded, flat between trades) without float-drift risk
+    from an incrementally-updated running total. Starts at 1.0 (no trades
+    yet), matching manual_redeploy_overlay's strategy_equity[0]=1.0.
+
+    This is the UNDILUTED benchmark -- what the strategy would be worth if
+    100% of capital had stayed deployed the whole time, regardless of any
+    skims actually taken. Used ONLY to drive the skim-trigger/peak/decline
+    timing (matching manual_redeploy_overlay's own use of strategy_equity[i]
+    for exactly that, and nothing else) -- the REAL deployed dollar value
+    (which shrinks as skims accumulate) is tracked separately via
+    watch_list.skim_strategy_value, not derived from this."""
+    with db._conn() as c:
+        rows = c.execute(
+            "SELECT pnl_pct FROM paper_trade_log WHERE wl_id=? AND position_source='core' "
+            "AND pnl_pct IS NOT NULL ORDER BY exit_time",
+            (wl_id,)
+        ).fetchall()
+    equity = 1.0
+    for r in rows:
+        equity *= (1 + r['pnl_pct'] / 100.0)
+    return equity
+
+
+def _latest_core_trade_pnl_pct(wl_id):
+    """The most recently closed CORE trade's own realized pnl_pct -- the
+    single trade that triggered THIS call to check_paper_skim (called once
+    per core close). None if this node has never closed a core trade."""
+    with db._conn() as c:
+        row = c.execute(
+            "SELECT pnl_pct FROM paper_trade_log WHERE wl_id=? AND position_source='core' "
+            "AND pnl_pct IS NOT NULL ORDER BY exit_time DESC LIMIT 1",
+            (wl_id,)
+        ).fetchone()
+    return row['pnl_pct'] if row else None
+
+
+def _spy_price_at(ts):
+    """Real SPY Close nearest at-or-before ts, from the same hourly cache
+    every other cached-data lookup in this codebase reads -- used to mark
+    the skim reserve to market (see check_paper_skim). None if no cached SPY
+    data exists at or before ts."""
+    df_h, _ = _load_cache('SPY')
+    if df_h is None or df_h.empty:
+        return None
+    prior = df_h[df_h.index <= ts]
+    if prior.empty:
+        return None
+    return float(prior['Close'].iloc[-1])
+
+
+def check_paper_skim(node):
+    """One incremental step of scripts/stacked_model/skim_reserve.py's
+    validated manual_redeploy_overlay loop, translated from "iterate a full
+    equity array" to "given the equity implied by trades closed so far,
+    advance the persisted state by one step" -- called after every CORE
+    paper trade close (equity only changes at a trade close; between closes
+    it's flat, exactly the loop's own between-bar assumption). All state
+    persists on the watch_list row instead of the loop's local variables,
+    since a live daemon restarts between calls where the backtest's single
+    process never did.
+
+    Tracks REAL dollar values (skim_strategy_value/skim_reserve_balance),
+    not the reference's normalized equity-unit weights (w_strategy/w_spy) --
+    equivalent economics, just expressed in dollars using this node's
+    starting_notional as the anchor, which is more directly useful for
+    everything downstream (Slack alerts, the eventual real redeploy amount)
+    than a unitless fraction. The reserve is marked to a REAL SPY price at
+    every call (fixing a gap found by review: the first version never
+    modeled the reserve actually earning/losing anything).
+
+    Skim itself (moving skim_frac of the CURRENTLY-DEPLOYED strategy value,
+    not the full undiluted notional -- fixed 2026-08-09, see
+    skim_strategy_value's schema comment for the bug this replaced) is
+    real-shape-identical to the backtest and fires automatically here.
+    Redeploy is deliberately alert-only (never automated) -- this only ever
+    calls record_skim_event(..., 'redeploy_alert', ...) and posts a Slack
+    message; a human decides whether/how much to actually move back,
+    exactly per the design's "reconcile as one action vs sync" framing
+    reused from core's own daily-track design. Already reachable from the
+    live daemon -- called from check_paper_sells (below) on every CORE paper
+    trade close, and check_paper_sells is unconditionally polled by
+    active_signals.py's run_loop, so no separate wiring was needed here
+    (unlike check_paper_drought_entry/check_paper_drought_handoff, which
+    required new call sites and their own paired review)."""
+    if not node.get('skim_enabled'):
+        return
+    wl_id, ticker, account = node['id'], node['ticker'], node.get('account')
+    equity = _paper_core_equity(wl_id)
+    default_step, default_frac, (thresh_80, thresh_100) = _skim_defaults()
+    skim_step = node.get('skim_step') if node.get('skim_step') is not None else default_step
+    skim_frac = node.get('skim_frac') if node.get('skim_frac') is not None else default_frac
+    starting_notional = node.get('starting_notional') or 50000
+
+    # First-ever call for this node (skim_strategy_value still NULL) seeds
+    # EVERYTHING from the node's actual current equity, not a flat 1.0/
+    # starting_notional baseline -- a node can have real paper-trading
+    # history predating skim_enabled=1 being set, and `equity` already
+    # reflects all of it. Seeding flat would otherwise fire one giant
+    # false skim capturing the entire pre-existing gain in a single shot
+    # (found by review, 2026-08-09) and make reconcile_overlay_nodes'
+    # skim-count comparison permanently wrong (the reference implies many
+    # incremental skims across that same history; a flat seed only ever
+    # produces one). On a subsequent call, strategy_value instead compounds
+    # by just the LATEST closed trade's own return -- mirrors
+    # manual_redeploy_overlay's `val_strategy = total * w_strategy *
+    # (1 + r_strat)` step, which happens every bar before that bar's skim
+    # check (also found missing entirely in an earlier version of this fix:
+    # strategy_value only ever shrank via skims and never grew with the
+    # strategy's own realized gains).
+    is_first_call = node.get('skim_strategy_value') is None
+    if is_first_call:
+        strategy_value = starting_notional * equity
+        skim_ref = equity
+        peak = equity
+        min_since_peak = equity
+    else:
+        strategy_value = node['skim_strategy_value']
+        latest_pnl_pct = _latest_core_trade_pnl_pct(wl_id)
+        if latest_pnl_pct is not None:
+            strategy_value *= (1 + latest_pnl_pct / 100.0)
+        skim_ref = node['skim_ref']
+        peak = node['skim_peak_before_decline']
+        min_since_peak = node['skim_min_since_peak']
+    declining = bool(node.get('skim_declining'))
+    alert_80_sent = bool(node.get('skim_alert_80_sent'))
+    alert_100_sent = bool(node.get('skim_alert_100_sent'))
+    reserve_value = node.get('skim_reserve_balance') or 0.0
+    now = datetime.now()
+    spy_price_now = _spy_price_at(now)
+
+    # Mark the reserve to market since the last mark, using real SPY price
+    # drift -- a no-op (r_spy=0) if there's no reserve yet or no prior mark.
+    last_mark_str = node.get('skim_last_mark_time')
+    if reserve_value > 0 and last_mark_str and spy_price_now is not None:
+        spy_price_last = _spy_price_at(datetime.strptime(last_mark_str, '%Y-%m-%d %H:%M:%S'))
+        if spy_price_last:
+            reserve_value *= (spy_price_now / spy_price_last)
+
+    # -- Skim: a fraction of the DEPLOYED strategy value moves to the
+    # reserve, mirroring manual_redeploy_overlay's `moved = w_strategy *
+    # skim_frac` (the sleeve shrinks by skim_frac at every skim, so later
+    # skims move less in absolute terms than the first -- the earlier
+    # version always recomputed off the full undiluted notional instead,
+    # diverging from the validated model in the wrong direction). --
+    if equity >= skim_ref * (1 + skim_step):
+        amount = strategy_value * skim_frac
+        strategy_value -= amount
+        reserve_value += amount
+        skim_ref = equity
+        shares_delta = amount / spy_price_now if spy_price_now else None
+        db.record_skim_event(wl_id, account, 'skim', amount, reserve_shares_delta=shares_delta,
+                              reserve_price=spy_price_now, reference_value=equity,
+                              detail=f"equity={equity:.4f} step={skim_step} frac={skim_frac}",
+                              new_balance_override=reserve_value)
+        if account and spy_price_now and shares_delta:
+            db.update_skim_reserve_pool(account, shares_delta, spy_price_now)
+        db.log_coverage_event("skim_fire", "paper", ticker=ticker, node_id=wl_id, result="fired",
+                               detail=f"equity={equity:.4f} amount={amount:.2f}")
+        if node.get('paper_alert_verbose'):
+            _post_message(f"🧪💰 PAPER SKIM — {ticker}  moved ${amount:,.2f} to reserve (equity={equity:.4f})")
+
+    # -- Redeploy alert (mirrors the declining/peak/min_since_peak/armed-set
+    # logic exactly -- the 2026-08-08 CRITICAL fix: a threshold may only fire
+    # on RECOVERY past it, and only if it was genuinely crossed on the way
+    # DOWN first (min_since_peak below peak*thr), not a wiggle at the peak.
+    # `has_reserve` mirrors the reference's `w_spy > 0` guard, dropped from
+    # the first version -- without it, a node that never skimmed can still
+    # alert "consider redeploying" against a genuinely empty reserve, found
+    # by both review passes (independent review differentially confirmed
+    # this is 100% of the divergence from the reference across 500 random
+    # equity paths). --
+    has_reserve = reserve_value > 0
+    new_alert_80, new_alert_100 = alert_80_sent, alert_100_sent
+    alert_just_fired = False
+    if equity > peak:
+        if declining and min_since_peak < peak and not alert_100_sent and has_reserve:
+            db.record_skim_event(wl_id, account, 'redeploy_alert', 0.0, reference_value=equity,
+                                  detail=f"threshold={thresh_100} equity={equity:.4f} peak={peak:.4f}",
+                                  new_balance_override=reserve_value)
+            db.log_coverage_event("skim_redeploy_alert", "paper", ticker=ticker, node_id=wl_id,
+                                   result="alerted", detail=f"threshold={thresh_100}")
+            if node.get('paper_alert_verbose'):
+                _post_message(f"🧪🔁 PAPER REDEPLOY ALERT — {ticker}  recovered to {thresh_100:.0%} of "
+                               f"pre-decline peak (${peak:.4f} equity-units) -- consider redeploying reserve")
+            alert_just_fired = True
+        # Full round trip past the old peak -- re-arm both thresholds for the
+        # NEXT decline cycle, matching armed = set(thresholds).
+        declining, peak, min_since_peak = False, equity, equity
+        new_alert_80, new_alert_100 = False, False
+    else:
+        min_since_peak = min(min_since_peak, equity)
+        if equity < peak * 0.999:
+            declining = True
+        if declining and not alert_80_sent and has_reserve and min_since_peak < peak * thresh_80 <= equity:
+            db.record_skim_event(wl_id, account, 'redeploy_alert', 0.0, reference_value=equity,
+                                  detail=f"threshold={thresh_80} equity={equity:.4f} peak={peak:.4f}",
+                                  new_balance_override=reserve_value)
+            db.log_coverage_event("skim_redeploy_alert", "paper", ticker=ticker, node_id=wl_id,
+                                   result="alerted", detail=f"threshold={thresh_80}")
+            if node.get('paper_alert_verbose'):
+                _post_message(f"🧪🔁 PAPER REDEPLOY ALERT — {ticker}  recovered to {thresh_80:.0%} of "
+                               f"pre-decline peak (${peak:.4f} equity-units) -- consider redeploying reserve")
+            new_alert_80 = True
+            alert_just_fired = True
+
+    state_kwargs = dict(skim_ref=skim_ref, skim_peak_before_decline=peak,
+                         skim_min_since_peak=min_since_peak, skim_declining=1 if declining else 0,
+                         skim_alert_80_sent=1 if new_alert_80 else 0, skim_alert_100_sent=1 if new_alert_100 else 0,
+                         skim_strategy_value=strategy_value, skim_reserve_balance=reserve_value)
+    if spy_price_now is not None:
+        state_kwargs['skim_last_mark_time'] = now.strftime('%Y-%m-%d %H:%M:%S')
+    if alert_just_fired:
+        state_kwargs['skim_alert_sent_at'] = now.strftime('%Y-%m-%d %H:%M:%S')
+    db.set_skim_state(wl_id, **state_kwargs)
+
+
 def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
     """Mirrors the real open_positions exit-check block in active_signals.run_loop,
     sharing last_seen_bar with the real block (safe -- a ticker is never
@@ -641,6 +1424,8 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
             df_hourly=df_hourly, paper=True)
         if just_activated_trailing and verbose:
             _post_message(f"🧪 PAPER trailing-sell armed — {ticker}")
+        if just_activated_trailing and node:
+            check_paper_addon_trigger(node, pos, cp, datetime.now())
         if reason:
             # exit_bar_time: the real graded bar's timestamp, captured explicitly here for
             # the at_bar_close branch -- exit_time itself is wall-clock, and for a bar-close
@@ -651,11 +1436,32 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
             # review, 2026-08-05). NULL on the mid-bar branch -- there, exit_time's wall clock
             # genuinely does fall inside the bar the trigger action occurred in, and
             # _bar_containing on it is the correct lookup.
+            exit_dt = datetime.now()
             db.close_position(pos['id'], exit_signal_price=cp, exit_price=target,
-                               exit_time=datetime.now(), exit_reason=reason, paper=True,
+                               exit_time=exit_dt, exit_reason=reason, paper=True,
                                exit_bar_time=last_bar_ts if at_bar_close else None)
+            # The core exit's own observability (coverage event + Slack alert)
+            # is recorded BEFORE the add-on/skim follow-on calls below, not
+            # after -- found by review, 2026-08-09: the first version ran
+            # those calls first, so an exception in either one (or a stale DB
+            # missing paper_addon_legs) would silently lose this exit's own
+            # coverage event and alert entirely, on top of whatever the
+            # follow-on call itself failed to do.
             db.log_coverage_event("exit_fill", "paper", ticker=ticker, position_id=pos['id'],
                                    node_id=pos.get('wl_id'), result=reason, detail=f"price={target:.4f}")
             if verbose:
                 _post_message(f"🧪 PAPER SELL — {ticker}  {reason} @ ${target:.4f}")
+            try:
+                close_paper_addon_leg_if_open(pos['id'], ticker, pos.get('wl_id'), target, exit_dt, reason, verbose)
+                if pos.get('position_source') == 'core' and node:
+                    # Equity (and therefore skim/redeploy state) only changes when
+                    # a CORE trade closes -- a drought_overlay close doesn't feed
+                    # _paper_core_equity's query (filtered to position_source='core'),
+                    # so skipping this call for that case is an optimization, not a
+                    # correctness guard, but it's cheap to be explicit about which
+                    # close actually matters here.
+                    check_paper_skim(node)
+            except Exception as e:
+                print(f"  [warn] {ticker} addon/skim follow-on failed after a real core exit "
+                      f"already closed and alerted: {e} — not re-raising")
             paper_sell_alerted.add((pos['id'], last_bar_ts))

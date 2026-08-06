@@ -198,6 +198,131 @@ def ensure_tables():
             # entry when set, so a future sync tool has a real lever to pull, but
             # nothing in the current codebase ever sets it.
             c.execute("ALTER TABLE watch_list ADD COLUMN daily_sync_halted_at TEXT")
+        if 'drought_overlay_enabled' not in wl_cols:
+            # 2026-08-09 -- generic config toggle for the drought overlay (buy the
+            # underlying during a confirmed low-vol no-signal gap, manage with the
+            # node's own SL/arm/trail state machine), per docs/design.md's 2026-08-07
+            # "Live automation design" section. Not ticker-specific code -- any node
+            # can turn this on with its own confirm_days/vol_gate below, same as any
+            # other strategy parameter on this table.
+            c.execute("ALTER TABLE watch_list ADD COLUMN drought_overlay_enabled INTEGER NOT NULL DEFAULT 0")
+        if 'drought_confirm_days' not in wl_cols:
+            # Mirrors scripts/stacked_model/drought.py::generate_drought_trades'
+            # confirm_days param name directly, so live and backtest code share one
+            # vocabulary. NULL when drought_overlay_enabled=0.
+            c.execute("ALTER TABLE watch_list ADD COLUMN drought_confirm_days INTEGER")
+        if 'drought_vol_gate' not in wl_cols:
+            # Mirrors generate_drought_trades' vol_gate param (percentile 0-1, None =
+            # no gate) -- NULL here means no gate, matching the backtest default.
+            c.execute("ALTER TABLE watch_list ADD COLUMN drought_vol_gate REAL")
+        if 'drought_sl_pct_override' not in wl_cols:
+            # Mirrors generate_drought_trades' sl_pct/arm_pct/trail_pct params --
+            # NULL (default, and the only validated setting so far: SOXL's real
+            # signal, docs/research_log.md's 2026-08-05/06 entries, explicitly
+            # reuses the node's OWN core fixed_sl/arm_sell_pct/trail_sell_pct; every
+            # independently-tuned non-default variant tested failed cliff-safety or
+            # out-of-sample) means "use this node's own core risk params", same as
+            # the backtest function's own default. Added now, ahead of any current
+            # need, specifically so a future re-tuning attempt (this axis has
+            # already been revisited once and may be again) doesn't need another
+            # migration -- non-NULL here would be an explicit, deliberate deviation
+            # from today's validated config, not a silent behavior change.
+            c.execute("ALTER TABLE watch_list ADD COLUMN drought_sl_pct_override REAL")
+        if 'drought_arm_pct_override' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN drought_arm_pct_override REAL")
+        if 'drought_trail_pct_override' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN drought_trail_pct_override REAL")
+        if 'addon_enabled' not in wl_cols:
+            # Margin add-on-at-arm: no separate parameters -- always borrows 100% of
+            # the position's current market value the moment trail_state['trailing']
+            # flips True (the same event notify_trailing_activated already detects),
+            # per the 2026-08-07/08 validated sizing rule. A different sizing rule
+            # would need new backtest work first, not just a new column here.
+            c.execute("ALTER TABLE watch_list ADD COLUMN addon_enabled INTEGER NOT NULL DEFAULT 0")
+        if 'skim_enabled' not in wl_cols:
+            # Skim-and-reserve overlay (docs/deep_backlog.md's 2026-08-04
+            # "decided-in-principle" entry): skims skim_frac of current strategy value
+            # into a pooled SPY reserve whenever equity makes a new high >= skim_step
+            # above the last skim reference. Redeploy is deliberately manual (a Slack
+            # alert, not automated) -- see skim_ref/skim_peak_before_decline/
+            # skim_min_since_peak below for the persisted state that alert needs.
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_enabled INTEGER NOT NULL DEFAULT 0")
+        if 'skim_step' not in wl_cols:
+            # Nullable, no default -- NULL means "not deliberately configured yet",
+            # matching drought_confirm_days/drought_vol_gate's own None-friendly
+            # convention (Opus review, 2026-08-09: a NOT NULL DEFAULT would silently
+            # backfill every existing node as if it had been deliberately tuned).
+            # scripts/stacked_model/skim_reserve.SKIM_STEP is the validated fallback
+            # a caller applies when this is NULL, not a DB-level default.
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_step REAL")
+        if 'skim_frac' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_frac REAL")
+        if 'skim_reserve_balance' not in wl_cols:
+            # Per-node LEDGER balance against the shared pooled SPY holding in
+            # skim_reserve_pool (per docs/backlog_cache.md's 2026-08-04 "later" note:
+            # multiple nodes' skims land in one physical SPY position per account, so
+            # shares aren't segregated -- this column is "how much of the pool is
+            # this node's", not a share count). Redeploy sells min(this, needed) of
+            # the pooled position and credits/debits this column.
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_reserve_balance REAL NOT NULL DEFAULT 0")
+        if 'skim_ref' not in wl_cols:
+            # Last equity level a skim fired at (ratchets up on each skim, per
+            # sim_skim_redeploy.skim_redeploy_overlay's validated logic) -- must
+            # persist across daemon restarts, unlike the backtest's in-memory loop var.
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_ref REAL")
+        if 'skim_peak_before_decline' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_peak_before_decline REAL")
+        if 'skim_min_since_peak' not in wl_cols:
+            # Persisted tracker for the redeploy trigger -- see
+            # scripts/stacked_model/skim_reserve.py's 2026-08-08 CRITICAL fix comment:
+            # without this, a 0.1% wiggle right at the peak looks like ">= 80% of
+            # peak" and fires the redeploy alert on noise, never having actually
+            # declined. Same field, same reason, persisted instead of a loop-local var.
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_min_since_peak REAL")
+        if 'skim_declining' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_declining INTEGER NOT NULL DEFAULT 0")
+        if 'skim_alert_sent_at' not in wl_cols:
+            # Human-readable "when did we last alert" display field -- NOT the
+            # idempotency gate itself (see skim_alert_80_sent/skim_alert_100_sent
+            # below for that). The validated redeploy design has TWO independent
+            # thresholds (80%/100% of the pre-decline peak,
+            # scripts/stacked_model/skim_reserve.py's REDEPLOY_THRESHOLDS) that
+            # can each fire once per decline cycle -- a single timestamp can't
+            # distinguish which one(s) already fired, so this alone would have
+            # under- or over-suppressed one of the two alerts.
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_alert_sent_at TEXT")
+        if 'skim_alert_80_sent' not in wl_cols:
+            # Per-threshold idempotency guards, mirroring skim_reserve.py's
+            # `armed` set (one entry per threshold, discarded once that
+            # threshold fires, reset to "armed" only on a fresh post-recovery
+            # high -- see manual_redeploy_overlay's `armed.discard`/
+            # `armed = set(thresholds)` reset point). Both reset to 0 together
+            # with skim_peak_before_decline whenever a fresh high is made
+            # (the same "armed = set(thresholds)" moment), never independently.
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_alert_80_sent INTEGER NOT NULL DEFAULT 0")
+        if 'skim_alert_100_sent' not in wl_cols:
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_alert_100_sent INTEGER NOT NULL DEFAULT 0")
+        if 'skim_strategy_value' not in wl_cols:
+            # Real dollar value currently deployed in the strategy sleeve --
+            # added 2026-08-09 (Opus review fix) after the first version's skim
+            # amount (`starting_notional * equity * skim_frac`, recomputed off
+            # the FULL undiluted equity every time) was found to diverge from
+            # the validated model in the wrong direction: manual_redeploy_overlay
+            # skims a fraction of the CURRENTLY-DEPLOYED sleeve (w_strategy),
+            # which shrinks by (1-skim_frac) at every skim, not the full
+            # notional recomputed fresh each time. NULL = not yet initialized
+            # (treated as starting_notional on first use, mirroring w_strategy's
+            # own 1.0 starting weight applied to real dollars instead of a
+            # normalized unit).
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_strategy_value REAL")
+        if 'skim_last_mark_time' not in wl_cols:
+            # Last time the reserve was marked to a real SPY price -- lets
+            # check_paper_skim compute the reserve's own real return since the
+            # prior mark (a genuine gap in the first version, flagged by
+            # review: the reserve never actually earned/lost anything, so
+            # paper couldn't measure the overlay's real net effect). NULL
+            # until the first mark.
+            c.execute("ALTER TABLE watch_list ADD COLUMN skim_last_mark_time TEXT")
 
         # account wasn't part of the original UNIQUE constraint -- found 2026-07-26 while
         # adding a second real DPST node in a different account: two nodes with identical
@@ -241,6 +366,26 @@ def ensure_tables():
                     paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
                     paper_role         TEXT,
                     daily_sync_halted_at TEXT,
+                    drought_overlay_enabled INTEGER NOT NULL DEFAULT 0,
+                    drought_confirm_days INTEGER,
+                    drought_vol_gate   REAL,
+                    drought_sl_pct_override REAL,
+                    drought_arm_pct_override REAL,
+                    drought_trail_pct_override REAL,
+                    addon_enabled      INTEGER NOT NULL DEFAULT 0,
+                    skim_enabled       INTEGER NOT NULL DEFAULT 0,
+                    skim_step          REAL,
+                    skim_frac          REAL,
+                    skim_reserve_balance REAL NOT NULL DEFAULT 0,
+                    skim_ref           REAL,
+                    skim_peak_before_decline REAL,
+                    skim_min_since_peak REAL,
+                    skim_declining     INTEGER NOT NULL DEFAULT 0,
+                    skim_alert_sent_at TEXT,
+                    skim_alert_80_sent INTEGER NOT NULL DEFAULT 0,
+                    skim_alert_100_sent INTEGER NOT NULL DEFAULT 0,
+                    skim_strategy_value REAL,
+                    skim_last_mark_time TEXT,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account)
@@ -292,6 +437,26 @@ def ensure_tables():
                     paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
                     paper_role         TEXT,
                     daily_sync_halted_at TEXT,
+                    drought_overlay_enabled INTEGER NOT NULL DEFAULT 0,
+                    drought_confirm_days INTEGER,
+                    drought_vol_gate   REAL,
+                    drought_sl_pct_override REAL,
+                    drought_arm_pct_override REAL,
+                    drought_trail_pct_override REAL,
+                    addon_enabled      INTEGER NOT NULL DEFAULT 0,
+                    skim_enabled       INTEGER NOT NULL DEFAULT 0,
+                    skim_step          REAL,
+                    skim_frac          REAL,
+                    skim_reserve_balance REAL NOT NULL DEFAULT 0,
+                    skim_ref           REAL,
+                    skim_peak_before_decline REAL,
+                    skim_min_since_peak REAL,
+                    skim_declining     INTEGER NOT NULL DEFAULT 0,
+                    skim_alert_sent_at TEXT,
+                    skim_alert_80_sent INTEGER NOT NULL DEFAULT 0,
+                    skim_alert_100_sent INTEGER NOT NULL DEFAULT 0,
+                    skim_strategy_value REAL,
+                    skim_last_mark_time TEXT,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account, paper_role)
@@ -370,6 +535,39 @@ def ensure_tables():
             # sig['last_bar']). NULL for every other caller, where signal_time already is
             # bar-aligned (found by Opus review, 2026-08-05).
             c.execute("ALTER TABLE open_positions ADD COLUMN signal_bar_time TEXT")
+        if 'position_source' not in op_cols:
+            # 'core' (default) | 'drought_overlay' -- discriminator for the 2026-08-09
+            # overlay-mechanism build (docs/design.md's 2026-08-07 "Live automation
+            # design" section). Deliberately does NOT include 'addon_leg' -- a cold
+            # Opus review (2026-08-09) found that an add-on leg sharing its parent's
+            # ticker/wl_id would break every single-row assumption in this file
+            # (get_open_position's ORDER BY entry_time DESC LIMIT 1 would silently
+            # return the leg instead of core; top_up_position/set_broker_stop_price/
+            # set_sl_order_id's ticker-keyed UPDATEs would clobber both rows;
+            # get_held_tickers/closed_today would misattribute). Add-on legs live in
+            # their own dedicated addon_legs/paper_addon_legs tables instead (below),
+            # never touching open_positions/trade_log at all -- drought_overlay is
+            # safe here specifically because it only ever opens while core is flat
+            # for the same wl_id (no simultaneous-row case), so the existing
+            # single-row lookups stay correct unmodified.
+            c.execute("ALTER TABLE open_positions ADD COLUMN position_source TEXT NOT NULL DEFAULT 'core' "
+                      "CHECK (position_source IN ('core', 'drought_overlay'))")
+        if 'drought_confirm_days' not in op_cols:
+            # Config snapshot at entry time, same reasoning as fixed_sl/trail_sell_pct
+            # etc. above (staged_test_config's baseline-drift protection pattern) --
+            # NULL except on position_source='drought_overlay' rows.
+            c.execute("ALTER TABLE open_positions ADD COLUMN drought_confirm_days INTEGER")
+        if 'drought_vol_gate' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN drought_vol_gate REAL")
+        if 'drought_gap_start' not in op_cols:
+            # The OBSERVED no-signal gap start this entry actually fired on -- distinct
+            # from drought_confirm_days/drought_vol_gate above (the threshold
+            # CONFIG). reconcile_overlay_nodes' real question is "did the backtest
+            # agree this gap was confirmed on this date," which needs the observed
+            # value, not just the threshold that was in effect (Opus review finding).
+            c.execute("ALTER TABLE open_positions ADD COLUMN drought_gap_start TEXT")
+        if 'drought_vol_pctile' not in op_cols:
+            c.execute("ALTER TABLE open_positions ADD COLUMN drought_vol_pctile REAL")
 
         # trade_log
         c.execute("""
@@ -432,6 +630,23 @@ def ensure_tables():
             # reactive branch, where exit_time's wall clock genuinely does fall inside the bar
             # the trigger action occurred in and _bar_containing is the correct lookup.
             c.execute("ALTER TABLE trade_log ADD COLUMN exit_bar_time TEXT")
+        if 'position_source' not in tl_cols:
+            # See open_positions.position_source above -- kept in the closed-trade
+            # record too since open_positions rows are deleted on close and
+            # reconcile_overlay_nodes needs to tell drought trades apart from core
+            # ones after the fact. No 'addon_leg' value here either -- see
+            # open_positions.position_source's comment (addon lives in its own
+            # addon_legs/paper_addon_legs tables).
+            c.execute("ALTER TABLE trade_log ADD COLUMN position_source TEXT NOT NULL DEFAULT 'core' "
+                      "CHECK (position_source IN ('core', 'drought_overlay'))")
+        if 'drought_confirm_days' not in tl_cols:
+            c.execute("ALTER TABLE trade_log ADD COLUMN drought_confirm_days INTEGER")
+        if 'drought_vol_gate' not in tl_cols:
+            c.execute("ALTER TABLE trade_log ADD COLUMN drought_vol_gate REAL")
+        if 'drought_gap_start' not in tl_cols:
+            c.execute("ALTER TABLE trade_log ADD COLUMN drought_gap_start TEXT")
+        if 'drought_vol_pctile' not in tl_cols:
+            c.execute("ALTER TABLE trade_log ADD COLUMN drought_vol_pctile REAL")
 
         # pending_buys -- tracks a trailing-buy order from BUY alert until Executed/Skipped
         # is confirmed, so a stalled broker-side fill can be reminded on (mirrors trail_state
@@ -519,6 +734,20 @@ def ensure_tables():
             # See open_positions.signal_bar_time above -- same rationale, kept
             # schema-identical for the same shared-INSERT reason as is_dry_run_sim.
             c.execute("ALTER TABLE paper_positions ADD COLUMN signal_bar_time TEXT")
+        if 'position_source' not in pp_cols:
+            # See open_positions.position_source above -- schema-identical for the
+            # same shared-INSERT reason as is_dry_run_sim/signal_bar_time. No
+            # 'addon_leg' value (see that comment) -- addon uses paper_addon_legs.
+            c.execute("ALTER TABLE paper_positions ADD COLUMN position_source TEXT NOT NULL DEFAULT 'core' "
+                      "CHECK (position_source IN ('core', 'drought_overlay'))")
+        if 'drought_confirm_days' not in pp_cols:
+            c.execute("ALTER TABLE paper_positions ADD COLUMN drought_confirm_days INTEGER")
+        if 'drought_vol_gate' not in pp_cols:
+            c.execute("ALTER TABLE paper_positions ADD COLUMN drought_vol_gate REAL")
+        if 'drought_gap_start' not in pp_cols:
+            c.execute("ALTER TABLE paper_positions ADD COLUMN drought_gap_start TEXT")
+        if 'drought_vol_pctile' not in pp_cols:
+            c.execute("ALTER TABLE paper_positions ADD COLUMN drought_vol_pctile REAL")
         c.execute("""
             CREATE TABLE IF NOT EXISTS paper_trade_log (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -562,6 +791,17 @@ def ensure_tables():
             c.execute("ALTER TABLE paper_trade_log ADD COLUMN signal_bar_time TEXT")
         if 'exit_bar_time' not in ptl_cols:
             c.execute("ALTER TABLE paper_trade_log ADD COLUMN exit_bar_time TEXT")
+        if 'position_source' not in ptl_cols:
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN position_source TEXT NOT NULL DEFAULT 'core' "
+                      "CHECK (position_source IN ('core', 'drought_overlay'))")
+        if 'drought_confirm_days' not in ptl_cols:
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN drought_confirm_days INTEGER")
+        if 'drought_gap_start' not in ptl_cols:
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN drought_gap_start TEXT")
+        if 'drought_vol_pctile' not in ptl_cols:
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN drought_vol_pctile REAL")
+        if 'drought_vol_gate' not in ptl_cols:
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN drought_vol_gate REAL")
         # paper_pending_buys -- lighter than pending_buys: no reminder machinery, since a
         # simulated fill is auto-detected every poll (paper_trading.update_paper_buys),
         # never confirmed by a human clicking a button.
@@ -640,6 +880,156 @@ def ensure_tables():
                 is_true_open INTEGER NOT NULL
             )
         """)
+
+        # skim_reserve_pool -- ONE pooled real SPY holding per account (not per node),
+        # per docs/backlog_cache.md's 2026-08-04 "later" note: multiple live nodes in
+        # the same account (e.g. HIBL/USD/YANG all in soxl_ira) skim into the same
+        # physical SPY position, so shares aren't segregated -- watch_list.
+        # skim_reserve_balance (per-node dollar ledger) tracks "whose" against this
+        # single shared position. avg_cost is a blended average-cost basis (accepted
+        # tradeoff -- fine for parking gains, not tax-lot precision; must stay
+        # isolated from AGQ's own Section-1256/K-1 basis treatment, never blended
+        # with it).
+        # reserve_ticker/reserve_shares (not spy_shares) -- SPY is the current
+        # validated parking vehicle (tested against QQQ/SSO/UPRO/QLD/TQQQ), but that
+        # was a real research choice, not a hardcoded assumption; naming the column
+        # after today's winner would make a future re-test look like a schema change
+        # (Opus review, 2026-08-09). Composite PK + explicit NOT NULL on account --
+        # a plain `account TEXT PRIMARY KEY` still permits multiple NULL rows in
+        # SQLite, and watch_list.account is known-nullable in production
+        # (signals_invariants.py has a dedicated check for it).
+        # KNOWN OPEN GAP (not fixed here, flagged by review): nothing currently
+        # guarantees two different ACCOUNTS nicknames (schwab_safety.py) can't
+        # resolve to the same real brokerage account hash, which would silently
+        # split one physical SPY holding across two pool rows here. Needs a
+        # signals_invariants.py check before this pool is used for real capital.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS skim_reserve_pool (
+                account        TEXT NOT NULL,
+                reserve_ticker TEXT NOT NULL DEFAULT 'SPY',
+                reserve_shares REAL NOT NULL DEFAULT 0,
+                avg_cost       REAL,
+                updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (account, reserve_ticker)
+            )
+        """)
+        # skim_reserve_log -- one row per real skim/redeploy event, mirrors
+        # watch_list_audit's mechanical-log pattern (append-only, never mutated).
+        # ledger_balance_after is this node's skim_reserve_balance immediately after
+        # the event, for a queryable running history without replaying every event.
+        # No uniqueness constraint here deliberately -- the actual fire-once
+        # guarantee lives at the state-transition level (watch_list.skim_ref
+        # ratchets monotonically, skim_declining/skim_alert_sent_at gate the
+        # redeploy alert), same pattern as pending_buys.gap_resize_date; this table
+        # is pure append-only history, not itself a dedup mechanism.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS skim_reserve_log (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                   TEXT NOT NULL DEFAULT (datetime('now')),
+                wl_id                INTEGER NOT NULL REFERENCES watch_list(id),
+                account              TEXT NOT NULL,
+                action               TEXT NOT NULL,  -- 'skim' | 'redeploy_alert' | 'redeploy'
+                amount               REAL NOT NULL,
+                reserve_shares_delta REAL,
+                reserve_price        REAL,
+                ledger_balance_after REAL NOT NULL,
+                reference_value      REAL,
+                detail               TEXT
+            )
+        """)
+        # overlay_reconciliation_log -- pure-observation nightly diagnostic for the
+        # drought/addon/skim mechanisms, mirroring daily_track_reconciliation_log's
+        # shape exactly (docs/design.md's 2026-08-07 "Paper/live-vs-backtest
+        # reconciliation" section -- item 3.5 of the staged checklist). One row per
+        # node per mechanism per mode per night. Never mutates any real state --
+        # same reasoning as the core daily-track reconcile: auto-correcting
+        # divergence erases exactly the signal this comparison exists to produce.
+        # mode + the UNIQUE constraint were both added on Opus review (2026-08-09):
+        # without mode, drought/skim running on both live-track and daily-track
+        # paper can't be told apart in the Grid; without the UNIQUE, an EOD
+        # catch-up re-run after a restart silently duplicates the night's row
+        # instead of upserting (the same gap daily_track_reconciliation_log has,
+        # not inherited here on purpose).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS overlay_reconciliation_log (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts             TEXT NOT NULL DEFAULT (datetime('now')),
+                wl_id          INTEGER NOT NULL REFERENCES watch_list(id),
+                ticker         TEXT NOT NULL,
+                mechanism      TEXT NOT NULL,  -- 'drought' | 'addon' | 'skim'
+                mode           TEXT NOT NULL,  -- 'live' | 'paper' | 'daily_sync'
+                check_date     TEXT NOT NULL,
+                actual_state   TEXT NOT NULL,
+                backtest_state TEXT NOT NULL,
+                match          INTEGER NOT NULL,
+                action         TEXT NOT NULL,
+                detail         TEXT,
+                UNIQUE(wl_id, mechanism, mode, check_date)
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_overlay_reconcile_wl_date "
+                  "ON overlay_reconciliation_log(wl_id, check_date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_open_positions_source "
+                  "ON open_positions(position_source)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_paper_positions_source "
+                  "ON paper_positions(position_source)")
+
+        # addon_legs/paper_addon_legs -- margin add-on-at-arm legs, DELIBERATELY a
+        # separate table from open_positions/trade_log rather than a
+        # position_source value there (see open_positions.position_source's
+        # comment above for why: an addon leg shares its parent's ticker/wl_id and
+        # opens WHILE the parent is still open, which would break every
+        # single-row-per-ticker/wl_id assumption in this file -- get_open_position,
+        # top_up_position, set_broker_stop_price, set_sl_order_id,
+        # get_held_tickers, closed_today, and schwab_safety.check_order's
+        # double-buy guard all assume at most one row). An addon leg never
+        # independently triggers its own SL/TRAIL check -- it closes in lockstep
+        # with its parent core position, driven by that position's own exit event,
+        # never polled on its own. parent_trade_log_id (not parent_position_id) is
+        # the PERMANENT link -- open_positions rows are deleted on close, so a
+        # pointer to one would dangle once both legs finish; open_positions.
+        # trade_log_id already gives the parent's permanent trade_log.id at leg
+        # creation time, so that's captured directly instead.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS addon_legs (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                wl_id                INTEGER NOT NULL REFERENCES watch_list(id),
+                parent_position_id   INTEGER,
+                parent_trade_log_id  INTEGER NOT NULL,
+                ticker               TEXT NOT NULL,
+                account              TEXT,
+                shares               REAL NOT NULL,
+                entry_price          REAL NOT NULL,
+                entry_time           TEXT NOT NULL,
+                status               TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+                exit_price           REAL,
+                exit_time            TEXT,
+                exit_reason          TEXT,
+                pnl_pct              REAL,
+                is_dry_run_sim       INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS paper_addon_legs (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                wl_id                INTEGER NOT NULL REFERENCES watch_list(id),
+                parent_position_id   INTEGER,
+                parent_trade_log_id  INTEGER NOT NULL,
+                ticker               TEXT NOT NULL,
+                account              TEXT,
+                shares               REAL NOT NULL,
+                entry_price          REAL NOT NULL,
+                entry_time           TEXT NOT NULL,
+                status               TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+                exit_price           REAL,
+                exit_time            TEXT,
+                exit_reason          TEXT,
+                pnl_pct              REAL,
+                is_dry_run_sim       INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_addon_legs_parent ON addon_legs(parent_position_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_paper_addon_legs_parent ON paper_addon_legs(parent_position_id)")
         c.commit()
 
         # coverage_events: one row per real firing of an automation control/phase
@@ -2173,6 +2563,49 @@ def get_daily_track_reconciliation_log(wl_id=None, limit=200):
     return [dict(r) for r in rows]
 
 
+def log_overlay_reconciliation(wl_id, ticker, mechanism, mode, check_date, actual_state,
+                                backtest_state, match, action, detail=None):
+    """One row per node per mechanism per mode per night -- mirrors
+    log_daily_track_reconciliation's shape and pure-observation contract
+    exactly (paper_trading.reconcile_overlay_nodes, 2026-08-09). INSERT OR
+    REPLACE respects the table's UNIQUE(wl_id, mechanism, mode, check_date)
+    constraint -- a same-day rerun (e.g. after a restart) replaces the
+    night's row with the LATEST result rather than duplicating it. Was
+    INSERT OR IGNORE (first-result-wins) until an independent review,
+    2026-08-09, found that let a transient 'replay_failed' row from an early
+    run permanently mask a later clean 'match' the same night -- REPLACE
+    means a genuine improvement on retry actually sticks. Unlike
+    daily_track_reconciliation_log, which has no UNIQUE constraint at all
+    and duplicates on every rerun (a known, not-yet-fixed gap there, not
+    inherited here)."""
+    with _conn() as c:
+        c.execute("""
+            INSERT OR REPLACE INTO overlay_reconciliation_log
+                (wl_id, ticker, mechanism, mode, check_date, actual_state, backtest_state,
+                 match, action, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (wl_id, ticker, mechanism, mode, check_date, actual_state, backtest_state,
+              1 if match else 0, action, detail))
+        c.commit()
+
+
+def get_overlay_reconciliation_log(wl_id=None, mechanism=None, limit=200):
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        q = "SELECT * FROM overlay_reconciliation_log WHERE 1=1"
+        params = []
+        if wl_id is not None:
+            q += " AND wl_id=?"
+            params.append(wl_id)
+        if mechanism is not None:
+            q += " AND mechanism=?"
+            params.append(mechanism)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = c.execute(q, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 def set_daily_sync_halted(wl_id, halted=True):
     """Halts (or clears) a daily-track node's paper entry -- set when a nightly reconcile
     finds an unexplained divergence (see reconcile_daily_track_nodes' docstring). Clearing
@@ -2349,7 +2782,9 @@ def closed_today(ticker, paper=False, node=None):
 
 
 def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False,
-                   is_dry_run_sim=False, signal_bar_time=None):
+                   is_dry_run_sim=False, signal_bar_time=None, position_source='core',
+                   drought_confirm_days=None, drought_vol_gate=None, drought_gap_start=None,
+                   drought_vol_pctile=None):
     """Returns True if a position was opened, False if skipped because one was
     already open for this node — callers that report success to Slack
     must check this, since a silent skip must not be reported as a fill.
@@ -2358,7 +2793,16 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
     wl_id refactor entry).
     is_dry_run_sim tags a fill synthesized against real price data because the
     account is dry_run (no real broker fill will ever arrive) -- mutually
-    exclusive with paper (a dry_run node is always mode='live', never research)."""
+    exclusive with paper (a dry_run node is always mode='live', never research).
+    position_source='drought_overlay' (with the drought_* fields) is the ONLY
+    non-'core' value accepted here -- add-on legs use open_addon_leg() and their
+    own dedicated table instead, never this function (see
+    open_positions.position_source's schema comment for why: an addon leg shares
+    its parent's wl_id and opens while the parent is still open, which this
+    function's own dedup check, and most of this file's ticker/wl_id-keyed
+    lookups, assume never happens)."""
+    if position_source == 'addon_leg':
+        raise ValueError("open_position() does not support position_source='addon_leg' -- use open_addon_leg()")
     positions_table, _ = _pos_tables(paper)
     with _position_lock, _conn() as c:
         # position_lock instrumentation (2026-08-01): proves the lock is
@@ -2393,15 +2837,18 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
                                 if hasattr(signal_bar_time, 'strftime') else signal_bar_time)
         trade_log_id = log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares,
                                         paper=paper, is_dry_run_sim=is_dry_run_sim,
-                                        signal_bar_time=signal_bar_time)
+                                        signal_bar_time=signal_bar_time, position_source=position_source,
+                                        drought_confirm_days=drought_confirm_days, drought_vol_gate=drought_vol_gate,
+                                        drought_gap_start=drought_gap_start, drought_vol_pctile=drought_vol_pctile)
         tp = node.get('take_profit')
         c.execute(f"""
             INSERT INTO {positions_table}
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, trade_log_id,
                  trail_sell_pct, fixed_sl, trail_buy_pct, arm_sell_pct, shares, account, wl_id, is_dry_run_sim,
-                 signal_bar_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 signal_bar_time, position_source, drought_confirm_days, drought_vol_gate,
+                 drought_gap_start, drought_vol_pctile)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
@@ -2411,7 +2858,8 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             node.get('trail_sell_pct'), node.get('fixed_sl'), node.get('trail_buy_pct'),
             node.get('arm_sell_pct'), float(shares) if shares is not None else None,
             node.get('account'), node.get('id'), 1 if is_dry_run_sim else 0,
-            signal_bar_time_str,
+            signal_bar_time_str, position_source, drought_confirm_days, drought_vol_gate,
+            drought_gap_start, drought_vol_pctile,
         ))
         c.commit()
         return True
@@ -2568,7 +3016,9 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
 
 
 def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False,
-                     is_dry_run_sim=False, signal_bar_time=None):
+                     is_dry_run_sim=False, signal_bar_time=None, position_source='core',
+                     drought_confirm_days=None, drought_vol_gate=None, drought_gap_start=None,
+                     drought_vol_pctile=None):
     _, trade_log_table = _pos_tables(paper)
     sig_time_str   = signal_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(signal_time, 'strftime') else signal_time
     entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
@@ -2581,8 +3031,9 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, sh
             INSERT INTO {trade_log_table}
                 (ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
                  signal_price, signal_time, entry_price, entry_time, entry_drift_pct, arm_sell_pct, shares, account,
-                 is_dry_run_sim, wl_id, signal_bar_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_dry_run_sim, wl_id, signal_bar_time, position_source, drought_confirm_days,
+                 drought_vol_gate, drought_gap_start, drought_vol_pctile)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             node['ticker'], node['strategy'], node['version'],
             int(node['window']), int(tp) if tp is not None else None, int(node['stop_loss']),
@@ -2590,7 +3041,8 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, sh
             float(signal_price), sig_time_str,
             float(entry_price), entry_time_str, entry_drift, node.get('arm_sell_pct'),
             float(shares) if shares is not None else None, node.get('account'), 1 if is_dry_run_sim else 0,
-            node.get('id'), signal_bar_time_str,
+            node.get('id'), signal_bar_time_str, position_source, drought_confirm_days,
+            drought_vol_gate, drought_gap_start, drought_vol_pctile,
         ))
         c.commit()
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -2612,4 +3064,270 @@ def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reas
             WHERE id = ?
         """, (float(exit_signal_price), float(exit_price), exit_time_str,
               exit_drift, pnl, exit_reason, exit_bar_time_str, trade_id))
+        c.commit()
+
+
+# ---------------------------------------------------------------------------
+# Drought overlay, margin add-on-at-arm, skim-and-reserve -- 2026-08-09 build.
+# See docs/design.md's 2026-08-07 "Live automation design" section and
+# open_positions.position_source's schema comment above for the shape
+# decisions (why drought reuses open_position()/open_positions, why add-on
+# deliberately does not).
+# ---------------------------------------------------------------------------
+
+def open_drought_overlay_position(node, signal_price, signal_time, entry_price, entry_time,
+                                   confirm_days, vol_gate=None, sl_pct=None, arm_pct=None, trail_pct=None,
+                                   gap_start=None, vol_pctile=None, shares=None, paper=False,
+                                   is_dry_run_sim=False, signal_bar_time=None):
+    """Thin wrapper around open_position() -- a drought-overlay entry is
+    real-shape-identical to a core entry (same ticker, same node's own SL/arm/
+    trail params carried on the row by default), just tagged
+    position_source='drought_overlay' plus the config (confirm_days/vol_gate)
+    and observed-fact (gap_start/vol_pctile) snapshot columns.
+
+    sl_pct/arm_pct/trail_pct mirror scripts/stacked_model/drought.py::
+    generate_drought_trades' own param names and None-means-node's-own-default
+    convention exactly, so live and backtest share one resolution order:
+    explicit call-site value > the node's persisted drought_*_pct_override
+    column > the node's own core fixed_sl/arm_sell_pct/trail_sell_pct. As of
+    2026-08-09 nothing sets the override columns (SOXL's only validated signal
+    uses plain node defaults, see drought_sl_pct_override's schema comment) --
+    this resolution exists so a future re-validated override doesn't need
+    another code change here, just a value in those columns or this call.
+    Only safe to call when the node's core position is flat for this wl_id
+    (drought is defined as filling the gap while core has no signal, and
+    open_position()'s own dedup check keys on wl_id alone regardless of
+    position_source -- a genuine second entry attempt while either is already
+    open is correctly rejected as a duplicate, not routed around)."""
+    overlay_node = dict(node)
+    resolved_sl = sl_pct if sl_pct is not None else node.get('drought_sl_pct_override')
+    resolved_arm = arm_pct if arm_pct is not None else node.get('drought_arm_pct_override')
+    resolved_trail = trail_pct if trail_pct is not None else node.get('drought_trail_pct_override')
+    if resolved_sl is not None:
+        overlay_node['fixed_sl'] = resolved_sl
+    if resolved_arm is not None:
+        # Route to whichever column check_sell_condition's db._tp_or_arm_pct
+        # actually reads for this node's strategy -- TrailingBothZScoreBreakout
+        # stores its arm value in arm_sell_pct, every other strategy (including
+        # TrailingExitZScoreBreakout) stores it in take_profit instead. Writing
+        # unconditionally to arm_sell_pct would silently no-op the override for
+        # a TrailingExit node -- the exact column-overload bug pattern already
+        # found 3x elsewhere in this codebase (see take_profit/trail_buy_pct
+        # notes in docs/backlog_cache.md), caught here before it became a 4th.
+        if overlay_node['strategy'] == 'TrailingBothZScoreBreakout':
+            overlay_node['arm_sell_pct'] = resolved_arm
+        else:
+            overlay_node['take_profit'] = resolved_arm
+    if resolved_trail is not None:
+        overlay_node['trail_sell_pct'] = resolved_trail
+    return open_position(overlay_node, signal_price, signal_time, entry_price, entry_time, shares=shares,
+                          paper=paper, is_dry_run_sim=is_dry_run_sim, signal_bar_time=signal_bar_time,
+                          position_source='drought_overlay', drought_confirm_days=confirm_days,
+                          drought_vol_gate=vol_gate, drought_gap_start=gap_start, drought_vol_pctile=vol_pctile)
+
+
+def get_drought_overlay_position(wl_id, paper=False):
+    """Explicit position_source filter, unlike get_open_position_by_wl_id --
+    defensive: a caller asking specifically "is there an open drought
+    position" should get None rather than a core row back if the two ever
+    did somehow coexist (which would itself be a bug elsewhere, not something
+    this getter should paper over)."""
+    positions_table, _ = _pos_tables(paper)
+    with _conn() as c:
+        row = c.execute(
+            f"SELECT * FROM {positions_table} WHERE wl_id=? AND position_source='drought_overlay' "
+            f"ORDER BY entry_time DESC LIMIT 1",
+            (wl_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d['trail_state'] = json.loads(d['trail_state']) if d.get('trail_state') else {}
+    return d
+
+
+def _addon_table(paper=False):
+    return 'paper_addon_legs' if paper else 'addon_legs'
+
+
+def open_addon_leg(parent_position, shares, entry_price, entry_time, paper=False, is_dry_run_sim=False):
+    """Opens a margin add-on-at-arm leg against an already-open CORE position
+    (parent_position, e.g. from get_open_position_by_wl_id) -- deliberately its
+    own table, not open_positions (see open_positions.position_source's schema
+    comment for the collision reasoning). parent_trade_log_id is captured from
+    parent_position['trade_log_id'] now, at creation time, since that's a
+    permanent trade_log.id -- parent_position_id (open_positions.id) is only
+    valid while the parent is still open and is not relied on after close."""
+    table = _addon_table(paper)
+    entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
+    with _conn() as c:
+        c.execute(f"""
+            INSERT INTO {table}
+                (wl_id, parent_position_id, parent_trade_log_id, ticker, account, shares,
+                 entry_price, entry_time, is_dry_run_sim)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            parent_position['wl_id'], parent_position['id'], parent_position['trade_log_id'],
+            parent_position['ticker'], parent_position.get('account'), float(shares),
+            float(entry_price), entry_time_str, 1 if is_dry_run_sim else 0,
+        ))
+        c.commit()
+        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def get_open_addon_leg_by_parent(parent_position_id, paper=False):
+    table = _addon_table(paper)
+    with _conn() as c:
+        row = c.execute(
+            f"SELECT * FROM {table} WHERE parent_position_id=? AND status='open' "
+            f"ORDER BY entry_time DESC LIMIT 1",
+            (parent_position_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_open_addon_legs(paper=False):
+    table = _addon_table(paper)
+    with _conn() as c:
+        return [dict(r) for r in c.execute(f"SELECT * FROM {table} WHERE status='open' ORDER BY entry_time").fetchall()]
+
+
+# Mirrors scripts/stacked_model/add_on.py::MARGIN_COST_FLAT_PCT (validated
+# negligible-but-real average margin-interest cost, ~33h typical hold --
+# duplicated rather than imported for the same reason _DROUGHT_TARGET_H0/H1
+# are duplicated in paper_trading.py: avoids pulling that module's backtester/
+# numba transitive imports into signals_db.py, which the live daemon always
+# loads. Found missing here by Opus review, 2026-08-09 -- close_addon_leg's
+# pnl_pct was 0.04pp optimistic vs. the validated model on every leg.
+_ADDON_MARGIN_COST_FLAT_PCT = 0.04
+
+
+def close_addon_leg(leg_id, exit_price, exit_time, exit_reason, paper=False):
+    """Closes an addon leg in isolation -- callers driving the real lockstep
+    close (leg closes exactly when its parent core position closes, per the
+    design's state machine) call this alongside close_position(), not instead
+    of it; this function has no awareness of the parent's own close and does
+    not enforce the lockstep itself."""
+    table = _addon_table(paper)
+    exit_time_str = exit_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(exit_time, 'strftime') else exit_time
+    with _conn() as c:
+        row = c.execute(f"SELECT entry_price FROM {table} WHERE id=?", (leg_id,)).fetchone()
+        if row is None:
+            return False
+        pnl = (exit_price - row['entry_price']) / row['entry_price'] * 100 - _ADDON_MARGIN_COST_FLAT_PCT
+        c.execute(f"""
+            UPDATE {table} SET status='closed', exit_price=?, exit_time=?, exit_reason=?, pnl_pct=?
+            WHERE id=?
+        """, (float(exit_price), exit_time_str, exit_reason, pnl, leg_id))
+        c.commit()
+        return True
+
+
+def get_skim_reserve_pool(account, reserve_ticker='SPY'):
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM skim_reserve_pool WHERE account=? AND reserve_ticker=?",
+            (account, reserve_ticker)
+        ).fetchone()
+    return dict(row) if row else {'account': account, 'reserve_ticker': reserve_ticker,
+                                   'reserve_shares': 0.0, 'avg_cost': None}
+
+
+def update_skim_reserve_pool(account, shares_delta, price, reserve_ticker='SPY'):
+    """Upserts the ONE pooled reserve position per (account, reserve_ticker) --
+    see skim_reserve_pool's schema comment for why this is pooled, not
+    per-node. Buying more (shares_delta > 0) blends avg_cost by the standard
+    weighted-average-cost convention; selling (shares_delta < 0, a redeploy)
+    reduces shares without touching avg_cost (the remaining shares' cost basis
+    is unchanged by a partial sale)."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT reserve_shares, avg_cost FROM skim_reserve_pool WHERE account=? AND reserve_ticker=?",
+            (account, reserve_ticker)
+        ).fetchone()
+        if row is None:
+            old_shares, old_cost = 0.0, None
+        else:
+            old_shares, old_cost = row['reserve_shares'], row['avg_cost']
+        new_shares = old_shares + shares_delta
+        if shares_delta > 0:
+            old_cost_basis = old_shares * old_cost if old_cost is not None else 0.0
+            new_cost = (old_cost_basis + shares_delta * price) / new_shares if new_shares > 0 else price
+        else:
+            new_cost = old_cost
+        c.execute("""
+            INSERT INTO skim_reserve_pool (account, reserve_ticker, reserve_shares, avg_cost, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(account, reserve_ticker) DO UPDATE SET
+                reserve_shares=excluded.reserve_shares, avg_cost=excluded.avg_cost, updated_at=excluded.updated_at
+        """, (account, reserve_ticker, new_shares, new_cost))
+        c.commit()
+
+
+def record_skim_event(wl_id, account, action, amount, reserve_shares_delta=None, reserve_price=None,
+                       reference_value=None, detail=None, new_balance_override=None):
+    """Appends to skim_reserve_log (pure history) and updates the node's own
+    skim_reserve_balance ledger by `amount` (positive for a skim moving money
+    INTO the reserve, negative for a redeploy moving money OUT) -- these two
+    writes are the ledger side; update_skim_reserve_pool (the physical
+    reserve_ticker shares) is called separately by the caller, since a
+    'redeploy_alert' event (no real order placed yet) updates neither the
+    ledger balance nor the pool, only logs that the alert fired.
+
+    new_balance_override: pass the caller's own already-computed balance
+    (e.g. paper_trading.check_paper_skim, which marks the reserve to a real
+    SPY price BEFORE applying this event and would otherwise disagree with
+    this function's naive current_balance+amount, which knows nothing about
+    that mark-to-market step) instead of deriving it from
+    current_balance+amount here. None (default) preserves the original
+    derive-it-yourself behavior for callers with no reason to override it."""
+    with _conn() as c:
+        if new_balance_override is not None:
+            new_balance = new_balance_override
+        else:
+            row = c.execute("SELECT skim_reserve_balance FROM watch_list WHERE id=?", (wl_id,)).fetchone()
+            current_balance = row['skim_reserve_balance'] if row else 0.0
+            new_balance = current_balance + amount if action != 'redeploy_alert' else current_balance
+        if action != 'redeploy_alert':
+            c.execute("UPDATE watch_list SET skim_reserve_balance=? WHERE id=?", (new_balance, wl_id))
+        c.execute("""
+            INSERT INTO skim_reserve_log
+                (wl_id, account, action, amount, reserve_shares_delta, reserve_price,
+                 ledger_balance_after, reference_value, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (wl_id, account, action, float(amount), reserve_shares_delta, reserve_price,
+              new_balance, reference_value, detail))
+        c.commit()
+
+
+_UNSET = object()
+
+
+def set_skim_state(wl_id, skim_ref=_UNSET, skim_peak_before_decline=_UNSET, skim_min_since_peak=_UNSET,
+                    skim_declining=_UNSET, skim_alert_sent_at=_UNSET, skim_alert_80_sent=_UNSET,
+                    skim_alert_100_sent=_UNSET, skim_strategy_value=_UNSET, skim_last_mark_time=_UNSET,
+                    skim_reserve_balance=_UNSET):
+    """Persists the redeploy-trigger tracking state (mirrors
+    scripts/stacked_model/skim_reserve.py's validated in-memory loop
+    variables of the same names -- see that module's 2026-08-08 CRITICAL fix
+    comment for why min_since_peak specifically must persist rather than be
+    re-derived). Only fields actually PASSED are updated (default sentinel
+    _UNSET, not None) -- callers typically update a subset per poll cycle, and
+    unlike a plain None default, this lets skim_alert_sent_at=None be passed
+    explicitly to clear the alert-sent marker back to NULL when a fresh
+    decline cycle starts, without that clear being indistinguishable from
+    "don't touch this field"."""
+    fields, values = [], []
+    for col, val in (('skim_ref', skim_ref), ('skim_peak_before_decline', skim_peak_before_decline),
+                      ('skim_min_since_peak', skim_min_since_peak), ('skim_declining', skim_declining),
+                      ('skim_alert_sent_at', skim_alert_sent_at), ('skim_alert_80_sent', skim_alert_80_sent),
+                      ('skim_alert_100_sent', skim_alert_100_sent), ('skim_strategy_value', skim_strategy_value),
+                      ('skim_last_mark_time', skim_last_mark_time), ('skim_reserve_balance', skim_reserve_balance)):
+        if val is not _UNSET:
+            fields.append(f"{col}=?")
+            values.append(val)
+    if not fields:
+        return
+    with _conn() as c:
+        c.execute(f"UPDATE watch_list SET {', '.join(fields)} WHERE id=?", (*values, wl_id))
         c.commit()

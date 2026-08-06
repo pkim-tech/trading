@@ -842,6 +842,18 @@ def run_loop(tickers: set = None):
                     print(f"  [paper] daily-track nightly reconcile: {n} divergence(s) classified")
                 _guarded("reconcile_daily_track_nodes", _reconcile_daily_track)
 
+                # 2026-08-09: nightly reconcile for the drought/addon/skim
+                # overlay mechanisms -- same log-only, idempotent, pure-
+                # observation shape as reconcile_daily_track_nodes above (never
+                # mutates any real/paper state). Safe to duplicate on a restart
+                # after 16:05 -- overlay_reconciliation_log's own UNIQUE(wl_id,
+                # mechanism, mode, check_date) constraint (log_overlay_
+                # reconciliation uses INSERT OR REPLACE) makes a same-day
+                # rerun refresh that night's row with the latest result
+                # instead of duplicating it or letting an earlier transient
+                # failure permanently mask a later clean result.
+                _guarded("reconcile_overlay_nodes", paper_trading.reconcile_overlay_nodes)
+
             # Separate gate from eod_report_alerted above (pre-seeded, unlike
             # it -- see eod_slack_alerted's definition) since these two post
             # to Slack: a duplicate log print is harmless, a duplicate Slack
@@ -945,6 +957,35 @@ def run_loop(tickers: set = None):
                     pinned_bar_alerted.add(pkey)
                     _guarded("pinned_exit_arm", _scan_pinned_exit_arm, open_positions, sell_alerted, last_seen_bar)
                     if (ph, pm) in _PINNED_ENTRY_TIMES and _is_trading_day(today):
+                        # drought-overlay HANDOFF, run here too -- a paired Opus
+                        # review of the wiring diff (2026-08-09) found that
+                        # _scan_pinned_entry below is the PRIMARY real core-entry
+                        # path for every current drought candidate (all
+                        # entry_timing='open_check' + automation-enabled), and it
+                        # runs well before the in_window/in_open_check_window-gated
+                        # HANDOFF loop later in this same iteration -- so a core
+                        # signal firing at exactly 9:30/14:30 would see the drought
+                        # position still open (already_held via open_position_keys)
+                        # and skip, burning that bar's alert, with HANDOFF only
+                        # clearing the drought row a poll or more later. Placed here,
+                        # HANDOFF now precedes every real core-entry path, not just
+                        # the two _scan_buy_signals calls.
+                        for node in watchlist:
+                            if not node.get('drought_overlay_enabled'):
+                                continue
+                            # Match _scan_pinned_entry's own real scope exactly
+                            # (open_check + automation-enabled) -- an
+                            # independent review of this fix found the first
+                            # version had NO node filter at all, so it ran
+                            # HANDOFF for a close-timing or non-automation
+                            # drought node at 9:30/14:30 even though no core
+                            # scan for THAT node ever runs at those moments,
+                            # closing its position with nothing behind it.
+                            if not (node.get('entry_timing') == 'open_check'
+                                    and node['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS):
+                                continue
+                            _guarded(f"drought_handoff_pinned[{node['ticker']}]",
+                                     paper_trading.check_paper_drought_handoff, node)
                         # This is a second, independent BUY entry point that never
                         # routed through _in_window (which only gates the ambient
                         # POLL_SECS-cadence scan) -- it's plausibly the actual path
@@ -1133,6 +1174,49 @@ def run_loop(tickers: set = None):
 
             in_window = _in_buy_window(now)
             in_open_check_window = _in_window(now, _OPEN_CHECK_WINDOWS)
+
+            # 2026-08-09: drought-overlay HANDOFF -- MUST run BEFORE this poll's
+            # own core buy-signal scans below (paper_trading.
+            # check_paper_drought_handoff's own docstring states this ordering
+            # requirement explicitly; this is where it's actually enforced).
+            # Gated to the same real signal-check windows core's own entry scan
+            # uses -- compute_buy_signal itself has no window gating, so calling
+            # this unconditionally every poll could close a drought position on
+            # a signal that only transiently existed between real window checks
+            # (found by the independent Opus review during the paper-trading
+            # build, MEDIUM-9). Node-aware gate (only in_open_check_window for an
+            # open_check-timing node, matching which scan actually runs for it
+            # this poll) -- a paired review of the wiring itself found the
+            # original blanket `in_window or in_open_check_window` gate ran
+            # HANDOFF for a close-timing node during the 9:31-9:40/14:31-14:40
+            # open_check windows even though no core scan runs for that node
+            # then, closing a drought position with nothing behind it.
+            # open_position_keys is refreshed immediately after (not left stale)
+            # -- the same review found the scans below would otherwise still see
+            # a just-closed drought row as "already held" via the pre-handoff
+            # snapshot taken earlier in this iteration.
+            # Reuses _ambient_buy_scan_nodes' OWN real decision (not a
+            # re-derived approximation of it) for which nodes the ambient
+            # scan actually processes this exact poll -- an independent
+            # review found the first version's `in_window` branch above
+            # treated every node as eligible, missing that function's own
+            # :25-:29 pre-pinned exclusion for open_check+automation-enabled
+            # nodes. Reusing the real function directly means this can never
+            # drift from it the way a second hand-copied condition could.
+            ambient_eligible_ids = {n['id'] for n in _ambient_buy_scan_nodes(watchlist, now)} if in_window else set()
+            handoff_ran = False
+            for node in watchlist:
+                if not node.get('drought_overlay_enabled'):
+                    continue
+                node_in_window = ((in_window and node['id'] in ambient_eligible_ids)
+                                  or (in_open_check_window and node.get('entry_timing') == 'open_check'))
+                if node_in_window:
+                    _guarded(f"drought_handoff[{node['ticker']}]", paper_trading.check_paper_drought_handoff, node)
+                    handoff_ran = True
+            if handoff_ran:
+                open_position_keys = ({_pos_key(p) for p in get_open_positions()}
+                                       | {_pos_key(p) for p in get_open_positions(paper=True)})
+
             if in_open_check_window:
                 open_check_nodes = [n for n in watchlist if n.get('entry_timing') == 'open_check']
                 if open_check_nodes:
@@ -1147,6 +1231,23 @@ def run_loop(tickers: set = None):
             elif not in_open_check_window:
                 windows = " or ".join(f"{h0:02d}:{m0:02d}" for h0, m0, _, _ in _SIGNAL_WINDOWS)
                 summaries.append(f"outside signal window — next: {windows} ET")
+
+            # drought-overlay ENTRY -- MUST run AFTER the core buy-signal scans
+            # above (the opposite ordering from HANDOFF), so a core signal that
+            # fired THIS poll already has its own pending-buy/position created
+            # first; check_paper_drought_entry's own get_paper_pending_buy/
+            # get_open_position_by_wl_id check then correctly sees that and
+            # skips, letting core win ties rather than racing it. Same
+            # node-aware window gate as HANDOFF above, for the same reason --
+            # reuses the SAME ambient_eligible_ids computed before the
+            # HANDOFF loop (still valid, `now` hasn't changed this iteration).
+            for node in watchlist:
+                if not node.get('drought_overlay_enabled'):
+                    continue
+                node_in_window = ((in_window and node['id'] in ambient_eligible_ids)
+                                  or (in_open_check_window and node.get('entry_timing') == 'open_check'))
+                if node_in_window:
+                    _guarded(f"drought_entry[{node['ticker']}]", paper_trading.check_paper_drought_entry, node)
 
             if summaries:
                 print(f"[{now.strftime('%H:%M:%S')}] {' | '.join(summaries)}")

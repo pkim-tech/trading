@@ -1346,3 +1346,34 @@ were both established patterns that should have been applied automatically on th
 this design and instead needed direct prompting to catch -- the standalone doc exists so the *next*
 new mechanism doesn't repeat that gap. Check it first for anything future, this section stays as the
 concrete worked example.
+
+### Built 2026-08-09 -- drought overlay + margin add-on-at-arm executed through live daemon wiring; put-hedge and staged real-order testing still open
+
+Executed the staged checklist above end to end for drought overlay and margin add-on-at-arm (put-hedge
+explicitly excluded, user's call at session start) -- items 1 (schema), 3 (paper-trading, both live-track
+and daily-track), 3.5 (nightly reconcile), 4 (Accountability Grid), 5 (truth-table tests), and the daemon
+wiring itself. Item 2 (`fake_broker.py` options support) was never needed since dropping put-hedge means
+no new asset class is involved -- everything here is equity-only, using the existing paper-order
+machinery. Full detail, including the real bugs found (1 CRITICAL, 4 HIGH, several MEDIUM/LOW, across
+three paired Opus review rounds) and fixed: `docs/deep_backlog.md`'s 2026-08-09 entry.
+
+**One real schema decision reverses this section's original sketch**: margin add-on legs do NOT get a
+`position_source='addon_leg'` value on `open_positions`/`trade_log` as drafted above -- a cold Opus
+review found that would break `get_open_position`/`top_up_position`/`set_broker_stop_price`/
+`get_held_tickers`/`schwab_safety.check_order`'s double-buy guard (all assume at most one row per
+ticker/wl_id, which an add-on leg sharing its parent's wl_id would violate). Add-on legs live in their own
+dedicated `addon_legs`/`paper_addon_legs` tables instead, linked to their parent via `parent_trade_log_id`
+(a permanent `trade_log.id`, not `parent_position_id`, which is deleted when the parent closes).
+Drought-overlay is unaffected by this -- it genuinely does use `position_source='drought_overlay'` on the
+shared tables, safely, because `open_position()`'s existing wl_id-keyed dedup already makes core and
+drought mutually exclusive for one node (drought only ever opens while core is flat).
+
+**Real-money blast radius**: everything built is paper-only. No path from any new function reaches
+`schwab_client`/`schwab_safety`, and the real live DB (`trading_live.db`) was never migrated this
+session -- only copies. The schema lands automatically the next time anything calls `ensure_tables()`
+against it (the next daemon restart), and every new config flag defaults to 0/NULL, so this is a genuine
+no-op for the current real watchlist until a node is deliberately opted in.
+
+**Not built**: put-hedge (scope exclusion), staged real-order testing (needs organic real signals over
+time), the edge-case hardening pass this project's own history suggests will be needed once staged
+testing starts producing real data.

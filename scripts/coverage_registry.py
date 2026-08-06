@@ -470,6 +470,110 @@ REGISTRY = [
                "order-placement control flow, a write failure (disk full, a concurrent-write race) could "
                "have propagated up and aborted an otherwise-approved real order; fixed by wrapping the "
                "whole function body in the same fire-and-forget try/except contract as log_coverage_event."),
+
+    # -- 2026-08-09: drought overlay / margin add-on-at-arm / skim-and-reserve --
+    # PAPER-ONLY (docs/design.md's 2026-08-07 "Live automation design" section)
+    # -- check_paper_drought_entry/check_paper_drought_handoff are now wired
+    # into active_signals.py's live poll loop (a separate paired review of that
+    # wiring specifically, plus a final session-wrap review of the cumulative
+    # diff); check_paper_addon_trigger/check_paper_skim were already reachable
+    # via the pre-existing check_paper_sells call, no wiring needed. All real
+    # DB writes stay paper-scoped (paper_positions/paper_trade_log/
+    # addon_legs/paper_addon_legs/skim_reserve_log) -- every real row these log
+    # will carry mode='paper' (or 'dry_run' for an is_dry_run_sim position)
+    # since no schwab_client/schwab_safety call is reachable from any of these
+    # paths. drought_overlay_enabled/addon_enabled/skim_enabled default to 0
+    # for every real node today, so this is a no-op for the current production
+    # watchlist until a node is deliberately opted in. Every scenario below is
+    # offline-covered by tests/test_overlay_paper_trading.py, built the same
+    # session.
+    dict(id='drought_entry',
+         scenario="Drought-overlay entry fires exactly once per confirmed no-signal "
+                  "gap, gated by confirm_days and (if set) the intraday-vol gate",
+         code_path="paper_trading.check_paper_drought_entry",
+         offline_coverage="tests/test_overlay_paper_trading.py: "
+                           "test_drought_entry_fires_once_confirmed_then_never_reenters_same_gap, "
+                           "test_drought_vol_gate_excludes_unknown_reading",
+         check_mechanism='coverage_events', scenario_key='drought_entry',
+         bad_results=[],
+         notes="A paired Opus review (2026-08-09) found and fixed a HIGH-severity bug in the first "
+               "version: the once-per-gap guard was missing entirely, so a drought position stopping "
+               "out early re-entered on every subsequent poll for the rest of the same gap -- the "
+               "validated backtest (find_drought_windows) makes exactly one trade per gap. Fixed via "
+               "drought_gap_start-keyed dedup against paper_positions/paper_trade_log."),
+    dict(id='drought_handoff',
+         scenario="An open drought-overlay position closes the moment the node's own "
+                  "core z-score signal fires again",
+         code_path="paper_trading.check_paper_drought_handoff",
+         offline_coverage="tests/test_overlay_paper_trading.py: "
+                           "test_drought_handoff_closes_position_on_core_signal",
+         check_mechanism='coverage_events', scenario_key='drought_handoff',
+         bad_results=[],
+         notes="MUST run BEFORE the node's own core buy-signal scan in the same poll cycle (the "
+               "opposite ordering requirement from drought_entry, which must run AFTER). Wired into "
+               "active_signals.py's run_loop at all THREE real core-entry paths (the pinned-bar "
+               "loop's entry block, the open_check _scan_buy_signals call, the ambient "
+               "_scan_buy_signals call) -- an independent review of the wiring found the first "
+               "attempt missed the pinned-bar path entirely, since that's the primary real entry "
+               "mechanism for every current drought candidate."),
+    dict(id='addon_entry_fill',
+         scenario="Margin add-on-at-arm leg opens the moment a core position's "
+                  "trailing-sell arms, sized to match the core position's current shares",
+         code_path="paper_trading.check_paper_addon_trigger",
+         offline_coverage="tests/test_overlay_paper_trading.py: "
+                           "test_addon_trigger_opens_leg_matching_core_shares_and_dedupes, "
+                           "test_addon_never_triggers_on_a_drought_position",
+         check_mechanism='coverage_events', scenario_key='addon_entry_fill',
+         bad_results=[],
+         notes="Deliberately its own table (addon_legs/paper_addon_legs), never open_positions/"
+               "trade_log -- a cold Opus review found that sharing those tables would break "
+               "get_open_position/top_up_position/set_broker_stop_price/get_held_tickers/"
+               "check_order's double-buy guard, all of which assume at most one row per ticker/wl_id."),
+    dict(id='addon_exit_fill',
+         scenario="An open add-on leg closes in lockstep with its parent core position's "
+                  "own exit (SL/TRAIL/TIME), never independently",
+         code_path="paper_trading.close_paper_addon_leg_if_open",
+         offline_coverage="tests/test_overlay_paper_trading.py: "
+                           "test_addon_leg_closes_in_lockstep_with_parent_and_applies_margin_cost, "
+                           "test_close_paper_addon_leg_if_open_is_a_noop_with_no_leg",
+         check_mechanism='coverage_events', scenario_key='addon_exit_fill',
+         bad_results=[],
+         notes="Applies the validated MARGIN_COST_FLAT_PCT haircut (0.04pp) to the leg's pnl_pct -- "
+               "missing in the first version (found by review), which was 0.04pp optimistic on every "
+               "leg relative to scripts/stacked_model/add_on.py's validated model."),
+    dict(id='skim_fire',
+         scenario="Skim moves skim_frac of the currently-deployed strategy value into "
+                  "the reserve on a new equity high >= skim_step above the last skim reference",
+         code_path="paper_trading.check_paper_skim",
+         offline_coverage="tests/test_overlay_paper_trading.py: "
+                           "test_skim_fires_on_new_high_and_amount_shrinks_each_time, "
+                           "test_skim_never_fires_on_a_wiggle_at_the_peak, "
+                           "test_skim_reserve_pool_actually_gains_real_shares",
+         check_mechanism='coverage_events', scenario_key='skim_fire',
+         bad_results=[],
+         notes="A paired review found the first version's skim amount diverged from the validated "
+               "model (scripts/stacked_model/skim_reserve.py's manual_redeploy_overlay) in the "
+               "WRONG DIRECTION -- it recomputed off the full undiluted notional every time instead "
+               "of a shrinking fraction of the already-reduced deployed sleeve, so later skims grew "
+               "instead of shrinking. Fixed via a real skim_strategy_value/skim_reserve_balance dollar "
+               "ledger, marked to a real cached SPY price at every call (the reserve was never "
+               "actually modeled at all in the first version)."),
+    dict(id='skim_redeploy_alert',
+         scenario="Alert-only (never automated) notification when equity recovers past "
+                  "80% or 100% of its pre-decline peak, only if a real non-empty reserve exists",
+         code_path="paper_trading.check_paper_skim",
+         offline_coverage="tests/test_overlay_paper_trading.py: "
+                           "test_redeploy_alert_never_fires_against_an_empty_reserve, "
+                           "test_redeploy_alerts_fire_exactly_twice_across_a_real_decline_recovery_cycle",
+         check_mechanism='coverage_events', scenario_key='skim_redeploy_alert',
+         bad_results=[],
+         notes="A paired review found the first version dropped the reference's `w_spy > 0` guard "
+               "entirely -- differential testing against the reference over 500 random equity paths "
+               "showed this ONE missing guard explained 100% of the divergence (alerts firing against "
+               "a genuinely empty reserve). Fixed via an explicit skim_reserve_balance>0 check on both "
+               "the 80% and 100% branches. Carries forward the 2026-08-08 CRITICAL anti-wiggle fix "
+               "(a threshold may only fire on real recovery from a real decline, never a sub-decline "
+               "wiggle at a new high) unchanged."),
 ]
 
 

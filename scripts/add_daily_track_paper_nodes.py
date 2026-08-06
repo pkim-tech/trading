@@ -62,6 +62,43 @@ def main():
             entry_timing=node["entry_timing"], starting_notional=node["starting_notional"],
             fixed_sl_override=node["fixed_sl"], account=account, paper_role="daily_sync",
         )
+        # add_node()'s signature has no params for the 2026-08-09 drought/addon/
+        # skim overlay columns -- without this direct sync, a daily-track clone
+        # would silently be created WITHOUT its live-track sibling's overlay
+        # config, defeating the whole point of a config-identical pair (found
+        # while building task 6 of the overlay checklist; not yet a real gap
+        # today since no live-track node has any of these enabled, but it would
+        # have silently bitten the first node that ever does).
+        with db._conn() as c:
+            clone_row = c.execute(
+                "SELECT id FROM watch_list WHERE ticker=? AND paper_role='daily_sync' "
+                "AND watchlist_id=? ORDER BY id DESC LIMIT 1",
+                (node["ticker"], node["watchlist_id"])
+            ).fetchone()
+            if clone_row is None:
+                # add_node() silently no-op'd (e.g. a dedup match against an
+                # already-existing row) rather than raising -- found by
+                # review, 2026-08-09: the original unguarded fetchone()[0]
+                # would crash with a confusing TypeError here instead of a
+                # clear message.
+                print(f"  WARNING: no daily-track clone found for {node['ticker']} after add_node() -- "
+                      f"skipping overlay-config sync for it")
+                continue
+            clone_id = clone_row[0]
+            c.execute("""
+                UPDATE watch_list SET
+                    drought_overlay_enabled=?, drought_confirm_days=?, drought_vol_gate=?,
+                    drought_sl_pct_override=?, drought_arm_pct_override=?, drought_trail_pct_override=?,
+                    addon_enabled=?, skim_enabled=?, skim_step=?, skim_frac=?
+                WHERE id=?
+            """, (
+                node.get("drought_overlay_enabled", 0), node.get("drought_confirm_days"),
+                node.get("drought_vol_gate"), node.get("drought_sl_pct_override"),
+                node.get("drought_arm_pct_override"), node.get("drought_trail_pct_override"),
+                node.get("addon_enabled", 0), node.get("skim_enabled", 0),
+                node.get("skim_step"), node.get("skim_frac"), clone_id,
+            ))
+            c.commit()
         print(f"  cloned {node['ticker']} ({strategy[:20]}) -> daily-track (daily_sync)")
 
     print("\nDaily-track nodes now on watchlist:")

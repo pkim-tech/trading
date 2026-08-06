@@ -97,6 +97,52 @@ def check_daily_sync_halted_nodes():
     return violations
 
 
+_OVERLAY_CONFIG_COLS = (
+    'drought_overlay_enabled', 'drought_confirm_days', 'drought_vol_gate',
+    'drought_sl_pct_override', 'drought_arm_pct_override', 'drought_trail_pct_override',
+    'addon_enabled', 'skim_enabled', 'skim_step', 'skim_frac',
+)
+
+
+def check_daily_track_overlay_config_matches_live_track():
+    """A daily-track node (paper_role='daily_sync') and its live-track sibling
+    (same ticker/strategy/version/window/account/watchlist_id, paper_role IS
+    NULL) must carry IDENTICAL drought/addon/skim overlay config -- the whole
+    point of the pair is to isolate live-tick-vs-Close pricing as the only
+    variable under test (docs/design.md's 2026-08-07 "Live automation
+    design" section), which reconcile_overlay_nodes can't do if the two
+    sides are running genuinely different config.
+
+    add_daily_track_paper_nodes.py syncs these columns at clone time (fixed
+    2026-08-09 -- add_node's signature has no params for them at all, so a
+    clone would otherwise silently drop them), but nothing enforces they
+    STAY in sync if the live-track node's config changes afterward -- this
+    check exists for exactly that drift, same shape as
+    check_staged_config_matches_expected below."""
+    violations = []
+    nodes = db.get_watchlist()
+    daily_tracks = [n for n in nodes if n.get('paper_role') == 'daily_sync']
+    for dt in daily_tracks:
+        sibling = next((
+            n for n in nodes
+            if n.get('paper_role') is None and n['ticker'] == dt['ticker']
+            and n['strategy'] == dt['strategy'] and n['version'] == dt['version']
+            and n['window'] == dt['window'] and n.get('account') == dt.get('account')
+            and n['watchlist_id'] == dt['watchlist_id']
+        ), None)
+        if sibling is None:
+            continue
+        for col in _OVERLAY_CONFIG_COLS:
+            if dt.get(col) != sibling.get(col):
+                violations.append(
+                    f"{dt['ticker']} daily-track (wl_id={dt['id']}) {col}={dt.get(col)!r} != "
+                    f"live-track (wl_id={sibling['id']}) {col}={sibling.get(col)!r} -- "
+                    f"reconcile_overlay_nodes can't isolate price-source noise if the pair's "
+                    f"overlay config genuinely differs."
+                )
+    return violations
+
+
 def check_live_node_missing_account():
     """No mode='live' node should have account=None.
 
@@ -391,6 +437,7 @@ CHECKS = [
     check_live_trailing_exit_automation_scope,
     check_research_mode_ticker_with_open_position_in_automation_scope,
     check_daily_sync_halted_nodes,
+    check_daily_track_overlay_config_matches_live_track,
     check_live_node_missing_account,
     check_tax_advantaged_excluded_tickers,
     check_brokerage_not_live_with_unresolved_leverage_gap,
