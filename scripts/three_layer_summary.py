@@ -85,22 +85,36 @@ def best_v5_node(conn, ticker):
             (window, z, arm, trail_buy_pct, trail_sell_pct, max_hold_hours,
              ralpha, rreturn, trades, win_rate) = row
             r = CLIFF_RADIUS
+            # trail_buy_pct MUST be held fixed here, not left unfiltered -- a TrailingBoth
+            # neighbor search without this compares against wildly different trail_buy_pct
+            # configs instead of real neighbors of the candidate's own value (the same bug
+            # found+fixed 2026-08-07 in an ad hoc query and in top_safe_nodes.py; this
+            # function had it too and went unnoticed through several real lookups the same
+            # session, including a false "not safe" verdict on UCO -- see
+            # docs/cliff_safety_query_checklist.md).
             worst = conn.execute(f"""
                 SELECT MIN({ROBUST_ALPHA_SQL}) FROM backtest_cache
                 WHERE version='v5' AND ticker=? AND strategy=? AND entry_timing=? AND stop_loss=?
-                  AND window=? AND z_score_threshold=?
+                  AND window=? AND z_score_threshold=? AND trail_buy_pct IS ?
                   AND {arm_col} BETWEEN ? AND ? AND trail_sell_pct BETWEEN ? AND ?
                   AND max_hold_hours BETWEEN ? AND ? AND trades>0
-            """, (ticker, strategy, ENTRY_TIMING, fixed_sl, window, z,
+            """, (ticker, strategy, ENTRY_TIMING, fixed_sl, window, z, trail_buy_pct,
                   arm - r, arm + r, trail_sell_pct - r, trail_sell_pct + r,
                   max_hold_hours - 7, max_hold_hours + 7)).fetchone()[0]
-            worst_neighbor = float(worst) if worst is not None else 0.0
+            # An empty neighbor set (MIN() over zero rows) is SQL NULL/Python None --
+            # this must NOT read as "safe" (0.0 >= 0 was true before this fix). The
+            # whole point of a cliff-safety check is that a wrong "safe" verdict is
+            # expensive (docs/cliff_safety_query_checklist.md) -- no-neighbor-coverage
+            # is exactly the case where the check has said nothing at all, not the case
+            # where it's vouched for the config. Kept explicit rather than relying on
+            # this query never actually returning an empty set today.
+            worst_neighbor = float(worst) if worst is not None else float("nan")
             candidates.append({
                 "ticker": ticker, "strategy": strategy, "window": window, "z": z,
                 "arm_pct": arm, "fixed_sl": fixed_sl, "trail_buy_pct": trail_buy_pct,
                 "trail_sell_pct": trail_sell_pct, "max_hold_hours": max_hold_hours,
                 "entry_timing": ENTRY_TIMING, "ralpha": ralpha, "rreturn": rreturn,
-                "worst_neighbor": worst_neighbor, "safe": worst_neighbor >= 0,
+                "worst_neighbor": worst_neighbor, "safe": worst is not None and worst_neighbor >= 0,
                 "trades": trades, "win_rate": win_rate,
             })
     if not candidates:

@@ -24,6 +24,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import active_signals as a
 import signals_db as db
+from scripts.export_trades import load_hourly
+from scripts.drought_overlay_sweep import get_ivol_series, _entry_vol_pctile
+
+_SMA_CACHE = {}
+_IVOL_CACHE = {}
+
+
+def _sma50(ticker):
+    """Daily-close 50-day SMA, cached per run -- informational only (added
+    2026-08-07, per the KORU upswing-watch idea: no alert/gate logic here,
+    just surfacing the number so a real trend-continuation check can be
+    manually judged at a glance)."""
+    if ticker not in _SMA_CACHE:
+        try:
+            daily = load_hourly(ticker)['Close'].resample('D').last().dropna()
+            _SMA_CACHE[ticker] = daily.rolling(50).mean().iloc[-1] if len(daily) >= 50 else None
+        except Exception:
+            _SMA_CACHE[ticker] = None
+    return _SMA_CACHE[ticker]
+
+
+def _current_vol_pctile(ticker):
+    """Latest intraday-vol percentile reading against the ticker's own full
+    history (same measure validated throughout the 2026-08-07 drought-overlay
+    work) -- informational only, completes the KORU upswing-watch idea's
+    second condition (SMA50 above = trend, this = calm) alongside it."""
+    if ticker not in _IVOL_CACHE:
+        try:
+            ivol = get_ivol_series(ticker)
+            _IVOL_CACHE[ticker] = _entry_vol_pctile(ivol.index[-1], ivol)
+        except Exception:
+            _IVOL_CACHE[ticker] = None
+    return _IVOL_CACHE[ticker]
 
 _LIVE_WINDOWS = [((10, 25), (10, 40)), ((15, 25), (15, 40))]
 
@@ -76,16 +109,22 @@ def print_status(watchlist_id=None):
         # account/mode, no way to tell them apart (found by paired Opus review,
         # 2026-08-05). id disambiguates unambiguously; role gives a human-readable tag.
         role = n.get('paper_role') or '-'
+        sma50 = _sma50(n['ticker'])
+        above_sma = (cur >= sma50) if sma50 is not None else None
+        vol_pctile = _current_vol_pctile(n['ticker'])
         rows.append((n['id'], n['ticker'], role, phase, trigger, cur, pct,
-                     n.get('trail_buy_pct'), n.get('account'), n.get('mode')))
+                     n.get('trail_buy_pct'), n.get('account'), n.get('mode'), sma50, above_sma, vol_pctile))
     rows.sort(key=lambda r: r[6])
 
     print(f"watchlist_id={watchlist_id}\n")
     print(f"{'Id':>5} {'Ticker':<6} {'Role':<11} {'Phase':>16} {'Trigger':>10} {'Current':>10} {'%':>8} "
-          f"{'TrailBuy%':>10} {'Account':>10} {'Mode':>10}")
-    for wl_id, t, role, phase, trig, cur, pct, tb, acc, mode in rows:
+          f"{'TrailBuy%':>10} {'Account':>10} {'Mode':>10} {'SMA50':>10} {'>SMA50':>7} {'VolPctl':>8}")
+    for wl_id, t, role, phase, trig, cur, pct, tb, acc, mode, sma50, above_sma, vol_pctile in rows:
+        sma50_s = f"{sma50:.2f}" if sma50 is not None else "n/a"
+        above_s = "" if above_sma is None else ("yes" if above_sma else "no")
+        vol_s = f"{vol_pctile:.2f}" if vol_pctile is not None else "n/a"
         print(f"{wl_id:>5} {t:<6} {role:<11} {phase:>16} {trig:>10.2f} {cur:>10.2f} {pct:>7.2f}% "
-              f"{str(tb):>10} {str(acc):>10} {str(mode):>10}")
+              f"{str(tb):>10} {str(acc):>10} {str(mode):>10} {sma50_s:>10} {above_s:>7} {vol_s:>8}")
 
 
 def print_history(ticker, num_bars=7, watchlist_id=None):

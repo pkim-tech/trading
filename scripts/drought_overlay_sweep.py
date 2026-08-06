@@ -71,7 +71,11 @@ BIG6_CLIFF_RADIUS = 2
 SL_GRID = [1, 2, 3, 5, 7, 10, 15, 18]
 ARM_GRID = [5, 10, 15, 20, 30, 40]
 TRAIL_GRID = [1, 2, 3, 5, 7, 10, 15]
-CONFIRM_DAYS_GRID = [5, 10, 15, 20]
+CONFIRM_DAYS_GRID = list(range(1, 21))  # widened 2026-08-08 from [5,10,15,20] -- that
+# coarse grid silently couldn't find confirm_days=3 at all (the value
+# drought_candidate_scan_18.py's original 1-15 dense scan found for SOXL), narrowing
+# what drought_out_of_sample_check.py could even consider once it was refactored to
+# reuse this shared grid instead of its own.
 
 
 ROBUST_ALPHA_SQL = (
@@ -289,10 +293,17 @@ def cliff_safety(pooled, key):
     return min(neighbor_comps), len(neighbor_comps)
 
 
-def cliff_safety_5axis(cells, key):
+def cliff_safety_5axis(cells, key, min_n=1):
     """Same grid-neighbor convention as cliff_safety(), extended to the 5-axis
     (confirm_days, vol_gate, sl, arm, trail) per-ticker cell space -- checked against
-    that ONE ticker's own cells dict, not a cross-ticker pooled one."""
+    that ONE ticker's own cells dict, not a cross-ticker pooled one.
+
+    min_n: a neighbor cell must have at least this many observations to count (default
+    1 -- any non-empty cell, the original behavior, unchanged for existing callers).
+    Found 2026-08-08: drought_out_of_sample_check.py excludes thin cells (< MIN_TRADES)
+    from being SELECTED but was still letting them serve as someone else's NEIGHBOR --
+    a single-window neighbor cell could single-handedly crown a candidate "safest" on
+    the strength of one data point. Pass min_n=MIN_TRADES there to close that."""
     cd, vg, sl, arm, trail = key
     grids = {0: CONFIRM_DAYS_GRID, 1: VOL_GATE_GRID, 2: SL_GRID, 3: ARM_GRID, 4: TRAIL_GRID}
     neighbor_comps = []
@@ -305,7 +316,7 @@ def cliff_safety_5axis(cells, key):
             n_key = list(key)
             n_key[axis] = grid[n_idx]
             n_key = tuple(n_key)
-            if n_key in cells and cells[n_key]:
+            if n_key in cells and len(cells[n_key]) >= min_n:
                 neighbor_comps.append(_compounded(cells[n_key]))
     if not neighbor_comps:
         return float("nan"), 0

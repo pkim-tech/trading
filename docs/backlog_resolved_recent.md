@@ -7,6 +7,12 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [backtest] Resolved 2026-08-08 — paired Opus review of the v5-stacked framework found 1 CRITICAL + 3 HIGH + several MEDIUM/LOW real bugs, all fixed; add-on math, skim-redeploy trigger, put-hedge liquidity/pricing, and drought's wrong-default-config bug corrected
+Full detail: `docs/research_log.md`'s 2026-08-08 entry / `docs/deep_backlog.md`'s 2026-08-08 entry (top). Most consequential: SOXL's `core+drought` was silently using an unvalidated default config, corrected 1587.0%→3461.5%; add-on's compounding math was inflating AGQ's number ~1.43x, now exact.
+
+## [backtest] Resolved 2026-08-07 (late) — two more real instances of the trail_buy_pct cliff-safety bug found and fixed in `three_layer_summary.py`/`top_safe_nodes.py`
+Full detail: `docs/deep_backlog.md`'s 2026-08-07 (late) entry. `top_safe_nodes.py`'s fix was later found incomplete (missing `entry_timing`) and closed the next session — see the 2026-08-08 entry above.
+
 ## [live-trading][security] Resolved 2026-08-05 (session-wrap review) — paired Opus review of the get_real_position_state/mode-scoped-guard diff found 8 real issues (1 HIGH crash bug, rest MEDIUM/LOW), all fixed
 Most serious: `watchlist_status.py` would crash (`KeyError: 'node'`) on any paper pending buy (`get_paper_pending_buy` never parsed `node_json`); `set_node_mode` had no tax-advantaged guard, reopening the K-1/UBTI gap the earlier mode-scoping was meant to close safely; AGQ's daily-track node had its `account` wrongly stripped, contradicting the user's explicit instruction. Full detail: `docs/deep_backlog.md`'s 2026-08-05 (session-wrap review) entry (top). Full suite: 539 passed; live_sim_harness: 7/7.
 
@@ -95,18 +101,3 @@ Resolved by the 2026-07-25 mode-flip back to `research`; verified 2026-08-01 (32
 
 ## [live-trading] Resolved 2026-08-01 (evening) — SL Slack alert falls back to a generic "should have auto-filled" guess; split into known/automation-pending/dry-run/manual code paths
 Full detail: `docs/deep_backlog.md`'s 2026-08-01 (evening) entry. Opus review of v1 caught 2 real bugs (dry-run false-alarm, a write-suppression gap), both fixed before commit. Full suite: 473 passed.
-
-## [live-trading] Resolved 2026-07-26, confirmed stale 2026-08-01 — Morning Report block-limit failure regressed (23 nodes now)
-Resolved via real chunking (`_post_chunked`), not the ticker-trim originally called for — confirmed present in code.
-
-## [live-trading][security] Resolved 2026-07-31 (session wrap) — a 3rd independent review of the complete production diff found 3 more real issues before commit, all fixed
-Full detail: `docs/deep_backlog.md`'s same-day entry (top).
-
-## [live-trading][security] Resolved 2026-07-31 — full exit/arm/entry execution-path audit (9 bugs) + same-day follow-up pass (8 more) + a same-day independent review of that follow-up (8 more, 1 real-money)
-Full detail: `docs/deep_backlog.md`'s three 2026-07-31 entries (top).
-
-## [live-trading][docs] Resolved 2026-07-31 — `enable_node_auto_fill_detection(node_id)`'s docstring corrected. Full detail: `docs/deep_backlog.md`'s 2026-07-30 (evening) entry.
-
-## [live-trading][security] Resolved 2026-07-29 — all 3 deferred design items from 2026-07-28 (night) now built: `tests/fake_broker.py`, `schwab_safety._log_pre_action_state_verification` (detection-only), `schwab_safety.record_node_streak` (monitor-only)
-Full detail: `docs/deep_backlog.md`'s 2026-07-29 entries (top two).
-

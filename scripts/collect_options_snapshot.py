@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.drought_detection_test import load_nodes
 
 DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "research" / "trading_universe.db"
-DEFAULT_TICKERS = ["AGQ", "DPST", "GDXU", "HIBL", "KORU", "NUGT", "SOXL", "UDOW", "USD", "YANG"]
+DEFAULT_TICKERS = ["AGQ", "DPST", "GDXU", "HIBL", "KORU", "NUGT", "SOXL", "UDOW", "USD", "YANG", "USO"]
 
 
 def ensure_table(conn):

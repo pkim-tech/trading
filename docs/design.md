@@ -1114,3 +1114,235 @@ found live when AGQ's daily-track clone (paper-only, zero real capital) was bloc
 entire purpose is preventing real tax exposure. User's explicit call: "override agq into the IRA
 account - we won't put it to live testing there this is paper trade only" — fix the guard itself to
 be mode-aware, not route around it per-script.
+
+## Live automation design: drought overlay, margin add-on-at-arm, put-hedge (2026-08-07, design only, not built)
+
+**Context**: the 2026-08-07 v5-stacked research session (see `docs/research_log.md`'s entry of the
+same date) validated three overlay mechanisms as real, backtested edges worth eventually running with
+real capital: the drought overlay (buy the underlying during a confirmed low-vol no-signal gap,
+manage with the core strategy's own SL/arm/trail state machine), margin add-on-at-arm (borrow 100% of
+the current position's size when a core position arms, doubling exposure), and put-hedge (a
+protective put purchased alongside any of the above, sized to the position, rolled/exited with it).
+This section is the architecture and staged rollout plan for turning those into real, generic,
+parameterized `watch_list` features — not yet implemented.
+
+**Explicit correction from the framing session had drifted into**: these are NOT ticker-specific
+code paths. Exactly like every other strategy parameter in this system (`fixed_sl`, `arm_pct`,
+`trail_sell_pct`, etc.), drought/add-on/put-hedge are config toggles + parameters on a `watch_list`
+node — any ticker's node can turn any of them on with its own parameter values. The backtest
+research happened to validate specific (ticker, parameter) combinations first (SOXL drought
+confirm_days=3/vol_gate=0.4, AGQ add-on), but the feature itself must be built generically, the same
+way the rest of this project already works.
+
+### Paper/live-vs-backtest reconciliation (real gap, found 2026-08-07 during design review -- missing from the first draft of this section)
+
+**The question that exposed the gap**: the backtest validated these mechanisms against a FIXED
+historical window (2023-2026). Live/paper execution runs forward on NEW data the backtest never
+saw, using real-time-computed inputs (vol_pctile against an accumulating history, confirm_days
+counted against live signal gaps) that will diverge from the specific historical instances already
+tested. Nothing in the first draft of this design said how anyone would know whether live execution
+was actually doing what the backtest said it would.
+
+**Answer: reuse the existing daily-track pattern, don't invent a new one.** Core strategy already
+solved this exact problem (`paper_trading.reconcile_daily_track_nodes`, `docs/design.md`'s 2026-08-05
+"Two-track paper trading" sections) -- a nightly job replays the real backtest kernel against
+whatever data actually happened that day, compares against what live/paper's real state machine
+actually did, classifies the divergence (`entry_miss_explained`/`unexplained`,
+`exit_bar_mismatch`, etc.), and writes one diagnostic row per node per night. Deliberately
+**pure observation** -- never auto-corrects, never auto-halts, per the same reasoning that applied to
+core: auto-resyncing erases exactly the signal this comparison exists to produce.
+
+The real, useful fact for these three new mechanisms: **the backtest kernel to replay against
+already exists**, built the same session this design doc's own gap was found in --
+`scripts/stacked_model/drought.py::generate_drought_trades`,
+`scripts/stacked_model/add_on.py::generate_addon_trades`, and
+`scripts/stacked_model/put_hedge.py::apply_hedge` ARE the equivalent of `_simulate_trail_both` for
+these mechanisms. A `reconcile_overlay_nodes` job (new, mirrors `reconcile_daily_track_nodes`'s
+shape) would: for each node with `drought_overlay_enabled`/`addon_enabled`/`put_hedge_enabled` set,
+call the matching backtest function against real data through today, compare its implied
+entry/exit/P&L to what the live/paper position rows actually recorded, log one diagnostic row/night.
+This is now explicitly item 3.5 in the staged pre-work checklist below -- it has to exist before any
+staged real-order testing (item 6), the same way daily-track reconciliation was built before trusting
+core's own live-vs-backtest parity.
+
+**Second real gap, caught in the same design-review conversation**: the daily-track/live-track split
+itself needs to exist for these three mechanisms too, not just the reconciliation job -- same reason
+it was originally built for core (`docs/design.md`'s 2026-08-05 "Two-track paper trading" sections):
+the backtest kernel prices everything off the last closed hourly bar's Close, but real (live-tick)
+execution prices will genuinely differ, and without a daily-track variant the reconciliation job
+above can't tell "the overlay logic is actually wrong" apart from "this is just normal price-source
+noise between a discrete backtest assumption and continuous live pricing." **Scoped to paper trading,
+same as core's existing daily-track nodes** (`paper_role='daily_sync'`) -- not a real-capital
+concept, a validation-fidelity tool that runs before real capital is ever involved. Concretely: each
+of the three mechanisms' paper-trading nodes (item 3 below) needs its own daily-track clone
+(`paper_role='daily_sync'`, prices off last-closed-hourly-bar Close, exactly mirroring
+`compute_buy_signal`'s existing `daily_sync` branch) alongside a normal live-tick-priced paper node --
+`reconcile_overlay_nodes` then reconciles the DAILY-TRACK node against the backtest kernel (clean,
+no price-source confound -- proves the logic), while a live-track-vs-daily-track comparison
+separately quantifies how much live-tick pricing costs/differs from the idealized assumption (an
+execution-quality question, not a correctness one). Folded into item 3's scope below, not a separate
+checklist item -- the paper-trading extension was always going to need this shape, it just wasn't
+stated explicitly until now.
+
+### Parameterization model (proposed, not yet schema-migrated)
+
+New `watch_list` columns (or a linked per-node config table, TBD at implementation time):
+- `drought_overlay_enabled` (bool), `drought_confirm_days` (int), `drought_vol_gate` (float, nullable
+  = no gate) -- mirrors `scripts/stacked_model/drought.py`'s `generate_drought_trades` signature
+  directly, so the backtest and live code paths share the same parameter names.
+- `addon_enabled` (bool) -- no separate parameters; add-on always borrows 100% of the current
+  position's size at the moment core's own trailing-arm condition fires (per the real math validated
+  2026-08-07: this sizing rule is what makes the backtest's multiplicative accounting exact rather
+  than an approximation -- a different sizing rule would need new backtest work first, not just a
+  new live parameter).
+- `put_hedge_enabled` (bool), `put_hedge_otm_pct` (float) -- applies to whichever of core/drought/
+  add-on legs are open at the time, each leg gets its OWN put (per the 2026-08-07 corrected
+  reasoning: add-on is a separate share block, needs its own hedge, not a shared one with core).
+
+### Real execution mechanics needed (not yet built, real gaps to close)
+
+**Proposed schema** (extends `open_positions` with a discriminator + linkage, adds one new table for
+options -- a genuinely different asset class, not a variant of an equity position):
+
+```sql
+-- open_positions gains:
+ALTER TABLE open_positions ADD COLUMN position_source TEXT DEFAULT 'core';
+  -- 'core' | 'drought_overlay' | 'addon_leg'
+ALTER TABLE open_positions ADD COLUMN parent_position_id INTEGER;
+  -- addon_leg rows point to the core position.id they're attached to; NULL for core/drought_overlay
+ALTER TABLE open_positions ADD COLUMN drought_confirm_days INTEGER;
+ALTER TABLE open_positions ADD COLUMN drought_vol_gate REAL;
+  -- both NULL except for position_source='drought_overlay' rows -- records what config produced
+  -- this entry, same reasoning as staged_test_config's baseline-drift protection
+
+-- new table, options are not equity shares:
+CREATE TABLE option_positions (
+    id INTEGER PRIMARY KEY,
+    wl_id INTEGER NOT NULL,
+    linked_position_id INTEGER NOT NULL REFERENCES open_positions(id),
+    ticker TEXT, strike REAL, expiration TEXT, contract_type TEXT DEFAULT 'put', quantity INTEGER,
+    entry_price REAL, entry_time TEXT,
+    status TEXT DEFAULT 'open',  -- 'open' | 'rolled' | 'closed'
+    exit_price REAL, exit_time TEXT,
+    roll_from_id INTEGER REFERENCES option_positions(id)  -- NULL unless this is a post-roll contract
+);
+```
+
+**State machines** (each mechanism's real transitions, not yet coded):
+
+1. **Drought overlay**: `WATCHING` (node's core position is flat, no signal recently) →
+   `CONFIRMING` (tracking elapsed no-signal days against `drought_confirm_days`, mirrors
+   `find_drought_windows`'s real logic) → `VOL_CHECK` (once confirmed, evaluate `drought_vol_gate`
+   against the live vol_pctile reading, same `_entry_vol_pctile` function the backtest already uses)
+   → `ENTERED` (real buy placed, `position_source='drought_overlay'` row created) → `ARMED` (price
+   crossed the node's own `arm_pct`, same mechanic as core) → `EXITED` via SL/TRAIL (identical to
+   core's own exit checks) OR **HANDOFF** (core's own real signal fires while this position is still
+   open -- the one genuinely new cross-position dependency: the drought-overlay poll must check the
+   SAME node's core signal state every cycle, not just its own SL/TRAIL levels).
+2. **Add-on**: `WATCHING` (linked core position open, not yet armed) → `TRIGGERED` (core's
+   `trail_state['trailing']` flips True -- the exact same event `notify_trailing_activated` already
+   detects for core's own arm notification, so add-on hooks the same real event, doesn't invent a new
+   detection path) → `BORROW_BUY` (place a real margin buy for 100% of the core position's current
+   market value -- `shares = floor(core_position.shares * core_position.current_price /
+   addon_entry_price)`, real order) → `LINKED` (`addon_leg` row's `parent_position_id` set) →
+   `EXITED` (fires on the SAME trigger as the parent core position -- SL/TRAIL/TIME -- both rows close
+   in the same real transaction, never independently).
+3. **Put-hedge**: on any qualifying equity position's real OPEN event (core entry, drought_overlay
+   entry, addon_leg creation) → if `put_hedge_enabled`: `BUY_TO_OPEN` (strike = entry_price *
+   (1 - put_hedge_otm_pct/100), nearest real expiration >= some minimum days-to-cover, mirrors
+   `get_roll_contract`'s real selection logic) → `HOLDING` (poll days-to-expiration) → if under a roll
+   threshold AND the linked equity position is still open: `ROLL` (sell current contract, buy a fresh
+   one, `roll_from_id` links them) → on the linked equity position's real CLOSE event: `SELL_TO_CLOSE`
+   (realize final hedge P&L). Real ordering question not yet resolved: does the put close BEFORE or
+   AFTER the linked equity sells, to avoid a moment of either unhedged exposure or double-selling risk
+   -- needs a real decision at implementation time, not assumed either way here.
+
+**New functions needed** (proposed names, matching this project's existing `signals_db.py`/
+`signals_notify.py`/`schwab_client.py` conventions -- not yet written):
+- `signals_db.open_drought_overlay_position(wl_id, entry_price, confirm_days, vol_gate, ...)`
+- `signals_notify.check_drought_overlay_entry(node)` -- called from the same poll loop as core's own
+  signal check, per-node
+- `signals_notify.check_drought_overlay_exit(position)` -- SL/TRAIL/HANDOFF, HANDOFF specifically
+  needs to read the SAME node's core signal state
+- `signals_db.open_addon_leg(parent_position_id, borrow_shares, entry_price)`
+- `signals_notify.check_addon_trigger(position)` -- hooked onto the same event
+  `notify_trailing_activated` already fires on
+- `schwab_client.place_option_buy_to_open(account, ticker, strike, expiration, quantity)` -- entirely
+  new, no options order-placement exists in this codebase today
+- `schwab_client.place_option_sell_to_close(account, option_position_id)`
+- `signals_notify.check_put_hedge_roll(option_position)`
+
+**Truth-table dimensions to enumerate** (item 5 below) -- the real combinatorial surface, not yet
+spot-checked let alone exhaustively covered:
+- core state: `{flat, open, armed}`
+- drought_overlay state per node: `{n/a (core not flat), watching, confirming, entered, armed,
+  exited}` -- by construction drought should never be `entered` while core is `open`/`armed`
+  simultaneously on the same node, but that's an assumption needing an explicit guard + test, not
+  just a comment
+- addon_leg state: `{none, open}` -- only reachable when core state is `armed`
+- put_hedge state, independently per linked position (core/drought_overlay/addon_leg can each carry
+  their own put): `{none, open, rolling, closed}`
+Real edge cases the enumeration needs to specifically resolve: a core position's real entry signal
+firing on the exact same poll cycle a drought-overlay HANDOFF check would also fire (which wins, and
+does the drought-overlay's sell need to complete before core's own buy is allowed to place, given the
+same-ticker double-buy guard already in `check_order`); a put-hedge roll needing to happen on the
+exact same bar its linked equity position exits; an addon_leg's SL trigger vs. its parent core
+position's own SL trigger firing on the same bar (should be identical by construction since they
+share the same exit rule, but needs a real test proving they never desync).
+
+### Staged pre-work checklist, in order (per the user's own explicit list, 2026-08-07)
+
+This project's own established convention (see `docs/design.md`'s "Test Fixtures & Coverage-Proof
+Techniques" table) is that live-capital-touching changes go through several DISTINCT, deliberately
+non-unified proof layers before real money is at risk. For a change this size (three new mechanisms,
+one entirely new asset class), all of the following are real prerequisites, not optional polish:
+
+1. **Design the real DB schema** for drought-overlay positions, add-on legs, and option-contract
+   tracking (extends the bullet points above into an actual migration) -- do this FIRST, since
+   everything else builds on top of real tables existing.
+2. **`tests/fake_broker.py` extension**: add options order-placement support (buy-to-open puts,
+   contract expiration/exercise/assignment simulation) -- currently equity-orders-only. A real,
+   nontrivial extension, not a small add.
+3. **Paper-trading extension**: `paper_trading.py` needs to simulate all three new mechanisms using
+   the SAME state machine real code will use, so paper-trading coverage exists BEFORE live orders do
+   (matches this project's standing practice of paper-testing every mechanism before it goes live).
+   **Each mechanism needs BOTH a live-track (live-tick priced) and daily-track
+   (`paper_role='daily_sync'`, last-closed-hourly-bar-Close priced) paper node**, same reason and same
+   shape as core's existing daily-track split -- without it, item 3.5's reconciliation can't separate
+   genuine logic bugs from ordinary price-source noise.
+3.5. **Paper/live-vs-backtest reconciliation** (found missing from the first draft of this design,
+   see the section above) -- a `reconcile_overlay_nodes` nightly job, mirroring
+   `paper_trading.reconcile_daily_track_nodes`'s pure-observation pattern exactly, replaying
+   `drought.py`/`add_on.py`/`put_hedge.py`'s real backtest functions against each day's actual data
+   and comparing to what live/paper actually recorded. Must exist before item 6 (staged real-order
+   testing), the same way core's own daily-track reconciliation was built and trusted before any of
+   core's live-vs-backtest parity claims were.
+4. **Trade-Flow Accountability Grid** (`scripts/coverage_registry.py`): new scenario rows for every
+   new control point (drought entry placement, drought HANDOFF exit, add-on trigger detection, add-on
+   order placement, put purchase, put roll, put exercise/sale) -- the grid can't answer "is this
+   proven live" for a mechanism it doesn't know exists yet.
+5. **Truth-table permutation coverage**: the real state-space here is genuinely bigger than anything
+   this system has modeled before -- core+drought+add-on+put-hedge can all be simultaneously "on" for
+   one node, and their real-world interactions (core arms while a drought-overlay position is also
+   open on the same ticker? a put-hedge contract expires mid-hold on any of the three position types?)
+   need explicit enumeration, not just spot-checking. This is exactly the kind of combinatorial
+   surface the existing truth-table testing technique exists for.
+6. **Staged real-order live testing**, matching the existing "Staged real-order test protocol"
+   pattern already used for `post_fill_topup`/`market_buy_placement` (small real notional, organic
+   real signals, no forced/faked triggers) -- applied fresh to each of the three new order types
+   (drought entry, add-on entry, put purchase), one at a time.
+7. **Edge-cases-on-edge-cases hardening pass**: this project's own history (the 2026-07-31
+   exit/arm/entry audit found 9 real bugs, a same-day follow-up found 8 more, an independent review of
+   THAT found 8 more) strongly suggests a dedicated audit pass will be needed once the above is built
+   and staged-tested, not a one-and-done implementation.
+
+**Not started this session** -- this is the plan to pick up fresh in a future session, given the real
+size of the undertaking (a new asset class, three new position-tracking concepts, and the full
+multi-layer proof process this project requires before real capital is at risk).
+
+**This 8-item staged checklist was extracted into a standalone, reusable document**,
+`docs/new_mechanism_promotion_standard.md`, since items 3.5 and the daily-track-split part of item 3
+were both established patterns that should have been applied automatically on the first draft of
+this design and instead needed direct prompting to catch -- the standalone doc exists so the *next*
+new mechanism doesn't repeat that gap. Check it first for anything future, this section stays as the
+concrete worked example.
