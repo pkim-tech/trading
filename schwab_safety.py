@@ -704,7 +704,8 @@ def _has_open_buy_order_in_account(orders: list, ticker: str) -> str | None:
     return None
 
 
-def _has_open_sell_order(orders: list, ticker: str, exclude_order_id: int | None = None) -> bool:
+def _has_open_sell_order(orders: list, ticker: str, exclude_order_id: int | None = None,
+                          exclude_order_ids=None) -> bool:
     """True if any resting SELL order for this exact ticker already exists.
     Unlike _has_open_order (any side blocks a second BUY), this only matches
     same-side (SELL) orders -- an unrelated resting BUY for this ticker must
@@ -712,12 +713,45 @@ def _has_open_sell_order(orders: list, ticker: str, exclude_order_id: int | None
     elsewhere (same-day-block, notional-cap exemption) for SELL.
     exclude_order_id -- see _has_open_order's docstring; same rationale,
     for the SELL-side replace calls (_attempt_automated_exit_sell's SL/TIME
-    exit, _attempt_automated_sell's TRAIL arm)."""
+    exit, _attempt_automated_sell's TRAIL arm).
+    exclude_order_ids -- additional ids to exclude (D3, docs/plans/
+    real_order_execution_drought_addon.md): a margin add-on leg's own
+    resting protective stop is a SECOND real, wanted SELL order for the same
+    ticker -- without excluding it here, the PARENT core position's own
+    ordinary exit placement (TRAIL arm, TP/SL/TIME replace) would see the
+    leg's stop as a duplicate and refuse to place/replace its own order,
+    even though is_addon_leg is False for that call (found by cold Opus
+    review before this shipped -- the original is_addon_leg exemption only
+    covered the leg's OWN placement, not the parent's, leaving the parent
+    permanently exit-blocked once a leg's stop existed)."""
+    exclude = set(exclude_order_ids or ())
+    if exclude_order_id is not None:
+        exclude.add(exclude_order_id)
+    for o in orders:
+        if o.get("orderId") in exclude:
+            continue
+        for leg in o.get("orderLegCollection", []):
+            if leg.get("instruction") == "SELL" and leg.get("instrument", {}).get("symbol") == ticker:
+                return True
+    return False
+
+
+def _has_open_buy_order_for_ticker(orders: list, ticker: str, exclude_order_id: int | None = None) -> bool:
+    """Same-side (BUY) mirror of _has_open_sell_order, for the add-on leg's
+    is_addon_leg exemption (docs/plans/real_order_execution_drought_addon.md
+    3.1 Exemption B). _has_open_order (any side) can't be used for add-on: at
+    the exact moment an add-on triggers, the just-armed parent core position
+    ALWAYS has a resting protective SELL at the broker (its sl_order_id STOP
+    or the arm-time TRAILING_STOP SELL _attempt_automated_sell just placed) --
+    _has_open_order would block the add-on BUY 100% of the time, by
+    construction, not hypothetically. This narrower check preserves the full
+    2026-07-24 double-buy protection (two resting BUYs for the same ticker)
+    while not self-blocking on the parent's own unrelated SELL leg."""
     for o in orders:
         if exclude_order_id is not None and o.get("orderId") == exclude_order_id:
             continue
         for leg in o.get("orderLegCollection", []):
-            if leg.get("instruction") == "SELL" and leg.get("instrument", {}).get("symbol") == ticker:
+            if leg.get("instruction") == "BUY" and leg.get("instrument", {}).get("symbol") == ticker:
                 return True
     return False
 
@@ -744,9 +778,20 @@ def _broker_confirms_order(orders: list, ticker: str, side: str, quantity: int) 
     return False
 
 
+# D2: an add-on leg is sized at 100% of an already-deployed core position --
+# by construction it's borrowing, so the ordinary cash check (which refuses
+# nearly every real add-on) is replaced with a buying-power check instead,
+# required to clear at least this multiple of the order notional. 2.0 =
+# never consume more than half the account's real buying power on one
+# add-on leg -- conservative, not derived from a backtest; loosen only with
+# a deliberate decision, not silently.
+ADDON_BUYING_POWER_HEADROOM_MULT = 2.0
+
+
 def check_order(
     account: str, ticker: str, quantity: int, price: float, side: str, counts: dict | None = None,
     is_gap_correction: bool = False, is_protective: bool = False, replacing_order_id: int | None = None,
+    is_addon_leg: bool = False,
 ) -> None:
     """Raises SafetyViolation if the order should not proceed. `counts`, if
     given, is used for the daily-cap/burst-cap/duplicate checks instead of
@@ -770,7 +815,17 @@ def check_order(
     order still resting (the cancel hasn't happened yet at check time) and
     self-blocks every single attempt. Found 2026-07-28: SH's automated SL/
     TIME exit was blocked 100% of the time for 4 real days by its own
-    protective SL order for exactly this reason."""
+    protective SL order for exactly this reason.
+    is_addon_leg: a REQUEST to run stricter checks, not a trust token -- see
+    the block below (BUY only). Five preconditions are verified fresh against
+    the local DB before any of the four exemptions (existing-position guard,
+    same-side-only dup-order check, signal-window gate, buying-power-based
+    cash check) take effect; failing any of them raises exactly like a normal
+    BUY would. Never exempts: kill switch, account allowlist,
+    node_automation_enabled/AUTOMATION_ENABLED_TICKERS, trading-day gate,
+    HARD_ORDER_CEILING, notional_cap, daily_order_cap, burst cap,
+    duplicate-order window, or _has_open_buy_order_in_account (a resting BUY
+    for a DIFFERENT ticker in this account still blocks)."""
     if kill_switch_engaged():
         _limits = ACCOUNTS.get(account)
         _mode = "live" if (_limits and not _limits.dry_run) else "dry_run"
@@ -846,6 +901,67 @@ def check_order(
         _log_pre_action_state_verification(
             account, ticker, _node_id, _mode, "BUY",
             _local_pos['shares'] if _local_pos else None)
+
+        if is_addon_leg:
+            # Five preconditions, verified fresh against the DB -- NOT trusted
+            # from the caller's claim (docs/plans/real_order_execution_drought_addon.md
+            # 3.1). Any failure raises exactly like an ordinary BUY block.
+            if limits.account_type != "margin":
+                signals_db.log_coverage_event(
+                    "addon_non_margin_account_blocked", _mode, ticker=ticker, node_id=_node_id,
+                    result="blocked", detail=f"account={account} account_type={limits.account_type}")
+                raise SafetyViolation(
+                    f"add-on leg refused -- '{account}' is not a margin account "
+                    f"(account_type={limits.account_type})")
+            if _local_pos is None or _local_pos.get('position_source') != 'core':
+                signals_db.log_coverage_event(
+                    "addon_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,
+                    result="blocked", detail="no_open_core_position")
+                raise SafetyViolation(
+                    f"add-on leg refused -- no open CORE position on file for ({ticker}, {account})")
+            _trail_state = _local_pos.get('trail_state') or {}
+            if _trail_state.get('trailing') is not True:
+                signals_db.log_coverage_event(
+                    "addon_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,
+                    result="blocked", detail="parent_not_armed")
+                raise SafetyViolation(
+                    "add-on leg refused -- parent position is not armed (trail_state.trailing is not True)")
+            if signals_db.get_open_addon_leg_by_parent(_local_pos['id']) is not None:
+                signals_db.log_coverage_event(
+                    "addon_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,
+                    result="blocked", detail="leg_already_open")
+                raise SafetyViolation("add-on leg refused -- a leg is already open for this parent")
+            if int(quantity) != int(_local_pos['shares']):
+                signals_db.log_coverage_event(
+                    "addon_size_mismatch_blocked", _mode, ticker=ticker, node_id=_node_id,
+                    result="blocked", detail=f"quantity={quantity} parent_shares={_local_pos['shares']:g}")
+                raise SafetyViolation(
+                    f"add-on leg refused -- quantity {quantity} must exactly equal the parent's "
+                    f"{_local_pos['shares']:g} shares")
+            # D5: combined-exposure ceiling. Deliberately conservative rather than
+            # inventing a new number -- reuses the account's own notional_cap as the
+            # combined-exposure bound (core position's own notional, at its real entry
+            # price, plus this add-on order) instead of a bespoke multiplier. This can
+            # under-permit a legitimate add-on on a node whose core leg alone is already
+            # close to the cap (flagged for the user to revisit -- see D5 in the plan).
+            _combined_notional = _local_pos['shares'] * _local_pos.get('entry_price', price) + quantity * price
+            if _combined_notional > limits.notional_cap:
+                signals_db.log_coverage_event(
+                    "addon_combined_exposure_blocked", _mode, ticker=ticker, node_id=_node_id,
+                    result="blocked",
+                    detail=f"combined=${_combined_notional:,.0f} cap=${limits.notional_cap:,.0f}")
+                raise SafetyViolation(
+                    f"add-on leg refused -- combined core+addon notional ${_combined_notional:,.0f} "
+                    f"exceeds {account}'s ${limits.notional_cap:,.0f} cap"
+                )
+            # All five preconditions passed -- this IS the accountability record for
+            # the widened gate (every firing reviewable, bad_results=[]).
+            signals_db.log_coverage_event(
+                "addon_double_buy_exemption", _mode, ticker=ticker, node_id=_node_id,
+                result="preconditions_passed",
+                detail=f"parent_shares={_local_pos['shares']:g} quantity={quantity} "
+                       f"combined_notional=${_combined_notional:,.0f}")
+
         # Existing-position guard (2026-08-02): closes the real gap confirmed
         # 2026-07-24 -- Schwab doesn't decrement account balance for a resting
         # order (two real resting TRAILING_STOP BUYs left get_account_balance
@@ -865,7 +981,7 @@ def check_order(
         # the live watchlist) -- fixing it properly needs the same wl_id-
         # threaded-through-schwab_client plumbing already flagged as a
         # separate follow-up, not done here.
-        if _local_pos and not is_protective:
+        if _local_pos and not is_protective and not is_addon_leg:
             signals_db.log_coverage_event(
                 "buy_blocked_position_exists", _mode, ticker=ticker, node_id=_node_id, result="blocked",
                 detail=f"account={account} held_shares={_local_pos['shares']:g}"
@@ -876,7 +992,14 @@ def check_order(
             )
         orders = _open_orders(account)
         _log_guard_input(account, ticker, "BUY", orders, replacing_order_id)
-        if _has_open_order(orders, ticker, exclude_order_id=replacing_order_id):
+        # Exemption B (is_addon_leg only): at the exact moment an add-on triggers,
+        # the parent core position ALWAYS has a resting protective SELL at the
+        # broker (its sl_order_id STOP or the arm-time TRAILING_STOP SELL) --
+        # _has_open_order (any side) would block the add-on BUY 100% of the time,
+        # by construction. Swap to the same-side-only check, which still catches
+        # a genuine second resting BUY for this ticker.
+        _dup_check = _has_open_buy_order_for_ticker if is_addon_leg else _has_open_order
+        if _dup_check(orders, ticker, exclude_order_id=replacing_order_id):
             signals_db.log_coverage_event("dup_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_same_ticker")
             raise SafetyViolation(
                 f"'{ticker}' already has an open/working order in '{account}' -- refusing a second "
@@ -910,7 +1033,43 @@ def check_order(
             _presell_pos['shares'] if _presell_pos else None)
         orders = _open_orders(account)
         _log_guard_input(account, ticker, "SELL", orders, replacing_order_id)
-        if _has_open_sell_order(orders, ticker, exclude_order_id=replacing_order_id):
+        # Addon leg lookup, NODE-scoped (via _node_id, already resolved above
+        # from ticker+account) rather than parent-position-scoped -- CRITICAL
+        # fix (found by cold Opus review before this shipped): the real
+        # lockstep close always runs AFTER db.close_position() has already
+        # DELETEd the parent's open_positions row (Part 7's own stated
+        # ordering: "called AFTER the core exit's own coverage event/alert"),
+        # so _presell_pos is None by the time the leg's own real exit SELL
+        # reaches this guard. A parent-id-based lookup (get_open_addon_leg_
+        # by_parent(_presell_pos['id'])) would therefore always come back
+        # empty for the one call this exemption exists to unblock. The leg's
+        # own addon_legs row is looked up independently of whether the core
+        # position is still on file.
+        _open_leg = signals_db.get_open_addon_leg_by_wl_id(_node_id) if _node_id is not None else None
+        # is_addon_leg SELL exemption (D3, docs/plans/real_order_execution_
+        # drought_addon.md 6.2): the leg's own protective stop is DELIBERATELY
+        # meant to rest ALONGSIDE the parent core position's own resting
+        # protective order for the same ticker -- two real, wanted SELLs, not
+        # the accidental-duplicate case this guard exists to catch. Verified
+        # (not trusted from the caller): an open addon leg must actually exist
+        # for this node before the exemption applies.
+        _addon_sell_exempt = False
+        if is_addon_leg:
+            if _open_leg is not None:
+                _addon_sell_exempt = True
+            else:
+                signals_db.log_coverage_event(
+                    "addon_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,
+                    result="blocked", detail="sell_no_open_leg_for_node")
+                raise SafetyViolation(
+                    f"add-on leg SELL refused for '{ticker}' -- no open addon leg on file for this node"
+                )
+        # Always excluded (not just when is_addon_leg): the parent core
+        # position's own ordinary exit placement must not be blocked by its
+        # own leg's resting stop, which is a real, wanted, SEPARATE order.
+        _leg_sl_order_id = _open_leg.get('sl_order_id') if _open_leg is not None else None
+        if _has_open_sell_order(orders, ticker, exclude_order_id=replacing_order_id,
+                                 exclude_order_ids={_leg_sl_order_id} if _leg_sl_order_id else None) and not _addon_sell_exempt:
             signals_db.log_coverage_event("dup_sell_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked")
             raise SafetyViolation(
                 f"'{ticker}' already has a resting SELL order in '{account}' -- refusing a second "
@@ -925,7 +1084,10 @@ def check_order(
         # does catch our own inflated-share-count bugs (e.g. a top-up that
         # recorded shares before the real fill was confirmed) before they
         # reach the broker as a would-be short.
-        pos = _presell_pos
+        # is_addon_leg bounds against the LEG's own recorded shares, not the
+        # (possibly already-closed) core position's -- see the _open_leg
+        # lookup rationale above.
+        pos = {'shares': _open_leg['shares']} if (is_addon_leg and _open_leg is not None) else _presell_pos
         # Fail closed when no local position row is found at all (automation_
         # principles.md #2) -- this branch used to only ever fire when `pos`
         # was truthy, silently skipping the bound entirely with no local
@@ -944,7 +1106,8 @@ def check_order(
         # plausible legacy-data gap) as of this fix. gap_resize's MARKET-buy
         # replacement path is exempt (is_gap_correction doesn't apply to SELL
         # here -- N/A, this branch is SELL-only) -- no other legitimate
-        # no-position SELL path was found.
+        # no-position SELL path was found (is_addon_leg's leg-close is the
+        # one exception, handled by the leg-shares basis above).
         if pos is None:
             signals_db.log_coverage_event(
                 "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_no_position",
@@ -995,7 +1158,7 @@ def check_order(
     # not by any test. A top-up isn't a fresh signal-driven entry -- it's
     # completing an already-approved one, same reasoning already applied to
     # is_gap_correction above.
-    if side == "BUY" and not is_gap_correction and not is_protective:
+    if side == "BUY" and not is_gap_correction and not is_protective and not is_addon_leg:
         now = _now()
         t = (now.hour, now.minute)
         all_windows = _SIGNAL_WINDOWS + _OPEN_CHECK_WINDOWS
@@ -1030,7 +1193,37 @@ def check_order(
     # a hard financial constraint. Fails closed (blocks the order) if the
     # balance fetch itself errors -- an unchecked order is exactly the risk
     # this check exists to prevent.
-    if side == "BUY":
+    if side == "BUY" and is_addon_leg:
+        # Exemption D (D2): an add-on leg is sized at 100% of an already-deployed
+        # position -- it's borrowing by construction, so the ordinary cash check
+        # (which reads availableFunds/cashAvailableForTrading) would refuse
+        # nearly every real add-on. Uses buying power instead, gated to this
+        # path only -- the ordinary cash check below still applies to every
+        # other BUY, including a core entry on the same margin account.
+        import schwab_client  # local import: schwab_client imports this module at load time
+        try:
+            buying_power = schwab_client.get_account_buying_power(account)
+        except Exception as e:
+            signals_db.log_coverage_event(
+                "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id,
+                result="failed_closed", detail=str(e))
+            raise SafetyViolation(f"could not verify '{account}' buying power, blocking add-on order: {e}")
+        required = notional * ADDON_BUYING_POWER_HEADROOM_MULT
+        if buying_power < required:
+            signals_db.log_coverage_event(
+                "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id,
+                result="blocked_insufficient",
+                detail=f"required=${required:,.0f} (mult={ADDON_BUYING_POWER_HEADROOM_MULT}) "
+                       f"available=${buying_power:,.0f}")
+            raise SafetyViolation(
+                f"add-on order notional ${notional:,.0f} x {ADDON_BUYING_POWER_HEADROOM_MULT} headroom = "
+                f"${required:,.0f} required, but '{account}' only has ${buying_power:,.0f} buying power"
+            )
+        signals_db.log_coverage_event(
+            "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id, result="passed",
+            detail=f"required=${required:,.0f} available=${buying_power:,.0f}"
+        )
+    elif side == "BUY":
         import schwab_client  # local import: schwab_client imports this module at load time
         try:
             cash_available = schwab_client.get_account_balance(account)
@@ -1094,7 +1287,29 @@ def check_order(
             f"max {GLOBAL_ORDERS_PER_MINUTE})"
         )
 
-    for o in counts.get("recent_orders", []):
+    # SELL-side fingerprint exemption when a known open addon leg exists for
+    # this node (D3, docs/plans/real_order_execution_drought_addon.md 6.2) --
+    # found by cold Opus review before this shipped, a real collision beyond
+    # the resting-order guards: a leg's own SELL (its D3 protective stop)
+    # always has the exact same (account, ticker, side, quantity) as the
+    # parent core position's own SELL, since the leg mirrors the parent's
+    # shares exactly by construction -- true in BOTH directions (the leg's
+    # placement looks like a dup of the parent's recent SELL, and the
+    # PARENT's own later exit then looks like a dup of the leg's recent
+    # SELL). Gating on is_addon_leg alone only fixed the first direction;
+    # the fingerprint check has no way to distinguish "core" from "leg" by
+    # side/quantity/ticker, so it must be skipped for SELL whenever this
+    # node has ANY open leg, not just when the current call is the leg's
+    # own placement. The real-account fallback below (_broker_confirms_
+    # order) makes this WORSE, not better, in this specific case: it treats
+    # the OTHER leg's genuinely-resting SELL as proof this is a confirmed
+    # duplicate retry, when it's actually proof a second, different, wanted
+    # order is deliberately being placed alongside it.
+    _skip_dup_window = is_addon_leg
+    if side == "SELL" and not _skip_dup_window and _node_id is not None:
+        if signals_db.get_open_addon_leg_by_wl_id(_node_id) is not None:
+            _skip_dup_window = True
+    for o in ([] if _skip_dup_window else counts.get("recent_orders", [])):
         prior_qty = o.get("quantity")
         qty_matches = (
             prior_qty is not None
@@ -1132,7 +1347,7 @@ def check_order(
 
 def approve_and_record(
     account: str, ticker: str, quantity: int, price: float, side: str, is_gap_correction: bool = False,
-    is_protective: bool = False, replacing_order_id: int | None = None,
+    is_protective: bool = False, replacing_order_id: int | None = None, is_addon_leg: bool = False,
 ) -> bool:
     """Call immediately before placing a real order. Raises SafetyViolation if
     blocked; otherwise records the order against the daily cap, the global
@@ -1152,7 +1367,7 @@ def approve_and_record(
         counts = json.loads(f.read() or "{}")
         check_order(account, ticker, quantity, price, side, counts=counts,
                     is_gap_correction=is_gap_correction, is_protective=is_protective,
-                    replacing_order_id=replacing_order_id)
+                    replacing_order_id=replacing_order_id, is_addon_leg=is_addon_leg)
         key = str(date.today())
         today = counts.setdefault(key, {})
         if side == "BUY":

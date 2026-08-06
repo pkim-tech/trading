@@ -119,6 +119,7 @@ from signals_notify import (
     send_reference_report, send_coverage_report, build_phased_monitors_report,
     update_dry_run_buys, update_real_pending_buys_running_low, check_dry_run_sim_sells,
     check_entry_abandon, build_eod_scenario_review,
+    check_drought_entry, check_drought_handoff, check_addon_leg_reconciliation,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
@@ -386,6 +387,24 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
             buy_alerted.add(alert_key)
             if already_held:
                 print(f"  [skip] BUY {sig['ticker']} z={sig['z_score']:+.2f} — position already open, no alert")
+                # Real drought HANDOFF ordering fix (docs/plans/
+                # real_order_execution_drought_addon.md 0.6/5.4): in real mode,
+                # HANDOFF *initiates* the exit before core's scan runs -- core's
+                # entry only lands on a LATER poll once the exit fill confirms.
+                # Without this, the blocker here is a drought position (or a
+                # still-resting drought entry order), and the once-per-day
+                # buy_alerted lockout above never releases (the already_held
+                # branch never discards it, unlike the already_pending branch
+                # below) -- core's real signal would burn its one alert slot and
+                # never re-fire for the rest of the day, even after the HANDOFF
+                # exit confirms a poll or two later. Paper never hits this: its
+                # HANDOFF is a synchronous DB write, so already_held is already
+                # False again by the time this same poll's core scan runs.
+                _blocking = db.get_open_position_by_wl_id(node['id'])
+                _handoff_in_flight = bool(_blocking) and _blocking.get('position_source') == 'drought_overlay' and (
+                    (_blocking.get('trail_state') or {}).get('exit_pending', {}).get('reason') == 'HANDOFF')
+                if _handoff_in_flight or db.get_drought_pending_buy(node['id']):
+                    buy_alerted.discard(alert_key)
             elif node.get('mode', 'live') == 'live':
                 # pending_wl_ids alone would have prevented the 2026-07-26 DIA/IWM/
                 # QQQ/LABU duplicate-pending-buy incident (a restarted daemon forgot
@@ -986,6 +1005,14 @@ def run_loop(tickers: set = None):
                                 continue
                             _guarded(f"drought_handoff_pinned[{node['ticker']}]",
                                      paper_trading.check_paper_drought_handoff, node)
+                            # Real sibling, exact same site, inverse mode gate --
+                            # check_drought_handoff no-ops immediately for a
+                            # research-mode node, so calling both unconditionally
+                            # is safe and keeps the paper call's behavior
+                            # completely unchanged (docs/plans/
+                            # real_order_execution_drought_addon.md 5.5).
+                            _guarded(f"drought_handoff_pinned_real[{node['ticker']}]",
+                                     check_drought_handoff, node)
                         # This is a second, independent BUY entry point that never
                         # routed through _in_window (which only gates the ambient
                         # POLL_SECS-cadence scan) -- it's plausibly the actual path
@@ -1131,6 +1158,13 @@ def run_loop(tickers: set = None):
             # that exact order FILLED, close the position, no manual tap required.
             _guarded("own_sell_fills", check_own_sell_fills, open_positions)
 
+            # Real add-on leg reconciliation (Part 6.4, docs/plans/
+            # real_order_execution_drought_addon.md) -- same unconditional
+            # cadence as check_own_sell_fills/check_auto_fills above, since a
+            # leg's entry order can go stale or its parent's lockstep close
+            # can be missed any time, not just inside a signal window.
+            _guarded("addon_leg_reconciliation", check_addon_leg_reconciliation, open_positions)
+
             # Fast-path fill reconciliation (Part 3, branch C) -- cheap, non-blocking
             # drain of whatever schwab_stream's account-activity websocket has queued
             # since the last iteration. check_auto_fills above is the always-on
@@ -1212,6 +1246,10 @@ def run_loop(tickers: set = None):
                                   or (in_open_check_window and node.get('entry_timing') == 'open_check'))
                 if node_in_window:
                     _guarded(f"drought_handoff[{node['ticker']}]", paper_trading.check_paper_drought_handoff, node)
+                    # Real sibling, exact same site/gate, inverse mode --
+                    # no-ops for a research-mode node (docs/plans/
+                    # real_order_execution_drought_addon.md 5.5).
+                    _guarded(f"drought_handoff_real[{node['ticker']}]", check_drought_handoff, node)
                     handoff_ran = True
             if handoff_ran:
                 open_position_keys = ({_pos_key(p) for p in get_open_positions()}
@@ -1248,6 +1286,10 @@ def run_loop(tickers: set = None):
                                   or (in_open_check_window and node.get('entry_timing') == 'open_check'))
                 if node_in_window:
                     _guarded(f"drought_entry[{node['ticker']}]", paper_trading.check_paper_drought_entry, node)
+                    # Real sibling, exact same site/gate/ordering, inverse mode --
+                    # no-ops for a research-mode node (docs/plans/
+                    # real_order_execution_drought_addon.md 5.5).
+                    _guarded(f"drought_entry_real[{node['ticker']}]", check_drought_entry, node)
 
             if summaries:
                 print(f"[{now.strftime('%H:%M:%S')}] {' | '.join(summaries)}")

@@ -78,6 +78,7 @@ class FakeBroker:
         self._id_counter = itertools.count(9_000_000_001)
         self.account_hashes = {}  # nickname -> fake hash
         self.cash_balances = {}   # nickname -> available cash (defaults to a large number)
+        self.buying_powers = {}   # nickname -> buying power (D2, defaults to cash_balances' value)
 
     # ------------------------------------------------------------------
     # Test-side setup helpers
@@ -85,6 +86,13 @@ class FakeBroker:
 
     def set_cash_balance(self, account, cash):
         self.cash_balances[account] = cash
+
+    def set_buying_power(self, account, buying_power):
+        """D2 (docs/plans/real_order_execution_drought_addon.md) -- the
+        add-on leg's cash-availability check reads 'buyingPower', a distinct
+        field from 'availableFunds'/'cashAvailableForTrading'. Defaults to
+        the account's cash_balances value if never set explicitly."""
+        self.buying_powers[account] = buying_power
 
     def set_quote(self, ticker, last, bid=None, ask=None):
         self.quotes[ticker] = {
@@ -147,7 +155,9 @@ class FakeBroker:
     def get_account(self, account_hash, fields=None):
         account = self._account_for_hash(account_hash)
         cash = self.cash_balances.get(account, 1_000_000.0)
-        response = {'securitiesAccount': {'currentBalances': {'availableFunds': cash}}}
+        buying_power = self.buying_powers.get(account, cash)
+        response = {'securitiesAccount': {'currentBalances': {'availableFunds': cash,
+                                                                'buyingPower': buying_power}}}
 
         # If fields parameter is provided and includes POSITIONS, add positions
         if fields is not None:

@@ -13,6 +13,7 @@ import strategies
 import signals_config as cfg
 import signals_db as db
 import signals_compute as compute
+import paper_trading
 import schwab_safety
 import schwab_client
 import schwab_stream
@@ -518,6 +519,16 @@ def check_live_state_reconciliation(open_positions):
 
         mismatch_found = False
         expected_shares = pos.get('shares')
+        # Add-on leg patch (Part 6.3, docs/plans/real_order_execution_drought_
+        # addon.md) -- REQUIRED, not optional: with a real leg open, the
+        # broker legitimately holds 2x what open_positions.shares says (core
+        # + leg, same ticker/account, two separate real fills). Without this,
+        # every poll after a real add-on fires would false-positive a
+        # "shares mismatch" and feed the reconciliation_mismatches streak.
+        if expected_shares is not None:
+            _open_leg = db.get_open_addon_leg_by_parent(pos['id'])
+            if _open_leg is not None:
+                expected_shares = expected_shares + _open_leg.get('shares', 0)
         if expected_shares is not None and real_shares != expected_shares:
             mismatch_found |= _alert_reconcile_mismatch(
                 pos, "shares",
@@ -1277,6 +1288,10 @@ def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
                                    node_id=pos.get('wl_id'), result=reason, detail=f"price={target:.4f}")
             _post_message(f"[DRY RUN] would have closed — {ticker}  {reason} @ ${target:.4f}")
             dry_run_sell_alerted.add((pos['id'], last_bar_ts))
+            try:
+                close_addon_leg_real_if_open(pos, target, reason, datetime.now())
+            except Exception as e:
+                print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1409,6 +1424,225 @@ def notify_buy_signal(node, sig):
         print("  Skipped.")
 
 
+def notify_drought_buy_signal(node, decision):
+    """Real drought-overlay entry order placement -- modelled on
+    notify_buy_signal (Part 4.2, docs/plans/real_order_execution_drought_addon.md),
+    reusing its own dispatch/sizing/fill-tracking machinery rather than a
+    parallel implementation. Drought entry mirrors BOTH core mechanisms,
+    dispatching on db._is_trailing_buy(node) exactly as notify_buy_signal
+    does -- because drought reuses the node's own strategy, the entry order
+    shape must follow the node's own entry_timing/strategy, never hardcoded.
+
+    decision is evaluate_drought_entry's real-mode return value (paper=False)
+    -- {'price','shares','confirm_days','vol_gate','vol_pctile','gap_start'}.
+    Sizing uses buy_order_sizing's own worst-case-pad formula (matching every
+    other real entry), NOT decision['shares'] directly (that's the naive
+    starting_notional//price figure evaluate_drought_entry returns for the
+    eligibility check itself, sizing-agnostic per D4)."""
+    ticker = node['ticker']
+    price = decision['price']
+    # sig-like dict, reusing signals_blocks._build_buy_blocks so drought
+    # doesn't need a parallel block builder (Part 4.2) -- drought has no real
+    # z-score/lower_band (it's a checkpoint-bar/time-based entry, not a
+    # z-score breakout), so z_score/lower_band are placeholders: lower_band=
+    # price (a reasonable SL-price-display approximation -- the REAL broker
+    # stop is anchored to pos['entry_price'] by _place_stop_loss_for_position
+    # regardless of what's shown here), z_score/hurst/adf_p unused by any
+    # downstream handler (verified by reading signals_handlers.py -- the
+    # button JSON value's z_score/lower_band fields are never read back).
+    sig_like = {'ticker': ticker, 'current_price': price, 'last_bar': datetime.now(),
+                'lower_band': price, 'z_score': 0.0, 'hurst': None, 'adf_p': None}
+
+    trailing_buy = db._is_trailing_buy(node)
+    auto_placed = False
+    order_id = None
+    # D4: flat starting_notional, matching evaluate_drought_entry's own
+    # sizing basis (generate_drought_trades is sizing-agnostic).
+    target_notional = node.get('starting_notional') or 50000
+    sizing = buy_order_sizing(node, sig_like, target_notional=target_notional)
+    if trailing_buy:
+        auto_placed, order_id = _attempt_automated_buy(node, sizing)
+    elif ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        auto_placed, order_id = _attempt_automated_market_buy(node, sizing)
+
+    channel, ts = _post_message(
+        f"🌵 DROUGHT ENTRY SIGNAL — {ticker}  ${price:.4f}  "
+        f"(confirm_days={decision['confirm_days']})",
+        _build_buy_blocks(node, sig_like, auto_placed=auto_placed),
+    )
+    db.add_pending_buy(node, sig_like, channel, ts, order_id=order_id, position_source='drought_overlay',
+                        drought_confirm_days=decision['confirm_days'], drought_vol_gate=decision['vol_gate'],
+                        drought_gap_start=decision['gap_start'], drought_vol_pctile=decision['vol_pctile'])
+    if auto_placed:
+        if trailing_buy:
+            db.mark_pending_buy_placed_by_wl_id(node['id'])
+        else:
+            _sync_confirm_and_protect(ticker, node, order_id)
+
+
+def check_drought_entry(node):
+    """Real-mode drought-overlay entry scan (Part 4.4). Exact mode-symmetry
+    with paper_trading.check_paper_drought_entry (which returns early on
+    mode=='live') -- this is its real-mode sibling, called from the SAME
+    wiring sites (active_signals.py), never replacing the paper call (a
+    research node's behavior must be unchanged)."""
+    if node.get('mode') != 'live':
+        return
+    if not node.get('drought_overlay_enabled'):
+        return
+    if node['ticker'] not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        return
+    if not schwab_safety.node_automation_enabled(node['id']):
+        return
+    if node.get('daily_sync_halted_at'):
+        return
+    decision = paper_trading.evaluate_drought_entry(node, paper=False)
+    if decision is None:
+        return
+    notify_drought_buy_signal(node, decision)
+    db.log_coverage_event("drought_entry_placement", _coverage_mode(node.get('account')), ticker=node['ticker'],
+                           node_id=node['id'], result="signalled",
+                           detail=f"confirm_days={decision['confirm_days']} vol_pctile={decision['vol_pctile']}")
+
+
+def check_drought_handoff(node):
+    """Real-mode drought HANDOFF (Part 5). Closes an open real drought-overlay
+    position (or cancels a still-resting drought entry order) the moment this
+    node's own core signal fires again -- exact mode-symmetry with
+    paper_trading.check_paper_drought_handoff, real's three-state twin
+    (paper's HANDOFF is a synchronous DB write; real has a resting-order
+    cancel race and an unconfirmed-fill window paper never has). Mirrors
+    check_entry_abandon's cancel logic for Case A rather than writing fresh,
+    and _attempt_automated_exit_sell for Case B rather than a parallel exit
+    path (docs/plans/real_order_execution_drought_addon.md 5.1-5.4)."""
+    if node.get('mode') != 'live':
+        return
+    if not node.get('drought_overlay_enabled'):
+        return
+    wl_id, ticker = node['id'], node['ticker']
+    pending = db.get_drought_pending_buy(wl_id)
+    pos = db.get_drought_overlay_position(wl_id, paper=False)
+    if pending is None and pos is None:
+        return
+    sig = compute.compute_buy_signal(node)
+    # Verbatim guard from check_paper_drought_handoff's CRITICAL 2026-08-09
+    # fix -- compute_buy_signal returns a real dict (signal='HOLD') on almost
+    # every poll; None only on a genuine data failure, never as "no signal."
+    if sig is None or sig['signal'] != 'BUY':
+        return
+    account = node.get('account')
+    limits = schwab_safety.ACCOUNTS.get(account) if account else None
+    mode = _coverage_mode(account)
+
+    # Case A: drought entry order still resting, unfilled.
+    if pending is not None:
+        order_id = pending.get('order_id')
+        if limits is not None and not limits.dry_run and pending.get('order_placed') and not order_id:
+            # Manual placement, no id on file -- alert for manual cancel, do
+            # NOT clear the row (mirrors check_entry_abandon's identical case).
+            db.log_coverage_event("drought_handoff_cancel", mode, ticker=ticker, node_id=wl_id,
+                                   result="no_order_id_on_file")
+            _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — core signal fired again but "
+                          f"the resting drought entry order has no broker id on file (placed manually) — "
+                          f"cannot auto-cancel. Cancel it manually if still resting.")
+            return
+        if order_id and limits is not None and not limits.dry_run:
+            try:
+                _, status = schwab_client.cancel_order(account, ticker, order_id)
+            except Exception as e:
+                db.log_coverage_event("drought_handoff_cancel", mode, ticker=ticker, node_id=wl_id,
+                                       result="cancel_failed", detail=str(e))
+                _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — drought HANDOFF cancel "
+                              f"request failed ({e}) — resting order may still be live, verify manually.")
+                return
+            if status == 'FILLED':
+                # Raced a real fill landing the instant we tried to cancel --
+                # reconcile it as a genuine drought fill (never discard real
+                # broker truth), then fall through to Case B this same poll.
+                db.log_coverage_event("drought_handoff_cancel", mode, ticker=ticker, node_id=wl_id,
+                                       result="raced_fill")
+                fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=order_id)
+                if fill is None:
+                    _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — drought HANDOFF cancel "
+                                  f"found status FILLED but the fill lookup itself failed — verify and "
+                                  f"reconcile manually.")
+                    return
+                _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=wl_id)
+                pos = db.get_drought_overlay_position(wl_id, paper=False)
+                if pos is None:
+                    return
+                # falls through to Case B below
+            elif status != 'CANCELED':
+                # Unconfirmed cancel -- fail closed: leave the local row in
+                # place and retry next poll, never discard tracking of a real
+                # order that may still be resting.
+                db.log_coverage_event("drought_handoff_cancel", mode, ticker=ticker, node_id=wl_id,
+                                       result="cancel_unconfirmed")
+                return
+            else:
+                db.clear_pending_buy_by_wl_id(wl_id)
+                db.log_coverage_event("drought_handoff_cancel", mode, ticker=ticker, node_id=wl_id,
+                                       result="cancelled_resting_entry")
+                _post_message(f"🔁 *{ticker}* ({account} · {mode_tag(account)}) — core signal fired again, "
+                              f"resting drought entry order cancelled before it filled.")
+                return
+        else:
+            # dry_run account, or order_id is None with nothing real ever
+            # placed -- nothing real to cancel, safe to clear.
+            db.clear_pending_buy_by_wl_id(wl_id)
+            db.log_coverage_event("drought_handoff_cancel", mode, ticker=ticker, node_id=wl_id,
+                                   result="cancelled_resting_entry_no_real_order")
+            return
+
+    if pos is None:
+        return
+
+    # Case B: drought position filled and open -- real market SELL,
+    # reason='HANDOFF'. Strongly prefer _attempt_automated_exit_sell over a
+    # parallel exit path -- it already resolves the resting order id, uses
+    # the atomic replace_equity_order_with_market, repoints sl_order_id,
+    # clears broker_stop_price.
+    price = sig['current_price']
+    order_id = _attempt_automated_exit_sell(pos, 'HANDOFF', price)
+    if order_id is None:
+        db.log_coverage_event("drought_handoff_exit_placement", mode, ticker=ticker, node_id=wl_id,
+                               result="failed_or_blocked")
+        _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — core signal fired again but the "
+                      f"real drought HANDOFF exit order could not be placed automatically — verify and "
+                      f"close the drought position manually.")
+        return
+    # The DB row must NOT close until the fill is confirmed -- follow
+    # notify_sell_signal's own poll pattern. Only close on a confirmed fill;
+    # otherwise persist trail_state['exit_pending'] and let
+    # check_own_sell_fills/check_auto_fills close it on a later poll. This is
+    # the key structural difference from paper (paper's HANDOFF is a
+    # synchronous DB write with no fill-confirmation step).
+    filled = None
+    account_for_poll = account
+    for _ in range(_GAP_FILL_POLL_ATTEMPTS):
+        filled = schwab_client.get_filled_order(account_for_poll, ticker, 'SELL', order_id=order_id)
+        if filled is not None:
+            break
+        time.sleep(_GAP_FILL_POLL_INTERVAL_SECS)
+    if filled is None:
+        fresh = db.get_position_by_id(pos['id']) or pos
+        state = dict(fresh.get('trail_state') or {})
+        state['exit_pending'] = {'reason': 'HANDOFF', 'order_id': order_id,
+                                  'placed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        db.update_position_trail_state(pos['id'], state)
+        db.log_coverage_event("drought_handoff_exit_placement", mode, ticker=ticker, node_id=wl_id,
+                               result="placed_unconfirmed", detail=f"order_id={order_id}")
+        _post_message(f"🔁 *{ticker}* ({account} · {mode_tag(account)}) — drought HANDOFF exit order placed, "
+                      f"waiting for fill confirmation.")
+        return
+    db.close_position(pos['id'], exit_signal_price=price, exit_price=filled['price'], exit_time=datetime.now(),
+                       exit_reason='HANDOFF', paper=False)
+    db.log_coverage_event("drought_handoff", mode, ticker=ticker, node_id=wl_id, result="closed",
+                           detail=f"price={filled['price']:.4f}")
+    _post_message(f"🔁 *{ticker}* ({account} · {mode_tag(account)}) — drought HANDOFF: closed @ "
+                  f"${filled['price']:.4f}, core signal active again")
+
+
 def notify_limit_fill(node, current_price, lower_band):
     ticker          = node['ticker']
     schwab_sl_pct   = node['stop_loss']
@@ -1510,6 +1744,17 @@ def notify_sell_signal(pos, reason, current_price, target_price):
 
     if filled is not None:
         actual_pnl = (filled['price'] - ep) / ep * 100
+        # Lockstep leg close BEFORE db.close_position -- see that call's own
+        # comment in check_dry_run_sim_sells for why (CRITICAL fix). A leg
+        # already closed by a racing path is a safe no-op (get_open_addon_
+        # leg_by_parent returns None); a genuine concurrent-close race
+        # against the SAME leg is a narrow, accepted residual risk, same
+        # class as _submit_replace_with_retry's documented ambiguity --
+        # not fully solved here.
+        try:
+            close_addon_leg_real_if_open(pos, filled['price'], reason, datetime.now())
+        except Exception as e:
+            print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
         closed = db.close_position(pos['id'], exit_signal_price=current_price, exit_price=filled['price'],
                                     exit_time=datetime.now(), exit_reason=reason)
         if closed:
@@ -1622,6 +1867,10 @@ def notify_sell_signal(pos, reason, current_price, target_price):
             drift_pct  = (exit_price - current_price) / current_price * 100
             actual_pnl = (exit_price - ep) / ep * 100
             note = f"Exited at ${exit_price:.4f}  (signal drift: {drift_pct:+.2f}%  P&L: {actual_pnl:+.2f}%)"
+            try:
+                close_addon_leg_real_if_open(pos, exit_price, reason, datetime.now())
+            except Exception as e:
+                print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
             db.close_position(pos['id'], exit_signal_price=current_price, exit_price=exit_price,
                                exit_time=datetime.now(), exit_reason=reason)
             print(f"  Position closed. {note}")
@@ -1742,6 +1991,406 @@ def notify_trailing_activated(pos, current_price):
         state['order_placed'] = True
         state['exit_order_id'] = exit_order_id
     db.update_position_trail_state(pos['id'], state)
+    # Real add-on-at-arm trigger (Part 6.1) -- called at the very END, wrapped
+    # in a never-re-raising try/except (precedented reasoning at
+    # paper_trading.py's own check_paper_addon_trigger call site: an
+    # independent review found running the follow-on before the core event's
+    # own observability could lose the core arm's coverage event/alert
+    # entirely). Re-reads the position fresh internally rather than trusting
+    # `pos` (the caller's pre-arm snapshot) or `fresh` (this function's own
+    # copy, now possibly stale after the trail_state write just above).
+    try:
+        check_addon_trigger_real(db.get_position_by_id(pos['id']) or fresh, current_price)
+    except Exception as e:
+        print(f"  [warn] {ticker} — unexpected error in check_addon_trigger_real: {e}")
+
+
+def check_addon_trigger_real(pos, current_price):
+    """Real margin add-on-at-arm entry (Part 6, docs/plans/
+    real_order_execution_drought_addon.md). Places a real MARKET BUY for
+    exactly pos['shares'] against the core position's own resting protective
+    SELL -- schwab_safety.check_order's is_addon_leg exemption is what makes
+    this reachable at all (see check_order's docstring for the five verified
+    preconditions). Every guard here duplicates part of that gate deliberately
+    -- a clean Slack message + a named coverage event for the common
+    skip/refuse cases, with check_order as the hard, non-bypassable backstop
+    regardless of what happens here."""
+    if pos is None:
+        return
+    node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+    if node is None or node.get('mode') != 'live':
+        return
+    if not node.get('addon_enabled'):
+        return
+    if pos.get('position_source') != 'core':
+        return
+    if db.get_open_addon_leg_by_parent(pos['id']) is not None:
+        return
+    ticker = pos['ticker']
+    if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        return
+    if not schwab_safety.node_automation_enabled(pos.get('wl_id')):
+        return
+    account = pos.get('account')
+    _mode = _coverage_mode(account)
+    limits = schwab_safety.ACCOUNTS.get(account)
+    if limits is None or limits.account_type != 'margin':
+        db.log_coverage_event("addon_entry_placement", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="blocked_non_margin_account",
+                               detail=f"account={account!r}")
+        _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — add-on skipped: "
+                      f"'{account}' is not a margin account")
+        return
+    shares = int(pos['shares'])
+    if shares < 1:
+        return
+    if pos.get('is_dry_run_sim'):
+        # Mirrors update_dry_run_buys/_fill_dry_run_buy's synthesis
+        # convention -- a dry_run-sim parent has no real broker order to
+        # mirror, so the leg is synthesized filled immediately against real
+        # price data, same as the parent's own entry/exit.
+        leg_id = db.open_addon_leg(pos, shares=shares, entry_price=current_price, entry_time=datetime.now(),
+                                    paper=False, is_dry_run_sim=True, entry_order_id=None, entry_status='filled')
+        db.log_coverage_event("addon_entry_fill", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="dry_run_sim_filled",
+                               detail=f"leg_id={leg_id} shares={shares} price={current_price:.4f}")
+        _post_message(f"🧪 *{ticker}* ({account} · {mode_tag(account)}) — add-on leg synthesized (dry_run_sim): "
+                      f"{shares}sh @ ${current_price:.4f}")
+        return
+    try:
+        _, order_id = schwab_client.place_equity_buy(account, ticker, shares, current_price, is_addon_leg=True)
+    except schwab_safety.SafetyViolation as e:
+        db.log_coverage_event("addon_entry_placement", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="blocked", detail=str(e))
+        return
+    except Exception as e:
+        db.log_coverage_event("addon_entry_placement", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="failed_unexpectedly", detail=str(e))
+        _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account)}) — add-on leg placement failed "
+                      f"unexpectedly: {e}")
+        return
+    if order_id is None:
+        # dry_run ACCOUNT (distinct from is_dry_run_sim above, which is a
+        # per-position tag) -- schwab_client's approve_and_record already
+        # ran every real check_order guard (including is_addon_leg's five
+        # preconditions) and only short-circuited the actual broker call, so
+        # this is a genuine successful dry-run, not a failure (a real
+        # failure would have raised above, never returned (None, None)). A
+        # dry_run order produces no real fill event to ever poll for, so it
+        # must be synthesized immediately -- found by contextual Opus review
+        # before this shipped: without this, the leg is written
+        # entry_status='placed' with entry_order_id=None, can never confirm
+        # filled, and check_addon_leg_reconciliation's timeout branch itself
+        # requires entry_order_id to attempt a cancel -- the leg is
+        # permanently stuck. This also blocks Part 12's mandatory full
+        # dry_run rehearsal cycle on 'brokerage' (margin + dry_run) from ever
+        # exercising fill confirmation, D3 stop placement, or lockstep exit.
+        leg_id = db.open_addon_leg(pos, shares=shares, entry_price=current_price, entry_time=datetime.now(),
+                                    paper=False, entry_order_id=None, entry_status='filled')
+        db.log_coverage_event("addon_entry_fill", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="dry_run_filled",
+                               detail=f"leg_id={leg_id} shares={shares} price={current_price:.4f}")
+        _place_stop_loss_for_addon_leg(leg_id, pos, node)
+        return
+    leg_id = db.open_addon_leg(pos, shares=shares, entry_price=current_price, entry_time=datetime.now(),
+                                paper=False, entry_order_id=order_id, entry_status='placed')
+    db.log_coverage_event("addon_entry_placement", _mode, ticker=ticker, position_id=pos.get('id'),
+                           node_id=pos.get('wl_id'), result="placed",
+                           detail=f"leg_id={leg_id} order_id={order_id} shares={shares}")
+    _post_message(f"➕ *{ticker}* ({account} · {mode_tag(account)}) — ADD-ON leg order placed: "
+                  f"{shares}sh @ ~${current_price:.4f}")
+    # Fill confirmation (Part 6.2) -- market order, fills near-immediately.
+    # Follows _sync_confirm_and_protect's pattern: short synchronous poll,
+    # then confirm. Does NOT route through _reconcile_buy_fill (pending_buys-
+    # driven, would try to open an open_positions row -- exactly what the
+    # separate addon_legs table exists to prevent).
+    filled = None
+    for _ in range(_SL_FAST_CONFIRM_ATTEMPTS):
+        filled = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=order_id)
+        if filled is not None:
+            break
+        time.sleep(_SL_FAST_CONFIRM_INTERVAL_SECS)
+    if filled is None:
+        db.log_coverage_event("addon_entry_fill", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="unconfirmed", detail=f"leg_id={leg_id}")
+        _post_message(f"⏱️ *{ticker}* ({account} · {mode_tag(account)}) — add-on leg order placed but not "
+                      f"yet confirmed filled — check_addon_leg_reconciliation will retry.")
+        return
+    db.set_addon_leg_entry_filled(leg_id, filled['price'])
+    db.log_coverage_event("addon_entry_fill", _mode, ticker=ticker, position_id=pos.get('id'),
+                           node_id=pos.get('wl_id'), result="filled",
+                           detail=f"leg_id={leg_id} price={filled['price']:.4f}")
+    _post_message(f"✅ *{ticker}* ({account} · {mode_tag(account)}) — add-on leg filled: "
+                  f"{shares}sh @ ${filled['price']:.4f}")
+    # D3: the leg gets its own broker-side protective stop, anchored to the
+    # PARENT's entry_price * (1 - sl_pct/100) -- the leg has no independent
+    # exit rule, it closes in lockstep with the parent (Part 7).
+    _place_stop_loss_for_addon_leg(leg_id, pos, node)
+
+
+def _place_stop_loss_for_addon_leg(leg_id, parent_pos, node):
+    """D3: places a real resting STOP for the add-on leg, anchored to the
+    PARENT's entry_price (not the leg's own fill price -- the leg has no
+    independent exit rule/model, its only job is to track the parent's real
+    stop level so an unstopped margin position is never the failure mode).
+    Mirrors _place_stop_loss_for_position's retry/fallback shape but against
+    addon_legs instead of open_positions."""
+    ticker = parent_pos['ticker']
+    account = parent_pos.get('account')
+    _mode = _coverage_mode(account)
+    sl_pct = parent_pos.get('fixed_sl') if strategies.uses_fixed_sl(parent_pos['strategy']) else parent_pos.get('stop_loss')
+    if not sl_pct:
+        return
+    stop_price = parent_pos['entry_price'] * (1 - sl_pct / 100)
+    leg = db.get_open_addon_leg_by_parent(parent_pos['id'])
+    if leg is None or not leg.get('shares'):
+        return
+    try:
+        _, order_id = schwab_client.place_stop_loss(account, ticker, int(leg['shares']), stop_price,
+                                                      is_addon_leg=True)
+    except Exception as e:
+        db.log_coverage_event("sl_placement", _mode, ticker=ticker, position_id=parent_pos.get('id'),
+                               node_id=parent_pos.get('wl_id'), result="failed", detail=f"addon_leg={leg_id}: {e}")
+        _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account)}) ADD-ON LEG UNPROTECTED — "
+                      f"stop-loss placement failed: {e} (place a stop-loss SELL {int(leg['shares'])} shares "
+                      f"@ ~${stop_price:.2f} manually)")
+        return
+    # order_id is None for a genuine dry_run account (schwab_client already
+    # ran every real guard and only short-circuited the broker call, same
+    # reasoning as check_addon_trigger_real's dry_run branch) -- recording
+    # broker_stop_price in that case would falsely claim a real broker stop
+    # exists, the same gap _place_stop_loss_for_position guards against
+    # (fixed 2026-08-01, mirrored here).
+    db.set_addon_leg_sl_order_id(leg_id, order_id, broker_stop_price=stop_price if order_id is not None else None)
+    db.log_coverage_event("sl_placement", _mode, ticker=ticker, position_id=parent_pos.get('id'),
+                           node_id=parent_pos.get('wl_id'),
+                           result="placed" if order_id is not None else "placed_dry_run",
+                           detail=f"addon_leg={leg_id}")
+
+
+_ADDON_LEG_ENTRY_TIMEOUT_MINUTES = 10
+
+
+def check_addon_leg_reconciliation(open_positions):
+    """New reconciliation sweep for real addon legs (Part 6.4), called each
+    poll alongside check_own_sell_fills/check_auto_fills. Two independent
+    checks, both pure detection/best-effort -- never a blocking gate:
+    (1) a leg still entry_status='placed' past a timeout: poll for a late
+    fill, else cancel and mark abandoned (mirrors check_entry_abandon's
+    cancel-with-confirmation pattern).
+    (2) an open leg whose parent position no longer exists but whose
+    parent_trade_log_id's trade_log row is already closed: the real lockstep
+    close (Part 7) was missed somewhere -- ALERT LOUDLY, do NOT auto-close at
+    a guessed price (pure observation, matching reconcile_daily_track_nodes'
+    stance)."""
+    for leg in db.get_open_addon_legs(paper=False):
+        ticker = leg['ticker']
+        account = leg.get('account')
+        mode = _coverage_mode(account)
+        if leg.get('entry_status') == 'placed' and leg.get('entry_order_id'):
+            placed_at = datetime.strptime(leg['entry_time'], '%Y-%m-%d %H:%M:%S')
+            if (datetime.now() - placed_at).total_seconds() < _ADDON_LEG_ENTRY_TIMEOUT_MINUTES * 60:
+                continue
+            fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=leg['entry_order_id'])
+            if fill is not None:
+                db.set_addon_leg_entry_filled(leg['id'], fill['price'])
+                db.log_coverage_event("addon_entry_fill", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                       result="filled_late_reconcile", detail=f"leg_id={leg['id']}")
+                # HIGH fix (found by cold Opus review before this shipped):
+                # the synchronous fast-confirm path in check_addon_trigger_
+                # real is the ONLY other place a leg's D3 protective stop is
+                # placed -- a fill confirmed only here (after that ~10s
+                # window already gave up) would otherwise leave a real,
+                # filled, margin leg with no stop and no further attempt to
+                # add one.
+                _parent_pos = db.get_position_by_id(leg['parent_position_id']) if leg.get('parent_position_id') else None
+                _node = db.get_watch_list_node_by_id(leg.get('wl_id'))
+                if _parent_pos is not None and _node is not None:
+                    _place_stop_loss_for_addon_leg(leg['id'], _parent_pos, _node)
+                continue
+            limits = schwab_safety.ACCOUNTS.get(account)
+            if limits is not None and not limits.dry_run:
+                try:
+                    _, status = schwab_client.cancel_order(account, ticker, leg['entry_order_id'])
+                except Exception as e:
+                    db.log_coverage_event("addon_leg_reconciliation", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                           result="cancel_failed", detail=f"leg_id={leg['id']}: {e}")
+                    continue
+                if status == 'FILLED':
+                    fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=leg['entry_order_id'])
+                    if fill is not None:
+                        db.set_addon_leg_entry_filled(leg['id'], fill['price'])
+                    continue
+                if status != 'CANCELED':
+                    db.log_coverage_event("addon_leg_reconciliation", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                           result="cancel_unconfirmed", detail=f"leg_id={leg['id']}")
+                    continue
+            # close_addon_leg (not set_addon_leg_entry_filled) -- must mark
+            # status='closed', not just entry_status='abandoned', or
+            # get_open_addon_legs/get_open_addon_leg_by_parent would keep
+            # seeing this row as open forever, permanently blocking a future
+            # add-on for the same parent (found by this file's own fake_broker
+            # test: the leg stayed in get_open_addon_legs() after the first
+            # version of this fix, Part 8 review-before-ship).
+            db.close_addon_leg(leg['id'], leg['entry_price'], datetime.now(), 'ABANDONED')
+            db.log_coverage_event("addon_leg_reconciliation", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                   result="abandoned", detail=f"leg_id={leg['id']}")
+            _post_message(f"⏱️ *{ticker}* ({account} · {mode_tag(account)}) — add-on leg entry order "
+                          f"({leg['id']}) never filled past {_ADDON_LEG_ENTRY_TIMEOUT_MINUTES}min — cancelled, "
+                          f"marked abandoned. Never sold shares never bought.")
+            continue
+
+        # A real exit SELL was placed (close_addon_leg_real_if_open) but
+        # wasn't confirmed within that call's short poll window -- pick up
+        # the confirmation here on a later poll (HIGH fix, cold Opus review
+        # before this shipped: exit_order_id used to be recorded nowhere,
+        # so an unconfirmed exit had zero further tracking at all).
+        if leg.get('exit_order_id') and leg.get('status') == 'open':
+            fill = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=leg['exit_order_id'])
+            if fill is not None:
+                db.close_addon_leg(leg['id'], fill['price'], datetime.now(), 'RECONCILED_EXIT')
+                db.log_coverage_event("addon_exit_fill", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                       result="closed_late_reconcile",
+                                       detail=f"leg_id={leg['id']} price={fill['price']:.4f}")
+            continue
+
+        if leg.get('parent_position_id') is not None:
+            _parent_still_open = db.get_position_by_id(leg['parent_position_id']) is not None
+            if _parent_still_open:
+                continue
+            with db._conn() as c:
+                _parent_closed = c.execute(
+                    "SELECT 1 FROM trade_log WHERE id=? AND exit_time IS NOT NULL",
+                    (leg['parent_trade_log_id'],)
+                ).fetchone() is not None
+            if _parent_closed:
+                db.log_coverage_event("addon_leg_reconciliation", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                       result="orphaned_leg_parent_closed", detail=f"leg_id={leg['id']}")
+                _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account)}) — add-on leg ({leg['id']}) "
+                              f"is still open but its parent core position has already closed — the real "
+                              f"lockstep close was missed. Verify and close the leg manually; NOT auto-closed.")
+
+
+def close_addon_leg_real_if_open(pos, exit_price, exit_reason, exit_time):
+    """Real mirror of paper_trading.close_paper_addon_leg_if_open (Part 7.1) --
+    places a real order first, then records the close. Never raises -- every
+    one of the 7 real call sites (Part 7.2) wraps this in a never-re-raising
+    try/except, called AFTER the core exit's own coverage event/alert.
+
+    Divergence to document: paper closes the leg at the parent's EXACT exit
+    price/reason. Real closes at the leg's own real fill price (slippage will
+    differ) and at the exit_reason THIS call was given -- log both so
+    reconciliation attributes the gap to slippage, not a logic bug."""
+    if pos is None:
+        return
+    leg = db.get_open_addon_leg_by_parent(pos['id'])
+    if leg is None:
+        return
+    ticker = pos['ticker']
+    account = pos.get('account')
+    mode = _coverage_mode(account)
+    limits = schwab_safety.ACCOUNTS.get(account) if account else None
+
+    if leg.get('entry_status') == 'placed':
+        # Still resting, unfilled -- cancel it, never sell shares never
+        # bought. A race to FILLED falls through to a real SELL instead.
+        order_id = leg.get('entry_order_id')
+        if limits is None:
+            db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                   result="unrecognized_account", detail=f"leg_id={leg['id']}")
+            _post_message(f"⚠️ *{ticker}* ({account!r}) — add-on leg ({leg['id']}) core position closed but "
+                          f"the account isn't recognized — cannot determine whether a real entry order needs "
+                          f"cancelling. Verify manually.")
+            return
+        if order_id and not limits.dry_run:
+            try:
+                _, status = schwab_client.cancel_order(account, ticker, order_id)
+            except Exception as e:
+                db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                       result="cancel_failed", detail=f"leg_id={leg['id']}: {e}")
+                return
+            if status == 'FILLED':
+                fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=order_id)
+                if fill is not None:
+                    db.set_addon_leg_entry_filled(leg['id'], fill['price'])
+                    leg = dict(leg)
+                    leg['entry_status'] = 'filled'
+                    leg['entry_price'] = fill['price']
+                # falls through to the real SELL branch below
+            elif status != 'CANCELED':
+                db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                       result="cancel_unconfirmed", detail=f"leg_id={leg['id']}")
+                return
+            else:
+                db.close_addon_leg(leg['id'], leg['entry_price'], exit_time, 'ABANDONED')
+                db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                       result="cancelled_unfilled_leg", detail=f"leg_id={leg['id']}")
+                return
+        else:
+            db.close_addon_leg(leg['id'], leg['entry_price'], exit_time, 'ABANDONED')
+            db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                   result="cancelled_unfilled_leg_no_real_order", detail=f"leg_id={leg['id']}")
+            return
+
+    # Leg is filled -- place/replace the real exit SELL, lockstep with the
+    # parent core position's own exit.
+    shares = int(leg['shares'])
+    resting_order_id = leg.get('sl_order_id')
+    # is_addon_leg=True: this is the LEG's own SELL, not the parent's --
+    # without it, check_order's ordinary resting-SELL dup guard sees the
+    # parent core position's own resting protective order (a real, separate,
+    # wanted order) as a duplicate and refuses this placement (CRITICAL,
+    # found by cold Opus review before this shipped).
+    try:
+        if resting_order_id:
+            _, order_id = schwab_client.replace_equity_order_with_market(
+                account, ticker, resting_order_id, "SELL", shares, exit_price, is_addon_leg=True)
+        else:
+            _, order_id = schwab_client.place_equity_sell(account, ticker, shares, exit_price, is_addon_leg=True)
+    except Exception as e:
+        db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                               result="failed", detail=f"leg_id={leg['id']}: {e}")
+        _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account)}) — add-on leg ({leg['id']}) exit SELL "
+                      f"failed: {e} — verify and close manually.")
+        return
+    if order_id is None:
+        # dry_run account (or an is_dry_run_sim leg, which is always on a
+        # dry_run account) -- a genuine successful dry-run produces no real
+        # fill event to ever poll for, so it must be synthesized immediately
+        # at the given exit_price, mirroring the entry-side fix above (found
+        # by contextual Opus review before this shipped: without this, an
+        # is_dry_run_sim/dry_run-account leg polls get_filled_order(order_id=
+        # None) forever and stays open permanently).
+        db.close_addon_leg(leg['id'], exit_price, exit_time, exit_reason)
+        db.log_coverage_event("addon_exit_fill", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                               result="dry_run_closed",
+                               detail=f"leg_id={leg['id']} price={exit_price:.4f} reason={exit_reason}")
+        return
+    filled = None
+    for _ in range(_GAP_FILL_POLL_ATTEMPTS):
+        filled = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=order_id)
+        if filled is not None:
+            break
+        time.sleep(_GAP_FILL_POLL_INTERVAL_SECS)
+    if filled is None:
+        # Persist order_id so check_addon_leg_reconciliation can revisit and
+        # close it on a later poll -- HIGH fix (cold Opus review before this
+        # shipped): set_addon_leg_exit_order_id existed but was never
+        # actually called anywhere, so an exit order unconfirmed within this
+        # short poll window had zero further tracking -- a real SELL live at
+        # the broker with no local record, and the leg row stuck open.
+        db.set_addon_leg_exit_order_id(leg['id'], order_id)
+        db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                               result="placed_unconfirmed", detail=f"leg_id={leg['id']} order_id={order_id}")
+        _post_message(f"🔁 *{ticker}* ({account} · {mode_tag(account)}) — add-on leg ({leg['id']}) exit order "
+                      f"placed, waiting for fill confirmation.")
+        return
+    db.close_addon_leg(leg['id'], filled['price'], exit_time, exit_reason)
+    db.log_coverage_event("addon_exit_fill", mode, ticker=ticker, node_id=leg.get('wl_id'), result="closed",
+                           detail=f"leg_id={leg['id']} leg_price={filled['price']:.4f} reason={exit_reason} "
+                                  f"parent_exit_price={exit_price:.4f}")
+    _post_message(f"✅ *{ticker}* ({account} · {mode_tag(account)}) — add-on leg ({leg['id']}) closed @ "
+                  f"${filled['price']:.4f} ({exit_reason}, lockstep with parent)")
 
 
 def check_trailing_reminders(open_positions):
@@ -1957,6 +2606,10 @@ def check_own_sell_fills(open_positions):
                               position_id=pos.get('id'), node_id=pos.get('wl_id'), result="closed",
                               detail=f"reason={exit_pending['reason']} price={fill['price']:.4f} via_recheck=1")
         _post_message(f"🤖 {ticker} — auto-detected exit fill at ${fill['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
+        try:
+            close_addon_leg_real_if_open(pos, fill['price'], exit_pending['reason'], datetime.now())
+        except Exception as e:
+            print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
 
 
 def check_exit_reminders(open_positions):
@@ -2177,7 +2830,7 @@ def check_buy_reminders():
         db.update_pending_buy_reminder(pending['id'], channel, ts, reminder_num)
 
 
-def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False):
+def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, target_notional=None):
     """Post-fill top-up (Part 3, branch C) -- compares the real fill notional
     against target_notional (the conservative worst-case sizing pads in
     buy_order_sizing/check_gap_resize mean a real fill usually comes in under
@@ -2196,10 +2849,19 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False):
     is_gap_correction is passed through from the triggering fill (True only
     when the fill itself came from check_gap_resize's MARKET replacement,
     which runs at _GAP_CHECK_WINDOW, outside _SIGNAL_WINDOWS/_OPEN_CHECK_WINDOWS)
-    so the top-up buy isn't wrongly blocked by the signal-window time gate."""
+    so the top-up buy isn't wrongly blocked by the signal-window time gate.
+    target_notional: explicit override -- a real drought-overlay fill's
+    caller (_reconcile_buy_fill) passes node['starting_notional'] here
+    instead of letting this default to _last_sale_recovery(node), since D4
+    (docs/plans/real_order_execution_drought_addon.md) established drought
+    sizing is flat starting_notional, not core's compounding recovery basis
+    -- _last_sale_recovery(node, position_source='core') would otherwise
+    target an unrelated (and possibly very different) core-compounded
+    notional for a drought top-up."""
     ticker = node['ticker']
     account = node.get('account')
-    target_notional = _last_sale_recovery(node)
+    if target_notional is None:
+        target_notional = _last_sale_recovery(node)
     delta = target_notional - (fill_price * filled_shares)
     if delta > fill_price:
         top_up_shares = int(delta // fill_price)
@@ -2329,8 +2991,8 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
     # normal, expected, strategy-modeled bounce-wait, which the kernel itself
     # never charges against hold time.
     fill_time = datetime.now()
-    opened = db.open_position(node, signal_price, fill_time, fill_price, fill_time,
-                               shares=filled_shares)
+    opened = db.open_position_from_pending(pending, signal_price, fill_time, fill_price, fill_time,
+                                            shares=filled_shares)
     if not opened:
         return
     drift_pct = (fill_price - signal_price) / signal_price * 100
@@ -2339,7 +3001,9 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
                            detail=f"shares={filled_shares:g} price={fill_price:.4f} drift={drift_pct:+.2f}%")
     _post_message(f"🤖 {ticker} — auto-detected fill at ${fill_price:.4f}  "
                   f"(drift: {drift_pct:+.2f}%)  {filled_shares:g} shares")
-    _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=is_gap_correction)
+    _drought_target_notional = node.get('starting_notional') if pending.get('position_source') == 'drought_overlay' else None
+    _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=is_gap_correction,
+                     target_notional=_drought_target_notional)
     if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         _place_stop_loss_for_position(node, ticker)
 
@@ -2605,6 +3269,10 @@ def check_auto_fills(open_positions):
         if not closed:
             continue
         _post_message(f"🤖 {ticker} — auto-detected exit fill at ${fill['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
+        try:
+            close_addon_leg_real_if_open(pos, fill['price'], exit_pending['reason'], datetime.now())
+        except Exception as e:
+            print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
 
 
 # ---------------------------------------------------------------------------

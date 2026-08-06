@@ -490,7 +490,8 @@ REGISTRY = [
     dict(id='drought_entry',
          scenario="Drought-overlay entry fires exactly once per confirmed no-signal "
                   "gap, gated by confirm_days and (if set) the intraday-vol gate",
-         code_path="paper_trading.check_paper_drought_entry",
+         code_path="paper_trading.check_paper_drought_entry / signals_notify.check_drought_entry "
+                    "(real, mode='live'), both over the shared paper_trading.evaluate_drought_entry",
          offline_coverage="tests/test_overlay_paper_trading.py: "
                            "test_drought_entry_fires_once_confirmed_then_never_reenters_same_gap, "
                            "test_drought_vol_gate_excludes_unknown_reading",
@@ -504,7 +505,7 @@ REGISTRY = [
     dict(id='drought_handoff',
          scenario="An open drought-overlay position closes the moment the node's own "
                   "core z-score signal fires again",
-         code_path="paper_trading.check_paper_drought_handoff",
+         code_path="paper_trading.check_paper_drought_handoff / signals_notify.check_drought_handoff (real)",
          offline_coverage="tests/test_overlay_paper_trading.py: "
                            "test_drought_handoff_closes_position_on_core_signal",
          check_mechanism='coverage_events', scenario_key='drought_handoff',
@@ -519,7 +520,7 @@ REGISTRY = [
     dict(id='addon_entry_fill',
          scenario="Margin add-on-at-arm leg opens the moment a core position's "
                   "trailing-sell arms, sized to match the core position's current shares",
-         code_path="paper_trading.check_paper_addon_trigger",
+         code_path="paper_trading.check_paper_addon_trigger / signals_notify.check_addon_trigger_real (real)",
          offline_coverage="tests/test_overlay_paper_trading.py: "
                            "test_addon_trigger_opens_leg_matching_core_shares_and_dedupes, "
                            "test_addon_never_triggers_on_a_drought_position",
@@ -532,7 +533,8 @@ REGISTRY = [
     dict(id='addon_exit_fill',
          scenario="An open add-on leg closes in lockstep with its parent core position's "
                   "own exit (SL/TRAIL/TIME), never independently",
-         code_path="paper_trading.close_paper_addon_leg_if_open",
+         code_path="paper_trading.close_paper_addon_leg_if_open / "
+                    "signals_notify.close_addon_leg_real_if_open (real, 7 call sites)",
          offline_coverage="tests/test_overlay_paper_trading.py: "
                            "test_addon_leg_closes_in_lockstep_with_parent_and_applies_margin_cost, "
                            "test_close_paper_addon_leg_if_open_is_a_noop_with_no_leg",
@@ -574,6 +576,94 @@ REGISTRY = [
                "the 80% and 100% branches. Carries forward the 2026-08-08 CRITICAL anti-wiggle fix "
                "(a threshold may only fire on real recovery from a real decline, never a sub-decline "
                "wiggle at a new high) unchanged."),
+
+    # Real-only control points, added with the real drought/add-on order-
+    # placement build (docs/plans/real_order_execution_drought_addon.md,
+    # Part 8) -- no paper analogue, since paper never calls schwab_client/
+    # schwab_safety. Not yet exercised live -- staged real-order testing
+    # (Part 12) is a deliberate later phase, organic-signal-only, executed by
+    # the user, never forced by an agent.
+    dict(id='drought_entry_placement',
+         scenario="A real (mode='live') drought-overlay entry places a real trailing-buy or "
+                  "market-buy order, dispatching on the node's own strategy exactly like core entry",
+         code_path="signals_notify.check_drought_entry / notify_drought_buy_signal",
+         offline_coverage="tests/test_fake_broker_drought_entry_scenario.py",
+         check_mechanism='coverage_events', scenario_key='drought_entry_placement',
+         bad_results=[],
+         notes="No live proof yet -- needs a mode='live' drought_overlay_enabled node on soxl_ira "
+               "(only coherent account, margin-typed) and an organic drought window to elapse."),
+    dict(id='drought_handoff_cancel',
+         scenario="A real drought HANDOFF cancels a still-resting drought entry order (Case A) -- "
+                  "including the race where the cancel attempt finds the order already FILLED",
+         code_path="signals_notify.check_drought_handoff",
+         offline_coverage="tests/test_fake_broker_drought_handoff_scenario.py",
+         check_mechanism='coverage_events', scenario_key='drought_handoff_cancel',
+         bad_results=[],
+         notes="Proves the new cancel race is handled -- without this row the mechanism has no "
+               "accountability record at all. No live proof yet."),
+    dict(id='drought_handoff_exit_placement',
+         scenario="A real drought HANDOFF places a real market SELL for an open drought position "
+                  "(Case B), and does not close the DB row until the fill is confirmed",
+         code_path="signals_notify.check_drought_handoff",
+         offline_coverage="tests/test_fake_broker_drought_handoff_scenario.py",
+         check_mechanism='coverage_events', scenario_key='drought_handoff_exit_placement',
+         bad_results=[],
+         notes="Key structural difference from paper's synchronous HANDOFF close -- real must persist "
+               "trail_state['exit_pending'] and let check_own_sell_fills/check_auto_fills close it on "
+               "an unconfirmed-fill poll. No live proof yet."),
+    dict(id='addon_entry_placement',
+         scenario="A real margin add-on-at-arm leg places a real MARKET BUY for exactly the parent "
+                  "core position's share count, despite the core's own resting protective SELL",
+         code_path="signals_notify.check_addon_trigger_real",
+         offline_coverage="tests/test_fake_broker_addon_entry_scenario.py",
+         check_mechanism='coverage_events', scenario_key='addon_entry_placement',
+         bad_results=[],
+         notes="This IS the whole point of the mechanism -- without addon_double_buy_exemption firing "
+               "first, this never places a real order at all (schwab_safety.check_order's ordinary "
+               "_has_open_order guard would block it 100% of the time by construction). No live proof "
+               "yet -- needs a mode='live' addon_enabled node on soxl_ira and an organic core arm."),
+    dict(id='addon_double_buy_exemption',
+         scenario="schwab_safety.check_order's is_addon_leg exemption fires only after all five "
+                  "preconditions verify true against the DB (margin account, open core position, "
+                  "parent genuinely armed, no leg already open, quantity exactly equals parent shares)",
+         code_path="schwab_safety.check_order (is_addon_leg branch)",
+         offline_coverage="tests/test_fake_broker_addon_entry_scenario.py",
+         check_mechanism='coverage_events', scenario_key='addon_double_buy_exemption',
+         bad_results=[],
+         notes="The single most important new row -- the accountability record for the widened gate. "
+               "detail records all five verified preconditions every time it fires, so every firing is "
+               "individually reviewable. No live proof yet."),
+    dict(id='addon_exit_placement',
+         scenario="A real add-on leg's lockstep close places a real order first (cancel if still "
+                  "unfilled, replace/place a market SELL if filled) before recording the close",
+         code_path="signals_notify.close_addon_leg_real_if_open",
+         offline_coverage="tests/test_fake_broker_addon_lockstep_exit_scenario.py",
+         check_mechanism='coverage_events', scenario_key='addon_exit_placement',
+         bad_results=[],
+         notes="Divergence from paper is deliberate and logged: real closes at the leg's OWN fill "
+               "price/reason (slippage will differ from the parent's exact exit price), not the "
+               "parent's exact values paper uses. No live proof yet."),
+    dict(id='addon_leg_reconciliation',
+         scenario="A real add-on leg still entry_status='placed' past a timeout is polled/cancelled/"
+                  "marked abandoned; an open leg whose parent already closed (missed lockstep) is "
+                  "alerted loudly, never auto-closed at a guessed price",
+         code_path="signals_notify.check_addon_leg_reconciliation",
+         offline_coverage="tests/test_fake_broker_addon_lockstep_exit_scenario.py",
+         check_mechanism='coverage_events', scenario_key='addon_leg_reconciliation',
+         bad_results=[],
+         notes="Pure observation for the orphaned-leg case, matching reconcile_daily_track_nodes' own "
+               "stance -- never auto-closes. No live proof yet."),
+    dict(id='drought_handoff_alert_slot_preserved',
+         scenario="Core's real BUY signal doesn't burn its once-per-day buy_alerted slot while a real "
+                  "drought HANDOFF is still in flight (resting cancel race or unconfirmed exit poll)",
+         code_path="active_signals._scan_buy_signals (already_held branch)",
+         offline_coverage="tests/test_fake_broker_drought_handoff_scenario.py",
+         check_mechanism='coverage_events', scenario_key=None,
+         bad_results=[],
+         notes="Real ordering contract: HANDOFF initiates the exit before core's scan runs, so core's "
+               "entry lands on a LATER poll once the fill confirms -- without this fix the already_held "
+               "branch never discards buy_alerted (unlike already_pending), permanently starving core's "
+               "signal for the rest of the day. No live proof yet -- structural, checked via test."),
 ]
 
 

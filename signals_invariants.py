@@ -433,6 +433,36 @@ def check_sim_mode_off_for_real_daemon():
     return []
 
 
+def check_addon_drought_live_nodes_have_coherent_account_type():
+    """A mode='live' node with addon_enabled=1 or drought_overlay_enabled=1
+    must sit on a real margin account -- add-on is structurally a margin
+    borrow (schwab_safety.check_order's is_addon_leg preconditions hard-refuse
+    a non-margin account already), and real drought HANDOFF closes drought
+    same-day and re-enters core same-day/same-ticker, which same_day_block
+    hard-blocks on a cash account (docs/plans/real_order_execution_drought_addon.md
+    0.3/0.8). Fail loud at daemon start rather than at the first real arm/gap
+    event, matching this file's existing pattern (e.g.
+    check_starting_notional_within_account_notional_cap)."""
+    violations = []
+    for node in db.get_watchlist():
+        if node['mode'] != 'live':
+            continue
+        if not (node.get('addon_enabled') or node.get('drought_overlay_enabled')):
+            continue
+        account = node.get('account')
+        limits = schwab_safety.ACCOUNTS.get(account) if account else None
+        if limits is None or limits.account_type != 'margin':
+            _flags = ', '.join(f for f, v in (('addon_enabled', node.get('addon_enabled')),
+                                               ('drought_overlay_enabled', node.get('drought_overlay_enabled'))) if v)
+            violations.append(
+                f"{node['ticker']} (wl_id={node['id']}) has {_flags}=1 and mode='live' but account="
+                f"{account!r} is not margin-typed (account_type="
+                f"{limits.account_type if limits else 'unknown'!r}) -- add-on's is_addon_leg preconditions "
+                f"and drought HANDOFF's same-day re-entry both require a margin account."
+            )
+    return violations
+
+
 CHECKS = [
     check_live_trailing_exit_automation_scope,
     check_research_mode_ticker_with_open_position_in_automation_scope,
@@ -444,6 +474,7 @@ CHECKS = [
     check_starting_notional_within_account_notional_cap,
     check_open_position_config_matches_live_node,
     check_staged_config_matches_expected,
+    check_addon_drought_live_nodes_have_coherent_account_type,
 ]
 
 

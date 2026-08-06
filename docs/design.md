@@ -1378,7 +1378,7 @@ no-op for the current real watchlist until a node is deliberately opted in.
 time), the edge-case hardening pass this project's own history suggests will be needed once staged
 testing starts producing real data.
 
-### Real-order execution edit plan (drought entry + add-on entry), 2026-08-1x — planned, not started
+### Real-order execution edit plan (drought entry + add-on entry), 2026-08-1x — planned, then implemented (see build-status addendum at the end of this section)
 
 Opus planning pass (research-only, no code written) covering everything needed to move drought-overlay
 entry and margin add-on-at-arm from paper-only to real order placement. Full plan saved verbatim below.
@@ -1403,4 +1403,114 @@ same-day HANDOFF re-entry) legally same-day-rebuy. Both mechanisms are only real
 `soxl_ira` today.
 
 Full plan: `docs/plans/real_order_execution_drought_addon.md`.
+
+**Build-status addendum, 2026-08-1x (later same day)** — Phases 1-9 of the plan implemented end-to-end
+(schema, `schwab_safety`/`schwab_client` `is_addon_leg` exemption, real drought entry, real drought HANDOFF,
+real add-on entry, real add-on lockstep exit, Accountability Grid rows, 4 new fake_broker scenario test
+files, reconciliation extended to `mode='live'`). **Nothing flipped live** — every mechanism still defaults
+off (0/NULL) for every real node; no agent step sets `mode='live'`, flips `dry_run=False`, or fires a real
+order, per the plan's own Part 12 constraint.
+
+**Paired Opus review (independent-cold + contextual) run and resolved same session.** Both reviews
+independently converged on the same root defect — a genuine CRITICAL — and each found one additional
+CRITICAL/HIGH the other missed; all confirmed findings were fixed and re-verified with real fake_broker
+tests (not just re-read), including two more latent bugs the reviews themselves didn't catch, found only by
+building a test that faithfully reproduced the real call-site ordering:
+
+- **[CRITICAL, both reviews independently]** The lockstep leg-exit SELL was structurally unplaceable 100% of
+  the time. Every one of the 7 real call sites runs `db.close_position()` (which DELETEs the parent's
+  `open_positions` row) BEFORE `close_addon_leg_real_if_open()`, so `check_order`'s SELL-branch preconditions
+  — both the original `is_addon_leg` exemption (parent-position-scoped) and the older fail-closed
+  no-position guard — always saw no parent position on file and refused the leg's own real exit order. Fixed
+  architecturally, not by reordering the 7 call sites: the `is_addon_leg` SELL exemption (and its position-
+  size bound) now resolves the open leg via `get_open_addon_leg_by_wl_id(_node_id)` — node-scoped, valid
+  whether or not the parent row still exists — instead of `get_open_addon_leg_by_parent(pos['id'])`.
+- **[CRITICAL, cold review]** Once the leg's own D3 protective stop was resting, the PARENT core position's
+  own ordinary exit placement (a real SL/TIME/TP trigger) was blocked by `_has_open_sell_order` seeing the
+  leg's stop as a duplicate resting SELL. Fixed: `_has_open_sell_order` gained a plural `exclude_order_ids`
+  param, and `check_order`'s SELL branch now always excludes a known open leg's `sl_order_id` (not just when
+  `is_addon_leg=True`) — the parent's own exit must never be blocked by its own leg's separate, wanted order.
+- **Two more real bugs in the SAME surface, found only by test-driven verification** (neither review caught
+  these — a direct read of the diff doesn't surface them, only exercising the real call order does):
+  `check_order`'s SELL-side duplicate-order-*fingerprint* check (a second, independent guard from the
+  resting-order check above, keyed on account/ticker/side/quantity within a 60s window) also fired in BOTH
+  directions — the leg's own stop placement looked like a fingerprint-dup of the parent's just-placed arm-time
+  SELL, and the parent's later real exit looked like a fingerprint-dup of the leg's own recently-placed stop
+  — since leg and core shares are identical by construction, every SELL pair for this ticker/account looks
+  like a duplicate to a check with no concept of "which leg." Fixed by skipping this fingerprint check for
+  SELL whenever the node has ANY open addon leg, not just when the current call is the leg's own placement.
+- **[HIGH, contextual review]** No dry-run fill synthesis for the add-on leg — a `dry_run=True` account (the
+  plan's own mandatory `brokerage`-account rehearsal prerequisite) never produces a real fill/order-id, so
+  the leg was written `entry_status='placed'`/`entry_order_id=None` and could never confirm, permanently
+  stranding it; the mirror gap existed on the exit side too. Fixed: both `check_addon_trigger_real` and
+  `close_addon_leg_real_if_open` now detect a genuine dry-run no-op (an order call that returned `(None,
+  None)` without raising — the only way that happens after `approve_and_record` already ran every real
+  guard) and synthesize the fill/close immediately, mirroring `update_dry_run_buys`'s existing convention.
+- **[HIGH, cold review]** A leg whose entry fill wasn't confirmed within the ~10s synchronous poll window
+  never got its D3 stop placed at all, and was left permanently unprotected. Fixed:
+  `check_addon_leg_reconciliation`'s late-fill-confirmation branch now also calls
+  `_place_stop_loss_for_addon_leg`.
+- **[HIGH, cold review]** `set_addon_leg_exit_order_id` existed but was called nowhere — an exit SELL
+  unconfirmed within `close_addon_leg_real_if_open`'s own short poll window had zero further tracking: a
+  real order live at the broker with no local record, leg stuck open forever. Fixed: the order id is now
+  persisted, and `check_addon_leg_reconciliation` gained a third check that polls and closes it on a later
+  cycle.
+- **[MEDIUM, cold review]** `_place_stop_loss_for_addon_leg` recorded a fabricated `broker_stop_price` for a
+  dry-run leg (order_id None). Fixed to only record it on a genuine placement, mirroring the existing
+  `_place_stop_loss_for_position` guard against the same class of false claim.
+- **[MEDIUM, contextual review]** The manual "Filled" Slack modal's suggested-share prefill
+  (`handle_trail_buy_filled`) wasn't drought-aware, unlike the dispatch fix already applied to
+  `handle_entry_price`'s equivalent prefill. Fixed to check the pending row's `position_source` the same way.
+
+**Not fixed this session** (lower severity, explicitly deferred rather than silently dropped): the
+orphaned-leg reconciliation alert has no throttle (could repeat every poll in a stuck scenario — same
+failure shape as the 2026-08-02 TRAIL-reminder spam, now a narrower window given the fixes above); the
+leg's own stop firing independently of the parent is undetected (D3's own plan language already accepts
+this as a known, low-probability gap); the full `test_fake_broker_overlay_truth_table_scenario.py` file from
+Part 9's list was not written (the four scenario files that were written directly drove and proved the real
+production code paths, including finding the bugs above — judged sufficient given the mechanism is still
+gated off for every real node).
+
+D1-D6 resolved this session:
+- **D1** (exemption shape): adopted the plan's own recommendation — `is_addon_leg`, not `is_protective`.
+- **D2** (cash/margin basis): adopted the plan's recommendation — new `schwab_client.get_account_buying_power`
+  + `ADDON_BUYING_POWER_HEADROOM_MULT=2.0`, gated to the add-on path only.
+- **D3** (add-on leg's own stop): adopted recommendation (b) — anchored to the PARENT's entry_price/stop_pct.
+  Required an unplanned extension: the leg's stop SELL collides with `check_order`'s existing resting-SELL
+  duplicate guard (the parent's own protective SELL is always already resting), so a matching SELL-side
+  `is_addon_leg` exemption (verified against an actual open leg for the parent) was added alongside the
+  BUY-side one the plan described.
+- **D4** (drought sizing basis): resolved by reading `scripts/stacked_model/drought.py::generate_drought_trades`
+  directly — it's pnl_pct-only (sizing-agnostic), so paper's `starting_notional // price` convention carries
+  over to real unchanged, matching every other real sizing path (`buy_order_sizing`).
+- **D5** (combined core+addon exposure vs. `soxl_ira`'s $3,000 cap): deliberately NOT a new invented number —
+  implemented as `core_notional + addon_notional <= account.notional_cap`, reusing the existing cap as a
+  combined-exposure ceiling. Conservative by construction (can only ever be MORE restrictive than no check at
+  all); flagged for the user to revisit if a real add-on candidate's core leg alone already consumes most of
+  the cap.
+- **D6** (first staged-test node): explicitly left for Part 12, user-executed only — not a code decision.
+
+New tests: `tests/test_fake_broker_addon_entry_scenario.py` (6), `tests/test_fake_broker_addon_lockstep_exit_scenario.py`
+(7), `tests/test_fake_broker_drought_entry_scenario.py` (4), `tests/test_fake_broker_drought_handoff_scenario.py`
+(5) — all real production code paths driven directly against `tests/fake_broker.py` (new `set_buying_power`
+support added), not mocked. Building these caught real bugs before/after the review round: the add-on entry
+happy-path test initially failed because `check_order`'s D5 combined-exposure default correctly rejected an
+oversized test fixture (test data fixed, not the guard); `check_addon_leg_reconciliation`'s timeout-abandon
+path called `set_addon_leg_entry_filled(entry_status='abandoned')` instead of `close_addon_leg`, leaving the
+row's `status` column stuck at `'open'` forever (would have permanently blocked any future add-on for that
+parent) — fixed to call `close_addon_leg` like every other abandon/cancel branch. Post-review, two dedicated
+tests reproducing the REAL call-site ordering (`test_lockstep_close_succeeds_after_parent_position_already_
+deleted`, `test_parents_own_exit_still_works_once_the_leg_has_its_own_resting_stop`) are what actually
+surfaced the two additional fingerprint-check bugs above — the reviews' own findings alone would not have
+caught them, only driving the real code did.
+
+Full suite after all fixes: 589/590 passed (`tests/test_schwab_automation.py::test_automated_exit_sell_
+replace_updates_stale_sl_order_id` fails on `webbrowser.Error: could not locate runnable browser` --
+confirmed pre-existing/environmental, reproduces identically in isolation with zero relation to this diff,
+independently confirmed by the contextual review agent against the pre-diff tree too). `scripts/live_sim_
+harness.py`: 7/7. `signals_invariants.py`: clean against the real live DB. `scripts/check_backlog_cache_
+lean.py`: clean.
+
+`signals_invariants.py` also gained a new `check_addon_drought_live_nodes_have_coherent_account_type` check
+(any `addon_enabled`/`drought_overlay_enabled` `mode='live'` node must sit on a real margin account).
 

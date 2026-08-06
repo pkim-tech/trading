@@ -237,24 +237,29 @@ def _build_market_order(side: str, ticker: str, quantity: int):
 
 def _place_equity_order(
     side: str, account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
-    is_protective: bool = False,
+    is_protective: bool = False, is_addon_leg: bool = False,
 ):
     """side is 'BUY' or 'SELL'. price is only used for the safety-cap notional
     check, not sent to the API -- this places a market order. Returns
-    (response, order_id); dry_run returns (None, None)."""
+    (response, order_id); dry_run returns (None, None).
+    is_addon_leg threads through to schwab_safety.check_order's is_addon_leg
+    exemption (docs/plans/real_order_execution_drought_addon.md 3.1) and tags
+    the Slack confirmation so a real add-on fill is distinguishable from the
+    core position's own order at a glance."""
     try:
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
-            is_protective=is_protective)
+            is_protective=is_protective, is_addon_leg=is_addon_leg)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED {side} {quantity} {ticker} in {account}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
         raise
 
+    _label = "ADD-ON " if is_addon_leg else ""
     if dry_run:
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
-        _post_message(f"[DRY RUN] would {side} {quantity} {ticker} in {account} (~${quantity * price:,.0f})")
-        print(f"[DRY RUN] would {side} {quantity} {ticker} in {account} (~${quantity * price:,.0f})")
+        _post_message(f"[DRY RUN] would {_label}{side} {quantity} {ticker} in {account} (~${quantity * price:,.0f})")
+        print(f"[DRY RUN] would {_label}{side} {quantity} {ticker} in {account} (~${quantity * price:,.0f})")
         return None, None
 
     account_hash = _resolve_account_hashes()[account]
@@ -264,7 +269,7 @@ def _place_equity_order(
         order_id = Utils(_get_client(), account_hash).extract_order_id(r)
         _post_order_confirmation(
             side, account_hash, order_id, ticker, account,
-            f"✅ {side} {quantity} {ticker} in {account} submitted to Schwab (~${quantity * price:,.0f})")
+            f"✅ {_label}{side} {quantity} {ticker} in {account} submitted to Schwab (~${quantity * price:,.0f})")
     except Exception:
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
         raise
@@ -274,7 +279,7 @@ def _place_equity_order(
 
 def replace_equity_order_with_market(
     account: str, ticker: str, order_id: int, side: str, quantity: int, price: float,
-    is_gap_correction: bool = False, is_protective: bool = False,
+    is_gap_correction: bool = False, is_protective: bool = False, is_addon_leg: bool = False,
 ):
     """Atomically replaces a resting order (e.g. a protective STOP) with a
     plain MARKET order of the given side/quantity, via schwab-py's
@@ -297,7 +302,7 @@ def replace_equity_order_with_market(
     try:
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
-            is_protective=is_protective, replacing_order_id=order_id)
+            is_protective=is_protective, replacing_order_id=order_id, is_addon_leg=is_addon_leg)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with MARKET {side} {quantity} {ticker} in {account}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
@@ -328,13 +333,13 @@ def replace_equity_order_with_market(
 
 
 def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
-                      is_protective: bool = False):
+                      is_protective: bool = False, is_addon_leg: bool = False):
     return _place_equity_order("BUY", account, ticker, quantity, price, is_gap_correction=is_gap_correction,
-                                is_protective=is_protective)
+                                is_protective=is_protective, is_addon_leg=is_addon_leg)
 
 
-def place_equity_sell(account: str, ticker: str, quantity: int, price: float):
-    return _place_equity_order("SELL", account, ticker, quantity, price)
+def place_equity_sell(account: str, ticker: str, quantity: int, price: float, is_addon_leg: bool = False):
+    return _place_equity_order("SELL", account, ticker, quantity, price, is_addon_leg=is_addon_leg)
 
 
 def _build_trailing_order(side: str, link_basis: StopPriceLinkBasis, ticker: str, quantity: int, trail_pct: float):
@@ -591,16 +596,21 @@ def get_session_open_price(ticker: str) -> tuple[float, bool]:
     return get_current_price(ticker), False
 
 
-def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float):
+def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float, is_addon_leg: bool = False):
     """Resting fixed-price STOP order -- the broker executes on breach without
     depending on our poll cadence (Part 4, Section 6), same mechanism already
     relied on for the trailing-sell order. Same OrderBuilder pattern as
     _place_trailing_order, just OrderType.STOP + set_stop_price instead of
     TRAILING_STOP + link-basis/offset. Returns (response, order_id); dry_run
-    returns (None, None)."""
+    returns (None, None).
+    is_addon_leg (D3, docs/plans/real_order_execution_drought_addon.md 6.2):
+    threads through to schwab_safety.check_order's matching SELL-side
+    exemption -- the leg's own stop is meant to rest ALONGSIDE the parent
+    core position's own resting protective order, which the ordinary
+    resting-SELL duplicate guard would otherwise refuse."""
     try:
         dry_run = schwab_safety.approve_and_record(
-            account, ticker, quantity, stop_price, "SELL", is_protective=True)
+            account, ticker, quantity, stop_price, "SELL", is_protective=True, is_addon_leg=is_addon_leg)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.4f}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
@@ -714,6 +724,25 @@ def get_account_balance(account: str) -> float:
     if "cashAvailableForTrading" in balances:
         return float(balances["cashAvailableForTrading"])
     return float(balances["availableFunds"])
+
+
+def get_account_buying_power(account: str) -> float:
+    """Real 'buyingPower' for the account, read fresh (never cached) -- used
+    only by the add-on leg's cash-availability check (D2,
+    docs/plans/real_order_execution_drought_addon.md 3.1 Exemption D). An
+    add-on is sized at 100% of an already-deployed position (by construction
+    it's borrowing), so get_account_balance's 'availableFunds'/
+    'cashAvailableForTrading' would refuse nearly every real add-on -- this
+    reads the margin-inclusive figure instead. Field name UNVERIFIED against a
+    real Schwab response (same caveat as get_account_balance's own fields when
+    first written) -- confirm against a real account before this path is
+    staged live. Raises on any failure, same fail-closed contract as
+    get_account_balance."""
+    account_hash = _resolve_account_hashes()[account]
+    r = _get_client().get_account(account_hash)
+    r.raise_for_status()
+    balances = r.json()["securitiesAccount"]["currentBalances"]
+    return float(balances["buyingPower"])
 
 
 def get_real_position(account: str, ticker: str) -> float:

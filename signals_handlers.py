@@ -12,7 +12,7 @@ import schwab_safety
 from signals_blocks import _post_message, _price_input_block, _shares_input_block
 from signals_helpers import _existing_position_note, _last_sale_recovery, clear_corp_action_alert
 from signals_notify import (send_reference_report, send_coverage_report, _place_stop_loss_for_position,
-                             _coverage_mode, _exit_order_resting)
+                             _coverage_mode, _exit_order_resting, close_addon_leg_real_if_open)
 
 if cfg.SOCKET_MODE:
 
@@ -73,7 +73,17 @@ if cfg.SOCKET_MODE:
         ts                = body['message']['ts']
         ticker            = data['node']['ticker']
         signal_price      = data['signal_price']
-        suggested_shares  = int(_last_sale_recovery(data['node']) // signal_price) if signal_price else None
+        # D4 (docs/plans/real_order_execution_drought_addon.md): a drought
+        # pending buy's suggested share prefill must use flat starting_notional,
+        # not core's compounding _last_sale_recovery basis -- found by
+        # contextual Opus review before this shipped (inconsistent with the
+        # dispatch fix already applied to handle_entry_price's own prefill).
+        _pending_for_prefill = db.get_pending_buy_by_wl_id(data['node']['id'])
+        if _pending_for_prefill and _pending_for_prefill.get('position_source') == 'drought_overlay':
+            suggested_shares = int((data['node'].get('starting_notional') or 50000) // signal_price) \
+                if signal_price else None
+        else:
+            suggested_shares = int(_last_sale_recovery(data['node']) // signal_price) if signal_price else None
         client.views_open(
             trigger_id=body['trigger_id'],
             view={
@@ -170,7 +180,15 @@ if cfg.SOCKET_MODE:
         # this is the manual-confirmation twin of that same automated path
         # (fixed 2026-07-31).
         fill_time = datetime.now()
-        opened = db.open_position(node, signal_price, fill_time, fill_price, fill_time, shares=shares)
+        # Fetch the pending row fresh (BEFORE clearing it) for its
+        # position_source discriminator -- `node` here is the Slack-metadata
+        # snapshot, not a fresh pending_buys row, so it doesn't carry that
+        # field (docs/plans/real_order_execution_drought_addon.md 4.3).
+        # Guaranteed to exist -- the guard above already confirmed a pending
+        # row for this node['id'] is present.
+        pending = db.get_pending_buy_by_wl_id(node['id'])
+        opened = db.open_position_from_pending(pending, signal_price, fill_time, fill_price, fill_time,
+                                                shares=shares)
         db.clear_pending_buy_by_wl_id(node['id'])
 
         if not opened:
@@ -247,7 +265,18 @@ if cfg.SOCKET_MODE:
         exec_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
         drift_pct  = (exec_price - signal_price) / signal_price * 100
         now        = datetime.now()
-        shares     = int(_last_sale_recovery(node) // exec_price)
+        # Fetch the pending row fresh for its position_source discriminator --
+        # `node` here is the Slack-metadata snapshot, not a fresh pending_buys
+        # row (docs/plans/real_order_execution_drought_addon.md 4.3). A real
+        # drought manual-Executed confirmation sizes off starting_notional
+        # (D4, flat -- generate_drought_trades is sizing-agnostic), never off
+        # _last_sale_recovery's core-only compounding basis, which could be a
+        # very different (and unrelated) number.
+        pending = db.get_pending_buy_by_wl_id(node['id'])
+        if pending and pending.get('position_source') == 'drought_overlay':
+            shares = int((node.get('starting_notional') or 50000) // exec_price)
+        else:
+            shares = int(_last_sale_recovery(node) // exec_price)
 
         if not any(p['node']['id'] == node['id'] for p in db.get_pending_buys()):
             # The pending_buys row this button was built from is already gone
@@ -274,7 +303,10 @@ if cfg.SOCKET_MODE:
                                    ticker=ticker, node_id=node['id'], result="resolved",
                                    detail=f"{len(same_ticker_pendings)} pending for {ticker}")
 
-        opened = db.open_position(node, signal_price, signal_time, exec_price, now, shares=shares)
+        # pending is guaranteed present -- the guard above already confirmed
+        # a pending row for this node['id'] exists.
+        opened = db.open_position_from_pending(pending, signal_price, signal_time, exec_price, now,
+                                                shares=shares)
 
         db.clear_pending_buy_by_wl_id(node['id'])
 
@@ -486,9 +518,20 @@ if cfg.SOCKET_MODE:
         drift_pct  = (exit_price - signal_price) / signal_price * 100
         actual_pnl = (exit_price - entry_price) / entry_price * 100
 
+        # Fetch fresh BEFORE closing -- close_position deletes the
+        # open_positions row (moves it to trade_log), and
+        # close_addon_leg_real_if_open (docs/plans/real_order_execution_
+        # drought_addon.md 7.2) needs the position dict (id/ticker/account)
+        # to find any open addon leg for it.
+        pos = db.get_position_by_id(position_id)
+
         db.close_position(position_id,
                            exit_signal_price=signal_price, exit_price=exit_price,
                            exit_time=datetime.now(), exit_reason=data.get('reason'))
+        try:
+            close_addon_leg_real_if_open(pos, exit_price, data.get('reason'), datetime.now())
+        except Exception as e:
+            print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
 
         note = f"${exit_price:.4f}  (signal drift: {drift_pct:+.2f}%  P&L: {actual_pnl:+.2f}%)"
         print(f"  Position closed via Slack: {ticker} at {note}")
@@ -587,9 +630,17 @@ if cfg.SOCKET_MODE:
         actual_pnl = (exit_price - entry_price) / entry_price * 100
         now        = datetime.now()
 
+        # Fetch fresh BEFORE closing -- see handle_exit_price's identical
+        # comment (docs/plans/real_order_execution_drought_addon.md 7.2).
+        pos = db.get_position_by_id(position_id)
+
         db.close_position(position_id,
                            exit_signal_price=exit_price, exit_price=exit_price,
                            exit_time=now, exit_reason='MANUAL')
+        try:
+            close_addon_leg_real_if_open(pos, exit_price, 'MANUAL', now)
+        except Exception as e:
+            print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
 
         note = f"${exit_price:.4f}  (P&L: {actual_pnl:+.2f}%)"
         print(f"  Position manually closed via Slack: {ticker} at {note}")

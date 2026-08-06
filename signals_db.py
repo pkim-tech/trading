@@ -693,6 +693,24 @@ def ensure_tables():
             # Set once a row's gap condition is confirmed and acted on for the day,
             # checked before any cancel/replace attempt -- survives a restart.
             c.execute("ALTER TABLE pending_buys ADD COLUMN gap_resize_date TEXT")
+        if 'position_source' not in pb_cols:
+            # Carries the drought discriminator through from signal to fill --
+            # every real fill consumer (_reconcile_buy_fill, handle_trail_buy_fill_price,
+            # handle_entry_price) must dispatch on this instead of defaulting to
+            # open_position's 'core', or a real drought entry would silently land
+            # as a core row (see docs/plans/real_order_execution_drought_addon.md 0.5).
+            # No CHECK constraint here (SQLite ALTER TABLE ADD COLUMN can't add one) --
+            # enforced in add_pending_buy instead, same pattern as open_positions'
+            # table-creation-time constraint.
+            c.execute("ALTER TABLE pending_buys ADD COLUMN position_source TEXT NOT NULL DEFAULT 'core'")
+        if 'drought_confirm_days' not in pb_cols:
+            c.execute("ALTER TABLE pending_buys ADD COLUMN drought_confirm_days INTEGER")
+        if 'drought_vol_gate' not in pb_cols:
+            c.execute("ALTER TABLE pending_buys ADD COLUMN drought_vol_gate REAL")
+        if 'drought_gap_start' not in pb_cols:
+            c.execute("ALTER TABLE pending_buys ADD COLUMN drought_gap_start TEXT")
+        if 'drought_vol_pctile' not in pb_cols:
+            c.execute("ALTER TABLE pending_buys ADD COLUMN drought_vol_pctile REAL")
 
         # paper_positions/paper_trade_log -- schema-identical mirrors of open_positions/
         # trade_log for schwab_safety.AUTOMATION_ENABLED_TICKERS tickers running in research
@@ -1030,6 +1048,28 @@ def ensure_tables():
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_addon_legs_parent ON addon_legs(parent_position_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_paper_addon_legs_parent ON paper_addon_legs(parent_position_id)")
+
+        # Real-execution-only columns on addon_legs -- deliberately NOT added to
+        # paper_addon_legs, so the schema asymmetry itself documents the real/paper
+        # difference (paper never places a broker order, see paper_trading.py's
+        # own docstring). entry_status is a separate nullable column rather than
+        # widening addon_legs.status's CHECK, to avoid a rebuild migration on a
+        # live table (docs/plans/real_order_execution_drought_addon.md 0.10/2.2).
+        al_cols = {r[1] for r in c.execute("PRAGMA table_info(addon_legs)").fetchall()}
+        if 'entry_order_id' not in al_cols:
+            c.execute("ALTER TABLE addon_legs ADD COLUMN entry_order_id INTEGER")
+        if 'exit_order_id' not in al_cols:
+            c.execute("ALTER TABLE addon_legs ADD COLUMN exit_order_id INTEGER")
+        if 'sl_order_id' not in al_cols:
+            c.execute("ALTER TABLE addon_legs ADD COLUMN sl_order_id INTEGER")
+        if 'broker_stop_price' not in al_cols:
+            c.execute("ALTER TABLE addon_legs ADD COLUMN broker_stop_price REAL")
+        if 'entry_status' not in al_cols:
+            # No CHECK constraint (ALTER TABLE ADD COLUMN limitation, same as
+            # pending_buys.position_source above) -- enforced in
+            # set_addon_leg_entry_filled/open_addon_leg instead. NULL for every
+            # pre-existing (paper) row; real rows always set this explicitly.
+            c.execute("ALTER TABLE addon_legs ADD COLUMN entry_status TEXT")
         c.commit()
 
         # coverage_events: one row per real firing of an automation control/phase
@@ -2445,20 +2485,44 @@ _PENDING_BUY_NODE_KEYS = ('id', 'ticker', 'strategy', 'version', 'window', 'take
                           'arm_sell_pct', 'account', 'starting_notional')
 
 
-def add_pending_buy(node, sig, channel, ts, order_id=None):
+def add_pending_buy(node, sig, channel, ts, order_id=None, position_source='core',
+                     drought_confirm_days=None, drought_vol_gate=None, drought_gap_start=None,
+                     drought_vol_pctile=None):
+    if position_source not in ('core', 'drought_overlay'):
+        raise ValueError(f"invalid position_source: {position_source!r}")
     node_subset = {k: node.get(k) for k in _PENDING_BUY_NODE_KEYS}
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with _conn() as c:
         c.execute(
             "INSERT INTO pending_buys (ticker, node_json, signal_price, signal_time, "
             "reminder_channel, reminder_ts, reminder_count, last_reminder_at, created_at, order_id, wl_id, "
-            "running_low) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+            "running_low, position_source, drought_confirm_days, drought_vol_gate, drought_gap_start, "
+            "drought_vol_pctile) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (node['ticker'], json.dumps(node_subset), sig['current_price'],
              sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'), channel, ts, now_str, now_str, order_id,
-             node.get('id'), sig['current_price']),
+             node.get('id'), sig['current_price'], position_source, drought_confirm_days,
+             drought_vol_gate, drought_gap_start, drought_vol_pctile),
         )
         c.commit()
+
+
+def get_drought_pending_buy(wl_id):
+    """pending_buys counterpart to get_open_position_by_wl_id's drought filter --
+    mirrors get_pending_buy_by_wl_id but scoped to position_source='drought_overlay',
+    used by check_drought_handoff to distinguish a resting drought entry order
+    from a resting core one for the same node."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM pending_buys WHERE wl_id = ? AND position_source = 'drought_overlay' "
+            "ORDER BY id DESC LIMIT 1",
+            (wl_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d['node'] = json.loads(d['node_json'])
+    return d
 
 
 def set_pending_buy_order_id(ticker, order_id):
@@ -2865,6 +2929,42 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
         return True
 
 
+def open_position_from_pending(pending, signal_price, signal_time, entry_price, entry_time, shares,
+                                paper=False, is_dry_run_sim=False):
+    """Single dispatch point for opening a position from a pending_buys row's
+    position_source discriminator -- shared by every real fill consumer
+    (signals_notify._reconcile_buy_fill, signals_handlers.handle_trail_buy_fill_price,
+    signals_handlers.handle_entry_price) so the three sites can't
+    independently drift, the exact drift pattern that produced the
+    take_profit/trail_buy_pct column-overload bug found 3x in this
+    codebase's history (docs/plans/real_order_execution_drought_addon.md 4.3).
+
+    pending is a dict with 'node' + 'position_source' (+ drought_* fields)
+    keys, as returned by get_pending_buy_by_wl_id/get_drought_pending_buy/
+    get_pending_buys -- callers that only have a Slack-metadata node dict
+    (not a fresh pending_buys row) must look one up first, e.g.
+    get_pending_buy_by_wl_id(node['id']), BEFORE clearing it.
+
+    signal_price/signal_time/entry_price/entry_time/shares are passed
+    through faithfully (not re-derived here) -- the three real call sites
+    have genuinely different signal_time semantics (fill-moment vs. the
+    original backdated signal for a manual catch-up entry, see
+    _reconcile_buy_fill's own hold-time-origin comment), so this function
+    must not assume signal_time == entry_time."""
+    node = pending['node']
+    if pending.get('position_source') == 'drought_overlay':
+        return open_position(
+            node, signal_price, signal_time, entry_price, entry_time, shares=shares, paper=paper,
+            is_dry_run_sim=is_dry_run_sim, position_source='drought_overlay',
+            drought_confirm_days=pending.get('drought_confirm_days'),
+            drought_vol_gate=pending.get('drought_vol_gate'),
+            drought_gap_start=pending.get('drought_gap_start'),
+            drought_vol_pctile=pending.get('drought_vol_pctile'),
+        )
+    return open_position(node, signal_price, signal_time, entry_price, entry_time, shares=shares,
+                          paper=paper, is_dry_run_sim=is_dry_run_sim)
+
+
 def top_up_position(wl_id, additional_shares, fill_price, paper=False):
     """Adds top-up shares to an already-open position, blending entry_price by
     share-weighted average -- used by signals_notify._reconcile_fill (Part 3,
@@ -3150,29 +3250,82 @@ def _addon_table(paper=False):
     return 'paper_addon_legs' if paper else 'addon_legs'
 
 
-def open_addon_leg(parent_position, shares, entry_price, entry_time, paper=False, is_dry_run_sim=False):
+def open_addon_leg(parent_position, shares, entry_price, entry_time, paper=False, is_dry_run_sim=False,
+                    entry_order_id=None, entry_status='filled'):
     """Opens a margin add-on-at-arm leg against an already-open CORE position
     (parent_position, e.g. from get_open_position_by_wl_id) -- deliberately its
     own table, not open_positions (see open_positions.position_source's schema
     comment for the collision reasoning). parent_trade_log_id is captured from
     parent_position['trade_log_id'] now, at creation time, since that's a
     permanent trade_log.id -- parent_position_id (open_positions.id) is only
-    valid while the parent is still open and is not relied on after close."""
+    valid while the parent is still open and is not relied on after close.
+
+    entry_order_id/entry_status are real-execution-only (paper always leaves
+    them at the defaults, which write NULL/'filled' into columns paper_addon_legs
+    doesn't even have -- fine, extra kwargs to a paper call site are simply
+    unused by the INSERT below since it targets addon_legs' real columns only
+    when paper=False; paper's own call site never passes them)."""
+    if entry_status not in ('placed', 'filled', 'abandoned'):
+        raise ValueError(f"invalid entry_status: {entry_status!r}")
     table = _addon_table(paper)
     entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(entry_time, 'strftime') else entry_time
     with _conn() as c:
-        c.execute(f"""
-            INSERT INTO {table}
-                (wl_id, parent_position_id, parent_trade_log_id, ticker, account, shares,
-                 entry_price, entry_time, is_dry_run_sim)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            parent_position['wl_id'], parent_position['id'], parent_position['trade_log_id'],
-            parent_position['ticker'], parent_position.get('account'), float(shares),
-            float(entry_price), entry_time_str, 1 if is_dry_run_sim else 0,
-        ))
+        if paper:
+            c.execute(f"""
+                INSERT INTO {table}
+                    (wl_id, parent_position_id, parent_trade_log_id, ticker, account, shares,
+                     entry_price, entry_time, is_dry_run_sim)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                parent_position['wl_id'], parent_position['id'], parent_position['trade_log_id'],
+                parent_position['ticker'], parent_position.get('account'), float(shares),
+                float(entry_price), entry_time_str, 1 if is_dry_run_sim else 0,
+            ))
+        else:
+            c.execute(f"""
+                INSERT INTO {table}
+                    (wl_id, parent_position_id, parent_trade_log_id, ticker, account, shares,
+                     entry_price, entry_time, is_dry_run_sim, entry_order_id, entry_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                parent_position['wl_id'], parent_position['id'], parent_position['trade_log_id'],
+                parent_position['ticker'], parent_position.get('account'), float(shares),
+                float(entry_price), entry_time_str, 1 if is_dry_run_sim else 0,
+                entry_order_id, entry_status,
+            ))
         c.commit()
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def set_addon_leg_entry_filled(leg_id, entry_price, entry_status='filled', paper=False):
+    """Confirms a real addon leg's market-buy fill -- entry_price is the real
+    fill price (may differ from the placement-time estimate); entry_status
+    moves 'placed' -> 'filled' (or 'abandoned' if check_addon_leg_reconciliation
+    times it out unfilled)."""
+    if entry_status not in ('filled', 'abandoned'):
+        raise ValueError(f"invalid entry_status: {entry_status!r}")
+    table = _addon_table(paper)
+    with _conn() as c:
+        c.execute(f"UPDATE {table} SET entry_price=?, entry_status=? WHERE id=?",
+                   (float(entry_price), entry_status, leg_id))
+        c.commit()
+
+
+def set_addon_leg_exit_order_id(leg_id, order_id, paper=False):
+    table = _addon_table(paper)
+    with _conn() as c:
+        c.execute(f"UPDATE {table} SET exit_order_id=? WHERE id=?", (order_id, leg_id))
+        c.commit()
+
+
+def set_addon_leg_sl_order_id(leg_id, order_id, broker_stop_price=None):
+    """D3: records the leg's own real resting protective STOP order id/price
+    (addon_legs only -- paper never places a real stop, no paper counterpart
+    needed)."""
+    with _conn() as c:
+        c.execute("UPDATE addon_legs SET sl_order_id=?, broker_stop_price=? WHERE id=?",
+                   (order_id, broker_stop_price, leg_id))
+        c.commit()
 
 
 def get_open_addon_leg_by_parent(parent_position_id, paper=False):
@@ -3182,6 +3335,20 @@ def get_open_addon_leg_by_parent(parent_position_id, paper=False):
             f"SELECT * FROM {table} WHERE parent_position_id=? AND status='open' "
             f"ORDER BY entry_time DESC LIMIT 1",
             (parent_position_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_open_addon_leg_by_wl_id(wl_id, paper=False):
+    """wl_id-scoped counterpart to get_open_addon_leg_by_parent -- needed by
+    check_addon_trigger_real/check_order's is_addon_leg preconditions, which
+    have the node/wl_id in scope before the parent open_positions row's id is
+    necessarily fresh in hand."""
+    table = _addon_table(paper)
+    with _conn() as c:
+        row = c.execute(
+            f"SELECT * FROM {table} WHERE wl_id=? AND status='open' ORDER BY entry_time DESC LIMIT 1",
+            (wl_id,)
         ).fetchone()
     return dict(row) if row else None
 

@@ -14,6 +14,7 @@ are sampled at POLL_SECS cadence, not tick-perfect against a real broker.
 from datetime import datetime
 
 import signals_db as db
+import schwab_safety
 from signals_compute import _current_price, _load_cache, _bars_held, check_sell_condition, compute_buy_signal
 from signals_blocks import _post_message
 from signals_helpers import buy_order_sizing, log_poll, resolve_at_bar_close
@@ -79,17 +80,20 @@ def start_paper_market_buy(node, sig):
         _post_message(f"🧪 PAPER MARKET BUY — {ticker}  {sizing['shares']}sh @ ${sig['current_price']:.4f}")
 
 
-def _last_core_exit_time(wl_id):
-    """Most recent CLOSED core (position_source='core') paper_trade_log exit
-    for this node -- the drought overlay's "gap start", mirroring
+def _last_core_exit_time(wl_id, paper=True):
+    """Most recent CLOSED core (position_source='core') trade_log exit for
+    this node -- the drought overlay's "gap start", mirroring
     find_drought_windows' own gap_start = exit_bars[signal_bars[k]]. Returns
     None if this node has never closed a core trade yet (matching the
     backtest: find_drought_windows only ever creates a window BETWEEN two
-    consecutive real trades, never before the first one)."""
+    consecutive real trades, never before the first one). paper=False reads
+    the real trade_log instead of paper_trade_log (Part 4.1, real drought
+    entry shares this exact eligibility decision, not a reimplementation)."""
+    table = 'paper_trade_log' if paper else 'trade_log'
     with db._conn() as c:
         row = c.execute(
-            "SELECT exit_time FROM paper_trade_log WHERE wl_id=? AND position_source='core' "
-            "AND exit_time IS NOT NULL ORDER BY exit_time DESC LIMIT 1",
+            f"SELECT exit_time FROM {table} WHERE wl_id=? AND position_source='core' "
+            f"AND exit_time IS NOT NULL ORDER BY exit_time DESC LIMIT 1",
             (wl_id,)
         ).fetchone()
     if row is None:
@@ -97,23 +101,26 @@ def _last_core_exit_time(wl_id):
     return datetime.strptime(row['exit_time'], '%Y-%m-%d %H:%M:%S')
 
 
-def _drought_trade_exists_for_gap(wl_id, gap_start_str):
+def _drought_trade_exists_for_gap(wl_id, gap_start_str, paper=True):
     """True if a drought_overlay trade already exists (open or closed) for
     this exact gap -- identified by drought_gap_start, which is constant for
     every entry attempt within the same gap (it only changes once a NEW core
-    trade closes). Checks BOTH paper_positions (still open) and
-    paper_trade_log (already closed) since a gap's one allowed trade could be
-    in either state."""
+    trade closes). Checks BOTH the positions table (still open) and the
+    trade_log table (already closed) since a gap's one allowed trade could be
+    in either state. paper=False reads the real open_positions/trade_log
+    tables."""
+    positions_table = 'paper_positions' if paper else 'open_positions'
+    trade_log_table = 'paper_trade_log' if paper else 'trade_log'
     with db._conn() as c:
         row = c.execute(
-            "SELECT 1 FROM paper_positions WHERE wl_id=? AND position_source='drought_overlay' "
-            "AND drought_gap_start=? LIMIT 1",
+            f"SELECT 1 FROM {positions_table} WHERE wl_id=? AND position_source='drought_overlay' "
+            f"AND drought_gap_start=? LIMIT 1",
             (wl_id, gap_start_str)
         ).fetchone()
         if row is None:
             row = c.execute(
-                "SELECT 1 FROM paper_trade_log WHERE wl_id=? AND position_source='drought_overlay' "
-                "AND drought_gap_start=? LIMIT 1",
+                f"SELECT 1 FROM {trade_log_table} WHERE wl_id=? AND position_source='drought_overlay' "
+                f"AND drought_gap_start=? LIMIT 1",
                 (wl_id, gap_start_str)
             ).fetchone()
     return row is not None
@@ -145,45 +152,41 @@ def _cached_ivol_series(ticker):
     return series
 
 
-def check_paper_drought_entry(node):
-    """Confirms and enters a drought-overlay position for a
-    drought_overlay_enabled node whose core paper position has been flat for
-    at least drought_confirm_days -- the live equivalent of
-    drought_overlay_test.find_drought_windows, which defines a "drought
-    window" as confirm_days*2 checkpoint bars (9:30/14:30 hourly closes, the
-    same TARGET_H0/TARGET_H1 pair) elapsing after a real trade's exit before
-    the next real trade's signal. Live has no "next signal" to look ahead to
-    -- that's exactly what check_paper_drought_handoff (below) detects as it
-    happens, not a backstop this function can precompute.
+def evaluate_drought_entry(node, paper=True):
+    """Pure eligibility decision for a drought-overlay entry -- the live
+    equivalent of drought_overlay_test.find_drought_windows, which defines a
+    "drought window" as confirm_days*2 checkpoint bars (9:30/14:30 hourly
+    closes, the same TARGET_H0/TARGET_H1 pair) elapsing after a real trade's
+    exit before the next real trade's signal. Live has no "next signal" to
+    look ahead to -- that's exactly what check_paper_drought_handoff/
+    signals_notify.check_drought_handoff detect as it happens, not a
+    backstop this function can precompute.
 
-    MUST be called AFTER this node's own core buy-signal scan in the same
-    poll cycle (active_signals._scan_buy_signals or equivalent) -- if core's
-    real signal fires this same poll, its own pending-buy/position gets
-    created first, and the get_paper_pending_buy/get_open_position_by_wl_id
-    check below correctly sees that and skips, so core always wins ties
-    rather than this function racing it. Wired into active_signals.py,
-    2026-08-09, after a paired review of that wiring (docs/CLAUDE.md's
-    session-wrap mandate) found and fixed the ordering/gating issues noted
-    inline in run_loop where this is actually called."""
+    Shared by check_paper_drought_entry (paper) and
+    signals_notify.check_drought_entry (real) -- both tracks run the SAME
+    eligibility state machine, not two independently-maintained copies
+    (docs/plans/real_order_execution_drought_addon.md 4.1). Deliberately does
+    NOT check node.get('mode')/daily_sync_halted_at -- those are the
+    CALLER's responsibility (paper vs. real dispatch happens one level up),
+    so a real-mode caller isn't short-circuited by a paper-only guard.
+
+    Returns {'price','shares','confirm_days','vol_gate','vol_pctile',
+    'gap_start'} or None if not eligible. `shares` here is the naive
+    starting_notional // price sizing (matches D4: generate_drought_trades is
+    sizing-agnostic, so this is a legitimate real default too) -- real order
+    placement re-sizes via buy_order_sizing's own worst-case-pad formula
+    before actually placing an order, this is not the final real share count."""
     if not node.get('drought_overlay_enabled') or not node.get('drought_confirm_days'):
-        return
-    if node.get('mode', 'live') == 'live':
-        # Paper-only mechanism -- a live node sharing open_position_keys with
-        # its own paper drought row would silently suppress its REAL BUY
-        # alerts (already_held in _scan_buy_signals unions real+paper by
-        # wl_id) without ever placing a real order. Found by a paired review
-        # of the wiring diff, 2026-08-09.
-        return
-    if node.get('daily_sync_halted_at'):
-        return
+        return None
     wl_id, ticker = node['id'], node['ticker']
-    if db.get_open_position_by_wl_id(wl_id, paper=True) or db.get_paper_pending_buy(wl_id):
-        return
-    last_exit = _last_core_exit_time(wl_id)
+    pending = db.get_paper_pending_buy(wl_id) if paper else db.get_pending_buy_by_wl_id(wl_id)
+    if db.get_open_position_by_wl_id(wl_id, paper=paper) or pending:
+        return None
+    last_exit = _last_core_exit_time(wl_id, paper=paper)
     if last_exit is None:
-        return
+        return None
     gap_start_str = last_exit.strftime('%Y-%m-%d %H:%M:%S')
-    if _drought_trade_exists_for_gap(wl_id, gap_start_str):
+    if _drought_trade_exists_for_gap(wl_id, gap_start_str, paper=paper):
         # Fire-once-per-gap -- the backtest's find_drought_windows makes
         # exactly ONE trade per gap between consecutive core signals, even if
         # that trade stops out early (there's real time left before the next
@@ -191,16 +194,16 @@ def check_paper_drought_entry(node):
         # for the rest of the gap once confirmed, since `last_exit`/`eligible`
         # never move again until a NEW core trade closes (found by paired
         # Opus review, 2026-08-09).
-        return
+        return None
     df_h, _ = _load_cache(ticker)
     if df_h is None or df_h.empty:
-        return
+        return None
     hours = df_h.index.hour
     checkpoint_mask = (hours == _DROUGHT_TARGET_H0) | (hours == _DROUGHT_TARGET_H1)
     eligible = df_h.index[checkpoint_mask & (df_h.index > last_exit)]
     confirm_days = node['drought_confirm_days']
     if len(eligible) < confirm_days * 2:
-        return
+        return None
     vol_gate = node.get('drought_vol_gate')
     vol_pctile = None
     if vol_gate is not None:
@@ -220,7 +223,7 @@ def check_paper_drought_entry(node):
         # instead of excluding it (found by cold Opus review, 2026-08-09).
         if vol_pctile is None or vol_pctile >= vol_gate:
             log_poll(f"{ticker} drought_entry gated: vol_pctile={vol_pctile} gate={vol_gate}")
-            return
+            return None
     # daily-track (paper_role='daily_sync') nodes price off the last closed
     # hourly bar's Close, exactly like compute_buy_signal's own daily_sync
     # branch and start_paper_buy/start_paper_market_buy's existing halt-check
@@ -232,20 +235,55 @@ def check_paper_drought_entry(node):
     else:
         price, _ = _current_price(ticker)
     if price is None:
-        return
+        return None
     starting_notional = node.get('starting_notional') or 50000
     shares = int(starting_notional // price)
     if shares < 1:
+        return None
+    return {'price': price, 'shares': shares, 'confirm_days': confirm_days, 'vol_gate': vol_gate,
+            'vol_pctile': vol_pctile, 'gap_start': gap_start_str}
+
+
+def check_paper_drought_entry(node):
+    """Confirms and enters a drought-overlay position for a
+    drought_overlay_enabled node whose core paper position has been flat for
+    at least drought_confirm_days. Thin caller over evaluate_drought_entry
+    (Part 4.1) -- this function owns only the paper-specific gating (mode,
+    daily_sync_halted_at) and the actual paper_positions write.
+
+    MUST be called AFTER this node's own core buy-signal scan in the same
+    poll cycle (active_signals._scan_buy_signals or equivalent) -- if core's
+    real signal fires this same poll, its own pending-buy/position gets
+    created first, and evaluate_drought_entry's own pending/position check
+    correctly sees that and returns None, so core always wins ties rather
+    than this function racing it. Wired into active_signals.py,
+    2026-08-09, after a paired review of that wiring (docs/CLAUDE.md's
+    session-wrap mandate) found and fixed the ordering/gating issues noted
+    inline in run_loop where this is actually called."""
+    if node.get('mode', 'live') == 'live':
+        # Paper-only mechanism -- a live node sharing open_position_keys with
+        # its own paper drought row would silently suppress its REAL BUY
+        # alerts (already_held in _scan_buy_signals unions real+paper by
+        # wl_id) without ever placing a real order. Found by a paired review
+        # of the wiring diff, 2026-08-09.
         return
+    if node.get('daily_sync_halted_at'):
+        return
+    decision = evaluate_drought_entry(node, paper=True)
+    if decision is None:
+        return
+    wl_id, ticker = node['id'], node['ticker']
     now = datetime.now()
-    db.open_drought_overlay_position(node, price, now, price, now, confirm_days=confirm_days,
-                                      vol_gate=vol_gate, gap_start=gap_start_str,
-                                      vol_pctile=vol_pctile, shares=shares, paper=True)
+    db.open_drought_overlay_position(node, decision['price'], now, decision['price'], now,
+                                      confirm_days=decision['confirm_days'], vol_gate=decision['vol_gate'],
+                                      gap_start=decision['gap_start'], vol_pctile=decision['vol_pctile'],
+                                      shares=decision['shares'], paper=True)
     db.log_coverage_event("drought_entry", "paper", ticker=ticker, node_id=wl_id, result="filled",
-                           detail=f"confirm_days={confirm_days} vol_pctile={vol_pctile} shares={shares}")
+                           detail=f"confirm_days={decision['confirm_days']} vol_pctile={decision['vol_pctile']} "
+                                  f"shares={decision['shares']}")
     if node.get('paper_alert_verbose'):
-        _post_message(f"🧪🌵 PAPER DROUGHT ENTRY — {ticker}  {shares}sh @ ${price:.4f} "
-                       f"(confirm_days={confirm_days})")
+        _post_message(f"🧪🌵 PAPER DROUGHT ENTRY — {ticker}  {decision['shares']}sh @ ${decision['price']:.4f} "
+                       f"(confirm_days={decision['confirm_days']})")
 
 
 def check_paper_drought_handoff(node):
@@ -859,7 +897,21 @@ def reconcile_daily_track_nodes():
 # ---------------------------------------------------------------------------
 
 def _overlay_mode(node):
+    """Part 9 (docs/plans/real_order_execution_drought_addon.md): a mode='live'
+    node reconciles against the real trade_log/open_positions/addon_legs
+    tables, not paper_trade_log/paper_positions/paper_addon_legs -- reuses
+    the same 'live'/'dry_run' distinction schwab_safety._coverage_mode makes
+    elsewhere in this codebase."""
+    if node.get('mode') == 'live':
+        limits = schwab_safety.ACCOUNTS.get(node.get('account'))
+        return 'live' if (limits and not limits.dry_run) else 'dry_run'
     return 'daily_sync' if node.get('paper_role') == 'daily_sync' else 'paper'
+
+
+def _overlay_paper_flag(mode):
+    """True if this reconcile mode reads the paper_* tables, False if it
+    reads the real tables (Part 9)."""
+    return mode not in ('live', 'dry_run')
 
 
 def _with_arm_pct(node):
@@ -907,10 +959,13 @@ def _reconcile_drought(node, check_date, mode):
     # immediately after confirmation, which is the same real bar paper's own
     # entry targets, but wall-clock float/string formatting differences
     # between the two sides make an exact string match brittle.
+    # Part 9: a live/dry_run node reconciles against the real trade_log, not
+    # paper_trade_log.
+    trade_log_table = 'paper_trade_log' if _overlay_paper_flag(mode) else 'trade_log'
     with db._conn() as c:
         row = c.execute(
-            "SELECT entry_time, exit_reason, pnl_pct FROM paper_trade_log WHERE wl_id=? "
-            "AND position_source='drought_overlay' ORDER BY entry_time DESC LIMIT 1",
+            f"SELECT entry_time, exit_reason, pnl_pct FROM {trade_log_table} WHERE wl_id=? "
+            f"AND position_source='drought_overlay' ORDER BY entry_time DESC LIMIT 1",
             (wl_id,)
         ).fetchone()
     if row is None:
@@ -955,10 +1010,13 @@ def _reconcile_addon(node, check_date, mode):
     bt_ref = bt_addon_trades[-1]
     bt_arm_time = df_h.index[bt_ref['entry_i']]  # add_on.py stores the arm bar in entry_i
     backtest_state = f"arm_time={bt_arm_time} raw_ret={bt_ref['raw_ret']:.4f}"
+    # Part 9: a live/dry_run node reconciles against the real addon_legs
+    # table, not paper_addon_legs.
+    addon_legs_table = 'paper_addon_legs' if _overlay_paper_flag(mode) else 'addon_legs'
     with db._conn() as c:
         row = c.execute(
-            "SELECT entry_time, exit_reason, pnl_pct, status FROM paper_addon_legs WHERE wl_id=? "
-            "ORDER BY entry_time DESC LIMIT 1", (wl_id,)
+            f"SELECT entry_time, exit_reason, pnl_pct, status FROM {addon_legs_table} WHERE wl_id=? "
+            f"ORDER BY entry_time DESC LIMIT 1", (wl_id,)
         ).fetchone()
     if row is None:
         db.log_overlay_reconciliation(
