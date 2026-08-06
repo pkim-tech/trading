@@ -40,6 +40,13 @@ def _groups(conn, ticker):
     return c.fetchall()
 
 
+# take_profit is NULL for TrailingBothZScoreBreakout rows -- that strategy stores its
+# arm value in arm_sell_pct instead (same root cause documented in top_safe_nodes.py).
+# COALESCE pulls whichever real column is actually populated for this row's strategy,
+# so a plain `take_profit IN (?)` filter never silently matches nothing on NULL.
+TP_COL_SQL = "COALESCE(take_profit, arm_sell_pct)"
+
+
 def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_threshold):
     """Winning row = best robust_alpha in this group. Island = winning row's
     own axis values +/- the 2 nearest distinct values that exist in this group
@@ -49,7 +56,7 @@ def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_th
     size (~50 nodes: 5 TP x 5 SL x 2 hold)."""
     c = conn.cursor()
     c.execute(f"""
-        SELECT take_profit, stop_loss, max_hold_hours, {ROBUST_ALPHA_SQL} AS robust_alpha
+        SELECT {TP_COL_SQL}, stop_loss, max_hold_hours, {ROBUST_ALPHA_SQL} AS robust_alpha
         FROM backtest_cache
         WHERE ticker=? AND strategy=? AND version=? AND window=? AND z_score_threshold=?
         ORDER BY robust_alpha DESC LIMIT 1
@@ -59,11 +66,11 @@ def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_th
         return []
     w_tp, w_sl, w_hold, _ = winner
 
-    def nearest_values(col, center):
+    def nearest_values(col_sql, center):
         if center is None:
             return {None}
         c.execute(f"""
-            SELECT DISTINCT {col} FROM backtest_cache
+            SELECT DISTINCT {col_sql} FROM backtest_cache
             WHERE ticker=? AND strategy=? AND version=? AND window=? AND z_score_threshold=?
         """, (ticker, strategy, version, window, z_score_threshold))
         vals = sorted(set(r[0] for r in c.fetchall() if r[0] is not None))
@@ -72,13 +79,13 @@ def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_th
         idx = vals.index(center)
         return set(vals[max(0, idx - 2):min(len(vals), idx + 3)])
 
-    tp_keep = list(nearest_values('take_profit', w_tp))
+    tp_keep = list(nearest_values(TP_COL_SQL, w_tp))
     sl_keep = list(nearest_values('stop_loss', w_sl))
     tp_ph = ','.join('?' * len(tp_keep))
     sl_ph = ','.join('?' * len(sl_keep))
     c.execute(f"""SELECT rowid FROM backtest_cache
                   WHERE ticker=? AND strategy=? AND version=? AND window=? AND z_score_threshold=?
-                  AND take_profit IN ({tp_ph}) AND stop_loss IN ({sl_ph})
+                  AND {TP_COL_SQL} IN ({tp_ph}) AND stop_loss IN ({sl_ph})
                   AND ABS(max_hold_hours - ?) <= 24""",
               [ticker, strategy, version, window, z_score_threshold] + tp_keep + sl_keep + [w_hold])
     return [r[0] for r in c.fetchall()]

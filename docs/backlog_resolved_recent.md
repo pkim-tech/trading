@@ -7,6 +7,9 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [backtest][data] Resolved 2026-08-08 (late) — `prune_backtest_cache.py`'s take_profit/NULL bug fixed; 17 tickers' zeroed TrailingBoth v5 island data recovered from the pre-prune archive
+Same root cause as the `top_safe_nodes.py`/`three_layer_summary.py` bug fixed 2026-08-07: `take_profit IN (?)` never matches NULL, and `TrailingBothZScoreBreakout` always stores NULL there (real value is in `arm_sell_pct`) — so the 2026-08-02 prune silently dropped this strategy's v5 data for 17 of 18 v4-universe tickers. Fixed via the same `COALESCE(take_profit, arm_sell_pct)` pattern. Recovered island-only (736,111 rows, 31K-63K/ticker) from the permanent pre-prune archive, `INSERT OR IGNORE`'d into the live DB after a full backup; validated via `PRAGMA integrity_check` (ok) and SOXL's recovered best alpha (1212.1%) matching the number already on record. Full detail: `docs/deep_backlog.md`'s 2026-08-08 (late) entry (top).
+
 ## [backtest] Resolved 2026-08-08 — paired Opus review of the v5-stacked framework found 1 CRITICAL + 3 HIGH + several MEDIUM/LOW real bugs, all fixed; add-on math, skim-redeploy trigger, put-hedge liquidity/pricing, and drought's wrong-default-config bug corrected
 Full detail: `docs/research_log.md`'s 2026-08-08 entry / `docs/deep_backlog.md`'s 2026-08-08 entry (top). Most consequential: SOXL's `core+drought` was silently using an unvalidated default config, corrected 1587.0%→3461.5%; add-on's compounding math was inflating AGQ's number ~1.43x, now exact.
 
