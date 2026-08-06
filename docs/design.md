@@ -1377,3 +1377,30 @@ no-op for the current real watchlist until a node is deliberately opted in.
 **Not built**: put-hedge (scope exclusion), staged real-order testing (needs organic real signals over
 time), the edge-case hardening pass this project's own history suggests will be needed once staged
 testing starts producing real data.
+
+### Real-order execution edit plan (drought entry + add-on entry), 2026-08-1x — planned, not started
+
+Opus planning pass (research-only, no code written) covering everything needed to move drought-overlay
+entry and margin add-on-at-arm from paper-only to real order placement. Full plan saved verbatim below.
+Skim-and-reserve confirmed out of scope (alert-only, never places an automated order, needs no real-order
+code). All 17 staged paper nodes (ids 167-183) untouched by this plan.
+
+**Requires user sign-off on 6 decisions (D1-D6) before any implementation starts** — see Part 1 below.
+
+**Most consequential finding**: the existing `check_order` double-buy guard is not one gate but effectively
+three for an add-on order — the existing-position guard, `_has_open_order` (side-agnostic, and a core
+position's own resting protective SELL is *always* present at the exact moment add-on triggers, so this
+blocks 100% of real attempts unless specifically fixed), and the signal-window gate. A naive `is_protective`
+exemption would also incorrectly inherit the daily-order-cap bypass. The plan's answer: a new, narrow
+`is_addon_leg` flag with 5 verified preconditions (margin account, armed core position, no existing leg,
+exact share-count match) plus a same-side-only `_has_open_buy_order_for_ticker` replacement for the
+side-agnostic check — preserves the real 2026-07-24 double-buy protection while unblocking the one shape
+guaranteed to occur on every add-on trigger.
+
+Second key finding: `soxl_ira` is the only account that is both live (`dry_run=False`) and margin-typed —
+every other account is either dry-run or cash-typed and structurally cannot margin-borrow or (for drought's
+same-day HANDOFF re-entry) legally same-day-rebuy. Both mechanisms are only real-money-coherent on
+`soxl_ira` today.
+
+Full plan: `docs/plans/real_order_execution_drought_addon.md`.
+

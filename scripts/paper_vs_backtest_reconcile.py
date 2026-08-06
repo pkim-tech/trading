@@ -185,6 +185,12 @@ def main():
     daily_track_wl_ids = {
         n["ticker"]: n["id"] for n in db.get_watchlist()
         if n.get("watchlist_id") == args.watchlist_id and n.get("paper_role") == "daily_sync"
+        and n.get("version") == "v5"  # excludes 'v5-overlay-test*' staged combo clones (2026-08-1x) --
+        # without this, this dict comprehension (last-row-wins per ticker, no MIN(id) the way
+        # load_nodes() uses for live-track) silently resolves to whichever staged clone has the
+        # highest id instead of the real v5 daily-track node, same bug class as
+        # add_daily_track_paper_nodes.py's version=='v5' filter / drought_detection_test.load_nodes's
+        # paper_role IS NULL hardening -- found live the same morning the staged clones were created.
         and (not args.tickers or n["ticker"] in args.tickers)
     }
     tickers = args.tickers or sorted(set(live_track_nodes) | set(daily_track_wl_ids))

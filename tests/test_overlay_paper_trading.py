@@ -696,3 +696,95 @@ def test_skim_first_call_seeds_from_real_equity_and_never_fires(core_node, monke
     assert node2['skim_ref'] == pytest.approx(1.5)
     assert node2['skim_peak_before_decline'] == pytest.approx(1.5)
     assert node2['skim_strategy_value'] == pytest.approx(10000 * 1.5)
+
+
+# ---------------------------------------------------------------------------
+# Skim x drought/addon interaction -- NOT part of the (core, drought, addon)
+# truth table above; skim is a 4th, independent node-level flag a node can
+# carry alongside any of those states. Confirmed by reading _paper_core_equity/
+# _latest_core_trade_pnl_pct directly: both filter to
+# position_source='core' in paper_trade_log, so drought_overlay trades (and
+# addon legs, which live in a wholly separate paper_addon_legs table) are
+# invisible to skim's equity/strategy_value math. This was an ACCIDENT of the
+# query filter, not a decision, until the user made the call explicit
+# (2026-08-1x staged-testing session): core-only is fine for now (skim isn't
+# planned for near-term use given small notional/trade volume), but this is a
+# real regression surface if skim is ever combined with drought/addon on the
+# same node without re-confirming this scope choice still holds. Locking the
+# CURRENT behavior in with an explicit test (rather than leaving it an
+# unverified side effect of the filter) so a future change to either query is
+# a deliberate, reviewed decision, not a silent behavior change.
+# ---------------------------------------------------------------------------
+
+def test_skim_ignores_drought_overlay_pnl_by_design(core_node, monkeypatch):
+    """Deliberate current scope, confirmed with the user: skim's equity
+    calculation only ever reflects position_source='core' trades. A drought-
+    overlay trade closing at a large P&L in between two core trades must NOT
+    move skim's strategy_value at all -- only the core trades' own returns
+    should compound it. If this ever fails, either the scope decision changed
+    (update this test to match) or _paper_core_equity/_latest_core_trade_pnl_pct
+    started reading drought_overlay rows by accident (a real regression)."""
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET skim_enabled=1, drought_overlay_enabled=1, "
+                   "drought_confirm_days=3, drought_vol_gate=0.4 WHERE id=?", (core_node['id'],))
+        c.commit()
+    monkeypatch.setattr(paper_trading, '_spy_price_at', lambda ts: 500.0)
+    node = _seed_skim(core_node, 0)
+    # 5%, deliberately below SKIM_STEP (0.10) -- a return AT or above the
+    # step would fire a skim itself and confound the "did drought's P&L leak
+    # in" assertion below with "did the skim math also change."
+    node = _close_core_trade(node, 5, 1)
+    paper_trading.check_paper_skim(node)
+    node = db.get_watch_list_node_by_id(node['id'])
+    strategy_value_before = node['skim_strategy_value']
+    assert strategy_value_before == pytest.approx(10000 * 1.05)
+
+    # A drought-overlay trade closes at a huge +200% return -- must be
+    # invisible to skim.
+    node = db.get_watch_list_node_by_id(node['id'])
+    ts = _TS[2]
+    db.open_drought_overlay_position(node, 100.0, ts, 100.0, ts, confirm_days=3, paper=True)
+    dpos = db.get_drought_overlay_position(node['id'], paper=True)
+    db.close_position(dpos['id'], exit_signal_price=300.0, exit_price=300.0, exit_time=ts,
+                       exit_reason='HANDOFF', paper=True)
+
+    # Next core trade at 0% -- if drought's return leaked in, strategy_value
+    # would have jumped between the two check_paper_skim calls even though
+    # this trade itself contributes nothing.
+    node = _close_core_trade(node, 0, 3)
+    paper_trading.check_paper_skim(node)
+    node = db.get_watch_list_node_by_id(node['id'])
+    assert node['skim_strategy_value'] == pytest.approx(strategy_value_before), \
+        "skim's strategy_value moved from a drought-overlay trade -- core-only scope regressed"
+
+
+def test_skim_ignores_addon_leg_pnl_by_design(core_node, monkeypatch):
+    """Same scope decision as above, for addon legs: an addon_leg's real P&L
+    (tracked entirely in paper_addon_legs, never paper_trade_log with
+    position_source='core') must not move skim's strategy_value either."""
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET skim_enabled=1, addon_enabled=1 WHERE id=?", (core_node['id'],))
+        c.commit()
+    monkeypatch.setattr(paper_trading, '_spy_price_at', lambda ts: 500.0)
+    node = _seed_skim(core_node, 0)
+
+    ts = _TS[1]
+    db.open_position(node, 100.0, ts, 100.0, ts, shares=10, paper=True)
+    pos = db.get_open_position_by_wl_id(node['id'], paper=True)
+    db.update_position_trail_state(pos['id'], {'trailing': True, 'peak': 105.0}, paper=True)
+    armed_pos = db.get_open_position_by_wl_id(node['id'], paper=True)
+    leg_id = db.open_addon_leg(armed_pos, shares=armed_pos['shares'], entry_price=105.0, entry_time=ts, paper=True)
+    # Addon leg closes at a huge +150% return -- must be invisible to skim.
+    db.close_addon_leg(leg_id, 262.5, ts, 'TRAIL', paper=True)
+    db.close_position(pos['id'], exit_signal_price=110.0, exit_price=110.0, exit_time=ts,
+                       exit_reason='TRAIL', paper=True)
+    node = db.get_watch_list_node_by_id(node['id'])
+    paper_trading.check_paper_skim(node)
+    node = db.get_watch_list_node_by_id(node['id'])
+    strategy_value_before = node['skim_strategy_value']
+
+    node = _close_core_trade(node, 0, 2)
+    paper_trading.check_paper_skim(node)
+    node = db.get_watch_list_node_by_id(node['id'])
+    assert node['skim_strategy_value'] == pytest.approx(strategy_value_before), \
+        "skim's strategy_value moved from an addon-leg trade -- core-only scope regressed"
