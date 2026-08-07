@@ -140,6 +140,24 @@ class AccountLimits:
                            # collapse -- reads as an unambiguous boolean gate:
                            # real_order_allowed = (node.state == 'live') AND account.trading_enabled
     account_type: str      # 'cash' or 'margin' (regular or IRA limited margin, same_day_block treats both the same)
+    margin_floor: float = 0.0
+    # How far BELOW $0 the cash_check below may let cash_available go, for an
+    # account that can genuinely borrow on margin -- the check floors at $0
+    # for every account today (2026-08-07), which is correct for a cash
+    # account and a LIMITED-margin IRA (soxl_ira: same-day settlement only,
+    # cannot actually borrow -- see the account_type mislabel note below) but
+    # wrong for a real full-margin account, which can legitimately run cash
+    # negative up to its real margin capacity. Deliberately NOT keyed off
+    # account_type=="margin" -- that field already conflates "same-day-
+    # settlement-capable" with "can actually borrow" (soxl_ira's real gap,
+    # documented in docs/backlog_cache.md's "account_type mislabel" entry) --
+    # a second overloaded read of the same flag would repeat that exact
+    # mistake. Real value for `brokerage` (the one genuine full-margin
+    # account) intentionally left at the default 0.0 -- not yet known
+    # (portfolio construction hasn't happened, and the account already
+    # carries some real leverage as of 2026-08-07); set explicitly once a
+    # real number exists. brokerage is trading_enabled=False today, so this
+    # has no live effect either way yet.
 
 
 # Placeholder per-account config -- tune before going live. Account-risk framing
@@ -640,7 +658,7 @@ def _log_pre_action_state_verification(account, ticker, node_id, mode, side, loc
 
 def _open_orders(account: str) -> list:
     """Non-terminal orders only, for the concurrent-resting-order guards
-    below (_has_open_order / _has_open_buy_order_in_account)."""
+    below (_has_open_order / _open_buy_tickers_in_account)."""
     return [o for o in _all_orders(account) if o.get("status") not in _OPEN_ORDER_STATUSES_EXCLUDED]
 
 
@@ -691,21 +709,66 @@ def _has_open_order(orders: list, ticker: str, exclude_order_id: int | None = No
     return False
 
 
-def _has_open_buy_order_in_account(orders: list, ticker: str) -> str | None:
-    """Ticker symbol of another resting BUY order anywhere in this account (or
-    None) -- used to block a second concurrent BUY into the same account.
-    Schwab does not reserve buying power for a resting order (see
-    _has_open_order's docstring context above), so the cash-availability
-    check in check_order compares each BUY's notional against the same
-    undecremented account balance -- a flat buffer alone can't cover two
-    simultaneous BUYs competing for the same cash once a second live ticker
-    ever shares an account (not reachable today: every live ticker has its
-    own account, see _live_ticker_accounts, but not structurally enforced)."""
+# _has_open_buy_order_in_account -- superseded 2026-08-07 by
+# _open_buy_tickers_in_account (below), which returns ALL other resting
+# tickers instead of just the first. Left commented rather than deleted
+# outright -- not yet re-reviewed after this specific cleanup (the paired
+# Opus review pass covered the diff that introduced the replacement, not
+# this follow-up removal); delete for real once that's confirmed safe.
+#
+# def _has_open_buy_order_in_account(orders: list, ticker: str) -> str | None:
+#     """Ticker symbol of another resting BUY order anywhere in this account (or
+#     None) -- used to block a second concurrent BUY into the same account."""
+#     for o in orders:
+#         for leg in o.get("orderLegCollection", []):
+#             if leg.get("instruction") == "BUY" and leg.get("instrument", {}).get("symbol") != ticker:
+#                 return leg.get("instrument", {}).get("symbol")
+#     return None
+
+
+def _open_buy_order_quantity(orders: list, ticker: str) -> float:
+    """Total resting BUY quantity for `ticker` across `orders` -- the real
+    committed share count, straight from the broker's own order book (not a
+    node config value). Used to reserve cash for another ticker's resting
+    BUY using its ACTUAL quantity x current price, not its node's
+    starting_notional -- found by contextual Opus review before this
+    shipped: LABD's real resting order needed only $208 (a tiny 1-share
+    node), but its starting_notional is $500 -- a ~2.4x over-reservation in
+    that direction alone (worse for larger padded-sizing nodes), which
+    directly undermines the fix's whole purpose of letting more tickers
+    trade concurrently. The mirror risk (under-reserving a gap-resize/top-up
+    order sized ABOVE starting_notional) is closed the same way, since this
+    reads the real resting quantity either way."""
+    total = 0.0
+    for o in orders:
+        for leg in o.get("orderLegCollection", []):
+            if leg.get("instruction") == "BUY" and leg.get("instrument", {}).get("symbol") == ticker:
+                total += leg.get("quantity") or 0.0
+    return total
+
+
+def _open_buy_tickers_in_account(orders: list, ticker: str) -> list[str]:
+    """ALL other tickers with a resting BUY anywhere in this account (sorted,
+    deduplicated) -- the multi-order-aware sibling of
+    _has_open_buy_order_in_account. Needed once the account-wide BUY guard
+    stopped blocking unconditionally (2026-08-07, cash-aware reservation
+    fix) -- before that, at most ONE other resting BUY could ever exist by
+    construction (the old guard blocked a 2nd from ever landing), so the
+    singular _has_open_buy_order_in_account was sufficient. Once a 2nd
+    ticker's BUY is allowed to rest (cash permitting), a 3rd ticker's BUY
+    must reserve against ALL of them, not just whichever one the singular
+    lookup happened to return first -- found by cold Opus review before this
+    shipped: an account like soxl_ira (11 live tickers, both daily signal
+    windows firing near-simultaneously) can realistically have 2+ resting
+    BUYs at once, and under-reserving for a 3rd on the missed one(s) would
+    silently reopen the exact undecremented-balance risk this guard exists
+    to prevent."""
+    found = set()
     for o in orders:
         for leg in o.get("orderLegCollection", []):
             if leg.get("instruction") == "BUY" and leg.get("instrument", {}).get("symbol") != ticker:
-                return leg.get("instrument", {}).get("symbol")
-    return None
+                found.add(leg.get("instrument", {}).get("symbol"))
+    return sorted(found)
 
 
 def _has_open_sell_order(orders: list, ticker: str, exclude_order_id: int | None = None,
@@ -910,6 +973,31 @@ def check_order(
             # Five preconditions, verified fresh against the DB -- NOT trusted
             # from the caller's claim (docs/plans/real_order_execution_drought_addon.md
             # 3.1). Any failure raises exactly like an ordinary BUY block.
+            #
+            # account_type=="margin" is a known overloaded-flag bug (see
+            # docs/backlog_cache.md's "account_type mislabel" entry) --
+            # conflates same-day-settlement-capable (what soxl_ira's limited
+            # margin actually grants) with real borrowing capacity (which it
+            # doesn't have). Explored fixing this 2026-08-07 via margin_floor
+            # (a real, non-overloaded signal) but landed on a DIFFERENT real
+            # correction first: add-on doesn't inherently need to borrow at
+            # all -- if the account has enough free cash to cover the
+            # doubled notional outright, it can fund it without touching
+            # margin, in ANY account type. The buying-power check just below
+            # already does real cash-sufficiency checking; a hard account-
+            # type/margin_floor gate on top of that is the wrong mechanism.
+            # A cash-aware version of this gate (checking real available
+            # cash vs. margin_floor only for a genuine shortfall) was
+            # designed but deliberately deferred -- real complexity found
+            # mid-design: add-on's cash draw can collide with the skim-
+            # reserve mechanism's earmarked-but-not-yet-moved cash, and with
+            # 8+ tickers able to trigger add-on near-concurrently, a single
+            # reservation number isn't enough (same shape as the multi-
+            # resting-BUY reservation fix earlier this session, one level
+            # up). User's call: moderate balances and no skim active yet,
+            # not worth solving now -- see docs/backlog_cache.md's 2026-08-07
+            # "2027 problem" entries. Left as the original account_type
+            # check, UNCHANGED from before this session, pending that design.
             if limits.account_type != "margin":
                 signals_db.log_coverage_event(
                     "addon_non_margin_account_blocked", _mode, ticker=ticker, node_id=_node_id,
@@ -1010,17 +1098,39 @@ def check_order(
                 f"concurrent BUY (Schwab doesn't reserve buying power for a resting order, so nothing "
                 f"else stops these from stacking)"
             )
-        other_ticker = _has_open_buy_order_in_account(orders, ticker)
-        if other_ticker:
+        # Cash-aware as of 2026-08-07 for an ordinary (non-addon) BUY -- an
+        # unconditional block here was too blunt for an account like
+        # soxl_ira that deliberately hosts many tickers on one account (by
+        # design, to maximize organic exercise of real order-placement code
+        # paths in production, not to run each ticker at capital-constrained
+        # size). Real incident: RETL's genuine signal was blocked because
+        # LABD already had a resting BUY, even though soxl_ira had ~$9,884
+        # left after LABD's $208 reservation -- comfortably enough for
+        # RETL's $800 order too. Deferred to the cash-availability check
+        # below (where `notional`/`cash_available` already live) instead of
+        # raising unconditionally here -- see that block for the real
+        # decision. is_addon_leg is the one exception, kept strict per the
+        # existing documented policy (never exempted -- see check_order's
+        # own docstring): add-on's cash mechanism is buying-power-based, not
+        # cash-based, so it isn't comparable to the reservation estimate
+        # used below, and stacking a second ticker's BUY against an
+        # already-armed add-on-eligible position is a materially different
+        # risk than two ordinary core entries.
+        # List, not a single ticker (fixed 2026-08-07, same review pass as
+        # the cash-aware guard itself): with the unconditional block gone,
+        # 2+ other tickers can genuinely have resting BUYs at once (11 live
+        # tickers on soxl_ira, both daily signal windows firing near-
+        # simultaneously) -- see _open_buy_tickers_in_account's docstring.
+        other_tickers = _open_buy_tickers_in_account(orders, ticker)
+        if other_tickers and is_addon_leg:
             signals_db.log_coverage_event(
-                "second_ticker_buy_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked",
-                detail=f"account={account} other_ticker={other_ticker}"
+                "second_ticker_buy_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_addon_leg",
+                detail=f"account={account} other_tickers={other_tickers}"
             )
             raise SafetyViolation(
-                f"account '{account}' already has a resting BUY order for '{other_ticker}' -- refusing "
-                f"a second concurrent BUY into the same account (Schwab doesn't reserve buying power "
-                f"for a resting order, so two BUYs in one account can both pass a cash check against "
-                f"the same undecremented balance -- automation_principles.md #1)"
+                f"account '{account}' already has a resting BUY order for {other_tickers} -- refusing "
+                f"a second concurrent BUY into the same account for an add-on leg (kept strict, not "
+                f"cash-aware, per policy)"
             )
 
     # Resting-SELL guard (2026-07-22, symmetric to the BUY-side guard above):
@@ -1236,20 +1346,82 @@ def check_order(
                 "cash_check", _mode, ticker=ticker, node_id=_node_id, result="failed_closed", detail=str(e)
             )
             raise SafetyViolation(f"could not verify '{account}' cash balance, blocking order: {e}")
-        required = notional + CASH_SAFETY_BUFFER
-        if cash_available < required:
+        # Reserve for EVERY other ticker's resting BUY found above (2026-08-07,
+        # replaces the old unconditional block) -- since Schwab doesn't
+        # decrement cash for a resting order, `cash_available` here is the
+        # SAME undecremented balance each other order's own cash check
+        # already passed against. Reserving REAL quantity (straight from the
+        # broker's own order book, _open_buy_order_quantity) x CURRENT price
+        # -- not the node's configured starting_notional -- models "is there
+        # still enough for all of them if they all eventually fill" using
+        # the actual committed size, not a config target. Found by
+        # contextual Opus review before this shipped: starting_notional can
+        # diverge sharply from the real resting order's size (LABD's real
+        # order needed $208, its node's starting_notional is $500 -- padded/
+        # conservative trailing-buy sizing and top-ups mean either direction
+        # is possible), which would either over-reserve (blocking a sibling
+        # for capital never actually committed -- directly undermining the
+        # whole point of this fix) or under-reserve (a gap-resize/top-up
+        # order sized above starting_notional). Also sidesteps the
+        # get_watch_list_node ambiguity gap a starting_notional lookup would
+        # hit for an account with several same-ticker nodes (e.g. `ira`'s
+        # AGQ/SOXL canary rows) -- no node lookup needed at all here.
+        # Summed across ALL of other_tickers, not just the first (fixed same
+        # session, cold Opus review: the single-order version silently
+        # under-reserved once the block was relaxed enough to let 2+ resting
+        # BUYs coexist). Fails closed (blocks) if a live price can't be
+        # fetched for any of them -- same conservative posture as the guard
+        # it replaces, not a silent $0 assumption.
+        _reserved_other = 0.0
+        _unpriced = []
+        for _ot in other_tickers:
+            _ot_qty = _open_buy_order_quantity(orders, _ot)
+            try:
+                _ot_price = schwab_client.get_current_price(_ot)
+            except Exception:
+                _unpriced.append(_ot)
+                continue
+            _reserved_other += _ot_qty * _ot_price
+        if _unpriced:
             signals_db.log_coverage_event(
-                "cash_check", _mode, ticker=ticker, node_id=_node_id, result="blocked_insufficient",
-                detail=f"required=${required:,.0f} available=${cash_available:,.0f}"
+                "second_ticker_buy_blocked", _mode, ticker=ticker, node_id=_node_id,
+                result="blocked_unpriced", detail=f"account={account} other_tickers={other_tickers} "
+                                                   f"unpriced={_unpriced}"
             )
             raise SafetyViolation(
-                f"order notional ${notional:,.0f} + ${CASH_SAFETY_BUFFER:,.0f} cash buffer = "
+                f"account '{account}' already has resting BUY order(s) for {other_tickers}, and a live "
+                f"price couldn't be fetched for {_unpriced} to estimate reserved cash -- refusing a "
+                f"second concurrent BUY"
+            )
+        required = notional + _reserved_other + CASH_SAFETY_BUFFER
+        # margin_floor lets a genuine full-margin account's cash legitimately
+        # go negative down to its real borrowing capacity (default 0.0 for
+        # every account today -- see AccountLimits.margin_floor's docstring).
+        if cash_available - required < limits.margin_floor:
+            signals_db.log_coverage_event(
+                "cash_check", _mode, ticker=ticker, node_id=_node_id, result="blocked_insufficient",
+                detail=f"required=${required:,.0f} (incl ${_reserved_other:,.0f} reserved for "
+                       f"{other_tickers}) available=${cash_available:,.0f} margin_floor=${limits.margin_floor:,.0f}"
+            )
+            raise SafetyViolation(
+                f"order notional ${notional:,.0f}"
+                + (f" + ${_reserved_other:,.0f} reserved for {other_tickers}'s resting BUY(s)" if other_tickers else "")
+                + f" + ${CASH_SAFETY_BUFFER:,.0f} cash buffer = "
                 f"${required:,.0f} required, but '{account}' only has ${cash_available:,.0f} available"
+                + (f" (margin floor ${limits.margin_floor:,.0f})" if limits.margin_floor else "")
             )
         signals_db.log_coverage_event(
             "cash_check", _mode, ticker=ticker, node_id=_node_id, result="passed",
-            detail=f"required=${required:,.0f} available=${cash_available:,.0f}"
+            detail=(f"required=${required:,.0f} (incl ${_reserved_other:,.0f} reserved for "
+                    f"{other_tickers}) available=${cash_available:,.0f}") if other_tickers else
+                   f"required=${required:,.0f} available=${cash_available:,.0f}"
         )
+        if other_tickers:
+            signals_db.log_coverage_event(
+                "second_ticker_buy_allowed", _mode, ticker=ticker, node_id=_node_id, result="allowed_cash_sufficient",
+                detail=f"account={account} other_tickers={other_tickers} reserved=${_reserved_other:,.0f} "
+                       f"notional=${notional:,.0f} available=${cash_available:,.0f}"
+            )
         # Informational only, not blocking (automation_principles.md #4) -- the
         # user keeps CASH_RESERVE_WATERMARK as their own operational cash
         # reserve per account; this doesn't gate the order, just flags that

@@ -40,6 +40,14 @@ def test_audit_one_reports_pending_buy_instead_of_flat(isolated_db, capsys):
     audit_one(TICKER)
 
     out = capsys.readouterr().out
-    assert 'pending buy resting' in out
+    assert 'local pending-buy row on file' in out
     assert 'entry in progress' in out
     assert 'none (flat)\n' not in out
+    # Wording fixed 2026-08-07 (real user confusion: a canary node's local
+    # pending_buys row used to print identically to a real resting broker
+    # order) -- this node is version='canary' and defaults to a non-'live'
+    # state, so it must render as CANARY specifically (LIVE checked first,
+    # then CANARY as its own distinct case, not lumped into a generic
+    # dry_run/paper label -- user's explicit correction).
+    assert 'CANARY' in out
+    assert '✅ LIVE' not in out  # LIVE branch must not have fired for a non-live node

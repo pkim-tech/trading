@@ -110,6 +110,35 @@ REGISTRY = [
          check_mechanism='coverage_events', scenario_key='sl_placement_fast_confirm_timeout',
          notes="Timeout branch confirmed reachable live (VOO, dry_run, 2026-07-24); doesn't confirm the "
                "fallback SL placement that follows actually succeeds."),
+    dict(id='sl_order_fills_independent_detection',
+         scenario="A position's own resting protective stop (sl_order_id) fills independently -- "
+                  "before the daemon's bar-close signal check ever computes an exit -- and gets "
+                  "detected/closed promptly, not left stuck open indefinitely",
+         code_path="signals_notify.check_sl_order_fills (new, polled every cycle BEFORE the "
+                    "bar-close exit scan in active_signals.py's run_loop)",
+         offline_coverage="tests/test_fake_broker_sl_order_fills_scenario.py: 5 tests -- "
+                           "no-exit-pending close, real post-arm TRAILING_STOP fill labeled TRAIL "
+                           "(not SL), trailing=True-but-unrepointed-order still labeled SL (the "
+                           "mislabel a paired Opus review caught), dedup with exit_pending, and the "
+                           "fewer-shares-than-tracked guard (alerts instead of auto-closing)",
+         check_mechanism='coverage_events', scenario_key='automated_exit_confirmed',
+         bad_results=[],
+         notes="Real incident, 2026-08-07 (LABD, soxl_ira): a 1-share, hair-trigger (fixed_sl=0.3%) "
+               "position's real stop filled ~7 minutes after entry, but check_own_sell_fills/"
+               "check_auto_fills only ever polled trail_state.exit_pending.order_id (which only exists "
+               "once OUR bar-close check has already computed an exit) -- open_positions stayed stuck "
+               "for 8+ hours, and every retry against the now-terminal sl_order_id 400'd, posting a "
+               "false 'UNPROTECTED -- place a stop-loss manually' alert on an already-safely-closed "
+               "position. Fixed same day, verified against the real stuck row (closed correctly: "
+               "entry $7.685 -> exit $7.66, SL, -0.33% pnl). exit_reason correctly derived from ORDER "
+               "IDENTITY (sl_order_id == trail_state.exit_order_id), not the trailing flag -- an "
+               "earlier draft keyed off state['trailing'] alone and would mislabel a genuine SL fill "
+               "as TRAIL whenever arming was persisted but the real trailing-sell placement had failed "
+               "(caught by a paired independent-cold + contextual Opus review before landing). Shares "
+               "the automated_exit_confirmed scenario_key with check_own_sell_fills/check_auto_fills' "
+               "existing exit-fill detection -- distinguish by detail containing 'via_sl_order_poll=1'. "
+               "No live re-confirmation yet since the fix landed beyond the one already-stuck LABD row "
+               "it was applied to manually."),
     dict(id='post_fill_topup',
          scenario="Post-fill top-up places a real order",
          code_path="_reconcile_fill",
@@ -169,11 +198,41 @@ REGISTRY = [
          notes="Passing path verified live+dry_run 2026-07-24. Blocking case (insufficient funds) never "
                "observed -- every real event so far shows result=passed."),
     dict(id='second_ticker_one_account',
-         scenario="Second-live-ticker-in-one-account BUY correctly blocked",
-         code_path="schwab_safety._has_open_buy_order_in_account",
-         offline_coverage="3 unit tests (test_schwab_safety.py)",
+         scenario="Second-live-ticker-in-one-account BUY correctly blocked when the account "
+                  "can't afford both reservations",
+         code_path="schwab_safety._open_buy_tickers_in_account / _open_buy_order_quantity / "
+                    "check_order's cash-check block (schwab_client.get_current_price)",
+         offline_coverage="test_schwab_safety.py::test_second_ticker_resting_buy_in_same_account_blocked; "
+                           "test_fake_broker_check_order_guards_phase2_scenario.py: "
+                           "test_second_ticker_buy_blocked_when_cash_cannot_cover_both, "
+                           "test_third_ticker_buy_reserves_against_both_other_resting_orders, "
+                           "test_second_ticker_buy_blocked_for_addon_leg_regardless_of_cash",
          check_mechanism='coverage_events', scenario_key='second_ticker_buy_blocked',
-         notes="Not reachable today (one ticker per account) -- will matter once account-sharing changes."),
+         bad_results=['blocked_unpriced'],
+         notes="Cash-aware as of 2026-08-07 (real incident: RETL's genuine BUY was blocked by LABD's "
+               "resting order despite ~$9,884 real headroom, since soxl_ira deliberately hosts 11 live "
+               "tickers on one account) -- was previously an unconditional block regardless of real "
+               "affordability, code_path/notes above were stale (this WAS reachable, fired for real "
+               "the same day it was 'not reachable' in this doc). Reservation sums ALL other resting "
+               "tickers' real quantity x live price (not a config value), fixed same session after a "
+               "paired Opus review caught a single-order-only version. is_addon_leg kept strict "
+               "(blocked_addon_leg), unaffected by the cash-aware change. No live confirmation yet of "
+               "the new blocked-for-real-cash-reasons path (only the old unconditional block and "
+               "today's addon_leg block have real events on file)."),
+    dict(id='second_ticker_buy_allowed_when_cash_sufficient',
+         scenario="Second-live-ticker-in-one-account BUY correctly ALLOWED when the account can "
+                  "afford both reservations (the actual point of the 2026-08-07 fix)",
+         code_path="schwab_safety.check_order's cash-check block, same as second_ticker_one_account",
+         offline_coverage="test_fake_broker_check_order_guards_phase2_scenario.py: "
+                           "test_second_ticker_buy_allowed_when_cash_covers_both, "
+                           "test_third_ticker_buy_reserves_against_both_other_resting_orders "
+                           "(3rd leg once cash is raised)",
+         check_mechanism='coverage_events', scenario_key='second_ticker_buy_allowed',
+         bad_results=[],
+         notes="New 2026-08-07 -- replaces the unconditional block's cost (a real, fundable RETL trade "
+               "was skipped today purely because LABD had a resting order, not because cash was "
+               "actually short). Real live confirmation still open: needs a genuine day where 2+ "
+               "soxl_ira tickers signal close together and the second one's BUY actually proceeds."),
     dict(id='daemon_exception_survival',
          scenario="Daemon survives an unhandled exception mid-loop",
          code_path="active_signals._guarded + outer try/except in run_loop",
@@ -542,7 +601,29 @@ REGISTRY = [
          bad_results=[],
          notes="Applies the validated MARGIN_COST_FLAT_PCT haircut (0.04pp) to the leg's pnl_pct -- "
                "missing in the first version (found by review), which was 0.04pp optimistic on every "
-               "leg relative to scripts/stacked_model/add_on.py's validated model."),
+               "leg relative to scripts/stacked_model/add_on.py's validated model. NOTE (2026-08-07): "
+               "this scenario_key is now also logged by the unrelated "
+               "addon_leg_independent_sl_fill_detection row below (result='sl_closed_reconcile') -- a "
+               "live event here does NOT distinguish lockstep-close proof from independent-stop-fill "
+               "proof; check the result value or see that row's own status instead."),
+    dict(id='addon_leg_independent_sl_fill_detection',
+         scenario="An add-on leg's OWN protective stop fills independently (before the parent's "
+                  "lockstep exit signal is ever computed) and gets detected/closed via reconciliation, "
+                  "not left stuck open",
+         code_path="signals_notify.check_addon_leg_reconciliation (new poll of leg['sl_order_id'])",
+         offline_coverage="No dedicated fake_broker test yet -- built same session as "
+                           "sl_order_fills_independent_detection below (same shape, one level down), "
+                           "not separately regression-tested.",
+         check_mechanism='coverage_events', scenario_key='addon_exit_fill',
+         bad_results=[],
+         notes="New 2026-08-07, same root cause and same review pass as the core-position "
+               "sl_order_fills_independent_detection fix -- check_addon_leg_reconciliation only ever "
+               "polled leg['exit_order_id'] (an order WE placed in response to the parent's already-"
+               "computed lockstep exit), never leg['sl_order_id'] (the leg's own resting stop, "
+               "continuously monitored by the broker independent of our bar-close checks). Shares the "
+               "addon_exit_fill scenario_key with the lockstep-close row above -- distinguish by "
+               "result='sl_closed_reconcile'. No fake_broker regression test written for this specific "
+               "branch (unlike the core-position sibling, which has 5) -- open follow-up."),
     dict(id='skim_fire',
          scenario="Skim moves skim_frac of the currently-deployed strategy value into "
                   "the reserve on a new equity high >= skim_step above the last skim reference",

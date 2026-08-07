@@ -111,6 +111,7 @@ from signals_notify import (
     TRAIL_REMINDER_MINUTES, _trailing_order_blocks, _supersede_message,
     notify_trailing_activated, check_trailing_reminders,
     EXIT_REMINDER_MINUTES, _exit_pending_blocks, check_exit_reminders, check_own_sell_fills,
+    check_sl_order_fills,
     BUY_REMINDER_MINUTES, _trailing_buy_status, _pending_buy_blocks, check_buy_reminders,
     check_auto_fills, check_gap_resize, drain_fill_queue,
     check_live_state_reconciliation, alert_stale_price_exit_suppressed,
@@ -957,6 +958,20 @@ def run_loop(tickers: set = None):
             # genuinely new hourly bar has closed since the last check, using that bar's
             # real Close/Low/High — not a live mid-bar tick — to match the backtest kernels.
             open_positions = get_open_positions()
+
+            # Runs before the bar-close exit scan below (not just alongside
+            # check_own_sell_fills/check_auto_fills later this cycle) -- a
+            # real protective stop-loss order is continuously monitored by
+            # the broker, not just at our discrete bar-close checks, so it
+            # can fill before our own signal check ever computes an exit and
+            # tries to act on the now-terminal order. Checking first means a
+            # fill that's already visible this cycle closes the position
+            # before _check_position_exit below ever gets a chance to 400 on
+            # it and post a false "UNPROTECTED" alert. See check_sl_order_fills'
+            # docstring (real incident, LABD, 2026-08-07).
+            _guarded("sl_order_fills", check_sl_order_fills, open_positions)
+            open_positions = get_open_positions()
+
             paper_positions = get_open_positions(paper=True)
             # Keyed via _pos_key: wl_id (the watch_list row's own PK) when available,
             # else a (ticker, window) fallback for legacy positions that predate the

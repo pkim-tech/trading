@@ -608,12 +608,17 @@ def test_second_ticker_resting_buy_in_same_account_blocked(env, monkeypatch):
     # BUY is already resting -- both would otherwise check cash against the
     # same undecremented Schwab balance (Schwab doesn't reserve buying power
     # for a resting order), so a flat cash buffer alone can't catch this.
+    # Reservation is real quantity x current price (2026-08-07 fix, not a
+    # node config value) -- mock get_current_price so this stays a pure unit
+    # test (no real network call for a fake ticker), sized large enough that
+    # the account's $1,000,000 mocked balance genuinely can't cover both.
     monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [
         {"status": "WORKING", "orderLegCollection": [
-            {"instruction": "BUY", "instrument": {"symbol": "OTHER_TICKER"}}
+            {"instruction": "BUY", "instrument": {"symbol": "OTHER_TICKER"}, "quantity": 100_000}
         ]}
     ])
-    with pytest.raises(schwab_safety.SafetyViolation, match="resting BUY order for 'OTHER_TICKER'"):
+    monkeypatch.setattr(schwab_client, 'get_current_price', lambda t: 50.0)
+    with pytest.raises(schwab_safety.SafetyViolation, match="reserved for .*OTHER_TICKER.*resting BUY"):
         schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
 
 

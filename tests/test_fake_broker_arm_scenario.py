@@ -119,10 +119,15 @@ def test_arm_places_a_fresh_trailing_sell_when_no_sl_to_replace(env, fake_broker
 
     updated = signals_db.get_open_position(TICKER)
     assert updated['trail_state'].get('order_placed') is True
-    # No prior sl_order_id existed to update (that's what makes this the
-    # "fresh placement" case) -- the new order's id correctly lives in
-    # trail_state.exit_order_id instead, not open_positions.sl_order_id
-    # (which stays None; the 2026-07-31 writeback fix only refreshes an
-    # existing sl_order_id after a REPLACE, it doesn't invent one).
-    assert updated['sl_order_id'] is None
+    # No prior sl_order_id existed (that's what makes this the "fresh
+    # placement" case) -- fixed 2026-08-07 (same review pass as
+    # check_sl_order_fills): sl_order_id must ALWAYS reflect whatever real
+    # order is currently resting, fresh placement or REPLACE alike, or
+    # check_sl_order_fills' independent poll (keyed on open_positions.
+    # sl_order_id, not trail_state.exit_order_id) can never see a fill on a
+    # trailing-sell that was placed fresh -- the same undetected-fill gap
+    # the LABD incident exposed, just reached via a missing-entry-SL
+    # precondition instead of an early-fill one.
+    assert updated['sl_order_id'] == new_orders[0]['orderId']
+    assert updated['trail_state'].get('exit_order_id') == new_orders[0]['orderId']
     assert updated['trail_state'].get('exit_order_id') == new_orders[0]['orderId']

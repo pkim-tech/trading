@@ -146,31 +146,39 @@ def _attempt_automated_sell(pos, current_price):
     db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed",
                            detail=f"shares={shares} trail_sell_pct={trail_sell_pct}")
-    if sl_order_id and exit_order_id is not None:
+    if exit_order_id is not None:
         # sl_order_id (open_positions column, distinct from trail_state.exit_order_id)
-        # is now dead -- replaced by this trailing-sell. Point it at the new order so
-        # any later reader (a fresh replace attempt via this same function on re-arm,
-        # the manual "cancel the existing stop-loss order" reminder text, the TRAIL+
-        # hold_time_forced fallback in _attempt_automated_exit_sell) sees what's
-        # actually resting instead of a dead order id -- same stuck-exit/false-alert
-        # bug class as the exit_order_id staleness fixed 2026-07-31, just via this
-        # replace path instead (found in the 2026-07-31 audit's "still open" list).
-        # `exit_order_id is not None` guard added after a later review: extract_order_id
-        # can legitimately return None on a real success (e.g. a missing Location
-        # header) -- without the guard, a real successful replace with an unextractable
-        # id would erase the previous (valid, still-real) sl_order_id, silencing the
-        # missing_sl reconciliation check (gated on sl_order_id truthy) and dropping
-        # resting_order_id to None for a later hold-time-forced exit, which then hits
-        # the fresh place_equity_sell path and gets rejected by the resting-order dup
-        # guard with no alert at all (the except block's both branches false). Matches
-        # the established pattern already used 600 lines away in
-        # _place_stop_loss_for_position (`if sl_order_id is not None:`).
+        # always tracks whatever real order is currently resting -- point it at the
+        # new trailing-sell so any later reader (a fresh replace attempt via this
+        # same function on re-arm, the manual "cancel the existing stop-loss order"
+        # reminder text, the TRAIL+hold_time_forced fallback in
+        # _attempt_automated_exit_sell, check_sl_order_fills' independent poll) sees
+        # what's actually resting instead of a dead order id (REPLACE case) or
+        # nothing at all (fresh-placement case). Originally gated on `sl_order_id`
+        # already being truthy (only rewriting on a REPLACE) -- found 2026-08-07,
+        # same paired-review pass as check_sl_order_fills: when no prior sl_order_id
+        # existed (e.g. the entry-time SL placement itself had failed), the fresh
+        # trailing-sell's id lived ONLY in trail_state.exit_order_id, so
+        # check_sl_order_fills (keyed on open_positions.sl_order_id) and the
+        # missing_sl reconciliation check could never see it -- the exact same
+        # undetected-fill exposure as the original LABD incident, just reached via a
+        # missing-entry-SL precondition instead of an early-fill one. Confirmed safe
+        # to write unconditionally: the missing_sl reconciliation check
+        # (check_live_state_reconciliation) only reads sl_order_id when
+        # `not state.get('trailing')`, and trailing is already True by the time this
+        # function is called, so no false missing_sl alert results.
+        # `exit_order_id is not None` guard kept from the original REPLACE-only fix:
+        # extract_order_id can legitimately return None on a real success (e.g. a
+        # missing Location header) -- without the guard, a real successful
+        # replace/placement with an unextractable id would erase the previous
+        # (valid, still-real) sl_order_id instead of just leaving it unset.
         db.set_sl_order_id_by_position(pos['id'], exit_order_id)
         # The stop-loss this price described is gone -- replaced by the
-        # trailing-sell above. Left uncleared, stop_status() would report
-        # 'known' off a dead price (Opus review, 2026-08-01: a real SL alert
-        # firing after this point would falsely say "broker stop on file, no
-        # action needed" for a position actually protected by an unconfirmed
+        # trailing-sell above (a no-op on the fresh-placement path, where there
+        # was no SL price to begin with). Left uncleared, stop_status() would
+        # report 'known' off a dead price (Opus review, 2026-08-01: a real SL
+        # alert firing after this point would falsely say "broker stop on file,
+        # no action needed" for a position actually protected by an unconfirmed
         # resting order, not the stop it describes).
         db.set_broker_stop_price_by_position(pos['id'], None)
     return True, exit_order_id
@@ -2273,6 +2281,30 @@ def check_addon_leg_reconciliation(open_positions):
                           f"marked abandoned. Never sold shares never bought.")
             continue
 
+        # Same gap check_sl_order_fills exists to close for the core
+        # position, one level down: a leg's own protective stop
+        # (_place_stop_loss_for_addon_leg, leg['sl_order_id']) rests
+        # continuously at the broker, independent of the parent's lockstep
+        # exit signal -- it can fill on its own before that signal is ever
+        # computed. The exit_order_id branch just below only covers an
+        # order WE placed in response to an already-computed lockstep exit;
+        # nothing else polls sl_order_id directly (found 2026-08-07, same
+        # review pass as check_sl_order_fills -- identical shape to the
+        # LABD incident, one level down).
+        if (leg.get('status') == 'open' and not leg.get('exit_order_id')
+                and leg.get('sl_order_id')):
+            fill = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=leg['sl_order_id'])
+            if fill is not None:
+                db.close_addon_leg(leg['id'], fill['price'], datetime.now(), 'SL_RECONCILED')
+                db.log_coverage_event("addon_exit_fill", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                       result="sl_closed_reconcile",
+                                       detail=f"leg_id={leg['id']} price={fill['price']:.4f}")
+                _leg_node = db.get_watch_list_node_by_id(leg.get('wl_id'))
+                _post_message(f"🤖 *{ticker}* ({account} · {mode_tag(account, _leg_node)}) — add-on leg "
+                              f"({leg['id']}) protective stop filled at ${fill['price']:.4f}, closed via "
+                              f"reconciliation poll")
+                continue
+
         # A real exit SELL was placed (close_addon_leg_real_if_open) but
         # wasn't confirmed within that call's short poll window -- pick up
         # the confirmation here on a later poll (HIGH fix, cold Opus review
@@ -2646,6 +2678,109 @@ def check_own_sell_fills(open_positions):
         _post_message(f"🤖 {ticker} — auto-detected exit fill at ${fill['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
         try:
             close_addon_leg_real_if_open(pos, fill['price'], exit_pending['reason'], datetime.now())
+        except Exception as e:
+            print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
+
+
+def check_sl_order_fills(open_positions):
+    """Every poll cycle, rechecks each open position's own resting protective
+    stop-loss order (pos['sl_order_id'], placed at entry via
+    _place_stop_loss_for_position and repointed on every replace -- always the
+    real order currently resting at the broker, see set_sl_order_id_by_position
+    call sites) for a FILLED status, independent of whether our own bar-close
+    signal check has ever computed an exit condition for this position.
+
+    Distinct from check_own_sell_fills, which only rechecks
+    trail_state.exit_pending.order_id -- an order that only exists once OUR
+    bar-close signal check has already fired and called
+    _attempt_automated_exit_sell. A real stop-loss order is continuously
+    monitored by the broker, not just at our discrete bar-close checks, so it
+    can fill on its own well before any exit_pending is ever created. Without
+    this poll, that fill went undetected until the reconciliation-mismatch
+    check flagged it (detection-only, never closes the position) -- and every
+    subsequent bar-close SL recheck then tried to replace the now-filled/
+    terminal sl_order_id via _attempt_automated_exit_sell, which 400'd and
+    posted a false "UNPROTECTED -- place a stop-loss manually" alert on an
+    already-safely-closed position (real incident, LABD, 2026-08-07 -- stuck
+    open 8+ hours, repeated false alerts, before this fix).
+
+    sl_order_id is repointed to the trailing-sell order id at arm time
+    (_attempt_automated_sell, line ~168) -- so this same poll also covers a
+    trailing-sell that fires on its own before a bar-close check ever
+    computes the TRAIL condition. exit_reason is derived from ORDER IDENTITY
+    (sl_order_id == trail_state.exit_order_id), not state['trailing'] --
+    trailing is persisted by check_sell_condition the moment a position arms,
+    independent of whether _attempt_automated_sell's own placement actually
+    succeeded (see that function's docstring): on a SafetyViolation, broker
+    exception, paused node, non-live node, or a ticker outside
+    AUTOMATION_ENABLED_TICKERS, sl_order_id is left pointing at the ORIGINAL
+    entry stop while trailing is already True. Keying off state['trailing']
+    would mislabel that stop's real SL fill as 'TRAIL' in trade_log (caught
+    by a paired Opus review, 2026-08-07, both independently -- one rated it
+    MEDIUM via the orderType angle, the other HIGH via this exact order-id
+    argument, converged in rebuttal on this fix)."""
+    for pos in open_positions:
+        sl_order_id = pos.get('sl_order_id')
+        if sl_order_id is None:
+            continue
+        state = pos.get('trail_state') or {}
+        exit_pending = state.get('exit_pending') or {}
+        if exit_pending.get('order_id') == sl_order_id:
+            # Already covered by check_own_sell_fills/check_auto_fills's poll
+            # of this exact order_id -- avoid a duplicate close/alert.
+            continue
+        account = pos.get('account')
+        if not account:
+            continue
+        ticker = pos['ticker']
+        fill = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=sl_order_id)
+        if fill is None:
+            continue
+        if state.get('exit_forced_by_hold_time'):
+            reason = 'TIME'
+        elif sl_order_id == state.get('exit_order_id'):
+            reason = 'TRAIL'
+        else:
+            reason = 'SL'
+        # Real, narrow residual gap (flagged in the same review, not fixed
+        # here): fill['quantity'] isn't checked against pos['shares']. A
+        # top_up_position failure or an addon leg sized independently of the
+        # core stop could leave sl_order_id resting for fewer shares than
+        # the local position tracks -- closing the WHOLE position on a
+        # partial fill would understate real open exposure. Alert instead of
+        # silently closing when the two disagree, matching the existing
+        # top_up_position "UNDERSTATED" alert pattern rather than inventing
+        # a new auto-correction.
+        if fill['quantity'] != pos['shares']:
+            _post_message(
+                f"⚠️ *{ticker}* ({account}) SL/TRAIL order {sl_order_id} filled for "
+                f"{fill['quantity']} shares but open_positions tracks {pos['shares']} -- "
+                f"not auto-closing, needs manual reconciliation"
+            )
+            db.log_coverage_event("automated_exit_confirmed", _coverage_mode(account), ticker=ticker,
+                                  position_id=pos.get('id'), node_id=pos.get('wl_id'), result="qty_mismatch",
+                                  detail=f"fill_qty={fill['quantity']} pos_shares={pos['shares']}")
+            continue
+        actual_pnl = (fill['price'] - pos['entry_price']) / pos['entry_price'] * 100
+        # broker_stop_price (the real trigger level, set when the order was
+        # placed/repointed) is a strictly better exit_signal_price than the
+        # fill price itself -- preserves the signal-vs-fill slippage this
+        # column exists to record, matching exit_pending's own
+        # current_price/fill-price split in the sibling check_own_sell_fills.
+        exit_signal_price = pos.get('broker_stop_price') or fill['price']
+        closed = db.close_position(pos['id'], exit_signal_price=exit_signal_price,
+                                    exit_price=fill['price'], exit_time=datetime.now(),
+                                    exit_reason=reason)
+        if not closed:
+            # Already closed this same cycle by another fill-detection path
+            # reading the same stale open_positions snapshot.
+            continue
+        db.log_coverage_event("automated_exit_confirmed", _coverage_mode(account), ticker=ticker,
+                              position_id=pos.get('id'), node_id=pos.get('wl_id'), result="closed",
+                              detail=f"reason={reason} price={fill['price']:.4f} via_sl_order_poll=1")
+        _post_message(f"🤖 {ticker} — auto-detected {reason} fill at ${fill['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
+        try:
+            close_addon_leg_real_if_open(pos, fill['price'], reason, datetime.now())
         except Exception as e:
             print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
 

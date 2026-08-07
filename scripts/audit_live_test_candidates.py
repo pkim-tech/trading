@@ -28,6 +28,7 @@ import active_signals as a
 import signals_compute as sc
 import signals_db as db
 import schwab_client
+import signals_helpers
 
 
 def _real_orders(account, ticker):
@@ -214,9 +215,44 @@ def audit_one(ticker, wl_id=None):
         # same blind spot as coverage_check.py's carryover-scoping bug above).
         pending = state['pending_buy']
         if pending:
-            print(f"  DB position: none (flat), but pending buy resting -- "
+            print(f"  DB position: none (flat) -- local pending-buy row on file: "
                   f"signal_price=${pending['signal_price']:.2f} signal_time={pending['signal_time']} "
                   f"order_placed={bool(pending['order_placed'])} order_id={pending.get('order_id')}")
+            # A pending_buys row is a LOCAL record, not proof a real broker
+            # order exists -- three genuinely different situations all
+            # printed order_placed/order_id and looked identical without
+            # this, which was the direct cause of a real confusion (user
+            # checked Schwab for a ticker this script called "pending buy
+            # resting" and found nothing -- 2026-08-07). LIVE-vs-not is the
+            # single most important fact and must be checked first, not
+            # buried after a generic dry_run/paper label (user's explicit
+            # correction, same session) -- CANARY is a real, deliberately
+            # distinct sub-case of not-live (version='canary' proof-of-life
+            # nodes, dry_run by design), not just another flavor of "paper."
+            _is_live = node.get('state') == 'live' and not signals_helpers.effectively_dry_run(account, node)
+            _is_canary = node.get('version') == 'canary'
+            if _is_live:
+                if pending.get('order_id'):
+                    print(f"  ✅ LIVE -- real broker order on file: id={pending['order_id']} -- if you "
+                          f"don't see this at Schwab, that's a real discrepancy, verify directly against "
+                          f"the order id.")
+                elif pending.get('order_placed'):
+                    print("  ⚠️  LIVE, but order_placed=True with NO order_id captured -- either placed "
+                          "manually at the broker (never confirmed here) or an automated placement whose "
+                          "id we couldn't extract. Cannot confirm a real order exists from this record "
+                          "alone; verify at the broker directly.")
+                else:
+                    print("  ⚠️  LIVE, but order_placed=False -- no real order was ever placed for this "
+                          "signal (e.g. blocked by a guard before reaching the broker, or still awaiting "
+                          "manual confirmation). Nothing should exist at the broker for this yet.")
+            elif _is_canary:
+                print("  🧪 CANARY -- proof-of-life test node, dry_run by design. No real broker order was "
+                      "ever placed or possible for this signal. Waiting on a synthetic bounce-fill "
+                      "(update_dry_run_buys), not a real resting order. Check nothing at the broker.")
+            else:
+                print("  📝 PAPER/DRY_RUN -- this node's real order attempts are simulated (not a canary, "
+                      "not live). No real broker order was ever placed or possible for this signal. "
+                      "Waiting on a synthetic bounce-fill (update_dry_run_buys), not a real resting order.")
             print("  verdict: entry in progress (pending buy) -- not a real entry candidate right now")
             return
         paper_pending = state['paper_pending_buy']

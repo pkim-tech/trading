@@ -7,6 +7,7 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][security] Resolved 2026-08-07 (evening) — LABD's stop-loss fill went undetected 8+ hours (no independent sl_order_id poll); RETL blocked by an overly blunt account-wide BUY guard, now cash-aware; Accountability Grid updated; paired Opus reviews confirmed. Full detail: `deep_backlog.md`.
 ## [live-trading][coverage] Resolved 2026-08-07 (late) — morning status-check tooling (`status_check.py`/`audit_one`, `watchlist_status.py`) had zero drought/add-on overlay visibility; now surfaces open drought positions + addon legs per node, plus a static enabled-flags column. Full detail: `deep_backlog.md`.
 ## [backtest][data] Resolved 2026-08-07 (later) — `prune_backtest_cache.py` missing `trades > 0` filter dropped real losing nodes for trivial zero-trade rows; full-universe recovery + new prune-validation standard (skill + script). 65GB archive deleted post-validation, 67GB backup kept ~1mo. Full detail: `deep_backlog.md`/`research_log.md`.
 ## [live-trading][security] Resolved 2026-08-07 — GDXU real orphaned position (soxl_ira, unprotected a week) root-caused, fixed, reconciled for real; new on-demand broker-truth sweep tool built. Full detail: `deep_backlog.md`.

@@ -179,36 +179,148 @@ def test_cash_check_blocks_insufficient_cash(env, fake_broker):
 
 
 # ===========================================================================
-# TEST 3: second_ticker_one_account
+# TEST 3: second_ticker_one_account (cash-aware as of 2026-08-07)
 # ===========================================================================
 
-def test_second_ticker_buy_blocked_by_first_ticker_resting_order(env, fake_broker):
-    """second_ticker_one_account: a resting BUY order for TICKER in 'soxl_ira'
-    should block a NEW BUY for 'TICKER_TWO' in the same account."""
-    _add_node(TICKER, 'soxl_ira', notional=50_000)
-    _add_node('TICKER_TWO', 'soxl_ira', notional=50_000)
+def test_second_ticker_buy_allowed_when_cash_covers_both(env, fake_broker):
+    """Cash-aware version of the old unconditional guard (real incident,
+    2026-08-07: RETL's genuine signal was blocked despite soxl_ira having
+    ample headroom after LABD's own resting BUY). When the account has
+    enough real cash to cover BOTH the resting order's REAL reserved amount
+    (its actual resting quantity x current price, not its node's config)
+    AND this new order's notional + buffer, the second ticker's BUY must
+    proceed."""
+    _add_node(TICKER, 'soxl_ira', notional=5_000)
+    _add_node('TICKER_TWO', 'soxl_ira', notional=5_000)
     fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
     fake_broker.set_quote('TICKER_TWO', last=20.0, bid=20.0, ask=20.01)
-    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    # Enough for TICKER's real $100 reservation (10 shares x $10) + TICKER_TWO's $200 notional + buffer.
+    fake_broker.set_cash_balance('soxl_ira', 10_000.0)
 
-    # Place first BUY for TICKER (will fill immediately with fake_broker's MARKET default)
     r1, oid1 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
     assert oid1 is not None
+    fake_broker.orders[oid1]['status'] = 'WORKING'  # stays resting
 
-    # Seed a resting BUY order for TICKER so it stays open (simulate it stayed WORKING)
+    r2, oid2 = schwab_client.place_equity_buy('soxl_ira', 'TICKER_TWO', 10, 20.0)
+    assert oid2 is not None, "TICKER_TWO's BUY must reach the broker when cash covers both"
+
+    events = signals_db.get_coverage_events(scenario_key='second_ticker_buy_allowed')
+    assert any(e['ticker'] == 'TICKER_TWO' and e['result'] == 'allowed_cash_sufficient' for e in events), \
+        "second_ticker_buy_allowed should log when cash covers both reservations"
+
+
+def test_second_ticker_buy_blocked_when_cash_cannot_cover_both(env, fake_broker):
+    """The real remaining guard: a resting BUY for TICKER reserves its
+    ACTUAL resting quantity x current price (10 shares @ $250 = $2,500 --
+    deliberately priced above the node's own $5,000 starting_notional
+    config so the real reservation, not a config number, is what drives the
+    block; kept under soxl_ira's $3,000 notional_cap so TICKER's own
+    placement isn't refused for an unrelated reason) against the account's
+    undecremented cash balance -- if the account can't ALSO afford
+    TICKER_TWO's order on top of that real reservation, it's still blocked
+    (for a real, cash-grounded reason now, not unconditionally). Cash is set
+    generously for TICKER's own placement (a real order's cash_check runs at
+    ITS OWN placement time), then lowered before TICKER_TWO's attempt to
+    simulate the account's real balance having genuinely thinned by the time
+    the second signal arrives."""
+    _add_node(TICKER, 'soxl_ira', notional=5_000)
+    _add_node('TICKER_TWO', 'soxl_ira', notional=5_000)
+    fake_broker.set_quote(TICKER, last=250.0, bid=250.0, ask=250.01)
+    fake_broker.set_quote('TICKER_TWO', last=20.0, bid=20.0, ask=20.01)
+    fake_broker.set_cash_balance('soxl_ira', 100_000.0)
+
+    r1, oid1 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 250.0)
+    assert oid1 is not None
     fake_broker.orders[oid1]['status'] = 'WORKING'
 
-    # Try to place a BUY for TICKER_TWO in the same account -- should be blocked
-    with pytest.raises(schwab_safety.SafetyViolation, match="already has a resting BUY"):
+    # Covers TICKER's real $2,500 reservation + its own $200 buffer, but not
+    # TICKER_TWO's $200 notional on top (required = $200 + $2,500 + $200 = $2,900).
+    fake_broker.set_cash_balance('soxl_ira', 2_800.0)
+
+    with pytest.raises(schwab_safety.SafetyViolation, match="cash buffer"):
         schwab_client.place_equity_buy('soxl_ira', 'TICKER_TWO', 10, 20.0)
 
     assert len([o for o in fake_broker.orders.values()
                 if o['orderLegCollection'][0]['instrument']['symbol'] == 'TICKER_TWO']) == 0, \
-        "TICKER_TWO order must not reach broker while TICKER BUY is resting"
+        "TICKER_TWO order must not reach broker when combined cash is insufficient"
+
+    events = signals_db.get_coverage_events(scenario_key='cash_check')
+    assert any(e['ticker'] == 'TICKER_TWO' and e['result'] == 'blocked_insufficient'
+               and 'reserved for' in e['detail'] and TICKER in e['detail'] for e in events), \
+        "cash_check should log the reservation detail when blocking on combined insufficiency"
+
+
+def test_second_ticker_buy_blocked_for_addon_leg_regardless_of_cash(env, fake_broker):
+    """is_addon_leg is never exempted from this guard, per check_order's own
+    documented policy -- kept strict even with ample cash, unlike the
+    ordinary-BUY case above. TICKER_TWO is given a fully-armed open core
+    position (matching quantity) so every OTHER is_addon_leg precondition
+    passes and this guard is the one actually under test."""
+    _add_node(TICKER, 'soxl_ira', notional=5_000)
+    node_two = _add_node('TICKER_TWO', 'soxl_ira', notional=5_000)
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_quote('TICKER_TWO', last=20.0, bid=20.0, ask=20.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+
+    r1, oid1 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
+    assert oid1 is not None
+    fake_broker.orders[oid1]['status'] = 'WORKING'  # TICKER stays resting
+
+    signals_db.open_position(node_two, signal_price=20.0, signal_time=_IN_WINDOW_TIME,
+                              entry_price=20.0, entry_time=_IN_WINDOW_TIME, shares=10)
+    pos_two = signals_db.get_open_position('TICKER_TWO')
+    signals_db.update_position_trail_state(pos_two['id'], {'trailing': True, 'peak': 20.0})
+
+    with pytest.raises(schwab_safety.SafetyViolation, match="add-on leg"):
+        schwab_safety.check_order('soxl_ira', 'TICKER_TWO', 10, 20.0, 'BUY', is_addon_leg=True)
 
     events = signals_db.get_coverage_events(scenario_key='second_ticker_buy_blocked')
-    assert any(e['ticker'] == 'TICKER_TWO' and e['result'] == 'blocked' for e in events), \
-        "second_ticker_buy_blocked should log when second ticker BUY is blocked"
+    assert any(e['ticker'] == 'TICKER_TWO' and e['result'] == 'blocked_addon_leg' for e in events), \
+        "second_ticker_buy_blocked should log blocked_addon_leg for an add-on leg regardless of cash"
+
+
+def test_third_ticker_buy_reserves_against_both_other_resting_orders(env, fake_broker):
+    """The real gap a cold Opus review caught before this shipped: once the
+    unconditional one-resting-BUY-at-a-time block was relaxed, 2+ other
+    tickers can genuinely have resting BUYs at once (soxl_ira has 11 live
+    tickers, both daily signal windows firing near-simultaneously) -- a
+    naive single-order reservation would silently ignore all but the first
+    it found. A 3rd ticker's BUY must reserve against BOTH other resting
+    orders' real quantity x price, not just one."""
+    schwab_safety.AUTOMATION_ENABLED_TICKERS.add('TICKER_THREE')
+    _add_node(TICKER, 'soxl_ira', notional=5_000)
+    _add_node('TICKER_TWO', 'soxl_ira', notional=5_000)
+    _add_node('TICKER_THREE', 'soxl_ira', notional=5_000)
+    fake_broker.set_quote(TICKER, last=150.0, bid=150.0, ask=150.01)
+    fake_broker.set_quote('TICKER_TWO', last=150.0, bid=150.0, ask=150.01)
+    fake_broker.set_quote('TICKER_THREE', last=20.0, bid=20.0, ask=20.01)
+    fake_broker.set_cash_balance('soxl_ira', 100_000.0)
+
+    r1, oid1 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 150.0)
+    assert oid1 is not None
+    fake_broker.orders[oid1]['status'] = 'WORKING'  # reserves $1,500
+
+    r2, oid2 = schwab_client.place_equity_buy('soxl_ira', 'TICKER_TWO', 10, 150.0)
+    assert oid2 is not None
+    fake_broker.orders[oid2]['status'] = 'WORKING'  # reserves another $1,500 ($3,000 total)
+
+    # Covers both $1,500 reservations ($3,000) + buffer, but not TICKER_THREE's
+    # $200 notional on top (required = $200 + $3,000 + $200 = $3,400).
+    fake_broker.set_cash_balance('soxl_ira', 3_300.0)
+
+    with pytest.raises(schwab_safety.SafetyViolation, match="cash buffer"):
+        schwab_client.place_equity_buy('soxl_ira', 'TICKER_THREE', 10, 20.0)
+
+    events = signals_db.get_coverage_events(scenario_key='cash_check')
+    blocked = [e for e in events if e['ticker'] == 'TICKER_THREE' and e['result'] == 'blocked_insufficient']
+    assert blocked, "TICKER_THREE's BUY should be blocked once both other reservations are summed"
+    assert TICKER in blocked[-1]['detail'] and 'TICKER_TWO' in blocked[-1]['detail'], \
+        "the blocking detail should reference BOTH other resting tickers, not just one"
+
+    # Raise cash enough to cover all three -- now it must proceed.
+    fake_broker.set_cash_balance('soxl_ira', 10_000.0)
+    r3, oid3 = schwab_client.place_equity_buy('soxl_ira', 'TICKER_THREE', 10, 20.0)
+    assert oid3 is not None, "TICKER_THREE's BUY must proceed once cash covers all three reservations"
 
 
 # ===========================================================================
