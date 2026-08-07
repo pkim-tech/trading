@@ -52,7 +52,7 @@ def env(monkeypatch, tmp_path):
     # Create a RESEARCH-mode node (NOT live) with the ticker in automation scope
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20,
                         take_profit=5.0, stop_loss=1.0, max_hold_hours=105,
-                        mode='research',  # <-- KEY: not 'live'
+                        state='paper',  # <-- KEY: not 'live'
                         trail_buy_pct=1.0, trail_pct=0.3, fixed_sl_override=1.0,
                         account='soxl_ira', starting_notional=5000)
 
@@ -76,7 +76,7 @@ def test_research_mode_node_skips_automated_sell(env, fake_broker, monkeypatch):
     incorrectly proceeds (the known gap documented in CLAUDE.md).
     """
     node = _node()
-    assert node['mode'] == 'research', "Test setup: node should be research mode"
+    assert node['state'] == 'paper', "Test setup: node should be paper state"
     assert TICKER in schwab_safety.AUTOMATION_ENABLED_TICKERS, "Test setup: ticker should be in automation scope"
 
     # Create a real open position via the node
@@ -111,8 +111,8 @@ def test_research_mode_node_skips_automated_sell(env, fake_broker, monkeypatch):
         f"got: {[e['result'] for e in events]}"
     )
     event = matching_events[0]
-    assert event['detail'] == "node_mode='research'", (
-        f"Event detail should show node_mode='research', got: {event['detail']}"
+    assert event['detail'] == "node_state='paper'", (
+        f"Event detail should show node_state='paper', got: {event['detail']}"
     )
 
     # Verify NO order reached the fake broker

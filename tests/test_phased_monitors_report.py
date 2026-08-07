@@ -63,7 +63,7 @@ def test_reports_circuit_breaker_trips(env):
 
 def test_reports_current_nonzero_streak_state(env):
     signals_db.add_node('TEST_EOD', 'ZScoreBreakout', 'test', window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='live', account='ira')
+                         stop_loss=5, max_hold_hours=56, state='live', account='ira')
     node = signals_db.get_watchlist()[0]
     schwab_safety.record_node_streak('TEST_EOD', 'ira', 'order_failures', hit=True, node_id=node['id'])
     report = signals_notify.build_phased_monitors_report(CHECK_DATE)

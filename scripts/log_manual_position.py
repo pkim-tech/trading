@@ -24,7 +24,7 @@ def main():
     watchlist_id = int(sys.argv[4]) if len(sys.argv) > 4 else a.get_active_watchlist_id()
 
     wl = a.get_watchlist(watchlist_id)
-    matches = [n for n in wl if n['ticker'] == ticker and n.get('mode') == 'live']
+    matches = [n for n in wl if n['ticker'] == ticker and n.get('state') != 'paper']
     if not matches:
         print(f"no live node for {ticker} on watchlist {watchlist_id}")
         sys.exit(1)

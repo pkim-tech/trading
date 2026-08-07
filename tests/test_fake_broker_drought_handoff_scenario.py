@@ -49,7 +49,7 @@ def env(monkeypatch, tmp_path):
 
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
-                         stop_loss=1, max_hold_hours=105, mode='live',
+                         stop_loss=1, max_hold_hours=105, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
                          account='soxl_ira', starting_notional=2000)
     with signals_db._conn() as c:
@@ -177,6 +177,29 @@ def test_handoff_places_real_market_sell_and_waits_for_confirmed_fill(env, fake_
     assert any(e['ticker'] == TICKER and e['result'] == 'closed' for e in events)
 
 
+def test_handoff_case_b_exit_failure_is_logged_and_alerted(env, fake_broker, monkeypatch):
+    """Case B's own failure branch (signals_notify.py:1607-1613) -- when
+    _attempt_automated_exit_sell fails closed (here: the global kill switch,
+    a real fail-closed reason, engaged the instant before HANDOFF's exit
+    attempt), the drought position must be left open (never silently
+    dropped) and a human alerted to close it manually."""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=51.0, bid=50.99, ask=51.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    now = datetime.now()
+    signals_db.open_drought_overlay_position(node, 50.0, now, 50.0, now, confirm_days=3, shares=40)
+    monkeypatch.setattr('signals_compute.compute_buy_signal', lambda n: _buy_signal(51.0))
+    schwab_safety.engage_kill_switch("test halt")
+
+    signals_notify.check_drought_handoff(node)
+
+    assert len(_real_orders(fake_broker, TICKER, side='SELL')) == 0
+    pos = signals_db.get_drought_overlay_position(node['id'])
+    assert pos is not None, "a failed exit attempt must never silently close the local row"
+    events = signals_db.get_coverage_events(scenario_key='drought_handoff_exit_placement')
+    assert any(e['ticker'] == TICKER and e['result'] == 'failed_or_blocked' for e in events)
+
+
 def test_handoff_alert_slot_preserved_while_still_pending(env, fake_broker, monkeypatch):
     """The 0.6/5.4 fix -- while a drought HANDOFF cancel/exit is still in
     flight (order status not yet confirmed), core's real BUY signal must not
@@ -200,3 +223,38 @@ def test_handoff_alert_slot_preserved_while_still_pending(env, fake_broker, monk
     _handoff_in_flight = bool(_blocking) and _blocking.get('position_source') == 'drought_overlay' and (
         (_blocking.get('trail_state') or {}).get('exit_pending', {}).get('reason') == 'HANDOFF')
     assert _handoff_in_flight, "the exit_pending marker must be recognized as a HANDOFF in flight"
+
+
+def test_handoff_cancel_unconfirmed_leaves_row_in_place_and_core_still_blocked(env, fake_broker, monkeypatch):
+    """The 3rd Case A branch (signals_notify.py:1575-1581) -- a cancel whose
+    confirmed status comes back neither FILLED nor CANCELED (broker-side
+    REJECTED/EXPIRED/a failed confirm poll are all real possibilities) must
+    fail closed: the local pending_buys row stays in place for a retry next
+    poll, never discarded as if the real order were confirmed gone. Simulated
+    by seeding the resting order already in a terminal-but-not-CANCELED state
+    (REJECTED) -- fake_broker's own cancel_order only sets CANCELED on a
+    still-non-terminal order, so this reaches the exact branch under test."""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    order_id = fake_broker.seed_resting_order('soxl_ira', TICKER, 'TRAILING_STOP', 'BUY', 40, trail_offset=1.0)
+    fake_broker.orders[order_id]['status'] = 'REJECTED'
+    signals_db.add_pending_buy(node, {'current_price': 50.0, 'last_bar': IN_WINDOW_TIME}, None, None,
+                                order_id=order_id, position_source='drought_overlay', drought_confirm_days=3)
+    with signals_db._conn() as c:
+        c.execute("UPDATE pending_buys SET order_placed=1 WHERE ticker=?", (TICKER,))
+        c.commit()
+    monkeypatch.setattr('signals_compute.compute_buy_signal', lambda n: _buy_signal())
+
+    signals_notify.check_drought_handoff(node)
+
+    # Row must still be there -- NOT cleared, unlike the confirmed-cancel case.
+    pending = signals_db.get_drought_pending_buy(node['id'])
+    assert pending is not None, "cancel_unconfirmed must never discard tracking of a possibly-still-real order"
+    events = signals_db.get_coverage_events(scenario_key='drought_handoff_cancel')
+    assert any(e['ticker'] == TICKER and e['result'] == 'cancel_unconfirmed' for e in events)
+
+    # And core's own entry must still see itself as blocked -- the pending
+    # row being present is exactly what active_signals._scan_buy_signals'
+    # already_pending check keys off.
+    assert signals_db.get_drought_pending_buy(node['id']) is not None

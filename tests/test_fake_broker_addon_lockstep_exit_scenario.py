@@ -22,6 +22,7 @@ import signals_config
 import signals_db
 import signals_notify
 import schwab_safety
+import schwab_client
 
 from fake_broker import fake_broker  # noqa: F401
 
@@ -49,7 +50,7 @@ def env(monkeypatch, tmp_path):
 
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
-                         stop_loss=1, max_hold_hours=105, mode='live',
+                         stop_loss=1, max_hold_hours=105, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
                          account='soxl_ira', starting_notional=2000)
     with signals_db._conn() as c:
@@ -158,6 +159,8 @@ def test_leg_still_placed_when_parent_exits_is_cancelled_never_sold(env, fake_br
     sells = _real_orders(fake_broker, TICKER, side='SELL')
     assert len(sells) == 0, "must never place a real SELL for shares that were never actually bought"
     assert signals_db.get_open_addon_leg_by_parent(pos['id']) is None
+    events = signals_db.get_coverage_events(scenario_key='addon_exit_placement')
+    assert any(e['ticker'] == TICKER and e['result'] == 'cancelled_unfilled_leg' for e in events)
 
 
 def test_leg_entry_cancel_races_to_filled_falls_through_to_real_sell(env, fake_broker):
@@ -229,3 +232,73 @@ def test_placed_leg_past_timeout_is_cancelled_and_marked_abandoned(env, fake_bro
     assert len(legs) == 0
     events = signals_db.get_coverage_events(scenario_key='addon_leg_reconciliation')
     assert any(e['ticker'] == TICKER and e['result'] == 'abandoned' for e in events)
+
+
+def test_leg_reconciliation_never_independently_closes_a_healthy_open_leg(env, fake_broker):
+    """The plan's own framing: a leg has no independent exit condition of its
+    own -- the ONLY code paths that ever close it are the lockstep close
+    (parent exits) and reconciliation's orphan-alert (parent already gone).
+    A leg that's simply open with its parent ALSO still open, regardless of
+    how far price has moved against it, must be left completely alone by
+    check_addon_leg_reconciliation -- no SELL order, no state change. (The
+    leg's own D3 resting STOP is a broker-side safety net, not a decision
+    this code makes on a poll.)"""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    pos = _open_core_position(node)
+    leg_id = signals_db.open_addon_leg(pos, shares=20, entry_price=51.0, entry_time=datetime.now(),
+                                        paper=False, entry_status='filled')
+
+    # A large adverse move against the leg -- if any independent notional-
+    # based exit existed, this is exactly the input that would trigger it.
+    fake_broker.set_quote(TICKER, last=30.0, bid=29.99, ask=30.01)
+    signals_notify.check_addon_leg_reconciliation([])
+
+    assert len(_real_orders(fake_broker, TICKER, side='SELL')) == 0
+    leg = signals_db.get_open_addon_leg_by_parent(pos['id'])
+    assert leg is not None and leg['id'] == leg_id and leg['entry_status'] == 'filled', (
+        "the leg must be completely unchanged -- reconciliation is pure observation"
+    )
+
+
+def test_reconciliation_sees_no_false_share_mismatch_with_an_open_leg(env, fake_broker):
+    """check_live_state_reconciliation's own add-on patch (signals_notify.py:
+    522-531) -- with a real leg open, the broker legitimately holds core+leg
+    shares (same ticker/account, two separate real fills), so expected_shares
+    must be widened to match before comparing, or this would false-positive a
+    'shares mismatch' on every single poll after a real add-on fires and feed
+    schwab_safety.record_node_streak's mismatch streak on a healthy position."""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+
+    # Real core BUY fill at the broker (20 shares) -- mirrors test_fake_broker_
+    # reconciliation_reporting_scenario.py's pattern for exercising
+    # get_real_position's actual parsing logic end-to-end, not a mocked return.
+    _, core_oid = schwab_client.place_equity_buy('soxl_ira', TICKER, 20, 51.0)
+    fake_broker.force_fill(core_oid, 51.0)
+    pos = _open_core_position(node, shares=20, entry_price=51.0)
+    # is_addon_leg's own precondition #2 requires the parent to be armed --
+    # arm it directly (not via notify_trailing_activated, which would place
+    # its own extra SELL order this test doesn't care about).
+    signals_db.update_position_trail_state(pos['id'], {'trailing': True, 'peak': 51.0})
+    pos = signals_db.get_open_position(TICKER)
+
+    # Real add-on leg BUY fill at the broker (another 20 shares, same ticker/account).
+    _, leg_oid = schwab_client.place_equity_buy('soxl_ira', TICKER, 20, 52.0, is_addon_leg=True)
+    fake_broker.force_fill(leg_oid, 52.0)
+    signals_db.open_addon_leg(pos, shares=20, entry_price=52.0, entry_time=datetime.now(),
+                               paper=False, entry_order_id=leg_oid, entry_status='filled')
+
+    assert schwab_client.get_real_position('soxl_ira', TICKER) == 40, (
+        "sanity check: broker should show core+leg combined"
+    )
+
+    signals_notify.check_live_state_reconciliation([signals_db.get_open_position(TICKER)])
+
+    events = signals_db.get_coverage_events(scenario_key='reconciliation_mismatch')
+    assert not any(e['ticker'] == TICKER and e.get('result') == 'shares' for e in events), (
+        "an open leg must never produce a false shares mismatch -- expected_shares "
+        "must be widened by the leg's own share count before comparing"
+    )

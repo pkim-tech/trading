@@ -49,7 +49,7 @@ def env(monkeypatch):
     monkeypatch.setattr(paper_trading, '_post_message', lambda *a, **kw: (None, None))
     db.ensure_tables()
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
-                stop_loss=1, max_hold_hours=7, mode='live',
+                stop_loss=1, max_hold_hours=7, state='live',
                 trail_buy_pct=5.0, trail_pct=1.0, starting_notional=5000,
                 fixed_sl_override=1.0, account='ira')
     yield

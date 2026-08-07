@@ -74,8 +74,8 @@ def main(watchlist_id=None):
     open_by_wl_id = {p['wl_id']: p for p in db.get_open_positions() if p.get('wl_id')}
     pending_by_wl_id = {p['node']['id']: p for p in db.get_pending_buys() if p.get('order_placed')}
 
-    live_nodes = [n for n in wl if n.get('mode') == 'live']
-    other_nodes = [n for n in wl if n.get('mode') != 'live']
+    live_nodes = [n for n in wl if n.get('state') != 'paper']
+    other_nodes = [n for n in wl if n.get('state') == 'paper']
 
     print(f"LIVE NODES ({len(live_nodes)}):")
     for n in sorted(live_nodes, key=lambda n: n['ticker']):
@@ -100,7 +100,7 @@ def main(watchlist_id=None):
     print(f"\nOTHER NODES ({len(other_nodes)}, research/paper -- informational only):")
     for n in sorted(other_nodes, key=lambda n: n['ticker']):
         tag = " [CANARY]" if n.get('version') == 'canary' else ""
-        print(f"  {n['ticker']:<6} {n['strategy']:<28} {n.get('account'):<10} {n.get('mode')}{tag}")
+        print(f"  {n['ticker']:<6} {n['strategy']:<28} {n.get('account'):<10} {n.get('state')}{tag}")
 
 
 if __name__ == '__main__':

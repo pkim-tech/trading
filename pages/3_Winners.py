@@ -5,7 +5,7 @@ import pandas as pd
 from pathlib import Path
 from active_signals import (add_node, remove_node, get_watchlist, label_node,
                              get_watchlists, create_watchlist, delete_watchlist,
-                             set_active_watchlist, set_node_mode)
+                             set_active_watchlist, set_node_state)
 from db_cache import get_kv
 
 DB_PATH      = "./cache/research/trading_universe.db"
@@ -340,10 +340,10 @@ if wl:
     ).merge(underlier[['symbol', 'Type']], left_on='ticker', right_on='symbol', how='left').drop(columns='symbol')
 
     wl_df['watch'] = True
-    wl_display = wl_df[['id', 'mode', 'ticker', 'Type', 'strategy', 'version', 'window', 'take_profit',
+    wl_display = wl_df[['id', 'state', 'ticker', 'Type', 'strategy', 'version', 'window', 'take_profit',
                           'stop_loss', 'max_hold_hours', 'z_score_threshold', 'trades', 'win_rate',
                           'strategy_return', 'alpha_vs_spy', 'asset_bh', 'spy_bh', 'label', 'watch']].rename(columns={
-        'id': 'ID', 'mode': 'Mode', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
+        'id': 'ID', 'state': 'State', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
         'window': 'Win', 'take_profit': 'TP%', 'stop_loss': 'SL%', 'max_hold_hours': 'Hold h',
         'z_score_threshold': 'Z Thresh',
         'trades': 'Trades', 'win_rate': 'Win%', 'strategy_return': 'Return',
@@ -356,7 +356,7 @@ if wl:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Mode":       st.column_config.SelectboxColumn("Mode", options=["live", "research"], required=True),
+            "State":      st.column_config.SelectboxColumn("State", options=["paper", "dry_run", "live"], required=True),
             "Label":      st.column_config.TextColumn("Label"),
             "Watch":      st.column_config.CheckboxColumn("Watch", help="Uncheck to remove"),
             'Win%':       st.column_config.NumberColumn(format="%.0f%%"),
@@ -365,7 +365,7 @@ if wl:
             'Asset B&H':  st.column_config.NumberColumn(format="%.1f%%"),
             'SPY B&H':    st.column_config.NumberColumn(format="%.1f%%"),
         },
-        disabled=[c for c in wl_display.columns if c not in ('Mode', 'Label', 'Watch')],
+        disabled=[c for c in wl_display.columns if c not in ('State', 'Label', 'Watch')],
     )
 
     # Remove unchecked rows
@@ -375,16 +375,16 @@ if wl:
         st.rerun()
 
     # Save edited mode
-    mode_changed = wl_display['Mode'] != wl_edited['Mode']
-    for i in wl_display.index[mode_changed]:
-        set_node_mode(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'Mode'])
+    state_changed = wl_display['State'] != wl_edited['State']
+    for i in wl_display.index[state_changed]:
+        set_node_state(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'State'])
 
     # Save edited labels
     label_changed = wl_display['Label'] != wl_edited['Label']
     for i in wl_display.index[label_changed]:
         label_node(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'Label'])
 
-    if mode_changed.any() or label_changed.any():
+    if state_changed.any() or label_changed.any():
         st.cache_data.clear()
         st.rerun()
 else:

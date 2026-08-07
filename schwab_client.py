@@ -237,7 +237,7 @@ def _build_market_order(side: str, ticker: str, quantity: int):
 
 def _place_equity_order(
     side: str, account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
-    is_protective: bool = False, is_addon_leg: bool = False,
+    is_protective: bool = False, is_addon_leg: bool = False, node_dry_run: bool = False,
 ):
     """side is 'BUY' or 'SELL'. price is only used for the safety-cap notional
     check, not sent to the API -- this places a market order. Returns
@@ -245,11 +245,13 @@ def _place_equity_order(
     is_addon_leg threads through to schwab_safety.check_order's is_addon_leg
     exemption (docs/plans/real_order_execution_drought_addon.md 3.1) and tags
     the Slack confirmation so a real add-on fill is distinguishable from the
-    core position's own order at a glance."""
+    core position's own order at a glance.
+    node_dry_run: per-node dry_run override (additive with the account-level
+    flag, see schwab_safety.approve_and_record's docstring)."""
     try:
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
-            is_protective=is_protective, is_addon_leg=is_addon_leg)
+            is_protective=is_protective, is_addon_leg=is_addon_leg, node_dry_run=node_dry_run)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED {side} {quantity} {ticker} in {account}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
@@ -280,6 +282,7 @@ def _place_equity_order(
 def replace_equity_order_with_market(
     account: str, ticker: str, order_id: int, side: str, quantity: int, price: float,
     is_gap_correction: bool = False, is_protective: bool = False, is_addon_leg: bool = False,
+    node_dry_run: bool = False,
 ):
     """Atomically replaces a resting order (e.g. a protective STOP) with a
     plain MARKET order of the given side/quantity, via schwab-py's
@@ -302,7 +305,8 @@ def replace_equity_order_with_market(
     try:
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
-            is_protective=is_protective, replacing_order_id=order_id, is_addon_leg=is_addon_leg)
+            is_protective=is_protective, replacing_order_id=order_id, is_addon_leg=is_addon_leg,
+            node_dry_run=node_dry_run)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with MARKET {side} {quantity} {ticker} in {account}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
@@ -333,13 +337,15 @@ def replace_equity_order_with_market(
 
 
 def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
-                      is_protective: bool = False, is_addon_leg: bool = False):
+                      is_protective: bool = False, is_addon_leg: bool = False, node_dry_run: bool = False):
     return _place_equity_order("BUY", account, ticker, quantity, price, is_gap_correction=is_gap_correction,
-                                is_protective=is_protective, is_addon_leg=is_addon_leg)
+                                is_protective=is_protective, is_addon_leg=is_addon_leg, node_dry_run=node_dry_run)
 
 
-def place_equity_sell(account: str, ticker: str, quantity: int, price: float, is_addon_leg: bool = False):
-    return _place_equity_order("SELL", account, ticker, quantity, price, is_addon_leg=is_addon_leg)
+def place_equity_sell(account: str, ticker: str, quantity: int, price: float, is_addon_leg: bool = False,
+                       node_dry_run: bool = False):
+    return _place_equity_order("SELL", account, ticker, quantity, price, is_addon_leg=is_addon_leg,
+                                node_dry_run=node_dry_run)
 
 
 def _build_trailing_order(side: str, link_basis: StopPriceLinkBasis, ticker: str, quantity: int, trail_pct: float):
@@ -359,17 +365,19 @@ def _build_trailing_order(side: str, link_basis: StopPriceLinkBasis, ticker: str
 
 def _place_trailing_order(
     side: str, link_basis: StopPriceLinkBasis, account: str, ticker: str,
-    quantity: int, price: float, trail_pct: float,
+    quantity: int, price: float, trail_pct: float, node_dry_run: bool = False,
 ):
     """side is 'BUY' or 'SELL'. price is the current live price, used only for
     the safety-cap notional check (quantity * price), not sent to the API.
     Orders are GOOD_TILL_CANCEL, matching the manual workflow's existing
     trailing-order convention (docs/CLAUDE.md's TrailingBothZScoreBreakout
     execution notes). Schwab tracks the running high/low and fires the order
-    itself; this module never polls for the bounce/pullback."""
+    itself; this module never polls for the bounce/pullback.
+    node_dry_run: per-node dry_run override (see schwab_safety.approve_and_record)."""
     label = "TRAILING BUY" if side == "BUY" else "TRAILING SELL"
     try:
-        dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, side)
+        dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, side,
+                                                     node_dry_run=node_dry_run)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED {label} {quantity} {ticker} in {account} "
                       f"(trail={trail_pct}%): {e}")
@@ -400,7 +408,8 @@ def _place_trailing_order(
     return r, order_id
 
 
-def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, quantity: int, price: float, trail_pct: float):
+def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, quantity: int, price: float,
+                                      trail_pct: float, node_dry_run: bool = False):
     """Same atomic-replace idea as replace_equity_order_with_market, for the
     TRAIL arm-time swap: a resting protective SL becomes a TRAILING_STOP
     SELL, as a single broker call instead of cancel_order + place_trailing_sell.
@@ -409,7 +418,7 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
     untouched."""
     try:
         dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, "SELL",
-                                                     replacing_order_id=order_id)
+                                                     replacing_order_id=order_id, node_dry_run=node_dry_run)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with TRAILING SELL {quantity} {ticker} "
                       f"in {account} (trail={trail_pct}%): {e}")
@@ -440,10 +449,12 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
     return r, new_order_id
 
 
-def place_trailing_buy(account: str, ticker: str, quantity: int, price: float, trail_pct: float):
+def place_trailing_buy(account: str, ticker: str, quantity: int, price: float, trail_pct: float,
+                        node_dry_run: bool = False):
     """trail_pct is the bounce-above-running-low trigger (matches the node's
     trail_buy_pct). ASK-linked, since a buy naturally references the ask."""
-    return _place_trailing_order("BUY", StopPriceLinkBasis.ASK, account, ticker, quantity, price, trail_pct)
+    return _place_trailing_order("BUY", StopPriceLinkBasis.ASK, account, ticker, quantity, price, trail_pct,
+                                  node_dry_run=node_dry_run)
 
 
 def _order_fill(o):
@@ -520,14 +531,16 @@ def get_filled_order(account: str, ticker: str, side: str, order_id: int = None)
     return candidates[-1][1]
 
 
-def place_trailing_sell(account: str, ticker: str, quantity: int, price: float, trail_pct: float):
+def place_trailing_sell(account: str, ticker: str, quantity: int, price: float, trail_pct: float,
+                         node_dry_run: bool = False):
     """trail_pct is the pullback-below-running-high trigger (matches the
     position's trail_sell_pct). BID-linked, since a sell naturally references
     the bid. Only relevant once the position's trailing-exit state has
     activated (strategies.TrailingBothZScoreBreakout.check_exit's
     state['trailing'] -- see signals_notify.notify_trailing_activated), same
     as the manual workflow's 'place the trailing stop order now' step."""
-    return _place_trailing_order("SELL", StopPriceLinkBasis.BID, account, ticker, quantity, price, trail_pct)
+    return _place_trailing_order("SELL", StopPriceLinkBasis.BID, account, ticker, quantity, price, trail_pct,
+                                  node_dry_run=node_dry_run)
 
 
 def cancel_order(account: str, ticker: str, order_id: int):
@@ -596,7 +609,8 @@ def get_session_open_price(ticker: str) -> tuple[float, bool]:
     return get_current_price(ticker), False
 
 
-def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float, is_addon_leg: bool = False):
+def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float, is_addon_leg: bool = False,
+                     node_dry_run: bool = False):
     """Resting fixed-price STOP order -- the broker executes on breach without
     depending on our poll cadence (Part 4, Section 6), same mechanism already
     relied on for the trailing-sell order. Same OrderBuilder pattern as
@@ -610,7 +624,8 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float,
     resting-SELL duplicate guard would otherwise refuse."""
     try:
         dry_run = schwab_safety.approve_and_record(
-            account, ticker, quantity, stop_price, "SELL", is_protective=True, is_addon_leg=is_addon_leg)
+            account, ticker, quantity, stop_price, "SELL", is_protective=True, is_addon_leg=is_addon_leg,
+            node_dry_run=node_dry_run)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.4f}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
@@ -648,7 +663,8 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float,
     return r, order_id
 
 
-def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quantity: int, stop_price: float):
+def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quantity: int, stop_price: float,
+                                  node_dry_run: bool = False):
     """Atomically replaces a resting order with a new fixed-price STOP order
     (a re-priced SL) -- same atomic-replace rationale as
     replace_equity_order_with_market/replace_order_with_trailing_sell: a
@@ -665,7 +681,8 @@ def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quant
     call their siblings."""
     try:
         dry_run = schwab_safety.approve_and_record(
-            account, ticker, quantity, stop_price, "SELL", is_protective=True, replacing_order_id=order_id)
+            account, ticker, quantity, stop_price, "SELL", is_protective=True, replacing_order_id=order_id,
+            node_dry_run=node_dry_run)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with STOP LOSS {quantity} {ticker} "
                       f"in {account} @ ${stop_price:.4f}: {e}")
@@ -762,6 +779,60 @@ def get_real_position(account: str, ticker: str) -> float:
         if p.get("instrument", {}).get("symbol") == ticker:
             return float(p.get("longQuantity", 0.0))
     return 0.0
+
+
+def _get_raw_real_positions(account: str) -> list:
+    """Shared fetch behind get_all_real_positions/get_all_real_short_positions
+    -- one real API call, read fresh (never cached)."""
+    account_hash = _resolve_account_hashes()[account]
+    r = _get_client().get_account(account_hash, fields=[schwab.client.Client.Account.Fields.POSITIONS])
+    r.raise_for_status()
+    return r.json()["securitiesAccount"].get("positions", [])
+
+
+def get_all_real_positions(account: str) -> dict:
+    """Every real LONG position currently held in `account`, read fresh --
+    {ticker: longQuantity}, zero-quantity rows dropped. Sums rather than
+    overwrites if Schwab ever returns 2+ rows for the same symbol (defensive
+    -- positions are documented as one aggregated row per instrument, but
+    silently understating a real quantity on a duplicate would be the wrong
+    failure direction for a ground-truth check). Unlike get_real_position
+    (single ticker, used when you already know what you're looking for),
+    this is the ground-truth sweep primitive: it answers "what does the
+    broker actually hold" with no assumption about which tickers should be
+    checked -- see automation_principles.md #1 ("never trust a local/cached
+    record as ground truth") and scripts/check_untracked_positions.py, built
+    2026-08-07 after a real position (GDXU, soxl_ira) sat completely
+    untracked in open_positions for a week with nothing ever sweeping the
+    broker's own position list to notice. See get_all_real_short_positions
+    for the short side -- deliberately NOT merged into this dict, since a
+    long+short in the same symbol is a distinct, more dangerous state than a
+    plain long that a single {ticker: qty} shape would obscure."""
+    out = {}
+    for p in _get_raw_real_positions(account):
+        symbol = p.get("instrument", {}).get("symbol")
+        qty = float(p.get("longQuantity", 0.0))
+        if symbol and qty:
+            out[symbol] = out.get(symbol, 0.0) + qty
+    return out
+
+
+def get_all_real_short_positions(account: str) -> dict:
+    """Every real SHORT position currently held in `account` -- {ticker:
+    shortQuantity}. get_all_real_positions only ever looks at longQuantity,
+    so a naked/accidental short (longQuantity=0, shortQuantity>0 -- exactly
+    the failure mode live_sanity_check.py's naked-SELL test exists to guard
+    against) was previously invisible to the ground-truth sweep: with no
+    local row it dropped out silently, and WITH a local row it rendered as
+    the misleading "STALE: broker holds 0" instead of "broker is short."
+    Found by paired Opus review, 2026-08-07."""
+    out = {}
+    for p in _get_raw_real_positions(account):
+        symbol = p.get("instrument", {}).get("symbol")
+        qty = float(p.get("shortQuantity", 0.0))
+        if symbol and qty:
+            out[symbol] = out.get(symbol, 0.0) + qty
+    return out
 
 
 def get_current_price(ticker: str) -> float:

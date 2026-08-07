@@ -53,7 +53,7 @@ def env(monkeypatch, tmp_path):
     # fake_broker patches the network layer, so exercising the actual
     # non-dry_run submission path is safe here.
     signals_db.add_node(TICKER, 'ZScoreBreakout', 'test', window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='live')
+                         stop_loss=5, max_hold_hours=56, state='live')
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'soxl_ira' WHERE ticker = ?", (TICKER,))
         c.commit()

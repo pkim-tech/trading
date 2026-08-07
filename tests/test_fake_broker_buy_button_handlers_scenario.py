@@ -91,7 +91,7 @@ def _add_node(version='test', account='ira', strategy='ZScoreBreakout',
         'take_profit': 10,
         'stop_loss': 5,
         'max_hold_hours': 56,
-        'mode': 'live',
+        'state': 'live',
         'account': account,
     }
     if trail_buy_pct is not None:

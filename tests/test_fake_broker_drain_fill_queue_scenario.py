@@ -55,7 +55,7 @@ def env(monkeypatch, tmp_path):
     # $50.05) so the post-fill top-up threshold isn't crossed -- keeps this
     # test isolated to the polled-vs-stream-quantity question only.
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
-                         stop_loss=5, max_hold_hours=7, mode='live',
+                         stop_loss=5, max_hold_hours=7, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
                          account=ACCOUNT, starting_notional=505)
 

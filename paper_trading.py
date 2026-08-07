@@ -17,7 +17,7 @@ import signals_db as db
 import schwab_safety
 from signals_compute import _current_price, _load_cache, _bars_held, check_sell_condition, compute_buy_signal
 from signals_blocks import _post_message
-from signals_helpers import buy_order_sizing, log_poll, resolve_at_bar_close
+from signals_helpers import buy_order_sizing, effectively_dry_run, log_poll, resolve_at_bar_close
 
 # Same checkpoint-bar hours the backtest's find_drought_windows uses
 # (scripts/drought_overlay_test.py's TARGET_H0/TARGET_H1) -- the 9:30 and
@@ -260,7 +260,7 @@ def check_paper_drought_entry(node):
     2026-08-09, after a paired review of that wiring (docs/CLAUDE.md's
     session-wrap mandate) found and fixed the ordering/gating issues noted
     inline in run_loop where this is actually called."""
-    if node.get('mode', 'live') == 'live':
+    if node.get('state') != 'paper':
         # Paper-only mechanism -- a live node sharing open_position_keys with
         # its own paper drought row would silently suppress its REAL BUY
         # alerts (already_held in _scan_buy_signals unions real+paper by
@@ -307,7 +307,7 @@ def check_paper_drought_handoff(node):
     core's scan (running later in the same poll) opens fresh -- no cycle is
     lost to the race either way. Wired into active_signals.py, 2026-08-09."""
     wl_id = node['id']
-    if node.get('mode', 'live') == 'live':
+    if node.get('state') != 'paper':
         # See check_paper_drought_entry's identical guard -- defense in
         # depth here too, though a live node should never have an open
         # drought position in the first place if the entry-side guard held.
@@ -897,14 +897,13 @@ def reconcile_daily_track_nodes():
 # ---------------------------------------------------------------------------
 
 def _overlay_mode(node):
-    """Part 9 (docs/plans/real_order_execution_drought_addon.md): a mode='live'
+    """Part 9 (docs/plans/real_order_execution_drought_addon.md): a non-paper
     node reconciles against the real trade_log/open_positions/addon_legs
     tables, not paper_trade_log/paper_positions/paper_addon_legs -- reuses
     the same 'live'/'dry_run' distinction schwab_safety._coverage_mode makes
     elsewhere in this codebase."""
-    if node.get('mode') == 'live':
-        limits = schwab_safety.ACCOUNTS.get(node.get('account'))
-        return 'live' if (limits and not limits.dry_run) else 'dry_run'
+    if node.get('state') != 'paper':
+        return 'dry_run' if effectively_dry_run(node.get('account'), node) else 'live'
     return 'daily_sync' if node.get('paper_role') == 'daily_sync' else 'paper'
 
 

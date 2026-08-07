@@ -68,7 +68,7 @@ def env(monkeypatch, tmp_path):
 def _add_dry_run_node(ticker, notional=5000):
     """Helper to add a node with account='ira' (which is dry_run=True)."""
     signals_db.add_node(ticker, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
-                         stop_loss=1, max_hold_hours=105, mode='live',
+                         stop_loss=1, max_hold_hours=105, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
                          account='ira', starting_notional=notional)
     return [n for n in signals_db.get_watchlist()

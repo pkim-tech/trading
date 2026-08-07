@@ -57,7 +57,7 @@ def core_node(isolated_db):
     make_synthetic_csv(TICKER, last_close=100.0)
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', 20, 30, 2, 48,
                 trail_buy_pct=1.0, trail_pct=7.0, account='test_acct',
-                entry_timing='open_check', starting_notional=10000, mode='research')
+                entry_timing='open_check', starting_notional=10000, state='paper')
     with db._conn() as c:
         wl_id = c.execute("SELECT id FROM watch_list WHERE ticker=?", (TICKER,)).fetchone()[0]
     yield db.get_watch_list_node_by_id(wl_id)
@@ -189,7 +189,7 @@ def test_drought_handoff_ignores_a_hold_signal(core_node, monkeypatch):
 
 def test_drought_functions_never_touch_a_live_mode_node(core_node):
     with db._conn() as c:
-        c.execute("UPDATE watch_list SET mode='live', drought_overlay_enabled=1, "
+        c.execute("UPDATE watch_list SET state='live', drought_overlay_enabled=1, "
                   "drought_confirm_days=3 WHERE id=?", (core_node['id'],))
         c.commit()
     node = db.get_watch_list_node_by_id(core_node['id'])

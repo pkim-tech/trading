@@ -34,7 +34,7 @@ def main():
     watchlist = db.get_watchlist()
     live_track_nodes = [
         n for n in watchlist
-        if n["ticker"] in V5_TICKERS and n.get("mode") == "research" and n.get("version") == "v5"
+        if n["ticker"] in V5_TICKERS and n.get("state") == "paper" and n.get("version") == "v5"
         and not n.get("paper_role")
     ]
     found = {n["ticker"] for n in live_track_nodes}
@@ -57,7 +57,7 @@ def main():
             ticker=node["ticker"], strategy=strategy, version=node["version"], window=node["window"],
             take_profit=take_profit, stop_loss=node["stop_loss"], max_hold_hours=node["max_hold_hours"],
             label=f"{node.get('label') or ''} (daily-track)".strip(),
-            z_score_threshold=node["z_score_threshold"], watchlist_id=node["watchlist_id"], mode="research",
+            z_score_threshold=node["z_score_threshold"], watchlist_id=node["watchlist_id"], state="paper",
             trail_buy_pct=node["trail_buy_pct"], trail_pct=node["trail_sell_pct"],
             entry_timing=node["entry_timing"], starting_notional=node["starting_notional"],
             fixed_sl_override=node["fixed_sl"], account=account, paper_role="daily_sync",

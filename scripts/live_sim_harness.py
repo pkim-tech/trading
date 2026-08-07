@@ -110,7 +110,7 @@ def cleanup_csv(ticker):
 def make_node(ticker, strategy, **overrides):
     kwargs = dict(
         window=20, take_profit=10, stop_loss=5, max_hold_hours=56,
-        mode='live', trail_buy_pct=1.0, trail_pct=1.0, entry_timing='close',
+        state='live', trail_buy_pct=1.0, trail_pct=1.0, entry_timing='close',
         starting_notional=50000,
     )
     kwargs.update(overrides)
@@ -260,7 +260,7 @@ def scenario_ambient_market_buy_entry(posted):
     ticker = 'ZHARN6'
     last_close = 100.0 - 6.0
     write_synthetic_csv(ticker, last_close)
-    node = make_node(ticker, 'TrailingExitZScoreBreakout', fixed_sl_override=5, mode='live')
+    node = make_node(ticker, 'TrailingExitZScoreBreakout', fixed_sl_override=5, state='live')
     with patch.object(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {ticker}), \
          patch.object(schwab_client, 'get_account_balance', return_value=1_000_000.0), \
          patch.object(schwab_safety, '_open_orders', return_value=[]), \

@@ -33,7 +33,7 @@ def main():
     db.add_node(
         ticker="SPY", strategy="TrailingBothZScoreBreakout", version=VERSION, window=99,
         take_profit=0.3, stop_loss=0, max_hold_hours=48, label="soxl_ira live-sell test",
-        z_score_threshold=2.0, watchlist_id=WATCHLIST_ID, mode="live",
+        z_score_threshold=2.0, watchlist_id=WATCHLIST_ID, state="live",
         trail_buy_pct=1.0, trail_pct=0.3, entry_timing="close", starting_notional=50000,
         fixed_sl_override=0.3, account="soxl_ira",
     )
@@ -41,7 +41,7 @@ def main():
     db.add_node(
         ticker="SH", strategy="TrailingBothZScoreBreakout", version=VERSION, window=99,
         take_profit=0.3, stop_loss=0, max_hold_hours=48, label="soxl_ira live-sell test",
-        z_score_threshold=2.0, watchlist_id=WATCHLIST_ID, mode="live",
+        z_score_threshold=2.0, watchlist_id=WATCHLIST_ID, state="live",
         trail_buy_pct=1.0, trail_pct=0.3, entry_timing="close", starting_notional=50000,
         fixed_sl_override=0.3, account="soxl_ira",
     )
@@ -54,7 +54,7 @@ def main():
     db.add_node(
         ticker="ERX", strategy="TrailingBothZScoreBreakout", version=VERSION, window=20,
         take_profit=5, stop_loss=0, max_hold_hours=24, label="soxl_ira live-buy test",
-        z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, mode="live",
+        z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, state="live",
         trail_buy_pct=0.5, trail_pct=2, entry_timing="close", starting_notional=190,
         fixed_sl_override=3, account="soxl_ira",
     )
@@ -62,7 +62,7 @@ def main():
     db.add_node(
         ticker="ERY", strategy="TrailingBothZScoreBreakout", version=VERSION, window=20,
         take_profit=5, stop_loss=0, max_hold_hours=24, label="soxl_ira live-buy test",
-        z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, mode="live",
+        z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, state="live",
         trail_buy_pct=0.5, trail_pct=2, entry_timing="close", starting_notional=21,
         fixed_sl_override=3, account="soxl_ira",
     )
@@ -73,7 +73,7 @@ def main():
     db.add_node(
         ticker="LABD", strategy="TrailingExitZScoreBreakout", version=VERSION, window=20,
         take_profit=10, stop_loss=0, max_hold_hours=24, label="soxl_ira live-buy test (market-buy path)",
-        z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, mode="live",
+        z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, state="live",
         trail_pct=0.5, entry_timing="open_check", starting_notional=22,
         fixed_sl_override=0.3, account="soxl_ira",
     )
@@ -88,7 +88,7 @@ def main():
     db.add_node(
         ticker="GDXD", strategy="TrailingBothZScoreBreakout", version=VERSION, window=20,
         take_profit=5, stop_loss=0, max_hold_hours=24, label="soxl_ira gap-resize test",
-        z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, mode="live",
+        z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, state="live",
         trail_buy_pct=0.3, trail_pct=2, entry_timing="close", starting_notional=500,
         fixed_sl_override=3, account="soxl_ira",
     )

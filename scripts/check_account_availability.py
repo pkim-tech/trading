@@ -16,8 +16,8 @@ for nickname, limits in schwab_safety.ACCOUNTS.items():
     try:
         hashes = schwab_client._resolve_account_hashes()
         if nickname in hashes:
-            print(f"  {nickname:12s} dry_run={limits.dry_run!s:5s} -- RESOLVES (real account hash found)")
+            print(f"  {nickname:12s} trading_enabled={limits.trading_enabled!s:5s} -- RESOLVES (real account hash found)")
         else:
-            print(f"  {nickname:12s} dry_run={limits.dry_run!s:5s} -- NOT LINKED (no SCHWAB_ACCOUNT_{nickname.upper()} match)")
+            print(f"  {nickname:12s} trading_enabled={limits.trading_enabled!s:5s} -- NOT LINKED (no SCHWAB_ACCOUNT_{nickname.upper()} match)")
     except Exception as e:
-        print(f"  {nickname:12s} dry_run={limits.dry_run!s:5s} -- ERROR: {e}")
+        print(f"  {nickname:12s} trading_enabled={limits.trading_enabled!s:5s} -- ERROR: {e}")

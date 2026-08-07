@@ -113,7 +113,7 @@ def print_status(watchlist_id=None):
         above_sma = (cur >= sma50) if sma50 is not None else None
         vol_pctile = _current_vol_pctile(n['ticker'])
         rows.append((n['id'], n['ticker'], role, phase, trigger, cur, pct,
-                     n.get('trail_buy_pct'), n.get('account'), n.get('mode'), sma50, above_sma, vol_pctile))
+                     n.get('trail_buy_pct'), n.get('account'), n.get('state'), sma50, above_sma, vol_pctile))
     rows.sort(key=lambda r: r[6])
 
     print(f"watchlist_id={watchlist_id}\n")

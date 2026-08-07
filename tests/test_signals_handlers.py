@@ -50,7 +50,7 @@ class _FakeClient:
 
 def _add_node(version='test', account='ira'):
     signals_db.add_node(TICKER, 'ZScoreBreakout', version, window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='live', account=account)
+                         stop_loss=5, max_hold_hours=56, state='live', account=account)
     return [n for n in signals_db.get_watchlist() if n['ticker'] == TICKER and n['version'] == version][0]
 
 

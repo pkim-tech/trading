@@ -32,9 +32,9 @@ def main():
                 rows = [dict(r) for r in c.execute(
                     "SELECT * FROM watch_list WHERE ticker = ? AND watchlist_id = ?",
                     (ticker, db.get_active_watchlist_id())).fetchall()]
-            live_rows = [r for r in rows if r.get("mode") == "live"]
+            live_rows = [r for r in rows if r.get("state") != "paper"]
             if len(live_rows) != 1:
-                print(f"  [skip] {ticker}: {len(live_rows)} mode='live' nodes on the active watchlist "
+                print(f"  [skip] {ticker}: {len(live_rows)} non-paper nodes on the active watchlist "
                       f"(need exactly 1) -- resolve manually with --wl-ids")
                 continue
             wl_ids.append(live_rows[0]["id"])

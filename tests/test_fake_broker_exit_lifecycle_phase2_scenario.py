@@ -68,7 +68,7 @@ def _add_node(ticker, account='soxl_ira', notional=5000):
     """Add a live-mode node for testing."""
     signals_db.add_node(ticker, 'TrailingBothZScoreBreakout', 'test', window=10,
                          take_profit=16.0, stop_loss=1.0, max_hold_hours=105,
-                         mode='live', trail_buy_pct=1.0, trail_pct=1.0,
+                         state='live', trail_buy_pct=1.0, trail_pct=1.0,
                          fixed_sl_override=1.0, account=account, starting_notional=notional)
     return [n for n in signals_db.get_watchlist()
             if n['ticker'] == ticker and n['account'] == account][0]

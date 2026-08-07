@@ -36,7 +36,7 @@ def env(monkeypatch, tmp_path):
     db.ensure_tables()
     make_synthetic_csv(TICKER, last_close=100.0)
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
-                stop_loss=1, max_hold_hours=7, mode='live',
+                stop_loss=1, max_hold_hours=7, state='live',
                 trail_buy_pct=1.0, trail_pct=1.0, starting_notional=5000, fixed_sl_override=1.0)
     with db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ?", (TICKER,))  # real ACCOUNTS['ira'].dry_run == True
@@ -59,7 +59,7 @@ def _sig(price):
 
 
 def test_dry_run_account_is_actually_dry_run():
-    assert schwab_safety.ACCOUNTS['ira'].dry_run is True
+    assert schwab_safety.ACCOUNTS['ira'].trading_enabled is False
 
 
 def test_pending_buy_for_dry_run_account_never_fills_without_synthesis(env):
@@ -166,7 +166,7 @@ def test_update_dry_run_buys_market_buy_eligible_node_fills_immediately(env, mon
     """Non-trailing (market-buy-eligible) node: no bounce-fill phase, should fill
     on the very next poll at whatever price is current."""
     db.add_node(TICKER, 'TrailingExitZScoreBreakout', 'test2', window=20, take_profit=7,
-                stop_loss=1, max_hold_hours=7, mode='live', trail_pct=1.0, starting_notional=5000,
+                stop_loss=1, max_hold_hours=7, state='live', trail_pct=1.0, starting_notional=5000,
                 fixed_sl_override=1.0)
     with db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ? AND version = 'test2'", (TICKER,))

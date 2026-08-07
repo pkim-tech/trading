@@ -4,7 +4,7 @@ import pandas as pd
 import yfinance as yf
 from active_signals import (get_watchlists, get_watchlist, add_node, remove_node,
                              label_node, create_watchlist, delete_watchlist,
-                             set_active_watchlist, set_node_mode)
+                             set_active_watchlist, set_node_state)
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
@@ -295,12 +295,12 @@ if watchlist:
                     r.get('fixed_sl'), r.get('trail_buy_pct'), r.get('trail_pct')) for r in watchlist)
     metrics = load_watchlist_metrics(params)
     m_df = pd.DataFrame(metrics)
-    wl_base = pd.concat([wl_raw[['id', 'mode', 'ticker', 'strategy', 'version', 'window', 'z_score_threshold',
+    wl_base = pd.concat([wl_raw[['id', 'state', 'ticker', 'strategy', 'version', 'window', 'z_score_threshold',
                                    'take_profit', 'stop_loss', 'max_hold_hours', 'label']].reset_index(drop=True), m_df], axis=1)
     wl_base['watch'] = True
 
     wl_display = wl_base.rename(columns={
-        'id': 'ID', 'mode': 'Mode', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
+        'id': 'ID', 'state': 'State', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
         'window': 'Window', 'z_score_threshold': 'Z', 'take_profit': 'TP%', 'stop_loss': 'SL%',
         'max_hold_hours': 'Hold h', 'label': 'Label',
         'alpha': 'Alpha%', 'ret': 'Return%', 'trades': 'Trades', 'win_rate': 'Win%',
@@ -313,7 +313,7 @@ if watchlist:
         height=35 * (len(wl_display) + 1) + 10,
         column_config={
             'ID':           st.column_config.NumberColumn('ID', disabled=True),
-            'Mode':         st.column_config.SelectboxColumn('Mode', options=['live', 'research'], required=True),
+            'State':        st.column_config.SelectboxColumn('State', options=['paper', 'dry_run', 'live'], required=True),
             'Label':        st.column_config.TextColumn('Label'),
             'Watch':        st.column_config.CheckboxColumn('Watch', help='Uncheck to remove'),
             'Alpha%':       st.column_config.NumberColumn(format='%.1f%%'),
@@ -323,7 +323,7 @@ if watchlist:
             'SPY B&H%':     st.column_config.NumberColumn(format='%.1f%%'),
             'Max Notional': st.column_config.NumberColumn(format='$%.0f'),
         },
-        disabled=[c for c in wl_display.columns if c not in ('Mode', 'Label', 'Watch')],
+        disabled=[c for c in wl_display.columns if c not in ('State', 'Label', 'Watch')],
     )
 
     # Remove unchecked rows
@@ -332,14 +332,14 @@ if watchlist:
         st.cache_data.clear()
         st.rerun()
 
-    # Save mode / label edits
-    mode_changed  = wl_display['Mode']  != wl_edited['Mode']
+    # Save state / label edits
+    state_changed = wl_display['State'] != wl_edited['State']
     label_changed = wl_display['Label'] != wl_edited['Label']
-    for i in wl_display.index[mode_changed]:
-        set_node_mode(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'Mode'])
+    for i in wl_display.index[state_changed]:
+        set_node_state(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'State'])
     for i in wl_display.index[label_changed]:
         label_node(int(wl_display.loc[i, 'ID']), wl_edited.loc[i, 'Label'])
-    if mode_changed.any() or label_changed.any():
+    if state_changed.any() or label_changed.any():
         st.cache_data.clear()
         st.rerun()
 

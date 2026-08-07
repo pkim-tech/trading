@@ -44,7 +44,7 @@ def env(monkeypatch, tmp_path):
 
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
-                         stop_loss=5, max_hold_hours=7, mode='live',
+                         stop_loss=5, max_hold_hours=7, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0)
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ?", (TICKER,))
@@ -159,7 +159,7 @@ def test_automated_sell_falls_back_when_node_mode_not_live(env):
                               entry_time=now, shares=100)
     pos = signals_db.get_open_position(TICKER)
     with signals_db._conn() as c:
-        c.execute("UPDATE watch_list SET mode='research' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE watch_list SET state='paper' WHERE ticker=?", (TICKER,))
         c.commit()
     signals_notify.notify_trailing_activated(pos, current_price=52.0)
     updated = [p for p in signals_db.get_open_positions() if p['ticker'] == TICKER][0]
@@ -281,6 +281,17 @@ def test_automated_exit_sell_replace_updates_stale_sl_order_id(env, monkeypatch)
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     monkeypatch.setattr(schwab_client, 'replace_equity_order_with_market', lambda *a, **kw: (None, 555))
+    # Not yet confirmed filled -- the branch this test actually exercises
+    # (a confirmed fill closes the position immediately and has no
+    # sl_order_id left to check). get_order_status must also be mocked
+    # (_exit_order_resting's real broker check) and time.sleep patched out,
+    # or this hits real network/delay -- both previously missing entirely,
+    # the actual root cause of this test's failure (found while verifying
+    # it wasn't caused by today's node_dry_run/mode_tag changes).
+    monkeypatch.setattr(schwab_client, 'get_filled_order',
+                         lambda account, ticker, side, order_id=None: None)
+    monkeypatch.setattr(schwab_client, 'get_order_status', lambda account, order_id: 'WORKING')
+    monkeypatch.setattr(signals_notify, 'time', type('T', (), {'sleep': staticmethod(lambda *a: None)}))
     signals_notify.notify_sell_signal(pos, 'TIME', current_price=51.0, target_price=51.0)
     updated = signals_db.get_open_position(TICKER)
     assert updated['sl_order_id'] == 555

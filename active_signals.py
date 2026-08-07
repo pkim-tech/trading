@@ -87,7 +87,7 @@ from signals_config import (
 from signals_db import (
     ensure_tables, get_watchlists, get_active_watchlist_id, create_watchlist,
     delete_watchlist, set_active_watchlist, get_watchlist, _config_fixed_stop_loss,
-    _tp_or_arm_pct, _is_trailing_buy, add_node, remove_node, set_node_mode, label_node,
+    _tp_or_arm_pct, _is_trailing_buy, add_node, remove_node, set_node_state, label_node,
     get_open_positions, get_held_tickers, add_pending_buy, get_pending_buys,
     clear_pending_buy, mark_pending_buy_placed, update_pending_buy_reminder,
     update_position_trail_state, closed_today, open_position, close_position,
@@ -114,7 +114,7 @@ from signals_notify import (
     BUY_REMINDER_MINUTES, _trailing_buy_status, _pending_buy_blocks, check_buy_reminders,
     check_auto_fills, check_gap_resize, drain_fill_queue,
     check_live_state_reconciliation, alert_stale_price_exit_suppressed,
-    _ticker_block, _send_window_alert, _coverage_mode,
+    _ticker_block, _send_window_alert, _coverage_mode, _effectively_dry_run,
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report, send_coverage_report, build_phased_monitors_report,
     update_dry_run_buys, update_real_pending_buys_running_low, check_dry_run_sim_sells,
@@ -306,7 +306,7 @@ def _real_order_or_position_exists(node, ticker):
     if not account or ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         return False
     limits = schwab_safety.ACCOUNTS.get(account)
-    if limits is None or limits.dry_run:
+    if limits is None or _effectively_dry_run(account, node):
         return False
 
     def _check():
@@ -378,7 +378,7 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
         # research-mode/paper node's real exit only ever lands in
         # paper_trade_log, never trade_log -- without it this unlock could
         # never fire for a paper node at all.
-        is_paper_node = node.get('mode', 'live') != 'live'
+        is_paper_node = node.get('state') == 'paper'
         if (alert_key in buy_alerted and not already_held
                 and node['id'] not in pending_wl_ids and closed_today(sig['ticker'], paper=is_paper_node, node=node)):
             buy_alerted.discard(alert_key)
@@ -405,7 +405,7 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                     (_blocking.get('trail_state') or {}).get('exit_pending', {}).get('reason') == 'HANDOFF')
                 if _handoff_in_flight or db.get_drought_pending_buy(node['id']):
                     buy_alerted.discard(alert_key)
-            elif node.get('mode', 'live') == 'live':
+            elif node.get('state') != 'paper':
                 # pending_wl_ids alone would have prevented the 2026-07-26 DIA/IWM/
                 # QQQ/LABU duplicate-pending-buy incident (a restarted daemon forgot
                 # buy_alerted and re-fired a fresh alert/pending_buys row on top of an
@@ -427,7 +427,7 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                     db.log_coverage_event("dup_buy_alert_suppressed", _coverage_mode(node.get('account')),
                                            ticker=sig['ticker'], node_id=node['id'], result="suppressed")
                     if not already_alerted_today:
-                        _post_message(f"🔇 {sig['ticker']} ({node.get('account')} · {_account_mode_tag(node.get('account'))}) "
+                        _post_message(f"🔇 {sig['ticker']} ({node.get('account')} · {_account_mode_tag(node.get('account'), node)}) "
                                       f"BUY signal suppressed — already pending/resting at broker or in pending_buys")
                 else:
                     notify_buy_signal(node, sig)
@@ -437,7 +437,7 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
             else:
                 print(f"  [research] BUY: {node['ticker']} z={sig['z_score']:+.2f} (no alert)")
         else:
-            mode_tag = ' [R]' if node.get('mode') == 'research' else ''
+            mode_tag = ' [R]' if node.get('state') == 'paper' else ''
             summaries.append(
                 f"{sig['ticker']}{mode_tag} z={sig['z_score']:+.2f} {sig['signal']}"
             )
@@ -1200,7 +1200,7 @@ def run_loop(tickers: set = None):
 
             # Intrabar fill detection for limit-entry nodes (all day, not just signal window)
             for node in watchlist:
-                if node.get('mode') != 'live':
+                if node.get('state') == 'paper':
                     continue
                 if node.get('strategy') != 'LimitOrderZScoreBreakout':
                     continue

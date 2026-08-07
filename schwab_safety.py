@@ -135,7 +135,10 @@ class AccountLimits:
     enabled: bool          # allowlist -- False blocks every order for this account
     notional_cap: float    # max $ per single order
     daily_order_cap: int   # max BUY orders per calendar day (SELLs don't count, 2026-07-25)
-    dry_run: bool          # True: log what would happen, never call place_order
+    trading_enabled: bool  # False: log what would happen, never call place_order (renamed
+                           # from dry_run, 2026-08-1x, alongside the node-level state
+                           # collapse -- reads as an unambiguous boolean gate:
+                           # real_order_allowed = (node.state == 'live') AND account.trading_enabled
     account_type: str      # 'cash' or 'margin' (regular or IRA limited margin, same_day_block treats both the same)
 
 
@@ -155,20 +158,20 @@ class AccountLimits:
 # and explicitly rejected -- it would've locked automation out of every
 # existing cash account.
 ACCOUNTS = {
-    "brokerage": AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  dry_run=True, account_type="margin"),
-    "sep":       AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  dry_run=True, account_type="cash"),
-    "roth":      AccountLimits(enabled=True, notional_cap=50_000, daily_order_cap=10, dry_run=True, account_type="cash"),
-    "ira":       AccountLimits(enabled=True, notional_cap=75_000, daily_order_cap=10, dry_run=True, account_type="cash"),
+    "brokerage": AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  trading_enabled=False, account_type="margin"),
+    "sep":       AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  trading_enabled=False, account_type="cash"),
+    "roth":      AccountLimits(enabled=True, notional_cap=50_000, daily_order_cap=10, trading_enabled=False, account_type="cash"),
+    "ira":       AccountLimits(enabled=True, notional_cap=75_000, daily_order_cap=10, trading_enabled=False, account_type="cash"),
     # New limited-margin IRA (2026-07-24 Friday test plan).
-    # dry_run=False 2026-07-24 -- the only account going live for today's real-order
-    # test plan (docs/live_test_plan_2026-07-24.md). Every other account stays dry_run=True.
+    # trading_enabled=True 2026-07-24 -- the only account going live for today's real-order
+    # test plan (docs/live_test_plan_2026-07-24.md). Every other account stays trading_enabled=False.
     # notional_cap raised 2026-08-03 800->3000 after a real $5k capital move brought the
     # account to ~$9k+ available -- the old $800 figure (set conservatively pending a real
     # balance check) was stale and would have structurally blocked every entry/top-up for
     # the newly-resized HIBL/USD/YANG nodes ($2,500/$1,000/$2,500 starting_notional), caught
     # by signals_invariants.py before it could bite live. $3,000 covers the largest single
     # order (HIBL/YANG $2,500) with buffer, stays conservative relative to real balance.
-    "soxl_ira":  AccountLimits(enabled=True, notional_cap=3_000,  daily_order_cap=100, dry_run=False, account_type="margin"),
+    "soxl_ira":  AccountLimits(enabled=True, notional_cap=3_000,  daily_order_cap=100, trading_enabled=True, account_type="margin"),
 }
 
 # Live-automation scope -- moved from a hardcoded Python literal to SCHWAB_AUTOMATION_TICKERS
@@ -438,15 +441,16 @@ def record_node_streak(ticker: str, account: str, kind: str, hit: bool, node_id=
 
         if just_tripped:
             limits = ACCOUNTS.get(account)
-            _mode = "live" if (limits and not limits.dry_run) else "dry_run"
+            _mode = "live" if (limits and limits.trading_enabled) else "dry_run"
             signals_db.log_coverage_event(
                 "node_circuit_breaker_tripped", _mode, ticker=ticker, node_id=node_id,
                 result="tripped", detail=f"kind={kind} streak={node_state[count_key]}"
             )
             import schwab_client  # local import: schwab_client imports this module at load time
             from signals_helpers import mode_tag  # local import: signals_helpers imports this module at load time
+            _node = signals_db.get_watch_list_node_by_id(node_id)
             schwab_client._post_message(
-                f"\U0001F6A8 *{ticker}* ({account} · {mode_tag(account)}) node id={node_id} circuit breaker "
+                f"\U0001F6A8 *{ticker}* ({account} · {mode_tag(account, _node)}) node id={node_id} circuit breaker "
                 f"TRIPPED: {node_state[count_key]} consecutive {kind.replace('_', ' ')} — "
                 f"monitor-only, automation NOT paused. Worth a look before it repeats."
             )
@@ -580,7 +584,7 @@ def _live_ticker_accounts() -> dict:
         # string passed into check_order, and letting it into the set risks
         # sorted() raising TypeError (None vs str) when check_order formats
         # the rejection message below.
-        if row["mode"] == "live" and row["account"]:
+        if row["state"] != "paper" and row["account"]:
             accounts_by_ticker.setdefault(row["ticker"], set()).add(row["account"])
     return accounts_by_ticker
 
@@ -828,7 +832,7 @@ def check_order(
     for a DIFFERENT ticker in this account still blocks)."""
     if kill_switch_engaged():
         _limits = ACCOUNTS.get(account)
-        _mode = "live" if (_limits and not _limits.dry_run) else "dry_run"
+        _mode = "live" if (_limits and _limits.trading_enabled) else "dry_run"
         signals_db.log_coverage_event("kill_switch_block", _mode, ticker=ticker, result="blocked",
                                        detail=kill_switch_reason())
         raise SafetyViolation(f"global kill switch engaged ({kill_switch_reason()})")
@@ -838,7 +842,7 @@ def check_order(
         raise SafetyViolation(f"unknown account '{account}' -- not in the allowlist")
     if not limits.enabled:
         raise SafetyViolation(f"account '{account}' is disabled in the allowlist")
-    _mode = "dry_run" if limits.dry_run else "live"
+    _mode = "dry_run" if not limits.trading_enabled else "live"
     # KNOWN LIMITATION (docs/backlog_cache.md's wl_id refactor entry): _node_id
     # is re-derived via a ticker+account best-effort lookup because no caller
     # in the schwab_client chain threads a real wl_id through yet -- that
@@ -1328,7 +1332,7 @@ def check_order(
         # before blocking -- ground truth, not a local heuristic
         # (automation_principles.md #1). Dry-run accounts have no broker book
         # to check against, so keep the pure local-record behavior.
-        if not limits.dry_run and not _broker_confirms_order(_all_orders(account), ticker, side, quantity):
+        if limits.trading_enabled and not _broker_confirms_order(_all_orders(account), ticker, side, quantity):
             signals_db.log_coverage_event(
                 "dup_order_retry_after_failure", _mode, ticker=ticker, node_id=_node_id, result="allowed_retry",
                 detail=f"side={side} qty={quantity}"
@@ -1348,21 +1352,28 @@ def check_order(
 def approve_and_record(
     account: str, ticker: str, quantity: int, price: float, side: str, is_gap_correction: bool = False,
     is_protective: bool = False, replacing_order_id: int | None = None, is_addon_leg: bool = False,
+    node_dry_run: bool = False,
 ) -> bool:
     """Call immediately before placing a real order. Raises SafetyViolation if
     blocked; otherwise records the order against the daily cap, the global
     per-minute burst cap, and the duplicate-order window, and returns whether
-    the account is in dry_run mode (caller must skip the real API call if so).
-    Checks and increments happen under the same file lock so two concurrent
-    callers can't both slip past a cap. is_gap_correction bypasses only the
-    signal-window time gate (see check_order) -- Part 3, branch B.
+    the order should be simulated rather than actually submitted (caller must
+    skip the real API call if so). Checks and increments happen under the
+    same file lock so two concurrent callers can't both slip past a cap.
+    is_gap_correction bypasses only the signal-window time gate (see
+    check_order) -- Part 3, branch B.
     is_protective bypasses only the daily_order_cap check, for a post-fill
     top-up BUY -- see check_order's docstring (SELL, including a stop-loss
     placement, is unconditionally exempt from this cap since 2026-07-25
     regardless of is_protective).
     replacing_order_id -- see check_order's docstring; threaded through by
     replace_equity_order_with_market/replace_order_with_trailing_sell so an
-    atomic replace call doesn't self-block on the exact order it's replacing."""
+    atomic replace call doesn't self-block on the exact order it's replacing.
+    node_dry_run: the per-node dry_run override (docs/backlog_cache.md, added
+    2026-08-1x) -- additive/OR-logic only against the account-level flag,
+    never a replacement. All the real safety guards in check_order still run
+    unconditionally regardless of either flag; this only decides whether the
+    caller actually submits to the broker afterward."""
     with _open_locked() as f:
         counts = json.loads(f.read() or "{}")
         check_order(account, ticker, quantity, price, side, counts=counts,
@@ -1385,4 +1396,4 @@ def approve_and_record(
         f.seek(0)
         f.truncate()
         f.write(json.dumps(counts))
-    return ACCOUNTS[account].dry_run
+    return (not ACCOUNTS[account].trading_enabled) or node_dry_run

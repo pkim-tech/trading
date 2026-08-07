@@ -46,7 +46,7 @@ def env(monkeypatch, tmp_path):
 
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
-                         stop_loss=5, max_hold_hours=7, mode='live',
+                         stop_loss=5, max_hold_hours=7, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000)
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ?", (TICKER,))
@@ -114,7 +114,7 @@ def test_gap_resize_replaces_order_when_trigger_cleared(env, monkeypatch):
     _seed_pending_order(monkeypatch, order_id=555)
     replace_calls = []
 
-    def _fake_replace(account, ticker, order_id, side, qty, price, is_gap_correction=False, is_protective=False):
+    def _fake_replace(account, ticker, order_id, side, qty, price, is_gap_correction=False, is_protective=False, **kw):
         replace_calls.append((order_id, side, qty))
         return object(), 999
 
@@ -218,7 +218,7 @@ def test_reconcile_buy_fill_resolves_correct_sibling_node(env, monkeypatch):
     _seed_pending_order(monkeypatch)
     node_a = _node()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test_sibling', window=20,
-                         take_profit=7, stop_loss=5, max_hold_hours=7, mode='live',
+                         take_profit=7, stop_loss=5, max_hold_hours=7, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000, account='ira')
     node_b = [n for n in signals_db.get_watchlist() if n['ticker'] == TICKER and n['version'] == 'test_sibling'][0]
     signals_db.add_pending_buy(node_b, _sig(), channel='C1', ts='999.1')
@@ -255,7 +255,7 @@ def test_reconcile_fill_places_real_broker_order_for_topup(env, monkeypatch):
     _seed_pending_order(monkeypatch)
     calls = []
     monkeypatch.setattr(schwab_client, 'place_equity_buy',
-                         lambda account, ticker, qty, price, is_gap_correction=False, is_protective=False:
+                         lambda account, ticker, qty, price, is_gap_correction=False, is_protective=False, **kw:
                              calls.append((qty, price, is_gap_correction)) or (object(), 999))
     # 100 shares @ 51 = $5100, well under the $50k target -> real top-up expected
     signals_notify._reconcile_buy_fill(TICKER, 51.0, 100)
@@ -291,7 +291,7 @@ def test_reconcile_fill_topup_passes_through_gap_correction(env, monkeypatch):
     _seed_pending_order(monkeypatch)
     calls = []
     monkeypatch.setattr(schwab_client, 'place_equity_buy',
-                         lambda account, ticker, qty, price, is_gap_correction=False, is_protective=False:
+                         lambda account, ticker, qty, price, is_gap_correction=False, is_protective=False, **kw:
                              calls.append(is_gap_correction) or (object(), 999))
     signals_notify._reconcile_buy_fill(TICKER, 51.0, 100, is_gap_correction=True)
     assert calls == [True]
@@ -305,7 +305,7 @@ def test_reconcile_buy_fill_places_sl_for_trailing_both_node(env, monkeypatch):
     _seed_pending_order(monkeypatch)
     sl_calls = []
     monkeypatch.setattr(schwab_client, 'place_stop_loss',
-                         lambda account, ticker, qty, stop_price: sl_calls.append((qty, stop_price)) or (object(), 777))
+                         lambda account, ticker, qty, stop_price, **kw: sl_calls.append((qty, stop_price)) or (object(), 777))
     signals_notify._reconcile_buy_fill(TICKER, 51.0, 100)
     assert len(sl_calls) == 1
     qty, stop_price = sl_calls[0]
@@ -417,7 +417,7 @@ def test_drain_fill_queue_resolves_node_by_order_id_not_fuzzy_ticker_account_loo
     # enabled for it -- if the fuzzy ticker+account lookup resolved to this
     # one instead of the real pending buy's node, the gate would wrongly fail.
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test2', window=25, take_profit=8,
-                         stop_loss=6, max_hold_hours=9, mode='live',
+                         stop_loss=6, max_hold_hours=9, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000)
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ? AND version = 'test2'", (TICKER,))

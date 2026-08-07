@@ -21,7 +21,7 @@ db.add_node(
     ticker="LABU", strategy="TrailingExitZScoreBreakout", version=VERSION, window=20,
     take_profit=10, stop_loss=0, max_hold_hours=24,
     label="soxl_ira live-buy test (market-buy path, LABD backup)",
-    z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, mode="live",
+    z_score_threshold=1.5, watchlist_id=WATCHLIST_ID, state="live",
     trail_pct=0.5, entry_timing="open_check", starting_notional=22,
     fixed_sl_override=0.3, account="soxl_ira",
 )

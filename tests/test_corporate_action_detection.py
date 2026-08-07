@@ -123,7 +123,7 @@ def test_apply_correction_clears_alert_and_updates_entry_price(monkeypatch, tmp_
     signals_db.ensure_tables()
     node_ticker = 'TEST_CORP_ACTION_APPLY'
     signals_db.add_node(node_ticker, 'ZScoreBreakout', 'test', window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='live')
+                         stop_loss=5, max_hold_hours=56, state='live')
     node = [n for n in signals_db.get_watchlist() if n['ticker'] == node_ticker][0]
     from datetime import datetime
     now = datetime.now()

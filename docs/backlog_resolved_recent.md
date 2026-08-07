@@ -7,6 +7,12 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][security] Resolved 2026-08-07 — GDXU real orphaned position (soxl_ira, unprotected a week) root-caused, fixed, reconciled for real; new on-demand broker-truth sweep tool built. Full detail: `deep_backlog.md`.
+## [live-trading][security] Resolved 2026-08-06/07 — `watch_list.mode`+account `dry_run` collapsed into one `state` column; 2 paired Opus reviews + exhaustive sweep found/fixed ~30 real bugs incl. a resurrecting-column CRITICAL. Full detail: `deep_backlog.md`.
+## [portfolio] Resolved 2026-08-1x — put-hedge skipped by explicit user call; relying on skim-and-reserve alone. `collect_options_snapshot.py` daily cron removed (no other consumer).
+
+## [backtest][coverage] Resolved 2026-08-1x — `trade_log`/`paper_trade_log` `wl_id=NULL` backfill applied to real live DB, with a new `added_at` tie-break for a live-track/daily-track ambiguity it surfaced. Full suite 589/1 pre-existing fail.
+
 ## [backtest][data] Resolved 2026-08-08 (late) — `prune_backtest_cache.py`'s take_profit/NULL bug fixed; 17 tickers' zeroed TrailingBoth v5 island data recovered from the pre-prune archive
 Same root cause as the `top_safe_nodes.py`/`three_layer_summary.py` bug fixed 2026-08-07: `take_profit IN (?)` never matches NULL, and `TrailingBothZScoreBreakout` always stores NULL there (real value is in `arm_sell_pct`) — so the 2026-08-02 prune silently dropped this strategy's v5 data for 17 of 18 v4-universe tickers. Fixed via the same `COALESCE(take_profit, arm_sell_pct)` pattern. Recovered island-only (736,111 rows, 31K-63K/ticker) from the permanent pre-prune archive, `INSERT OR IGNORE`'d into the live DB after a full backup; validated via `PRAGMA integrity_check` (ok) and SOXL's recovered best alpha (1212.1%) matching the number already on record. Full detail: `docs/deep_backlog.md`'s 2026-08-08 (late) entry (top).
 

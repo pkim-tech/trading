@@ -46,7 +46,7 @@ def env(monkeypatch, tmp_path):
     # max_hold_hours=7 bars -- fake_node/_synthetic_timestamps convention: hours_ago
     # is really bars-ago on the fixed 2025 hourly grid.
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
-                stop_loss=1, max_hold_hours=7, mode='live',
+                stop_loss=1, max_hold_hours=7, state='live',
                 trail_buy_pct=1.0, trail_pct=1.0, starting_notional=5000, fixed_sl_override=1.0)
 
     yield posted
@@ -300,7 +300,7 @@ def test_market_buy_node_has_no_bounce_wait_to_abandon(env):
     should never be touched by the abandon check -- db._is_trailing_buy gates
     it, same guard used by update_dry_run_buys/update_paper_buys."""
     db.add_node(TICKER + '_MKT', 'ZScoreBreakout', 'test', window=20, take_profit=7,
-                stop_loss=1, max_hold_hours=7, mode='live')
+                stop_loss=1, max_hold_hours=7, state='live')
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER + '_MKT'][0]
     make_synthetic_csv(TICKER + '_MKT', last_close=100.0)
     try:

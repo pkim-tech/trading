@@ -128,7 +128,15 @@ def ensure_tables():
                 ALTER TABLE watch_list_new RENAME TO watch_list;
             """)
         else:
-            if 'mode' not in wl_cols:
+            if 'mode' not in wl_cols and 'state' not in wl_cols:
+                # Only re-add 'mode' for a genuinely pre-migration DB (one that has
+                # neither column yet) -- the later state migration block reads it to
+                # backfill 'state' before dropping it for good. Once 'state' exists,
+                # 'mode' must stay gone: this branch used to fire unconditionally on
+                # every ensure_tables() call, silently resurrecting 'mode' (default
+                # 'live', on EVERY row) immediately after the state migration dropped
+                # it -- confirmed via Opus review reproducing this against a copy of
+                # the real production DB, 2026-08-06.
                 c.execute("ALTER TABLE watch_list ADD COLUMN mode TEXT NOT NULL DEFAULT 'live'")
             if 'z_score_threshold' not in wl_cols:
                 c.execute("ALTER TABLE watch_list ADD COLUMN z_score_threshold REAL NOT NULL DEFAULT 2.0")
@@ -323,6 +331,49 @@ def ensure_tables():
             # paper couldn't measure the overlay's real net effect). NULL
             # until the first mark.
             c.execute("ALTER TABLE watch_list ADD COLUMN skim_last_mark_time TEXT")
+        if 'state' not in wl_cols:
+            # Collapses mode ('research'/'live') + the per-node dry_run
+            # override (both discussed 2026-08-1x, dry_run itself only
+            # landed hours earlier the same session before this collapse was
+            # decided) into ONE column -- 'paper' / 'dry_run' / 'live',
+            # mutually exclusive and exhaustive. Per the user's explicit
+            # call: these are stored separately from the ACCOUNT-level ceiling
+            # (schwab_safety.ACCOUNTS[account].trading_enabled, kept as a
+            # real, independently-checked gate -- real_order_allowed =
+            # (node.state == 'live') AND (account.trading_enabled == True)),
+            # but a node's own mode+dry_run were two fields answering one
+            # question ("what is this node doing right now") and reasoning
+            # about two fields for one fact was the friction being removed.
+            # 'paper' means paper_trading.py's simulation (mode=='research'
+            # today) -- never consults schwab_client at all, a categorically
+            # different thing from 'dry_run', which DOES run every real
+            # check_order guard, just short-circuits at the final broker
+            # call. Backfilled from the real mode/dry_run/account columns
+            # below (needs schwab_safety.ACCOUNTS for the account-level
+            # ceiling -- local import to break the signals_db<->schwab_safety
+            # circular import, same pattern already used at check_order's
+            # cash-check call site in schwab_safety.py).
+            c.execute("ALTER TABLE watch_list ADD COLUMN state TEXT NOT NULL DEFAULT 'paper'")
+            import schwab_safety
+            # dry_run itself is brand new the same session as this collapse --
+            # most real DBs never had it at all (only this session's own test
+            # DBs, mid-refactor, might). Handle both.
+            _had_dry_run_col = 'dry_run' in wl_cols
+            select_cols = "id, mode, dry_run, account" if _had_dry_run_col else "id, mode, account"
+            rows = c.execute(f"SELECT {select_cols} FROM watch_list").fetchall()
+            for r in rows:
+                if r['mode'] != 'live':
+                    state = 'paper'
+                else:
+                    limits = schwab_safety.ACCOUNTS.get(r['account'])
+                    account_dry = not bool(limits and limits.trading_enabled)
+                    node_dry = bool(r['dry_run']) if _had_dry_run_col else False
+                    state = 'dry_run' if (account_dry or node_dry) else 'live'
+                c.execute("UPDATE watch_list SET state=? WHERE id=?", (state, r['id']))
+            c.commit()
+            c.execute("ALTER TABLE watch_list DROP COLUMN mode")
+            if _had_dry_run_col:
+                c.execute("ALTER TABLE watch_list DROP COLUMN dry_run")
 
         # account wasn't part of the original UNIQUE constraint -- found 2026-07-26 while
         # adding a second real DPST node in a different account: two nodes with identical
@@ -342,7 +393,7 @@ def ensure_tables():
                 CREATE TABLE watch_list_new (
                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                     watchlist_id       INTEGER NOT NULL,
-                    mode               TEXT NOT NULL DEFAULT 'live',
+                    state              TEXT NOT NULL DEFAULT 'paper',
                     ticker             TEXT NOT NULL,
                     strategy           TEXT NOT NULL,
                     version            TEXT NOT NULL,
@@ -413,7 +464,7 @@ def ensure_tables():
                 CREATE TABLE watch_list_new (
                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                     watchlist_id       INTEGER NOT NULL,
-                    mode               TEXT NOT NULL DEFAULT 'live',
+                    state              TEXT NOT NULL DEFAULT 'paper',
                     ticker             TEXT NOT NULL,
                     strategy           TEXT NOT NULL,
                     version            TEXT NOT NULL,
@@ -1402,22 +1453,74 @@ def ensure_tables():
                     c.execute(f"UPDATE {tbl} SET wl_id=? WHERE id=?", (node_id, r['id']))
         c.commit()
 
-        # open_positions/paper_positions carry no node_json to recover wl_id from --
-        # best-effort match each still-NULL row to a current watch_list row on
-        # (ticker, strategy, version, window, account). An unmatched/ambiguous row is
-        # left NULL (acceptable: a legacy position from a now-changed/deleted node,
-        # not a live one) -- every position opened via open_position() from here
-        # forward always gets a real wl_id written at insert time.
-        for tbl in ('open_positions', 'paper_positions'):
+        # node_json 'state' backfill -- a pending_buys/paper_pending_buys row created
+        # before the mode+dry_run -> state collapse (2026-08-06) has a node_json
+        # snapshot with no 'state' key at all. Readers disagree on what a missing key
+        # means: effectively_dry_run() treats it as not-live (fails closed, simulates),
+        # but node_dry_run=(node.get('state') != 'live') at the real order-placement
+        # call sites ALSO now fails closed post-fix -- but check_entry_abandon's cancel
+        # branch (_effectively_dry_run gate) would still wrongly skip a real
+        # cancel_order for an old row missing 'state' on a real node, since it reads
+        # True (dry-run) for that case. Backfill from the live watch_list row (via the
+        # wl_id just set above) so old snapshots carry the real state going forward --
+        # matches the node's state AT THE TIME OF THIS MIGRATION, not necessarily at
+        # order-placement time, which is the same best-effort limitation the wl_id
+        # backfill above already accepts.
+        for tbl in ('pending_buys', 'paper_pending_buys'):
+            rows = c.execute(f"SELECT id, node_json, wl_id FROM {tbl}").fetchall()
+            for r in rows:
+                try:
+                    node = json.loads(r['node_json'])
+                except (TypeError, ValueError):
+                    continue
+                if 'state' in node or r['wl_id'] is None:
+                    continue
+                wl_row = c.execute("SELECT state FROM watch_list WHERE id=?", (r['wl_id'],)).fetchone()
+                if wl_row is None:
+                    continue
+                node['state'] = wl_row['state']
+                c.execute(f"UPDATE {tbl} SET node_json=? WHERE id=?", (json.dumps(node), r['id']))
+        c.commit()
+
+        # open_positions/paper_positions/trade_log/paper_trade_log carry no node_json to
+        # recover wl_id from -- best-effort match each still-NULL row to a current
+        # watch_list row on (ticker, strategy, version, window, account). An
+        # unmatched/ambiguous row is left NULL (acceptable: a legacy position/trade from
+        # a now-changed/deleted node, or a genuine live-track/daily-track duplicate --
+        # not a live one) -- every row written via open_position()/log_trade_entry from
+        # here forward always gets a real wl_id at insert time. trade_log/paper_trade_log
+        # added 2026-08-1x: log_trade_entry's wl_id write only landed in commit fb699cf
+        # (2026-08-09), so rows predating it were stuck NULL despite the sibling
+        # open_positions/paper_positions row (much older write, since 2026-07-26) having
+        # the right value all along -- confirmed real via coverage_events, not a live bug.
+        for tbl in ('open_positions', 'paper_positions', 'trade_log', 'paper_trade_log'):
             rows = c.execute(
-                f"SELECT id, ticker, strategy, version, window, account FROM {tbl} WHERE wl_id IS NULL"
+                f"SELECT id, ticker, strategy, version, window, account, entry_time FROM {tbl} WHERE wl_id IS NULL"
             ).fetchall()
             for r in rows:
                 candidates = c.execute(
-                    "SELECT id FROM watch_list WHERE ticker=? AND strategy=? AND version=? AND window=? "
-                    "AND COALESCE(account,'')=COALESCE(?,'')",
+                    "SELECT id, added_at FROM watch_list WHERE ticker=? AND strategy=? AND version=? "
+                    "AND window=? AND COALESCE(account,'')=COALESCE(?,'')",
                     (r['ticker'], r['strategy'], r['version'], r['window'], r['account']),
                 ).fetchall()
+                if r['entry_time']:
+                    # A trade that predates a candidate node's own creation can't
+                    # belong to it -- applies regardless of candidate count.
+                    # CRITICAL fix (found by paired Opus review, 2026-08-1x): this
+                    # filter originally only ran when len(candidates) > 1, added to
+                    # break a live-track/daily-track tie (added 2026-08-05, both
+                    # identical on every column above except added_at). But a
+                    # SINGLE candidate can be just as wrong -- confirmed live via
+                    # watch_list_audit (added_at is never reset by a rebuild
+                    # migration, it's the real add_node timestamp): 8 real trade_log
+                    # rows had been silently attributed to a since-deleted-and-
+                    # recreated node (e.g. a 'soxl_test'/'canary' version reused
+                    # after the original was removed) whose real creation postdated
+                    # the trade by hours to days. Applying this filter universally
+                    # correctly nulls those back out -- same "acceptable, leave
+                    # NULL" convention this migration already uses for a genuinely
+                    # unmatchable row, not a regression.
+                    candidates = [cand for cand in candidates if cand['added_at'] <= r['entry_time']]
                 if len(candidates) == 1:
                     c.execute(f"UPDATE {tbl} SET wl_id=? WHERE id=?", (candidates[0]['id'], r['id']))
         c.commit()
@@ -1607,7 +1710,7 @@ def _is_trailing_buy(node):
 
 
 def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours,
-             label='', z_score_threshold=2.0, watchlist_id=None, mode='live',
+             label='', z_score_threshold=2.0, watchlist_id=None, state='paper',
              trail_buy_pct=None, trail_pct=None, entry_timing='close', starting_notional=50000,
              fixed_sl_override=None, account=None, paper_role=None):
     """trail_buy_pct/trail_pct: pass the real values directly for v3.x nodes (where
@@ -1619,8 +1722,12 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
     a constant) — pass whatever backtest_cache's stop_loss column shows, it's vestigial.
     fixed_sl_override: pass the real per-node SL (e.g. a v4 SL-sweep value) directly —
     without it, uses_fixed_sl strategies always fall back to config.json's stale global
-    default, which is wrong for any node whose real SL differs from that default."""
-    if mode == 'live' and account and ticker.upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
+    default, which is wrong for any node whose real SL differs from that default.
+    state: 'paper' / 'dry_run' / 'live' (see ensure_tables()'s schema comment) —
+    replaces the old separate mode='live'/'research' + node-level dry_run override."""
+    if state not in ('paper', 'dry_run', 'live'):
+        raise ValueError(f"add_node: invalid state {state!r} -- must be 'paper'/'dry_run'/'live'")
+    if state != 'paper' and account and ticker.upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
             kw in account.lower() for kw in ("ira", "roth", "sep")):
         raise ValueError(
             f"add_node refused: {ticker} is excluded from tax-advantaged accounts "
@@ -1703,16 +1810,16 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
             return
         cur = c.execute("""
             INSERT INTO watch_list
-                (watchlist_id, mode, ticker, strategy, version, window, take_profit,
+                (watchlist_id, state, ticker, strategy, version, window, take_profit,
                  stop_loss, max_hold_hours, label, z_score_threshold, trail_sell_pct, fixed_sl,
                  trail_buy_pct, arm_sell_pct, entry_timing, starting_notional, account, paper_role)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (watchlist_id, mode, ticker, strategy, version, int(window), stored_take_profit,
+        """, (watchlist_id, state, ticker, strategy, version, int(window), stored_take_profit,
               int(stop_loss), int(max_hold_hours), label, float(z_score_threshold),
               stored_trail_sell_pct, fixed_sl, stored_trail_buy_pct, stored_arm_sell_pct,
               entry_timing, float(starting_notional), account, paper_role))
         _log_audit(c, 'add_node', watchlist_id=watchlist_id, watch_id=cur.lastrowid,
-                   ticker=ticker, detail=f"strategy={strategy} version={version} mode={mode}")
+                   ticker=ticker, detail=f"strategy={strategy} version={version} state={state}")
         c.commit()
 
 
@@ -1729,27 +1836,35 @@ def remove_node(watch_id):
         c.commit()
 
 
-def set_node_mode(watch_id, mode):
-    """add_node's tax-advantaged-account guard only fires at node CREATION time
-    (mode='live' + an excluded ticker + an ira/roth/sep account) -- a node
-    created mode='research' in that same account, then flipped live via this
-    function, bypassed it entirely (found by paired Opus review, 2026-08-05).
-    Mirrors add_node's exact check rather than re-deriving it."""
+def set_node_state(watch_id, state):
+    """Sets the one field answering "what is this node doing right now" --
+    'paper' / 'dry_run' / 'live' (collapses the old separate set_node_mode +
+    set_node_dry_run, 2026-08-1x). add_node's tax-advantaged-account guard
+    only fires at node CREATION time (state != 'paper' + an excluded ticker +
+    an ira/roth/sep account) -- a node created state='paper' in that same
+    account, then flipped to dry_run/live via this function, bypassed it
+    entirely (found by paired Opus review, 2026-08-05, for the old mode
+    version of this same gap). Mirrors add_node's exact check rather than
+    re-deriving it. Real order placement additionally requires the
+    account-level schwab_safety.ACCOUNTS[account].trading_enabled ceiling --
+    this function only ever sets the node's own half of that AND."""
+    if state not in ('paper', 'dry_run', 'live'):
+        raise ValueError(f"set_node_state: invalid state {state!r} -- must be 'paper'/'dry_run'/'live'")
     with _conn() as c:
         row = c.execute(
-            "SELECT watchlist_id, ticker, mode, account FROM watch_list WHERE id = ?", (watch_id,)
+            "SELECT watchlist_id, ticker, state, account FROM watch_list WHERE id = ?", (watch_id,)
         ).fetchone()
-        if row and mode == 'live' and row['account'] and row['ticker'].upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
+        if row and state != 'paper' and row['account'] and row['ticker'].upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
                 kw in row['account'].lower() for kw in ("ira", "roth", "sep")):
             raise ValueError(
-                f"set_node_mode refused: {row['ticker']} (wl_id={watch_id}) is excluded from "
+                f"set_node_state refused: {row['ticker']} (wl_id={watch_id}) is excluded from "
                 f"tax-advantaged accounts (account={row['account']!r}) -- see CLAUDE.md's "
                 f"'Ticker exclusion, decided 2026-08-04' note (K-1/UBTI risk). Confirm the "
                 f"ticker's real K-1 status before overriding.")
-        c.execute("UPDATE watch_list SET mode = ? WHERE id = ?", (mode, watch_id))
+        c.execute("UPDATE watch_list SET state = ? WHERE id = ?", (state, watch_id))
         if row:
-            _log_audit(c, 'set_node_mode', watchlist_id=row['watchlist_id'], watch_id=watch_id,
-                       ticker=row['ticker'], detail=f"{row['mode']} -> {mode}")
+            _log_audit(c, 'set_node_state', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                       ticker=row['ticker'], detail=f"{row['state']} -> {state}")
         c.commit()
 
 
@@ -2338,6 +2453,33 @@ def get_open_position(ticker, paper=False):
     return d
 
 
+def get_real_open_position(ticker, account=None):
+    """Real (is_dry_run_sim=0) open_positions row only, optionally scoped to
+    account -- neither get_open_position nor get_open_position_for_account
+    exclude synthetic dry-run-sim rows, which is wrong for a caller
+    specifically asking "does a REAL position already exist" (found 2026-08-07:
+    _reconcile_buy_fill's orphan-fill check used bare get_open_position(ticker),
+    so a same-ticker is_dry_run_sim=1 canary position in a different account
+    would be mistaken for "this real fill was already reconciled" and silently
+    suppress the alert for a genuinely untracked real fill)."""
+    with _conn() as c:
+        if account:
+            row = c.execute(
+                "SELECT * FROM open_positions WHERE ticker=? AND account=? AND is_dry_run_sim=0 "
+                "ORDER BY entry_time DESC LIMIT 1", (ticker, account)
+            ).fetchone()
+        else:
+            row = c.execute(
+                "SELECT * FROM open_positions WHERE ticker=? AND is_dry_run_sim=0 "
+                "ORDER BY entry_time DESC LIMIT 1", (ticker,)
+            ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d['trail_state'] = json.loads(d['trail_state']) if d.get('trail_state') else {}
+    return d
+
+
 def get_open_position_for_account(ticker, account, paper=False):
     """(ticker, account)-keyed sibling of get_open_position() -- used by
     schwab_safety.check_order's oversell guard, which already has `account` in
@@ -2482,7 +2624,7 @@ def get_held_tickers():
 
 _PENDING_BUY_NODE_KEYS = ('id', 'ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
                           'max_hold_hours', 'label', 'trail_sell_pct', 'fixed_sl', 'trail_buy_pct',
-                          'arm_sell_pct', 'account', 'starting_notional')
+                          'arm_sell_pct', 'account', 'starting_notional', 'state')
 
 
 def add_pending_buy(node, sig, channel, ts, order_id=None, position_source='core',

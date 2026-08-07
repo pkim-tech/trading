@@ -63,7 +63,7 @@ LIVE_DB_PATH = "./cache/live/trading_live.db"
 
 NODE_COLS = [
     'ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
-    'max_hold_hours', 'z_score_threshold', 'mode', 'trail_sell_pct', 'fixed_sl',
+    'max_hold_hours', 'z_score_threshold', 'state', 'trail_sell_pct', 'fixed_sl',
     'trail_buy_pct', 'arm_sell_pct', 'account', 'alpha', 'label',
 ]
 
@@ -212,8 +212,8 @@ class SimShell(cmd.Cmd):
         if ticker in A.get_held_tickers():
             print(f"  [skip] {ticker} already held -- no alert (matches run_loop's skip logic)")
             return
-        if node.get('mode', 'live') != 'live':
-            print(f"  [research] {ticker} would BUY but mode={node.get('mode')} -- no alert")
+        if node.get('state') == 'paper':
+            print(f"  [research] {ticker} would BUY but state={node.get('state')} -- no alert")
             return
         A.notify_buy_signal(node, sig)
 
@@ -321,7 +321,7 @@ class SimShell(cmd.Cmd):
         "state -- show sim watch_list + open positions + trail_state"
         print("watch_list:")
         for n in A.get_watchlist():
-            print(f"  {n['ticker']:6s} {n['strategy']:26s} {n['version']:6s} mode={n.get('mode')}")
+            print(f"  {n['ticker']:6s} {n['strategy']:26s} {n['version']:6s} state={n.get('state')}")
         print("open_positions:")
         for p in A.get_open_positions():
             print(f"  {p['ticker']:6s} entry=${p['entry_price']:.4f} @ {p['entry_time']}"

@@ -43,7 +43,7 @@ def env(monkeypatch, tmp_path):
     db.ensure_tables()
     make_synthetic_csv(TICKER, last_close=100.0)
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
-                stop_loss=1, max_hold_hours=7, mode='live',
+                stop_loss=1, max_hold_hours=7, state='live',
                 trail_buy_pct=1.0, trail_pct=1.0, starting_notional=5000, fixed_sl_override=1.0)
 
     yield posted

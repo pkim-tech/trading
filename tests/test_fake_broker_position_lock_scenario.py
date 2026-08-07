@@ -29,7 +29,7 @@ def env(monkeypatch):
     monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
-                         stop_loss=1, max_hold_hours=105, mode='live',
+                         stop_loss=1, max_hold_hours=105, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0, account='ira')
     yield
     os.unlink(tmp_db.name)

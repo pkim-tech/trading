@@ -28,10 +28,10 @@ def check_live_trailing_exit_automation_scope():
     """
     violations = []
     for node in db.get_watchlist():
-        if node['mode'] == 'live' and node['strategy'] == 'TrailingExitZScoreBreakout':
+        if node['state'] != 'paper' and node['strategy'] == 'TrailingExitZScoreBreakout':
             if node['ticker'] not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
                 violations.append(
-                    f"{node['ticker']} (wl_id={node['id']}) is mode='live' "
+                    f"{node['ticker']} (wl_id={node['id']}) is state={node['state']!r} "
                     f"TrailingExitZScoreBreakout but not in AUTOMATION_ENABLED_TICKERS -- "
                     f"a manual 'Executed' tap would be silently discarded "
                     f"(signals_handlers.handle_entry_price/handle_trail_buy_fill_price)."
@@ -60,14 +60,14 @@ def check_research_mode_ticker_with_open_position_in_automation_scope():
     """
     violations = []
     for node in db.get_watchlist():
-        if node['mode'] != 'live' and node['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        if node['state'] == 'paper' and node['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS:
             # wl_id-keyed, not ticker-only -- a ticker-only lookup (db.get_open_position)
             # would false-positive on a deliberate live+research node pair for the same
             # ticker (e.g. DPST/GDXU) whenever the *live* node holds the real position.
             pos = db.get_open_position_by_wl_id(node['id'], paper=False)
             if pos is not None:
                 violations.append(
-                    f"{node['ticker']} (wl_id={node['id']}) is mode='{node['mode']}' but has a "
+                    f"{node['ticker']} (wl_id={node['id']}) is state={node['state']!r} but has a "
                     f"real open position and is in AUTOMATION_ENABLED_TICKERS -- its exit would "
                     f"still be routed through automated-sell (signals_notify.notify_trailing_activated "
                     f"-> _attempt_automated_sell, ticker-gated only, not mode-gated)."
@@ -156,9 +156,9 @@ def check_live_node_missing_account():
     """
     violations = []
     for node in db.get_watchlist():
-        if node['mode'] == 'live' and not node.get('account'):
+        if node['state'] != 'paper' and not node.get('account'):
             violations.append(
-                f"{node['ticker']} (wl_id={node['id']}) is mode='live' with account=None -- "
+                f"{node['ticker']} (wl_id={node['id']}) is state={node['state']!r} with account=None -- "
                 f"check_order will fail closed as 'unknown account' for every order attempt."
             )
     return violations
@@ -188,7 +188,7 @@ def check_tax_advantaged_excluded_tickers():
     for node in db.get_watchlist():
         ticker = (node.get('ticker') or '').upper()
         account = node.get('account') or ''
-        if node.get('mode') == 'live' and ticker in db.TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
+        if node.get('state') != 'paper' and ticker in db.TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
                 kw in account.lower() for kw in ("ira", "roth", "sep")):
             violations.append(
                 f"{ticker} (wl_id={node['id']}) is in account={account!r}, but "
@@ -199,8 +199,8 @@ def check_tax_advantaged_excluded_tickers():
 
 
 def check_brokerage_not_live_with_unresolved_leverage_gap():
-    """The 'brokerage' account must stay dry_run=True until the availableFunds
-    leverage-inclusive-cash gap is resolved.
+    """The 'brokerage' account must stay trading_enabled=False until the
+    availableFunds leverage-inclusive-cash gap is resolved.
 
     Depends on this: schwab_client.get_account_balance's cash check reads
     availableFunds, which for a genuine Reg-T margin account like 'brokerage'
@@ -208,16 +208,16 @@ def check_brokerage_not_live_with_unresolved_leverage_gap():
     check_order's cash-availability check is meant to be a conservative
     real-cash gate; against a live 'brokerage' it could currently pass a BUY
     partly funded by borrowing rather than settled cash. Bounded today only by
-    dry_run=True. (docs/backlog_cache.md, Opus review 2026-07-23 night, not
+    trading_enabled=False. (docs/backlog_cache.md, Opus review 2026-07-23 night, not
     yet fixed.)
     """
     violations = []
     brokerage = schwab_safety.ACCOUNTS.get('brokerage')
-    if brokerage is not None and not brokerage.dry_run:
+    if brokerage is not None and brokerage.trading_enabled:
         violations.append(
-            "schwab_safety.ACCOUNTS['brokerage'].dry_run is False -- the availableFunds "
+            "schwab_safety.ACCOUNTS['brokerage'].trading_enabled is True -- the availableFunds "
             "leverage-inclusive-cash gap (get_account_balance / check_order's cash check) "
-            "was never fixed for a real margin account, only bounded by dry_run=True."
+            "was never fixed for a real margin account, only bounded by trading_enabled=False."
         )
     return violations
 
@@ -239,7 +239,7 @@ def check_starting_notional_within_account_notional_cap():
     catching the underlying config mismatch itself."""
     violations = []
     for node in db.get_watchlist():
-        if node['mode'] != 'live':
+        if node['state'] == 'paper':
             continue
         account = node.get('account')
         starting_notional = node.get('starting_notional')
@@ -391,13 +391,21 @@ def print_staged_config_status(account=None):
 
 
 def print_all_live_node_state():
-    """Both real-money live tiers -- soxl_ira (SH/RETL/GDXU/DPST/SPY) and ira
-    (the 13 canary/mirror nodes) -- as two back-to-back tables, one call site
-    for every caller that wants the full readiness picture (daemon startup,
-    the 7am/EOD daily slots, and this module's own CLI)."""
+    """All three tiers with real (or dry-run-against-real-code) mode='live'
+    nodes -- soxl_ira (SH/RETL/GDXU/DPST/SPY), ira (the 13 canary/mirror
+    nodes), and brokerage (the SOXL drought/addon dry-run canaries added
+    2026-08-1x, margin-typed/dry_run=True -- the plan's own prerequisite
+    rehearsal layer before any real order) -- as three back-to-back tables,
+    one call site for every caller that wants the full readiness picture
+    (daemon startup, the 7am/EOD daily slots, and this module's own CLI).
+    brokerage added after being found missing entirely: seeding a
+    staged_test_config baseline for a new live node is silently useless if
+    nothing ever prints its drift status."""
     print_staged_config_status(account='soxl_ira')
     print()
     print_staged_config_status(account='ira')
+    print()
+    print_staged_config_status(account='brokerage')
 
 
 def check_sim_mode_off_for_real_daemon():
@@ -445,7 +453,7 @@ def check_addon_drought_live_nodes_have_coherent_account_type():
     check_starting_notional_within_account_notional_cap)."""
     violations = []
     for node in db.get_watchlist():
-        if node['mode'] != 'live':
+        if node['state'] == 'paper':
             continue
         if not (node.get('addon_enabled') or node.get('drought_overlay_enabled')):
             continue

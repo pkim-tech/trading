@@ -45,7 +45,7 @@ def env(monkeypatch, tmp_path):
 
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'ZScoreBreakout', 'test', window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='live')
+                         stop_loss=5, max_hold_hours=56, state='live')
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ?", (TICKER,))
         c.commit()
@@ -218,7 +218,7 @@ def test_ticker_not_on_watchlist_blocked(env):
 
 def test_live_ticker_outside_automation_pilot_scope_blocked(env):
     signals_db.add_node('TEST_OTHER_LIVE', 'ZScoreBreakout', 'test', window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='live')
+                         stop_loss=5, max_hold_hours=56, state='live')
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = 'TEST_OTHER_LIVE'")
         c.commit()
@@ -228,7 +228,7 @@ def test_live_ticker_outside_automation_pilot_scope_blocked(env):
 
 def test_research_mode_ticker_blocked(env):
     signals_db.add_node('TEST_RESEARCH', 'ZScoreBreakout', 'test', window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='research')
+                         stop_loss=5, max_hold_hours=56, state='paper')
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = 'TEST_RESEARCH'")
         c.commit()
@@ -314,7 +314,7 @@ def test_node_level_automation_pause_does_not_block_sibling_node_other_account(e
     # different (unambiguous) account.
     node_a = _get_node()
     signals_db.add_node(TICKER, 'ZScoreBreakout', 'test_sibling', window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='live', account='brokerage')
+                         stop_loss=5, max_hold_hours=56, state='live', account='brokerage')
     schwab_safety.pause_node_automation(node_a['id'], reason="test pause")
     result = schwab_client.place_equity_buy('brokerage', TICKER, 5, 50.0)
     assert result == (None, None)  # dry_run -- node_a's pause doesn't touch node_b
@@ -330,7 +330,7 @@ def test_node_level_automation_pause_no_op_for_ambiguous_sibling_same_account(en
     # pins down so a future fix (or regression) is visible.
     node_a = _get_node()
     signals_db.add_node(TICKER, 'ZScoreBreakout', 'test_ambiguous', window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='live', account='ira')
+                         stop_loss=5, max_hold_hours=56, state='live', account='ira')
     schwab_safety.pause_node_automation(node_a['id'], reason="test pause")
     result = schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
     assert result == (None, None)  # not blocked -- the pause is a no-op here (known limitation)
@@ -342,7 +342,7 @@ def test_two_nodes_same_ticker_diff_accounts_logs_event(env):
     # paper-vs-real pairing) -- check_order must not treat this as an
     # error, just log it for coverage visibility.
     signals_db.add_node(TICKER, 'ZScoreBreakout', 'test2', window=20, take_profit=10,
-                         stop_loss=5, max_hold_hours=56, mode='live', account='brokerage')
+                         stop_loss=5, max_hold_hours=56, state='live', account='brokerage')
     result = schwab_client.place_equity_buy('ira', TICKER, 5, 50.0)
     assert result == (None, None)  # dry_run -- not blocked
     events = signals_db.get_coverage_events(scenario_key="two_nodes_same_ticker_diff_accounts")
@@ -478,7 +478,7 @@ def test_duplicate_guard_allows_retry_when_broker_never_confirms_prior_attempt(e
     # duplicate to the old purely-local check. The fix (2026-07-22) cross-
     # checks the broker's real order book before blocking a retry -- if
     # nothing genuinely reached the broker, the retry must go through.
-    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'dry_run', False)
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'trading_enabled', True)
     monkeypatch.setattr(schwab_safety, '_all_orders', lambda account: [])
     counts = {"recent_orders": [
         {"account": "ira", "ticker": TICKER, "side": "BUY", "quantity": 5, "ts": time.time()}
@@ -490,7 +490,7 @@ def test_duplicate_guard_allows_retry_when_broker_never_confirms_prior_attempt(e
 
 
 def test_duplicate_guard_blocks_when_broker_confirms_prior_attempt(env, monkeypatch):
-    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'dry_run', False)
+    monkeypatch.setattr(schwab_safety.ACCOUNTS['ira'], 'trading_enabled', True)
     monkeypatch.setattr(schwab_safety, '_all_orders', lambda account: [
         {"status": "WORKING", "orderLegCollection": [
             {"instruction": "BUY", "instrument": {"symbol": TICKER}, "quantity": 5}

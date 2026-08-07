@@ -65,7 +65,7 @@ def env(monkeypatch, tmp_path):
 
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=50,
-                         stop_loss=0, max_hold_hours=24, mode='live',
+                         stop_loss=0, max_hold_hours=24, state='live',
                          trail_buy_pct=1.0, trail_pct=50.0, fixed_sl_override=50.0)
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account='soxl_ira', arm_sell_pct=0.3, trail_sell_pct=50.0 "

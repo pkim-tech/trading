@@ -71,6 +71,20 @@ COMBOS = [
     # AGQ -- realistic candidate configs only, not exhaustive.
     ("AGQ", 86, 157, "v5-overlay-test", ADDON_CFG),                                      # addon, no skim (already staged)
     ("AGQ", 86, 157, "v5-overlay-test-skim-a", _merge(SKIM_CFG, ADDON_CFG)),              # addon + skim
+    # AGQ drought/drought+addon, added 2026-08-1x: a real, pre-existing gap --
+    # every SOXL combo above is TrailingBothZScoreBreakout (trailing-buy
+    # entry); AGQ is the only ticker in this matrix running the OTHER real
+    # entry mechanism (TrailingExitZScoreBreakout, market-buy), and its
+    # drought/drought+addon combos were never added, so the market-buy
+    # drought-entry dispatch branch (notify_drought_buy_signal's
+    # _attempt_automated_market_buy path) had zero paper-trading coverage at
+    # all -- only a same-session fake_broker unit test. NOT a candidacy
+    # re-opening: AGQ's drought overlay was already rejected on the merits
+    # (see docs/research_log.md, uniformly negative at every confirm_days) --
+    # these two nodes exist purely to prove the market-buy MECHANISM, not to
+    # re-litigate AGQ as a real drought candidate.
+    ("AGQ", 86, 157, "v5-overlay-test-d", DROUGHT_CFG),                                  # drought only
+    ("AGQ", 86, 157, "v5-overlay-test-da", _merge(DROUGHT_CFG, ADDON_CFG)),               # drought+addon
 ]
 
 
@@ -90,7 +104,7 @@ def _clone(src, version, overlay_cfg, track_label):
         ticker=src["ticker"], strategy=strategy, version=version, window=src["window"],
         take_profit=take_profit, stop_loss=src["stop_loss"], max_hold_hours=src["max_hold_hours"],
         label=label, z_score_threshold=src["z_score_threshold"], watchlist_id=src["watchlist_id"],
-        mode="research", trail_buy_pct=src["trail_buy_pct"], trail_pct=src["trail_sell_pct"],
+        state="paper", trail_buy_pct=src["trail_buy_pct"], trail_pct=src["trail_sell_pct"],
         entry_timing=src["entry_timing"], starting_notional=src["starting_notional"],
         fixed_sl_override=src["fixed_sl"], account=src.get("account"), paper_role=src.get("paper_role"),
     )

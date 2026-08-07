@@ -64,13 +64,13 @@ PAIRS = {
 
 with db._conn() as c:
     rows = [dict(r) for r in c.execute(
-        "SELECT id, ticker, account, mode, watchlist_id, strategy FROM watch_list "
+        "SELECT id, ticker, account, state, watchlist_id, strategy FROM watch_list "
         "WHERE version='canary' ORDER BY ticker"
     ).fetchall()]
 
 for r in rows:
     pairs_with, testing = PAIRS.get(r['ticker'], ('?', 'not in PAIRS mapping -- update this script'))
-    print(f"  {r['ticker']:6s} wl_id={r['id']:4d}  account={r['account']:10s} mode={r['mode']:8s} "
+    print(f"  {r['ticker']:6s} wl_id={r['id']:4d}  account={r['account']:10s} state={r['state']:8s} "
           f"watchlist_id={r['watchlist_id']}  strategy={r['strategy']:28s} "
           f"pairs_with={pairs_with:8s} testing={testing}")
 print(f"\n{len(rows)} canary node(s) total.")

@@ -44,12 +44,12 @@ def load_node(ticker, watchlist_id):
     row = con.execute("""
         SELECT ticker, strategy, window, z_score_threshold, arm_sell_pct, take_profit, fixed_sl,
                trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing
-        FROM watch_list WHERE watchlist_id=? AND mode='research' AND ticker=?
+        FROM watch_list WHERE watchlist_id=? AND state='paper' AND ticker=?
         ORDER BY id LIMIT 1
     """, (watchlist_id, ticker)).fetchone()
     con.close()
     if row is None:
-        raise ValueError(f"no research-mode node for {ticker} on watchlist {watchlist_id}")
+        raise ValueError(f"no paper-state node for {ticker} on watchlist {watchlist_id}")
     cols = ["ticker", "strategy", "window", "z", "arm_sell_pct", "take_profit", "fixed_sl",
             "trail_buy_pct", "trail_sell_pct", "max_hold_hours", "entry_timing"]
     node = dict(zip(cols, row))

@@ -52,7 +52,7 @@ def env(monkeypatch, tmp_path):
 
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
-                         stop_loss=1, max_hold_hours=105, mode='live',
+                         stop_loss=1, max_hold_hours=105, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
                          account='soxl_ira', starting_notional=5000)
     with signals_db._conn() as c:
@@ -133,6 +133,10 @@ def test_addon_leg_places_real_market_buy_despite_resting_protective_sell(env, f
 
     events = signals_db.get_coverage_events(scenario_key='addon_double_buy_exemption')
     assert any(e['ticker'] == TICKER and e['result'] == 'preconditions_passed' for e in events)
+    placement_events = signals_db.get_coverage_events(scenario_key='addon_entry_placement')
+    assert any(e['ticker'] == TICKER and e['result'] == 'placed' for e in placement_events)
+    fill_events = signals_db.get_coverage_events(scenario_key='addon_entry_fill')
+    assert any(e['ticker'] == TICKER and e['result'] == 'filled' for e in fill_events)
 
 
 def test_second_resting_buy_for_same_ticker_still_blocks_addon(env, fake_broker):
@@ -247,3 +251,131 @@ def test_parents_own_exit_still_works_once_the_leg_has_its_own_resting_stop(env,
 
 
 
+
+
+def test_addon_never_attempted_against_an_open_drought_overlay_position(env, fake_broker):
+    """check_addon_trigger_real's own position_source=='core' guard (line
+    2025-2026) -- an armed DROUGHT position must never be mistaken for the
+    core position add-on is designed against. This is the real collision
+    surface between the two mechanisms built this session: without this
+    guard, a drought position reaching its own arm point would incorrectly
+    trigger a real margin add-on leg."""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    fake_broker.set_buying_power('soxl_ira', 1_000_000.0)
+    now = datetime.now()
+    signals_db.open_drought_overlay_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                                                entry_time=now, confirm_days=3, shares=20)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account=? WHERE ticker=?", ('soxl_ira', TICKER))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    assert pos['position_source'] == 'drought_overlay'
+    signals_db.update_position_trail_state(pos['id'], {'trailing': True, 'peak': 50.0})
+    pos = signals_db.get_open_position(TICKER)
+
+    signals_notify.check_addon_trigger_real(pos, current_price=52.0)
+
+    assert len(_real_orders(fake_broker, TICKER, side='BUY')) == 0
+    assert signals_db.get_open_addon_leg_by_parent(pos['id']) is None
+
+
+def test_addon_leg_refused_when_parent_not_actually_armed(env, fake_broker):
+    """is_addon_leg's precondition #2 (schwab_safety.check_order:922-928) --
+    calling check_addon_trigger_real directly (bypassing notify_trailing_
+    activated, which normally arms trail_state first) exercises this guard
+    on its own terms: even though check_addon_trigger_real's own guards all
+    pass, the deeper is_addon_leg exemption inside check_order must still
+    refuse a real order for a parent that was never actually armed."""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    fake_broker.set_buying_power('soxl_ira', 1_000_000.0)
+    # Open the core position directly (not via _open_core_position, which
+    # deliberately seeds trail_state.trailing=True to match the real
+    # precondition) -- here we need the position UNARMED, the case under test.
+    now = datetime.now()
+    signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=20)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account=? WHERE ticker=?", ('soxl_ira', TICKER))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    assert not (pos.get('trail_state') or {}).get('trailing')
+
+    signals_notify.check_addon_trigger_real(pos, current_price=52.0)
+
+    assert len(_real_orders(fake_broker, TICKER, side='BUY')) == 0
+    assert signals_db.get_open_addon_leg_by_parent(pos['id']) is None
+    events = signals_db.get_coverage_events(scenario_key='addon_precondition_blocked')
+    assert any(e['ticker'] == TICKER and e['detail'] == 'parent_not_armed' for e in events)
+
+
+def test_addon_leg_blocked_by_combined_exposure_ceiling(env, fake_broker):
+    """D5 (schwab_safety.check_order:941-956) -- core+addon combined notional
+    exceeding the account's own notional_cap must refuse the real order,
+    even with ample buying power. Deliberately conservative: reuses the
+    account's existing cap rather than a bespoke add-on multiplier (see D5
+    in docs/plans/real_order_execution_drought_addon.md)."""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    fake_broker.set_buying_power('soxl_ira', 1_000_000.0)
+    # core notional 40*50=2000, addon notional 40*52=2080, combined 4080 --
+    # soxl_ira's real notional_cap is 3000, so this must be refused.
+    pos = _open_core_position(node, shares=40, entry_price=50.0)
+
+    signals_notify.notify_trailing_activated(pos, current_price=52.0)
+
+    assert len(_real_orders(fake_broker, TICKER, side='BUY')) == 0
+    assert signals_db.get_open_addon_leg_by_parent(pos['id']) is None
+    events = signals_db.get_coverage_events(scenario_key='addon_combined_exposure_blocked')
+    assert any(e['ticker'] == TICKER and e['result'] == 'blocked' for e in events)
+
+
+def test_addon_leg_still_blocked_by_global_kill_switch(env, fake_broker, monkeypatch):
+    """The kill switch is a rogue-algo off-switch that must block everything,
+    including add-on's own is_addon_leg exemption -- that exemption widens
+    ONE specific guard (the resting-order dup check), never the kill switch
+    itself. Calling check_addon_trigger_real directly (parent already armed
+    without going through notify_trailing_activated) isolates this from the
+    parent's own arm-time SELL placement, which the kill switch would also
+    correctly block."""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    fake_broker.set_buying_power('soxl_ira', 1_000_000.0)
+    pos = _open_core_position(node)
+    signals_db.update_position_trail_state(pos['id'], {'trailing': True, 'peak': 50.0})
+    pos = signals_db.get_open_position(TICKER)
+    schwab_safety.engage_kill_switch("test halt")
+
+    signals_notify.check_addon_trigger_real(pos, current_price=52.0)
+
+    assert len(_real_orders(fake_broker, TICKER, side='BUY')) == 0
+    assert signals_db.get_open_addon_leg_by_parent(pos['id']) is None
+    events = signals_db.get_coverage_events(scenario_key='kill_switch_block')
+    assert any(e['ticker'] == TICKER for e in events)
+
+
+def test_addon_size_mismatch_refused_by_check_order_directly(env, fake_broker):
+    """is_addon_leg's precondition #4 (schwab_safety.check_order:934-940) --
+    quantity must exactly equal the parent's own share count. Not reachable
+    through check_addon_trigger_real's real call path (it always passes
+    int(pos['shares']) verbatim, so this can only diverge from a caller bug),
+    but the guard itself is real defense-in-depth and must be proven to
+    exist -- calling schwab_safety.check_order directly with a deliberately
+    mismatched quantity, the same way is_addon_leg's other 4 preconditions
+    are proven above via the real check_addon_trigger_real integration path."""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    fake_broker.set_buying_power('soxl_ira', 1_000_000.0)
+    pos = _open_core_position(node, shares=20)
+
+    with pytest.raises(schwab_safety.SafetyViolation, match="quantity"):
+        schwab_safety.check_order('soxl_ira', TICKER, 21, 52.0, 'BUY', is_addon_leg=True)
+
+    events = signals_db.get_coverage_events(scenario_key='addon_size_mismatch_blocked')
+    assert any(e['ticker'] == TICKER and e['result'] == 'blocked' for e in events)

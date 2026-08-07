@@ -10,7 +10,7 @@ import signals_db as db
 
 with db._conn() as c:
     rows = [dict(r) for r in c.execute(
-        "SELECT id, ticker, version, account, mode, watchlist_id, added_at FROM watch_list "
+        "SELECT id, ticker, version, account, state, watchlist_id, added_at FROM watch_list "
         "WHERE ticker='GDXD' ORDER BY id"
     ).fetchall()]
 

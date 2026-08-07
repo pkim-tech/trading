@@ -553,7 +553,7 @@ def load_watchlist_pivot():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("ATTACH DATABASE ? AS live_db", ("./cache/live/trading_live.db",))
         df = pd.read_sql('''
-            SELECT w.ticker, w.mode, w.strategy, w.version,
+            SELECT w.ticker, w.state, w.strategy, w.version,
                    w.window, w.z_score_threshold, w.take_profit, w.stop_loss, w.max_hold_hours,
                    b.alpha_vs_spy, b.strategy_return, b.trades, b.win_rate
             FROM live_db.watch_list w
@@ -574,7 +574,7 @@ def load_watchlist_pivot():
         'TrailingExitZScoreBreakout': 'Trail',
     }
     df['strat_col'] = df['strategy'].map(strat_short).fillna(df['strategy']) + ' ' + df['version']
-    df['row'] = df['ticker'] + ' (' + df['mode'] + ')'
+    df['row'] = df['ticker'] + ' (' + df['state'] + ')'
     pivot = df.pivot_table(index='row', columns='strat_col', values='alpha_vs_spy', aggfunc='max')
     pivot['best'] = pivot.max(axis=1)
     return pivot.sort_values('best', ascending=False).round(1)
@@ -664,7 +664,7 @@ else:
             if t['result'] != 'OPEN':
                 compounded *= (1 + t['return_pct'])
         trade_pivot_summary.append({
-            'Ticker': node['ticker'], 'Mode': node['mode'], 'Version': node['version'],
+            'Ticker': node['ticker'], 'State': node['state'], 'Version': node['version'],
             'Trades': closed, 'WIN': counts['WIN'], 'LOSS': counts['LOSS'],
             'TWIN': counts['TWIN'], 'TLOSS': counts['TLOSS'], 'OPEN': counts['OPEN'],
             'Win+TWin %': round(100 * win_twin / closed, 1) if closed else None,
@@ -675,7 +675,7 @@ else:
     st.dataframe(pd.DataFrame(trade_pivot_summary), use_container_width=True, hide_index=True)
 
     st.write("**Drill into a node**")
-    trade_pivot_labels = {n['id']: f"{n['ticker']} ({n['version']}, {n['mode']})" for n in trade_pivot_nodes}
+    trade_pivot_labels = {n['id']: f"{n['ticker']} ({n['version']}, {n['state']})" for n in trade_pivot_nodes}
     trade_pivot_selected_id = st.selectbox(
         "Node", options=list(trade_pivot_labels.keys()), format_func=lambda i: trade_pivot_labels[i],
         key="trade_pivot_node_select")

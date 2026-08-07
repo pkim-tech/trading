@@ -18,7 +18,7 @@ import signals_db as db
 
 VERSION = "v5"
 ENTRY_TIMING = "open_check"
-MODE = "research"
+STATE = "paper"
 STARTING_NOTIONAL = 50000
 LABEL = "v5 promotion 2026-07-20"
 
@@ -49,7 +49,7 @@ def main():
         db.add_node(
             ticker=ticker, strategy=strategy, version=VERSION, window=window,
             take_profit=tp, stop_loss=fixed_sl, max_hold_hours=hold,
-            label=LABEL, z_score_threshold=z, watchlist_id=wl_id, mode=MODE,
+            label=LABEL, z_score_threshold=z, watchlist_id=wl_id, state=STATE,
             trail_buy_pct=trail_buy, trail_pct=trail_sell,
             entry_timing=ENTRY_TIMING, starting_notional=STARTING_NOTIONAL,
             fixed_sl_override=fixed_sl,

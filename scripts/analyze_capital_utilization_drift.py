@@ -47,7 +47,7 @@ def get_live_trailing_buy_nodes():
     rows = conn.execute(
         "SELECT ticker, window, arm_sell_pct, trail_buy_pct, trail_sell_pct, fixed_sl, "
         "max_hold_hours, z_score_threshold, starting_notional, account FROM watch_list "
-        "WHERE watchlist_id=? AND mode='live' AND strategy='TrailingBothZScoreBreakout' "
+        "WHERE watchlist_id=? AND state != 'paper' AND strategy='TrailingBothZScoreBreakout' "
         "ORDER BY ticker", (wl_id,)
     ).fetchall()
     conn.close()

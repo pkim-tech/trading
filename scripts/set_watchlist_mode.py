@@ -1,7 +1,7 @@
-"""Set mode ('live'/'research') for one or more tickers on a watchlist.
+"""Set state ('paper'/'dry_run'/'live') for one or more tickers on a watchlist.
 
-Usage: python scripts/set_watchlist_mode.py <watchlist_id> <mode> TICKER [TICKER ...]
-Example: python scripts/set_watchlist_mode.py 9 research YANG GDXU DPST NUGT TQQQ
+Usage: python scripts/set_watchlist_mode.py <watchlist_id> <state> TICKER [TICKER ...]
+Example: python scripts/set_watchlist_mode.py 9 paper YANG GDXU DPST NUGT TQQQ
 """
 import sys
 import sqlite3
@@ -19,28 +19,28 @@ def main():
         sys.exit(1)
 
     watchlist_id = int(sys.argv[1])
-    mode = sys.argv[2]
+    state = sys.argv[2]
     tickers = [t.upper() for t in sys.argv[3:]]
-    if mode not in ('live', 'research'):
-        print(f"mode must be 'live' or 'research', got {mode!r}")
+    if state not in ('paper', 'dry_run', 'live'):
+        print(f"state must be 'paper'/'dry_run'/'live', got {state!r}")
         sys.exit(1)
 
     conn = sqlite3.connect(str(a.DB_PATH))
     conn.row_factory = sqlite3.Row
     for ticker in tickers:
         rows = conn.execute(
-            "SELECT id, mode FROM watch_list WHERE watchlist_id=? AND ticker=?",
+            "SELECT id, state FROM watch_list WHERE watchlist_id=? AND ticker=?",
             (watchlist_id, ticker),
         ).fetchall()
         if not rows:
             print(f"  no node for {ticker} on watchlist {watchlist_id} -- skipping")
             continue
         for r in rows:
-            # Routes through db.set_node_mode (not a raw UPDATE) so its tax-advantaged-
+            # Routes through db.set_node_state (not a raw UPDATE) so its tax-advantaged-
             # account guard (K-1/UBTI risk, added 2026-08-05) applies here too.
             try:
-                db.set_node_mode(r['id'], mode)
-                print(f"  {ticker} (id={r['id']}): {r['mode']} -> {mode}")
+                db.set_node_state(r['id'], state)
+                print(f"  {ticker} (id={r['id']}): {r['state']} -> {state}")
             except ValueError as e:
                 print(f"  {ticker} (id={r['id']}): REFUSED -- {e}")
     conn.close()

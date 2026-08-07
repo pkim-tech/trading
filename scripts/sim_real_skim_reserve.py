@@ -40,9 +40,9 @@ def get_node(ticker, watchlist_id):
     cur = conn.cursor()
     cur.execute(
         """SELECT window, arm_sell_pct, trail_buy_pct, trail_sell_pct, fixed_sl,
-                  max_hold_hours, z_score_threshold, starting_notional, mode
+                  max_hold_hours, z_score_threshold, starting_notional, state
            FROM watch_list WHERE ticker=? AND watchlist_id=?
-           ORDER BY (mode='live') DESC LIMIT 1""",
+           ORDER BY (state != 'paper') DESC LIMIT 1""",
         (ticker, watchlist_id),
     )
     row = cur.fetchone()

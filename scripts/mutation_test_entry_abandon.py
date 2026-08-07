@@ -35,7 +35,7 @@ MUTATIONS = [
         "HIGH real-money: the manual-placement (order_placed, no order_id) "
         "guard is removed -- falls through to clear-and-claim-cancelled "
         "while a real order may still be resting with zero local tracking.",
-        "        if not limits.dry_run and pb.get('order_placed') and not order_id:",
+        "        if not _effectively_dry_run(account, node) and pb.get('order_placed') and not order_id:",
         "        if False:  # MUTATED: removed the no-order-id-on-file guard",
         "tests/test_entry_abandon.py::"
         "test_real_account_manual_placement_with_no_order_id_does_not_clear_or_false_claim",

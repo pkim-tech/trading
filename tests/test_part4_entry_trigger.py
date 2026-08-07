@@ -54,7 +54,7 @@ def env(monkeypatch, tmp_path):
     # trailing-buy strategy (buy_axis_col != 'trail_buy_pct'), so this is the
     # non-trailing / plain-market-buy path Part 4 automates.
     signals_db.add_node(TICKER, 'TrailingExitZScoreBreakout', 'test', window=10, take_profit=26,
-                         stop_loss=2, max_hold_hours=100, mode='live',
+                         stop_loss=2, max_hold_hours=100, state='live',
                          trail_pct=8.0, fixed_sl_override=5.0, entry_timing='open_check',
                          starting_notional=20000)
     with signals_db._conn() as c:
@@ -339,7 +339,7 @@ def test_sync_confirm_and_protect_places_sl_on_fill(env, monkeypatch):
                          lambda account, ticker, side, order_id=None: {'price': 49.0, 'quantity': 100})
     placed_calls = []
     monkeypatch.setattr(schwab_client, 'place_stop_loss',
-                         lambda account, ticker, qty, stop_price: (placed_calls.append((qty, stop_price)) or (object(), 999)))
+                         lambda account, ticker, qty, stop_price, **kw: (placed_calls.append((qty, stop_price)) or (object(), 999)))
     signals_notify._sync_confirm_and_protect(TICKER, _node())
     pos = signals_db.get_open_position(TICKER)
     assert pos is not None
@@ -387,7 +387,7 @@ def test_sl_placement_retries_and_succeeds_when_not_yet_breached(env, monkeypatc
     _open_pos(entry_price=49.0)
     calls = {'stop_loss': 0, 'market_sell': 0}
 
-    def _place_stop_loss(account, ticker, qty, stop_price):
+    def _place_stop_loss(account, ticker, qty, stop_price, **kw):
         calls['stop_loss'] += 1
         if calls['stop_loss'] == 1:
             raise RuntimeError("STOP LOSS TEST_PART4 order 111 was REJECTED")
@@ -416,13 +416,13 @@ def test_sl_placement_falls_back_to_market_sell_when_price_already_breached(env,
     pos = _open_pos(entry_price=49.0)  # fixed_sl=5.0 -> stop_price = 46.55
     calls = {'stop_loss': 0, 'market_sell': 0}
 
-    def _place_stop_loss(account, ticker, qty, stop_price):
+    def _place_stop_loss(account, ticker, qty, stop_price, **kw):
         calls['stop_loss'] += 1
         raise RuntimeError("REJECTED")
 
     monkeypatch.setattr(schwab_client, 'place_stop_loss', _place_stop_loss)
 
-    def _place_equity_sell(account, ticker, qty, price):
+    def _place_equity_sell(account, ticker, qty, price, **kw):
         calls['market_sell'] += 1
         return (object(), 444)
 
@@ -452,7 +452,7 @@ def test_sl_placement_falls_back_to_market_sell_when_price_already_breached(env,
 def test_sl_placement_gives_up_after_max_retries_and_alerts_unprotected(env, monkeypatch):
     _open_pos(entry_price=49.0)
 
-    def _place_stop_loss(account, ticker, qty, stop_price):
+    def _place_stop_loss(account, ticker, qty, stop_price, **kw):
         raise RuntimeError("REJECTED")
 
     monkeypatch.setattr(schwab_client, 'place_stop_loss', _place_stop_loss)
@@ -478,7 +478,7 @@ def test_sl_placement_retry_stops_cleanly_if_already_protected(env, monkeypatch)
     _open_pos(entry_price=49.0)
     calls = {'stop_loss': 0}
 
-    def _place_stop_loss(account, ticker, qty, stop_price):
+    def _place_stop_loss(account, ticker, qty, stop_price, **kw):
         calls['stop_loss'] += 1
         if calls['stop_loss'] == 1:
             raise RuntimeError("REJECTED")
@@ -595,7 +595,7 @@ def test_scan_pinned_exit_arm_dedups_against_sell_alerted(env, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_start_paper_market_buy_opens_position_immediately(env):
-    node = dict(_node(), mode='research')
+    node = dict(_node(), state='paper')
     sig = _sig(price=50.0)
     paper_trading.start_paper_market_buy(node, sig)
     pos = signals_db.get_open_position(TICKER, paper=True)
@@ -606,7 +606,7 @@ def test_start_paper_market_buy_opens_position_immediately(env):
 
 
 def test_start_paper_market_buy_dedups_existing_position(env):
-    node = dict(_node(), mode='research')
+    node = dict(_node(), state='paper')
     sig = _sig(price=50.0)
     paper_trading.start_paper_market_buy(node, sig)
     first = signals_db.get_open_position(TICKER, paper=True)
@@ -616,7 +616,7 @@ def test_start_paper_market_buy_dedups_existing_position(env):
 
 
 def test_start_paper_buy_dispatches_non_trailing_to_market_buy(env):
-    node = dict(_node(), mode='research')
+    node = dict(_node(), state='paper')
     sig = _sig(price=50.0)
     paper_trading.start_paper_buy(node, sig)
     assert signals_db.get_open_position(TICKER, paper=True) is not None

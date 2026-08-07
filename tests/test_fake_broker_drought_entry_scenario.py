@@ -31,6 +31,7 @@ import schwab_safety
 from fake_broker import fake_broker  # noqa: F401
 
 TICKER = 'TEST_DROUGHT_ENTRY_SCENARIO'
+MARKET_TICKER = 'TEST_DROUGHT_ENTRY_MARKET_SCENARIO'
 IN_WINDOW_TIME = datetime(2026, 7, 29, 10, 30)
 
 _DECISION = {'price': 50.0, 'shares': 100, 'confirm_days': 3, 'vol_gate': None,
@@ -50,24 +51,40 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'NODE_BREAKER_PATH', tmp_path / "schwab_node_breaker_state.json")
     monkeypatch.setattr(schwab_safety, 'AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_auto_fill_detection.json")
     monkeypatch.setattr(schwab_safety, 'NODE_AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_node_auto_fill_detection.json")
-    monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER})
+    monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {TICKER, MARKET_TICKER})
     monkeypatch.setattr(schwab_safety, '_now', lambda: IN_WINDOW_TIME)
     monkeypatch.delenv('SCHWAB_KILL_SWITCH', raising=False)
     monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: (None, None))
+    # _sync_confirm_and_protect's fast-confirm retry loop (market-buy drought
+    # entries only -- trailing-buy drought entries never reach this) sleeps
+    # between polls; fake_broker fills a MARKET order on the same tick it's
+    # placed, so the real fill is always found on attempt 1, but patch it out
+    # anyway to match test_fake_broker_entry_scenario.py's convention and
+    # guarantee this can never introduce real wall-clock delay.
+    monkeypatch.setattr(signals_notify, 'time', type('T', (), {'sleep': staticmethod(lambda *a: None)}))
+    monkeypatch.setattr(signals_notify.cfg, 'INTERACTIVE', False)
 
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
-                         stop_loss=1, max_hold_hours=105, mode='live',
+                         stop_loss=1, max_hold_hours=105, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
                          account='soxl_ira', starting_notional=2000)
+    signals_db.add_node(MARKET_TICKER, 'TrailingExitZScoreBreakout', 'test', window=10, take_profit=16.0,
+                         stop_loss=1, max_hold_hours=105, state='live',
+                         trail_pct=1.0, fixed_sl_override=1.0,
+                         account='soxl_ira', starting_notional=2000)
     with signals_db._conn() as c:
-        c.execute("UPDATE watch_list SET drought_overlay_enabled=1, drought_confirm_days=3 WHERE ticker=?",
-                   (TICKER,))
+        c.execute("UPDATE watch_list SET drought_overlay_enabled=1, drought_confirm_days=3 WHERE ticker IN (?, ?)",
+                   (TICKER, MARKET_TICKER))
         c.commit()
 
     yield
 
     Path(tmp_db.name).unlink(missing_ok=True)
+
+
+def _market_node():
+    return [n for n in signals_db.get_watchlist() if n['ticker'] == MARKET_TICKER][0]
 
 
 def _node():
@@ -103,6 +120,8 @@ def test_drought_entry_places_real_trailing_buy_for_trailingboth_node(env, fake_
     assert pending['position_source'] == 'drought_overlay'
     assert pending['drought_confirm_days'] == 3
     assert pending['order_placed'] == 1
+    events = signals_db.get_coverage_events(scenario_key='drought_entry_placement')
+    assert any(e['ticker'] == TICKER and e['result'] == 'signalled' for e in events)
 
 
 def test_drought_entry_is_a_noop_for_a_research_mode_node(env, fake_broker, monkeypatch):
@@ -110,7 +129,7 @@ def test_drought_entry_is_a_noop_for_a_research_mode_node(env, fake_broker, monk
     real order at all -- mode-symmetry with check_paper_drought_entry."""
     monkeypatch.setattr(paper_trading, 'evaluate_drought_entry', lambda node, paper=False: dict(_DECISION))
     with signals_db._conn() as c:
-        c.execute("UPDATE watch_list SET mode='research' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE watch_list SET state='paper' WHERE ticker=?", (TICKER,))
         c.commit()
     fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
     fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
@@ -152,4 +171,36 @@ def test_drought_pending_buy_fill_opens_a_drought_overlay_position_not_core(env,
     assert pos is not None
     assert pos['position_source'] == 'drought_overlay'
     assert pos['drought_confirm_days'] == 3
+    assert signals_db.get_drought_pending_buy(node['id']) is None
+
+
+def test_drought_entry_places_real_market_buy_for_trailingexit_node(env, fake_broker, monkeypatch):
+    """Market-buy variant of the trailing-buy test above -- notify_drought_
+    buy_signal dispatches on db._is_trailing_buy(node), so a TrailingExitZScoreBreakout
+    drought node must go through _attempt_automated_market_buy/_sync_confirm_and_protect
+    instead, filling immediately (fake_broker's same-tick MARKET semantics) and
+    opening a drought_overlay position with a real resting STOP -- all in one
+    check_drought_entry call, unlike the trailing-buy path which stays pending."""
+    monkeypatch.setattr(paper_trading, 'evaluate_drought_entry', lambda node, paper=False: dict(_DECISION))
+    fake_broker.set_quote(MARKET_TICKER, last=50.0, bid=49.99, ask=50.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    node = _market_node()
+
+    signals_notify.check_drought_entry(node)
+
+    market_orders = _real_orders(fake_broker, MARKET_TICKER, side='BUY')
+    assert len(market_orders) >= 1
+    assert all(o['orderType'] == 'MARKET' and o['status'] == 'FILLED' for o in market_orders)
+
+    pos = signals_db.get_open_position(MARKET_TICKER)
+    assert pos is not None
+    assert pos['position_source'] == 'drought_overlay'
+    assert pos['drought_confirm_days'] == 3
+
+    stop_orders = [o for o in fake_broker.orders.values()
+                    if o['orderLegCollection'][0]['instrument']['symbol'] == MARKET_TICKER
+                    and o['orderType'] == 'STOP']
+    assert len(stop_orders) == 1
+    assert stop_orders[0]['status'] == 'WORKING'
+    assert pos['sl_order_id'] == stop_orders[0]['orderId']
     assert signals_db.get_drought_pending_buy(node['id']) is None

@@ -107,7 +107,7 @@ def get_node_params(ticker):
         """SELECT strategy, window, z_score_threshold, take_profit, fixed_sl,
                   trail_buy_pct, trail_sell_pct, arm_sell_pct, max_hold_hours
            FROM watch_list WHERE ticker=? AND watchlist_id=65
-           ORDER BY (mode='live') DESC, id DESC LIMIT 1""",
+           ORDER BY (state != 'paper') DESC, id DESC LIMIT 1""",
         (ticker,),
     )
     row = cur.fetchone()

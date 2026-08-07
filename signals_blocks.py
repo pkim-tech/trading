@@ -174,7 +174,7 @@ def _build_buy_blocks(node, sig, auto_placed=False):
     max_notional_str = f"  |  max `${max_notional/1000:.0f}k` / `{max_shares} shares` @ 1% vol" if max_notional else ""
 
     account = node.get('account') or 'unmapped'
-    acct_tag = f"`{account} · {mode_tag(account)}`"
+    acct_tag = f"`{account} · {mode_tag(account, node)}`"
     if trailing_buy:
         auto_str = "  🤖 *auto-placed at broker*" if auto_placed else ""
         entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — {acct_tag}{max_notional_str}{auto_str}"
@@ -208,7 +208,7 @@ def _build_buy_blocks(node, sig, auto_placed=False):
             "node":         {k: node.get(k) for k in ('id', 'ticker', 'strategy', 'version', 'window',
                                                         'take_profit', 'stop_loss', 'max_hold_hours', 'label',
                                                         'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct',
-                                                        'starting_notional', 'account')},
+                                                        'starting_notional', 'account', 'state')},
             "signal_price": price,
             "signal_time":  sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'),
             "lower_band":   sig['lower_band'],
@@ -278,6 +278,7 @@ def _build_sell_blocks(pos, reason, current_price, target_price, resting_confirm
     ep      = pos['entry_price']
     pct     = (current_price - ep) / ep * 100
     account = pos.get('account') or 'unmapped'
+    _node   = db.get_watch_list_node_by_id(pos.get('wl_id'))
 
     if reason == 'TP':
         emoji   = "🟢"
@@ -331,7 +332,7 @@ def _build_sell_blocks(pos, reason, current_price, target_price, resting_confirm
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
             "text": (
-                f"{emoji} *{ticker}* ({account} · {mode_tag(account)}) — {label}\n"
+                f"{emoji} *{ticker}* ({account} · {mode_tag(account, _node)}) — {label}\n"
                 f"{action}\n"
                 f"entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`"
             )}},

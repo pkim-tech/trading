@@ -72,7 +72,7 @@ def _resolve_live_node(ticker):
             (ticker, db.get_active_watchlist_id())).fetchall()]
     if not rows:
         return None, None
-    live_rows = [r for r in rows if r.get("mode") == "live"]
+    live_rows = [r for r in rows if r.get("state") != "paper"]
     if len(live_rows) == 1:
         return live_rows[0], None
     if len(rows) == 1:
@@ -133,8 +133,8 @@ def audit_one(ticker, wl_id=None):
         node, ambiguous = _resolve_live_node(ticker)
     if node is None:
         if ambiguous:
-            modes = ", ".join(f"{r['account']}/{r['mode']}" for r in ambiguous)
-            print(f"  verdict: ambiguous -- {len(ambiguous)} nodes ({modes}), none uniquely mode='live'")
+            modes = ", ".join(f"{r['account']}/{r['state']}" for r in ambiguous)
+            print(f"  verdict: ambiguous -- {len(ambiguous)} nodes ({modes}), none uniquely non-paper")
         else:
             print("  verdict: no watch_list node -- not a candidate")
         return

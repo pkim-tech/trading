@@ -113,10 +113,10 @@ def test_compute_buy_signal_daily_track_trims_still_forming_current_bar(monkeypa
 def _add_pair(ticker=TICKER, strategy='TrailingBothZScoreBreakout'):
     db.add_node(ticker, strategy, 'v5', window=10, take_profit=25,
                 stop_loss=1, max_hold_hours=56, trail_buy_pct=3.0, trail_pct=4.0,
-                fixed_sl_override=1, mode='research')
+                fixed_sl_override=1, state='paper')
     db.add_node(ticker, strategy, 'v5', window=10, take_profit=25,
                 stop_loss=1, max_hold_hours=56, trail_buy_pct=3.0, trail_pct=4.0,
-                fixed_sl_override=1, mode='research', paper_role='daily_sync')
+                fixed_sl_override=1, state='paper', paper_role='daily_sync')
     nodes = sorted([n for n in db.get_watchlist() if n['ticker'] == ticker],
                     key=lambda n: n.get('paper_role') or '')
     return nodes[0], nodes[1]
@@ -130,7 +130,7 @@ def test_add_node_allows_daily_track_sibling_without_collision(isolated_db):
 
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=10, take_profit=25,
                 stop_loss=1, max_hold_hours=56, trail_buy_pct=3.0, trail_pct=4.0,
-                fixed_sl_override=1, mode='research', paper_role='daily_sync')
+                fixed_sl_override=1, state='paper', paper_role='daily_sync')
     assert len([n for n in db.get_watchlist() if n['ticker'] == TICKER]) == 2
 
 

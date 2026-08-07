@@ -58,7 +58,7 @@ def env(monkeypatch, tmp_path):
     # mean so compute_buy_signal reliably fires a real BUY, matching the real
     # canary IWM node's own hair-trigger design.
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
-                         stop_loss=1, max_hold_hours=48, mode='live', z_score_threshold=0.1,
+                         stop_loss=1, max_hold_hours=48, state='live', z_score_threshold=0.1,
                          trail_buy_pct=0.1, trail_pct=0.1, fixed_sl_override=1.0,
                          entry_timing='open_check', account='soxl_ira', starting_notional=800)
     make_synthetic_csv(TICKER, last_close=85.0)

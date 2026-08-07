@@ -11,7 +11,43 @@ import signals_db as db
 _CORP_ACTION_ALERT_PATH = Path(__file__).parent / "cache" / "live" / "corporate_action_alerts.json"
 
 
-def mode_tag(account):
+def node_state(node):
+    """The single field a node is ever in -- 'paper' / 'dry_run' / 'live',
+    mutually exclusive and exhaustive, stored directly as watch_list.state
+    (collapsed 2026-08-1x from the old separate mode + node-level dry_run
+    override, per the user's explicit call: reasoning about two fields for
+    one fact -- "what is this node doing right now" -- was the friction being
+    removed). The account-level ceiling (schwab_safety.ACCOUNTS[account].
+    trading_enabled) stays a genuinely separate, independently-checked fact
+    -- real_order_allowed = (node.state == 'live') AND account.trading_enabled.
+    This accessor exists as the one blessed way to read it (vs. reaching into
+    node['state'] ad hoc everywhere) -- kept trivial on purpose."""
+    return node.get('state', 'paper')
+
+
+def effectively_dry_run(account, node=None):
+    """True if a real order attempt for this (account, node) pair will be
+    simulated rather than actually submitted:
+        real_order_allowed = (node.state == 'live') AND account.trading_enabled
+    i.e. this returns the negation. node.state and the account-level ceiling
+    are two genuinely independent facts (2026-08-1x design decision -- the
+    account flag stays an enforced ceiling, never absorbed into node.state),
+    combined here rather than pre-cached, so a later account promotion/
+    demotion is reflected immediately without touching every node's own row.
+    The single shared implementation -- signals_notify._effectively_dry_run
+    and paper_trading._overlay_mode both delegate here instead of keeping
+    their own inlined copies (they can't call each other directly due to the
+    signals_notify<->paper_trading import direction, but both can reach this
+    module)."""
+    if node is not None and node.get('state') != 'live':
+        return True
+    limits = schwab_safety.ACCOUNTS.get(account)
+    if limits is None:
+        return False
+    return not limits.trading_enabled
+
+
+def mode_tag(account, node=None):
     """'LIVE' / 'DRY-RUN' / 'UNKNOWN' display tag for an alert header -- shared
     by signals_notify.py and signals_blocks.py so every alert can show real
     vs. simulated status next to the account name, not the account name alone
@@ -22,13 +58,16 @@ def mode_tag(account):
     log row, but this one labels human-facing risk, and a real-money position
     with a NULL account (e.g. a manual/legacy position) defaulting to a
     reassuring 'DRY-RUN' is the wrong failure direction (Opus review,
-    2026-07-26). UNKNOWN is deliberately alarming instead."""
+    2026-07-26). UNKNOWN is deliberately alarming instead.
+    node: pass whenever available (2026-08-1x) -- without it, a node-forced-
+    dry-run override on an otherwise-real account mislabels as LIVE, since
+    this function only sees the account's own flag."""
     if account is None:
         return "UNKNOWN"
     limits = schwab_safety.ACCOUNTS.get(account)
     if limits is None:
         return "UNKNOWN"
-    return "DRY-RUN" if limits.dry_run else "LIVE"
+    return "DRY-RUN" if effectively_dry_run(account, node) else "LIVE"
 
 
 def stop_status(pos):
@@ -63,8 +102,17 @@ def stop_status(pos):
     bsp = pos.get('broker_stop_price')
     if bsp:
         return 'known', bsp
-    limits = schwab_safety.ACCOUNTS.get(pos.get('account'))
-    if limits is not None and limits.dry_run:
+    _node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+    # A real open position under a state='paper' node is itself an anomaly
+    # (signals_invariants.check_research_mode_ticker_with_open_position_in_
+    # automation_scope exists to catch exactly this) -- must not render as
+    # the reassuring 'dry-run' effectively_dry_run(node=paper) would give it
+    # (Opus review, 2026-08-06: found while auditing the mode/dry_run->state
+    # collapse). Only a genuine state='dry_run' node, or a state='live' node
+    # on a non-trading_enabled account, means 'dry-run' here.
+    if _node is not None and _node.get('state') == 'paper':
+        pass
+    elif effectively_dry_run(pos.get('account'), _node):
         return 'dry-run', None
     if pos.get('ticker') in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         return 'automation-pending', None

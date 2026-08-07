@@ -113,7 +113,7 @@ def test_scan_buy_signals_relocks_after_real_same_day_close(db, monkeypatch):
     to alert again."""
     A = db
     A.add_node(TICKER, 'ZScoreBreakout', 'test', window=20, take_profit=10, stop_loss=5,
-               max_hold_hours=56)
+               max_hold_hours=56, state='live')
     node = [n for n in A.get_watchlist() if n['ticker'] == TICKER][0]
 
     buy_sig = {'ticker': TICKER, 'window': node['window'], 'signal': 'BUY', 'z_score': -2.5,

@@ -50,7 +50,7 @@ if __name__ == '__main__':
         c.commit()
     print(f"deactivated {n_deactivated} old global reconciliation_mismatch row(s)")
 
-    live_nodes = [n for n in db.get_watchlist() if n.get('mode') == 'live']
+    live_nodes = [n for n in db.get_watchlist() if n.get('state') != 'paper']
     for node in sorted(live_nodes, key=lambda n: (n['account'] or '', n['ticker'])):
         db.add_scenario_expectation(
             scenario_key='reconciliation_mismatch',

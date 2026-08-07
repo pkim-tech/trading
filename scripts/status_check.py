@@ -94,7 +94,7 @@ def _tickers_worth_checking():
     reachable through this selector at all (found by paired Opus review,
     2026-08-05)."""
     watchlist = db.get_watchlist()
-    tickers = {n['ticker'] for n in watchlist if n['mode'] == 'live'}
+    tickers = {n['ticker'] for n in watchlist if n['state'] != 'paper'}
     tickers |= {p['ticker'] for p in db.get_open_positions(paper=True)}
     tickers |= {p['ticker'] for p in db.get_pending_buys()}
     tickers |= {p['ticker'] for p in db.get_paper_pending_buys()}

@@ -58,7 +58,7 @@ def env(monkeypatch, tmp_path):
 def _add_node(ticker, account, notional=5000):
     """Create a watch_list node for the given (ticker, account) pair."""
     signals_db.add_node(ticker, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
-                         stop_loss=1, max_hold_hours=105, mode='live',
+                         stop_loss=1, max_hold_hours=105, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
                          account=account, starting_notional=notional)
     return [n for n in signals_db.get_watchlist()

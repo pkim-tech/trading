@@ -95,7 +95,7 @@ def load_nodes():
     rows = con.execute("""
         SELECT MIN(id), ticker, strategy, window, z_score_threshold, arm_sell_pct, take_profit,
                fixed_sl, trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing
-        FROM watch_list WHERE watchlist_id=65 AND mode='research'
+        FROM watch_list WHERE watchlist_id=65 AND state='paper'
         GROUP BY ticker
     """).fetchall()
     con.close()

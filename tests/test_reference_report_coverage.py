@@ -88,7 +88,7 @@ def test_build_reference_table_shows_a_held_paper_position(env, monkeypatch):
     })
     signals_db.add_node(
         ticker='PAPERTEST', strategy='TrailingBothZScoreBreakout', version='v5', window=10,
-        take_profit=30.0, stop_loss=2, max_hold_hours=70, mode='research', account='ira',
+        take_profit=30.0, stop_loss=2, max_hold_hours=70, state='paper', account='ira',
         trail_buy_pct=3.0, trail_pct=1.0,
     )
     node = signals_db.get_watch_list_node(ticker='PAPERTEST')
