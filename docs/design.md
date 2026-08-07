@@ -1488,7 +1488,7 @@ D1-D6 resolved this session:
   combined-exposure ceiling. Conservative by construction (can only ever be MORE restrictive than no check at
   all); flagged for the user to revisit if a real add-on candidate's core leg alone already consumes most of
   the cap.
-- **D6** (first staged-test node): explicitly left for Part 12, user-executed only — not a code decision.
+- **D6** (first staged-test node): decided 2026-08-07 (later) — SOXL in `soxl_ira`, user's call. Not yet actionable: no SOXL/`soxl_ira` `watch_list` node currently exists (that account has GDXU/SPY/SH/DPST/RETL/LABD/ERY/HIBL/USD/YANG, not SOXL) — one needs to be added before Part 12 staging can run.
 
 New tests: `tests/test_fake_broker_addon_entry_scenario.py` (6), `tests/test_fake_broker_addon_lockstep_exit_scenario.py`
 (7), `tests/test_fake_broker_drought_entry_scenario.py` (4), `tests/test_fake_broker_drought_handoff_scenario.py`
