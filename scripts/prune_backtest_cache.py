@@ -25,17 +25,35 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from top_safe_nodes import CLIFF_RADIUS  # single source of truth for neighbor width --
+# importing (not re-hardcoding) so this and top_safe_nodes.py's own cliff-safety check
+# can't drift apart again the way they did before 2026-08-07 (this prune kept only
+# +/-2 grid steps while top_safe_nodes.py's real check needs +/-CLIFF_RADIUS=3, silently
+# dropping ~49% of the neighbor cells cliff-safety needs -- found by paired Opus review).
 
 DB_PATH = Path("cache/research/trading_universe.db")
 PRUNED_PATH = Path("cache/research/trading_universe_pruned.db")
+VALIDATION_SENTINEL = Path("cache/research/.prune_validated")
 
 ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_vs_spy), "
                      "COALESCE(alpha_vs_spy_certain, alpha_vs_spy))")
 
+# Deterministic tiebreaker appended to every ORDER BY ... LIMIT 1 winner-selection query
+# in this module -- found 2026-08-07 that 5,800 of 11,288 real (ticker,strategy,version,
+# window,z,entry_timing) groups have a tied max robust_alpha, so without this the winner
+# (and therefore the island's own center) was arbitrary/non-reproducible run to run.
+TIEBREAK_SQL = "trades DESC, stop_loss, max_hold_hours"
+
 
 def _groups(conn, ticker):
+    # entry_timing included 2026-08-07 -- it's a real backtest_cache PK column (close vs
+    # open_check are different sweep campaigns), previously pooled into one group here,
+    # which silently dropped the losing timing's real island in any group holding both
+    # (measured: 22 of 23 such groups lost data this way).
     c = conn.cursor()
-    c.execute("""SELECT DISTINCT strategy, version, window, z_score_threshold
+    c.execute("""SELECT DISTINCT strategy, version, window, z_score_threshold, entry_timing
                  FROM backtest_cache WHERE ticker=?""", (ticker,))
     return c.fetchall()
 
@@ -47,20 +65,23 @@ def _groups(conn, ticker):
 TP_COL_SQL = "COALESCE(take_profit, arm_sell_pct)"
 
 
-def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_threshold):
-    """Winning row = best robust_alpha in this group. Island = winning row's
-    own axis values +/- the 2 nearest distinct values that exist in this group
-    on take_profit and stop_loss (handles varying step sizes per strategy/
-    version naturally, no hardcoded step size), and any max_hold_hours within
-    +/-24h of the winner's -- roughly the project's existing "Island view"
-    size (~50 nodes: 5 TP x 5 SL x 2 hold)."""
+def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_threshold, entry_timing):
+    """Winning row = best robust_alpha in this group (trades>0 required, ties broken
+    deterministically -- see TIEBREAK_SQL). Island = winning row's own axis values +/-
+    the CLIFF_RADIUS nearest distinct values that exist in this group on take_profit and
+    stop_loss (index-based, handles varying step sizes per strategy/version naturally,
+    no hardcoded step size -- but the RADIUS itself is imported from top_safe_nodes.py so
+    it can't silently fall short of what that cliff-safety check actually needs), and any
+    max_hold_hours within +/-24h of the winner's (already wider than the +/-7h
+    top_safe_nodes.py needs, so untouched)."""
     c = conn.cursor()
     c.execute(f"""
         SELECT {TP_COL_SQL}, stop_loss, max_hold_hours, {ROBUST_ALPHA_SQL} AS robust_alpha
         FROM backtest_cache
-        WHERE ticker=? AND strategy=? AND version=? AND window=? AND z_score_threshold=? AND trades > 0
-        ORDER BY robust_alpha DESC LIMIT 1
-    """, (ticker, strategy, version, window, z_score_threshold))
+        WHERE ticker=? AND strategy=? AND version=? AND window=? AND z_score_threshold=?
+              AND entry_timing=? AND trades > 0
+        ORDER BY robust_alpha DESC, {TIEBREAK_SQL} LIMIT 1
+    """, (ticker, strategy, version, window, z_score_threshold, entry_timing))
     winner = c.fetchone()
     if winner is None:
         return []
@@ -72,12 +93,13 @@ def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_th
         c.execute(f"""
             SELECT DISTINCT {col_sql} FROM backtest_cache
             WHERE ticker=? AND strategy=? AND version=? AND window=? AND z_score_threshold=?
-        """, (ticker, strategy, version, window, z_score_threshold))
+                  AND entry_timing=?
+        """, (ticker, strategy, version, window, z_score_threshold, entry_timing))
         vals = sorted(set(r[0] for r in c.fetchall() if r[0] is not None))
         if center not in vals:
             return {center}
         idx = vals.index(center)
-        return set(vals[max(0, idx - 2):min(len(vals), idx + 3)])
+        return set(vals[max(0, idx - CLIFF_RADIUS):min(len(vals), idx + CLIFF_RADIUS + 1)])
 
     tp_keep = list(nearest_values(TP_COL_SQL, w_tp))
     sl_keep = list(nearest_values('stop_loss', w_sl))
@@ -85,9 +107,10 @@ def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_th
     sl_ph = ','.join('?' * len(sl_keep))
     c.execute(f"""SELECT rowid FROM backtest_cache
                   WHERE ticker=? AND strategy=? AND version=? AND window=? AND z_score_threshold=?
+                  AND entry_timing=?
                   AND {TP_COL_SQL} IN ({tp_ph}) AND stop_loss IN ({sl_ph})
                   AND ABS(max_hold_hours - ?) <= 24""",
-              [ticker, strategy, version, window, z_score_threshold] + tp_keep + sl_keep + [w_hold])
+              [ticker, strategy, version, window, z_score_threshold, entry_timing] + tp_keep + sl_keep + [w_hold])
     return [r[0] for r in c.fetchall()]
 
 
@@ -97,8 +120,8 @@ def _compute_keep_rowids(conn):
     all_tickers = [r[0] for r in c.fetchall()]
     keep = set()
     for ticker in all_tickers:
-        for strategy, version, window, z in _groups(conn, ticker):
-            keep.update(_island_rowids_for_group(conn, ticker, strategy, version, window, z))
+        for strategy, version, window, z, entry_timing in _groups(conn, ticker):
+            keep.update(_island_rowids_for_group(conn, ticker, strategy, version, window, z, entry_timing))
     return keep
 
 
@@ -150,19 +173,82 @@ def cmd_build():
     c.execute("SELECT COUNT(*) FROM pruned.backtest_cache")
     n = c.fetchone()[0]
     print(f"Pruned backtest_cache row count: {n:,}")
+
+    # Indexes are NOT covered by the schema copy above (that only copies
+    # sqlite_master type='table' rows) -- found 2026-08-07 the hard way: the
+    # 2026-08-07 swap silently dropped idx_bc_ticker/idx_bc_version_ticker_strategy,
+    # invisible to full_db_prune_validate.py (which only checks row content),
+    # and only surfaced as query performance degrading afterward. Mirrors
+    # run_optimization_sweep.rebuild_indexes() exactly -- keep the two in sync.
+    print("Rebuilding indexes on pruned.backtest_cache...")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_window ON pruned.backtest_cache(version, window)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker_strategy ON pruned.backtest_cache(version, ticker, strategy)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_return ON pruned.backtest_cache(version, strategy_return)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_ticker ON pruned.backtest_cache(ticker)")
+    conn.commit()
+
     conn.close()
     print(f"\nBuilt {PRUNED_PATH} -- original {DB_PATH} untouched. "
           f"Inspect it, then run --swap to replace the original.")
+
+
+def pruned_fingerprint():
+    """Binds a validation pass to one specific build -- mtime+size of PRUNED_PATH,
+    good enough to detect "a different --build ran since you validated," not meant
+    to be cryptographically strong."""
+    st = PRUNED_PATH.stat()
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def live_db_fingerprint():
+    """Binds a validation pass to the live DB's state at that moment -- mtime+size
+    of DB_PATH. Added 2026-08-07: the sentinel previously bound ONLY to the pruned
+    file, not the live DB, so a sweep writing new rows into DB_PATH during a long
+    manual validation run (real today: 40+ min, spanning a lock-contention crash
+    and an index rebuild) could have its new rows silently discarded on swap --
+    the sentinel would still read as valid since it never checked the live DB at
+    all. The normal automated path (run_liquidity_tranches.sh's tight
+    sweep-then-immediately-prune sequencing) doesn't hit this in practice, but
+    nothing enforced that assumption before now."""
+    st = DB_PATH.stat()
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def write_validation_sentinel():
+    """Called by scripts/full_db_prune_validate.py only after every check passes --
+    cmd_swap refuses to run without a fresh, matching sentinel (found 2026-08-07:
+    cmd_swap previously only checked PRUNED_PATH.exists(), so a stale or
+    never-validated build could be swapped in by hand with no gate at all)."""
+    VALIDATION_SENTINEL.write_text(f"{pruned_fingerprint()}|{live_db_fingerprint()}")
 
 
 def cmd_swap():
     if not PRUNED_PATH.exists():
         print("No pruned DB found -- run --build first.")
         return
+    if not VALIDATION_SENTINEL.exists():
+        print("No validation sentinel found -- run scripts/full_db_prune_validate.py "
+              "(or another validator that calls write_validation_sentinel()) and confirm "
+              "it passes before swapping. Refusing to swap an unvalidated build.")
+        return
+    recorded = VALIDATION_SENTINEL.read_text().strip()
+    recorded_pruned, _, recorded_live = recorded.partition("|")
+    if recorded_pruned != pruned_fingerprint():
+        print("Validation sentinel is STALE -- the pruned DB has changed (or been "
+              "rebuilt) since the last passing validation. Refusing to swap. "
+              "Re-run the validator against the current --build output first.")
+        return
+    if not recorded_live or recorded_live != live_db_fingerprint():
+        print("Validation sentinel is STALE -- the LIVE DB has changed since the "
+              "last passing validation (e.g. a sweep wrote new rows). Swapping now "
+              "would silently discard that new data. Refusing to swap. Re-run the "
+              "validator against the current live DB first.")
+        return
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     moved_aside = DB_PATH.with_name(f"trading_universe.db.pre_prune_{ts}")
     shutil.move(str(DB_PATH), str(moved_aside))
     shutil.move(str(PRUNED_PATH), str(DB_PATH))
+    VALIDATION_SENTINEL.unlink()
     print(f"Original moved to {moved_aside} (not deleted -- remove manually once confirmed).")
     print(f"{PRUNED_PATH.name} is now {DB_PATH.name}.")
 
