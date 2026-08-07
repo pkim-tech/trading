@@ -1514,3 +1514,31 @@ lean.py`: clean.
 `signals_invariants.py` also gained a new `check_addon_drought_live_nodes_have_coherent_account_type` check
 (any `addon_enabled`/`drought_overlay_enabled` `mode='live'` node must sit on a real margin account).
 
+
+---
+
+## Two-persona mental model (2026-08-07)
+
+Working split, arrived at by user conversation, not a code convention — recorded here since it's high-level
+enough to have no other home:
+
+- **Research persona**: the whole path from raw candidate to a fully-decided plan — backtesting, node
+  selection, portfolio/tax/compliance/account-placement decisions. Anything answering "what should happen."
+  Needs Opus review (bad logic here undercuts everything downstream) but not `fake_broker`/`live_sim_harness`
+  (nothing here touches a real order path). Sweep campaigns are a high-latency mode within this persona —
+  user-launched only, good to fill with other research/backlog conversation while one runs.
+- **Execution persona**: confirming the running code does what was already decided — `signals_*.py`/
+  `schwab_*.py`, live coverage, alerting. Anything answering "is it actually doing its job." Gets the full
+  review + `fake_broker`/`live_sim_harness` bar.
+- **Risk-manager stance**: not a third session — it's the auditing/gating posture (paired Opus review,
+  cliff-safety filtering, coverage registry, circuit breakers, invariants checks) applied *to* the output of
+  the other two, not a place to go think on its own.
+
+Practical implication: keep research and execution conversations in separate sessions by default — mixing
+them lets one's discipline leak into the other. Portfolio/tax/compliance sits on the research side (planning),
+not execution, despite feeling operational.
+
+**Anticipated trajectory, not yet true**: once v5+overlay execution code is proven and running BAU, and
+portfolio/tax/risk settle into periodic checks rather than open decisions, most remaining active-judgment work
+collapses into the research persona — the next alpha search never really stops being live work the way the
+others do.
