@@ -12,6 +12,11 @@
 > ~7 days (already permanent in `deep_backlog.md`), (4) remove the item from this file. When a
 > genuinely new backlog item is raised, add a 1-2 line entry here directly (no full-detail
 > writeup needed unless/until it resolves).
+>
+> **Prioritization**: `docs/roadmap.md` holds the phased "where are we headed and in what
+> order" vision (universe sweep for overlay-friendly nodes → portfolio construction → modest
+> live capital → trend/edge-decay detection → scale up). Triage open items below against it —
+> an item serving the current phase generally outranks one serving a later phase.
 
 ## [live-trading][coverage] Idea, raised 2026-08-07 (late) — should the morning status check "self-heal" (wire `check_untracked_positions.py`'s ground-truth sweep into the daily routine, possibly auto-correct)? User wants to noodle on scope before deciding.
 Not yet scoped — open question is how far "self-heal" goes: (1) just wire the existing on-demand sweep into the morning routine so it runs automatically instead of requiring a manual invocation, vs. (2) actually auto-correct local records to match broker truth. Worth noting before deciding: this project has repeatedly and deliberately chosen detect-only over auto-correct elsewhere (daily-track reconciliation's "no auto-resync," the node circuit breaker's monitor-only design, the GDXU incident's actual fix being "alert loudly" not "silently fix") — the recurring reason is that auto-correction can erase or mask the exact signal worth investigating. User's own reaction: "no need to go crazy," suggesting a narrower scope than full auto-reconcile. Revisit next session.
@@ -48,6 +53,9 @@ GDXU's original 2026-07-30 staged order (`stage_live_test_order.py`, role `gap_r
 
 ## [live-trading] Idea, raised 2026-08-07 — generalize `stage_live_test_order.py`'s fail-closed node-resolution pattern to other order types/tools that bypass schwab_safety
 Only the TRAILING BUY path in `stage_live_test_order.py` got the new fail-closed check (refuse to place unless a `watch_list` node resolves, `--wl-id` override available) — because that's the only order type there whose downstream tracking depends on a `pending_buys` row existing. Worth auditing whether `scripts/live_sanity_check.py` or any other direct-broker-bypass tool has an analogous untracked-order exposure.
+
+## [backtest][ops] Hold, set 2026-08-07 — keep `trading_universe.db.pre_prune_20260807_100407` (67G) as a backup until ~2026-09-07
+This is the pre-swap copy of the full merged-recovery DB from the `trades > 0` island-selection prune bug fix/recovery this session (see `docs/research_log.md`'s 2026-08-07 prune-bug entry). User's explicit call after the 65GB pre-any-pruning archive was deleted the same session — "it was useful to have the 65g backup," so keep this one around ~1 month in case another prune bug surfaces before fully trusting the current pruned live DB. Don't delete before ~2026-09-07 without asking.
 
 ## [backtest] Deferred, raised 2026-08-07 (late) — `backtest_cache`'s overloaded columns need a real schema definition, not more ad hoc patches
 Root cause of the trail_buy_pct/take_profit bug recurring three times today wasn't three independent slips — it's that columns like `take_profit` (means different things per strategy, NULL for TrailingBoth) and `trail_buy_pct` (real for TrailingBoth, always-zero for TrailingExit) have no documented, enforced contract, so every new query has to rediscover the semantics. Real fix: an explicit schema definition (which column means what per strategy, which must always be held fixed together in a neighbor search) future code follows instead of assumes. **User's explicit call: deferred to next phase, tied to whenever a new strategy variant is actually designed** — not tonight. "Limp along" on the current ad hoc-patch approach until then. (The 2026-08-02 `prune_backtest_cache.py` instance of this same root cause is now fixed — see `backlog_resolved_recent.md`.)
