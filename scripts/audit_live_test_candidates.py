@@ -181,6 +181,32 @@ def audit_one(ticker, wl_id=None):
     if not resting:
         print("  resting order: none")
 
+    # Overlay state (2026-08-08 addition) -- drought/addon run on their own
+    # tables (drought is a normal open_positions/paper_positions row tagged
+    # position_source='drought_overlay'; addon is a separate addon_legs/
+    # paper_addon_legs table entirely), so neither was visible here before --
+    # a real add-on BUY or drought entry could be sitting open on this node
+    # with no trace in the morning check. is_paper mirrors node.state, not
+    # the core position's own real/paper split, since a drought/addon leg
+    # can exist independently of whatever core currently shows.
+    overlay_is_paper = node.get('state') == 'paper'
+    if node.get('drought_overlay_enabled'):
+        dpos = db.get_drought_overlay_position(node['id'], paper=overlay_is_paper)
+        if dpos is not None and dpos.get('status', 'open') != 'closed':
+            dtag = " [PAPER]" if overlay_is_paper else ""
+            print(f"  drought overlay position{dtag}: {dpos.get('shares'):g} shares @ "
+                  f"${dpos['entry_price']:.4f} (entered {dpos['entry_time']})")
+        else:
+            print("  drought overlay position: none")
+    if node.get('addon_enabled'):
+        aleg = db.get_open_addon_leg_by_wl_id(node['id'], paper=overlay_is_paper)
+        if aleg is not None:
+            atag = " [PAPER]" if overlay_is_paper else ""
+            print(f"  addon leg{atag}: {aleg.get('shares'):g} shares @ "
+                  f"${aleg['entry_price']:.4f} (entered {aleg['entry_time']}, status={aleg.get('status')})")
+        else:
+            print("  addon leg: none")
+
     if pos is None:
         # A resting trailing-buy has no open_positions row yet (that's only created
         # on fill) -- checking pos alone here previously reported "flat" for a node

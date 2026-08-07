@@ -58,7 +58,7 @@ def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_th
     c.execute(f"""
         SELECT {TP_COL_SQL}, stop_loss, max_hold_hours, {ROBUST_ALPHA_SQL} AS robust_alpha
         FROM backtest_cache
-        WHERE ticker=? AND strategy=? AND version=? AND window=? AND z_score_threshold=?
+        WHERE ticker=? AND strategy=? AND version=? AND window=? AND z_score_threshold=? AND trades > 0
         ORDER BY robust_alpha DESC LIMIT 1
     """, (ticker, strategy, version, window, z_score_threshold))
     winner = c.fetchone()

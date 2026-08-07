@@ -112,19 +112,37 @@ def print_status(watchlist_id=None):
         sma50 = _sma50(n['ticker'])
         above_sma = (cur >= sma50) if sma50 is not None else None
         vol_pctile = _current_vol_pctile(n['ticker'])
+
+        # Overlay flags are static config (2026-08-08 addition) -- previously
+        # invisible here, had to be checked by hand-querying watch_list.
+        is_paper = n.get('state') == 'paper'
+        ovl = ('D' if n.get('drought_overlay_enabled') else '') + ('A' if n.get('addon_enabled') else '')
+        ovl = ovl or '-'
+        # Open overlay positions fold into Phase (not a separate column) --
+        # this is the thing actually worth noticing on a scan, and stays quiet
+        # for the common case where nothing overlay-related is live.
+        if n.get('drought_overlay_enabled'):
+            dpos = db.get_drought_overlay_position(n['id'], paper=is_paper)
+            if dpos is not None:
+                phase = f"drought-held({phase})"
+        if n.get('addon_enabled'):
+            aleg = db.get_open_addon_leg_by_wl_id(n['id'], paper=is_paper)
+            if aleg is not None:
+                phase = f"{phase}+addon"
+
         rows.append((n['id'], n['ticker'], role, phase, trigger, cur, pct,
-                     n.get('trail_buy_pct'), n.get('account'), n.get('state'), sma50, above_sma, vol_pctile))
+                     n.get('trail_buy_pct'), n.get('account'), n.get('state'), sma50, above_sma, vol_pctile, ovl))
     rows.sort(key=lambda r: r[6])
 
     print(f"watchlist_id={watchlist_id}\n")
-    print(f"{'Id':>5} {'Ticker':<6} {'Role':<11} {'Phase':>16} {'Trigger':>10} {'Current':>10} {'%':>8} "
-          f"{'TrailBuy%':>10} {'Account':>10} {'Mode':>10} {'SMA50':>10} {'>SMA50':>7} {'VolPctl':>8}")
-    for wl_id, t, role, phase, trig, cur, pct, tb, acc, mode, sma50, above_sma, vol_pctile in rows:
+    print(f"{'Id':>5} {'Ticker':<6} {'Role':<11} {'Phase':>20} {'Trigger':>10} {'Current':>10} {'%':>8} "
+          f"{'TrailBuy%':>10} {'Account':>10} {'Mode':>10} {'SMA50':>10} {'>SMA50':>7} {'VolPctl':>8} {'Ovl':>4}")
+    for wl_id, t, role, phase, trig, cur, pct, tb, acc, mode, sma50, above_sma, vol_pctile, ovl in rows:
         sma50_s = f"{sma50:.2f}" if sma50 is not None else "n/a"
         above_s = "" if above_sma is None else ("yes" if above_sma else "no")
         vol_s = f"{vol_pctile:.2f}" if vol_pctile is not None else "n/a"
-        print(f"{wl_id:>5} {t:<6} {role:<11} {phase:>16} {trig:>10.2f} {cur:>10.2f} {pct:>7.2f}% "
-              f"{str(tb):>10} {str(acc):>10} {str(mode):>10} {sma50_s:>10} {above_s:>7} {vol_s:>8}")
+        print(f"{wl_id:>5} {t:<6} {role:<11} {phase:>20} {trig:>10.2f} {cur:>10.2f} {pct:>7.2f}% "
+              f"{str(tb):>10} {str(acc):>10} {str(mode):>10} {sma50_s:>10} {above_s:>7} {vol_s:>8} {ovl:>4}")
 
 
 def print_history(ticker, num_bars=7, watchlist_id=None):

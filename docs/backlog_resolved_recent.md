@@ -7,6 +7,7 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][coverage] Resolved 2026-08-07 (late) — morning status-check tooling (`status_check.py`/`audit_one`, `watchlist_status.py`) had zero drought/add-on overlay visibility; now surfaces open drought positions + addon legs per node, plus a static enabled-flags column. Full detail: `deep_backlog.md`.
 ## [live-trading][security] Resolved 2026-08-07 — GDXU real orphaned position (soxl_ira, unprotected a week) root-caused, fixed, reconciled for real; new on-demand broker-truth sweep tool built. Full detail: `deep_backlog.md`.
 ## [live-trading][security] Resolved 2026-08-06/07 — `watch_list.mode`+account `dry_run` collapsed into one `state` column; 2 paired Opus reviews + exhaustive sweep found/fixed ~30 real bugs incl. a resurrecting-column CRITICAL. Full detail: `deep_backlog.md`.
 ## [portfolio] Resolved 2026-08-1x — put-hedge skipped by explicit user call; relying on skim-and-reserve alone. `collect_options_snapshot.py` daily cron removed (no other consumer).
