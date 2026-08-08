@@ -19,6 +19,7 @@ Usage:
   .venv/bin/python scripts/candidate_summary_report.py TNA --skip-5min  # faster, skip yfinance calls
 """
 import argparse
+import csv
 import sqlite3
 import sys
 from pathlib import Path
@@ -136,6 +137,42 @@ def overlay_summary(conn, ticker, mechanism):
     return len(rets), compounded(rets), wr
 
 
+def _write_csv(name, rows):
+    out_path = Path("output") / (name if name.endswith(".csv") else f"{name}.csv")
+    out_path.parent.mkdir(exist_ok=True)
+    fieldnames = ["ticker", "core_alpha_pct", "abs_return_pct", "years", "trades",
+                  "ann_excess_pct", "fillacc_possible_win_pct", "fillacc_possible_mean_err_pct",
+                  "fillacc_n", "worst_neighbor_pct", "status",
+                  "addon_n", "addon_compounded_pct", "addon_win_rate_pct",
+                  "drought_n", "drought_compounded_pct", "drought_win_rate_pct",
+                  "x_addon_pct", "x_drought_pct"]
+    with open(out_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in rows:
+            if row[1] is None:
+                w.writerow({"ticker": row[0]})
+                continue
+            (ticker, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
+             addon, drought, addon_mult, drought_mult) = row
+            w.writerow({
+                "ticker": ticker, "core_alpha_pct": ralpha, "abs_return_pct": sret,
+                "years": years, "trades": trades, "ann_excess_pct": ann_excess,
+                "fillacc_possible_win_pct": fill_acc[0] if fill_acc else None,
+                "fillacc_possible_mean_err_pct": fill_acc[1] if fill_acc else None,
+                "fillacc_n": fill_acc[2] if fill_acc else None,
+                "worst_neighbor_pct": wn, "status": cliff,
+                "addon_n": addon[0] if addon else None,
+                "addon_compounded_pct": addon[1] if addon else None,
+                "addon_win_rate_pct": addon[2] if addon else None,
+                "drought_n": drought[0] if drought else None,
+                "drought_compounded_pct": drought[1] if drought else None,
+                "drought_win_rate_pct": drought[2] if drought else None,
+                "x_addon_pct": addon_mult, "x_drought_pct": drought_mult,
+            })
+    print(f"Wrote {out_path} ({len(rows)} rows)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("tickers", nargs="*")
@@ -143,6 +180,7 @@ def main():
     ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--skip-5min", action="store_true",
                      help="skip the 5-min fill-accuracy replay (saves a yfinance call per ticker)")
+    ap.add_argument("--csv", default=None, help="write output/<name>.csv instead of the wide terminal table")
     args = ap.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -183,6 +221,10 @@ def main():
                      addon, drought, addon_mult, drought_mult))
 
     conn.close()
+
+    if args.csv:
+        _write_csv(args.csv, rows)
+        return
 
     hdr = "%-8s %9s %9s %6s %6s %10s %14s %9s %6s %20s %20s %12s %12s" % (
         "Ticker", "CoreA%", "AbsRet%", "Years", "Trades", "AnnExcess%", "FillAcc(win%,err%)",
