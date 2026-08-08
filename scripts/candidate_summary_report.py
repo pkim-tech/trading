@@ -90,6 +90,12 @@ COLUMN_DEFS = {
     "x_drought_pct": "NAIVE estimate of core+drought combined, same (1+core)*(1+overlay)-1 formula. Drought "
                       "fills core's own idle-time gaps SEQUENTIALLY, so this approximation is more defensible "
                       "than x_addon_pct, but still not the rigorous stacked model.",
+    "liquidity_dollars_per_day": "avg_vol_10d * last_price * 0.01 from the tickers table -- this project's "
+                                  "standard real dollar-liquidity estimate (confirmed against CLAUDE.md's cited "
+                                  "figures, e.g. AGQ ~$2.02M, HIBL ~$89.9K). This is supposed to be the FIRST-pass "
+                                  "filter before spending validation effort on a candidate (see the 2026-08-07 "
+                                  "'liquidity was never the limiting filter' finding) -- a great alpha number on "
+                                  "an illiquid name is untradeable regardless of the rest of this row.",
 }
 
 
@@ -180,6 +186,16 @@ def compounded(rets):
     return (prod - 1) * 100
 
 
+def liquidity_dollars_per_day(conn, ticker):
+    """Real dollar liquidity, this project's standard formula (see
+    campaign_comparison_table.py) -- avg_vol_10d*last_price*0.01, confirmed
+    against CLAUDE.md's cited figures (AGQ ~$2.02M/day, HIBL ~$89.9K/day)."""
+    c = conn.cursor()
+    c.execute("SELECT avg_vol_10d * last_price * 0.01 FROM tickers WHERE symbol=?", (ticker,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+
 def overlay_summary(conn, ticker, mechanism):
     c = conn.cursor()
     c.execute("""
@@ -202,7 +218,7 @@ def _row_to_record(row):
     if row[1] is None:
         return {"ticker": ticker}
     (ticker, strategy, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
-     addon, drought, addon_mult, drought_mult) = row
+     addon, drought, addon_mult, drought_mult, liquidity) = row
     return {
         "ticker": ticker, "strategy": strategy, "core_alpha_pct": ralpha, "abs_return_pct": sret,
         "years": years, "trades": trades, "ann_excess_pct": ann_excess,
@@ -217,6 +233,7 @@ def _row_to_record(row):
         "drought_compounded_pct": drought[1] if drought else None,
         "drought_win_rate_pct": drought[2] if drought else None,
         "x_addon_pct": addon_mult, "x_drought_pct": drought_mult,
+        "liquidity_dollars_per_day": liquidity,
     }
 
 
@@ -315,8 +332,9 @@ def main():
         core_mult = 1 + sret / 100
         addon_mult = (core_mult * (1 + addon[1] / 100) - 1) * 100 if addon else None
         drought_mult = (core_mult * (1 + drought[1] / 100) - 1) * 100 if drought else None
+        liquidity = liquidity_dollars_per_day(conn, ticker)
         rows.append((ticker, strategy, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
-                     addon, drought, addon_mult, drought_mult))
+                     addon, drought, addon_mult, drought_mult, liquidity))
 
     conn.close()
 
@@ -327,8 +345,8 @@ def main():
         _write_csv(args.csv, rows)
         return
 
-    hdr = "%-8s %9s %9s %6s %6s %10s %14s %9s %6s %20s %20s %12s %12s" % (
-        "Ticker", "CoreA%", "AbsRet%", "Years", "Trades", "AnnExcess%", "FillAcc(win%,err%)",
+    hdr = "%-8s %12s %9s %9s %6s %6s %10s %14s %9s %6s %20s %20s %12s %12s" % (
+        "Ticker", "Liquidity$/d", "CoreA%", "AbsRet%", "Years", "Trades", "AnnExcess%", "FillAcc(win%,err%)",
         "WorstNb%", "Status", "Addon(n,comp%,WR%)", "Drought(n,comp%,WR%)", "x Addon%", "x Drought%")
     print(hdr)
     print("(x columns are a NAIVE multiplicative estimate, not real stacked-model math -- see docstring)")
@@ -350,7 +368,9 @@ def main():
                   if rec['drought_n'] is not None else "-")
         am_str = f"{rec['x_addon_pct']:+.1f}" if rec['x_addon_pct'] is not None else "-"
         dm_str = f"{rec['x_drought_pct']:+.1f}" if rec['x_drought_pct'] is not None else "-"
-        print(f"{rec['ticker']:8} {rec['core_alpha_pct']:>9.1f} {rec['abs_return_pct']:>9.1f} "
+        liq = rec['liquidity_dollars_per_day']
+        liq_str = f"${liq:,.0f}" if liq is not None else "n/a"
+        print(f"{rec['ticker']:8} {liq_str:>12} {rec['core_alpha_pct']:>9.1f} {rec['abs_return_pct']:>9.1f} "
               f"{rec['years']!s:>6} {rec['trades']:>6} {ae_str:>10} {fa_str:>14} "
               f"{wn_str} {rec['status']:>6} {ao_str:>20} {dr_str:>20} {am_str:>12} {dm_str:>12}")
 

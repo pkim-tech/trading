@@ -8,6 +8,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from candidate_summary_report import (
     best_node, worst_neighbor, overlay_summary, annualized_excess, fill_accuracy_summary,
+    liquidity_dollars_per_day, COLUMN_DEFS,
 )
 
 DB_PATH = "./cache/research/trading_universe.db"
@@ -74,8 +75,10 @@ def build_report(tickers, version, run_5min):
         core_mult = 1 + sret / 100
         addon_mult = (core_mult * (1 + addon[1] / 100) - 1) * 100 if addon else None
         drought_mult = (core_mult * (1 + drought[1] / 100) - 1) * 100 if drought else None
+        liquidity = liquidity_dollars_per_day(conn, ticker)
         rows.append({
-            "ticker": ticker, "strategy": strategy, "core_alpha_pct": ralpha, "abs_return_pct": sret,
+            "ticker": ticker, "liquidity_dollars_per_day": liquidity,
+            "strategy": strategy, "core_alpha_pct": ralpha, "abs_return_pct": sret,
             "years": years, "trades": trades, "ann_excess_pct": ann_excess,
             "fillacc_possible_win_pct": fill_acc[0] if fill_acc else None,
             "fillacc_mean_err_pct": fill_acc[1] if fill_acc else None,
@@ -102,6 +105,7 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
     column_config={
+        "liquidity_dollars_per_day": st.column_config.NumberColumn("Liquidity $/day", format="$%.0f"),
         "core_alpha_pct": st.column_config.NumberColumn("Core Alpha %", format="%+.1f%%"),
         "abs_return_pct": st.column_config.NumberColumn("Abs Return %", format="%+.1f%%"),
         "ann_excess_pct": st.column_config.NumberColumn("Annualized Excess %", format="%+.1f%%"),
@@ -122,5 +126,10 @@ st.caption(
     "check Years/Trades before trusting a large value from a short/thin sample (e.g. SPCL: ~3000%+ "
     "off 0.31y/3 trades is an annualization artifact, not a real signal). "
     "x Addon %/x Drought % are a NAIVE multiplicative estimate, not real stacked-model math -- "
-    "see candidate_summary_report.py's docstring."
+    "see candidate_summary_report.py's docstring. Liquidity should be the FIRST-pass filter, not an "
+    "afterthought (see the 2026-08-07 'liquidity was never the limiting filter' finding)."
 )
+
+with st.expander("Column definitions"):
+    for col, definition in COLUMN_DEFS.items():
+        st.markdown(f"**{col}** -- {definition}")
