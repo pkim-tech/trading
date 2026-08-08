@@ -24,6 +24,11 @@
 > any deferred item whose date has already passed, so it surfaces again instead of quietly
 > aging out. No separate section — stays in place, in normal open-items order.
 
+## [backtest] URGENT, session-wrap review pending 2026-08-08 — paired Opus review of `run_optimization_sweep.py`'s new sl_sweep_summary persistence (Checkpoint 2 change, i2+i3 worst_neighbor, best_alpha>100% gate) launched but not yet returned when context ran out. Check `SendMessage` to agents a1bbdd9e3db4a50de (cold) and abfa1f91f0e892e11 (contextual), or re-review the diff fresh, before trusting this data or building further on it. Resolve any CONFIRMED findings.
+
+## [backtest] Open, raised 2026-08-08 — "possible" fill-resolution is empirically more accurate than pessimistic/certain (small sample, needs a broader check)
+Full detail: `docs/research_log.md`'s 2026-08-08 entry. 25 real signals across 6 tickers: possible closest to real 5-min fill in 24/25, mean abs error 0.107% vs pessimistic 0.871%/certain 1.374%, both biased toward understating achievable fill price. Real implication if it holds broadly: `robust_alpha`'s `MIN(possible,pessimistic,certain)` convention may be needlessly conservative project-wide, not protective. Not yet broadened past this first sample -- do that before changing the convention anywhere real.
+
 ## [live-trading] Open, raised 2026-08-08 — check `roth`/`brokerage` real account opening status (revisit ~2026-08-12)
 Both accounts still `schwab_safety.ACCOUNTS[...].trading_enabled=False` (`schwab_safety.py:179,181`) as of 2026-08-08. Confirmed with the user 2026-08-08: not available yet (real-world Schwab account-opening/compliance, not a code blocker) — check back next Wednesday for status.
 

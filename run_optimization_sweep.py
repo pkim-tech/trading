@@ -242,6 +242,20 @@ def init_idempotent_db():
             UNIQUE(ticker, strategy, version, stop_loss, trail_sell_pct, entry_timing, run_timestamp)
         )
     """)
+    # worst_neighbor_alpha_i3 (2026-08-08): this table existed with a
+    # worst_neighbor_alpha column (i2, matching this module's own
+    # CLIFF_RADIUS=2) but was never actually populated -- Checkpoint 2 computed
+    # the value live every campaign and only logged it, never persisted it,
+    # so every downstream consumer (top_safe_nodes.py etc, CLIFF_RADIUS=3) had
+    # to slowly re-derive it from scratch. Fixed same day: Checkpoint 2 now
+    # inserts here (scoped to best_alpha > 100%, "should be fewer nodes" --
+    # user's call, keeps this cheap rather than storing for every candidate),
+    # with i3 added alongside the existing i2 column so both radii are on hand
+    # without a second slow re-scan.
+    try:
+        cursor.execute("ALTER TABLE sl_sweep_summary ADD COLUMN worst_neighbor_alpha_i3 REAL")
+    except Exception:
+        pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sweep_runs (
@@ -517,6 +531,9 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
             })
         else:
             unvisited_tasks.append(t)
+
+    logger.info(f"[{ticker}] {phase_label}: {len(matrix_results):,} cached, "
+                f"{len(unvisited_tasks):,} to compute (of {len(tasks):,} total)")
 
     if not unvisited_tasks:
         conn.close()
@@ -920,6 +937,59 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
             cliff = worst_neighbor < 0
             logger.info(f"  [{ticker}] best={best_alpha:+.1f}%  worst_neighbor={worst_neighbor:+.1f}%  {'CLIFF' if cliff else 'safe'}")
             results.append({'ticker': ticker, 'best_alpha': best_alpha, 'worst_neighbor': worst_neighbor})
+
+            # Persist i2 (above) and i3 (this project's other standing cliff-safety
+            # radius, see scripts/top_safe_nodes.py's CLIFF_RADIUS=3) for the group's
+            # winner, so future consumers don't have to slowly re-derive this from
+            # scratch. Scoped to best_alpha > 100% ("should be fewer nodes" -- user's
+            # call, 2026-08-08) rather than every candidate.
+            # CRITICAL fix (2026-08-08, caught by same-session cold Opus review before
+            # this ever shipped to a committed state): sl_c holds the campaign's
+            # trail_buy_pct/trail_pct for uses_fixed_sl strategies (per
+            # _sl_axis_real_column), NOT the real stop_loss -- the real campaign SL is
+            # the `fixed_sl` parameter. Originally inserted sl_c into the stop_loss
+            # column (wrong value, corrupted the UNIQUE key across campaigns) and
+            # tpct_c into best_node_trail_buy_pct (actually trail_sell_pct, duplicating
+            # the real trail_sell_pct column and losing the real trail_buy_pct
+            # entirely). 18 rows written under the bug were deleted from the live DB.
+            # STILL OPEN, not fixed this session (MEDIUM, doesn't corrupt data): fresh
+            # datetime.now() per row means INSERT OR REPLACE never actually replaces a
+            # prior run for the same combo -- consumers must MAX(run_timestamp)-dedupe.
+            # Best-effort: a failure
+            # here must never break the sweep itself.
+            if best_alpha > 100:
+                CLIFF_RADIUS_I3 = 3
+                try:
+                    worst_i3 = conn.execute(f"""
+                        SELECT MIN({ROBUST_ALPHA_SQL}) FROM backtest_cache
+                        WHERE version=? AND ticker=? AND strategy=?
+                          AND window=? AND z_score_threshold=?
+                          AND axis_tp        BETWEEN ? AND ?
+                          AND {_sl_axis_real_column(sl_axis_col)}  BETWEEN ? AND ?
+                          AND max_hold_hours BETWEEN ? AND ?
+                          {scope_sql} {tpct_filter}
+                          AND trades > 0
+                    """, (config_version, ticker, strategy_name,
+                          win_c, z_c,
+                          tp_c - CLIFF_RADIUS_I3, tp_c + CLIFF_RADIUS_I3,
+                          sl_c - CLIFF_RADIUS_I3, sl_c + CLIFF_RADIUS_I3,
+                          hold_c - 7, hold_c + 7,
+                          *scope_params, *tpct_params)).fetchone()[0]
+                    worst_neighbor_i3 = float(worst_i3) if worst_i3 is not None else 0.0
+                    conn.execute("""
+                        INSERT OR REPLACE INTO sl_sweep_summary
+                            (ticker, strategy, version, stop_loss, trail_sell_pct, entry_timing,
+                             best_alpha, worst_neighbor_alpha, worst_neighbor_alpha_i3,
+                             best_node_tp, best_node_hold, best_node_trail_buy_pct,
+                             any_cliff_safe, run_timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (ticker, strategy_name, config_version, fixed_sl, tpct_c, entry_timing,
+                          best_alpha, worst_neighbor, worst_neighbor_i3,
+                          tp_c, hold_c, sl_c if sl_axis_col == 'trail_buy_pct' else None,
+                          0 if cliff else 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                    conn.commit()
+                except Exception as e:
+                    logger.warning(f"  [{ticker}] failed to persist sl_sweep_summary row: {e}")
 
     if not results:
         return [], []

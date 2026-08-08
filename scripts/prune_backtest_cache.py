@@ -180,11 +180,17 @@ def cmd_build():
     # invisible to full_db_prune_validate.py (which only checks row content),
     # and only surfaced as query performance degrading afterward. Mirrors
     # run_optimization_sweep.rebuild_indexes() exactly -- keep the two in sync.
+    # SQLite's schema-qualified CREATE INDEX puts the schema prefix on the INDEX
+    # NAME, not the table name (`CREATE INDEX schema.idx ON table(...)`, not
+    # `CREATE INDEX idx ON schema.table(...)`) -- got this backwards on the first
+    # pass, which crashed with "near '.': syntax error" the first time this code
+    # path actually ran (a `--build` against real tranche data), since the earlier
+    # fix was only Python-syntax-checked, never smoke-tested end to end.
     print("Rebuilding indexes on pruned.backtest_cache...")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_window ON pruned.backtest_cache(version, window)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker_strategy ON pruned.backtest_cache(version, ticker, strategy)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_return ON pruned.backtest_cache(version, strategy_return)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_bc_ticker ON pruned.backtest_cache(ticker)")
+    conn.execute("CREATE INDEX IF NOT EXISTS pruned.idx_bc_version_window ON backtest_cache(version, window)")
+    conn.execute("CREATE INDEX IF NOT EXISTS pruned.idx_bc_version_ticker_strategy ON backtest_cache(version, ticker, strategy)")
+    conn.execute("CREATE INDEX IF NOT EXISTS pruned.idx_bc_version_return ON backtest_cache(version, strategy_return)")
+    conn.execute("CREATE INDEX IF NOT EXISTS pruned.idx_bc_ticker ON backtest_cache(ticker)")
     conn.commit()
 
     conn.close()

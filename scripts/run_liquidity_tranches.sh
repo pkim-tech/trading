@@ -121,33 +121,24 @@ run_tranche() {
     ./scripts/run_sweep_queue.sh --skip-cache-refresh
 
   echo ""
-  echo "--- Tranche $n sweep done — $(date). Locating best node PRE-prune. ---"
-  local pre="$STATE_DIR/tranche_${n}_pre.txt"
-  local post="$STATE_DIR/tranche_${n}_post.txt"
-  $PYTHON scripts/locate_best_node.py $tickers --out "$pre"
-
-  echo ""
-  echo "--- Pruning backtest_cache to island-only. ---"
-  $PYTHON scripts/prune_backtest_cache.py --dry-run
-  $PYTHON scripts/prune_backtest_cache.py --build
+  echo "--- Tranche $n sweep done — $(date). Running full extract+validate (all tickers/groups, not just this tranche's). ---"
+  # Was: separate --dry-run/--build/--swap plus a locate_best_node.py pre/post
+  # diff scoped to just this tranche's tickers. Replaced 2026-08-07 after that
+  # flow silently no-op'd on tranche 2 -- cmd_swap() now requires a validation
+  # sentinel (added same day to stop an unvalidated build from being swapped
+  # in by hand), but this script still called --swap directly without ever
+  # running the validator that writes it. cmd_swap()'s refusal prints and
+  # returns (exit 0), which `set -e` can't catch, so the script silently
+  # continued, compared PRE against POST (trivially equal since nothing had
+  # actually changed), and marked the tranche done -- with the live DB never
+  # actually shrinking. scripts/full_db_prune_validate.py both replaces the
+  # weaker tranche-scoped pre/post check (it validates every real
+  # (ticker,strategy,version,window,z,entry_timing) group, not just one row
+  # per this tranche's tickers) AND writes the sentinel --swap now requires,
+  # so this single call does both jobs.
+  $PYTHON scripts/full_db_prune_validate.py
   $PYTHON scripts/prune_backtest_cache.py --swap
-
-  echo ""
-  echo "--- Locating best node POST-prune, comparing. ---"
-  $PYTHON scripts/locate_best_node.py $tickers --out "$post"
-
-  if ! diff -q "$pre" "$post" > /dev/null; then
-    echo ""
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo " PRUNE VALIDATION FAILED for tranche $n -- best node"
-    echo " changed after pruning. This is a real pruning bug,"
-    echo " not a warning to ignore. Stopping (no marker written)."
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "--- PRE ---"; cat "$pre"
-    echo "--- POST ---"; cat "$post"
-    exit 1
-  fi
-  echo "Prune validation OK -- best node unchanged for all of: $tickers"
+  echo "Extract validation OK -- swapped in."
 
   echo ""
   echo "--- Running overlay shim for tranche $n. ---"
