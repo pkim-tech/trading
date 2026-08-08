@@ -6843,3 +6843,17 @@ Continuation of the prior session's liquidity-screen sweep work. User took over 
 **Sweep state at session end:** tranches 1-6 done, tranche 7 running. `./scripts/run_liquidity_tranches.sh --status` for current state; script now correctly self-validates and self-heals the extract/swap step going forward.
 
 **Committed at session end:** `run_optimization_sweep.py` (with the cold-review fix applied), `scripts/prune_backtest_cache.py`, `scripts/run_liquidity_tranches.sh`, `scripts/top_safe_nodes.py`, plus new `scripts/candidate_overlay_robustness_check.py`, `scripts/candidate_summary_report.py`, `scripts/run_overlay_shim_for_node.py`, `scripts/verify_fill_resolution_accuracy.py`, and doc updates. `config.json` is the sweep's own transient patch state, never committed directly.
+
+---
+
+## 2026-08-08 (later) — Session-persona convention added to CLAUDE.md, settled on a simple Research vs. everything-else tag after trying and rejecting richer taxonomies
+
+Root problem: two concurrent sessions (a long-running Research liquidity-screen sweep and an Execution session on Slack alerting/LABD-RETL fixes) wrote interleaved entries to `docs/session_cache.md`, and this very session's `go` at start only surfaced the first ~60-line entry (the Research one), silently missing the second entry sitting one level deeper — a live demonstration of the exact problem being discussed.
+
+Iterated through several designs in conversation, each narrowed by direct user feedback: 2 personas (Research/Execution) → 3 (added Platform for meta/infra work, since this exact conversation didn't fit either bucket) → considered a 4th "all" catch-all → explicitly rejected all of that ("going to 3-4 personas is super hard to keep track of. I like the research vs non research track"). **Landed on: a single optional `[Research]` tag** applied at `session close`/`session wrap` time when a session was mostly backtest-kernel/sweep/candidate-overlay work; everything else stays untagged, no second label to maintain. `go` (bare) reads `docs/session_cache.md` unfiltered — the normal single-session case. `go research` is only for deliberately starting a concurrent session alongside an active/expected sweep, scoping the read to `[Research]`-tagged + untagged-legacy entries.
+
+Retroactively tagged the current 5 `session_cache.md` entries (2 Research, 3 now untagged — the "Execution" label from an earlier draft was stripped).
+
+**Also surfaced, not yet acted on**: `go`'s ~60-line read cap effectively only ever shows the single most recent entry now that entries run 20+ lines each — real limitation, not just a formatting choice. User's chosen mitigations (rather than re-engineering `go`'s read logic): (1) habitually run `session wrap` immediately followed by `go` again rather than trusting a later `go` to reconstruct full cross-thread state, accepting the idle-window gap as a "tax"; (2) time wraps more tightly to shrink the window where two threads' entries could land out of order. Both are saved as memory notes (`feedback_wrap_then_go_habit`, `project_persona_tagging_convention`) for future sessions.
+
+No trading-logic code changed this session (`CLAUDE.md` only) — the mandatory paired-Opus-review step doesn't apply. `config.json` left uncommitted (transient sweep-patch state, per existing convention); the liquidity-screen sweep continued running unattended throughout (tranche 8 in progress on TMV at session end).
