@@ -709,23 +709,6 @@ def _has_open_order(orders: list, ticker: str, exclude_order_id: int | None = No
     return False
 
 
-# _has_open_buy_order_in_account -- superseded 2026-08-07 by
-# _open_buy_tickers_in_account (below), which returns ALL other resting
-# tickers instead of just the first. Left commented rather than deleted
-# outright -- not yet re-reviewed after this specific cleanup (the paired
-# Opus review pass covered the diff that introduced the replacement, not
-# this follow-up removal); delete for real once that's confirmed safe.
-#
-# def _has_open_buy_order_in_account(orders: list, ticker: str) -> str | None:
-#     """Ticker symbol of another resting BUY order anywhere in this account (or
-#     None) -- used to block a second concurrent BUY into the same account."""
-#     for o in orders:
-#         for leg in o.get("orderLegCollection", []):
-#             if leg.get("instruction") == "BUY" and leg.get("instrument", {}).get("symbol") != ticker:
-#                 return leg.get("instrument", {}).get("symbol")
-#     return None
-
-
 def _open_buy_order_quantity(orders: list, ticker: str) -> float:
     """Total resting BUY quantity for `ticker` across `orders` -- the real
     committed share count, straight from the broker's own order book (not a
@@ -749,12 +732,13 @@ def _open_buy_order_quantity(orders: list, ticker: str) -> float:
 
 def _open_buy_tickers_in_account(orders: list, ticker: str) -> list[str]:
     """ALL other tickers with a resting BUY anywhere in this account (sorted,
-    deduplicated) -- the multi-order-aware sibling of
-    _has_open_buy_order_in_account. Needed once the account-wide BUY guard
-    stopped blocking unconditionally (2026-08-07, cash-aware reservation
-    fix) -- before that, at most ONE other resting BUY could ever exist by
-    construction (the old guard blocked a 2nd from ever landing), so the
-    singular _has_open_buy_order_in_account was sufficient. Once a 2nd
+    deduplicated) -- the multi-order-aware sibling of the earlier singular
+    lookup this function replaced (deleted 2026-08-08, its job is now fully
+    subsumed here). Needed once the account-wide BUY guard stopped blocking
+    unconditionally (2026-08-07, cash-aware reservation fix) -- before that,
+    at most ONE other resting BUY could ever exist by construction (the old
+    guard blocked a 2nd from ever landing), so the old singular lookup was
+    sufficient. Once a 2nd
     ticker's BUY is allowed to rest (cash permitting), a 3rd ticker's BUY
     must reserve against ALL of them, not just whichever one the singular
     lookup happened to return first -- found by cold Opus review before this
@@ -891,8 +875,9 @@ def check_order(
     BUY would. Never exempts: kill switch, account allowlist,
     node_automation_enabled/AUTOMATION_ENABLED_TICKERS, trading-day gate,
     HARD_ORDER_CEILING, notional_cap, daily_order_cap, burst cap,
-    duplicate-order window, or _has_open_buy_order_in_account (a resting BUY
-    for a DIFFERENT ticker in this account still blocks)."""
+    duplicate-order window, or _open_buy_tickers_in_account (a resting BUY
+    for a DIFFERENT ticker in this account still blocks, cash permitting --
+    see that function's docstring)."""
     if kill_switch_engaged():
         _limits = ACCOUNTS.get(account)
         _mode = "live" if (_limits and _limits.trading_enabled) else "dry_run"

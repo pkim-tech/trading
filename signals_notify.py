@@ -21,7 +21,8 @@ from signals_charts import _chart_buy, _chart_sell, _upload_chart
 from signals_blocks import _post_message, _post_chunked, _build_buy_blocks, _build_sell_blocks
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
-    buy_order_sizing, effectively_dry_run, log_poll, mode_tag, resolve_at_bar_close, stop_status,
+    buy_order_sizing, effectively_dry_run, has_capital_at_stake, log_poll, mode_tag,
+    resolve_at_bar_close, should_alert_live, stop_status,
 )
 # scripts/ has no __init__.py but is still importable as a Python 3 implicit
 # namespace package as long as repo root is on sys.path (true whenever this
@@ -1009,7 +1010,7 @@ def check_entry_abandon():
     without this, a trailing buy that never bounces has no timeout live at
     all -- the real broker order rests GOOD_TILL_CANCEL forever
     (schwab_client._build_trailing_order), and schwab_safety._has_open_order/
-    _has_open_buy_order_in_account then permanently block every other real
+    _open_buy_tickers_in_account then permanently block every other real
     BUY attempt on that ticker (or account, for the account-wide guard) since
     they see it as still-open. Found in the 2026-07-31 exit/arm/entry audit,
     [HIGHEST] of the items left open that session.
@@ -1380,10 +1381,19 @@ def notify_buy_signal(node, sig):
         sizing = buy_order_sizing(node, sig)
         auto_placed, order_id = _attempt_automated_market_buy(node, sizing)
 
-    channel, ts = _post_message(
-        f"BUY SIGNAL — {ticker}  ${price:.4f}  z={z:.2f}  ({bar_str})",
-        _build_buy_blocks(node, sig, auto_placed=auto_placed),
-    )
+    # Sub-capital-at-stake nodes get zero real-time Slack (2026-08-08 user
+    # call) -- both dry_run AND small-notional live nodes (e.g. soxl_ira's
+    # $500-$2,500 nodes) are below the bar; every event here is still fully
+    # logged (coverage_events, pending_buys) for EOD-only review regardless.
+    # Tracking below (pending_buys, automated placement) is unaffected --
+    # only the Slack post itself is skipped.
+    if not should_alert_live(node):
+        channel, ts = None, None
+    else:
+        channel, ts = _post_message(
+            f"BUY SIGNAL — {ticker}  ${price:.4f}  z={z:.2f}  ({bar_str})",
+            _build_buy_blocks(node, sig, auto_placed=auto_placed),
+        )
 
     # Tracked regardless of INTERACTIVE -- a trailing-buy or automated-market-buy
     # order is still pending fill confirmation even in SIM_MODE or webhook-only
@@ -1799,8 +1809,15 @@ def notify_sell_signal(pos, reason, current_price, target_price):
             db.log_coverage_event("automated_exit_confirmed", _coverage_mode(pos.get('account')), ticker=ticker,
                                    position_id=pos.get('id'), node_id=pos.get('wl_id'), result="closed",
                                    detail=f"reason={reason} price={filled['price']:.4f}")
-            _post_message(f"🤖 {ticker} — {reason_labels[reason]} auto-closed at ${filled['price']:.4f}  "
-                          f"(P&L: {(filled['price']-ep)/ep*100:+.2f}%)")
+            # _node is None fails toward ALERTING, not muting -- a deleted/
+            # unresolvable node behind a still-real, still-open position
+            # (the documented EDC/UDOW pattern: node removed or reconfigured
+            # while a real position stays open) must not silently lose its
+            # only alerts. Found by paired Opus review, 2026-08-08.
+            _node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+            if _node is None or has_capital_at_stake(_node):
+                _post_message(f"🤖 {ticker} — {reason_labels[reason]} auto-closed at ${filled['price']:.4f}  "
+                              f"(P&L: {(filled['price']-ep)/ep*100:+.2f}%)")
             print(f"  Auto-closed via confirmed broker fill @ ${filled['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
         return
 
@@ -1862,7 +1879,22 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     if suppress and already_tracked:
         print(f"  TRAIL exit routine (already tracked, resting) -- alert suppressed, state preserved")
         return
-    if suppress:
+    # Capital-at-stake gate (2026-08-08, extended after the user's explicit
+    # confirmation: "I'm not going to do anything anyway on these smaller
+    # positions" -- automation is the real protection for a sub-threshold
+    # node regardless, so this manual-confirmation alert is pointless noise
+    # for it, same as everything else muted tonight). Checked BEFORE the
+    # routine-wait suppress logic below, which exists to solve a different
+    # problem (don't go silent near the reminder-window cutoff) that only
+    # matters for a position the user will actually act on.
+    # _node is None fails toward ALERTING, not muting -- see the identical
+    # rationale above (auto-closed branch) and the paired Opus review finding
+    # that landed it, 2026-08-08.
+    _node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+    alert_eligible = _node is None or has_capital_at_stake(_node)
+    if not alert_eligible:
+        channel, ts = None, None
+    elif suppress:
         channel, ts = None, None
         print(f"  TRAIL exit routine (order already resting) -- alert suppressed")
     else:
@@ -1997,7 +2029,21 @@ def _supersede_message(channel, ts, ticker):
 def notify_trailing_activated(pos, current_price):
     ticker = pos['ticker']
     auto_placed, exit_order_id = _attempt_automated_sell(pos, current_price)
-    if auto_placed:
+    # Capital-at-stake gate (2026-08-08, extended to the manual-placement
+    # branch after the user's explicit confirmation: "I'm not going to do
+    # anything anyway on these smaller positions" -- automation is the real
+    # protection for a sub-threshold node regardless, so even the "place a
+    # real order" prompt is pointless noise for it). Node's static
+    # definition (has_capital_at_stake), not the position's own dollar
+    # exposure -- one consistent definition of "capital at stake"
+    # everywhere. dry_run is covered too (effectively_dry_run inside
+    # has_capital_at_stake always returns False for it).
+    # _node is None fails toward ALERTING, not muting -- see notify_sell_
+    # signal's identical fix and rationale, 2026-08-08 paired Opus review.
+    _node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+    if not (_node is None or has_capital_at_stake(_node)):
+        channel, ts = None, None
+    elif auto_placed:
         channel, ts = _post_message(
             f"🤖 {ticker} trailing stop activated — order auto-placed at the broker",
             blocks=[{"type": "section", "text": {"type": "mrkdwn",
@@ -2490,6 +2536,13 @@ def check_trailing_reminders(open_positions):
         pos = db.get_position_by_id(pos['id'])
         if pos is None:
             continue
+        # Sub-capital-at-stake nodes get zero real-time Slack, including this
+        # reminder loop -- found missing by paired Opus review, 2026-08-08.
+        # _node is None fails toward ALERTING (same rationale as
+        # notify_trailing_activated's identical fix), not muting.
+        _node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+        if _node is not None and not has_capital_at_stake(_node):
+            continue
         state = pos.get('trail_state') or {}
         if not state.get('trailing') or state.get('order_placed'):
             continue
@@ -2818,6 +2871,19 @@ def check_exit_reminders(open_positions):
         pos = db.get_position_by_id(pos['id'])
         if pos is None:
             continue
+        # dry_run gets zero Slack noise (2026-08-08 user call) -- mirrors
+        # check_trailing_reminders' existing is_dry_run_sim skip above, which
+        # this function never had (a real gap: dry_run exit reminders nagged
+        # every EXIT_REMINDER_MINUTES with nothing to actually confirm).
+        if pos.get('is_dry_run_sim'):
+            continue
+        # Sub-capital-at-stake nodes get zero real-time Slack, including this
+        # reminder loop -- found missing by paired Opus review, 2026-08-08.
+        # _node is None fails toward ALERTING, not muting (same rationale as
+        # the other three sites this session).
+        _node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+        if _node is not None and not has_capital_at_stake(_node):
+            continue
         state = pos.get('trail_state') or {}
         exit_pending = state.get('exit_pending')
         if not exit_pending:
@@ -2982,6 +3048,14 @@ def check_buy_reminders():
         account = pending['node'].get('account')
         if _effectively_dry_run(account, pending['node']):
             continue
+        # Sub-capital-at-stake nodes get zero real-time Slack, including the
+        # reminder loop -- found missing by paired Opus review, 2026-08-08:
+        # notify_buy_signal mutes the INITIAL alert but still creates the
+        # pending_buys row (tracking is deliberately unconditional), so
+        # without this the reminder loop nagged every BUY_REMINDER_MINUTES
+        # for a signal the user was never shown in the first place.
+        if not has_capital_at_stake(pending['node']):
+            continue
         last_at = datetime.strptime(pending['last_reminder_at'], '%Y-%m-%d %H:%M:%S')
         if (now - last_at).total_seconds() < BUY_REMINDER_MINUTES * 60:
             continue
@@ -3000,6 +3074,116 @@ def check_buy_reminders():
         channel, ts = _post_message(
             f"{pending['ticker']} trailing buy — still pending (reminder #{reminder_num})", blocks=blocks)
         db.update_pending_buy_reminder(pending['id'], channel, ts, reminder_num)
+
+
+INTRADAY_RISK_REVIEW_WINDOW = ((9, 15), (16, 0))
+
+# Conservative substring match against coverage_events.result -- deliberately
+# NOT matching "blocked_*" (found by paired Opus review, 2026-08-08: many
+# blocked_* results are a guard working correctly, e.g. blocked_same_ticker/
+# blocked_addon_leg, not a failure -- misclassifying those as "concerning"
+# would recreate the exact noise problem this whole session was about
+# fixing). Only unambiguous failure/anomaly language.
+_CONCERNING_RESULT_SUBSTRINGS = (
+    "fail", "reject", "mismatch", "tripped", "orphaned", "overspent", "unrecognized_account",
+)
+
+
+def _load_intraday_risk_review_state():
+    try:
+        state = json.loads(cfg.INTRADAY_RISK_REVIEW_STATE_PATH.read_text())
+        return state if isinstance(state, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_intraday_risk_review_state(state):
+    cfg.INTRADAY_RISK_REVIEW_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cfg.INTRADAY_RISK_REVIEW_STATE_PATH.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state))
+    tmp.replace(cfg.INTRADAY_RISK_REVIEW_STATE_PATH)
+
+
+def check_intraday_risk_review(now=None):
+    """Reviews trading_incidents AND coverage_events for anything new since
+    the last check and Slack-alerts only if something's there -- built
+    2026-08-08 as the direct consequence of muting routine/anomaly Slack
+    alerts for sub-capital-at-stake nodes (soxl_ira's small live positions,
+    dry_run, canary) tonight: those events are still fully logged, just not
+    paged in real time, so this is what actually reviews them.
+
+    Originally scoped to trading_incidents only -- found by paired Opus
+    review, 2026-08-08, to have no real trigger: no daemon code path calls
+    log_incident, only manual scripts do, so the check ran every cycle and
+    could never find anything real. Extended to also scan coverage_events,
+    filtered to _CONCERNING_RESULT_SUBSTRINGS (deliberately narrow -- see
+    that constant's own comment) so it can't recreate the noise problem this
+    whole session was about fixing. Most real anomalies already have their
+    own unconditional, size-independent Slack alert (the UNPROTECTED-style
+    🚨 messages elsewhere in this file, never touched by tonight's muting) --
+    this is a second-layer catch for anything logged to coverage_events
+    WITHOUT a dedicated alert of its own.
+
+    A judgment-based review layer (an LLM call, or a dedicated session,
+    reading raw events rather than this fixed rule) was discussed and
+    deliberately deferred -- this is the cheap, deterministic first version.
+    No interval throttle deliberately -- this is a cheap DB query, not an
+    LLM call, so it just runs every poll cycle (POLL_SECS, ~5min default)
+    inside INTRADAY_RISK_REVIEW_WINDOW on a real trading day; caller (the
+    main poll loop) calls this unconditionally every cycle, the
+    window/trading-day gating happens in here.
+
+    Both watermarks: on a missing/corrupt state file, seed to the CURRENT
+    max id (not 0) so a fresh start doesn't dump every historical row
+    (including already-resolved incidents) as "new" -- found by paired Opus
+    review. Watermarks only advance on a CONFIRMED post (channel and ts both
+    truthy) -- a failed/unconfirmed Slack post must not silently mark a real
+    incident as reviewed, found by the same review round."""
+    now = now or datetime.now()
+    today = now.strftime('%Y-%m-%d')
+    if not _coverage_is_trading_day(today):
+        return
+    (h0, m0), (h1, m1) = INTRADAY_RISK_REVIEW_WINDOW
+    if not ((h0, m0) <= (now.hour, now.minute) <= (h1, m1)):
+        return
+
+    state = _load_intraday_risk_review_state()
+
+    all_incidents = db.get_incidents(open_only=True, limit=200)
+    if 'last_seen_incident_id' not in state:
+        state['last_seen_incident_id'] = max((i['id'] for i in all_incidents), default=0)
+    last_seen_incident_id = state['last_seen_incident_id']
+    new_incidents = sorted(
+        (i for i in all_incidents if i['id'] > last_seen_incident_id), key=lambda i: i['id'])
+
+    all_events = db.get_coverage_events(limit=500)
+    if 'last_seen_coverage_event_id' not in state:
+        state['last_seen_coverage_event_id'] = max((e['id'] for e in all_events), default=0)
+    last_seen_event_id = state['last_seen_coverage_event_id']
+    new_events = sorted(
+        (e for e in all_events
+         if e['id'] > last_seen_event_id
+         and any(s in (e.get('result') or '') for s in _CONCERNING_RESULT_SUBSTRINGS)),
+        key=lambda e: e['id'])
+
+    if new_incidents or new_events:
+        lines = [f"🚨 Intraday risk review — {len(new_incidents)} new incident(s), "
+                 f"{len(new_events)} concerning coverage event(s) since last check:"]
+        for i in new_incidents:
+            money = " [REAL MONEY]" if i.get('real_money_impact') else ""
+            lines.append(f"  [incident #{i['id']}]{money} {i['ticker'] or ''} ({i.get('account') or 'n/a'}) — {i['title']}")
+            lines.append(f"    {i['detail'][:300]}")
+        for e in new_events:
+            lines.append(f"  [coverage_event #{e['id']}] {e['scenario_key']} result={e['result']} "
+                         f"{e.get('ticker') or ''} — {(e.get('detail') or '')[:200]}")
+        channel, ts = _post_message("\n".join(lines))
+        if channel and ts:
+            if new_incidents:
+                state['last_seen_incident_id'] = max(i['id'] for i in new_incidents)
+            if new_events:
+                state['last_seen_coverage_event_id'] = max(e['id'] for e in new_events)
+
+    _save_intraday_risk_review_state(state)
 
 
 def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, target_notional=None):
@@ -4302,8 +4486,25 @@ def build_phased_monitors_report(check_date):
 def send_reference_report(watchlist):
     """One source of truth (build_reference_table) rendered as mobile-readable
     prose per ticker -- flat and held both shown with their real next trigger,
-    grouped: held positions first, then buy candidates sorted by proximity."""
+    grouped: held positions first, then buy candidates sorted by proximity.
+
+    One uniform filter (2026-08-08 user call, final form): both Open
+    Positions and Buy Candidates are filtered to has_capital_at_stake nodes
+    only ($10k+ starting_notional, live). An earlier draft showed any real
+    open position regardless of size -- explicitly rejected by the user
+    ("i just said i don't want to see it") in favor of one consistent rule
+    everywhere, no size carve-out. Sub-threshold real positions (e.g.
+    soxl_ira's $500 nodes) are still fully tracked/protected by automation
+    and logged to coverage_events -- just not shown in this report.
+    When there's nothing in either tier, still posts the header/kill-switch-
+    status/engine-buttons block (this is the ONLY place those buttons ever
+    render -- an earlier version of this function short-circuited before
+    building them at all, silently removing the emergency Stop Engine
+    control from Slack every single day once zero nodes crossed the
+    threshold, found and fixed by paired Opus review, 2026-08-08) and adds
+    a short status line instead of the full held/candidate detail."""
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+    watchlist = [n for n in watchlist if has_capital_at_stake(n)]
     rows = build_reference_table(watchlist)
 
     def sort_key(r):
@@ -4359,10 +4560,18 @@ def send_reference_report(watchlist):
         for r in held_rows:
             units.append(_ticker_block(r))
     else:
-        units.append([{"type": "context", "elements": [{"type": "mrkdwn", "text": "No open positions."}]}])
+        # Not "No open positions" -- that's a claim about ALL real positions,
+        # which this report no longer shows (a sub-threshold live position,
+        # e.g. soxl_ira's $500 nodes, may genuinely be open right now, just
+        # not rendered here). Fixed by paired Opus review, 2026-08-08.
+        units.append([{"type": "context", "elements": [{"type": "mrkdwn",
+            "text": f"No open positions above ${cfg.CAPITAL_AT_STAKE_THRESHOLD:,.0f} initial notional."}]}])
 
     units.append([{"type": "divider"}])
     units.append([{"type": "header", "text": {"type": "plain_text", "text": "Buy Candidates"}}])
+    if not flat_rows:
+        units.append([{"type": "context", "elements": [{"type": "mrkdwn",
+            "text": f"No nodes above ${cfg.CAPITAL_AT_STAKE_THRESHOLD:,.0f} initial notional to watch."}]}])
     for r in flat_rows:
         units.append(_ticker_block(r))
         proximity = r.get('Proximity')

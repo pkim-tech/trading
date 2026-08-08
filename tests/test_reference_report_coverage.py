@@ -30,6 +30,11 @@ def env(monkeypatch):
 
 
 def test_send_reference_report_logs_sent_on_successful_post(env, monkeypatch):
+    # Empty watchlist -> no held/candidate rows -> still goes through the
+    # normal _post_chunked path (2026-08-08: the earlier "nothing to report"
+    # short-circuit was removed by paired Opus review -- it silently dropped
+    # the kill-switch status and Start/Stop Engine buttons from Slack every
+    # day once zero nodes crossed the capital-at-stake threshold).
     monkeypatch.setattr(signals_notify, '_post_chunked', lambda *a, **kw: ("C123", "1234.5678"))
     signals_notify.send_reference_report([])
     events = signals_db.get_coverage_events(scenario_key="morning_report_delivery")
@@ -50,8 +55,12 @@ def test_send_reference_report_actually_chunks_a_large_watchlist(env, monkeypatc
     path end-to-end against a synthetic 60-row watchlist -- the unit tests for
     _post_chunked itself only use synthetic block lists, so nothing previously
     proved real report rows chunk correctly at scale (Opus review, 2026-07-26)."""
+    # _node must be a real capital-at-stake node (2026-08-08: Buy Candidates
+    # rows are now filtered to has_capital_at_stake) -- state='live' in a
+    # trading_enabled account, starting_notional over the $10k bar.
     fake_rows = [
-        {"Ticker": f"T{i}", "Version": "v5", "Held": False, "Next Action": "NO_DATA", "Strategy": "Test"}
+        {"Ticker": f"T{i}", "Version": "v5", "Held": False, "Next Action": "NO_DATA", "Strategy": "Test",
+         "_node": {"state": "live", "account": "soxl_ira", "starting_notional": 20_000}}
         for i in range(60)
     ]
     monkeypatch.setattr(signals_notify, 'build_reference_table', lambda watchlist: fake_rows)

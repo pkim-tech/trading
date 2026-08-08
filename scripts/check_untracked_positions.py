@@ -171,15 +171,15 @@ def _check_null_account_rows():
     return findings
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--account", nargs="+", help="specific account(s); default: every account in "
-                     "schwab_safety.ACCOUNTS plus any other linked/resolvable account")
-    args = ap.parse_args()
-
-    if args.account:
-        accounts = args.account
-    else:
+def run_full_sweep(accounts=None):
+    """Runs the sweep across `accounts` (default: every schwab_safety.ACCOUNTS
+    account plus any other linked/resolvable one, same default as main()) and
+    returns {account: [finding, ...]} for accounts with findings, "(NULL
+    account)" included when applicable. Empty dict means clean. Shared by
+    main() (CLI) and active_signals.py's 07:00 readiness block (auto-run,
+    detect-only -- see docs/backlog_cache.md's 2026-08-07 self-heal scoping
+    decision: alert on findings, never auto-correct)."""
+    if accounts is None:
         # Union, not just schwab_safety.ACCOUNTS.keys() -- a linked account
         # that isn't in ACCOUNTS yet (e.g. a newly-opened one, still pending
         # compliance/token setup) is real and holds real shares, but was
@@ -200,6 +200,17 @@ def main():
     null_findings = _check_null_account_rows()
     if null_findings:
         all_findings["(NULL account)"] = null_findings
+
+    return all_findings
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--account", nargs="+", help="specific account(s); default: every account in "
+                     "schwab_safety.ACCOUNTS plus any other linked/resolvable account")
+    args = ap.parse_args()
+
+    all_findings = run_full_sweep(args.account)
 
     print(f"\n{'='*60}")
     if all_findings:

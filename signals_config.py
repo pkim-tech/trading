@@ -23,6 +23,18 @@ CONFIG_PATH      = Path("./config.json")
 POLL_SECS        = int(os.environ.get("SIGNAL_POLL_SECS", 300))
 SLACK_HOOK       = os.environ.get("SLACK_WEBHOOK_URL", "")
 
+# Dollar bar a live node's starting_notional must cross to count as genuine
+# capital at stake (2026-08-08 user call) -- below this, Slack alerting
+# (routine AND anomaly) is suppressed in favor of EOD-only review; the
+# underlying event/incident logging is never suppressed regardless of this
+# threshold. See signals_helpers.has_capital_at_stake.
+CAPITAL_AT_STAKE_THRESHOLD = float(os.environ.get("CAPITAL_AT_STAKE_THRESHOLD", 10_000))
+
+# Persisted marker for signals_notify.check_intraday_risk_review -- survives
+# a daemon restart (unlike an in-memory set) so a restart mid-window doesn't
+# either re-alert on an already-seen incident or silently skip a new one.
+INTRADAY_RISK_REVIEW_STATE_PATH = LIVE_DIR / "intraday_risk_review_state.json"
+
 LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 HUMAN_LOG_PATH   = LOG_DIR / "active_signals.log"

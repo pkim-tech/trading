@@ -1542,3 +1542,21 @@ not execution, despite feeling operational.
 portfolio/tax/risk settle into periodic checks rather than open decisions, most remaining active-judgment work
 collapses into the research persona — the next alpha search never really stops being live work the way the
 others do.
+
+---
+
+## Capital-at-stake alerting model (2026-08-08)
+
+Real-time Slack visibility is now gated on `signals_helpers.has_capital_at_stake(node)` —
+`state=='live'` AND the account has `trading_enabled=True` AND `starting_notional` crosses
+`signals_config.CAPITAL_AT_STAKE_THRESHOLD` ($10k default, env-configurable) — not on `live` vs
+`dry_run` alone. Below the bar (which includes `soxl_ira`'s current 11 real nodes, deliberately
+kept small as a proving-ground tier): zero real-time Slack for routine signals, reminder loops,
+and manual-action prompts alike — the underlying event/state tracking is never suppressed, only
+the Slack post. `signals_notify.check_intraday_risk_review()` (wired into `active_signals.py`'s
+poll loop) is the compensating control: reviews `trading_incidents` plus a narrow
+`coverage_events` scan every cycle during market hours, alerting only on something genuinely new.
+Full build/review narrative, incl. the 4 HIGH bugs a paired Opus review found and fixed (ungated
+reminder loops, the Reference Report's empty-state path silently dropping the kill-switch
+status/Stop Engine buttons, node-lookup failures muting real alerts, the review having no real
+trigger before the `coverage_events` extension): `docs/deep_backlog.md`'s 2026-08-08 entry.

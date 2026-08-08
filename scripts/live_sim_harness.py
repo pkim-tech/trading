@@ -138,7 +138,14 @@ def scenario_pinned_entry_trailing_buy(posted):
     pending = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
     assert pending, "expected a pending_buys row after a trailing-buy BUY signal"
     assert pending[0]['order_placed'], "trailing-buy order should auto-place (dry_run) and mark placed"
-    assert any('BUY SIGNAL' in m for m in posted), "expected the BUY SIGNAL Slack message"
+    # The harness's 'ira' account is dry_run (trading_enabled=False) -- as of
+    # 2026-08-08, dry_run nodes get zero real-time Slack for the routine BUY
+    # SIGNAL post (has_capital_at_stake is always False for a dry_run node),
+    # even though the underlying entry mechanics (pending_buys row, order
+    # marked placed) are deliberately unconditional and still fire, asserted
+    # above. Confirms the mute, not just its absence.
+    assert not any('BUY SIGNAL' in m for m in posted), \
+        "BUY SIGNAL should be muted for this dry_run node, not posted"
     assert any('TRAILING BUY' in m for m in posted), "expected the dry-run trailing-buy order message"
 
 

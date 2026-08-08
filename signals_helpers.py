@@ -70,6 +70,40 @@ def mode_tag(account, node=None):
     return "DRY-RUN" if effectively_dry_run(account, node) else "LIVE"
 
 
+def has_capital_at_stake(node):
+    """True only when a node is BOTH live (real order placement -- see
+    effectively_dry_run) AND sized at genuinely meaningful capital
+    (starting_notional >= cfg.CAPITAL_AT_STAKE_THRESHOLD). 'live' alone is
+    not the same fact -- soxl_ira's nodes place real orders but at
+    $500-$2,500 notional, which the user explicitly does not consider
+    capital at stake (2026-08-08). Deliberately mechanical (a dollar
+    comparison, not a manual per-node tag) so a node crosses this bar
+    automatically once real accounts (roth/brokerage) are funded and sized
+    for real, without needing another manual re-scoping pass. Zero nodes
+    cross it as of 2026-08-08."""
+    account = node.get('account')
+    if effectively_dry_run(account, node):
+        return False
+    return (node.get('starting_notional') or 0) >= cfg.CAPITAL_AT_STAKE_THRESHOLD
+
+
+def should_alert_live(node):
+    """Whether THIS node's Slack alerts (routine AND anomaly alike) should
+    post in real time at all, vs. being suppressed in favor of EOD-only
+    review (2026-08-08 user call -- explicitly NOT limited to routine
+    alerts: a bug affecting a shared code path could just as easily hit a
+    capital-at-stake node, so sub-threshold anomalies still need reviewing,
+    just not real-time paging). This gate is ONLY for the Slack post itself
+    -- every caller must keep its own coverage_events/log_incident call
+    unconditional regardless of this return value, so nothing is silently
+    lost, only its real-time visibility. Equivalent to has_capital_at_stake
+    today (single deciding factor), but named/kept separate since the
+    decision of "does this alert page now" is conceptually the caller's
+    question, not the same question has_capital_at_stake answers for the
+    Reference Report's candidate-row filter."""
+    return has_capital_at_stake(node)
+
+
 def stop_status(pos):
     """Distinguishes what broker_stop_price actually tells us for a given
     position, since None is ambiguous between several very different

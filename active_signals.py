@@ -121,6 +121,7 @@ from signals_notify import (
     update_dry_run_buys, update_real_pending_buys_running_low, check_dry_run_sim_sells,
     check_entry_abandon, build_eod_scenario_review,
     check_drought_entry, check_drought_handoff, check_addon_leg_reconciliation,
+    check_intraday_risk_review,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
@@ -836,6 +837,35 @@ def run_loop(tickers: set = None):
                         # just visibility at start of day.
                         _guarded("live_node_state[07:00]", signals_invariants.print_all_live_node_state)
 
+                        # Ground-truth broker sweep -- "does the broker hold
+                        # anything real with no local record, or a local
+                        # record the broker no longer backs" -- previously
+                        # only ever run on-demand (scripts/check_untracked_
+                        # positions.py, built after the GDXU incident sat
+                        # undetected a week). Wired in here 2026-08-08 per
+                        # user's explicit scoping call: auto-run, detect-only,
+                        # alert on findings, NEVER auto-correct -- matches
+                        # every other "ground truth vs local belief" check in
+                        # this project (daily-track reconciliation, node
+                        # circuit breaker) that deliberately stays
+                        # observation-only, since auto-correction would erase
+                        # the exact signal this sweep exists to surface.
+                        def _check_untracked_positions():
+                            from scripts.check_untracked_positions import run_full_sweep
+                            findings = run_full_sweep()
+                            if findings:
+                                total = sum(len(f) for f in findings.values())
+                                lines = []
+                                for acct, acct_findings in findings.items():
+                                    lines.append(f"*{acct}*")
+                                    lines.extend(acct_findings)
+                                msg = "\n".join(lines)
+                                print(f"[untracked_positions] {rlabel}: {total} finding(s):\n{msg}")
+                                _post_message(f"🚨 Untracked/mismatched real position(s) found ({today}):\n{msg}")
+                            else:
+                                print(f"[untracked_positions] {rlabel}: clean, all accounts matched.")
+                        _guarded("untracked_positions[07:00]", _check_untracked_positions)
+
             gap_h0, gap_m0, gap_h1, gap_m1 = _GAP_CHECK_WINDOW
             if (gap_h0, gap_m0) <= (now.hour, now.minute) <= (gap_h1, gap_m1) and today not in gap_check_alerted:
                 gap_check_alerted.add(today)
@@ -1161,6 +1191,12 @@ def run_loop(tickers: set = None):
                 _guarded("trailing_reminders", check_trailing_reminders, open_positions)
                 _guarded("exit_reminders", check_exit_reminders, open_positions)
                 _guarded("buy_reminders", check_buy_reminders)
+
+            # Called every cycle (POLL_SECS cadence, no interval throttle of
+            # its own -- deliberately, it's a cheap DB query) -- its own
+            # internal gating (trading day + 9:15-16:00 ET window) decides
+            # whether it actually does anything, same pattern as check_gap_resize.
+            _guarded("intraday_risk_review", check_intraday_risk_review)
 
             # Not gated to market hours -- a GTC trailing order can fill any time it's
             # resting at the broker, and auto-fill-detection is opt-in per ticker anyway

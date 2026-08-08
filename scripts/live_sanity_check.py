@@ -124,6 +124,19 @@ def run_one(client, account_hash, ticker, test, account_label):
                        f"(order_id={order_id}) — check Schwab immediately")
         db.log_coverage_event(f"sanity_{test}", "live", ticker=ticker, result="unexpectedly_accepted",
                                detail=f"order_id={order_id} qty={quantity}")
+        # A Slack ping alone can be missed if the operator has stepped away
+        # since typing the confirmation -- this position/order has zero row
+        # in open_positions (no watch_list node backs it), so without a
+        # durable ticket it could go unnoticed the same way GDXU's untracked
+        # order did. trading_incidents survives until someone explicitly
+        # resolves it, unlike a Slack message.
+        db.log_incident(
+            f"live_sanity_check: {test} unexpectedly ACCEPTED for {ticker}",
+            f"order_id={order_id} qty={quantity} account={account_label} -- expected Schwab to "
+            f"reject this order; it was accepted instead. This position/order has NO row in "
+            f"open_positions (no watch_list node backs it) and will not be monitored or exited "
+            f"automatically. Verify real state in Schwab's UI and resolve manually.",
+            ticker=ticker, account=account_label, real_money_impact=True)
     except Exception as e:
         print(f"  REJECTED as expected: {e}")
         _post_message(f"✅ SANITY TEST {ticker} — order rejected as expected ({test})")
