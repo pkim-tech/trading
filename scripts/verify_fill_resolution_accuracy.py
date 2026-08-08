@@ -145,6 +145,58 @@ def find_all_resolution_signals(ticker, window, z_thresh, trail_buy_pct, max_hol
     return [results[i] for i in order if results[i]['signal_time'] >= cutoff]
 
 
+def fill_accuracy_for_node(ticker, window, z_score_threshold, trail_buy_pct_pct, max_hold_hours, df_5m=None):
+    """Real-signal fill-accuracy diffs for one node, as a DataFrame (columns:
+    signal_time, possible_diff_pct, pessimistic_diff_pct, certain_diff_pct).
+    Pass a pre-downloaded df_5m to avoid re-fetching yfinance per node when
+    comparing several candidate nodes for the same ticker (candidate_5min_report.py).
+    Extracted from main() 2026-08-08 (later) so callers other than the CLI
+    (e.g. a multi-candidate comparison report) can reuse this without a
+    subprocess/CLI round trip."""
+    trail_buy_pct = trail_buy_pct_pct / 100.0
+    cutoff = pd.Timestamp.now().normalize() - timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
+    signals = find_all_resolution_signals(
+        ticker, window, z_score_threshold, trail_buy_pct, max_hold_hours, cutoff)
+    real_signals = [s for s in signals if any(k in s for k in ('possible', 'pessimistic', 'certain'))]
+    if not real_signals:
+        return pd.DataFrame(columns=['signal_time', 'possible_diff_pct', 'pessimistic_diff_pct', 'certain_diff_pct'])
+
+    if df_5m is None:
+        df_5m = yf.download(ticker, period="60d", interval="5m", multi_level_index=False, progress=False)
+        df_5m.index = pd.to_datetime(df_5m.index).tz_localize(None)
+
+    rows = []
+    for s in real_signals:
+        real = replay_five_min(ticker, df_5m, s['signal_time'], s['signal_close'],
+                                trail_buy_pct, s['cutoff_time'])
+        if real is None:
+            continue
+        row = {'signal_time': s['signal_time']}
+        for res in ('possible', 'pessimistic', 'certain'):
+            if res in s:
+                _, px = s[res]
+                row[f'{res}_diff_pct'] = (real['five_min_entry_price'] - px) / px * 100
+            else:
+                row[f'{res}_diff_pct'] = None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def print_accuracy_summary(df):
+    diff_cols = ['possible_diff_pct', 'pessimistic_diff_pct', 'certain_diff_pct']
+    print("\n--- Which resolution is closest to the real 5-min fill, per signal ---")
+    abs_diffs = df[diff_cols].abs()
+    closest = abs_diffs.idxmin(axis=1).str.replace('_diff_pct', '', regex=False)
+    print(closest.value_counts())
+
+    print("\n--- Mean absolute price diff vs real 5-min fill, per resolution ---")
+    for col in diff_cols:
+        vals = df[col].dropna()
+        if len(vals):
+            print(f"  {col.replace('_diff_pct', ''):12}: mean_abs={vals.abs().mean():.3f}%  "
+                  f"mean_signed={vals.mean():+.3f}%  n={len(vals)}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--adhoc", required=True,
@@ -158,56 +210,24 @@ def main():
                        'z_score_threshold': float(z), 'trail_buy_pct': float(tb),
                        'max_hold_hours': int(hold)})
 
-    cutoff = pd.Timestamp.now().normalize() - timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
-    rows = []
-
+    all_rows = []
     for n in nodes:
-        ticker = n['ticker']
-        trail_buy_pct = n['trail_buy_pct'] / 100.0
-        signals = find_all_resolution_signals(
-            ticker, n['window'], n['z_score_threshold'], trail_buy_pct, n['max_hold_hours'], cutoff)
-        real_signals = [s for s in signals if any(k in s for k in ('possible', 'pessimistic', 'certain'))]
-        if not real_signals:
-            print(f"{ticker}: no resolved signals in the last {FIVE_MIN_LOOKBACK_DAYS}d")
+        df = fill_accuracy_for_node(n['ticker'], n['window'], n['z_score_threshold'],
+                                     n['trail_buy_pct'], n['max_hold_hours'])
+        if df.empty:
+            print(f"{n['ticker']}: no resolved signals in the last {FIVE_MIN_LOOKBACK_DAYS}d")
             continue
+        df.insert(0, 'ticker', n['ticker'])
+        all_rows.append(df)
 
-        df_5m = yf.download(ticker, period="60d", interval="5m", multi_level_index=False, progress=False)
-        df_5m.index = pd.to_datetime(df_5m.index).tz_localize(None)
-
-        for s in real_signals:
-            real = replay_five_min(ticker, df_5m, s['signal_time'], s['signal_close'],
-                                    trail_buy_pct, s['cutoff_time'])
-            if real is None:
-                continue
-            row = {'ticker': ticker, 'signal_time': s['signal_time']}
-            for res in ('possible', 'pessimistic', 'certain'):
-                if res in s:
-                    _, px = s[res]
-                    row[f'{res}_diff_pct'] = (real['five_min_entry_price'] - px) / px * 100
-                else:
-                    row[f'{res}_diff_pct'] = None
-            rows.append(row)
-
-    if not rows:
+    if not all_rows:
         print("No comparable signals found.")
         return
 
-    df = pd.DataFrame(rows)
+    df = pd.concat(all_rows, ignore_index=True)
     pd.set_option('display.width', 160)
     print(df.to_string(index=False))
-
-    print("\n--- Which resolution is closest to the real 5-min fill, per signal ---")
-    diff_cols = ['possible_diff_pct', 'pessimistic_diff_pct', 'certain_diff_pct']
-    abs_diffs = df[diff_cols].abs()
-    closest = abs_diffs.idxmin(axis=1).str.replace('_diff_pct', '', regex=False)
-    print(closest.value_counts())
-
-    print("\n--- Mean absolute price diff vs real 5-min fill, per resolution ---")
-    for col in diff_cols:
-        vals = df[col].dropna()
-        if len(vals):
-            print(f"  {col.replace('_diff_pct', ''):12}: mean_abs={vals.abs().mean():.3f}%  "
-                  f"mean_signed={vals.mean():+.3f}%  n={len(vals)}")
+    print_accuracy_summary(df)
 
 
 if __name__ == "__main__":
