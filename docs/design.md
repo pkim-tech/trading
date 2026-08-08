@@ -645,6 +645,17 @@ Grid and the canary system were kept separate on purpose, see the `docs/backlog_
 2026-07-27 entries). This section is a map of what exists and what each one is actually for, so that
 doesn't need re-deriving in conversation.
 
+**Partial exception, 2026-08-08**: all 7 canary letters' `scenario_expectations` scenarios now also
+appear as `REGISTRY` rows on the Trade-Flow Accountability Grid (`scripts/coverage_registry.py`,
+`check_mechanism='scenario_expectations'`), since canary nodes lost all real-time Slack visibility
+that same session (the "capital at stake" alert redesign mutes any `state='dry_run'` node, which every
+canary is by construction) — the Grid/EOD report became the only place to see canary activity at all.
+This is visibility unification only, not a merge of what each system answers: the Grid still tracks
+all-time evidence, canary/`coverage_check.py` still tracks day-scoped expected-vs-actual. See
+`docs/deep_backlog.md`'s 2026-08-08 (weekend) entry for the full build (plus `scripts/restage_canary_nodes.py`,
+a nightly close-only reset tool for stale canary positions, and the paired-review fixes that redesign
+went through).
+
 | System | Answers | Scope | Key files |
 |---|---|---|---|
 | **Trade-Flow Accountability Grid** | "Has this real logic branch ever fired, live/dry-run/paper, ever?" — an all-time evidence log. | Project-wide (32-41+ rows, one per real trade-flow branch) | `scripts/coverage_registry.py`, `pages/14_Coverage.py` |

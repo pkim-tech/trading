@@ -95,6 +95,54 @@ REGISTRY = [
          check_mechanism='scenario_expectations', scenario_key='canary_market_buy_exit',
          notes="No real (non-dry_run) order has ever been placed by this system. Entry mechanism not "
                "separately verified by the daily check."),
+    dict(id='canary_full_lifecycle',
+         scenario="A/A-mirror (IVV/SPXU): full happy-path lifecycle same day -- entry -> bounce-fill -> "
+                  "arm -> trailing-sell exit, hair-trigger config (fixed_sl=30% unreachable, arm/trail "
+                  "thresholds 0.1%) forcing every state transition to fire same-day",
+         code_path="Whole BUY->arm->TRAIL scan chain (active_signals._scan_buy_signals / "
+                    "check_sell_condition) -- a full-daemon regression, not one function",
+         offline_coverage="N/A -- deliberately a full-stack live regression, not isolated to one "
+                           "fake_broker scenario",
+         check_mechanism='scenario_expectations', scenario_key='canary_full_lifecycle',
+         notes="Canary letter A (docs/design.md's A-F design, see scripts/list_canary_nodes.py). "
+               "The baseline 'does the whole mechanism work end to end' proof. Added to the Grid "
+               "2026-08-08 -- previously checked daily by coverage_check.py but had no Grid row."),
+    dict(id='canary_early_sl',
+         scenario="B/B-mirror (QQQ/QID): entry -> bounce-fill -> immediate same-day SL "
+                  "(arm=10% unreachable, fixed_sl=0.1% hair-trigger)",
+         code_path="check_sell_condition's SL branch, exercised via the daily poll",
+         offline_coverage="N/A -- live regression",
+         check_mechanism='scenario_expectations', scenario_key='canary_early_sl',
+         notes="Canary letter B. Added to the Grid 2026-08-08."),
+    dict(id='canary_overnight_carry',
+         scenario="D/D-mirror (DIA/SDOW): trail_buy_pct=5.0% wide enough that the bounce-fill is "
+                  "unlikely to complete same day -- expects a pending trailing-buy still resting "
+                  "(pending_buys row) at EOD, carried into tomorrow's open",
+         code_path="pending_buys tracking / running_low across a session boundary -- regression check "
+                    "for the 2026-07-22 stale-cache-at-open fix",
+         offline_coverage="N/A -- live regression",
+         check_mechanism='scenario_expectations', scenario_key='canary_overnight_carry',
+         notes="Canary letter D. A same-day fill isn't itself wrong, just not the scenario this canary "
+               "is designed to exercise -- coverage_check.py's check already handles that ambiguity "
+               "(either a pending row or a closed trade counts as 'something real happened,' only the "
+               "former matches design intent). Added to the Grid 2026-08-08."),
+    dict(id='canary_time_exit',
+         scenario="F/F-mirror (XLF/FAZ): arm (take_profit=50%) and SL both practically unreachable, "
+                  "max_hold_hours=2 -- the only exit path left open is TIME",
+         code_path="check_sell_condition's TIME branch / exit_forced_by_hold_time",
+         offline_coverage="N/A -- live regression",
+         check_mechanism='scenario_expectations', scenario_key='canary_time_exit',
+         notes="Canary letter F. Added to the Grid 2026-08-08."),
+    dict(id='canary_bull_bear_pair',
+         scenario="G pair (JNUG/JDST): same-underlying (junior gold miners) bull/bear pair, correlation-"
+                  "check design",
+         code_path="No dedicated code path -- both nodes run the standard mechanism; this canary is "
+                    "about the PAIR relationship, not a single mechanism",
+         offline_coverage="N/A -- live regression",
+         check_mechanism='scenario_expectations', scenario_key='canary_bull_bear_pair',
+         notes="Canary letter G. No real correlation-verification logic built yet (see "
+               "docs/backlog_cache.md) -- monitored the same simple same-day-trade-happened way as "
+               "every other canary. Added to the Grid 2026-08-08."),
     dict(id='sl_sync_placement',
          scenario="SL placed at signal price after fill (sync path)",
          code_path="_place_stop_loss_for_position via sync confirm",

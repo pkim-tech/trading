@@ -133,7 +133,7 @@ def test_check_trade_lifecycle_met_when_exit_reason_matches(isolated_db):
     _add_closed_trade('WIN', today, today)
     check_date = today.date().isoformat()
     scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["WIN", "LOSS"]}')
-    met, summary = _check_trade_lifecycle(scenario, check_date)
+    met, summary, _no_activity = _check_trade_lifecycle(scenario, check_date)
     assert met is True
     assert 'WIN' in summary
 
@@ -143,14 +143,14 @@ def test_check_trade_lifecycle_not_met_on_wrong_exit_reason(isolated_db):
     _add_closed_trade('SL', today, today)
     check_date = today.date().isoformat()
     scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["WIN", "LOSS"]}')
-    met, summary = _check_trade_lifecycle(scenario, check_date)
+    met, summary, _no_activity = _check_trade_lifecycle(scenario, check_date)
     assert met is False
     assert 'SL' in summary
 
 
 def test_check_trade_lifecycle_not_met_when_no_trade_closed(isolated_db):
     scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["TIME"]}')
-    met, summary = _check_trade_lifecycle(scenario, '2026-07-24')
+    met, summary, _no_activity = _check_trade_lifecycle(scenario, '2026-07-24')
     assert met is False
     assert 'no closed trade' in summary
 
@@ -164,14 +164,14 @@ def test_check_trade_lifecycle_pending_carryover_met_by_pending_row(isolated_db)
     db.add_pending_buy(n, sig, channel='C123', ts='123.456')
     check_date = now.date().isoformat()
     scenario = dict(ticker=TICKER, check_params='{"expect_pending_carryover": true}')
-    met, summary = _check_trade_lifecycle(scenario, check_date)
+    met, summary, _no_activity = _check_trade_lifecycle(scenario, check_date)
     assert met is True
     assert 'pending_buys' in summary
 
 
 def test_check_trade_lifecycle_pending_carryover_not_met_when_nothing_happened(isolated_db):
     scenario = dict(ticker=TICKER, check_params='{"expect_pending_carryover": true}')
-    met, summary = _check_trade_lifecycle(scenario, '2026-07-24')
+    met, summary, _no_activity = _check_trade_lifecycle(scenario, '2026-07-24')
     assert met is False
 
 
@@ -188,7 +188,7 @@ def test_check_trade_lifecycle_pending_carryover_met_when_signal_predates_check_
     db.add_pending_buy(n, sig, channel='C123', ts='123.456')
     check_date = datetime.now().date().isoformat()
     scenario = dict(ticker=TICKER, check_params='{"expect_pending_carryover": true}')
-    met, summary = _check_trade_lifecycle(scenario, check_date)
+    met, summary, _no_activity = _check_trade_lifecycle(scenario, check_date)
     assert met is True
     assert 'pending_buys' in summary
 
@@ -226,8 +226,8 @@ def test_check_trade_lifecycle_scopes_to_node_not_just_ticker(isolated_db):
     scenario_b = dict(ticker=TICKER, node_id=node_b['id'],
                        check_params='{"expect_exit_reason": ["WIN", "LOSS"]}')
 
-    met_a, _ = _check_trade_lifecycle(scenario_a, check_date)
-    met_b, summary_b = _check_trade_lifecycle(scenario_b, check_date)
+    met_a, _, _a_no_activity = _check_trade_lifecycle(scenario_a, check_date)
+    met_b, summary_b, _b_no_activity = _check_trade_lifecycle(scenario_b, check_date)
     assert met_a is True
     # Without node scoping, node_b would have falsely inherited node_a's trade.
     assert met_b is False
@@ -639,7 +639,7 @@ def test_check_coverage_event_met_when_good_result_fires_today(isolated_db):
     check_date = datetime.now().strftime('%Y-%m-%d')
     db.log_coverage_event('cov_daily_a', 'live', result='placed')
     scenario = dict(scenario_key='cov_daily_a', check_params='{}')
-    met, summary = _check_coverage_event(scenario, check_date)
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
     assert met is True
     assert '1x event' in summary
 
@@ -647,7 +647,7 @@ def test_check_coverage_event_met_when_good_result_fires_today(isolated_db):
 def test_check_coverage_event_not_met_when_no_events_today(isolated_db):
     check_date = datetime.now().strftime('%Y-%m-%d')
     scenario = dict(scenario_key='cov_daily_missing', check_params='{}')
-    met, summary = _check_coverage_event(scenario, check_date)
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
     assert met is False
     assert 'no coverage_events' in summary
 
@@ -714,7 +714,7 @@ def test_check_coverage_event_not_met_when_only_bad_results_fire(isolated_db):
     db.log_coverage_event('cov_daily_b', 'live', result='blocked')
     scenario = dict(scenario_key='cov_daily_b',
                      check_params='{"bad_results": ["blocked"]}')
-    met, summary = _check_coverage_event(scenario, check_date)
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
     assert met is False
     assert 'all bad_results' in summary
 
@@ -723,11 +723,11 @@ def test_check_coverage_event_respects_mode_filter(isolated_db):
     check_date = datetime.now().strftime('%Y-%m-%d')
     db.log_coverage_event('cov_daily_c', 'paper', result='market_filled')
     scenario = dict(scenario_key='cov_daily_c', mode='dry_run', check_params='{}')
-    met, summary = _check_coverage_event(scenario, check_date)
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
     assert met is False  # only a paper event exists, dry_run filter excludes it
 
     db.log_coverage_event('cov_daily_c', 'dry_run', result='market_filled')
-    met, summary = _check_coverage_event(scenario, check_date)
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
     assert met is True
 
 
@@ -738,7 +738,7 @@ def test_check_coverage_event_mode_filter_isolates_shared_scenario_key(isolated_
     check_date = datetime.now().strftime('%Y-%m-%d')
     db.log_coverage_event('entry_fill', 'paper', result='market_filled')
     dry_run_row = dict(scenario_key='entry_fill', mode='dry_run', check_params='{}')
-    met, _ = _check_coverage_event(dry_run_row, check_date)
+    met, _, _no_activity = _check_coverage_event(dry_run_row, check_date)
     assert met is False
 
 
@@ -749,11 +749,11 @@ def test_check_coverage_event_scopes_to_ticker_and_node_id(isolated_db):
     check_date = datetime.now().strftime('%Y-%m-%d')
     db.log_coverage_event('cov_daily_g', 'live', ticker='OTHER', node_id=999, result='placed')
     scenario = dict(scenario_key='cov_daily_g', ticker='TARGET', node_id=42, check_params='{}')
-    met, summary = _check_coverage_event(scenario, check_date)
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
     assert met is False
 
     db.log_coverage_event('cov_daily_g', 'live', ticker='TARGET', node_id=42, result='placed')
-    met, summary = _check_coverage_event(scenario, check_date)
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
     assert met is True
 
 
@@ -761,7 +761,7 @@ def test_check_coverage_event_ignores_events_from_other_days(isolated_db):
     check_date = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
     db.log_coverage_event('cov_daily_d', 'live', result='placed')  # logged "today", not check_date
     scenario = dict(scenario_key='cov_daily_d', check_params='{}')
-    met, summary = _check_coverage_event(scenario, check_date)
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
     assert met is False
 
 
@@ -791,9 +791,9 @@ def test_check_coverage_event_uses_local_not_utc_date():
                        "VALUES ('2026-07-25 01:00:00', 'cov_tz', 'live', 'placed')")
             c.commit()
         scenario = dict(scenario_key='cov_tz', check_params='{}')
-        met, summary = _check_coverage_event(scenario, '2026-07-24')
+        met, summary, _no_activity = _check_coverage_event(scenario, '2026-07-24')
         assert met is True, f"UTC 2026-07-25 01:00 should attribute to ET 2026-07-24: {summary}"
-        met, summary = _check_coverage_event(scenario, '2026-07-25')
+        met, summary, _no_activity = _check_coverage_event(scenario, '2026-07-25')
         assert met is False, f"must not also match the UTC calendar date: {summary}"
     finally:
         signals_config.DB_PATH = orig

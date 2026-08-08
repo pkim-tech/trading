@@ -2132,7 +2132,11 @@ def record_deviation(check_date, scenario_key, expected_outcome, actual_summary,
     get_deviations(unexplained_only=True) (found by Opus review, 2026-07-27, the same
     session clear_deviation_if_resolved switched from delete to auto-explain). See
     add_scenario_expectation for why this is an explicit COALESCE-based check-then-
-    upsert rather than a UNIQUE-backed ON CONFLICT."""
+    upsert rather than a UNIQUE-backed ON CONFLICT.
+
+    Returns the row's id (2026-08-08, needed by coverage_check.py's price-action
+    auto-explain: it must immediately call explain_deviation on this exact row right
+    after recording it, not rely on a later re-check)."""
     with _conn() as c:
         existing = c.execute("""
             SELECT id, reason_by FROM coverage_deviations
@@ -2153,13 +2157,16 @@ def record_deviation(check_date, scenario_key, expected_outcome, actual_summary,
                     UPDATE coverage_deviations SET actual_summary=?, ts=datetime('now')
                     WHERE id=?
                 """, (actual_summary, existing['id']))
+            c.commit()
+            return existing['id']
         else:
-            c.execute("""
+            cur = c.execute("""
                 INSERT INTO coverage_deviations
                     (check_date, scenario_key, ticker, node_id, mode, expected_outcome, actual_summary)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (check_date, scenario_key, ticker, node_id, mode, expected_outcome, actual_summary))
-        c.commit()
+            c.commit()
+            return cur.lastrowid
 
 
 def clear_deviation_if_resolved(check_date, scenario_key, ticker=None, node_id=None, mode=None):
@@ -2305,7 +2312,14 @@ def get_closed_trades_for_ticker_on_date(ticker, check_date, strategy=None, vers
     disambiguators (from get_watch_list_node) to scope correctly, or a wrong
     node's trade can satisfy a different node's expectation (found by Opus
     review, 2026-07-24)."""
-    q = "SELECT * FROM trade_log WHERE ticker = ? AND date(entry_time) = ? AND date(exit_time) = ?"
+    # exit_reason='RESTAGED' (scripts/restage_canary_nodes.py, 2026-08-08) is a
+    # maintenance close, not a real market-driven outcome -- excluded here so a
+    # same-day entry that gets restaged that evening can't be picked up as
+    # "the" scenario trade for that date (would report a spurious "expected
+    # TP/TRAIL, got RESTAGED" deviation and, via record_deviation's clear-on-
+    # change logic, could silently overwrite an already-correct explanation).
+    q = ("SELECT * FROM trade_log WHERE ticker = ? AND date(entry_time) = ? AND date(exit_time) = ? "
+         "AND (exit_reason IS NULL OR exit_reason != 'RESTAGED')")
     params = [ticker, check_date, check_date]
     if strategy:
         q += " AND strategy = ?"

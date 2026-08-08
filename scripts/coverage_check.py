@@ -22,9 +22,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas as pd
 import pandas_market_calendars as mcal
 
 import signals_db as db
+import signals_compute as compute
+import strategies
 
 _NYSE_CAL = mcal.get_calendar('NYSE')
 
@@ -43,8 +46,68 @@ def _is_trading_day(check_date):
     return not _NYSE_CAL.schedule(start_date=check_date, end_date=check_date).empty
 
 
+def _entry_threshold_crossed(ticker, node, check_date):
+    """Returns True/False if node's real entry (BUY) threshold provably did/didn't
+    cross on check_date, using the SAME check_signal() the live daemon runs -- not a
+    reimplementation of the z-score math -- against cached hourly price data (per
+    docs/daily-routine-check's convention: recompute directly from cached data, never
+    infer from a log grep). Returns None whenever this can't be determined with
+    confidence (missing/unrecognized strategy, missing CSV, insufficient prior-day
+    history, zero std) -- callers must only auto-explain a deviation on an explicit
+    False, never on None, so a data gap fails toward leaving the ticket for a human
+    to look at rather than silently excusing it (2026-08-08, built after confirming
+    live against IVV: z stayed +0.8 to +2.8 across 4 straight days against a -0.1
+    entry threshold -- the 'no closed trade' deviations really were just no signal).
+
+    Restricted to target_hours (9,10,11,12,13,14 anchors) matching CLAUDE.md's real
+    live signal-window scope -- the 15:30 bar is never checked live either.
+
+    Checks both bar Close AND bar Open (2026-08-08, paired-review finding) for a
+    node with entry_timing='open_check' -- the live daemon's pinned entry scan
+    (`active_signals._scan_pinned_entry`) evaluates the bar's Open, not just its
+    Close, so checking Close alone could return False (auto-explain: no signal)
+    for a node whose real Open leg actually crossed. A close-only node is
+    unaffected -- the live daemon never evaluates its Open either."""
+    strat_cls = getattr(strategies, node.get('strategy') or '', None)
+    if strat_cls is None or not issubclass(strat_cls, strategies.BaseStrategy):
+        return None
+    df, df_daily = compute._load_cache(ticker)
+    if df is None or df.empty:
+        return None
+    window = node.get('window')
+    z_thresh = node.get('z_score_threshold')
+    if not window or z_thresh is None:
+        return None
+    strat = strat_cls(window=window, z_score_threshold=z_thresh)
+    ind = strat.generate_daily_indicators(df_daily)
+
+    day = pd.Timestamp(check_date)
+    daily_dates = ind.index.normalize()
+    prior_days = daily_dates[daily_dates < day]
+    if len(prior_days) == 0:
+        return None
+    prior_day = prior_days.max()
+    sma, std = ind.loc[prior_day, "SMA"], ind.loc[prior_day, "Std"]
+    if pd.isna(sma) or pd.isna(std) or std == 0:
+        return None
+
+    bars = df[(df.index.normalize() == day) & (df.index.hour.isin(range(9, 15)))]
+    if bars.empty:
+        return None
+    check_open_too = node.get('entry_timing') == 'open_check'
+    for _, bar in bars.iterrows():
+        prices = [bar["Close"]] + ([bar["Open"]] if check_open_too and "Open" in bar else [])
+        for price in prices:
+            if strat.check_signal(dict(sma=sma, std=std, current_price=price)) == 'BUY':
+                return True
+    return False
+
+
 def _check_trade_lifecycle(scenario, check_date):
-    """Returns (met: bool, actual_summary: str)."""
+    """Returns (met: bool, actual_summary: str, no_activity: bool). no_activity is
+    True only when NOTHING happened at all (no pending_buys row, no closed trade) --
+    False when a trade DID happen but with the wrong outcome (a real behavioral bug,
+    never eligible for the price-action auto-explain below)."""
     params = json.loads(scenario['check_params'] or '{}')
     ticker = scenario['ticker']
     # ticker alone is ambiguous when a ticker has more than one real node (e.g.
@@ -68,24 +131,25 @@ def _check_trade_lifecycle(scenario, check_date):
     if params.get('expect_pending_carryover'):
         pending = db.get_pending_buys_for_ticker_on_date(ticker, check_date, **disambig)
         if pending:
-            return True, f"pending_buys row present (order_placed={pending[0]['order_placed']})"
+            return True, f"pending_buys row present (order_placed={pending[0]['order_placed']})", False
         trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date, **disambig)
         if trades:
-            return True, f"same-day fill instead of carryover (exit_reason={trades[0]['exit_reason']}) -- not the designed scenario but real activity occurred"
-        return False, f"no pending_buys row and no closed trade found for {ticker} on {check_date}"
+            return True, f"same-day fill instead of carryover (exit_reason={trades[0]['exit_reason']}) -- not the designed scenario but real activity occurred", False
+        return False, f"no pending_buys row and no closed trade found for {ticker} on {check_date}", True
 
     expect_reasons = params.get('expect_exit_reason', [])
     trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date, **disambig)
     if not trades:
-        return False, f"no closed trade found for {ticker} on {check_date}"
+        return False, f"no closed trade found for {ticker} on {check_date}", True
     reason = trades[0]['exit_reason']
     if reason in expect_reasons:
-        return True, f"exit_reason={reason}"
-    return False, f"exit_reason={reason}, expected one of {expect_reasons}"
+        return True, f"exit_reason={reason}", False
+    return False, f"exit_reason={reason}, expected one of {expect_reasons}", False
 
 
 def _check_coverage_event(scenario, check_date):
-    """Returns (met: bool, actual_summary: str) for a 'coverage_event' scenario
+    """Returns (met: bool, actual_summary: str, no_activity: bool) for a
+    'coverage_event' scenario
     -- the daily-firing counterpart to scenario_registry.compute_status(),
     scoped to a single day instead of all-time. scenario['scenario_key'] is
     the real coverage_events.scenario_key (reused directly, not a separate
@@ -134,12 +198,12 @@ def _check_coverage_event(scenario, check_date):
     with db._conn() as c:
         rows = c.execute(q, args).fetchall()
     if not rows:
-        return False, f"no coverage_events for {scenario['scenario_key']!r} on {check_date}"
+        return False, f"no coverage_events for {scenario['scenario_key']!r} on {check_date}", False
     total = sum(r['n'] for r in rows)
     good = sum(r['n'] for r in rows if r['result'] not in bad_results)
     if good > 0:
-        return True, f"{total}x event(s), {good} good, last result set {[r['result'] for r in rows]}"
-    return False, f"{total}x event(s), all bad_results {sorted(bad_results)}: {[r['result'] for r in rows]}"
+        return True, f"{total}x event(s), {good} good, last result set {[r['result'] for r in rows]}", False
+    return False, f"{total}x event(s), all bad_results {sorted(bad_results)}: {[r['result'] for r in rows]}", False
 
 
 CHECKERS = {
@@ -211,7 +275,7 @@ def run_check(check_date):
             print(f"  ? {s['scenario_key']:26s} {s['ticker'] or '':6s} unknown check_method={s['check_method']!r}, skipped")
             results.append(dict(base, status='skipped', summary=f"unknown check_method={s['check_method']!r}"))
             continue
-        met, actual_summary = checker(s, check_date)
+        met, actual_summary, no_activity = checker(s, check_date)
         informational = s['expected_frequency'] == 'informational'
         if met:
             db.clear_deviation_if_resolved(check_date, s['scenario_key'],
@@ -226,10 +290,53 @@ def run_check(check_date):
             print(f"  ✗ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}  (informational, no ticket)")
             results.append(dict(base, status='deviated', ticket_eligible=False, summary=actual_summary))
         else:
-            db.record_deviation(check_date, s['scenario_key'], s['expected_outcome'], actual_summary,
-                                 ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
-            print(f"  ✗ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
-            results.append(dict(base, status='deviated', summary=actual_summary))
+            dev_id = db.record_deviation(check_date, s['scenario_key'], s['expected_outcome'], actual_summary,
+                                          ticker=s['ticker'], node_id=s.get('node_id'), mode=s.get('mode'))
+            # Price-action auto-explain (2026-08-08): a 'no activity at all'
+            # trade_lifecycle miss (no pending_buys row, no closed trade) is
+            # NOT automatically a bug -- most of these are a hair-trigger
+            # canary's entry threshold simply not crossing that day, real and
+            # ordinary market behavior (confirmed empirically against IVV: z
+            # stayed +0.8 to +2.8 for 4 straight days against a -0.1 entry
+            # threshold). Only auto-explain when _entry_threshold_crossed
+            # returns an explicit False -- None (data unavailable/unsupported
+            # strategy) or True (it DID cross but still no trade -- a real
+            # bug) both fall through to the normal unexplained ticket. A trade
+            # that happened with the WRONG outcome (no_activity=False) is
+            # never eligible here either -- that's a behavioral bug, not a
+            # missing-signal question.
+            # A row that already carries a HUMAN-authored reason (reason_by='user')
+            # must never be silently overwritten by this auto-explain -- found by
+            # paired Opus review 2026-08-08: record_deviation's own docstring
+            # already enforces "never clobber a human reason" on re-record, but
+            # explain_deviation itself has no such guard, so an unconditional call
+            # here could replace real testimony (e.g. "confirmed real bug, SL
+            # branch never fired") with the generic auto-verified string on a
+            # later rerun for the same date. Checked fresh, not cached from
+            # before record_deviation ran, since that call may have just touched
+            # this exact row.
+            auto_reason = None
+            if no_activity:
+                with db._conn() as c:
+                    row = c.execute("SELECT reason_by FROM coverage_deviations WHERE id=?", (dev_id,)).fetchone()
+                already_human_explained = row is not None and row['reason_by'] == 'user'
+                if not already_human_explained:
+                    node = db.get_watch_list_node_by_id(s.get('node_id')) if s.get('node_id') is not None else None
+                    if node is not None and s.get('ticker'):
+                        crossed = _entry_threshold_crossed(s['ticker'], node, check_date)
+                        if crossed is False:
+                            auto_reason = (f"Auto-verified: {s['ticker']}'s real cached price data never "
+                                            f"crossed its entry threshold (z_score_threshold="
+                                            f"{node.get('z_score_threshold')}) on {check_date} -- no real "
+                                            f"signal to act on, not a code defect.")
+            if auto_reason:
+                db.explain_deviation(dev_id, auto_reason, reason_by='system')
+                print(f"  ○ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}  "
+                      f"(auto-explained: price never crossed entry threshold)")
+                results.append(dict(base, status='deviated', auto_explained=True, summary=actual_summary))
+            else:
+                print(f"  ✗ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
+                results.append(dict(base, status='deviated', summary=actual_summary))
 
     unexplained = db.get_deviations(unexplained_only=True)
     if unexplained:
