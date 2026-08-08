@@ -6889,3 +6889,13 @@ Started from running `go research` cold and noticing it pulled in ~12% of contex
 **Fixed**: `go research` now also scopes `backlog_cache.md`/`backlog_resolved_recent.md` to entries carrying a `[backtest]` tag anywhere in the tag list (so `[backtest][live-trading]` combos still count), skipping everything else. User's explicit call on the known lossiness (a research-relevant item could in principle be mistagged and get skipped): acceptable, since the weekly cleanup pass already re-triages/recategorizes backlog items, so a miscategorized item won't stay invisible long.
 
 Doc-only change (`CLAUDE.md`'s Session Commands section) — no trading-logic/kernel files touched, so the `session wrap` paired-Opus-review gate doesn't apply. Other uncommitted changes present in the working tree (`config.json`, `docs/backlog_cache.md`, `docs/backlog_resolved_recent.md`, `docs/deep_backlog.md`, `scripts/coverage_check.py`, `scripts/coverage_registry.py`, `signals_db.py`, `.claude/skills/weekend-cleanup/`, `scripts/restage_canary_nodes.py`) belong to a concurrent non-research session and were left untouched, not committed here.
+
+---
+
+## 2026-08-08 (later still, 2) — `go research`'s backlog scoping actually wired to a real filter script, closing the gap the prior fix left open
+
+Prior session's fix (scoping `go research`'s backlog reads to `[backtest]`-tagged entries) only changed the *instruction* — I still read both files in full via `Read` and filtered in the summary, paying the same context cost as no filtering. User caught this live ("still loaded in 11% context").
+
+**Built `scripts/backlog_filter.py`**: extracts only entries carrying a given tag (anywhere in the header's tag list, e.g. `[backtest][live-trading]` still matches `--tag backtest`) from `docs/backlog_cache.md`/`docs/backlog_resolved_recent.md`, reusing `check_backlog_cache_lean.py`'s existing `## [` entry-split regex. Verified: 415→90 lines (78% reduction) on the real files. `CLAUDE.md`'s `go research` bullet now calls this script directly instead of describing a filter to apply after a full read.
+
+No `active_signals.py`/`signals_*.py`/`schwab_*.py`/backtest-kernel files touched — paired-Opus-review gate doesn't apply. Other uncommitted changes in the working tree (`config.json`, `docs/backlog_cache.md`, `docs/backlog_resolved_recent.md`, `docs/deep_backlog.md`, `scripts/coverage_check.py`, `scripts/coverage_registry.py`, `signals_db.py`, `.claude/skills/weekend-cleanup/`, `scripts/restage_canary_nodes.py`) belong to a concurrent non-research session, left untouched.
