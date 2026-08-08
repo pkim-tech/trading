@@ -17,7 +17,7 @@ DB_PATH      = Path("./cache/research/trading_universe.db")
 CLIFF_RADIUS = 3
 
 
-def best_safe_node(df_ticker, min_alpha=200):
+def best_safe_node(df_ticker, min_alpha=200, metric="robust_alpha"):
     # Rank/filter/neighbor-check on robust_alpha (MIN of possible/pessimistic/
     # certain fill resolutions), NOT raw alpha_vs_spy -- fixed 2026-08-08 after
     # finding this script was the one tool in the project still using the
@@ -26,8 +26,11 @@ def best_safe_node(df_ticker, min_alpha=200):
     # alpha was 111.3% but robust_alpha was only 28.6%; UGL 56.9% vs 25.7% --
     # both "safe" verdicts had been computed on the wrong metric. df_ticker
     # must already have a `robust_alpha` column (see main()).
-    df = df_ticker.sort_values("robust_alpha", ascending=False)
-    candidates = df[df["robust_alpha"] >= min_alpha]
+    # `metric` param added 2026-08-08 (later) so compare_fill_resolution_selection.py
+    # can reuse this exact selection logic with alpha_vs_spy ("possible" alone)
+    # instead of duplicating it -- default stays robust_alpha for every existing caller.
+    df = df_ticker.sort_values(metric, ascending=False)
+    candidates = df[df[metric] >= min_alpha]
     for i, (_, row) in enumerate(candidates.iterrows()):
         # trail_buy_pct/trail_sell_pct/entry_timing MUST be held exactly fixed here, not
         # left unfiltered -- a neighbor search without this compares against wildly
@@ -50,7 +53,7 @@ def best_safe_node(df_ticker, min_alpha=200):
             (df["stop_loss"].between(row["stop_loss"] - CLIFF_RADIUS, row["stop_loss"] + CLIFF_RADIUS)) &
             (df["max_hold_hours"].between(row["max_hold_hours"] - 7, row["max_hold_hours"] + 7))
         )
-        worst = df.loc[mask, "robust_alpha"].min()
+        worst = df.loc[mask, metric].min()
         # A neighbor set that comes back empty must never read as "safe" -- MIN() over
         # nothing is NaN, and `NaN >= 0` is False in pandas, so this already fails
         # closed today; kept explicit rather than relying on that implicitly.
@@ -66,6 +69,7 @@ def best_safe_node(df_ticker, min_alpha=200):
                 'z': row["z_score_threshold"], 'trail_buy_pct': row["trail_buy_pct"],
                 'trail_sell_pct': row["trail_sell_pct"], 'entry_timing': row["entry_timing"],
                 'alpha': row["robust_alpha"], 'alpha_raw': row["alpha_vs_spy"],
+                'alpha_pessimistic': row["alpha_vs_spy_pessimistic"], 'alpha_certain': row["alpha_vs_spy_certain"],
                 'return': row["strategy_return"], 'trades': int(row["trades"]),
                 'win_rate': row["win_rate"], 'worst_neighbor': worst
             }
