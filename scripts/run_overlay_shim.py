@@ -100,11 +100,14 @@ def run_addon(node, candidate_node_id, ticker, trades, df_h):
     return rows
 
 
-def run_for_ticker(conn, ticker, version, confirm_days):
-    node = node_dict(conn, ticker, version)
-    if node is None:
-        print(f"{ticker}: no backtest_cache data, skipping")
-        return []
+def run_for_node(conn, ticker, node, confirm_days, mechanisms=("drought", "addon")):
+    """Runs the overlay backtest(s) against an ARBITRARY, already-built node
+    dict (not necessarily the ticker's single auto-picked best) -- added
+    2026-08-08 (later) so candidate_summary_report.py can compute overlay
+    results on demand for all 3 candidate-selection types (safe/unsafe/
+    possible), not just whichever one happens to already be registered.
+    `mechanisms` lets a caller compute only the missing one(s) instead of
+    re-running (and re-inserting) a mechanism that's already in the DB."""
     try:
         trades, df_h = get_trades_and_bars(node)
     except Exception as e:
@@ -115,8 +118,20 @@ def run_for_ticker(conn, ticker, version, confirm_days):
         return []
 
     candidate_node_id = get_or_create_candidate_node(conn, node)
-    return (run_drought(node, candidate_node_id, ticker, trades, df_h, confirm_days)
-            + run_addon(node, candidate_node_id, ticker, trades, df_h))
+    rows = []
+    if "drought" in mechanisms:
+        rows += run_drought(node, candidate_node_id, ticker, trades, df_h, confirm_days)
+    if "addon" in mechanisms:
+        rows += run_addon(node, candidate_node_id, ticker, trades, df_h)
+    return rows
+
+
+def run_for_ticker(conn, ticker, version, confirm_days):
+    node = node_dict(conn, ticker, version)
+    if node is None:
+        print(f"{ticker}: no backtest_cache data, skipping")
+        return []
+    return run_for_node(conn, ticker, node, confirm_days)
 
 
 def main():

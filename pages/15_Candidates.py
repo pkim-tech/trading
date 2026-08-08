@@ -6,10 +6,7 @@ import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from candidate_summary_report import (
-    best_node, worst_neighbor, overlay_summary, annualized_excess, fill_accuracy_summary,
-    liquidity_dollars_per_day, COLUMN_DEFS,
-)
+from candidate_summary_report import build_rows_for_ticker, _row_to_record, COLUMN_DEFS, ensure_candidate_nodes_table, ensure_overlay_table
 
 DB_PATH = "./cache/research/trading_universe.db"
 
@@ -39,7 +36,7 @@ def load_backtest_versions():
 all_tickers = load_tickers()
 versions = load_backtest_versions()
 
-c1, c2, c3 = st.columns([3, 1, 1])
+c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
 with c1:
     tickers = st.multiselect("Tickers", options=all_tickers, default=all_tickers)
 with c2:
@@ -47,6 +44,13 @@ with c2:
 with c3:
     run_5min = st.toggle("5-min fill accuracy", value=False,
                           help="Hits yfinance once per ticker -- off by default for speed.")
+with c4:
+    run_overlay = st.toggle("Compute overlay", value=False,
+                             help="Runs the real drought/addon overlay backtest on demand for any of the "
+                                  "3 candidate rows that don't have it yet -- off by default, can take a "
+                                  "few seconds per ticker.")
+
+min_alpha = st.number_input("Min alpha floor (for 'best safe node' search)", value=200.0, step=50.0)
 
 if not tickers:
     st.info("Select at least one ticker.")
@@ -54,51 +58,18 @@ if not tickers:
 
 
 @st.cache_data(ttl=600, show_spinner="Building candidate report...")
-def build_report(tickers, version, run_5min):
+def build_report(tickers, version, min_alpha, skip_5min, skip_overlay):
     conn = sqlite3.connect(DB_PATH)
+    ensure_candidate_nodes_table(conn)
+    ensure_overlay_table(conn)
     rows = []
     for ticker in tickers:
-        node = best_node(conn, ticker, version)
-        if node is None:
-            rows.append({"ticker": ticker, "status": "NO_DATA"})
-            continue
-        (strategy, window, z, entry_timing, sl, tp, hold, tb, ts,
-         ralpha, sret, trades, wr, spy_bh) = node
-        wn = worst_neighbor(conn, ticker, version, strategy, window, z,
-                             entry_timing, sl, tp, hold, tb, ts)
-        addon = overlay_summary(conn, ticker, "addon")
-        drought = overlay_summary(conn, ticker, "drought")
-        cliff = "CLIFF" if (wn is not None and wn < 0) else ("SAFE" if wn is not None else "?")
-        days, ann_excess = annualized_excess(ticker, sret, spy_bh)
-        years = round(days / 365.25, 2) if days else None
-        fill_acc = fill_accuracy_summary(ticker, strategy, window, z, tb, hold) if run_5min else None
-        core_mult = 1 + sret / 100
-        addon_mult = (core_mult * (1 + addon[1] / 100) - 1) * 100 if addon else None
-        drought_mult = (core_mult * (1 + drought[1] / 100) - 1) * 100 if drought else None
-        liquidity = liquidity_dollars_per_day(conn, ticker)
-        rows.append({
-            "ticker": ticker, "liquidity_dollars_per_day": liquidity,
-            "strategy": strategy, "core_alpha_pct": ralpha, "abs_return_pct": sret,
-            "years": years, "trades": trades, "ann_excess_pct": ann_excess,
-            "fillacc_possible_win_pct": fill_acc[0] if fill_acc else None,
-            "fillacc_mean_err_pct": fill_acc[1] if fill_acc else None,
-            "fillacc_n": fill_acc[2] if fill_acc else None,
-            "worst_neighbor_pct": wn, "status": cliff,
-            "addon_n": addon[0] if addon else None,
-            "addon_compounded_pct": addon[1] if addon else None,
-            "addon_win_rate_pct": addon[2] if addon else None,
-            "drought_n": drought[0] if drought else None,
-            "drought_compounded_pct": drought[1] if drought else None,
-            "drought_win_rate_pct": drought[2] if drought else None,
-            "x_addon_pct": addon_mult, "x_drought_pct": drought_mult,
-            "window": window, "z": z, "trail_buy_pct": tb, "trail_sell_pct": ts,
-            "entry_timing": entry_timing, "stop_loss": sl, "take_profit_or_arm": tp, "max_hold_hours": hold,
-        })
+        rows.extend(build_rows_for_ticker(conn, ticker, version, min_alpha, skip_5min, skip_overlay))
     conn.close()
-    return pd.DataFrame(rows)
+    return pd.DataFrame([_row_to_record(r) for r in rows])
 
 
-df = build_report(tuple(sorted(tickers)), version, run_5min)
+df = build_report(tuple(sorted(tickers)), version, min_alpha, not run_5min, not run_overlay)
 
 st.dataframe(
     df,
@@ -110,7 +81,7 @@ st.dataframe(
         "abs_return_pct": st.column_config.NumberColumn("Abs Return %", format="%+.1f%%"),
         "ann_excess_pct": st.column_config.NumberColumn("Annualized Excess %", format="%+.1f%%"),
         "fillacc_possible_win_pct": st.column_config.NumberColumn("Fill-Acc Win %", format="%.0f%%"),
-        "fillacc_mean_err_pct": st.column_config.NumberColumn("Fill-Acc Mean Err %", format="%.3f%%"),
+        "fillacc_possible_mean_err_pct": st.column_config.NumberColumn("Fill-Acc Mean Err %", format="%.3f%%"),
         "worst_neighbor_pct": st.column_config.NumberColumn("Worst Neighbor %", format="%+.1f%%"),
         "addon_compounded_pct": st.column_config.NumberColumn("Addon Compounded %", format="%+.2f%%"),
         "addon_win_rate_pct": st.column_config.NumberColumn("Addon Win %", format="%.0f%%"),

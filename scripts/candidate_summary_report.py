@@ -1,22 +1,29 @@
-"""Consolidated liquidity-screen candidate summary -- core alpha, ANNUALIZED
+"""Consolidated liquidity-screen candidate summary -- for each ticker, THREE
+candidate rows (best safe node / best unsafe node / 5min best possible node,
+see CANDIDATE_LABELS below), each with core alpha, raw return, ANNUALIZED
 excess return (CAGR-based, fair across tickers with different cached-history
-lengths), 5-min real-fill accuracy, worst neighbor (cliff-safety, computed
-for the ACTUAL winning node regardless of whether it passes -- unlike
-top_safe_nodes.py, which only reports a node if it clears the safety bar),
-liquidity, and drought/add-on overlay results, all in one table. Built
-2026-08-08 after repeatedly rebuilding pieces of this table by hand in
-conversation -- consolidates locate_best_node.py's winner pick,
-top_safe_nodes.py's neighbor-check logic, annualized_alpha_report.py's CAGR
-calc, verify_fill_resolution_accuracy.py's 5-min replay, and
-candidate_overlay_results into one script. The canonical "everything at a
-glance" candidate report -- keep adding to this rather than spinning up
-another standalone comparison script, per the user's explicit call
-2026-08-08 (later).
+lengths), 5-min real-fill accuracy, worst neighbor (cliff-safety), liquidity,
+and drought/add-on overlay results (only shown when that exact row's params
+match a registered candidate_nodes entry -- overlay backtests are only ever
+run against ONE specific node's params, not all three candidate types, so
+showing the same overlay numbers on every row would misrepresent them as
+validated for configs they were never tested against). Built 2026-08-08
+after repeatedly rebuilding pieces of this table by hand in conversation --
+consolidates locate_best_node.py's winner pick, top_safe_nodes.py's
+neighbor-check logic, candidate_5min_report.py's 3-way candidate split,
+annualized_alpha_report.py's CAGR calc, verify_fill_resolution_accuracy.py's
+5-min replay, and candidate_overlay_results into one script. The canonical
+"everything at a glance" candidate report -- keep adding to this rather than
+spinning up another standalone comparison script, per the user's explicit
+call 2026-08-08 (later). Row structure (3 rows/ticker, not 1) is also the
+user's explicit call, same session -- "i would look at best unsafe first to
+just make sure we're not missing anything."
 
 Usage:
   .venv/bin/python scripts/candidate_summary_report.py TNA URTY SQQQ ...
   .venv/bin/python scripts/candidate_summary_report.py --all-swept
   .venv/bin/python scripts/candidate_summary_report.py TNA --skip-5min  # faster, skip yfinance calls
+  .venv/bin/python scripts/candidate_summary_report.py TNA --xlsx report  # output/report.xlsx, 2 sheets
 """
 import argparse
 import csv
@@ -30,57 +37,93 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from top_safe_nodes import CLIFF_RADIUS
 from annualized_alpha_report import calendar_days, cagr
 from verify_fill_resolution_accuracy import fill_accuracy_for_node
+from candidate_5min_report import find_candidates
+from run_overlay_shim import (
+    run_for_node as run_overlay_for_node, ensure_candidate_nodes_table, ensure_table as ensure_overlay_table,
+)
+from datetime import datetime as _datetime
 
 DB_PATH = "cache/research/trading_universe.db"
 ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_vs_spy), "
                      "COALESCE(alpha_vs_spy_certain, alpha_vs_spy))")
+
+# Relabels find_candidates()'s internal keys to the user's requested wording
+# 2026-08-08 (later) -- kept as a separate map (not renamed at the source in
+# candidate_5min_report.py) since that script's own terminal output is aimed
+# at a different, more technical audience/context.
+CANDIDATE_LABELS = {
+    'cliff-safe (current convention)': 'best safe node',
+    'best robust_alpha (ignoring cliff-safety)': 'best unsafe node',
+    'best possible (raw alpha_vs_spy)': '5min best possible',
+}
+CANDIDATE_TYPE_ORDER = ['best safe node', 'best unsafe node', '5min best possible']
 
 # Single source of truth for what each output column means -- used for both
 # the xlsx glossary sheet and (imported directly) the Streamlit Candidates
 # page's glossary expander, so the two never drift apart.
 COLUMN_DEFS = {
     "ticker": "The symbol.",
-    "strategy": "Which strategy class the best node uses (TrailingBothZScoreBreakout = trailing-buy entry, "
-                "TrailingExitZScoreBreakout = market-buy entry).",
-    "core_alpha_pct": "robust_alpha for the best node: MIN(possible, pessimistic, certain) fill-resolution "
+    "candidate_type": "Which of the 3 candidate-selection methods produced this row: 'best safe node' "
+                       "(robust_alpha=MIN(possible,pessimistic,certain), required to pass the CLIFF_RADIUS=3 "
+                       "neighbor-safety check -- this project's real selection convention), 'best unsafe node' "
+                       "(top robust_alpha row regardless of whether it clears the safety check -- look here "
+                       "first to sanity-check the safe pick isn't missing something), or '5min best possible' "
+                       "(top raw 'possible'-resolution alpha_vs_spy row, ignoring robustness entirely -- named "
+                       "for the 5-min fill-accuracy finding that 'possible' is empirically the most accurate "
+                       "single resolution, see docs/research_log.md's 2026-08-08 entries). Rows are dropped, "
+                       "not duplicated, when two of the three methods pick the identical node.",
+    "strategy": "Which strategy class this ticker's rows use (TrailingBothZScoreBreakout = trailing-buy entry, "
+                "TrailingExitZScoreBreakout = market-buy entry) -- always the strategy of the ticker's single "
+                "best robust_alpha row across all strategies; all 3 candidate rows for a ticker share it.",
+    "core_alpha_pct": "robust_alpha for this row's node: MIN(possible, pessimistic, certain) fill-resolution "
                        "alpha vs SPY, over the ticker's full cached-data window. This project's standard "
-                       "selection metric -- see CLAUDE.md's kernel versioning notes.",
-    "abs_return_pct": "The strategy's own raw compounded return (not vs SPY) over the same window.",
+                       "selection metric -- WITH SPY subtracted (see abs_return_pct for the raw number).",
+    "abs_return_pct": "This row's node's own RAW compounded return (SPY NOT subtracted) over the same window. "
+                       "Read this next to core_alpha_pct when weighing a 'safe but small' pick against a "
+                       "'ridiculous but risky' one -- core_alpha_pct/worst_neighbor_pct are SPY-adjusted, this "
+                       "one isn't.",
     "years": "Real calendar span of this ticker's cached hourly data (days between the earliest and latest "
              "cached bar, /365.25). Tickers vary a lot here (e.g. SOXL ~3.0y vs SPCL ~0.31y) -- this is why "
              "core_alpha_pct/abs_return_pct alone aren't fairly comparable across tickers.",
-    "trades": "Number of completed trades in the best node's backtest.",
-    "ann_excess_pct": "CAGR-based excess return over SPY, annualized over the full calendar window (years "
-                       "column) -- fixes the cross-ticker horizon-mismatch problem above. A large value backed "
-                       "by a short 'years'/low 'trades' is weak evidence (e.g. SPCL's ~3000%+ off 0.31y/3 "
-                       "trades is an annualization artifact, not a real signal) -- always read this next to "
-                       "years/trades, never alone. See docs/research_log.md's 2026-08-08 'annualized excess' "
-                       "entries for the full derivation.",
-    "fillacc_possible_win_pct": "Of this node's real trailing-buy entry signals in the last ~58 days (yfinance's "
-                                 "5-min history cap), the % where the 'possible' fill resolution (the kernel's "
-                                 "default, optimistic-but-unmodified bounce-fill assumption) was closest to the "
-                                 "REAL 5-minute-bar fill price, vs the 'pessimistic'/'certain' alternatives. "
-                                 "Blank for TrailingExitZScoreBreakout nodes (market-buy entry has no bounce-fill "
-                                 "resolution to check) or if trail_buy_pct=0.",
+    "trades": "Number of completed trades in this row's node's backtest.",
+    "ann_excess_pct": "CAGR-based excess return over SPY (SPY-adjusted, like core_alpha_pct), annualized over "
+                       "the full calendar window (years column) -- fixes the cross-ticker horizon-mismatch "
+                       "problem above. A large value backed by a short 'years'/low 'trades' is weak evidence "
+                       "(e.g. SPCL's ~3000%+ off 0.31y/3 trades is an annualization artifact, not a real "
+                       "signal) -- always read this next to years/trades, never alone.",
+    "fillacc_possible_win_pct": "Of this row's node's real trailing-buy entry signals in the last ~58 days "
+                                 "(yfinance's 5-min history cap), the % where the 'possible' fill resolution "
+                                 "(the kernel's default, optimistic-but-unmodified bounce-fill assumption) was "
+                                 "closest to the REAL 5-minute-bar fill price, vs the 'pessimistic'/'certain' "
+                                 "alternatives. Blank for TrailingExitZScoreBreakout rows (market-buy entry has "
+                                 "no bounce-fill resolution to check) or if trail_buy_pct=0.",
     "fillacc_possible_mean_err_pct": "Mean absolute price error (%) of the 'possible' resolution vs the real "
                                       "5-min fill, across those same signals. Lower is better/more trustworthy. "
                                       "Same blank-condition as fillacc_possible_win_pct.",
     "fillacc_n": "How many real signals the fill-accuracy check above is actually based on -- often single "
                  "digits in a 58-day window, so treat a 100% win rate on n=1-2 with real caution.",
     "worst_neighbor_pct": "Cliff-safety check: the worst robust_alpha found among nearby take_profit/stop_loss "
-                           "grid values (CLIFF_RADIUS=3 steps) around the best node's own params, holding every "
-                           "other axis fixed. Negative means a small parameter nudge would have lost money -- "
-                           "see docs/cliff_safety_query_checklist.md.",
-    "status": "CLIFF (worst_neighbor_pct < 0, the pick is fragile to small parameter changes) or SAFE "
-              "(worst_neighbor_pct >= 0). Unlike top_safe_nodes.py, this is computed for whatever node actually "
-              "won on core_alpha_pct, even if that node isn't cliff-safe -- so you can see HOW unsafe it is, "
-              "not just a pass/fail.",
-    "addon_n": "Number of backtested add-on-leg trades found for this ticker's registered candidate node(s) "
-               "(candidate_overlay_results, mechanism='addon'). Blank if none registered/run yet.",
-    "addon_compounded_pct": "Compounded return of just the add-on overlay's own trades (not combined with core).",
-    "addon_win_rate_pct": "% of add-on trades that were profitable.",
-    "drought_n": "Number of backtested drought-overlay trades found (mechanism='drought'). Blank if none "
-                 "registered/run yet.",
+                           "grid values (CLIFF_RADIUS=3 steps) AND max_hold_hours +/-7 around this row's node "
+                           "params, holding every other axis fixed -- deliberately matches "
+                           "top_safe_nodes.best_safe_node()'s own tolerance (found 2026-08-08: a wider +/-24 "
+                           "hold tolerance, prune_backtest_cache.py's own convention, could make a node "
+                           "certified 'safe' by best_safe_node() show CLIFF here, purely from a hold-time "
+                           "window inconsistency, not a real disagreement about safety). Negative means a "
+                           "nearby parameter nudge would have lost money -- see "
+                           "docs/cliff_safety_query_checklist.md.",
+    "status": "CLIFF (worst_neighbor_pct < 0, fragile to small parameter changes) or SAFE (worst_neighbor_pct "
+              ">= 0), computed fresh for THIS row's own node -- so 'best unsafe node'/'5min best possible' rows "
+              "can (and often do) show CLIFF even though 'best safe node' always shows SAFE by construction.",
+    "addon_n": "Number of backtested add-on-leg trades for THIS exact row's own node params -- computed on "
+               "demand (run_overlay_shim.py) the first time a candidate is seen, then reused from "
+               "candidate_overlay_results on later runs. All 3 candidate rows for a ticker get their own real "
+               "run against their own params, not a shared/repeated number. Blank only if the node has <2 "
+               "real trades to evaluate an overlay against, or --skip-overlay was passed.",
+    "addon_compounded_pct": "Compounded return of just the add-on overlay's own trades (not combined with core). "
+                             "Same blank-condition as addon_n.",
+    "addon_win_rate_pct": "% of add-on trades that were profitable. Same blank-condition as addon_n.",
+    "drought_n": "Number of backtested drought-overlay trades, same on-demand-per-row-node computation and "
+                 "blank-condition as addon_n.",
     "drought_compounded_pct": "Compounded return of just the drought overlay's own trades (not combined with core).",
     "drought_win_rate_pct": "% of drought trades that were profitable.",
     "x_addon_pct": "NAIVE estimate of core+add-on combined: (1+core_return)*(1+addon_return)-1. Add-on capital "
@@ -92,25 +135,44 @@ COLUMN_DEFS = {
                       "than x_addon_pct, but still not the rigorous stacked model.",
     "liquidity_dollars_per_day": "avg_vol_10d * last_price * 0.01 from the tickers table -- this project's "
                                   "standard real dollar-liquidity estimate (confirmed against CLAUDE.md's cited "
-                                  "figures, e.g. AGQ ~$2.02M, HIBL ~$89.9K). This is supposed to be the FIRST-pass "
-                                  "filter before spending validation effort on a candidate (see the 2026-08-07 "
-                                  "'liquidity was never the limiting filter' finding) -- a great alpha number on "
-                                  "an illiquid name is untradeable regardless of the rest of this row.",
+                                  "figures, e.g. AGQ ~$2.02M, HIBL ~$89.9K). Ticker-level, same across all 3 "
+                                  "candidate rows for a ticker. Supposed to be the FIRST-pass filter before "
+                                  "spending validation effort on a candidate (see the 2026-08-07 'liquidity was "
+                                  "never the limiting filter' finding) -- a great alpha number on an illiquid "
+                                  "name is untradeable regardless of the rest of this row.",
 }
 
 
-def best_node(conn, ticker, version="v5"):
+def best_node_strategy(conn, ticker, version="v5"):
+    """Which strategy has this ticker's single best robust_alpha row, across
+    ALL strategies -- used to scope the 3-way candidate split to one strategy
+    (mixing TrailingBoth/TrailingExit params in a neighbor search wouldn't be
+    meaningful, same convention top_safe_nodes.py already uses). Also returns
+    spy_bh (ticker-level, identical across every row for this ticker/version,
+    so fetched once here rather than per candidate)."""
     c = conn.cursor()
     c.execute(f"""
-        SELECT strategy, window, z_score_threshold, entry_timing, stop_loss,
-               COALESCE(take_profit, arm_sell_pct) AS tp, max_hold_hours,
-               trail_buy_pct, trail_sell_pct, {ROBUST_ALPHA_SQL} AS ralpha,
-               strategy_return, trades, win_rate, spy_bh
-        FROM backtest_cache
+        SELECT strategy, spy_bh FROM backtest_cache
         WHERE ticker=? AND version=? AND trades>0
-        ORDER BY ralpha DESC LIMIT 1
+        ORDER BY {ROBUST_ALPHA_SQL} DESC LIMIT 1
     """, (ticker, version))
     return c.fetchone()
+
+
+def load_ticker_df(conn, ticker, version, strategy):
+    import pandas as pd
+    df = pd.read_sql("""
+        SELECT ticker, COALESCE(take_profit, arm_sell_pct) AS take_profit, stop_loss, max_hold_hours, window,
+               z_score_threshold, trail_buy_pct, trail_sell_pct, entry_timing,
+               alpha_vs_spy, alpha_vs_spy_pessimistic, alpha_vs_spy_certain,
+               strategy_return, trades, win_rate
+        FROM backtest_cache
+        WHERE ticker=? AND version=? AND strategy=? AND trades>0
+    """, conn, params=(ticker, version, strategy))
+    pess = df["alpha_vs_spy_pessimistic"].fillna(df["alpha_vs_spy"])
+    cert = df["alpha_vs_spy_certain"].fillna(df["alpha_vs_spy"])
+    df["robust_alpha"] = pd.concat([df["alpha_vs_spy"], pess, cert], axis=1).min(axis=1)
+    return df
 
 
 def annualized_excess(ticker, strategy_return, spy_bh_full_window):
@@ -148,8 +210,19 @@ def fill_accuracy_summary(ticker, strategy, window, z, trail_buy_pct, hold):
 def worst_neighbor(conn, ticker, version, strategy, window, z, entry_timing,
                     sl, tp, hold, tb, ts):
     """Worst robust_alpha among the CLIFF_RADIUS-step neighborhood on
-    take_profit/stop_loss (index-based nearest-distinct-values, same
-    convention as prune_backtest_cache.py), holding every other axis fixed."""
+    take_profit/stop_loss (index-based nearest-distinct-values), holding
+    every other axis fixed. max_hold_hours tolerance intentionally set to
+    +/-7 (not prune_backtest_cache.py's own +/-24) to MATCH
+    top_safe_nodes.best_safe_node()'s tolerance -- found 2026-08-08 that a
+    node top_safe_nodes.py certified 'safe' (+2.7% worst neighbor at +/-7)
+    came back CLIFF here at +/-24 (-9.8%) for TNA, purely because +/-24
+    happened to span this ticker's ENTIRE swept hold-time range (6 values,
+    7 apart) rather than just nearby ones. Since this report's 'best safe
+    node' label comes directly from best_safe_node()'s own check, this
+    function must use the same tolerance or the label and Status column can
+    visibly disagree. prune_backtest_cache.py's +/-24 is left untouched --
+    that's a real, separate, deliberate convention for island selection, not
+    something to change as a side effect of this report."""
     c = conn.cursor()
 
     def nearest_values(col_sql, center):
@@ -174,7 +247,7 @@ def worst_neighbor(conn, ticker, version, strategy, window, z, entry_timing,
               AND entry_timing=? AND trail_buy_pct=? AND trail_sell_pct=?
               AND COALESCE(take_profit, arm_sell_pct) IN ({tp_ph})
               AND stop_loss IN ({sl_ph})
-              AND ABS(max_hold_hours - ?) <= 24 AND trades > 0
+              AND ABS(max_hold_hours - ?) <= 7 AND trades > 0
     """, [ticker, version, strategy, window, z, entry_timing, tb, ts] + tp_keep + sl_keep + [hold])
     return c.fetchone()[0]
 
@@ -196,18 +269,64 @@ def liquidity_dollars_per_day(conn, ticker):
     return row[0] if row else None
 
 
-def overlay_summary(conn, ticker, mechanism):
+def overlay_summary_for_node(conn, ticker, strategy, version, mechanism, node):
+    """Overlay backtests (candidate_overlay_results) are only ever run
+    against ONE specific node's exact params (via candidate_nodes/
+    run_overlay_shim.py), not against all 3 candidate types -- so this
+    matches on the full param tuple, not just ticker, and returns None
+    (blank) for a candidate row that was never actually run through the
+    overlay shim, rather than showing another row's numbers as if they
+    applied here too."""
     c = conn.cursor()
     c.execute("""
         SELECT cor.ret FROM candidate_overlay_results cor
         JOIN candidate_nodes cn ON cn.id = cor.candidate_node_id
-        WHERE cn.ticker=? AND cor.mechanism=?
-    """, (ticker, mechanism))
+        WHERE cn.ticker=? AND cor.mechanism=? AND cn.strategy=? AND cn.version=?
+              AND cn.window=? AND cn.z=? AND cn.fixed_sl=? AND cn.arm_pct=?
+              AND cn.trail_buy_pct=? AND cn.trail_sell_pct=? AND cn.max_hold_hours=? AND cn.entry_timing=?
+    """, (ticker, mechanism, strategy, version, node['window'], node['z'], node['sl'], node['arm_pct'],
+          node['trail_buy_pct'], node['trail_sell_pct'], node['hold'], node['entry_timing']))
     rets = [r[0] for r in c.fetchall()]
     if not rets:
         return None
     wr = sum(1 for r in rets if r > 0) / len(rets) * 100
     return len(rets), compounded(rets), wr
+
+
+def ensure_overlay_for_node(conn, ticker, strategy, version, node, confirm_days=10):
+    """Computes drought/addon overlay results on demand for THIS exact node
+    if they're not already in candidate_overlay_results -- added 2026-08-08
+    (later) per the user's explicit call: 'all three candidates should get
+    the same overlay treatment', not just whichever one happened to already
+    be registered from an earlier locate_best_node.py/run_overlay_shim.py
+    run. Only computes the missing mechanism(s); commits immediately so a
+    later run's overlay_summary_for_node lookup (and other tools reading
+    candidate_overlay_results) see it too."""
+    missing = {m for m in ("drought", "addon")
+               if overlay_summary_for_node(conn, ticker, strategy, version, m, node) is None}
+    if not missing:
+        return
+    shim_node = {
+        'ticker': ticker, 'strategy': strategy, 'version': version,
+        'window': node['window'], 'z': node['z'], 'fixed_sl': node['sl'],
+        'arm_pct': node['arm_pct'], 'trail_buy_pct': node['trail_buy_pct'],
+        'trail_sell_pct': node['trail_sell_pct'], 'max_hold_hours': node['hold'],
+        'entry_timing': node['entry_timing'],
+        'robust_alpha': node['robust_alpha'], 'trades': node['trades'],
+    }
+    rows = run_overlay_for_node(conn, ticker, shim_node, confirm_days, mechanisms=missing)
+    if not rows:
+        return
+    run_ts = _datetime.now().isoformat(timespec="seconds")
+    conn.executemany("""
+        INSERT INTO candidate_overlay_results
+            (run_timestamp, mechanism, ticker, candidate_node_id,
+             confirm_days, entry_time, exit_time, exit_reason, ret)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [(run_ts, r["mechanism"], r["ticker"], r["candidate_node_id"],
+           r["confirm_days"], r["entry_time"], r["exit_time"], r["exit_reason"], r["ret"])
+          for r in rows])
+    conn.commit()
 
 
 def _row_to_record(row):
@@ -217,10 +336,11 @@ def _row_to_record(row):
     ticker = row[0]
     if row[1] is None:
         return {"ticker": ticker}
-    (ticker, strategy, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
+    (ticker, candidate_type, strategy, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
      addon, drought, addon_mult, drought_mult, liquidity) = row
     return {
-        "ticker": ticker, "strategy": strategy, "core_alpha_pct": ralpha, "abs_return_pct": sret,
+        "ticker": ticker, "candidate_type": candidate_type, "strategy": strategy,
+        "core_alpha_pct": ralpha, "abs_return_pct": sret,
         "years": years, "trades": trades, "ann_excess_pct": ann_excess,
         "fillacc_possible_win_pct": fill_acc[0] if fill_acc else None,
         "fillacc_possible_mean_err_pct": fill_acc[1] if fill_acc else None,
@@ -285,42 +405,35 @@ def _write_xlsx(name, rows):
     print(f"Wrote {out_path} ({len(rows)} rows, 2 sheets)")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("tickers", nargs="*")
-    ap.add_argument("--version", default="v5")
-    ap.add_argument("--db", default=DB_PATH)
-    ap.add_argument("--skip-5min", action="store_true",
-                     help="skip the 5-min fill-accuracy replay (saves a yfinance call per ticker)")
-    ap.add_argument("--csv", default=None, help="write output/<name>.csv instead of the wide terminal table")
-    ap.add_argument("--xlsx", default=None,
-                     help="write output/<name>.xlsx (Candidates sheet + Column Definitions glossary sheet) "
-                          "instead of the wide terminal table")
-    args = ap.parse_args()
+def build_rows_for_ticker(conn, ticker, version, min_alpha, skip_5min, skip_overlay=False):
+    """Returns a list of internal row tuples, one per candidate type (up to
+    3, deduped -- see find_candidates()), or [(ticker, None)] if there's no
+    data/no candidates at all."""
+    best = best_node_strategy(conn, ticker, version)
+    if best is None:
+        return [(ticker, None)]
+    strategy, spy_bh = best
 
-    conn = sqlite3.connect(args.db)
-    tickers = args.tickers
-    if not tickers:
-        c = conn.cursor()
-        c.execute("SELECT DISTINCT ticker FROM candidate_nodes")
-        tickers = [r[0] for r in c.fetchall()]
+    df_t = load_ticker_df(conn, ticker, version, strategy)
+    candidates = find_candidates(df_t, min_alpha)
+    if not candidates:
+        return [(ticker, None)]
 
     rows = []
-    for ticker in tickers:
-        node = best_node(conn, ticker, args.version)
-        if node is None:
-            rows.append((ticker, None))
-            continue
-        (strategy, window, z, entry_timing, sl, tp, hold, tb, ts,
-         ralpha, sret, trades, wr, spy_bh) = node
-        wn = worst_neighbor(conn, ticker, args.version, strategy, window, z,
-                             entry_timing, sl, tp, hold, tb, ts)
-        addon = overlay_summary(conn, ticker, "addon")
-        drought = overlay_summary(conn, ticker, "drought")
+    for raw_label, node in candidates.items():
+        label = CANDIDATE_LABELS.get(raw_label, raw_label)
+        wn = worst_neighbor(conn, ticker, version, strategy, node['window'], node['z'],
+                             node['entry_timing'], node['sl'], node['arm_pct'], node['hold'],
+                             node['trail_buy_pct'], node['trail_sell_pct'])
         cliff = "CLIFF" if (wn is not None and wn < 0) else ("SAFE" if wn is not None else "?")
-        days, ann_excess = annualized_excess(ticker, sret, spy_bh)
+        days, ann_excess = annualized_excess(ticker, node['return'], spy_bh)
         years = round(days / 365.25, 2) if days else None
-        fill_acc = None if args.skip_5min else fill_accuracy_summary(ticker, strategy, window, z, tb, hold)
+        fill_acc = None if skip_5min else fill_accuracy_summary(
+            ticker, strategy, node['window'], node['z'], node['trail_buy_pct'], node['hold'])
+        if not skip_overlay:
+            ensure_overlay_for_node(conn, ticker, strategy, version, node)
+        addon = overlay_summary_for_node(conn, ticker, strategy, version, "addon", node)
+        drought = overlay_summary_for_node(conn, ticker, strategy, version, "drought", node)
         # NAIVE multiplicative combination -- (1 + core) * (1 + overlay) - 1.
         # This is an APPROXIMATION, not real stacked-model math: drought fills
         # core's own time gaps sequentially (so multiplying compounded
@@ -329,12 +442,48 @@ def main():
         # multiplying it against core here overstates/misrepresents the real
         # combined effect -- v5_stacked_backtest.py's proper parallel-return
         # model is the rigorous version of this, not this quick estimate.
-        core_mult = 1 + sret / 100
+        core_mult = 1 + node['return'] / 100
         addon_mult = (core_mult * (1 + addon[1] / 100) - 1) * 100 if addon else None
         drought_mult = (core_mult * (1 + drought[1] / 100) - 1) * 100 if drought else None
         liquidity = liquidity_dollars_per_day(conn, ticker)
-        rows.append((ticker, strategy, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
-                     addon, drought, addon_mult, drought_mult, liquidity))
+        rows.append((ticker, label, strategy, node['robust_alpha'], node['return'], years, node['trades'],
+                     ann_excess, fill_acc, wn, cliff, addon, drought, addon_mult, drought_mult, liquidity))
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("tickers", nargs="*")
+    ap.add_argument("--version", default="v5")
+    ap.add_argument("--db", default=DB_PATH)
+    ap.add_argument("--min-alpha", type=float, default=200,
+                     help="Alpha floor for the 'best safe node' cliff-safety search (default 200%%, matching "
+                          "top_safe_nodes.py's convention). 'best unsafe node'/'5min best possible' are always "
+                          "shown regardless of this floor.")
+    ap.add_argument("--skip-5min", action="store_true",
+                     help="skip the 5-min fill-accuracy replay (saves a yfinance call per ticker)")
+    ap.add_argument("--skip-overlay", action="store_true",
+                     help="skip computing drought/addon overlay for candidates that don't have it yet "
+                          "(faster, but addon/drought columns stay blank for un-registered candidates)")
+    ap.add_argument("--csv", default=None, help="write output/<name>.csv instead of the wide terminal table")
+    ap.add_argument("--xlsx", default=None,
+                     help="write output/<name>.xlsx (Candidates sheet + Column Definitions glossary sheet) "
+                          "instead of the wide terminal table")
+    args = ap.parse_args()
+
+    conn = sqlite3.connect(args.db)
+    ensure_candidate_nodes_table(conn)
+    ensure_overlay_table(conn)
+    tickers = args.tickers
+    if not tickers:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT ticker FROM candidate_nodes")
+        tickers = [r[0] for r in c.fetchall()]
+
+    rows = []
+    for ticker in tickers:
+        rows.extend(build_rows_for_ticker(conn, ticker, args.version, args.min_alpha, args.skip_5min,
+                                           args.skip_overlay))
 
     conn.close()
 
@@ -345,15 +494,30 @@ def main():
         _write_csv(args.csv, rows)
         return
 
-    hdr = "%-8s %12s %9s %9s %6s %6s %10s %14s %9s %6s %20s %20s %12s %12s" % (
-        "Ticker", "Liquidity$/d", "CoreA%", "AbsRet%", "Years", "Trades", "AnnExcess%", "FillAcc(win%,err%)",
-        "WorstNb%", "Status", "Addon(n,comp%,WR%)", "Drought(n,comp%,WR%)", "x Addon%", "x Drought%")
+    hdr = "%-8s %-20s %12s %9s %9s %6s %6s %10s %14s %9s %6s %20s %20s %12s %12s" % (
+        "Ticker", "Candidate", "Liquidity$/d", "CoreA%", "AbsRet%", "Years", "Trades", "AnnExcess%",
+        "FillAcc(win%,err%)", "WorstNb%", "Status", "Addon(n,comp%,WR%)", "Drought(n,comp%,WR%)",
+        "x Addon%", "x Drought%")
     print(hdr)
     print("(x columns are a NAIVE multiplicative estimate, not real stacked-model math -- see docstring)")
-    print("(AnnExcess% = CAGR-based excess over SPY, comparable across tickers with different cached-history "
-          "lengths -- see annualized_alpha_report.py. Years/Trades sit right next to it: a big AnnExcess% "
-          "backed by a short history / few trades is weaker evidence than the same number over a long one.)")
-    for row in sorted(rows, key=lambda r: -(r[2] if r[1] is not None else -1e9)):
+    print("(AnnExcess%/CoreA% are SPY-adjusted; AbsRet% is not -- see COLUMN_DEFS. Years/Trades sit next to "
+          "AnnExcess%: a big number backed by a short history / few trades is weaker evidence.)")
+    print("(Addon/Drought columns are blank unless THIS row's exact params match a registered candidate_nodes "
+          "entry that was actually run through the overlay shim -- not repeated across a ticker's 3 rows.)")
+
+    ticker_best = {}
+    for row in rows:
+        if row[1] is None:
+            continue
+        ticker_best[row[0]] = max(ticker_best.get(row[0], -1e9), row[3])
+
+    def sort_key(row):
+        ticker = row[0]
+        best = ticker_best.get(ticker, -1e9) if row[1] is not None else -1e9
+        type_rank = CANDIDATE_TYPE_ORDER.index(row[1]) if row[1] in CANDIDATE_TYPE_ORDER else 99
+        return (-best, ticker, type_rank)
+
+    for row in sorted(rows, key=sort_key):
         rec = _row_to_record(row)
         if rec.get("core_alpha_pct") is None:
             print(f"{rec['ticker']:8} NO_DATA")
@@ -370,8 +534,8 @@ def main():
         dm_str = f"{rec['x_drought_pct']:+.1f}" if rec['x_drought_pct'] is not None else "-"
         liq = rec['liquidity_dollars_per_day']
         liq_str = f"${liq:,.0f}" if liq is not None else "n/a"
-        print(f"{rec['ticker']:8} {liq_str:>12} {rec['core_alpha_pct']:>9.1f} {rec['abs_return_pct']:>9.1f} "
-              f"{rec['years']!s:>6} {rec['trades']:>6} {ae_str:>10} {fa_str:>14} "
+        print(f"{rec['ticker']:8} {rec['candidate_type']:<20} {liq_str:>12} {rec['core_alpha_pct']:>9.1f} "
+              f"{rec['abs_return_pct']:>9.1f} {rec['years']!s:>6} {rec['trades']:>6} {ae_str:>10} {fa_str:>14} "
               f"{wn_str} {rec['status']:>6} {ao_str:>20} {dr_str:>20} {am_str:>12} {dm_str:>12}")
 
 

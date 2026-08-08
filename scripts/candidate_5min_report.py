@@ -41,7 +41,7 @@ def _node_from_row(row):
         'trail_buy_pct': row['trail_buy_pct'], 'trail_sell_pct': row['trail_sell_pct'],
         'entry_timing': row['entry_timing'], 'arm_pct': row['take_profit'],
         'sl': int(row['stop_loss']), 'hold': int(row['max_hold_hours']),
-        'trades': int(row['trades']),
+        'trades': int(row['trades']), 'return': row['strategy_return'],
         'alpha_raw': row['alpha_vs_spy'], 'alpha_pessimistic': row['alpha_vs_spy_pessimistic'],
         'alpha_certain': row['alpha_vs_spy_certain'], 'robust_alpha': row['robust_alpha'],
     }

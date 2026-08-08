@@ -40,6 +40,22 @@ Before trusting *any* cliff-safety / robustness / neighbor-search query result:
    alpha didn't match the independently-confirmed real value), the query has a real bug, not the
    underlying data a real problem.
 
+## max_hold_hours neighbor radius: decided 2026-08-08 (later) — radius=1 (±7h/1 trading day), not radius=3
+
+Found while building `candidate_summary_report.py`'s 3-candidate-row report: `top_safe_nodes.
+best_safe_node()` checks `max_hold_hours` neighbors with a fixed `±7` (radius=1, one 7-bar trading
+day — every real swept campaign uses exactly 7-hour hold-time steps, confirmed project-wide,
+11,613 campaigns, zero exceptions), while `take_profit`/`stop_loss` in that same function use
+`CLIFF_RADIUS=3` (index-based nearest-3-distinct-values) — an inconsistent radius across axes
+within one safety check. Concretely surfaced on TNA: a node `best_safe_node()` certified SAFE
+(worst_neighbor +2.7% at radius=1) came back CLIFF (-9.8%) at radius=3, driven by a real loss at
+`hold=105` (3 steps out) invisible to the radius=1 check. **User's explicit call: keep radius=1**
+— didn't want a 3-trading-day-wide hold tolerance as the real safety standard, even though it
+would catch cases like TNA's. `top_safe_nodes.py`/`candidate_summary_report.py` unchanged
+(already used ±7 or were fixed to match it same session). `prune_backtest_cache.py`'s `±24`
+keep-threshold (island retention, not a safety verdict) is a deliberate wider superset margin —
+left as-is, not affected by this decision.
+
 ## Why this matters more than a normal bug
 
 This isn't just "a bug was found and fixed" — it produced a **confident, specific, wrong claim**
