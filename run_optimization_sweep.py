@@ -938,26 +938,45 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
             logger.info(f"  [{ticker}] best={best_alpha:+.1f}%  worst_neighbor={worst_neighbor:+.1f}%  {'CLIFF' if cliff else 'safe'}")
             results.append({'ticker': ticker, 'best_alpha': best_alpha, 'worst_neighbor': worst_neighbor})
 
+            # DISABLED 2026-08-08 (contextual Opus review, same session, after the cold
+            # review's fix below already landed): still broken in two further ways --
+            # (1) CRITICAL: rows carry no window/z_score_threshold/fixed_sl, so a stored
+            # row can't be mapped back to which campaign/node it describes (confirmed:
+            # JNUG/TrailingExit/stop_loss=1 already got 3 indistinguishable rows from 3
+            # different fixed_sl campaigns). (2) HIGH: the i3 neighbor query varies
+            # trail_buy_pct (this function's sl_axis) instead of holding it fixed, so it
+            # measures a materially different thing than top_safe_nodes.py's own
+            # CLIFF_RADIUS=3 (measured ~18x apart on a real SOXL node: -139.9% here vs
+            # -7.6% from top_safe_nodes.py). A consumer trusting this column inherits a
+            # false, far-more-pessimistic verdict. Turned off rather than shipped broken
+            # while context ran out mid-session -- see docs/backlog_cache.md for the
+            # real fix (needs window/z/fixed_sl/a correctly-named trail_buy_pct column,
+            # and i3's neighbor query needs to hold trail_buy_pct fixed to match
+            # top_safe_nodes.py's own convention) before re-enabling.
             # Persist i2 (above) and i3 (this project's other standing cliff-safety
             # radius, see scripts/top_safe_nodes.py's CLIFF_RADIUS=3) for the group's
             # winner, so future consumers don't have to slowly re-derive this from
             # scratch. Scoped to best_alpha > 100% ("should be fewer nodes" -- user's
-            # call, 2026-08-08) rather than every candidate.
-            # CRITICAL fix (2026-08-08, caught by same-session cold Opus review before
-            # this ever shipped to a committed state): sl_c holds the campaign's
-            # trail_buy_pct/trail_pct for uses_fixed_sl strategies (per
-            # _sl_axis_real_column), NOT the real stop_loss -- the real campaign SL is
-            # the `fixed_sl` parameter. Originally inserted sl_c into the stop_loss
-            # column (wrong value, corrupted the UNIQUE key across campaigns) and
-            # tpct_c into best_node_trail_buy_pct (actually trail_sell_pct, duplicating
-            # the real trail_sell_pct column and losing the real trail_buy_pct
-            # entirely). 18 rows written under the bug were deleted from the live DB.
-            # STILL OPEN, not fixed this session (MEDIUM, doesn't corrupt data): fresh
-            # datetime.now() per row means INSERT OR REPLACE never actually replaces a
-            # prior run for the same combo -- consumers must MAX(run_timestamp)-dedupe.
-            # Best-effort: a failure
+            # call, 2026-08-08) rather than every candidate. Best-effort: a failure
             # here must never break the sweep itself.
-            if best_alpha > 100:
+            #
+            # DISABLED 2026-08-08 (`if DISABLED_2026_08_08 and ...` below) -- a
+            # same-session contextual Opus review, run after the cold review's fix
+            # (stop_loss/best_node_trail_buy_pct mislabeling) already landed, found
+            # this is still broken in two further ways: (1) CRITICAL: rows carry no
+            # window/z_score_threshold/fixed_sl, so a stored row can't be mapped back
+            # to which campaign/node it describes (confirmed: JNUG/TrailingExit/
+            # stop_loss=1 already got 3 indistinguishable rows from 3 different
+            # fixed_sl campaigns). (2) HIGH: the i3 neighbor query varies trail_buy_pct
+            # (this function's sl_axis) instead of holding it fixed, so it measures a
+            # materially different thing than top_safe_nodes.py's own CLIFF_RADIUS=3
+            # (measured ~18x apart on a real SOXL node: -139.9% here vs -7.6% from
+            # top_safe_nodes.py). Turned off rather than shipped broken while context
+            # ran out mid-session -- see docs/backlog_cache.md for the real fix (needs
+            # window/z/fixed_sl/a correctly-named trail_buy_pct column, and i3's
+            # neighbor query needs to hold trail_buy_pct fixed) before re-enabling.
+            DISABLED_2026_08_08 = True
+            if (not DISABLED_2026_08_08) and best_alpha > 100:
                 CLIFF_RADIUS_I3 = 3
                 try:
                     worst_i3 = conn.execute(f"""
