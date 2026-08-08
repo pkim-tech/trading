@@ -35,6 +35,63 @@ DB_PATH = "cache/research/trading_universe.db"
 ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_vs_spy), "
                      "COALESCE(alpha_vs_spy_certain, alpha_vs_spy))")
 
+# Single source of truth for what each output column means -- used for both
+# the xlsx glossary sheet and (imported directly) the Streamlit Candidates
+# page's glossary expander, so the two never drift apart.
+COLUMN_DEFS = {
+    "ticker": "The symbol.",
+    "strategy": "Which strategy class the best node uses (TrailingBothZScoreBreakout = trailing-buy entry, "
+                "TrailingExitZScoreBreakout = market-buy entry).",
+    "core_alpha_pct": "robust_alpha for the best node: MIN(possible, pessimistic, certain) fill-resolution "
+                       "alpha vs SPY, over the ticker's full cached-data window. This project's standard "
+                       "selection metric -- see CLAUDE.md's kernel versioning notes.",
+    "abs_return_pct": "The strategy's own raw compounded return (not vs SPY) over the same window.",
+    "years": "Real calendar span of this ticker's cached hourly data (days between the earliest and latest "
+             "cached bar, /365.25). Tickers vary a lot here (e.g. SOXL ~3.0y vs SPCL ~0.31y) -- this is why "
+             "core_alpha_pct/abs_return_pct alone aren't fairly comparable across tickers.",
+    "trades": "Number of completed trades in the best node's backtest.",
+    "ann_excess_pct": "CAGR-based excess return over SPY, annualized over the full calendar window (years "
+                       "column) -- fixes the cross-ticker horizon-mismatch problem above. A large value backed "
+                       "by a short 'years'/low 'trades' is weak evidence (e.g. SPCL's ~3000%+ off 0.31y/3 "
+                       "trades is an annualization artifact, not a real signal) -- always read this next to "
+                       "years/trades, never alone. See docs/research_log.md's 2026-08-08 'annualized excess' "
+                       "entries for the full derivation.",
+    "fillacc_possible_win_pct": "Of this node's real trailing-buy entry signals in the last ~58 days (yfinance's "
+                                 "5-min history cap), the % where the 'possible' fill resolution (the kernel's "
+                                 "default, optimistic-but-unmodified bounce-fill assumption) was closest to the "
+                                 "REAL 5-minute-bar fill price, vs the 'pessimistic'/'certain' alternatives. "
+                                 "Blank for TrailingExitZScoreBreakout nodes (market-buy entry has no bounce-fill "
+                                 "resolution to check) or if trail_buy_pct=0.",
+    "fillacc_possible_mean_err_pct": "Mean absolute price error (%) of the 'possible' resolution vs the real "
+                                      "5-min fill, across those same signals. Lower is better/more trustworthy. "
+                                      "Same blank-condition as fillacc_possible_win_pct.",
+    "fillacc_n": "How many real signals the fill-accuracy check above is actually based on -- often single "
+                 "digits in a 58-day window, so treat a 100% win rate on n=1-2 with real caution.",
+    "worst_neighbor_pct": "Cliff-safety check: the worst robust_alpha found among nearby take_profit/stop_loss "
+                           "grid values (CLIFF_RADIUS=3 steps) around the best node's own params, holding every "
+                           "other axis fixed. Negative means a small parameter nudge would have lost money -- "
+                           "see docs/cliff_safety_query_checklist.md.",
+    "status": "CLIFF (worst_neighbor_pct < 0, the pick is fragile to small parameter changes) or SAFE "
+              "(worst_neighbor_pct >= 0). Unlike top_safe_nodes.py, this is computed for whatever node actually "
+              "won on core_alpha_pct, even if that node isn't cliff-safe -- so you can see HOW unsafe it is, "
+              "not just a pass/fail.",
+    "addon_n": "Number of backtested add-on-leg trades found for this ticker's registered candidate node(s) "
+               "(candidate_overlay_results, mechanism='addon'). Blank if none registered/run yet.",
+    "addon_compounded_pct": "Compounded return of just the add-on overlay's own trades (not combined with core).",
+    "addon_win_rate_pct": "% of add-on trades that were profitable.",
+    "drought_n": "Number of backtested drought-overlay trades found (mechanism='drought'). Blank if none "
+                 "registered/run yet.",
+    "drought_compounded_pct": "Compounded return of just the drought overlay's own trades (not combined with core).",
+    "drought_win_rate_pct": "% of drought trades that were profitable.",
+    "x_addon_pct": "NAIVE estimate of core+add-on combined: (1+core_return)*(1+addon_return)-1. Add-on capital "
+                   "runs CONCURRENTLY with an open core position (not sequentially), so this OVERSTATES the "
+                   "real combined effect -- v5_stacked_backtest.py's parallel-return model is the rigorous "
+                   "version. Treat this column as a rough upper bound, not a real number.",
+    "x_drought_pct": "NAIVE estimate of core+drought combined, same (1+core)*(1+overlay)-1 formula. Drought "
+                      "fills core's own idle-time gaps SEQUENTIALLY, so this approximation is more defensible "
+                      "than x_addon_pct, but still not the rigorous stacked model.",
+}
+
 
 def best_node(conn, ticker, version="v5"):
     c = conn.cursor()
@@ -137,40 +194,78 @@ def overlay_summary(conn, ticker, mechanism):
     return len(rets), compounded(rets), wr
 
 
+def _row_to_record(row):
+    """Converts one internal row tuple to a {column_name: value} dict keyed
+    exactly like COLUMN_DEFS, so CSV/xlsx/terminal output and the glossary
+    all agree on column names in one place."""
+    ticker = row[0]
+    if row[1] is None:
+        return {"ticker": ticker}
+    (ticker, strategy, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
+     addon, drought, addon_mult, drought_mult) = row
+    return {
+        "ticker": ticker, "strategy": strategy, "core_alpha_pct": ralpha, "abs_return_pct": sret,
+        "years": years, "trades": trades, "ann_excess_pct": ann_excess,
+        "fillacc_possible_win_pct": fill_acc[0] if fill_acc else None,
+        "fillacc_possible_mean_err_pct": fill_acc[1] if fill_acc else None,
+        "fillacc_n": fill_acc[2] if fill_acc else None,
+        "worst_neighbor_pct": wn, "status": cliff,
+        "addon_n": addon[0] if addon else None,
+        "addon_compounded_pct": addon[1] if addon else None,
+        "addon_win_rate_pct": addon[2] if addon else None,
+        "drought_n": drought[0] if drought else None,
+        "drought_compounded_pct": drought[1] if drought else None,
+        "drought_win_rate_pct": drought[2] if drought else None,
+        "x_addon_pct": addon_mult, "x_drought_pct": drought_mult,
+    }
+
+
 def _write_csv(name, rows):
     out_path = Path("output") / (name if name.endswith(".csv") else f"{name}.csv")
     out_path.parent.mkdir(exist_ok=True)
-    fieldnames = ["ticker", "core_alpha_pct", "abs_return_pct", "years", "trades",
-                  "ann_excess_pct", "fillacc_possible_win_pct", "fillacc_possible_mean_err_pct",
-                  "fillacc_n", "worst_neighbor_pct", "status",
-                  "addon_n", "addon_compounded_pct", "addon_win_rate_pct",
-                  "drought_n", "drought_compounded_pct", "drought_win_rate_pct",
-                  "x_addon_pct", "x_drought_pct"]
     with open(out_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=list(COLUMN_DEFS.keys()))
         w.writeheader()
         for row in rows:
-            if row[1] is None:
-                w.writerow({"ticker": row[0]})
-                continue
-            (ticker, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
-             addon, drought, addon_mult, drought_mult) = row
-            w.writerow({
-                "ticker": ticker, "core_alpha_pct": ralpha, "abs_return_pct": sret,
-                "years": years, "trades": trades, "ann_excess_pct": ann_excess,
-                "fillacc_possible_win_pct": fill_acc[0] if fill_acc else None,
-                "fillacc_possible_mean_err_pct": fill_acc[1] if fill_acc else None,
-                "fillacc_n": fill_acc[2] if fill_acc else None,
-                "worst_neighbor_pct": wn, "status": cliff,
-                "addon_n": addon[0] if addon else None,
-                "addon_compounded_pct": addon[1] if addon else None,
-                "addon_win_rate_pct": addon[2] if addon else None,
-                "drought_n": drought[0] if drought else None,
-                "drought_compounded_pct": drought[1] if drought else None,
-                "drought_win_rate_pct": drought[2] if drought else None,
-                "x_addon_pct": addon_mult, "x_drought_pct": drought_mult,
-            })
+            w.writerow(_row_to_record(row))
     print(f"Wrote {out_path} ({len(rows)} rows)")
+
+
+def _write_xlsx(name, rows):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    from openpyxl.utils import get_column_letter
+
+    out_path = Path("output") / (name if name.endswith(".xlsx") else f"{name}.xlsx")
+    out_path.parent.mkdir(exist_ok=True)
+
+    wb = Workbook()
+    data_ws = wb.active
+    data_ws.title = "Candidates"
+
+    cols = list(COLUMN_DEFS.keys())
+    data_ws.append(cols)
+    for cell in data_ws[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        rec = _row_to_record(row)
+        data_ws.append([rec.get(c) for c in cols])
+    data_ws.freeze_panes = "A2"
+    for i, col in enumerate(cols, start=1):
+        data_ws.column_dimensions[get_column_letter(i)].width = max(12, min(len(col) + 2, 28))
+
+    def_ws = wb.create_sheet("Column Definitions")
+    def_ws.append(["Column", "Definition"])
+    for cell in def_ws[1]:
+        cell.font = Font(bold=True)
+    for col, definition in COLUMN_DEFS.items():
+        def_ws.append([col, definition])
+        def_ws.cell(row=def_ws.max_row, column=2).alignment = Alignment(wrap_text=True, vertical="top")
+    def_ws.column_dimensions["A"].width = 32
+    def_ws.column_dimensions["B"].width = 110
+
+    wb.save(out_path)
+    print(f"Wrote {out_path} ({len(rows)} rows, 2 sheets)")
 
 
 def main():
@@ -181,6 +276,9 @@ def main():
     ap.add_argument("--skip-5min", action="store_true",
                      help="skip the 5-min fill-accuracy replay (saves a yfinance call per ticker)")
     ap.add_argument("--csv", default=None, help="write output/<name>.csv instead of the wide terminal table")
+    ap.add_argument("--xlsx", default=None,
+                     help="write output/<name>.xlsx (Candidates sheet + Column Definitions glossary sheet) "
+                          "instead of the wide terminal table")
     args = ap.parse_args()
 
     conn = sqlite3.connect(args.db)
@@ -217,11 +315,14 @@ def main():
         core_mult = 1 + sret / 100
         addon_mult = (core_mult * (1 + addon[1] / 100) - 1) * 100 if addon else None
         drought_mult = (core_mult * (1 + drought[1] / 100) - 1) * 100 if drought else None
-        rows.append((ticker, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
+        rows.append((ticker, strategy, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
                      addon, drought, addon_mult, drought_mult))
 
     conn.close()
 
+    if args.xlsx:
+        _write_xlsx(args.xlsx, rows)
+        return
     if args.csv:
         _write_csv(args.csv, rows)
         return
@@ -234,21 +335,24 @@ def main():
     print("(AnnExcess% = CAGR-based excess over SPY, comparable across tickers with different cached-history "
           "lengths -- see annualized_alpha_report.py. Years/Trades sit right next to it: a big AnnExcess% "
           "backed by a short history / few trades is weaker evidence than the same number over a long one.)")
-    for row in sorted(rows, key=lambda r: -(r[1] if r[1] is not None else -1e9)):
-        if row[1] is None:
-            print(f"{row[0]:8} NO_DATA")
+    for row in sorted(rows, key=lambda r: -(r[2] if r[1] is not None else -1e9)):
+        rec = _row_to_record(row)
+        if rec.get("core_alpha_pct") is None:
+            print(f"{rec['ticker']:8} NO_DATA")
             continue
-        (ticker, ralpha, sret, years, trades, ann_excess, fill_acc, wn, cliff,
-         addon, drought, addon_mult, drought_mult) = row
-        wn_str = f"{wn:>9.1f}" if wn is not None else "      n/a"
-        ae_str = f"{ann_excess:+.1f}" if ann_excess is not None else "-"
-        fa_str = f"{fill_acc[0]:.0f}%,{fill_acc[1]:.2f}%,n={fill_acc[2]}" if fill_acc else "-"
-        ao_str = f"{addon[0]},{addon[1]:+.2f}%,{addon[2]:.0f}%" if addon else "-"
-        dr_str = f"{drought[0]},{drought[1]:+.2f}%,{drought[2]:.0f}%" if drought else "-"
-        am_str = f"{addon_mult:+.1f}" if addon_mult is not None else "-"
-        dm_str = f"{drought_mult:+.1f}" if drought_mult is not None else "-"
-        print(f"{ticker:8} {ralpha:>9.1f} {sret:>9.1f} {years!s:>6} {trades:>6} {ae_str:>10} {fa_str:>14} "
-              f"{wn_str} {cliff:>6} {ao_str:>20} {dr_str:>20} {am_str:>12} {dm_str:>12}")
+        wn_str = f"{rec['worst_neighbor_pct']:>9.1f}" if rec['worst_neighbor_pct'] is not None else "      n/a"
+        ae_str = f"{rec['ann_excess_pct']:+.1f}" if rec['ann_excess_pct'] is not None else "-"
+        fa_str = (f"{rec['fillacc_possible_win_pct']:.0f}%,{rec['fillacc_possible_mean_err_pct']:.2f}%,"
+                  f"n={rec['fillacc_n']}") if rec['fillacc_possible_win_pct'] is not None else "-"
+        ao_str = (f"{rec['addon_n']},{rec['addon_compounded_pct']:+.2f}%,{rec['addon_win_rate_pct']:.0f}%"
+                  if rec['addon_n'] is not None else "-")
+        dr_str = (f"{rec['drought_n']},{rec['drought_compounded_pct']:+.2f}%,{rec['drought_win_rate_pct']:.0f}%"
+                  if rec['drought_n'] is not None else "-")
+        am_str = f"{rec['x_addon_pct']:+.1f}" if rec['x_addon_pct'] is not None else "-"
+        dm_str = f"{rec['x_drought_pct']:+.1f}" if rec['x_drought_pct'] is not None else "-"
+        print(f"{rec['ticker']:8} {rec['core_alpha_pct']:>9.1f} {rec['abs_return_pct']:>9.1f} "
+              f"{rec['years']!s:>6} {rec['trades']:>6} {ae_str:>10} {fa_str:>14} "
+              f"{wn_str} {rec['status']:>6} {ao_str:>20} {dr_str:>20} {am_str:>12} {dm_str:>12}")
 
 
 if __name__ == "__main__":
