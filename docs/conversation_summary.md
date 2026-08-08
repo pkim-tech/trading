@@ -6879,3 +6879,13 @@ Started from broadening the prior session's fill-resolution-accuracy check (25�
 **Not done**: the remaining out-of-sample/included-vs-excluded robustness steps on the candidates that passed; deduping the now-4-deep `candidate_nodes` registrations for some tickers; deciding whether `ann_excess_pct` should actually inform real prioritization (open backlog item).
 
 Full detail: `docs/research_log.md`'s five 2026-08-08 (later*) entries. No `active_signals.py`/`signals_*.py`/`schwab_*.py`/backtest-kernel files changed this session — the `session wrap` paired-Opus-review gate does not apply. `signals_invariants.py` and `check_backlog_cache_lean.py` both clean.
+
+---
+
+## 2026-08-08 (later still) — `go research`'s backlog reads scoped to `[backtest]`-tagged entries, cutting a real ~12% context tax
+
+Started from running `go research` cold and noticing it pulled in ~12% of context — traced to `docs/backlog_cache.md` (293 lines) and `docs/backlog_resolved_recent.md` (119 lines) both being read in full, unfiltered, even though `go research` already scopes `session_cache.md` to `[Research]`-tagged entries. Most of both backlog files is `[live-trading]`-tagged noise irrelevant to a concurrent Research thread.
+
+**Fixed**: `go research` now also scopes `backlog_cache.md`/`backlog_resolved_recent.md` to entries carrying a `[backtest]` tag anywhere in the tag list (so `[backtest][live-trading]` combos still count), skipping everything else. User's explicit call on the known lossiness (a research-relevant item could in principle be mistagged and get skipped): acceptable, since the weekly cleanup pass already re-triages/recategorizes backlog items, so a miscategorized item won't stay invisible long.
+
+Doc-only change (`CLAUDE.md`'s Session Commands section) — no trading-logic/kernel files touched, so the `session wrap` paired-Opus-review gate doesn't apply. Other uncommitted changes present in the working tree (`config.json`, `docs/backlog_cache.md`, `docs/backlog_resolved_recent.md`, `docs/deep_backlog.md`, `scripts/coverage_check.py`, `scripts/coverage_registry.py`, `signals_db.py`, `.claude/skills/weekend-cleanup/`, `scripts/restage_canary_nodes.py`) belong to a concurrent non-research session and were left untouched, not committed here.
