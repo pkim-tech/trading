@@ -256,6 +256,16 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE sl_sweep_summary ADD COLUMN worst_neighbor_alpha_i3 REAL")
     except Exception:
         pass
+    # window/z_score_threshold/fixed_sl (2026-08-0x): without these, a row can't be
+    # mapped back to which campaign/node it describes -- the CRITICAL gap that led
+    # to disabling this table's persistence 2026-08-08 (confirmed: JNUG/TrailingExit/
+    # stop_loss=1 produced 3 indistinguishable rows from 3 different fixed_sl
+    # campaigns before this fix).
+    for col, coltype in (('window', 'INTEGER'), ('z_score_threshold', 'REAL'), ('fixed_sl', 'REAL')):
+        try:
+            cursor.execute(f"ALTER TABLE sl_sweep_summary ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sweep_runs (
@@ -900,7 +910,9 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
             row = conn.execute(f"""
                 SELECT axis_tp, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, window, z_score_threshold,
                        {ROBUST_ALPHA_SQL} AS robust_alpha,
-                       {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct
+                       {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct,
+                       stop_loss AS literal_stop_loss, trail_buy_pct AS literal_trail_buy_pct,
+                       trail_sell_pct AS literal_trail_sell_pct
                 FROM backtest_cache
                 WHERE version=? AND ticker=? AND strategy=? AND trades > 0 {scope_sql}
                 ORDER BY robust_alpha DESC LIMIT 1
@@ -910,6 +922,21 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
 
             tp_c, sl_c, hold_c, win_c, z_c, best_alpha, tpct_c = (
                 int(row[0]), int(row[1]), int(row[2]), int(row[3]), float(row[4]), float(row[5]), float(row[6]))
+            # literal_stop_loss/literal_trail_buy_pct/literal_trail_sell_pct: the
+            # LITERAL backtest_cache columns of that name (distinct from sl_c above,
+            # which is the axis _sl_axis_real_column resolves to -- for TrailingBoth
+            # that's trail_buy_pct itself, and for TrailingExit it's trail_sell_pct,
+            # not the literal stop_loss column). Fetched directly, not derived from
+            # tpct_c/fourth_axis_col, because a prior version of this fix pinned
+            # trail_sell_pct=0.0 whenever it was the strategy's sl_axis rather than
+            # its fourth_axis (TrailingExit's real case) -- 0.0 matches zero rows for
+            # that strategy, so the neighbor search silently returned empty and
+            # failed open to a fabricated "safe" 0.0 (paired Opus review, both
+            # independent-cold and contextual, converged on this same CRITICAL
+            # finding). Only needed for the i3 neighbor query below, which must
+            # mirror top_safe_nodes.py's own convention exactly.
+            literal_sl_c, literal_trail_buy_pct_c, literal_trail_sell_pct_c = (
+                float(row[7]), float(row[8]), float(row[9]))
 
             tpct_filter = ""
             tpct_params = []
@@ -938,21 +965,6 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
             logger.info(f"  [{ticker}] best={best_alpha:+.1f}%  worst_neighbor={worst_neighbor:+.1f}%  {'CLIFF' if cliff else 'safe'}")
             results.append({'ticker': ticker, 'best_alpha': best_alpha, 'worst_neighbor': worst_neighbor})
 
-            # DISABLED 2026-08-08 (contextual Opus review, same session, after the cold
-            # review's fix below already landed): still broken in two further ways --
-            # (1) CRITICAL: rows carry no window/z_score_threshold/fixed_sl, so a stored
-            # row can't be mapped back to which campaign/node it describes (confirmed:
-            # JNUG/TrailingExit/stop_loss=1 already got 3 indistinguishable rows from 3
-            # different fixed_sl campaigns). (2) HIGH: the i3 neighbor query varies
-            # trail_buy_pct (this function's sl_axis) instead of holding it fixed, so it
-            # measures a materially different thing than top_safe_nodes.py's own
-            # CLIFF_RADIUS=3 (measured ~18x apart on a real SOXL node: -139.9% here vs
-            # -7.6% from top_safe_nodes.py). A consumer trusting this column inherits a
-            # false, far-more-pessimistic verdict. Turned off rather than shipped broken
-            # while context ran out mid-session -- see docs/backlog_cache.md for the
-            # real fix (needs window/z/fixed_sl/a correctly-named trail_buy_pct column,
-            # and i3's neighbor query needs to hold trail_buy_pct fixed to match
-            # top_safe_nodes.py's own convention) before re-enabling.
             # Persist i2 (above) and i3 (this project's other standing cliff-safety
             # radius, see scripts/top_safe_nodes.py's CLIFF_RADIUS=3) for the group's
             # winner, so future consumers don't have to slowly re-derive this from
@@ -960,23 +972,46 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
             # call, 2026-08-08) rather than every candidate. Best-effort: a failure
             # here must never break the sweep itself.
             #
-            # DISABLED 2026-08-08 (`if DISABLED_2026_08_08 and ...` below) -- a
-            # same-session contextual Opus review, run after the cold review's fix
-            # (stop_loss/best_node_trail_buy_pct mislabeling) already landed, found
-            # this is still broken in two further ways: (1) CRITICAL: rows carry no
-            # window/z_score_threshold/fixed_sl, so a stored row can't be mapped back
-            # to which campaign/node it describes (confirmed: JNUG/TrailingExit/
-            # stop_loss=1 already got 3 indistinguishable rows from 3 different
-            # fixed_sl campaigns). (2) HIGH: the i3 neighbor query varies trail_buy_pct
-            # (this function's sl_axis) instead of holding it fixed, so it measures a
-            # materially different thing than top_safe_nodes.py's own CLIFF_RADIUS=3
-            # (measured ~18x apart on a real SOXL node: -139.9% here vs -7.6% from
-            # top_safe_nodes.py). Turned off rather than shipped broken while context
-            # ran out mid-session -- see docs/backlog_cache.md for the real fix (needs
-            # window/z/fixed_sl/a correctly-named trail_buy_pct column, and i3's
-            # neighbor query needs to hold trail_buy_pct fixed) before re-enabling.
-            DISABLED_2026_08_08 = True
-            if (not DISABLED_2026_08_08) and best_alpha > 100:
+            # RE-ENABLED 2026-08-0x, then fixed AGAIN same session after a paired
+            # Opus review (independent-cold + contextual, both converged
+            # independently with matching real-data measurements) found the first
+            # re-enable attempt was itself broken in two ways:
+            # (1) CRITICAL -- pinning trail_sell_pct via
+            # `tpct_c if fourth_axis_col == 'trail_pct' else 0.0` is wrong for
+            # TrailingExitZScoreBreakout: its sl_axis IS 'trail_pct' (real column
+            # trail_sell_pct), not its fourth_axis (which is None), so this pinned
+            # 0.0 -- a value matching zero real rows for that strategy (30 distinct
+            # real values, none 0.0). The neighbor search came back empty every
+            # time, and `else 0.0` on the MIN() result then persisted a fabricated
+            # "safe" 0.0 for every TrailingExit row. Fixed: pin against
+            # literal_trail_sell_pct_c (the literal column, fetched directly above)
+            # instead of re-deriving from tpct_c/fourth_axis_col.
+            # (2) HIGH -- the original comment's "harmless no-op" claim about
+            # {scope_sql} was correct as a statement (it does pin stop_loss=fixed_sl
+            # exactly for uses_fixed_sl strategies) but wrong about the
+            # consequence: it meant the "stop_loss BETWEEN" radius never actually
+            # searched neighboring fixed_sl campaigns, while top_safe_nodes.py's
+            # own CLIFF_RADIUS=3 (scripts/top_safe_nodes.py:35-55) is NOT
+            # campaign-scoped -- it pools the whole ticker/strategy/version's
+            # backtest_cache and only 4 distinct fixed_sl values typically exist,
+            # so its +/-3 window genuinely spans nearly all of them. Measured on
+            # real SOXL/v5/TrailingBoth data: this function's campaign-scoped i3
+            # read 666.3% while the true top_safe_nodes-equivalent number was 5.6%
+            # -- up to ~119x more optimistic than the real convention it claimed to
+            # match, a worse failure direction than the original 18x-pessimistic
+            # bug this whole fix was written to close. Fixed: the i3 query now
+            # drops the stop_loss half of {scope_sql} and only holds entry_timing
+            # fixed (matching top_safe_nodes.py's own scoping exactly), letting
+            # "stop_loss BETWEEN" genuinely search neighboring fixed_sl campaigns
+            # for every strategy, not just non-uses_fixed_sl ones.
+            # Residual, accepted difference (LOW, both reviews flagged, not fixed):
+            # top_safe_nodes.best_safe_node() ranks unscoped across ALL campaigns
+            # with a min_alpha=200 floor and walks down ranks until a safe one is
+            # found -- it can pick a different anchor node than this function's
+            # single campaign-scoped top-1. The two numbers are now comparable in
+            # NEIGHBORHOOD (same radius convention, same held-fixed axes) but can
+            # still legitimately describe different winning nodes.
+            if best_alpha > 100:
                 CLIFF_RADIUS_I3 = 3
                 try:
                     worst_i3 = conn.execute(f"""
@@ -984,25 +1019,37 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                         WHERE version=? AND ticker=? AND strategy=?
                           AND window=? AND z_score_threshold=?
                           AND axis_tp        BETWEEN ? AND ?
-                          AND {_sl_axis_real_column(sl_axis_col)}  BETWEEN ? AND ?
+                          AND stop_loss      BETWEEN ? AND ?
                           AND max_hold_hours BETWEEN ? AND ?
-                          {scope_sql} {tpct_filter}
+                          AND trail_buy_pct  = ?
+                          AND trail_sell_pct = ?
+                          AND entry_timing   = ?
                           AND trades > 0
                     """, (config_version, ticker, strategy_name,
                           win_c, z_c,
                           tp_c - CLIFF_RADIUS_I3, tp_c + CLIFF_RADIUS_I3,
-                          sl_c - CLIFF_RADIUS_I3, sl_c + CLIFF_RADIUS_I3,
+                          literal_sl_c - CLIFF_RADIUS_I3, literal_sl_c + CLIFF_RADIUS_I3,
                           hold_c - 7, hold_c + 7,
-                          *scope_params, *tpct_params)).fetchone()[0]
-                    worst_neighbor_i3 = float(worst_i3) if worst_i3 is not None else 0.0
+                          literal_trail_buy_pct_c,
+                          literal_trail_sell_pct_c,
+                          entry_timing)).fetchone()[0]
+                    # None (not 0.0) on an empty neighbor set -- matches
+                    # top_safe_nodes.py's own fail-closed handling (its
+                    # pd.notna(worst) guard); a fabricated 0.0 here would read as
+                    # "exactly non-cliff" for a case that was never actually
+                    # checked (the same CRITICAL-adjacent failure mode as bug (1)
+                    # above, caught by the same paired review).
+                    worst_neighbor_i3 = float(worst_i3) if worst_i3 is not None else None
                     conn.execute("""
                         INSERT OR REPLACE INTO sl_sweep_summary
                             (ticker, strategy, version, stop_loss, trail_sell_pct, entry_timing,
+                             window, z_score_threshold, fixed_sl,
                              best_alpha, worst_neighbor_alpha, worst_neighbor_alpha_i3,
                              best_node_tp, best_node_hold, best_node_trail_buy_pct,
                              any_cliff_safe, run_timestamp)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (ticker, strategy_name, config_version, fixed_sl, tpct_c, entry_timing,
+                          win_c, z_c, fixed_sl,
                           best_alpha, worst_neighbor, worst_neighbor_i3,
                           tp_c, hold_c, sl_c if sl_axis_col == 'trail_buy_pct' else None,
                           0 if cliff else 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
