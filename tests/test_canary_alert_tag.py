@@ -65,6 +65,18 @@ def test_build_buy_blocks_no_canary_tag_for_real_node(isolated_db, monkeypatch):
     assert '🧪CANARY' not in blocks[0]['text']['text']
 
 
+def test_build_buy_blocks_tags_canary_family_variant(isolated_db, monkeypatch):
+    """2026-08-09 paired review finding: exact version=='canary' equality
+    missed real canary-family variant nodes (e.g. 'v5-canary-drought-addon')
+    -- these are the ONLY canary-family nodes reachable via a real Slack post
+    today (via notify_drought_buy_signal's separate missing-gate bug, fixed
+    same session), so the exact-match gap wasn't just theoretical."""
+    monkeypatch.setattr(signals_config, 'RESEARCH_DB_PATH', Path('/nonexistent/trading_universe.db'))
+    node = _add_node('v5-canary-drought-addon')
+    blocks = signals_blocks._build_buy_blocks(node, _fake_sig())
+    assert '🧪CANARY' in blocks[0]['text']['text']
+
+
 def _fake_pos(wl_id, account='ira'):
     return {
         'id': 1, 'ticker': TICKER, 'entry_price': 80.0, 'account': account, 'wl_id': wl_id,

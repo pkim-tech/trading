@@ -937,6 +937,12 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
             # mirror top_safe_nodes.py's own convention exactly.
             literal_sl_c, literal_trail_buy_pct_c, literal_trail_sell_pct_c = (
                 float(row[7]), float(row[8]), float(row[9]))
+            # axis_tp is a REAL column -- tp_c's int() truncation is harmless today
+            # (every real v5 axis_tp value is currently a whole number) but would
+            # silently shift the i3 neighborhood off top_safe_nodes.py's exact-float
+            # convention for a future fractional TP/arm grid (paired review finding).
+            # Only the i3 block below uses this; i2 above is untouched, out of scope.
+            axis_tp_f = float(row[0])
 
             tpct_filter = ""
             tpct_params = []
@@ -1027,7 +1033,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                           AND trades > 0
                     """, (config_version, ticker, strategy_name,
                           win_c, z_c,
-                          tp_c - CLIFF_RADIUS_I3, tp_c + CLIFF_RADIUS_I3,
+                          axis_tp_f - CLIFF_RADIUS_I3, axis_tp_f + CLIFF_RADIUS_I3,
                           literal_sl_c - CLIFF_RADIUS_I3, literal_sl_c + CLIFF_RADIUS_I3,
                           hold_c - 7, hold_c + 7,
                           literal_trail_buy_pct_c,
@@ -1040,6 +1046,24 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                     # checked (the same CRITICAL-adjacent failure mode as bug (1)
                     # above, caught by the same paired review).
                     worst_neighbor_i3 = float(worst_i3) if worst_i3 is not None else None
+                    # Persist the LITERAL columns (fetched above), not tpct_c/sl_c --
+                    # a 2nd paired review round (independent-cold + contextual, both
+                    # converged) found the first fix only corrected the i3 QUERY, not
+                    # this INSERT: tpct_c is hardcoded 0 whenever fourth_axis_col !=
+                    # 'trail_pct' (TrailingExit's real case, since trail_sell_pct is
+                    # its sl_axis, not its fourth_axis), so every TrailingExit row
+                    # still persisted a fabricated trail_sell_pct=0.0/NULL
+                    # best_node_trail_buy_pct -- the exact "row can't be mapped back
+                    # to its node" CRITICAL this whole re-enable exists to close,
+                    # still open on the write side. Also: stop_loss/fixed_sl are only
+                    # meaningful for uses_fixed_sl strategies (TrailingBoth/
+                    # TrailingExit, where fixed_sl really is a real per-campaign
+                    # constant) -- for a future non-uses_fixed_sl strategy through
+                    # this path (e.g. plain ZScoreBreakout), fixed_sl doesn't exist as
+                    # a real campaign concept and the real SL is literal_sl_c instead
+                    # (2nd paired review round, MEDIUM, confirmed latent -- no such
+                    # campaign has run through here yet).
+                    _uses_fixed_sl = strategies.uses_fixed_sl(strategy_name)
                     conn.execute("""
                         INSERT OR REPLACE INTO sl_sweep_summary
                             (ticker, strategy, version, stop_loss, trail_sell_pct, entry_timing,
@@ -1048,10 +1072,13 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                              best_node_tp, best_node_hold, best_node_trail_buy_pct,
                              any_cliff_safe, run_timestamp)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (ticker, strategy_name, config_version, fixed_sl, tpct_c, entry_timing,
-                          win_c, z_c, fixed_sl,
+                    """, (ticker, strategy_name, config_version,
+                          fixed_sl if _uses_fixed_sl else literal_sl_c,
+                          literal_trail_sell_pct_c, entry_timing,
+                          win_c, z_c, fixed_sl if _uses_fixed_sl else None,
                           best_alpha, worst_neighbor, worst_neighbor_i3,
-                          tp_c, hold_c, sl_c if sl_axis_col == 'trail_buy_pct' else None,
+                          axis_tp_f, hold_c,
+                          literal_trail_buy_pct_c if sl_axis_col == 'trail_buy_pct' else None,
                           0 if cliff else 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                     conn.commit()
                 except Exception as e:

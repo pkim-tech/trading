@@ -1513,11 +1513,22 @@ def notify_drought_buy_signal(node, decision):
     elif ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         auto_placed, order_id = _attempt_automated_market_buy(node, sizing)
 
-    channel, ts = _post_message(
-        f"🌵 DROUGHT ENTRY SIGNAL — {ticker}  ${price:.4f}  "
-        f"(confirm_days={decision['confirm_days']})",
-        _build_buy_blocks(node, sig_like, auto_placed=auto_placed),
-    )
+    # Sub-capital-at-stake nodes get zero real-time Slack (2026-08-08 user
+    # call, same gate as notify_buy_signal) -- this call site was missed
+    # when that redesign landed, found by 2026-08-09 paired review: 11 real
+    # soxl_ira nodes ($500-$2,500) and 3 dry_run brokerage canary-drought
+    # nodes have drought_overlay_enabled=1, all below the capital-at-stake
+    # bar, and were getting real-time posts regardless. Tracking below
+    # (pending_buy, automated placement) is unaffected -- only the Slack
+    # post itself is skipped, matching notify_buy_signal's contract.
+    if not should_alert_live(node):
+        channel, ts = None, None
+    else:
+        channel, ts = _post_message(
+            f"🌵 DROUGHT ENTRY SIGNAL — {ticker}  ${price:.4f}  "
+            f"(confirm_days={decision['confirm_days']})",
+            _build_buy_blocks(node, sig_like, auto_placed=auto_placed),
+        )
     db.add_pending_buy(node, sig_like, channel, ts, order_id=order_id, position_source='drought_overlay',
                         drought_confirm_days=decision['confirm_days'], drought_vol_gate=decision['vol_gate'],
                         drought_gap_start=decision['gap_start'], drought_vol_pctile=decision['vol_pctile'])
@@ -3757,7 +3768,10 @@ def _ticker_block(row):
         # state right now (whole watchlist), canary is a synthetic test node
         # not meant to be traded at all (see the "Manually Open" suppression
         # below, automation_principles.md #0/#7).
-        mode_tag = ' 🧪CANARY' if (row.get('_node') or {}).get('version') == 'canary' \
+        # Substring, not exact-equality (2026-08-09 paired review, same gap
+        # found in the new BUY/SELL alert tags) -- misses canary-family
+        # variants like 'v5-canary-drought-addon' otherwise.
+        mode_tag = ' 🧪CANARY' if 'canary' in ((row.get('_node') or {}).get('version') or '') \
             else (' (research)' if row.get('State') == 'paper' else '')
         text = (
             f"{phase_str}*{ticker}* `{version}`{mode_tag}{account_str}{last_sale_str}\n"

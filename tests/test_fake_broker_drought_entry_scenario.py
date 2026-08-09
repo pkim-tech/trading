@@ -124,6 +124,52 @@ def test_drought_entry_places_real_trailing_buy_for_trailingboth_node(env, fake_
     assert any(e['ticker'] == TICKER and e['result'] == 'signalled' for e in events)
 
 
+def test_drought_entry_respects_capital_at_stake_alert_gate(env, fake_broker, monkeypatch):
+    """2026-08-09 paired review finding: notify_drought_buy_signal called
+    _post_message unconditionally, missing the should_alert_live gate every
+    other real BUY alert (notify_buy_signal) already has -- found because it
+    directly affects 11 real soxl_ira nodes ($500-$2,500, all below the
+    capital-at-stake bar) and 3 dry_run brokerage canary-drought nodes.
+    Tracking (pending_buy, coverage_events, real order placement) must stay
+    unconditional -- only the Slack post itself should be gated."""
+    monkeypatch.setattr(paper_trading, 'evaluate_drought_entry', lambda node, paper=False: dict(_DECISION))
+    fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    posts = []
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda *a, **kw: (posts.append(a), (None, None))[1])
+    node = _node()  # starting_notional=2000, real soxl_ira -- sub-capital-at-stake
+
+    signals_notify.check_drought_entry(node)
+
+    assert posts == [], "sub-capital-at-stake node must get zero real-time Slack post"
+    # Tracking still fires regardless of the alert gate.
+    orders = _real_orders(fake_broker, TICKER, side='BUY')
+    assert len(orders) == 1
+    pending = signals_db.get_drought_pending_buy(node['id'])
+    assert pending is not None and pending['order_placed'] == 1
+
+
+def test_drought_entry_alerts_for_a_capital_at_stake_node(env, fake_broker, monkeypatch):
+    """Mirror of the gate test above -- a node crossing the capital-at-stake
+    bar must still get its real-time Slack post."""
+    monkeypatch.setattr(paper_trading, 'evaluate_drought_entry', lambda node, paper=False: dict(_DECISION))
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET starting_notional=50000 WHERE ticker=?", (TICKER,))
+        c.commit()
+    fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    posts = []
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda *a, **kw: (posts.append(a), ('C1', '1'))[1])
+    node = _node()
+
+    signals_notify.check_drought_entry(node)
+
+    assert len(posts) == 1, "a capital-at-stake node must still get its real-time drought entry alert"
+    assert 'DROUGHT ENTRY SIGNAL' in posts[0][0]
+
+
 def test_drought_entry_is_a_noop_for_a_research_mode_node(env, fake_broker, monkeypatch):
     """Regression assertion: an identical research-mode node must place NO
     real order at all -- mode-symmetry with check_paper_drought_entry."""

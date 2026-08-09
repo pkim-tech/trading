@@ -183,7 +183,11 @@ def _build_buy_blocks(node, sig, auto_placed=False):
     # close now rather than leave a landmine for whenever that gating logic
     # changes -- mode_tag() itself only ever returns LIVE/DRY-RUN/UNKNOWN,
     # deliberately not overloaded here since it's shared with other alerts.
-    canary_tag = ' 🧪CANARY' if node.get('version') == 'canary' else ''
+    # Substring, not exact-equality (paired review finding): canary-family
+    # variant nodes (e.g. 'v5-canary-drought', 'v5-canary-drought-addon')
+    # exist alongside the original bare 'canary' version and are otherwise
+    # missed -- verified no non-canary version string contains "canary".
+    canary_tag = ' 🧪CANARY' if 'canary' in (node.get('version') or '') else ''
     acct_tag = f"`{account} · {mode_tag(account, node)}{canary_tag}`"
     if trailing_buy:
         auto_str = "  🤖 *auto-placed at broker*" if auto_placed else ""
@@ -340,7 +344,7 @@ def _build_sell_blocks(pos, reason, current_price, target_price, resting_confirm
             action = f"Change Stop Loss → Market Close order (exit by EOD)"
 
     # See _build_buy_blocks' matching canary_tag comment -- same gap, same fix.
-    canary_tag = ' 🧪CANARY' if (_node or {}).get('version') == 'canary' else ''
+    canary_tag = ' 🧪CANARY' if 'canary' in ((_node or {}).get('version') or '') else ''
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
             "text": (
