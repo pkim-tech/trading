@@ -7,6 +7,12 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [backtest][portfolio] Resolved 2026-08-08 (late) — SOXL drought overlay superseded by the 2026-08-07 out-of-sample validation (confirm_days=3/vol_gate=0.4, +174.8%, positive both halves), no longer the fragile 2/13-trade result. Full detail: `deep_backlog.md`.
+## [backtest] Resolved 2026-08-08 (late) — same-bar arm/take-profit trigger reframed as a deliberate decision (matches live's one-bar-late behavior), not open work. Full detail: `deep_backlog.md`.
+## [backtest] Resolved 2026-08-08 (late) — data mutation log confirmed built and wired, just never exercised (no real stock split since 2026-07-22); prune's dynamic table-copy already covers it. Full detail: `deep_backlog.md`.
+## [live-trading] Resolved 2026-08-09 — real BUY/SELL Slack alerts now carry a 🧪CANARY tag (`_build_buy_blocks`/`_build_sell_blocks`), matching the Reference Report/paper-trading convention. Currently unreachable in live practice (canary nodes never cross has_capital_at_stake) but closed rather than left as a landmine. 5 new tests. Full detail: `deep_backlog.md`.
+## [live-trading] Resolved 2026-08-09 — Part 4 (TrailingExitZScoreBreakout entry/fill/SL automation) and Part 3 (trailing-buy budget adherence) live-test status checked directly against coverage_registry.py, not assumed stale. Both mostly verified-live now; each has exactly one known gap (pinned_entry_trigger, post_fill_topup), both already tracked elsewhere. Full detail: `deep_backlog.md`.
+## [backtest] Resolved 2026-08-08 (late) — v3.x deleted from `backtest_cache` (6.83M rows, 55%); v5 confirmed the live watchlist's sole real dependency; v4-disk-footprint and fixed_sl=15% sweep items closed as moot alongside it. Full detail: `deep_backlog.md`.
 ## [backtest] Resolved 2026-08-08 (later still) — sl_sweep_summary worst_neighbor persistence re-enabled after a 2nd paired Opus review round found the first re-enable attempt itself broken (1 CRITICAL + 1 HIGH), both fixed and verified against real data. Full detail: `deep_backlog.md`.
 ## [backtest][data] Resolved 2026-08-08 (late) — SQQQ/SOXS/UCO/QLD's v5 sweep data recovered (3.42M rows) from the pre-prune archive, re-pruned, swapped in; validated against `top_safe_nodes.py`. UCO best +125.8%, SOXS +86.5%, QLD +34.7%; SQQQ genuinely has no cliff-safe node. Full detail: `deep_backlog.md`.
 ## [live-trading][coverage] Resolved 2026-08-08 (weekend) — canary scenario_expectations unified onto the Accountability Grid (all 7 letters, was 2/7); price-action auto-explain for benign no-trade deviations; new `scripts/restage_canary_nodes.py` nightly clean-reset tool (close-only, run for real, SPXU/TWM). Paired Opus review (independent-cold + contextual + rebuttal) found 2 HIGH bugs (auto-explain could clobber a human reason; restage's original reopen design made real canary bugs invisible/auto-explained-away) + 2 MEDIUM/LOW, all fixed and reverified (56/56 + 5/5 + 7/7 tests). Full detail: `deep_backlog.md`.
@@ -79,44 +85,3 @@ Full detail: `docs/deep_backlog.md`'s 2026-08-02 entry. Integrity-checked, spot-
 ## [live-trading][security] Resolved 2026-08-02 — broker_stop_price clearing (already fixed 2026-08-01) + Skip now cancels a real resting FRESH exit order, but never the standing TRAIL protection
 Full detail: `docs/deep_backlog.md`'s 2026-08-02 entry. Paired review caught a HIGH regression in the first draft (would've cancelled a position's only protection); rewritten + tested. Full suite: 499 passed.
 
-## [live-trading][security] Resolved 2026-08-01 (session-wrap review) — final whole-diff Opus review of all 5 session pieces together found 2 real cross-piece bugs
-Full detail: `docs/deep_backlog.md`'s entry. HIGH: `broker_stop_price` (piece 1) went live but was never cleared on replace, a real alert-accuracy regression — fixed + tested. MEDIUM: `SIM_MODE` fail-safe (piece 4) was disabled by any library import of `active_signals` — fixed via `__name__ == '__main__'` gating.
-
-## [live-trading][security] Resolved 2026-08-01 — real live-trading bug found via the Accountability Grid: post-fill top-up BUYs were blocked 100% of the time outside signal windows
-Full detail: `docs/deep_backlog.md`'s entry. `is_protective` now exempts the signal-window gate, matching `is_gap_correction`'s existing exemption. 2 confirmed real failures on file (RETL, LABD).
-
-## [backtest] Resolved 2026-08-01 (compounding-drag item) — independent Opus challenge of the 2026-08-01 research tangent, then a redo + user correction on the drag finding
-Bear-market/regime items from the same challenge are still open — see `docs/backlog_cache.md`. Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry.
-
-## [live-trading][security] Resolved 2026-08-01 (evening) — real incident: an ad hoc test call posted a real Slack message; SIM_MODE flipped to a fail-safe default
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 (evening) entry / `CLAUDE.md`'s Live Trading section. Real daemon launch command unchanged — `active_signals.py` now forces SIM_MODE=0 for itself before `signals_config` is even imported.
-
-## [live-trading][coverage] Resolved 2026-08-01 — reconciliation_mismatch broken out per-node (20 rows, was 1 global)
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 entry. Also found+fixed a real regression while validating: the EOD Slack report would have posted 20 lines/day instead of 1; grouped into a summary line.
-
-## [live-trading][security] Resolved (retroactively confirmed 2026-08-01) — 2026-07-23 night soxl_ira live-order testing findings, all closed within days
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 entry. Async-confirmation gap was fixed 2026-07-24 (`fda9b2a`); left marked `Open` for a week past its actual resolution.
-
-## [live-trading][coverage] Resolved 2026-08-01 — GDXU TRAIL-exit alert wording: TP/TRAIL/TIME sell alerts no longer claim "Cancel Stop Loss order" for a position already managed by a resting automated exit order
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 (evening) entry. 2 review rounds (Opus) found and fixed a HIGH gap (order_id presence isn't proof of a resting order) and 2 MEDIUM gaps before landing.
-
-## [live-trading][security] Resolved 2026-08-01 (late) — `handle_entry_price` never auto-placed a protective stop for automation-scoped market-buy fills; new paired independent+contextual review pattern adopted
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 (late) entry.
-
-## [live-trading][testing] Resolved 2026-08-01 — fake_broker coverage pushed 6/41 → 37/41 tracked branches with a real regression test
-Full detail: commit `f3b9bab`, `docs/deep_backlog.md`'s 2026-08-01 entry.
-
-## [live-trading][coverage] Resolved 2026-08-01 — JDST re-paired with JNUG as a same-underlying bull/bear pair (new `canary_bull_bear_pair` scenario), not VOO's E-scenario mirror
-Full detail: commit `f3b9bab`, `docs/deep_backlog.md`'s 2026-08-01 entry.
-
-## [live-trading] Superseded 2026-08-01 — GDXD's old $5k-pilot-node role has no live successor plan; DPST now fills the "small real-money live volunteer" slot instead
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry.
-
-## [live-trading][coverage] Partially resolved 2026-08-01 — the 07-27 canary_* duplicate-row concern was already inert; cleaned up
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 entry. Root cause: a `mode` column added mid-migration (07-25) broke the dedup key; the old rows were already `active=0` and excluded everywhere — never a live bug. 1 follow-up still open.
-
-## [live-trading] Resolved (confirmed stale 2026-08-01) — paper trading is currently fully dormant system-wide
-Resolved by the 2026-07-25 mode-flip back to `research`; verified 2026-08-01 (32 closed trades, 6 open positions, genuinely active).
-
-## [live-trading] Resolved 2026-08-01 (evening) — SL Slack alert falls back to a generic "should have auto-filled" guess; split into known/automation-pending/dry-run/manual code paths
-Full detail: `docs/deep_backlog.md`'s 2026-08-01 (evening) entry. Opus review of v1 caught 2 real bugs (dry-run false-alarm, a write-suppression gap), both fixed before commit. Full suite: 473 passed.
