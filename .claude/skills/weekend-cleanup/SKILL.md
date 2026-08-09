@@ -1,6 +1,6 @@
 ---
 name: weekend-cleanup
-description: Reconfirm every "staged" live-trading backlog item (and other staged items) against real DB/broker state, since staged items are things "waiting on an organic signal" and the weekend is dead time to check whether that signal already fired without the backlog being updated. Use when the user says "weekend cleanup," "reconfirm the staged items," or asks to check the backlog is still accurate on a non-trading day.
+description: Reconfirm every "staged" live-trading backlog item (and other staged items) against real DB/broker state, since staged items are things "waiting on an organic signal" and the weekend is dead time to check whether that signal already fired without the backlog being updated. Also does a weekly audit of the week's commits for new features/behavior changes that landed with no proportional new test coverage. Use when the user says "weekend cleanup," "reconfirm the staged items," "weekly checkin," or asks to check the backlog is still accurate on a non-trading day.
 ---
 
 # Weekend cleanup
@@ -78,6 +78,46 @@ worrying about racing a live trading window.
    `backlog_cache.md`/`backlog_resolved_recent.md`/`deep_backlog.md` --
    confirm with the user before committing the doc updates, same as any
    other backlog-maintenance edit.
+
+## Weekly commit/test-coverage audit
+
+Added 2026-08-08 (evening), after the same-day canary Grid/restage/auto-
+explain commit (`dcda025`) was found to have shipped 3 real behavior
+changes -- `restage_canary_nodes.py` (new tool, 131 lines), price-action
+auto-explain in `coverage_check.py`, and the `reason_by`-clobber guard the
+session's own paired review had just found and fixed -- with **zero new
+test functions**. The commit's "Full suite: 631 passed" was true but
+misleading: that was the pre-existing count, unchanged by the diff (the
+only test-file edits were mechanical 2-tuple -> 3-tuple signature fixes).
+Nobody caught it until directly asked to review the backlog against recent
+commits. This step exists so that check happens on a cadence, not only
+when prompted.
+
+1. **Walk every commit from the last 7 days** (`git log --oneline --since="7 days ago"`,
+   then `git show --stat <sha>` per commit) and for each one that adds a new
+   feature, new code path, or a real behavior change (not a pure doc/backlog/
+   research-script/one-off-analysis commit):
+   - Check whether the commit's own diff touched a test file, and if so,
+     whether it added genuinely new `def test_*` functions -- not just
+     signature/call-site fixes forced by an unrelated refactor (that's what
+     the `dcda025` commit's diff looked like at a glance; only a real diff
+     read caught that no new test logic existed).
+   - If a new script was added (`scripts/*.py`) with no matching
+     `tests/test_*.py`, that's a gap regardless of what the commit message
+     claims about "full suite passed."
+   - Cross-check any bug the commit's message claims was "verified with a
+     regression test" -- grep for it. A claim in a commit message is not
+     proof; find the actual test.
+2. **Report gaps found**, grouped by commit, each with: what shipped, what's
+   untested, and a concrete list of the missing test cases (mirroring how
+   the existing code's own docstrings describe its edge cases/guards -- they
+   usually already enumerate exactly what a test should cover, since the
+   paired-review process demands explaining the "why" inline).
+3. **Only write the missing tests after reporting** -- same confirm-before-
+   editing posture as the staged-item backlog edits above, since writing
+   tests touches committed files, not just backlog prose. (Exception: if the
+   user has already said "yes, write them" in the same conversation, proceed
+   directly -- don't re-ask for a decision already made.)
 
 ## Scope notes
 
