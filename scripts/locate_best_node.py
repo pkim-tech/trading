@@ -91,7 +91,36 @@ def ensure_candidate_nodes_table(conn: sqlite3.Connection):
                    trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing)
         )
     """)
+    # pick/comment migration, added 2026-08-09: the user's real promotion
+    # decision (Pick: yes/no + a free-text comment, e.g. "SpaceX 2x") needs
+    # to survive a re-run of candidate_full_review.py --xlsx, which
+    # otherwise always writes a fresh sheet from the DB with no memory of
+    # what was already decided. candidate_nodes is this project's existing
+    # interim per-node registry (real id, deduped by full param tuple) --
+    # storing the decision here instead of a separate table means the report
+    # can just LEFT JOIN it back in on the same id it already computes.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)").fetchall()}
+    if "pick" not in cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN pick TEXT")
+    if "comment" not in cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN comment TEXT")
     conn.commit()
+
+
+def set_pick_comment(conn: sqlite3.Connection, node_id: int, pick: str = None, comment: str = None):
+    """Updates ONLY the fields actually passed (None means 'leave alone', not
+    'clear it') -- so `--comment "..."` alone doesn't wipe out an existing
+    pick, and vice versa."""
+    if pick is not None:
+        conn.execute("UPDATE candidate_nodes SET pick=? WHERE id=?", (pick, node_id))
+    if comment is not None:
+        conn.execute("UPDATE candidate_nodes SET comment=? WHERE id=?", (comment, node_id))
+    conn.commit()
+
+
+def get_pick_comment(conn: sqlite3.Connection, node_id: int):
+    row = conn.execute("SELECT pick, comment FROM candidate_nodes WHERE id=?", (node_id,)).fetchone()
+    return (row[0], row[1]) if row else (None, None)
 
 
 def get_or_create_candidate_node(conn: sqlite3.Connection, node: dict) -> int:

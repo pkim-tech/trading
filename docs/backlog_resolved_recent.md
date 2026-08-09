@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [backtest] Investigated 2026-08-09 (later) — "certain" fill-resolution's credited entry price found unobtainable by any real order; corrected SOXL example alpha drops ~10x (+13,030.7%→+1,270.3%), still real but concentrated in one historical window. Full detail: `deep_backlog.md`/`research_log.md`.
+## [backtest] Built 2026-08-09 (later) — `candidate_full_review.py` follow-up closes 3 real gaps (item 4 core-only, item 8 no core fluke check, overlay-process step 4 never built), adds bear-market stress + real 2025-crash check + persistent Pick/Comment tracking via `node_id`. 2nd paired Fable+Opus review found 1 HIGH (22+ duplicated `candidate_overlay_results` rows) + 7 MEDIUM/LOW, all fixed. SPCL and FNGU disqualified (single-stock/mandate-change contamination; 10-holding FANG+ index, below 20-security bar). Full detail: `deep_backlog.md`.
 ## [backtest] Built 2026-08-09 — `scripts/candidate_full_review.py`, the canonical one-sheet candidate report (4 candidate types, full watchlist_candidate_checklist.md scope, indicative tranches, no hard filters); paired Fable+Opus review found 2 HIGH + several MEDIUM real bugs (window-keyed cache bug, fragile robust_alpha node lookup, same-day-block math/sign issues, missing item 3), all fixed and verified against the reviewers' own repro numbers. Full detail: `deep_backlog.md`.
 ## [backtest][data] Resolved 2026-08-09 — SPY/QQQ/USO liquidity data gap fixed (real yfinance fetch, no `tickers` row existed at all); `candidate_nodes.arm_pct` BLOB-corruption bug fixed at source + 18 existing bad rows repaired (13 dupes redirected/deleted, 5 repaired in place). Full detail: `deep_backlog.md`.
 ## [portfolio][tax] Resolved 2026-08-09 — K-1/Section 1256 tax forecast tool built: 60/40 blended rate, per-PTP loss silo, 2 separate reserve buckets (tax-due vs safe-harbor step-up), quarterly tracker, stress test. `k1_tax.py`/`scripts/k1_tax_forecast.py`/`pages/16_K1_Tax.py`, 27 new tests. Not yet populated with real trade data. Full detail: `deep_backlog.md`.
@@ -80,18 +82,4 @@ Individual v5 nodes' own edges unaffected — only the combination mechanism was
 ## [backtest] Resolved 2026-08-03 — FFT cycle detection to inform z-score window selection: negative result
 No significant periodicity found in any of the 10 v5 watchlist tickers' return series (permutation-null p=0.076-0.837, all above 0.05); no correlation with the empirically-chosen `window` (10 vs 20). Full detail: `docs/research_log.md`'s 2026-08-03 entry, `docs/deep_backlog.md`'s pointer entry. The regime-detection half of the original idea is re-opened separately in `docs/backlog_cache.md`.
 
-## [live-trading][security] Closed 2026-08-02 (stale, not new work) — `live_sanity_check.py`'s oversized-BUY/naked-SELL tests were actually run 2026-07-23; and the related "is an oversell test constructible" question resolved to "no, structurally guaranteed by account mechanics"
-Both were mistakenly still open in `backlog_cache.md`. Full detail: `docs/deep_backlog.md`'s two entries (search "closed 2026-08-02").
-
-## [live-trading][security] Resolved 2026-08-02 — existing-position BUY guard closes the real double-buy gap confirmed 2026-07-24
-Full detail: `docs/deep_backlog.md`'s entry. `check_order` now blocks a 2nd real BUY when a position already exists for (ticker, account), unless `is_protective` (top-up). Ticker+account-keyed (not node-keyed) is a documented, currently-latent limitation. Full suite: 507 passed.
-
-## [live-trading][coverage] Resolved 2026-08-02 — TRAIL-exit reminder spam fixed: routine "still resting" alert suppressed until reminder #3 (~45min), only the arm-time ping and eventual fill/escalation alerts remain
-Full detail: `docs/deep_backlog.md`'s entry. Cold Opus review found+fixed a HIGH gap (could've gone silent up to ~17.75h near/outside the 9-16 reminder window) plus 2 lower issues before landing.
-
-## [backtest][data] Resolved 2026-08-02 — `backtest_cache` pruned to island-only (65GB → 256MB, 493,720 of 167.5M rows kept); original moved aside, not deleted
-Full detail: `docs/deep_backlog.md`'s 2026-08-02 entry. Integrity-checked, spot-checked against pre-prune numbers.
-
-## [live-trading][security] Resolved 2026-08-02 — broker_stop_price clearing (already fixed 2026-08-01) + Skip now cancels a real resting FRESH exit order, but never the standing TRAIL protection
-Full detail: `docs/deep_backlog.md`'s 2026-08-02 entry. Paired review caught a HIGH regression in the first draft (would've cancelled a position's only protection); rewritten + tested. Full suite: 499 passed.
 

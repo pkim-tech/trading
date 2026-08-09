@@ -279,12 +279,22 @@ def overlay_summary_for_node(conn, ticker, strategy, version, mechanism, node):
     overlay shim, rather than showing another row's numbers as if they
     applied here too."""
     c = conn.cursor()
+    # Real gap found in paired review 2026-08-09 (candidate_full_review.py):
+    # run_overlay_shim.py's INSERT has no dedup and can be re-run for the
+    # same node -- 22+ real candidate_node_ids have 2-5 duplicate
+    # run_timestamps for the same mechanism, silently inflating n/compounded
+    # here. Scoped to the latest run_timestamp per (candidate_node_id,
+    # mechanism), matching the same fix in candidate_full_review.overlay_robustness.
     c.execute("""
         SELECT cor.ret FROM candidate_overlay_results cor
         JOIN candidate_nodes cn ON cn.id = cor.candidate_node_id
         WHERE cn.ticker=? AND cor.mechanism=? AND cn.strategy=? AND cn.version=?
               AND cn.window=? AND cn.z=? AND cn.fixed_sl=? AND cn.arm_pct=?
               AND cn.trail_buy_pct=? AND cn.trail_sell_pct=? AND cn.max_hold_hours=? AND cn.entry_timing=?
+              AND cor.run_timestamp = (
+                  SELECT MAX(cor2.run_timestamp) FROM candidate_overlay_results cor2
+                  WHERE cor2.candidate_node_id = cor.candidate_node_id AND cor2.mechanism = cor.mechanism
+              )
     """, (ticker, mechanism, strategy, version, node['window'], node['z'], node['sl'], node['arm_pct'],
           node['trail_buy_pct'], node['trail_sell_pct'], node['hold'], node['entry_timing']))
     rets = [r[0] for r in c.fetchall()]
