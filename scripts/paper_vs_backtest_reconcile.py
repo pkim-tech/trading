@@ -171,6 +171,22 @@ def report_daily_track(tickers, daily_track_wl_ids, start, end, csv):
         print(f"\nWrote {OUTPUT_DIR / 'paper_vs_backtest_reconcile_dailytrack.csv'}")
 
 
+def get_daily_track_wl_ids(watchlist_id, tickers=None):
+    """ticker -> wl_id for real v5 daily-track nodes only. version=='v5' excludes
+    'v5-overlay-test*' staged combo clones (2026-08-1x) -- without it, this dict
+    comprehension (last-row-wins per ticker, no MIN(id) the way load_nodes() uses
+    for live-track) silently resolves to whichever staged clone has the highest id
+    instead of the real v5 daily-track node, same bug class as
+    add_daily_track_paper_nodes.py's version=='v5' filter / drought_detection_test.
+    load_nodes's paper_role IS NULL hardening -- found live the same morning the
+    staged clones were created."""
+    return {
+        n["ticker"]: n["id"] for n in db.get_watchlist(watchlist_id)
+        if n.get("paper_role") == "daily_sync" and n.get("version") == "v5"
+        and (not tickers or n["ticker"] in tickers)
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tickers", nargs="*", default=None)
@@ -182,17 +198,7 @@ def main():
     end = args.end or pd.Timestamp.now().strftime("%Y-%m-%d")
 
     live_track_nodes = {n["ticker"]: n for n in load_nodes(args.watchlist_id, args.tickers)}
-    daily_track_wl_ids = {
-        n["ticker"]: n["id"] for n in db.get_watchlist()
-        if n.get("watchlist_id") == args.watchlist_id and n.get("paper_role") == "daily_sync"
-        and n.get("version") == "v5"  # excludes 'v5-overlay-test*' staged combo clones (2026-08-1x) --
-        # without this, this dict comprehension (last-row-wins per ticker, no MIN(id) the way
-        # load_nodes() uses for live-track) silently resolves to whichever staged clone has the
-        # highest id instead of the real v5 daily-track node, same bug class as
-        # add_daily_track_paper_nodes.py's version=='v5' filter / drought_detection_test.load_nodes's
-        # paper_role IS NULL hardening -- found live the same morning the staged clones were created.
-        and (not args.tickers or n["ticker"] in args.tickers)
-    }
+    daily_track_wl_ids = get_daily_track_wl_ids(args.watchlist_id, args.tickers)
     tickers = args.tickers or sorted(set(live_track_nodes) | set(daily_track_wl_ids))
 
     report_live_track(tickers, live_track_nodes, args.watchlist_id, args.start, end, args.csv)

@@ -135,6 +135,52 @@ def test_add_node_allows_daily_track_sibling_without_collision(isolated_db):
 
 
 # ---------------------------------------------------------------------------
+# scripts/paper_vs_backtest_reconcile.get_daily_track_wl_ids -- 2026-08-06 fix
+# (commit d64ef98), landed with zero test coverage until this file. Real live
+# bug: a staged 'v5-overlay-test*' clone sharing a ticker+paper_role could
+# silently shadow the real v5 daily-track node in the ticker->wl_id lookup
+# (last-row-wins, no version filter).
+# ---------------------------------------------------------------------------
+
+def test_get_daily_track_wl_ids_ignores_staged_overlay_test_clone(isolated_db):
+    from scripts.paper_vs_backtest_reconcile import get_daily_track_wl_ids
+
+    wl_id = db.create_watchlist('TEST_RECONCILE_WL')
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=10, take_profit=25,
+                stop_loss=1, max_hold_hours=56, trail_buy_pct=3.0, trail_pct=4.0,
+                fixed_sl_override=1, state='paper', paper_role='daily_sync', watchlist_id=wl_id)
+    # A staged combo-matrix clone, same ticker/paper_role, added LATER (higher id) --
+    # this is exactly the shape that shadowed the real node before the fix.
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5-overlay-test', window=10, take_profit=25,
+                stop_loss=1, max_hold_hours=56, trail_buy_pct=3.0, trail_pct=4.0,
+                fixed_sl_override=1, state='paper', paper_role='daily_sync', watchlist_id=wl_id)
+
+    real_node_row = [n for n in db.get_watchlist(wl_id) if n['version'] == 'v5'][0]
+    result = get_daily_track_wl_ids(wl_id)
+
+    assert result[TICKER] == real_node_row['id']
+
+
+def test_get_daily_track_wl_ids_excludes_live_track_and_other_watchlists(isolated_db):
+    from scripts.paper_vs_backtest_reconcile import get_daily_track_wl_ids
+
+    wl_id = db.create_watchlist('TEST_RECONCILE_WL2')
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=10, take_profit=25,
+                stop_loss=1, max_hold_hours=56, trail_buy_pct=3.0, trail_pct=4.0,
+                fixed_sl_override=1, state='paper', watchlist_id=wl_id)  # live-track: no paper_role
+    daily_node_row = [n for n in db.get_watchlist(wl_id) if n['paper_role'] is None]
+    assert daily_node_row  # sanity: the live-track node exists
+
+    assert get_daily_track_wl_ids(wl_id) == {}  # no daily_sync node yet -- must not pick up live-track
+
+    other_wl_id = db.create_watchlist('TEST_RECONCILE_WL3')
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=10, take_profit=25,
+                stop_loss=1, max_hold_hours=56, trail_buy_pct=3.0, trail_pct=4.0,
+                fixed_sl_override=1, state='paper', paper_role='daily_sync', watchlist_id=other_wl_id)
+    assert get_daily_track_wl_ids(wl_id) == {}  # scoped to wl_id, not global
+
+
+# ---------------------------------------------------------------------------
 # daily_sync_halted_at gate -- still real code (for a future manual "sync"
 # tool), just never set by reconcile anymore
 # ---------------------------------------------------------------------------
