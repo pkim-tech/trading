@@ -174,7 +174,17 @@ def _build_buy_blocks(node, sig, auto_placed=False):
     max_notional_str = f"  |  max `${max_notional/1000:.0f}k` / `{max_shares} shares` @ 1% vol" if max_notional else ""
 
     account = node.get('account') or 'unmapped'
-    acct_tag = f"`{account} · {mode_tag(account, node)}`"
+    # 🧪CANARY tag (2026-08-09): mirrors the Reference Report's existing marker
+    # (signals_notify.py's build_reference_table) -- the real per-signal BUY
+    # alert (this function) never had it, found 2026-07-24. Currently
+    # unreachable in practice (canary nodes are dry_run/no real capital, so
+    # should_alert_live/has_capital_at_stake suppresses this Slack post
+    # entirely as of the 2026-08-08 capital-at-stake redesign) but cheap to
+    # close now rather than leave a landmine for whenever that gating logic
+    # changes -- mode_tag() itself only ever returns LIVE/DRY-RUN/UNKNOWN,
+    # deliberately not overloaded here since it's shared with other alerts.
+    canary_tag = ' 🧪CANARY' if node.get('version') == 'canary' else ''
+    acct_tag = f"`{account} · {mode_tag(account, node)}{canary_tag}`"
     if trailing_buy:
         auto_str = "  🤖 *auto-placed at broker*" if auto_placed else ""
         entry_line = f"🟢 *{ticker}* — BUY — Trailing Buy {trail_buy_pct:.0f}% — trigger `${price:.2f}` — `{shares} shares` (~${target_notional/1000:.0f}k) — {acct_tag}{max_notional_str}{auto_str}"
@@ -329,10 +339,12 @@ def _build_sell_blocks(pos, reason, current_price, target_price, resting_confirm
         else:
             action = f"Change Stop Loss → Market Close order (exit by EOD)"
 
+    # See _build_buy_blocks' matching canary_tag comment -- same gap, same fix.
+    canary_tag = ' 🧪CANARY' if (_node or {}).get('version') == 'canary' else ''
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
             "text": (
-                f"{emoji} *{ticker}* ({account} · {mode_tag(account, _node)}) — {label}\n"
+                f"{emoji} *{ticker}* ({account} · {mode_tag(account, _node)}{canary_tag}) — {label}\n"
                 f"{action}\n"
                 f"entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`"
             )}},
