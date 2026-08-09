@@ -141,13 +141,10 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 ## [backtest][live-trading][new-strategy] Research idea, raised 2026-07-25 — monthly universe rescreen (recurring cadence) + a possible "v6" momentum-exhaustion-bounce strategy variant
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
-## [live-trading][security] Deferred, not currently reachable, found by Opus review 2026-07-24 evening — manual-"Filled" SL call is ticker-gated but not mode-gated
-Add a `node.get('mode', 'live') == 'live'` guard alongside the ticker check if/when that routing changes — see `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry. Distinct from the 2026-08-01 `handle_entry_price` SL-placement fix (different code path) — still open.
+## [live-trading][security] Downgraded 2026-08-09, not currently reachable, found by Opus review 2026-07-24 evening — manual-"Filled" SL call is ticker-gated but not mode-gated
+Add a `node.get('mode', 'live') == 'live'` guard alongside the ticker check if/when that routing changes — see `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry. Distinct from the 2026-08-01 `handle_entry_price` SL-placement fix (different code path). **2026-08-09**: handler code (`handle_trail_buy_fill_price`) still exists, code-level reachability finding unchanged (still gated behind a routing change that hasn't happened) — but the user has confirmed moving completely away from manual button-click confirmation as an operational direction, making the one future scenario that would make this reachable even less likely to ever matter. Not closed (the code condition itself is unchanged) but deprioritized further.
 
 ## [live-trading][coverage] Minor, found 2026-07-24 ~evening via Opus review — record_deviation doesn't refresh expected_outcome on rerun
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading] Idea, raised 2026-07-24 ~15:05 ET — open a new margin account strictly dedicated to one real production ticker; keep soxl_ira as the standing multi-ticker test account
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 ## [live-trading][tax] Idea, raised 2026-07-24 ~15:10 ET — run SOXL in both `roth` and `soxl_ira`, but `roth` needs to become limited-margin first
