@@ -181,9 +181,6 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 ## [backtest] Research idea, not started, 2026-07-20 — is overnight gap frequency/magnitude asymmetric (up-gap vs down-gap)?
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
-## [live-trading] Low priority, 2026-07-19 — paper-trading dedup is ticker-only, not `(ticker, window)`-aware
-Full detail in `docs/deep_backlog.md`.
-
 ## [live-trading][security] Phase 4 (deferred to cloud-infrastructure planning), 2026-07-18 — move order-placement/mutating Schwab calls behind a separate proxy this session can't write to
 Full detail in `docs/deep_backlog.md`.
 

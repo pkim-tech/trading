@@ -7,6 +7,7 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][coverage] Resolved 2026-08-09 — record_deviation now refreshes expected_outcome on rerun (fixed, 2 new tests); paper-trading dedup confirmed already wl_id-based, stale item closed. Full detail: `deep_backlog.md`.
 ## [live-trading] Resolved 2026-08-09 — new-margin-account-per-ticker idea confirmed as the actual plan, folded into the one-account-per-ticker directional call. Full detail: `deep_backlog.md`.
 ## [live-trading][security] Parked 2026-08-09 — max cumulative BUY notional per ticker per day: concrete live gap already closed by the 2026-08-02 existing-position guard; traced through cross-thread races, starting_notional staleness, and add-on interaction before concluding remaining justification is generic defense-in-depth only. Full detail: `deep_backlog.md`.
 ## [live-trading][compliance] Resolved 2026-08-09 — daily_order_cap/PDT item confirmed fully done, all 3 pieces landed 2026-07-25 (same day raised); sat stale as "open" for 2 weeks. Full detail: `deep_backlog.md`.

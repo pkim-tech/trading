@@ -1,5 +1,10 @@
 # Backlog
 
+## ✅ [live-trading][coverage] Resolved 2026-08-09 — record_deviation now refreshes expected_outcome on rerun; paper-trading dedup confirmed already wl_id-based (stale item)
+**record_deviation fix**: the `ON CONFLICT` path refreshed `actual_summary`/`ts` but not `expected_outcome` (found 2026-07-24 Opus review) — if a `scenario_expectations` row's text was edited and the same `(check_date, scenario_key, ticker)` deviation re-recorded same day, the row kept stale wording. Both UPDATE branches (system-reason-clear and plain-refresh) now also set `expected_outcome=?`. 2 new tests (`tests/test_coverage_check.py`), full file: 57 passed.
+
+**Paper-trading dedup**: checked the actual code before building anything — already fixed. `paper_trading.start_paper_buy`/`start_paper_market_buy` dedup via `db.get_paper_pending_buy(node['id'])`/`db.get_open_position_by_wl_id(node['id'], paper=True)`, both `wl_id`-keyed (more precise than the `(ticker, window)` the 2026-07-19 item asked for), per the same wl_id refactor that fixed the equivalent real-position dedup gap. Nothing to build — item was stale, same pattern as several other items closed this session.
+
 ## ✅ [live-trading] Resolved 2026-08-09 — new-margin-account-per-ticker idea confirmed as the actual plan, folded into the one-account-per-ticker directional call
 Original 2026-07-24 idea: open a new margin account strictly dedicated to one real production ticker, keeping `soxl_ira` as the standing multi-ticker test account. User confirmed 2026-08-09: yes, this is the plan — `brokerage` stays capped at 1 ticker, and if another ticker needs real margin capacity, a new dedicated account gets split off rather than sharing `brokerage`. Same decision as the one-account-per-ticker item above, not a separate idea — folded in rather than tracked twice.
 
