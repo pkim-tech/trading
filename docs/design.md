@@ -1571,3 +1571,33 @@ Full build/review narrative, incl. the 4 HIGH bugs a paired Opus review found an
 reminder loops, the Reference Report's empty-state path silently dropping the kill-switch
 status/Stop Engine buttons, node-lookup failures muting real alerts, the review having no real
 trigger before the `coverage_events` extension): `docs/deep_backlog.md`'s 2026-08-08 entry.
+
+---
+
+## Account architecture: containment boundary, directional call (2026-08-09)
+
+Resolves the "one account per ticker" reassessment (raised 2026-08-08, since the system moved to
+node-based rather than ticker-based) with a concrete split by account type, not a single rule:
+
+- **Real margin accounts (`brokerage`)**: strict 1-ticker cap, matching the original blast-radius
+  containment framing (a rogue algorithm on ticker A structurally cannot reach ticker B's capital
+  if they're in separate accounts). If another ticker needs real margin capacity, a new dedicated
+  account gets split off rather than sharing `brokerage`.
+- **IRA-type accounts**: sharing more than 1 ticker per account is acceptable, but needs explicit
+  wariness about shared cash — same risk shape as the RETL cash-aware-BUY-guard fix and add-on's
+  shared-margin-pool "2027 problem" (one ticker's BUY starving/over-committing another's share of
+  the same pool).
+- **Node-level self-policing of shared capital use deliberately deferred** — the initial real
+  rollout is scoped to 3 tickers at moderate size, which bounds the shared-cash risk naturally
+  without a sophisticated safeguard built now. Revisit once ticker count or sizing grows past that.
+  Note: `soxl_ira` already runs 11 real live nodes on one account today ($500-$2,500 each, the
+  deliberate small proving-ground tier) — a live precedent already past this "3 tickers, moderate"
+  scope, kept as-is (different intent: proving-ground, not the new moderate-size rollout) rather
+  than treated as a contradiction to resolve now.
+
+Related, same session: the `availableFunds` leverage-inclusive-cash gap for `brokerage` (real
+margin, confirmed 2026-08-09 as *currently* borrowed, not theoretical) is linked to this same
+account-opening timeline — the real fix needs a live API balance response to pick the correct
+settled-cash field, which arrives alongside real account access. `signals_invariants.
+check_brokerage_not_live_with_unresolved_leverage_gap` hard-blocks `brokerage.trading_enabled=True`
+in the meantime; verified clean 2026-08-09.
