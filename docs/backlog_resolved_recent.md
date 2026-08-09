@@ -7,6 +7,7 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading] Resolved 2026-08-09 — small real EDC pilot idea (2026-07-22) confirmed done via a different mechanism: the existing hand-tracked spreadsheet position already covers it, no separate automated pilot node needed. Full detail: `deep_backlog.md`.
 ## [live-trading] Resolved 2026-08-09 — `SCHWAB_AUTOMATION_TICKERS` trim confirmed done; ~11 real live tickers is the right scope, EDC deliberately excluded, no broader research-universe trim wanted. Full detail: `deep_backlog.md`.
 ## [backtest][portfolio] Resolved 2026-08-08 (late) — SOXL drought overlay superseded by the 2026-08-07 out-of-sample validation (confirm_days=3/vol_gate=0.4, +174.8%, positive both halves), no longer the fragile 2/13-trade result. Full detail: `deep_backlog.md`.
 ## [backtest] Resolved 2026-08-08 (late) — same-bar arm/take-profit trigger reframed as a deliberate decision (matches live's one-bar-late behavior), not open work. Full detail: `deep_backlog.md`.

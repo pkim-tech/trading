@@ -177,9 +177,6 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 ## [backtest] Open, paused 2026-07-22 — "v6" idle-capital parking idea; inconclusive, downturn-specific follow-up queued
 Tested (`docs/research_log.md`'s 2026-07-22 entry): no robust fold-consistent edge found. Follow-up idea (check specifically during real SPY drawdown episodes — dates listed in CLAUDE.md) raised but not yet run.
 
-## [live-trading] Idea, raised 2026-07-22, not designed — small (10-share) real EDC pilot position, held ~1 month to shake out issues before scaling
-Note: EDC's node was fully removed from `watch_list` 2026-07-19 (its one open position is now hand-tracked via spreadsheet) — re-confirm this idea's premise still holds before acting on it.
-
 ## [live-trading][tax] Open question, raised 2026-07-22 — which ticker (SOXL vs AGQ) goes to the taxable brokerage account first; wash-sale cross-account mechanic needs one more confirmation
 Gated on the broader wash-sale/tax analysis item below, also still open.
 
