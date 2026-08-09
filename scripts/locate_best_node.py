@@ -106,9 +106,20 @@ def get_or_create_candidate_node(conn: sqlite3.Connection, node: dict) -> int:
     grid cell was recomputed with different code, which is exactly the kind of
     drift this project's history says to notice, not silently paper over."""
     import datetime as _dt
+    # Cast every value to a native Python type before it ever reaches sqlite3 --
+    # found 2026-08-09 that a numpy.int64 (routine when a pandas column happens
+    # to be all-whole-number, e.g. TrailingExit's take_profit grid values) gets
+    # silently stored as a raw binary BLOB by sqlite3's default adapter instead
+    # of a number, since sqlite3 has no built-in adapter for numpy scalar types.
+    # 17 existing candidate_nodes rows had this (all arm_pct, all
+    # TrailingExitZScoreBreakout) -- repaired directly in the DB; this cast is
+    # what stops it from recurring on the next insert.
+    _INT_COLS = {"window", "max_hold_hours"}
     key_cols = ("ticker", "strategy", "version", "window", "z", "fixed_sl", "arm_pct",
                 "trail_buy_pct", "trail_sell_pct", "max_hold_hours", "entry_timing")
-    key_vals = tuple(node[c] for c in key_cols)
+    key_vals = tuple(int(node[c]) if c in _INT_COLS else
+                      (str(node[c]) if isinstance(node[c], str) else float(node[c]))
+                      for c in key_cols)
     existing = conn.execute(f"""
         SELECT id FROM candidate_nodes
         WHERE {' AND '.join(f'{c}=?' for c in key_cols)}
@@ -120,7 +131,7 @@ def get_or_create_candidate_node(conn: sqlite3.Connection, node: dict) -> int:
             (created_at, {', '.join(key_cols)}, robust_alpha, trades)
         VALUES (?, {', '.join('?' for _ in key_cols)}, ?, ?)
     """, (_dt.datetime.now().isoformat(timespec="seconds"), *key_vals,
-          node["robust_alpha"], node["trades"]))
+          float(node["robust_alpha"]), int(node["trades"])))
     conn.commit()
     return cur.lastrowid
 

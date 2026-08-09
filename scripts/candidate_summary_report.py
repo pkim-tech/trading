@@ -55,8 +55,9 @@ CANDIDATE_LABELS = {
     'cliff-safe (current convention)': 'best safe node',
     'best robust_alpha (ignoring cliff-safety)': 'best unsafe node',
     'best possible (raw alpha_vs_spy)': '5min best possible',
+    'best certain (alpha_vs_spy_certain, no-guessing resolution)': 'best certain',
 }
-CANDIDATE_TYPE_ORDER = ['best safe node', 'best unsafe node', '5min best possible']
+CANDIDATE_TYPE_ORDER = ['best safe node', 'best unsafe node', '5min best possible', 'best certain']
 
 # Single source of truth for what each output column means -- used for both
 # the xlsx glossary sheet and (imported directly) the Streamlit Candidates

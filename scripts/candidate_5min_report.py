@@ -53,8 +53,18 @@ def _node_key(n):
 
 
 def find_candidates(df_t, min_alpha):
-    """Returns {label: node_dict} for the three candidate types, deduped by
-    identical params (a label is dropped if it's identical to one already found)."""
+    """Returns {label: node_dict} for the four candidate types, deduped by
+    identical params (a label is dropped if it's identical to one already found).
+
+    Note the asymmetry between 'best possible' and 'best certain': robust_alpha
+    (used by the safe/unsafe types) is MIN(possible, pessimistic, certain) --
+    pessimistic/certain only ever act as a DOWNSIDE FLOOR on whatever possible
+    already ranked best, never as their own independent ranking axis. 'best
+    certain' (added 2026-08-09) closes that gap -- it's the node that would
+    win under the certain (no-guessing) resolution alone, which can be a
+    genuinely different node than any of the other three when possible's
+    optimistic bounce-fill assumption picks a node that certain would have
+    ranked lower."""
     candidates = {}
 
     cliff_safe = best_safe_node(df_t, min_alpha=min_alpha, metric="robust_alpha")
@@ -72,6 +82,14 @@ def find_candidates(df_t, min_alpha):
     existing_keys = {_node_key(n) for n in candidates.values()}
     if _node_key(top_possible) not in existing_keys:
         candidates['best possible (raw alpha_vs_spy)'] = top_possible
+
+    df_cert = df_t.copy()
+    df_cert["_alpha_certain_filled"] = df_cert["alpha_vs_spy_certain"].fillna(df_cert["alpha_vs_spy"])
+    top_certain_row = df_cert.sort_values("_alpha_certain_filled", ascending=False).iloc[0]
+    top_certain = _node_from_row(top_certain_row)
+    existing_keys = {_node_key(n) for n in candidates.values()}
+    if _node_key(top_certain) not in existing_keys:
+        candidates['best certain (alpha_vs_spy_certain, no-guessing resolution)'] = top_certain
 
     return candidates
 

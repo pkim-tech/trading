@@ -177,7 +177,13 @@ def fill_accuracy_for_node(ticker, window, z_score_threshold, trail_buy_pct_pct,
                 _, px = s[res]
                 row[f'{res}_diff_pct'] = (real['five_min_entry_price'] - px) / px * 100
             else:
-                row[f'{res}_diff_pct'] = None
+                # np.nan, not None -- a column that's missing for EVERY real
+                # signal (e.g. no 'certain' resolution ever computed) would
+                # otherwise infer as object dtype, and pandas' .abs() raises
+                # TypeError on an object-dtype column containing None (found
+                # 2026-08-09 running candidate_full_review.py at real scale,
+                # 82 tickers -- first caller to hit this edge case).
+                row[f'{res}_diff_pct'] = np.nan
         rows.append(row)
     return pd.DataFrame(rows)
 
