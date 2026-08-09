@@ -624,15 +624,24 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
         from this bar's own dip. Always fires on the same bar as 'possible' or
         later, always at the same-or-worse trigger price — a real bracket
         partner for 'possible', unlike 'certain' below.
-      - certain (new): only resolves a fill when provably true regardless of
-        ordering — this bar's Open clears the trigger from the prior-confirmed
-        running_low (certain, Open is chronologically first), or this bar's
-        Close clears the trigger from the now-fully-known running_low (certain,
-        Close is chronologically last, this bar's low has already happened by
-        then). Anything else defers — no bullish/bearish guessing. Because
-        deferral can let running_low fall further before a certain fill locks
-        in, 'certain' can end up *better* than 'possible' on a given trade —
-        it is not a pessimistic-price bound, just a no-guessing one.
+      - certain (new, corrected 2026-08-09): only resolves a fill when provably
+        true regardless of ordering, via three real cases: (1) this bar's Open
+        clears the trigger from the prior-confirmed running_low (Open is
+        chronologically first) -- fills at that Open price, can be better than
+        'possible'; (2) this bar's own Low doesn't move running_low (the
+        trigger was frozen for the whole bar, no ordering ambiguity at all) and
+        High clears it -- fills at that frozen trigger price, same determinism
+        as case 1, can also be better than 'possible'; (3) this bar's own Low
+        DOES move running_low (a genuinely ambiguous bar) but the bar's Close
+        still clears the resulting lower trigger -- fills at
+        min(buy_trigger_prior, high), the true worst-case price provable over
+        BOTH intrabar orderings (see the code comment at the certain branch's
+        Close-confirm case for the proof). Case 3 is a genuine
+        pessimistic-price bound, unlike cases 1-2 -- 'certain' is NOT uniformly
+        a no-guessing-but-possibly-optimistic resolution; it mixes a
+        can-beat-possible case with a worst-case-price case depending on which
+        of the three fires. Anything not covered by these three defers,
+        letting running_low fall further before the next check.
     Exit-side logic (SL/TP/trailing/TIME) is identical/shared across all three —
     not an ordering ambiguity, see backlog. Both intrabar-continuous exit
     triggers (SL, trailing-stop) check the bar's Open against the level
@@ -992,17 +1001,50 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
                 in_trade_c = True; waiting_c = False; trailing_c = False
             else:
                 updated_low_c = low if low < running_low_c else running_low_c
-                buy_trigger_updated = updated_low_c * (1.0 + trail_buy_pct)
-                if cp >= buy_trigger_updated:
-                    entry_price_c = buy_trigger_updated
+                if updated_low_c == running_low_c and high >= buy_trigger_prior:
+                    # this bar's own low never moved the trigger, so it was
+                    # frozen for the entire bar -- a High-touch here is
+                    # certain regardless of intrabar ordering, same
+                    # determinism as the Open-gap case above (found
+                    # 2026-08-09: the Close-only check below was silently
+                    # missing this deterministic case and deferring days
+                    # past a real, provable fill).
+                    entry_price_c = buy_trigger_prior
                     tp_price_c    = entry_price_c * (1.0 + take_profit)
                     stop_price_c  = entry_price_c * (1.0 - stop_loss)
                     entry_bar_c   = i; held_c = 0
                     in_trade_c = True; waiting_c = False; trailing_c = False
                 else:
-                    running_low_c = updated_low_c
-                    if wait_bars_c >= max_hours_to_hold:
-                        waiting_c = False
+                    buy_trigger_updated = updated_low_c * (1.0 + trail_buy_pct)
+                    if cp >= buy_trigger_updated:
+                        # Close-confirmed fill: credit min(buy_trigger_prior, high),
+                        # the true provable worst-case fill price over BOTH
+                        # intrabar orderings -- not cp (2026-08-09 first-pass fix,
+                        # found by paired review to still be an unproven guess:
+                        # cp has no proven relation to the real fill, it's just
+                        # provably >= the old buggy credit). Proof: if
+                        # high >= buy_trigger_prior, the trigger is at most
+                        # buy_trigger_prior for the whole bar (attained by a
+                        # high-first path), so fill <= buy_trigger_prior. If
+                        # high < buy_trigger_prior, the fill can't exceed the
+                        # bar's own high (price must reach the trigger to cross
+                        # it), so fill <= high, and high >= low*(1+trail_buy_pct)
+                        # is guaranteed here since high >= cp >= buy_trigger_updated.
+                        # Both bounds are tight (2026-08-09, paired Opus review +
+                        # isolation test, see docs/research_log.md). This makes
+                        # certain's entry a genuine worst-case-PRICE bound for
+                        # this branch, not just a worst-case-FILL proof --
+                        # deliberately different from the frozen-trigger case
+                        # above, which can credit a price BETTER than possible.
+                        entry_price_c = buy_trigger_prior if buy_trigger_prior < high else high
+                        tp_price_c    = entry_price_c * (1.0 + take_profit)
+                        stop_price_c  = entry_price_c * (1.0 - stop_loss)
+                        entry_bar_c   = i; held_c = 0
+                        in_trade_c = True; waiting_c = False; trailing_c = False
+                    else:
+                        running_low_c = updated_low_c
+                        if wait_bars_c >= max_hours_to_hold:
+                            waiting_c = False
         else:
             h = hours[i]
             if h == target_h0 or h == target_h1:
@@ -1062,6 +1104,169 @@ def _simulate_trail_both(prices, highs, lows, hours, daily_idx, sma_arr, std_arr
             hours_held_c[:count_c], results_c[:count_c], returns_c[:count_c])
 
 
+@njit(cache=True)
+def _simulate_certain_only(prices, highs, lows, hours, daily_idx, sma_arr, std_arr, trend_arr, has_trend,
+                            take_profit, stop_loss, max_hours_to_hold, trail_buy_pct, trail_pct, target_h0, target_h1, z_thresh,
+                            opens, open_check_entry_timing, same_day_block=False):
+    """Standalone 'certain' resolution only -- same corrected logic as the
+    certain branch of _simulate_trail_both (frozen-trigger case + real-Close
+    crediting, fixed 2026-08-09), but without possible/pessimistic's parallel
+    state machines. Built specifically so recomputing certain's stored
+    backtest_cache columns after the 2026-08-09 fix doesn't have to pay for
+    re-deriving possible/pessimistic too, which are unaffected by the bug and
+    don't need to change. Not used by the live sweep engine (which still
+    wants all three in one pass via _simulate_trail_both) -- this is for the
+    dedicated recompute pass only. Keep in sync with _simulate_trail_both's
+    certain branch if either changes."""
+    entry_i    = np.empty(MAX_TRADES, dtype=np.int64)
+    exit_i     = np.empty(MAX_TRADES, dtype=np.int64)
+    entry_p    = np.empty(MAX_TRADES, dtype=np.float64)
+    exit_p     = np.empty(MAX_TRADES, dtype=np.float64)
+    hours_held = np.empty(MAX_TRADES, dtype=np.int64)
+    results    = np.empty(MAX_TRADES, dtype=np.int64)
+    returns    = np.empty(MAX_TRADES, dtype=np.float64)
+    count      = 0
+
+    in_trade     = False
+    waiting      = False
+    trailing     = False
+    entry_price  = 0.0
+    stop_price   = 0.0
+    tp_price     = 0.0
+    peak         = 0.0
+    entry_bar    = 0
+    held         = 0
+    running_low  = 0.0
+    wait_bars    = 0
+    last_exit_day = -1
+
+    n = len(prices)
+    for i in range(n):
+        cp   = prices[i]
+        op   = opens[i]
+        high = highs[i]
+        low  = lows[i]
+
+        if in_trade:
+            held += 1
+            if trailing:
+                trail_stop_gap = peak * (1.0 - trail_pct)
+                if op <= trail_stop_gap:
+                    exit_px = op
+                    pc = (exit_px - entry_price) / entry_price
+                    entry_i[count] = entry_bar; exit_i[count] = i
+                    entry_p[count] = entry_price; exit_p[count] = exit_px
+                    hours_held[count] = held
+                    results[count] = WIN if pc > 0 else LOSS; returns[count] = pc
+                    count += 1; in_trade = False; trailing = False
+                    last_exit_day = daily_idx[i]
+                else:
+                    if high > peak:
+                        peak = high
+                    trail_stop = peak * (1.0 - trail_pct)
+                    if low <= trail_stop or held >= max_hours_to_hold:
+                        exit_px = trail_stop if low <= trail_stop else cp
+                        pc = (exit_px - entry_price) / entry_price
+                        entry_i[count] = entry_bar; exit_i[count] = i
+                        entry_p[count] = entry_price; exit_p[count] = exit_px
+                        hours_held[count] = held
+                        results[count] = WIN if pc > 0 else LOSS; returns[count] = pc
+                        count += 1; in_trade = False; trailing = False
+                        last_exit_day = daily_idx[i]
+            elif op <= stop_price:
+                pc = (op - entry_price) / entry_price
+                entry_i[count] = entry_bar; exit_i[count] = i
+                entry_p[count] = entry_price; exit_p[count] = op
+                hours_held[count] = held; results[count] = LOSS; returns[count] = pc
+                count += 1; in_trade = False
+                last_exit_day = daily_idx[i]
+            elif low <= stop_price:
+                pc = (stop_price - entry_price) / entry_price
+                entry_i[count] = entry_bar; exit_i[count] = i
+                entry_p[count] = entry_price; exit_p[count] = stop_price
+                hours_held[count] = held; results[count] = LOSS; returns[count] = pc
+                count += 1; in_trade = False
+                last_exit_day = daily_idx[i]
+            elif cp >= tp_price:
+                trailing = True; peak = cp
+            elif held >= max_hours_to_hold:
+                pc = (cp - entry_price) / entry_price
+                entry_i[count] = entry_bar; exit_i[count] = i
+                entry_p[count] = entry_price; exit_p[count] = cp
+                hours_held[count] = held
+                results[count] = TWIN if pc > 0 else TLOSS; returns[count] = pc
+                count += 1; in_trade = False
+                last_exit_day = daily_idx[i]
+        elif waiting:
+            wait_bars += 1
+            buy_trigger_prior = running_low * (1.0 + trail_buy_pct)
+            if op >= buy_trigger_prior:
+                entry_price = op
+                tp_price    = entry_price * (1.0 + take_profit)
+                stop_price  = entry_price * (1.0 - stop_loss)
+                entry_bar   = i; held = 0
+                in_trade = True; waiting = False; trailing = False
+            else:
+                updated_low = low if low < running_low else running_low
+                if updated_low == running_low and high >= buy_trigger_prior:
+                    entry_price = buy_trigger_prior
+                    tp_price    = entry_price * (1.0 + take_profit)
+                    stop_price  = entry_price * (1.0 - stop_loss)
+                    entry_bar   = i; held = 0
+                    in_trade = True; waiting = False; trailing = False
+                else:
+                    buy_trigger_updated = updated_low * (1.0 + trail_buy_pct)
+                    if cp >= buy_trigger_updated:
+                        # min(buy_trigger_prior, high) -- see _simulate_trail_both's
+                        # matching branch for the full proof; must stay in sync.
+                        entry_price = buy_trigger_prior if buy_trigger_prior < high else high
+                        tp_price    = entry_price * (1.0 + take_profit)
+                        stop_price  = entry_price * (1.0 - stop_loss)
+                        entry_bar   = i; held = 0
+                        in_trade = True; waiting = False; trailing = False
+                    else:
+                        running_low = updated_low
+                        if wait_bars >= max_hours_to_hold:
+                            waiting = False
+        else:
+            h = hours[i]
+            if h == target_h0 or h == target_h1:
+                di = daily_idx[i]
+                if di >= 0:
+                    sma = sma_arr[di]; std = std_arr[di]
+                    if std != 0.0:
+                        lower_band = sma - std * z_thresh
+                        blocked = same_day_block and di == last_exit_day
+                        fired = False
+                        if not blocked:
+                            if open_check_entry_timing:
+                                if has_trend:
+                                    signal_open = (op <= lower_band) and (op > trend_arr[di])
+                                else:
+                                    signal_open = op <= lower_band
+                                if signal_open:
+                                    waiting = True; running_low = op; wait_bars = 0
+                                    fired = True
+                            if not fired:
+                                if has_trend:
+                                    signal = (cp <= lower_band) and (cp > trend_arr[di])
+                                else:
+                                    signal = cp <= lower_band
+                                if signal:
+                                    waiting = True; running_low = cp; wait_bars = 0
+
+    if in_trade:
+        cp = prices[n - 1]
+        pc = (cp - entry_price) / entry_price
+        entry_i[count] = entry_bar; exit_i[count] = n - 1
+        entry_p[count] = entry_price; exit_p[count] = cp
+        hours_held[count] = held; results[count] = OPEN; returns[count] = pc
+        count += 1
+
+    return (entry_i[:count], exit_i[:count], entry_p[:count], exit_p[:count],
+            hours_held[:count], results[:count], returns[:count])
+
+
 def run_backtest_v19(df_hourly, df_daily_indicators, ticker,
                      mode="BACKTEST", target_hours=(9, 14),
                      take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28,
@@ -1103,6 +1308,30 @@ def run_backtest_v110(df_hourly, df_daily_indicators, ticker,
         trades_certain = _build_trades(ticker, p['timestamps'], ei_c, xi_c, ep_c, xp_c, held_c, res_c, ret_c)
         return trades, trades_pessimistic, trades_certain
     return trades
+
+
+def run_backtest_certain_only(df_hourly, df_daily_indicators, ticker,
+                               mode="BACKTEST", target_hours=(9, 14),
+                               take_profit=0.05, stop_loss=0.15, max_hours_to_hold=28,
+                               z_score_threshold=2.0, trail_buy_pct=0.02, trail_pct=0.03,
+                               entry_timing='close', prep=None, same_day_block=False):
+    """Certain resolution only, via the lean _simulate_certain_only kernel --
+    for the backtest_cache certain-column recompute pass (see
+    docs/backlog_cache.md's 2026-08-09 certain-fix entry), not the live sweep
+    engine (which still wants all three resolutions from run_backtest_v110/
+    _simulate_trail_both in one pass)."""
+    p = prep if prep is not None else prep_inputs(df_hourly, df_daily_indicators)
+    target_h0, target_h1 = int(target_hours[0]), int(target_hours[1])
+
+    ei, xi, ep, xp, held, res, ret = _simulate_certain_only(
+        p['prices'], p['highs'], p['lows'], p['hours'], p['daily_idx'],
+        p['sma_arr'], p['std_arr'], p['trend_arr'], p['has_trend'],
+        float(take_profit), float(stop_loss), int(max_hours_to_hold),
+        float(trail_buy_pct), float(trail_pct),
+        target_h0, target_h1, float(z_score_threshold),
+        p['opens'], entry_timing == 'open_check', bool(same_day_block)
+    )
+    return _build_trades(ticker, p['timestamps'], ei, xi, ep, xp, held, res, ret)
 
 
 @njit(cache=True)

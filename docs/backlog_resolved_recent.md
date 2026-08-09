@@ -7,6 +7,12 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [backtest] Resolved 2026-08-09 (later still) — `certain` kernel fix (frozen-trigger + min(buy_trigger_prior,high) Close-confirm bound) applied, paired-reviewed, and pinned with 4 new tests; full recompute + tooling gap tabled, `possible` stays the standard. Full detail: `deep_backlog.md`/`research_log.md`.
+
+## [backtest] Resolved 2026-08-09 (later still) — real K1/underlier-count screener columns added to `tickers`; GLL/KOLD/UGL/UVXY confirmed K-1, BULZ + single-commodity/bond-future family (GLL/KOLD/UGL/TBT/TMF/TMV) disqualified. Full detail: `deep_backlog.md`.
+
+## [backtest] Resolved 2026-08-09 (later still) — `candidate_full_review.py` gained 3 robustness-gated CAGR-stacking columns; drought's vol-gate REAL_SELECTION verdict now actually overrides the plain drought number; report outputs now timestamped. Full detail: `deep_backlog.md`.
+
 ## [backtest] Investigated 2026-08-09 (later) — "certain" fill-resolution's credited entry price found unobtainable by any real order; corrected SOXL example alpha drops ~10x (+13,030.7%→+1,270.3%), still real but concentrated in one historical window. Full detail: `deep_backlog.md`/`research_log.md`.
 ## [backtest] Built 2026-08-09 (later) — `candidate_full_review.py` follow-up closes 3 real gaps (item 4 core-only, item 8 no core fluke check, overlay-process step 4 never built), adds bear-market stress + real 2025-crash check + persistent Pick/Comment tracking via `node_id`. 2nd paired Fable+Opus review found 1 HIGH (22+ duplicated `candidate_overlay_results` rows) + 7 MEDIUM/LOW, all fixed. SPCL and FNGU disqualified (single-stock/mandate-change contamination; 10-holding FANG+ index, below 20-security bar). Full detail: `deep_backlog.md`.
 ## [backtest] Built 2026-08-09 — `scripts/candidate_full_review.py`, the canonical one-sheet candidate report (4 candidate types, full watchlist_candidate_checklist.md scope, indicative tranches, no hard filters); paired Fable+Opus review found 2 HIGH + several MEDIUM real bugs (window-keyed cache bug, fragile robust_alpha node lookup, same-day-block math/sign issues, missing item 3), all fixed and verified against the reviewers' own repro numbers. Full detail: `deep_backlog.md`.

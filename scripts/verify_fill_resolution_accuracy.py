@@ -104,6 +104,12 @@ def find_all_resolution_signals(ticker, window, z_thresh, trail_buy_pct, max_hol
                         waiting_p = False
 
             if waiting_c:
+                # kept in sync with backtester._simulate_trail_both's certain
+                # branch (fixed 2026-08-09: frozen-trigger case +
+                # min(buy_trigger_prior, high) Close-confirm bound -- found
+                # stale here during a paired Opus session-wrap review, since
+                # this script's own accuracy finding is what justified
+                # defaulting to 'possible').
                 wait_bars_c += 1
                 buy_trigger_prior = running_low_c * (1.0 + trail_buy_pct)
                 if op >= buy_trigger_prior:
@@ -111,14 +117,19 @@ def find_all_resolution_signals(ticker, window, z_thresh, trail_buy_pct, max_hol
                     waiting_c = False
                 else:
                     updated_low_c = low if low < running_low_c else running_low_c
-                    buy_trigger_updated = updated_low_c * (1.0 + trail_buy_pct)
-                    if cp >= buy_trigger_updated:
-                        rec['certain'] = (timestamps[i], buy_trigger_updated)
+                    if updated_low_c == running_low_c and high >= buy_trigger_prior:
+                        rec['certain'] = (timestamps[i], buy_trigger_prior)
                         waiting_c = False
                     else:
-                        running_low_c = updated_low_c
-                        if wait_bars_c >= max_hold_hours:
+                        buy_trigger_updated = updated_low_c * (1.0 + trail_buy_pct)
+                        if cp >= buy_trigger_updated:
+                            fill = buy_trigger_prior if buy_trigger_prior < high else high
+                            rec['certain'] = (timestamps[i], fill)
                             waiting_c = False
+                        else:
+                            running_low_c = updated_low_c
+                            if wait_bars_c >= max_hold_hours:
+                                waiting_c = False
             continue
 
         h = hours[i]

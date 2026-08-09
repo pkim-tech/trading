@@ -542,19 +542,27 @@ def simulate_trail_both_signal_tracked(p, take_profit, stop_loss, max_hours_to_h
                         if low < s['running_low']:
                             s['running_low'] = low
                         entry_price = None
-                else:  # certain
+                else:  # certain -- kept in sync with backtester._simulate_trail_both's
+                    # certain branch (fixed 2026-08-09: frozen-trigger case +
+                    # min(buy_trigger_prior, high) Close-confirm bound, not the
+                    # stale buy_trigger_updated/cp this mirror had drifted to
+                    # after the kernel fix -- found stale during a paired
+                    # Opus session-wrap review).
                     buy_trigger_prior = s['running_low'] * (1.0 + trail_buy_pct)
                     if op >= buy_trigger_prior:
                         entry_price = op
                     else:
                         updated_low = low if low < s['running_low'] else s['running_low']
-                        buy_trigger_updated = updated_low * (1.0 + trail_buy_pct)
-                        if cp >= buy_trigger_updated:
-                            entry_price = buy_trigger_updated
-                            s['running_low'] = updated_low
+                        if updated_low == s['running_low'] and high >= buy_trigger_prior:
+                            entry_price = buy_trigger_prior
                         else:
-                            s['running_low'] = updated_low
-                            entry_price = None
+                            buy_trigger_updated = updated_low * (1.0 + trail_buy_pct)
+                            if cp >= buy_trigger_updated:
+                                entry_price = buy_trigger_prior if buy_trigger_prior < high else high
+                                s['running_low'] = updated_low
+                            else:
+                                s['running_low'] = updated_low
+                                entry_price = None
 
                 if entry_price is not None:
                     s['entry_price'] = entry_price

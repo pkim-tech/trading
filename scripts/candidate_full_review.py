@@ -59,6 +59,7 @@ import argparse
 import csv
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -114,6 +115,14 @@ COLUMN_DEFS = {
                  "check (issuer tax-document page) -- every other ticker honestly reads 'not checked', never "
                  "guessed from structural resemblance to a confirmed ticker.",
     "k1_tranche": "K1_CONFIRMED / CLEAN_CONFIRMED / ETN_NOT_K1 / NOT_CHECKED bucket of k1_status.",
+    "underlier_count": "Number of constituent securities in the underlying index/basket, from real research "
+                        "(stockanalysis.com/etf.com/issuer fact sheet) -- NULL if never researched. This "
+                        "project's diversification minimum is ~20; below that is a real disqualification risk "
+                        "(FNGU=10, BULZ=15, QPUX=13 already disqualified on this basis). A single-underlier "
+                        "fund (one stock or one futures contract, e.g. crypto-linked ETHU/SOLT) shows 1 -- not "
+                        "automatically disqualifying if the underlying asset itself is explicitly in scope.",
+    "underlier_note": "One-line description of what the fund actually tracks and any notable structural fact "
+                       "(ETN issuer credit risk, shared underlier with a sibling ticker, etc.).",
     "candidate_type": "Which candidate-selection method produced this row: 'best safe node' (robust_alpha, "
                        "required to pass cliff-safety -- this project's real selection convention), 'best "
                        "unsafe node' (top robust_alpha regardless of cliff-safety), '5min best possible' (top "
@@ -205,6 +214,17 @@ COLUMN_DEFS = {
     "drought_late_wr_pct": "Drought win rate in the late (last ~30%) half.",
     "drought_wr_verdict": "STABLE / FADING / blank -- checklist item 4, applied to drought.",
     "drought_wr_tranche": "Clean bucket of drought_wr_verdict.",
+    "core_addon_cagr_pct": "Annualized CAGR of core stacked with add-on -- add-on's own factor is used only "
+                            "if addon_robustness_verdict is OK, otherwise treated as a no-op (1x, i.e. equal "
+                            "to strategy_cagr_pct) so a FRAGILE overlay can't inflate the combined number.",
+    "core_drought_cagr_pct": "Same as core_addon_cagr_pct, for drought (gated on drought_robustness_verdict) -- "
+                              "EXCEPT when drought_ie_verdict=REAL_SELECTION, in which case the vol-gated "
+                              "included-only return replaces the plain drought factor entirely (a confirmed "
+                              "real filter is a strictly better estimate than the ungated overlay).",
+    "core_both_cagr_pct": "Core stacked with BOTH add-on and drought, each independently gated on its own "
+                           "robustness verdict (or the vol-gated REAL_SELECTION override for drought, see "
+                           "core_drought_cagr_pct) -- multiplicative, not additive (two ~1.5x-robust overlays "
+                           "combine to ~2.3x, not ~3x -- see docs/research_log.md's 2026-08-09 entry).",
     "drought_ie_confirm_days": "confirm_days used for the included-vs-excluded challenge below (pulled from "
                                 "this node's own existing drought overlay run, so it stays consistent with "
                                 "drought_n above).",
@@ -1097,8 +1117,19 @@ K1_STATUS = {
 }
 
 
-def k1_status(ticker):
-    return K1_STATUS.get(ticker, "not checked")
+def k1_status(conn, ticker):
+    """Reads from tickers.k1_status (the real screener table) -- migrated
+    2026-08-09 off the hardcoded K1_STATUS dict above, which is kept only as
+    the historical seed data (see the DB populate step in session history)."""
+    row = conn.execute("SELECT k1_status FROM tickers WHERE symbol=?", (ticker,)).fetchone()
+    return row[0] if row and row[0] else "not checked"
+
+
+def underlier_info(conn, ticker):
+    """(underlier_count, underlier_note) from tickers -- the same real
+    screener table k1_status now reads from. Both None if never researched."""
+    row = conn.execute("SELECT underlier_count, underlier_note FROM tickers WHERE symbol=?", (ticker,)).fetchone()
+    return (row[0], row[1]) if row else (None, None)
 
 
 _BEAR_UNDERLYING_CACHE = {}
@@ -1471,6 +1502,15 @@ def _build_output_row(rec):
     return row
 
 
+def _timestamped_name(name, ext):
+    """Appends a run timestamp to the given base name so successive --csv/--xlsx
+    runs never overwrite each other -- every run is real evidence (which
+    confirm_days/node config produced which numbers), same "never delete,
+    versioning exists for coexistence" convention as backtest_cache."""
+    stem = name[: -len(ext)] if name.endswith(ext) else name
+    return f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+
+
 def _write_xlsx(name, csv_rows):
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment
@@ -1587,7 +1627,8 @@ def main():
             strat_cagr = cagr(rec["abs_return_pct"], years * 365.25) if years else None
             rec["strategy_cagr_pct"] = strat_cagr
             rec["sector"] = ticker_sector(conn, ticker)
-            rec["k1_status"] = k1_status(ticker)
+            rec["k1_status"] = k1_status(conn, ticker)
+            rec["underlier_count"], rec["underlier_note"] = underlier_info(conn, ticker)
             rec["trend_30d_pct"] = trend_30d
             rec["trend_90d_pct"] = trend_90d
             rec["split_flag"] = split_flag
@@ -1618,8 +1659,30 @@ def main():
                 rec["pick"], rec["comment"] = get_pick_comment(conn, node_id)
                 rec["addon_robustness"] = overlay_robustness(conn, ticker, strategy, args.version, "addon", node)
                 rec["drought_robustness"] = overlay_robustness(conn, ticker, strategy, args.version, "drought", node)
+                core_factor = 1.0 + sret / 100.0
+                addon_ok = rec["addon_robustness"] is not None and rec["addon_robustness"]["verdict"] == "OK"
+                drought_ok = rec["drought_robustness"] is not None and rec["drought_robustness"]["verdict"] == "OK"
+                addon_factor_gated = (1.0 + addon[1] / 100.0) if (addon and addon_ok) else 1.0
+                drought_factor_gated = (1.0 + drought[1] / 100.0) if (drought and drought_ok) else 1.0
                 rec["drought_included_excluded"] = None if args.skip_overlay else drought_included_excluded_check(
                     conn, ticker, strategy, args.version, node, vol_gate=args.vol_gate)
+                # If the vol-gate is confirmed to do real differential
+                # selection (not just look profitable in isolation), its
+                # included-only return REPLACES the plain drought factor for
+                # the stacked CAGR columns -- the ungated drought_ok/
+                # drought_factor_gated above is a strictly worse estimate
+                # once a validated filter exists for this node (found
+                # 2026-08-09: the two computations were previously silently
+                # disconnected -- drought_ie_* was diagnostic-only and never
+                # fed back into +Drght%/+Both%).
+                ie = rec["drought_included_excluded"]
+                if ie is not None and ie.get("verdict") == "REAL_SELECTION":
+                    drought_factor_gated = 1.0 + ie["included_compounded_pct"] / 100.0
+                days_span = years * 365.25 if years else None
+                rec["core_addon_cagr_pct"] = cagr((core_factor * addon_factor_gated - 1.0) * 100.0, days_span)
+                rec["core_drought_cagr_pct"] = cagr((core_factor * drought_factor_gated - 1.0) * 100.0, days_span)
+                rec["core_both_cagr_pct"] = cagr(
+                    (core_factor * addon_factor_gated * drought_factor_gated - 1.0) * 100.0, days_span)
                 node_key = _node_key(node)
                 rec["also_matches"] = membership.get(node_key, [candidate_type])
                 rec["alpha_possible_pct"] = node["alpha_raw"]
@@ -1636,6 +1699,9 @@ def main():
             else:
                 rec["addon_robustness"] = None
                 rec["drought_robustness"] = None
+                rec["core_addon_cagr_pct"] = None
+                rec["core_drought_cagr_pct"] = None
+                rec["core_both_cagr_pct"] = None
                 rec["drought_included_excluded"] = None
                 rec["bear_market"] = None
                 rec["also_matches"] = [candidate_type]
@@ -1651,7 +1717,8 @@ def main():
         csv_rows = [_build_output_row(rec) for rec in out_rows]
 
     if args.csv:
-        out_path = Path("output") / (args.csv if args.csv.endswith(".csv") else f"{args.csv}.csv")
+        csv_name = _timestamped_name(args.csv, ".csv")
+        out_path = Path("output") / csv_name
         out_path.parent.mkdir(exist_ok=True)
         with open(out_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=FIELDNAMES)
@@ -1661,16 +1728,17 @@ def main():
         print(f"Wrote {out_path} ({len(out_rows)} rows)")
 
     if args.xlsx:
-        xlsx_name = args.xlsx if args.xlsx.endswith(".xlsx") else f"{args.xlsx}.xlsx"
-        _write_xlsx(args.xlsx, csv_rows)
+        xlsx_name = _timestamped_name(args.xlsx, ".xlsx")
+        _write_xlsx(xlsx_name, csv_rows)
         print(f"Wrote output/{xlsx_name} ({len(out_rows)} rows)")
 
     if args.csv or args.xlsx:
         return
 
-    hdr = ("%-8s %-20s %12s %8s %9s %9s %10s %6s %6s %6s %6s | %-28s | %-28s" % (
+    hdr = ("%-8s %-20s %12s %8s %9s %9s %10s %6s %6s %6s %6s | %-28s | %-28s | %8s %8s %8s" % (
         "Ticker", "Candidate", "Liquidity$/d", "CAGR%", "AbsRet%", "AnnExcess%", "WorstNb%",
-        "Years", "Trades", "Status", "Fill", "Addon(n,comp%,WR%,robust)", "Drought(n,comp%,WR%,robust)"))
+        "Years", "Trades", "Status", "Fill", "Addon(n,comp%,WR%,robust)", "Drought(n,comp%,WR%,robust)",
+        "+Addon%", "+Drght%", "+Both%"))
     print(hdr)
     print("-" * len(hdr))
     for rec in out_rows:
@@ -1697,9 +1765,15 @@ def main():
         also = rec.get("also_matches", [rec["candidate_type"]])
         type_label = rec['candidate_type'] if len(also) < 2 else " = ".join(also)
 
+        def stacked_str(key):
+            v = rec.get(key)
+            return f"{v:+.1f}" if v is not None else "-"
+
         print(f"{rec['ticker']:8} {type_label:<20} {liq_str:>12} {cagr_str:>8} "
               f"{rec['abs_return_pct']:>9.1f} {ae_str:>10} {wn_str:>10} {rec['years']!s:>6} {rec['trades']:>6} "
-              f"{rec['status']:>6} {fill_str:>6} | {ao_str:<28} | {dr_str:<28}")
+              f"{rec['status']:>6} {fill_str:>6} | {ao_str:<28} | {dr_str:<28} | "
+              f"{stacked_str('core_addon_cagr_pct'):>8} {stacked_str('core_drought_cagr_pct'):>8} "
+              f"{stacked_str('core_both_cagr_pct'):>8}")
 
 
 if __name__ == "__main__":
