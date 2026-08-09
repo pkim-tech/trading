@@ -174,9 +174,6 @@ Tested (`docs/research_log.md`'s 2026-07-22 entry): no robust fold-consistent ed
 ## [live-trading][tax] Open question, raised 2026-07-22 — which ticker (SOXL vs AGQ) goes to the taxable brokerage account first; wash-sale cross-account mechanic needs one more confirmation
 Gated on the broader wash-sale/tax analysis item below, also still open.
 
-## [live-trading][security] Deferred to next session, discussed at length 2026-07-22 — max cumulative BUY notional per ticker per day (backstop against a repeat-buy/runaway bug)
-User wants to think it over before picking a final multiplier. Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
 ## [live-trading] Low priority, idea raised 2026-07-21 — should `CASH_SAFETY_BUFFER` scale with order size instead of staying a flat $200?
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
