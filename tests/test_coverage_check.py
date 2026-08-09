@@ -98,6 +98,24 @@ def test_record_deviation_rerun_preserves_existing_reason(isolated_db):
     assert row['actual_summary'] == 'got Y again'
 
 
+def test_record_deviation_refreshes_expected_outcome_on_rerun(isolated_db):
+    """2026-07-24 Opus review finding: the ON CONFLICT path refreshed
+    actual_summary/ts but not expected_outcome -- if a scenario_expectations
+    row's expected_outcome text is edited and the same deviation is
+    re-recorded same day, the row kept the stale text. Covers both the
+    system-reason-clear branch and the plain-refresh branch."""
+    db.record_deviation('2026-07-24', 'sk_a', 'expected X (old wording)', 'got Y', ticker=TICKER)
+    db.record_deviation('2026-07-24', 'sk_a', 'expected X (new wording)', 'got Y again', ticker=TICKER)
+    row = db.get_deviations()[0]
+    assert row['expected_outcome'] == 'expected X (new wording)'
+
+    db.record_deviation('2026-07-24', 'sk_g', 'expected Z (old)', 'got W', ticker=TICKER)
+    db.clear_deviation_if_resolved('2026-07-24', 'sk_g', ticker=TICKER)
+    db.record_deviation('2026-07-24', 'sk_g', 'expected Z (new)', 'got W again -- real failure', ticker=TICKER)
+    row = [d for d in db.get_deviations() if d['scenario_key'] == 'sk_g'][0]
+    assert row['expected_outcome'] == 'expected Z (new)'
+
+
 def test_record_deviation_clears_system_reason_on_new_deviation(isolated_db):
     """Opus review, 2026-07-27: a system-authored auto-resolution (from
     clear_deviation_if_resolved) is not testimony about a NEW failure -- if the

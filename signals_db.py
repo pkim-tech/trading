@@ -2149,14 +2149,14 @@ def record_deviation(check_date, scenario_key, expected_outcome, actual_summary,
             if existing['reason_by'] == 'system':
                 c.execute("""
                     UPDATE coverage_deviations
-                    SET actual_summary=?, ts=datetime('now'), reason=NULL, reason_by=NULL, reason_ts=NULL
+                    SET expected_outcome=?, actual_summary=?, ts=datetime('now'), reason=NULL, reason_by=NULL, reason_ts=NULL
                     WHERE id=?
-                """, (actual_summary, existing['id']))
+                """, (expected_outcome, actual_summary, existing['id']))
             else:
                 c.execute("""
-                    UPDATE coverage_deviations SET actual_summary=?, ts=datetime('now')
+                    UPDATE coverage_deviations SET expected_outcome=?, actual_summary=?, ts=datetime('now')
                     WHERE id=?
-                """, (actual_summary, existing['id']))
+                """, (expected_outcome, actual_summary, existing['id']))
             c.commit()
             return existing['id']
         else:
