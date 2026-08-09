@@ -1,5 +1,15 @@
 # Backlog
 
+## ✅ [live-trading][compliance] Resolved 2026-08-09 — daily_order_cap/PDT item confirmed fully done, all 3 pieces landed 2026-07-25 same day it was raised
+The backlog entry sat as "open" for 2 weeks despite being fully resolved the same day it was raised — never marked closed. Verified all 3 pieces directly against real code/docs, not assumed:
+1. **Schwab PDT-framework rollout confirmed** — `docs/conversation_summary.md`: "PDT rule is confirmed already gone (Schwab implemented FINRA's replacement 2026-06-04, not a future 90-day wait)."
+2. **SELL-increment fix** — `git log -L 1541,1542:schwab_safety.py` shows commit `a1678ac` (2026-07-25, "Fix daily_order_cap SELL-side blocking/increment"): `approve_and_record` only increments the counter `if side == "BUY"`, and `check_order`'s cap-check (line 1435) is already `side == "BUY"`-gated too. SELL orders, including protective SL/top-up, are unconditionally exempt.
+3. **Bumped `daily_order_cap` number** — same commit `a1678ac` set `soxl_ira`'s `daily_order_cap=100`.
+Nothing left to build. This item's "open" status was pure doc staleness — a real instance of the same failure mode already caught for Part 3/Part 4 earlier this session.
+
+## ✅ [live-trading][security] Resolved 2026-08-09 — stale-pending-buys guard's manual-fill-confirmation gap confirmed currently unreachable
+Found by Opus review round 6 (2026-07-25): `handle_entry_price`/`handle_trail_buy_fill_price` assume every rendered Executed/Filled button implies a real `pending_buys` row exists — an assumption that breaks for a live-mode `TrailingExitZScoreBreakout` ticker NOT in `SCHWAB_AUTOMATION_TICKERS` (which only gets a manual, non-automated fill-confirmation flow). Verified directly (not assumed) against the real `watch_list`/`schwab_safety.AUTOMATION_ENABLED_TICKERS`: both currently-live `TrailingExitZScoreBreakout` nodes (DPST, YANG) are inside automation scope — the exact scenario this gap requires doesn't currently exist, matching the user's "we don't have manual fills" call. `signals_invariants.py` still monitors the config state that would trigger it (unchanged, still useful defense-in-depth) — the underlying handler itself is unfixed, so this would resurface if a future live TE ticker is ever added outside automation scope. Not proactively hardened now, per the same "widen organic coverage over forcing/pre-empting an unreachable case" convention already established this session.
+
 ## ✅ [live-trading] Resolved 2026-08-09 — small real EDC pilot idea (2026-07-22) confirmed done, just via a different mechanism than originally envisioned
 Original idea: a formal 10-share automated `watch_list` node, held ~1 month to shake out issues before scaling. User's call: the real goal (get live/real-money experience on EDC without full automation risk) is already satisfied by the existing hand-tracked spreadsheet position (EDC's one open manual position, since its `watch_list` node was fully removed 2026-07-19) — no separate automated pilot node needed.
 

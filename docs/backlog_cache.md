@@ -138,14 +138,8 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
 
 
-## [live-trading][compliance] Open, raised 2026-07-25 (3rd time this has come up in conversation) — FINRA eliminated the PDT rule/$25k threshold in 2026; re-evaluate daily_order_cap's purpose and confirm Schwab's rollout status
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
 ## [backtest][live-trading][new-strategy] Research idea, raised 2026-07-25 — monthly universe rescreen (recurring cadence) + a possible "v6" momentum-exhaustion-bounce strategy variant
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][security] Latent, found by Opus review round 6, 2026-07-25 — stale-pending-buys guard could silently discard a real manual fill confirmation if a ticker is ever outside SCHWAB_AUTOMATION_TICKERS
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). `signals_invariants.py` monitors the config state that would trigger it but doesn't fix the underlying handler.
 
 ## [live-trading][security] Deferred, not currently reachable, found by Opus review 2026-07-24 evening — manual-"Filled" SL call is ticker-gated but not mode-gated
 Add a `node.get('mode', 'live') == 'live'` guard alongside the ticker check if/when that routing changes — see `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry. Distinct from the 2026-08-01 `handle_entry_price` SL-placement fix (different code path) — still open.
