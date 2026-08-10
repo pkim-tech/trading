@@ -1,5 +1,18 @@
 # Backlog
 
+## ✅ [backtest] Resolved 2026-08-10 — BOIL/JNUG/UGL-possible/URTY-addon step-4 (included-vs-excluded) triage closed, all real negative/mixed results
+Raised 2026-08-09 (`docs/research_log.md`'s 2026-08-08 later-still-4 entry / `deep_backlog.md`'s 2026-08-09 `candidate_full_review.py` follow-up entry): `drought_included_excluded_check()` (step 4 tooling) was built and wired into every report row, but these 4 tickers' actual verdicts had never been pulled and read.
+
+**Pulled from the real report (`output/candidate_full_review_20260809_192051.xlsx`) and cross-checked against the user's own current tracker**:
+- **BOIL**: all 3 candidate-type rows (best unsafe node, 5min best possible, best certain) are CLIFF. No safe node exists for BOIL at all.
+- **JNUG**: only `best safe node` (id=44, SAFE) passes `REAL_SELECTION`; the other two candidate types (`5min best possible` id=45, `best certain` id=149) are `NO_REAL_SELECTION`. Inconsistent across the ticker's own candidate rows — the drought overlay's vol-gate doesn't help JNUG in any real, ticker-wide sense.
+- **UGL**: 1 SAFE node (`best safe node`, id=23) but it's `NO_REAL_SELECTION`; the other 3 rows are CLIFF. No config is both safe and passes the challenge. (User's own tracker, which includes walk-forward fold data this particular report batch didn't compute, reads this as 2 CLIFF + 1 failed-fold rather than 3 CLIFF — consistent in substance: no clean UGL config exists either way.)
+- **URTY-addon**: the ticker's one SAFE node (`best safe node`, id=128)'s add-on overlay is `FRAGILE (half negative)`, addon_compounded_pct=-4.4% — genuinely doesn't work, not a missing-data gap.
+
+All four are real, mostly negative closures — none of these tickers had a hidden good config waiting to be found; the original "still need to triage" flag is now answered with data, not left open on a guess.
+
+**Left as a separate, still-open minor item** (not part of this closure): several tickers have 2-4 registered `candidate_nodes` rows from repeated re-runs, not deduped/pruned — see the standalone backlog_cache.md line.
+
 ## ✅ [backtest] Resolved 2026-08-10 — HIBL/GDXU drought-overlay SOXL-grade rigor: the default cliff-safety-first pick fails the included-vs-excluded challenge for both; the CAGR-first pick (this project's actual selection convention, see `docs/research_log.md`'s CAGR-first candidate-picking finding) passes it and dominates on every other axis too
 Raised 2026-08-07 (`docs/research_log.md`'s entry that day): GDXU had passed a single-trade-dependency stress test; HIBL hadn't been stress-tested at all; neither had the out-of-sample fit/test split or included-vs-excluded (step 4) challenge SOXL's config went through.
 
