@@ -876,8 +876,11 @@ def check_order(
     node_automation_enabled/AUTOMATION_ENABLED_TICKERS, trading-day gate,
     HARD_ORDER_CEILING, notional_cap, daily_order_cap, burst cap,
     duplicate-order window, or _open_buy_tickers_in_account (a resting BUY
-    for a DIFFERENT ticker in this account still blocks, cash permitting --
-    see that function's docstring)."""
+    for a DIFFERENT ticker in this account still blocks -- cash-permitting
+    for an ordinary BUY, buying-power-permitting for an add-on leg, per the
+    2026-08-10 fix bringing the add-on path onto the same real-affordability
+    model instead of an unconditional block -- see that function's
+    docstring)."""
     if kill_switch_engaged():
         _limits = ACCOUNTS.get(account)
         _mode = "live" if (_limits and _limits.trading_enabled) else "dry_run"
@@ -1094,13 +1097,8 @@ def check_order(
         # RETL's $800 order too. Deferred to the cash-availability check
         # below (where `notional`/`cash_available` already live) instead of
         # raising unconditionally here -- see that block for the real
-        # decision. is_addon_leg is the one exception, kept strict per the
-        # existing documented policy (never exempted -- see check_order's
-        # own docstring): add-on's cash mechanism is buying-power-based, not
-        # cash-based, so it isn't comparable to the reservation estimate
-        # used below, and stacking a second ticker's BUY against an
-        # already-armed add-on-eligible position is a materially different
-        # risk than two ordinary core entries.
+        # decision. (is_addon_leg used to be kept strict here -- see the
+        # 2026-08-10 comment further down for why that's no longer true.)
         # List, not a single ticker (fixed 2026-08-07, same review pass as
         # the cash-aware guard itself): with the unconditional block gone,
         # 2+ other tickers can genuinely have resting BUYs at once (11 live
@@ -1351,6 +1349,16 @@ def check_order(
                     f"{other_tickers}) available=${buying_power:,.0f}") if other_tickers else
                    f"required=${required:,.0f} available=${buying_power:,.0f}"
         )
+        if other_tickers:
+            # Mirrors the non-addon `second_ticker_buy_allowed` event below --
+            # makes the 2026-08-10 relaxation's payoff observable the same
+            # way (2026-08-10, follow-up #4 from that fix's paired review).
+            signals_db.log_coverage_event(
+                "addon_second_ticker_buy_allowed", _mode, ticker=ticker, node_id=_node_id,
+                result="allowed_buying_power_sufficient",
+                detail=f"account={account} other_tickers={other_tickers} reserved=${_reserved_other:,.0f} "
+                       f"notional=${notional:,.0f} available=${buying_power:,.0f}"
+            )
     elif side == "BUY":
         import schwab_client  # local import: schwab_client imports this module at load time
         try:

@@ -121,7 +121,7 @@ from signals_notify import (
     update_dry_run_buys, update_real_pending_buys_running_low, check_dry_run_sim_sells,
     check_entry_abandon, build_eod_scenario_review,
     check_drought_entry, check_drought_handoff, check_addon_leg_reconciliation,
-    check_intraday_risk_review,
+    check_intraday_risk_review, check_addon_buying_power_drift,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
@@ -1002,6 +1002,17 @@ def run_loop(tickers: set = None):
             _guarded("sl_order_fills", check_sl_order_fills, open_positions)
             open_positions = get_open_positions()
 
+            # Moved here 2026-08-10 (was after exit_check/paper/dry-run sells
+            # below) -- user's call: broker-vs-local-DB state should be
+            # verified before this cycle's SELL/BUY actions are considered,
+            # same "broker is ground truth, check first" reasoning as
+            # check_sl_order_fills immediately above, not just alongside the
+            # other post-hoc checks it used to sit next to. Detection/alert-
+            # only (never blocks or gates an order), so moving it earlier
+            # only changes when a mismatch is *noticed*, not what happens as
+            # a result.
+            _guarded("live_state_reconciliation", check_live_state_reconciliation, open_positions)
+
             paper_positions = get_open_positions(paper=True)
             # Keyed via _pos_key: wl_id (the watch_list row's own PK) when available,
             # else a (ticker, window) fallback for legacy positions that predate the
@@ -1185,7 +1196,6 @@ def run_loop(tickers: set = None):
             _guarded("paper_check_sells", paper_trading.check_paper_sells, last_seen_bar, paper_sell_alerted, _load_cache)
             _guarded("dry_run_sim_check_sells", check_dry_run_sim_sells,
                      last_seen_bar, dry_run_sell_alerted, _load_cache)
-            _guarded("live_state_reconciliation", check_live_state_reconciliation, open_positions)
 
             if _reminders_active(now):
                 _guarded("trailing_reminders", check_trailing_reminders, open_positions)
@@ -1197,6 +1207,13 @@ def run_loop(tickers: set = None):
             # internal gating (trading day + 9:15-16:00 ET window) decides
             # whether it actually does anything, same pattern as check_gap_resize.
             _guarded("intraday_risk_review", check_intraday_risk_review)
+
+            # Called every cycle like the check above -- its own internal
+            # gating (trading day + once-per-day state watermark) decides
+            # whether it actually makes a real broker call. Added 2026-08-10
+            # as follow-up #1 of the add-on buying-power reservation fix
+            # (docs/deep_backlog.md's 2026-08-09/10 entry).
+            _guarded("addon_buying_power_drift", check_addon_buying_power_drift)
 
             # Not gated to market hours -- a GTC trailing order can fill any time it's
             # resting at the broker, and auto-fill-detection is opt-in per ticker anyway

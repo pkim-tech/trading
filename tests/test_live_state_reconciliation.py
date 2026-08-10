@@ -31,6 +31,7 @@ def env(monkeypatch, tmp_path):
     posted = []
     monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: posted.append(a[0] if a else kw.get('text')))
     signals_notify._RECONCILE_ALERTED.clear()
+    signals_notify._RECONCILE_FETCH_FAIL_ALERTED.clear()
 
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
@@ -186,14 +187,77 @@ def test_no_alert_outside_automation_scope(env, monkeypatch):
     assert env == []
 
 
-def test_fetch_failure_skips_position_without_raising(env, monkeypatch):
+def test_fetch_failure_retries_then_alerts_and_skips_position(env, monkeypatch):
+    """2026-08-10: a fetch failure now retries _RECONCILE_FETCH_RETRIES times
+    before giving up, and alerts (rather than silently skipping) once all
+    retries are exhausted -- a real broker-connectivity problem is itself
+    worth knowing about, per the user's call."""
     pos = _open_pos(shares=100)
 
+    call_count = 0
+
     def _raise(account, ticker):
+        nonlocal call_count
+        call_count += 1
         raise RuntimeError("network error")
     monkeypatch.setattr(schwab_client, 'get_real_position', _raise)
+    monkeypatch.setattr(signals_notify, '_RECONCILE_FETCH_RETRY_DELAY_SECS', 0)  # don't slow the test down
     signals_notify.check_live_state_reconciliation([pos])  # must not raise
-    assert env == []
+    assert call_count == signals_notify._RECONCILE_FETCH_RETRIES
+    assert len(env) == 1 and "fetch failed" in env[0]
+
+    events = signals_db.get_coverage_events(scenario_key='reconciliation_fetch_failed')
+    assert any(e['ticker'] == TICKER and e['result'] == 'failed_after_retries' for e in events)
+
+
+def test_fetch_failure_alert_is_cooldown_gated_per_account(env, monkeypatch):
+    """2026-08-10 fix (paired review finding, all 3 reviewers): the fetch-
+    failure alert must not re-fire every poll during a sustained outage."""
+    pos = _open_pos(shares=100)
+    monkeypatch.setattr(schwab_client, 'get_real_position',
+                         lambda account, ticker: (_ for _ in ()).throw(RuntimeError("down")))
+    monkeypatch.setattr(signals_notify, '_RECONCILE_FETCH_RETRY_DELAY_SECS', 0)
+    signals_notify.check_live_state_reconciliation([pos])
+    signals_notify.check_live_state_reconciliation([pos])
+    assert len(env) == 1  # second call's alert suppressed by the per-account cooldown
+
+
+def test_second_position_same_down_account_skips_retry_sleep(env, monkeypatch):
+    """2026-08-10 fix: once an account has exhausted retries once THIS CALL,
+    a second position on the same account must not pay another full
+    retry-and-sleep sequence -- the latency-stacking finding from the paired
+    review (up to 6s x N positions ahead of the pinned entry/exit scans)."""
+    pos1 = _open_pos(shares=100)
+    signals_db.add_node('TEST_RECONCILE_TWO', 'TrailingBothZScoreBreakout', 'test', window=20,
+                         take_profit=7, stop_loss=5, max_hold_hours=7, state='live',
+                         trail_buy_pct=1.0, trail_pct=1.0)
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET account='ira' WHERE ticker='TEST_RECONCILE_TWO'")
+        c.commit()
+    schwab_safety.AUTOMATION_ENABLED_TICKERS.add('TEST_RECONCILE_TWO')
+    node2 = [n for n in signals_db.get_watchlist() if n['ticker'] == 'TEST_RECONCILE_TWO'][0]
+    now = datetime.now()
+    signals_db.open_position(node2, signal_price=50.0, signal_time=now, entry_price=50.0,
+                              entry_time=now, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='ira' WHERE ticker='TEST_RECONCILE_TWO'")
+        c.commit()
+    pos2 = signals_db.get_open_position('TEST_RECONCILE_TWO')
+
+    calls = []
+
+    def _raise(account, ticker):
+        calls.append(ticker)
+        raise RuntimeError("down")
+    monkeypatch.setattr(schwab_client, 'get_real_position', _raise)
+    monkeypatch.setattr(signals_notify, '_RECONCILE_FETCH_RETRY_DELAY_SECS', 0)
+    signals_notify.check_live_state_reconciliation([pos1, pos2])
+    # pos1 pays the full 3-attempt retry; pos2 (same account, already known
+    # down this call) must skip straight to the failure path with 0 attempts.
+    assert len(calls) == signals_notify._RECONCILE_FETCH_RETRIES
+    events = signals_db.get_coverage_events(scenario_key='reconciliation_fetch_failed')
+    tickers_logged = {e['ticker'] for e in events if e['result'] == 'failed_after_retries'}
+    assert tickers_logged == {TICKER, 'TEST_RECONCILE_TWO'}
 
 
 def test_snoozed_ticker_suppresses_both_alert_and_coverage_event(env, monkeypatch):

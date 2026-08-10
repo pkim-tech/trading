@@ -250,33 +250,102 @@ def test_second_ticker_buy_blocked_when_cash_cannot_cover_both(env, fake_broker)
         "cash_check should log the reservation detail when blocking on combined insufficiency"
 
 
-def test_second_ticker_buy_blocked_for_addon_leg_regardless_of_cash(env, fake_broker):
-    """is_addon_leg is never exempted from this guard, per check_order's own
-    documented policy -- kept strict even with ample cash, unlike the
-    ordinary-BUY case above. TICKER_TWO is given a fully-armed open core
-    position (matching quantity) so every OTHER is_addon_leg precondition
-    passes and this guard is the one actually under test."""
+def _armed_addon_node(ticker, account, entry_price, shares, notional=5_000):
+    """Helper shared by the 3 addon-buying-power tests below: creates a node
+    with an open, fully-armed core position so every is_addon_leg
+    precondition OTHER than the buying-power/reservation check under test
+    already passes."""
+    node = _add_node(ticker, account, notional=notional)
+    signals_db.open_position(node, signal_price=entry_price, signal_time=_IN_WINDOW_TIME,
+                              entry_price=entry_price, entry_time=_IN_WINDOW_TIME, shares=shares)
+    pos = signals_db.get_open_position(ticker)
+    signals_db.update_position_trail_state(pos['id'], {'trailing': True, 'peak': entry_price})
+    return node
+
+
+def test_addon_second_ticker_buy_allowed_when_buying_power_covers_both(env, fake_broker):
+    """2026-08-10 fix: is_addon_leg is NO LONGER unconditionally blocked just
+    because another ticker has a resting BUY in the same account (same
+    "1-ticker-per-account artifact" shape as the RETL/LABD incident, fixed
+    for the ordinary-BUY case in the sibling test above). When buying power
+    covers the add-on's own 2x-headroom notional PLUS the other ticker's
+    real reserved amount, the add-on BUY must proceed."""
     _add_node(TICKER, 'soxl_ira', notional=5_000)
-    node_two = _add_node('TICKER_TWO', 'soxl_ira', notional=5_000)
+    _armed_addon_node('TICKER_TWO', 'soxl_ira', entry_price=20.0, shares=10, notional=5_000)
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_quote('TICKER_TWO', last=20.0, bid=20.0, ask=20.01)
+    fake_broker.set_cash_balance('soxl_ira', 10_000.0)
+    fake_broker.set_buying_power('soxl_ira', 10_000.0)
+
+    r1, oid1 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
+    assert oid1 is not None
+    fake_broker.orders[oid1]['status'] = 'WORKING'  # TICKER stays resting, reserves $100
+
+    # required = 200*2 (addon headroom) + 100 (TICKER reservation) = $500
+    schwab_safety.check_order('soxl_ira', 'TICKER_TWO', 10, 20.0, 'BUY', is_addon_leg=True)
+
+    events = signals_db.get_coverage_events(scenario_key='addon_buying_power_check')
+    assert any(e['ticker'] == 'TICKER_TWO' and e['result'] == 'passed' for e in events), \
+        "addon_buying_power_check should log 'passed' when buying power covers both"
+    assert any(e['ticker'] == 'TICKER_TWO' and e['result'] == 'allowed_buying_power_sufficient'
+               for e in signals_db.get_coverage_events(scenario_key='addon_second_ticker_buy_allowed')), \
+        "addon_second_ticker_buy_allowed should log the relaxation's payoff"
+
+
+def test_addon_second_ticker_buy_blocked_when_buying_power_cannot_cover_both(env, fake_broker):
+    """The real remaining guard for add-on legs: TICKER's resting order
+    reserves its actual quantity x current price against the account's
+    buying power -- if that leaves too little for TICKER_TWO's add-on
+    headroom requirement, it's still blocked (for a real, buying-power-
+    grounded reason, not unconditionally)."""
+    _add_node(TICKER, 'soxl_ira', notional=5_000)
+    _armed_addon_node('TICKER_TWO', 'soxl_ira', entry_price=20.0, shares=10, notional=5_000)
     fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
     fake_broker.set_quote('TICKER_TWO', last=20.0, bid=20.0, ask=20.01)
     fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
 
     r1, oid1 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
     assert oid1 is not None
-    fake_broker.orders[oid1]['status'] = 'WORKING'  # TICKER stays resting
+    fake_broker.orders[oid1]['status'] = 'WORKING'  # reserves $100
 
-    signals_db.open_position(node_two, signal_price=20.0, signal_time=_IN_WINDOW_TIME,
-                              entry_price=20.0, entry_time=_IN_WINDOW_TIME, shares=10)
-    pos_two = signals_db.get_open_position('TICKER_TWO')
-    signals_db.update_position_trail_state(pos_two['id'], {'trailing': True, 'peak': 20.0})
+    # required = 200*2 (addon headroom) + 100 (TICKER reservation) = $500; give it $499.
+    fake_broker.set_buying_power('soxl_ira', 499.0)
 
-    with pytest.raises(schwab_safety.SafetyViolation, match="add-on leg"):
+    with pytest.raises(schwab_safety.SafetyViolation, match="buying power"):
         schwab_safety.check_order('soxl_ira', 'TICKER_TWO', 10, 20.0, 'BUY', is_addon_leg=True)
 
-    events = signals_db.get_coverage_events(scenario_key='second_ticker_buy_blocked')
-    assert any(e['ticker'] == 'TICKER_TWO' and e['result'] == 'blocked_addon_leg' for e in events), \
-        "second_ticker_buy_blocked should log blocked_addon_leg for an add-on leg regardless of cash"
+    events = signals_db.get_coverage_events(scenario_key='addon_buying_power_check')
+    assert any(e['ticker'] == 'TICKER_TWO' and e['result'] == 'blocked_insufficient'
+               and 'reserved for' in e['detail'] and TICKER in e['detail'] for e in events), \
+        "addon_buying_power_check should log the reservation detail when blocking"
+
+
+def test_addon_buy_blocked_unpriced_when_other_ticker_price_unavailable(env, fake_broker, monkeypatch):
+    """If a live price can't be fetched for another ticker with a resting
+    BUY, the add-on order must fail closed (blocked_unpriced) rather than
+    silently reserving $0 for it."""
+    _add_node(TICKER, 'soxl_ira', notional=5_000)
+    _armed_addon_node('TICKER_TWO', 'soxl_ira', entry_price=20.0, shares=10, notional=5_000)
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_quote('TICKER_TWO', last=20.0, bid=20.0, ask=20.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    fake_broker.set_buying_power('soxl_ira', 1_000_000.0)
+
+    r1, oid1 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
+    assert oid1 is not None
+    fake_broker.orders[oid1]['status'] = 'WORKING'
+
+    real_get_price = schwab_client.get_current_price
+    monkeypatch.setattr(schwab_client, 'get_current_price',
+                         lambda t: (_ for _ in ()).throw(RuntimeError("no quote")) if t == TICKER
+                         else real_get_price(t))
+
+    with pytest.raises(schwab_safety.SafetyViolation, match="live price"):
+        schwab_safety.check_order('soxl_ira', 'TICKER_TWO', 10, 20.0, 'BUY', is_addon_leg=True)
+
+    events = signals_db.get_coverage_events(scenario_key='addon_buying_power_check')
+    assert any(e['ticker'] == 'TICKER_TWO' and e['result'] == 'blocked_unpriced' for e in events), \
+        "addon_buying_power_check should log blocked_unpriced when another ticker's price is unavailable"
 
 
 def test_third_ticker_buy_reserves_against_both_other_resting_orders(env, fake_broker):

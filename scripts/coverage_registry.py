@@ -247,14 +247,13 @@ REGISTRY = [
                "observed -- every real event so far shows result=passed."),
     dict(id='second_ticker_one_account',
          scenario="Second-live-ticker-in-one-account BUY correctly blocked when the account "
-                  "can't afford both reservations",
+                  "can't afford both reservations (non-addon path)",
          code_path="schwab_safety._open_buy_tickers_in_account / _open_buy_order_quantity / "
                     "check_order's cash-check block (schwab_client.get_current_price)",
          offline_coverage="test_schwab_safety.py::test_second_ticker_resting_buy_in_same_account_blocked; "
                            "test_fake_broker_check_order_guards_phase2_scenario.py: "
                            "test_second_ticker_buy_blocked_when_cash_cannot_cover_both, "
-                           "test_third_ticker_buy_reserves_against_both_other_resting_orders, "
-                           "test_second_ticker_buy_blocked_for_addon_leg_regardless_of_cash",
+                           "test_third_ticker_buy_reserves_against_both_other_resting_orders",
          check_mechanism='coverage_events', scenario_key='second_ticker_buy_blocked',
          bad_results=['blocked_unpriced'],
          notes="Cash-aware as of 2026-08-07 (real incident: RETL's genuine BUY was blocked by LABD's "
@@ -263,13 +262,16 @@ REGISTRY = [
                "affordability, code_path/notes above were stale (this WAS reachable, fired for real "
                "the same day it was 'not reachable' in this doc). Reservation sums ALL other resting "
                "tickers' real quantity x live price (not a config value), fixed same session after a "
-               "paired Opus review caught a single-order-only version. is_addon_leg kept strict "
-               "(blocked_addon_leg), unaffected by the cash-aware change. No live confirmation yet of "
-               "the new blocked-for-real-cash-reasons path (only the old unconditional block and "
-               "today's addon_leg block have real events on file)."),
+               "paired Opus review caught a single-order-only version. Scoped to the non-addon path "
+               "only as of 2026-08-10 -- is_addon_leg had the identical unconditional-block bug "
+               "(found via a direct audit of the RETL/LABD incident, docs/deep_backlog.md's "
+               "2026-08-09/10 entry) and now has its own real gate, see addon_buying_power_check "
+               "below, not this scenario_key. No live confirmation yet of the new "
+               "blocked-for-real-cash-reasons path here (only the old unconditional block has real "
+               "events on file)."),
     dict(id='second_ticker_buy_allowed_when_cash_sufficient',
          scenario="Second-live-ticker-in-one-account BUY correctly ALLOWED when the account can "
-                  "afford both reservations (the actual point of the 2026-08-07 fix)",
+                  "afford both reservations (non-addon path, the actual point of the 2026-08-07 fix)",
          code_path="schwab_safety.check_order's cash-check block, same as second_ticker_one_account",
          offline_coverage="test_fake_broker_check_order_guards_phase2_scenario.py: "
                            "test_second_ticker_buy_allowed_when_cash_covers_both, "
@@ -281,6 +283,66 @@ REGISTRY = [
                "was skipped today purely because LABD had a resting order, not because cash was "
                "actually short). Real live confirmation still open: needs a genuine day where 2+ "
                "soxl_ira tickers signal close together and the second one's BUY actually proceeds."),
+    dict(id='addon_buying_power_check',
+         scenario="Add-on-leg BUY's buying-power check (pass, insufficient, and unpriced-other-ticker "
+                  "branches), including the 2026-08-10 fix folding a reservation for other tickers' "
+                  "resting-order notional into this check",
+         code_path="schwab_safety.check_order's is_addon_leg buying-power block "
+                   "(schwab_client.get_account_buying_power / get_current_price)",
+         offline_coverage="test_fake_broker_check_order_guards_phase2_scenario.py: "
+                           "test_addon_second_ticker_buy_allowed_when_buying_power_covers_both, "
+                           "test_addon_second_ticker_buy_blocked_when_buying_power_cannot_cover_both, "
+                           "test_addon_buy_blocked_unpriced_when_other_ticker_price_unavailable",
+         check_mechanism='coverage_events', scenario_key='addon_buying_power_check',
+         bad_results=['blocked_unpriced', 'failed_closed'],
+         notes="No row existed at all before 2026-08-10 -- verified directly against the live DB "
+               "(zero coverage_events rows for any addon_% scenario_key as of this fix) that this "
+               "was ALSO wired-never-fired, not just missing a registry row; a pre-existing "
+               "gap surfaced while fixing the RETL/LABD-shaped 1-ticker-per-account bug in this "
+               "path (docs/deep_backlog.md's 2026-08-09/10 entry, follow-up #3). "
+               "Reservation-headroom asymmetry still open (follow-up #1 in that entry): "
+               "_reserved_other here is NOT scaled by ADDON_BUYING_POWER_HEADROOM_MULT the way the "
+               "add-on's own notional is -- currently harmless only because buying_power==cash on "
+               "every live account today; see the new addon_buying_power_drift_check scenario "
+               "below, added specifically to catch the moment that assumption stops holding. "
+               "failed_closed means the buying-power fetch itself failed and the order was "
+               "refused -- the guard failing safe, not working normally, same reasoning as "
+               "blocked_unpriced."),
+    dict(id='addon_buying_power_drift_check',
+         scenario="Daily daemon check: does buying_power still equal cash balance for every "
+                  "account hosting a live addon_enabled node?",
+         code_path="signals_notify.check_addon_buying_power_drift "
+                   "(schwab_client.get_account_balance / get_account_buying_power)",
+         offline_coverage="tests/test_addon_buying_power_drift.py (10 tests)",
+         check_mechanism='coverage_events', scenario_key='addon_buying_power_drift_check',
+         bad_results=['diverged', 'fetch_failed'],
+         notes="New 2026-08-10, follow-up #1 of the RETL/LABD-shaped add-on buying-power fix "
+               "(docs/deep_backlog.md's 2026-08-09/10 entry) -- addon_buying_power_check's other-"
+               "ticker reservation is 1x, not scaled the way the add-on's own notional is, an "
+               "asymmetry masked only by buying_power==cash holding true today. This check runs "
+               "once/day PER ACCOUNT in the daemon (active_signals.py) and alerts unconditionally "
+               "on a real divergence -- doesn't fix the asymmetry, just catches the moment its "
+               "cover assumption breaks. Tracked per-account (not one global watermark) since a "
+               "paired review (2026-08-10) caught the first version stamping the whole day done "
+               "even on total fetch failure; fetch_failed (renamed from an inaccurate "
+               "'failed_closed' the same review caught -- nothing fails closed here, the account "
+               "is just skipped and retried next poll) and an unconfirmed diverged-alert post both "
+               "leave that account unmarked so the next ~5min poll retries it. No live events yet "
+               "(just wired in)."),
+    dict(id='addon_second_ticker_buy_allowed',
+         scenario="Add-on-leg BUY correctly ALLOWED alongside another ticker's resting order when "
+                  "buying power covers both (the actual point of the 2026-08-10 fix, mirroring "
+                  "the non-addon second_ticker_buy_allowed row)",
+         code_path="schwab_safety.check_order's is_addon_leg buying-power block, same as "
+                   "addon_buying_power_check",
+         offline_coverage="test_fake_broker_check_order_guards_phase2_scenario.py::"
+                           "test_addon_second_ticker_buy_allowed_when_buying_power_covers_both",
+         check_mechanism='coverage_events', scenario_key='addon_second_ticker_buy_allowed',
+         bad_results=[],
+         notes="New 2026-08-10, follow-up #4 of the RETL/LABD-shaped add-on buying-power fix "
+               "(docs/deep_backlog.md's 2026-08-09/10 entry) -- the add-on path previously logged "
+               "no event when it let an order through alongside another ticker's resting order, "
+               "asymmetric with the non-addon sibling path. No live events yet (just wired in)."),
     dict(id='daemon_exception_survival',
          scenario="Daemon survives an unhandled exception mid-loop",
          code_path="active_signals._guarded + outer try/except in run_loop",

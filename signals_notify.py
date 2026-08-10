@@ -375,6 +375,17 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
 _RECONCILE_ALERTED: dict[str, float] = {}
 _RECONCILE_COOLDOWN_SECS = 900  # 15 min -- matches the reminder-nag/section-alert cadence elsewhere
 
+# Per-ACCOUNT (not per-position) cooldown for the fetch-failure alert below --
+# a broker outage is one fact affecting every position on that account
+# simultaneously, not N independent ones. Reuses _RECONCILE_COOLDOWN_SECS'
+# cadence. Added 2026-08-10 after paired review (Fable independent-cold +
+# Opus independent-cold + Opus contextual, all three converged) found the
+# original version posted, unbounded, every poll cycle per position -- with
+# 11 live soxl_ira nodes that's ~11 messages/5min indefinitely during any
+# sustained outage, exactly the alert-fatigue shape the 2026-08-08 capital-
+# at-stake redesign existed to eliminate.
+_RECONCILE_FETCH_FAIL_ALERTED: dict[str, float] = {}
+
 
 # _fresh_node (round 3) was removed 2026-07-25 -- a later Opus review pass
 # (round 6) proved it had become a pure no-op: after round 5's fix pinned
@@ -476,6 +487,10 @@ def alert_stale_price_exit_suppressed(pos):
     )
 
 
+_RECONCILE_FETCH_RETRIES = 3
+_RECONCILE_FETCH_RETRY_DELAY_SECS = 3
+
+
 def check_live_state_reconciliation(open_positions):
     """Detection-only live-state reconciliation (automation_principles.md #5,
     #1 -- backlog 2026-07-21). For each open position on an automation-scope
@@ -500,10 +515,26 @@ def check_live_state_reconciliation(open_positions):
     slippage, a deliberate manual override, a timing lag) would trigger a
     real, wrong "fix". The broker is treated as ground truth (automation_
     principles.md #1) -- the suggested fix always corrects the DB/order side,
-    never assumes the broker is wrong. Best-effort: a fetch failure just skips
-    that position for this cycle (nothing here blocks or gates a real order,
-    so there's no fail-closed obligation the way schwab_safety.check_order
-    has)."""
+    never assumes the broker is wrong. A fetch failure retries up to
+    _RECONCILE_FETCH_RETRIES total attempts, _RECONCILE_FETCH_RETRY_DELAY_SECS
+    apart (2026-08-10, user's call -- a single transient failure shouldn't
+    skip a position's check silently); only after all attempts fail does it
+    log 'failed_after_retries' and alert (a real broker-connectivity problem
+    is itself worth knowing about, not just quietly missing this position for
+    the cycle) and skip that position for this cycle. The alert itself is
+    cooldown-gated per account (_RECONCILE_FETCH_FAIL_ALERTED, see its own
+    comment) and wrapped so a Slack-post failure can't abort the rest of this
+    loop. Once an account has exhausted its retries once in a given call,
+    every later position on that SAME account this cycle skips straight to
+    the failure path with no further retry/sleep -- a broker-wide outage
+    would otherwise cost every open position its own full retry-and-sleep
+    sequence (found by all 3 paired-review passes: up to 6s x N positions
+    stacked ahead of the pinned entry/exit scans this check was moved in
+    front of, see its call site in active_signals.py). Nothing here blocks or
+    gates a real order, so there's no fail-closed obligation the way
+    schwab_safety.check_order has -- this alerts, it doesn't refuse
+    anything."""
+    _accounts_down_this_cycle: set[str] = set()
     for pos in open_positions:
         if pos.get('is_dry_run_sim'):
             # No real order was ever placed for this position -- the broker has
@@ -537,15 +568,49 @@ def check_live_state_reconciliation(open_positions):
             continue
         _node_id = pos.get('wl_id')
         _node = db.get_watch_list_node_by_id(_node_id)
-        try:
-            real_shares = schwab_client.get_real_position(account, ticker)
-            orders = schwab_safety._open_orders(account)
-        except Exception as e:
+        # Retry a transient fetch failure a few seconds apart (2026-08-10,
+        # user's call) before giving up -- a single flaky call used to skip
+        # the whole position for the cycle silently; 3 failures in a row is
+        # a real signal worth an alert (a broker-connectivity problem, not
+        # noise), not just quietly missing this position's check.
+        real_shares = orders = None
+        last_exc = None
+        if account in _accounts_down_this_cycle:
+            # Already exhausted retries once for this account this cycle --
+            # don't pay another 6s of sleep to reconfirm what's already known.
+            last_exc = RuntimeError(f"account '{account}' already failed reconciliation fetch this cycle")
+        else:
+            for attempt in range(1, _RECONCILE_FETCH_RETRIES + 1):
+                try:
+                    real_shares = schwab_client.get_real_position(account, ticker)
+                    orders = schwab_safety._open_orders(account)
+                    last_exc = None
+                    break
+                except Exception as e:
+                    last_exc = e
+                    if attempt < _RECONCILE_FETCH_RETRIES:
+                        time.sleep(_RECONCILE_FETCH_RETRY_DELAY_SECS)
+            if last_exc is not None:
+                _accounts_down_this_cycle.add(account)
+        if last_exc is not None:
             db.log_coverage_event(
                 "reconciliation_fetch_failed", _coverage_mode(account),
-                ticker=ticker, position_id=pos.get('id'), node_id=_node_id, result="skipped", detail=str(e)
+                ticker=ticker, position_id=pos.get('id'), node_id=_node_id,
+                result="failed_after_retries",
+                detail=f"{_RECONCILE_FETCH_RETRIES} attempts, last error: {last_exc}"
             )
-            print(f"  [reconcile] {ticker}: fetch failed, skipping this cycle: {e}")
+            _fetch_fail_last = _RECONCILE_FETCH_FAIL_ALERTED.get(account, 0)
+            if time.time() - _fetch_fail_last >= _RECONCILE_COOLDOWN_SECS:
+                _RECONCILE_FETCH_FAIL_ALERTED[account] = time.time()
+                try:
+                    _post_message(
+                        f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state reconciliation "
+                        f"fetch failed {_RECONCILE_FETCH_RETRIES}x in a row this cycle — could not verify "
+                        f"broker state\n(`{last_exc}`)"
+                    )
+                except Exception as post_exc:
+                    print(f"  [reconcile] {ticker}: fetch-failure alert itself failed to post: {post_exc}")
+            print(f"  [reconcile] {ticker}: fetch failed {_RECONCILE_FETCH_RETRIES}x, skipping this cycle: {last_exc}")
             continue
 
         mismatch_found = False
@@ -3092,7 +3157,7 @@ INTRADAY_RISK_REVIEW_WINDOW = ((9, 15), (16, 0))
 # Conservative substring match against coverage_events.result -- deliberately
 # NOT matching "blocked_*" (found by paired Opus review, 2026-08-08: many
 # blocked_* results are a guard working correctly, e.g. blocked_same_ticker/
-# blocked_addon_leg, not a failure -- misclassifying those as "concerning"
+# blocked_insufficient, not a failure -- misclassifying those as "concerning"
 # would recreate the exact noise problem this whole session was about
 # fixing). Only unambiguous failure/anomaly language.
 _CONCERNING_RESULT_SUBSTRINGS = (
@@ -3195,6 +3260,129 @@ def check_intraday_risk_review(now=None):
                 state['last_seen_coverage_event_id'] = max(e['id'] for e in new_events)
 
     _save_intraday_risk_review_state(state)
+
+
+# Tolerance for the drift check below -- not zero, since real balance values
+# can carry sub-dollar float noise even when buying_power and cash are
+# conceptually "the same field."
+ADDON_BUYING_POWER_DRIFT_TOLERANCE = 1.0
+
+
+def _load_addon_buying_power_drift_state():
+    try:
+        state = json.loads(cfg.ADDON_BUYING_POWER_DRIFT_STATE_PATH.read_text())
+        return state if isinstance(state, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_addon_buying_power_drift_state(state):
+    cfg.ADDON_BUYING_POWER_DRIFT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cfg.ADDON_BUYING_POWER_DRIFT_STATE_PATH.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state))
+    tmp.replace(cfg.ADDON_BUYING_POWER_DRIFT_STATE_PATH)
+
+
+def check_addon_buying_power_drift(now=None):
+    """Daily daemon check for follow-up #1 of the 2026-08-10 add-on
+    buying-power reservation fix (docs/deep_backlog.md's 2026-08-09/10
+    entry): schwab_safety.check_order's is_addon_leg buying-power block
+    reserves OTHER tickers' resting-order notional at 1x, while the add-on's
+    OWN notional gets ADDON_BUYING_POWER_HEADROOM_MULT (2x) -- an asymmetry
+    that's currently harmless ONLY because buying_power == cash balance
+    exactly on every real account with an addon_enabled live node today
+    (verified directly via schwab_client at the time of that fix). The
+    reservation math under-reserves by the leverage factor the moment that
+    stops being true (a genuine Reg-T margin account, or if soxl_ira's
+    IRA-limited-margin type ever grants real leverage) -- this check exists
+    to catch THAT moment, not to fix the asymmetry itself (deliberately left
+    as a real, undecided design question -- see that backlog entry).
+
+    Tracked PER ACCOUNT, not one global watermark (2026-08-10, fixed by
+    paired review -- all 3 reviewers independently caught the original
+    single-watermark version stamping the whole day done even when every
+    account's fetch failed, which could silently disable this check for the
+    rest of the day with no retry and no alert -- the opposite of what a
+    monitor for "the safety net's own assumption broke" should do). Each
+    account's own successful check (diverged OR no_drift) is what marks it
+    done for today; a fetch failure leaves it unmarked, so the next poll
+    cycle (still same day, ~5min later) retries it -- no separate retry loop
+    needed, the daemon's own cadence provides that. A diverged account is
+    ALSO left unmarked if the alert doesn't confirm-post, mirroring
+    check_intraday_risk_review's confirmed-post-before-advancing-watermark
+    pattern a few dozen lines above -- a lost divergence alert must not be
+    silently treated as "handled." Only checks accounts that currently host
+    at least one state='live' addon_enabled node -- an account with no live
+    add-on exposure has nothing this check protects.
+
+    Alerts unconditionally (not gated on has_capital_at_stake) -- this is an
+    infrastructure-assumption failure that silently under-reserves buying
+    power for every add-on-eligible node on the account, not a per-node
+    routine/anomaly event; the whole point of should_alert_live's capital
+    threshold (mute routine noise below $10k) doesn't apply to "a safety
+    check's own precondition just broke."
+    """
+    now = now or datetime.now()
+    today = now.strftime('%Y-%m-%d')
+    if not _coverage_is_trading_day(today):
+        return
+
+    accounts = sorted({
+        node['account'] for node in db.get_watchlist()
+        if node.get('state') == 'live' and node.get('addon_enabled') and node.get('account')
+    })
+    if not accounts:
+        return
+
+    state = _load_addon_buying_power_drift_state()
+    checked = state.get('checked') or {}
+    pending = [a for a in accounts if checked.get(a) != today]
+    if not pending:
+        return
+
+    diverged = []
+    for account in pending:
+        # coverage_events has no `account` column -- ticker is the closest
+        # dimension the table offers, and there's no real ticker for an
+        # account-level check, so the account name goes there instead.
+        mode = _coverage_mode(account)
+        try:
+            cash = schwab_client.get_account_balance(account)
+            buying_power = schwab_client.get_account_buying_power(account)
+        except Exception as e:
+            db.log_coverage_event(
+                "addon_buying_power_drift_check", mode, ticker=account,
+                result="fetch_failed", detail=str(e))
+            continue
+        diff = buying_power - cash
+        if abs(diff) > ADDON_BUYING_POWER_DRIFT_TOLERANCE:
+            diverged.append((account, cash, buying_power, diff))
+            db.log_coverage_event(
+                "addon_buying_power_drift_check", mode, ticker=account,
+                result="diverged", detail=f"account={account} cash=${cash:,.2f} "
+                                           f"buying_power=${buying_power:,.2f} diff=${diff:,.2f}")
+        else:
+            db.log_coverage_event(
+                "addon_buying_power_drift_check", mode, ticker=account,
+                result="no_drift", detail=f"account={account} cash=${cash:,.2f} "
+                                           f"buying_power=${buying_power:,.2f}")
+            checked[account] = today
+
+    if diverged:
+        lines = ["\U0001F4B0 Add-on buying-power assumption broke — reservation math needs revisiting "
+                 "(not blocking any order on its own):"]
+        for account, cash, buying_power, diff in diverged:
+            lines.append(f"  {account}: cash=${cash:,.2f} buying_power=${buying_power:,.2f} "
+                         f"(diff ${diff:,.2f}) — addon_buying_power_check's other-ticker reservation "
+                         f"is 1x, not scaled for this gap")
+        channel, ts = _post_message("\n".join(lines))
+        if channel and ts:
+            for account, *_ in diverged:
+                checked[account] = today
+        # else: leave those accounts unmarked so the next poll retries the alert.
+
+    state['checked'] = checked
+    _save_addon_buying_power_drift_state(state)
 
 
 def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, target_notional=None):

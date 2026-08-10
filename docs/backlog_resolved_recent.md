@@ -7,6 +7,10 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [backtest] Resolved 2026-08-10 — HIBL/GDXU drought-overlay SOXL-grade rigor closed: the report's default cliff-safety-first ("best safe node") pick fails the included-vs-excluded challenge for both, but the CAGR-first pick (the user's actual selection convention) beats it on CAGR, worst_neighbor, AND passes REAL_SELECTION for both tickers. Full detail: `deep_backlog.md`.
+
+## [live-trading] Resolved 2026-08-10 — all 5 add-on buying-power fix follow-ups closed (item 1 via a new daily drift-monitoring job, not a math fix); `check_live_state_reconciliation` gained retry+alert-on-failure and moved earlier in the poll loop; 3-way paired review (Fable+Opus independent-cold + Opus contextual) found and fixed real alert-spam/watermark bugs in the new code before it shipped. Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved 2026-08-09 (later still, 4) — USO/UCO/SCO stale backlog items closed against the candidate report; SCO confirmed real CLIFF (no safe node), not a missing-data gap. Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved 2026-08-09 (later still) — `certain` kernel fix (frozen-trigger + min(buy_trigger_prior,high) Close-confirm bound) applied, paired-reviewed, and pinned with 4 new tests; full recompute + tooling gap tabled, `possible` stays the standard. Full detail: `deep_backlog.md`/`research_log.md`.

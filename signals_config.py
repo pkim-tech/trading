@@ -35,6 +35,11 @@ CAPITAL_AT_STAKE_THRESHOLD = float(os.environ.get("CAPITAL_AT_STAKE_THRESHOLD", 
 # either re-alert on an already-seen incident or silently skip a new one.
 INTRADAY_RISK_REVIEW_STATE_PATH = LIVE_DIR / "intraday_risk_review_state.json"
 
+# Persisted last-checked-date marker for signals_notify.check_addon_buying_power_drift
+# -- once/day is enough (real broker balance calls), and surviving a restart
+# avoids re-checking (and potentially re-alerting) on the same day.
+ADDON_BUYING_POWER_DRIFT_STATE_PATH = LIVE_DIR / "addon_buying_power_drift_state.json"
+
 LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 HUMAN_LOG_PATH   = LOG_DIR / "active_signals.log"
