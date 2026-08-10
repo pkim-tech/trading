@@ -407,6 +407,18 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                     (_blocking.get('trail_state') or {}).get('exit_pending', {}).get('reason') == 'HANDOFF')
                 if _handoff_in_flight or db.get_drought_pending_buy(node['id']):
                     buy_alerted.discard(alert_key)
+                    # Two distinct result values, not one -- a still-resting
+                    # drought entry order (pre-handoff) also releases the slot
+                    # here, and compute_status buckets purely on (mode, result)
+                    # with bad_results=[] for this row, so a single shared
+                    # result string would let that sub-case alone flip this
+                    # row to verified-live without the HANDOFF race itself
+                    # (the scenario this row exists to document) ever firing
+                    # (found by paired Opus review, 2026-08-10).
+                    db.log_coverage_event("drought_handoff_alert_slot_preserved", _coverage_mode(node.get('account'), node),
+                                           ticker=sig['ticker'], node_id=node['id'],
+                                           result="slot_released_handoff" if _handoff_in_flight
+                                                  else "slot_released_pending_entry")
             elif node.get('state') != 'paper':
                 # pending_wl_ids alone would have prevented the 2026-07-26 DIA/IWM/
                 # QQQ/LABU duplicate-pending-buy incident (a restarted daemon forgot

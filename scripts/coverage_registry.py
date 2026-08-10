@@ -849,12 +849,17 @@ REGISTRY = [
                   "drought HANDOFF is still in flight (resting cancel race or unconfirmed exit poll)",
          code_path="active_signals._scan_buy_signals (already_held branch)",
          offline_coverage="tests/test_fake_broker_drought_handoff_scenario.py",
-         check_mechanism='coverage_events', scenario_key=None,
+         check_mechanism='coverage_events', scenario_key='drought_handoff_alert_slot_preserved',
          bad_results=[],
          notes="Real ordering contract: HANDOFF initiates the exit before core's scan runs, so core's "
                "entry lands on a LATER poll once the fill confirms -- without this fix the already_held "
                "branch never discards buy_alerted (unlike already_pending), permanently starving core's "
-               "signal for the rest of the day. No live proof yet -- structural, checked via test."),
+               "signal for the rest of the day. Instrumented 2026-08-10 (was previously not-instrumented "
+               "-- no log_coverage_event call existed on this path at all). The same release also fires "
+               "for a still-resting drought ENTRY order (pre-handoff, not the unwind race this row is "
+               "about) -- logged as a distinct result='slot_released_pending_entry' vs. "
+               "'slot_released_handoff' precisely so that sub-case alone can't false-flip this row to "
+               "verified-live. No live proof of the handoff case yet."),
 ]
 
 
