@@ -7,7 +7,7 @@ controlled fake-broker tests:
   - dry_run_sim_close        (exit_fill, mode='dry_run')
 
 Uses the same fake_broker fixture + isolated DB pattern as the other scenario tests.
-For dry_run branches (1,3,4), uses account 'ira' (dry_run=True in schwab_safety.ACCOUNTS)
+For dry_run branches (1,3,4), uses account 'roth' (dry_run=True in schwab_safety.ACCOUNTS)
 since that's the real precondition -- schwab_client short-circuits before ever
 reaching fake_broker for these specific dry_run scenarios, by design (that's
 the exact behavior being proven). daemon_exception_survival is the only
@@ -66,13 +66,13 @@ def env(monkeypatch, tmp_path):
 
 
 def _add_dry_run_node(ticker, notional=5000):
-    """Helper to add a node with account='ira' (which is dry_run=True)."""
+    """Helper to add a node with account='roth' (which is dry_run=True)."""
     signals_db.add_node(ticker, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
                          stop_loss=1, max_hold_hours=105, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
-                         account='ira', starting_notional=notional)
+                         account='roth', starting_notional=notional)
     return [n for n in signals_db.get_watchlist()
-            if n['ticker'] == ticker and n['account'] == 'ira'][0]
+            if n['ticker'] == ticker and n['account'] == 'roth'][0]
 
 
 # =============================================================================

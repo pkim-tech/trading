@@ -122,7 +122,7 @@ def test_skips_row_gap_resize_already_touched_today(env, monkeypatch):
 
 
 def test_dry_run_account_abandons_without_calling_broker(env, monkeypatch):
-    _set_account('ira')  # real ACCOUNTS['ira'].dry_run == True
+    _set_account('roth')  # real ACCOUNTS['roth'].dry_run == True
     node = _node()
     db.add_pending_buy(node, _sig(100.0, hours_ago=10), channel=None, ts=None)
 
@@ -263,7 +263,7 @@ def test_dry_run_account_manual_placement_with_no_order_id_still_abandons(env):
     real resting (dry_run never places a real order via either the
     automated or manual path) -- must not be blocked by the real-account-only
     'no order id on file' guard above."""
-    _set_account('ira')  # dry_run=True
+    _set_account('roth')  # dry_run=True
     node = _node()
     db.add_pending_buy(node, _sig(100.0, hours_ago=10), channel=None, ts=None)  # order_id=None
     db.mark_pending_buy_placed_by_wl_id(node['id'])
@@ -284,7 +284,7 @@ def test_account_uses_pinned_node_snapshot_not_live_watch_list_edit(env, monkeyp
     db.add_pending_buy(node, _sig(100.0, hours_ago=10), channel=None, ts=None, order_id=555)
     db.mark_pending_buy_placed_by_wl_id(node['id'])
 
-    _set_account('ira')  # live node edited to a dry_run account afterward
+    _set_account('roth')  # live node edited to a dry_run account afterward
 
     calls = []
     monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: (

@@ -58,7 +58,7 @@ def env(monkeypatch, tmp_path):
                          trail_pct=8.0, fixed_sl_override=5.0, entry_timing='open_check',
                          starting_notional=20000)
     with signals_db._conn() as c:
-        c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ?", (TICKER,))
+        c.execute("UPDATE watch_list SET account = 'roth' WHERE ticker = ?", (TICKER,))
         c.commit()
 
     yield
@@ -317,16 +317,16 @@ def test_place_stop_loss_dry_run(env):
     signals_db.open_position(_node(), signal_price=47.5, signal_time=now, entry_price=47.5,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth' WHERE ticker=?", (TICKER,))
         c.commit()
-    r, order_id = schwab_client.place_stop_loss('ira', TICKER, 100, 47.5)
+    r, order_id = schwab_client.place_stop_loss('roth', TICKER, 100, 47.5)
     assert (r, order_id) == (None, None)
 
 
 def test_place_stop_loss_blocked_by_kill_switch(env, monkeypatch):
     monkeypatch.setattr(schwab_safety, 'kill_switch_engaged', lambda: True)
     with pytest.raises(schwab_safety.SafetyViolation):
-        schwab_client.place_stop_loss('ira', TICKER, 100, 47.5)
+        schwab_client.place_stop_loss('roth', TICKER, 100, 47.5)
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +512,7 @@ def test_attempt_automated_sell_replaces_sl_order_id_atomically(env, monkeypatch
                               entry_time=now, shares=100)
     signals_db.set_sl_order_id(TICKER, 777)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira', trail_sell_pct=8.0 WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth', trail_sell_pct=8.0 WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
 
@@ -535,7 +535,7 @@ def test_attempt_automated_sell_skips_cancel_when_no_sl_order_id(env, monkeypatc
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira', trail_sell_pct=8.0 WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth', trail_sell_pct=8.0 WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
 

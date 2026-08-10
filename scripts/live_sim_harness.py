@@ -116,7 +116,7 @@ def make_node(ticker, strategy, **overrides):
     kwargs.update(overrides)
     db.add_node(ticker, strategy, 'harness', **kwargs)
     with db._conn() as c:
-        c.execute("UPDATE watch_list SET account='ira' WHERE ticker=?", (ticker,))
+        c.execute("UPDATE watch_list SET account='roth' WHERE ticker=?", (ticker,))
         c.commit()
     return [n for n in db.get_watchlist() if n['ticker'] == ticker][0]
 
@@ -138,7 +138,7 @@ def scenario_pinned_entry_trailing_buy(posted):
     pending = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
     assert pending, "expected a pending_buys row after a trailing-buy BUY signal"
     assert pending[0]['order_placed'], "trailing-buy order should auto-place (dry_run) and mark placed"
-    # The harness's 'ira' account is dry_run (trading_enabled=False) -- as of
+    # The harness's 'roth' account is dry_run (trading_enabled=False) -- as of
     # 2026-08-08, dry_run nodes get zero real-time Slack for the routine BUY
     # SIGNAL post (has_capital_at_stake is always False for a dry_run node),
     # even though the underlying entry mechanics (pending_buys row, order
@@ -230,7 +230,7 @@ def scenario_gap_resize(posted):
     # a correct-looking message while placing the wrong order underneath.
     spy.assert_called_once()
     call_account, call_ticker, call_shares, call_price = spy.call_args.args
-    assert call_account == 'ira'
+    assert call_account == 'roth'
     assert call_ticker == ticker
     assert spy.call_args.kwargs.get('is_gap_correction') is True
     padded_price = current_price * (1 + notify._GAP_RESIZE_PAD_PCT / 100)

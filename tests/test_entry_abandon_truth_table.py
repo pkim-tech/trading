@@ -9,7 +9,7 @@ artifact (a comprehensive table, not scattered examples) as a more
 deterministic alternative to relying on independent code review.
 
 account_kind: 'unrecognized' (limits is None), 'dry_run' (real dry_run=True
-account, 'ira'), 'real' (dry_run=False account, 'soxl_ira')."""
+account, 'roth'), 'real' (dry_run=False account, 'soxl_ira')."""
 import sys
 import tempfile
 from datetime import datetime
@@ -66,7 +66,7 @@ def _sig(price, hours_ago):
 
 _ACCOUNT_FOR_KIND = {
     'unrecognized': 'totally_unknown_xyz',
-    'dry_run': 'ira',        # real ACCOUNTS['ira'].dry_run == True
+    'dry_run': 'roth',        # real ACCOUNTS['roth'].dry_run == True
     'real': 'soxl_ira',      # real ACCOUNTS['soxl_ira'].dry_run == False
 }
 

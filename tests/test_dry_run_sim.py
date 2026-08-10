@@ -4,7 +4,7 @@ gets a real fill event (schwab_client short-circuits before the broker call),
 so these mirror paper_trading.py's simulation but write to the real
 open_positions/trade_log tables, tagged is_dry_run_sim=1. Follows
 tests/test_live_state_reconciliation.py's fixture pattern (real add_node,
-account patched to 'ira', a real dry_run=True account)."""
+account patched to 'roth', a real dry_run=True account)."""
 import sys
 import tempfile
 from datetime import datetime, timedelta
@@ -39,7 +39,7 @@ def env(monkeypatch, tmp_path):
                 stop_loss=1, max_hold_hours=7, state='live',
                 trail_buy_pct=1.0, trail_pct=1.0, starting_notional=5000, fixed_sl_override=1.0)
     with db._conn() as c:
-        c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ?", (TICKER,))  # real ACCOUNTS['ira'].dry_run == True
+        c.execute("UPDATE watch_list SET account = 'roth' WHERE ticker = ?", (TICKER,))  # real ACCOUNTS['roth'].trading_enabled == False
         c.commit()
 
     yield posted
@@ -59,7 +59,7 @@ def _sig(price):
 
 
 def test_dry_run_account_is_actually_dry_run():
-    assert schwab_safety.ACCOUNTS['ira'].trading_enabled is False
+    assert schwab_safety.ACCOUNTS['roth'].trading_enabled is False
 
 
 def test_pending_buy_for_dry_run_account_never_fills_without_synthesis(env):
@@ -94,7 +94,7 @@ def test_update_dry_run_buys_fills_on_bounce_and_opens_real_position_tagged(env,
     pos = positions[0]
     assert pos['is_dry_run_sim'] == 1
     assert pos['entry_price'] == 92.0
-    assert pos['account'] == 'ira'
+    assert pos['account'] == 'roth'
 
     with db._conn() as c:
         row = c.execute("SELECT is_dry_run_sim FROM trade_log WHERE id = ?", (pos['trade_log_id'],)).fetchone()
@@ -169,7 +169,7 @@ def test_update_dry_run_buys_market_buy_eligible_node_fills_immediately(env, mon
                 stop_loss=1, max_hold_hours=7, state='live', trail_pct=1.0, starting_notional=5000,
                 fixed_sl_override=1.0)
     with db._conn() as c:
-        c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ? AND version = 'test2'", (TICKER,))
+        c.execute("UPDATE watch_list SET account = 'roth' WHERE ticker = ? AND version = 'test2'", (TICKER,))
         c.commit()
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER and n['version'] == 'test2'][0]
     assert db._is_trailing_buy(node) is False

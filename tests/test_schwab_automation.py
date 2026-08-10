@@ -47,7 +47,7 @@ def env(monkeypatch, tmp_path):
                          stop_loss=5, max_hold_hours=7, state='live',
                          trail_buy_pct=1.0, trail_pct=1.0)
     with signals_db._conn() as c:
-        c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ?", (TICKER,))
+        c.execute("UPDATE watch_list SET account = 'roth' WHERE ticker = ?", (TICKER,))
         c.commit()
 
     yield
@@ -111,7 +111,7 @@ def test_automated_sell_placed_and_marks_order_placed(env):
                               entry_time=now, shares=100)
     pos = signals_db.get_open_position(TICKER)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth' WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     signals_notify.notify_trailing_activated(pos, current_price=52.0)
@@ -125,7 +125,7 @@ def test_automated_sell_placed_logs_coverage_event(env):
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth' WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     signals_notify.notify_trailing_activated(pos, current_price=52.0)
@@ -202,7 +202,7 @@ def test_automated_sell_notifies_sl_price_when_trailing_sell_fails_after_sl_canc
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth', sl_order_id='12345' WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
 
@@ -222,7 +222,7 @@ def test_automated_sell_notifies_sl_price_when_trailing_sell_fails_after_sl_canc
     unprotected_msgs = [m for m in posted if "UNPROTECTED" in m]
     assert len(unprotected_msgs) == 1
     assert f"*{TICKER}*" in unprotected_msgs[0]
-    assert "(ira · DRY-RUN)" in unprotected_msgs[0]
+    assert "(roth · DRY-RUN)" in unprotected_msgs[0]
     assert "place stop-loss SELL 100" in unprotected_msgs[0]
     # TrailingBothZScoreBreakout uses_fixed_sl -- real SL % comes from
     # pos['fixed_sl'] (config.json's fixed_stop_loss), not node['stop_loss'].
@@ -239,7 +239,7 @@ def test_notify_sell_signal_time_exit_logs_coverage_event(env):
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth' WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     signals_notify.notify_sell_signal(pos, 'TIME', current_price=51.0, target_price=51.0)
@@ -259,7 +259,7 @@ def test_automated_sell_replace_updates_stale_sl_order_id(env, monkeypatch):
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth', sl_order_id='12345' WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     monkeypatch.setattr(schwab_client, 'replace_order_with_trailing_sell', lambda *a, **kw: (None, 987))
@@ -277,7 +277,7 @@ def test_automated_exit_sell_replace_updates_stale_sl_order_id(env, monkeypatch)
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth', sl_order_id='12345' WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     monkeypatch.setattr(schwab_client, 'replace_equity_order_with_market', lambda *a, **kw: (None, 555))
@@ -309,7 +309,7 @@ def test_automated_sell_replace_does_not_erase_sl_order_id_when_new_id_unextract
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth', sl_order_id='12345' WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     monkeypatch.setattr(schwab_client, 'replace_order_with_trailing_sell', lambda *a, **kw: (None, None))
@@ -325,7 +325,7 @@ def test_automated_exit_sell_replace_does_not_erase_sl_order_id_when_new_id_unex
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira', sl_order_id='12345' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth', sl_order_id='12345' WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     monkeypatch.setattr(schwab_client, 'replace_equity_order_with_market', lambda *a, **kw: (None, None))
@@ -362,7 +362,7 @@ def test_notify_sell_signal_non_time_reason_does_not_log_time_exit_event(env):
     signals_db.open_position(node, signal_price=50.0, signal_time=now, entry_price=50.0,
                               entry_time=now, shares=100)
     with signals_db._conn() as c:
-        c.execute("UPDATE open_positions SET account='ira' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE open_positions SET account='roth' WHERE ticker=?", (TICKER,))
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     signals_notify.notify_sell_signal(pos, 'SL', current_price=48.0, target_price=48.0)
@@ -477,7 +477,7 @@ def test_check_buy_reminders_skips_dry_run_account(env, monkeypatch):
     """A dry_run account's pending buy is resolved entirely by
     update_dry_run_buys' own synthesis -- check_buy_reminders nagging
     'Confirm Filled/Missed It/Cancelled' is meaningless noise for it (no real
-    order exists to confirm). TICKER's node is on account='ira', which is
+    order exists to confirm). TICKER's node is on account='roth', which is
     real dry_run=True config (not monkeypatched here -- exercising the actual
     account lookup). Found live 2026-07-29 (FAZ): 14 spurious reminders over
     ~2 hours, all before a fill that resolved automatically regardless."""

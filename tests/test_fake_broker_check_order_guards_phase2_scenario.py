@@ -399,9 +399,9 @@ def test_third_ticker_buy_reserves_against_both_other_resting_orders(env, fake_b
 def test_same_day_block_cash_account_blocked(env, fake_broker):
     """same_day_block: a same-day re-buy in a 'cash' account should be blocked
     after a same-day exit (result='blocked')."""
-    _add_node(TICKER, 'ira', notional=50_000)  # ira is a 'cash' account
+    _add_node(TICKER, 'roth', notional=50_000)  # ira is a 'cash' account
     fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
-    fake_broker.set_cash_balance('ira', 1_000_000.0)
+    fake_broker.set_cash_balance('roth', 1_000_000.0)
 
     # Seed a closed trade for today
     today = datetime.now().strftime('%Y-%m-%d')
@@ -423,7 +423,7 @@ def test_same_day_block_cash_account_blocked(env, fake_broker):
 
     # Try to place a BUY on the same day -- should be blocked
     with pytest.raises(schwab_safety.SafetyViolation, match="same-day"):
-        schwab_client.place_equity_buy('ira', TICKER, 10, 10.0)
+        schwab_client.place_equity_buy('roth', TICKER, 10, 10.0)
 
     events = signals_db.get_coverage_events(scenario_key='same_day_block')
     assert any(e['ticker'] == TICKER and e['result'] == 'blocked' for e in events), \

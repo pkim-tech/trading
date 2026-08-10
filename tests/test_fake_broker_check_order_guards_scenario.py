@@ -74,13 +74,13 @@ def _real_placed_orders(fake_broker_, ticker):
 
 
 def test_kill_switch_blocks_real_placement(env, fake_broker):
-    _add_node(TICKER, 'ira')
+    _add_node(TICKER, 'roth')
     fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
-    fake_broker.set_cash_balance('ira', 100_000.0)
+    fake_broker.set_cash_balance('roth', 100_000.0)
     schwab_safety.engage_kill_switch("test halt")
 
     with pytest.raises(schwab_safety.SafetyViolation, match="kill switch"):
-        schwab_client.place_equity_buy('ira', TICKER, 10, 10.0)
+        schwab_client.place_equity_buy('roth', TICKER, 10, 10.0)
 
     assert _real_placed_orders(fake_broker, TICKER) == [], \
         "kill switch must block before any real order reaches the broker"
@@ -141,13 +141,13 @@ def test_two_nodes_same_ticker_diff_accounts_both_allowed(env, fake_broker):
     # exists in ACCOUNTS today). The guard itself doesn't care about
     # dry_run; what matters is neither account's order is rejected as
     # "assigned to the wrong account" for this ticker.
-    _add_node(TICKER, 'ira')
+    _add_node(TICKER, 'roth')
     _add_node(TICKER, 'soxl_ira')
     fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
-    fake_broker.set_cash_balance('ira', 1_000_000.0)
+    fake_broker.set_cash_balance('roth', 1_000_000.0)
     fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
 
-    r1, oid1 = schwab_client.place_equity_buy('ira', TICKER, 10, 10.0)  # dry_run -> (None, None), no exception
+    r1, oid1 = schwab_client.place_equity_buy('roth', TICKER, 10, 10.0)  # dry_run -> (None, None), no exception
     r2, oid2 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
     assert oid2 is not None, "the real (non-dry_run) account's node must be allowed through"
 
