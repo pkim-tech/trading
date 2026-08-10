@@ -24,6 +24,9 @@
 > any deferred item whose date has already passed, so it surfaces again instead of quietly
 > aging out. No separate section — stays in place, in normal open-items order.
 
+## [live-trading] Open, raised 2026-08-09 (late) — resync live soxl_ira node params to current best v5 data; only 6 of 11 nodes checked so far
+DPST/HIBL/GDXU/RETL/SOXL/YANG (the 6 overlapping the return-first candidate shortlist) were checked: SOXL+YANG match current best v5 exactly; DPST runs a different strategy class entirely (TrailingExit live vs TrailingBoth now best, likely due to the 2026-08-02→08-08 take_profit/NULL prune bug that zeroed 17 tickers' TrailingBoth v5 data — not fully confirmed which tickers were affected, no ticker-level list exists in any commit/doc); HIBL/GDXU/RETL diverge for other reasons (stale v5 pick, `soxl_test`-origin node, deliberate test config respectively). User's call: don't chase the exact "why," just resync to current best data. **Not yet checked**: ERY, SH, SPY, USD, LABD (the other 5 soxl_ira live nodes) — LABD/ERY are confirmed deliberate test configs (see `staged_test_config`), not resync candidates; SH/SPY/USD status unchecked.
+
 ## [backtest] Idea, raised 2026-08-09 — does this mean-reversion strategy do anything interesting on recently-IPO'd stocks (post-IPO drawdown/mean-reversion pattern)?
 Prompted by SPCL's real underlying (SpaceX Class A shares, since a June 2026 mandate change) having given back almost all its gains since IPO. Two real caveats before chasing this: (1) this system's universe is leveraged ETFs, not individual common stocks — testing this needs either fetching real individual-stock price history for a basket of recent IPOs, or checking whether any already-screened candidate tickers happen to be linked to recently-IPO'd names; (2) SPCL's own data can't be the test case (mandate-change contamination, see `deep_backlog.md`'s 2026-08-09 disqualification entries). Not started.
 
