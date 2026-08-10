@@ -1106,17 +1106,16 @@ def check_order(
         # 2+ other tickers can genuinely have resting BUYs at once (11 live
         # tickers on soxl_ira, both daily signal windows firing near-
         # simultaneously) -- see _open_buy_tickers_in_account's docstring.
+        # is_addon_leg no longer raises unconditionally here (fixed
+        # 2026-08-10, same "1-ticker-per-account artifact" shape as the
+        # general case above -- found via a direct audit prompted by the
+        # RETL/LABD incident, see docs/deep_backlog.md's 2026-08-09/10
+        # entry): the old block refused ANY add-on the instant another
+        # ticker had a resting BUY, with no check of whether buying power
+        # actually was insufficient, despite the addon_buying_power_check
+        # below existing specifically to answer that question. Reservation
+        # for other_tickers is now folded into that check instead.
         other_tickers = _open_buy_tickers_in_account(orders, ticker)
-        if other_tickers and is_addon_leg:
-            signals_db.log_coverage_event(
-                "second_ticker_buy_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_addon_leg",
-                detail=f"account={account} other_tickers={other_tickers}"
-            )
-            raise SafetyViolation(
-                f"account '{account}' already has a resting BUY order for {other_tickers} -- refusing "
-                f"a second concurrent BUY into the same account for an add-on leg (kept strict, not "
-                f"cash-aware, per policy)"
-            )
 
     # Resting-SELL guard (2026-07-22, symmetric to the BUY-side guard above):
     # found via Opus review that SELL had no such check at all, which is what
@@ -1307,20 +1306,50 @@ def check_order(
                 "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id,
                 result="failed_closed", detail=str(e))
             raise SafetyViolation(f"could not verify '{account}' buying power, blocking add-on order: {e}")
-        required = notional * ADDON_BUYING_POWER_HEADROOM_MULT
+        # Reserve for every other ticker's resting BUY (2026-08-10, mirrors the
+        # non-addon cash-aware reservation below) -- other_tickers/orders were
+        # already fetched above regardless of is_addon_leg. Real committed
+        # quantity x current price, not starting_notional, same reasoning as
+        # the non-addon version. Fails closed if a live price can't be
+        # fetched for any of them.
+        _reserved_other = 0.0
+        _unpriced = []
+        for _ot in other_tickers:
+            _ot_qty = _open_buy_order_quantity(orders, _ot)
+            try:
+                _ot_price = schwab_client.get_current_price(_ot)
+            except Exception:
+                _unpriced.append(_ot)
+                continue
+            _reserved_other += _ot_qty * _ot_price
+        if _unpriced:
+            signals_db.log_coverage_event(
+                "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id,
+                result="blocked_unpriced", detail=f"account={account} other_tickers={other_tickers} "
+                                                   f"unpriced={_unpriced}"
+            )
+            raise SafetyViolation(
+                f"account '{account}' already has resting BUY order(s) for {other_tickers}, and a live "
+                f"price couldn't be fetched for {_unpriced} to estimate reserved buying power -- "
+                f"refusing the add-on order"
+            )
+        required = notional * ADDON_BUYING_POWER_HEADROOM_MULT + _reserved_other
         if buying_power < required:
             signals_db.log_coverage_event(
                 "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id,
                 result="blocked_insufficient",
-                detail=f"required=${required:,.0f} (mult={ADDON_BUYING_POWER_HEADROOM_MULT}) "
-                       f"available=${buying_power:,.0f}")
+                detail=f"required=${required:,.0f} (mult={ADDON_BUYING_POWER_HEADROOM_MULT}, incl "
+                       f"${_reserved_other:,.0f} reserved for {other_tickers}) available=${buying_power:,.0f}")
             raise SafetyViolation(
-                f"add-on order notional ${notional:,.0f} x {ADDON_BUYING_POWER_HEADROOM_MULT} headroom = "
-                f"${required:,.0f} required, but '{account}' only has ${buying_power:,.0f} buying power"
+                f"add-on order notional ${notional:,.0f} x {ADDON_BUYING_POWER_HEADROOM_MULT} headroom"
+                + (f" + ${_reserved_other:,.0f} reserved for {other_tickers}'s resting BUY(s)" if other_tickers else "")
+                + f" = ${required:,.0f} required, but '{account}' only has ${buying_power:,.0f} buying power"
             )
         signals_db.log_coverage_event(
             "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id, result="passed",
-            detail=f"required=${required:,.0f} available=${buying_power:,.0f}"
+            detail=(f"required=${required:,.0f} (incl ${_reserved_other:,.0f} reserved for "
+                    f"{other_tickers}) available=${buying_power:,.0f}") if other_tickers else
+                   f"required=${required:,.0f} available=${buying_power:,.0f}"
         )
     elif side == "BUY":
         import schwab_client  # local import: schwab_client imports this module at load time

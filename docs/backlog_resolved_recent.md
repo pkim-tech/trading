@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [backtest] Resolved 2026-08-09 (later still, 4) — USO/UCO/SCO stale backlog items closed against the candidate report; SCO confirmed real CLIFF (no safe node), not a missing-data gap. Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved 2026-08-09 (later still) — `certain` kernel fix (frozen-trigger + min(buy_trigger_prior,high) Close-confirm bound) applied, paired-reviewed, and pinned with 4 new tests; full recompute + tooling gap tabled, `possible` stays the standard. Full detail: `deep_backlog.md`/`research_log.md`.
 
 ## [backtest] Resolved 2026-08-09 (later still) — real K1/underlier-count screener columns added to `tickers`; GLL/KOLD/UGL/UVXY confirmed K-1, BULZ + single-commodity/bond-future family (GLL/KOLD/UGL/TBT/TMF/TMV) disqualified. Full detail: `deep_backlog.md`.
