@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import signals_config
 import signals_db as db
-from scripts.audit_live_test_candidates import audit_one
+from scripts.audit_live_test_candidates import audit_one, _scenario_relevance
 
 TICKER = 'TEST_AUDIT_PENDING'
 
@@ -51,3 +51,96 @@ def test_audit_one_reports_pending_buy_instead_of_flat(isolated_db, capsys):
     # dry_run/paper label -- user's explicit correction).
     assert 'CANARY' in out
     assert '✅ LIVE' not in out  # LIVE branch must not have fired for a non-live node
+
+
+# ---------------------------------------------------------------------------
+# _scenario_relevance / STALE? banner (2026-08-10) -- closes the gap found the
+# same day SH's staged 'time_exit_via_trail' detune (trail_buy_pct 1%->5%,
+# widened by a LATER, unrelated session for a completely different scenario,
+# post_fill_topup) sat live for days after its actual designed scenario had
+# already gone verified-live via a different node (RETL) -- nothing anywhere
+# connected "this staged detune's reason for existing" to "is that reason
+# still true." Confirmed against the real DB the same day this landed: SH,
+# ERY, and the old (sunset) GDXU wl_id=108 row all immediately flagged STALE?
+# on their first real run.
+# ---------------------------------------------------------------------------
+
+def _make_staged_node(role, expected_config):
+    """Opens a real open_positions row (not just a bare watch_list node) so
+    audit_one reaches the 'holding' branch, which calls _print_staged_config
+    unconditionally -- the flat/entry-candidate branch needs real cached
+    price data (a.compute_buy_signal) this synthetic test ticker doesn't
+    have, and returns before ever reaching _print_staged_config."""
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
+    db.set_staged_test_config(node['id'], TICKER, role, expected_config, notes='test')
+    now = datetime.now()
+    db.open_position(node, signal_price=100.0, signal_time=now, entry_price=101.0,
+                      entry_time=now, shares=10)
+    return db.get_watch_list_node_by_id(node['id'])
+
+
+def test_scenario_relevance_none_for_baseline_config():
+    assert _scenario_relevance('baseline_config') is None
+
+
+def test_scenario_relevance_none_for_unmapped_role():
+    """A future scenario_role added to staged_test_config without a matching
+    SCENARIO_ROLE_TO_GRID_IDS entry must not crash -- it's simply not checked,
+    same as 'baseline_config'."""
+    assert _scenario_relevance('some_brand_new_role_nobody_mapped_yet') is None
+
+
+def test_scenario_relevance_reports_wired_never_fired_when_no_events(isolated_db):
+    relevance = _scenario_relevance('time_exit_via_trail')
+    assert len(relevance) == 1
+    assert 'time_exit_trigger: wired-never-fired' in relevance[0]
+
+
+def test_stale_banner_fires_when_grid_scenario_already_verified_live(isolated_db, capsys):
+    node = _make_staged_node('time_exit_via_trail',
+                              dict(arm_sell_pct=0.3, fixed_sl=50, trail_sell_pct=50, max_hold_hours=31))
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET arm_sell_pct=0.3, fixed_sl=50, trail_sell_pct=50, "
+                   "max_hold_hours=31 WHERE id=?", (node['id'],))
+        c.commit()
+    db.log_coverage_event('time_exit_trigger', 'live', ticker=TICKER, node_id=node['id'], result='fired')
+
+    audit_one(TICKER)
+
+    out = capsys.readouterr().out
+    assert 'grid relevance: time_exit_trigger: verified-live' in out
+    assert 'STALE?' in out
+
+
+def test_stale_banner_absent_when_grid_scenario_not_yet_proven(isolated_db, capsys):
+    node = _make_staged_node('time_exit_via_trail',
+                              dict(arm_sell_pct=0.3, fixed_sl=50, trail_sell_pct=50, max_hold_hours=31))
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET arm_sell_pct=0.3, fixed_sl=50, trail_sell_pct=50, "
+                   "max_hold_hours=31 WHERE id=?", (node['id'],))
+        c.commit()
+
+    audit_one(TICKER)
+
+    out = capsys.readouterr().out
+    assert 'grid relevance: time_exit_trigger: wired-never-fired' in out
+    assert 'STALE?' not in out
+
+
+def test_stale_banner_requires_all_mapped_grid_ids_verified(isolated_db, capsys):
+    """gap_resize_and_topup maps to TWO grid rows (gap_resize, post_fill_topup)
+    -- only one being verified-live must not trigger the STALE? banner."""
+    node = _make_staged_node('gap_resize_and_topup', dict(trail_buy_pct=1.0, starting_notional=500))
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET trail_buy_pct=1.0, starting_notional=500 WHERE id=?", (node['id'],))
+        c.commit()
+    db.log_coverage_event('gap_resize', 'live', ticker=TICKER, node_id=node['id'], result='placed')
+
+    audit_one(TICKER)
+
+    out = capsys.readouterr().out
+    assert 'gap_resize: verified-live' in out
+    assert 'post_fill_topup: wired-never-fired' in out
+    assert 'STALE?' not in out

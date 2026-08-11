@@ -58,7 +58,7 @@ def _attempt_automated_buy(node, sizing):
     try:
         _, order_id = schwab_client.place_trailing_buy(
             account, ticker, sizing['shares'], sizing['price'], sizing['trail_buy_pct'],
-            node_dry_run=(node.get('state') != 'live'))
+            node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
     except schwab_safety.SafetyViolation:
         return False, None
     except Exception as e:
@@ -117,10 +117,11 @@ def _attempt_automated_sell(pos, current_price):
             # between (found 2026-07-27, raised directly by the user).
             _, exit_order_id = schwab_client.replace_order_with_trailing_sell(
                 account, ticker, sl_order_id, shares, current_price, trail_sell_pct,
-                node_dry_run=(node.get('state') != 'live'))
+                node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
         else:
             _, exit_order_id = schwab_client.place_trailing_sell(account, ticker, shares, current_price,
-                                                                   trail_sell_pct, node_dry_run=(node.get('state') != 'live'))
+                                                                   trail_sell_pct, node_dry_run=(node.get('state') != 'live'),
+                                                                   node_id=node.get('id'))
     except Exception as e:
         # A failed replace/placement here is the same "genuinely unprotected"
         # case as before -- there's no safe automatic recovery (re-placing the
@@ -311,10 +312,11 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
             # between (found 2026-07-27, raised directly by the user).
             _, order_id = schwab_client.replace_equity_order_with_market(
                 account, ticker, resting_order_id, "SELL", shares, current_price,
-                node_dry_run=(node.get('state') != 'live'))
+                node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
         else:
             _, order_id = schwab_client.place_equity_sell(account, ticker, shares, current_price,
-                                                            node_dry_run=(node.get('state') != 'live'))
+                                                            node_dry_run=(node.get('state') != 'live'),
+                                                            node_id=node.get('id'))
     except Exception as e:
         db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                                node_id=pos.get('wl_id'),
@@ -725,7 +727,8 @@ def _attempt_automated_market_buy(node, sizing):
     account = node.get('account')
     try:
         _, order_id = schwab_client.place_equity_buy(account, ticker, sizing['shares'], sizing['price'],
-                                                       node_dry_run=(node.get('state') != 'live'))
+                                                       node_dry_run=(node.get('state') != 'live'),
+                                                       node_id=node.get('id'))
     except schwab_safety.SafetyViolation:
         return False, None
     except Exception as e:
@@ -792,7 +795,8 @@ def _place_stop_loss_for_position(node, ticker):
     shares = int(pos['shares'])
     try:
         _, sl_order_id = schwab_client.place_stop_loss(account, ticker, shares, stop_price,
-                                                         node_dry_run=(node.get('state') != 'live'))
+                                                         node_dry_run=(node.get('state') != 'live'),
+                                                         node_id=node.get('id'))
     except schwab_safety.SafetyViolation as e:
         # Not retried -- a policy block (kill switch, paused automation, an
         # existing SL/SELL order already resting) won't resolve differently
@@ -835,7 +839,8 @@ def _place_stop_loss_for_position(node, ticker):
             if current_price is not None and current_price <= stop_price:
                 try:
                     _, market_order_id = schwab_client.place_equity_sell(account, ticker, shares, current_price,
-                                                                           node_dry_run=(node.get('state') != 'live'))
+                                                                           node_dry_run=(node.get('state') != 'live'),
+                                                                           node_id=node.get('id'))
                 except schwab_safety.SafetyViolation:
                     db.log_coverage_event(
                         "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
@@ -885,7 +890,8 @@ def _place_stop_loss_for_position(node, ticker):
                 return
             try:
                 _, sl_order_id = schwab_client.place_stop_loss(account, ticker, shares, stop_price,
-                                                         node_dry_run=(node.get('state') != 'live'))
+                                                         node_dry_run=(node.get('state') != 'live'),
+                                                         node_id=node.get('id'))
             except schwab_safety.SafetyViolation:
                 db.log_coverage_event(
                     "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
@@ -2220,7 +2226,8 @@ def check_addon_trigger_real(pos, current_price):
         return
     try:
         _, order_id = schwab_client.place_equity_buy(account, ticker, shares, current_price, is_addon_leg=True,
-                                                       node_dry_run=(node.get('state') != 'live'))
+                                                       node_dry_run=(node.get('state') != 'live'),
+                                                       node_id=pos.get('wl_id'))
     except schwab_safety.SafetyViolation as e:
         db.log_coverage_event("addon_entry_placement", _mode, ticker=ticker, position_id=pos.get('id'),
                                node_id=pos.get('wl_id'), result="blocked", detail=str(e))
@@ -2309,7 +2316,8 @@ def _place_stop_loss_for_addon_leg(leg_id, parent_pos, node):
         return
     try:
         _, order_id = schwab_client.place_stop_loss(account, ticker, int(leg['shares']), stop_price,
-                                                      is_addon_leg=True, node_dry_run=(node.get('state') != 'live'))
+                                                      is_addon_leg=True, node_dry_run=(node.get('state') != 'live'),
+                                                      node_id=node.get('id'))
     except Exception as e:
         db.log_coverage_event("sl_placement", _mode, ticker=ticker, position_id=parent_pos.get('id'),
                                node_id=parent_pos.get('wl_id'), result="failed", detail=f"addon_leg={leg_id}: {e}")
@@ -2534,10 +2542,11 @@ def close_addon_leg_real_if_open(pos, exit_price, exit_reason, exit_time):
         if resting_order_id:
             _, order_id = schwab_client.replace_equity_order_with_market(
                 account, ticker, resting_order_id, "SELL", shares, exit_price, is_addon_leg=True,
-                node_dry_run=(node.get('state') != 'live') if node else True)
+                node_dry_run=(node.get('state') != 'live') if node else True, node_id=leg.get('wl_id'))
         else:
             _, order_id = schwab_client.place_equity_sell(account, ticker, shares, exit_price, is_addon_leg=True,
-                                                            node_dry_run=(node.get('state') != 'live') if node else True)
+                                                            node_dry_run=(node.get('state') != 'live') if node else True,
+                                                            node_id=leg.get('wl_id'))
     except Exception as e:
         db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
                                result="failed", detail=f"leg_id={leg['id']}: {e}")
@@ -3424,7 +3433,7 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
             try:
                 schwab_client.place_equity_buy(account, ticker, top_up_shares, fill_price,
                                                 is_gap_correction=is_gap_correction, is_protective=True,
-                                                node_dry_run=(node.get('state') != 'live'))
+                                                node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
             except schwab_safety.SafetyViolation as e:
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
                                        node_id=node.get('id'), result="blocked", detail=str(e))
@@ -3676,11 +3685,11 @@ def check_gap_resize():
                 # all in between (found 2026-07-27, raised directly by the user).
                 _, new_order_id = schwab_client.replace_equity_order_with_market(
                     account, ticker, order_id, "BUY", shares, current_price, is_gap_correction=True,
-                    node_dry_run=(node.get('state') != 'live'))
+                    node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
             else:
                 _, new_order_id = schwab_client.place_equity_buy(
                     account, ticker, shares, current_price, is_gap_correction=True,
-                    node_dry_run=(node.get('state') != 'live'))
+                    node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
         except schwab_safety.SafetyViolation as e:
             db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                    node_id=node.get('id'), result="blocked", detail=str(e))

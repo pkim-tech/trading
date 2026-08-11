@@ -238,6 +238,7 @@ def _build_market_order(side: str, ticker: str, quantity: int):
 def _place_equity_order(
     side: str, account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
     is_protective: bool = False, is_addon_leg: bool = False, node_dry_run: bool = False,
+    node_id: int | None = None,
 ):
     """side is 'BUY' or 'SELL'. price is only used for the safety-cap notional
     check, not sent to the API -- this places a market order. Returns
@@ -251,7 +252,8 @@ def _place_equity_order(
     try:
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
-            is_protective=is_protective, is_addon_leg=is_addon_leg, node_dry_run=node_dry_run)
+            is_protective=is_protective, is_addon_leg=is_addon_leg, node_dry_run=node_dry_run,
+            node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED {side} {quantity} {ticker} in {account}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
@@ -282,7 +284,7 @@ def _place_equity_order(
 def replace_equity_order_with_market(
     account: str, ticker: str, order_id: int, side: str, quantity: int, price: float,
     is_gap_correction: bool = False, is_protective: bool = False, is_addon_leg: bool = False,
-    node_dry_run: bool = False,
+    node_dry_run: bool = False, node_id: int | None = None,
 ):
     """Atomically replaces a resting order (e.g. a protective STOP) with a
     plain MARKET order of the given side/quantity, via schwab-py's
@@ -306,7 +308,7 @@ def replace_equity_order_with_market(
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
             is_protective=is_protective, replacing_order_id=order_id, is_addon_leg=is_addon_leg,
-            node_dry_run=node_dry_run)
+            node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with MARKET {side} {quantity} {ticker} in {account}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
@@ -337,15 +339,17 @@ def replace_equity_order_with_market(
 
 
 def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
-                      is_protective: bool = False, is_addon_leg: bool = False, node_dry_run: bool = False):
+                      is_protective: bool = False, is_addon_leg: bool = False, node_dry_run: bool = False,
+                      node_id: int | None = None):
     return _place_equity_order("BUY", account, ticker, quantity, price, is_gap_correction=is_gap_correction,
-                                is_protective=is_protective, is_addon_leg=is_addon_leg, node_dry_run=node_dry_run)
+                                is_protective=is_protective, is_addon_leg=is_addon_leg, node_dry_run=node_dry_run,
+                                node_id=node_id)
 
 
 def place_equity_sell(account: str, ticker: str, quantity: int, price: float, is_addon_leg: bool = False,
-                       node_dry_run: bool = False):
+                       node_dry_run: bool = False, node_id: int | None = None):
     return _place_equity_order("SELL", account, ticker, quantity, price, is_addon_leg=is_addon_leg,
-                                node_dry_run=node_dry_run)
+                                node_dry_run=node_dry_run, node_id=node_id)
 
 
 def _build_trailing_order(side: str, link_basis: StopPriceLinkBasis, ticker: str, quantity: int, trail_pct: float):
@@ -366,6 +370,7 @@ def _build_trailing_order(side: str, link_basis: StopPriceLinkBasis, ticker: str
 def _place_trailing_order(
     side: str, link_basis: StopPriceLinkBasis, account: str, ticker: str,
     quantity: int, price: float, trail_pct: float, node_dry_run: bool = False,
+    node_id: int | None = None,
 ):
     """side is 'BUY' or 'SELL'. price is the current live price, used only for
     the safety-cap notional check (quantity * price), not sent to the API.
@@ -377,7 +382,7 @@ def _place_trailing_order(
     label = "TRAILING BUY" if side == "BUY" else "TRAILING SELL"
     try:
         dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, side,
-                                                     node_dry_run=node_dry_run)
+                                                     node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED {label} {quantity} {ticker} in {account} "
                       f"(trail={trail_pct}%): {e}")
@@ -409,7 +414,7 @@ def _place_trailing_order(
 
 
 def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, quantity: int, price: float,
-                                      trail_pct: float, node_dry_run: bool = False):
+                                      trail_pct: float, node_dry_run: bool = False, node_id: int | None = None):
     """Same atomic-replace idea as replace_equity_order_with_market, for the
     TRAIL arm-time swap: a resting protective SL becomes a TRAILING_STOP
     SELL, as a single broker call instead of cancel_order + place_trailing_sell.
@@ -418,7 +423,8 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
     untouched."""
     try:
         dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, "SELL",
-                                                     replacing_order_id=order_id, node_dry_run=node_dry_run)
+                                                     replacing_order_id=order_id, node_dry_run=node_dry_run,
+                                                     node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with TRAILING SELL {quantity} {ticker} "
                       f"in {account} (trail={trail_pct}%): {e}")
@@ -450,11 +456,11 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
 
 
 def place_trailing_buy(account: str, ticker: str, quantity: int, price: float, trail_pct: float,
-                        node_dry_run: bool = False):
+                        node_dry_run: bool = False, node_id: int | None = None):
     """trail_pct is the bounce-above-running-low trigger (matches the node's
     trail_buy_pct). ASK-linked, since a buy naturally references the ask."""
     return _place_trailing_order("BUY", StopPriceLinkBasis.ASK, account, ticker, quantity, price, trail_pct,
-                                  node_dry_run=node_dry_run)
+                                  node_dry_run=node_dry_run, node_id=node_id)
 
 
 def _order_fill(o):
@@ -532,7 +538,7 @@ def get_filled_order(account: str, ticker: str, side: str, order_id: int = None)
 
 
 def place_trailing_sell(account: str, ticker: str, quantity: int, price: float, trail_pct: float,
-                         node_dry_run: bool = False):
+                         node_dry_run: bool = False, node_id: int | None = None):
     """trail_pct is the pullback-below-running-high trigger (matches the
     position's trail_sell_pct). BID-linked, since a sell naturally references
     the bid. Only relevant once the position's trailing-exit state has
@@ -540,7 +546,7 @@ def place_trailing_sell(account: str, ticker: str, quantity: int, price: float, 
     state['trailing'] -- see signals_notify.notify_trailing_activated), same
     as the manual workflow's 'place the trailing stop order now' step."""
     return _place_trailing_order("SELL", StopPriceLinkBasis.BID, account, ticker, quantity, price, trail_pct,
-                                  node_dry_run=node_dry_run)
+                                  node_dry_run=node_dry_run, node_id=node_id)
 
 
 def cancel_order(account: str, ticker: str, order_id: int):
@@ -610,7 +616,7 @@ def get_session_open_price(ticker: str) -> tuple[float, bool]:
 
 
 def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float, is_addon_leg: bool = False,
-                     node_dry_run: bool = False):
+                     node_dry_run: bool = False, node_id: int | None = None):
     """Resting fixed-price STOP order -- the broker executes on breach without
     depending on our poll cadence (Part 4, Section 6), same mechanism already
     relied on for the trailing-sell order. Same OrderBuilder pattern as
@@ -625,7 +631,7 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float,
     try:
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, stop_price, "SELL", is_protective=True, is_addon_leg=is_addon_leg,
-            node_dry_run=node_dry_run)
+            node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.4f}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
@@ -664,7 +670,7 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float,
 
 
 def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quantity: int, stop_price: float,
-                                  node_dry_run: bool = False):
+                                  node_dry_run: bool = False, node_id: int | None = None):
     """Atomically replaces a resting order with a new fixed-price STOP order
     (a re-priced SL) -- same atomic-replace rationale as
     replace_equity_order_with_market/replace_order_with_trailing_sell: a
@@ -682,7 +688,7 @@ def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quant
     try:
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, stop_price, "SELL", is_protective=True, replacing_order_id=order_id,
-            node_dry_run=node_dry_run)
+            node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with STOP LOSS {quantity} {ticker} "
                       f"in {account} @ ${stop_price:.4f}: {e}")
@@ -833,6 +839,55 @@ def get_all_real_short_positions(account: str) -> dict:
         if symbol and qty:
             out[symbol] = out.get(symbol, 0.0) + qty
     return out
+
+
+def get_real_orders(account: str, ticker: str) -> list:
+    """Every real order (any status, any age Schwab's default order-history
+    window returns) touching `ticker` in `account`, read fresh -- one row per
+    order, flattened from Schwab's orderLegCollection shape down to the
+    fields callers actually use. Moved here 2026-08-10 from
+    scripts/audit_live_test_candidates.py's private _real_orders (same body,
+    now a public schwab_client function so it can be reused by
+    signals_helpers.get_full_position_state without a scripts/ -> core-module
+    import, which would invert the project's normal layering)."""
+    account_hash = _resolve_account_hashes()[account]
+    client = _get_client()
+    r = client.get_orders_for_account(account_hash)
+    r.raise_for_status()
+    orders = []
+    for o in r.json():
+        for leg in o.get("orderLegCollection", []):
+            if leg.get("instrument", {}).get("symbol") == ticker:
+                orders.append({
+                    "orderId": o.get("orderId"), "status": o.get("status"),
+                    "orderType": o.get("orderType"), "instruction": leg.get("instruction"),
+                    "quantity": leg.get("quantity"), "enteredTime": o.get("enteredTime"),
+                    "stopPrice": o.get("stopPrice"),
+                    "stopPriceOffset": o.get("stopPriceOffset"),  # trailing orders carry the trail % here, not stopPrice
+                })
+                break
+    return orders
+
+
+def filter_resting_orders(orders: list) -> list:
+    """Subset of get_real_orders' output that's still actually resting at the
+    broker (not filled/cancelled/rejected). Originally moved verbatim from
+    scripts/audit_live_test_candidates.py's private _resting_orders, which
+    used a hand-picked 5-status allowlist (WORKING/AWAITING_STOP_CONDITION/
+    QUEUED/ACCEPTED/PENDING_ACTIVATION) -- fine for that script's own
+    human-eyeballed printout, but a real gap once this became the shared
+    read behind signals_helpers.get_full_position_state's mismatch
+    detection (2026-08-10 paired review): an order sitting in an
+    intermediate acknowledgement-phase status Schwab documents but the
+    allowlist never enumerated (e.g. PENDING_ACKNOWLEDGEMENT,
+    AWAITING_PARENT_ORDER) would read as 'not resting' -- a false 'no
+    matching resting order' on a genuinely fine order, or a missed orphan on
+    the flip side. Now the same blocklist-of-terminal-statuses
+    schwab_safety.py itself uses to define 'still open at the broker'
+    (schwab_safety._OPEN_ORDER_STATUSES_EXCLUDED, also referenced this way
+    by signals_notify.py) -- one definition of 'resting', not two that can
+    silently drift apart."""
+    return [o for o in orders if o["status"] not in schwab_safety._OPEN_ORDER_STATUSES_EXCLUDED]
 
 
 def get_current_price(ticker: str) -> float:

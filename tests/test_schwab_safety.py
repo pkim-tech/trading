@@ -336,6 +336,32 @@ def test_node_level_automation_pause_no_op_for_ambiguous_sibling_same_account(en
     assert result == (None, None)  # not blocked -- the pause is a no-op here (known limitation)
 
 
+def test_node_id_resolves_ambiguous_sibling_same_account(env):
+    # Companion to the "known limitation" test above -- proves the fix
+    # (2026-08-10, found live via a real AGQ/brokerage collision: a dry_run
+    # canary node and a new live node sharing ticker='AGQ', account='brokerage').
+    # Every real production call site now passes node_id (threaded from
+    # schwab_client's 8 place_*/replace_* functions -> approve_and_record ->
+    # check_order), so the exact ambiguous-lookup scenario above no longer
+    # applies once node_id is supplied: a node-level pause on node_a must NOT
+    # affect node_b, even though they share (ticker, account), because
+    # check_order uses node_id directly instead of re-deriving it via the
+    # ambiguous ticker+account ORM lookup.
+    node_a = _get_node()
+    signals_db.add_node(TICKER, 'ZScoreBreakout', 'test_ambiguous_fixed', window=20,
+                         take_profit=10, stop_loss=5, max_hold_hours=56, state='live',
+                         account='roth')
+    node_b = signals_db.get_watch_list_node(ticker=TICKER, account='roth', version='test_ambiguous_fixed')
+    schwab_safety.pause_node_automation(node_a['id'], reason="test pause")
+    # node_a's pause must not block node_b's BUY when node_b's real id is given.
+    result = schwab_client.place_equity_buy('roth', TICKER, 5, 50.0, node_id=node_b['id'])
+    assert result == (None, None)  # dry_run, allowed -- node_b is unpaused
+
+    # And node_a's own pause must still take effect for node_a itself.
+    with pytest.raises(schwab_safety.SafetyViolation, match="automation paused"):
+        schwab_client.place_equity_buy('roth', TICKER, 5, 50.0, node_id=node_a['id'])
+
+
 def test_two_nodes_same_ticker_diff_accounts_logs_event(env):
     # Real gap fixed 2026-07-25 (wl_id refactor): the same ticker can be
     # deliberately live in two different accounts at once (e.g. DPST's

@@ -194,8 +194,12 @@ REGISTRY = [
          check_mechanism='coverage_events', scenario_key='top_up',
          bad_results=['blocked', 'failed_unexpectedly', 'db_update_failed_after_real_order',
                       'overspent_no_corrective_sell'],
-         notes="2026-07-24 real attempt was blocked by the pre-fix daily_order_cap bug (now fixed) -- "
-               "real-money risk open until a real successful top-up is observed post-fix."),
+         notes="2026-07-24 real attempt was blocked by the pre-fix daily_order_cap bug (now fixed). "
+               "Real successful top-up observed live 2026-08-10: RETL's (soxl_ira) real drought-overlay "
+               "entry filled under target notional and _reconcile_fill placed a genuine top-up "
+               "(result='placed', 2 shares, 78->80). Same day, ERY's staged test independently fired "
+               "the overspent_no_corrective_sell branch (a stale tiny _last_sale_recovery basis from an "
+               "earlier 1-share test trade, not a bug) -- confirms that branch too."),
     dict(id='gap_resize',
          scenario="Overnight gap-resize (cancel trailing buy, replace w/ market)",
          code_path="signals_notify.check_gap_resize, _GAP_CHECK_WINDOW",
@@ -781,8 +785,10 @@ REGISTRY = [
          offline_coverage="tests/test_fake_broker_drought_entry_scenario.py",
          check_mechanism='coverage_events', scenario_key='drought_entry_placement',
          bad_results=[],
-         notes="No live proof yet -- needs a mode='live' drought_overlay_enabled node on soxl_ira "
-               "(only coherent account, margin-typed) and an organic drought window to elapse."),
+         notes="Live proof observed 2026-08-10: RETL (wl_id=143, soxl_ira) fired a real drought-overlay "
+               "entry (confirm_days=3), which then reconciled and topped up correctly (see "
+               "post_fill_topup's notes) -- 2x live total (first signalled 2026-08-07, confirmed to "
+               "actual placement+fill 2026-08-10)."),
     dict(id='drought_handoff_cancel',
          scenario="A real drought HANDOFF cancels a still-resting drought entry order (Case A) -- "
                   "including the race where the cancel attempt finds the order already FILLED",

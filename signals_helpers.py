@@ -410,3 +410,129 @@ def _phase_emoji(pos, pending_buy):
         armed = _PHASE_GREY
     sold = _PHASE_YELLOW if trail_state.get('exit_pending') else _PHASE_GREY
     return f"{_PHASE_GREEN}{_PHASE_GREEN}{armed}{sold}"
+
+
+def get_full_position_state(wl_id):
+    """db.get_real_position_state(wl_id) (local: pending_buys/open_positions/
+    trade_log, real-over-paper) merged with a fresh broker-side read -- the
+    "check both sides" ground-truth call this project has been missing.
+    db.get_real_position_state already stopped status_check.py/
+    audit_live_test_candidates.py/watchlist_status.py from independently
+    hand-rolling LOCAL state (2026-08-05), but none of them ever fed the
+    broker's own view back into one comparable structure -- audit_one prints
+    local and broker facts side by side for a human to eyeball, never diffs
+    them programmatically. Built 2026-08-10 after coverage_check.py's
+    _check_trade_lifecycle turned out to be a 3rd independent recurrence of
+    the same "missing one of the real states" bug shape (see docs/
+    backlog_cache.md's 2026-08-04 "broader diagnosis" item) -- that specific
+    fix only needed the local 3 states (pending/open/closed), but the
+    question "should we also check the broker side" is this function.
+
+    Broker calls are best-effort: a fetch failure is recorded in
+    broker_fetch_error rather than raised, so a transient API hiccup can't
+    take down a caller iterating many tickers (matches audit_one's existing
+    try/except pattern). A node with no account (never placed a real order)
+    short-circuits to the local-only view with broker fields left None.
+
+    mismatches is only populated when effectively_dry_run(account, node) is
+    False -- i.e. a real order for this node actually reaches the broker.
+    node['state']=='live' is NOT sufficient on its own (a paired-review
+    finding, 2026-08-10, on the first version of this function, which used
+    state=='live' alone): roth/brokerage sit at account.trading_enabled=False
+    while carrying real state='live' nodes (GDXU/KORU/DFEN in roth,
+    ETHU/AGQ in brokerage as of 2026-08-10) -- those fill via
+    signals_notify.update_dry_run_buys' synthesis path (is_dry_run_sim=1
+    open_positions rows), never touch the broker at all, and would
+    otherwise report a permanent false "broker holds 0" mismatch. This is
+    the same effectively_dry_run this module already uses elsewhere (see its
+    own docstring) -- not a second, independently-drifting definition.
+
+    mismatches branches on the REAL local fields directly (real_position/
+    pending_buy), not on the merged `status` string -- `status` collapses
+    onto 'holding_paper'/'pending_entry' (paper) when only paper state
+    exists, which would otherwise skip real-orphan detection for a live
+    node with a paper position/pending-buy also on file (both axes are
+    independent, see get_real_position_state's own docstring).
+
+    The 'holding' branch's share-count check adds any open add-on leg's
+    shares to open_positions.shares before comparing against the broker's
+    aggregate total -- addon_legs is a deliberately separate table (see
+    open_addon_leg's docstring) sharing the same ticker/account, so the
+    broker total is core+leg while open_positions.shares alone is core-only;
+    9 real soxl_ira nodes carry addon_enabled=1 today. Deliberately does NOT
+    also check for a missing protective order on an open position --
+    signals_notify.check_live_state_reconciliation already does that, with
+    retry/outage handling and Slack alerting this function doesn't
+    replicate; duplicating a weaker copy of that specific check here is
+    exactly the two-independently-drifting-implementations problem
+    get_real_position_state itself was built to close (see its docstring).
+    The 'pending_entry' branch only asserts a mismatch when
+    pending_buy['order_placed'] is true -- a pending_buys row with
+    order_placed=0 is the normal window between a BUY signal firing and the
+    order actually being placed (manual 3-step Slack flow or automation),
+    not evidence of anything wrong; and only against BUY-instruction resting
+    orders, so a leftover protective SELL/stop can't mask a genuinely
+    missing entry order. Order-status filtering (schwab_client.
+    filter_resting_orders) mirrors schwab_safety's own open-order definition
+    (a blocklist of terminal statuses), not a hand-picked allowlist, so an
+    intermediate acknowledgement-phase status isn't misread as "not resting."
+
+    Returns db.get_real_position_state(wl_id)'s dict plus: broker_shares,
+    broker_resting_orders (list), broker_cash, broker_fetch_error (None on
+    success), mismatches (list of str, broker treated as ground truth per
+    automation_principles.md #1 -- a disagreement always means the local/DB
+    side needs correcting, never the broker)."""
+    import schwab_client  # local import: schwab_client -> signals_blocks -> signals_helpers
+    state = db.get_real_position_state(wl_id)
+    node = state['node']
+    state['broker_shares'] = None
+    state['broker_resting_orders'] = []
+    state['broker_cash'] = None
+    state['broker_fetch_error'] = None
+    state['mismatches'] = []
+    if node is None or not node.get('account'):
+        return state
+    account = node['account']
+    ticker = node['ticker']
+    try:
+        state['broker_shares'] = schwab_client.get_real_position(account, ticker)
+        orders = schwab_client.get_real_orders(account, ticker)
+        state['broker_resting_orders'] = schwab_client.filter_resting_orders(orders)
+        state['broker_cash'] = schwab_client.get_account_balance(account)
+    except Exception as e:
+        state['broker_fetch_error'] = str(e)
+        return state  # can't compare without a broker read; report the failure, not a guessed mismatch
+
+    if effectively_dry_run(account, node):
+        return state  # see docstring: no real order for this node ever reaches the broker
+
+    real_pos = state['real_position']
+    real_pending = state['pending_buy']
+    resting_buys = [o for o in state['broker_resting_orders'] if o.get('instruction') == 'BUY']
+
+    if real_pos is not None:
+        local_shares = real_pos.get('shares') or 0
+        addon_leg = db.get_open_addon_leg_by_wl_id(wl_id, paper=False)
+        if addon_leg:
+            local_shares += addon_leg.get('shares') or 0
+        if state['broker_shares'] == 0:
+            state['mismatches'].append(
+                f"local shows an open position ({local_shares} shares, incl. add-on leg) but broker holds 0")
+        elif abs(state['broker_shares'] - local_shares) > 1e-6:
+            state['mismatches'].append(
+                f"share-count mismatch: local={local_shares} (incl. add-on leg) broker={state['broker_shares']}")
+    elif real_pending is not None and real_pending.get('order_placed'):
+        if not resting_buys:
+            state['mismatches'].append(
+                "local shows a resting pending buy (order_placed=1) but broker has no matching resting BUY order")
+    else:
+        # Nothing real locally (no open position, no placed pending order) --
+        # regardless of what paper state might separately exist on this node.
+        if state['broker_shares']:
+            state['mismatches'].append(
+                f"local shows no real position but broker holds {state['broker_shares']} shares "
+                f"(orphaned real position)")
+        elif state['broker_resting_orders']:
+            state['mismatches'].append(
+                "local shows no real position/pending-order but broker has a resting order for this ticker")
+    return state

@@ -193,6 +193,28 @@ def test_check_trade_lifecycle_pending_carryover_not_met_when_nothing_happened(i
     assert met is False
 
 
+def test_check_trade_lifecycle_pending_carryover_met_by_still_open_position(isolated_db):
+    """Direct regression for the SDOW gap found 2026-08-10: a same-day fill
+    that hasn't exited yet (open_positions, not pending_buys or trade_log)
+    is real activity -- the check must not report false 'no activity' for
+    it. Before get_open_positions_for_ticker_on_date existed, this was the
+    3rd independent recurrence of the same missing-a-real-state bug shape
+    already fixed twice for this exact scenario (see
+    get_open_positions_for_ticker_on_date's docstring)."""
+    now = datetime.now()
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
+    db.open_position(n, signal_price=100.0, signal_time=now, entry_price=101.0,
+                      entry_time=now, shares=10)
+    check_date = now.date().isoformat()
+    scenario = dict(ticker=TICKER, check_params='{"expect_pending_carryover": true}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is True
+    assert no_activity is False
+    assert 'still open' in summary
+
+
 def test_check_trade_lifecycle_pending_carryover_met_when_signal_predates_check_date(isolated_db):
     """The real designed scenario: a resting trailing-buy signaled on a PRIOR
     day, still pending as of check_date -- an exact date(signal_time)==check_date

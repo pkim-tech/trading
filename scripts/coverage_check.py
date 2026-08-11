@@ -132,10 +132,18 @@ def _check_trade_lifecycle(scenario, check_date):
         pending = db.get_pending_buys_for_ticker_on_date(ticker, check_date, **disambig)
         if pending:
             return True, f"pending_buys row present (order_placed={pending[0]['order_placed']})", False
+        # Third real state (pending -> open -> closed) -- a same-day fill that
+        # hasn't exited yet is real activity neither of the other two lookups
+        # can see (2026-08-10, found via SDOW: filled same day, still open,
+        # reported false 'no activity' -- see get_open_positions_for_ticker_on_date's
+        # docstring for the full history of this bug shape recurring).
+        open_pos = db.get_open_positions_for_ticker_on_date(ticker, check_date, **disambig)
+        if open_pos:
+            return True, f"same-day fill still open (shares={open_pos[0]['shares']}) instead of carryover -- not the designed scenario but real activity occurred", False
         trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date, **disambig)
         if trades:
             return True, f"same-day fill instead of carryover (exit_reason={trades[0]['exit_reason']}) -- not the designed scenario but real activity occurred", False
-        return False, f"no pending_buys row and no closed trade found for {ticker} on {check_date}", True
+        return False, f"no pending_buys row, no open position, and no closed trade found for {ticker} on {check_date}", True
 
     expect_reasons = params.get('expect_exit_reason', [])
     trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date, **disambig)

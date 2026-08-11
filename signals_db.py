@@ -2338,6 +2338,48 @@ def get_closed_trades_for_ticker_on_date(ticker, check_date, strategy=None, vers
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
+def get_open_positions_for_ticker_on_date(ticker, check_date, strategy=None, version=None,
+                                           window=None, account=None):
+    """open_positions rows entered on or before check_date and still open --
+    the third real state (pending -> open -> closed) coverage_check.py's
+    trade_lifecycle carryover check was missing until 2026-08-10 (SDOW's
+    real canary fill was still open, not yet closed, when the daily check
+    ran -- neither get_pending_buys_for_ticker_on_date (already resolved,
+    row deleted on fill) nor get_closed_trades_for_ticker_on_date (not
+    exited yet) saw it, so the check reported false 'no activity' -- the 3rd
+    independent recurrence of this exact bug shape, see docs/
+    backlog_cache.md's 2026-08-04 'broader diagnosis' item).
+
+    date(entry_time) <= check_date, not == -- a paired-review finding on the
+    first version of this function (2026-08-10): an exact-date match
+    reproduces the identical bug on day 2 of a multi-day-open position (the
+    row is still present, still real activity, but entry_time is no longer
+    "today"). This mirrors get_pending_buys_for_ticker_on_date's own
+    signal_time <= check_date fix for the identical reasoning -- see that
+    function's docstring. open_positions has no exit_time column --
+    presence in the table means currently open by construction
+    (close_position deletes the row and writes trade_log instead), so no
+    exit_time filter is needed the way the closed-trades sibling needs one.
+    Scoped the same way as its two siblings above."""
+    q = "SELECT * FROM open_positions WHERE ticker = ? AND date(entry_time) <= ?"
+    params = [ticker, check_date]
+    if strategy:
+        q += " AND strategy = ?"
+        params.append(strategy)
+    if version:
+        q += " AND version = ?"
+        params.append(version)
+    if window is not None:
+        q += " AND window = ?"
+        params.append(window)
+    if account:
+        q += " AND account = ?"
+        params.append(account)
+    q += " ORDER BY id DESC"
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
 def get_pending_buys_for_ticker_on_date(ticker, check_date, strategy=None, version=None,
                                          window=None, account=None):
     """See get_closed_trades_for_ticker_on_date for why ticker alone is

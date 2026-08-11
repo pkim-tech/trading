@@ -111,6 +111,30 @@ no need to re-test":
    the mechanism needs a fresh live confirmation under current code, not a
    pass based on old evidence.
 
+## Checking whether a staged detune has outlived its purpose
+
+A different staleness direction from the section above: not "did the code
+change since verification," but "did the scenario this staged node exists
+to prove get proven ANYWAY, by a different node's organic signal, while the
+staged detune sat there untouched." Real example, 2026-08-10: SH's node
+(`soxl_ira`) was detuned 2026-07-29 for `time_exit_via_trail`; that Grid
+scenario (`time_exit_trigger`) went `verified-live` 2026-08-07 via a
+*different* node entirely -- SH's detune kept sitting there, doing nothing,
+because nothing connected "SH's reason for being detuned" to "is that reason
+still true." Same day, a later session separately repurposed SH for an
+unrelated scenario (widened `trail_buy_pct` for `post_fill_topup`) without
+ever updating `staged_test_config`'s row to reflect it -- two undocumented,
+untracked purposes stacked on one node.
+
+`scripts/audit_live_test_candidates.py --staged` now checks this
+automatically: every `staged_test_config` row prints a "grid relevance" line
+per Grid scenario its `scenario_role` maps to (see
+`SCENARIO_ROLE_TO_GRID_IDS` in that script), and a `🧹 STALE?` banner when
+every mapped scenario is already `verified-live`. Run it before assuming a
+staged node's detuned config is still earning its keep -- and when staging a
+*new* scenario_role, add it to `SCENARIO_ROLE_TO_GRID_IDS` so future staging
+gets this check for free.
+
 ## Running a full regression pass
 
 Trigger: after a batch of real execution-code changes lands (the same

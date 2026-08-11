@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][coverage] Resolved 2026-08-10 — `post_fill_topup`/`drought_entry_placement` got real live proof via RETL's drought-overlay entry (first-ever `top_up` `result='placed'`); found/fixed a real 3rd-recurrence coverage_check.py gap (missing open-position state) while checking it; built `signals_helpers.get_full_position_state` (local+broker ground-truth diff), paired review found+fixed 3 real false-positive bugs before it shipped. Full suite green. Full detail: `deep_backlog.md`.
+
 ## [live-trading] Resolved 2026-08-10 — `ira` account activated for real (trading_enabled=True, $10k nodes: DPST/JNUG/NUGT/SOXL), entering the "modest live capital" roadmap phase; 9-ticker promotion checklist run; paired review found+fixed 3 real bugs (silent SOXL node dedup, ira's daily_order_cap saturating from canary traffic, a JNUG canary/real ticker+account collision that could've blocked a real exit SELL); 11 test files + live_sim_harness.py fixed for the same "assumed ira stays dormant" pattern. Full suite 707/707. Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved 2026-08-10 — BOIL/JNUG/UGL/URTY-addon step-4 (included-vs-excluded) triage closed: BOIL all-CLIFF (3/3), JNUG only its 1 SAFE node passes REAL_SELECTION (inconsistent, doesn't help overall), UGL's 1 SAFE node fails the challenge (NO_REAL_SELECTION) + 3 CLIFF nodes, URTY-addon's 1 SAFE node's addon overlay is FRAGILE (half negative), -4.4% compounded. All real negative/mixed results, not a missing-data gap. Full detail: `deep_backlog.md`.

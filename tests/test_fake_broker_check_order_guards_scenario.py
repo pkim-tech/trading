@@ -174,3 +174,42 @@ def test_node_level_automation_pause_blocks_then_resume_unblocks(env, fake_broke
     r, oid = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
     assert oid is not None, "resuming automation must unblock the same node's real order"
     assert len(_real_placed_orders(fake_broker, TICKER)) == 1
+
+
+def test_node_id_disambiguates_same_ticker_account_siblings(env, fake_broker):
+    # Fake-venue proof of the 2026-08-10 fix (found live: AGQ had a dry_run
+    # canary node and a new live node both ticker='AGQ', account='brokerage'
+    # -- get_watch_list_node's ticker+account lookup can't tell them apart).
+    # Every real production call site now passes node_id (threaded from
+    # schwab_client's place_*/replace_* functions -> approve_and_record ->
+    # check_order), so pausing sibling A must block only A's real order,
+    # never siblings B's, even though they share (ticker, account) -- proven
+    # here against the real fake_broker order book, not just an in-process
+    # assertion (test_schwab_safety.py's unit-level companion test).
+    signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test_sib_a', window=10, take_profit=16.0,
+                         stop_loss=1, max_hold_hours=105, state='live',
+                         trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
+                         account='soxl_ira', starting_notional=5000)
+    signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test_sib_b', window=10, take_profit=16.0,
+                         stop_loss=1, max_hold_hours=105, state='live',
+                         trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
+                         account='soxl_ira', starting_notional=5000)
+    node_a = signals_db.get_watch_list_node(ticker=TICKER, account='soxl_ira', version='test_sib_a')
+    node_b = signals_db.get_watch_list_node(ticker=TICKER, account='soxl_ira', version='test_sib_b')
+    assert node_a['id'] != node_b['id']
+    # Confirms the ambiguity this fix closes actually exists on this DB state
+    # -- ticker+account alone can't resolve either sibling.
+    assert signals_db.get_watch_list_node(ticker=TICKER, account='soxl_ira') is None
+
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    schwab_safety.pause_node_automation(node_a['id'], reason="test pause")
+
+    with pytest.raises(schwab_safety.SafetyViolation, match="automation paused"):
+        schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0, node_id=node_a['id'])
+    assert _real_placed_orders(fake_broker, TICKER) == [], \
+        "node_a's paused order must never reach the broker"
+
+    r, oid = schwab_client.place_equity_buy('soxl_ira', TICKER, 50, 10.0, node_id=node_b['id'])
+    assert oid is not None, "node_b's real order must go through -- node_a's pause must not leak onto it"
+    assert len(_real_placed_orders(fake_broker, TICKER)) == 1

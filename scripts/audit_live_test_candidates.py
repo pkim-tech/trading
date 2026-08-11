@@ -17,6 +17,11 @@ For each ticker, reports:
     candidacy)
   - a verdict: which of entry / TIME-exit / TRAIL-exit this ticker currently
     fits, or "unclear" if it fits none cleanly
+  - --staged mode only: whether the Grid scenario(s) this node's staged role
+    exists to prove are ALREADY verified-live (possibly via a different
+    node) -- a "STALE?" banner flags a staged detune that may no longer be
+    doing anything useful. See SCENARIO_ROLE_TO_GRID_IDS below; extend it
+    when staging a new scenario_role.
 """
 import argparse
 import sys
@@ -29,30 +34,54 @@ import signals_compute as sc
 import signals_db as db
 import schwab_client
 import signals_helpers
+from scripts.coverage_registry import REGISTRY, compute_status
+
+# scenario_role (staged_test_config, free text) -> the Trade-Flow Accountability
+# Grid row id(s) (scripts/coverage_registry.py's REGISTRY) it exists to prove.
+# 'baseline_config' isn't a test scenario at all -- it's the generic per-node
+# drift-check baseline every live node gets (signals_invariants.
+# check_staged_config_matches_expected), not staged FOR anything, so it's
+# deliberately absent here. Built 2026-08-10 after SH's staged 'time_exit_via_trail'
+# detune (trail_buy_pct widened 1%->5% by a LATER, unrelated session for an
+# entirely different scenario, post_fill_topup -- never reflected in this row
+# at all) sat untouched for days after its actual scenario had already gone
+# verified-live via a different node (RETL) and its config had drifted for a
+# different, undocumented reason -- nothing anywhere connected "this staged
+# detune's reason for existing" to "is that reason still true." Extend this
+# dict when a new staged scenario_role is introduced (live-test-node-setup
+# skill should update it as part of staging a new role).
+SCENARIO_ROLE_TO_GRID_IDS = {
+    'time_exit_via_trail': ['time_exit_trigger'],
+    'time_exit_via_sl': ['time_exit_trigger'],
+    'gap_resize_and_topup': ['gap_resize', 'post_fill_topup'],
+}
 
 
-def _real_orders(account, ticker):
-    account_hash = schwab_client._resolve_account_hashes()[account]
-    client = schwab_client._get_client()
-    r = client.get_orders_for_account(account_hash)
-    r.raise_for_status()
-    orders = []
-    for o in r.json():
-        for leg in o.get("orderLegCollection", []):
-            if leg.get("instrument", {}).get("symbol") == ticker:
-                orders.append({
-                    "orderId": o.get("orderId"), "status": o.get("status"),
-                    "orderType": o.get("orderType"), "instruction": leg.get("instruction"),
-                    "quantity": leg.get("quantity"), "enteredTime": o.get("enteredTime"),
-                    "stopPrice": o.get("stopPrice"),
-                    "stopPriceOffset": o.get("stopPriceOffset"),  # trailing orders carry the trail % here, not stopPrice
-                })
-                break
-    return orders
+def _scenario_relevance(scenario_role):
+    """Returns a list of 'grid_id: status' strings for a staged scenario_role
+    that maps to one or more Grid rows -- None if the role isn't a mapped
+    test scenario (e.g. 'baseline_config', or a role added to staged_test_config
+    without a corresponding SCENARIO_ROLE_TO_GRID_IDS entry yet)."""
+    grid_ids = SCENARIO_ROLE_TO_GRID_IDS.get(scenario_role)
+    if not grid_ids:
+        return None
+    by_id = {row['id']: row for row in REGISTRY}
+    out = []
+    for gid in grid_ids:
+        row = by_id.get(gid)
+        if row is None:
+            out.append(f"{gid}: (no matching Grid row -- registry may have renamed/removed it)")
+            continue
+        status, detail = compute_status(row)
+        out.append(f"{gid}: {status} ({detail})")
+    return out
 
 
-def _resting_orders(orders):
-    return [o for o in orders if o["status"] in ("WORKING", "AWAITING_STOP_CONDITION", "QUEUED", "ACCEPTED", "PENDING_ACTIVATION")]
+# _real_orders/_resting_orders moved to schwab_client.get_real_orders/
+# filter_resting_orders 2026-08-10 so signals_helpers.get_full_position_state
+# can reuse them without importing a scripts/ module from a core module.
+_real_orders = schwab_client.get_real_orders
+_resting_orders = schwab_client.filter_resting_orders
 
 
 def _resolve_live_node(ticker):
@@ -106,6 +135,16 @@ def _print_staged_config(node, source):
         print(f"  \U000026A0️  STAGED CONFIG MISMATCH: {'; '.join(mismatches)}")
     else:
         print(f"  staged config: matches expected ({', '.join(f'{k}={v}' for k, v in row['expected_config'].items())})")
+    relevance = _scenario_relevance(row['scenario_role'])
+    if relevance is not None:
+        all_verified = all(r.startswith(f"{gid}: verified-live")
+                            for r, gid in zip(relevance, SCENARIO_ROLE_TO_GRID_IDS[row['scenario_role']]))
+        for r in relevance:
+            print(f"    grid relevance: {r}")
+        if all_verified:
+            print(f"  \U0001F9F9 STALE? every Grid scenario this staged role exists to prove is already "
+                  f"verified-live -- confirm whether this node's detuned config is still needed, or "
+                  f"revert/remove this staged_test_config row.")
 
 
 def audit_one(ticker, wl_id=None):

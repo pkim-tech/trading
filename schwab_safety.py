@@ -842,7 +842,7 @@ ADDON_BUYING_POWER_HEADROOM_MULT = 2.0
 def check_order(
     account: str, ticker: str, quantity: int, price: float, side: str, counts: dict | None = None,
     is_gap_correction: bool = False, is_protective: bool = False, replacing_order_id: int | None = None,
-    is_addon_leg: bool = False,
+    is_addon_leg: bool = False, node_id: int | None = None,
 ) -> None:
     """Raises SafetyViolation if the order should not proceed. `counts`, if
     given, is used for the daily-cap/burst-cap/duplicate checks instead of
@@ -880,7 +880,19 @@ def check_order(
     for an ordinary BUY, buying-power-permitting for an add-on leg, per the
     2026-08-10 fix bringing the add-on path onto the same real-affordability
     model instead of an unconditional block -- see that function's
-    docstring)."""
+    docstring).
+    node_id: the real watch_list.id this order belongs to, threaded through
+    from schwab_client's 6 place_*/replace_* functions (2026-08-10) -- closes
+    the wl_id-refactor gap this module's own comment used to flag as a
+    separate, not-yet-done follow-up. When given, this is used directly for
+    _node_id and for the local-position lookups below (get_open_position_by_
+    wl_id) instead of the ambiguous ticker+account derivation, so two nodes
+    sharing a (ticker, account) pair -- e.g. a dry_run rehearsal canary and a
+    real live node, the AGQ/brokerage collision found 2026-08-10 -- no longer
+    resolve to each other's automation-pause state or position. Optional and
+    defaults to None so any caller not yet updated still gets the old
+    ticker+account-derived (ambiguous-on-collision) behavior -- not every
+    call site threads a node_id yet (e.g. manual/script-driven order calls)."""
     if kill_switch_engaged():
         _limits = ACCOUNTS.get(account)
         _mode = "live" if (_limits and _limits.trading_enabled) else "dry_run"
@@ -894,17 +906,17 @@ def check_order(
     if not limits.enabled:
         raise SafetyViolation(f"account '{account}' is disabled in the allowlist")
     _mode = "dry_run" if not limits.trading_enabled else "live"
-    # KNOWN LIMITATION (docs/backlog_cache.md's wl_id refactor entry): _node_id
-    # is re-derived via a ticker+account best-effort lookup because no caller
-    # in the schwab_client chain threads a real wl_id through yet -- that
-    # plumbing (schwab_client's 6 place_* functions -> approve_and_record ->
-    # here) was scoped as its own follow-up, not done this session.
-    # get_watch_list_node() returns None on an ambiguous match (2+ nodes same
-    # ticker+account), so node_automation_enabled(None) below silently
-    # defaults to True in exactly that case -- a node-level pause is a no-op
-    # for two same-account nodes on one ticker until this is threaded properly.
-    _node = signals_db.get_watch_list_node(ticker=ticker, account=account)
-    _node_id = _node['id'] if _node else None
+    if node_id is not None:
+        _node_id = node_id
+    else:
+        # Fallback for callers that haven't threaded a real node_id through
+        # yet (see the node_id param docstring above). get_watch_list_node()
+        # returns None on an ambiguous match (2+ nodes same ticker+account),
+        # so node_automation_enabled(None) below silently defaults to True in
+        # exactly that case -- a node-level pause is a no-op for two
+        # same-account nodes on one ticker for any caller still on this path.
+        _node = signals_db.get_watch_list_node(ticker=ticker, account=account)
+        _node_id = _node['id'] if _node else None
 
     ticker_accounts = _live_ticker_accounts()
     if ticker not in ticker_accounts:
@@ -952,7 +964,8 @@ def check_order(
         )
 
     if side == "BUY":
-        _local_pos = signals_db.get_open_position_for_account(ticker, account)
+        _local_pos = (signals_db.get_open_position_by_wl_id(node_id) if node_id is not None
+                      else signals_db.get_open_position_for_account(ticker, account))
         _log_pre_action_state_verification(
             account, ticker, _node_id, _mode, "BUY",
             _local_pos['shares'] if _local_pos else None)
@@ -1052,15 +1065,15 @@ def check_order(
         # window before the first order fills, not after. is_protective is the
         # one sanctioned exception: _reconcile_fill's post-fill top-up is
         # completing THIS SAME position's sizing, not adding a new one.
-        # KNOWN LIMITATION (found by review, 2026-08-02, same shape as the
-        # _node_id ambiguity noted above): get_open_position_for_account is
-        # ticker+account-keyed, not wl_id-keyed, so if 2 live nodes ever
-        # shared a ticker+account, this would wrongly block the SECOND node's
-        # genuine first entry as if it were a duplicate of the first node's
-        # position. Not reachable today (verified: no such pairing exists on
-        # the live watchlist) -- fixing it properly needs the same wl_id-
-        # threaded-through-schwab_client plumbing already flagged as a
-        # separate follow-up, not done here.
+        # Was a KNOWN LIMITATION (found by review, 2026-08-02, same shape as
+        # the _node_id ambiguity noted above): get_open_position_for_account
+        # is ticker+account-keyed, not wl_id-keyed, so 2 live nodes sharing a
+        # ticker+account (the real AGQ/brokerage collision found 2026-08-10)
+        # would wrongly block the SECOND node's genuine first entry as if it
+        # were a duplicate of the first node's position. Fixed 2026-08-10 for
+        # any caller passing node_id (see that param's docstring above) --
+        # _local_pos is wl_id-scoped in that case. Still ambiguous for a
+        # caller that doesn't pass node_id.
         if _local_pos and not is_protective and not is_addon_leg:
             signals_db.log_coverage_event(
                 "buy_blocked_position_exists", _mode, ticker=ticker, node_id=_node_id, result="blocked",
@@ -1123,7 +1136,8 @@ def check_order(
     # not account-wide like the BUY guard: an unrelated resting BUY for this
     # ticker must not block closing a position.
     if side == "SELL":
-        _presell_pos = signals_db.get_open_position_for_account(ticker, account)
+        _presell_pos = (signals_db.get_open_position_by_wl_id(node_id) if node_id is not None
+                        else signals_db.get_open_position_for_account(ticker, account))
         _log_pre_action_state_verification(
             account, ticker, _node_id, _mode, "SELL",
             _presell_pos['shares'] if _presell_pos else None)
@@ -1546,7 +1560,7 @@ def check_order(
 def approve_and_record(
     account: str, ticker: str, quantity: int, price: float, side: str, is_gap_correction: bool = False,
     is_protective: bool = False, replacing_order_id: int | None = None, is_addon_leg: bool = False,
-    node_dry_run: bool = False,
+    node_dry_run: bool = False, node_id: int | None = None,
 ) -> bool:
     """Call immediately before placing a real order. Raises SafetyViolation if
     blocked; otherwise records the order against the daily cap, the global
@@ -1567,12 +1581,16 @@ def approve_and_record(
     2026-08-1x) -- additive/OR-logic only against the account-level flag,
     never a replacement. All the real safety guards in check_order still run
     unconditionally regardless of either flag; this only decides whether the
-    caller actually submits to the broker afterward."""
+    caller actually submits to the broker afterward.
+    node_id: threaded straight through to check_order's node_id param (see
+    its docstring) -- schwab_client's place_*/replace_* functions pass this
+    from the real node dict already in scope at their call sites."""
     with _open_locked() as f:
         counts = json.loads(f.read() or "{}")
         check_order(account, ticker, quantity, price, side, counts=counts,
                     is_gap_correction=is_gap_correction, is_protective=is_protective,
-                    replacing_order_id=replacing_order_id, is_addon_leg=is_addon_leg)
+                    replacing_order_id=replacing_order_id, is_addon_leg=is_addon_leg,
+                    node_id=node_id)
         key = str(date.today())
         today = counts.setdefault(key, {})
         if side == "BUY":
