@@ -1690,3 +1690,32 @@ account-opening timeline — the real fix needs a live API balance response to p
 settled-cash field, which arrives alongside real account access. `signals_invariants.
 check_brokerage_not_live_with_unresolved_leverage_gap` hard-blocks `brokerage.trading_enabled=True`
 in the meantime; verified clean 2026-08-09.
+
+---
+
+## Candidate-to-watchlist traceability: `watch_list_candidate_link` (2026-08-11)
+
+`watch_list` (`cache/live/trading_live.db`) and `candidate_nodes` (`cache/research/trading_universe.db`)
+are separate SQLite files — no real FK ever existed between them. Every prior attempt to answer
+"which candidate did this live node come from" was a live, best-effort exact-param-tuple recompute
+(`portfolio_account_status.py`'s `candidate_node_id` export), which breaks silently on any
+post-promotion config tweak and gave a real agent multiple wrong answers in one session (missed a
+config axis, compared the wrong column for `TrailingExitZScoreBreakout` strategies, matched against
+the wrong reference row instead of the user's actual documented pick).
+
+Fix: `signals_db.watch_list_candidate_link(wl_id, candidate_node_id, role, linked_at, note)`, set
+explicitly via `set_candidate_link`/read via `get_candidate_links` — never inferred, never
+recomputed from params. `candidate_node_id` is a soft reference (no real FK possible across DB
+files); a resolver is responsible for confirming the row still exists. `role` (`'core'`/`'drought'`/
+`'add_on'`/`'overlay'`) lets one node carry multiple links, since a node's core strategy config and
+its drought/add-on overlay config can genuinely trace to different candidates. `scripts/
+node_candidate_trace.py` reports every real/paper node's linked candidate or flags it unlinked.
+
+**Explicit scope boundary**: this table records the user's candidate SELECTION decision — it does
+not make one, and nothing here should be read as authorization to auto-promote or auto-pick a
+candidate.
+
+**Known gap, not yet built**: sweep-campaign-level provenance — tying a `candidate_nodes` row back
+to a real, identifiable backtest sweep run (something like `backtest_cache.run_timestamp`/`version`),
+not just a param tuple. Landed on as the more correct foundation than an invented "candidate list
+I was shown" concept, but not designed or built. See `docs/backlog_cache.md`.

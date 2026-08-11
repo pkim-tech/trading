@@ -1554,6 +1554,46 @@ def ensure_tables():
                     c.execute(f"UPDATE {tbl} SET wl_id=? WHERE id=?", (candidates[0]['id'], r['id']))
         c.commit()
 
+        # watch_list_candidate_link, added 2026-08-11 -- a real, explicit link from a
+        # watch_list node to the candidate_nodes row (cache/research/trading_universe.db)
+        # it was actually promoted from. Built after a session of the agent guessing this
+        # link via exact-param-tuple matching and getting it wrong multiple times (missed
+        # axes, wrong column for TrailingExit strategies' arm value, comparing against the
+        # highest-robust_alpha row instead of the user's real CAGR-first pick). This table
+        # exists specifically so that guessing is never needed again: set explicitly at
+        # promotion time, one row per (wl_id, role). candidate_node_id is a soft reference,
+        # not a real FK -- candidate_nodes lives in a different SQLite file entirely, so
+        # there's no way to enforce it at the DB layer (set_candidate_link validates both
+        # ends -- existence + ticker/strategy match -- at write time instead).
+        # Per the user's explicit framing: this table records the user's candidate
+        # SELECTION decision, it does not make one -- nothing here should ever be treated
+        # as authorization to auto-promote or auto-pick a candidate.
+        #
+        # KNOWN LIMITATION on `role` (flagged by session-wrap contextual review,
+        # 2026-08-11): candidate_nodes has ONLY core-strategy columns (ticker/strategy/
+        # version/window/z/fixed_sl/arm_pct/trail_buy_pct/trail_sell_pct/max_hold_hours/
+        # entry_timing) -- no drought/add-on/skim fields exist there at all. So a
+        # role='drought' row records "the candidate whose CORE params this node's
+        # drought-enabled config is layered on top of", NOT a separately-validated
+        # drought-specific candidate (confirm_days/vol_gate have no recorded provenance
+        # anywhere in this table). `role` in practice tonight tracked which slot in the
+        # user's own external candidate-review list (Pick column: Core/Drought/Overlay/
+        # Add On) a node's promotion came from, not a genuine per-mechanism config source.
+        # Don't read a role='drought' row as proof the drought NUMBERS were validated --
+        # only that the CORE strategy config was.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS watch_list_candidate_link (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                wl_id             INTEGER NOT NULL REFERENCES watch_list(id),
+                candidate_node_id INTEGER NOT NULL,
+                role              TEXT NOT NULL DEFAULT 'core',
+                linked_at         TEXT NOT NULL DEFAULT (datetime('now')),
+                note              TEXT,
+                UNIQUE(wl_id, role)
+            )
+        """)
+        c.commit()
+
 
 # ---------------------------------------------------------------------------
 # Watch list CRUD
@@ -1570,6 +1610,108 @@ def get_watchlist_audit(limit=200):
     with _conn() as c:
         return [dict(r) for r in c.execute(
             "SELECT * FROM watch_list_audit ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()]
+
+
+_DROUGHT_OVERRIDE_UNSET = object()
+
+
+def set_drought_config(wl_id, confirm_days, vol_gate, sl_override=_DROUGHT_OVERRIDE_UNSET,
+                        arm_override=_DROUGHT_OVERRIDE_UNSET, trail_override=_DROUGHT_OVERRIDE_UNSET):
+    """Enables the drought overlay on a real watch_list node with an explicit,
+    already-validated config -- never invented/guessed values. Mirrors the
+    manual UPDATE pattern used ad hoc for the 2026-08-07 drought/addon
+    widening, as a real function instead of one-off SQL.
+
+    sl_override/arm_override/trail_override use a sentinel default, not None
+    -- both reviewers independently caught the first version of this function
+    unconditionally writing all three override columns, so a later call to
+    adjust just confirm_days/vol_gate silently NULLed any previously-set
+    override back to 'use the node's own core risk params' (see the
+    drought_*_override schema comment). Pass None explicitly to actually
+    clear an override; omit the arg to leave whatever's already there alone."""
+    with _conn() as c:
+        row = c.execute("SELECT watchlist_id, ticker FROM watch_list WHERE id=?", (wl_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"set_drought_config: no watch_list row with id={wl_id}")
+        sets = ["drought_overlay_enabled=1", "drought_confirm_days=?", "drought_vol_gate=?"]
+        params = [confirm_days, vol_gate]
+        overrides = [("drought_sl_pct_override", sl_override),
+                     ("drought_arm_pct_override", arm_override),
+                     ("drought_trail_pct_override", trail_override)]
+        for col, val in overrides:
+            if val is not _DROUGHT_OVERRIDE_UNSET:
+                sets.append(f"{col}=?")
+                params.append(val)
+        params.append(wl_id)
+        c.execute(f"UPDATE watch_list SET {', '.join(sets)} WHERE id=?", params)
+        _log_audit(c, 'set_drought_config', watchlist_id=row['watchlist_id'], watch_id=wl_id,
+                   ticker=row['ticker'], detail=f"confirm_days={confirm_days} vol_gate={vol_gate}")
+        c.commit()
+
+
+def set_candidate_link(wl_id, candidate_node_id, role='core', note=None):
+    """Records which candidate_nodes row (cache/research/trading_universe.db) a
+    watch_list node was actually promoted from -- an explicit decision, never a
+    guess. One row per (wl_id, role): re-linking the same role overwrites the
+    prior link rather than duplicating (a node's real source can be corrected,
+    same as any other recorded fact) -- linked_at reflects the most recent
+    confirmation, not the first.
+
+    Validates BOTH ends before writing -- both reviewers independently flagged
+    the first version as writing an unvalidated id, which is the exact failure
+    mode this table exists to eliminate (a wrong link now looks MORE
+    authoritative than the param-guess it replaced). wl_id must be a real
+    watch_list row; candidate_node_id must be a real candidate_nodes row whose
+    ticker/strategy actually match the node's -- this is a deliberate,
+    one-time exception to this module's usual "no live cross-DB join" rule
+    (see the `alpha` column comment above), justified because this function is
+    called rarely (at promotion time) and its whole point is trustworthiness.
+    role is case/whitespace-normalized so 'Core' and 'core' can't silently
+    become two rows under the UNIQUE(wl_id, role) constraint. note is
+    preserved (not blanked) when a re-link omits it."""
+    import sqlite3
+    import signals_config
+    role = role.strip().lower()
+    with _conn() as c:
+        node = c.execute("SELECT ticker, strategy FROM watch_list WHERE id=?", (wl_id,)).fetchone()
+        if node is None:
+            raise ValueError(f"set_candidate_link: no watch_list row with id={wl_id}")
+        cand_conn = sqlite3.connect(signals_config.RESEARCH_DB_PATH)
+        cand_conn.row_factory = sqlite3.Row
+        try:
+            cand = cand_conn.execute(
+                "SELECT ticker, strategy FROM candidate_nodes WHERE id=?", (candidate_node_id,)
+            ).fetchone()
+        finally:
+            cand_conn.close()
+        if cand is None:
+            raise ValueError(f"set_candidate_link: no candidate_nodes row with id={candidate_node_id}")
+        if cand['ticker'] != node['ticker'] or cand['strategy'] != node['strategy']:
+            raise ValueError(
+                f"set_candidate_link: candidate {candidate_node_id} is {cand['ticker']}/"
+                f"{cand['strategy']}, but watch_list node {wl_id} is {node['ticker']}/"
+                f"{node['strategy']} -- refusing to link mismatched tickers/strategies")
+        c.execute("""
+            INSERT INTO watch_list_candidate_link (wl_id, candidate_node_id, role, note)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(wl_id, role) DO UPDATE SET
+                candidate_node_id=excluded.candidate_node_id,
+                linked_at=datetime('now'),
+                note=COALESCE(excluded.note, watch_list_candidate_link.note)
+        """, (wl_id, candidate_node_id, role, note))
+        c.commit()
+
+
+def get_candidate_links(wl_id=None):
+    """All recorded links, or every link for one node when wl_id is given."""
+    with _conn() as c:
+        if wl_id is not None:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM watch_list_candidate_link WHERE wl_id=? ORDER BY role", (wl_id,)
+            ).fetchall()]
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM watch_list_candidate_link ORDER BY wl_id, role"
         ).fetchall()]
 
 

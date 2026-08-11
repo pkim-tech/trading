@@ -504,6 +504,39 @@ def _bar_index_for(df_h, ts):
         return None
 
 
+def _added_at_floor_bar(df_h, added_at_str):
+    """Cold-start floor for reconcile_daily_track_nodes: the last bar fully
+    CLOSED at-or-before the node's real creation moment -- a bar that started
+    before creation but closes AFTER it stays eligible, since daily_sync's
+    signal check happens off the closed bar in the NEXT signal window, by
+    which point the node already existed and genuinely could have caught it.
+    watch_list.added_at is stored UTC (the column's `datetime('now')`
+    default), while df_h's index is ET-naive hourly bars -- converted here at
+    point-of-use rather than at the schema level (added_at has other
+    consumers; changing its stored format is a much bigger, riskier change
+    than fixing where this one caller reads it). Found 2026-08-11 by an
+    independent cold review, verified empirically against real SOXL bars: the
+    original naive-string floor was shifted ~4-5h into the future, silently
+    dropping the 14:30 bar -- exactly the one the 15:25-15:40 signal window
+    evaluates -- for any node created during market hours.
+    Returns None (never raises) on any parse/comparison failure -- callers
+    should treat that the same as 'no bookmark yet' (floor at -1), matching
+    the established pattern for _bar_index_for's None return rather than
+    crashing the whole nightly job for every remaining node."""
+    import pandas as pd
+    from zoneinfo import ZoneInfo
+    if not added_at_str:
+        return None
+    try:
+        added_et = (pd.Timestamp(added_at_str, tz='UTC')
+                    .tz_convert(ZoneInfo('America/New_York')).tz_localize(None))
+        close_times = df_h.index + pd.Timedelta(hours=1)
+        pos = close_times.searchsorted(added_et, side='right') - 1
+        return int(pos) if pos >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _bar_containing(df_h, ts):
     """Which cached bar's window contains wall-clock ts -- the last bar timestamped
     at or before ts. Used for EXIT bar resolution: unlike an entry signal (which can
@@ -848,7 +881,23 @@ def reconcile_daily_track_nodes():
                 else:
                     bookmark_i = resolved
             else:
-                bookmark_i = -1
+                # Cold start: floor at the node's own creation bar, not -1 (the
+                # ticker's entire cached history) -- a backtest trade whose signal
+                # predates added_at is one daily-track structurally could never have
+                # caught (the node didn't exist yet), so it isn't a real miss. Found
+                # 2026-08-11: the first real catch-up run flagged 17 such trades
+                # (some a month before their node's creation) as entry_miss_unexplained.
+                # See _added_at_floor_bar's docstring for the UTC/ET conversion and
+                # bar-close-not-bar-start semantics this depends on.
+                resolved = _added_at_floor_bar(df_h, node.get('added_at'))
+                if resolved is None:
+                    if node.get('added_at'):
+                        print(f"  [daily_track] {node['ticker']} wl_id={node['id']} added_at "
+                              f"{node['added_at']!r} couldn't be resolved to a bar -- "
+                              f"re-scanning from the earliest trade")
+                    bookmark_i = -1
+                else:
+                    bookmark_i = resolved
             bt_ref = next((t for t in trades if t['signal_i'] > bookmark_i), None)
 
             if bt_ref is None:

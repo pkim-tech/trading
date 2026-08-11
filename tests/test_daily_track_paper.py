@@ -119,6 +119,16 @@ def _add_pair(ticker=TICKER, strategy='TrailingBothZScoreBreakout'):
                 fixed_sl_override=1, state='paper', paper_role='daily_sync')
     nodes = sorted([n for n in db.get_watchlist() if n['ticker'] == ticker],
                     key=lambda n: n.get('paper_role') or '')
+    # Pin added_at safely in the past -- real add_node stamps real wall-clock
+    # now, which sits AFTER every test's synthetic bars (all built relative to
+    # datetime.now()) and would trip the 2026-08-11 cold-start-floors-at-
+    # added_at fix on every one of them, not just the test that exercises it.
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET added_at=? WHERE id IN (?, ?)",
+                  ('2000-01-01 00:00:00', nodes[0]['id'], nodes[1]['id']))
+        c.commit()
+    nodes = sorted([n for n in db.get_watchlist() if n['ticker'] == ticker],
+                    key=lambda n: n.get('paper_role') or '')
     return nodes[0], nodes[1]
 
 
@@ -1171,3 +1181,99 @@ def test_reconcile_no_false_match_when_backtest_holds_open_trade_past_bookmark(i
     assert log[0]['action'] == 'steady_state_watching_open_trade'
     assert log[0]['action'] != 'match'
     assert log[0]['backtest_state'] == 'open'
+
+
+def test_reconcile_cold_start_floors_at_node_creation_not_ticker_history(isolated_db, monkeypatch):
+    """Cold start (no bookmark yet) used to scan from signal_i=-1 -- the
+    ticker's ENTIRE cached backtest history, including trades from before the
+    daily-track node even existed. A trade daily-track structurally could
+    never have caught (it didn't exist yet) got flagged 'entry_miss_unexplained'
+    -- found 2026-08-11 against the real DB, 17 nodes each flagged one such
+    trade on the first real catch-up run. Fixed: cold start floors at the
+    node's own `added_at`, so a trade entirely before creation resolves to
+    'match' (nothing to compare) instead of a false miss."""
+    import pandas as pd
+    import numpy as np
+    from backtester import WIN
+
+    _, daily_node = _add_pair()
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    idx = pd.date_range(now - timedelta(hours=10), periods=5, freq='h')
+    df_h = pd.DataFrame({'Open': [90.0] * 5, 'Close': [100.0] * 5}, index=idx)
+    p = dict(daily_idx=np.array([0] * 5), sma_arr=np.array([100.0]),
+             std_arr=np.array([1.0]), prices=np.array([100.0] * 5))
+
+    # Node's added_at set explicitly AFTER all 5 bars (unlike _add_pair's
+    # default of a safely-past 2000-01-01) -- this is the case under test.
+    # Stored as UTC (matching watch_list.added_at's real column default,
+    # datetime('now')) since the cold-start floor converts UTC->ET before
+    # comparing against df_h's ET-naive bar index -- writing local time
+    # directly here would silently test the wrong thing.
+    from zoneinfo import ZoneInfo
+    added_at_et = (now - timedelta(hours=1)).replace(tzinfo=ZoneInfo('America/New_York'))
+    added_at_utc = added_at_et.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%d %H:%M:%S')
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET added_at=? WHERE id=?", (added_at_utc, daily_node['id']))
+        c.commit()
+
+    pre_creation_trade = dict(signal_i=0, signal_z=-10.0, entry_i=1, arm_i=None, exit_i=3,
+                               entry_p=91.0, exit_p=98.0, held=2, result=WIN, ret=0.05)
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', lambda node: ([pre_creation_trade], df_h, p))
+    assert db.get_daily_track_bookmark(daily_node['id']) is None
+
+    paper_trading.reconcile_daily_track_nodes()
+
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    assert len(log) == 1
+    assert log[0]['action'] == 'match'
+    assert log[0]['action'] != 'entry_miss_unexplained'
+    # Nothing to advance past -- the floor isn't a real trade comparison.
+    assert db.get_daily_track_bookmark(daily_node['id']) is None
+
+
+def test_reconcile_cold_start_uses_real_added_at_with_correct_utc_to_et_conversion(isolated_db, monkeypatch):
+    """Regression test for a real bug found by an independent cold review,
+    verified empirically against production data: watch_list.added_at is
+    stored UTC (SQLite's own datetime('now') column default), but the
+    cold-start floor originally compared it directly against ET-naive bar
+    timestamps with no conversion -- shifting the floor ~4-5h into the
+    future and silently dropping a bar that closed AFTER the node was
+    actually created (a real, catchable signal), for any node created
+    during market hours. Uses a real add_node() call, not a hand-written
+    added_at string, so the actual UTC-stamped production value from
+    ensure_tables()'s `added_at TEXT DEFAULT (datetime('now'))` is what's
+    under test -- a hand-written local-time string would hide this exact bug."""
+    import pandas as pd
+    import numpy as np
+    from zoneinfo import ZoneInfo
+    from backtester import WIN
+
+    db.add_node('COLDSTART_TZ', 'TrailingBothZScoreBreakout', 'v5', window=10, take_profit=25,
+                stop_loss=1, max_hold_hours=56, trail_buy_pct=3.0, trail_pct=4.0,
+                fixed_sl_override=1, state='paper', paper_role='daily_sync')
+    daily_node = [n for n in db.get_watchlist() if n['ticker'] == 'COLDSTART_TZ'][0]
+
+    added_et = (pd.Timestamp(daily_node['added_at'], tz='UTC')
+                .tz_convert(ZoneInfo('America/New_York')).tz_localize(None))
+
+    # A bar that STARTS 30 minutes before creation and CLOSES 30 minutes
+    # after it -- the node existed by the time this bar's signal would be
+    # checked (the next signal window, after the bar closes), so this is a
+    # real, catchable trade. The old UTC-vs-ET bug floored past it.
+    bar_start = added_et - pd.Timedelta(minutes=30)
+    idx = pd.DatetimeIndex([bar_start])
+    df_h = pd.DataFrame({'Open': [90.0], 'Close': [100.0]}, index=idx)
+    p = dict(daily_idx=np.array([0]), sma_arr=np.array([100.0]),
+             std_arr=np.array([1.0]), prices=np.array([100.0]))
+
+    straddling_trade = dict(signal_i=0, signal_z=-10.0, entry_i=0, arm_i=None, exit_i=0,
+                             entry_p=91.0, exit_p=98.0, held=1, result=WIN, ret=0.05)
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', lambda node: ([straddling_trade], df_h, p))
+
+    paper_trading.reconcile_daily_track_nodes()
+
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    assert len(log) == 1
+    # Must be evaluated as a real trade, not silently floored away as 'match'
+    # (nothing to compare) -- that was the old bug's exact symptom.
+    assert log[0]['action'] != 'match'

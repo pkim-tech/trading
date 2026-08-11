@@ -24,6 +24,9 @@
 > any deferred item whose date has already passed, so it surfaces again instead of quietly
 > aging out. No separate section — stays in place, in normal open-items order.
 
+## [backtest][live-trading] Partially built 2026-08-11 (late) — node<->candidate link table shipped, 13 real nodes traced + 3 new $10k ira positions added; sweep-campaign-level traceability still open
+Full detail: `docs/deep_backlog.md`'s 2026-08-11 (late) entry (top).
+
 ## [live-trading][security] Open, raised 2026-08-10 — don't promote a 2nd `state='live'` sibling on AGQ/`brokerage` (or any ticker+account pair) before addressing duplicate-order guards and live-state reconciliation, which still assume ticker+account uniqueness
 Found by the paired review of the 2026-08-10 `node_id` disambiguation fix: `check_order`'s duplicate-order guards (`_has_open_order`/`_has_open_buy_order_for_ticker`, the `(account, ticker, side, quantity)` fingerprint window) and `signals_notify.check_live_state_reconciliation` (broker-level share-count check) both key off `(ticker, account)`, not per-node — neither can be fixed by `node_id` threading alone since Schwab's own order book/balance API has no concept of this project's node identity. Two genuinely `live` siblings sharing one `(ticker, account)` would block each other's real orders and permanently trip the circuit breaker via reconciliation mismatches. Not reachable today — AGQ's only `live` node is id=203; the other two AGQ/`brokerage` nodes (41, 193) are `dry_run`, kept off the broker by `_effectively_dry_run`. Full detail: `docs/deep_backlog.md`'s 2026-08-10 entry.
 
