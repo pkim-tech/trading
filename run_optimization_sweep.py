@@ -229,6 +229,19 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE backtest_cache ADD COLUMN generation INTEGER")
     except Exception:
         pass
+    # sweep_run_id (2026-08-11): links a row back to the sweep_runs invocation
+    # that computed it -- the real gap behind "which kernel/git-commit produced
+    # this candidate_nodes pick," raised 2026-08-11 after the watch_list_
+    # candidate_link table made the wl_id<->candidate_nodes link real but left
+    # candidate_nodes<->sweep-run untraceable. Nullable, no PK change, NO
+    # BACKFILL of existing rows (same convention as phase/generation above) --
+    # historical rows predate this column and stay NULL; only rows written by
+    # a sweep run that passes run_id through dispatch_parallel_grid going
+    # forward get stamped.
+    try:
+        cursor.execute("ALTER TABLE backtest_cache ADD COLUMN sweep_run_id INTEGER")
+    except Exception:
+        pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sl_sweep_summary (
@@ -282,8 +295,44 @@ def init_idempotent_db():
             log_file      TEXT
         )
     """)
+    # git_commit/kernel_dirty (2026-08-11): the actual "identifiable sweep run"
+    # piece -- version (e.g. 'v5') is a data-versioning tag the user chooses,
+    # not a code identity, so two runs tagged the same version can still have
+    # computed results with different backtester.py/strategies.py code (this
+    # has happened for real -- see CLAUDE.md's kernel-fix-mid-campaign
+    # history). git_commit is HEAD's real sha at start_sweep_run time;
+    # kernel_dirty flags whether backtester.py/strategies.py had uncommitted
+    # changes when the run started (a real run against not-yet-committed
+    # kernel code is a genuine traceability gap worth flagging, not silently
+    # trusting the commit hash as the whole story).
+    sr_cols = {r[1] for r in cursor.execute("PRAGMA table_info(sweep_runs)").fetchall()}
+    if "git_commit" not in sr_cols:
+        cursor.execute("ALTER TABLE sweep_runs ADD COLUMN git_commit TEXT")
+    if "kernel_dirty" not in sr_cols:
+        cursor.execute("ALTER TABLE sweep_runs ADD COLUMN kernel_dirty INTEGER")
     conn.commit()
     conn.close()
+
+
+def _current_kernel_git_state():
+    """Returns (git_commit, kernel_dirty) for the running process's checkout --
+    best-effort: any failure (git missing, not a repo, etc.) returns (None, None)
+    rather than blocking a real sweep run over a provenance nicety."""
+    import subprocess
+    repo_dir = str(Path(__file__).resolve().parent)
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True,
+            text=True, timeout=5, check=True
+        ).stdout.strip()
+        dirty_out = subprocess.run(
+            ["git", "status", "--porcelain", "--", "backtester.py", "strategies.py"],
+            cwd=repo_dir, capture_output=True, text=True, timeout=5, check=True
+        ).stdout
+        return commit, int(bool(dirty_out.strip()))
+    except Exception as e:
+        logger.warning(f"Could not determine kernel git state: {e}")
+        return None, None
 
 
 def rebuild_indexes():
@@ -304,16 +353,22 @@ def rebuild_indexes():
 
 
 def start_sweep_run(config_version, strategy_names, tickers, config, log_file):
+    git_commit, kernel_dirty = _current_kernel_git_state()
     conn = sqlite3.connect(DB_PATH, timeout=60.0)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sweep_runs (version, started_at, status, strategies, tickers, config_json, log_file)
-        VALUES (?, ?, 'RUNNING', ?, ?, ?, ?)
+        INSERT INTO sweep_runs (version, started_at, status, strategies, tickers, config_json, log_file,
+                                 git_commit, kernel_dirty)
+        VALUES (?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?)
     """, (config_version, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-          json.dumps(strategy_names), json.dumps(tickers), json.dumps(config), str(log_file)))
+          json.dumps(strategy_names), json.dumps(tickers), json.dumps(config), str(log_file),
+          git_commit, kernel_dirty))
     conn.commit()
     run_id = cur.lastrowid
     conn.close()
+    if kernel_dirty:
+        logger.warning(f"sweep_runs id={run_id}: backtester.py/strategies.py have UNCOMMITTED changes -- "
+                        f"this run's results won't be reproducible from git_commit={git_commit} alone.")
     return run_id
 
 
@@ -483,7 +538,7 @@ def run_single_backtest_node_isolated(args):
     }
 
 
-def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None):
+def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None):
     conn   = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
     matrix_results  = []
@@ -642,7 +697,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                                num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
                                stored_fsl, row_trail_buy_pct, row_trail_pct, wtw, row_arm_sell_pct, float(tp),
                                entry_timing, comp_ret_pess, alpha_pess, comp_ret_cert, alpha_cert, phase_label,
-                               generation))
+                               generation, run_id))
 
                 if len(buffer) >= batch_size:
                     cursor.executemany(
@@ -652,8 +707,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                             run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
                             win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                             strategy_return_pessimistic, alpha_vs_spy_pessimistic,
-                            strategy_return_certain, alpha_vs_spy_certain, phase, generation)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         buffer
                     )
                     buffer = []
@@ -670,8 +725,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                 run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
                 win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                 strategy_return_pessimistic, alpha_vs_spy_pessimistic,
-                strategy_return_certain, alpha_vs_spy_certain, phase, generation)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             buffer
         )
     conn.commit()
@@ -745,7 +800,7 @@ def _campaign_scope_sql(strategy_name, fixed_sl, entry_timing):
     return " AND entry_timing=?", [entry_timing]
 
 
-def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
+def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None):
     z_thresholds = hp['z_score_thresholds']
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     expected = (len(z_thresholds) * len(hp['windows']) * len(hp['take_profits'])
@@ -779,7 +834,7 @@ def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, sp
              for tpct in trail_pcts]
 
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
-                           "Phase1-Coarse", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
+                           "Phase1-Coarse", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
 
 
 # ── Checkpoint 1: rank by coarse alpha, return island candidates ──────────────
@@ -817,7 +872,7 @@ def identify_island_candidates(config_version, strategy_name, n_index, n_stock, 
 
 # ── Phase 2: Island mesh ──────────────────────────────────────────────────────
 
-def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None):
+def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None):
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
@@ -856,12 +911,12 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
     logger.info(f"[{ticker}] Phase2 island mesh: {len(tasks)} tasks ({N_ISLANDS} islands ±{FINE_RADIUS})")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
                            "Phase2-Island", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing,
-                           generation=generation)
+                           generation=generation, run_id=run_id)
 
 
 # ── Phase 2.5: targeted cliff-box sweep around true best node ────────────────
 
-def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
+def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None):
     """Sweep ±CLIFF_RADIUS in TP/SL and ±7h in hold around the true best node from Phase 2.
     Guarantees cliff check has complete neighborhood data regardless of where the peak landed.
     For TrailingBothZScoreBreakout, also sweeps the trail_pct axis's immediate neighbors
@@ -896,7 +951,7 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
 
     logger.info(f"[{ticker}] Phase2.5 cliff-box: {len(tasks)} tasks around TP={tp_c} SL={sl_c} hold={hold_c}h")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
-                           "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
+                           "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
 
 
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
@@ -1116,7 +1171,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
 
 # ── Phase 3: Full mesh ────────────────────────────────────────────────────────
 
-def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close'):
+def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None):
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     tasks = [(tp, sl, int(hold), int(w), float(z), float(tpct))
              for z    in hp['z_score_thresholds']
@@ -1128,7 +1183,7 @@ def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_
 
     logger.info(f"[{ticker}] Phase3 full mesh: {len(tasks)} tasks (cache skips coarse+island already done)")
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
-                           "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
+                           "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
 
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     with sqlite3.connect(DB_PATH) as conn:
@@ -1294,7 +1349,7 @@ if __name__ == "__main__":
                         logger.warning(f"Unknown strategy: {name}")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
+                    run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
 
             logger.info("Phase 1 complete.")
 
@@ -1316,7 +1371,7 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
+                    run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
                 continue
 
             island_tickers = []
@@ -1342,7 +1397,7 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 2.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, generation=gen + 1)
+                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, generation=gen + 1, run_id=run_id)
 
                 logger.info(f"Phase 2 gen {gen+1} complete.")
 
@@ -1357,7 +1412,7 @@ if __name__ == "__main__":
                 if ticker not in bh_cache:
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
+                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
 
             # ── Checkpoint 2 ─────────────────────────────────────────────
             logger.info(f"\nCheckpoint 2: cliff check on {len(island_tickers)} island tickers [{config_version}]...")
@@ -1384,7 +1439,7 @@ if __name__ == "__main__":
                     logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing)
+                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
 
     if args.skip_cache_refresh:
         logger.info("\nSkipping cache refresh and index rebuild (--skip-cache-refresh).")

@@ -34,16 +34,21 @@ NODE_COLS = ["ticker", "strategy", "window", "z_score_threshold", "arm_sell_pct"
 
 
 def best_row(conn: sqlite3.Connection, ticker: str, version: str = "v5") -> dict | None:
+    # sweep_run_id (2026-08-11): carries the winning backtest_cache row's
+    # provenance stamp (NULL for any row computed before this column existed)
+    # through to node_dict()/get_or_create_candidate_node, so a real candidate
+    # can be traced back to the sweep_runs row (git_commit, campaign config)
+    # that computed it, not just its 'version' data tag.
     cols_sql = ", ".join(NODE_COLS)
     row = conn.execute(f"""
-        SELECT {cols_sql}, stop_loss, {ROBUST_ALPHA_SQL} AS robust_alpha, trades
+        SELECT {cols_sql}, stop_loss, {ROBUST_ALPHA_SQL} AS robust_alpha, trades, sweep_run_id
         FROM backtest_cache
         WHERE ticker=? AND version=? AND trades > 0
         ORDER BY robust_alpha DESC LIMIT 1
     """, (ticker, version)).fetchone()
     if row is None:
         return None
-    keys = NODE_COLS + ["stop_loss", "robust_alpha", "trades"]
+    keys = NODE_COLS + ["stop_loss", "robust_alpha", "trades", "sweep_run_id"]
     return dict(zip(keys, row))
 
 
@@ -91,6 +96,17 @@ def ensure_candidate_nodes_table(conn: sqlite3.Connection):
                    trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing)
         )
     """)
+    # sweep_run_id (2026-08-11): the candidate's provenance -- which
+    # backtest_cache row (and via it, which sweep_runs invocation: git_commit,
+    # campaign params) this candidate was selected from. Nullable -- NULL for
+    # every candidate registered before this column existed, and for any
+    # candidate whose source backtest_cache row itself predates the
+    # sweep_run_id column on that table (no backfill of either, same
+    # convention as backtest_cache's own phase/generation/sweep_run_id
+    # columns -- see run_optimization_sweep.py's init_idempotent_db).
+    cn_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)").fetchall()}
+    if "sweep_run_id" not in cn_cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN sweep_run_id INTEGER")
     # pick/comment migration, added 2026-08-09: the user's real promotion
     # decision (Pick: yes/no + a free-text comment, e.g. "SpaceX 2x") needs
     # to survive a re-run of candidate_full_review.py --xlsx, which
@@ -155,12 +171,18 @@ def get_or_create_candidate_node(conn: sqlite3.Connection, node: dict) -> int:
     """, key_vals).fetchone()
     if existing:
         return existing[0]
+    # sweep_run_id: carried through from node['sweep_run_id'] when the caller
+    # populated it (node_dict()/best_row() do) -- absent/None for a node dict
+    # built some other way (e.g. hand-constructed), which just leaves the new
+    # row's provenance NULL rather than erroring.
+    sweep_run_id = node.get("sweep_run_id")
+    sweep_run_id = int(sweep_run_id) if sweep_run_id is not None else None
     cur = conn.execute(f"""
         INSERT INTO candidate_nodes
-            (created_at, {', '.join(key_cols)}, robust_alpha, trades)
-        VALUES (?, {', '.join('?' for _ in key_cols)}, ?, ?)
+            (created_at, {', '.join(key_cols)}, robust_alpha, trades, sweep_run_id)
+        VALUES (?, {', '.join('?' for _ in key_cols)}, ?, ?, ?)
     """, (_dt.datetime.now().isoformat(timespec="seconds"), *key_vals,
-          float(node["robust_alpha"]), int(node["trades"])))
+          float(node["robust_alpha"]), int(node["trades"]), sweep_run_id))
     conn.commit()
     return cur.lastrowid
 

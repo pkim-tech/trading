@@ -1715,7 +1715,22 @@ node_candidate_trace.py` reports every real/paper node's linked candidate or fla
 not make one, and nothing here should be read as authorization to auto-promote or auto-pick a
 candidate.
 
-**Known gap, not yet built**: sweep-campaign-level provenance — tying a `candidate_nodes` row back
-to a real, identifiable backtest sweep run (something like `backtest_cache.run_timestamp`/`version`),
-not just a param tuple. Landed on as the more correct foundation than an invented "candidate list
-I was shown" concept, but not designed or built. See `docs/backlog_cache.md`.
+**Sweep-campaign-level provenance, built 2026-08-11**: `sweep_runs` (`run_optimization_sweep.py`)
+already existed (`version`/`started_at`/`strategies`/`tickers`/`config_json`/`status`), but no
+`backtest_cache` row was ever stamped with which `sweep_runs.id` computed it — so `version` (a
+data tag the user chooses, e.g. `'v5'`) was the only campaign identity, and two runs sharing a
+version tag could still have run different kernel code (this happened for real — see CLAUDE.md's
+kernel-fix-mid-campaign history). Fixed: `sweep_runs` gained `git_commit`/`kernel_dirty` (captured
+at `start_sweep_run` via `git rev-parse HEAD` + a dirty-check scoped to `backtester.py`/
+`strategies.py` only — the actual kernel code, not the sweep engine itself); `backtest_cache`
+gained a nullable `sweep_run_id` column, threaded as an optional `run_id` kwarg through
+`dispatch_parallel_grid` and all 4 phase functions, stamped only on rows a run genuinely computes
+fresh (cache-hit rows, already excluded from `unvisited_tasks`, are never touched). `candidate_nodes`
+gained the matching nullable `sweep_run_id`, populated by `locate_best_node.py`'s `best_row`/
+`node_dict`/`get_or_create_candidate_node` and by the 4 candidate-type node-dict builders in
+`candidate_5min_report.py`/`top_safe_nodes.py` (the actual `candidate_full_review.py` selection
+path). `scripts/node_candidate_trace.py` now shows each linked candidate's sweep run (started_at,
+short git commit, DIRTY flag) when one is on file. **No backfill** of either column — same
+convention as `backtest_cache`'s existing `phase`/`generation` columns — every row/candidate
+registered before 2026-08-11 stays NULL/`[no sweep_run recorded]`; provenance only starts
+accumulating from the next real sweep run forward.

@@ -44,6 +44,11 @@ def _node_from_row(row):
         'trades': int(row['trades']), 'return': row['strategy_return'],
         'alpha_raw': row['alpha_vs_spy'], 'alpha_pessimistic': row['alpha_vs_spy_pessimistic'],
         'alpha_certain': row['alpha_vs_spy_certain'], 'robust_alpha': row['robust_alpha'],
+        # sweep_run_id (2026-08-11): only present when row came from load_ticker_df's
+        # SELECT (candidate_full_review.py's path) -- absent from a plain dict/Series
+        # missing the column raises KeyError via row['sweep_run_id'], so use .get()-style
+        # access via dict(row) upstream if this is ever called on a column-incomplete row.
+        'sweep_run_id': row['sweep_run_id'] if 'sweep_run_id' in row else None,
     }
 
 

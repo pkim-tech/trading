@@ -71,7 +71,8 @@ def best_safe_node(df_ticker, min_alpha=200, metric="robust_alpha"):
                 'alpha': row["robust_alpha"], 'alpha_raw': row["alpha_vs_spy"],
                 'alpha_pessimistic': row["alpha_vs_spy_pessimistic"], 'alpha_certain': row["alpha_vs_spy_certain"],
                 'return': row["strategy_return"], 'trades': int(row["trades"]),
-                'win_rate': row["win_rate"], 'worst_neighbor': worst
+                'win_rate': row["win_rate"], 'worst_neighbor': worst,
+                'sweep_run_id': row["sweep_run_id"] if "sweep_run_id" in row else None,
             }
     return None
 

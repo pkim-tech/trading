@@ -1654,6 +1654,7 @@ def main():
                     "trail_buy_pct": node["trail_buy_pct"], "trail_sell_pct": node["trail_sell_pct"],
                     "max_hold_hours": node["hold"], "entry_timing": node["entry_timing"],
                     "robust_alpha": node["robust_alpha"], "trades": node["trades"],
+                    "sweep_run_id": node.get("sweep_run_id"),
                 })
                 rec["node_id"] = node_id
                 rec["pick"], rec["comment"] = get_pick_comment(conn, node_id)

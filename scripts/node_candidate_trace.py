@@ -54,10 +54,29 @@ def main():
             continue
         for link in links:
             cand = cand_conn.execute(
-                "SELECT id, robust_alpha, trades FROM candidate_nodes WHERE id=?",
+                "SELECT id, robust_alpha, trades, sweep_run_id FROM candidate_nodes WHERE id=?",
                 (link['candidate_node_id'],)).fetchone()
-            cand_desc = (f"id={cand['id']} alpha={cand['robust_alpha']:.1f} trades={cand['trades']}"
-                         if cand else f"id={link['candidate_node_id']} (row not found -- stale reference)")
+            if not cand:
+                cand_desc = f"id={link['candidate_node_id']} (row not found -- stale reference)"
+            else:
+                cand_desc = f"id={cand['id']} alpha={cand['robust_alpha']:.1f} trades={cand['trades']}"
+                # sweep_run_id (2026-08-11): NULL for any candidate registered
+                # before this column existed, or sourced from a pre-existing
+                # backtest_cache row computed before sweep_run_id was stamped --
+                # both real, expected gaps, not a bug -- see run_optimization_
+                # sweep.py's init_idempotent_db "no backfill" note.
+                if cand['sweep_run_id'] is not None:
+                    run = cand_conn.execute(
+                        "SELECT started_at, git_commit, kernel_dirty FROM sweep_runs WHERE id=?",
+                        (cand['sweep_run_id'],)).fetchone()
+                    if run:
+                        commit_short = (run['git_commit'] or '?')[:8]
+                        dirty_flag = ' DIRTY' if run['kernel_dirty'] else ''
+                        cand_desc += f"  [sweep_run={cand['sweep_run_id']} {run['started_at']} @{commit_short}{dirty_flag}]"
+                    else:
+                        cand_desc += f"  [sweep_run={cand['sweep_run_id']} (row not found)]"
+                else:
+                    cand_desc += "  [no sweep_run recorded]"
             print(f"{n['ticker']:7} {n['account'] or '-':10} {n['state']:8} {n['id']:>6}  "
                   f"[{link['role']}] {cand_desc}  (linked {link['linked_at']})")
     print(f"\n{shown} node(s) shown, {sum(1 for n in nodes if n['id'] not in links_by_wl)} of "

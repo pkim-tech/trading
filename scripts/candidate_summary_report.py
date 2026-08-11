@@ -166,7 +166,7 @@ def load_ticker_df(conn, ticker, version, strategy):
         SELECT ticker, COALESCE(take_profit, arm_sell_pct) AS take_profit, stop_loss, max_hold_hours, window,
                z_score_threshold, trail_buy_pct, trail_sell_pct, entry_timing,
                alpha_vs_spy, alpha_vs_spy_pessimistic, alpha_vs_spy_certain,
-               strategy_return, trades, win_rate
+               strategy_return, trades, win_rate, sweep_run_id
         FROM backtest_cache
         WHERE ticker=? AND version=? AND strategy=? AND trades>0
     """, conn, params=(ticker, version, strategy))
