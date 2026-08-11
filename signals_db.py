@@ -2559,6 +2559,32 @@ def get_open_position_for_account(ticker, account, paper=False):
     return d
 
 
+def get_orphaned_open_position_for_account(ticker, account, paper=False):
+    """Sibling of get_open_position_for_account, scoped to wl_id IS NULL rows
+    only -- a legacy position predating the wl_id migration, or one the
+    backfill couldn't uniquely resolve (see open_position()'s own matching
+    comment). Added 2026-08-10 as a safety-net fallback for check_order's
+    node_id-scoped BUY/SELL guards: get_open_position_by_wl_id(node_id) can't
+    see an orphaned row (it has no wl_id to match), and returning None there
+    must not be read as "this ticker+account is genuinely flat" -- real
+    capital could still be sitting in an unattributed row. Deliberately does
+    NOT fall back further to any wl_id-tagged row (that would reintroduce the
+    exact sibling-misattribution bug node_id threading was built to fix) --
+    only a truly unattributed position counts here."""
+    positions_table, _ = _pos_tables(paper)
+    with _conn() as c:
+        row = c.execute(
+            f"SELECT * FROM {positions_table} WHERE ticker=? AND account=? AND wl_id IS NULL "
+            f"ORDER BY entry_time DESC LIMIT 1",
+            (ticker, account)
+        ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d['trail_state'] = json.loads(d['trail_state']) if d.get('trail_state') else {}
+    return d
+
+
 def get_open_position_by_wl_id(wl_id, paper=False):
     """wl_id-keyed sibling of get_open_position() -- use this at any call site
     that already has a specific node's id in scope, since ticker alone is

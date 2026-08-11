@@ -16,3 +16,4 @@ slack_bolt
 schwab-py
 pandas_market_calendars
 hypothesis  # property-based testing, added 2026-07-31 for paper_trading's fill/abandon ordering
+pytest-xdist  # parallel test runs (-n auto), added 2026-08-10 -- cut the suite from ~15.5min to ~5min

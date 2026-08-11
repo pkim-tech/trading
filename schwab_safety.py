@@ -907,6 +907,24 @@ def check_order(
         raise SafetyViolation(f"account '{account}' is disabled in the allowlist")
     _mode = "dry_run" if not limits.trading_enabled else "live"
     if node_id is not None:
+        # Verified, not trusted from the caller (Opus review, 2026-08-10,
+        # MEDIUM): the old ticker+account derivation guaranteed the resolved
+        # node actually belonged to this (ticker, account) pair; a bare
+        # node_id doesn't. A caller passing a moved/sibling/stale node's id
+        # would otherwise silently apply the WRONG node's automation-pause
+        # and position-guard state. Fails safe to the old ambiguous
+        # derivation on mismatch rather than raising -- this is a real-money
+        # order-placement gate, not somewhere to introduce a new way to
+        # unexpectedly block a legitimate order over a caller-side bug; the
+        # mismatch itself is still logged so it's visible, not silent.
+        _node_check = signals_db.get_watch_list_node_by_id(node_id)
+        if _node_check and (_node_check.get('ticker') != ticker or _node_check.get('account') != account):
+            signals_db.log_coverage_event(
+                "node_id_ticker_account_mismatch", _mode, ticker=ticker, node_id=node_id, result="fallback",
+                detail=f"node.ticker={_node_check.get('ticker')!r} node.account={_node_check.get('account')!r} "
+                       f"vs call ticker={ticker!r} account={account!r}")
+            node_id = None
+    if node_id is not None:
         _node_id = node_id
     else:
         # Fallback for callers that haven't threaded a real node_id through
@@ -964,8 +982,23 @@ def check_order(
         )
 
     if side == "BUY":
-        _local_pos = (signals_db.get_open_position_by_wl_id(node_id) if node_id is not None
-                      else signals_db.get_open_position_for_account(ticker, account))
+        if node_id is not None:
+            # Paired Opus review, 2026-08-10 (HIGH, confirmed): a bare
+            # get_open_position_by_wl_id(node_id) misses any position whose
+            # wl_id doesn't match -- a legacy/unbackfilled wl_id IS NULL row
+            # (open_position()'s own docstring documents these exist) or a
+            # node recreated under a new id while its position stayed open
+            # under the old one. Both would make this guard fail OPEN (a
+            # second real BUY approved against real, untracked capital) --
+            # the exact double-buy gap the 2026-08-02 existing-position guard
+            # was built to close in the first place. Falls back to the
+            # orphaned-only lookup (never a sibling's wl_id-tagged row --
+            # that would reintroduce the misattribution this fix exists to
+            # prevent) so an unattributed real position still blocks.
+            _local_pos = (signals_db.get_open_position_by_wl_id(node_id)
+                          or signals_db.get_orphaned_open_position_for_account(ticker, account))
+        else:
+            _local_pos = signals_db.get_open_position_for_account(ticker, account)
         _log_pre_action_state_verification(
             account, ticker, _node_id, _mode, "BUY",
             _local_pos['shares'] if _local_pos else None)
@@ -1136,8 +1169,15 @@ def check_order(
     # not account-wide like the BUY guard: an unrelated resting BUY for this
     # ticker must not block closing a position.
     if side == "SELL":
-        _presell_pos = (signals_db.get_open_position_by_wl_id(node_id) if node_id is not None
-                        else signals_db.get_open_position_for_account(ticker, account))
+        if node_id is not None:
+            # Mirror of the BUY-side fallback above -- without it, a real
+            # exit for an orphaned/unbackfilled position would fail CLOSED
+            # (SafetyViolation, "no open position on file") instead of
+            # finding it and letting the exit through.
+            _presell_pos = (signals_db.get_open_position_by_wl_id(node_id)
+                            or signals_db.get_orphaned_open_position_for_account(ticker, account))
+        else:
+            _presell_pos = signals_db.get_open_position_for_account(ticker, account)
         _log_pre_action_state_verification(
             account, ticker, _node_id, _mode, "SELL",
             _presell_pos['shares'] if _presell_pos else None)

@@ -331,6 +331,12 @@ def test_node_level_automation_pause_no_op_for_ambiguous_sibling_same_account(en
     node_a = _get_node()
     signals_db.add_node(TICKER, 'ZScoreBreakout', 'test_ambiguous', window=20, take_profit=10,
                          stop_loss=5, max_hold_hours=56, state='live', account='roth')
+    # Confirms the ambiguity this test documents actually exists on this DB
+    # state -- without this, a future fixture change that accidentally makes
+    # the two nodes resolvable would let this test silently degrade to the
+    # already-covered unambiguous-sibling case above while still passing
+    # (found by Opus review, 2026-08-10).
+    assert signals_db.get_watch_list_node(ticker=TICKER, account='roth') is None
     schwab_safety.pause_node_automation(node_a['id'], reason="test pause")
     result = schwab_client.place_equity_buy('roth', TICKER, 5, 50.0)
     assert result == (None, None)  # not blocked -- the pause is a no-op here (known limitation)
@@ -359,6 +365,23 @@ def test_node_id_resolves_ambiguous_sibling_same_account(env):
 
     # And node_a's own pause must still take effect for node_a itself.
     with pytest.raises(schwab_safety.SafetyViolation, match="automation paused"):
+        schwab_client.place_equity_buy('roth', TICKER, 5, 50.0, node_id=node_a['id'])
+
+
+def test_node_id_scoped_buy_guard_still_catches_orphaned_wl_id_null_position(env):
+    # Opus review finding, 2026-08-10 (HIGH, confirmed): get_open_position_by_
+    # wl_id(node_id) alone would miss a legacy/unbackfilled position whose
+    # wl_id is NULL (signals_db.open_position()'s own docstring documents
+    # these can exist), silently letting a second real BUY through against
+    # real, untracked capital -- exactly the double-buy gap the 2026-08-02
+    # existing-position guard exists to close. check_order must fall back to
+    # get_orphaned_open_position_for_account and still block.
+    _seed_position(shares=10)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET wl_id=NULL WHERE ticker=?", (TICKER,))
+        c.commit()
+    node_a = _get_node()  # account='roth' per env's setup; wl_id-null position is also 'roth'
+    with pytest.raises(schwab_safety.SafetyViolation, match="already has an open position"):
         schwab_client.place_equity_buy('roth', TICKER, 5, 50.0, node_id=node_a['id'])
 
 

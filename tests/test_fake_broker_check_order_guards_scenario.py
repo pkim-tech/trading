@@ -213,3 +213,47 @@ def test_node_id_disambiguates_same_ticker_account_siblings(env, fake_broker):
     r, oid = schwab_client.place_equity_buy('soxl_ira', TICKER, 50, 10.0, node_id=node_b['id'])
     assert oid is not None, "node_b's real order must go through -- node_a's pause must not leak onto it"
     assert len(_real_placed_orders(fake_broker, TICKER)) == 1
+
+
+def test_existing_position_guard_scoped_to_node_not_ticker_account(env, fake_broker):
+    # Companion to the pause-scoping test above -- proves the SAME node_id
+    # disambiguation also scopes the BUY existing-position guard correctly
+    # (schwab_safety.check_order's _local_pos lookup), the higher-consequence
+    # half per both paired-review passes 2026-08-10: pre-fix, node_b's
+    # genuine first real entry would have been wrongly blocked as a
+    # duplicate by node_a's real, unrelated open position -- exactly the
+    # shape AGQ/brokerage will hit once that account goes live (node 193's
+    # dry_run/is_dry_run_sim position sitting alongside node 203's real
+    # first entry).
+    signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test_sib_a2', window=10, take_profit=16.0,
+                         stop_loss=1, max_hold_hours=105, state='live',
+                         trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
+                         account='soxl_ira', starting_notional=5000)
+    signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test_sib_b2', window=10, take_profit=16.0,
+                         stop_loss=1, max_hold_hours=105, state='live',
+                         trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0,
+                         account='soxl_ira', starting_notional=5000)
+    node_a = signals_db.get_watch_list_node(ticker=TICKER, account='soxl_ira', version='test_sib_a2')
+    node_b = signals_db.get_watch_list_node(ticker=TICKER, account='soxl_ira', version='test_sib_b2')
+    assert node_a['id'] != node_b['id']
+
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+
+    # node_a opens a real position first (its own resting BUY fills immediately
+    # against fake_broker's default behavior).
+    r, oid_a = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0, node_id=node_a['id'])
+    assert oid_a is not None
+    signals_db.open_position(node_a, signal_price=10.0, signal_time=datetime.now(),
+                              entry_price=10.0, entry_time=datetime.now(), shares=10)
+
+    # node_b's own genuine first entry must still go through -- must NOT be
+    # blocked as a duplicate of node_a's real, unrelated position.
+    r2, oid_b = schwab_client.place_equity_buy('soxl_ira', TICKER, 20, 10.0, node_id=node_b['id'])
+    assert oid_b is not None, "node_b's real first entry must not be blocked by node_a's unrelated position"
+
+    # And node_a's OWN second BUY attempt must still be correctly blocked as
+    # a genuine duplicate against its own position (the guard must still work
+    # in the positive direction, not just stop false-blocking).
+    with pytest.raises(schwab_safety.SafetyViolation, match="already has an open position"):
+        schwab_client.place_equity_buy('soxl_ira', TICKER, 15, 10.0, node_id=node_a['id'])

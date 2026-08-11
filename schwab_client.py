@@ -256,12 +256,12 @@ def _place_equity_order(
             node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED {side} {quantity} {ticker} in {account}: {e}")
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
     _label = "ADD-ON " if is_addon_leg else ""
     if dry_run:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
         _post_message(f"[DRY RUN] would {_label}{side} {quantity} {ticker} in {account} (~${quantity * price:,.0f})")
         print(f"[DRY RUN] would {_label}{side} {quantity} {ticker} in {account} (~${quantity * price:,.0f})")
         return None, None
@@ -275,9 +275,9 @@ def _place_equity_order(
             side, account_hash, order_id, ticker, account,
             f"✅ {_label}{side} {quantity} {ticker} in {account} submitted to Schwab (~${quantity * price:,.0f})")
     except Exception:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
-    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
     return r, order_id
 
 
@@ -311,11 +311,11 @@ def replace_equity_order_with_market(
             node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with MARKET {side} {quantity} {ticker} in {account}: {e}")
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
     if dry_run:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
         msg = (f"[DRY RUN] would replace order {order_id} with MARKET {side} {quantity} {ticker} "
                f"in {account} (~${quantity * price:,.0f})")
         _post_message(msg)
@@ -332,9 +332,9 @@ def replace_equity_order_with_market(
             f"✅ Replaced order {order_id} with MARKET {side} {quantity} {ticker} in {account} "
             f"(~${quantity * price:,.0f})")
     except Exception:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
-    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
     return r, new_order_id
 
 
@@ -386,11 +386,11 @@ def _place_trailing_order(
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED {label} {quantity} {ticker} in {account} "
                       f"(trail={trail_pct}%): {e}")
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
     if dry_run:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
         msg = (f"[DRY RUN] would place {label} {quantity} {ticker} in {account} "
                f"(trail={trail_pct}%, ~${quantity * price:,.0f})")
         _post_message(msg)
@@ -407,9 +407,9 @@ def _place_trailing_order(
             f"✅ {label} {quantity} {ticker} in {account} submitted to Schwab "
             f"(trail={trail_pct}%, ~${quantity * price:,.0f})")
     except Exception:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
-    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
     return r, order_id
 
 
@@ -428,11 +428,11 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with TRAILING SELL {quantity} {ticker} "
                       f"in {account} (trail={trail_pct}%): {e}")
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
     if dry_run:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
         msg = (f"[DRY RUN] would replace order {order_id} with TRAILING SELL {quantity} {ticker} "
                f"in {account} (trail={trail_pct}%, ~${quantity * price:,.0f})")
         _post_message(msg)
@@ -449,9 +449,9 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
             f"✅ Replaced order {order_id} with TRAILING SELL {quantity} {ticker} in {account} "
             f"(trail={trail_pct}%, ~${quantity * price:,.0f})")
     except Exception:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
-    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
     return r, new_order_id
 
 
@@ -634,11 +634,11 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float,
             node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.4f}: {e}")
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
     if dry_run:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
         msg = f"[DRY RUN] would place STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.4f}"
         _post_message(msg)
         print(msg)
@@ -663,9 +663,9 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float,
             "STOP LOSS", account_hash, order_id, ticker, account,
             f"✅ STOP LOSS {quantity} {ticker} in {account} submitted to Schwab @ ${stop_price:.2f}")
     except Exception:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
-    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
     return r, order_id
 
 
@@ -692,11 +692,11 @@ def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quant
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with STOP LOSS {quantity} {ticker} "
                       f"in {account} @ ${stop_price:.4f}: {e}")
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
     if dry_run:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
         msg = (f"[DRY RUN] would replace order {order_id} with STOP LOSS {quantity} {ticker} "
                f"in {account} @ ${stop_price:.4f}")
         _post_message(msg)
@@ -719,9 +719,9 @@ def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quant
             "REPLACE->STOP LOSS", account_hash, new_order_id, ticker, account,
             f"✅ Replaced order {order_id} with STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.2f}")
     except Exception:
-        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True)
+        schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
-    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False)
+    schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
     return r, new_order_id
 
 

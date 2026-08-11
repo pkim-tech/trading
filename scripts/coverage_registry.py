@@ -508,11 +508,17 @@ REGISTRY = [
          scenario="Node-level automation pause blocks real orders for just that node, not sibling nodes "
                   "on the same ticker",
          code_path="schwab_safety.pause_node_automation, node_automation_enabled",
-         offline_coverage="None yet",
+         offline_coverage="tests/test_schwab_safety.py: test_node_id_resolves_ambiguous_sibling_same_account; "
+                           "tests/test_fake_broker_check_order_guards_scenario.py: "
+                           "test_node_id_disambiguates_same_ticker_account_siblings",
          check_mechanism='coverage_events', scenario_key='node_level_automation_pause',
          notes="Instrumented 2026-07-28 (blocked branch only). No Slack button wired to it yet "
-               "(console/script-only). Known limitation: fuzzy node lookup fails open (not closed) for "
-               "2 nodes sharing both ticker AND account."),
+               "(console/script-only). Fuzzy-node-lookup fail-open for 2 nodes sharing both ticker AND "
+               "account was a known limitation until 2026-08-10 -- fixed via node_id threaded through "
+               "schwab_client's 8 order-placement functions -> approve_and_record -> check_order; every "
+               "real production call site now passes node_id, so the fuzzy ticker+account lookup is only "
+               "a fallback for a caller that doesn't (none remain). See docs/deep_backlog.md's 2026-08-10 "
+               "entry."),
     dict(id='oversell_guard_correct_position',
          scenario="check_order's oversell guard resolves the right position when 2 live nodes share a "
                   "ticker in different accounts",
