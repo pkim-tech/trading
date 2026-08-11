@@ -454,11 +454,15 @@ REGISTRY = [
                "not that the real poll-reconfirm path ran (the same sl_placement/top_up blocked-vs-"
                "succeeded conflation this registry was built to catch)."),
     dict(id='same_day_block',
-         scenario="same_day_block skips correctly for margin accounts, still blocks cash accounts",
-         code_path="schwab_safety.check_order (AccountLimits.account_type)",
-         offline_coverage="2 unit tests (test_schwab_safety.py)",
+         scenario="same_day_block skips correctly for margin accounts unless a node opts in via "
+                  "watch_list.force_same_day_block, still blocks cash accounts unconditionally",
+         code_path="schwab_safety.check_order (AccountLimits.account_type, watch_list.force_same_day_block)",
+         offline_coverage="3 unit/fake_broker tests (test_schwab_safety.py, "
+                           "test_fake_broker_check_order_guards_phase2_scenario.py)",
          check_mechanism='coverage_events', scenario_key='same_day_block',
-         notes="No real same-day re-buy has ever been attempted live in either account type."),
+         notes="No real same-day re-buy has ever been attempted live in either account type. "
+               "force_same_day_block (2026-08-11, per-node opt-in) is unset on every real node "
+               "today -- built but not yet turned on anywhere."),
     dict(id='manual_buy_confirmation_account',
          scenario="Manual BUY confirmation (Executed/Filled/Manual Open) opens a position with the real "
                   "account, not NULL",

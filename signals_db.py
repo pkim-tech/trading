@@ -402,6 +402,17 @@ def ensure_tables():
             if _had_dry_run_col:
                 c.execute("ALTER TABLE watch_list DROP COLUMN dry_run")
 
+        if 'force_same_day_block' not in wl_cols:
+            # Per-ticker (node-level, not account-level) opt-in override, 2026-08-11:
+            # schwab_safety.check_order's same_day_block guard normally exempts
+            # margin accounts entirely (no real cash-settlement constraint to
+            # protect there) -- this lets the user apply the same same-day-rebuy
+            # discipline to a SPECIFIC node anyway, regardless of its account's
+            # account_type. Not a settlement-risk finding for margin; purely the
+            # user's own choice. Default 0 -- no live behavior change for any
+            # existing node until set explicitly per node.
+            c.execute("ALTER TABLE watch_list ADD COLUMN force_same_day_block INTEGER NOT NULL DEFAULT 0")
+
         # account wasn't part of the original UNIQUE constraint -- found 2026-07-26 while
         # adding a second real DPST node in a different account: two nodes with identical
         # strategy params but different accounts are genuinely distinct (the whole point of
@@ -465,6 +476,7 @@ def ensure_tables():
                     skim_alert_100_sent INTEGER NOT NULL DEFAULT 0,
                     skim_strategy_value REAL,
                     skim_last_mark_time TEXT,
+                    force_same_day_block INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account)
@@ -537,6 +549,7 @@ def ensure_tables():
                     skim_alert_100_sent INTEGER NOT NULL DEFAULT 0,
                     skim_strategy_value REAL,
                     skim_last_mark_time TEXT,
+                    force_same_day_block INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account, paper_role)
@@ -2060,6 +2073,25 @@ def annotate_node(watch_id, annotation):
         if row:
             _log_audit(c, 'annotate_node', watchlist_id=row['watchlist_id'], watch_id=watch_id,
                        ticker=row['ticker'], detail=annotation)
+        c.commit()
+
+
+def set_force_same_day_block(watch_id, enabled):
+    """Per-node (per-ticker) opt-in override, 2026-08-11: applies schwab_
+    safety.check_order's same_day_block guard even on a margin-account node,
+    which is normally exempt (no real cash-settlement constraint to
+    protect). Not a settlement-risk fix -- purely the user's own choice to
+    apply the same same-day-rebuy discipline to this specific node."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, force_same_day_block FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"set_force_same_day_block: no watch_list row with id={watch_id}")
+        c.execute("UPDATE watch_list SET force_same_day_block = ? WHERE id = ?",
+                   (1 if enabled else 0, watch_id))
+        _log_audit(c, 'set_force_same_day_block', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                   ticker=row['ticker'], detail=f"{bool(row['force_same_day_block'])} -> {bool(enabled)}")
         c.commit()
 
 

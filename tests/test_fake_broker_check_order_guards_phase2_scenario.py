@@ -465,6 +465,104 @@ def test_same_day_block_margin_account_allowed(env, fake_broker):
         "same_day_block should log 'skipped_margin_account' for margin account"
 
 
+def test_same_day_block_margin_account_force_override_blocked(env, fake_broker):
+    """same_day_block: a node's own force_same_day_block=True applies the
+    block even though its account is 'margin' (2026-08-11, user's own
+    per-TICKER opt-in choice, not a settlement finding for margin) -- same
+    fixture shape as the margin-allowed test above, just with this specific
+    node's flag set via the real setter, not an account-level override."""
+    node = _add_node(TICKER, 'soxl_ira', notional=50_000)  # soxl_ira is 'margin'
+    signals_db.set_force_same_day_block(node['id'], True)
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    with signals_db._conn() as c:
+        c.execute("""
+            INSERT INTO trade_log
+                (ticker, strategy, version, window, stop_loss, max_hold_hours, signal_price, signal_time,
+                 entry_price, entry_time, entry_drift_pct, exit_price, exit_time, exit_reason, account)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            TICKER, 'TrailingBothZScoreBreakout', 'test', 10, 1, 105,
+            10.0, f"{today} 10:30:00",
+            10.0, f"{today} 10:31:00",
+            0.0,  # entry_drift_pct
+            10.5, f"{today} 14:30:00",  # exit today
+            "TRAIL",
+            'soxl_ira',
+        ))
+        c.commit()
+
+    with pytest.raises(schwab_safety.SafetyViolation, match="same-day"):
+        schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
+
+    events = signals_db.get_coverage_events(scenario_key='same_day_block')
+    assert any(e['ticker'] == TICKER and e['result'] == 'blocked' for e in events), \
+        "same_day_block should log 'blocked' for a margin account with force_same_day_block=True"
+
+
+def test_same_day_block_margin_account_force_override_no_false_block_when_not_closed_today(env, fake_broker):
+    """force_same_day_block=True must not block a BUY when the ticker was NOT
+    actually sold today -- the flag only widens WHICH accounts the guard
+    applies to, it doesn't change the underlying closed_today(ticker)
+    trigger condition. No trade_log row seeded here at all."""
+    node = _add_node(TICKER, 'soxl_ira', notional=50_000)
+    signals_db.set_force_same_day_block(node['id'], True)
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+
+    r, oid = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
+    assert oid is not None, "no same-day close on record -- BUY should go through despite the override"
+
+    events = signals_db.get_coverage_events(scenario_key='same_day_block')
+    assert not any(e['ticker'] == TICKER for e in events), \
+        "same_day_block shouldn't even fire when the ticker wasn't closed today"
+
+
+def test_same_day_block_force_override_does_not_block_protective_topup(env, fake_broker):
+    """CRITICAL fix from the 2026-08-11 session-wrap cold Opus review: the
+    same_day_block section (including force_same_day_block) used to run
+    UNCONDITIONALLY ahead of the is_protective/is_addon_leg exemptions
+    (which only covered the separate duplicate-open-position guard further
+    down) -- so a sanctioned post-fill top-up BUY (is_protective=True, e.g.
+    the real, live-proven post_fill_topup mechanism) on a node with
+    force_same_day_block=True and a same-day exit on record would have been
+    wrongly rejected as an ordinary re-buy. Since both live-enabled accounts
+    (ira, soxl_ira) are margin, this override is the only way same_day_block
+    can ever fire on real capital -- this must not block a protective call."""
+    node = _add_node(TICKER, 'soxl_ira', notional=50_000)
+    signals_db.set_force_same_day_block(node['id'], True)
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    with signals_db._conn() as c:
+        c.execute("""
+            INSERT INTO trade_log
+                (ticker, strategy, version, window, stop_loss, max_hold_hours, signal_price, signal_time,
+                 entry_price, entry_time, entry_drift_pct, exit_price, exit_time, exit_reason, account)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            TICKER, 'TrailingBothZScoreBreakout', 'test', 10, 1, 105,
+            10.0, f"{today} 10:30:00",
+            10.0, f"{today} 10:31:00",
+            0.0,  # entry_drift_pct
+            10.5, f"{today} 14:30:00",  # exit today
+            "TRAIL",
+            'soxl_ira',
+        ))
+        c.commit()
+
+    # Ordinary BUY still blocked (sanity check the flag is really on)...
+    with pytest.raises(schwab_safety.SafetyViolation, match="same-day"):
+        schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
+
+    # ...but a protective top-up call must go through despite the same-day close.
+    r, oid = schwab_client.place_equity_buy('soxl_ira', TICKER, 5, 10.0, is_protective=True)
+    assert oid is not None, "is_protective BUY must be exempt from same_day_block/force_same_day_block"
+
+
 # ===========================================================================
 # TEST 5: dup_sell_order_blocked
 # ===========================================================================

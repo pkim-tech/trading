@@ -1734,3 +1734,62 @@ short git commit, DIRTY flag) when one is on file. **No backfill** of either col
 convention as `backtest_cache`'s existing `phase`/`generation` columns — every row/candidate
 registered before 2026-08-11 stays NULL/`[no sweep_run recorded]`; provenance only starts
 accumulating from the next real sweep run forward.
+
+---
+
+## Per-ticker same-day-rebuy block override: `watch_list.force_same_day_block` (2026-08-11)
+
+`schwab_safety.check_order`'s existing `same_day_block` guard (2026-07-15) blocks a BUY on a
+ticker that was sold earlier the same day, but only for `account_type == "cash"` accounts — a
+real T+1 cash-settlement/good-faith-violation risk that margin accounts (regular or limited-
+margin IRA) genuinely don't have, so they're normally exempt. The user asked for the ABILITY to
+apply the same block to a specific ticker even when it lives in a margin account, purely as
+their own choice (not a settlement-risk finding) — explicitly clarified (twice, correcting an
+initial account-level framing) that this must be scoped **per node/ticker, not per account**.
+
+Fix: new `watch_list.force_same_day_block` column (`INTEGER NOT NULL DEFAULT 0`), migrated into
+`ensure_tables()` — added to all 3 places `watch_list`'s schema is defined in that function (the
+main incremental `ALTER TABLE` ladder, plus both hardcoded `CREATE TABLE watch_list_new` rebuild
+blocks for the older account-uniqueness and paper_role-uniqueness migrations, which use a
+dynamic `PRAGMA table_info`-derived column list for their `INSERT...SELECT` but a hardcoded
+column list for the `CREATE TABLE` itself — missing the new column from either rebuild would
+silently drop it on any DB still needing that migration path, e.g. a fresh test DB). New
+`signals_db.set_force_same_day_block(watch_id, enabled)` setter, audit-logged via
+`watch_list_audit`, same convention as `set_starting_notional`/`set_drought_config`.
+`check_order`'s `same_day_block` section now re-fetches the resolved node fresh via
+`get_watch_list_node_by_id(_node_id)` (not reused from earlier in the function) and blocks when
+`account_type == "cash" OR node.force_same_day_block` — the flag only WIDENS which accounts the
+guard applies to, it doesn't change the underlying `closed_today(ticker)` trigger, so a node with
+the flag set still isn't blocked on a day it wasn't actually sold. Default 0 for every node —
+zero live behavior change; not yet enabled on any real node (user's call, 2026-08-11: build it,
+decide who gets it later). Migration verified against the real 2.1G `trading_live.db` (row count
+preserved, `PRAGMA integrity_check` ok) and a truly fresh DB (all 3 schema paths exercised).
+
+**Session-wrap paired review (independent-cold + contextual, both Opus) found real issues in the
+first version, most serious fixed before shipping**: the entire `same_day_block` section
+(including the new override) ran UNCONDITIONALLY ahead of `check_order`'s `is_protective`/
+`is_addon_leg` exemptions, which only ever covered the separate duplicate-open-position guard
+further down — so a sanctioned post-fill top-up (`is_protective=True`, e.g. `post_fill_topup`,
+real-live-proven 2026-08-10 on RETL/`soxl_ira`) or a real add-on leg BUY landing on a same-day-
+exit day would have been wrongly rejected as an ordinary re-buy. This gap already existed for
+cash accounts but was never reachable (no cash account has ever been `trading_enabled`) —
+`force_same_day_block` made it reachable for the first time on real capital, since both live
+accounts (`ira`, `soxl_ira`) are margin and this override is the only way `same_day_block` can
+ever fire on them. **Fixed**: the whole section now short-circuits on `is_protective`/
+`is_addon_leg`, with a new regression test (`test_same_day_block_force_override_does_not_block_
+protective_topup`) proving a protective call goes through even with the flag on and a same-day
+close on record. Also fixed: the exception message for the override case previously implied the
+same-day close was this node's own trade — corrected to note the underlying trigger
+(`closed_today(ticker)`) is ticker-global, same as the pre-existing cash-account behavior, not
+scoped to which account/node actually closed the position (a deliberate reuse of the existing
+trigger, confirmed against the user's explicit "not talking about same ticker across multiple
+accounts" framing — not a new gap, just a messaging fix). **Deferred, not fixed this session**
+(tracked in `docs/backlog_cache.md`): `get_or_create_candidate_node`'s early-return can leave a
+re-registered candidate with a stale `sweep_run_id` from an earlier sweep run if the same param
+tuple wins again under different kernel code; `force_same_day_block` has no CLI/report/
+`seed_baseline_config.py` surface yet (Python-API-only, matches "not yet enabled anywhere" — real
+gap once it IS enabled); `kernel_dirty` only checks `backtester.py`/`strategies.py`, not
+`run_optimization_sweep.py` itself or `config.json`; node-resolution failure inside the
+same_day_block section fails open silently (logs `skipped_margin_account`, indistinguishable from
+a legitimate exemption) — same accepted-limitation shape as `node_automation_enabled(None)`
+elsewhere in this function, not tightened further this session.

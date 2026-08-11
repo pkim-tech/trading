@@ -198,3 +198,42 @@ def test_set_drought_config_writes_audit_row(isolated_db):
     audit = db.get_watchlist_audit()
     matching = [a for a in audit if a['action'] == 'set_drought_config' and a['watch_id'] == node['id']]
     assert len(matching) == 1
+
+
+# ---------------------------------------------------------------------------
+# set_force_same_day_block (2026-08-11) -- per-node opt-in override of
+# schwab_safety.check_order's same_day_block guard, so a specific ticker can
+# get the block even on a margin-account node (normally exempt). The actual
+# BUY-blocking behavior is covered by tests/test_fake_broker_check_order_
+# guards_phase2_scenario.py; these are the setter-level unit tests, same
+# convention as set_drought_config above.
+# ---------------------------------------------------------------------------
+
+def test_set_force_same_day_block_defaults_off(isolated_db):
+    node = _node()
+    assert node['force_same_day_block'] == 0
+
+
+def test_set_force_same_day_block_enables_and_disables(isolated_db):
+    node = _node()
+    db.set_force_same_day_block(node['id'], True)
+    updated = [n for n in db.get_watchlist() if n['id'] == node['id']][0]
+    assert updated['force_same_day_block'] == 1
+
+    db.set_force_same_day_block(node['id'], False)
+    updated = [n for n in db.get_watchlist() if n['id'] == node['id']][0]
+    assert updated['force_same_day_block'] == 0
+
+
+def test_set_force_same_day_block_rejects_nonexistent_wl_id(isolated_db):
+    with pytest.raises(ValueError, match="no watch_list row"):
+        db.set_force_same_day_block(999999, True)
+
+
+def test_set_force_same_day_block_writes_audit_row(isolated_db):
+    node = _node()
+    db.set_force_same_day_block(node['id'], True)
+    audit = db.get_watchlist_audit()
+    matching = [a for a in audit if a['action'] == 'set_force_same_day_block' and a['watch_id'] == node['id']]
+    assert len(matching) == 1
+    assert matching[0]['detail'] == 'False -> True'

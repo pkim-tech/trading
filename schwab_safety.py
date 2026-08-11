@@ -966,20 +966,56 @@ def check_order(
     # direction (a soft employer recommendation, not enforced, deliberately
     # left out). Margin accounts (regular or IRA limited margin) don't have
     # this settlement restriction (2026-07-20 finding, resolved 2026-07-22)
-    # -- skip for them.
-    if side == "BUY" and limits.account_type == "cash" and signals_db.closed_today(ticker):
-        signals_db.log_coverage_event(
-            "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="blocked",
-            detail=f"account={account} account_type={limits.account_type}"
-        )
-        raise SafetyViolation(
-            f"'{ticker}' was sold today -- same-day re-buy risks a cash-account good-faith violation"
-        )
-    elif side == "BUY" and limits.account_type == "margin" and signals_db.closed_today(ticker):
-        signals_db.log_coverage_event(
-            "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="skipped_margin_account",
-            detail=f"account={account} account_type={limits.account_type}"
-        )
+    # -- skip for them, UNLESS the node itself opts in via watch_list.
+    # force_same_day_block (2026-08-11: per-TICKER, not per-account -- the
+    # user's own choice to apply the same discipline to a specific node,
+    # regardless of account_type; not a settlement-risk finding for margin).
+    # The TRIGGER (signals_db.closed_today(ticker)) is ticker-global, same as
+    # the pre-existing cash-account behavior -- it does NOT scope to which
+    # account/node actually closed the position. So a node with the flag set
+    # can be blocked by a same-day exit that happened in a DIFFERENT account
+    # entirely (both reviewers flagged this, 2026-08-11 session-wrap review).
+    # This is a deliberate reuse of the existing trigger, not a new gap --
+    # confirmed against the user, who was explicit that cross-account same-
+    # ticker scoping is out of scope for this feature -- but the exception
+    # message below says which node is affected, not implying the CLOSE
+    # itself was that node's own trade.
+    #
+    # is_protective/is_addon_leg BUYs are exempt from this entire section
+    # (found by cold Opus review before force_same_day_block shipped, 2026-
+    # 08-11): this check ran unconditionally ahead of the is_protective/
+    # is_addon_leg exemptions further down in the `side == "BUY"` block
+    # below, which only cover the duplicate-open-position guard, not this
+    # one. A sanctioned post-fill top-up (is_protective=True -- e.g.
+    # post_fill_topup, real-live-proven 2026-08-10 on RETL/soxl_ira) or a
+    # real add-on leg BUY landing on a day this ticker also had a same-day
+    # exit would have been wrongly rejected as an ordinary re-buy. This was
+    # already latent for cash accounts (never reachable -- no cash account
+    # has ever been trading_enabled); force_same_day_block makes it reachable
+    # for the first time, on real capital, since both live-enabled accounts
+    # (ira, soxl_ira) are margin and this override is the only way
+    # same_day_block can ever fire on them.
+    if side == "BUY" and not is_protective and not is_addon_leg:
+        # Re-fetched fresh here (not reused from the node_id-resolution block
+        # above, which only keeps _node_id, not the full row) -- same
+        # re-read-before-trusting convention as the rest of this function.
+        _node_for_same_day = signals_db.get_watch_list_node_by_id(_node_id) if _node_id is not None else None
+        _force_same_day_block = bool(_node_for_same_day and _node_for_same_day.get('force_same_day_block'))
+        if signals_db.closed_today(ticker) and (limits.account_type == "cash" or _force_same_day_block):
+            signals_db.log_coverage_event(
+                "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="blocked",
+                detail=f"account={account} account_type={limits.account_type} "
+                       f"force_same_day_block={_force_same_day_block}"
+            )
+            reason = ("same-day re-buy risks a cash-account good-faith violation" if limits.account_type == "cash"
+                       else f"node id={_node_id!r}'s force_same_day_block is set -- the same-day close may have "
+                            f"happened in a different account for this ticker, not necessarily this node's own")
+            raise SafetyViolation(f"'{ticker}' was sold today (some account) -- {reason}")
+        elif limits.account_type == "margin" and signals_db.closed_today(ticker):
+            signals_db.log_coverage_event(
+                "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="skipped_margin_account",
+                detail=f"account={account} account_type={limits.account_type}"
+            )
 
     if side == "BUY":
         if node_id is not None:
