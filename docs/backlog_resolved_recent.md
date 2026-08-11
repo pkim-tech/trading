@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][security] Resolved 2026-08-11 — LABD retired after a real `_last_sale_recovery` basis-lock (permanent 0-share sizing); the "buried scenario prose in a baseline_config row" gap that hid it fixed and swept (none else found); STALE-banner wording corrected to "pause, keep as regression fixture" not "revert/remove". Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved 2026-08-11 — sweep-campaign-level provenance built: `sweep_runs` gained `git_commit`/`kernel_dirty`, `backtest_cache`/`candidate_nodes` gained nullable `sweep_run_id` (no backfill), threaded through the sweep engine and the real candidate-selection reporting path; `node_candidate_trace.py` now shows it. Full detail: `deep_backlog.md`.
 ## [testing] Resolved 2026-08-11 — the "2 flaky datetime tests" backlog item was misdiagnosed; real cause was an unscoped pytest-xdist file race (`--dist=loadscope` fix), 6-12 failures/run before, 0 after across repeated verification. Full detail: `deep_backlog.md`.
 ## [live-trading] Resolved 2026-08-11 — SH's `soxl_ira` `trail_buy_pct` reverted 5%→1% now that `post_fill_topup` has real live proof; HIBL confirmed as candidate 113 (still diverged, link/resync pending); RETL confirmed as candidate 178, user says "kinda in limbo." Full detail: `deep_backlog.md`.
@@ -92,17 +94,4 @@ Was `"next: 10:25 or 14:55 ET"` (stale); now built dynamically (`"next: 10:25 or
 Fixed via `date(signal_time) <= check_date` (a pending_buys row is deleted on resolution, so presence = still resting) and a new `get_pending_buy_by_wl_id` used in `audit_one`. Tests: `tests/test_coverage_check.py`, new `tests/test_audit_live_test_candidates.py`. 3rd bug in the same finding (cosmetic stale status-message time string) still open, see `docs/backlog_cache.md`.
 
 ## [live-trading][security] Resolved 2026-08-04 (very late) — HIBL/USD/YANG had no staged_test_config baseline row (zero config-drift protection since their 2026-08-03 live flip); seeded via scripts/seed_baseline_config.py, confirmed in signals_invariants.py. Added as required check 14 in docs/watchlist_candidate_checklist.md so it happens at promotion time going forward, not caught after the fact.
-
-## [live-trading] Resolved 2026-08-03 — HIBL/USD/YANG flipped research→live with planned notional ($2,500/$1,000/$2,500); soxl_ira notional_cap raised 800→3000 to match
-Caught by `signals_invariants.py` before it could bite live — old $800 cap would've structurally blocked every entry for the resized nodes. Independent Opus review found 2 real follow-on points left open by user's call. Full detail: `docs/deep_backlog.md`'s 2026-08-03 entry.
-
-## [backtest] Resolved 2026-08-03 — SOXS added to real v5 backtest_cache; TrailingExitZScoreBreakout fixed_sl=2 is the cliff-safe winner (73 trades, 11.0% win rate, +113.0% alpha)
-`TrailingBothZScoreBreakout` has no cliff-safe node at any fixed_sl (an earlier mid-sweep read was from an incomplete Phase1-only pass). Full detail: `docs/deep_backlog.md`'s 2026-08-03 entry.
-
-## [backtest] Resolved 2026-08-03 — paired-ticker/idle-capital strategy paradigm refuted with real cross-checked evidence (90-pair matrix, mean~1.0, no consistent edge); framework abandoned
-Individual v5 nodes' own edges unaffected — only the combination mechanism was refuted. Full detail: `docs/research_log.md`'s 2026-08-03 entry, `docs/deep_backlog.md`'s pointer entry.
-
-## [backtest] Resolved 2026-08-03 — FFT cycle detection to inform z-score window selection: negative result
-No significant periodicity found in any of the 10 v5 watchlist tickers' return series (permutation-null p=0.076-0.837, all above 0.05); no correlation with the empirically-chosen `window` (10 vs 20). Full detail: `docs/research_log.md`'s 2026-08-03 entry, `docs/deep_backlog.md`'s pointer entry. The regime-detection half of the original idea is re-opened separately in `docs/backlog_cache.md`.
-
 

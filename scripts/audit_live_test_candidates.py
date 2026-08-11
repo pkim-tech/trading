@@ -143,8 +143,37 @@ def _print_staged_config(node, source):
             print(f"    grid relevance: {r}")
         if all_verified:
             print(f"  \U0001F9F9 STALE? every Grid scenario this staged role exists to prove is already "
-                  f"verified-live -- confirm whether this node's detuned config is still needed, or "
-                  f"revert/remove this staged_test_config row.")
+                  f"verified-live -- confirm whether this node should keep running hot. The staged "
+                  f"config is a reusable regression fixture (see the live-test-node-setup skill's "
+                  f"regression-pass mode) -- pause it from active live duty (state flip) rather than "
+                  f"reverting/deleting its detune, so it can be re-run after future trading-code changes.")
+    elif row['scenario_role'] == 'baseline_config' and _looks_like_buried_scenario(row.get('notes')):
+        # LABD (wl_id=152) sat stuck for ~22h with a real, already-proven test
+        # purpose ("SCENARIO CONTEXT... confirmed live 2026-08-07") written as
+        # free-text prose inside a baseline_config row instead of its own
+        # scenario_role -- invisible to the STALE check above since
+        # scenario_role='baseline_config' is deliberately excluded from
+        # SCENARIO_ROLE_TO_GRID_IDS (found+fixed 2026-08-11). This can't
+        # compute an actual STALE verdict (no scenario_role to look up), so it
+        # just surfaces the mismatch itself: prose claims a real test scenario,
+        # role field says "not a test scenario at all."
+        print(f"  ⚠️  scenario prose found in a baseline_config row -- this staged test "
+              f"purpose isn't tracked by the STALE check above (only scenario_role values in "
+              f"SCENARIO_ROLE_TO_GRID_IDS are). Give it its own scenario_role, or fold the "
+              f"scenario notes back into a properly-mapped row.")
+
+
+def _looks_like_buried_scenario(notes):
+    """Heuristic for the LABD failure shape: a baseline_config row's notes
+    describing a real test scenario (arm/exit mechanics, a live-confirmation
+    claim) instead of just the generic drift-check snapshot boilerplate every
+    other baseline_config row carries. Deliberately loose (substring match,
+    not a structured field) -- false positives just print an extra line for a
+    human to dismiss; a false negative silently recreates the exact bug this
+    check exists to catch."""
+    if not notes:
+        return False
+    return 'SCENARIO CONTEXT' in notes.upper()
 
 
 def audit_one(ticker, wl_id=None):
