@@ -570,6 +570,45 @@ def _close_alone_would_breach_trail(node, p, arm_i, exit_i):
     return False
 
 
+def _daily_track_comparison_terminal(actual_state, backtest_state, grace_ok=True):
+    """Whether a specific backtest-trade comparison (bt_ref) has reached a
+    conclusive verdict, so reconcile_daily_track_nodes' bookmark should
+    advance past it rather than re-checking the same trade again. Added
+    2026-08-10 alongside the bookmark fix; revised same day after a paired
+    Opus review (independent-cold + contextual, with a rebuttal exchange)
+    found the first version wrong on two of its four cases -- see
+    reconcile_daily_track_nodes' docstring for the full false-positive bug
+    this closes and the review history behind this specific boundary.
+
+    Terminal: 'flat' AND grace_ok (a miss's fate is permanent -- daily-track
+    can never retroactively enter a bar that's already in the past -- but
+    ONLY once daily-track has genuinely had its full chance to enter: the
+    grace gate, checked by the caller, requires the trade's signal bar to
+    predate the current session, not just require any calendar day to have
+    passed on the bookmark itself); 'closed' AND backtest_state=='closed'
+    (both sides genuinely done).
+
+    NOT terminal: actual_state=='open' (still in progress on daily-track's
+    side); actual_state=='flat' with grace_ok=False (too soon to conclude a
+    miss -- daily-track may still fire later this same session, off the
+    fully-closed bar); actual_state=='closed' with backtest_state=='open'
+    (exit_early -- daily-track's own side is done, but since only the
+    backtest's LATEST trade can be OPEN, waiting turns this into the real
+    closed/closed exit-bar comparison within a bounded number of nights
+    (max_hold_hours) instead of permanently discarding it -- found by the
+    contextual review to be the one case with zero analysis performed yet,
+    corrected from the first version which wrongly treated 'closed'
+    unconditionally as terminal regardless of the backtest side);
+    actual_state=='open_different_trade' (a genuine unexplained ambiguity --
+    deliberately left pinned so it keeps surfacing rather than silently
+    advancing past an unresolved real gap)."""
+    if actual_state == 'flat':
+        return grace_ok
+    if actual_state == 'closed':
+        return backtest_state == 'closed'
+    return False
+
+
 def reconcile_daily_track_nodes():
     """Nightly reconcile for every paper_role='daily_sync' node (docs/design.md's
     "Two-account paper trading" section) -- PURE OBSERVATION, no state mutation.
@@ -588,8 +627,11 @@ def reconcile_daily_track_nodes():
     signals, forever; this function only classifies and logs, every night, in
     full (db.log_daily_track_reconciliation) -- "logs would be terrible to
     query" (user, 2026-08-05) is why this is a DB table, not print statements.
-    At most one log row per (wl_id, check_date) -- a restart after 16:05
-    re-running this function is a no-op for a node already logged today.
+    At most one log-writing PASS per (wl_id, check_date) -- a restart after
+    16:05 re-running this function is a no-op for a node already reconciled
+    today (see the bookmark-based idempotency check below, not a same-day
+    per-row check -- a single pass can legitimately write multiple rows, see
+    "Bookmark and catch-up" below).
 
     Entries: daily-track's signal check already prices off the closed hourly bar
     (compute_buy_signal, paper_role='daily_sync' branch). Exits: daily-track's
@@ -599,15 +641,74 @@ def reconcile_daily_track_nodes():
     still lands inside some real hourly bar's window, resolved after the fact
     once that bar is cached.
 
-    Comparison is anchored on the BACKTEST's most recent trade (`bt_ref` --
-    open or already closed, whichever `trades[-1]` is), not on daily-track's
-    own most recent activity -- anchoring on daily-track's own history let a
-    stale old trade permanently mask detection of a genuinely new miss once
-    any trade history existed (found by the contextual Opus review). Given
-    `bt_ref`'s signal bar, look for daily-track's OWN record of that SAME
-    trade (its open position, if the open position's signal bar matches; else
-    a closed trade in its history at that same signal bar) -- 'flat' means no
-    record of THIS trade specifically, not "nothing recent."
+    Bookmark and catch-up (added 2026-08-10, revised same day after a paired
+    Opus review + rebuttal exchange): comparison targets the EARLIEST backtest
+    trade after the node's `daily_track_bookmark_signal_bar` (a persisted
+    signal-bar timestamp), NOT always the single latest trade -- the original
+    version of this function always used `trades[-1]`, which is wrong whenever
+    daily-track is still legitimately mid-trade on an EARLIER backtest trade
+    (its own real hold duration differs from the backtest's theoretical one
+    for that same entry -- exactly the timing divergence this tool exists to
+    detect). That bug misclassified every such night as 'ambiguous_position',
+    a false positive, not a real divergence.
+
+    The bookmark only advances past a trade once its comparison reaches a
+    TERMINAL verdict (see _daily_track_comparison_terminal) -- never a
+    position-state mutation, purely tracks which comparison is in progress.
+    Each call processes ONE NODE'S trades in a loop, catching up through
+    every already-resolved trade in a single pass (not one trade per
+    calendar day) -- an earlier version paced catch-up at one trade per day
+    via an incidental interaction with the same-day idempotency guard below,
+    which meant a node with e.g. 130 unreviewed historical trades (measured
+    real case: a node whose backtest replay reaches back to the ticker's
+    2023 cached history) would take ~130 calendar nights to reach anything
+    describing CURRENT state -- found by the contextual review, confirmed by
+    the cold review's independent DB measurement. The same-day check (does a
+    log row for today already exist for this node) is still evaluated ONCE,
+    before the catch-up loop starts, exactly as before -- so a same-day
+    daemon restart still can't double-process a node. What changed is that
+    the loop no longer stops after one trade once it's allowed to run at
+    all; it keeps advancing through every already-terminal trade within that
+    one pass, so a restart mid-catch-up isn't possible (each pass runs to
+    completion or to the first non-terminal trade before returning).
+
+    No bookmark yet means -1 (start from the node's very earliest backtest
+    trade), not a special-cased "assume trades[-1]" -- an earlier draft tried
+    to preserve the old trades[-1] behavior on a node's first run to avoid a
+    disruptive cold catch-up, but that's genuinely indistinguishable from
+    "brand new node, no history to disrupt" (both just read as bookmark=None)
+    and actively reintroduced the same bug it was meant to avoid (caught by a
+    test written against the fix itself). Combined with the single-pass
+    catch-up above, the real cost of starting from -1 is one slower first
+    run (replaying and logging every historical trade once), not a
+    months-long drip.
+
+    `_daily_track_comparison_terminal`'s terminal boundary (see its own
+    docstring) requires a grace check on 'flat' (a missed entry isn't
+    conclusively permanent until the trade's signal bar predates the CURRENT
+    session -- daily-track may still fire later that same session, off the
+    fully-closed bar, per the Open-leg note below) and treats 'closed' with
+    backtest_state=='open' (exit_early) as NOT terminal (waiting a bounded
+    number of nights, capped by max_hold_hours, turns a no-analysis row into
+    the real closed/closed exit-bar comparison -- this tool's actual
+    headline deliverable for exit-side timing divergence). The FIRST version
+    of this fix got both of these wrong (terminal-on-any-'flat' reintroduced
+    the exact ambiguous_position false positive for a narrow but real
+    same-session race; terminal-on-any-'closed' silently discarded the
+    highest-value comparison this function produces) -- caught by the
+    required paired review + rebuttal exchange, not by the original author.
+
+    Given `bt_ref`'s signal bar, look for daily-track's OWN record of that
+    SAME trade (its open position, if the open position's signal bar
+    matches; else a closed trade in its history at that same signal bar) --
+    'flat' means no record of THIS trade specifically, not "nothing recent."
+    When `bt_ref is None` (nothing left after the bookmark), that no longer
+    means "the backtest has no trades at all" the way it did before this
+    bookmark existed -- see the dedicated branch below, which distinguishes
+    "genuinely nothing pending" from "the bookmark already advanced past the
+    backtest's own still-open latest trade, which just hasn't resolved yet"
+    (the latter used to silently collapse to a false 'match' -- maximum real
+    divergence reported as clean -- found by the cold review).
 
     A still-resting paper pending buy (bounce-fill wait phase) is a fourth
     state, not flat/open/closed -- logged separately (action='pending_skip')
@@ -677,9 +778,17 @@ def reconcile_daily_track_nodes():
     from backtester import OPEN
 
     today = datetime.now().strftime('%Y-%m-%d')
+    today_date = datetime.now().date()
     touched = 0
     for node in db.get_watchlist():
-        if node.get('paper_role') != 'daily_sync':
+        # version=='v5' excludes 'v5-overlay-test*' staged combo clones
+        # (2026-08-1x) from this real-node reconcile -- found by the cold
+        # review's rebuttal pass, 2026-08-10: this function was missing the
+        # same version filter its sibling scripts/paper_vs_backtest_reconcile
+        # .get_daily_track_wl_ids already carries (there for the identical
+        # reason -- without it, staged test clones get swept into the same
+        # nightly diagnostic as real v5 daily-track nodes).
+        if node.get('paper_role') != 'daily_sync' or node.get('version') != 'v5':
             continue
         if any(r['check_date'] == today for r in db.get_daily_track_reconciliation_log(node['id'], limit=5)):
             continue  # already reconciled today (e.g. a restart after 16:05)
@@ -707,170 +816,287 @@ def reconcile_daily_track_nodes():
                 actual_state='unknown', backtest_state='unknown', bar_match=False,
                 action='replay_failed', explained_by_price=None, detail=str(e))
             continue
-        bt_ref = trades[-1] if trades else None
-        backtest_state = 'open' if bt_ref and bt_ref['result'] == OPEN else ('closed' if bt_ref else 'flat')
-        target_signal_i = bt_ref['signal_i'] if bt_ref else None
 
-        actual_open = db.get_open_position_by_wl_id(node['id'], paper=True)
-        actual_open_signal_i = (
-            _bar_index_for(df_h, actual_open.get('signal_bar_time') or actual_open['signal_time'])
-            if actual_open else None)
-
-        actual_ref = actual_closed = None
-        if actual_open is not None and target_signal_i is not None and actual_open_signal_i == target_signal_i:
-            actual_ref, actual_state = actual_open, 'open'
-        elif target_signal_i is not None:
-            actual_closed = next(
-                (t for t in db.get_trade_log_for_wl_id(node['id'], paper=True)
-                 if t.get('exit_time')
-                 and _bar_index_for(df_h, t.get('signal_bar_time') or t['signal_time']) == target_signal_i),
-                None)
-            if actual_closed is not None:
-                actual_ref, actual_state = actual_closed, 'closed'
-            elif actual_open is not None:
-                actual_state = 'open_different_trade'
+        # Catch-up loop -- processes every already-terminal trade for this
+        # node in ONE pass (see the function docstring's "Bookmark and
+        # catch-up" section), stopping at the first non-terminal trade or
+        # once there's nothing left after the bookmark. any_logged tracks
+        # whether a real (terminal-trade) row was already written tonight --
+        # the "nothing left after the bookmark" outcome only gets its own
+        # row when it's the WHOLE story for tonight (steady state, nothing
+        # new since last time); appending it after real catch-up rows would
+        # just be a redundant "still nothing new" echo of the row already
+        # written, exactly the kind of log noise this design exists to avoid.
+        any_logged = False
+        while True:
+            bookmark_str = db.get_daily_track_bookmark(node['id'])
+            # _bar_index_for is contractually allowed to return None when a
+            # timestamp doesn't land exactly on a cached bar -- comparing
+            # that directly against an int with `>` raises TypeError and
+            # would kill the whole nightly job for every remaining node
+            # (found independently by both reviewers). Falls back to -1
+            # (re-scan from the earliest trade) rather than crash; this is a
+            # real, if rare, degraded-recovery path, not just belt-and-suspenders,
+            # so it's logged rather than silent.
+            if bookmark_str:
+                resolved = _bar_index_for(df_h, bookmark_str)
+                if resolved is None:
+                    print(f"  [daily_track] {node['ticker']} wl_id={node['id']} bookmark "
+                          f"{bookmark_str!r} not found in current cached data -- re-scanning "
+                          f"from the earliest trade")
+                    bookmark_i = -1
+                else:
+                    bookmark_i = resolved
             else:
-                actual_state = 'flat'
-        elif actual_open is not None:
-            actual_state = 'open_different_trade'
-        else:
-            actual_state = 'flat'
+                bookmark_i = -1
+            bt_ref = next((t for t in trades if t['signal_i'] > bookmark_i), None)
 
-        common = dict(
-            wl_id=node['id'], ticker=node['ticker'], check_date=today,
-            actual_state=actual_state, backtest_state=backtest_state,
-            actual_entry_price=actual_ref['entry_price'] if actual_ref else None,
-            actual_entry_time=actual_ref['entry_time'] if actual_ref else None,
-            actual_signal_price=actual_ref['signal_price'] if actual_ref else None,
-            actual_exit_time=actual_closed['exit_time'] if actual_closed else None,
-            backtest_entry_price=bt_ref['entry_p'] if bt_ref else None,
-            backtest_entry_time=(df_h.index[bt_ref['entry_i']].strftime('%Y-%m-%d %H:%M:%S')
-                                  if bt_ref else None),
-            backtest_signal_z=bt_ref['signal_z'] if bt_ref else None,
-            backtest_exit_time=(df_h.index[bt_ref['exit_i']].strftime('%Y-%m-%d %H:%M:%S')
-                                 if bt_ref and backtest_state == 'closed' else None),
-        )
+            if bt_ref is None:
+                # No longer means "the backtest has no trades at all" the way
+                # it did before the bookmark existed -- it can also mean "the
+                # bookmark already advanced past the backtest's own still-open
+                # LATEST trade, which just hasn't resolved yet." Collapsing
+                # both to a blanket 'match' would silently report maximum
+                # real divergence (backtest holding an open position, daily-
+                # track flat or already exited) as clean every night (found
+                # by the cold review). Only the genuine "nothing pending at
+                # all" case gets 'match'.
+                if any_logged:
+                    # A real row was already written this pass -- that row
+                    # already tells tonight's story; this "nothing further to
+                    # process" outcome is implied by it, not new information.
+                    break
+                still_watching_open = bool(trades) and trades[-1]['result'] == OPEN and trades[-1]['signal_i'] <= bookmark_i
+                actual_open = db.get_open_position_by_wl_id(node['id'], paper=True)
+                if still_watching_open:
+                    touched += 1
+                    db.log_daily_track_reconciliation(
+                        wl_id=node['id'], ticker=node['ticker'], check_date=today,
+                        actual_state='open_different_trade' if actual_open is not None else 'flat',
+                        backtest_state='open', bar_match=False,
+                        action='steady_state_watching_open_trade', explained_by_price=None,
+                        detail="the backtest's most recent trade is still open beyond the bookmark -- "
+                               "nothing new to compare yet, not a clean match",
+                    )
+                elif actual_open is not None:
+                    # daily-track is holding a real position with NO
+                    # corresponding backtest reference at all (not even a
+                    # still-open one) -- a genuine unexplained gap, not a
+                    # clean match. Preserves the pre-bookmark behavior for
+                    # this case (a node whose backtest replay has zero
+                    # trades at all, or whose bookmark has caught up past
+                    # everything the backtest knows about).
+                    touched += 1
+                    db.log_daily_track_reconciliation(
+                        wl_id=node['id'], ticker=node['ticker'], check_date=today,
+                        actual_state='open_different_trade', backtest_state='flat', bar_match=False,
+                        action='ambiguous_position', explained_by_price=False,
+                        detail="daily-track is holding a position that matches neither the backtest's "
+                               "current reference trade nor any resolvable flat/closed state -- unexplained",
+                    )
+                else:
+                    db.log_daily_track_reconciliation(
+                        wl_id=node['id'], ticker=node['ticker'], check_date=today,
+                        actual_state='flat', backtest_state='flat', bar_match=True,
+                        action='match', explained_by_price=None,
+                    )
+                break
 
-        if actual_state == 'open_different_trade':
-            touched += 1
-            db.log_daily_track_reconciliation(
-                action='ambiguous_position', explained_by_price=False, bar_match=False,
-                detail="daily-track is holding a position that matches neither the backtest's "
-                       "current reference trade nor any resolvable flat/closed state -- unexplained",
-                **common)
-            continue
+            backtest_state = 'open' if bt_ref['result'] == OPEN else 'closed'
+            target_signal_i = bt_ref['signal_i']
 
-        if actual_state == 'flat':
-            bar_match = bt_ref is None
-            common['bar_match'] = bar_match
-            if bar_match:
-                db.log_daily_track_reconciliation(action='match', explained_by_price=None, **common)
+            actual_open = db.get_open_position_by_wl_id(node['id'], paper=True)
+            actual_open_signal_i = (
+                _bar_index_for(df_h, actual_open.get('signal_bar_time') or actual_open['signal_time'])
+                if actual_open else None)
+
+            actual_ref = actual_closed = None
+            if actual_open is not None and actual_open_signal_i == target_signal_i:
+                actual_ref, actual_state = actual_open, 'open'
+            else:
+                actual_closed = next(
+                    (t for t in db.get_trade_log_for_wl_id(node['id'], paper=True)
+                     if t.get('exit_time')
+                     and _bar_index_for(df_h, t.get('signal_bar_time') or t['signal_time']) == target_signal_i),
+                    None)
+                if actual_closed is not None:
+                    actual_ref, actual_state = actual_closed, 'closed'
+                elif actual_open is not None:
+                    actual_state = 'open_different_trade'
+                else:
+                    actual_state = 'flat'
+
+            common = dict(
+                wl_id=node['id'], ticker=node['ticker'], check_date=today,
+                actual_state=actual_state, backtest_state=backtest_state,
+                actual_entry_price=actual_ref['entry_price'] if actual_ref else None,
+                actual_entry_time=actual_ref['entry_time'] if actual_ref else None,
+                actual_signal_price=actual_ref['signal_price'] if actual_ref else None,
+                actual_exit_time=actual_closed['exit_time'] if actual_closed else None,
+                backtest_entry_price=bt_ref['entry_p'],
+                backtest_entry_time=df_h.index[bt_ref['entry_i']].strftime('%Y-%m-%d %H:%M:%S'),
+                backtest_signal_z=bt_ref['signal_z'],
+                backtest_exit_time=(df_h.index[bt_ref['exit_i']].strftime('%Y-%m-%d %H:%M:%S')
+                                     if backtest_state == 'closed' else None),
+            )
+
+            if actual_state == 'open_different_trade':
+                touched += 1
+                db.log_daily_track_reconciliation(
+                    action='ambiguous_position', explained_by_price=False, bar_match=False,
+                    detail="daily-track is holding a position that matches neither the backtest's "
+                           "current reference trade nor any resolvable flat/closed state -- unexplained",
+                    **common)
+                any_logged = True
+                break  # non-terminal -- a genuine unresolved gap, keep surfacing it
+
+            if actual_state == 'flat':
+                # Grace gate -- a miss is only conclusively permanent once
+                # daily-track has genuinely had its full chance to enter:
+                # the signal bar must predate the CURRENT session. Without
+                # this, a trade whose signal bar is from earlier TODAY could
+                # be marked terminal before daily-track has had its
+                # structurally-guaranteed later chance to fire off the
+                # fully-closed bar (see the entry-timing note in the
+                # function docstring) -- found by the cold review; the
+                # narrow real trigger is a daemon that's up at reconcile
+                # time (16:05 ET) but missed an earlier signal window that
+                # same day.
+                signal_bar_date = df_h.index[target_signal_i].date()
+                grace_ok = signal_bar_date < today_date
+                touched += 1
+                di = p['daily_idx'][target_signal_i]
+                lower_band_val = None
+                if di >= 0 and p['std_arr'][di] != 0.0:
+                    lower_band_val = p['sma_arr'][di] - p['std_arr'][di] * node['z_score_threshold']
+                    close_would_fire = p['prices'][target_signal_i] <= lower_band_val
+                    explained = not close_would_fire
+                    action = 'entry_miss_explained' if explained else 'entry_miss_unexplained'
+                    detail = ("backtest signal fired via bar Open, not Close -- explained" if explained else
+                              "backtest signal would have fired on Close alone too -- daily-track should "
+                              "have caught it, unexplained gap")
+                else:
+                    # No prior-day indicator history (di<0) or a zero-Std day -- the counterfactual
+                    # itself can't be computed, distinct from "computed it and it wasn't explained"
+                    # (found by the contextual Opus review, 2026-08-05 -- the prior version defaulted
+                    # this to explained_by_price=False/'entry_miss_unexplained', misrepresenting
+                    # "unknown" as "checked and found unexplained").
+                    explained = None
+                    action = 'no_backtest_data'
+                    detail = "can't compute the entry counterfactual (no prior-day indicator history or a zero-Std day)"
+                if not grace_ok:
+                    detail += " -- signal bar is from the current session, too soon to call this a permanent miss"
+                db.log_daily_track_reconciliation(
+                    action=action, explained_by_price=explained, backtest_lower_band=lower_band_val,
+                    detail=detail, bar_match=False, **common)
+                any_logged = True
+                if not _daily_track_comparison_terminal(actual_state, backtest_state, grace_ok=grace_ok):
+                    break
+                # Advance AFTER a successful log write, not before -- a crash/
+                # failure between the two used to leave the bookmark advanced
+                # with no row to show for it, permanently skipping the trade
+                # (found by the cold review).
+                db.set_daily_track_bookmark(node['id'], df_h.index[target_signal_i].strftime('%Y-%m-%d %H:%M:%S'))
                 continue
-            touched += 1
-            di = p['daily_idx'][target_signal_i]
-            lower_band_val = None
-            if di >= 0 and p['std_arr'][di] != 0.0:
-                lower_band_val = p['sma_arr'][di] - p['std_arr'][di] * node['z_score_threshold']
-                close_would_fire = p['prices'][target_signal_i] <= lower_band_val
-                explained = not close_would_fire
-                action = 'entry_miss_explained' if explained else 'entry_miss_unexplained'
-                detail = ("backtest signal fired via bar Open, not Close -- explained" if explained else
-                          "backtest signal would have fired on Close alone too -- daily-track should "
-                          "have caught it, unexplained gap")
-            else:
-                # No prior-day indicator history (di<0) or a zero-Std day -- the counterfactual
-                # itself can't be computed, distinct from "computed it and it wasn't explained"
-                # (found by the contextual Opus review, 2026-08-05 -- the prior version defaulted
-                # this to explained_by_price=False/'entry_miss_unexplained', misrepresenting
-                # "unknown" as "checked and found unexplained").
-                explained = None
-                action = 'no_backtest_data'
-                detail = "can't compute the entry counterfactual (no prior-day indicator history or a zero-Std day)"
-            db.log_daily_track_reconciliation(
-                action=action, explained_by_price=explained, backtest_lower_band=lower_band_val,
-                detail=detail, **common)
-            continue
 
-        if actual_state == 'open':
+            if actual_state == 'open':
+                if backtest_state == 'open':
+                    db.log_daily_track_reconciliation(action='match', explained_by_price=None, bar_match=True, **common)
+                    any_logged = True
+                    break  # both still in progress -- non-terminal, keep watching
+                # backtest's intrabar Low/trailing-peak breached a stop daily-track's polling
+                # never sampled -- can we prove it's wick-only?
+                touched += 1
+                arm_i = bt_ref.get('arm_i')
+                max_hold = node.get('max_hold_hours')
+                # TIME-forced is a bar-count question, not a price one -- checked regardless of
+                # arm_i, since the kernel produces a genuine TIME exit (TWIN/TLOSS) for a
+                # never-armed trade too, not just the armed held>=max_hold_hours branch. An
+                # earlier version required arm_i is not None here, which routed an unarmed
+                # TIME exit into the SL wick counterfactual instead -- Close is nowhere near the
+                # entry-based SL threshold for a trade that never got close to breaching it, so
+                # it always resolved "explained" with an actively false "SL breach was wick-only"
+                # detail, silently hiding a real bar-count divergence (found by the contextual
+                # Opus review, 2026-08-05, reproduced live).
+                time_forced = (max_hold is not None
+                               and bt_ref.get('held') is not None and bt_ref['held'] >= max_hold)
+                breach = None
+                if time_forced:
+                    reason_none = "backtest exit was TIME-forced -- a bar-count question, not a price one"
+                elif arm_i is None:
+                    breach = _close_alone_would_breach_sl(node, p, bt_ref['exit_i'], bt_ref['entry_p'])
+                    reason_none = None
+                else:
+                    breach = _close_alone_would_breach_trail(node, p, arm_i, bt_ref['exit_i'])
+                    reason_none = None
+                # breach may be a numpy.bool_ (array comparison) -- `is False` is an identity
+                # check that silently never matches numpy.bool_(False) (found live while testing
+                # this exact branch, 2026-08-05); compare by value instead.
+                explained = breach is not None and not breach
+                if explained:
+                    detail = ("backtest's SL breach was wick-only (Close alone would not have "
+                               "triggered it) -- daily-track's live-tick polling couldn't have caught "
+                               "it either") if arm_i is None else (
+                              "backtest's trailing-stop breach was wick-only (a Close-only peak "
+                              "reconstruction would not have triggered it) -- daily-track's live-tick "
+                              "polling couldn't have caught it either")
+                    action = 'exit_wick_explained'
+                else:
+                    detail = reason_none or (
+                        "the bar's Close alone would also have breached the trigger -- not just a "
+                        "wick, daily-track should have caught it")
+                    action = 'exit_wick_unexplained'
+                db.log_daily_track_reconciliation(
+                    action=action, explained_by_price=explained, bar_match=False,
+                    detail=f"backtest already closed this trade but daily-track is still holding it -- "
+                           f"{detail}", **common)
+                any_logged = True
+                break  # daily-track's own position is still open -- non-terminal, keep watching
+
+            # actual_state == 'closed'
             if backtest_state == 'open':
+                # exit_early -- daily-track's own side is done, but no
+                # counterfactual has run yet. NOT terminal (revised from the
+                # first version, which treated this as terminal and silently
+                # discarded the exit-bar comparison): only the backtest's
+                # LATEST trade can be OPEN, so a bounded number of nights
+                # (capped by max_hold_hours) turns this into the real
+                # closed/closed comparison below -- found by the contextual
+                # review to be this tool's headline exit-side deliverable,
+                # thrown away for nothing by advancing early.
+                touched += 1
+                db.log_daily_track_reconciliation(
+                    action='exit_early', explained_by_price=None, bar_match=False,
+                    detail="daily-track already closed this trade but the backtest replay still shows "
+                           "it open -- exits aren't price-source-isolated, no counterfactual to run yet "
+                           "(will be re-checked once the backtest's own reference trade closes)",
+                    **common)
+                any_logged = True
+                break
+
+            # exit_bar_time (captured explicitly for a bar-close exit -- see check_paper_sells)
+            # is an exact bar match; wall-clock exit_time alone (the mid-bar reactive case) needs
+            # the at-or-before lookup instead, since it genuinely falls inside the bar the
+            # trigger action occurred in.
+            if actual_closed.get('exit_bar_time'):
+                actual_exit_i = _bar_index_for(df_h, actual_closed['exit_bar_time'])
+            else:
+                actual_exit_i = _bar_containing(df_h, actual_closed['exit_time'])
+            exit_bar_match = actual_exit_i is not None and actual_exit_i == bt_ref['exit_i']
+            if exit_bar_match:
                 db.log_daily_track_reconciliation(action='match', explained_by_price=None, bar_match=True, **common)
-                continue
-            # backtest's intrabar Low/trailing-peak breached a stop daily-track's polling
-            # never sampled -- can we prove it's wick-only?
-            touched += 1
-            arm_i = bt_ref.get('arm_i')
-            max_hold = node.get('max_hold_hours')
-            # TIME-forced is a bar-count question, not a price one -- checked regardless of
-            # arm_i, since the kernel produces a genuine TIME exit (TWIN/TLOSS) for a
-            # never-armed trade too, not just the armed held>=max_hold_hours branch. An
-            # earlier version required arm_i is not None here, which routed an unarmed
-            # TIME exit into the SL wick counterfactual instead -- Close is nowhere near the
-            # entry-based SL threshold for a trade that never got close to breaching it, so
-            # it always resolved "explained" with an actively false "SL breach was wick-only"
-            # detail, silently hiding a real bar-count divergence (found by the contextual
-            # Opus review, 2026-08-05, reproduced live).
-            time_forced = (max_hold is not None
-                           and bt_ref.get('held') is not None and bt_ref['held'] >= max_hold)
-            breach = None
-            if time_forced:
-                reason_none = "backtest exit was TIME-forced -- a bar-count question, not a price one"
-            elif arm_i is None:
-                breach = _close_alone_would_breach_sl(node, p, bt_ref['exit_i'], bt_ref['entry_p'])
-                reason_none = None
             else:
-                breach = _close_alone_would_breach_trail(node, p, arm_i, bt_ref['exit_i'])
-                reason_none = None
-            # breach may be a numpy.bool_ (array comparison) -- `is False` is an identity
-            # check that silently never matches numpy.bool_(False) (found live while testing
-            # this exact branch, 2026-08-05); compare by value instead.
-            explained = breach is not None and not breach
-            if explained:
-                detail = ("backtest's SL breach was wick-only (Close alone would not have "
-                           "triggered it) -- daily-track's live-tick polling couldn't have caught "
-                           "it either") if arm_i is None else (
-                          "backtest's trailing-stop breach was wick-only (a Close-only peak "
-                          "reconstruction would not have triggered it) -- daily-track's live-tick "
-                          "polling couldn't have caught it either")
-                action = 'exit_wick_explained'
-            else:
-                detail = reason_none or (
-                    "the bar's Close alone would also have breached the trigger -- not just a "
-                    "wick, daily-track should have caught it")
-                action = 'exit_wick_unexplained'
-            db.log_daily_track_reconciliation(
-                action=action, explained_by_price=explained, bar_match=False,
-                detail=f"backtest already closed this trade but daily-track is still holding it -- "
-                       f"{detail}", **common)
+                touched += 1
+                db.log_daily_track_reconciliation(
+                    action='exit_bar_mismatch', explained_by_price=False, bar_match=False,
+                    detail=f"both sides closed this trade, but on different bars (daily-track exit "
+                           f"resolved to bar {actual_exit_i}, backtest exit_i={bt_ref['exit_i']}) -- "
+                           f"unexplained exit-side divergence", **common)
+            any_logged = True
+            # Both sides closed -- terminal either way (match or mismatch),
+            # advance AFTER the log write.
+            db.set_daily_track_bookmark(node['id'], df_h.index[target_signal_i].strftime('%Y-%m-%d %H:%M:%S'))
             continue
-
-        # actual_state == 'closed'
-        if backtest_state == 'open':
-            touched += 1
-            db.log_daily_track_reconciliation(
-                action='exit_early', explained_by_price=None, bar_match=False,
-                detail="daily-track already closed this trade but the backtest replay still shows "
-                       "it open -- exits aren't price-source-isolated, no counterfactual to run",
-                **common)
-            continue
-
-        # exit_bar_time (captured explicitly for a bar-close exit -- see check_paper_sells)
-        # is an exact bar match; wall-clock exit_time alone (the mid-bar reactive case) needs
-        # the at-or-before lookup instead, since it genuinely falls inside the bar the
-        # trigger action occurred in.
-        if actual_closed.get('exit_bar_time'):
-            actual_exit_i = _bar_index_for(df_h, actual_closed['exit_bar_time'])
-        else:
-            actual_exit_i = _bar_containing(df_h, actual_closed['exit_time'])
-        exit_bar_match = actual_exit_i is not None and actual_exit_i == bt_ref['exit_i']
-        if exit_bar_match:
-            db.log_daily_track_reconciliation(action='match', explained_by_price=None, bar_match=True, **common)
-            continue
-        touched += 1
-        db.log_daily_track_reconciliation(
-            action='exit_bar_mismatch', explained_by_price=False, bar_match=False,
-            detail=f"both sides closed this trade, but on different bars (daily-track exit "
-                   f"resolved to bar {actual_exit_i}, backtest exit_i={bt_ref['exit_i']}) -- "
-                   f"unexplained exit-side divergence", **common)
     return touched
 
 

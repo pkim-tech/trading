@@ -951,6 +951,95 @@ Full suite after this round: still 533 passed (the `arm_i` fix and its 4 new tes
 pre-existing unrelated collection error, so this is genuinely 0 failures/errors, not 533-of-534).
 `tests/test_daily_track_paper.py` is now 30 tests.
 
+## bt_ref bookmark fix — real false-positive bug found+fixed, 2026-08-10
+
+`reconcile_daily_track_nodes` always compared daily-track's actual state against the backtest's
+single LATEST trade (`trades[-1]`), recomputed fresh every night. Wrong whenever daily-track is
+still legitimately mid-trade on an EARLIER backtest trade — its own real hold duration differs from
+the backtest's theoretical one for that same entry, exactly the timing divergence this tool exists
+to detect. Every night in between, daily-track's real open position (matching the earlier trade's
+signal bar) matched neither the backtest's current latest trade nor any resolvable flat/closed
+state — misclassified as `ambiguous_position`, an unexplained false positive, not a real bug. Found
+via direct conversation with the user working through what "reset periodically" should actually mean
+here (answer: not a position-state reset — that was tried once, found buggy, and explicitly reversed
+per the entry above — but the *comparison anchor* itself needed fixing).
+
+Fixed with a new `daily_track_bookmark_signal_bar` column (`watch_list`) tracking the signal-bar
+timestamp of whichever backtest trade is currently being reconciled. Each night, `bt_ref` targets
+the earliest backtest trade after the bookmark (not `trades[-1]`); the bookmark only advances once
+that specific trade's comparison reaches a terminal verdict (`_daily_track_comparison_terminal`:
+`actual_state in ('flat', 'closed')` — a miss's fate and a completed exit are both permanent,
+regardless of whether the backtest's own reference trade has closed yet; an `open` actual_state
+stays pinned so tomorrow re-checks the same trade rather than skipping ahead). Never a
+position-state mutation — same pure-observation contract as before, just correctly tracking WHICH
+comparison is in progress.
+
+No bookmark yet (`None`) defaults to -1 (start from the node's very earliest backtest trade), not a
+special-cased "assume `trades[-1]`" fallback — a first-draft version of this fix tried the latter to
+avoid a disruptive cold catch-up for already-running nodes, but "no bookmark" is genuinely
+indistinguishable from "brand new node with nothing to disrupt," and the fallback actively
+reintroduced the exact bug it was meant to avoid (caught by a test written against the fix itself,
+not by review). The accepted cost: an already-long-running daily-track node does a slow, one-trade-
+per-night catch-up through its historical backlog on rollout, rather than jumping straight to
+"today" — harmless for a pure-observation diagnostic log, unlike a false-positive misclassification.
+
+2 new tests (`test_reconcile_bookmark_targets_earlier_trade_daily_track_is_still_holding`,
+`test_reconcile_bookmark_advances_once_trade_comparison_is_terminal`); 1 pre-existing test
+(`test_reconcile_catches_new_missed_entry_after_old_closed_trade`) updated to pre-seed the bookmark
+past its incidental setup trade, since the fix means reconcile now processes one trade per call
+(the earliest unresolved one) rather than always jumping to latest.
+
+## bt_ref bookmark fix — session-wrap paired review found the above wrong on 4 points, all fixed same day
+
+Required paired Opus review (independent-cold + contextual, with a rebuttal exchange) of the fix
+above found real problems before it shipped — the "accepted cost" framing above was wrong by two
+orders of magnitude, and the terminal boundary was wrong on two of its four cases:
+
+- **Crash bug (HIGH, found independently by both reviewers)**: `_bar_index_for` can return `None`
+  (its own documented contract) when a bookmark timestamp doesn't land on a cached bar; the fix's
+  `t['signal_i'] > bookmark_i` then raised `TypeError`, killing the whole nightly job for every
+  remaining node, sticky (no log row written, so it re-crashed every night). Fixed: falls back to
+  -1 (re-scan from the earliest trade) and logs the recovery instead of crashing.
+- **False `'match'` during real max divergence (HIGH, cold review)**: once the bookmark advances
+  past a still-open backtest trade, `bt_ref is None` used to collapse to `backtest_state='flat'` +
+  `action='match'` — silently reporting "clean" during exactly the periods of maximum real
+  divergence. Fixed: a new `steady_state_watching_open_trade` action distinguishes "genuinely
+  nothing pending" from "bookmark exhausted while the backtest still holds an open trade."
+- **`exit_early` wrongly terminal (HIGH, contextual review)**: `closed`+backtest-`open` was treated
+  as terminal, permanently discarding the real exit-bar comparison (this tool's actual headline
+  deliverable) the moment it became available. Fixed: not terminal — since only the backtest's
+  LATEST trade can be `OPEN`, a bounded wait (capped by `max_hold_hours`) converts it into the real
+  `closed`/`closed` comparison instead.
+- **Cold-start `-1` = ~130 nights of noise per node (HIGH, contextual review, verified against the
+  live DB)**: the "accepted cost" reasoning in the entry above never quantified the actual cost — a
+  real AGQ daily-track replay reaches back to 2023-08-07 (130 trades), and the fix as first shipped
+  paced catch-up at one trade per calendar night (an incidental interaction with the same-day
+  idempotency guard), meaning ~6 months before the log described anything current. Also found in
+  the same pass: `reconcile_daily_track_nodes` was missing the `version=='v5'` filter its sibling
+  `scripts/paper_vs_backtest_reconcile.get_daily_track_wl_ids` already carries, doubling the
+  affected node count (10 real + 10 staged `v5-overlay-test*` clones). Fixed: a single reconcile
+  pass now catches up through every already-terminal trade in one run (loop, not one-trade-per-day),
+  plus the missing version filter.
+- Also fixed: `flat` needed a grace gate (a trade whose signal bar is from the CURRENT session isn't
+  conclusively a permanent miss yet — daily-track may still fire later that same session, off the
+  fully-closed bar); bookmark now advances AFTER a successful log write, not before (a crash in
+  between used to silently, permanently skip a trade); `_log_audit` removed from
+  `set_daily_track_bookmark` (a diagnostic cursor advanced routinely, not a real node mutation —
+  logging every advance would have diluted `watch_list_audit`); stale docstring/typo cleanup.
+
+Both reviews' findings were then cross-rebutted (each reviewer given the other's findings, asked to
+confirm/refute) before any fix — one finding (cold's original claim that `'flat'` should never be
+terminal at all) was refuted with a concrete code trace (the `pending_skip` guard on resting paper
+orders already blocks the scenario it depended on) and would have deadlocked every node's bookmark
+permanently had it been adopted as proposed. 5 new tests added targeting each fix directly
+(`test_reconcile_exit_early_not_terminal_resolves_once_backtest_closes`,
+`test_reconcile_flat_grace_gate_blocks_same_session_signal`,
+`test_reconcile_unresolvable_bookmark_falls_back_instead_of_crashing`,
+`test_reconcile_catches_up_multiple_historical_trades_in_one_pass`,
+`test_reconcile_no_false_match_when_backtest_holds_open_trade_past_bookmark`). Full suite green
+throughout (35/35 in `test_daily_track_paper.py`, 140/140 across every file importing
+`paper_trading`, `signals_invariants.py` clean, `live_sim_harness.py` 7/7).
+
 ## Two-account paper trading (original design, added 2026-08-04 very late)
 
 **Motivation**: a long investigation (`docs/research_log.md`'s 2026-08-04 very-late entry) found

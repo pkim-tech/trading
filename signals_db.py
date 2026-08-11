@@ -206,6 +206,33 @@ def ensure_tables():
             # entry when set, so a future sync tool has a real lever to pull, but
             # nothing in the current codebase ever sets it.
             c.execute("ALTER TABLE watch_list ADD COLUMN daily_sync_halted_at TEXT")
+        if 'daily_track_bookmark_signal_bar' not in wl_cols:
+            # Added 2026-08-10 -- fixes a real false-positive bug in
+            # reconcile_daily_track_nodes: it always compared daily-track's
+            # actual state against the backtest's single LATEST trade
+            # (trades[-1]), which is wrong whenever daily-track is still
+            # legitimately mid-trade on an EARLIER backtest trade (its own
+            # hold duration differs from the backtest's for that same
+            # entry -- exactly the timing divergence this tool exists to
+            # detect) -- every night in between misclassified as
+            # 'ambiguous_position'/unexplained, not a real bug.
+            # This bookmark tracks "the signal-bar timestamp of the last
+            # backtest trade this node has been fully, conclusively
+            # reconciled through" -- reconcile always targets the earliest
+            # backtest trade with signal_bar > bookmark (not trades[-1]),
+            # and only advances the bookmark once that specific trade's
+            # comparison reaches a terminal verdict (see
+            # _daily_track_comparison_terminal in paper_trading.py -- revised
+            # 2026-08-10 after a paired review found the first version's
+            # terminal boundary wrong on two of its four cases).
+            # Deliberately NOT a position-state reset (the user's explicit
+            # 2026-08-05 call against auto-resync stands unchanged) -- this
+            # only tracks which comparison is in progress, never touches a
+            # real open_positions/paper_positions row. A single reconcile
+            # pass can catch up through and advance past several already-
+            # resolved trades in one call, not just one per calendar day --
+            # see reconcile_daily_track_nodes' docstring.
+            c.execute("ALTER TABLE watch_list ADD COLUMN daily_track_bookmark_signal_bar TEXT")
         if 'drought_overlay_enabled' not in wl_cols:
             # 2026-08-09 -- generic config toggle for the drought overlay (buy the
             # underlying during a confirmed low-vol no-signal gap, manage with the
@@ -417,6 +444,7 @@ def ensure_tables():
                     paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
                     paper_role         TEXT,
                     daily_sync_halted_at TEXT,
+                    daily_track_bookmark_signal_bar TEXT,
                     drought_overlay_enabled INTEGER NOT NULL DEFAULT 0,
                     drought_confirm_days INTEGER,
                     drought_vol_gate   REAL,
@@ -488,6 +516,7 @@ def ensure_tables():
                     paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
                     paper_role         TEXT,
                     daily_sync_halted_at TEXT,
+                    daily_track_bookmark_signal_bar TEXT,
                     drought_overlay_enabled INTEGER NOT NULL DEFAULT 0,
                     drought_confirm_days INTEGER,
                     drought_vol_gate   REAL,
@@ -2902,6 +2931,36 @@ def set_daily_sync_halted(wl_id, halted=True):
         c.execute("UPDATE watch_list SET daily_sync_halted_at = ? WHERE id = ?",
                    (datetime.now().strftime('%Y-%m-%d %H:%M:%S') if halted else None, wl_id))
         _log_audit(c, 'set_daily_sync_halted', watch_id=wl_id, detail=f"halted={halted}")
+        c.commit()
+
+
+def get_daily_track_bookmark(wl_id):
+    """Returns the signal-bar timestamp (string) of the last backtest trade this
+    daily-track node has been fully, conclusively reconciled through, or None if
+    reconciliation hasn't started yet for this node."""
+    with _conn() as c:
+        row = c.execute("SELECT daily_track_bookmark_signal_bar FROM watch_list WHERE id = ?",
+                         (wl_id,)).fetchone()
+        return row[0] if row else None
+
+
+def set_daily_track_bookmark(wl_id, signal_bar_str):
+    """Advances (or clears, with None) the daily-track reconcile bookmark. Only
+    called from reconcile_daily_track_nodes once a specific backtest trade's
+    comparison reaches a terminal verdict -- never a position-state mutation,
+    purely tracks which comparison is in progress. See the watch_list schema
+    migration comment (ensure_tables) for the full rationale.
+
+    Deliberately NOT logged via _log_audit (unlike set_daily_sync_halted,
+    a real behavioral toggle) -- this is a diagnostic cursor advanced
+    routinely, potentially several times per node per reconcile pass (see
+    the "single-pass catch-up" note in reconcile_daily_track_nodes'
+    docstring); logging every advance would dilute watch_list_audit, the
+    mutation history of record for genuine node config changes, with noise
+    (flagged by both the cold and contextual paired review, 2026-08-10)."""
+    with _conn() as c:
+        c.execute("UPDATE watch_list SET daily_track_bookmark_signal_bar = ? WHERE id = ?",
+                   (signal_bar_str, wl_id))
         c.commit()
 
 

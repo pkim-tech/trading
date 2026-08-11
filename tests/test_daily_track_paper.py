@@ -738,6 +738,13 @@ def test_reconcile_catches_new_missed_entry_after_old_closed_trade(isolated_db, 
     old_pos = db.get_open_position_by_wl_id(daily_node['id'], paper=True)
     db.close_position(old_pos['id'], exit_signal_price=95.0, exit_price=95.0, exit_time=idx[1],
                        exit_reason='SL', paper=True, exit_bar_time=idx[1])
+    # Simulates the old trade already having been confirmed on a prior night
+    # (a real bookmark would hold this after reconcile processed it once) --
+    # since 2026-08-10's bookmark fix, reconcile targets one trade per call
+    # (the earliest unresolved one after the bookmark), not always the
+    # latest, so this test's actual subject (the NEW missed entry) needs the
+    # old, already-resolved trade pre-confirmed rather than re-derived here.
+    db.set_daily_track_bookmark(daily_node['id'], old_signal_bar.strftime('%Y-%m-%d %H:%M:%S'))
 
     new_bt_trade = dict(signal_i=4, signal_z=-10.0, entry_i=5, arm_i=None, exit_i=5,
                          entry_p=89.0, exit_p=89.0, held=0, result=OPEN, ret=0.0)
@@ -851,3 +858,316 @@ def test_reconcile_entry_miss_no_backtest_data_when_counterfactual_uncomputable(
     log = db.get_daily_track_reconciliation_log(daily_node['id'])
     assert log[0]['action'] == 'no_backtest_data'
     assert log[0]['explained_by_price'] is None
+
+
+# ---------------------------------------------------------------------------
+# daily_track_bookmark -- fixed 2026-08-10, real false-positive bug: bt_ref
+# always targeted the backtest's single LATEST trade regardless of which
+# trade daily-track was actually still working through.
+# ---------------------------------------------------------------------------
+
+def test_reconcile_bookmark_targets_earlier_trade_daily_track_is_still_holding(isolated_db, monkeypatch):
+    """The false-positive scenario this fix closes: daily-track is still
+    legitimately open on an EARLIER backtest trade (its own hold duration
+    differs from the backtest's for that same entry) while the backtest has
+    already moved on to a later trade. Before this fix, bt_ref always
+    targeted the later trade (trades[-1]), so daily-track's real open
+    position matched neither its signal bar nor any resolvable flat/closed
+    state -- misclassified as 'ambiguous_position' every night. With no
+    bookmark set (a node's first run, defaulting to -1/earliest), reconcile
+    must target the earlier (still-open, matching) trade, not the later one."""
+    import pandas as pd
+    import numpy as np
+    from backtester import OPEN, WIN
+
+    _, daily_node = _add_pair()
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    idx = pd.date_range(now - timedelta(hours=10), periods=10, freq='h')
+    df_h = pd.DataFrame({'Open': [90.0] * 10, 'Close': [100.0] * 10}, index=idx)
+    p = dict(daily_idx=np.array([0] * 10), sma_arr=np.array([100.0]),
+             std_arr=np.array([1.0]), prices=np.array([100.0] * 10))
+
+    earlier_signal_bar = idx[0]
+    assert db.get_daily_track_bookmark(daily_node['id']) is None
+
+    earlier_trade = dict(signal_i=0, signal_z=-10.0, entry_i=1, arm_i=None, exit_i=None,
+                          entry_p=91.0, exit_p=None, held=None, result=OPEN, ret=0.0)
+    later_trade = dict(signal_i=6, signal_z=-10.0, entry_i=7, arm_i=None, exit_i=8,
+                        entry_p=93.0, exit_p=98.0, held=1, result=WIN, ret=0.05)
+
+    def _fake_replay(node):
+        return [earlier_trade, later_trade], df_h, p
+
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', _fake_replay)
+
+    # daily-track really is holding the EARLIER trade -- same signal bar,
+    # still open, matching the backtest's own still-open reference for it.
+    db.open_position(daily_node, 91.0, now, 91.0, now, shares=10, paper=True,
+                      signal_bar_time=earlier_signal_bar)
+
+    touched = paper_trading.reconcile_daily_track_nodes()
+
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    assert log[0]['action'] == 'match'
+    assert log[0]['actual_state'] == 'open'
+    assert log[0]['backtest_state'] == 'open'
+    assert log[0]['backtest_entry_time'] == idx[1].strftime('%Y-%m-%d %H:%M:%S')  # entry_i=1
+    # Non-terminal (both sides still open) -- bookmark must stay unset, not
+    # jump ahead to the later trade, so tomorrow's run re-checks this exact
+    # trade again instead of skipping past a real still-open comparison.
+    assert db.get_daily_track_bookmark(daily_node['id']) is None
+
+
+def test_reconcile_bookmark_advances_once_trade_comparison_is_terminal(isolated_db, monkeypatch):
+    """Once a trade's comparison reaches a terminal verdict (both sides
+    closed, matched here), the bookmark must advance to that trade's signal
+    bar so tomorrow's reconcile targets the NEXT backtest trade instead of
+    re-checking this same resolved one forever."""
+    import pandas as pd
+    import numpy as np
+    from backtester import WIN
+
+    _, daily_node = _add_pair()
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    idx = pd.date_range(now - timedelta(hours=5), periods=5, freq='h')
+    df_h = pd.DataFrame({'Open': [90.0] * 5, 'Close': [100.0] * 5}, index=idx)
+    p = dict(daily_idx=np.array([0] * 5), sma_arr=np.array([100.0]),
+             std_arr=np.array([1.0]), prices=np.array([100.0] * 5))
+    signal_bar = idx[0]
+
+    db.open_position(daily_node, 91.0, now, 91.0, now, shares=10, paper=True,
+                      signal_bar_time=signal_bar)
+    open_pos = db.get_open_position_by_wl_id(daily_node['id'], paper=True)
+    db.close_position(open_pos['id'], exit_signal_price=98.0, exit_price=98.0, exit_time=idx[3],
+                       exit_reason='TIME', paper=True, exit_bar_time=idx[3])
+
+    bt_trade = dict(signal_i=0, signal_z=-10.0, entry_i=1, arm_i=None, exit_i=3,
+                     entry_p=91.0, exit_p=98.0, held=2, result=WIN, ret=0.05)
+
+    def _fake_replay(node):
+        return [bt_trade], df_h, p
+
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', _fake_replay)
+    assert db.get_daily_track_bookmark(daily_node['id']) is None
+
+    paper_trading.reconcile_daily_track_nodes()
+
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    assert log[0]['action'] == 'match'
+    assert log[0]['actual_state'] == 'closed'
+    assert log[0]['backtest_state'] == 'closed'
+    assert db.get_daily_track_bookmark(daily_node['id']) == signal_bar.strftime('%Y-%m-%d %H:%M:%S')
+
+
+# ---------------------------------------------------------------------------
+# Paired-review fixes, 2026-08-10 -- exit_early no longer terminal, grace
+# gate on 'flat', unresolvable-bookmark crash guard, single-pass catch-up,
+# and no false 'match' when the backtest still holds an open trade past the
+# bookmark.
+# ---------------------------------------------------------------------------
+
+def test_reconcile_exit_early_not_terminal_resolves_once_backtest_closes(isolated_db, monkeypatch):
+    """First version of the bookmark fix treated closed+backtest-open
+    (exit_early) as terminal, silently discarding the real exit-bar
+    comparison forever (found by the contextual review). Fixed: exit_early
+    is NOT terminal -- the bookmark stays put, and once the backtest's own
+    reference trade closes too (on a later call), it resolves into the real
+    closed/closed comparison instead."""
+    import pandas as pd
+    import numpy as np
+    from backtester import OPEN, WIN
+
+    _, daily_node = _add_pair()
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    idx = pd.date_range(now - timedelta(hours=5), periods=5, freq='h')
+    df_h = pd.DataFrame({'Open': [90.0] * 5, 'Close': [100.0] * 5}, index=idx)
+    p = dict(daily_idx=np.array([0] * 5), sma_arr=np.array([100.0]),
+             std_arr=np.array([1.0]), prices=np.array([100.0] * 5))
+    signal_bar = idx[0]
+
+    db.open_position(daily_node, 91.0, now, 91.0, now, shares=10, paper=True,
+                      signal_bar_time=signal_bar)
+    open_pos = db.get_open_position_by_wl_id(daily_node['id'], paper=True)
+    db.close_position(open_pos['id'], exit_signal_price=95.0, exit_price=95.0, exit_time=idx[2],
+                       exit_reason='SL', paper=True, exit_bar_time=idx[2])
+
+    # Night 1: backtest's own reference trade is still OPEN.
+    open_bt_trade = dict(signal_i=0, signal_z=-10.0, entry_i=1, arm_i=None, exit_i=None,
+                          entry_p=91.0, exit_p=None, held=None, result=OPEN, ret=0.0)
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', lambda node: ([open_bt_trade], df_h, p))
+
+    paper_trading.reconcile_daily_track_nodes()
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    assert log[0]['action'] == 'exit_early'
+    # NOT terminal -- bookmark must stay unset so the same trade gets
+    # re-checked once the backtest's own reference closes.
+    assert db.get_daily_track_bookmark(daily_node['id']) is None
+
+    # Night 2 (simulated -- bypass the idempotency guard the same way other
+    # tests in this file don't need to, since check_date only blocks a
+    # SECOND call on the exact same calendar day): backtest's reference
+    # trade has now closed too, on the same bar daily-track closed on.
+    closed_bt_trade = dict(signal_i=0, signal_z=-10.0, entry_i=1, arm_i=None, exit_i=2,
+                            entry_p=91.0, exit_p=95.0, held=1, result=WIN, ret=0.04)
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', lambda node: ([closed_bt_trade], df_h, p))
+    # Force past the same-day guard directly (this test is about the
+    # terminal-boundary logic, not the calendar-day guard already covered by
+    # test_reconcile_is_a_noop_the_second_time_same_day).
+    with db._conn() as c:
+        c.execute("DELETE FROM daily_track_reconciliation_log WHERE wl_id=?", (daily_node['id'],))
+        c.commit()
+
+    paper_trading.reconcile_daily_track_nodes()
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    assert log[0]['action'] == 'match'
+    assert log[0]['actual_state'] == 'closed'
+    assert log[0]['backtest_state'] == 'closed'
+    assert db.get_daily_track_bookmark(daily_node['id']) == signal_bar.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def test_reconcile_flat_grace_gate_blocks_same_session_signal(isolated_db, monkeypatch):
+    """First version treated any 'flat' as immediately terminal, which could
+    advance the bookmark past a trade whose signal bar is from LATER THE
+    SAME SESSION daily-track hasn't had its structurally-guaranteed chance
+    to fire on yet (found by the cold review). Fixed: 'flat' only becomes
+    terminal once the trade's signal bar predates the current calendar day."""
+    import pandas as pd
+    import numpy as np
+    from backtester import OPEN
+
+    _, daily_node = _add_pair()
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    # Signal bar is THIS session -- today.
+    idx = pd.date_range(now, periods=1, freq='h')
+    df_h = pd.DataFrame({'Open': [90.0], 'Close': [100.0]}, index=idx)
+    p = dict(daily_idx=np.array([-1]), sma_arr=np.array([100.0]),
+             std_arr=np.array([1.0]), prices=np.array([100.0]))
+
+    bt_trade = dict(signal_i=0, signal_z=-10.0, entry_i=0, arm_i=None, exit_i=None,
+                     entry_p=91.0, exit_p=None, held=None, result=OPEN, ret=0.0)
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', lambda node: ([bt_trade], df_h, p))
+
+    paper_trading.reconcile_daily_track_nodes()
+
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    assert len(log) == 1  # still logged -- informational, just not terminal
+    assert log[0]['actual_state'] == 'flat'
+    assert 'current session' in log[0]['detail']
+    # NOT terminal -- bookmark must stay unset.
+    assert db.get_daily_track_bookmark(daily_node['id']) is None
+
+
+def test_reconcile_unresolvable_bookmark_falls_back_instead_of_crashing(isolated_db, monkeypatch):
+    """First version compared an unresolvable bookmark (_bar_index_for
+    returns None when a timestamp doesn't land exactly on a cached bar --
+    its own documented contract) directly with `>`, raising TypeError and
+    killing the whole nightly job for every remaining node (found
+    independently by both reviewers). Fixed: falls back to -1 (re-scan from
+    the earliest trade) instead of crashing."""
+    import pandas as pd
+    import numpy as np
+    from backtester import WIN
+
+    _, daily_node = _add_pair()
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    idx = pd.date_range(now - timedelta(hours=3), periods=3, freq='h')
+    df_h = pd.DataFrame({'Open': [90.0] * 3, 'Close': [100.0] * 3}, index=idx)
+    p = dict(daily_idx=np.array([0] * 3), sma_arr=np.array([100.0]),
+             std_arr=np.array([1.0]), prices=np.array([100.0] * 3))
+
+    # A bookmark timestamp that does not land on any bar in df_h.index.
+    db.set_daily_track_bookmark(daily_node['id'], '2020-01-01 00:00:00')
+
+    bt_trade = dict(signal_i=0, signal_z=-10.0, entry_i=1, arm_i=None, exit_i=2,
+                     entry_p=91.0, exit_p=95.0, held=1, result=WIN, ret=0.04)
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', lambda node: ([bt_trade], df_h, p))
+
+    # Must not raise.
+    touched = paper_trading.reconcile_daily_track_nodes()
+    assert touched >= 0
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    assert len(log) == 1
+    assert log[0]['backtest_state'] == 'closed'  # recovered normally after the fallback -- real trade, not a crash
+
+
+def test_reconcile_catches_up_multiple_historical_trades_in_one_pass(isolated_db, monkeypatch):
+    """First version paced catch-up at one trade per calendar day via an
+    incidental interaction with the same-day idempotency guard -- a node
+    with N unreviewed historical trades took N calendar nights to reach
+    anything describing current state (found by the contextual review,
+    measured against the live DB: ~130 nights for a real node). Fixed: a
+    single call catches up through every already-terminal trade in one
+    pass."""
+    import pandas as pd
+    import numpy as np
+    from backtester import WIN
+
+    _, daily_node = _add_pair()
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    idx = pd.date_range(now - timedelta(hours=9), periods=9, freq='h')
+    df_h = pd.DataFrame({'Open': [90.0] * 9, 'Close': [100.0] * 9}, index=idx)
+    p = dict(daily_idx=np.array([0] * 9), sma_arr=np.array([100.0]),
+             std_arr=np.array([1.0]), prices=np.array([100.0] * 9))
+
+    # 3 fully-resolved historical trades, all matched cleanly by daily-track.
+    bt_trades = []
+    for i, (sig, ent, ext) in enumerate([(0, 1, 2), (3, 4, 5), (6, 7, 8)]):
+        bt_trades.append(dict(signal_i=sig, signal_z=-10.0, entry_i=ent, arm_i=None, exit_i=ext,
+                               entry_p=91.0, exit_p=95.0, held=1, result=WIN, ret=0.04))
+        entry_time = now - timedelta(hours=9) + timedelta(hours=ent)
+        exit_time = now - timedelta(hours=9) + timedelta(hours=ext)
+        db.open_position(daily_node, 91.0, entry_time, 91.0, entry_time, shares=10, paper=True,
+                          signal_bar_time=idx[sig])
+        open_pos = db.get_open_position_by_wl_id(daily_node['id'], paper=True)
+        db.close_position(open_pos['id'], exit_signal_price=95.0, exit_price=95.0, exit_time=exit_time,
+                           exit_reason='SL', paper=True, exit_bar_time=idx[ext])
+
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', lambda node: (bt_trades, df_h, p))
+    assert db.get_daily_track_bookmark(daily_node['id']) is None
+
+    touched = paper_trading.reconcile_daily_track_nodes()
+
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    # All 3 real trades classified in this ONE call (not one-per-night) --
+    # no trailing redundant "nothing left" row appended after real rows.
+    assert len(log) == 3
+    assert all(r['action'] == 'match' for r in log)
+    # Bookmark caught all the way up to the LAST trade, not just the first.
+    assert db.get_daily_track_bookmark(daily_node['id']) == idx[6].strftime('%Y-%m-%d %H:%M:%S')
+
+
+def test_reconcile_no_false_match_when_backtest_holds_open_trade_past_bookmark(isolated_db, monkeypatch):
+    """First version collapsed bt_ref=None to a blanket 'match', which used
+    to only mean "the backtest has no trades at all." Once the bookmark can
+    legitimately advance past a still-open backtest trade (a permanent
+    'flat' miss, terminal once grace_ok), bt_ref=None can ALSO mean "nothing
+    new past the bookmark, but the backtest's own latest trade is still
+    open and unresolved" -- collapsing both to 'match' silently reported
+    maximum real divergence as clean (found by the cold review)."""
+    import pandas as pd
+    import numpy as np
+    from backtester import OPEN
+
+    _, daily_node = _add_pair()
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    idx = pd.date_range(now - timedelta(hours=5), periods=5, freq='h')
+    df_h = pd.DataFrame({'Open': [90.0] * 5, 'Close': [100.0] * 5}, index=idx)
+    p = dict(daily_idx=np.array([0] * 5), sma_arr=np.array([100.0]),
+             std_arr=np.array([1.0]), prices=np.array([100.0] * 5))
+    signal_bar = idx[0]
+
+    # Bookmark already advanced past this trade's own signal bar (simulates
+    # a prior night's terminal 'flat' verdict on it).
+    db.set_daily_track_bookmark(daily_node['id'], signal_bar.strftime('%Y-%m-%d %H:%M:%S'))
+
+    bt_trade = dict(signal_i=0, signal_z=-10.0, entry_i=1, arm_i=None, exit_i=None,
+                     entry_p=91.0, exit_p=None, held=None, result=OPEN, ret=0.0)
+    monkeypatch.setattr(paper_trading, '_backtest_replay_for_node', lambda node: ([bt_trade], df_h, p))
+
+    paper_trading.reconcile_daily_track_nodes()
+
+    log = db.get_daily_track_reconciliation_log(daily_node['id'])
+    assert len(log) == 1
+    assert log[0]['action'] == 'steady_state_watching_open_trade'
+    assert log[0]['action'] != 'match'
+    assert log[0]['backtest_state'] == 'open'
