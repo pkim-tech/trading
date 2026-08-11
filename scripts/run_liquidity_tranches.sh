@@ -116,7 +116,15 @@ run_tranche() {
   echo " Tickers: $tickers"
   echo "======================================================"
 
-  VERSION=v5 TICKERS="$tickers" FIXED_SLS="1 2 3" \
+  # v5.1 (2026-08-11): version bump after the under-caching data-gap fix (trading_incidents
+  # id=5) -- dispatch_parallel_grid's cache-hit check has no data-freshness awareness, so
+  # resweeping under the old 'v5' tag would silently skip every already-covered grid
+  # coordinate rather than recompute against the now-longer real history. The 23 tranche
+  # tickers whose raw data didn't actually change tonight already have their v5 rows copied
+  # forward to v5.1 (tagged copied_from_version='v5' in backtest_cache) -- this sweep will
+  # correctly skip those (already cached under v5.1) and only really compute the tickers
+  # that need it. See docs/backlog_cache.md's 2026-08-11 v5.1 entry.
+  VERSION=v5.1 TICKERS="$tickers" FIXED_SLS="1 2 3" \
     STRATEGIES="TrailingBothZScoreBreakout TrailingExitZScoreBreakout" \
     ./scripts/run_sweep_queue.sh --skip-cache-refresh
 
@@ -142,7 +150,7 @@ run_tranche() {
 
   echo ""
   echo "--- Running overlay shim for tranche $n. ---"
-  $PYTHON scripts/run_overlay_shim.py $tickers --out "$STATE_DIR/tranche_${n}_overlay.csv" || \
+  $PYTHON scripts/run_overlay_shim.py $tickers --version v5.1 --out "$STATE_DIR/tranche_${n}_overlay.csv" || \
     echo "(overlay shim non-fatal failure/no data -- see output above, tranche still marked done)"
 
   date > "$marker"

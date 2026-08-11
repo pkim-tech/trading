@@ -1793,3 +1793,49 @@ gap once it IS enabled); `kernel_dirty` only checks `backtester.py`/`strategies.
 same_day_block section fails open silently (logs `skipped_margin_account`, indistinguishable from
 a legitimate exemption) — same accepted-limitation shape as `node_automation_enabled(None)`
 elsewhere in this function, not tightened further this session.
+
+## `v5.1` sweep version + `backtest_cache.copied_from_version`, 2026-08-11
+
+Root cause of the night's data investigation (`trading_incidents` id=4/5, Opus-confirmed): 215
+tickers were silently under-backfilled (~13mo of real hourly history cached when yfinance
+actually had ~35mo available for free — a fetch-window bug, not a paid-vendor gap), and
+`dispatch_parallel_grid`'s per-task cache-hit check has no data-freshness awareness — it keys
+purely on `(strategy, version, ticker, entry_timing)` + grid coordinates, so resweeping under the
+existing `v5` tag would silently skip every already-covered grid point rather than recompute
+against the now-longer real history. Confirmed via `strategy_cagr_pct = cagr(cached
+abs_return_pct, freshly-recomputed years)` mixing two different time windows in one formula —
+real example: SOXS showed 93.4% CAGR in one run and 28.6% in a later run, same node, same stale
+cached return, only the freshly-computed `years` denominator changed as the backfill landed.
+
+Fix: version-bump to `v5.1` for tickers whose raw data actually changed tonight. Of 216 changed
+tickers, only 40 already had `v5` `backtest_cache` coverage (need a real resweep to avoid the
+skip trap); the other 176 have no prior `v5` rows at all (a plain sweep works fine, nothing to
+skip). Of the 56 real liquidity-tranche tickers (`scripts/run_liquidity_tranches.sh`), 33 need a
+genuine `v5.1` resweep; the other 23 had no underlying data change, so their `v5` rows were
+copied forward to `v5.1` directly (`INSERT ... SELECT` with `version='v5.1'`, ~1.62M rows) rather
+than wastefully rerunning the kernel for an identical result. `run_liquidity_tranches.sh` updated
+to sweep and overlay-shim under `v5.1` instead of `v5` (both the `run_sweep_queue.sh` call and
+`run_overlay_shim.py --version`, found separately — the overlay step defaults to `v5` on its own
+and would have silently stayed on stale nodes even after the sweep step correctly moved to v5.1).
+
+New nullable `backtest_cache.copied_from_version` column (no PK impact — this table has no
+integer id, its primary key is the full grid-coordinate tuple) distinguishes a genuinely fresh
+`v5.1` recompute (NULL) from a row carried forward unchanged from `v5` (`'v5'`) — the `sweep_run_id`
+column added earlier the same night by a concurrent session couldn't serve this purpose since
+historical rows (both the source `v5` rows and the copies) predate it and are NULL either way.
+
+**Deliberately deferred, not built tonight**: `candidate_full_review.py`'s node-selection/cliff-
+safety search still only queries one `version=?` at a time — for the legacy 18-ticker v5 core
+(SOXL/AGQ/DPST/etc., not part of any tranche, deliberately left un-reswept per the user's call
+that ~21-day staleness is fine for a long-horizon strategy with no regime-change detection), this
+means candidate picks still only ever see `v5`. Combining `v5`/`v5.1` results per ticker (and
+picking the right one when a ticker has both) needs a real design pass — tie-breaking, how the
+cliff-safety neighbor search handles a ticker with mixed-version grid coverage — not a quick
+filter change. See `docs/backlog_cache.md`'s 2026-08-11 entry.
+
+**Also found and reverted same session**: SOXS and LABU were briefly promoted to real
+`state='live'`/`state='paper'` nodes based on the stale `v5` numbers before this was caught; SOXS
+was reverted to `paper` then restored to `live` once the user confirmed the original pick (on its
+own narrower-but-self-consistent data window at the time) wasn't actually wrong, just
+now-knowably-incomplete — a real resweep will give it a number to trust going forward. LABU
+stayed `paper` throughout (never went live). See `trading_incidents` id=3-5 for the full trail.

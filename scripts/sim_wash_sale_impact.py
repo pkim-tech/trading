@@ -22,8 +22,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backtester import prep_inputs, run_backtest_dispatch
 import strategies
+from scripts.drought_overlay_test import get_trades_and_bars, find_drought_windows, simulate_overlay
 
 CACHE_DIR = Path("cache/research")
+
+# generic overlay config used for real soxl_ira nodes without a validated per-ticker
+# drought fit (2026-08-07 "widen across all live nodes" decision) -- used here only
+# to illustrate the WORST-CASE additional re-entry exposure overlay adds to the wash-
+# sale timeline, not a claim this is JNUG's actual/validated overlay config.
+GENERIC_DROUGHT_CONFIRM_DAYS = 3
 
 # real live/research node params (watchlist 65) -- extend as needed
 NODES = {
@@ -35,6 +42,9 @@ NODES = {
                  entry_timing="open_check"),
     "SOXL": dict(strategy=strategies.TrailingBothZScoreBreakout, window=10, z_score_threshold=1.0,
                  take_profit=30.0, fixed_sl=2.0, trail_buy_pct=3.0, trail_sell_pct=1.0, max_hold_hours=70,
+                 entry_timing="open_check"),
+    "JNUG": dict(strategy=strategies.TrailingBothZScoreBreakout, window=10, z_score_threshold=1.0,
+                 take_profit=29.0, fixed_sl=1.0, trail_buy_pct=1.0, trail_sell_pct=1.0, max_hold_hours=112,
                  entry_timing="open_check"),
 }
 
@@ -63,26 +73,77 @@ def get_real_trades(ticker):
     return pd.DataFrame(trades).sort_values("Entry Time").reset_index(drop=True)
 
 
-def simulate_wash_sales(df, notional):
-    """Sequential basis-chain simulation: a disallowed loss is added to the cost
-    basis of the NEXT chronological entry within the wash window, reducing that
-    trade's own eventual taxable gain/loss by exactly the carried amount. The chain
-    keeps extending through consecutive washed losses until a trade finally closes
-    without a nearby re-entry -- at which point the whole carried amount becomes
-    deductible that year. This is a simplification (real wash-sale lot-matching can
-    be more particular about which specific replacement lot absorbs a disallowed
-    loss), reasonable for an estimate, not a substitute for real tax software/advice."""
-    df = df.copy()
-    df["raw_dollar_pnl"] = notional * df["Return"]
+def get_drought_trades(ticker):
+    """Real drought-overlay entries (same-ticker re-entries during a core-signal gap)
+    for the wash-sale timeline -- reuses get_trades_and_bars/find_drought_windows/
+    simulate_overlay directly (scripts/drought_overlay_test.py), not reimplemented.
+    Add-on legs are deliberately NOT included: an add-on buys more of an ALREADY-OPEN
+    position and exits alongside it (scripts/stacked_model/add_on.py), so it's not a
+    separate sale-then-repurchase event -- no new wash-sale-relevant date."""
+    node = NODES[ticker]
+    df_h = load_hourly(ticker)
+    core_node = dict(
+        ticker=ticker, strategy=node["strategy"].__name__, window=node["window"],
+        z=node["z_score_threshold"], arm_pct=node["take_profit"], fixed_sl=node["fixed_sl"],
+        trail_buy_pct=node["trail_buy_pct"], trail_sell_pct=node["trail_sell_pct"],
+        max_hold_hours=node["max_hold_hours"], entry_timing=node["entry_timing"],
+    )
+    core_trades, df_h = get_trades_and_bars(core_node)
+    windows = find_drought_windows(core_trades, df_h, GENERIC_DROUGHT_CONFIRM_DAYS)
 
+    rows = []
+    for entry_i, backstop_i in windows:
+        r = simulate_overlay(df_h, entry_i, backstop_i, node["fixed_sl"], node["take_profit"],
+                              node["trail_sell_pct"])
+        entry_bar = entry_i + 1 if entry_i + 1 < len(df_h) else entry_i
+        rows.append({
+            "Entry Time": df_h.index[entry_bar],
+            "Exit Time": df_h.index[r["exit_i"]],
+            "Return": r["ret"],
+            "source": "drought",
+        })
+    return pd.DataFrame(rows)
+
+
+def simulate_wash_sales(df, notional):
+    """Sequential basis-chain simulation, with COMPOUNDING notional: the dollars
+    actually deployed into trade i+1 are whatever trade i's real proceeds were
+    (100% reinvested), not a fixed reset amount -- you don't get fresh capital
+    injected between trades, you redeploy what you actually have. This is tracked
+    SEPARATELY from the wash-sale tax-basis adjustment: a disallowed loss doesn't
+    change how much real cash you have (that's already reflected by compounding
+    the actual proceeds forward) -- it only inflates the TAX BASIS of the next
+    lot, so a later sale shows a smaller taxable gain (or bigger taxable loss)
+    than the real dollar move, by exactly the amount still owed from earlier
+    disallowed losses. The chain keeps extending through consecutive washed
+    losses until a trade finally closes without a nearby re-entry -- at which
+    point the whole carried amount is finally recognized for tax purposes that
+    year. Simplification (real wash-sale lot-matching can be more particular
+    about which specific replacement lot absorbs a disallowed loss), reasonable
+    for an estimate, not a substitute for real tax software/advice."""
+    df = df.copy()
+
+    entry_cash = [0.0] * len(df)
+    proceeds_col = [0.0] * len(df)
+    raw_pnl = [0.0] * len(df)
     carried_in = [0.0] * len(df)
+    tax_basis = [0.0] * len(df)
     taxable_pnl = [0.0] * len(df)
     deferred = [False] * len(df)
+
+    running_cash = notional  # compounds trade to trade -- real dollars, not tax basis
     pending_carry = 0.0
 
     for i, row in df.iterrows():
+        entry_cash[i] = running_cash
+        proceeds = running_cash * (1.0 + row["Return"])
+        proceeds_col[i] = proceeds
+        raw_pnl[i] = proceeds - running_cash
+
         carried_in[i] = pending_carry
-        adjusted_pnl = row["raw_dollar_pnl"] - pending_carry
+        this_tax_basis = running_cash + pending_carry
+        tax_basis[i] = this_tax_basis
+        adjusted_pnl = proceeds - this_tax_basis
         pending_carry = 0.0
 
         if adjusted_pnl < 0:
@@ -96,12 +157,18 @@ def simulate_wash_sales(df, notional):
         if washed:
             deferred[i] = True
             taxable_pnl[i] = 0.0
-            pending_carry = -adjusted_pnl  # carried into the NEXT trade's cost basis
+            pending_carry = -adjusted_pnl  # carried into the NEXT trade's tax basis
         else:
             taxable_pnl[i] = adjusted_pnl
 
+        running_cash = proceeds  # real dollars compound regardless of tax treatment
+
+    df["entry_cash"] = entry_cash
+    df["proceeds"] = proceeds_col
+    df["raw_dollar_pnl"] = raw_pnl
     df["carried_basis_in"] = carried_in
-    df["adjusted_pnl"] = df["raw_dollar_pnl"] - df["carried_basis_in"]
+    df["tax_basis"] = tax_basis
+    df["adjusted_pnl"] = df["proceeds"] - df["tax_basis"]
     df["wash_disallowed"] = deferred
     df["taxable_pnl_this_trade"] = taxable_pnl
     return df
@@ -115,9 +182,17 @@ def main():
     ap.add_argument("--tax-rate", type=float, default=0.32,
                      help="illustrative short-term/ordinary-income rate -- ALL these trades are "
                           "held days, so short-term rates apply; this is a placeholder, not your real bracket")
+    ap.add_argument("--overlay", action="store_true",
+                     help="also include real drought-overlay re-entries (generic confirm_days=3 "
+                          "config) in the wash-sale timeline -- more re-entries only ever ADD wash-"
+                          "sale exposure, never reduce it")
     args = ap.parse_args()
 
     trades = get_real_trades(args.ticker)
+    trades["source"] = "core"
+    if args.overlay:
+        drought = get_drought_trades(args.ticker)
+        trades = pd.concat([trades, drought], ignore_index=True).sort_values("Entry Time").reset_index(drop=True)
     if args.start:
         trades = trades[trades["Entry Time"] >= pd.Timestamp(args.start)].reset_index(drop=True)
 
@@ -126,12 +201,13 @@ def main():
     print(f"{args.ticker}: {len(result)} trades, ${args.notional:,.0f} notional per trade, "
           f"illustrative tax rate {args.tax_rate:.0%} (short-term/ordinary-income, since every "
           f"trade here is held days -- NOT your real bracket, adjust with --tax-rate)\n")
-    print(f"{'Entry':<12}{'Exit':<12}{'Raw P&L':>12}{'Carried In':>12}{'Adjusted':>12}{'Washed?':>9}{'Taxable':>12}")
+    print(f"{'Entry':<12}{'Exit':<12}{'Src':<8}{'Cash In':>12}{'Proceeds':>12}{'Raw P&L':>10}"
+          f"{'+Carried':>10}{'Tax Basis':>12}{'Washed?':>9}{'Taxable':>12}")
     for _, r in result.iterrows():
-        print(f"{r['Entry Time'].date()!s:<12}{r['Exit Time'].date()!s:<12}"
-              f"{r['raw_dollar_pnl']:>12,.0f}{r['carried_basis_in']:>12,.0f}"
-              f"{r['adjusted_pnl']:>12,.0f}{'YES' if r['wash_disallowed'] else '':>9}"
-              f"{r['taxable_pnl_this_trade']:>12,.0f}")
+        print(f"{r['Entry Time'].date()!s:<12}{r['Exit Time'].date()!s:<12}{r.get('source', 'core'):<8}"
+              f"{r['entry_cash']:>12,.0f}{r['proceeds']:>12,.0f}{r['raw_dollar_pnl']:>10,.0f}"
+              f"{r['carried_basis_in']:>10,.0f}{r['tax_basis']:>12,.0f}"
+              f"{'YES' if r['wash_disallowed'] else '':>9}{r['taxable_pnl_this_trade']:>12,.0f}")
 
     total_taxable = result["taxable_pnl_this_trade"].sum()
     total_raw = result["raw_dollar_pnl"].sum()
