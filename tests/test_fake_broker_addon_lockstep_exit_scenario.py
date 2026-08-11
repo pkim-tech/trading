@@ -106,6 +106,42 @@ def test_open_filled_leg_closes_in_lockstep_via_real_market_sell(env, fake_broke
     assert any(e['ticker'] == TICKER and e['result'] == 'closed' for e in events)
 
 
+def test_filled_leg_with_resting_sl_closes_via_replace_not_fresh_sell(env, fake_broker):
+    """Real gap found 2026-08-10 via fake_broker_coverage_matrix.py: every
+    other test in this file leaves the leg's sl_order_id unset, so
+    close_addon_leg_real_if_open's replace_equity_order_with_market branch
+    (the leg already has its own real resting protective STOP, same as
+    _place_stop_loss_for_addon_leg would leave it in normal operation) had
+    never actually been driven through a test -- only the no-resting-order
+    place_equity_sell branch above was covered, despite both sharing the
+    same entrypoint name."""
+    node = _node()
+    fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    pos = _open_core_position(node)
+    leg_id = signals_db.open_addon_leg(pos, shares=20, entry_price=51.0, entry_time=datetime.now(),
+                                        paper=False, entry_status='filled')
+    # Seed a real resting protective STOP for the leg, matching what
+    # _place_stop_loss_for_addon_leg leaves behind after a normal entry fill.
+    _, sl_order_id = schwab_client.place_stop_loss('soxl_ira', TICKER, 20, 45.0, is_addon_leg=True,
+                                                     node_dry_run=False, node_id=node['id'])
+    signals_db.set_addon_leg_sl_order_id(leg_id, sl_order_id, broker_stop_price=45.0)
+
+    signals_notify.close_addon_leg_real_if_open(pos, exit_price=53.0, exit_reason='SL', exit_time=datetime.now())
+
+    old_stop = fake_broker.orders[sl_order_id]
+    assert old_stop['status'] == 'REPLACED'
+    market_sells = [o for o in fake_broker.orders.values()
+                    if o['orderLegCollection'][0]['instrument']['symbol'] == TICKER
+                    and o['orderLegCollection'][0]['instruction'] == 'SELL'
+                    and o['orderType'] == 'MARKET']
+    assert len(market_sells) == 1
+    assert market_sells[0]['orderLegCollection'][0]['quantity'] == 20
+    assert signals_db.get_open_addon_leg_by_parent(pos['id']) is None
+    events = signals_db.get_coverage_events(scenario_key='addon_exit_fill')
+    assert any(e['ticker'] == TICKER and e['result'] == 'closed' for e in events)
+
+
 def test_lockstep_close_succeeds_after_parent_position_already_deleted(env, fake_broker):
     """The real call-site ordering (all 7 production sites): db.close_position
     deletes the parent's open_positions row BEFORE close_addon_leg_real_if_open

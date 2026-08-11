@@ -97,6 +97,48 @@ USE_CASES = [
     dict(id="entry_abandon_cancel",
          desc="Entry-abandon timeout: real resting trailing-buy cancelled outright",
          entrypoint="check_entry_abandon", via="check_entry_abandon", schwab_fn="cancel_order"),
+
+    # Drought-overlay and margin add-on rows -- added 2026-08-10, this script's
+    # own accounting was stale for these since USE_CASES was last extended
+    # before either mechanism existed. These mirror the Grid's
+    # drought_entry_placement/drought_handoff_cancel/drought_handoff_exit_placement/
+    # addon_entry_placement/addon_exit_placement scenario_keys, so the two
+    # accountability tools describe the same real call graph instead of
+    # silently diverging on scope.
+    dict(id="drought_entry_placement",
+         desc="Real drought-overlay entry order placement",
+         entrypoint="check_drought_entry", via="notify_drought_buy_signal",
+         schwab_fn="place_trailing_buy or place_equity_buy (dispatches on node strategy, same as core entry)"),
+    dict(id="drought_handoff_cancel",
+         desc="Drought HANDOFF Case A: resting unfilled drought entry order cancelled when core signal fires again",
+         entrypoint="check_drought_handoff", via="check_drought_handoff", schwab_fn="cancel_order"),
+    dict(id="drought_handoff_exit_placement",
+         desc="Drought HANDOFF Case B: open drought position closed with a real market SELL",
+         entrypoint="check_drought_handoff", via="_attempt_automated_exit_sell",
+         schwab_fn="replace_equity_order_with_market or place_equity_sell (same dispatch as core exit)"),
+    dict(id="addon_entry_placement",
+         desc="Real margin add-on-at-arm entry: MARKET BUY for the addon leg",
+         entrypoint="check_addon_trigger_real", via="check_addon_trigger_real", schwab_fn="place_equity_buy"),
+    dict(id="addon_exit_cancel_unfilled_leg",
+         desc="Add-on lockstep close: leg still resting/unfilled when parent exits -- cancelled, never sold",
+         entrypoint="close_addon_leg_real_if_open", via="close_addon_leg_real_if_open", schwab_fn="cancel_order"),
+    dict(id="addon_exit_fresh_market_sell",
+         desc="Add-on lockstep close: filled leg with no resting SL to replace -- fresh market SELL",
+         entrypoint="close_addon_leg_real_if_open", via="close_addon_leg_real_if_open",
+         schwab_fn="place_equity_sell"),
+    dict(id="addon_exit_replace_resting",
+         desc="Add-on lockstep close: filled leg's own resting SL replaced with a real market SELL",
+         entrypoint="close_addon_leg_real_if_open", via="close_addon_leg_real_if_open",
+         schwab_fn="replace_equity_order_with_market",
+         # Was a real gap until 2026-08-10 -- every open_addon_leg() call in
+         # test_fake_broker_addon_lockstep_exit_scenario.py omitted
+         # sl_order_id, so only the fresh-placement branch above was ever
+         # reached despite the entrypoint matching. Closed same day by
+         # test_filled_leg_with_resting_sl_closes_via_replace_not_fresh_sell,
+         # which seeds a real resting STOP first -- the grep-based detection
+         # below is trustworthy again, no manual override needed (same
+         # resolution pattern as exit_fresh_market_sell/gap_resize_fresh above).
+         ),
 ]
 
 
