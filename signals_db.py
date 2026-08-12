@@ -492,6 +492,20 @@ def ensure_tables():
             # existing node until set explicitly per node.
             c.execute("ALTER TABLE watch_list ADD COLUMN force_same_day_block INTEGER NOT NULL DEFAULT 0")
 
+        if 'starting_notional_override' not in wl_cols:
+            # 2026-08-12: signals_helpers._last_sale_recovery permanently
+            # compounds real order sizing off this node's last closed
+            # trade_log proceeds once one exists, silently ignoring any
+            # future edit to starting_notional (found while trying to
+            # deliberately resize AGQ/ETHU/JNUG's real brokerage nodes --
+            # same root shape as the LABD basis-lock bug, but for growing a
+            # position rather than shrinking it to 0). Nullable REAL,
+            # default NULL (no live behavior change until set explicitly) --
+            # when set, _last_sale_recovery returns this value directly,
+            # bypassing both the trade_log lookup AND the plain
+            # starting_notional fallback, until explicitly cleared again.
+            c.execute("ALTER TABLE watch_list ADD COLUMN starting_notional_override REAL")
+
         # account wasn't part of the original UNIQUE constraint -- found 2026-07-26 while
         # adding a second real DPST node in a different account: two nodes with identical
         # strategy params but different accounts are genuinely distinct (the whole point of
@@ -556,6 +570,7 @@ def ensure_tables():
                     skim_strategy_value REAL,
                     skim_last_mark_time TEXT,
                     force_same_day_block INTEGER NOT NULL DEFAULT 0,
+                    starting_notional_override REAL,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account)
@@ -629,6 +644,7 @@ def ensure_tables():
                     skim_strategy_value REAL,
                     skim_last_mark_time TEXT,
                     force_same_day_block INTEGER NOT NULL DEFAULT 0,
+                    starting_notional_override REAL,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account, paper_role)
@@ -2227,6 +2243,44 @@ def set_starting_notional(watch_id, starting_notional):
         if row:
             _log_audit(c, 'set_starting_notional', watchlist_id=row['watchlist_id'], watch_id=watch_id,
                        ticker=row['ticker'], detail=f"{row['starting_notional']} -> {starting_notional}")
+        c.commit()
+
+
+def set_starting_notional_override(watch_id, value):
+    """Pins the next real order's sizing to `value`, bypassing
+    signals_helpers._last_sale_recovery's trade_log-compounding lookup
+    entirely -- the only way to deliberately grow (or shrink) a node's real
+    position size once it has closed at least one real trade (see that
+    function's docstring: starting_notional alone stops taking effect the
+    moment a real trade exists). Stays active until explicitly cleared via
+    clear_starting_notional_override -- NOT a one-shot (no code path
+    consumes/clears it automatically), so organic trade_log compounding
+    stays bypassed until a human decides to resume it."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, starting_notional_override FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"set_starting_notional_override: no watch_list row with id={watch_id}")
+        c.execute("UPDATE watch_list SET starting_notional_override = ? WHERE id = ?",
+                   (float(value), watch_id))
+        _log_audit(c, 'set_starting_notional_override', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                   ticker=row['ticker'], detail=f"{row['starting_notional_override']} -> {value}")
+        c.commit()
+
+
+def clear_starting_notional_override(watch_id):
+    """Resumes organic trade_log-proceeds compounding (see
+    set_starting_notional_override's docstring)."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, starting_notional_override FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"clear_starting_notional_override: no watch_list row with id={watch_id}")
+        c.execute("UPDATE watch_list SET starting_notional_override = NULL WHERE id = ?", (watch_id,))
+        _log_audit(c, 'clear_starting_notional_override', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                   ticker=row['ticker'], detail=f"{row['starting_notional_override']} -> NULL")
         c.commit()
 
 

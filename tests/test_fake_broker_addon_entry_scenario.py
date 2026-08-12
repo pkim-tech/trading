@@ -183,8 +183,11 @@ def test_addon_leg_blocked_by_insufficient_buying_power(env, fake_broker):
     node = _node()
     fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
     fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
-    # notional ~= 20 * 52 = 1040; headroom mult 2.0 requires >= 2080.
-    fake_broker.set_buying_power('soxl_ira', 1_000.0)
+    # notional ~= 20 * 52 = 1040; headroom mult 2.0 requires >= 2080. The real
+    # order-time check is leverage-aware (2026-08-12): equity/margin_req, not
+    # the raw buyingPower field -- set_equity(500) at the default 50%
+    # margin req (2x) gives buying_power=1000, same ceiling as before.
+    fake_broker.set_equity('soxl_ira', 500.0)
     pos = _open_core_position(node)
 
     signals_notify.notify_trailing_activated(pos, current_price=52.0)

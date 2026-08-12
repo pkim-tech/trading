@@ -52,17 +52,20 @@ def test_zero_price_is_not_trusted_as_known(monkeypatch):
 
 
 def test_dry_run_account_never_renders_as_automation_pending(monkeypatch):
-    # 'roth' is dry_run=True in schwab_safety.ACCOUNTS -- even though AGQ is
+    # 'sep' is dry_run=True in schwab_safety.ACCOUNTS -- even though AGQ is
     # automation-scoped, no automated placement ever really happens for this
     # account, so this must NOT render as a placement-failure anomaly.
+    # ('roth' was the dry-run example account until activated for real
+    # 2026-08-12, docs/deep_backlog.md -- same fix pattern as the 2026-08-11
+    # sweep for other tests hardcoding 'roth'.)
     monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {'AGQ'})
-    status, bsp = stop_status({'ticker': 'AGQ', 'account': 'roth', 'broker_stop_price': None})
+    status, bsp = stop_status({'ticker': 'AGQ', 'account': 'sep', 'broker_stop_price': None})
     assert status == 'dry-run'
     assert bsp is None
 
 
 def test_dry_run_takes_precedence_over_ticker_scope_regardless_of_scope():
-    status, bsp = stop_status({'ticker': 'SH', 'account': 'roth', 'broker_stop_price': None})
+    status, bsp = stop_status({'ticker': 'SH', 'account': 'sep', 'broker_stop_price': None})
     assert status == 'dry-run'
 
 

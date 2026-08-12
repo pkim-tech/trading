@@ -309,7 +309,10 @@ def test_addon_second_ticker_buy_blocked_when_buying_power_cannot_cover_both(env
     fake_broker.orders[oid1]['status'] = 'WORKING'  # reserves $100
 
     # required = 200*2 (addon headroom) + 100 (TICKER reservation) = $500; give it $499.
-    fake_broker.set_buying_power('soxl_ira', 499.0)
+    # Real order-time check is leverage-aware (2026-08-12): equity/margin_req,
+    # not the raw buyingPower field -- set_equity(249.5) at the default 50%
+    # margin req (2x) gives buying_power=499, same ceiling as before.
+    fake_broker.set_equity('soxl_ira', 249.5)
 
     with pytest.raises(schwab_safety.SafetyViolation, match="buying power"):
         schwab_safety.check_order('soxl_ira', 'TICKER_TWO', 10, 20.0, 'BUY', is_addon_leg=True)

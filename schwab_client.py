@@ -771,22 +771,71 @@ def get_account_balance(account: str) -> float:
 
 
 def get_account_buying_power(account: str) -> float:
-    """Real 'buyingPower' for the account, read fresh (never cached) -- used
-    only by the add-on leg's cash-availability check (D2,
-    docs/plans/real_order_execution_drought_addon.md 3.1 Exemption D). An
-    add-on is sized at 100% of an already-deployed position (by construction
-    it's borrowing), so get_account_balance's 'availableFunds'/
-    'cashAvailableForTrading' would refuse nearly every real add-on -- this
-    reads the margin-inclusive figure instead. Field name UNVERIFIED against a
-    real Schwab response (same caveat as get_account_balance's own fields when
-    first written) -- confirm against a real account before this path is
-    staged live. Raises on any failure, same fail-closed contract as
-    get_account_balance."""
+    """Real, raw 'buyingPower' for the account, read fresh (never cached).
+    NO LONGER used by the add-on leg's real cash-availability check (see
+    get_leveraged_buying_power below, 2026-08-12) -- confirmed this raw field
+    is computed at a blanket 50% margin requirement, which overstates real
+    capacity for a real 3x leveraged fund (e.g. SOXL/HIBL -- confirmed
+    2026-08-12 JNUG/ETHU are actually 2x, fundLeverageFactor=200.0, same as
+    AGQ; don't assume from ticker name alone) by roughly 1/3. Kept
+    only for signals_notify.check_addon_buying_power_drift, which
+    deliberately still wants the raw, un-leverage-adjusted number -- it's
+    watching whether get_account_balance's own settled-cash-vs-margin
+    assumption still holds for the account overall, a different question
+    than 'what's the real safe order size for this specific ticker.' Raises
+    on any failure, same fail-closed contract as get_account_balance."""
     account_hash = _resolve_account_hashes()[account]
     r = _get_client().get_account(account_hash)
     r.raise_for_status()
     balances = r.json()["securitiesAccount"]["currentBalances"]
     return float(balances["buyingPower"])
+
+
+def get_account_margin_requirement(ticker: str) -> float:
+    """Real house margin requirement fraction for `ticker`, read fresh from a
+    live quote's fundamental.fundLeverageFactor (Client.get_quote). 50% for a
+    2x fund, 75% for a 3x fund -- confirmed 2026-08-12 against a real
+    `brokerage` account response: $20,000 cash / 0.50 = $40,000 exactly
+    matches AGQ's (2x, fundLeverageFactor=200.0) real reported buyingPower.
+    A 1x/unleveraged fund isn't a real scenario for this system (every ticker
+    traded is 2x or 3x) -- falls through to the same 50% bucket as 2x rather
+    than raising, since 50% is the less-permissive (safer) of the two known
+    real values. Raises if fundLeverageFactor is missing entirely from the
+    quote -- fail closed, same contract as get_account_balance."""
+    r = _get_client().get_quote(ticker)
+    r.raise_for_status()
+    data = r.json().get(ticker)
+    if not data:
+        raise ValueError(f"no quote data returned for {ticker}")
+    leverage = data.get('fundamental', {}).get('fundLeverageFactor')
+    if leverage is None:
+        raise ValueError(f"no fundLeverageFactor in quote for {ticker} -- "
+                          f"can't determine real margin requirement")
+    return 0.75 if leverage >= 250.0 else 0.50
+
+
+def get_leveraged_buying_power(account: str, ticker: str) -> float:
+    """Real, leverage-aware buying power for `ticker` in `account` --
+    equity / get_account_margin_requirement(ticker), NOT Schwab's raw
+    'buyingPower' balance field (see get_account_buying_power's docstring --
+    that field is a blanket-50%-requirement number, confirmed 2026-08-12 to
+    overstate real capacity for a 3x fund like SOXL/HIBL by roughly
+    1/3 -- AGQ/ETHU/JNUG are all actually 2x). Used only by the add-on leg's cash-availability check (D2,
+    docs/plans/real_order_execution_drought_addon.md 3.1 Exemption D) -- an
+    add-on is sized at 100% of an already-deployed position (by construction
+    it's borrowing), so get_account_balance's settled-cash cashBalance would
+    refuse nearly every real add-on. Deliberately a separate function from
+    get_account_buying_power, not a change to it, so
+    signals_notify.check_addon_buying_power_drift keeps watching the raw
+    field it was actually built to watch, unaffected by this fix. Raises on
+    any failure, same fail-closed contract as get_account_balance."""
+    account_hash = _resolve_account_hashes()[account]
+    r = _get_client().get_account(account_hash)
+    r.raise_for_status()
+    balances = r.json()["securitiesAccount"]["currentBalances"]
+    equity = float(balances["equity"])
+    margin_req = get_account_margin_requirement(ticker)
+    return equity / margin_req
 
 
 def get_real_position(account: str, ticker: str) -> float:

@@ -1482,7 +1482,12 @@ def check_order(
         # other BUY, including a core entry on the same margin account.
         import schwab_client  # local import: schwab_client imports this module at load time
         try:
-            buying_power = schwab_client.get_account_buying_power(account)
+            # Leverage-aware (2026-08-12) -- get_account_buying_power's raw
+            # field is a blanket 50%-margin-requirement number that
+            # overstates real capacity for a 3x fund; this reads
+            # equity/margin_req(ticker) instead. See
+            # get_leveraged_buying_power's docstring.
+            buying_power = schwab_client.get_leveraged_buying_power(account, ticker)
         except Exception as e:
             signals_db.log_coverage_event(
                 "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id,

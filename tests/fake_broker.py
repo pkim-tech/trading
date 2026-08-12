@@ -79,6 +79,10 @@ class FakeBroker:
         self.account_hashes = {}  # nickname -> fake hash
         self.cash_balances = {}   # nickname -> available cash (defaults to a large number)
         self.buying_powers = {}   # nickname -> buying power (D2, defaults to cash_balances' value)
+        self.equities = {}        # nickname -> equity (2026-08-12, leveraged buying power basis;
+                                   # defaults to cash_balances' value, matching a real flat account)
+        self.leverage_factors = {}  # ticker -> fundLeverageFactor (2026-08-12, e.g. 200.0=2x/300.0=3x;
+                                     # defaults to 200.0/50% margin req, matching a real 2x fund)
 
     # ------------------------------------------------------------------
     # Test-side setup helpers
@@ -88,11 +92,27 @@ class FakeBroker:
         self.cash_balances[account] = cash
 
     def set_buying_power(self, account, buying_power):
-        """D2 (docs/plans/real_order_execution_drought_addon.md) -- the
-        add-on leg's cash-availability check reads 'buyingPower', a distinct
-        field from 'availableFunds'/'cashAvailableForTrading'. Defaults to
-        the account's cash_balances value if never set explicitly."""
+        """D2 (docs/plans/real_order_execution_drought_addon.md) -- the raw
+        'buyingPower' field. Since 2026-08-12 this only feeds
+        signals_notify.check_addon_buying_power_drift (the drift monitor) --
+        the real add-on order-time check uses get_leveraged_buying_power
+        instead (see set_equity/set_leverage_factor below). Defaults to the
+        account's cash_balances value if never set explicitly."""
         self.buying_powers[account] = buying_power
+
+    def set_equity(self, account, equity):
+        """2026-08-12 -- basis for get_leveraged_buying_power (real add-on
+        order-time check: equity / margin_req(ticker)). Defaults to the
+        account's cash_balances value if never set explicitly, matching a
+        real flat account (equity == cash when nothing is held)."""
+        self.equities[account] = equity
+
+    def set_leverage_factor(self, ticker, factor):
+        """2026-08-12 -- fundamental.fundLeverageFactor as returned by a real
+        quote (200.0=2x, 300.0=3x), read by
+        schwab_client.get_account_margin_requirement. Defaults to 200.0
+        (2x/50% margin requirement) if never set explicitly."""
+        self.leverage_factors[ticker] = factor
 
     def set_quote(self, ticker, last, bid=None, ask=None):
         self.quotes[ticker] = {
@@ -156,8 +176,10 @@ class FakeBroker:
         account = self._account_for_hash(account_hash)
         cash = self.cash_balances.get(account, 1_000_000.0)
         buying_power = self.buying_powers.get(account, cash)
+        equity = self.equities.get(account, cash)
         response = {'securitiesAccount': {'currentBalances': {'availableFunds': cash,
-                                                                'buyingPower': buying_power}}}
+                                                                'buyingPower': buying_power,
+                                                                'equity': equity}}}
 
         # If fields parameter is provided and includes POSITIONS, add positions
         if fields is not None:
@@ -195,9 +217,11 @@ class FakeBroker:
 
     def get_quote(self, ticker):
         q = self.quotes.get(ticker, {'lastPrice': 0.0, 'bidPrice': 0.0, 'askPrice': 0.0})
+        leverage = self.leverage_factors.get(ticker, 200.0)
         return FakeResponse({ticker: {
             'quote': dict(q),
             'extended': {'lastPrice': q['lastPrice']},
+            'fundamental': {'fundLeverageFactor': leverage},
         }})
 
     def get_orders_for_account(self, account_hash):

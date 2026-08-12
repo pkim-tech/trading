@@ -315,7 +315,17 @@ def _last_sale_recovery(node, position_source='core'):
     position_source (default 'core') -- a drought exit's proceeds must never
     size the next core entry and vice versa (real once drought/addon trades
     exist; no-op today since trade_log has zero non-core rows, see
-    docs/plans/real_order_execution_drought_addon.md 0.7)."""
+    docs/plans/real_order_execution_drought_addon.md 0.7).
+
+    starting_notional_override (2026-08-12), when set, is checked FIRST and
+    returned directly -- bypasses both the trade_log lookup below and the
+    plain starting_notional fallback. The only real lever to deliberately
+    grow (or shrink) a node's sizing once it has closed a real trade; a
+    plain starting_notional edit silently has no effect past that point
+    (see signals_db.set_starting_notional_override)."""
+    override = node.get('starting_notional_override')
+    if override is not None:
+        return override
     ticker = node['ticker']
     with db._conn() as c:
         c.row_factory = sqlite3.Row

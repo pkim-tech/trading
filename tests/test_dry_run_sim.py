@@ -59,7 +59,11 @@ def _sig(price):
 
 
 def test_dry_run_account_is_actually_dry_run():
-    assert schwab_safety.ACCOUNTS['roth'].trading_enabled is False
+    # 'roth' was the dry-run example account until it was activated for real
+    # 2026-08-12 (docs/deep_backlog.md) -- 'sep' is the current stand-in,
+    # same fix pattern as the 2026-08-11 sweep that already caught this for
+    # other tests hardcoding 'roth'.
+    assert schwab_safety.ACCOUNTS['sep'].trading_enabled is False
 
 
 def test_pending_buy_for_dry_run_account_never_fills_without_synthesis(env):

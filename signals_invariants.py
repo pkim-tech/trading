@@ -210,24 +210,30 @@ def check_tax_advantaged_excluded_tickers():
 
 
 def check_brokerage_not_live_with_unresolved_leverage_gap():
-    """The 'brokerage' account must stay trading_enabled=False until the
-    add-on buying-power leverage gap is resolved.
+    """Historically blocked 'brokerage' trading_enabled=True until the
+    leverage-inclusive-cash gap was resolved. BOTH sides now fixed
+    2026-08-12:
 
-    Core-entry side FIXED 2026-08-12: schwab_client.get_account_balance now
-    reads cashBalance (real settled cash) instead of the margin-inclusive
-    availableFunds, so a plain core BUY can no longer be partly funded by
-    borrowing without that being a deliberate, sized decision.
+    Core-entry side: schwab_client.get_account_balance now reads cashBalance
+    (real settled cash) instead of the margin-inclusive availableFunds, so a
+    plain core BUY can no longer be partly funded by borrowing.
 
-    Still open: get_account_buying_power (used only by the is_addon_leg BUY
-    path) reads the raw 'buyingPower' field, which is NOT leverage-factor-aware
-    -- confirmed 2026-08-12 against a real brokerage response that it's
-    computed at a uniform 50% margin requirement (correct for a 2x fund like
-    AGQ, but overstates real capacity for a 3x fund like JNUG/ETHU by roughly
-    1/3, since Schwab's real house requirement for 3x leveraged ETFs is 75%,
-    not 50%). 3 real live brokerage nodes (AGQ/ETHU/JNUG) carry
-    addon_enabled=1 today, so this is a live-reachable gap the moment
-    trading_enabled flips True. (docs/backlog_cache.md, needs a leverage-aware
-    margin_req(ticker) calc before this can close.)
+    Add-on side: schwab_client.get_leveraged_buying_power (new, used by the
+    is_addon_leg BUY path instead of the old get_account_buying_power) computes
+    equity / get_account_margin_requirement(ticker) -- real leverage-factor-
+    aware margin requirement (50% for a 2x fund -- AGQ/ETHU/JNUG are all
+    actually 2x, confirmed 2026-08-12 -- 75% for a real 3x fund like
+    SOXL/HIBL, confirmed against a real brokerage account response:
+    $20,000/0.50 = $40,000 exact match to AGQ's real reported buyingPower).
+    The old raw 'buyingPower' field is no longer used for real order sizing --
+    kept only for signals_notify.check_addon_buying_power_drift, a distinct
+    account-level monitor.
+
+    This check is left in place (not removed) as a deliberate, explicit gate
+    -- flipping trading_enabled=True for a real margin account with real
+    capital is a decision for a human to make directly, not something a code
+    fix should silently unblock. Remove/repurpose this check only once that
+    decision is actually made. (docs/backlog_cache.md.)
     """
     violations = []
     brokerage = schwab_safety.ACCOUNTS.get('brokerage')
