@@ -15,9 +15,11 @@ from datetime import datetime
 
 import signals_db as db
 import schwab_safety
-from signals_compute import _current_price, _load_cache, _bars_held, check_sell_condition, compute_buy_signal
+from signals_compute import _current_price, _live_tick_price, _load_cache, _bars_held, check_sell_condition, compute_buy_signal
 from signals_blocks import _post_message
-from signals_helpers import buy_order_sizing, effectively_dry_run, log_poll, resolve_at_bar_close
+from signals_helpers import (
+    buy_order_sizing, effectively_dry_run, log_poll, resolve_at_bar_close, MAX_RUNNING_LOW_DROP_PCT,
+)
 
 # Same checkpoint-bar hours the backtest's find_drought_windows uses
 # (scripts/drought_overlay_test.py's TARGET_H0/TARGET_H1) -- the 9:30 and
@@ -362,7 +364,50 @@ def update_paper_buys():
         ticker = pb['ticker']
         node = pb['node']
         wl_id = node.get('id')
+        # Live re-read, not the frozen signal-time snapshot -- paper_role isn't in
+        # _PENDING_BUY_NODE_KEYS (signals_db.py), so pb['node'].get('paper_role') is
+        # always None regardless of the node's real value. Needed below for the
+        # daily-track price-source gate, and reused for the alert checks further down
+        # (previously two separate re-reads; consolidated here, same semantics).
+        live_node = db.get_watch_list_node_by_id(wl_id) if wl_id else None
         price, _ = _current_price(ticker)
+        # Upgrade to a real live tick when one's available -- _current_price alone
+        # only reflects the cached hourly bar, refreshed on the background
+        # data-collector's own schedule (can lag tens of minutes behind real price
+        # movement during a fast open). A trailing-buy wait tracks running_low/
+        # trigger continuously across many polls, so a stale snapshot held for
+        # that long can miss the real moment price actually crossed the trigger
+        # -- unlike evaluate_drought_entry's single point-in-time check above,
+        # where that risk doesn't compound the same way. Found live 2026-07-27:
+        # SOXL's real gap-up-then-crash open was invisible to update_paper_buys
+        # for a full 29 minutes because _current_price returned the identical
+        # stale price on every poll in that window; kept _current_price's own
+        # None/staleness gate below unchanged (still needed for the
+        # no-data-at-all / genuinely-stale-cache case the abandon-timeout logic
+        # depends on) and only upgrade the price itself once that gate passes.
+        #
+        # Skipped for daily-track (paper_role='daily_sync') nodes: daily-track exists
+        # specifically to isolate price-source timing (live tick vs. cached hourly
+        # Close) as the one variable against a backtest replay -- silently upgrading
+        # its fill price here would contaminate exactly the experiment it runs
+        # (identical rationale to evaluate_drought_entry's existing daily_sync branch
+        # above; found missing here by paired Opus review, 2026-08-12, before this
+        # shipped -- 11 real daily-track TrailingBoth nodes exist today, none had
+        # filled yet, so this would have silently corrupted the first one).
+        is_daily_sync = bool(live_node) and live_node.get('paper_role') == 'daily_sync'
+        if price is not None and not is_daily_sync:
+            price = _live_tick_price(ticker, price)
+            # Bound a single poll's running_low drop -- without this, one bad/thin
+            # extended-hours print (_live_tick_price uses prepost=True) could
+            # permanently ratchet running_low down to a price nothing real ever
+            # confirmed (running_low is monotonically non-increasing via min()), and
+            # unlike the real-order equivalent this fills a real position off that
+            # ratcheted trigger. Same bound and rationale as
+            # signals_notify.update_real_pending_buys_running_low's
+            # _MAX_RUNNING_LOW_DROP_PCT (2026-07-31), reused here rather than
+            # reinvented (found missing here by paired Opus review, 2026-08-12).
+            floor = pb['running_low'] * (1 - MAX_RUNNING_LOW_DROP_PCT / 100)
+            price = max(price, floor)
         # Abandon-eligibility (bars_held) only needs cached bar history, not
         # a fresh live price -- computed regardless of whether price below
         # is available, so a stale/unavailable price (compute._current_price's

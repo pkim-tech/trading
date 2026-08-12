@@ -169,9 +169,9 @@ def test_running_low_bounded_against_a_single_anomalous_print(env, fake_broker):
     fake_broker.set_quote(TICKER, last=1.00, bid=1.00, ask=1.01)
     signals_notify.update_real_pending_buys_running_low()
     tracked = [p for p in signals_db.get_pending_buys() if p['ticker'] == TICKER][0]
-    expected_floor = signal_price * (1 - signals_notify._MAX_RUNNING_LOW_DROP_PCT / 100)
+    expected_floor = signal_price * (1 - signals_notify.MAX_RUNNING_LOW_DROP_PCT / 100)
     assert tracked['running_low'] == pytest.approx(expected_floor), (
-        f"expected running_low bounded to the {signals_notify._MAX_RUNNING_LOW_DROP_PCT}% floor "
+        f"expected running_low bounded to the {signals_notify.MAX_RUNNING_LOW_DROP_PCT}% floor "
         f"({expected_floor}), got {tracked['running_low']} -- a single bad print was adopted outright"
     )
 

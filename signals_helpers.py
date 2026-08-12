@@ -546,3 +546,11 @@ def get_full_position_state(wl_id):
             state['mismatches'].append(
                 "local shows no real position/pending-order but broker has a resting order for this ticker")
     return state
+
+
+MAX_RUNNING_LOW_DROP_PCT = 20.0  # see signals_notify.update_real_pending_buys_running_low's
+# docstring for the full rationale -- a single poll's running_low may not drop by more than
+# this in one step, so one bad/thin extended-hours print can't permanently ratchet a
+# trailing-buy's trigger down to a price nothing real ever confirmed. Moved here from
+# signals_notify.py 2026-08-12 so paper_trading.py (which signals_notify.py itself imports,
+# so it can't import back) can reuse the same bound instead of reinventing it.

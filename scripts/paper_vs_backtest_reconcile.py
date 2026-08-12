@@ -33,7 +33,9 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import signals_db as db
-from scripts.drought_overlay_test import load_nodes, get_trades_and_bars
+from backtester import prep_inputs, OPEN
+from scripts.export_trades import load_hourly, simulate_trail_both_annotated, simulate_trail_exit_chaos
+from scripts.drought_overlay_test import build_indicators, TARGET_H0, TARGET_H1
 
 LIVE_DB = Path("cache/live/trading_live.db")
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
@@ -60,31 +62,170 @@ def get_paper_trades(wl_id, start, end):
     return pd.DataFrame(rows, columns=["ticker", "entry_time", "exit_time", "pnl_pct", "exit_reason"])
 
 
+def get_trades_and_bars_since(node, sim_start):
+    """Same replay get_trades_and_bars() does, except the simulator's own bar-by-bar
+    loop only sees hourly rows from sim_start onward -- so it starts flat (no position),
+    matching how paper trading itself actually started, instead of a full multi-year
+    replay that can be sitting mid-position on whatever calendar date happens to fall
+    inside the comparison window.
+
+    Found 2026-08-12 diagnosing a false 'paper diverged from backtest' reading for
+    YANG: the full-history replay was still holding a position it opened 2026-07-20
+    (predating this node's real activity), so its entry-check loop never got a chance
+    to evaluate the 2026-07-28/29 window at all -- not a signal-computation bug, a
+    cold-start artifact of comparing paper's real (flat-start) history against a
+    backtest that assumes it's always been trading.
+
+    Only the per-hourly-bar arrays (prices/highs/lows/opens/hours/daily_idx/timestamps)
+    are sliced -- sma_arr/std_arr/trend_arr stay full/unsliced since they're indexed
+    per calendar day via daily_idx, not per array position, so slicing them too would
+    misalign every lookup. This keeps the full lookback available for computing SMA/std
+    (a node's window needs real prior-day history), it just stops the simulator from
+    opening/holding a position based on a signal from before sim_start.
+    """
+    df_h = load_hourly(node["ticker"])
+    df_daily = df_h.resample("D").last().dropna(subset=["Close"])
+    ind = build_indicators(node["strategy"], df_daily, node["window"])
+    p = prep_inputs(df_h, ind)
+    open_check = node["entry_timing"] == "open_check"
+
+    start_pos = p["timestamps"].searchsorted(pd.Timestamp(sim_start))
+    p_sliced = dict(p)
+    for k in ("prices", "highs", "lows", "opens", "hours", "daily_idx", "timestamps"):
+        p_sliced[k] = p[k][start_pos:]
+
+    if node["strategy"] == "TrailingBothZScoreBreakout":
+        trades = simulate_trail_both_annotated(
+            p_sliced, node["arm_pct"] / 100.0, node["fixed_sl"] / 100.0, node["max_hold_hours"],
+            node["trail_buy_pct"] / 100.0, node["trail_sell_pct"] / 100.0,
+            TARGET_H0, TARGET_H1, node["z"], open_check=open_check,
+        )
+    elif node["strategy"] == "TrailingExitZScoreBreakout":
+        rng = np.random.default_rng(0)
+        trades = simulate_trail_exit_chaos(
+            p_sliced, node["arm_pct"] / 100.0, node["fixed_sl"] / 100.0, node["max_hold_hours"],
+            node["trail_sell_pct"] / 100.0, TARGET_H0, TARGET_H1, node["z"],
+            rng, "drop", 0.0, "drop", 0.0, open_check=open_check,
+        )
+    else:
+        raise ValueError(f"unhandled strategy {node['strategy']}")
+
+    real_trades = [t for t in trades if t["signal_i"] is not None and t["result"] != OPEN]
+    return real_trades, p_sliced["timestamps"]
+
+
 def get_backtest_trades_in_window(node, start, end):
     """end is a YYYY-MM-DD date; pd.Timestamp(end) is midnight, so extend by a day or every
     trade signaling ON the end date is silently excluded -- same class of bug as
-    get_paper_trades' date-string truncation."""
-    trades, df_h = get_trades_and_bars(node)
+    get_paper_trades' date-string truncation.
+
+    sim_start is the node's own added_at (when this exact config started existing/being
+    scanned), not the report's --start -- the simulator must start flat at the node's
+    real inception regardless of what display window the caller asked for, or a report
+    window starting after inception would still inherit a phantom already-open position
+    from before it. --start/--end still filter which resulting trades are shown.
+
+    added_at is stored in UTC (watch_list's schema default is `datetime('now')`, which
+    SQLite evaluates in UTC -- no 'localtime' modifier -- confirmed directly against the
+    real DB, 2026-08-12 paired review) while every hourly bar timestamp is naive
+    US/Eastern. Converted here (not inside get_trades_and_bars_since, whose sim_start
+    contract is "already a naive-ET timestamp") since the `start` fallback below is
+    already in that form (a plain YYYY-MM-DD date) and needs no conversion -- only the
+    added_at path does. Currently latent for every node this script has been run
+    against (all created outside trading hours, so the ~4h UTC/ET offset doesn't cross a
+    bar boundary), but real for nodes created intraday (e.g. wl_id=169, added 2026-08-06
+    11:16:16 UTC = 07:16 ET -- a naive comparison would have started the slice ~4h later
+    than the node actually existed, silently dropping a real inception-day signal, the
+    same false-divergence shape this whole fix exists to eliminate)."""
+    added_at = node.get("added_at")
+    if added_at:
+        sim_start = (pd.Timestamp(added_at, tz="UTC")
+                     .tz_convert("America/New_York").tz_localize(None))
+    else:
+        sim_start = start
+    trades, timestamps = get_trades_and_bars_since(node, sim_start)
     out = []
     end_bound = pd.Timestamp(end) + pd.Timedelta(days=1)
     for t in trades:
         if t["signal_i"] is None:
             continue
-        et = df_h.index[t["signal_i"]]
+        et = timestamps[t["signal_i"]]
         if pd.Timestamp(start) <= et <= end_bound:
             out.append({"entry_time": et, "ret": t["ret"], "result": t["result"]})
     return out
 
 
-def report_live_track(tickers, live_track_nodes, watchlist_id, start, end, csv):
+def resolve_live_track_nodes_by_activity(watchlist_id, tickers=None):
+    """Live-track (paper_role IS NULL) nodes that actually have real trade history,
+    resolved by wl_id rather than load_nodes()'s MIN(id)/state='paper' heuristic.
+
+    That heuristic silently breaks two ways, both found 2026-08-12 while diagnosing a
+    false 'paper diverged from backtest' reading: (1) once a node is promoted to
+    state='live' (e.g. SOXL wl_id=92), it drops out of the state='paper' filter entirely,
+    so the comparison falls back to a same-ticker sibling that never traded at all;
+    (2) even while still state='paper', a ticker can have many duplicate/candidate nodes
+    sharing it, and MIN(id) has no reason to land on the one with real paper_trade_log
+    rows -- confirmed for every one of HIBL/USD/SOXL/KORU/YANG/UDOW/AGQ, each compared
+    against a node with a genuinely different strategy/window/z/fixed_sl than the one
+    that actually produced the real trades.
+
+    Resolves per wl_id (not per ticker) since one ticker can have more than one
+    live-track node with real history (e.g. HIBL 89 and its since-promoted-to-live
+    clone 154) -- reporting per-node keeps each comparison apples-to-apples instead of
+    conflating two distinct configs' trades under one ticker label.
+
+    A ticker whose live-track node(s) exist but have NEVER produced any real paper
+    activity (DPST, GDXU, NUGT as of 2026-08-12) still gets exactly one row -- the
+    lowest-id `state='paper'` node, falling back to lowest-id overall if none is
+    `paper` -- rather than vanishing from the report entirely. "Backtest fired N
+    signals, paper fired zero" (the original YANG-shaped question this whole
+    investigation started from) needs to stay answerable; filtering purely on
+    activity would make it silently unanswerable for a genuinely-inactive node
+    (found by paired Opus review, 2026-08-12, before this shipped).
+    """
+    con = sqlite3.connect(LIVE_DB)
+    active_ids = {r[0] for r in con.execute("SELECT DISTINCT wl_id FROM paper_trade_log")}
+    active_ids |= {r[0] for r in con.execute("SELECT DISTINCT wl_id FROM paper_positions")}
+    active_ids |= {r[0] for r in con.execute("SELECT DISTINCT wl_id FROM paper_pending_buys")}
+    con.close()
+
+    cols = ["id", "ticker", "strategy", "window", "z_score_threshold", "arm_sell_pct",
+            "take_profit", "fixed_sl", "trail_buy_pct", "trail_sell_pct", "max_hold_hours",
+            "entry_timing", "state", "added_at"]
+
+    def _to_node(n):
+        node = {c: n.get(c) for c in cols}
+        node["z"] = node.pop("z_score_threshold")
+        node["arm_pct"] = node["arm_sell_pct"] if node["strategy"] == "TrailingBothZScoreBreakout" else node["take_profit"]
+        return node
+
+    live_track_raw = [
+        n for n in db.get_watchlist(watchlist_id)
+        if n.get("paper_role") is None and (not tickers or n["ticker"] in tickers)
+    ]
+    nodes = [_to_node(n) for n in live_track_raw if n["id"] in active_ids]
+
+    tickers_with_activity = {node["ticker"] for node in nodes}
+    by_ticker = {}
+    for n in live_track_raw:
+        if n["ticker"] in tickers_with_activity:
+            continue
+        by_ticker.setdefault(n["ticker"], []).append(n)
+    for ticker, candidates in by_ticker.items():
+        paper_state = [n for n in candidates if n.get("state") == "paper"]
+        pick = min(paper_state or candidates, key=lambda n: n["id"])
+        nodes.append(_to_node(pick))
+
+    return nodes
+
+
+def report_live_track(nodes, watchlist_id, start, end, csv):
     print(f"=== Live-track (backtest vs paper) reconciliation: {start} to {end} ===\n")
     rows = []
-    for t in tickers:
-        node = live_track_nodes.get(t)
-        if node is None:
-            print(f"{t}: no live-track (paper_role IS NULL) research node on watchlist "
-                  f"{watchlist_id}, skipping")
-            continue
+    if not nodes:
+        print(f"(no live-track nodes with real paper trade history on watchlist {watchlist_id})")
+    for node in nodes:
+        t = node["ticker"]
         paper = get_paper_trades(node["id"], start, end)
         bt_trades = get_backtest_trades_in_window(node, start, end)
         p_closed = paper.dropna(subset=["pnl_pct"])
@@ -98,7 +239,7 @@ def report_live_track(tickers, live_track_nodes, watchlist_id, start, end, csv):
         p_comp = float(np.prod([1 + r for r in p_rets]) - 1) if p_rets else float("nan")
 
         rows.append({
-            "ticker": t,
+            "ticker": t, "wl_id": node["id"], "state": node.get("state"),
             "backtest_n": len(bt_rets), "backtest_win_rate": bt_win / len(bt_rets) if bt_rets else float("nan"),
             "backtest_compounded_pct": bt_comp * 100 if bt_rets else float("nan"),
             "paper_n": len(p_rets), "paper_win_rate": p_win / len(p_rets) if p_rets else float("nan"),
@@ -197,11 +338,11 @@ def main():
     args = parser.parse_args()
     end = args.end or pd.Timestamp.now().strftime("%Y-%m-%d")
 
-    live_track_nodes = {n["ticker"]: n for n in load_nodes(args.watchlist_id, args.tickers)}
+    live_track_nodes = resolve_live_track_nodes_by_activity(args.watchlist_id, args.tickers)
     daily_track_wl_ids = get_daily_track_wl_ids(args.watchlist_id, args.tickers)
-    tickers = args.tickers or sorted(set(live_track_nodes) | set(daily_track_wl_ids))
+    tickers = args.tickers or sorted({n["ticker"] for n in live_track_nodes} | set(daily_track_wl_ids))
 
-    report_live_track(tickers, live_track_nodes, args.watchlist_id, args.start, end, args.csv)
+    report_live_track(live_track_nodes, args.watchlist_id, args.start, end, args.csv)
     report_daily_track(tickers, daily_track_wl_ids, args.start, end, args.csv)
 
 

@@ -7,6 +7,9 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [backtest][tooling] Resolved 2026-08-12 (evening) — `scripts/paper_vs_backtest_reconcile.py`'s two real bugs (wrong node-config selection, unbounded full-history backtest replay causing a cold-start artifact) fixed; confirmed real for KORU/YANG only, not HIBL/USD/SOXL. Paired review found+fixed 2 more (sim_start UTC/ET timezone mismatch, inactive nodes vanishing from the report). Full detail: `deep_backlog.md`.
+## [live-trading] Resolved 2026-08-12 (evening) — `paper_trading.update_paper_buys` fixed to price its trailing-buy fill simulation off a live tick instead of a stale cached hourly bar; found via a real SOXL gap-up-then-crash divergence traced to a 29-minute frozen price in the poll log. Paired review caught+fixed a real HIGH bug in the first version (daily-track price-source contamination) + a missing running_low drop-bound before it shipped. Real live trading unaffected. Full detail: `deep_backlog.md`.
+
 ## [live-trading][tax] Resolved (expired clean) 2026-08-12 — GDXU/AGQ IRA-type wash-sale clearance-date hold confirmed honored (GDXU's real `roth` node went live 2026-08-10, after both clearance dates); stale open item removed. Full detail: `deep_backlog.md`.
 ## [live-trading] Resolved 2026-08-12 — `brokerage.trading_enabled` flipped to True (both leverage gaps fixed); the deliberate human-decision invariant gate removed per its own docstring's instruction; daemon needs a restart to pick it up. Full detail: `deep_backlog.md`.
 ## [live-trading] Superseded 2026-08-12 — "open a new real live account for genuine margin add-on testing (AGQ)" is moot now that `brokerage` itself fills that role (funded, live, AGQ addon-enabled, leverage-aware buying-power confirmed). Full detail: `deep_backlog.md`.

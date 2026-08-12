@@ -22,7 +22,7 @@ from signals_blocks import _post_message, _post_chunked, _build_buy_blocks, _bui
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
     buy_order_sizing, effectively_dry_run, has_capital_at_stake, log_poll, mode_tag,
-    resolve_at_bar_close, should_alert_live, stop_status,
+    resolve_at_bar_close, should_alert_live, stop_status, MAX_RUNNING_LOW_DROP_PCT,
 )
 # scripts/ has no __init__.py but is still importable as a Python 3 implicit
 # namespace package as long as repo root is on sys.path (true whenever this
@@ -973,9 +973,6 @@ def _sync_confirm_and_protect(ticker, node, order_id=None):
     _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'], account=account)
 
 
-_MAX_RUNNING_LOW_DROP_PCT = 20.0  # see update_real_pending_buys_running_low's docstring
-
-
 def update_real_pending_buys_running_low():
     """Tracks pending_buys.running_low for a REAL (non-dry_run) resting
     trailing-buy -- mirrors update_dry_run_buys' tracking logic below, but
@@ -1016,7 +1013,7 @@ def update_real_pending_buys_running_low():
     produces an artificially low buy_trigger for check_gap_resize to compare
     the real opening print against, firing a real, unwarranted MARKET buy.
     Found in the 2026-07-31 audit's still-open list. Bound: a single poll may
-    not lower running_low by more than _MAX_RUNNING_LOW_DROP_PCT in one step
+    not lower running_low by more than MAX_RUNNING_LOW_DROP_PCT in one step
     (generous -- comfortably above any real single-poll move for a real
     ticker at the default 5-min POLL_SECS cadence, automation_principles.md
     #7a's cheap-static-buffer preference over precisely modeling which prints
@@ -1046,7 +1043,7 @@ def update_real_pending_buys_running_low():
         if price is None:
             continue
         current = pb['running_low'] or pb['signal_price']
-        floor = current * (1 - _MAX_RUNNING_LOW_DROP_PCT / 100)
+        floor = current * (1 - MAX_RUNNING_LOW_DROP_PCT / 100)
         running_low = max(min(current, price), floor)
         if running_low != pb['running_low']:
             db.update_pending_buy_running_low(wl_id, running_low)

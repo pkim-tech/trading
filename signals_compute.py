@@ -73,6 +73,40 @@ def _current_price(ticker):
     return price, last_ts
 
 
+def _live_tick_price(ticker, fallback):
+    """Real live 1-minute tick fetch (yfinance) -- unlike _current_price's cached
+    hourly-bar snapshot (only refreshed whenever the background data-collector
+    process next runs, which can lag real price movement by tens of minutes
+    during a fast-moving open), this hits the market directly. Falls back to
+    `fallback` (typically _current_price's cached value) on any fetch failure or
+    empty result, same behavior compute_buy_signal already relied on inline
+    before this was extracted 2026-08-12.
+
+    Found live: SOXL's 2026-07-27 paper trailing-buy fill missed a real
+    gap-up-then-crash entirely because update_paper_buys tracked price via
+    _current_price alone -- it returned the identical $140.08 snapshot for 29
+    straight minutes right after market open while the daemon's own poll loop
+    kept running normally every ~34s, then jumped straight to $132.53 once the
+    hourly-bar cache finally refreshed, well past where a live tick (or a real
+    broker's continuously-live trailing order) would have caught the trigger
+    crossing. compute_buy_signal's live-tick fetch was never affected (it's a
+    different price path) -- only price-tracking loops that used
+    _current_price alone during a trailing-buy wait or a real-account pending
+    buy (the latter fixed 2026-07-29 via schwab_client.get_current_price,
+    see signals_notify.update_real_pending_buys_running_low) had this gap.
+    Paper had no broker to source a real-time quote from, so this reuses the
+    same yfinance 1-minute path compute_buy_signal already trusts, instead of
+    depending on schwab_client (which paper deliberately never calls)."""
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            hist = ex.submit(
+                lambda: yf.Ticker(ticker).history(period='1d', interval='1m', prepost=True)
+            ).result(timeout=10)
+        return float(hist['Close'].iloc[-1]) if not hist.empty else fallback
+    except Exception:
+        return fallback
+
+
 # ---------------------------------------------------------------------------
 # Signal computation
 # ---------------------------------------------------------------------------
@@ -186,12 +220,7 @@ def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override
     elif price_override is not None:
         current_price = price_override
     else:
-        try:
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                hist = ex.submit(lambda: yf.Ticker(ticker).history(period='1d', interval='1m', prepost=True)).result(timeout=10)
-            current_price = float(hist['Close'].iloc[-1]) if not hist.empty else close_series.iloc[-1]
-        except Exception:
-            current_price = close_series.iloc[-1]
+        current_price = _live_tick_price(ticker, close_series.iloc[-1])
     discontinuity = detect_price_discontinuity(current_price, prev_close)
     if discontinuity:
         print(f"⚠️ Possible corporate action for {ticker}: prev_close={prev_close:.4f} "
