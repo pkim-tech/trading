@@ -54,6 +54,19 @@ SCENARIO_ROLE_TO_GRID_IDS = {
     'time_exit_via_trail': ['time_exit_trigger'],
     'time_exit_via_sl': ['time_exit_trigger'],
     'gap_resize_and_topup': ['gap_resize', 'post_fill_topup'],
+    # Added 2026-08-12 alongside the staged_test_config multi-role migration
+    # -- RETL genuinely carries both roles simultaneously (drought_overlay_
+    # enabled=1 + addon_enabled=1), previously untracked since one node could
+    # only hold one scenario_role before. Keep in sync with the duplicate
+    # copy in scripts/coverage_check.py (see that copy's comment for why it's
+    # duplicated, not imported).
+    'drought_handoff': ['drought_entry', 'drought_handoff', 'drought_entry_placement',
+                         'drought_handoff_cancel', 'drought_handoff_exit_placement',
+                         'drought_handoff_alert_slot_preserved'],
+    'addon': ['addon_entry_fill', 'addon_entry_placement', 'addon_exit_fill',
+              'addon_exit_placement', 'addon_leg_independent_sl_fill_detection',
+              'addon_leg_reconciliation', 'addon_second_ticker_buy_allowed',
+              'addon_buying_power_check', 'addon_double_buy_exemption'],
 }
 
 
@@ -120,47 +133,51 @@ def _print_staged_config(node, source):
     staged = [s for s in db.get_staged_test_configs() if s["wl_id"] == node["id"]]
     if not staged:
         return
-    row = staged[0]
-    print(f"  staged test role: {row['scenario_role']}")
-    if row.get("notes"):
-        print(f"    notes: {row['notes']}")
-    mismatches = []
-    for field, expected in row["expected_config"].items():
-        actual = source.get(field)
-        if actual is None:
-            continue
-        if abs(float(actual) - float(expected)) > 0.01:
-            mismatches.append(f"{field}: expected {expected}, actual {actual}")
-    if mismatches:
-        print(f"  \U000026A0️  STAGED CONFIG MISMATCH: {'; '.join(mismatches)}")
-    else:
-        print(f"  staged config: matches expected ({', '.join(f'{k}={v}' for k, v in row['expected_config'].items())})")
-    relevance = _scenario_relevance(row['scenario_role'])
-    if relevance is not None:
-        all_verified = all(r.startswith(f"{gid}: verified-live")
-                            for r, gid in zip(relevance, SCENARIO_ROLE_TO_GRID_IDS[row['scenario_role']]))
-        for r in relevance:
-            print(f"    grid relevance: {r}")
-        if all_verified:
-            print(f"  \U0001F9F9 STALE? every Grid scenario this staged role exists to prove is already "
-                  f"verified-live -- confirm whether this node should keep running hot. The staged "
-                  f"config is a reusable regression fixture (see the live-test-node-setup skill's "
-                  f"regression-pass mode) -- pause it from active live duty (state flip) rather than "
-                  f"reverting/deleting its detune, so it can be re-run after future trading-code changes.")
-    elif row['scenario_role'] == 'baseline_config' and _looks_like_buried_scenario(row.get('notes')):
-        # LABD (wl_id=152) sat stuck for ~22h with a real, already-proven test
-        # purpose ("SCENARIO CONTEXT... confirmed live 2026-08-07") written as
-        # free-text prose inside a baseline_config row instead of its own
-        # scenario_role -- invisible to the STALE check above since
-        # scenario_role='baseline_config' is deliberately excluded from
-        # SCENARIO_ROLE_TO_GRID_IDS (found+fixed 2026-08-11). This can't
-        # compute an actual STALE verdict (no scenario_role to look up), so it
-        # just surfaces the mismatch itself: prose claims a real test scenario,
-        # role field says "not a test scenario at all."
-        print(f"  ⚠️  scenario prose found in a baseline_config row -- this staged test "
-              f"purpose isn't tracked by the STALE check above (only scenario_role values in "
-              f"SCENARIO_ROLE_TO_GRID_IDS are). Give it its own scenario_role, or fold the "
-              f"scenario notes back into a properly-mapped row.")
+    # A node can now genuinely carry more than one row (2026-08-12 migration,
+    # see RETL: time_exit_via_sl + drought_handoff + post_fill_topup + addon
+    # simultaneously) -- loop over every role instead of only staged[0], or
+    # every role past the first would silently go unreported.
+    for row in staged:
+        print(f"  staged test role: {row['scenario_role']}")
+        if row.get("notes"):
+            print(f"    notes: {row['notes']}")
+        mismatches = []
+        for field, expected in row["expected_config"].items():
+            actual = source.get(field)
+            if actual is None:
+                continue
+            if abs(float(actual) - float(expected)) > 0.01:
+                mismatches.append(f"{field}: expected {expected}, actual {actual}")
+        if mismatches:
+            print(f"  \U000026A0️  STAGED CONFIG MISMATCH: {'; '.join(mismatches)}")
+        else:
+            print(f"  staged config: matches expected ({', '.join(f'{k}={v}' for k, v in row['expected_config'].items())})")
+        relevance = _scenario_relevance(row['scenario_role'])
+        if relevance is not None:
+            all_verified = all(r.startswith(f"{gid}: verified-live")
+                                for r, gid in zip(relevance, SCENARIO_ROLE_TO_GRID_IDS[row['scenario_role']]))
+            for r in relevance:
+                print(f"    grid relevance: {r}")
+            if all_verified:
+                print(f"  \U0001F9F9 STALE? every Grid scenario this staged role exists to prove is already "
+                      f"verified-live -- confirm whether this node should keep running hot. The staged "
+                      f"config is a reusable regression fixture (see the live-test-node-setup skill's "
+                      f"regression-pass mode) -- pause it from active live duty (state flip) rather than "
+                      f"reverting/deleting its detune, so it can be re-run after future trading-code changes.")
+        elif row['scenario_role'] == 'baseline_config' and _looks_like_buried_scenario(row.get('notes')):
+            # LABD (wl_id=152) sat stuck for ~22h with a real, already-proven test
+            # purpose ("SCENARIO CONTEXT... confirmed live 2026-08-07") written as
+            # free-text prose inside a baseline_config row instead of its own
+            # scenario_role -- invisible to the STALE check above since
+            # scenario_role='baseline_config' is deliberately excluded from
+            # SCENARIO_ROLE_TO_GRID_IDS (found+fixed 2026-08-11). This can't
+            # compute an actual STALE verdict (no scenario_role to look up), so it
+            # just surfaces the mismatch itself: prose claims a real test scenario,
+            # role field says "not a test scenario at all."
+            print(f"  ⚠️  scenario prose found in a baseline_config row -- this staged test "
+                  f"purpose isn't tracked by the STALE check above (only scenario_role values in "
+                  f"SCENARIO_ROLE_TO_GRID_IDS are). Give it its own scenario_role, or fold the "
+                  f"scenario notes back into a properly-mapped row.")
 
 
 def _looks_like_buried_scenario(notes):
@@ -419,8 +436,17 @@ def main():
     if not args.tickers and not args.staged:
         ap.error("pass --tickers T [T ...] or --staged")
     if args.staged:
+        # Dedupe on wl_id -- a node can now hold multiple staged_test_config
+        # rows (one per scenario_role, 2026-08-12 migration), but audit_one
+        # already prints every role for a node in one pass (_print_staged_config
+        # loops over all of them internally) -- without this, a multi-role node
+        # like RETL would get audited (including a real broker query) once per
+        # role instead of once total. First-seen order preserved, not sorted.
+        seen_wl_ids = []
         for s in db.get_staged_test_configs():
-            audit_one(s["ticker"], wl_id=s["wl_id"])
+            if s["wl_id"] not in seen_wl_ids:
+                seen_wl_ids.append(s["wl_id"])
+                audit_one(s["ticker"], wl_id=s["wl_id"])
     else:
         for ticker in args.tickers:
             audit_one(ticker)

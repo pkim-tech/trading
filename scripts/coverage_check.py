@@ -220,6 +220,135 @@ CHECKERS = {
 }
 
 
+# Mirrors scripts/audit_live_test_candidates.py's SCENARIO_ROLE_TO_GRID_IDS --
+# duplicated rather than imported because that module pulls in active_signals
+# (Slack Bolt app, daemon deps), which this script cannot afford: active_signals
+# itself imports coverage_check for the EOD report, so importing back would be
+# circular. Keep both copies in sync by hand when either changes (extend here
+# whenever staging a new scenario_role there).
+SCENARIO_ROLE_TO_GRID_IDS = {
+    'time_exit_via_trail': ['time_exit_trigger'],
+    'time_exit_via_sl': ['time_exit_trigger'],
+    'gap_resize_and_topup': ['gap_resize', 'post_fill_topup'],
+    # Added 2026-08-12 alongside the staged_test_config multi-role migration
+    # -- RETL genuinely carries both roles simultaneously (drought_overlay_
+    # enabled=1 + addon_enabled=1), previously untracked since one node could
+    # only hold one scenario_role before.
+    'drought_handoff': ['drought_entry', 'drought_handoff', 'drought_entry_placement',
+                         'drought_handoff_cancel', 'drought_handoff_exit_placement',
+                         'drought_handoff_alert_slot_preserved'],
+    'addon': ['addon_entry_fill', 'addon_entry_placement', 'addon_exit_fill',
+              'addon_exit_placement', 'addon_leg_independent_sl_fill_detection',
+              'addon_leg_reconciliation', 'addon_second_ticker_buy_allowed',
+              'addon_buying_power_check', 'addon_double_buy_exemption'],
+}
+
+
+def _last_hit_by_mode(scenario_key):
+    """Returns {mode: {ticker, ts}} -- the most recent coverage_events row per
+    mode for this scenario_key. SQLite's bare-column-with-MAX() extension
+    (documented, reliable behavior, not ambiguous) guarantees ticker reflects
+    the same row as the returned MAX(ts), not an arbitrary row sharing the
+    group. Empty dict if this scenario_key has never fired via coverage_events
+    (either check_mechanism='scenario_expectations', which never logs a
+    coverage_events row -- see _last_hit_trade_lifecycle below -- or it
+    genuinely never fired)."""
+    with db._conn() as c:
+        rows = c.execute(
+            "SELECT mode, ticker, MAX(ts) as last_ts FROM coverage_events "
+            "WHERE scenario_key=? GROUP BY mode", (scenario_key,)
+        ).fetchall()
+    return {r['mode']: dict(ticker=r['ticker'], ts=r['last_ts']) for r in rows}
+
+
+def _last_hit_trade_lifecycle(scenario_key):
+    """check_mechanism='scenario_expectations' rows (the canary_* scenarios)
+    never log a coverage_events row -- their proof lives in trade_log instead,
+    scoped by the real scenario_expectations.ticker/node_id. Returns the same
+    shape as _last_hit_by_mode ({mode: {ticker, ts}}), mode always 'live'
+    since canary nodes' scenario_expectations rows are all mode='live' (they
+    exercise the real order-placement code path with dry_run=True at the
+    account level, not a separate coverage_events mode)."""
+    exps = [s for s in db.get_scenario_expectations() if s['scenario_key'] == scenario_key
+            and s['check_method'] == 'trade_lifecycle']
+    best = None
+    for s in exps:
+        node = db.get_watch_list_node_by_id(s.get('node_id')) if s.get('node_id') is not None else None
+        disambig = dict(strategy=node.get('strategy'), version=node.get('version'),
+                         window=node.get('window'), account=node.get('account')) if node else {}
+        with db._conn() as c:
+            q = "SELECT exit_time, ticker FROM trade_log WHERE ticker=?"
+            args = [s['ticker']]
+            for k, v in disambig.items():
+                if v is not None:
+                    q += f" AND {k}=?"
+                    args.append(v)
+            q += " ORDER BY exit_time DESC LIMIT 1"
+            row = c.execute(q, args).fetchone()
+        if row and row['exit_time'] and (best is None or row['exit_time'] > best['ts']):
+            best = dict(ticker=row['ticker'], ts=row['exit_time'])
+    return {'live': best} if best else {}
+
+
+def _staged_coverage_for_rule(rule_id):
+    """Returns a list of 'TICKER (account, role=scenario_role)' strings for
+    every currently-staged watch_list node whose scenario_role maps (via
+    SCENARIO_ROLE_TO_GRID_IDS) to this rule_id -- answers "what's staged to
+    cover this" distinctly from "has it ever been covered". A staged node
+    positioned for a rule but not yet fired shows up here even with an empty
+    _last_hit_by_mode/_last_hit_trade_lifecycle result above."""
+    out = []
+    for role, grid_ids in SCENARIO_ROLE_TO_GRID_IDS.items():
+        if rule_id not in grid_ids:
+            continue
+        for row in db.get_staged_test_configs():
+            if row['scenario_role'] != role:
+                continue
+            node = db.get_watch_list_node_by_id(row['wl_id'])
+            if node is None:
+                continue
+            out.append(f"{node['ticker']} ({node['account']}, role={role})")
+    return out
+
+
+def print_by_rule_report():
+    """The coverage-rule-centric view: for every real logic branch in
+    coverage_registry.REGISTRY, print (1) current status, (2) the last real
+    hit per mode -- datetime + ticker, canary/live/paper/dry_run kept
+    separate rather than collapsed into one number, and (3) any staged node
+    currently positioned to hit it. Answers three distinct questions in one
+    pass: did we cover everything (status), when/what last covered it
+    (last-hit), and what's staged to cover it next (staged) -- deliberately
+    NOT the same as run_check()'s per-ticker daily pass/fail; a rule here can
+    span many tickers/nodes, and this view is all-time, not scoped to one day."""
+    from scripts.coverage_registry import REGISTRY, compute_status
+    db.ensure_tables()
+    print("Coverage-rule report (all-time, not scoped to today)\n")
+    for row in REGISTRY:
+        status, status_detail = compute_status(row)
+        print(f"[{row['id']}]  status={status}")
+        print(f"    {status_detail}")
+        if row['check_mechanism'] == 'coverage_events' and row.get('scenario_key'):
+            hits = _last_hit_by_mode(row['scenario_key'])
+        elif row['check_mechanism'] == 'scenario_expectations' and row.get('scenario_key'):
+            hits = _last_hit_trade_lifecycle(row['scenario_key'])
+        elif row['check_mechanism'] == 'open_price_quality_log':
+            with db._conn() as c:
+                r = c.execute("SELECT ticker, MAX(ts) as last_ts FROM open_price_quality_log").fetchone()
+            hits = {'live': dict(ticker=r['ticker'], ts=r['last_ts'])} if r and r['last_ts'] else {}
+        else:
+            hits = {}
+        if hits:
+            for mode, h in sorted(hits.items()):
+                print(f"    last hit ({mode}): {h['ticker']} @ {h['ts']}")
+        else:
+            print("    last hit: never")
+        staged = _staged_coverage_for_rule(row['id'])
+        if staged:
+            print(f"    staged to cover: {', '.join(staged)}")
+        print()
+
+
 def run_check(check_date):
     """Returns a list of per-scenario result dicts (status: 'met'/'deviated'/
     'skipped', scenario_key, ticker, summary) in addition to printing/
@@ -361,6 +490,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--date', default=None, help='YYYY-MM-DD, defaults to today')
     ap.add_argument('--explain', nargs=2, metavar=('ID', 'REASON'), default=None)
+    ap.add_argument('--by-rule', action='store_true',
+                     help="coverage-rule-centric view instead of the daily per-ticker check: "
+                          "status + last hit (datetime/ticker/mode) + what's staged to cover it next")
     args = ap.parse_args()
 
     if args.explain:
@@ -368,6 +500,10 @@ def main():
         dev_id, reason = args.explain
         db.explain_deviation(int(dev_id), reason)
         print(f"explained deviation {dev_id}: {reason}")
+        return
+
+    if args.by_rule:
+        print_by_rule_report()
         return
 
     check_date = args.date or date.today().isoformat()

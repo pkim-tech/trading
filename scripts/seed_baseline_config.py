@@ -9,11 +9,19 @@ not just the 3 explicit test roles. Built 2026-07-30 per user request: "are we
 prepared for today?" should cover all live tickers, not just canaries.
 
 Deliberately NOT idempotent in the usual "safe to rerun" sense: skips any node
-that already has a staged_test_config row (of any scenario_role) rather than
-overwriting it -- rerunning would otherwise silently adopt a since-drifted live
-value as the new "expected" baseline, defeating the whole point of the drift
-check. To intentionally re-baseline a node after a deliberate config change,
-clear its row first via signals_db.clear_staged_test_config(wl_id), then rerun.
+that already has a scenario_role=='baseline_config' row specifically (not "any
+row" -- fixed 2026-08-12 alongside the staged_test_config multi-role migration;
+before that fix, a node with any OTHER role, e.g. RETL's time_exit_via_sl, was
+silently skipped forever and got zero baseline_config drift coverage on its
+other fields) rather than overwriting it -- rerunning would otherwise silently
+adopt a since-drifted live value as the new "expected" baseline, defeating the
+whole point of the drift check. To intentionally re-baseline a node after a
+deliberate config change, clear its baseline_config row specifically --
+signals_db.clear_staged_test_config(wl_id, role='baseline_config') -- then
+rerun. Do NOT call clear_staged_test_config(wl_id) with no role on a node that
+might carry other designed test roles (RETL/SH/ERY/GDXU-shaped nodes): that
+clears every role on the node, not just baseline_config, silently destroying
+roles this script has no way to recreate.
 
 --merge-new-fields: for every EXISTING 'baseline_config' row, adds any FIELDS
 key not already present in its expected_config (from the node's current real
@@ -73,13 +81,21 @@ def main():
     args = ap.parse_args()
 
     db.ensure_tables()
-    staged = {s['wl_id']: s for s in db.get_staged_test_configs()}
+    # A list, not a wl_id-keyed dict -- a node can now hold multiple
+    # scenario_role rows (2026-08-12 migration, see RETL), so collapsing to
+    # one row per wl_id would silently drop every role but the last one
+    # iterated. The merge-new-fields loop below already filters to just
+    # scenario_role=='baseline_config' rows, so this list form naturally
+    # still touches exactly the same rows it always did -- just without the
+    # dict-collapse data loss risk on a genuinely multi-role node.
+    staged = db.get_staged_test_configs()
 
     if args.merge_new_fields:
         updated = 0
-        for wl_id, row in staged.items():
+        for row in staged:
             if row['scenario_role'] != 'baseline_config':
                 continue
+            wl_id = row['wl_id']
             node = db.get_watch_list_node_by_id(wl_id)
             if node is None:
                 continue
@@ -102,7 +118,19 @@ def main():
     # including what's now split into 'dry_run'/'live'). Narrower to
     # state=='live' only would silently skip newly-created dry_run overlay
     # nodes going forward -- found by paired Opus review.
-    already_staged = set(staged.keys())
+    #
+    # Narrowed 2026-08-12 to scenario_role=='baseline_config' specifically,
+    # not "any row for this wl_id" -- found by paired Opus review of the same
+    # session's multi-role migration: RETL/SH/ERY/GDXU are real soxl_ira
+    # state='live' nodes carrying a designed test role (time_exit_via_sl,
+    # gap_resize_and_topup, etc.) but were getting silently skipped here
+    # forever, so they had ZERO baseline_config drift coverage -- only their
+    # narrow test-role fields (2-4 columns) were ever checked, not the full
+    # FIELDS set every other live node gets. A node can hold both a test role
+    # AND a baseline_config row now (that's the whole point of the multi-role
+    # migration), so this no longer needs to treat "has any row" as "don't
+    # touch."
+    already_staged = {s['wl_id'] for s in staged if s['scenario_role'] == 'baseline_config'}
     seeded = 0
     for node in db.get_watchlist():
         if node['state'] == 'paper' or node['id'] in already_staged:

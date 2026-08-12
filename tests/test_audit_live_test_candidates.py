@@ -144,3 +144,88 @@ def test_stale_banner_requires_all_mapped_grid_ids_verified(isolated_db, capsys)
     assert 'gap_resize: verified-live' in out
     assert 'post_fill_topup: wired-never-fired' in out
     assert 'STALE?' not in out
+
+
+# ---------------------------------------------------------------------------
+# staged_test_config multi-role (2026-08-12) -- UNIQUE(wl_id) widened to
+# UNIQUE(wl_id, scenario_role) after RETL organically ended up genuinely
+# serving 4 roles at once with no way to register more than one. These tests
+# pin: (1) set_staged_test_config no longer clobbers a different role's row
+# for the same node, (2) clear_staged_test_config's role= param removes just
+# one role, (3) audit_one/_print_staged_config prints every role for a node,
+# not just the first.
+# ---------------------------------------------------------------------------
+
+def test_set_staged_test_config_does_not_clobber_other_roles(isolated_db):
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
+
+    db.set_staged_test_config(node['id'], TICKER, 'time_exit_via_sl', dict(fixed_sl=50), notes='role A')
+    db.set_staged_test_config(node['id'], TICKER, 'drought_handoff', dict(drought_confirm_days=3), notes='role B')
+
+    rows = [r for r in db.get_staged_test_configs() if r['wl_id'] == node['id']]
+    roles = {r['scenario_role'] for r in rows}
+    assert roles == {'time_exit_via_sl', 'drought_handoff'}
+
+
+def test_set_staged_test_config_updates_in_place_for_same_role(isolated_db):
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
+
+    db.set_staged_test_config(node['id'], TICKER, 'addon', dict(addon_enabled=1), notes='v1')
+    db.set_staged_test_config(node['id'], TICKER, 'addon', dict(addon_enabled=1), notes='v2')
+
+    rows = [r for r in db.get_staged_test_configs() if r['wl_id'] == node['id']]
+    assert len(rows) == 1
+    assert rows[0]['notes'] == 'v2'
+
+
+def test_clear_staged_test_config_with_role_removes_only_that_role(isolated_db):
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
+    db.set_staged_test_config(node['id'], TICKER, 'time_exit_via_sl', dict(fixed_sl=50))
+    db.set_staged_test_config(node['id'], TICKER, 'addon', dict(addon_enabled=1))
+
+    db.clear_staged_test_config(node['id'], role='addon')
+
+    rows = [r for r in db.get_staged_test_configs() if r['wl_id'] == node['id']]
+    assert len(rows) == 1
+    assert rows[0]['scenario_role'] == 'time_exit_via_sl'
+
+
+def test_clear_staged_test_config_without_role_removes_all(isolated_db):
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
+    db.set_staged_test_config(node['id'], TICKER, 'time_exit_via_sl', dict(fixed_sl=50))
+    db.set_staged_test_config(node['id'], TICKER, 'addon', dict(addon_enabled=1))
+
+    db.clear_staged_test_config(node['id'])
+
+    rows = [r for r in db.get_staged_test_configs() if r['wl_id'] == node['id']]
+    assert rows == []
+
+
+def test_audit_one_prints_every_role_for_a_multi_role_node(isolated_db, capsys):
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
+    db.set_staged_test_config(node['id'], TICKER, 'time_exit_via_sl',
+                               dict(arm_sell_pct=0.3, fixed_sl=50, trail_sell_pct=50, max_hold_hours=31))
+    db.set_staged_test_config(node['id'], TICKER, 'addon', dict(addon_enabled=1))
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET arm_sell_pct=0.3, fixed_sl=50, trail_sell_pct=50, "
+                   "max_hold_hours=31, addon_enabled=1 WHERE id=?", (node['id'],))
+        c.commit()
+    now = datetime.now()
+    db.open_position(node, signal_price=100.0, signal_time=now, entry_price=101.0,
+                      entry_time=now, shares=10)
+
+    audit_one(TICKER)
+
+    out = capsys.readouterr().out
+    assert 'staged test role: time_exit_via_sl' in out
+    assert 'staged test role: addon' in out

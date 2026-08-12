@@ -1,7 +1,10 @@
 """Seeds signals_db.staged_test_config with the real, currently-active live
 test roles (SH/RETL/GDXU, 2026-07-29) -- the structured "what should this
 node's config be" mapping that replaces re-deriving/re-explaining this by
-hand each check-in. Idempotent (set_staged_test_config upserts on wl_id).
+hand each check-in. Idempotent (set_staged_test_config upserts on
+(wl_id, scenario_role) -- widened 2026-08-12 from wl_id alone, so re-running
+this after a scenario_role rename leaves the old-named row as a stale orphan
+rather than updating it in place; clear it explicitly first if renaming).
 
 Run once (or after any staged-test redesign): .venv/bin/python scripts/seed_staged_test_config.py
 """

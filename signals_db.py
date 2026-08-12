@@ -1401,9 +1401,14 @@ def ensure_tables():
         # "fixed_sl": 50, "trail_sell_pct": 50, "max_hold_hours": 31}) --
         # scripts/audit_live_test_candidates.py's --staged flag diffs this
         # against the real current node/position config, the same MISMATCH
-        # pattern already used there for fixed_sl-vs-real-order-price. UNIQUE
-        # on wl_id is safe here (unlike scenario_expectations) since wl_id is
-        # NOT NULL -- no nullable-column dedup gotcha.
+        # pattern already used there for fixed_sl-vs-real-order-price.
+        # UNIQUE(wl_id, scenario_role) -- widened 2026-08-12 from UNIQUE(wl_id)
+        # after RETL organically ended up genuinely serving 4 roles at once
+        # (time_exit_via_sl, drought_handoff, post_fill_topup, addon) with no
+        # way to register more than one formally -- the old constraint assumed
+        # one node = one test role, which stopped being true the moment a
+        # node started carrying multiple overlays live simultaneously. wl_id
+        # is still NOT NULL -- no nullable-column dedup gotcha either way.
         c.execute("""
             CREATE TABLE IF NOT EXISTS staged_test_config (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1414,10 +1419,48 @@ def ensure_tables():
                 notes           TEXT,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
-                UNIQUE(wl_id)
+                UNIQUE(wl_id, scenario_role)
             )
         """)
         c.commit()
+        stc_sql_row = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='staged_test_config'").fetchone()
+        if stc_sql_row and 'UNIQUE(wl_id, scenario_role)' not in stc_sql_row[0]:
+            # DROP IF EXISTS first -- a prior failed rebuild attempt leaves this
+            # orphaned, and CREATE TABLE with no IF NOT EXISTS would then
+            # permanently brick every future ensure_tables() call (same bug
+            # shape as the watch_list rebuild above, found by Opus review
+            # 2026-07-26; reintroduced and caught again here by paired Opus
+            # review 2026-08-12). Wrapped in an explicit BEGIN/COMMIT *inside*
+            # the script itself (not a separate c.execute("BEGIN") beforehand
+            # -- executescript() issues an implicit COMMIT before running if
+            # there's a pending transaction, which would silently discard
+            # that and leave the DDL sequence unprotected again; verified
+            # empirically that in-script BEGIN/COMMIT does correctly wrap
+            # SQLite's transactional DDL) so a crash between DROP and RENAME
+            # can't strand the real data in staged_test_config_new with
+            # nothing pointing at it.
+            c.execute("DROP TABLE IF EXISTS staged_test_config_new")
+            c.executescript("""
+                BEGIN IMMEDIATE;
+                CREATE TABLE staged_test_config_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wl_id           INTEGER NOT NULL REFERENCES watch_list(id),
+                    ticker          TEXT NOT NULL,
+                    scenario_role   TEXT NOT NULL,
+                    expected_config TEXT NOT NULL,
+                    notes           TEXT,
+                    created_at      TEXT NOT NULL,
+                    updated_at      TEXT NOT NULL,
+                    UNIQUE(wl_id, scenario_role)
+                );
+                INSERT INTO staged_test_config_new
+                    SELECT id, wl_id, ticker, scenario_role, expected_config, notes, created_at, updated_at
+                    FROM staged_test_config;
+                DROP TABLE staged_test_config;
+                ALTER TABLE staged_test_config_new RENAME TO staged_test_config;
+                COMMIT;
+            """)
 
         # coverage_deviations: one row per (check_date, scenario_key, node_id/ticker, mode)
         # where a daily expectation wasn't met. `reason` starts NULL --
@@ -2314,17 +2357,24 @@ def add_scenario_expectation(scenario_key, expected_outcome, expected_frequency,
 def set_staged_test_config(wl_id, ticker, scenario_role, expected_config: dict, notes=None):
     """Insert-or-update the structured 'what should this staged live test's
     config be' row for a node -- see ensure_tables' staged_test_config
-    comment. expected_config is stored as JSON; pass a plain dict."""
+    comment. expected_config is stored as JSON; pass a plain dict.
+
+    Existing-row lookup is keyed on (wl_id, scenario_role), not wl_id alone
+    (changed 2026-08-12 alongside the UNIQUE(wl_id, scenario_role) migration)
+    -- a node can now genuinely serve multiple roles at once (see RETL), so
+    setting one role must not clobber another role's row for the same node."""
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     config_json = json.dumps(expected_config)
     with _conn() as c:
-        existing = c.execute("SELECT id FROM staged_test_config WHERE wl_id = ?", (wl_id,)).fetchone()
+        existing = c.execute(
+            "SELECT id FROM staged_test_config WHERE wl_id = ? AND scenario_role = ?",
+            (wl_id, scenario_role)).fetchone()
         if existing:
             c.execute("""
                 UPDATE staged_test_config SET
-                    ticker=?, scenario_role=?, expected_config=?, notes=?, updated_at=?
-                WHERE wl_id=?
-            """, (ticker, scenario_role, config_json, notes, now_str, wl_id))
+                    ticker=?, expected_config=?, notes=?, updated_at=?
+                WHERE wl_id=? AND scenario_role=?
+            """, (ticker, config_json, notes, now_str, wl_id, scenario_role))
         else:
             c.execute("""
                 INSERT INTO staged_test_config
@@ -2336,7 +2386,11 @@ def set_staged_test_config(wl_id, ticker, scenario_role, expected_config: dict, 
 
 def get_staged_test_configs():
     """Every currently-active staged-live-test row, expected_config parsed
-    back into a dict."""
+    back into a dict. A node may contribute more than one row now (multiple
+    scenario_roles) -- callers that assume one row per wl_id must group
+    explicitly, not just index/dict-key by wl_id (see scripts/
+    seed_baseline_config.py and scripts/audit_live_test_candidates.py for the
+    2026-08-12 fix to both)."""
     with _conn() as c:
         rows = [dict(r) for r in c.execute("SELECT * FROM staged_test_config ORDER BY id").fetchall()]
     for r in rows:
@@ -2344,11 +2398,19 @@ def get_staged_test_configs():
     return rows
 
 
-def clear_staged_test_config(wl_id):
-    """Removes a node's staged-test row once that test has concluded (fixed
-    and confirmed live, or abandoned) -- not meant to accumulate forever."""
+def clear_staged_test_config(wl_id, role=None):
+    """Removes a node's staged-test row(s) once that test has concluded
+    (fixed and confirmed live, or abandoned) -- not meant to accumulate
+    forever. role=None (default) clears every role for this node, matching
+    the original pre-multi-role behavior (used by seed_baseline_config.py's
+    documented re-baseline flow: clear the node entirely, then rerun). Pass
+    an explicit role to clear just that one role and leave the node's other
+    roles untouched."""
     with _conn() as c:
-        c.execute("DELETE FROM staged_test_config WHERE wl_id = ?", (wl_id,))
+        if role is None:
+            c.execute("DELETE FROM staged_test_config WHERE wl_id = ?", (wl_id,))
+        else:
+            c.execute("DELETE FROM staged_test_config WHERE wl_id = ? AND scenario_role = ?", (wl_id, role))
         c.commit()
 
 

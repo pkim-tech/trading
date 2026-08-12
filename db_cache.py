@@ -123,6 +123,121 @@ def get_bad_tick_scans(ticker=None, limit=500):
         return [dict(r) for r in conn.execute(q, params).fetchall()]
 
 
+def _ensure_sweep_tranches_table(conn):
+    # sweep_tranches: DB-backed replacement for scripts/liquidity_tranches.txt's
+    # hand-edited ticker-membership list, same rationale as the accounts table
+    # replacing hardcoded account config (2026-08-11) and SCHWAB_AUTOMATION_TICKERS
+    # moving off a Python literal -- a flat file that gets hand-edited repeatedly
+    # (disqualified-ticker removals, priority reshuffles) has no audit trail of
+    # who/when/why. This table is the source of truth; scripts/
+    # render_liquidity_tranches.py regenerates the .txt file from it in the exact
+    # format run_liquidity_tranches.sh already parses, so that script's tested
+    # bash parsing logic doesn't need to change at all. Soft-delete (active=0),
+    # never a hard DELETE, per standing convention -- a disqualification is itself
+    # a real fact worth keeping, not just an absence.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sweep_tranches (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign     TEXT NOT NULL DEFAULT 'liquidity_screen',
+            tranche_num  INTEGER NOT NULL,
+            ticker       TEXT NOT NULL,
+            active       INTEGER NOT NULL DEFAULT 1,
+            added_at     TEXT NOT NULL DEFAULT (datetime('now')),
+            removed_at   TEXT,
+            reason       TEXT,
+            UNIQUE(campaign, tranche_num, ticker)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sweep_campaign_config (
+            campaign     TEXT PRIMARY KEY,
+            version      TEXT NOT NULL,
+            fixed_sls    TEXT NOT NULL,
+            strategies   TEXT NOT NULL,
+            entry_timing TEXT NOT NULL,
+            updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
+
+def set_sweep_campaign_config(campaign, version, fixed_sls, strategies, entry_timing):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_sweep_tranches_table(conn)
+        conn.execute("""
+            INSERT INTO sweep_campaign_config (campaign, version, fixed_sls, strategies, entry_timing, updated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(campaign) DO UPDATE SET
+                version=excluded.version, fixed_sls=excluded.fixed_sls,
+                strategies=excluded.strategies, entry_timing=excluded.entry_timing,
+                updated_at=excluded.updated_at
+        """, (campaign, version, fixed_sls, strategies, entry_timing))
+
+
+def get_sweep_campaign_config(campaign):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_sweep_tranches_table(conn)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM sweep_campaign_config WHERE campaign=?", (campaign,)).fetchone()
+        return dict(row) if row else None
+
+
+def add_tranche_ticker(campaign, tranche_num, ticker, reason=None):
+    """Adds a ticker to a tranche, or reactivates it (clears removed_at) if it
+    was previously soft-removed under the same (campaign, tranche_num, ticker)
+    -- a ticker moving back into scope (e.g. a disqualification reversed) keeps
+    its original added_at rather than looking like a brand-new row."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_sweep_tranches_table(conn)
+        conn.execute("""
+            INSERT INTO sweep_tranches (campaign, tranche_num, ticker, active, reason)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(campaign, tranche_num, ticker) DO UPDATE SET
+                active=1, removed_at=NULL, reason=excluded.reason
+        """, (campaign, tranche_num, ticker, reason))
+
+
+def remove_tranche_ticker(campaign, tranche_num, ticker, reason):
+    """Soft-removes a ticker from a tranche -- reason is required (not optional)
+    since a removal with no recorded why is exactly the discrepancy-tracking gap
+    this table exists to close."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_sweep_tranches_table(conn)
+        conn.execute("""
+            UPDATE sweep_tranches SET active=0, removed_at=datetime('now'), reason=?
+            WHERE campaign=? AND tranche_num=? AND ticker=?
+        """, (reason, campaign, tranche_num, ticker))
+
+
+def get_tranches(campaign='liquidity_screen', active_only=True):
+    """Returns {tranche_num: [ticker, ...]}, tickers in insertion (added_at) order
+    within each tranche."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_sweep_tranches_table(conn)
+        conn.row_factory = sqlite3.Row
+        q = "SELECT tranche_num, ticker FROM sweep_tranches"
+        if active_only:
+            q += " WHERE active=1"
+        q += " ORDER BY tranche_num, added_at, id"
+        rows = conn.execute(q).fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r['tranche_num'], []).append(r['ticker'])
+    return out
+
+
+def get_tranche_audit(campaign='liquidity_screen'):
+    """Full history including inactive (removed) rows, for review -- every
+    removal carries its reason, never silently dropped."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_sweep_tranches_table(conn)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT * FROM sweep_tranches WHERE campaign=?
+            ORDER BY tranche_num, added_at, id
+        """, (campaign,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_kv(key):
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_table(conn)
