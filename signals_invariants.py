@@ -211,16 +211,23 @@ def check_tax_advantaged_excluded_tickers():
 
 def check_brokerage_not_live_with_unresolved_leverage_gap():
     """The 'brokerage' account must stay trading_enabled=False until the
-    availableFunds leverage-inclusive-cash gap is resolved.
+    add-on buying-power leverage gap is resolved.
 
-    Depends on this: schwab_client.get_account_balance's cash check reads
-    availableFunds, which for a genuine Reg-T margin account like 'brokerage'
-    can exceed settled cash (includes loan value of held marginable positions).
-    check_order's cash-availability check is meant to be a conservative
-    real-cash gate; against a live 'brokerage' it could currently pass a BUY
-    partly funded by borrowing rather than settled cash. Bounded today only by
-    trading_enabled=False. (docs/backlog_cache.md, Opus review 2026-07-23 night, not
-    yet fixed.)
+    Core-entry side FIXED 2026-08-12: schwab_client.get_account_balance now
+    reads cashBalance (real settled cash) instead of the margin-inclusive
+    availableFunds, so a plain core BUY can no longer be partly funded by
+    borrowing without that being a deliberate, sized decision.
+
+    Still open: get_account_buying_power (used only by the is_addon_leg BUY
+    path) reads the raw 'buyingPower' field, which is NOT leverage-factor-aware
+    -- confirmed 2026-08-12 against a real brokerage response that it's
+    computed at a uniform 50% margin requirement (correct for a 2x fund like
+    AGQ, but overstates real capacity for a 3x fund like JNUG/ETHU by roughly
+    1/3, since Schwab's real house requirement for 3x leveraged ETFs is 75%,
+    not 50%). 3 real live brokerage nodes (AGQ/ETHU/JNUG) carry
+    addon_enabled=1 today, so this is a live-reachable gap the moment
+    trading_enabled flips True. (docs/backlog_cache.md, needs a leverage-aware
+    margin_req(ticker) calc before this can close.)
     """
     violations = []
     brokerage = schwab_safety.ACCOUNTS.get('brokerage')

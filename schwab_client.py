@@ -742,24 +742,29 @@ def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quant
 
 
 def get_account_balance(account: str) -> float:
-    """Real available cash for the account, read fresh (never cached) --
-    Client.get_account, securitiesAccount.currentBalances. Confirmed 2026-07-23
-    against two real margin-type accounts: 'cashAvailableForTrading' (the
-    original field name, from Schwab's documented schema but never checked
-    against a real response until then) doesn't exist on either -- Schwab
-    returns 'availableFunds' instead for a MARGIN account. Falls back to
-    'availableFunds' when the first key is missing rather than assuming one or
-    the other; cash-type accounts (sep/roth) haven't been confirmed to return
-    'cashAvailableForTrading' for real either, but no real response has
-    disproven it yet, so it stays the first choice. Raises on any failure
-    (network, both fields missing, etc.) rather than returning a fallback
-    value -- the caller (schwab_safety.check_order) must fail closed on a
-    balance-check failure, not silently allow the order through with an
+    """Real settled cash for the account, read fresh (never cached) --
+    Client.get_account, securitiesAccount.currentBalances. Prefers
+    'cashBalance' (confirmed 2026-08-12 against all 4 real accounts:
+    brokerage/roth/ira/soxl_ira -- literal settled cash, never inflated by
+    margin loan value against a held position, unlike 'availableFunds', which
+    is margin-inclusive for a genuine Reg-T account (see the
+    check_brokerage_not_live_with_unresolved_leverage_gap invariant this
+    closes) and happened to be numerically identical to cashBalance on every
+    account checked, since none currently holds a marginable position with
+    borrowed value). Falls back to 'availableFunds', then
+    'cashAvailableForTrading' (the original field name from Schwab's
+    documented schema, confirmed 2026-07-23 to not exist on any real account
+    checked so far) for a response shape this hasn't seen yet. Raises on any
+    failure (network, no known field present, etc.) rather than returning a
+    fallback value -- the caller (schwab_safety.check_order) must fail closed
+    on a balance-check failure, not silently allow the order through with an
     unknown balance."""
     account_hash = _resolve_account_hashes()[account]
     r = _get_client().get_account(account_hash)
     r.raise_for_status()
     balances = r.json()["securitiesAccount"]["currentBalances"]
+    if "cashBalance" in balances:
+        return float(balances["cashBalance"])
     if "cashAvailableForTrading" in balances:
         return float(balances["cashAvailableForTrading"])
     return float(balances["availableFunds"])
