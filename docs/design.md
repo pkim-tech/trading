@@ -1689,7 +1689,10 @@ margin, confirmed 2026-08-09 as *currently* borrowed, not theoretical) is linked
 account-opening timeline — the real fix needs a live API balance response to pick the correct
 settled-cash field, which arrives alongside real account access. `signals_invariants.
 check_brokerage_not_live_with_unresolved_leverage_gap` hard-blocks `brokerage.trading_enabled=True`
-in the meantime; verified clean 2026-08-09.
+in the meantime; verified clean 2026-08-09. **Update 2026-08-12: both gaps fixed for real (core-cash
+`cashBalance` fix + leverage-aware `get_leveraged_buying_power`), the human decision to flip was made,
+and this check was removed per its own docstring's instruction — see CLAUDE.md's Live Trading section
+for the current state and its narrower replacement, `check_margin_floor_zero_for_trading_enabled_accounts`.**
 
 ---
 

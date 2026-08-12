@@ -309,10 +309,9 @@ def test_addon_second_ticker_buy_blocked_when_buying_power_cannot_cover_both(env
     fake_broker.orders[oid1]['status'] = 'WORKING'  # reserves $100
 
     # required = 200*2 (addon headroom) + 100 (TICKER reservation) = $500; give it $499.
-    # get_leveraged_buying_power was reverted out of this path 2026-08-12
-    # (paired Opus review found it live-reachable on soxl_ira -- a limited-
-    # margin account -- with a materially overstated result); back on the
-    # raw buyingPower field until it's redesigned.
+    # get_leveraged_buying_power (fixed 2026-08-12, commit a16ede6) clamps to
+    # min(equity/margin_req, raw buyingPower) -- the raw field is the binding
+    # constraint here, so setting it low is still what makes this block.
     fake_broker.set_buying_power('soxl_ira', 499.0)
 
     with pytest.raises(schwab_safety.SafetyViolation, match="buying power"):

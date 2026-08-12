@@ -209,40 +209,29 @@ def check_tax_advantaged_excluded_tickers():
     return violations
 
 
-def check_brokerage_not_live_with_unresolved_leverage_gap():
-    """Historically blocked 'brokerage' trading_enabled=True until the
-    leverage-inclusive-cash gap was resolved. BOTH sides now fixed
-    2026-08-12:
-
-    Core-entry side: schwab_client.get_account_balance now reads cashBalance
-    (real settled cash) instead of the margin-inclusive availableFunds, so a
-    plain core BUY can no longer be partly funded by borrowing.
-
-    Add-on side: schwab_client.get_leveraged_buying_power (new, used by the
-    is_addon_leg BUY path instead of the old get_account_buying_power) computes
-    equity / get_account_margin_requirement(ticker) -- real leverage-factor-
-    aware margin requirement (50% for a 2x fund -- AGQ/ETHU/JNUG are all
-    actually 2x, confirmed 2026-08-12 -- 75% for a real 3x fund like
-    SOXL/HIBL, confirmed against a real brokerage account response:
-    $20,000/0.50 = $40,000 exact match to AGQ's real reported buyingPower).
-    The old raw 'buyingPower' field is no longer used for real order sizing --
-    kept only for signals_notify.check_addon_buying_power_drift, a distinct
-    account-level monitor.
-
-    This check is left in place (not removed) as a deliberate, explicit gate
-    -- flipping trading_enabled=True for a real margin account with real
-    capital is a decision for a human to make directly, not something a code
-    fix should silently unblock. Remove/repurpose this check only once that
-    decision is actually made. (docs/backlog_cache.md.)
-    """
+def check_margin_floor_zero_for_trading_enabled_accounts():
+    """AccountLimits.margin_floor is dormant scaffolding, not active
+    functionality -- it exists to let a genuine full-margin account's real
+    CORE-entry cash go negative up to a deliberately-set real borrowing
+    limit (schwab_safety.py's cash check, ~line 1614), but every account
+    defaults to 0.0 (cash-only core entries), matching the user's explicit
+    design call that ordinary trades should stay cash-only and only add-on
+    legs use margin. It's a plain DB float (accounts.margin_floor) any
+    script could set -- nothing else guards it. A nonzero value on a
+    trading_enabled account would silently reopen the exact core-entry
+    leverage-inclusive-cash gap that check_brokerage_not_live_with_
+    unresolved_leverage_gap (removed 2026-08-12 once its own two gaps were
+    fixed) used to bound -- this is the narrow, still-live piece of that
+    same risk, not a full replacement for that check's broader scope."""
     violations = []
-    brokerage = schwab_safety.ACCOUNTS.get('brokerage')
-    if brokerage is not None and brokerage.trading_enabled:
-        violations.append(
-            "schwab_safety.ACCOUNTS['brokerage'].trading_enabled is True -- the availableFunds "
-            "leverage-inclusive-cash gap (get_account_balance / check_order's cash check) "
-            "was never fixed for a real margin account, only bounded by trading_enabled=False."
-        )
+    for alias, limits in schwab_safety.ACCOUNTS.items():
+        if limits.trading_enabled and limits.margin_floor != 0.0:
+            violations.append(
+                f"accounts.{alias}.margin_floor is {limits.margin_floor} (nonzero) on a "
+                f"trading_enabled account -- this lets real core-entry cash go negative on "
+                f"margin, a deliberate design reversal that should be a reviewed decision, "
+                f"not a silent DB edit."
+            )
     return violations
 
 
@@ -560,7 +549,7 @@ CHECKS = [
     check_daily_track_overlay_config_matches_live_track,
     check_live_node_missing_account,
     check_tax_advantaged_excluded_tickers,
-    check_brokerage_not_live_with_unresolved_leverage_gap,
+    check_margin_floor_zero_for_trading_enabled_accounts,
     check_starting_notional_within_account_notional_cap,
     check_open_position_config_matches_live_node,
     check_staged_config_matches_expected,

@@ -251,12 +251,15 @@ REGISTRY = [
          check_mechanism='coverage_events', scenario_key='cash_check',
          notes="Passing path verified live+dry_run 2026-07-24. Blocking case (insufficient funds) never "
                "observed -- every real event so far shows result=passed. Fixed 2026-08-12: now reads "
-               "real settled cashBalance instead of margin-inclusive availableFunds (closes the "
-               "brokerage leverage gap, see check_brokerage_not_live_with_unresolved_leverage_gap) -- "
-               "same scenario_key, no new coverage_events branch, but the real fetched value changed. "
-               "Confirmed live same day (real brokerage account query) that cashBalance == "
-               "availableFunds on every account today (none holds margin), so no observable live "
-               "behavior change yet."),
+               "real settled cashBalance instead of margin-inclusive availableFunds, closing the "
+               "brokerage core-entry leverage gap (the invariant that used to guard this, "
+               "check_brokerage_not_live_with_unresolved_leverage_gap, was removed the same day once "
+               "the gap was fixed and brokerage.trading_enabled was flipped True -- see "
+               "check_margin_floor_zero_for_trading_enabled_accounts for the narrower piece that's "
+               "still guarded) -- same scenario_key, no new coverage_events branch, but the real "
+               "fetched value changed. Confirmed live same day (real brokerage account query) that "
+               "cashBalance == availableFunds on every account today (none holds margin), so no "
+               "observable live behavior change yet."),
     dict(id='second_ticker_one_account',
          scenario="Second-live-ticker-in-one-account BUY correctly blocked when the account "
                   "can't afford both reservations (non-addon path)",

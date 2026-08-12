@@ -71,7 +71,7 @@ import yfinance as yf
 from annualized_alpha_report import cagr
 from candidate_summary_report import (
     DB_PATH, build_rows_for_ticker, _row_to_record, best_node_strategy, load_ticker_df,
-    CANDIDATE_LABELS,
+    CANDIDATE_LABELS, resolve_version,
 )
 from candidate_5min_report import best_safe_node, _node_from_row, _node_key
 from run_overlay_shim import ensure_candidate_nodes_table, ensure_table as ensure_overlay_table
@@ -227,6 +227,14 @@ COLUMN_DEFS = {
                            "robustness verdict (or the vol-gated REAL_SELECTION override for drought, see "
                            "core_drought_cagr_pct) -- multiplicative, not additive (two ~1.5x-robust overlays "
                            "combine to ~2.3x, not ~3x -- see docs/research_log.md's 2026-08-09 entry).",
+    "core_sdb_cagr_pct": "Annualized CAGR of the core node's OWN trade sequence with same_day_block applied -- "
+                          "unlike core_addon_cagr_pct/core_drought_cagr_pct (which STACK an overlay on top of "
+                          "core), same_day_block instead REPLACES some of core's own trades (blocks a same-day "
+                          "cash-account re-buy), so this is CAGR of sdb_compounded_blocked_pct directly, not a "
+                          "multiplicative combination with strategy_cagr_pct. Always computed automatically for "
+                          "every TrailingBoth candidate (unless --skip-walkforward), matching the drought/addon "
+                          "'compute it for every row, not just on request' convention. Blank for "
+                          "TrailingExitZScoreBreakout (no same_day_block parameter to test).",
     "drought_ie_confirm_days": "confirm_days used for the included-vs-excluded challenge below (pulled from "
                                 "this node's own existing drought overlay run, so it stays consistent with "
                                 "drought_n above).",
@@ -294,6 +302,10 @@ COLUMN_DEFS = {
                                 "raw before/after values regardless).",
     "sdb_alpha_unblocked_pct": "Robust alpha with same_day_block OFF (the raw baseline).",
     "sdb_alpha_blocked_pct": "Robust alpha with same_day_block ON.",
+    "sdb_compounded_unblocked_pct": "Core node's raw compounded return with same_day_block OFF -- the same "
+                                     "kind of number as drought_compounded_pct/addon_compounded_pct, feeding "
+                                     "core_sdb_cagr_pct below.",
+    "sdb_compounded_blocked_pct": "Core node's raw compounded return with same_day_block ON.",
     "sdb_retention_early_pct": "sdb_alpha_retention_pct computed on just the early half of the same-day-block "
                                 "stability split -- checklist item 10.",
     "sdb_retention_late_pct": "sdb_alpha_retention_pct computed on just the late half.",
@@ -1097,6 +1109,16 @@ def core_walk_forward(ticker, strategy, node, n_folds=DEFAULT_FOLDS):
                 if a_u_late is not None and a_u_late > 0:
                     retention_late = (a_b_late / a_u_late * 100) if a_b_late is not None else 0.0
 
+            # Raw compounded-return pair (2026-08-12), added alongside the
+            # existing alpha-based retention numbers above so same_day_block
+            # gets the same "with-lever vs without-lever compounded return"
+            # treatment drought/addon already have (drought_compounded_pct/
+            # addon_compounded_pct) -- previously same_day_block only
+            # exposed an alpha RATIO, never the actual before/after % return
+            # this report's stacked-CAGR columns (core_addon_cagr_pct etc.)
+            # need to fold it in the same way.
+            compounded_unblocked_pct = compounded([t["Return"] for t in closed])
+            compounded_blocked_pct = compounded([t["Return"] for t in closed_block])
             same_day_block_check = {
                 "trade_retention_pct": trade_retention_pct,
                 "alpha_retention_pct": alpha_retention_pct,
@@ -1104,6 +1126,8 @@ def core_walk_forward(ticker, strategy, node, n_folds=DEFAULT_FOLDS):
                 "alpha_blocked_pct": alpha_blocked,
                 "retention_early_pct": retention_early,
                 "retention_late_pct": retention_late,
+                "compounded_unblocked_pct": compounded_unblocked_pct,
+                "compounded_blocked_pct": compounded_blocked_pct,
             }
 
     current_dd_pct = None
@@ -1547,6 +1571,8 @@ def _build_output_row(rec):
     row["sdb_alpha_blocked_pct"] = sdb["alpha_blocked_pct"] if sdb else None
     row["sdb_retention_early_pct"] = sdb["retention_early_pct"] if sdb else None
     row["sdb_retention_late_pct"] = sdb["retention_late_pct"] if sdb else None
+    row["sdb_compounded_unblocked_pct"] = sdb["compounded_unblocked_pct"] if sdb else None
+    row["sdb_compounded_blocked_pct"] = sdb["compounded_blocked_pct"] if sdb else None
     efa = rec.get("exit_fill_acc")
     row["exit_fillacc_win_pct"] = efa[0] if efa else None
     row["exit_fillacc_mean_err_pct"] = efa[1] if efa else None
@@ -1600,7 +1626,9 @@ def _write_xlsx(name, csv_rows):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("tickers", nargs="*")
-    ap.add_argument("--version", default="v5")
+    ap.add_argument("--version", default=None,
+                     help="force a single version for every ticker (old behavior). Default: auto-resolve "
+                          "per ticker via resolve_version() -- v5.1 when the ticker has it, else v5.")
     ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--min-alpha", type=float, default=0,
                      help="Alpha floor for the 'best safe node' cliff-safety search (default 0 -- show "
@@ -1657,19 +1685,20 @@ def main():
 
     out_rows = []
     for ticker in tickers:
-        best = best_node_strategy(conn, ticker, args.version)
+        version = args.version or resolve_version(conn, ticker)
+        best = best_node_strategy(conn, ticker, version)
         membership = {}
         label_to_node = {}
         if best is not None:
             strategy0, _ = best
-            df_t = load_ticker_df(conn, ticker, args.version, strategy0)
+            df_t = load_ticker_df(conn, ticker, version, strategy0)
             if not df_t.empty:
                 membership, label_to_node = candidate_type_membership(df_t, args.min_alpha)
 
         trend_30d, trend_90d = (None, None) if args.skip_trend else ticker_trend(ticker)
         split_flag = None if args.skip_splits else ticker_split_flag(ticker)
 
-        for row in build_rows_for_ticker(conn, ticker, args.version, args.min_alpha, args.skip_5min,
+        for row in build_rows_for_ticker(conn, ticker, version, args.min_alpha, args.skip_5min,
                                           args.skip_overlay):
             if row[1] is None:
                 out_rows.append({"ticker": ticker, "no_data": True})
@@ -1701,7 +1730,7 @@ def main():
             node = label_to_node.get(raw_label) if raw_label else None
             if node:
                 node_id = get_or_create_candidate_node(conn, {
-                    "ticker": ticker, "strategy": strategy, "version": args.version,
+                    "ticker": ticker, "strategy": strategy, "version": version,
                     "window": node["window"], "z": node["z"], "fixed_sl": node["sl"], "arm_pct": node["arm_pct"],
                     "trail_buy_pct": node["trail_buy_pct"], "trail_sell_pct": node["trail_sell_pct"],
                     "max_hold_hours": node["hold"], "entry_timing": node["entry_timing"],
@@ -1710,15 +1739,15 @@ def main():
                 })
                 rec["node_id"] = node_id
                 rec["pick"], rec["comment"] = get_pick_comment(conn, node_id)
-                rec["addon_robustness"] = overlay_robustness(conn, ticker, strategy, args.version, "addon", node)
-                rec["drought_robustness"] = overlay_robustness(conn, ticker, strategy, args.version, "drought", node)
+                rec["addon_robustness"] = overlay_robustness(conn, ticker, strategy, version, "addon", node)
+                rec["drought_robustness"] = overlay_robustness(conn, ticker, strategy, version, "drought", node)
                 core_factor = 1.0 + sret / 100.0
                 addon_ok = rec["addon_robustness"] is not None and rec["addon_robustness"]["verdict"] == "OK"
                 drought_ok = rec["drought_robustness"] is not None and rec["drought_robustness"]["verdict"] == "OK"
                 addon_factor_gated = (1.0 + addon[1] / 100.0) if (addon and addon_ok) else 1.0
                 drought_factor_gated = (1.0 + drought[1] / 100.0) if (drought and drought_ok) else 1.0
                 rec["drought_included_excluded"] = None if args.skip_overlay else drought_included_excluded_check(
-                    conn, ticker, strategy, args.version, node, vol_gate=args.vol_gate)
+                    conn, ticker, strategy, version, node, vol_gate=args.vol_gate)
                 # If the vol-gate is confirmed to do real differential
                 # selection (not just look profitable in isolation), its
                 # included-only return REPLACES the plain drought factor for
@@ -1745,6 +1774,10 @@ def main():
                                              else node["alpha_raw"])
                 rec["walk_forward"] = None if args.skip_walkforward else core_walk_forward(
                     ticker, strategy, node, args.folds)
+                sdb_check = rec["walk_forward"]["same_day_block_check"] if rec["walk_forward"] else None
+                rec["core_sdb_cagr_pct"] = (cagr(sdb_check["compounded_blocked_pct"], days_span)
+                                             if sdb_check and sdb_check.get("compounded_blocked_pct") is not None
+                                             else None)
                 rec["exit_fill_acc"] = None if args.skip_5min else exit_fill_accuracy_summary(
                     ticker, strategy, node)
                 rec["bear_market"] = None if args.skip_bear_market else bear_market_stress_check(
@@ -1755,6 +1788,7 @@ def main():
                 rec["core_addon_cagr_pct"] = None
                 rec["core_drought_cagr_pct"] = None
                 rec["core_both_cagr_pct"] = None
+                rec["core_sdb_cagr_pct"] = None
                 rec["drought_included_excluded"] = None
                 rec["bear_market"] = None
                 rec["also_matches"] = [candidate_type]
@@ -1788,10 +1822,10 @@ def main():
     if args.csv or args.xlsx:
         return
 
-    hdr = ("%-8s %-20s %12s %8s %9s %9s %10s %6s %6s %6s %6s | %-28s | %-28s | %8s %8s %8s" % (
+    hdr = ("%-8s %-20s %12s %8s %9s %9s %10s %6s %6s %6s %6s | %-28s | %-28s | %8s %8s %8s %8s" % (
         "Ticker", "Candidate", "Liquidity$/d", "CAGR%", "AbsRet%", "AnnExcess%", "WorstNb%",
         "Years", "Trades", "Status", "Fill", "Addon(n,comp%,WR%,robust)", "Drought(n,comp%,WR%,robust)",
-        "+Addon%", "+Drght%", "+Both%"))
+        "+Addon%", "+Drght%", "+Both%", "SDB%"))
     print(hdr)
     print("-" * len(hdr))
     for rec in out_rows:
@@ -1826,7 +1860,7 @@ def main():
               f"{rec['abs_return_pct']:>9.1f} {ae_str:>10} {wn_str:>10} {rec['years']!s:>6} {rec['trades']:>6} "
               f"{rec['status']:>6} {fill_str:>6} | {ao_str:<28} | {dr_str:<28} | "
               f"{stacked_str('core_addon_cagr_pct'):>8} {stacked_str('core_drought_cagr_pct'):>8} "
-              f"{stacked_str('core_both_cagr_pct'):>8}")
+              f"{stacked_str('core_both_cagr_pct'):>8} {stacked_str('core_sdb_cagr_pct'):>8}")
 
 
 if __name__ == "__main__":

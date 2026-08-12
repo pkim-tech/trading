@@ -143,13 +143,18 @@ def get_or_create_candidate_node(conn: sqlite3.Connection, node: dict) -> int:
     """Returns the candidate_nodes.id for this exact node param tuple, inserting
     a fresh row (with a NEW created_at/robust_alpha/trades snapshot) only if no
     matching row exists yet -- a param-identical relocate (e.g. after a prune
-    validation pass) reuses the same id, but if backtest_cache's underlying
-    numbers for that exact param combo somehow changed, this does NOT update
-    the existing row's robust_alpha/trades snapshot (INSERT OR IGNORE semantics
-    -- first-seen wins). That's a deliberate limitation, not an oversight: a
-    stale snapshot on an unchanged param tuple would only happen if the same
-    grid cell was recomputed with different code, which is exactly the kind of
-    drift this project's history says to notice, not silently paper over."""
+    validation pass) reuses the same id.
+
+    If backtest_cache's underlying numbers for that exact param combo changed
+    (the same grid cell recomputed with different kernel code, e.g. the
+    2026-08-11 certain-fill-resolution fix), the existing row's
+    robust_alpha/trades/sweep_run_id are refreshed in place -- fixed
+    2026-08-12, since a stale sweep_run_id let node_candidate_trace.py print a
+    confident git-commit stamp that didn't actually produce the numbers
+    currently backing the candidate (worse than the NULL the no-backfill
+    convention implies elsewhere). Prints a one-line drift notice when a
+    refresh actually changes something, since this project's history says to
+    notice recomputation drift, not silently paper over it."""
     import datetime as _dt
     # Cast every value to a native Python type before it ever reaches sqlite3 --
     # found 2026-08-09 that a numpy.int64 (routine when a pandas column happens
@@ -166,17 +171,31 @@ def get_or_create_candidate_node(conn: sqlite3.Connection, node: dict) -> int:
                       (str(node[c]) if isinstance(node[c], str) else float(node[c]))
                       for c in key_cols)
     existing = conn.execute(f"""
-        SELECT id FROM candidate_nodes
+        SELECT id, robust_alpha, trades, sweep_run_id FROM candidate_nodes
         WHERE {' AND '.join(f'{c}=?' for c in key_cols)}
     """, key_vals).fetchone()
-    if existing:
-        return existing[0]
     # sweep_run_id: carried through from node['sweep_run_id'] when the caller
     # populated it (node_dict()/best_row() do) -- absent/None for a node dict
     # built some other way (e.g. hand-constructed), which just leaves the new
     # row's provenance NULL rather than erroring.
     sweep_run_id = node.get("sweep_run_id")
     sweep_run_id = int(sweep_run_id) if sweep_run_id is not None else None
+    if existing:
+        existing_id, old_alpha, old_trades, old_sweep_run_id = existing
+        new_alpha, new_trades = float(node["robust_alpha"]), int(node["trades"])
+        # Never downgrade a known sweep_run_id to NULL just because this
+        # particular caller didn't supply one (e.g. a hand-constructed node
+        # dict) -- only overwrite it when the new call actually knows one.
+        effective_sweep_run_id = sweep_run_id if sweep_run_id is not None else old_sweep_run_id
+        if (old_alpha, old_trades, old_sweep_run_id) != (new_alpha, new_trades, effective_sweep_run_id):
+            print(f"[locate_best_node] candidate_nodes id={existing_id} refreshed: "
+                  f"robust_alpha {old_alpha:.1f}->{new_alpha:.1f}, trades {old_trades}->{new_trades}, "
+                  f"sweep_run_id {old_sweep_run_id}->{effective_sweep_run_id}")
+            conn.execute("""
+                UPDATE candidate_nodes SET robust_alpha=?, trades=?, sweep_run_id=? WHERE id=?
+            """, (new_alpha, new_trades, effective_sweep_run_id, existing_id))
+            conn.commit()
+        return existing_id
     cur = conn.execute(f"""
         INSERT INTO candidate_nodes
             (created_at, {', '.join(key_cols)}, robust_alpha, trades, sweep_run_id)

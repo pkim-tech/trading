@@ -751,14 +751,21 @@ def get_account_balance(account: str) -> float:
     leverage-inclusive-cash gap for 'brokerage', a genuine margin account)
     and happened to be numerically identical to cashBalance on every
     account checked, since none currently holds a marginable position with
-    borrowed value). Falls back to 'availableFunds', then
-    'cashAvailableForTrading' (the original field name from Schwab's
-    documented schema, confirmed 2026-07-23 to not exist on any real account
-    checked so far) for a response shape this hasn't seen yet. Raises on any
-    failure (network, no known field present, etc.) rather than returning a
-    fallback value -- the caller (schwab_safety.check_order) must fail closed
-    on a balance-check failure, not silently allow the order through with an
-    unknown balance."""
+    borrowed value). Falls back to 'cashAvailableForTrading' (the original
+    field name from Schwab's documented schema, confirmed 2026-07-23 to not
+    exist on any real account checked so far) for a response shape this
+    hasn't seen yet, then 'availableFunds' as the last resort. Note: for a
+    genuine cash-type account (cash_settlement_type=='cash' -- only 'sep'
+    today, trading_enabled=False), cashBalance can in principle include
+    unsettled sale proceeds that cashAvailableForTrading would exclude,
+    making this preference order slightly less conservative than it could
+    be for that account type specifically -- inert today since
+    cashAvailableForTrading has never actually appeared on a real response,
+    but worth knowing if a cash-type account is ever made trading_enabled.
+    Raises on any failure (network, no known field present, etc.) rather
+    than returning a fallback value -- the caller (schwab_safety.check_order)
+    must fail closed on a balance-check failure, not silently allow the
+    order through with an unknown balance."""
     account_hash = _resolve_account_hashes()[account]
     r = _get_client().get_account(account_hash)
     r.raise_for_status()
@@ -811,19 +818,20 @@ def get_account_margin_requirement(ticker: str) -> float:
     fundLeverageFactor is missing entirely from the quote -- fail closed,
     same contract as get_account_balance.
 
-    NOT CURRENTLY WIRED INTO ANY REAL ORDER-CHECK PATH (as of 2026-08-12).
-    schwab_safety.check_order's is_addon_leg branch was briefly pointed at
-    get_leveraged_buying_power (below) the same session, then reverted after
-    a paired Opus review found it live-reachable on soxl_ira -- a limited-
-    margin IRA that cannot actually borrow, where margin_capable=True is
-    seeded only to preserve an unrelated old gate's behavior, not because it
-    reflects real leverage capability -- and that equity/margin_req computes
-    GROSS theoretical capacity, never subtracting capital already deployed
-    in open positions, unlike Schwab's own real-time buyingPower field
-    (confirmed empirically: it visibly shrinks as resting orders accumulate).
-    Do not wire this back into a real order-check without first fixing both:
-    (1) gate on genuine leverage-granting capability, not margin_capable;
-    (2) net out already-committed capital, not just total equity."""
+    WIRED into schwab_safety.check_order's is_addon_leg branch via
+    get_leveraged_buying_power (below), as of 2026-08-12. An earlier same-day
+    version was briefly wired unclamped, then reverted after a paired Opus
+    review found it live-reachable on soxl_ira -- a limited-margin IRA that
+    cannot actually borrow, where margin_capable=True is seeded only to
+    preserve an unrelated old gate's behavior, not because it reflects real
+    leverage capability -- and that equity/margin_req computes GROSS
+    theoretical capacity, never subtracting capital already deployed in open
+    positions, unlike Schwab's own real-time buyingPower field (confirmed
+    empirically: it visibly shrinks as resting orders accumulate). Both
+    concerns are now resolved by get_leveraged_buying_power's clamp (commit
+    a16ede6): it returns min(equity/margin_req(ticker), Schwab's raw
+    buyingPower), so the raw field's real-time netting and margin_capable
+    accuracy bound this function's gross estimate on both counts."""
     r = _get_client().get_quote(ticker)
     r.raise_for_status()
     data = r.json().get(ticker)
@@ -855,9 +863,9 @@ def get_leveraged_buying_power(account: str, ticker: str) -> float:
     2026-08-12 same session: a first version without this clamp was briefly
     wired into schwab_safety.check_order's is_addon_leg branch, found live-
     reachable on soxl_ira with a materially overstated result by a paired
-    Opus review, and reverted before this clamp was added -- verify against
-    real soxl_ira/brokerage data before re-wiring (see
-    tests/test_leveraged_buying_power.py). Raises on any failure, same
+    Opus review, and reverted before this clamp was added -- now wired back
+    in with the clamp, verified live against real soxl_ira/brokerage data
+    (see tests/test_leveraged_buying_power.py). Raises on any failure, same
     fail-closed contract as get_account_balance."""
     account_hash = _resolve_account_hashes()[account]
     r = _get_client().get_account(account_hash)

@@ -184,10 +184,10 @@ def test_addon_leg_blocked_by_insufficient_buying_power(env, fake_broker):
     fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
     fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
     # notional ~= 20 * 52 = 1040; headroom mult 2.0 requires >= 2080.
-    # get_leveraged_buying_power was reverted out of this path 2026-08-12
-    # (paired Opus review found it live-reachable on soxl_ira -- a limited-
-    # margin account -- with a materially overstated result); back on the
-    # raw buyingPower field until it's redesigned.
+    # get_leveraged_buying_power (fixed 2026-08-12, commit a16ede6) clamps to
+    # min(equity/margin_req, raw buyingPower) -- on soxl_ira (margin_req=0.75
+    # via margin_capable=True) the raw field is the binding constraint here,
+    # so setting it low is still what makes this scenario block.
     fake_broker.set_buying_power('soxl_ira', 1_000.0)
     pos = _open_core_position(node)
 
