@@ -7261,3 +7261,18 @@ Two new real Schwab accounts (`brokerage` $20k genuine Reg-T margin, `roth` $60k
 **Verification**: 764/764 full suite, `scripts/live_sim_harness.py` 7/7, `signals_invariants.py` zero violations against the real live DB — all post-fix. `docs/design.md` and `docs/deep_backlog.md` updated with full detail; the older "GDXU/DFEN/KORU need to move to a new Roth account" backlog item's account-side blocker is now resolved (the node migration itself is still open, separate work).
 
 **Not done, deliberately out of scope**: renaming any alias, a surrogate-ID migration, the cash-aware add-on redesign.
+
+---
+
+## 2026-08-12 — Roth activated for real; brokerage prepped but held; portfolio_account_status.py's real/paper ambiguity fixed
+`roth` funded ($60k, confirmed via real Schwab API) and `trading_enabled` flipped to 1. DFEN/GDXU/KORU resized from placeholder notional ($258/$800/$52) to $10,000 each -- these were the real 2026-08-11 promotion nodes temporarily parked in `ira` (a documented open backlog item: "need to move to a new Roth account once it's wired in"). Their `ira` duplicates (wl_id=208/209/210) were confirmed flat (no open position/pending buy) and retired via `signals_db.remove_node`, closing the real cross-account double-exposure that existed while both were simultaneously live. All 6 touched nodes' params were independently re-verified against their `watch_list_candidate_link`-linked candidate rows -- zero real mismatches.
+
+`brokerage` (funded, $20k) stays `trading_enabled=False` -- deliberately not touched, blocked on the pre-existing `signals_invariants.check_brokerage_not_live_with_unresolved_leverage_gap` (the `availableFunds` margin-borrowed-cash gap). JNUG/ETHU/AGQ resized $10,000/$49/$231 -> $2,000 each per user's explicit sizing call; JNUG got `force_same_day_block=1` (overlay/add-on were already configured from a prior session). The leverage-gap fix itself was scoped but deliberately deferred to its own dedicated session -- judged too risky to patch under time pressure.
+
+SOXL's small `soxl_ira` proving-ground node (wl_id=196, added 2026-08-07, never fired -- zero trade_log/coverage_events/open position) retired per user's call, after establishing there were 14 `watch_list_candidate_link` rows for 10 distinct tickers (matching CLAUDE.md's documented 10-ticker real candidate list), the extra rows being SOXL's dual-account link and the since-retired ira/roth DFEN/GDXU/KORU duplicates.
+
+**Real bug caught while investigating a user question ("why does it think SOXL has a position in ira?")**: `scripts/portfolio_account_status.py`'s terminal table buried the real-vs-paper distinction inside its status text (`"holding(paper)"`), read as ambiguous mid-line and had just caused a real misread of SOXL's node 92 (a paper-only 430sh position on an otherwise-real `state='live'` node). Fixed with a dedicated `capital` column (REAL/paper/-), deliberately derived from `get_real_position_state`'s raw fields rather than its collapsed `status` string -- a naive fix keyed off `status` would have mislabeled a paper-only pending buy as REAL, since `status=='pending_entry'` conflates real and paper pending orders identically. Caught and fixed before shipping.
+
+Noted but not investigated further: `git status` showed a concurrent session's in-progress work (`config.json`, `scripts/node_candidate_trace.py`) mid-session -- left untouched, only this session's own files committed.
+
+`signals_invariants.py` clean after all changes (one real transient violation self-caught and fixed: an orphaned `staged_test_config` row left behind by SOXL's node retirement).

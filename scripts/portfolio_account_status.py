@@ -99,6 +99,7 @@ def _load_candidate_lookup():
 _DERIVED_COLUMN_DEFS = {
     "trading_enabled": "schwab_safety.ACCOUNTS[account].trading_enabled -- whether this account can place real (non-dry_run) orders at all (None if account isn't in ACCOUNTS).",
     "position_status": "Real-time status from signals_db.get_real_position_state: flat / pending_entry / holding / holding_paper.",
+    "capital": "REAL / paper / - -- whether position_status's position/pending-order is real broker capital or a paper-trading simulation. Derived independently of position_status (which collapses real and paper pending-buys into the same 'pending_entry' string) to avoid mislabeling a paper-only resting order as REAL.",
     "position_detail": "Shares@entry_price if holding, 'resting order' if a trailing-buy is pending, else blank.",
     "candidate_node_id": "Best-effort match to candidate_nodes.id (cache/research/trading_universe.db) by exact param tuple (ticker/strategy/version/window/z/fixed_sl/arm_pct/trail_buy_pct/trail_sell_pct/max_hold_hours/entry_timing) -- same match convention as locate_best_node.get_or_create_candidate_node. No stored FK exists between the two tables, so this is a live recompute every run, not a persisted link. Blank if no candidate_nodes row has the exact same params (common for canary/soxl_test/manually-tuned nodes, which were never sourced from the candidate pipeline), or if params drifted after promotion.",
     "candidate_robust_alpha": "robust_alpha (MIN of possible/pessimistic/certain) recorded on the matched candidate_nodes row, for direct comparison against what's actually running live -- confirms the promoted node really is the validated one, not just a same-ticker lookalike.",
@@ -128,6 +129,7 @@ def _build_record(r, candidate_lookup):
     rec["account"] = rec["account"] or "(none)"
     rec["trading_enabled"] = limits.trading_enabled if limits is not None else None
     rec["position_status"] = pos_state["status"]
+    rec["capital"] = _capital_label(pos_state)
     rec["position_detail"] = _position_detail(pos_state)
     key = _candidate_key(r, wl_col_names=True)
     match = candidate_lookup.get(key) if key is not None else None
@@ -150,9 +152,31 @@ _STRATEGY_ABBREV = {
 _STATUS_LABEL = {
     "holding": "HOLDING",
     "pending_entry": "pending",
-    "holding_paper": "holding(paper)",
+    "holding_paper": "holding",
     "flat": "-",
 }
+
+
+def _capital_label(pos_state):
+    """Separate, unmissable column -- deliberately NOT folded back into
+    _STATUS_LABEL's text (e.g. the old "holding(paper)"). Found live
+    2026-08-12: reading the compact terminal table, a paper-only position on
+    a real state='live' node (SOXL/ira, wl_id=92) read as if it might be real
+    capital -- the "(paper)" suffix was there but easy to miss mid-line.
+    REAL/paper/- as their own column, REAL uppercase vs paper lowercase, is
+    meant to survive a fast skim.
+
+    Reads pos_state's raw real_position/pending_buy/paper_position/
+    paper_pending_buy fields directly instead of its collapsed `status`
+    string -- `status=='pending_entry'` alone is ambiguous (get_real_position_state
+    maps BOTH a real pending_buy and a paper_pending_buy to that same string),
+    so deriving this column from `status` would have silently mislabeled a
+    paper-only resting order as REAL."""
+    if pos_state["real_position"] is not None or pos_state["pending_buy"] is not None:
+        return "REAL"
+    if pos_state["paper_position"] is not None or pos_state["paper_pending_buy"] is not None:
+        return "paper"
+    return "-"
 
 
 def _trunc(s, width):
@@ -287,7 +311,7 @@ def main():
         print(header.ljust(100, "="))
         print(f"  {'node_id':>7s}  {'ticker':6s}  {'strategy':14s} {'ver':20s} {'label':16s} "
               f"{'state':8s} {'timing':11s} {'notional':>10s} {'ovl':4s} "
-              f"{'status':16s} {'position':16s}  added")
+              f"{'status':10s} {'capital':7s} {'position':16s}  added")
 
         for r in [r for r in rows if (r["account"] or "(none)") == account]:
             pos_state = db.get_real_position_state(r["id"])
@@ -303,8 +327,8 @@ def main():
                 f"{_trunc(r['version'], 20):20s} {_trunc(r['label'], 16):16s} "
                 f"{(r['state'] or '-'):8s} "
                 f"{(r['entry_timing'] or '-'):11s} {notional:>10s} {ovl:4s} "
-                f"{_STATUS_LABEL[pos_state['status']]:16s} {_position_detail(pos_state):16s}  "
-                f"{r['added_at']}"
+                f"{_STATUS_LABEL[pos_state['status']]:10s} {_capital_label(pos_state):7s} "
+                f"{_position_detail(pos_state):16s}  {r['added_at']}"
             )
         print()
 
