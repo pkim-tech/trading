@@ -245,10 +245,18 @@ REGISTRY = [
     dict(id='cash_check',
          scenario="Cash-balance check blocks an order correctly",
          code_path="schwab_client.get_account_balance + schwab_safety.check_order",
-         offline_coverage="8 unit tests (test_schwab_safety.py), Opus-reviewed 2026-07-21",
+         offline_coverage="8 unit tests (test_schwab_safety.py), Opus-reviewed 2026-07-21; "
+                           "3 new field-preference tests 2026-08-12 (test_schwab_client.py) pin the "
+                           "cashBalance/cashAvailableForTrading/availableFunds fallback order",
          check_mechanism='coverage_events', scenario_key='cash_check',
          notes="Passing path verified live+dry_run 2026-07-24. Blocking case (insufficient funds) never "
-               "observed -- every real event so far shows result=passed."),
+               "observed -- every real event so far shows result=passed. Fixed 2026-08-12: now reads "
+               "real settled cashBalance instead of margin-inclusive availableFunds (closes the "
+               "brokerage leverage gap, see check_brokerage_not_live_with_unresolved_leverage_gap) -- "
+               "same scenario_key, no new coverage_events branch, but the real fetched value changed. "
+               "Confirmed live same day (real brokerage account query) that cashBalance == "
+               "availableFunds on every account today (none holds margin), so no observable live "
+               "behavior change yet."),
     dict(id='second_ticker_one_account',
          scenario="Second-live-ticker-in-one-account BUY correctly blocked when the account "
                   "can't afford both reservations (non-addon path)",
@@ -292,11 +300,14 @@ REGISTRY = [
                   "branches), including the 2026-08-10 fix folding a reservation for other tickers' "
                   "resting-order notional into this check",
          code_path="schwab_safety.check_order's is_addon_leg buying-power block "
-                   "(schwab_client.get_account_buying_power / get_current_price)",
+                   "(schwab_client.get_leveraged_buying_power / get_current_price)",
          offline_coverage="test_fake_broker_check_order_guards_phase2_scenario.py: "
                            "test_addon_second_ticker_buy_allowed_when_buying_power_covers_both, "
                            "test_addon_second_ticker_buy_blocked_when_buying_power_cannot_cover_both, "
-                           "test_addon_buy_blocked_unpriced_when_other_ticker_price_unavailable",
+                           "test_addon_buy_blocked_unpriced_when_other_ticker_price_unavailable; "
+                           "test_leveraged_buying_power.py (11 tests) covers get_leveraged_buying_power/"
+                           "get_account_margin_requirement directly, incl. the min()-clamp and "
+                           "inverse-fund (-leverage) cases",
          check_mechanism='coverage_events', scenario_key='addon_buying_power_check',
          bad_results=['blocked_unpriced', 'failed_closed'],
          notes="No row existed at all before 2026-08-10 -- verified directly against the live DB "
@@ -304,12 +315,26 @@ REGISTRY = [
                "was ALSO wired-never-fired, not just missing a registry row; a pre-existing "
                "gap surfaced while fixing the RETL/LABD-shaped 1-ticker-per-account bug in this "
                "path (docs/deep_backlog.md's 2026-08-09/10 entry, follow-up #3). "
-               "Reservation-headroom asymmetry still open (follow-up #1 in that entry): "
-               "_reserved_other here is NOT scaled by ADDON_BUYING_POWER_HEADROOM_MULT the way the "
-               "add-on's own notional is -- currently harmless only because buying_power==cash on "
-               "every live account today; see the new addon_buying_power_drift_check scenario "
-               "below, added specifically to catch the moment that assumption stops holding. "
-               "failed_closed means the buying-power fetch itself failed and the order was "
+               "Fixed 2026-08-12: buying_power now uses get_leveraged_buying_power, which returns "
+               "min(equity/margin_req(ticker), Schwab's raw 'buyingPower' field). A first version "
+               "without the clamp (raw leverage-aware term alone) was briefly wired in and found by "
+               "paired Opus review to be live-reachable on soxl_ira (7 real addon_enabled nodes) "
+               "with a materially overstated result -- a limited-margin IRA gets zero real leverage "
+               "from Schwab (confirmed live: soxl_ira's real buyingPower == cashBalance exactly), "
+               "but the unclamped formula assumed 2x anyway. The min()-clamp fixes this by "
+               "construction: it can only ever tighten the raw figure (the original point -- raw "
+               "'buyingPower' assumes a blanket 50% requirement, overstating real capacity for a "
+               "genuine 3x fund like SOXL/HIBL) and can never loosen it beyond what Schwab's own "
+               "real-time number already allows, since that number already nets out committed "
+               "capital and correctly reflects zero leverage on a non-margin account. Verified live "
+               "post-fix: soxl_ira returns its real $9,075.38, not the unclamped formula's inflated "
+               "$20,073.76. Reservation-headroom asymmetry still open (follow-up #1 in the "
+               "2026-08-09/10 entry): _reserved_other here is NOT scaled by "
+               "ADDON_BUYING_POWER_HEADROOM_MULT the way the add-on's own notional is -- harmless "
+               "only because buying_power==cash on every live account today (still true post-fix, "
+               "by construction, for every account without genuine margin); see "
+               "addon_buying_power_drift_check below, which watches for the moment that stops "
+               "holding. failed_closed means the buying-power fetch itself failed and the order was "
                "refused -- the guard failing safe, not working normally, same reasoning as "
                "blocked_unpriced."),
     dict(id='addon_buying_power_drift_check',
@@ -332,7 +357,14 @@ REGISTRY = [
                "'failed_closed' the same review caught -- nothing fails closed here, the account "
                "is just skipped and retried next poll) and an unconfirmed diverged-alert post both "
                "leave that account unmarked so the next ~5min poll retries it. No live events yet "
-               "(just wired in)."),
+               "(just wired in). 2026-08-12: addon_buying_power_check's real order-time source "
+               "switched to get_leveraged_buying_power (min(equity/margin_req, raw buyingPower) -- "
+               "see that row's notes for the full fix history). This drift check still compares the "
+               "OLD raw get_account_buying_power against cashBalance -- by construction (the "
+               "min()-clamp), the real order-check's number can never exceed this raw figure, so "
+               "'diverged' here (buying_power != cash) still correctly flags exactly the moment a "
+               "real margin account starts carrying real margin -- the premise holds, just via the "
+               "clamp rather than coincidence."),
     dict(id='addon_second_ticker_buy_allowed',
          scenario="Add-on-leg BUY correctly ALLOWED alongside another ticker's resting order when "
                   "buying power covers both (the actual point of the 2026-08-10 fix, mirroring "

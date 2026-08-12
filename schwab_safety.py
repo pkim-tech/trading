@@ -1482,11 +1482,14 @@ def check_order(
         # other BUY, including a core entry on the same margin account.
         import schwab_client  # local import: schwab_client imports this module at load time
         try:
-            # Leverage-aware (2026-08-12) -- get_account_buying_power's raw
-            # field is a blanket 50%-margin-requirement number that
-            # overstates real capacity for a 3x fund; this reads
-            # equity/margin_req(ticker) instead. See
-            # get_leveraged_buying_power's docstring.
+            # Leverage-aware AND clamped (2026-08-12) -- get_leveraged_buying_power
+            # returns min(equity/margin_req(ticker), Schwab's raw 'buyingPower'
+            # field). A first version without the clamp was briefly wired in here,
+            # found live-reachable on soxl_ira with a materially overstated result
+            # (a limited-margin IRA, no real leverage -- see that function's
+            # docstring), and reverted; the clamp fixes it by construction (can
+            # only tighten the raw figure for a real 3x fund, never loosen it
+            # beyond what Schwab's own real-time number already allows).
             buying_power = schwab_client.get_leveraged_buying_power(account, ticker)
         except Exception as e:
             signals_db.log_coverage_event(

@@ -2,8 +2,22 @@ import schwab_client
 
 
 class _FakeResponse:
+    def __init__(self, json_data=None):
+        self._json_data = json_data
+
     def raise_for_status(self):
         pass
+
+    def json(self):
+        return self._json_data
+
+
+class _FakeBalanceClient:
+    def __init__(self, balances):
+        self._balances = balances
+
+    def get_account(self, account_hash, fields=None):
+        return _FakeResponse({"securitiesAccount": {"currentBalances": self._balances}})
 
 
 def test_submit_order_with_retry_succeeds_after_transient_failures(monkeypatch):
@@ -78,3 +92,33 @@ def test_get_client_applies_short_timeout(monkeypatch):
     assert calls == [schwab_client._CLIENT_TIMEOUT_SECS]
 
     schwab_client._client = None
+
+
+# ---------------------------------------------------------------------------
+# get_account_balance field-preference (2026-08-12)
+# ---------------------------------------------------------------------------
+
+def _setup_balance(monkeypatch, balances):
+    monkeypatch.setattr(schwab_client, '_get_client', lambda: _FakeBalanceClient(balances))
+    monkeypatch.setattr(schwab_client, '_resolve_account_hashes', lambda: {'brokerage': 'hash123'})
+
+
+def test_get_account_balance_prefers_cash_balance_when_present(monkeypatch):
+    """Real settled cash, confirmed 2026-08-12 -- must win over the
+    margin-inclusive availableFunds even when they differ (e.g. real margin
+    drawn against a held position)."""
+    _setup_balance(monkeypatch, {'cashBalance': 20000.0, 'availableFunds': 40000.0})
+    assert schwab_client.get_account_balance('brokerage') == 20000.0
+
+
+def test_get_account_balance_falls_back_to_cash_available_for_trading(monkeypatch):
+    _setup_balance(monkeypatch, {'cashAvailableForTrading': 15000.0, 'availableFunds': 40000.0})
+    assert schwab_client.get_account_balance('brokerage') == 15000.0
+
+
+def test_get_account_balance_falls_back_to_available_funds_when_nothing_else_present(monkeypatch):
+    """Real response shape confirmed 2026-08-12 to never actually hit this
+    branch on a live account (cashBalance always present) -- kept as a
+    fail-safe for a response shape not yet seen, not the expected path."""
+    _setup_balance(monkeypatch, {'availableFunds': 40000.0})
+    assert schwab_client.get_account_balance('brokerage') == 40000.0

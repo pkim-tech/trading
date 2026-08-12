@@ -179,7 +179,8 @@ class FakeBroker:
         equity = self.equities.get(account, cash)
         response = {'securitiesAccount': {'currentBalances': {'availableFunds': cash,
                                                                 'buyingPower': buying_power,
-                                                                'equity': equity}}}
+                                                                'equity': equity,
+                                                                'cashBalance': cash}}}
 
         # If fields parameter is provided and includes POSITIONS, add positions
         if fields is not None:

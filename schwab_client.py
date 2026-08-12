@@ -747,9 +747,9 @@ def get_account_balance(account: str) -> float:
     'cashBalance' (confirmed 2026-08-12 against all 4 real accounts:
     brokerage/roth/ira/soxl_ira -- literal settled cash, never inflated by
     margin loan value against a held position, unlike 'availableFunds', which
-    is margin-inclusive for a genuine Reg-T account (see the
-    check_brokerage_not_live_with_unresolved_leverage_gap invariant this
-    closes) and happened to be numerically identical to cashBalance on every
+    is margin-inclusive for a genuine Reg-T account (this closed the real
+    leverage-inclusive-cash gap for 'brokerage', a genuine margin account)
+    and happened to be numerically identical to cashBalance on every
     account checked, since none currently holds a marginable position with
     borrowed value). Falls back to 'availableFunds', then
     'cashAvailableForTrading' (the original field name from Schwab's
@@ -797,11 +797,33 @@ def get_account_margin_requirement(ticker: str) -> float:
     2x fund, 75% for a 3x fund -- confirmed 2026-08-12 against a real
     `brokerage` account response: $20,000 cash / 0.50 = $40,000 exactly
     matches AGQ's (2x, fundLeverageFactor=200.0) real reported buyingPower.
-    A 1x/unleveraged fund isn't a real scenario for this system (every ticker
-    traded is 2x or 3x) -- falls through to the same 50% bucket as 2x rather
-    than raising, since 50% is the less-permissive (safer) of the two known
-    real values. Raises if fundLeverageFactor is missing entirely from the
-    quote -- fail closed, same contract as get_account_balance."""
+
+    Uses abs(leverage) -- inverse funds report a NEGATIVE factor (confirmed
+    2026-08-12: YANG=-300.0, ERY=-200.0, SH=-100.0), and a genuine 3x inverse
+    fund (YANG) needs the 75% bucket exactly like a 3x long fund; the
+    original version compared the raw signed value and silently misbucketed
+    every inverse ticker (caught by paired Opus review before this function
+    was ever wired into a real order-check path).
+
+    A 1x/unleveraged fund falls through to the 50% bucket -- note this is
+    the MORE permissive bucket (equity/0.50 > equity/0.75), not "safer" as
+    an earlier version of this docstring incorrectly claimed. Raises if
+    fundLeverageFactor is missing entirely from the quote -- fail closed,
+    same contract as get_account_balance.
+
+    NOT CURRENTLY WIRED INTO ANY REAL ORDER-CHECK PATH (as of 2026-08-12).
+    schwab_safety.check_order's is_addon_leg branch was briefly pointed at
+    get_leveraged_buying_power (below) the same session, then reverted after
+    a paired Opus review found it live-reachable on soxl_ira -- a limited-
+    margin IRA that cannot actually borrow, where margin_capable=True is
+    seeded only to preserve an unrelated old gate's behavior, not because it
+    reflects real leverage capability -- and that equity/margin_req computes
+    GROSS theoretical capacity, never subtracting capital already deployed
+    in open positions, unlike Schwab's own real-time buyingPower field
+    (confirmed empirically: it visibly shrinks as resting orders accumulate).
+    Do not wire this back into a real order-check without first fixing both:
+    (1) gate on genuine leverage-granting capability, not margin_capable;
+    (2) net out already-committed capital, not just total equity."""
     r = _get_client().get_quote(ticker)
     r.raise_for_status()
     data = r.json().get(ticker)
@@ -811,31 +833,40 @@ def get_account_margin_requirement(ticker: str) -> float:
     if leverage is None:
         raise ValueError(f"no fundLeverageFactor in quote for {ticker} -- "
                           f"can't determine real margin requirement")
-    return 0.75 if leverage >= 250.0 else 0.50
+    return 0.75 if abs(leverage) >= 250.0 else 0.50
 
 
 def get_leveraged_buying_power(account: str, ticker: str) -> float:
     """Real, leverage-aware buying power for `ticker` in `account` --
-    equity / get_account_margin_requirement(ticker), NOT Schwab's raw
-    'buyingPower' balance field (see get_account_buying_power's docstring --
-    that field is a blanket-50%-requirement number, confirmed 2026-08-12 to
-    overstate real capacity for a 3x fund like SOXL/HIBL by roughly
-    1/3 -- AGQ/ETHU/JNUG are all actually 2x). Used only by the add-on leg's cash-availability check (D2,
-    docs/plans/real_order_execution_drought_addon.md 3.1 Exemption D) -- an
-    add-on is sized at 100% of an already-deployed position (by construction
-    it's borrowing), so get_account_balance's settled-cash cashBalance would
-    refuse nearly every real add-on. Deliberately a separate function from
-    get_account_buying_power, not a change to it, so
-    signals_notify.check_addon_buying_power_drift keeps watching the raw
-    field it was actually built to watch, unaffected by this fix. Raises on
-    any failure, same fail-closed contract as get_account_balance."""
+    min(equity / get_account_margin_requirement(ticker), Schwab's own raw
+    'buyingPower' field). The leverage-aware term alone (equity/margin_req)
+    is GROSS theoretical capacity -- it never subtracts capital already
+    deployed in open positions, and assumes real 2x/3x borrowing capability
+    exists regardless of account type. Clamping to the raw 'buyingPower'
+    field fixes both: that field is confirmed (2026-08-12, live) to already
+    net out committed capital in real time (it visibly shrinks as resting
+    orders accumulate) AND to correctly reflect zero leverage for a
+    limited-margin account (soxl_ira: real buyingPower == cashBalance
+    exactly, no 2x assumption) -- so the clamp can only ever TIGHTEN the raw
+    figure (the original point: raw 'buyingPower' is a blanket 50%-
+    requirement number that overstates real capacity for a genuine 3x fund
+    like SOXL/HIBL by roughly 1/3) and can never loosen it beyond what
+    Schwab itself already says is really available. Reverted-then-fixed
+    2026-08-12 same session: a first version without this clamp was briefly
+    wired into schwab_safety.check_order's is_addon_leg branch, found live-
+    reachable on soxl_ira with a materially overstated result by a paired
+    Opus review, and reverted before this clamp was added -- verify against
+    real soxl_ira/brokerage data before re-wiring (see
+    tests/test_leveraged_buying_power.py). Raises on any failure, same
+    fail-closed contract as get_account_balance."""
     account_hash = _resolve_account_hashes()[account]
     r = _get_client().get_account(account_hash)
     r.raise_for_status()
     balances = r.json()["securitiesAccount"]["currentBalances"]
     equity = float(balances["equity"])
+    raw_buying_power = float(balances["buyingPower"])
     margin_req = get_account_margin_requirement(ticker)
-    return equity / margin_req
+    return min(equity / margin_req, raw_buying_power)
 
 
 def get_real_position(account: str, ticker: str) -> float:

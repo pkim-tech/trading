@@ -21,6 +21,17 @@ does NOT model real P&L drift over the backtest window, so this is an
 approximation of "if the account had stayed at today's size the whole time,"
 not a claim about what actually would have happened with compounding.
 
+STALE / N/A as of 2026-08-12 (later same session): get_leveraged_buying_power
+was reverted out of the real order-check path (paired Opus review found it
+materially overstates real buying power on soxl_ira -- see that function's
+docstring), so this script's premise (simulating collisions against it) has
+no current real-world counterpart. NODES' notional values are also now stale
+(real starting_notional was raised $2,000->$6,000 for all 3 the same
+session, after this script was written). Kept for whenever
+get_leveraged_buying_power is redesigned and safely re-wired -- re-verify
+both the notional values and EQUITY against real state before trusting a
+rerun's numbers.
+
 Usage: .venv/bin/python scripts/sim_addon_buying_power_collision.py
 """
 import sys
@@ -37,13 +48,13 @@ HEADROOM_MULT = 2.0
 NODES = {
     'AGQ': dict(ticker='AGQ', strategy='TrailingExitZScoreBreakout', window=10, z=1.0,
                 fixed_sl=2.0, arm_pct=8.0, trail_buy_pct=0.0, trail_sell_pct=7.0,
-                max_hold_hours=84, entry_timing='open_check', notional=2000.0),
+                max_hold_hours=84, entry_timing='open_check', notional=6000.0),
     'ETHU': dict(ticker='ETHU', strategy='TrailingBothZScoreBreakout', window=10, z=2.0,
                  fixed_sl=2.0, arm_pct=30.0, trail_buy_pct=2.0, trail_sell_pct=2.0,
-                 max_hold_hours=98, entry_timing='open_check', notional=2000.0),
+                 max_hold_hours=98, entry_timing='open_check', notional=6000.0),
     'JNUG': dict(ticker='JNUG', strategy='TrailingBothZScoreBreakout', window=10, z=1.0,
                  fixed_sl=1.0, arm_pct=29.0, trail_buy_pct=1.0, trail_sell_pct=1.0,
-                 max_hold_hours=112, entry_timing='open_check', notional=2000.0),
+                 max_hold_hours=112, entry_timing='open_check', notional=6000.0),
 }
 
 
