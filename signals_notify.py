@@ -1430,7 +1430,7 @@ def notify_buy_signal(node, sig):
     print(f"  Hurst (100 bars): {hurst_str}   ADF p: {adf_str}")
     _limits = schwab_safety.ACCOUNTS.get(node.get('account'))
     if db.closed_today(ticker):
-        if _limits and _limits.account_type == 'cash':
+        if _limits and _limits.cash_settlement_type == 'cash':
             print(f"  ⚠️🔁 SAME DAY BUY WARNING: {ticker} already sold today — cash may not be settled (T+1)")
         elif not _limits:
             # Missing/unrecognized account -- can't tell if this is a cash
@@ -2201,12 +2201,12 @@ def check_addon_trigger_real(pos, current_price):
     account = pos.get('account')
     _mode = _coverage_mode(account)
     limits = schwab_safety.ACCOUNTS.get(account)
-    if limits is None or limits.account_type != 'margin':
+    if limits is None or not limits.margin_capable:
         db.log_coverage_event("addon_entry_placement", _mode, ticker=ticker, position_id=pos.get('id'),
                                node_id=pos.get('wl_id'), result="blocked_non_margin_account",
                                detail=f"account={account!r}")
         _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — add-on skipped: "
-                      f"'{account}' is not a margin account")
+                      f"'{account}' is not margin-capable")
         return
     shares = int(pos['shares'])
     if shares < 1:

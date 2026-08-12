@@ -158,14 +158,19 @@ def test_second_resting_buy_for_same_ticker_still_blocks_addon(env, fake_broker)
 
 
 def test_addon_leg_hard_refused_on_non_margin_account(env, fake_broker):
+    # Uses 'sep' -- 'roth' was margin_capable=False before 2026-08-11 (this
+    # test's original target) but became real limited-margin this session
+    # (margin_capable=True now, matching brokerage/ira/soxl_ira); 'sep' is
+    # the one account still non-margin-capable. See accounts table /
+    # schwab_safety.ACCOUNTS.
     with signals_db._conn() as c:
-        c.execute("UPDATE watch_list SET account='roth' WHERE ticker=?", (TICKER,))
+        c.execute("UPDATE watch_list SET account='sep' WHERE ticker=?", (TICKER,))
         c.commit()
     node = _node()
     fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
-    fake_broker.set_cash_balance('roth', 1_000_000.0)
-    fake_broker.set_buying_power('roth', 1_000_000.0)
-    pos = _open_core_position(node, account='roth')
+    fake_broker.set_cash_balance('sep', 1_000_000.0)
+    fake_broker.set_buying_power('sep', 1_000_000.0)
+    pos = _open_core_position(node, account='sep')
 
     signals_notify.notify_trailing_activated(pos, current_price=52.0)
 

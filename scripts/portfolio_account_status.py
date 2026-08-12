@@ -280,7 +280,8 @@ def main():
         if limits is not None:
             header += (
                 f"(trading_enabled={limits.trading_enabled}, "
-                f"account_type={limits.account_type}, "
+                f"cash_settlement_type={limits.cash_settlement_type}, "
+                f"margin_capable={limits.margin_capable}, "
                 f"notional_cap=${limits.notional_cap:,}) "
             )
         print(header.ljust(100, "="))

@@ -13,6 +13,7 @@ import fcntl
 import functools
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -139,58 +140,157 @@ class AccountLimits:
                            # from dry_run, 2026-08-1x, alongside the node-level state
                            # collapse -- reads as an unambiguous boolean gate:
                            # real_order_allowed = (node.state == 'live') AND account.trading_enabled
-    account_type: str      # 'cash' or 'margin' (regular or IRA limited margin, same_day_block treats both the same)
+    cash_settlement_type: str  # 'cash' or 'margin' -- SAME-DAY CASH-SETTLEMENT semantics only
+                                # (same_day_block below). Renamed from account_type 2026-08-11:
+                                # that field used to also gate real margin-borrowing eligibility
+                                # for add-on legs, a conflation that was wrong for soxl_ira
+                                # (limited margin: same-day settlement, but cannot actually
+                                # borrow) -- see margin_capable below, the split-out field.
+    margin_capable: bool = False  # real margin-borrowing eligibility (add-on legs). NOT the
+                                   # same question as cash_settlement_type=='margin' -- see above.
     margin_floor: float = 0.0
     # How far BELOW $0 the cash_check below may let cash_available go, for an
     # account that can genuinely borrow on margin -- the check floors at $0
     # for every account today (2026-08-07), which is correct for a cash
     # account and a LIMITED-margin IRA (soxl_ira: same-day settlement only,
-    # cannot actually borrow -- see the account_type mislabel note below) but
-    # wrong for a real full-margin account, which can legitimately run cash
-    # negative up to its real margin capacity. Deliberately NOT keyed off
-    # account_type=="margin" -- that field already conflates "same-day-
-    # settlement-capable" with "can actually borrow" (soxl_ira's real gap,
-    # documented in docs/backlog_cache.md's "account_type mislabel" entry) --
-    # a second overloaded read of the same flag would repeat that exact
-    # mistake. Real value for `brokerage` (the one genuine full-margin
-    # account) intentionally left at the default 0.0 -- not yet known
-    # (portfolio construction hasn't happened, and the account already
-    # carries some real leverage as of 2026-08-07); set explicitly once a
-    # real number exists. brokerage is trading_enabled=False today, so this
-    # has no live effect either way yet.
+    # cannot actually borrow) but wrong for a real full-margin account, which
+    # can legitimately run cash negative up to its real margin capacity.
+    # Real value for `brokerage` (the one genuine full-margin account)
+    # intentionally left at the default 0.0 -- not yet known (portfolio
+    # construction hasn't happened, and the account already carries some real
+    # leverage as of 2026-08-07); set explicitly once a real number exists.
+    # brokerage is trading_enabled=False today, so this has no live effect
+    # either way yet.
+    is_tax_advantaged: bool = False  # real IRA/Roth/SEP tax status -- explicit, not guessed
+                                      # from the alias string (see signals_db._is_tax_advantaged_
+                                      # account, replaces 3 substring guards that admitted they'd
+                                      # fail open on a future account name like "hsa"/"401k").
 
 
-# Placeholder per-account config -- tune before going live. Account-risk framing
-# from the 2026-07-13 research session: Brokerage/SEP are large and need tight
-# controls, Roth ($50k) is deliberate play money, IRA is fine/not small.
-# account_type (2026-07-22): brokerage already has margin (ordinary taxable
-# brokerage accounts do by default); sep/roth/ira are plain cash, confirmed by
-# the user. The new (5th) limited-margin IRA funded this session isn't listed
-# here yet -- not wired into .env/NICKNAMES (schwab_client.py) until its API
-# token scope + compliance trading permission both clear, see the
-# project_new_ira_account_status memory. Used only by same_day_block below,
-# not a gate on whether an account can trade live at all -- the user's model
-# is one account per ticker, growing over time as capital/liquidity needs it
-# (fund a new trade in a new account rather than liquidating an existing
-# one), so a blanket "cash accounts can never go live" rule was considered
-# and explicitly rejected -- it would've locked automation out of every
-# existing cash account.
-ACCOUNTS = {
-    "brokerage": AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  trading_enabled=False, account_type="margin"),
-    "sep":       AccountLimits(enabled=True, notional_cap=10_000, daily_order_cap=5,  trading_enabled=False, account_type="cash"),
-    "roth":      AccountLimits(enabled=True, notional_cap=50_000, daily_order_cap=10, trading_enabled=False, account_type="cash"),
-    "ira":       AccountLimits(enabled=True, notional_cap=75_000, daily_order_cap=100, trading_enabled=True, account_type="margin"),
-    # New limited-margin IRA (2026-07-24 Friday test plan).
-    # trading_enabled=True 2026-07-24 -- the only account going live for today's real-order
-    # test plan (docs/live_test_plan_2026-07-24.md). Every other account stays trading_enabled=False.
-    # notional_cap raised 2026-08-03 800->3000 after a real $5k capital move brought the
-    # account to ~$9k+ available -- the old $800 figure (set conservatively pending a real
-    # balance check) was stale and would have structurally blocked every entry/top-up for
-    # the newly-resized HIBL/USD/YANG nodes ($2,500/$1,000/$2,500 starting_notional), caught
-    # by signals_invariants.py before it could bite live. $3,000 covers the largest single
-    # order (HIBL/YANG $2,500) with buffer, stays conservative relative to real balance.
-    "soxl_ira":  AccountLimits(enabled=True, notional_cap=3_000,  daily_order_cap=100, trading_enabled=True, account_type="margin"),
-}
+class _AccountsDict(dict):
+    """DB-backed replacement for the old hardcoded ACCOUNTS literal, loaded
+    lazily from signals_db's `accounts` table on first access (mirrors
+    schwab_client._account_hashes's lazy-cache-once-per-process pattern). A
+    real dict subclass, not a proxy, so every existing call-site shape keeps
+    working unchanged -- including test monkeypatches directly on the
+    AccountLimits instances stored here (e.g.
+    ACCOUNTS['roth'].trading_enabled = True). Every dict read method real
+    callers use is overridden to trigger the lazy load -- NOT just
+    __getitem__/get(): scripts/check_account_availability.py uses .items(),
+    scripts/check_untracked_positions.py uses .keys(),
+    scripts/sim_1m_four_bucket_portfolio.py uses `in ACCOUNTS` -- missing any
+    of these would silently look like zero configured accounts instead of
+    erroring (found in review before this shipped).
+
+    Self-invalidating on signals_config.DB_PATH change, tracked via
+    _loaded_db_path -- deliberately NOT the same no-invalidation-ever
+    posture as schwab_client._account_hashes, because ~69 test files swap
+    DB_PATH per-test and relying on every one of them to also call
+    reload_accounts() in the right order (after their own ensure_tables()
+    call) is exactly the kind of cross-test staleness bug this project's own
+    history shows Opus review catches. A real daemon process only ever has
+    one DB_PATH for its whole lifetime, so this check is a no-op cost there."""
+
+    _loaded = False
+    _loaded_db_path = None
+    _reload_lock = threading.Lock()  # class attribute -- one lock shared across the singleton ACCOUNTS instance
+
+    def _reload_locked(self):
+        """Assumes _reload_lock is already held -- never call directly,
+        only via _ensure_loaded()."""
+        conn = signals_db._conn()
+        try:
+            rows = list(conn.execute(
+                "SELECT * FROM accounts WHERE retired_at IS NULL"
+            ).fetchall())
+        finally:
+            conn.close()
+        if not rows:
+            # Never cache an empty result as if it were real data -- an
+            # empty `accounts` table (migration hasn't run against this DB
+            # yet, or a real transaction-ordering race) must fail loud, not
+            # make every account look unconfigured. A genuinely-zero-account
+            # deployment isn't a real scenario for this codebase.
+            raise RuntimeError(
+                "accounts table has no non-retired rows -- has "
+                "signals_db.ensure_tables() run against this DB_PATH yet?")
+        fresh = {r['alias']: AccountLimits(
+            enabled=bool(r['enabled']),
+            notional_cap=r['notional_cap'],
+            daily_order_cap=r['daily_order_cap'],
+            trading_enabled=bool(r['trading_enabled']),
+            cash_settlement_type=r['cash_settlement_type'],
+            margin_capable=bool(r['margin_capable']),
+            margin_floor=r['margin_floor'],
+            is_tax_advantaged=bool(r['is_tax_advantaged']),
+        ) for r in rows}
+        self.clear()
+        for k, v in fresh.items():
+            dict.__setitem__(self, k, v)
+        self._loaded = True
+        self._loaded_db_path = signals_db.cfg.DB_PATH
+
+    def _ensure_loaded(self):
+        # Cold-review finding, 2026-08-11: the daemon runs a poll-loop thread
+        # and a Slack Socket Mode handler thread concurrently (same pattern
+        # signals_db._position_lock guards elsewhere). The staleness CHECK
+        # itself must be inside the lock, not just the reload body -- a
+        # thread that reads self._loaded==True without the lock could act on
+        # a stale/transiently-cleared view while another thread is mid-
+        # reload. Every read method calls this before touching self, so
+        # locking here (not each caller separately) covers all of them.
+        with self._reload_lock:
+            if not self._loaded or self._loaded_db_path != signals_db.cfg.DB_PATH:
+                self._reload_locked()
+
+    def _reload(self):
+        """Public-ish entry point for reload_accounts() -- goes through the
+        same lock as _ensure_loaded()."""
+        with self._reload_lock:
+            self._reload_locked()
+
+    def get(self, key, default=None):
+        self._ensure_loaded()
+        return dict.get(self, key, default)
+
+    def __getitem__(self, key):
+        self._ensure_loaded()
+        return dict.__getitem__(self, key)
+
+    def __contains__(self, key):
+        self._ensure_loaded()
+        return dict.__contains__(self, key)
+
+    def items(self):
+        self._ensure_loaded()
+        return dict.items(self)
+
+    def keys(self):
+        self._ensure_loaded()
+        return dict.keys(self)
+
+    def values(self):
+        self._ensure_loaded()
+        return dict.values(self)
+
+    def __iter__(self):
+        self._ensure_loaded()
+        return dict.__iter__(self)
+
+    def __len__(self):
+        self._ensure_loaded()
+        return dict.__len__(self)
+
+
+ACCOUNTS = _AccountsDict()
+
+
+def reload_accounts():
+    """Force a fresh read from the `accounts` table. No automatic
+    invalidation exists (matching schwab_client._account_hashes's own
+    no-invalidation precedent) -- call this after ensure_tables() seeds a
+    different DB_PATH (tests) or after an accounts row changes mid-process."""
+    ACCOUNTS._reload()
 
 # Live-automation scope -- moved from a hardcoded Python literal to SCHWAB_AUTOMATION_TICKERS
 # in .env (2026-07-19). Reasoning: this set is deployment-specific (which tickers *this*
@@ -1001,20 +1101,20 @@ def check_order(
         # re-read-before-trusting convention as the rest of this function.
         _node_for_same_day = signals_db.get_watch_list_node_by_id(_node_id) if _node_id is not None else None
         _force_same_day_block = bool(_node_for_same_day and _node_for_same_day.get('force_same_day_block'))
-        if signals_db.closed_today(ticker) and (limits.account_type == "cash" or _force_same_day_block):
+        if signals_db.closed_today(ticker) and (limits.cash_settlement_type == "cash" or _force_same_day_block):
             signals_db.log_coverage_event(
                 "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="blocked",
-                detail=f"account={account} account_type={limits.account_type} "
+                detail=f"account={account} cash_settlement_type={limits.cash_settlement_type} "
                        f"force_same_day_block={_force_same_day_block}"
             )
-            reason = ("same-day re-buy risks a cash-account good-faith violation" if limits.account_type == "cash"
+            reason = ("same-day re-buy risks a cash-account good-faith violation" if limits.cash_settlement_type == "cash"
                        else f"node id={_node_id!r}'s force_same_day_block is set -- the same-day close may have "
                             f"happened in a different account for this ticker, not necessarily this node's own")
             raise SafetyViolation(f"'{ticker}' was sold today (some account) -- {reason}")
-        elif limits.account_type == "margin" and signals_db.closed_today(ticker):
+        elif limits.cash_settlement_type == "margin" and signals_db.closed_today(ticker):
             signals_db.log_coverage_event(
                 "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="skipped_margin_account",
-                detail=f"account={account} account_type={limits.account_type}"
+                detail=f"account={account} cash_settlement_type={limits.cash_settlement_type}"
             )
 
     if side == "BUY":
@@ -1044,37 +1144,31 @@ def check_order(
             # from the caller's claim (docs/plans/real_order_execution_drought_addon.md
             # 3.1). Any failure raises exactly like an ordinary BUY block.
             #
-            # account_type=="margin" is a known overloaded-flag bug (see
-            # docs/backlog_cache.md's "account_type mislabel" entry) --
-            # conflates same-day-settlement-capable (what soxl_ira's limited
-            # margin actually grants) with real borrowing capacity (which it
-            # doesn't have). Explored fixing this 2026-08-07 via margin_floor
-            # (a real, non-overloaded signal) but landed on a DIFFERENT real
-            # correction first: add-on doesn't inherently need to borrow at
-            # all -- if the account has enough free cash to cover the
-            # doubled notional outright, it can fund it without touching
-            # margin, in ANY account type. The buying-power check just below
-            # already does real cash-sufficiency checking; a hard account-
-            # type/margin_floor gate on top of that is the wrong mechanism.
-            # A cash-aware version of this gate (checking real available
-            # cash vs. margin_floor only for a genuine shortfall) was
-            # designed but deliberately deferred -- real complexity found
-            # mid-design: add-on's cash draw can collide with the skim-
-            # reserve mechanism's earmarked-but-not-yet-moved cash, and with
-            # 8+ tickers able to trigger add-on near-concurrently, a single
-            # reservation number isn't enough (same shape as the multi-
-            # resting-BUY reservation fix earlier this session, one level
-            # up). User's call: moderate balances and no skim active yet,
-            # not worth solving now -- see docs/backlog_cache.md's 2026-08-07
-            # "2027 problem" entries. Left as the original account_type
-            # check, UNCHANGED from before this session, pending that design.
-            if limits.account_type != "margin":
+            # margin_capable was split out from the old overloaded account_type
+            # field 2026-08-11 (see docs/deep_backlog.md's accounts-table
+            # entry) specifically so this check reads real borrowing
+            # eligibility instead of same-day-settlement capability -- but
+            # its VALUES were seeded to exactly preserve this check's prior
+            # behavior (margin_capable=True for brokerage/roth/ira/soxl_ira,
+            # False only for sep), not to fix the soxl_ira mislabel itself.
+            # That real fix (add-on doesn't inherently need to borrow -- a
+            # cash-aware check against real available cash, falling back to
+            # margin capacity only for a genuine shortfall) was designed but
+            # deliberately deferred: add-on's cash draw can collide with the
+            # skim-reserve mechanism's earmarked-but-not-yet-moved cash, and
+            # with 8+ tickers able to trigger add-on near-concurrently, a
+            # single reservation number isn't enough (same shape as the
+            # multi-resting-BUY reservation fix elsewhere in this file).
+            # User's call, reconfirmed 2026-08-11: moderate balances, no skim
+            # active yet, not worth solving now -- see docs/backlog_cache.md's
+            # 2026-08-07 "2027 problem" entries.
+            if not limits.margin_capable:
                 signals_db.log_coverage_event(
                     "addon_non_margin_account_blocked", _mode, ticker=ticker, node_id=_node_id,
-                    result="blocked", detail=f"account={account} account_type={limits.account_type}")
+                    result="blocked", detail=f"account={account} margin_capable={limits.margin_capable}")
                 raise SafetyViolation(
-                    f"add-on leg refused -- '{account}' is not a margin account "
-                    f"(account_type={limits.account_type})")
+                    f"add-on leg refused -- '{account}' is not margin-capable "
+                    f"(margin_capable={limits.margin_capable})")
             if _local_pos is None or _local_pos.get('position_source') != 'core':
                 signals_db.log_coverage_event(
                     "addon_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,

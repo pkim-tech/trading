@@ -104,7 +104,7 @@ def _print_manual_checks(account, ticker, side, quantity, price):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--account", required=True, help="account nickname (schwab_client.NICKNAMES)")
+    ap.add_argument("--account", required=True, help="account nickname (see the accounts table / schwab_safety.ACCOUNTS)")
     ap.add_argument("--ticker", required=True)
     ap.add_argument("--side", required=True, choices=["BUY", "SELL"])
     ap.add_argument("--order-type", required=True, choices=["MARKET", "TRAILING", "STOP"])

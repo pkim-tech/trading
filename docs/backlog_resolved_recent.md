@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][security] Resolved 2026-08-11 (late) — hardcoded `schwab_safety.ACCOUNTS`/`schwab_client.NICKNAMES` replaced by a DB-backed `accounts` table ("Option 1.5"); `account_type` split into `cash_settlement_type`/`margin_capable`; 3 tax-advantaged substring guesses replaced with an explicit `is_tax_advantaged` column, failing loud instead of guessing. Triggered by `brokerage`/`roth` real accounts being funded/linked this session. Paired post-implementation review (independent-cold + contextual) found 1 HIGH + 3 MEDIUM + 2 LOW, all fixed. Real live DB migrated (backed up, confirmed additive-only). 764/764 tests, `live_sim_harness.py` 7/7, `signals_invariants.py` clean. Full detail: `deep_backlog.md`.
+
 ## [live-trading][security] Resolved 2026-08-11 — LABD retired after a real `_last_sale_recovery` basis-lock (permanent 0-share sizing); the "buried scenario prose in a baseline_config row" gap that hid it fixed and swept (none else found); STALE-banner wording corrected to "pause, keep as regression fixture" not "revert/remove". Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved 2026-08-11 — sweep-campaign-level provenance built: `sweep_runs` gained `git_commit`/`kernel_dirty`, `backtest_cache`/`candidate_nodes` gained nullable `sweep_run_id` (no backfill), threaded through the sweep engine and the real candidate-selection reporting path; `node_candidate_trace.py` now shows it. Full detail: `deep_backlog.md`.
@@ -92,6 +94,4 @@ Was `"next: 10:25 or 14:55 ET"` (stale); now built dynamically (`"next: 10:25 or
 
 ## [live-trading][coverage] Resolved 2026-08-05 — the two real live-check bugs found 2026-08-04 very late: `get_pending_buys_for_ticker_on_date`'s exact-date match (broke `canary_overnight_carry` for SDOW/DIA) and `audit_live_test_candidates.audit_one`/`status_check.py` never checking `pending_buys` (a resting trailing-buy showed as "flat")
 Fixed via `date(signal_time) <= check_date` (a pending_buys row is deleted on resolution, so presence = still resting) and a new `get_pending_buy_by_wl_id` used in `audit_one`. Tests: `tests/test_coverage_check.py`, new `tests/test_audit_live_test_candidates.py`. 3rd bug in the same finding (cosmetic stale status-message time string) still open, see `docs/backlog_cache.md`.
-
-## [live-trading][security] Resolved 2026-08-04 (very late) — HIBL/USD/YANG had no staged_test_config baseline row (zero config-drift protection since their 2026-08-03 live flip); seeded via scripts/seed_baseline_config.py, confirmed in signals_invariants.py. Added as required check 14 in docs/watchlist_candidate_checklist.md so it happens at promotion time going forward, not caught after the fact.
 

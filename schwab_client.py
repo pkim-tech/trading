@@ -23,12 +23,11 @@ from schwab.utils import Utils
 
 import schwab_auth
 import schwab_safety
+import signals_db
 from signals_blocks import _post_message
 
 _client = None
 _account_hashes = None  # nickname -> Schwab's encrypted account hash, resolved lazily
-
-NICKNAMES = ["brokerage", "sep", "roth", "ira", "soxl_ira"]
 
 
 # schwab-py defaults to a 30s httpx timeout on every call. This daemon is
@@ -202,6 +201,23 @@ def _post_order_confirmation(label, account_hash, order_id, ticker, account, sub
         _post_message(submitted_msg)
 
 
+def _live_nicknames() -> list:
+    """Non-retired account aliases from signals_db's `accounts` table --
+    replaces the old hardcoded NICKNAMES list (2026-08-11), which was a
+    second, independent nickname source kept in sync with schwab_safety.
+    ACCOUNTS only by convention. Queried fresh on every call rather than
+    cached separately -- cheap (one indexed SELECT), and the one real
+    consumer (_resolve_account_hashes below) already caches ITS OWN result
+    for the process lifetime, so this only actually runs once in practice."""
+    conn = signals_db._conn()
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT alias FROM accounts WHERE retired_at IS NULL ORDER BY alias"
+        ).fetchall()]
+    finally:
+        conn.close()
+
+
 def _resolve_account_hashes() -> dict:
     global _account_hashes
     if _account_hashes is not None:
@@ -210,7 +226,7 @@ def _resolve_account_hashes() -> dict:
     # env vars hold only an account-number suffix (e.g. last 3-4 digits, as
     # shown in Schwab's own masked UI) -- the full number never needs to be
     # typed/stored, just enough digits to be unambiguous among linked accounts.
-    suffixes = {n: os.environ.get(f"SCHWAB_ACCOUNT_{n.upper()}") for n in NICKNAMES}
+    suffixes = {n: os.environ.get(f"SCHWAB_ACCOUNT_{n.upper()}") for n in _live_nicknames()}
     r = _get_client().get_account_numbers()
     r.raise_for_status()
     accounts = r.json()

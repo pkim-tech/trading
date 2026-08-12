@@ -42,18 +42,28 @@ def isolated_db(monkeypatch):
     tmp_db.close()
     monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))
     db.ensure_tables()
+    # Force ACCOUNTS to load against THIS test's fresh DB_PATH now, before
+    # _real_account below injects its fake account doubles -- otherwise the
+    # DB-backed ACCOUNTS cache (self-invalidating on DB_PATH change, added
+    # 2026-08-11) would wipe those injected keys the first time something
+    # triggers a real reload mid-test (schwab_safety.py's own docstring flags
+    # this exact hazard).
+    schwab_safety.reload_accounts()
     yield db
     os.unlink(tmp_db.name)
 
 
 @pytest.fixture(autouse=True)
-def _real_account(monkeypatch):
+def _real_account(monkeypatch, isolated_db):
     """effectively_dry_run(account, node) checks schwab_safety.ACCOUNTS[account]
     .trading_enabled, not just node.state -- give every test a real account by
     default so 'live' actually means real (a test relying on real ACCOUNTS
     config, like the true first version's bug, would silently pass/fail
     depending on today's live-trading rollout state instead of what's being
-    tested)."""
+    tested). Explicitly depends on isolated_db (not just autouse ordering,
+    which pytest doesn't guarantee relative to a non-autouse fixture) so
+    ACCOUNTS is already loaded against this test's DB_PATH before these fake
+    keys are injected -- see isolated_db's own comment."""
     fake_limits = type('L', (), {'trading_enabled': True})()
     monkeypatch.setitem(schwab_safety.ACCOUNTS, 'TEST_REAL_ACCT', fake_limits)
     fake_dry_limits = type('L', (), {'trading_enabled': False})()

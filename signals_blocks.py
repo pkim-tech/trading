@@ -198,7 +198,7 @@ def _build_buy_blocks(node, sig, auto_placed=False):
     warning_line = ""
     _limits = schwab_safety.ACCOUNTS.get(node.get('account'))
     if db.closed_today(ticker):
-        if _limits and _limits.account_type == 'cash':
+        if _limits and _limits.cash_settlement_type == 'cash':
             warning_line = (
                 f"\n⚠️🔁 *SAME DAY BUY WARNING:* {ticker} already sold today in a "
                 f"{node.get('account', 'non-brokerage')} account — cash may not be settled (T+1). Confirm funds are available before entering."

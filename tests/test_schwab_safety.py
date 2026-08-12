@@ -147,6 +147,14 @@ def _clear_position():
 
 
 def test_same_day_rebuy_blocked_after_earlier_sale(env):
+    # Uses 'sep' as the cash-settlement_type account example -- 'roth' was
+    # cash_settlement_type='cash' before 2026-08-11 (this test's original
+    # target), but roth became a genuine real limited-margin account this
+    # session (cash_settlement_type='margin' now); 'sep' is the one account
+    # still cash-typed. See accounts table / schwab_safety.ACCOUNTS.
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET account = 'sep' WHERE ticker = ?", (TICKER,))
+        c.commit()
     from datetime import datetime, timedelta
     node = _get_node()
     signal_time = datetime.now() - timedelta(hours=10)
@@ -158,7 +166,7 @@ def test_same_day_rebuy_blocked_after_earlier_sale(env):
         exit_reason='SL', entry_price=101.0,
     )
     with pytest.raises(schwab_safety.SafetyViolation, match="good-faith violation"):
-        schwab_client.place_equity_buy('roth', TICKER, 5, 50.0)
+        schwab_client.place_equity_buy('sep', TICKER, 5, 50.0)
     events = signals_db.get_coverage_events(scenario_key="same_day_block")
     assert len(events) == 1
     assert events[0]['result'] == "blocked"
@@ -166,9 +174,12 @@ def test_same_day_rebuy_blocked_after_earlier_sale(env):
 
 
 def test_same_day_rebuy_not_blocked_in_margin_account(env):
-    """Margin accounts (regular or IRA limited margin) don't have the cash-
-    account T+1 settlement restriction same_day_block exists for -- brokerage
-    is account_type='margin' in schwab_safety.ACCOUNTS, unlike 'roth' (cash)."""
+    """Margin-settlement accounts don't have the cash-account T+1 settlement
+    restriction same_day_block exists for -- brokerage is
+    cash_settlement_type='margin' in the accounts table, unlike 'sep'
+    (cash_settlement_type='cash', the one remaining cash-typed account as of
+    2026-08-11 -- roth is real limited-margin now, cash_settlement_type=
+    'margin' too)."""
     from datetime import datetime, timedelta
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'brokerage' WHERE ticker = ?", (TICKER,))

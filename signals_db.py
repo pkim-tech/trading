@@ -25,6 +25,26 @@ import signals_config as cfg
 TAX_ADVANTAGED_EXCLUDED_TICKERS = {"USO", "AGQ"}
 
 
+def _is_tax_advantaged_account(account: str) -> bool:
+    """Real, explicit tax-advantaged status from the `accounts` table --
+    replaces 3 former substring guesses (`any(kw in account.lower() for kw
+    in ("ira","roth","sep"))`) that admitted in their own comments they'd
+    fail open on a future account name that didn't happen to contain one of
+    those substrings (e.g. "hsa"/"401k"). Fails LOUD (raises) on an unknown
+    account alias instead of silently returning False -- an unrecognized
+    account is a real problem to surface, not a reason to assume "not tax-
+    advantaged" and let a K-1 ticker through. Local import of schwab_safety
+    to avoid a circular import (schwab_safety imports signals_db at module
+    level) -- same pattern already used elsewhere in this file."""
+    import schwab_safety
+    limits = schwab_safety.ACCOUNTS.get(account)
+    if limits is None:
+        raise ValueError(
+            f"account {account!r} is not a known account alias -- refusing "
+            f"to guess its tax-advantaged status")
+    return limits.is_tax_advantaged
+
+
 def _conn():
     c = sqlite3.connect(cfg.DB_PATH)
     c.row_factory = sqlite3.Row
@@ -61,6 +81,65 @@ def ensure_tables():
         c.commit()
 
         main_id = c.execute("SELECT id FROM watchlists WHERE name='main'").fetchone()[0]
+
+        # accounts: DB-backed replacement for schwab_safety's old hardcoded
+        # ACCOUNTS dict + schwab_client's separate hardcoded NICKNAMES list --
+        # those two were kept in sync by convention only. `alias` stays the
+        # real key (no surrogate ID migration -- decided scope, see
+        # docs/deep_backlog.md's accounts-table entry): the 7+ tables that
+        # already store `account` as free text are untouched by this change.
+        # `cash_settlement_type`/`margin_capable` replace the old single
+        # overloaded `account_type` field (was answering two unrelated
+        # questions -- same-day cash-settlement eligibility vs. real
+        # margin-borrowing capability -- a conflation already known wrong for
+        # soxl_ira). `is_tax_advantaged` replaces 3 separate substring
+        # guesses (`"ira" in account.lower()` etc, which admitted in their
+        # own comments they'd fail open on a name like "hsa"/"401k") with an
+        # explicit, NOT NULL column. Seeded directly here (not via
+        # schwab_safety.ACCOUNTS) and committed before the watch_list
+        # `state`-backfill migration below, which reads schwab_safety.ACCOUNTS
+        # and would otherwise race a lazy DB-backed load against this
+        # transaction. An alias is retired (`retired_at`), never renamed or
+        # reused, so no code ever needs to treat "the roth account" as a
+        # moving target.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                alias                 TEXT PRIMARY KEY,
+                schwab_name           TEXT,
+                enabled               INTEGER NOT NULL DEFAULT 1,
+                notional_cap          REAL    NOT NULL,
+                daily_order_cap       INTEGER NOT NULL,
+                trading_enabled       INTEGER NOT NULL DEFAULT 0,
+                cash_settlement_type  TEXT    NOT NULL CHECK (cash_settlement_type IN ('cash','margin')),
+                margin_capable        INTEGER NOT NULL DEFAULT 0,
+                margin_floor          REAL    NOT NULL DEFAULT 0.0,
+                is_tax_advantaged     INTEGER NOT NULL,
+                retired_at            TEXT
+            )
+        """)
+        # margin_capable mirrors the real account_type != "margin" gate
+        # behavior as of 2026-08-11: True for brokerage/roth/ira/soxl_ira,
+        # False only for sep. roth's real account_type was itself corrected
+        # cash->margin earlier the same session (a genuine real-world
+        # change -- roth became a real limited-margin account), so this
+        # is NOT "preserving a stale value" -- it reflects the account's
+        # actual current status. Don't "fix" this back to roth=cash without
+        # first confirming roth's real Schwab account type.
+        for row in (
+            ('brokerage', 'BRO-A-1',      10_000, 5,   0, 'margin', 1, 0.0, 0),
+            ('sep',       'sep',          10_000, 5,   0, 'cash',   0, 0.0, 1),
+            ('roth',      'ROTH-A-1',     50_000, 10,  0, 'margin', 1, 0.0, 1),
+            ('ira',       'Rollover IRA', 75_000, 100, 1, 'margin', 1, 0.0, 1),
+            ('soxl_ira',  'IRA-A-1',      3_000,  100, 1, 'margin', 1, 0.0, 1),
+        ):
+            c.execute("""
+                INSERT OR IGNORE INTO accounts
+                    (alias, schwab_name, notional_cap, daily_order_cap,
+                     trading_enabled, cash_settlement_type, margin_capable,
+                     margin_floor, is_tax_advantaged)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, row)
+        c.commit()
 
         # watch_list_audit: append-only log of watchlist/node mutations (create/delete/
         # activate a watchlist, add/remove/mode/label a node) — no audit trail existed
@@ -1911,8 +1990,8 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
     replaces the old separate mode='live'/'research' + node-level dry_run override."""
     if state not in ('paper', 'dry_run', 'live'):
         raise ValueError(f"add_node: invalid state {state!r} -- must be 'paper'/'dry_run'/'live'")
-    if state != 'paper' and account and ticker.upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
-            kw in account.lower() for kw in ("ira", "roth", "sep")):
+    if state != 'paper' and account and ticker.upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and \
+            _is_tax_advantaged_account(account):
         raise ValueError(
             f"add_node refused: {ticker} is excluded from tax-advantaged accounts "
             f"(account={account!r}) — see CLAUDE.md's 'Ticker exclusion, decided "
@@ -2038,8 +2117,8 @@ def set_node_state(watch_id, state):
         row = c.execute(
             "SELECT watchlist_id, ticker, state, account FROM watch_list WHERE id = ?", (watch_id,)
         ).fetchone()
-        if row and state != 'paper' and row['account'] and row['ticker'].upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
-                kw in row['account'].lower() for kw in ("ira", "roth", "sep")):
+        if row and state != 'paper' and row['account'] and row['ticker'].upper() in TAX_ADVANTAGED_EXCLUDED_TICKERS and \
+                _is_tax_advantaged_account(row['account']):
             raise ValueError(
                 f"set_node_state refused: {row['ticker']} (wl_id={watch_id}) is excluded from "
                 f"tax-advantaged accounts (account={row['account']!r}) -- see CLAUDE.md's "

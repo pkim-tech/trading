@@ -180,16 +180,27 @@ def check_tax_advantaged_excluded_tickers():
     add-to-watchlist buttons, most scripts) creates the node first and assigns
     account via a raw `UPDATE watch_list SET account=...` afterward, which
     bypasses that guard entirely. This check catches that gap after the fact.
-    Same substring account-name classification as add_node's guard (correct for
-    today's real account names -- brokerage/sep/roth/ira/soxl_ira -- but would
-    fail open on a future name like 'hsa'/'401k'; see docs/backlog_cache.md).
+    Uses the same explicit accounts.is_tax_advantaged lookup as add_node's
+    guard (signals_db._is_tax_advantaged_account) -- no longer a substring
+    guess on the account name (2026-08-11, see docs/deep_backlog.md's
+    accounts-table entry). An unrecognized account alias is reported as its
+    own violation below rather than letting the ValueError crash run_all().
     """
     violations = []
     for node in db.get_watchlist():
         ticker = (node.get('ticker') or '').upper()
         account = node.get('account') or ''
-        if node.get('state') != 'paper' and ticker in db.TAX_ADVANTAGED_EXCLUDED_TICKERS and any(
-                kw in account.lower() for kw in ("ira", "roth", "sep")):
+        if node.get('state') == 'paper' or ticker not in db.TAX_ADVANTAGED_EXCLUDED_TICKERS or not account:
+            continue
+        try:
+            is_tax_advantaged = db._is_tax_advantaged_account(account)
+        except ValueError:
+            violations.append(
+                f"{ticker} (wl_id={node['id']}) has unrecognized account={account!r} -- "
+                f"cannot verify tax-advantaged exclusion (K-1/UBTI risk check skipped)."
+            )
+            continue
+        if is_tax_advantaged:
             violations.append(
                 f"{ticker} (wl_id={node['id']}) is in account={account!r}, but "
                 f"is on the tax-advantaged exclusion list (K-1/UBTI risk) -- "
@@ -442,32 +453,90 @@ def check_sim_mode_off_for_real_daemon():
 
 
 def check_addon_drought_live_nodes_have_coherent_account_type():
-    """A mode='live' node with addon_enabled=1 or drought_overlay_enabled=1
-    must sit on a real margin account -- add-on is structurally a margin
-    borrow (schwab_safety.check_order's is_addon_leg preconditions hard-refuse
-    a non-margin account already), and real drought HANDOFF closes drought
-    same-day and re-enters core same-day/same-ticker, which same_day_block
-    hard-blocks on a cash account (docs/plans/real_order_execution_drought_addon.md
-    0.3/0.8). Fail loud at daemon start rather than at the first real arm/gap
+    """A mode='live' node with addon_enabled=1 must sit on a margin_capable
+    account (add-on is structurally a margin borrow -- schwab_safety.check_
+    order's is_addon_leg preconditions hard-refuse a non-margin_capable
+    account already). A node with drought_overlay_enabled=1 must sit on a
+    cash_settlement_type=='margin' account (real drought HANDOFF closes
+    drought same-day and re-enters core same-day/same-ticker, which
+    same_day_block hard-blocks on a cash-settlement account --
+    docs/plans/real_order_execution_drought_addon.md 0.3/0.8). These were one
+    combined account_type=='margin' check before 2026-08-11's accounts-table
+    split -- now checked against the specific field each flag actually
+    depends on, since a future account could plausibly have one without the
+    other. Fail loud at daemon start rather than at the first real arm/gap
     event, matching this file's existing pattern (e.g.
     check_starting_notional_within_account_notional_cap)."""
     violations = []
     for node in db.get_watchlist():
         if node['state'] == 'paper':
             continue
-        if not (node.get('addon_enabled') or node.get('drought_overlay_enabled')):
-            continue
         account = node.get('account')
         limits = schwab_safety.ACCOUNTS.get(account) if account else None
-        if limits is None or limits.account_type != 'margin':
-            _flags = ', '.join(f for f, v in (('addon_enabled', node.get('addon_enabled')),
-                                               ('drought_overlay_enabled', node.get('drought_overlay_enabled'))) if v)
+        if node.get('addon_enabled') and (limits is None or not limits.margin_capable):
             violations.append(
-                f"{node['ticker']} (wl_id={node['id']}) has {_flags}=1 and mode='live' but account="
-                f"{account!r} is not margin-typed (account_type="
-                f"{limits.account_type if limits else 'unknown'!r}) -- add-on's is_addon_leg preconditions "
-                f"and drought HANDOFF's same-day re-entry both require a margin account."
+                f"{node['ticker']} (wl_id={node['id']}) has addon_enabled=1 and mode='live' but "
+                f"account={account!r} is not margin_capable "
+                f"({limits.margin_capable if limits else 'unknown'!r}) -- add-on's is_addon_leg "
+                f"preconditions require real margin-borrowing eligibility."
             )
+        if node.get('drought_overlay_enabled') and (limits is None or limits.cash_settlement_type != 'margin'):
+            violations.append(
+                f"{node['ticker']} (wl_id={node['id']}) has drought_overlay_enabled=1 and mode='live' but "
+                f"account={account!r} is not cash_settlement_type=='margin' "
+                f"({limits.cash_settlement_type if limits else 'unknown'!r}) -- drought HANDOFF's "
+                f"same-day core re-entry requires same-day cash-settlement exemption."
+            )
+    return violations
+
+
+# Live-state tables: a retired alias here would be a real, current problem
+# (a node/position/pool still pointing at an account that's been retired) --
+# checked against non-retired aliases only. Historical/log tables: a retired
+# alias here is EXPECTED and correct once an account is ever retired (old
+# rows don't get rewritten) -- checked against every alias that ever
+# existed, retired or not, so retiring an account doesn't make this
+# permanently red (cold-review finding, 2026-08-11).
+_ACCOUNT_COLUMN_TABLES_LIVE = [
+    'watch_list', 'open_positions', 'paper_positions', 'skim_reserve_pool',
+]
+_ACCOUNT_COLUMN_TABLES_HISTORICAL = [
+    'trade_log', 'paper_trade_log', 'addon_legs', 'paper_addon_legs',
+    'coverage_snoozes', 'skim_reserve_log', 'trading_incidents',
+]
+
+
+def check_all_account_values_are_known_aliases():
+    """Every non-NULL `account` value actually present across the 11 tables
+    that carry one (confirmed via a live PRAGMA table_info sweep, 2026-08-11
+    -- don't trust a hardcoded list here without reconfirming, that's exactly
+    how this list itself could go stale) must exist as a known alias in the
+    `accounts` table -- non-retired only for live-state tables, any alias
+    ever (retired included) for historical/log tables. Replaces the FK
+    enforcement `account` columns don't have (plain TEXT, no CHECK
+    constraint anywhere). Depends on this: every schwab_safety.ACCOUNTS.get(
+    account) call site treats an unknown key as "no limits apply" (returns
+    None, usually then skipped/fails soft) rather than "this is a typo or an
+    orphaned/retired alias" -- this check is what actually catches that
+    class of mistake, since nothing else does."""
+    violations = []
+    known_live = set(schwab_safety.ACCOUNTS.keys())
+    with db._conn() as c:
+        known_all = {r[0] for r in c.execute("SELECT alias FROM accounts").fetchall()}
+        for table, known in (
+            [(t, known_live) for t in _ACCOUNT_COLUMN_TABLES_LIVE]
+            + [(t, known_all) for t in _ACCOUNT_COLUMN_TABLES_HISTORICAL]
+        ):
+            rows = c.execute(
+                f"SELECT DISTINCT account FROM {table} WHERE account IS NOT NULL"
+            ).fetchall()
+            for (account,) in rows:
+                if account not in known:
+                    scope = "non-retired " if table in _ACCOUNT_COLUMN_TABLES_LIVE else ""
+                    violations.append(
+                        f"{table}.account={account!r} is not a known {scope}"
+                        f"account alias (accounts table)"
+                    )
     return violations
 
 
@@ -483,6 +552,7 @@ CHECKS = [
     check_open_position_config_matches_live_node,
     check_staged_config_matches_expected,
     check_addon_drought_live_nodes_have_coherent_account_type,
+    check_all_account_values_are_known_aliases,
 ]
 
 

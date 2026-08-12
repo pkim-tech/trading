@@ -456,7 +456,7 @@ REGISTRY = [
     dict(id='same_day_block',
          scenario="same_day_block skips correctly for margin accounts unless a node opts in via "
                   "watch_list.force_same_day_block, still blocks cash accounts unconditionally",
-         code_path="schwab_safety.check_order (AccountLimits.account_type, watch_list.force_same_day_block)",
+         code_path="schwab_safety.check_order (AccountLimits.cash_settlement_type, watch_list.force_same_day_block)",
          offline_coverage="3 unit/fake_broker tests (test_schwab_safety.py, "
                            "test_fake_broker_check_order_guards_phase2_scenario.py)",
          check_mechanism='coverage_events', scenario_key='same_day_block',
