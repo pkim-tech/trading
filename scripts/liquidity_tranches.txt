@@ -1,0 +1,41 @@
+# Single source of truth for the liquidity-tranche campaign, read by both
+# run_liquidity_tranches.sh and liquidity_tranche_progress.py. Don't
+# hardcode any of this a second time in either script.
+#
+# Reorganized 2026-08-11 (later still) after finding SCO/QID/SDS/DRIP (old
+# tranche 3) were being reswept for nothing -- v5.1 only needs to recompute
+# the ~40 tickers whose raw hourly data changed in the 2026-08-11 backfill
+# (see docs/backlog_cache.md's v5.1 entry); everyone else either already
+# has complete v5.1 coverage via the copy-forward step, or never needed
+# one. Tranches 4-9 are the real remaining work, ordered by descending v5
+# robust_alpha (best proxy available pre-resweep -- numbers may shift once
+# actually recomputed). Tranches 10/11/13 are tickers that already have
+# full v5.1 data via copy-forward -- parked at the back, optional/
+# low-priority re-verification only, not required for the campaign to be
+# considered complete. Tranche 14 (crypto) stays last per the original
+# deliberate policy (crypto doesn't reliably mean-revert), not by alpha
+# rank -- ETHU pulled forward into tranche 3 per explicit request.
+#
+# Campaign params (same VERSION/FIXED_SLS/STRATEGIES/ENTRY_TIMING passed to
+# run_sweep_queue.sh for every tranche -- see the 2026-08-11 version-bump
+# note in run_liquidity_tranches.sh for why v5.1, not v5).
+VERSION=v5.1
+FIXED_SLS=1 2 3
+STRATEGIES=TrailingBothZScoreBreakout TrailingExitZScoreBreakout
+ENTRY_TIMING=open_check
+#
+# Tranches: "<number> <space-separated tickers>"
+1 SQQQ
+2 TZA SPXL TNA SPXU SPXS
+3 TECL ETHU
+4 JNUG BULZ DFEN OILU BOIL
+5 FNGU WEBL ERX GUSH YINN
+6 SOLT ROM SSG MQQQ TECS
+7 UGL SRTY TMV FAZ LABD
+8 SDOW CWEB UVXY TWM TBT
+9 DXD
+10 KOLD QPUX URTY FAS CURE
+11 SPCL DRN DDM UWM JDST
+12 EDC
+13 FNGD ERY TMF GLL
+14 BTCZ BITU BITX

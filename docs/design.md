@@ -1839,3 +1839,52 @@ was reverted to `paper` then restored to `live` once the user confirmed the orig
 own narrower-but-self-consistent data window at the time) wasn't actually wrong, just
 now-knowably-incomplete — a real resweep will give it a number to trust going forward. LABU
 stayed `paper` throughout (never went live). See `trading_incidents` id=3-5 for the full trail.
+
+## Bad-tick scanning, CAGR-first candidate selection, and single-source-of-truth tranche config (2026-08-11, later still)
+
+Three real, additive infrastructure pieces built during the same DFEN/ETHU/GDXU staleness
+investigation that motivated the `v5.1` entry above, all committed to `scripts/`:
+
+**`scan_bad_ticks.py`** — flags a bar as a suspect data glitch when it moves >40% from the prior
+bar's Close AND the very next bar reverses ≥70% of that move in the opposite direction (a real
+crash/rip doesn't round-trip like that). Built after DFEN's `TrailingExitZScoreBreakout` "winner"
+(80,812% alpha) turned out to be one fabricated trade off a single bad tick
+(`2024-06-03 09:30`: Close/Low=$0.27 vs a $28.75 Open/neighbors). `--fix` applies the conservative
+correction (Low=Close=Open for the bad bar — doesn't fabricate a specific "true" price, just
+removes the fake signal) and logs it to `db_cache.data_mutation_log`. Every scan run (hit or not)
+is also logged to a new `db_cache.bad_tick_scan_log` table with the actual per-ticker date range
+scanned, not just the hits found — built after finding two tickers in the same campaign had
+different cache end-dates (TECL stale by a day vs DFEN/ETHU current), so a rerun's differing
+results could otherwise be misread as a new bug rather than a shifted window. Wired into
+`run_liquidity_tranches.sh` as an advisory (non-blocking) pre-sweep step per tranche — prints a
+loud banner with the exact `--fix` command if hits are found, doesn't stop the sweep.
+
+**`sdb_recommend` / "best CAGR-safe node"** — two related fixes to `candidate_full_review.py`'s
+candidate-selection tooling, both per the user's explicit call that CAGR should drive selection,
+not raw `robust_alpha`. (1) A new "best CAGR-safe node" candidate type
+(`candidate_5min_report.find_candidates`), reusing `top_safe_nodes.best_safe_node()` with
+`metric="alpha_vs_spy"` instead of the default `"robust_alpha"` — `alpha_vs_spy` (the "possible"
+resolution alone) is order-equivalent to CAGR for a fixed ticker (same `years`/SPY-baseline apply
+to every row of its grid), so this ranks AND cliff-checks consistently on the CAGR-equivalent
+metric. Exposed a real latent bug while wiring this up: `candidate_summary_report.worst_neighbor()`
+was hardcoded to always check `robust_alpha` regardless of which metric actually selected the
+row — fine for the existing types (metric always matched), but produced a contradictory CLIFF
+status for a node genuinely verified safe under `alpha_vs_spy`. Fixed by adding a `metric` param
+to `worst_neighbor()`, applied only to the new candidate type (existing types' behavior
+intentionally unchanged). (2) `sdb_recommend` column — BLOCK_HELPS / BLOCK_HELPS_UNSTABLE /
+NEUTRAL / COSTS verdict on the existing `same_day_block_check` machinery, requiring the
+block-helps signal to hold in BOTH stability halves (not just the overall ratio) before calling
+it BLOCK_HELPS outright — a real LABU node showed 167% overall retention but only 80.8% in its
+late half, correctly downgraded to UNSTABLE rather than trusted at face value.
+
+**`scripts/liquidity_tranches.txt`** — single source of truth for the liquidity-tranche campaign
+(tranche membership + `VERSION`/`FIXED_SLS`/`STRATEGIES`/`ENTRY_TIMING`), read by both
+`run_liquidity_tranches.sh` (bash) and the new `scripts/liquidity_tranche_progress.py` (fine-
+grained in-progress status, since `--status` only reports tranche-level done/pending). Replaced
+an earlier design that hardcoded the same tranche list independently in both the bash script and
+a Python parser of the bash script's own variable syntax — both rejected during review as
+duplicated/fragile state; a flat `<number> <space-separated tickers>` file each language can read
+directly is the actual fix. Tranches were also reordered this session: 4 tickers found to be
+getting reswept for zero benefit (raw data unchanged, not in the real 40-ticker "needs v5.1"
+list) were pulled out; the real remaining work is now ordered by descending `v5` alpha (best
+available pre-resweep proxy) instead of the original liquidity-screen order.

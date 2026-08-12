@@ -70,6 +70,59 @@ def get_data_mutations(ticker=None, limit=200):
         return [dict(r) for r in conn.execute(q, params).fetchall()]
 
 
+def _ensure_bad_tick_scan_table(conn):
+    # bad_tick_scan_log: one row per ticker per scan_bad_ticks.py run, recording
+    # the actual date range/row count scanned -- not just the hits found. Built
+    # 2026-08-11 after the DFEN bad-tick investigation: without recording what
+    # window was actually scanned, a rerun with a shifted cache window (new bars
+    # appended, or a ticker's data refetched) produces different results with no
+    # way to tell "the data changed" from "the scan logic changed" from "a new
+    # bad tick appeared." hits_json is the full hit list for that ticker (usually
+    # empty), so a scan's findings are permanent even if the underlying CSV is
+    # later patched.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bad_tick_scan_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            ticker       TEXT NOT NULL,
+            date_start   TEXT,
+            date_end     TEXT,
+            row_count    INTEGER,
+            threshold    REAL,
+            recovery_frac REAL,
+            hits_count   INTEGER,
+            hits_json    TEXT
+        )
+    """)
+
+
+def log_bad_tick_scan(ticker, date_start, date_end, row_count, threshold,
+                       recovery_frac, hits):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_bad_tick_scan_table(conn)
+        conn.execute("""
+            INSERT INTO bad_tick_scan_log
+                (ticker, date_start, date_end, row_count, threshold, recovery_frac,
+                 hits_count, hits_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, date_start, date_end, row_count, threshold, recovery_frac,
+              len(hits), json.dumps(hits, default=str)))
+
+
+def get_bad_tick_scans(ticker=None, limit=500):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_bad_tick_scan_table(conn)
+        conn.row_factory = sqlite3.Row
+        q = "SELECT * FROM bad_tick_scan_log"
+        params = ()
+        if ticker:
+            q += " WHERE ticker = ?"
+            params = (ticker,)
+        q += " ORDER BY id DESC LIMIT ?"
+        params = params + (limit,)
+        return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+
 def get_kv(key):
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_table(conn)

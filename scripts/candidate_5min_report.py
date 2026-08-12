@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-For each ticker, finds three candidate nodes -- best CLIFF-SAFE (current
+For each ticker, finds candidate nodes -- best CLIFF-SAFE (current
 selection convention: robust_alpha, MIN of possible/pessimistic/certain,
-required to pass the neighbor-safety check), best NON-CLIFF-SAFE (top
-robust_alpha row regardless of whether it clears the neighbor check), and
-best POSSIBLE (top raw alpha_vs_spy row, ignoring robustness entirely) --
+required to pass the neighbor-safety check), best CAGR-SAFE (same
+neighbor-safety check, but ranked on alpha_vs_spy/CAGR-equivalent instead
+of robust_alpha -- added 2026-08-11 per explicit request that CAGR, not
+robust_alpha, is the real selection preference), best NON-CLIFF-SAFE (top
+robust_alpha row regardless of whether it clears the neighbor check), best
+POSSIBLE (top raw alpha_vs_spy row, ignoring robustness entirely), and best
+CERTAIN (top alpha_vs_spy_certain row, the no-guessing fill resolution) --
 then runs the real 5-min-bar fill-accuracy replay (verify_fill_resolution_
 accuracy.py) against each one's actual entry params, so node selection can
 be informed by which resolution is empirically closest to real fills, not
@@ -58,7 +62,7 @@ def _node_key(n):
 
 
 def find_candidates(df_t, min_alpha):
-    """Returns {label: node_dict} for the four candidate types, deduped by
+    """Returns {label: node_dict} for the five candidate types, deduped by
     identical params (a label is dropped if it's identical to one already found).
 
     Note the asymmetry between 'best possible' and 'best certain': robust_alpha
@@ -77,9 +81,29 @@ def find_candidates(df_t, min_alpha):
         cliff_safe['robust_alpha'] = cliff_safe.pop('alpha')  # normalize to match _node_from_row's key
         candidates['cliff-safe (current convention)'] = cliff_safe
 
+    # CAGR-first pick, added 2026-08-11 per explicit request. alpha_vs_spy
+    # (the 'possible' resolution alone) is order-equivalent to CAGR for a
+    # fixed ticker (same years, same SPY baseline for every row of its
+    # grid), so reusing best_safe_node() with metric="alpha_vs_spy" ranks
+    # AND cliff-checks consistently on the CAGR-equivalent metric, rather
+    # than mixing a CAGR-based rank with a robust_alpha-based safety check.
+    # best_safe_node()'s 'alpha' key is always robust_alpha regardless of
+    # `metric` (deliberate, see that function) -- don't relabel it as
+    # alpha_vs_spy, the real CAGR-equivalent value is already in 'alpha_raw'.
+    cagr_safe = best_safe_node(df_t, min_alpha=min_alpha, metric="alpha_vs_spy")
+    if cagr_safe:
+        cagr_safe['robust_alpha'] = cagr_safe.pop('alpha')
+        if not cliff_safe or _node_key(cagr_safe) != _node_key(cliff_safe):
+            candidates['CAGR-first (possible-resolution, cliff-checked on the same metric)'] = cagr_safe
+
     top_robust_row = df_t.sort_values("robust_alpha", ascending=False).iloc[0]
     top_robust = _node_from_row(top_robust_row)
-    if not cliff_safe or _node_key(top_robust) != _node_key(cliff_safe):
+    # Was: only checked against cliff_safe (fine when cliff_safe was the
+    # only preceding candidate; incomplete now that cagr_safe can also
+    # precede this and collide). Matches the full-existing_keys pattern
+    # top_possible/top_certain already use below.
+    existing_keys = {_node_key(n) for n in candidates.values()}
+    if _node_key(top_robust) not in existing_keys:
         candidates['best robust_alpha (ignoring cliff-safety)'] = top_robust
 
     top_possible_row = df_t.sort_values("alpha_vs_spy", ascending=False).iloc[0]

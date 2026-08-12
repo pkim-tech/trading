@@ -42,21 +42,28 @@ cd "$(dirname "$0")/.."
 PYTHON=".venv/bin/python"
 STATE_DIR="logs/.liquidity_tranche_state"
 
-TRANCHE_1="SQQQ"
-TRANCHE_2="TZA SPXL TNA SPXU SPXS"
-TRANCHE_3="SCO QID SDS DRIP TECL"
-TRANCHE_4="UVXY FNGU UGL TMF SDOW"
-TRANCHE_5="URTY GLL FAS SRTY BOIL"
-TRANCHE_6="TECS LABD KOLD JNUG YINN"
-TRANCHE_7="BULZ ERY SPCL FNGD ERX"
-TRANCHE_8="GUSH DXD JDST UWM TMV"
-TRANCHE_9="FAZ TBT DFEN MQQQ TWM"
-TRANCHE_10="SSG DRN DDM ROM SOLT"
-TRANCHE_11="CWEB WEBL QPUX CURE OILU"
-TRANCHE_12="EDC"
-# Crypto-linked, run last -- lowest-priority to validate, not excluded outright.
-TRANCHE_13="BTCZ BITX ETHU BITU"
-ALL_TRANCHES="1 2 3 4 5 6 7 8 9 10 11 12 13"
+# Campaign params + tranche membership live in scripts/liquidity_tranches.txt
+# -- the single source of truth, also read directly by
+# scripts/liquidity_tranche_progress.py. Don't hardcode any of this a
+# second time in either script; see that file's header comment for the
+# reorg rationale (2026-08-11).
+TRANCHES_FILE="scripts/liquidity_tranches.txt"
+declare -A TRANCHE_TICKERS
+ALL_TRANCHES=""
+while IFS= read -r line; do
+  [[ -z "$line" || "$line" =~ ^# ]] && continue
+  if [[ "$line" =~ ^([0-9]+)\ (.+)$ ]]; then
+    TRANCHE_TICKERS[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+    ALL_TRANCHES="$ALL_TRANCHES ${BASH_REMATCH[1]}"
+  elif [[ "$line" =~ ^([A-Z_]+)=(.+)$ ]]; then
+    declare "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
+  fi
+done < "$TRANCHES_FILE"
+ALL_TRANCHES="${ALL_TRANCHES# }"
+: "${VERSION:?VERSION not found in $TRANCHES_FILE}"
+: "${FIXED_SLS:?FIXED_SLS not found in $TRANCHES_FILE}"
+: "${STRATEGIES:?STRATEGIES not found in $TRANCHES_FILE}"
+: "${ENTRY_TIMING:?ENTRY_TIMING not found in $TRANCHES_FILE}"
 
 mkdir -p logs "$STATE_DIR"
 
@@ -81,21 +88,7 @@ LOG="logs/liquidity_tranches_$(date +%Y%m%d_%H%M%S).log"
 echo "Logging to $LOG (console + file via tee)"
 
 tickers_for() {
-  case "$1" in
-    1) echo "$TRANCHE_1" ;;
-    2) echo "$TRANCHE_2" ;;
-    3) echo "$TRANCHE_3" ;;
-    4) echo "$TRANCHE_4" ;;
-    5) echo "$TRANCHE_5" ;;
-    6) echo "$TRANCHE_6" ;;
-    7) echo "$TRANCHE_7" ;;
-    8) echo "$TRANCHE_8" ;;
-    9) echo "$TRANCHE_9" ;;
-    10) echo "$TRANCHE_10" ;;
-    11) echo "$TRANCHE_11" ;;
-    12) echo "$TRANCHE_12" ;;
-    13) echo "$TRANCHE_13" ;;
-  esac
+  echo "${TRANCHE_TICKERS[$1]}"
 }
 
 run_tranche() {
@@ -116,6 +109,31 @@ run_tranche() {
   echo " Tickers: $tickers"
   echo "======================================================"
 
+  # Bad-tick data scan (2026-08-11) -- catches the DFEN shape (a single bad
+  # print fabricating a fake headline return) BEFORE burning compute
+  # sweeping garbage data, not after chasing an outlier number back to its
+  # cause. Advisory only: logs to bad_tick_scan_log and prints a warning,
+  # does not block the sweep -- findings can be addressed (patch the CSV,
+  # like DFEN) or deliberately deferred, user's call either way.
+  echo ""
+  echo "--- Tranche $n pre-sweep data scan ---"
+  set +e
+  $PYTHON scripts/scan_bad_ticks.py --tickers $tickers
+  scan_rc=$?
+  set -e
+  if [ "$scan_rc" -eq 2 ]; then
+    echo ""
+    echo "########################################################"
+    echo "# WARNING: bad-tick data found above for tranche $n tickers."
+    echo "# NOT auto-fixed, NOT blocking the sweep -- run"
+    echo "#   .venv/bin/python scripts/scan_bad_ticks.py --fix --tickers $tickers"
+    echo "# to patch it, then resweep the affected ticker(s)."
+    echo "########################################################"
+    echo ""
+  elif [ "$scan_rc" -ne 0 ]; then
+    echo "(scan_bad_ticks.py failed with exit $scan_rc -- not blocking the sweep, but the data wasn't checked this run)"
+  fi
+
   # v5.1 (2026-08-11): version bump after the under-caching data-gap fix (trading_incidents
   # id=5) -- dispatch_parallel_grid's cache-hit check has no data-freshness awareness, so
   # resweeping under the old 'v5' tag would silently skip every already-covered grid
@@ -124,8 +142,9 @@ run_tranche() {
   # forward to v5.1 (tagged copied_from_version='v5' in backtest_cache) -- this sweep will
   # correctly skip those (already cached under v5.1) and only really compute the tickers
   # that need it. See docs/backlog_cache.md's 2026-08-11 v5.1 entry.
-  VERSION=v5.1 TICKERS="$tickers" FIXED_SLS="1 2 3" \
-    STRATEGIES="TrailingBothZScoreBreakout TrailingExitZScoreBreakout" \
+  # VERSION/FIXED_SLS/STRATEGIES come from scripts/liquidity_tranches.txt, not hardcoded here.
+  VERSION="$VERSION" TICKERS="$tickers" FIXED_SLS="$FIXED_SLS" \
+    STRATEGIES="$STRATEGIES" \
     ./scripts/run_sweep_queue.sh --skip-cache-refresh
 
   echo ""
@@ -150,7 +169,7 @@ run_tranche() {
 
   echo ""
   echo "--- Running overlay shim for tranche $n. ---"
-  $PYTHON scripts/run_overlay_shim.py $tickers --version v5.1 --out "$STATE_DIR/tranche_${n}_overlay.csv" || \
+  $PYTHON scripts/run_overlay_shim.py $tickers --version "$VERSION" --out "$STATE_DIR/tranche_${n}_overlay.csv" || \
     echo "(overlay shim non-fatal failure/no data -- see output above, tranche still marked done)"
 
   date > "$marker"

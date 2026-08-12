@@ -53,20 +53,24 @@ ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_
 # at a different, more technical audience/context.
 CANDIDATE_LABELS = {
     'cliff-safe (current convention)': 'best safe node',
+    'CAGR-first (possible-resolution, cliff-checked on the same metric)': 'best CAGR-safe node',
     'best robust_alpha (ignoring cliff-safety)': 'best unsafe node',
     'best possible (raw alpha_vs_spy)': '5min best possible',
     'best certain (alpha_vs_spy_certain, no-guessing resolution)': 'best certain',
 }
-CANDIDATE_TYPE_ORDER = ['best safe node', 'best unsafe node', '5min best possible', 'best certain']
+CANDIDATE_TYPE_ORDER = ['best safe node', 'best CAGR-safe node', 'best unsafe node', '5min best possible',
+                         'best certain']
 
 # Single source of truth for what each output column means -- used for both
 # the xlsx glossary sheet and (imported directly) the Streamlit Candidates
 # page's glossary expander, so the two never drift apart.
 COLUMN_DEFS = {
     "ticker": "The symbol.",
-    "candidate_type": "Which of the 3 candidate-selection methods produced this row: 'best safe node' "
+    "candidate_type": "Which of the 4 candidate-selection methods produced this row: 'best safe node' "
                        "(robust_alpha=MIN(possible,pessimistic,certain), required to pass the CLIFF_RADIUS=3 "
-                       "neighbor-safety check -- this project's real selection convention), 'best unsafe node' "
+                       "neighbor-safety check -- this project's real selection convention), 'best CAGR-safe "
+                       "node' (same cliff-safety check but ranked on alpha_vs_spy/CAGR-equivalent instead of "
+                       "robust_alpha -- your actual real-world selection preference), 'best unsafe node' "
                        "(top robust_alpha row regardless of whether it clears the safety check -- look here "
                        "first to sanity-check the safe pick isn't missing something), or '5min best possible' "
                        "(top raw 'possible'-resolution alpha_vs_spy row, ignoring robustness entirely -- named "
@@ -209,8 +213,8 @@ def fill_accuracy_summary(ticker, strategy, window, z, trail_buy_pct, hold):
 
 
 def worst_neighbor(conn, ticker, version, strategy, window, z, entry_timing,
-                    sl, tp, hold, tb, ts):
-    """Worst robust_alpha among the CLIFF_RADIUS-step neighborhood on
+                    sl, tp, hold, tb, ts, metric="robust_alpha"):
+    """Worst `metric` among the CLIFF_RADIUS-step neighborhood on
     take_profit/stop_loss (index-based nearest-distinct-values), holding
     every other axis fixed. max_hold_hours tolerance intentionally set to
     +/-7 (not prune_backtest_cache.py's own +/-24) to MATCH
@@ -219,11 +223,17 @@ def worst_neighbor(conn, ticker, version, strategy, window, z, entry_timing,
     came back CLIFF here at +/-24 (-9.8%) for TNA, purely because +/-24
     happened to span this ticker's ENTIRE swept hold-time range (6 values,
     7 apart) rather than just nearby ones. Since this report's 'best safe
-    node' label comes directly from best_safe_node()'s own check, this
-    function must use the same tolerance or the label and Status column can
-    visibly disagree. prune_backtest_cache.py's +/-24 is left untouched --
+    node'/'best CAGR-safe node' labels come directly from best_safe_node()'s
+    own check, this function must use the SAME tolerance AND the SAME
+    metric that check used, or the label and Status column can visibly
+    disagree -- found 2026-08-11 for 'best CAGR-safe node': this function
+    defaulted to robust_alpha unconditionally, so a node genuinely verified
+    safe under alpha_vs_spy (its own selection metric) printed a
+    contradictory CLIFF status computed against a DIFFERENT metric than the
+    one that vetted it. prune_backtest_cache.py's +/-24 is left untouched --
     that's a real, separate, deliberate convention for island selection, not
     something to change as a side effect of this report."""
+    metric_sql = ROBUST_ALPHA_SQL if metric == "robust_alpha" else metric
     c = conn.cursor()
 
     def nearest_values(col_sql, center):
@@ -243,7 +253,7 @@ def worst_neighbor(conn, ticker, version, strategy, window, z, entry_timing,
     tp_ph = ",".join("?" * len(tp_keep))
     sl_ph = ",".join("?" * len(sl_keep))
     c.execute(f"""
-        SELECT MIN({ROBUST_ALPHA_SQL}) FROM backtest_cache
+        SELECT MIN({metric_sql}) FROM backtest_cache
         WHERE ticker=? AND version=? AND strategy=? AND window=? AND z_score_threshold=?
               AND entry_timing=? AND trail_buy_pct=? AND trail_sell_pct=?
               AND COALESCE(take_profit, arm_sell_pct) IN ({tp_ph})
@@ -430,12 +440,27 @@ def build_rows_for_ticker(conn, ticker, version, min_alpha, skip_5min, skip_over
     if not candidates:
         return [(ticker, None)]
 
+    # Only 'CAGR-first' gets a non-default metric here -- it's the one new
+    # type whose own selection check (inside best_safe_node) used
+    # alpha_vs_spy, not robust_alpha, so its Status/WorstNb must be
+    # recomputed on that SAME metric or it visibly contradicts its own
+    # label (found 2026-08-11, see worst_neighbor's docstring). The other
+    # 4 types keep their existing, unchanged robust_alpha-based Status --
+    # deliberately not widened to '5min best possible'/'best certain' too,
+    # which have their own separate, longstanding, deliberate "show the
+    # robust_alpha view even though a different metric picked this node"
+    # framing that isn't part of this fix's scope.
+    WN_METRIC_BY_LABEL = {
+        'CAGR-first (possible-resolution, cliff-checked on the same metric)': 'alpha_vs_spy',
+    }
+
     rows = []
     for raw_label, node in candidates.items():
         label = CANDIDATE_LABELS.get(raw_label, raw_label)
         wn = worst_neighbor(conn, ticker, version, strategy, node['window'], node['z'],
                              node['entry_timing'], node['sl'], node['arm_pct'], node['hold'],
-                             node['trail_buy_pct'], node['trail_sell_pct'])
+                             node['trail_buy_pct'], node['trail_sell_pct'],
+                             metric=WN_METRIC_BY_LABEL.get(raw_label, "robust_alpha"))
         cliff = "CLIFF" if (wn is not None and wn < 0) else ("SAFE" if wn is not None else "?")
         days, ann_excess = annualized_excess(ticker, node['return'], spy_bh)
         years = round(days / 365.25, 2) if days else None

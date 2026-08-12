@@ -35,6 +35,21 @@ import signals_db as db
 
 FIELDS = ('arm_sell_pct', 'fixed_sl', 'trail_sell_pct', 'max_hold_hours',
           'trail_buy_pct', 'starting_notional',
+          # window/z_score_threshold added 2026-08-11 -- found live on GDXU
+          # (wl_id=208): its watch_list_candidate_link correctly pointed to
+          # candidate_node_id=120 (z=1.0), but the deployed live node was
+          # actually running z=2.0 -- every OTHER field matched, so this drift
+          # check reported clean the whole time. These two aren't "settings"
+          # the way arm/SL/trail are -- they define WHICH backtested config a
+          # node structurally IS, so a drift here means the live node isn't a
+          # tweaked version of the validated candidate, it's an entirely
+          # different, unvalidated one. Previously omitted because the
+          # original 2026-07-30 FIELDS list was scoped around risk/execution
+          # parameters someone might hand-edit, not node identity -- never
+          # revisited when watch_list_candidate_link (which DOES catch this,
+          # but only if someone runs node_candidate_trace.py and checks by
+          # eye) was built for a related but different purpose.
+          'window', 'z_score_threshold',
           # Overlay params added 2026-08-06 -- previously untracked here, so a
           # silent drift in any of these (accidental edit, migration
           # side-effect, stale manual patch) rendered as a false "matches

@@ -125,10 +125,12 @@ COLUMN_DEFS = {
                        "(ETN issuer credit risk, shared underlier with a sibling ticker, etc.).",
     "candidate_type": "Which candidate-selection method produced this row: 'best safe node' (robust_alpha, "
                        "required to pass cliff-safety -- this project's real selection convention), 'best "
-                       "unsafe node' (top robust_alpha regardless of cliff-safety), '5min best possible' (top "
-                       "raw 'possible'-resolution alpha, ignoring robustness), or 'best certain' (top "
-                       "alpha_vs_spy_certain, the no-guessing fill resolution -- can differ from the other "
-                       "three when 'possible's optimistic bounce-fill assumption picks a different node).",
+                       "CAGR-safe node' (same cliff-safety check, ranked on alpha_vs_spy/CAGR-equivalent "
+                       "instead of robust_alpha), 'best unsafe node' (top robust_alpha regardless of "
+                       "cliff-safety), '5min best possible' (top raw 'possible'-resolution alpha, ignoring "
+                       "robustness), or 'best certain' (top alpha_vs_spy_certain, the no-guessing fill "
+                       "resolution -- can differ from the others when 'possible's optimistic bounce-fill "
+                       "assumption picks a different node).",
     "also_matches": "Every candidate_type label that landed on this SAME node (params identical) -- shown as "
                     "'A = B' when two+ methods agree, so a row isn't presented as one method's pick when it's "
                     "really a consensus across several.",
@@ -302,6 +304,15 @@ COLUMN_DEFS = {
     "sdb_tranche": "LOW_RETENTION / MODERATE_RETENTION / HIGH_RETENTION bucket of sdb_alpha_retention_pct. "
                    "'N/A (TrailingExit)' for TrailingExitZScoreBreakout rows -- same_day_block only applies to "
                    "TrailingBothZScoreBreakout.",
+    "sdb_recommend": "Whether force_same_day_block looks worth flagging on this node's real watch_list row, "
+                     "same framing as the drought/addon overlay verdicts -- a direct 'is this a real execution "
+                     "lever worth using' recommendation, not just the raw retention number. BLOCK_HELPS: "
+                     "blocked robust alpha exceeds unblocked (retention >105%) AND holds up in both the early "
+                     "and late stability halves (checklist item 10) -- the LABU shape (76.6% vs 73.0%). "
+                     "BLOCK_HELPS_UNSTABLE: retention >105% overall but doesn't hold in one stability half -- "
+                     "real gain, but don't trust it blindly, check the split. NEUTRAL: retention 95-105%, "
+                     "not worth the added complexity either way. COSTS: retention <95%, blocking this node "
+                     "would give up real alpha. N/A (TrailingExit) / no data otherwise.",
     "x_addon_pct": "NAIVE estimate of core+add-on combined: (1+core_return)*(1+addon_return)-1. Add-on capital "
                    "runs CONCURRENTLY with an open core position (not sequentially), so this OVERSTATES the "
                    "real combined effect -- treat as a rough upper bound, not a real number.",
@@ -596,6 +607,31 @@ def candidate_type_membership(df_t, min_alpha):
         cliff_safe['robust_alpha'] = cliff_safe.pop('alpha')
         membership.setdefault(_node_key(cliff_safe), []).append('best safe node')
         label_to_node['cliff-safe (current convention)'] = cliff_safe
+
+    # CAGR-first pick, added 2026-08-11 per explicit request ("CAGR is more
+    # important"/"use that instead of alpha across the board"). alpha_vs_spy
+    # (the 'possible' resolution alone) is order-equivalent to CAGR for a
+    # fixed ticker -- same years, same SPY baseline apply to every row of its
+    # grid -- so reusing best_safe_node() with metric="alpha_vs_spy" ranks
+    # AND cliff-checks consistently on the CAGR-equivalent metric, rather
+    # than mixing a CAGR-based rank with a robust_alpha-based safety check.
+    # Deliberately additive, not a replacement of "best safe node" above --
+    # fully swapping robust_alpha for possible-only as the DEFAULT
+    # safety/selection metric project-wide is the bigger, already-flagged
+    # (2026-08-08/2026-08-10 backlog) convention change that needs the full
+    # backtest-change-rollout process, not a quick edit here.
+    cagr_safe = best_safe_node(df_t, min_alpha=min_alpha, metric="alpha_vs_spy")
+    if cagr_safe:
+        # best_safe_node()'s 'alpha' key is always robust_alpha regardless of
+        # `metric` (deliberate -- lets a caller see how a metric-X-selected
+        # node scores on the always-conservative measure too, same pattern
+        # compare_fill_resolution_selection.py already relies on). The actual
+        # ranking/safety-check metric used here (alpha_vs_spy, CAGR-order-
+        # equivalent) is separately in 'alpha_raw' -- don't relabel 'alpha'
+        # as alpha_vs_spy, that would silently swap in the wrong value.
+        cagr_safe['robust_alpha'] = cagr_safe.pop('alpha')
+        membership.setdefault(_node_key(cagr_safe), []).append('best CAGR-safe node')
+        label_to_node['CAGR-first (possible-resolution, cliff-checked on the same metric)'] = cagr_safe
 
     top_robust_row = df_t.sort_values("robust_alpha", ascending=False).iloc[0]
     top_robust = _node_from_row(top_robust_row)
@@ -1396,9 +1432,25 @@ def add_tranches(rec):
     sdb_alpha_ret = sdb_rec.get("alpha_retention_pct") if sdb_rec else None
     if sdb_alpha_ret is None:
         rec["sdb_tranche"] = "N/A (TrailingExit)" if rec.get("strategy") == "TrailingExitZScoreBreakout" else None
+        rec["sdb_recommend"] = rec["sdb_tranche"]
     else:
         rec["sdb_tranche"] = _bucket(sdb_alpha_ret, [25, 75], ["LOW_RETENTION", "MODERATE_RETENTION",
                                                                 "HIGH_RETENTION"])
+        if sdb_alpha_ret > 105:
+            early, late = sdb_rec.get("retention_early_pct"), sdb_rec.get("retention_late_pct")
+            # "Holds up" means the block also helps (>100%) in BOTH stability
+            # halves independently -- a real, consistent gain (the LABU
+            # shape), not just one lucky half dragging the overall ratio up.
+            # A missing half (too few trades to split) is treated as unknown,
+            # not confirmed -- stays UNSTABLE rather than defaulting to HELPS.
+            if early is not None and late is not None and early > 100 and late > 100:
+                rec["sdb_recommend"] = "BLOCK_HELPS"
+            else:
+                rec["sdb_recommend"] = "BLOCK_HELPS_UNSTABLE"
+        elif sdb_alpha_ret >= 95:
+            rec["sdb_recommend"] = "NEUTRAL"
+        else:
+            rec["sdb_recommend"] = "COSTS"
     return rec
 
 
