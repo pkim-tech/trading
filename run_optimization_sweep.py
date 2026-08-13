@@ -305,11 +305,24 @@ def init_idempotent_db():
     # changes when the run started (a real run against not-yet-committed
     # kernel code is a genuine traceability gap worth flagging, not silently
     # trusting the commit hash as the whole story).
+    # try/except per column (2026-08-13 paired review, LOW-MEDIUM): the bare
+    # if-not-in-cols-then-ALTER pattern below is check-then-act, not atomic across
+    # processes -- two invocations starting simultaneously on the first run after
+    # a schema change (e.g. the Streamlit UI and a queued sweep step) could both
+    # see the column missing and the loser crashes on a real, uncaught
+    # "duplicate column name" error. Matches the already-safe backtest_cache
+    # ALTER pattern above.
     sr_cols = {r[1] for r in cursor.execute("PRAGMA table_info(sweep_runs)").fetchall()}
     if "git_commit" not in sr_cols:
-        cursor.execute("ALTER TABLE sweep_runs ADD COLUMN git_commit TEXT")
+        try:
+            cursor.execute("ALTER TABLE sweep_runs ADD COLUMN git_commit TEXT")
+        except Exception:
+            pass
     if "kernel_dirty" not in sr_cols:
-        cursor.execute("ALTER TABLE sweep_runs ADD COLUMN kernel_dirty INTEGER")
+        try:
+            cursor.execute("ALTER TABLE sweep_runs ADD COLUMN kernel_dirty INTEGER")
+        except Exception:
+            pass
     # data_start/data_end (2026-08-12): git_commit/kernel_dirty above answer "what code
     # produced this run" -- these answer "what data did it see." Found needed for real:
     # JNUG's backtest_cache rows nearly tripled trade count between two runs 3 days apart
@@ -319,10 +332,31 @@ def init_idempotent_db():
     # that (the CSV itself still has zero retention/versioning -- a snapshot would be
     # needed for that), but it stops the next occurrence from being unexplainable in the
     # same way: at least the loaded date range is on file per run.
+    #
+    # NEITHER column is backfilled onto pre-2026-08-13 rows (2026-08-13 paired review,
+    # CRITICAL, corrected same day): data_start WAS backfilled from each ticker's current
+    # CSV once, on the "a ticker's earliest cached bar never moves" assumption -- false.
+    # scripts/backfill_hourly_history.py (built 2026-08-11, one day earlier) explicitly
+    # re-extends a ticker's history backward on demand and was run across 218 tickers that
+    # day; JNUG's own earliest bar moved from 2025-06-27 to 2023-09-12 as a result. The
+    # backfill silently stamped that 2023-09-12 date onto JNUG's 2026-08-08 sweep_runs rows
+    # -- runs that, per docs/deep_backlog.md's own 2026-08-08 entry, had zero data before
+    # 2025-06-27 at the time they ran. That's not an approximation, it's a fabricated
+    # provenance record on exactly the row the JNUG investigation would have queried.
+    # Reverted: any row with data_start set but data_end still NULL was backfilled, not
+    # genuinely captured (data_end is never backfilled, only set together with data_start
+    # by a real start_sweep_run() call) -- all 1,128 such rows nulled back out. Every
+    # pre-2026-08-13 row is now honestly NULL unless it was a real live capture.
     if "data_start" not in sr_cols:
-        cursor.execute("ALTER TABLE sweep_runs ADD COLUMN data_start TEXT")
+        try:
+            cursor.execute("ALTER TABLE sweep_runs ADD COLUMN data_start TEXT")
+        except Exception:
+            pass
     if "data_end" not in sr_cols:
-        cursor.execute("ALTER TABLE sweep_runs ADD COLUMN data_end TEXT")
+        try:
+            cursor.execute("ALTER TABLE sweep_runs ADD COLUMN data_end TEXT")
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
@@ -371,20 +405,36 @@ def _tickers_data_date_range(tickers):
     git_commit/kernel_dirty's "what code ran it." Best-effort per ticker (a missing/
     unreadable CSV is skipped, not fatal to starting the sweep); returns (None, None)
     if no ticker's CSV was readable at all."""
+    # SPY is always included below (2026-08-13 paired review): alpha_vs_spy/spy_bh for every
+    # ticker in a run comes from SPY_1h.csv via compute_bh_returns, loaded independently of
+    # `tickers` -- a SPY-only data revision would otherwise be invisible to this function even
+    # though it changes every alpha number the run produces.
+    #
+    # Everything below is inside the try (2026-08-13 paired review, HIGH): a tz-aware or
+    # malformed CSV (e.g. a bootstrap fetch that skipped tz_localize(None), or a torn read from
+    # data_collector.py's background sync overlapping this read) used to leave the comparison/
+    # strftime calls unguarded -- a TypeError/AttributeError there would crash the whole sweep
+    # before status='FAILED' is ever recorded (this runs before sys.excepthook is installed in
+    # main()). Now: tz-aware timestamps are localized to naive (matching every other CSV reader
+    # in this file), and a non-DatetimeIndex result (garbled first column) is caught by the same
+    # try instead of reaching the comparison.
     lo, hi = None, None
-    for ticker in tickers:
+    for ticker in set(tickers) | {"SPY"}:
         cache_path = CACHE_DIR / f"{ticker}_1h.csv"
         try:
             df = pd.read_csv(cache_path, index_col=0, usecols=[0], parse_dates=True)
             if len(df.index) == 0:
                 continue
-            t_lo, t_hi = df.index.min(), df.index.max()
+            idx = pd.DatetimeIndex(df.index)
+            if idx.tz is not None:
+                idx = idx.tz_localize(None)
+            t_lo, t_hi = idx.min(), idx.max()
+            if lo is None or t_lo < lo:
+                lo = t_lo
+            if hi is None or t_hi > hi:
+                hi = t_hi
         except Exception:
             continue
-        if lo is None or t_lo < lo:
-            lo = t_lo
-        if hi is None or t_hi > hi:
-            hi = t_hi
     fmt = lambda ts: ts.strftime("%Y-%m-%d %H:%M:%S") if ts is not None else None
     return fmt(lo), fmt(hi)
 

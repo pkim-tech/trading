@@ -1738,6 +1738,53 @@ convention as `backtest_cache`'s existing `phase`/`generation` columns — every
 registered before 2026-08-11 stays NULL/`[no sweep_run recorded]`; provenance only starts
 accumulating from the next real sweep run forward.
 
+**Data-window provenance added 2026-08-13**: `git_commit`/`kernel_dirty` above answer "what CODE
+produced this run" — nothing answered "what DATA it saw." Found needed for real investigating
+JNUG's `backtest_cache` divergence between two runs 3 days apart (56 trades/~150-395% return vs
+149-154 trades/~994-2419%, identical param tuple) — traced to the underlying hourly CSV itself
+being silently revised between the two runs, with zero record of what either run's data actually
+looked like. Fixed: `sweep_runs` gained `data_start`/`data_end`, the real min/max Datetime across
+each run's tickers' cached hourly CSVs (`_tickers_data_date_range()`, called at `start_sweep_run`
+time). `data_end` deliberately not backfilled — the historical CSV content at each past run's
+moment is genuinely gone, so a value derived from today's CSV would misrepresent itself as real.
+Doesn't recover JNUG's already-lost history; closes the gap for future runs.
+
+**Paired review same day (independent-cold + contextual) found and fixed 4 real issues before this
+was trusted**: (1) CRITICAL — `data_start`'s backfill ("a ticker's earliest cached bar practically
+never moves") was actively false: `scripts/backfill_hourly_history.py` (built one day earlier,
+2026-08-11) explicitly re-extends a ticker's history backward on demand and was run across 218
+tickers that day, including JNUG (2025-06-27 → 2023-09-12). The backfill had stamped that later
+date onto JNUG's 2026-08-08 `sweep_runs` rows — runs that genuinely had zero data before
+2025-06-27 — fabricating exactly the kind of misleading provenance record this feature exists to
+prevent. Reverted: all 1,128 backfilled rows nulled back to `data_start=NULL` (identified cleanly
+via `data_end IS NULL`, since `data_end` is never backfilled — only the 11 rows with a genuine live
+capture, both columns set together, were preserved). (2) HIGH — the helper's comparison/`strftime`
+calls sat outside the `try` around `pd.read_csv`, so a tz-aware or malformed CSV could crash the
+whole sweep before `status='FAILED'` is ever recorded (verified: 0/1,476 current CSVs trigger it,
+but a bootstrap fetch missing `tz_localize(None)` or a torn read from `data_collector.py`'s
+concurrent background sync could). Fixed: tz-localization + the full comparison moved inside the
+try. (3) MEDIUM/LOW — `SPY_1h.csv` (source of every ticker's `alpha_vs_spy`/`spy_bh`) wasn't
+included in the scanned ticker set, so a SPY-only revision would be invisible despite changing
+every alpha number the run produced. Fixed: SPY always included. (4) LOW-MEDIUM — the `sweep_runs`
+schema migration's check-then-act `ALTER TABLE` pattern (shared with the pre-existing
+`git_commit`/`kernel_dirty` columns) had a real, if narrow, race between two processes starting
+their first post-upgrade run simultaneously. Fixed: wrapped in try/except, matching the already-safe
+`backtest_cache` ALTER pattern elsewhere in this function.
+
+**Known limitations, not fixed this pass** (documented rather than silently accepted): the recorded
+window is a union across all tickers in a run, not per-ticker — a 30+-ticker run (130 of 1,139 real
+runs are multi-ticker) records one span even though tickers can have very different history depths,
+so a short-history outlier's true window isn't independently visible. The window is captured once
+at run start, not re-checked at completion, so a multi-hour run overlapping `data_collector.py`'s
+5-minute sync loop could see its data revised mid-run with nothing recording that drift. A min/max
+span can't detect an in-place value mutation that doesn't change the span (a `keep='last'` overwrite
+of an already-cached bar, a split-guard rescale, a `scan_bad_ticks.py --fix` correction) — the new
+`data_manager.py` revision-diff log (same session) partially covers this but lands in
+`data_collector.log`, not joined to any `sweep_run_id`. A same-`version` rerun's `INSERT OR REPLACE`
+overwrites `backtest_cache.sweep_run_id` in place, losing the earlier run's link (pre-existing
+behavior, not introduced by this change — JNUG's own evidence survived only because the two runs
+used different version tags).
+
 ---
 
 ## Per-ticker same-day-rebuy block override: `watch_list.force_same_day_block` (2026-08-11)
