@@ -467,7 +467,13 @@ REGISTRY = [
                "events to one that raced); the dedicated concurrency test above is what actually "
                "proves serialization. 'already_closed' is excluded via bad_results since it's a "
                "benign no-op (a routine double-call finding nothing to close) with zero lock "
-               "contention, not evidence the lock protected anything (Opus review, 2026-08-01)."),
+               "contention, not evidence the lock protected anything (Opus review, 2026-08-01). "
+               "Deprioritized 2026-08-13 (user's call): the only real contention shape this guards "
+               "against is the poll loop and a Slack button click racing the same position, and the "
+               "user's actual interaction pattern is kill-switch-only (rarely/never uses per-position "
+               "Slack buttons for routine open/close) -- so this race is unlikely to occur in practice "
+               "regardless of proof status. Still real, still worth fixing if it's ever cheap to do, "
+               "just not worth flagging in routine coverage reviews going forward."),
     dict(id='dup_order_retry_after_failure',
          scenario="Duplicate-order retry after a real rejected/failed order isn't wrongly blocked",
          code_path="schwab_safety._broker_confirms_order",

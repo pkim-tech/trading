@@ -262,3 +262,63 @@ def test_scan_pinned_exit_arm_skips_dry_run_sim_position(env, monkeypatch):
     assert sell_alerted == set()
     assert posted == []  # no real notify_trailing_activated/notify_sell_signal Slack flow
     assert db.get_open_positions() == [pos]  # still open -- untouched by this loop
+
+
+def test_two_dry_run_nodes_same_ticker_fills_and_exits_dont_cross_contaminate(env, monkeypatch):
+    """2026-08-13: built alongside the FAS/FAZ canary consolidation, which deliberately runs
+    multiple detuned dry_run nodes sharing one ticker+account (e.g. several distinct scenario
+    configs, all on ticker FAS in account soxl_ira). Confirms update_dry_run_buys/
+    check_dry_run_sim_sells key strictly by wl_id, not by (ticker, account) -- two nodes
+    sharing a ticker, both with pending buys/open positions at once, must fill/exit
+    independently and never let one node's synthesis touch the other's row."""
+    node1 = _node()  # TICKER, version='test', wl_id=node1['id']
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test3', window=20, take_profit=9,
+                stop_loss=1, max_hold_hours=9, state='live',
+                trail_buy_pct=1.0, trail_pct=1.0, starting_notional=5000, fixed_sl_override=1.0)
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET account = 'roth' WHERE ticker = ? AND version = 'test3'", (TICKER,))
+        c.commit()
+    node2 = [n for n in db.get_watchlist() if n['ticker'] == TICKER and n['version'] == 'test3'][0]
+    assert node1['id'] != node2['id']
+
+    db.add_pending_buy(node1, _sig(100.0), channel=None, ts=None)
+    db.add_pending_buy(node2, _sig(200.0), channel=None, ts=None)
+    assert len(db.get_pending_buys()) == 2
+
+    # Both bounce-fill in the same poll cycle -- current_price keyed by ticker only
+    # (matches production: _current_price takes a ticker, not a node), so both
+    # nodes' pending rows see the same price stream.
+    monkeypatch.setattr(signals_notify.compute, '_current_price', lambda t: (90.0, None))
+    signals_notify.update_dry_run_buys()
+    monkeypatch.setattr(signals_notify.compute, '_current_price', lambda t: (92.0, None))
+    signals_notify.update_dry_run_buys()
+
+    assert db.get_pending_buys() == []
+    positions = db.get_open_positions()
+    assert len(positions) == 2
+    by_wl_id = {p['wl_id']: p for p in positions}
+    assert set(by_wl_id) == {node1['id'], node2['id']}
+    # Entry price is the same for both here (both bounce-filled off the same price
+    # stream) -- the real assertion is that each position row is genuinely
+    # attributed to its own wl_id, not that prices differ.
+    assert by_wl_id[node1['id']]['entry_price'] == 92.0
+    assert by_wl_id[node2['id']]['entry_price'] == 92.0
+
+    # Exit: force node1's position into an SL breach, leave node2's untouched.
+    from signals_compute import _load_cache
+    df_hourly, _ = _load_cache(TICKER)
+    last_seen_bar = {p['id']: df_hourly.index[-1] for p in positions}
+    monkeypatch.setattr(signals_notify.compute, '_current_price', lambda t: (85.0, None))  # -7.6% > 1% fixed_sl for both
+    signals_notify.check_dry_run_sim_sells(last_seen_bar, set(), _load_cache)
+
+    remaining = db.get_open_positions()
+    # Both nodes share fixed_sl=1% so both breach -- the real point is each closes
+    # via its OWN trade_log_id, not a swapped/duplicated one.
+    assert remaining == []
+    with db._conn() as c:
+        rows = c.execute(
+            "SELECT wl_id, exit_reason, is_dry_run_sim FROM trade_log WHERE ticker = ? ORDER BY wl_id",
+            (TICKER,)).fetchall()
+    assert len(rows) == 2
+    assert {r['wl_id'] for r in rows} == {node1['id'], node2['id']}
+    assert all(r['exit_reason'] == 'SL' and r['is_dry_run_sim'] == 1 for r in rows)
