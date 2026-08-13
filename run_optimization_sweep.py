@@ -310,6 +310,19 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE sweep_runs ADD COLUMN git_commit TEXT")
     if "kernel_dirty" not in sr_cols:
         cursor.execute("ALTER TABLE sweep_runs ADD COLUMN kernel_dirty INTEGER")
+    # data_start/data_end (2026-08-12): git_commit/kernel_dirty above answer "what code
+    # produced this run" -- these answer "what data did it see." Found needed for real:
+    # JNUG's backtest_cache rows nearly tripled trade count between two runs 3 days apart
+    # (2026-08-08 vs 2026-08-11) with no bad tick, no split-guard rescale logged, and no
+    # way to tell what the raw hourly CSV actually contained at either run's moment --
+    # only *when* the run happened, not what data window it loaded. This doesn't solve
+    # that (the CSV itself still has zero retention/versioning -- a snapshot would be
+    # needed for that), but it stops the next occurrence from being unexplainable in the
+    # same way: at least the loaded date range is on file per run.
+    if "data_start" not in sr_cols:
+        cursor.execute("ALTER TABLE sweep_runs ADD COLUMN data_start TEXT")
+    if "data_end" not in sr_cols:
+        cursor.execute("ALTER TABLE sweep_runs ADD COLUMN data_end TEXT")
     conn.commit()
     conn.close()
 
@@ -352,17 +365,42 @@ def rebuild_indexes():
     conn.close()
 
 
+def _tickers_data_date_range(tickers):
+    """Real min/max Datetime actually present across these tickers' cached hourly CSVs,
+    right now, at sweep-start time -- the "what data did this run load" counterpart to
+    git_commit/kernel_dirty's "what code ran it." Best-effort per ticker (a missing/
+    unreadable CSV is skipped, not fatal to starting the sweep); returns (None, None)
+    if no ticker's CSV was readable at all."""
+    lo, hi = None, None
+    for ticker in tickers:
+        cache_path = CACHE_DIR / f"{ticker}_1h.csv"
+        try:
+            df = pd.read_csv(cache_path, index_col=0, usecols=[0], parse_dates=True)
+            if len(df.index) == 0:
+                continue
+            t_lo, t_hi = df.index.min(), df.index.max()
+        except Exception:
+            continue
+        if lo is None or t_lo < lo:
+            lo = t_lo
+        if hi is None or t_hi > hi:
+            hi = t_hi
+    fmt = lambda ts: ts.strftime("%Y-%m-%d %H:%M:%S") if ts is not None else None
+    return fmt(lo), fmt(hi)
+
+
 def start_sweep_run(config_version, strategy_names, tickers, config, log_file):
     git_commit, kernel_dirty = _current_kernel_git_state()
+    data_start, data_end = _tickers_data_date_range(tickers)
     conn = sqlite3.connect(DB_PATH, timeout=60.0)
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO sweep_runs (version, started_at, status, strategies, tickers, config_json, log_file,
-                                 git_commit, kernel_dirty)
-        VALUES (?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?)
+                                 git_commit, kernel_dirty, data_start, data_end)
+        VALUES (?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?)
     """, (config_version, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
           json.dumps(strategy_names), json.dumps(tickers), json.dumps(config), str(log_file),
-          git_commit, kernel_dirty))
+          git_commit, kernel_dirty, data_start, data_end))
     conn.commit()
     run_id = cur.lastrowid
     conn.close()

@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 import pandas as pd
@@ -155,7 +156,36 @@ def fetch_live_data_smart(ticker):
         # 5. De-duplicate using the datetime index
         df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
         df_combined = df_combined.sort_index()
-        
+
+        # 5b. Revision-diff log (2026-08-12): the JNUG incident that motivated this had
+        # zero trail anywhere -- data_collector.log only ever recorded "synced OK", never
+        # whether the sync appended new bars, silently revised existing ones (keep='last'
+        # above means a fresh Yahoo value always wins over what was already cached), or
+        # both. This doesn't prevent a revision (Yahoo's data is still trusted as-is,
+        # same as before) -- it just makes one detectable after the fact instead of
+        # invisible. Uses logging (not print, unlike the rest of this function) so it
+        # actually lands in data_collector.log via the handlers data_collector.py installs
+        # on the root logger at import time -- the existing print() calls in this function
+        # don't reach that file at all, confirmed empirically (2026-08-12: grepped for
+        # this function's own print() text in the real log, zero hits).
+        try:
+            new_bars = df_delta.index.difference(df_local.index)
+            price_cols = [c for c in ("Open", "High", "Low", "Close") if c in df_local.columns and c in df_delta.columns]
+            revised = []
+            for ts in overlap:
+                old_row, new_row = df_local.loc[ts], df_delta.loc[ts]
+                if any(abs(float(old_row[c]) - float(new_row[c])) > 1e-6 * max(1.0, abs(float(old_row[c]))) for c in price_cols):
+                    revised.append((ts, float(old_row.get("Close", float("nan"))), float(new_row.get("Close", float("nan")))))
+            logging.info(f"{ticker}: sync appended {len(new_bars)} new bar(s), "
+                         f"revised {len(revised)} existing bar(s) out of {len(overlap)} overlapping")
+            if revised:
+                sample = ", ".join(f"{ts} Close {old:.4f}->{new:.4f}" for ts, old, new in revised[:5])
+                logging.warning(f"{ticker}: {len(revised)} existing bar(s) silently revised on sync "
+                                 f"(not a detected split -- see split-guard log above if this ticker also "
+                                 f"triggered that): {sample}{' ...' if len(revised) > 5 else ''}")
+        except Exception as e:
+            logging.warning(f"{ticker}: revision-diff logging failed (proceeding with write anyway): {e}")
+
         # 6. Save to disk cleanly
         df_combined.index.name = "Datetime"
         df_combined.to_csv(cache_path)

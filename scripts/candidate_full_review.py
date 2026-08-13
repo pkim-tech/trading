@@ -85,6 +85,7 @@ from v4_max_drawdown import max_drawdown
 from run_optimization_sweep import _summarize_trades
 from verify_trailing_sell_resolution import find_hourly_trailing_exits, replay_five_min, FIVE_MIN_LOOKBACK_DAYS
 from drought_overlay_test import find_drought_windows, get_trades_and_bars, simulate_overlay
+from calendar_year_returns import calendar_year_breakdown, format_calendar_years
 from drought_overlay_sweep import get_ivol_series, _entry_vol_pctile
 from sim_bear_market_stress import (
     PROXIES as _BEAR_PROXIES, CRASHES as _BEAR_CRASHES, fetch_underlying as _bear_fetch_underlying,
@@ -152,6 +153,10 @@ COLUMN_DEFS = {
     "abs_return_pct": "This node's own RAW compounded return (SPY NOT subtracted) over the same window.",
     "strategy_cagr_pct": "Annualized (CAGR) version of abs_return_pct, over the real cached-data years span.",
     "cagr_tranche": "strategy_cagr_pct bucketed (negative / 0-50% / 50-100% / 100-200% / 200%+).",
+    "calendar_years_pct": "Per-calendar-year compounded return (tax-year-aligned, exit date determines the year, "
+                           "current year flagged YTD/not annualized) -- only computed with --show-calendar-years, "
+                           "and only for rows marked Pick (a full trade replay per row would be too slow to run "
+                           "by default across every candidate-type row).",
     "ann_excess_pct": "CAGR-based excess return over SPY (SPY-adjusted, like core_alpha_pct), annualized -- "
                        "fixes the cross-ticker horizon-mismatch problem (tickers have very different real "
                        "cached-data spans). Always read next to years/trades -- a large value backed by a "
@@ -1646,6 +1651,9 @@ def main():
                      help="skip the stock-split check (yfinance network call per ticker)")
     ap.add_argument("--vol-gate", type=float, default=DEFAULT_VOL_GATE,
                      help="entry-vol percentile gate for the drought included-vs-excluded challenge")
+    ap.add_argument("--show-calendar-years", action="store_true",
+                     help="compute per-calendar-year return breakdown (tax-relevant) for Pick rows only "
+                          "(needs a full trade replay per Pick, so opt-in rather than default-on)")
     ap.add_argument("--skip-bear-market", action="store_true",
                      help="skip the historical-crash stress test (real yfinance network call per "
                           "underlying proxy, cached across tickers sharing one -- e.g. SOXL/USD/SOXS all "
@@ -1739,6 +1747,23 @@ def main():
                 })
                 rec["node_id"] = node_id
                 rec["pick"], rec["comment"] = get_pick_comment(conn, node_id)
+                if args.show_calendar_years and rec["pick"]:
+                    # Same gt_node key-shape gotcha as drought_included_excluded_check
+                    # above (get_trades_and_bars needs fixed_sl/max_hold_hours, not
+                    # this row's sl/hold shape) -- only for Pick rows, a full trade
+                    # replay per row would be too slow to run by default.
+                    gt_node = {
+                        "ticker": ticker, "strategy": strategy, "window": node["window"], "z": node["z"],
+                        "fixed_sl": node["sl"], "arm_pct": node["arm_pct"], "trail_buy_pct": node["trail_buy_pct"],
+                        "trail_sell_pct": node["trail_sell_pct"], "max_hold_hours": node["hold"],
+                        "entry_timing": node["entry_timing"],
+                    }
+                    try:
+                        cy_trades, cy_df_h = get_trades_and_bars(gt_node)
+                        rec["calendar_years_pct"] = format_calendar_years(
+                            calendar_year_breakdown(cy_trades, cy_df_h))
+                    except Exception as e:
+                        print(f"calendar_years({ticker}): get_trades_and_bars failed: {e}", file=sys.stderr)
                 rec["addon_robustness"] = overlay_robustness(conn, ticker, strategy, version, "addon", node)
                 rec["drought_robustness"] = overlay_robustness(conn, ticker, strategy, version, "drought", node)
                 core_factor = 1.0 + sret / 100.0
@@ -1861,6 +1886,8 @@ def main():
               f"{rec['status']:>6} {fill_str:>6} | {ao_str:<28} | {dr_str:<28} | "
               f"{stacked_str('core_addon_cagr_pct'):>8} {stacked_str('core_drought_cagr_pct'):>8} "
               f"{stacked_str('core_both_cagr_pct'):>8} {stacked_str('core_sdb_cagr_pct'):>8}")
+        if rec.get("calendar_years_pct"):
+            print(f"         └─ Calendar years: {rec['calendar_years_pct']}")
 
 
 if __name__ == "__main__":

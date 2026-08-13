@@ -18,6 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import strategies as strategies_module
+from drought_overlay_test import get_trades_and_bars
+from calendar_year_returns import calendar_year_breakdown, format_calendar_years
 
 DB_PATH = "cache/research/trading_universe.db"
 CLIFF_RADIUS = 2
@@ -68,6 +70,10 @@ def best_node(con, version, ticker, strategy, fixed_sl, entry_timing):
         "fixed_sl": fixed_sl, "tp": tp_c, "axis": sl_c, "hold": hold_c, "window": win_c,
         "z": z_c, "best": best_alpha, "worst": worst_neighbor, "safe": worst_neighbor >= 0,
         "trades": trades, "winrate": winrate,
+        # tpct (2026-08-13): already computed above for the cliff-check query's
+        # trail_pct filter, just not previously exposed -- needed to reconstruct
+        # a full node (trail_sell_pct for TrailingBoth) for --show-calendar-years.
+        "tpct": tpct_c,
     }
 
 
@@ -99,6 +105,28 @@ _KNOWN_ABBREVIATIONS = {
 }
 
 
+def _gt_node(ticker, strategy, node, entry_timing):
+    """Reconstructs a get_trades_and_bars-compatible dict from a best_node()
+    result -- 'axis'/'tp'/'tpct' are strategy-normalized column names (see
+    best_node()'s real_col/axis_tp resolution), not literal field names, so
+    which one means trail_buy_pct vs trail_sell_pct vs arm_pct depends on the
+    strategy's real sl_axis (same overloaded-column mapping best_node() itself
+    already resolves via strategies_module.resolve_axis_columns -- reused here
+    rather than re-guessed, since getting this wrong is exactly the recurring
+    bug shape this project has hit before with trail_buy_pct/take_profit)."""
+    sl_axis, _ = strategies_module.resolve_axis_columns(strategy)
+    if sl_axis == "trail_buy_pct":  # TrailingBoth: axis=trail_buy_pct, tpct=trail_sell_pct
+        trail_buy_pct, trail_sell_pct = node["axis"], node["tpct"]
+    else:  # TrailingExit (sl_axis == 'trail_pct'): axis IS trail_sell_pct, no trail_buy_pct
+        trail_buy_pct, trail_sell_pct = 0.0, node["axis"]
+    return {
+        "ticker": ticker, "strategy": strategy, "window": node["window"], "z": node["z"],
+        "fixed_sl": node["fixed_sl"], "arm_pct": node["tp"],
+        "trail_buy_pct": trail_buy_pct, "trail_sell_pct": trail_sell_pct,
+        "max_hold_hours": node["hold"], "entry_timing": entry_timing,
+    }
+
+
 def short_label(strategy_name):
     """Distinguishing abbreviation for a strategy class name, e.g.
     'TrailingBothZScoreBreakout' -> 'TB', 'TrailingExitZScoreBreakout' -> 'TE'
@@ -120,6 +148,9 @@ def main():
     p.add_argument("--tickers", nargs="+", required=True)
     p.add_argument("--min-best", type=float, default=None,
                     help="Drop tickers whose winning (safe, or best-any if none safe) alpha is below this threshold.")
+    p.add_argument("--show-calendar-years", action="store_true",
+                    help="compute per-calendar-year return breakdown (tax-relevant) for each ticker's "
+                         "printed winner node (needs a trade replay per ticker, opt-in)")
     args = p.parse_args()
 
     if len(args.strategies) != 2:
@@ -185,6 +216,18 @@ def main():
         liq_str = f"${liq.get(t, 0):,.0f}"
         print(f"| {t} | {winner} | {a_best} | {a_wnbr} | {a_node} | {a_trd} | {a_wr} | "
               f"{b_best} | {b_wnbr} | {b_node} | {b_trd} | {b_wr} | {liq_str} |")
+
+        if args.show_calendar_years:
+            for strategy, shown in ((strat_a, a_show), (strat_b, b_show)):
+                if shown is None:
+                    continue
+                try:
+                    gt_node = _gt_node(t, strategy, shown, args.entry_timing)
+                    trades, df_h = get_trades_and_bars(gt_node)
+                    cy_str = format_calendar_years(calendar_year_breakdown(trades, df_h))
+                except Exception as e:
+                    cy_str = f"(failed: {e})"
+                print(f"    {t} {short_label(strategy)} calendar years: {cy_str}")
 
 
 if __name__ == "__main__":
