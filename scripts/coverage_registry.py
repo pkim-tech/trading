@@ -57,11 +57,16 @@ author adds it once, same effort as any other docstring note.
 """
 import re
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import signals_db as db
+# Deferred-safe: scripts/coverage_check.py itself only imports coverage_registry
+# inside a function body (never at module scope), so this module-level import
+# can't create a real import cycle in either load order.
+from scripts.coverage_check import _check_trade_lifecycle, _is_trading_day
 
 DB_PATH = "./cache/live/trading_live.db"
 _TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
@@ -227,12 +232,16 @@ REGISTRY = [
                "not yet observed against a genuinely resting real (non-dry_run) order live. As of "
                "build time, DIA/SDOW (dry_run 'ira') are the only real pending rows exercising the "
                "no-real-order-to-cancel path."),
-    dict(id='kernel_fill_parity',
-         scenario="Trailing-buy/-stop fill resolution parity vs backtest kernel",
-         code_path="kernel + live sizing",
-         offline_coverage="verify_trailing_buy_resolution.py / verify_trailing_sell_resolution.py",
-         check_mechanism='offline_only', scenario_key=None,
-         notes="Offline-only by design -- rerun after any kernel/signals_notify/schwab_safety change."),
+    # 'kernel_fill_parity' removed 2026-08-13 -- this row asked a categorically different question
+    # than everything else in the Grid: does the backtest kernel's fill-resolution math agree with
+    # the live code's own version of the same math (a code-consistency check between two Python
+    # implementations), not "does a real execution mechanism work" (what every other row proves).
+    # No live/canary node can ever touch this -- it's not a trade, it's not a broker interaction,
+    # it's a manual rerun of verify_trailing_buy_resolution.py/verify_trailing_sell_resolution.py.
+    # Already has a real, standing home: docs/pre_commit_checklist.md's "if active_signals.py/
+    # strategies.py/backtester.py changed this session" item, run at every session wrap. The Grid
+    # row was redundant documentation pointing at a check that already runs somewhere better-suited
+    # to a code-review-time question.
     dict(id='open_price_quality',
          scenario="Open-price quality (real open vs. what live code captured)",
          code_path="_scan_pinned_entry logging -> open_price_quality_log",
@@ -260,34 +269,17 @@ REGISTRY = [
                "fetched value changed. Confirmed live same day (real brokerage account query) that "
                "cashBalance == availableFunds on every account today (none holds margin), so no "
                "observable live behavior change yet."),
-    dict(id='second_ticker_one_account',
-         scenario="Second-live-ticker-in-one-account BUY correctly blocked when the account "
-                  "can't afford both reservations (non-addon path)",
-         code_path="schwab_safety._open_buy_tickers_in_account / _open_buy_order_quantity / "
-                    "check_order's cash-check block (schwab_client.get_current_price)",
-         offline_coverage="test_schwab_safety.py::test_second_ticker_resting_buy_in_same_account_blocked; "
-                           "test_fake_broker_check_order_guards_phase2_scenario.py: "
-                           "test_second_ticker_buy_blocked_when_cash_cannot_cover_both, "
-                           "test_third_ticker_buy_reserves_against_both_other_resting_orders",
-         check_mechanism='coverage_events', scenario_key='second_ticker_buy_blocked',
-         bad_results=['blocked_unpriced'],
-         notes="Cash-aware as of 2026-08-07 (real incident: RETL's genuine BUY was blocked by LABD's "
-               "resting order despite ~$9,884 real headroom, since soxl_ira deliberately hosts 11 live "
-               "tickers on one account) -- was previously an unconditional block regardless of real "
-               "affordability, code_path/notes above were stale (this WAS reachable, fired for real "
-               "the same day it was 'not reachable' in this doc). Reservation sums ALL other resting "
-               "tickers' real quantity x live price (not a config value), fixed same session after a "
-               "paired Opus review caught a single-order-only version. Scoped to the non-addon path "
-               "only as of 2026-08-10 -- is_addon_leg had the identical unconditional-block bug "
-               "(found via a direct audit of the RETL/LABD incident, docs/deep_backlog.md's "
-               "2026-08-09/10 entry) and now has its own real gate, see addon_buying_power_check "
-               "below, not this scenario_key. No live confirmation yet of the new "
-               "blocked-for-real-cash-reasons path here (only the old unconditional block has real "
-               "events on file)."),
+    # 'second_ticker_one_account' (scenario_key 'second_ticker_buy_blocked') removed 2026-08-13 --
+    # redundant. Its only reachable result (blocked_unpriced, a price-fetch-failure edge case) is
+    # excluded as non-evidence, and the real cash-aware behavior it claimed to test is already
+    # fully proven by 2 sibling rows: cash_check (result='blocked_insufficient' for the blocked
+    # case) and second_ticker_buy_allowed_when_cash_sufficient below (the allowed case). No harness
+    # could ever make this row independently prove anything -- a Grid attribution issue, not a
+    # code defect, and the row added no information once traced back to its real logging.
     dict(id='second_ticker_buy_allowed_when_cash_sufficient',
          scenario="Second-live-ticker-in-one-account BUY correctly ALLOWED when the account can "
                   "afford both reservations (non-addon path, the actual point of the 2026-08-07 fix)",
-         code_path="schwab_safety.check_order's cash-check block, same as second_ticker_one_account",
+         code_path="schwab_safety.check_order's cash-check block",
          offline_coverage="test_fake_broker_check_order_guards_phase2_scenario.py: "
                            "test_second_ticker_buy_allowed_when_cash_covers_both, "
                            "test_third_ticker_buy_reserves_against_both_other_resting_orders "
@@ -381,14 +373,22 @@ REGISTRY = [
          notes="New 2026-08-10, follow-up #4 of the RETL/LABD-shaped add-on buying-power fix "
                "(docs/deep_backlog.md's 2026-08-09/10 entry) -- the add-on path previously logged "
                "no event when it let an order through alongside another ticker's resting order, "
-               "asymmetric with the non-addon sibling path. No live events yet (just wired in)."),
+               "asymmetric with the non-addon sibling path. No live events yet (just wired in).",
+         not_prod_required_note="User's call, 2026-08-13: known edge case (needs the addon trigger to "
+                                 "coincide with another ticker's resting order, a timing coincidence not "
+                                 "organic trading), not planning to force-test it. Lowered out of the "
+                                 "active red bucket, not deleted."),
     dict(id='daemon_exception_survival',
          scenario="Daemon survives an unhandled exception mid-loop",
          code_path="active_signals._guarded + outer try/except in run_loop",
          offline_coverage="7 unit tests (test_run_loop_fault_tolerance.py)",
          check_mechanism='coverage_events', scenario_key='daemon_section_exception',
          notes="360 real-looking rows were pytest pollution, cleaned up 2026-07-25 -- 0 real occurrences "
-               "since. No test runs a real run_loop iteration end-to-end with a failing section."),
+               "since. No test runs a real run_loop iteration end-to-end with a failing section.",
+         not_prod_required_note="User's call, 2026-08-13: needs a genuine unhandled daemon-loop exception, "
+                                 "a real fault no config can force regardless of live/canary/paper node "
+                                 "type. Not something we're actively testing or planning to force. Lowered "
+                                 "out of the active red bucket, not deleted."),
     dict(id='dup_order_no_false_block',
          scenario="Duplicate-order guard doesn't false-block a legitimate top-up",
          code_path="schwab_safety quantity-aware guard",
@@ -414,7 +414,15 @@ REGISTRY = [
          offline_coverage="2 unit tests (test_schwab_automation.py)",
          check_mechanism='coverage_events', scenario_key='automated_sell_mode_skip',
          notes="Instrumented 2026-07-28. No ticker has ever hit this scenario live (automation-scope "
-               "tickers only run mode='live') -- expect wired-never-fired until that changes."),
+               "tickers only run mode='live') -- expect wired-never-fired until that changes.",
+         structural_note="Checked directly against the real code (2026-08-13): the log call fires only "
+                          "for node.get('state') == 'paper' specifically, not any non-live state -- a "
+                          "canary/dry_run node never trips it (falls through to the normal automation "
+                          "path, gated only by node_automation_enabled). Requires a node that's actually "
+                          "state='paper' while still carrying a real open_positions row and staying in "
+                          "AUTOMATION_ENABLED_TICKERS -- a specific state-transition artifact (same shape "
+                          "as UDOW's deliberately-seeded 2026-07-23 test position), not something more "
+                          "canary volume or trading days can organically produce."),
     dict(id='live_state_reconciliation_mismatch',
          scenario="Live-state reconciliation detects and alerts on a real mismatch",
          code_path="signals_notify.check_live_state_reconciliation, schwab_client.get_real_position",
@@ -435,7 +443,14 @@ REGISTRY = [
          offline_coverage="2 unit tests (test_schwab_safety.py)",
          check_mechanism='coverage_events', scenario_key='dup_sell_order_blocked',
          notes="Built 2026-07-22 as the structural fix preventing the trail_state bug from stacking "
-               "two real exit orders."),
+               "two real exit orders.",
+         not_prod_required_note="User's call, 2026-08-13: cannot be deterministically detuned/forced via "
+                                 "node config -- needs a genuine duplicate-SELL race, not something we're "
+                                 "actively testing or planning to force. Note is purely informational here "
+                                 "since real evidence already exists (7x live, last 2026-07-31) -- "
+                                 "compute_status only falls back to this note when there's no real "
+                                 "evidence at all, so the Grid correctly keeps showing verified-live, "
+                                 "tracking that it already happened organically."),
     dict(id='manual_sl_fallback_alert',
          scenario="Manual SL-price fallback alert fires correctly when trailing-sell placement fails "
                   "post-SL-cancel",
@@ -443,7 +458,14 @@ REGISTRY = [
          offline_coverage="1 unit test (test_schwab_automation.py)",
          check_mechanism='coverage_events', scenario_key='manual_sl_fallback_alert',
          notes="Instrumented 2026-07-28. Deliberately no auto-recovery (user's call) -- needs a real "
-               "failed placement to confirm the alert text/price are useful in practice."),
+               "failed placement to confirm the alert text/price are useful in practice.",
+         not_prod_required_note="User's call, 2026-08-13: cannot be deterministically detuned/forced via "
+                                 "node config -- needs a genuine broker placement failure, pure luck, not "
+                                 "something we're actively testing or planning to force. Note is purely "
+                                 "informational here since real evidence already exists (8x live, last "
+                                 "2026-08-07) -- compute_status only falls back to this note when there's "
+                                 "no real evidence at all, so the Grid correctly keeps showing "
+                                 "verified-live, tracking that it already happened organically."),
     dict(id='position_lock',
          scenario="Poll loop and Slack handler can't double-open/double-close the same position",
          code_path="signals_db._position_lock around open_position/close_position",
@@ -493,7 +515,11 @@ REGISTRY = [
                "result once this scenario starts firing live -- without listing them, compute_status "
                "would render this row verified-live off events that only prove the opt-in gate fired, "
                "not that the real poll-reconfirm path ran (the same sl_placement/top_up blocked-vs-"
-               "succeeded conflation this registry was built to catch)."),
+               "succeeded conflation this registry was built to catch).",
+         not_prod_required_note="User's call, 2026-08-13: known edge case (needs a genuine multi-"
+                                 "execution partial fill from the real broker, pure luck -- could "
+                                 "realistically go a year without a hit), not planning to force-test it. "
+                                 "Lowered out of the active red bucket, not deleted."),
     dict(id='same_day_block',
          scenario="same_day_block skips correctly for margin accounts unless a node opts in via "
                   "watch_list.force_same_day_block, still blocks cash accounts unconditionally",
@@ -515,7 +541,22 @@ REGISTRY = [
          bad_results=['no_account'],
          notes="Instrumented 2026-07-28 at all 3 confirmation handlers. Real bug found+fixed 2026-07-25 "
                "(both Slack button payloads omitted account/id). Not yet observed against a real Slack "
-               "button click."),
+               "button click.",
+         structural_note="Checked directly against the real code (2026-08-13): this fires only inside "
+                          "handle_entry_price/handle_trail_buy_fill_price, reached exclusively by a human "
+                          "tapping a real Slack Executed/Filled button. Canary/dry_run nodes never reach "
+                          "this code path at all -- their fills are synthesized programmatically by "
+                          "update_dry_run_buys (called every poll), which never renders a button. Widening "
+                          "canary surface can't help; only a genuine state='live' manual confirmation can. "
+                          "Given the project's stated direction of moving away from manual confirmation "
+                          "toward automation, this surface may keep shrinking rather than growing.",
+         not_prod_required_note="User's call, 2026-08-13: the only way to organically close this is being "
+                                 "at the keyboard at the exact moment a real signal fires and manually "
+                                 "tapping the button -- not something to plan around during work hours. Not "
+                                 "deleted, not deprioritized as unimportant -- lowered out of the active "
+                                 "red bucket until entry confirmation is fully automated (removing the "
+                                 "manual click this row depends on entirely) or an organic click happens "
+                                 "to occur. Revisit if/when automation coverage widens."),
     dict(id='stale_buy_button_guard',
          scenario="Stale/duplicate Executed or Filled button tap doesn't open a phantom position",
          code_path="signals_handlers.handle_entry_price/handle_trail_buy_fill_price (pending_buys-existence guard)",
@@ -523,7 +564,15 @@ REGISTRY = [
          check_mechanism='coverage_events', scenario_key='stale_buy_button_guard',
          notes="Instrumented 2026-07-28. Known latent gap: assumes every rendered Executed button has a "
                "backing pending_buys row, which breaks for a live TrailingExit ticker outside "
-               "SCHWAB_AUTOMATION_TICKERS."),
+               "SCHWAB_AUTOMATION_TICKERS.",
+         structural_note="Same code-path constraint as manual_buy_confirmation_account, checked "
+                          "2026-08-13: only reachable via a real human Slack button tap on a state='live' "
+                          "node -- canary/dry_run fills bypass this handler chain entirely via "
+                          "update_dry_run_buys. Needs a genuine stale/duplicate click on a real "
+                          "confirmation, not more trading volume.",
+         not_prod_required_note="Same as manual_buy_confirmation_account -- user's call, 2026-08-13. Not "
+                                 "something to plan around during work hours; lowered out of the active "
+                                 "red bucket, not deleted."),
     dict(id='two_nodes_same_ticker_diff_accounts',
          scenario="Two concurrent live nodes on the same ticker in different accounts can both place real orders",
          code_path="schwab_safety._live_ticker_accounts/check_order (ticker->set-of-accounts)",
@@ -539,7 +588,13 @@ REGISTRY = [
          check_mechanism='coverage_events', scenario_key='buy_buttons_resolve_correct_node',
          notes="Instrumented 2026-07-28 in handle_entry_price/handle_trail_buy_fill_price, fires only when "
                "2+ pending buys exist for the ticker at click time. SELL-side already did this correctly "
-               "via position_id."),
+               "via position_id.",
+         structural_note="Confirmed via batch canary-forceability review, 2026-08-13: same handler-chain "
+                          "constraint as manual_buy_confirmation_account -- only reachable via a real human "
+                          "Slack button tap; canary/dry_run fills bypass this entirely via update_dry_run_buys.",
+         not_prod_required_note="Same as manual_buy_confirmation_account -- user's call, 2026-08-13. Not "
+                                 "something to plan around during work hours; lowered out of the active "
+                                 "red bucket, not deleted."),
     dict(id='buy_fill_reconciles_correct_node',
          scenario="A real broker BUY fill reconciles against the correct node's pending_buys row when 2+ "
                   "are pending for the same ticker",
@@ -548,7 +603,11 @@ REGISTRY = [
          check_mechanism='coverage_events', scenario_key='buy_fill_reconciles_correct_node',
          bad_results=['no_match'],
          notes="Instrumented 2026-07-28, fires only when 2+ pendings exist for the ticker at fill time. "
-               "drain_fill_queue's stream entry point passes its best-effort ticker+account-derived node id."),
+               "drain_fill_queue's stream entry point passes its best-effort ticker+account-derived node id.",
+         not_prod_required_note="User's call, 2026-08-13: known edge case (needs 2 real pending buys on "
+                                 "the same ticker to coincide, plus a real broker fill -- not organic "
+                                 "trading), not planning to force-test it. Lowered out of the active red "
+                                 "bucket, not deleted."),
     dict(id='node_level_automation_pause',
          scenario="Node-level automation pause blocks real orders for just that node, not sibling nodes "
                   "on the same ticker",
@@ -564,6 +623,103 @@ REGISTRY = [
                "real production call site now passes node_id, so the fuzzy ticker+account lookup is only "
                "a fallback for a caller that doesn't (none remain). See docs/deep_backlog.md's 2026-08-10 "
                "entry."),
+    dict(id='unknown_account_block',
+         scenario="check_order blocks a real order attempt for an account not in the accounts allowlist",
+         code_path="schwab_safety.check_order (ACCOUNTS.get(account) is None)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='unknown_account_block',
+         notes="Instrumented 2026-08-13 -- found by paired review of the same-night Slack "
+               "noise-reduction gate: this SafetyViolation reason (plus the 5 below) previously "
+               "raised with no coverage_event logged at all, so a blocked order for any of them "
+               "had zero record anywhere once the gate's Slack suppression also applied to a "
+               "sub-capital-at-stake node. 'blocked' is the correct/good outcome (no bad_results)."),
+    dict(id='account_disabled_block',
+         scenario="check_order blocks a real order attempt for an account explicitly disabled in the allowlist",
+         code_path="schwab_safety.check_order (not limits.enabled)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='account_disabled_block',
+         notes="Instrumented 2026-08-13, same pass as unknown_account_block above. 'blocked' is "
+               "the correct/good outcome (no bad_results)."),
+    dict(id='ticker_not_live_mode_block',
+         scenario="check_order blocks a real order for a ticker no longer 'live' by the time the "
+                  "safety gate runs, even though an earlier step in the same poll cycle read it as live",
+         code_path="schwab_safety.check_order (_live_ticker_accounts(), queried fresh each call)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='ticker_not_live_mode_block',
+         notes="Instrumented 2026-08-13, same pass as unknown_account_block above. Real trigger is "
+               "a config/state race (a node demoted mid-poll-cycle), not routine -- genuinely "
+               "anomalous, unlike the automation-pause rows below which are intentional. 'blocked' "
+               "is the correct/good outcome (no bad_results)."),
+    dict(id='ticker_account_assignment_mismatch',
+         scenario="check_order blocks a real order whose (ticker, account) pair doesn't match any "
+                  "live-mode watch_list assignment",
+         code_path="schwab_safety.check_order (account not in ticker_accounts[ticker])",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='ticker_account_assignment_mismatch',
+         notes="Instrumented 2026-08-13, same pass as unknown_account_block above. 'blocked' is "
+               "the correct/good outcome (no bad_results)."),
+    dict(id='ticker_not_in_automation_scope_block',
+         scenario="check_order blocks a real order for a ticker not in AUTOMATION_ENABLED_TICKERS "
+                  "(still manual-only)",
+         code_path="schwab_safety.check_order (ticker not in AUTOMATION_ENABLED_TICKERS)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='ticker_not_in_automation_scope_block',
+         notes="Instrumented 2026-08-13, same pass as unknown_account_block above. 'blocked' is "
+               "the correct/good outcome (no bad_results)."),
+    dict(id='ticker_level_automation_pause',
+         scenario="check_order blocks a real order via the per-ticker automation toggle (distinct "
+                  "from node_level_automation_pause below, which is per-node)",
+         code_path="schwab_safety.check_order (not ticker_automation_enabled(ticker))",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='ticker_level_automation_pause',
+         notes="Instrumented 2026-08-13, same pass as unknown_account_block above. 'blocked' is "
+               "the correct/good outcome (no bad_results)."),
+    dict(id='buy_trading_day_block',
+         scenario="check_order blocks a real BUY attempted on a non-NYSE-trading day",
+         code_path="schwab_safety.check_order (_is_trading_day)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='buy_trading_day_block',
+         notes="Instrumented 2026-08-13, same paired-review pass as the 6 SafetyViolation "
+               "reasons above. 'blocked' is the correct/good outcome (no bad_results)."),
+    dict(id='buy_signal_window_block',
+         scenario="check_order blocks a real BUY attempted outside the signal/open-check windows",
+         code_path="schwab_safety.check_order (_SIGNAL_WINDOWS + _OPEN_CHECK_WINDOWS)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='buy_signal_window_block',
+         notes="Instrumented 2026-08-13, same pass as buy_trading_day_block above. 'blocked' is "
+               "the correct/good outcome (no bad_results)."),
+    dict(id='hard_order_ceiling_block',
+         scenario="check_order blocks a real order whose notional exceeds the absolute HARD_ORDER_CEILING",
+         code_path="schwab_safety.check_order (HARD_ORDER_CEILING)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='hard_order_ceiling_block',
+         notes="Instrumented 2026-08-13, same pass as buy_trading_day_block above. 'blocked' is "
+               "the correct/good outcome (no bad_results)."),
+    dict(id='notional_cap_block',
+         scenario="check_order blocks a real BUY whose notional exceeds the account's own notional_cap",
+         code_path="schwab_safety.check_order (AccountLimits.notional_cap)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='notional_cap_block',
+         notes="Instrumented 2026-08-13, same pass as buy_trading_day_block above. 'blocked' is "
+               "the correct/good outcome (no bad_results)."),
+    dict(id='daily_order_cap_block',
+         scenario="check_order blocks a real BUY once an account has hit its daily order cap "
+                  "(non-protective only -- a protective top-up bypasses this, logged separately "
+                  "as daily_cap_protective_bypass)",
+         code_path="schwab_safety.check_order (AccountLimits.daily_order_cap)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='daily_order_cap_block',
+         notes="Instrumented 2026-08-13, same pass as buy_trading_day_block above. 'blocked' is "
+               "the correct/good outcome (no bad_results)."),
+    dict(id='global_burst_cap_block',
+         scenario="check_order blocks a real order once GLOBAL_ORDERS_PER_MINUTE (all-accounts) is hit",
+         code_path="schwab_safety.check_order (GLOBAL_ORDERS_PER_MINUTE)",
+         offline_coverage="None yet",
+         check_mechanism='coverage_events', scenario_key='global_burst_cap_block',
+         notes="Instrumented 2026-08-13, same pass as buy_trading_day_block above. Real capacity "
+               "concern flagged the same session: ~25 hair-trigger canary nodes now share this "
+               "12/min cap with real-money orders (see docs/backlog_cache.md). 'blocked' is the "
+               "correct/good outcome (no bad_results)."),
     dict(id='oversell_guard_correct_position',
          scenario="check_order's oversell guard resolves the right position when 2 live nodes share a "
                   "ticker in different accounts",
@@ -573,7 +729,14 @@ REGISTRY = [
          notes="Free row 2026-07-28: schwab_safety.py already logs sell_exceeds_position_blocked (built "
                "2026-07-24 alongside the oversell fix) -- it just never had a registry row. 'blocked' is "
                "the correct/good outcome (no bad_results). Found by 2nd Opus review round 2026-07-26 "
-               "(ticker-only lookup could resolve wrong account's position)."),
+               "(ticker-only lookup could resolve wrong account's position). Real instrumentation gap "
+               "found and fixed 2026-08-13 (user pushback: a negative test case is real proof too, the "
+               "actual gap was that the POSITIVE case -- position resolved correctly, SELL proceeds -- "
+               "was never logged at all, only the 2 failure branches were): schwab_safety.py now logs "
+               "result='resolved' on the success path (check_order, right after the "
+               "quantity-vs-position-shares bound passes). This fires on every normal successful SELL "
+               "guard pass, canary or live -- should close organically very soon, no longer a special "
+               "case needing artificial DB corruption to exercise."),
     dict(id='dry_run_buy_synthesis',
          scenario="A dry_run=True account's trailing-buy/market-buy order synthesizes a real fill "
                   "(bounce-fill or immediate) since no real broker fill event will ever arrive",
@@ -631,16 +794,47 @@ REGISTRY = [
                "for whether this function's real order placement (as opposed to its guard logic) ever "
                "succeeds. 'blocked' (a SafetyViolation) is left out of bad_results deliberately -- it's "
                "the correct outcome when a real guard fires, not a failure of this scenario."),
-    dict(id='time_exit_trigger',
+    dict(id='time_exit_trigger_unarmed',
          scenario="A real (non-paper/dry_run-sim) position's TIME-based exit (max_hold_hours) fires "
-                  "the SELL alert",
-         code_path="signals_notify.notify_sell_signal (reason=='TIME' branch)",
+                  "the SELL alert while the position was NEVER armed (plain hold-time expiry, exits "
+                  "via the same path as a normal TP/SL/TIME market sell)",
+         code_path="signals_notify.notify_sell_signal (reason=='TIME' branch, exit_forced_by_hold_time "
+                    "False/absent)",
          offline_coverage="signals_compute.check_sell_condition has kernel-parity coverage via "
                            "kernel_fill_parity; the live alert-firing side was untested",
-         check_mechanism='coverage_events', scenario_key='time_exit_trigger',
-         notes="New instrumentation, 2026-07-27 evening. Only fires the alert -- doesn't confirm the "
-               "position actually gets closed (that's a manual Slack-button step for a real position, "
-               "same gap as manual_buy_confirmation_account)."),
+         check_mechanism='coverage_events', scenario_key='time_exit_trigger_unarmed',
+         notes="Split 2026-08-13 from the former single 'time_exit_trigger' row -- found while "
+               "mapping designated testers that RETL (time_exit_via_sl role) and SH (time_exit_via_trail "
+               "role) exercise two genuinely different code paths that were both silently reported under "
+               "one scenario_key, masking that the armed sub-case (see the sibling row below) had zero "
+               "live confirmation under current code. New instrumentation, 2026-07-27 evening. Only "
+               "fires the alert -- doesn't confirm the position actually gets closed (that's a manual "
+               "Slack-button step for a real position, same gap as manual_buy_confirmation_account)."),
+    dict(id='time_exit_trigger_armed',
+         scenario="A real (non-paper/dry_run-sim) position's TIME-based exit fires while the position "
+                  "WAS armed (trailing=True) -- hold-time expired mid-trail, forcing the resting "
+                  "trailing-sell order to be replaced with a market sell instead of a plain exit",
+         code_path="signals_notify.notify_sell_signal (reason=='TIME' branch) + "
+                    "_attempt_automated_exit_sell's exit_forced_by_hold_time force-replace branch",
+         offline_coverage="signals_compute.check_sell_condition has kernel-parity coverage via "
+                           "kernel_fill_parity; the live alert-firing side was untested",
+         check_mechanism='coverage_events', scenario_key='time_exit_trigger_armed',
+         notes="Split 2026-08-13, see the sibling row above. This is the historically-buggy sub-case "
+               "(SH, 2026-07-29: stuck for hours on a 50%-wide trail order that was never going to fire "
+               "before the hold-time deadline). Of the 7 pre-split coverage_events rows sharing the old "
+               "combined scenario_key, 5 were SH itself (2026-07-27/28, one continuous position id=18, "
+               "re-alerting hourly BEFORE any automated TP/SL/TIME exit path existed at all -- evidence "
+               "of the original bug firing, not a working exit, correctly left unmigrated) and SH's only "
+               "real closed trade (2026-07-31) predates the 2026-08-01 exit_reason labeling fix and is "
+               "stored exit_reason='TRAIL', not 'TIME' -- also not valid proof. **However**, GDXU's "
+               "2026-08-07 event (position_id=71) checked directly against coverage_events and IS "
+               "genuine post-both-fixes proof: a trailing_arm_state_reread/automated_sell_execution "
+               "event fired before the TIME exit, confirming the position was armed when hold-time "
+               "forced the exit. Migrated to this scenario_key 2026-08-13 -- verified-live (1x), not "
+               "wired-never-fired. SH (node 135) was the standing tester for this role but was paused "
+               "2026-08-13 (shares SPY's underlying index, freed for a possible hedge use) -- ERX "
+               "(node 226, soxl_ira) now carries the time_exit_via_trail role and is currently flat, "
+               "waiting on a second, independent confirmation."),
     dict(id='buy_fill_reconciled',
          scenario="A real detected BUY fill opens the position with the correct shares/price (not just "
                   "the correct node identity)",
@@ -718,14 +912,22 @@ REGISTRY = [
                     "(real, mode='live'), both over the shared paper_trading.evaluate_drought_entry",
          offline_coverage="tests/test_overlay_paper_trading.py: "
                            "test_drought_entry_fires_once_confirmed_then_never_reenters_same_gap, "
-                           "test_drought_vol_gate_excludes_unknown_reading",
+                           "test_drought_vol_gate_excludes_unknown_reading; "
+                           "tests/test_fake_broker_drought_entry_scenario.py::"
+                           "test_drought_entry_places_real_trailing_buy_for_trailingboth_node "
+                           "(real-mode decision-event assertion, added 2026-08-13)",
          check_mechanism='coverage_events', scenario_key='drought_entry',
          bad_results=[],
          notes="A paired Opus review (2026-08-09) found and fixed a HIGH-severity bug in the first "
                "version: the once-per-gap guard was missing entirely, so a drought position stopping "
                "out early re-entered on every subsequent poll for the rest of the same gap -- the "
                "validated backtest (find_drought_windows) makes exactly one trade per gap. Fixed via "
-               "drought_gap_start-keyed dedup against paper_positions/paper_trade_log."),
+               "drought_gap_start-keyed dedup against paper_positions/paper_trade_log. Real-mode "
+               "instrumentation gap fixed 2026-08-13: signals_notify.check_drought_entry computed the "
+               "same shared evaluate_drought_entry decision as paper but never logged this scenario_key "
+               "itself (only the downstream drought_entry_placement) -- no fake_broker test could have "
+               "asserted an event the real code never logged, which is why fake_venue_proof read 'none' "
+               "despite drought_entry_placement's sibling test already covering the same real code path."),
     dict(id='drought_handoff',
          scenario="An open drought-overlay position closes the moment the node's own "
                   "core z-score signal fires again",
@@ -900,7 +1102,11 @@ REGISTRY = [
          check_mechanism='coverage_events', scenario_key='addon_leg_reconciliation',
          bad_results=[],
          notes="Pure observation for the orphaned-leg case, matching reconcile_daily_track_nodes' own "
-               "stance -- never auto-closes. No live proof yet."),
+               "stance -- never auto-closes. No live proof yet.",
+         not_prod_required_note="User's call, 2026-08-13: known edge case (needs a genuinely orphaned/"
+                                 "timed-out addon leg, not a normal successful entry-fill-exit cycle), "
+                                 "not planning to force-test it. Lowered out of the active red bucket, "
+                                 "not deleted."),
     dict(id='drought_handoff_alert_slot_preserved',
          scenario="Core's real BUY signal doesn't burn its once-per-day buy_alerted slot while a real "
                   "drought HANDOFF is still in flight (resting cancel race or unconfirmed exit poll)",
@@ -1112,6 +1318,41 @@ def fake_venue_proof_for(scenario_key):
     return 'none', 'No fake_broker-based test exercises this scenario_key yet.'
 
 
+def _scenario_expectation_recent_proof(scenario_key, lookback_days=21):
+    """Cross-checks a scenario_expectations-mechanism scenario directly against
+    real trade_log/pending_buys/open_positions data over the last lookback_days
+    calendar days, reusing coverage_check._check_trade_lifecycle (the same
+    function the daily check itself runs) rather than re-deriving the logic --
+    so this can never silently drift from what "met" actually means for that
+    checker. Returns a detail string on the first real match found (most
+    recent day first), or None if nothing in the window proves it.
+
+    Exists because coverage_deviations only ever records FAILURES (a day the
+    check passes writes nothing) -- so zero deviation rows is structurally
+    ambiguous between "always passed silently" and "never actually checked,"
+    and compute_status's caller-facing default for that ambiguity used to be
+    the pessimistic 'wired-never-fired' with no attempt to resolve it.
+    Confirmed real 2026-08-13: canary_time_exit (XLF/FAZ) had 7 real correct
+    TIME exits on file (2026-08-04 through 2026-08-11) and still read
+    wired-never-fired, since none of those passing days ever produced a
+    coverage_deviations row to find."""
+    expectations = [e for e in db.get_scenario_expectations(active_only=False)
+                     if e['scenario_key'] == scenario_key]
+    if not expectations:
+        return None
+    today = date.today()
+    days = [today - timedelta(days=i) for i in range(lookback_days)]
+    days = [d for d in days if _is_trading_day(d.isoformat())]
+    for exp in expectations:
+        for d in days:
+            met, summary, no_activity = _check_trade_lifecycle(exp, d.isoformat())
+            if met and not no_activity:
+                return (f"{exp.get('ticker') or ''} node_id={exp.get('node_id')}: "
+                         f"{summary} on {d.isoformat()} (direct trade_log/pending_buys "
+                         f"check, {lookback_days}d lookback)")
+    return None
+
+
 def compute_status(row):
     """Returns (status_str, detail_str) computed live from real DB rows -- never
     a hand-typed field. status_str is one of: 'not-instrumented', 'offline-only',
@@ -1158,9 +1399,18 @@ def compute_status(row):
                 return 'deviation-unexplained', (
                     f"{unexplained['n']}x unexplained deviation, last {unexplained['last_ts']} -- "
                     f"a real, currently-unresolved failure")
+            # reason_by='system' is written by TWO different call sites with opposite
+            # meanings: clear_deviation_if_resolved's 'Auto-resolved: ...' (genuine proof
+            # the scenario was met on a later same-day check) and coverage_check.py's
+            # price-action auto-explain 'Auto-verified: ... never crossed entry threshold'
+            # (the OPPOSITE of proof -- explains why nothing happened, not that it did).
+            # Found 2026-08-13 (Opus review): counting both identically fabricated
+            # verified-live for market_buy_placement (VOO) -- 8x 'auto-resolved' with
+            # zero of them genuine. Only the 'Auto-resolved:' prefix is real proof.
             system_resolved = c.execute(
                 "SELECT COUNT(*) n, MAX(ts) last_ts FROM coverage_deviations "
-                "WHERE scenario_key = ? AND reason_by = 'system'", (row['scenario_key'],)
+                "WHERE scenario_key = ? AND reason_by = 'system' AND reason LIKE 'Auto-resolved:%'",
+                (row['scenario_key'],)
             ).fetchone()
             if system_resolved['n'] > 0:
                 return 'verified-live', (
@@ -1170,13 +1420,19 @@ def compute_status(row):
                 "SELECT COUNT(*) n FROM coverage_deviations WHERE scenario_key = ?",
                 (row['scenario_key'],)
             ).fetchone()
-            if any_row['n'] > 0:
-                return 'wired-never-fired', (
-                    "Only human-explained historical deviation(s) exist -- explains a past "
-                    "failure, doesn't prove current correct behavior.")
+        # No positive OR negative signal in coverage_deviations -- cross-check
+        # directly against real trade_log/pending_buys/open_positions before
+        # falling back to the pessimistic default (see docstring above).
+        direct_proof = _scenario_expectation_recent_proof(row['scenario_key'])
+        if direct_proof:
+            return 'verified-live', direct_proof
+        if any_row['n'] > 0:
             return 'wired-never-fired', (
-                "No coverage_deviations history at all -- this mechanism can't distinguish "
-                "'always passed silently' from 'daily check never actually ran.'")
+                "Only human-explained historical deviation(s) exist -- explains a past "
+                "failure, doesn't prove current correct behavior.")
+        return 'wired-never-fired', (
+            "No coverage_deviations history at all -- this mechanism can't distinguish "
+            "'always passed silently' from 'daily check never actually ran.'")
 
     mode_filter = row.get('mode_filter')
     bad_results = set(row.get('bad_results', []))
@@ -1212,13 +1468,171 @@ def compute_status(row):
         return ('live-attempt-failed' if mode == 'live' else f'{mode}-attempt-failed',
                 f"{m['n']}x {mode}, all bad_results ({bad_results}), last {m['last_ts']} -- "
                 f"fired for real but never with a good outcome")
+    if row.get('not_prod_required_note'):
+        # A deliberate, human demotion (2026-08-13) -- not a code-derived
+        # verdict like structural-gap. Treated the same as offline-only:
+        # a neutral, non-red status, not something waiting to be closed.
+        return 'not-prod-required', row['not_prod_required_note']
+    if row.get('structural_note'):
+        # Distinct from the plain wired-never-fired default below: this row
+        # has been checked directly against the real code and confirmed to
+        # need a specific condition organic trading volume/more canary nodes
+        # can't produce on their own (see the row's structural_note) -- worth
+        # surfacing as its own status rather than looking identical to "just
+        # hasn't happened yet, give it more days."
+        return 'structural-gap', row['structural_note']
     return 'wired-never-fired', 'scenario_key exists in code but has never logged a real event.'
+
+
+# The BEST (cheapest/lowest-risk) harness CAPABLE of producing evidence for this row -- not
+# the only one, and not "has it been proven yet" (that's compute_status()'s job). Three buckets
+# only (2026-08-13, collapsed from an earlier 7-bucket draft per the user's correction: paper and
+# canary are the same underlying thing -- neither ever reaches the real broker/venue, "canary" is
+# just a paper/dry_run node that happens to be hair-triggered; that's a config choice, not a
+# structural difference). Deliberately only 2 values -- a 3rd 'fake_venue' bucket was considered
+# and dropped 2026-08-13 (its only member, kernel_fill_parity, was removed from REGISTRY entirely
+# for asking a categorically different question -- see that removal's comment above):
+#
+#   'live'            -- needs real capital. Either the code path structurally short-circuits
+#                        before reaching the real broker for any dry_run/paper node (is_dry_run_sim
+#                        bypass, order_id always None under dry_run), or it needs a genuine human
+#                        Slack click on a real position, or a genuine live-only fault/coincidence.
+#   'canary'          -- a dry_run or paper node genuinely exercises the real guard/decision chain
+#                        without ever needing the broker network call itself. Zero capital risk.
+#
+# A row with no entry here at all (see e.g. second_ticker_one_account's removal comment) means
+# the live/canary question doesn't apply to it -- not an oversight, a deliberate exclusion with
+# its own documented reason. best_harness_for() returns None for such an id.
+#
+# Built from the actual code-verified findings of a 4-agent parallel investigation (each agent
+# read the real log_coverage_event call sites and traced dry_run/is_dry_run_sim short-circuits)
+# plus manual checks in the same session. THIS IS A MANUAL CLASSIFICATION, NOT LIVE-COMPUTED --
+# unlike every other function in this file, nothing here re-derives from current code state
+# automatically. If the code changes (a dry_run bypass removed, a new path opened), this dict can
+# silently go stale with no warning. Treat entries as a snapshot to verify against real code
+# before relying on them for a real decision, same as any other stale-claim risk in this project.
+BEST_HARNESS = {
+    # --- live (26) ---
+    'addon_buying_power_check': 'live',
+    'addon_buying_power_drift_check': 'live',
+    'addon_double_buy_exemption': 'live',
+    'addon_entry_placement': 'live',
+    'addon_exit_placement': 'live',
+    'addon_leg_independent_sl_fill_detection': 'live',
+    'addon_leg_reconciliation': 'live',        # also luck-adjacent: needs an orphaned leg
+    'addon_second_ticker_buy_allowed': 'live',  # also luck-adjacent: needs a timing coincidence
+    'drought_handoff': 'live',
+    'drought_handoff_exit_placement': 'live',
+    'automated_sell_execution': 'live',
+    'exit_arm_latency': 'live',
+    'post_fill_topup': 'live',
+    'sl_order_fills_independent_detection': 'live',
+    'sl_sync_placement': 'live',
+    'time_exit_trigger_unarmed': 'live',
+    'time_exit_trigger_armed': 'live',
+    'trailing_arm_reread': 'live',
+    'dup_sell_order_blocked': 'live',
+    'buy_fill_reconciled': 'live',
+    'buy_fill_reconciles_correct_node': 'live',  # also luck-adjacent: needs 2 pending buys to coincide
+    'fast_path_fill_reconciliation': 'live',     # also luck-adjacent: needs a real partial fill
+    'manual_sl_fallback_alert': 'live',          # also luck-adjacent: needs a genuine broker failure
+    'manual_buy_confirmation_account': 'live',   # needs a real human Slack click on a live node
+    'stale_buy_button_guard': 'live',            # needs a real human Slack click on a live node
+    'buy_buttons_resolve_correct_node': 'live',  # needs a real human Slack click on a live node
+    'daemon_exception_survival': 'live',         # genuine fault, no config forces it
+
+    # --- canary -- everything else, listed explicitly so this dict stays a complete, auditable
+    # map instead of relying on a silent default. Includes 2 rows that are harness-agnostic/
+    # scheduled (morning_report_delivery, automated_sell_mode_skip -- the latter's real trigger
+    # is specifically state=='paper'). oversell_guard_correct_position's log call was missing
+    # a success-path entry (fixed 2026-08-13, schwab_safety.py) -- correctly 'canary' now that
+    # it's properly instrumented. ---
+    'account_disabled_block': 'canary',
+    'addon_entry_fill': 'canary',
+    'addon_exit_fill': 'canary',
+    'buy_blocked_position_exists': 'canary',
+    'canary_bull_bear_pair': 'canary',
+    'canary_early_sl': 'canary',
+    'canary_full_lifecycle': 'canary',
+    'canary_overnight_carry': 'canary',
+    'canary_time_exit': 'canary',
+    'cash_check': 'canary',
+    'drought_entry': 'canary',
+    'drought_entry_placement': 'canary',
+    'drought_handoff_alert_slot_preserved': 'canary',  # partial: only the pending-entry sub-case
+    'drought_handoff_cancel': 'canary',                # partial: only the no-real-order sub-case
+    'dry_run_buy_synthesis': 'canary',
+    'dry_run_sim_close': 'canary',
+    'dup_order_no_false_block': 'canary',
+    'dup_order_retry_after_failure': 'canary',
+    'entry_abandon_timeout': 'canary',
+    'gap_resize': 'canary',
+    'kill_switch_block': 'canary',
+    'live_state_reconciliation_mismatch': 'canary',    # needs a manually-seeded fake position
+    'market_buy_placement': 'canary',
+    'node_circuit_breaker': 'canary',
+    'node_level_automation_pause': 'canary',
+    'open_price_quality': 'canary',
+    'pinned_entry_trigger': 'canary',
+    'position_lock': 'canary',
+    'pre_action_state_verification': 'canary',
+    'same_day_block': 'canary',                        # narrow: needs force_same_day_block=1
+    'second_ticker_buy_allowed_when_cash_sufficient': 'canary',
+    'sl_async_fallback': 'canary',
+    'ticker_account_assignment_mismatch': 'canary',
+    'ticker_level_automation_pause': 'canary',
+    'ticker_not_in_automation_scope_block': 'canary',
+    'ticker_not_live_mode_block': 'canary',
+    'two_nodes_same_ticker_diff_accounts': 'canary',
+    'unknown_account_block': 'canary',
+    # 6 check_order guard rows added by a concurrent session, classified 2026-08-13 -- same
+    # mechanism shape as cash_check/same_day_block above: check_order runs identically for a
+    # dry_run node (only the final broker submission is skipped), so no real capital is needed.
+    # buy_signal_window_block/buy_trading_day_block need deliberate staging (an inflated
+    # starting_notional_override, a tightened cap) -- they don't fire from ordinary traffic,
+    # since active_signals._in_window's own scan gate pre-empts the daemon from ever attempting
+    # an out-of-window/non-trading-day BUY in the first place (found during Opus review).
+    'buy_signal_window_block': 'canary',
+    'buy_trading_day_block': 'canary',
+    'daily_order_cap_block': 'canary',
+    'global_burst_cap_block': 'canary',
+    'hard_order_ceiling_block': 'canary',               # $100k HARD_ORDER_CEILING -- needs an
+                                                         # inflated starting_notional_override to
+                                                         # force safely on a dry_run node
+    'notional_cap_block': 'canary',
+    # paper_entry_fill/paper_exit_fill corrected 2026-08-13 (Opus review, same pass as
+    # skim_fire/skim_redeploy_alert below) -- 'canary' was wrong: code_path is entirely
+    # paper_trading.py (start_paper_market_buy/update_paper_buys, check_paper_sells), and
+    # the dry_run leg of the SAME shared scenario_key is already separately covered by
+    # dry_run_buy_synthesis/dry_run_sim_close (signals_notify.py, mode_filter='dry_run')
+    # -- these two rows have zero incremental dry_run reachability of their own.
+    'paper_entry_fill': 'paper',
+    'paper_exit_fill': 'paper',
+    # skim_fire/skim_redeploy_alert corrected 2026-08-13 (Opus review) -- unlike the two rows
+    # above, these have NO dry_run reachability at all, not even incidentally: check_paper_skim
+    # (paper_trading.py) never calls schwab_client/schwab_safety, is only ever invoked from
+    # check_paper_sells' paper-position-close path, and hardcodes mode="paper" in its two
+    # log_coverage_event calls. A dry_run node's real/dry_run core position close never reaches
+    # this function at all -- 'canary' was factually wrong, not just an imprecise label.
+    'skim_fire': 'paper',
+    'skim_redeploy_alert': 'paper',
+    'oversell_guard_correct_position': 'canary',
+    'morning_report_delivery': 'canary',          # harness-agnostic, scheduled
+    'automated_sell_mode_skip': 'canary',         # trigger is specifically state=='paper'
+}
+
+
+def best_harness_for(row_id):
+    """Returns the BEST_HARNESS classification for a REGISTRY row id, or None if this
+    manual map hasn't been extended to cover it yet (e.g. a new row added since 2026-08-13)."""
+    return BEST_HARNESS.get(row_id)
 
 
 STATUS_ORDER = {
     'deviation-unexplained': 0, 'not-instrumented': 1, 'wired-never-fired': 1,
     'live-attempt-failed': 1, 'dry_run-attempt-failed': 1, 'paper-attempt-failed': 1,
-    'paper-only': 2, 'dry_run-only': 3, 'offline-only': 4, 'verified-live': 5,
+    'structural-gap': 1.5, 'paper-only': 2, 'dry_run-only': 3, 'offline-only': 4,
+    'not-prod-required': 4, 'verified-live': 5,
 }
 
 MODES = ('paper', 'dry_run', 'live')
@@ -1259,9 +1673,14 @@ def compute_mode_statuses(row):
                     result[m] = ('deviation-unexplained',
                                  f"{unexplained['n']}x unexplained, last {unexplained['last_ts']}")
                     continue
+                # Same fix as compute_status's identical query above (2026-08-13):
+                # only 'Auto-resolved:' is genuine proof -- 'Auto-verified: ... never
+                # crossed entry threshold' also carries reason_by='system' but means
+                # the opposite (explains an absence, not a success).
                 system_resolved = c.execute(
                     "SELECT COUNT(*) n, MAX(ts) last_ts FROM coverage_deviations "
-                    "WHERE scenario_key = ? AND mode = ? AND reason_by = 'system'",
+                    "WHERE scenario_key = ? AND mode = ? AND reason_by = 'system' "
+                    "AND reason LIKE 'Auto-resolved:%'",
                     (row['scenario_key'], m)).fetchone()
                 if system_resolved['n'] > 0:
                     result[m] = ('verified',

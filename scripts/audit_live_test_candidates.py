@@ -51,8 +51,8 @@ from scripts.coverage_registry import REGISTRY, compute_status
 # dict when a new staged scenario_role is introduced (live-test-node-setup
 # skill should update it as part of staging a new role).
 SCENARIO_ROLE_TO_GRID_IDS = {
-    'time_exit_via_trail': ['time_exit_trigger'],
-    'time_exit_via_sl': ['time_exit_trigger'],
+    'time_exit_via_trail': ['time_exit_trigger_armed'],
+    'time_exit_via_sl': ['time_exit_trigger_unarmed'],
     'gap_resize_and_topup': ['gap_resize', 'post_fill_topup'],
     # Added 2026-08-12 alongside the staged_test_config multi-role migration
     # -- RETL genuinely carries both roles simultaneously (drought_overlay_

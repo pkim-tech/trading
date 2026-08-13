@@ -154,6 +154,24 @@ def _check_trade_lifecycle(scenario, check_date):
     expect_reasons = params.get('expect_exit_reason', [])
     trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date, **disambig)
     if not trades:
+        # Same bug shape as the carryover branch above (2026-08-13, found via
+        # VOO/QQQ/IVV: a trailing-buy fired and bounce-filled into a real open
+        # position the next morning, but this branch only ever looked at
+        # get_closed_trades_for_ticker_on_date for the exact check_date -- a
+        # real, in-progress multi-day-hold trade read as "no activity" and
+        # minted a false unexplained deviation every day until it closed.
+        # Mirror the carryover branch's pending_buys -> open_positions
+        # fallback: real activity in progress isn't the designed same-day
+        # outcome, but it's not "nothing happened" either, so it must not be
+        # eligible for the no_activity price-action auto-explain (which would
+        # incorrectly reason about *today's* entry signal for a position that
+        # already entered on an earlier day).
+        pending = db.get_pending_buys_for_ticker_on_date(ticker, check_date, **disambig)
+        if pending:
+            return True, f"pending_buys row present (order_placed={pending[0]['order_placed']}) -- entry not yet resolved", False
+        open_pos = db.get_open_positions_for_ticker_on_date(ticker, check_date, **disambig)
+        if open_pos:
+            return True, f"position still open (shares={open_pos[0]['shares']}) -- exit not yet resolved", False
         return False, f"no closed trade found for {ticker} on {check_date}", True
     reason = trades[0]['exit_reason']
     if reason in expect_reasons:
@@ -233,8 +251,8 @@ CHECKERS = {
 # circular. Keep both copies in sync by hand when either changes (extend here
 # whenever staging a new scenario_role there).
 SCENARIO_ROLE_TO_GRID_IDS = {
-    'time_exit_via_trail': ['time_exit_trigger'],
-    'time_exit_via_sl': ['time_exit_trigger'],
+    'time_exit_via_trail': ['time_exit_trigger_armed'],
+    'time_exit_via_sl': ['time_exit_trigger_unarmed'],
     'gap_resize_and_topup': ['gap_resize', 'post_fill_topup'],
     # Added 2026-08-12 alongside the staged_test_config multi-role migration
     # -- RETL genuinely carries both roles simultaneously (drought_overlay_
@@ -406,6 +424,33 @@ def run_check(check_date):
         # Opus review 2026-07-28: reconciliation_mismatch is the sole
         # DAILY_EXPECTED_IDS scenario and would otherwise mint an unexplained
         # coverage_deviations ticket every single day it's snoozed.
+        # A scenario's node_id can be re-pointed to a node that didn't exist yet on
+        # check_date (e.g. a repoint onto a brand-new node, or a manual --date backfill
+        # run right after node creation) -- checking it anyway mints a permanent,
+        # confidently-wrong deviation for a date the node had no real data at all.
+        # Found 2026-08-13: the FAS/FAZ canary repoint produced exactly this shape, 16
+        # coverage_deviations rows across 8 IDs, some auto-explained with a fabricated
+        # "price never crossed threshold" reason. scripts/coverage_ticket_table.py's
+        # timing-discrepancy check catches this generically now; this guard stops it
+        # from recurring at the source.
+        # added_at is stored via SQLite's datetime('now') -- UTC -- while check_date is
+        # an ET trading-calendar date; comparing the raw UTC string's date substring
+        # against check_date can be off by a day near midnight ET (e.g. 00:43 UTC on
+        # the 13th is still the evening of the 12th ET). Converted via 'localtime' here
+        # (system TZ confirmed ET), same fix pattern as the documented UTC-vs-local trap
+        # in test_snooze_coverage_uses_local_time_not_utc. Found by Opus review 2026-08-13.
+        node_id = s.get('node_id')
+        if node_id is not None:
+            with db._conn() as c:
+                row = c.execute(
+                    "SELECT date(added_at, 'localtime') AS d FROM watch_list WHERE id=?",
+                    (node_id,)).fetchone()
+            added_at = row['d'] if row and row['d'] else None
+            if added_at and check_date < added_at:
+                summary = f"node_id={node_id} did not exist yet on {check_date} (added {added_at})"
+                print(f"  ~ {s['scenario_key']:26s} {s['ticker'] or '':6s} {summary}, skipped")
+                results.append(dict(base, status='skipped', summary=summary))
+                continue
         active_snoozes = db.get_active_snoozes(s['scenario_key'])
         if active_snoozes:
             snooze = active_snoozes[0]

@@ -243,7 +243,7 @@ def test_notify_sell_signal_time_exit_logs_coverage_event(env):
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     signals_notify.notify_sell_signal(pos, 'TIME', current_price=51.0, target_price=51.0)
-    events = signals_db.get_coverage_events(scenario_key="time_exit_trigger")
+    events = signals_db.get_coverage_events(scenario_key="time_exit_trigger_unarmed")
     assert len(events) == 1
     assert events[0]['result'] == "alert_fired"
     assert events[0]['ticker'] == TICKER
@@ -366,8 +366,8 @@ def test_notify_sell_signal_non_time_reason_does_not_log_time_exit_event(env):
         c.commit()
     pos = signals_db.get_open_position(TICKER)
     signals_notify.notify_sell_signal(pos, 'SL', current_price=48.0, target_price=48.0)
-    events = signals_db.get_coverage_events(scenario_key="time_exit_trigger")
-    assert len(events) == 0
+    assert len(signals_db.get_coverage_events(scenario_key="time_exit_trigger_unarmed")) == 0
+    assert len(signals_db.get_coverage_events(scenario_key="time_exit_trigger_armed")) == 0
 
 
 def test_automated_sell_falls_back_when_no_matching_node(env):

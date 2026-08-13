@@ -1860,7 +1860,14 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     pct        = (current_price - ep) / ep * 100
 
     if reason == 'TIME':
-        db.log_coverage_event("time_exit_trigger", _coverage_mode(pos.get('account')), ticker=ticker,
+        # Split 2026-08-13: hold-time expiry while never-armed and hold-time expiry
+        # while armed (exit_forced_by_hold_time) are two genuinely different code
+        # paths that used to share one scenario_key, masking that the armed
+        # sub-case had zero live confirmation under current code (SH's only closed
+        # trade predates the 2026-08-01 exit_reason labeling fix).
+        hold_time_armed = bool((pos.get('trail_state') or {}).get('exit_forced_by_hold_time'))
+        time_scenario_key = "time_exit_trigger_armed" if hold_time_armed else "time_exit_trigger_unarmed"
+        db.log_coverage_event(time_scenario_key, _coverage_mode(pos.get('account')), ticker=ticker,
                                position_id=pos.get('id'), node_id=pos.get('wl_id'), result="alert_fired",
                                detail=f"target={target_price:.4f}")
 

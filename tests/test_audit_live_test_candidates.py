@@ -95,7 +95,7 @@ def test_scenario_relevance_none_for_unmapped_role():
 def test_scenario_relevance_reports_wired_never_fired_when_no_events(isolated_db):
     relevance = _scenario_relevance('time_exit_via_trail')
     assert len(relevance) == 1
-    assert 'time_exit_trigger: wired-never-fired' in relevance[0]
+    assert 'time_exit_trigger_armed: wired-never-fired' in relevance[0]
 
 
 def test_stale_banner_fires_when_grid_scenario_already_verified_live(isolated_db, capsys):
@@ -105,12 +105,12 @@ def test_stale_banner_fires_when_grid_scenario_already_verified_live(isolated_db
         c.execute("UPDATE watch_list SET arm_sell_pct=0.3, fixed_sl=50, trail_sell_pct=50, "
                    "max_hold_hours=31 WHERE id=?", (node['id'],))
         c.commit()
-    db.log_coverage_event('time_exit_trigger', 'live', ticker=TICKER, node_id=node['id'], result='fired')
+    db.log_coverage_event('time_exit_trigger_armed', 'live', ticker=TICKER, node_id=node['id'], result='fired')
 
     audit_one(TICKER)
 
     out = capsys.readouterr().out
-    assert 'grid relevance: time_exit_trigger: verified-live' in out
+    assert 'grid relevance: time_exit_trigger_armed: verified-live' in out
     assert 'STALE?' in out
 
 
@@ -125,7 +125,7 @@ def test_stale_banner_absent_when_grid_scenario_not_yet_proven(isolated_db, caps
     audit_one(TICKER)
 
     out = capsys.readouterr().out
-    assert 'grid relevance: time_exit_trigger: wired-never-fired' in out
+    assert 'grid relevance: time_exit_trigger_armed: wired-never-fired' in out
     assert 'STALE?' not in out
 
 

@@ -200,9 +200,9 @@ def test_unarmed_position_past_max_hold_replaces_resting_sl_with_market_exit(env
     closed_pos = signals_db.get_open_position(TICKER)
     assert closed_pos is None, "position should be auto-closed on confirmed fill"
 
-    time_exit_events = signals_db.get_coverage_events(scenario_key='time_exit_trigger')
+    time_exit_events = signals_db.get_coverage_events(scenario_key='time_exit_trigger_unarmed')
     assert any(e['ticker'] == TICKER for e in time_exit_events), \
-        "notify_sell_signal(reason='TIME') should log the time_exit_trigger coverage event"
+        "notify_sell_signal(reason='TIME') should log the time_exit_trigger_unarmed coverage event"
 
 
 def test_armed_position_past_max_hold_with_failed_arm_placement_still_exits(env, fake_broker, monkeypatch):

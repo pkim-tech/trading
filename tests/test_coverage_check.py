@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import signals_config
 import signals_db as db
 from scripts.coverage_check import _check_trade_lifecycle, _check_coverage_event, run_check
-from scripts.coverage_registry import compute_status, compute_mode_statuses
+from scripts.coverage_registry import compute_status, compute_mode_statuses, STATUS_ORDER
 
 TICKER = 'TEST_CANARY'
 
@@ -171,6 +171,46 @@ def test_check_trade_lifecycle_not_met_when_no_trade_closed(isolated_db):
     met, summary, _no_activity = _check_trade_lifecycle(scenario, '2026-07-24')
     assert met is False
     assert 'no closed trade' in summary
+
+
+def test_check_trade_lifecycle_exit_reason_met_by_still_open_position(isolated_db):
+    """Real bug, found 2026-08-13 (VOO/QQQ/IVV, 08-11): the plain exit-reason
+    branch only ever checked get_closed_trades_for_ticker_on_date for the
+    exact check_date, so a real in-progress multi-day-hold trade (entered
+    today, not yet exited) read as false 'no closed trade found' -- the
+    identical bug shape the expect_pending_carryover branch already fixed.
+    A still-open position must be recognized as real, unresolved activity
+    (met=True, no_activity=False), not eligible for the no-activity auto-
+    explain path."""
+    now = datetime.now()
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
+    db.open_position(n, signal_price=100.0, signal_time=now, entry_price=101.0,
+                      entry_time=now, shares=10)
+    check_date = now.date().isoformat()
+    scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["TIME"]}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is True
+    assert no_activity is False
+    assert 'still open' in summary
+
+
+def test_check_trade_lifecycle_exit_reason_met_by_pending_buy(isolated_db):
+    """Same gap, one state earlier: a resting trailing-buy (not filled yet)
+    is also real, unresolved activity -- must not read as 'no activity'."""
+    now = datetime.now()
+    db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
+                stop_loss=0, max_hold_hours=48)
+    n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
+    sig = dict(current_price=100.0, last_bar=now)
+    db.add_pending_buy(n, sig, channel='C123', ts='123.456')
+    check_date = now.date().isoformat()
+    scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["TIME"]}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is True
+    assert no_activity is False
+    assert 'pending_buys' in summary
 
 
 def test_check_trade_lifecycle_pending_carryover_met_by_pending_row(isolated_db):
@@ -469,6 +509,31 @@ def test_snooze_coverage_uses_local_time_not_utc(isolated_db):
     assert db.is_snoozed('some_scenario', ticker=TICKER) is True
 
 
+def test_run_check_skips_scenario_when_node_predates_check_date(isolated_db):
+    """A scenario_expectations row can be (re)pointed at a node_id whose watch_list.added_at
+    postdates check_date -- e.g. a repoint onto a brand-new node, or a manual --date backfill
+    run right after node creation. Checking it anyway mints a permanent, confidently-wrong
+    deviation for a date the node had no real data at all -- found live 2026-08-13 (the FAS/FAZ
+    canary repoint), 16 coverage_deviations rows across 8 check_date/node_id pairs, some even
+    auto-explained with a fabricated 'price never crossed entry threshold' reason. Must be
+    skipped, not deviated, and must never call the underlying checker at all."""
+    db.add_node('TEST_TIMING_NODE', 'TrailingBothZScoreBreakout', 'v4', window=10,
+                take_profit=1.0, stop_loss=2.0, max_hold_hours=48, account='ira', state='dry_run')
+    with db._conn() as c:
+        node = c.execute("SELECT id FROM watch_list WHERE ticker='TEST_TIMING_NODE'").fetchone()
+        node_id = node['id']
+        c.execute("UPDATE watch_list SET added_at='2026-08-13 00:43:36' WHERE id=?", (node_id,))
+        c.commit()
+
+    db.add_scenario_expectation('sk_predates_node', 'expected happy path', 'daily',
+                                 'trade_lifecycle', ticker='TEST_TIMING_NODE', node_id=node_id,
+                                 check_params='{"exit_reason": "TIME"}')
+    results = run_check('2026-08-11')
+    assert results[0]['status'] == 'skipped'
+    assert 'did not exist yet' in results[0]['summary']
+    assert db.get_deviations() == []
+
+
 def test_run_check_skips_snoozed_scenario_instead_of_deviating(isolated_db):
     """A scenario under an active coverage_snoozes row must not mint a
     coverage_deviations ticket just because it's silenced -- found by Opus
@@ -659,6 +724,77 @@ def test_compute_status_scenario_expectations_no_history_is_not_verified(isolate
     row = dict(check_mechanism='scenario_expectations', scenario_key='sk_reg_never_seen')
     status, detail = compute_status(row)
     assert status == 'wired-never-fired'
+
+
+def test_compute_status_scenario_expectations_direct_trade_proof_is_verified(isolated_db):
+    """Real bug, found 2026-08-13: coverage_deviations only ever records
+    FAILURES, so a scenario that's been passing cleanly every day (zero
+    deviation rows, ever) was structurally indistinguishable from one that's
+    never actually been checked -- compute_status defaulted to the
+    pessimistic 'wired-never-fired' in both cases. canary_time_exit (XLF/FAZ)
+    had 7 real correct TIME exits on file and still read wired-never-fired.
+    Fix: cross-check the real scenario_expectations row directly against
+    trade_log over a recent lookback before falling back to that default."""
+    today = datetime.now()
+    _add_closed_trade('TIME', today, today)
+    db.add_scenario_expectation(
+        scenario_key='sk_reg5', expected_outcome='TIME exit', expected_frequency='daily',
+        check_method='trade_lifecycle', ticker=TICKER,
+        check_params='{"expect_exit_reason": ["TIME"]}',
+    )
+    # No coverage_deviations rows at all -- the exact ambiguous state the bug
+    # couldn't resolve.
+    row = dict(check_mechanism='scenario_expectations', scenario_key='sk_reg5')
+    status, detail = compute_status(row)
+    assert status == 'verified-live'
+    assert 'TIME' in detail
+
+
+def test_compute_status_scenario_expectations_no_recent_trade_stays_wired_never_fired(isolated_db):
+    """A real scenario_expectations row exists, but the linked ticker has no
+    matching trade anywhere in the lookback window -- must not fabricate
+    positive evidence that isn't there."""
+    db.add_scenario_expectation(
+        scenario_key='sk_reg6', expected_outcome='TIME exit', expected_frequency='daily',
+        check_method='trade_lifecycle', ticker=TICKER,
+        check_params='{"expect_exit_reason": ["TIME"]}',
+    )
+    row = dict(check_mechanism='scenario_expectations', scenario_key='sk_reg6')
+    status, detail = compute_status(row)
+    assert status == 'wired-never-fired'
+
+
+def test_compute_status_structural_note_distinct_from_wired_never_fired(isolated_db):
+    """Added 2026-08-13: a coverage_events row that's been checked directly
+    against the real code and confirmed to need a specific condition organic
+    trading volume can't produce (e.g. manual_buy_confirmation_account --
+    canary/dry_run nodes bypass that handler chain entirely) must render as
+    its own 'structural-gap' status, not look identical to a scenario that's
+    simply waiting on more trading days."""
+    row = dict(check_mechanism='coverage_events', scenario_key='sk_reg_structural',
+               structural_note='needs a real human Slack button tap, canary bypasses this path')
+    status, detail = compute_status(row)
+    assert status == 'structural-gap'
+    assert 'Slack button' in detail
+
+    # No structural_note -> unchanged plain wired-never-fired behavior.
+    row2 = dict(check_mechanism='coverage_events', scenario_key='sk_reg_plain')
+    status2, detail2 = compute_status(row2)
+    assert status2 == 'wired-never-fired'
+
+
+def test_compute_status_not_prod_required_note_is_neutral_not_red(isolated_db):
+    """Added 2026-08-13: a row the user deliberately demoted (e.g. the 3
+    human-Slack-click-dependent rows -- not something to plan around during
+    work hours) must render as a neutral 'not-prod-required' status, same
+    treatment as offline-only -- not deleted, not red, not conflated with a
+    genuine structural-gap still worth chasing."""
+    row = dict(check_mechanism='coverage_events', scenario_key='sk_reg_demoted',
+               not_prod_required_note='user demoted this, not something to plan around')
+    status, detail = compute_status(row)
+    assert status == 'not-prod-required'
+    assert 'demoted' in detail
+    assert STATUS_ORDER[status] == STATUS_ORDER['offline-only']
 
 
 def test_compute_status_bad_results_downgrades_verified(isolated_db):

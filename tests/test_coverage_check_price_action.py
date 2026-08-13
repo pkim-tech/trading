@@ -117,6 +117,12 @@ def _add_real_node():
                 stop_loss=1.0, max_hold_hours=48, state='live', account='ira',
                 z_score_threshold=1.0, entry_timing='close')
     with db._conn() as c:
+        # added_at set well before this file's fixed check_date (2025-01-07) -- run_check's
+        # node-predates-check_date guard (2026-08-13, closes the FAS/FAZ backfill-artifact bug
+        # shape) would otherwise skip every scenario here, since add_node's real default
+        # added_at is "now" (test run time), which is always after any 2025 fixture date.
+        c.execute("UPDATE watch_list SET added_at='2025-01-01 00:00:00' WHERE ticker=?", (TICKER,))
+        c.commit()
         row = c.execute("SELECT * FROM watch_list WHERE ticker=?", (TICKER,)).fetchone()
     return dict(row)
 
