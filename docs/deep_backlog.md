@@ -1,5 +1,8 @@
 # Backlog
 
+## ✅ [backtest] Resolved 2026-08-13 (evening) — GDXU's "never reswept to v5.1" backlog item was stale; already reswept same pass as NUGT/SOXS
+The 2026-08-12 item claimed GDXU's data changed in the 2026-08-11 backfill but had zero `v5.1` rows in `backtest_cache`, leaving its `REAL_SELECTION` low-vol-gate verdict (candidate node 120) unverified against current data. Direct DB check while clearing up other backfill-adjacent items: GDXU actually has real, COMPLETE `v5.1` `sweep_runs` for both strategies (ids 1236-1238 `TrailingBothZScoreBreakout`, 1245-1247 `TrailingExitZScoreBreakout`, all commit `bd8e35c`, 04:10-05:51 ET) — the same resweep pass that covered NUGT and SOXS (see the earlier same-day DFEN entry above). `backtest_cache` confirms 73,164 + 8,366 real v5.1 rows. No resweep needed. `candidate_full_review.py`'s `resolve_version()` (fixed 2026-08-12, auto-picks the latest version with data per ticker) already surfaces this data without any further change — the `REAL_SELECTION` verdict question the original item raised is already answerable from the current report, no action needed.
+
 ## ✅ [backtest] Resolved 2026-08-13 (evening) — DFEN reswept to v5.1 (dedicated tranche 0); a real prune-validate row-count flag on an unrelated JNUG group investigated and resolved (legitimate better-optimum find, not data loss), then swapped in
 Closes the "GDXU/NUGT/DFEN/SOXS still only have v5" backlog item's last remaining gap. DFEN's `v5.1` `backtest_cache` rows had been deleted after an earlier bad-tick fix (logged in `data_mutation_log`) and never resweep — GDXU/NUGT/SOXS were confirmed already reswept earlier the same day via a direct `sweep_runs` check (commit `bd8e35c`, 04:10-05:51 ET), narrowing the item to DFEN alone.
 

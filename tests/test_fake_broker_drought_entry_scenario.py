@@ -122,6 +122,12 @@ def test_drought_entry_places_real_trailing_buy_for_trailingboth_node(env, fake_
     assert pending['order_placed'] == 1
     events = signals_db.get_coverage_events(scenario_key='drought_entry_placement')
     assert any(e['ticker'] == TICKER and e['result'] == 'signalled' for e in events)
+    # registry id 'drought_entry' -- the decision-layer event (2026-08-13 fix:
+    # the real path only ever logged drought_entry_placement, never the
+    # once-per-gap dedup guard's own decision event paper's caller logs).
+    decision_events = signals_db.get_coverage_events(scenario_key='drought_entry')
+    assert any(e['ticker'] == TICKER and e['mode'] != 'paper' and e['result'] == 'signalled'
+               for e in decision_events)
 
 
 def test_drought_entry_respects_capital_at_stake_alert_gate(env, fake_broker, monkeypatch):

@@ -106,6 +106,16 @@ def test_sl_fill_with_no_exit_pending_closes_the_position(env, fake_broker):
     assert rows[0][0] == 'SL'
     assert rows[0][1] == pytest.approx(7.66)
 
+    # registry id 'sl_order_fills_independent_detection' -- prior versions of
+    # this file exercised the real behavior (position closes correctly) but
+    # never asserted the log_coverage_event call itself, so the event line
+    # could be silently deleted and nothing here would catch it (found
+    # 2026-08-13, fake_venue_proof_for scan).
+    events = signals_db.get_coverage_events(scenario_key='automated_exit_confirmed')
+    matches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'closed'
+               and 'via_sl_order_poll=1' in (e['detail'] or '')]
+    assert len(matches) == 1
+
 
 def test_sl_fill_after_real_arm_is_labeled_trail(env, fake_broker):
     """The real post-arm shape: _attempt_automated_sell replaced the entry

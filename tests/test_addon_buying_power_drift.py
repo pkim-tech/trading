@@ -20,6 +20,9 @@ import signals_db
 import signals_notify
 import schwab_client
 
+sys.path.insert(0, str(Path(__file__).parent))
+from fake_broker import fake_broker  # noqa: F401
+
 TICKER = 'TEST_ADDON_DRIFT'
 
 
@@ -162,3 +165,22 @@ def test_non_trading_day_is_a_no_op(env, monkeypatch):
     monkeypatch.setattr(schwab_client, 'get_account_balance', lambda a: (_ for _ in ()).throw(AssertionError("should not be called")))
     signals_notify.check_addon_buying_power_drift(now=TRADING_HOURS_NOON)
     assert env == []
+
+
+def test_fake_broker_diverging_buying_power_and_cash_alerts(env, fake_broker):
+    """registry id 'addon_buying_power_drift_check' -- every other test above
+    monkeypatches schwab_client.get_account_balance/get_account_buying_power
+    per-call, which proves the drift-detection LOGIC but never drives the
+    real Client.get_account() call schwab_client.py actually makes (found
+    2026-08-13, fake_venue_proof_for scan: this file had zero fake_broker
+    coverage despite being a real order-adjacent check). fake_broker patches
+    at the schwab-py client boundary instead, so this exercises the genuine
+    get_account_balance/get_account_buying_power code paths end to end."""
+    _add_addon_node(TICKER, 'soxl_ira')
+    fake_broker.set_cash_balance('soxl_ira', 10_000.0)
+    fake_broker.set_buying_power('soxl_ira', 20_000.0)  # real leverage appeared
+    signals_notify.check_addon_buying_power_drift(now=TRADING_HOURS_NOON)
+    assert len(env) == 1
+    assert 'soxl_ira' in env[0]
+    events = signals_db.get_coverage_events(scenario_key='addon_buying_power_drift_check')
+    assert any(e['result'] == 'diverged' for e in events)

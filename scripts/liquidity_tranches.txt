@@ -8,10 +8,11 @@ STRATEGIES=TrailingBothZScoreBreakout TrailingExitZScoreBreakout
 ENTRY_TIMING=open_check
 #
 # Tranches: "<number> <space-separated tickers>"
+0 DFEN
 1 SQQQ
 2 TZA SPXL TNA SPXU SPXS
 3 TECL ETHU
-4 JNUG DFEN OILU BOIL
+4 JNUG OILU BOIL
 5 WEBL ERX GUSH YINN
 6 SOLT ROM SSG MQQQ TECS
 7 UGL SRTY FAZ LABD

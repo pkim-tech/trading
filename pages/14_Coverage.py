@@ -24,8 +24,11 @@ STATUS_LABEL = {
     'live-attempt-failed': '🟥 Live attempt, no good outcome',
     'dry_run-attempt-failed': '🟥 Dry-run attempt, no good outcome',
     'paper-attempt-failed': '🟥 Paper attempt, no good outcome',
+    'structural-gap': '🟪 Structural gap (more trading volume won\'t resolve this)',
     'paper-only': '🟨 Paper only', 'dry_run-only': '🟧 Dry-run only',
-    'offline-only': '⬛ Offline-only (by design)', 'verified-live': '🟩 Verified live',
+    'offline-only': '⬛ Offline-only (by design)',
+    'not-prod-required': '⬛ Not prod-required (deliberately demoted, not deleted)',
+    'verified-live': '🟩 Verified live',
 }
 # Heatmap row-background per status -- worst (red) to best (green), matching STATUS_LABEL's emoji.
 STATUS_COLOR = {
@@ -35,9 +38,11 @@ STATUS_COLOR = {
     STATUS_LABEL['live-attempt-failed']:     '#f5b7b1',
     STATUS_LABEL['dry_run-attempt-failed']:  '#f5b7b1',
     STATUS_LABEL['paper-attempt-failed']:    '#f5b7b1',
+    STATUS_LABEL['structural-gap']:          '#d7bde2',
     STATUS_LABEL['paper-only']:              '#fdebd0',
     STATUS_LABEL['dry_run-only']:            '#fce4ba',
     STATUS_LABEL['offline-only']:            '#cfcfcf',
+    STATUS_LABEL['not-prod-required']:       '#cfcfcf',
     STATUS_LABEL['verified-live']:           '#c9e8c4',
 }
 
