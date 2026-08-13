@@ -27,8 +27,14 @@ SLACK_HOOK       = os.environ.get("SLACK_WEBHOOK_URL", "")
 # capital at stake (2026-08-08 user call) -- below this, Slack alerting
 # (routine AND anomaly) is suppressed in favor of EOD-only review; the
 # underlying event/incident logging is never suppressed regardless of this
-# threshold. See signals_helpers.has_capital_at_stake.
-CAPITAL_AT_STAKE_THRESHOLD = float(os.environ.get("CAPITAL_AT_STAKE_THRESHOLD", 10_000))
+# threshold. See signals_helpers.has_capital_at_stake. Lowered 10,000->5,000
+# on 2026-08-13 (user's explicit call) so brokerage's 3 real $6,000 nodes
+# (AGQ/ETHU/JNUG) cross it -- the $10k default put them on the wrong side,
+# suppressing real-money alerts the user wanted visible while extending this
+# same gate to a broader set of previously-ungated Slack call sites
+# (canary/dry_run fills, reminder loops) as the general noise-reduction
+# filter. soxl_ira's nodes (max $2,500) still stay under it either way.
+CAPITAL_AT_STAKE_THRESHOLD = float(os.environ.get("CAPITAL_AT_STAKE_THRESHOLD", 5_000))
 
 # Persisted marker for signals_notify.check_intraday_risk_review -- survives
 # a daemon restart (unlike an in-memory set) so a restart mid-window doesn't

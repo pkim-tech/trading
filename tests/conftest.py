@@ -31,7 +31,7 @@ def _no_real_slack_posts(monkeypatch):
     the interactive/button-driven branch regardless of what SIM_MODE
     happens to default to in this environment -- that's a real-daemon
     launch-time concern, not a test concern)."""
-    noop = lambda text, blocks=None, thread_ts=None, reply_broadcast=False: (None, None)
+    noop = lambda text, blocks=None, thread_ts=None, reply_broadcast=False, node_id=None: (None, None)
     import signals_blocks
     import signals_config as cfg
     monkeypatch.setattr(signals_blocks, '_post_message', noop)

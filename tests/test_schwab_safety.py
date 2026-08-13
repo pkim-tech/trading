@@ -710,7 +710,7 @@ def test_reserve_watermark_warning_posted_but_not_blocking(env, monkeypatch):
     # raw balance is already below CASH_RESERVE_WATERMARK -- should warn, not
     # block.
     posted = []
-    monkeypatch.setattr(schwab_client, '_post_message', lambda msg: posted.append(msg))
+    monkeypatch.setattr(schwab_client, '_post_message', lambda msg, **kw: posted.append(msg))
     monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 500.0)
     result = schwab_client.place_equity_buy('roth', TICKER, 1, 50.0)
     assert result == (None, None)  # dry_run -- not blocked
@@ -721,7 +721,7 @@ def test_reserve_watermark_warning_posted_but_not_blocking(env, monkeypatch):
 
 def test_no_reserve_warning_when_comfortably_above_watermark(env, monkeypatch):
     posted = []
-    monkeypatch.setattr(schwab_client, '_post_message', lambda msg: posted.append(msg))
+    monkeypatch.setattr(schwab_client, '_post_message', lambda msg, **kw: posted.append(msg))
     monkeypatch.setattr(
         schwab_client, 'get_account_balance',
         lambda account: schwab_safety.CASH_RESERVE_WATERMARK + 1,

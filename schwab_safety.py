@@ -1002,8 +1002,17 @@ def check_order(
 
     limits = ACCOUNTS.get(account)
     if limits is None:
+        # mode is unknowable here (no ACCOUNTS row to read trading_enabled
+        # from) -- logged as 'dry_run' rather than guessing 'live', matching
+        # _coverage_mode's own None-account convention elsewhere.
+        signals_db.log_coverage_event("unknown_account_block", "dry_run", ticker=ticker, node_id=node_id,
+                                       result="blocked",
+                                       detail=f"account={account!r} not in allowlist (node_id caller-supplied, unverified)")
         raise SafetyViolation(f"unknown account '{account}' -- not in the allowlist")
     if not limits.enabled:
+        signals_db.log_coverage_event("account_disabled_block", "dry_run" if not limits.trading_enabled else "live",
+                                       ticker=ticker, node_id=node_id, result="blocked",
+                                       detail=f"account={account!r} disabled (node_id caller-supplied, unverified)")
         raise SafetyViolation(f"account '{account}' is disabled in the allowlist")
     _mode = "dry_run" if not limits.trading_enabled else "live"
     if node_id is not None:
@@ -1038,8 +1047,21 @@ def check_order(
 
     ticker_accounts = _live_ticker_accounts()
     if ticker not in ticker_accounts:
+        # Real trigger: a node_id-race, not routine -- a signal check earlier
+        # in the same poll cycle read the node as state='live', but by the
+        # time this order-placement gate actually runs, the node has been
+        # demoted (paper/dry_run/research) or removed from the watchlist,
+        # e.g. a user-initiated mode flip landing mid-cycle. Genuinely
+        # anomalous (config/state mismatch), not an intentional pause like
+        # node/ticker automation toggles below.
+        signals_db.log_coverage_event("ticker_not_live_mode_block", _mode, ticker=ticker,
+                                       node_id=_node_id, result="blocked",
+                                       detail=f"'{ticker}' not in _live_ticker_accounts() at check_order time")
         raise SafetyViolation(f"'{ticker}' is not a live-mode ticker on the active watchlist")
     if account not in ticker_accounts[ticker]:
+        signals_db.log_coverage_event(
+            "ticker_account_assignment_mismatch", _mode, ticker=ticker, node_id=_node_id, result="blocked",
+            detail=f"account={account!r} not in assigned accounts {sorted(ticker_accounts[ticker])}")
         raise SafetyViolation(
             f"'{ticker}' is not assigned to account '{account}' "
             f"(assigned accounts: {sorted(ticker_accounts[ticker])})"
@@ -1053,11 +1075,16 @@ def check_order(
                                        result="blocked")
         raise SafetyViolation(f"node id={_node_id} for '{ticker}' has automation paused")
     if ticker not in AUTOMATION_ENABLED_TICKERS:
+        signals_db.log_coverage_event("ticker_not_in_automation_scope_block", _mode, ticker=ticker,
+                                       node_id=_node_id, result="blocked",
+                                       detail=f"'{ticker}' not in AUTOMATION_ENABLED_TICKERS")
         raise SafetyViolation(
             f"'{ticker}' is not in the automation pilot scope {AUTOMATION_ENABLED_TICKERS} "
             f"-- still manual-only"
         )
     if not ticker_automation_enabled(ticker):
+        signals_db.log_coverage_event("ticker_level_automation_pause", _mode, ticker=ticker,
+                                       node_id=_node_id, result="blocked")
         raise SafetyViolation(f"'{ticker}' automation is paused (per-ticker toggle) -- resume from the reference report")
 
     # Same-day re-buy guardrail (2026-07-15): a same-day re-buy risks a real
@@ -1406,6 +1433,17 @@ def check_order(
                 f"SELL {quantity:g} {ticker} exceeds the {pos['shares']:g} shares on file for "
                 f"'{account}' -- refusing a would-be short"
             )
+        # Success path, added 2026-08-13: both branches above only ever logged a FAILURE
+        # (blocked_no_position, blocked) -- registry row 'oversell_guard_correct_position' had no
+        # way to show positive evidence that this guard resolves the right position under real
+        # 2-node-same-ticker-different-account conditions, since a clean pass was silent. Real
+        # instrumentation gap, not evidence the guard "can never pass" (found via user pushback,
+        # 2026-08-13 -- a negative test case genuinely does count as proof, this row's actual gap
+        # was simply that the POSITIVE case was never logged at all).
+        signals_db.log_coverage_event(
+            "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="resolved",
+            detail=f"quantity={quantity:g} held={pos['shares']:g}"
+        )
 
     # Trading-day gate, BUY only, unconditional (including gap-correction --
     # an overnight gap only exists ahead of a real trading day, so there's no
@@ -1413,6 +1451,9 @@ def check_order(
     if side == "BUY":
         now = _now()
         if not _is_trading_day(now.strftime('%Y-%m-%d')):
+            signals_db.log_coverage_event("buy_trading_day_block", _mode, ticker=ticker,
+                                           node_id=_node_id, result="blocked",
+                                           detail=now.strftime('%Y-%m-%d'))
             raise SafetyViolation(
                 f"BUY blocked -- {now.strftime('%Y-%m-%d')} is not an NYSE trading day"
             )
@@ -1444,12 +1485,18 @@ def check_order(
         all_windows = _SIGNAL_WINDOWS + _OPEN_CHECK_WINDOWS
         in_window = any((h0, m0) <= t <= (h1, m1) for h0, m0, h1, m1 in all_windows)
         if not in_window:
+            signals_db.log_coverage_event("buy_signal_window_block", _mode, ticker=ticker,
+                                           node_id=_node_id, result="blocked",
+                                           detail=f"current time {t[0]:02d}:{t[1]:02d}")
             raise SafetyViolation(
                 f"BUY outside signal windows {all_windows} (current time {t[0]:02d}:{t[1]:02d})"
             )
 
     notional = quantity * price
     if notional > HARD_ORDER_CEILING:
+        signals_db.log_coverage_event("hard_order_ceiling_block", _mode, ticker=ticker,
+                                       node_id=_node_id, result="blocked",
+                                       detail=f"notional=${notional:,.0f} ceiling=${HARD_ORDER_CEILING:,.0f}")
         raise SafetyViolation(
             f"order notional ${notional:,.0f} ({ticker} x{quantity}) exceeds hard ceiling ${HARD_ORDER_CEILING:,.0f}"
         )
@@ -1462,6 +1509,9 @@ def check_order(
     # itself never shrinks below the cap on its own. HARD_ORDER_CEILING above
     # still applies to both sides as an absolute sanity backstop.
     if side == "BUY" and notional > limits.notional_cap:
+        signals_db.log_coverage_event("notional_cap_block", _mode, ticker=ticker,
+                                       node_id=_node_id, result="blocked",
+                                       detail=f"notional=${notional:,.0f} cap=${limits.notional_cap:,.0f}")
         raise SafetyViolation(
             f"order notional ${notional:,.0f} ({ticker} x{quantity}) exceeds {account} cap ${limits.notional_cap:,.0f}"
         )
@@ -1668,10 +1718,16 @@ def check_order(
                 detail=f"account={account} count={count} cap={limits.daily_order_cap} side={side}"
             )
         else:
+            signals_db.log_coverage_event("daily_order_cap_block", _mode, ticker=ticker,
+                                           node_id=_node_id, result="blocked",
+                                           detail=f"account={account} count={count} cap={limits.daily_order_cap}")
             raise SafetyViolation(f"account '{account}' has hit its daily order cap ({limits.daily_order_cap})")
 
     recent = [t for t in counts.get("recent_order_timestamps", []) if time.time() - t < 60]
     if len(recent) >= GLOBAL_ORDERS_PER_MINUTE:
+        signals_db.log_coverage_event("global_burst_cap_block", _mode, ticker=ticker,
+                                       node_id=_node_id, result="blocked",
+                                       detail=f"recent={len(recent)} max={GLOBAL_ORDERS_PER_MINUTE}")
         raise SafetyViolation(
             f"global burst cap hit ({len(recent)} orders across all accounts in the last minute, "
             f"max {GLOBAL_ORDERS_PER_MINUTE})"

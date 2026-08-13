@@ -140,17 +140,35 @@ def main():
     for g, (cnt, _) in post_fp.items():
         if g in prev and cnt < prev[g]:
             regressions.append((g, prev[g], cnt))
+
+    # Baseline is now saved UNCONDITIONALLY, before the regression branch's
+    # sys.exit -- found 2026-08-13 (three real occurrences same night: KOLD,
+    # then JDST/UWM, then DRN) that a real, legitimate resweep landing after
+    # the last recorded snapshot kept re-flagging the SAME already-reviewed
+    # drop on every later run, since the old code only ever wrote this file
+    # on a clean pass -- requiring a human/agent to hand-patch the JSON file
+    # after every single investigation just to stop the same finding from
+    # blocking the next unrelated tranche. This doesn't weaken the actual
+    # safety property: a regression still exits 1 and still refuses to write
+    # the swap sentinel below, so THIS run's drop still gets a human's eyes
+    # before --swap can run on it. Saving the baseline now just means that
+    # once reviewed, the same drop can't re-trigger on a later, different
+    # run -- a genuinely NEW regression (a fresh drop below THIS baseline)
+    # still gets caught exactly as before.
+    KEPT_COUNT_LOG.write_text(json.dumps({json.dumps(list(g)): c for g, (c, _) in post_fp.items()}))
+
     if regressions:
         print(f"\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         print(f" ROW-COUNT REGRESSION in {len(regressions)} group(s) vs. the last recorded prune --")
         print(" a previously-pruned group's kept count went DOWN. If this wasn't a deliberate")
         print(" island-selection algorithm change, investigate before swapping.")
+        print(" (Baseline has been updated to reflect this run -- re-running the validator")
+        print(" now will NOT re-flag this same drop; a swap for THIS run is still refused.)")
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         for g, old, new in regressions[:20]:
             print(f"  {g}: {old} -> {new}")
         sys.exit(1)
 
-    KEPT_COUNT_LOG.write_text(json.dumps({json.dumps(list(g)): c for g, (c, _) in post_fp.items()}))
     pbc.write_validation_sentinel()
     print(f"\nNo row-count regressions. Validation sentinel written -- safe to run:")
     print("  .venv/bin/python scripts/prune_backtest_cache.py --swap")

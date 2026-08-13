@@ -229,31 +229,80 @@ def write_validation_sentinel():
 
 
 def cmd_swap():
+    # Every refusal branch below calls sys.exit(1), not a plain `return` --
+    # found 2026-08-12 that a plain return exits 0, which `set -e` in
+    # run_liquidity_tranches.sh can't catch, so the script would silently
+    # continue past a swap that never happened, print "Extract validation OK
+    # -- swapped in.", and mark the tranche done with the live DB unchanged.
+    # This is the exact historical bug this module's own comments describe
+    # fixing once already (see the Phase-2 rewrite note above) -- it had crept
+    # back in because these specific branches were never touched by that fix.
     if not PRUNED_PATH.exists():
         print("No pruned DB found -- run --build first.")
-        return
+        sys.exit(1)
     if not VALIDATION_SENTINEL.exists():
         print("No validation sentinel found -- run scripts/full_db_prune_validate.py "
               "(or another validator that calls write_validation_sentinel()) and confirm "
               "it passes before swapping. Refusing to swap an unvalidated build.")
-        return
+        sys.exit(1)
     recorded = VALIDATION_SENTINEL.read_text().strip()
     recorded_pruned, _, recorded_live = recorded.partition("|")
     if recorded_pruned != pruned_fingerprint():
         print("Validation sentinel is STALE -- the pruned DB has changed (or been "
               "rebuilt) since the last passing validation. Refusing to swap. "
               "Re-run the validator against the current --build output first.")
-        return
+        sys.exit(1)
     if not recorded_live or recorded_live != live_db_fingerprint():
         print("Validation sentinel is STALE -- the LIVE DB has changed since the "
               "last passing validation (e.g. a sweep wrote new rows). Swapping now "
               "would silently discard that new data. Refusing to swap. Re-run the "
               "validator against the current live DB first.")
-        return
+        sys.exit(1)
+    # DB_PATH runs in WAL journal mode -- shutil.move() below only renames the
+    # main .db file, not its -wal/-shm sidecars. Found 2026-08-12 the hard way:
+    # a swap that ran while another process (a read-only diagnostic query) still
+    # held DB_PATH open left a live, un-checkpointed trading_universe.db-wal
+    # behind under the OLD canonical name after the rename. The pruned file then
+    # got moved INTO that same canonical name and SQLite auto-adopted the
+    # orphaned -wal purely by filename adjacency -- replaying WAL frames written
+    # against the original (much larger) file's page layout onto the pruned
+    # file's completely different layout, corrupting its schema b-tree
+    # (sqlite_master ended up holding backtest_cache row data). Checkpointing
+    # with TRUNCATE here forces the -wal file to be fully flushed and removed;
+    # if any other connection is still open against DB_PATH, TRUNCATE can't
+    # fully clear it and reports nonzero remaining log/checkpointed frames --
+    # refuse to swap in that case rather than risk the same corruption again.
+    check_conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    busy, log_frames, checkpointed = check_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    check_conn.close()
+    if busy or log_frames > 0:
+        print(f"Refusing to swap -- WAL checkpoint didn't fully clear "
+              f"(busy={busy}, log_frames={log_frames}, checkpointed={checkpointed}). "
+              f"Another connection is still holding {DB_PATH} open (e.g. a lingering "
+              f"read/diagnostic query) -- close it and re-run --swap.")
+        sys.exit(1)
+    for sidecar_suffix in ("-wal", "-shm"):
+        p = DB_PATH.with_name(DB_PATH.name + sidecar_suffix)
+        if p.exists():
+            print(f"Refusing to swap -- {p} still present after a clean WAL checkpoint "
+                  f"(unexpected). Investigate before retrying.")
+            sys.exit(1)
+
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     moved_aside = DB_PATH.with_name(f"trading_universe.db.pre_prune_{ts}")
     shutil.move(str(DB_PATH), str(moved_aside))
     shutil.move(str(PRUNED_PATH), str(DB_PATH))
+    # PRUNED_PATH was built as a fresh file via ATTACH DATABASE, which defaults to
+    # rollback-journal mode (not WAL) -- confirmed empirically after this bug (no
+    # -wal/-shm ever appears for it). Still, verify explicitly rather than assume,
+    # since a future change to cmd_build() could set WAL on the attached db too.
+    for sidecar_suffix in ("-wal", "-shm"):
+        p = PRUNED_PATH.with_name(PRUNED_PATH.name + sidecar_suffix)
+        if p.exists():
+            dest = moved_aside.with_name(moved_aside.name + sidecar_suffix)
+            print(f"WARNING: unexpected {p} found for the pruned build -- moving "
+                  f"alongside {DB_PATH.name} rather than leaving it orphaned.")
+            shutil.move(str(p), str(DB_PATH.with_name(DB_PATH.name + sidecar_suffix)))
     VALIDATION_SENTINEL.unlink()
     print(f"Original moved to {moved_aside} (not deleted -- remove manually once confirmed).")
     print(f"{PRUNED_PATH.name} is now {DB_PATH.name}.")

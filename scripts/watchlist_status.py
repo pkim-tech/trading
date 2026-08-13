@@ -115,8 +115,14 @@ def print_status(watchlist_id=None):
 
         # Overlay flags are static config (2026-08-08 addition) -- previously
         # invisible here, had to be checked by hand-querying watch_list.
+        # 'S' (force_same_day_block) added 2026-08-13 -- found completely
+        # untracked anywhere despite being live on JNUG (wl_id=205) and
+        # materially changing real order-placement behavior. See
+        # docs/deep_backlog.md's 2026-08-13 entry.
         is_paper = n.get('state') == 'paper'
-        ovl = ('D' if n.get('drought_overlay_enabled') else '') + ('A' if n.get('addon_enabled') else '')
+        ovl = (('D' if n.get('drought_overlay_enabled') else '') +
+               ('A' if n.get('addon_enabled') else '') +
+               ('S' if n.get('force_same_day_block') else ''))
         ovl = ovl or '-'
         # Open overlay positions fold into Phase (not a separate column) --
         # this is the thing actually worth noticing on a scan, and stays quiet

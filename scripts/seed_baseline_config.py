@@ -69,7 +69,15 @@ FIELDS = ('arm_sell_pct', 'fixed_sl', 'trail_sell_pct', 'max_hold_hours',
           # false-positive on every run for a node that's correctly off.
           'drought_overlay_enabled', 'drought_confirm_days', 'drought_vol_gate',
           'drought_sl_pct_override', 'drought_arm_pct_override', 'drought_trail_pct_override',
-          'addon_enabled', 'skim_enabled', 'skim_step', 'skim_frac')
+          'addon_enabled', 'skim_enabled', 'skim_step', 'skim_frac',
+          # force_same_day_block added 2026-08-13 -- found completely untracked
+          # despite being live on a real node (JNUG, wl_id=205, brokerage) and
+          # materially changing real order-placement behavior (blocks a
+          # same-day re-buy that would otherwise be allowed). No CLI/report
+          # surface at all before this -- a silent flip either direction would
+          # have been invisible to every existing monitoring path. See
+          # docs/deep_backlog.md's 2026-08-13 entry.
+          'force_same_day_block')
 
 def main():
     import argparse

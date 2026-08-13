@@ -7,12 +7,44 @@ import requests
 import schwab_safety
 import signals_config as cfg
 import signals_db as db
-from signals_helpers import _add_trading_hours, _last_sale_recovery, buy_order_sizing, mode_tag, stop_status
+from signals_helpers import (
+    _add_trading_hours, _last_sale_recovery, buy_order_sizing, mode_tag,
+    should_alert_live, stop_status,
+)
 
 
-def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False):
+def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node_id=None):
     """Returns (channel, ts) when posted via the Socket Mode client (None, None
-    otherwise) so callers can track a message for later reminder/supersede."""
+    otherwise) so callers can track a message for later reminder/supersede.
+
+    node_id: optional -- when given, resolves the real watch_list node and
+    gates the actual Slack send on should_alert_live(node) (2026-08-13, the
+    project's noise-reduction pass: canary/dry_run/soxl_ira's small live tier
+    were flooding Slack with routine order-attempt messages the user
+    explicitly doesn't want to see in real time). A suppressed message is
+    still logged via log_slack_message below (mode 'suppressed') -- never
+    silently lost, only its real-time visibility, same contract as
+    has_capital_at_stake's other consumers. Omitting node_id (the default)
+    always sends -- system-wide messages (EOD/coverage reports, generic
+    errors) aren't ticker-scoped and were never in scope for this gate."""
+    if node_id is not None:
+        # Deliberately isolated in its own try/except, unlike the rest of this
+        # function relying on each callee's own internal safety -- everything
+        # this calls today (get_watch_list_node_by_id, should_alert_live) is
+        # already defensively coded, but nothing about a noise-reduction
+        # filter should ever be able to newly raise past this point and block
+        # the actual Slack send (let alone anything upstream of it), the way
+        # a real Slack outage/rejection already can't (both send paths below
+        # have their own try/except). Fails toward sending on any surprise.
+        try:
+            node = db.get_watch_list_node_by_id(node_id)
+            suppress = node is not None and not should_alert_live(node)
+        except Exception as e:
+            suppress = False
+            print(f"  [alert gate error] {e} -- failing open, sending")
+        if suppress:
+            db.log_slack_message('suppressed', text, error=None)
+            return None, None
     if cfg.SIM_MODE:
         scenario_suffix = f" ({cfg.SIM_SCENARIO})" if cfg.SIM_SCENARIO else ""
         text = f"🧪 SIM{scenario_suffix} — {text}"

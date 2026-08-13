@@ -357,7 +357,7 @@ def main():
     for scenario in SCENARIOS:
         name = scenario.__name__
         posted = []
-        noop_post = lambda text, blocks=None, _posted=posted: (_posted.append(text), (None, None))[1]
+        noop_post = lambda text, blocks=None, thread_ts=None, reply_broadcast=False, node_id=None, _posted=posted: (_posted.append(text), (None, None))[1]
         with ExitStack() as stack:
             for mod in (A, notify, schwab_client):
                 if hasattr(mod, '_post_message'):

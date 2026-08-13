@@ -72,19 +72,43 @@ def mode_tag(account, node=None):
 
 def has_capital_at_stake(node):
     """True only when a node is BOTH live (real order placement -- see
-    effectively_dry_run) AND sized at genuinely meaningful capital
-    (starting_notional >= cfg.CAPITAL_AT_STAKE_THRESHOLD). 'live' alone is
-    not the same fact -- soxl_ira's nodes place real orders but at
+    effectively_dry_run) AND sized at genuinely meaningful capital. 'live'
+    alone is not the same fact -- soxl_ira's nodes place real orders but at
     $500-$2,500 notional, which the user explicitly does not consider
     capital at stake (2026-08-08). Deliberately mechanical (a dollar
     comparison, not a manual per-node tag) so a node crosses this bar
     automatically once real accounts (roth/brokerage) are funded and sized
-    for real, without needing another manual re-scoping pass. Zero nodes
-    cross it as of 2026-08-08."""
+    for real, without needing another manual re-scoping pass.
+
+    Compares against MAX(static starting_notional, real effective notional
+    via _last_sale_recovery -- compounded proceeds of the node's last closed
+    trade, or starting_notional_override) -- fixed 2026-08-13 (paired review
+    of the Slack noise-reduction gate found two opposite failure modes of
+    using either value alone): a compounding soxl_ira node could grow its
+    real per-order notional past the threshold while its static column
+    stays small (static-only misses it), but a real brokerage node
+    ($6,000 static) that closes a losing trade would have its comparison
+    basis floor to the real (now-smaller) proceeds and could silently drop
+    below threshold on a cumulative loss (effective-only goes dark exactly
+    when a node needs MORE visibility, not less -- the opposite of intent,
+    and sizing's floor(target/price) means proceeds run slightly below
+    notional even at breakeven, so this ratchets down over time absent
+    wins). MAX of both closes both directions: a node only needs EITHER its
+    configured baseline OR its real compounded value to clear the bar.
+    _last_sale_recovery does a real DB query and can raise (missing ticker/
+    no trade history and no starting_notional) -- caught here, falling back
+    to the static column alone so this function's existing callers
+    (build_reference_table's unguarded list comprehension, the reminder
+    loops) can't newly crash from this change."""
     account = node.get('account')
     if effectively_dry_run(account, node):
         return False
-    return (node.get('starting_notional') or 0) >= cfg.CAPITAL_AT_STAKE_THRESHOLD
+    static = node.get('starting_notional') or 0
+    try:
+        effective = _last_sale_recovery(node)
+    except Exception:
+        effective = 0
+    return max(static, effective or 0) >= cfg.CAPITAL_AT_STAKE_THRESHOLD
 
 
 def should_alert_live(node):

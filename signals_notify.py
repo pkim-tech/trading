@@ -37,9 +37,14 @@ def _attempt_automated_buy(node, sizing):
     Order Placed'. Returns (False, None) (falls back to the existing manual
     flow) if the ticker isn't in scope, or if schwab_safety blocks the order
     for any reason (paused, outside signal window, kill switch, etc.) --
-    schwab_client already Slack-posts the BLOCKED/DRY RUN message either way,
-    this function just decides which button set the caller should render.
-    Returns (True, order_id) on success -- order_id is None in dry_run."""
+    schwab_client Slack-posts the BLOCKED/DRY RUN message either way UNLESS
+    the node is below CAPITAL_AT_STAKE_THRESHOLD (2026-08-13 noise-reduction
+    gate -- see signals_blocks._post_message's node_id param), in which case
+    it's suppressed there but still logged via schwab_safety.check_order's
+    own log_coverage_event calls for the 6 SafetyViolation reasons that
+    previously had no record at all. This function just decides which button
+    set the caller should render. Returns (True, order_id) on success --
+    order_id is None in dry_run."""
     ticker = node['ticker']
     if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         return False, None
@@ -1351,7 +1356,7 @@ def _fill_dry_run_buy(node, pb, price):
     db.log_coverage_event("entry_fill", "dry_run", ticker=ticker, node_id=node.get('id'),
                            result="sim_filled", detail=f"shares={shares} price={price:.4f}")
     label = "TRAILING BUY" if trailing_buy else "MARKET BUY"
-    _post_message(f"[DRY RUN] would have filled {label} — {ticker}  {shares}sh @ ${price:.4f}")
+    _post_message(f"[DRY RUN] would have filled {label} — {ticker}  {shares}sh @ ${price:.4f}", node_id=node.get('id'))
 
 
 def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
@@ -1387,13 +1392,13 @@ def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
             pos, cp, datetime.now(), at_bar_close=at_bar_close, low=low, high=high, open_price=op,
             df_hourly=df_hourly)
         if just_activated_trailing:
-            _post_message(f"[DRY RUN] trailing-sell would arm — {ticker}")
+            _post_message(f"[DRY RUN] trailing-sell would arm — {ticker}", node_id=pos.get('wl_id'))
         if reason:
             db.close_position(pos['id'], exit_signal_price=cp, exit_price=target,
                                exit_time=datetime.now(), exit_reason=reason)
             db.log_coverage_event("exit_fill", "dry_run", ticker=ticker, position_id=pos['id'],
                                    node_id=pos.get('wl_id'), result=reason, detail=f"price={target:.4f}")
-            _post_message(f"[DRY RUN] would have closed — {ticker}  {reason} @ ${target:.4f}")
+            _post_message(f"[DRY RUN] would have closed — {ticker}  {reason} @ ${target:.4f}", node_id=pos.get('wl_id'))
             dry_run_sell_alerted.add((pos['id'], last_bar_ts))
             try:
                 close_addon_leg_real_if_open(pos, target, reason, datetime.now())
@@ -1626,6 +1631,18 @@ def check_drought_entry(node):
     decision = paper_trading.evaluate_drought_entry(node, paper=False)
     if decision is None:
         return
+    # The once-per-gap dedup guard's own decision-layer event (Grid row
+    # 'drought_entry') -- distinct from drought_entry_placement below, which
+    # is the real order-placement outcome. Found 2026-08-13: this real path
+    # computed the identical shared decision (evaluate_drought_entry) as
+    # paper_trading.check_paper_drought_entry, but only paper's caller ever
+    # logged "drought_entry" (paper_trading.py's own call) -- the real side
+    # silently skipped straight to drought_entry_placement, so the Grid's
+    # drought_entry row could never accumulate real fake_venue_proof (no
+    # fake_broker test can assert an event this real code never logs).
+    db.log_coverage_event("drought_entry", _coverage_mode(node.get('account')), ticker=node['ticker'],
+                           node_id=node['id'], result="signalled",
+                           detail=f"confirm_days={decision['confirm_days']} vol_pctile={decision['vol_pctile']}")
     notify_drought_buy_signal(node, decision)
     db.log_coverage_event("drought_entry_placement", _coverage_mode(node.get('account')), ticker=node['ticker'],
                            node_id=node['id'], result="signalled",
