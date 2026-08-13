@@ -14,8 +14,11 @@ on the 6 tickers being replaced (queried directly from the live DB before writin
 -- not reinvented from scratch.
 
 The bull/bear-pair scenario (previously JNUG/JDST, two different underlyings) is redefined to
-check FAS-vs-FAZ's own inverse relationship instead -- user confirmed this explicitly
-(2026-08-13), not assumed.
+share FAS/FAZ's time-exit node/config instead of a dedicated correlation check -- user confirmed
+this consolidation explicitly (2026-08-13), not assumed. Caveat, found by paired review same
+day: this does NOT implement an actual FAS-vs-FAZ inverse-price comparison -- it's the same
+trade_lifecycle exit-reason check as canary_time_exit, just tagged with a separate
+scenario_key/expected_frequency. A real pairwise check is unbuilt; see docs/backlog_cache.md.
 
 Old 11-ticker nodes are NOT retired by this script -- they keep running in parallel until the
 new FAS/FAZ nodes have organically fired and been confirmed correct, per the project's standing
@@ -43,7 +46,7 @@ for ticker in ('FAS', 'FAZ'):
         label='CANARY-full-lifecycle (was IVV)', z_score_threshold=0.1,
         watchlist_id=WATCHLIST_ID, state=STATE, account=ACCOUNT,
         trail_buy_pct=0.1, trail_pct=0.1, entry_timing='close',
-        starting_notional=10000, fixed_sl_override=30,
+        starting_notional=500, fixed_sl_override=30,
     )
 
 # Scenario B: early-SL path -- BUY -> bounce-fill -> immediate SL, same day.
@@ -55,7 +58,7 @@ for ticker in ('FAS', 'FAZ'):
         label='CANARY-early-SL (was QQQ)', z_score_threshold=0.1,
         watchlist_id=WATCHLIST_ID, state=STATE, account=ACCOUNT,
         trail_buy_pct=0.1, trail_pct=0.1, entry_timing='close',
-        starting_notional=10000, fixed_sl_override=0.1,
+        starting_notional=500, fixed_sl_override=0.1,
     )
 
 # Scenario C: pinned/open_check entry timing. Was IWM. Same arm/SL shape as A
@@ -75,7 +78,7 @@ for ticker in ('FAS', 'FAZ'):
         label='CANARY-pinned-entry (was IWM)', z_score_threshold=0.1,
         watchlist_id=WATCHLIST_ID, state=STATE, account=ACCOUNT,
         trail_buy_pct=0.1, trail_pct=0.1, entry_timing='open_check',
-        starting_notional=10000, fixed_sl_override=30,
+        starting_notional=500, fixed_sl_override=30,
     )
 
 # Scenario D: overnight carry -- wide trail_buy_pct (5%) so the trailing-buy fill
@@ -87,7 +90,7 @@ for ticker in ('FAS', 'FAZ'):
         label='CANARY-overnight-carry (was DIA)', z_score_threshold=0.1,
         watchlist_id=WATCHLIST_ID, state=STATE, account=ACCOUNT,
         trail_buy_pct=5.0, trail_pct=0.1, entry_timing='close',
-        starting_notional=10000, fixed_sl_override=30,
+        starting_notional=500, fixed_sl_override=30,
     )
 
 # Scenario E: market-buy entry mechanism (TrailingExitZScoreBreakout, not
@@ -100,14 +103,15 @@ for ticker in ('FAS', 'FAZ'):
         label='CANARY-market-buy-exit (was VOO)', z_score_threshold=0.1,
         watchlist_id=WATCHLIST_ID, state=STATE, account=ACCOUNT,
         trail_buy_pct=0.0, trail_pct=0.1, entry_timing='close',
-        starting_notional=10000, fixed_sl_override=90,
+        starting_notional=500, fixed_sl_override=90,
     )
 
 # Scenario F: TIME-only forced exit -- arm=50/fixed_sl=50 both practically
 # unreachable, max_hold_hours=2 forces the hold-time exit. This is FAZ's
 # existing, already-proven-live config, reused as-is; FAS gets the mirror.
-# Also serves as the redefined bull/bear-pair scenario (G, was JNUG/JDST) --
-# FAS-vs-FAZ's own inverse relationship, confirmed with user 2026-08-13.
+# Also carries the redefined bull/bear-pair scenario (G, was JNUG/JDST) --
+# same node/config as time-exit, not a real pairwise FAS-vs-FAZ check (see
+# module docstring's caveat, added 2026-08-13 after paired review).
 for ticker in ('FAS', 'FAZ'):
     db.add_node(
         ticker=ticker, strategy='TrailingBothZScoreBreakout', version='canary',
@@ -115,7 +119,7 @@ for ticker in ('FAS', 'FAZ'):
         label='CANARY-time-exit + bull-bear-pair (was XLF/FAZ, JNUG/JDST)', z_score_threshold=0.1,
         watchlist_id=WATCHLIST_ID, state=STATE, account=ACCOUNT,
         trail_buy_pct=0.1, trail_pct=0.1, entry_timing='close',
-        starting_notional=10000, fixed_sl_override=50,
+        starting_notional=500, fixed_sl_override=50,
     )
 
 print("Done. Run scripts/status_check.py or query watch_list directly to confirm the new nodes.")

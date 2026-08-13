@@ -1,17 +1,19 @@
 """EOD/nightly-routine live-node table: account | ticker | trigger | price | state/action |
 validation-vs-backtest, split into (brokerage/roth/ira) vs soxl_ira, per the user's requested
 nightly-routine format (2026-08-12). Real state only (open_positions/pending_buys), current
-price + trigger recomputed from cached hourly data via the real strategy indicator code
-(matches compute_buy_signal's own prior-day SMA/Std method).
+price + trigger recomputed from cached hourly data via the real strategy indicator code,
+sliced to strictly-before-today before computing indicators -- matches
+signals_compute.compute_buy_signal's own prior-day SMA/Std method exactly (fixed 2026-08-13:
+the original version included today's own in-progress bar, diverging from production by
+~1.5% on real SOXL data, found by paired review).
 
-Validation column is a REAL replay of each node's exact live config over a trailing window
-(default 4 weeks, --weeks to change) via the same flat-start replay machinery
-scripts/paper_vs_backtest_reconcile.py uses (get_trades_and_bars_since) -- not the
-full-history robust_alpha number, which the user explicitly said isn't what they want here
-(2026-08-13: "i don't need alpha - i need cagr ... i mean like in the last few weeks").
-Trade count over a few weeks is small for most nodes (these strategies fire infrequently),
-so the annualized CAGR figure is noisy by construction -- the raw trade count and window
-return are printed alongside it so that noise is visible, not hidden."""
+Validation column is a REAL replay of each node's exact live config over 4 fixed rolling
+windows (4wk/3mo/YTD/1yr) via the same flat-start replay machinery
+scripts/paper_vs_backtest_reconcile.py uses (get_trades_and_bars_since) -- window return %
+and trade count per window, not an annualized CAGR figure (the user asked for CAGR initially
+but the raw window return + trade count is what's actually printed, since annualizing a
+1-4-trade sample is noisy to the point of being misleading -- 2026-08-13: "i don't need
+alpha - i need cagr ... i mean like in the last few weeks")."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -32,14 +34,20 @@ SOXL_IRA_ACCOUNTS = {"soxl_ira"}
 OTHER_ACCOUNTS = {"brokerage", "roth", "ira"}
 
 
-def load_live_nodes(conn):
+def load_nodes(conn, states):
+    """states: iterable of watch_list.state values to include. The 'Brokerage/Roth/IRA' table
+    is real-capital-only (state='live'); the soxl_ira table also needs 'dry_run' (2026-08-13
+    fix: the new FAS/FAZ canary nodes built this session are all state='dry_run' -- the
+    original state='live'-only filter meant the very nodes this table exists to track for
+    soxl_ira never appeared in it, found by paired review)."""
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("""SELECT id, ticker, account, strategy, window, z_score_threshold, fixed_sl,
-                        arm_sell_pct, take_profit, trail_buy_pct, trail_sell_pct, entry_timing,
-                        max_hold_hours, added_at, drought_overlay_enabled, drought_vol_gate,
-                        drought_confirm_days, addon_enabled, force_same_day_block
-                 FROM watch_list WHERE state='live'""")
+    placeholders = ",".join("?" * len(states))
+    c.execute(f"""SELECT id, ticker, account, strategy, window, z_score_threshold, fixed_sl,
+                         arm_sell_pct, take_profit, trail_buy_pct, trail_sell_pct, entry_timing,
+                         max_hold_hours, added_at, drought_overlay_enabled, drought_vol_gate,
+                         drought_confirm_days, addon_enabled, force_same_day_block
+                  FROM watch_list WHERE state IN ({placeholders})""", states)
     nodes = [dict(r) for r in c.fetchall()]
     for n in nodes:
         n["z"] = n["z_score_threshold"]
@@ -53,6 +61,11 @@ def load_live_nodes(conn):
 
 
 def trigger_and_price(node):
+    """current price + real entry trigger, computed the SAME way signals_compute.compute_buy_signal
+    does it -- df_daily sliced to STRICTLY BEFORE today before computing indicators (2026-08-13
+    fix: the original version resampled the full frame including today's own in-progress bar,
+    which inflates/deflates SMA/Std with a partial day's data -- confirmed on real SOXL data to
+    diverge from production by ~1.5%, found by paired review)."""
     t = node["ticker"]
     df = pd.read_csv(CACHE_DIR / f"{t}_1h.csv", index_col=0, parse_dates=True)
     close_col = "Adj Close" if "Adj Close" in df.columns else "Close"
@@ -60,9 +73,11 @@ def trigger_and_price(node):
         df["Close"] = df[close_col]
     current = df["Close"].iloc[-1]
     df_daily = df.resample("D").last().dropna(subset=["Close"])
+    today = pd.Timestamp.now().normalize()
+    df_daily_prior = df_daily[df_daily.index < today]
     strat_cls = getattr(strategies, node["strategy"])
     strat = strat_cls(window=node["window"], z_score_threshold=node["z_score_threshold"])
-    ind = strat.generate_daily_indicators(df_daily)
+    ind = strat.generate_daily_indicators(df_daily_prior)
     ind = ind.dropna()
     if ind.empty:
         return current, None, None
@@ -177,9 +192,8 @@ def print_table(conn, nodes, title):
 
 def main():
     conn = sqlite3.connect(DB_PATH)
-    nodes = load_live_nodes(conn)
-    other = [n for n in nodes if n["account"] in OTHER_ACCOUNTS]
-    soxl_ira = [n for n in nodes if n["account"] in SOXL_IRA_ACCOUNTS]
+    other = [n for n in load_nodes(conn, ["live"]) if n["account"] in OTHER_ACCOUNTS]
+    soxl_ira = [n for n in load_nodes(conn, ["live", "dry_run"]) if n["account"] in SOXL_IRA_ACCOUNTS]
     print_table(conn, other, "Brokerage / Roth / IRA (real capital)")
     print_table(conn, soxl_ira, "soxl_ira (staged tests + proving-ground)")
     conn.close()

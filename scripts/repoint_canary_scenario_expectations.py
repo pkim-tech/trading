@@ -1,11 +1,26 @@
-"""Repoints the 13 active canary-letter scenario_expectations rows (previously spread across
-11 tickers: DIA/FAZ(old)/IVV/IWM/JDST/QID/QQQ/SDOW/SPXU/TWM/XLF) onto the 12 new FAS/FAZ nodes
-built by scripts/build_fas_faz_canary_nodes.py (2026-08-13). Deactivates the old rows (doesn't
-delete -- matches project's pause-not-delete convention) and adds new rows for FAS+FAZ per
-scenario, preserving each scenario's real check_params/expected_frequency exactly as they were.
+"""Adds scenario_expectations rows for the 12 new FAS/FAZ nodes built by
+scripts/build_fas_faz_canary_nodes.py (2026-08-13), alongside (not replacing) the 13 existing
+rows for the old 11-ticker canary design (DIA/FAZ(old)/IVV/IWM/JDST/QID/QQQ/SDOW/SPXU/TWM/XLF).
 
-canary_bull_bear_pair is redefined (user-confirmed 2026-08-13) to point at the same FAS/FAZ
-time-exit node pair, rather than JNUG/JDST -- it now checks FAS-vs-FAZ's own inverse behavior.
+2026-08-13, paired-review fix: an earlier version of this script deactivated the 13 old rows
+(active=0), which directly contradicted build_fas_faz_canary_nodes.py's own stated plan ("old
+11-ticker nodes ... keep running in parallel until the new FAS/FAZ nodes have organically
+fired and been confirmed correct") -- deactivating their scenario_expectations meant the old
+nodes got ZERO daily checking during exactly the window they're meant to serve as the
+fallback/comparison. Now both old and new rows stay active=1 simultaneously. This is only
+safe because of a second same-day fix: coverage_check.py's trade_lifecycle lookups now
+disambiguate by wl_id (node_id), not just strategy/version/window/account -- without that
+fix, having 5 same-shaped FAS canary nodes AND the old rows all active at once would let
+scenarios cross-satisfy/cross-fail each other even worse than the single-side version did.
+
+canary_bull_bear_pair is repointed (user-confirmed 2026-08-13) onto the same FAS/FAZ node pair
+as canary_time_exit, rather than JNUG/JDST. CAVEAT (paired review, same day): this does NOT
+implement a real FAS-vs-FAZ inverse-price check -- it's the identical trade_lifecycle
+exit-reason check as canary_time_exit on the same node, so expected_frequency is set to
+'informational' here too (was 'daily', carried over verbatim from the old JNUG/JDST rows --
+wrong on the new shared node, since 'daily' would mint a false ticket on any day the node
+doesn't complete a same-day round trip, the exact case 'informational' exists to allow).
+A real pairwise check is unbuilt; see docs/backlog_cache.md.
 
 Run once, after build_fas_faz_canary_nodes.py: .venv/bin/python scripts/repoint_canary_scenario_expectations.py
 """
@@ -15,9 +30,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import signals_db as db
 
-# Old active scenario_expectations rows (id, scenario_key) to deactivate.
-OLD_IDS = [7, 8, 9, 10, 11, 12, 29, 30, 31, 32, 34, 35, 36]
-
 # (scenario_key, expected_frequency, check_params, [FAS wl_id, FAZ wl_id])
 NEW_ROWS = [
     ('canary_full_lifecycle', 'daily', {"expect_exit_reason": ["TRAIL"]}, [212, 213]),
@@ -26,7 +38,7 @@ NEW_ROWS = [
     ('canary_overnight_carry', 'daily', {"expect_pending_carryover": True}, [216, 217]),
     ('canary_market_buy_exit', 'daily', {"expect_exit_reason": ["SL", "TIME", "TRAIL"]}, [218, 219]),
     ('canary_time_exit', 'informational', {"expect_exit_reason": ["TIME"]}, [220, 221]),
-    ('canary_bull_bear_pair', 'daily', {"expect_exit_reason": ["SL", "TIME", "TRAIL"]}, [220, 221]),
+    ('canary_bull_bear_pair', 'informational', {"expect_exit_reason": ["SL", "TIME", "TRAIL"]}, [220, 221]),
 ]
 
 TICKER_BY_WLID = {212: 'FAS', 213: 'FAZ', 214: 'FAS', 215: 'FAZ', 216: 'FAS', 217: 'FAZ',
@@ -35,11 +47,12 @@ TICKER_BY_WLID = {212: 'FAS', 213: 'FAZ', 214: 'FAS', 215: 'FAZ', 216: 'FAS', 21
 import json
 
 with db._conn() as c:
-    for old_id in OLD_IDS:
-        c.execute("UPDATE scenario_expectations SET active=0, updated_at=datetime('now') WHERE id=?",
-                   (old_id,))
+    reactivated = c.execute(
+        "UPDATE scenario_expectations SET active=1, updated_at=datetime('now') "
+        "WHERE id IN (7,8,9,10,11,12,29,30,31,32,34,35,36) AND active=0"
+    ).rowcount
     c.commit()
-print(f"Deactivated {len(OLD_IDS)} old scenario_expectations rows.")
+print(f"Reactivated {reactivated} old scenario_expectations row(s) (now running in parallel with the new FAS/FAZ rows).")
 
 for scenario_key, freq, check_params, wl_ids in NEW_ROWS:
     for wl_id in wl_ids:

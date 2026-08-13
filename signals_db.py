@@ -2701,7 +2701,7 @@ def get_active_snoozes(scenario_key=None):
 
 
 def get_closed_trades_for_ticker_on_date(ticker, check_date, strategy=None, version=None,
-                                          window=None, account=None):
+                                          window=None, account=None, wl_id=None):
     """trade_log rows that both entered and exited on check_date (YYYY-MM-DD) --
     the 'same-day full lifecycle' shape coverage_check.py's trade_lifecycle
     check needs. Newest first. Ticker alone is ambiguous when a ticker has more
@@ -2709,7 +2709,20 @@ def get_closed_trades_for_ticker_on_date(ticker, check_date, strategy=None, vers
     accounts/versions on the same active watchlist) -- pass the node's
     disambiguators (from get_watch_list_node) to scope correctly, or a wrong
     node's trade can satisfy a different node's expectation (found by Opus
-    review, 2026-07-24)."""
+    review, 2026-07-24).
+
+    wl_id (2026-08-13): the strategy/version/window/account tuple stopped being
+    a unique disambiguator once the FAS/FAZ canary consolidation put multiple
+    distinct scenario nodes on the same ticker+strategy+version+window+account
+    (found by paired review of that same change) -- pass wl_id when available
+    for an exact match instead of relying on the tuple alone. Matches `wl_id = ?
+    OR wl_id IS NULL` (not a strict equality), mirroring open_position()'s own
+    dedup pattern -- a legacy/pre-wl_id-migration trade_log row (wl_id NULL)
+    must still be matchable via the other disambiguators, or this would
+    silently stop finding real historical trades instead of just tightening
+    the ambiguous case. Real rows created going forward always have wl_id set
+    (log_trade_entry threads it through), so this fallback only ever engages
+    for genuinely legacy data."""
     # exit_reason='RESTAGED' (scripts/restage_canary_nodes.py, 2026-08-08) is a
     # maintenance close, not a real market-driven outcome -- excluded here so a
     # same-day entry that gets restaged that evening can't be picked up as
@@ -2731,13 +2744,16 @@ def get_closed_trades_for_ticker_on_date(ticker, check_date, strategy=None, vers
     if account:
         q += " AND account = ?"
         params.append(account)
+    if wl_id is not None:
+        q += " AND (wl_id = ? OR wl_id IS NULL)"
+        params.append(wl_id)
     q += " ORDER BY id DESC"
     with _conn() as c:
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
 def get_open_positions_for_ticker_on_date(ticker, check_date, strategy=None, version=None,
-                                           window=None, account=None):
+                                           window=None, account=None, wl_id=None):
     """open_positions rows entered on or before check_date and still open --
     the third real state (pending -> open -> closed) coverage_check.py's
     trade_lifecycle carryover check was missing until 2026-08-10 (SDOW's
@@ -2758,7 +2774,8 @@ def get_open_positions_for_ticker_on_date(ticker, check_date, strategy=None, ver
     presence in the table means currently open by construction
     (close_position deletes the row and writes trade_log instead), so no
     exit_time filter is needed the way the closed-trades sibling needs one.
-    Scoped the same way as its two siblings above."""
+    Scoped the same way as its two siblings above. wl_id (2026-08-13): see
+    get_closed_trades_for_ticker_on_date's docstring -- same additive fix."""
     q = "SELECT * FROM open_positions WHERE ticker = ? AND date(entry_time) <= ?"
     params = [ticker, check_date]
     if strategy:
@@ -2773,17 +2790,22 @@ def get_open_positions_for_ticker_on_date(ticker, check_date, strategy=None, ver
     if account:
         q += " AND account = ?"
         params.append(account)
+    if wl_id is not None:
+        q += " AND (wl_id = ? OR wl_id IS NULL)"
+        params.append(wl_id)
     q += " ORDER BY id DESC"
     with _conn() as c:
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
 def get_pending_buys_for_ticker_on_date(ticker, check_date, strategy=None, version=None,
-                                         window=None, account=None):
+                                         window=None, account=None, wl_id=None):
     """See get_closed_trades_for_ticker_on_date for why ticker alone is
     ambiguous. pending_buys has no real strategy/version/window/account
     columns (they live inside node_json), so disambiguation is a Python-side
-    filter after the ticker/date SQL match, not a SQL WHERE clause.
+    filter after the ticker/date SQL match, not a SQL WHERE clause. wl_id IS
+    a real column, though (2026-08-13, same fix as the two sibling functions)
+    -- filtered in SQL directly, ANDed with whatever else is passed.
 
     signal_time <= check_date (not ==): a pending_buys row is deleted the
     moment it resolves (clear_pending_buy*), so any row still present as of
@@ -2792,11 +2814,14 @@ def get_pending_buys_for_ticker_on_date(ticker, check_date, strategy=None, versi
     specifically one whose signal_time is a PRIOR day. An exact-date match
     produced a false "no pending_buys row" for every such scenario once the
     order aged past its signal day (found 2026-08-04)."""
+    q = "SELECT * FROM pending_buys WHERE ticker = ? AND date(signal_time) <= ?"
+    params = [ticker, check_date]
+    if wl_id is not None:
+        q += " AND (wl_id = ? OR wl_id IS NULL)"
+        params.append(wl_id)
+    q += " ORDER BY id DESC"
     with _conn() as c:
-        rows = [dict(r) for r in c.execute("""
-            SELECT * FROM pending_buys WHERE ticker = ? AND date(signal_time) <= ?
-            ORDER BY id DESC
-        """, (ticker, check_date)).fetchall()]
+        rows = [dict(r) for r in c.execute(q, params).fetchall()]
     for r in rows:
         r['node'] = json.loads(r['node_json'])
     if not any([strategy, version, window is not None, account]):

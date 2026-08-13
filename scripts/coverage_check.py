@@ -125,8 +125,14 @@ def _check_trade_lifecycle(scenario, check_date):
         # with no signal that it happened. Surface it instead.
         print(f"  ! {scenario['scenario_key']:26s} {ticker or '':6s} node_id={node_id} no longer "
               f"resolves -- falling back to ticker-only scoping (ambiguous if ticker has >1 node)")
+    # wl_id (2026-08-13): the strategy/version/window/account tuple alone stopped
+    # being unique once the FAS/FAZ canary consolidation put multiple distinct
+    # scenario nodes on the same ticker+strategy+version+window+account (found
+    # by paired review of that same change) -- pass node_id through as an exact
+    # disambiguator wherever a real node resolved, not just the tuple.
     disambig = dict(strategy=node.get('strategy'), version=node.get('version'),
-                     window=node.get('window'), account=node.get('account')) if node else {}
+                     window=node.get('window'), account=node.get('account'),
+                     wl_id=node_id) if node else {}
 
     if params.get('expect_pending_carryover'):
         pending = db.get_pending_buys_for_ticker_on_date(ticker, check_date, **disambig)
