@@ -268,6 +268,150 @@ def nearest_split_factor(ratio):
     return min(candidates, key=lambda r: abs(ratio - r))
 
 
+def get_real_splits(ticker):
+    """Fetches yfinance's authoritative corporate-actions split history for
+    `ticker` (tz-naive index) -- the same call scripts/check_stock_splits.py
+    uses. Returns an empty pd.Series on any fetch failure (never raises),
+    so a network hiccup fails toward "no corrections applied" rather than
+    silently trusting the price-only heuristic alone."""
+    import pandas as pd
+    import yfinance as yf
+    try:
+        splits = yf.Ticker(ticker).splits
+        if not splits.empty:
+            splits.index = splits.index.tz_localize(None)
+        return splits
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def detect_one_bar_split_artifacts(df, splits, tolerance=0.03, recovery_tolerance=0.15,
+                                    split_date_tolerance_days=1):
+    """Scans an OHLC dataframe (needs a Close column, sorted ascending by a
+    datetime index) for a single-bar split-day artifact: one bar's Close
+    diverges from the PRIOR bar's Close by a clean split-like ratio, the
+    NEXT bar's Close is back near the prior bar's scale (generous tolerance
+    -- this only needs to distinguish "recovered" from "stayed crashed", not
+    pin an exact number; ordinary bar-to-bar drift plus the fact real corp-
+    action recovery bars aren't perfectly clean multiples means a tight
+    match on the recovery leg misses real hits, found 2026-08-13 on
+    ARMH/CRDU), AND a REAL corporate action is on file within
+    `split_date_tolerance_days` of the bar with a matching ratio.
+
+    `splits` -- a pd.Series indexed by real split-effective date -> ratio,
+    e.g. from get_real_splits(ticker) (production) or a hand-built fixture
+    (tests). Required, not optional: pass an empty pd.Series() to disable
+    all detection (e.g. if the real-split lookup itself failed) rather than
+    falling back to the price-only heuristic. This gate is load-bearing, not
+    a nice-to-have -- paired Opus review (2026-08-13) confirmed that without
+    it, a genuine large one-bar move that happens to land near a clean ratio
+    and mostly reverts next bar (exactly LCDL's shape, deliberately left
+    un-"fixed" -- see docs/research_log.md's 2026-08-13 entry) would be
+    silently rescaled by the heuristic alone; a plain bad-tick spike
+    (verified repro: 10.0 -> 15.1 -> 10.05) also false-positives on the
+    ratio+recovery check by itself.
+
+    This is the signature of yfinance serving a partially-adjusted print for
+    exactly the split-effective bar -- distinct from the whole-history
+    rescale in data_manager.py's incremental-fetch path (which fires on a
+    stale-cache-vs-fresh-fetch mismatch across many overlap bars); this
+    fires on a single already-fetched dataframe, including the very first
+    bootstrap pull, which the incremental path never covers at all. Found
+    2026-08-13: 11 of 12 tickers flagged by scripts/scan_bad_ticks.py as
+    unexplained "bad ticks" were actually this, confirmed against real
+    corporate-action dates (RXL, IHF/IYH/IHE, STHH/ASMH/ARMH, LTL, BFOR,
+    CRDU, UPW).
+
+    Known remaining limitation: the first and last bar of `df` are never
+    scanned (both neighbors are required) -- low-severity since an
+    uncorrected edge-bar artifact is no worse than the pre-fix status quo,
+    just not newly caught by this function.
+
+    Detection only -- doesn't mutate df. Returns a list of (timestamp,
+    factor) hits, factor = prior_close / bar_close (the real yfinance split
+    ratio, not the raw price ratio -- see fix_one_bar_split_artifacts)."""
+    import math
+    import pandas as pd
+    hits = []
+    if splits is None or len(splits) == 0:
+        return hits
+    idx = df.index
+    for i in range(1, len(df) - 1):
+        prev_close = df["Close"].iloc[i - 1]
+        bar_close = df["Close"].iloc[i]
+        next_close = df["Close"].iloc[i + 1]
+        if not (math.isfinite(prev_close) and prev_close > 0
+                and math.isfinite(bar_close) and bar_close > 0
+                and math.isfinite(next_close) and next_close > 0):
+            continue
+        ratio_to_prev = detect_price_discontinuity(bar_close, prev_close, tolerance=tolerance)
+        if ratio_to_prev is None:
+            continue
+        if abs(next_close - prev_close) / prev_close > recovery_tolerance:
+            continue
+        bar_date = idx[i]
+        real_ratio = None
+        for split_date, split_ratio in splits.items():
+            days_off = abs((pd.Timestamp(split_date).normalize()
+                             - pd.Timestamp(bar_date).normalize()).days)
+            if days_off <= split_date_tolerance_days and split_ratio > 0:
+                # yfinance's split_ratio is shares-multiplier (2.0 for a 2:1
+                # forward split); a forward split raises share count and
+                # lowers price, matching our price-fall ratio_to_prev directly.
+                if abs(split_ratio - ratio_to_prev) / split_ratio < tolerance * 3:
+                    real_ratio = split_ratio
+                    break
+        if real_ratio is None:
+            continue
+        hits.append((idx[i], real_ratio))
+    return hits
+
+
+def fix_one_bar_split_artifacts(df, splits, tolerance=0.03, recovery_tolerance=0.15,
+                                 split_date_tolerance_days=1):
+    """Applies detect_one_bar_split_artifacts and corrects each hit.
+
+    Correction strategy (redesigned 2026-08-13 after paired Opus review
+    found the original per-field proportional-rescale approach could turn a
+    genuinely volatile-but-valid bar internally inconsistent -- e.g. a real
+    Low legitimately far below the prior Close got inflated past the bar's
+    own High, verified repro: prev_close=100, bar O=100/H=101/L=60/C=50
+    became O=100/H=101/L=120/C=100, Low>High): rather than guessing which
+    individual OHLC fields are on which scale, this FLATTENS the whole
+    flagged bar to a single verified-trustworthy anchor price -- if the
+    bar's own Open is already on the same scale as the prior bar's Close
+    (the "close-only" artifact shape: RXL/IHF/IYH/IHE/STHH/ASMH/ARMH/LTL/
+    BFOR/CRDU), the anchor is that Open; if Open itself is also off-scale
+    (the "whole-bar" shape: UPW), the anchor is the prior bar's Close
+    instead. Either way the result (O=H=L=C=anchor) is trivially internally
+    consistent by construction and never fabricates a price nothing in the
+    original data or the real split record supports -- a strictly more
+    conservative choice than trying to preserve a (partially unverifiable)
+    intrabar range.
+
+    Returns (corrected_df, fixes) -- fixes is a list of dicts (ts, factor,
+    old_close, new_close) suitable for db_cache.log_data_mutation. Does not
+    mutate the input df in place."""
+    hits = detect_one_bar_split_artifacts(df, splits, tolerance, recovery_tolerance,
+                                           split_date_tolerance_days)
+    df = df.copy()
+    fixes = []
+    price_cols = [c for c in ("Open", "High", "Low", "Close") if c in df.columns]
+    for ts, factor in hits:
+        pos = df.index.get_loc(ts)
+        prev_close = float(df["Close"].iloc[pos - 1])
+        old_close = float(df.loc[ts, "Close"])
+        bar_open = float(df.loc[ts, "Open"]) if "Open" in df.columns else None
+        if bar_open is not None and prev_close and abs(bar_open - prev_close) / prev_close <= tolerance:
+            anchor = bar_open
+        else:
+            anchor = prev_close
+        for col in price_cols:
+            df.loc[ts, col] = anchor
+        fixes.append({"ts": ts, "factor": factor, "old_close": old_close, "new_close": anchor})
+    return df, fixes
+
+
 def _proximity_emoji(pct_away):
     if pct_away < 5:
         return "🔶"

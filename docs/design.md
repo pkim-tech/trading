@@ -1995,3 +1995,43 @@ A 4-way paired review (independent-cold Opus + contextual Opus + Sonnet + Fable)
 Separately, `force_same_day_block` (live on JNUG/brokerage since 2026-08-11, per the real same_day_block finding that JNUG is the one ticker it helps) had zero visibility anywhere — not in `watchlist_status.py`, not tracked by `seed_baseline_config.py`'s daily config-drift check. Added to both: `seed_baseline_config.py`'s `FIELDS` (not yet applied to existing `baseline_config` rows — needs `--merge-new-fields`, user runs) and `watchlist_status.py`'s `Ovl` column (`D`/`A`/`S` for drought/addon/same-day-block).
 
 Verification: full suite 831/831 throughout (825 baseline + 6 new gate-pinning tests). Full detail: `docs/deep_backlog.md`'s 2026-08-13 (night) "finish Slack cleanup" entry.
+
+## Split-guard extended to a single-bar, real-corp-action-gated artifact fix (2026-08-13, research pass)
+
+`data_manager.py`'s existing split-guard (2026-07-15, see `docs/research_log.md`'s 2026-07-22 entry)
+only catches a split by comparing a fresh incremental re-fetch against the local cache — an
+overlap-ratio check that fires when many overlapping bars all show the same consistent scale
+mismatch. It structurally can't catch a split-effective bar whose partially-adjusted print lands
+entirely inside a *single* already-fetched pull (the bootstrap 730-day download, or an incremental
+delta before it's ever compared against a prior cache) — found via `scripts/scan_bad_ticks.py`'s
+existing 12 unexplained hits, 11 of which turned out to be real, confirmed corporate-action splits
+(RXL, IHF/IYH/IHE, STHH/ASMH/ARMH, LTL, BFOR, CRDU, UPW) sitting uncorrected because of exactly this
+gap — `data_mutation_log` had zero rows for any of them.
+
+New `signals_helpers.get_real_splits`/`detect_one_bar_split_artifacts`/`fix_one_bar_split_artifacts`:
+scans for a bar whose Close diverges from the prior bar's Close by a clean split ratio with the next
+bar recovering nearby, but — critically — only corrects it when a REAL split is on file
+(`yf.Ticker(ticker).splits`, the same authoritative source `scripts/check_stock_splits.py` already
+used) within 1 day at a matching ratio. Correction flattens the whole flagged bar to a single
+verified-trustworthy anchor (the bar's own Open if already on-scale, else the prior bar's Close)
+rather than rescaling individual OHLC fields, guaranteeing internal consistency by construction.
+Wired into both of `data_manager.py`'s bootstrap and incremental-fetch paths via a shared
+`_apply_split_artifact_fix` helper, so a *future* split on an already-cached ticker is covered too,
+not just first-time bootstraps.
+
+**Session-wrap's mandatory paired Opus review (independent-cold + contextual, since this touched
+`signals_helpers.py`) caught real bugs in the first version before it was committed**: no real-split
+cross-check at all (fired on the price heuristic alone, which both reviewers showed would false-
+positive on a genuine large move — exactly LCDL's own shape, deliberately left un-"fixed" and
+disqualified instead — and on a plain bad-tick spike); wired only into the bootstrap path, leaving
+every already-cached ticker's future splits uncaught; a per-field proportional-rescale correction
+that could produce an internally inconsistent bar (verified repro: Low > High on a genuinely
+volatile-but-valid bar); a NaN next-bar Close silently bypassing the recovery-check guard. Full
+rebuttal exchange between both reviewers confirmed every finding with no contradictions. Redesigned
+per the above before committing; 13 tests (`tests/test_one_bar_split_artifacts.py`) now pin explicit
+regressions for each confirmed bug. All 11 tickers' cached data re-corrected from a pre-fix backup
+using the corrected function, now directly confirmed against real split records (UPW's was only
+"near-certain" via web search before). `scan_bad_ticks.py` clean on all 11 post-fix.
+
+Left flagged, not fixed this session (out of scope for this diff, pre-existing): Step 3's own
+overlap-guard hardcodes `consistent=True` when exactly one bar overlaps — see `docs/backlog_cache.md`.

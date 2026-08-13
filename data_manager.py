@@ -6,12 +6,35 @@ import yfinance as yf
 from pathlib import Path
 from datetime import datetime
 
-from signals_helpers import detect_price_discontinuity
+from signals_helpers import detect_price_discontinuity, fix_one_bar_split_artifacts, get_real_splits
 import db_cache
 
 # Create a local directory named 'cache' to store data files
 CACHE_DIR = Path("./cache/research")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _apply_split_artifact_fix(ticker, df):
+    """Shared by both the bootstrap (Step 1) and incremental (Step 3) paths
+    -- see signals_helpers.fix_one_bar_split_artifacts's docstring for the
+    full design/history. Fetches the real split record fresh each call
+    (cheap relative to the yf.download this always runs alongside); an empty
+    result (fetch failure or genuinely no splits on file) means zero
+    corrections are applied, never a fallback to the price-heuristic alone."""
+    splits = get_real_splits(ticker)
+    pre_fix_df = df
+    df, fixes = fix_one_bar_split_artifacts(df, splits)
+    for fix in fixes:
+        print(f"⚠️ Corrected one-bar split artifact for {ticker} at {fix['ts']} "
+              f"(factor={fix['factor']:.2f}, Close {fix['old_close']:.4f} -> {fix['new_close']:.4f})")
+        try:
+            db_cache.log_data_mutation(
+                ticker, float(fix['factor']), str(fix['ts']), fix['old_close'], fix['new_close'],
+                "one-bar split-artifact fix (real-split-confirmed)", pre_fix_df,
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to log data mutation for {ticker} (proceeding anyway): {e}")
+    return df
 
 def generate_synthetic_data(days=60, points_per_day=7, base_price=150.0):
     """
@@ -59,7 +82,22 @@ def fetch_live_data_smart(ticker):
             # Explicitly force datetime index and remove timezone info for uniform storage
             df_new.index = pd.to_datetime(df_new.index).tz_localize(None)
             df_new.index.name = "Datetime"
-                
+
+            # Same-pull split-artifact guard (2026-08-13): the incremental-
+            # fetch split-guard below only fires on a stale-cache-vs-fresh-
+            # fetch mismatch, so it never covers this initial bootstrap pull
+            # -- found live via 11 of 12 scripts/scan_bad_ticks.py "bad tick"
+            # hits, all real splits whose split-effective bar yfinance served
+            # partially-adjusted within this single 730-day pull. Gated on a
+            # REAL confirmed split (get_real_splits) -- see
+            # signals_helpers.fix_one_bar_split_artifacts's docstring for why
+            # the price-heuristic-only version (an earlier draft of this fix)
+            # was rejected by paired Opus review. Also applied in Step 3
+            # below (df_combined), since a NEW split on an already-cached
+            # ticker hits this same artifact shape and this bootstrap branch
+            # only ever runs once per ticker.
+            df_new = _apply_split_artifact_fix(ticker, df_new)
+
             df_new.to_csv(cache_path)
             print(f"💾 Initial 2-year history cached for {ticker}.")
             
@@ -185,6 +223,14 @@ def fetch_live_data_smart(ticker):
                                  f"triggered that): {sample}{' ...' if len(revised) > 5 else ''}")
         except Exception as e:
             logging.warning(f"{ticker}: revision-diff logging failed (proceeding with write anyway): {e}")
+
+        # 5c. Same-pull split-artifact guard (2026-08-13) -- see
+        # _apply_split_artifact_fix's docstring. Applied here (not just at
+        # bootstrap) since a NEW split on an already-cached ticker produces
+        # the identical single-bar artifact shape, and this incremental path
+        # is what every subsequent update after bootstrap actually runs
+        # through -- the far more common case going forward.
+        df_combined = _apply_split_artifact_fix(ticker, df_combined)
 
         # 6. Save to disk cleanly
         df_combined.index.name = "Datetime"
