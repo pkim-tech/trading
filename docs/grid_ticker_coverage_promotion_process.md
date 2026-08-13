@@ -9,6 +9,51 @@ alpha) — this process is about *test coverage*, not alpha or new mechanisms. F
 (late), captured after finding this needs to recur as the Grid grows (a concurrent session added
 6 new rows mid-cycle the same week).
 
+## Testing philosophy: evidence tiers and the two kinds of test plan
+
+Captured 2026-08-14 after finding the existing model (every scenario's test plan = a detuned
+ticker/node, canary or live) doesn't fit a real class of Grid rows: `schwab_safety.check_order`'s
+guard-*rejection* paths (`unknown_account_block`, `hard_order_ceiling_block`,
+`buy_signal_window_block`, etc.). No steady-state node config produces these from ordinary
+trading — a well-behaved node, by design, should never trip them. Forcing one to happen is a
+different kind of test plan than detuning a ticker's exit parameters.
+
+**Evidence tiers, highest to lowest** (see `scripts/coverage_proof_matrix.py`'s module docstring
+for the authoritative definitions): LIVE (real capital produced it) > CANARY (a real
+`coverage_events` row with `mode='dry_run'` exists, from *any* source) > PAPER > SIMULATOR (a
+`tests/test_fake_broker_*.py` test proves the code, zero real firing) > UNIT-TEST (plain mock,
+no fake broker) > NONE. Always prefer the highest tier reachable — canary before live before
+simulation — but the ceiling for a given row is capped by which test-plan kind actually applies
+to it, not by ambition.
+
+**Test-plan kind 1 — ticker-based (the default, existing model).** A `watch_list` node, detuned
+in canary (dry_run) or live, sits in the normal poll loop and organically trips the scenario as
+part of ordinary signal-driven trading. Tracked by `scripts/coverage_designated_tester.py`. Use
+this whenever the scenario is something a real ticker's price action can produce (an SL exit, an
+add-on trigger, a drought entry).
+
+**Test-plan kind 2 — script-based (new, for guard-rejection rows).** A named script deliberately
+calls `schwab_safety.check_order`/`approve_and_record` once, on demand, against a real dry_run
+account with an out-of-bounds parameter (oversized notional, off-hours timestamp, wrong account) —
+no node involved, no waiting. This still lands at CANARY tier on the proof matrix (the tier check
+only cares that a real `mode='dry_run'` event was logged, not whether a node or a script produced
+it) — it's a different mechanism for reaching the same tier, not a lesser one. `scripts/
+coverage_designated_tester.py` doesn't track this kind yet (only node-based testers) — a
+script-owned row currently misreports as `-- none designated --`, which reads as an unowned gap
+even when it isn't. Extending the tracker to record a script-based test plan is backlogged (see
+`docs/backlog_cache.md`), not yet built.
+
+**When SIMULATOR is the accepted ceiling, not a gap.** Some rows genuinely aren't worth forcing to
+CANARY even via a script — same shape as the existing `not-prod-required` rows in
+`scripts/coverage_registry.py`. Accept SIMULATOR as final when the cost of forcing evidence
+exceeds the value of the extra tier: e.g. `unknown_account_block` (only provable by deliberately
+calling code wrong — proves the guard exists, nothing about real state), `global_burst_cap_block`
+(forcing it means 12 real orders across all accounts within 60s, which would throttle actual
+concurrent order placement during the test window), `account_disabled_block` (disabling an
+account blocks every node on it, including real live ones sharing that account). This is a
+judgment call, not a formula — mark it explicitly (a `structural_note`/`not-prod-required` entry
+in the registry, with the reason), don't just leave it silently unaddressed.
+
 ## When to run this
 Whenever `scripts/coverage_harness_breakdown.py` reports `unclassified` rows (the Grid grew since
 `BEST_HARNESS` was last updated), or when a backlog review flags a `wired-never-fired` live-side
