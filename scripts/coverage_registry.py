@@ -495,7 +495,13 @@ REGISTRY = [
                "user's actual interaction pattern is kill-switch-only (rarely/never uses per-position "
                "Slack buttons for routine open/close) -- so this race is unlikely to occur in practice "
                "regardless of proof status. Still real, still worth fixing if it's ever cheap to do, "
-               "just not worth flagging in routine coverage reviews going forward."),
+               "just not worth flagging in routine coverage reviews going forward.",
+         not_prod_required_note="User's call, 2026-08-13 (see notes): only 'skipped_duplicate' would "
+                                 "be real evidence of the lock resolving genuine contention, and that "
+                                 "requires the poll loop and a Slack button racing the same position -- "
+                                 "unlikely given kill-switch-only usage. Fires constantly (acquired/"
+                                 "closed on every normal call) but can structurally never look 'good' "
+                                 "under that bar, so it's demoted rather than left permanently red."),
     dict(id='dup_order_retry_after_failure',
          scenario="Duplicate-order retry after a real rejected/failed order isn't wrongly blocked",
          code_path="schwab_safety._broker_confirms_order",
@@ -1488,6 +1494,15 @@ def compute_status(row):
         m = by_mode[mode]
         if m['good_n'] > 0:
             return label, f"{m['n']}x {mode}, last {m['last_ts']}"
+        # A genuine good outcome always wins (organic proof is never suppressed) --
+        # but a row that fires constantly and can structurally never look good
+        # (e.g. position_lock: only real lock contention counts as evidence, and
+        # that's unlikely given actual usage) would otherwise sit in *-attempt-failed
+        # forever despite already being a deliberate, human-reviewed demotion. Found
+        # 2026-08-14: the not_prod_required_note check below was unreachable for any
+        # row with real event history, only ever applying to zero-event rows.
+        if row.get('not_prod_required_note'):
+            return 'not-prod-required', row['not_prod_required_note']
         return ('live-attempt-failed' if mode == 'live' else f'{mode}-attempt-failed',
                 f"{m['n']}x {mode}, all bad_results ({bad_results}), last {m['last_ts']} -- "
                 f"fired for real but never with a good outcome")
