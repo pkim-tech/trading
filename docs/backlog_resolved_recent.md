@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][testing] Resolved 2026-08-14 (evening) — built `scripts/verify_real_trades_vs_kernel.py`, the actual "trades must equal backtest" North Star instrument; fixed 2 real bugs in the existing tooling along the way. Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved 2026-08-13 (evening) — GDXU's stale "never reswept to v5.1" backlog item confirmed stale: direct DB check found real, COMPLETE v5.1 sweep_runs (both strategies, commit `bd8e35c`, 04:10-05:51 ET) already on file — same resweep pass that covered NUGT/SOXS. `candidate_full_review.py`'s `resolve_version()` auto-picks v5.1 per ticker (fixed 2026-08-12), so its `REAL_SELECTION` verdict already reflects current data with no further action needed. Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved 2026-08-13 (evening) — DFEN reswept to v5.1 via a dedicated tranche 0 (liquidity_tranches campaign), confirmed real via `sweep_runs`; prune-validate flagged a real row-count drop on an unrelated JNUG group (1848→1176), investigated and confirmed a legitimate better-optimum find (not data loss/restart), independently cross-checked via `top_safe_nodes.py`, then swapped in cleanly (9,946,974 rows, integrity_check ok). Full detail: `deep_backlog.md`.

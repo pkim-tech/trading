@@ -26,11 +26,23 @@ script cannot report a clean MATCH — its value right now is catching *new, add
 divergence (e.g. via first-mismatch trade index/date moving in a run-to-run diff), not a
 binary pass/fail.
 
-v1.9/v1.10 (TrailingBuyZScoreBreakout/TrailingBothZScoreBreakout) are deliberately absent
-from compare() below: active_signals.py has no live entry implementation for the
-trailing-buy "wait for bounce" state machine yet (tracked as P0 #3), so comparing them here
-would just restate that known gap rather than test derived-input correctness. kernel_trades()
-still supports them so the wiring is ready once P0 #3 lands.
+v1.9/v1.10 (TrailingBuyZScoreBreakout/TrailingBothZScoreBreakout) are absent from compare()
+below for a different reason than this docstring used to say (corrected 2026-08-14 — the
+old text claimed "no live entry implementation yet," which is stale: the real live daemon
+has run TrailingBothZScoreBreakout's trailing-buy bounce-fill mechanic for months, it's the
+live default strategy). The real reason is structural to THIS harness: replay()'s loop calls
+compute_buy_signal once per bar and opens the position immediately on the same bar the signal
+fires — it has no equivalent of the real resting-order "wait for price to bounce above the
+running low" state machine (update_real_pending_buys_running_low/_reconcile_fill in
+signals_notify.py), which fills asynchronously over subsequent bars/ticks. kernel_trades()
+already gets this right for TrailingBoth (run_backtest_v110 simulates the bounce-fill
+natively) — it's specifically replay()'s side that would need a real multi-bar pending-buy
+loop built, not just a call added to compare(). Not done here: real, non-trivial work,
+tracked as its own backlog item. **For the actual "did a real live trade match what the
+backtest would have predicted" question, use scripts/verify_real_trades_vs_kernel.py
+instead** — it reads real trade_log rows directly (ground truth) rather than trying to
+replay live-orchestration functions against synthetic historical data, so it doesn't
+inherit this gap.
 
 Usage: .venv/bin/python scripts/verify_live_parity.py
 """
@@ -80,6 +92,12 @@ def replay(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_p
 
     uses_fixed_sl = strategies.uses_fixed_sl(strategy_name)
     node = {
+        # open_position() requires node['id'] for its dedup lookup (WHERE wl_id=?) --
+        # -1 is safe here since _throwaway_db() gives every replay() call a fresh,
+        # empty temp DB, so there's no real id to collide with (found 2026-08-14,
+        # this call was raising KeyError unconditionally -- the script had not
+        # actually run successfully in some time).
+        'id': -1,
         'ticker': ticker, 'strategy': strategy_name, 'version': 'test',
         'window': window, 'z_score_threshold': z_thresh,
         'take_profit': take_profit_pct, 'stop_loss': stop_loss_pct,

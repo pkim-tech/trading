@@ -24,9 +24,6 @@
 > any deferred item whose date has already passed, so it surfaces again instead of quietly
 > aging out. No separate section — stays in place, in normal open-items order.
 
-## [live-trading][testing] HIGH, found 2026-08-14 (Opus plan-challenge) — fragmented live-vs-backtest verification tooling doesn't answer "trades must equal backtest"; needs consolidation
-Full detail: `docs/deep_backlog.md`'s 2026-08-14 (evening) entry. `verify_live_parity.py`/`paper_vs_backtest_reconcile.py` each answer a narrow question, neither reads real `trade_log` against the actual live strategy — the real North Star question has no instrument yet.
-
 ## [portfolio] Idea, raised 2026-08-14 — if AGQ (or another strategy) succeeds, do we cycle out some TQQQ? Not modeled
 User's typed notes: a portfolio-rebalancing question, not yet modeled anywhere — if one strategy/ticker (e.g. AGQ) performs well, should capital be deliberately rotated out of an existing holding like TQQQ (held outside this system per `project_watchlist_selection_rationale` memory) into it, rather than TQQQ being a static, never-touched allocation. Distinct from the existing "TQQQ cleared for IRA trading" backlog item (that's about adding a new TQQQ node/candidacy; this is about rebalancing an existing position based on relative performance). Not scoped, not modeled, no script exists for this question.
 
