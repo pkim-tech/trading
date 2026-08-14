@@ -111,8 +111,12 @@ def test_sl_fill_with_no_exit_pending_closes_the_position(env, fake_broker):
     # never asserted the log_coverage_event call itself, so the event line
     # could be silently deleted and nothing here would catch it (found
     # 2026-08-13, fake_venue_proof_for scan).
+    # result is now 'closed_via_sl_order_poll' (was 'closed', identical to 2 sibling call
+    # sites sharing this scenario_key -- coverage_registry.py's bad_results couldn't
+    # actually distinguish them by detail text, so a sibling event was silently counting
+    # as this path's proof; fixed 2026-08-14, Opus audit).
     events = signals_db.get_coverage_events(scenario_key='automated_exit_confirmed')
-    matches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'closed'
+    matches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'closed_via_sl_order_poll'
                and 'via_sl_order_poll=1' in (e['detail'] or '')]
     assert len(matches) == 1
 

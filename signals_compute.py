@@ -5,7 +5,7 @@ SMA/Std indicator cache), and sell-condition checking.
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import pandas as pd
 import yfinance as yf
@@ -14,9 +14,15 @@ import strategies
 import signals_config as cfg
 import signals_db as db
 from signals_helpers import (
-    detect_price_discontinuity, nearest_split_factor,
-    already_alerted_corp_action, mark_corp_action_alerted, log_poll,
+    detect_price_discontinuity, nearest_split_factor, real_split_confirmed_since,
+    already_alerted_corp_action, mark_corp_action_alerted, log_poll, coverage_mode,
 )
+
+# (ticker, date-str) pairs already logged as price_discontinuity_ruled_out today -- see
+# check_sell_condition's dedup comment. In-memory only (resets on daemon restart), unlike
+# the persistent corp-action alert state -- acceptable here since this is a low-stakes
+# observability event, not a human-facing alert that must never re-fire.
+_ruled_out_logged_today = set()
 from signals_blocks import _post_message
 
 
@@ -292,37 +298,65 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
     discontinuity = detect_price_discontinuity(current_price, pos['entry_price'])
     if discontinuity:
         ticker = pos['ticker']
-        print(f"⚠️ Possible corporate action for {ticker}: entry_price={pos['entry_price']:.4f} "
-              f"current={current_price:.4f} ratio={discontinuity:.2f} -- freezing SL/arm checks")
-        # Paper positions skip the interactive alert -- "Apply Correction"'s handler
-        # assumes a real open_positions id, and this is scoring infrastructure, not
-        # real capital, so a plain freeze (no self-heal button) is an acceptable gap.
-        if not paper and not already_alerted_corp_action(ticker):
-            factor = nearest_split_factor(discontinuity)
-            proposed_entry = pos['entry_price'] / factor
-            value = json.dumps({"position_id": pos['id'], "ticker": ticker, "proposed_entry_price": proposed_entry})
-            _post_message(
-                f"⚠️ Possible corporate action — {ticker}",
-                blocks=[
-                    {"type": "section", "text": {"type": "mrkdwn", "text": (
-                        f"⚠️ *{ticker}* — possible corporate action (ratio≈{discontinuity:.2f}, "
-                        f"nearest factor {factor}).\n"
-                        f"Recorded entry: `${pos['entry_price']:.4f}`  |  Current: `${current_price:.4f}`\n"
-                        f"Proposed corrected entry: `${proposed_entry:.4f}`\n"
-                        f"SL/arm checks are frozen for this ticker until corrected."
-                    )}},
-                    {"type": "actions", "elements": [
-                        {"type": "button", "text": {"type": "plain_text", "text": "Apply Correction"},
-                         "style": "primary", "action_id": "apply_corp_action_correction", "value": value},
-                    ]},
-                ],
-            )
-            mark_corp_action_alerted(ticker)
-        # entry_price is untrustworthy against an unadjusted corporate action --
-        # a real SL check here would be mechanically true regardless of actual
-        # performance (exactly the false-SL scenario found live with KORU
-        # 2026-07-15). No exit signal until a human confirms/re-bases the position.
-        return None, None, False
+        # Gated on a REAL confirmed split (2026-08-14), not the price-ratio heuristic
+        # alone -- found live on NUGT: an ordinary ~46% rally coincidentally matched a
+        # 1/1.5 split ratio within tolerance, freezing SL/TP/TIME protection right
+        # around the position's peak for no real reason. real_split_confirmed_since
+        # returns False (don't freeze) only when a split is genuinely ruled out;
+        # True (real split) or None (fetch failed, can't rule it out) both still
+        # freeze -- a false freeze is human-correctable, a false all-clear on a real
+        # split isn't.
+        entry_time = pos.get('entry_time') or pos.get('signal_time')
+        confirmed = real_split_confirmed_since(ticker, entry_time) if entry_time else None
+        if confirmed is False:
+            # Once per (ticker, today) -- the ratio can hold for the whole duration of a
+            # real rally (days/weeks), and this branch is reached every poll while it
+            # does; logging unconditionally would write thousands of identical rows to
+            # coverage_events for the exact case this fix says is a non-event (found by
+            # paired Opus review, 2026-08-14 -- the same review that added this dedup
+            # also added the missing price_discontinuity_ruled_out Grid row).
+            dedup_key = (ticker, date.today().isoformat())
+            if dedup_key not in _ruled_out_logged_today:
+                _ruled_out_logged_today.add(dedup_key)
+                _mode = 'paper' if paper else coverage_mode(pos.get('account'))
+                db.log_coverage_event("price_discontinuity_ruled_out", _mode, ticker=ticker,
+                                    position_id=pos.get('id'), node_id=pos.get('wl_id'), result="no_real_split",
+                                    detail=f"ratio={discontinuity:.2f} entry_price={pos['entry_price']:.4f} "
+                                           f"current={current_price:.4f}")
+        else:
+            print(f"⚠️ Possible corporate action for {ticker}: entry_price={pos['entry_price']:.4f} "
+                  f"current={current_price:.4f} ratio={discontinuity:.2f} -- freezing SL/arm checks "
+                  f"(real-split-confirmed={confirmed})")
+            # Paper positions skip the interactive alert -- "Apply Correction"'s handler
+            # assumes a real open_positions id, and this is scoring infrastructure, not
+            # real capital, so a plain freeze (no self-heal button) is an acceptable gap.
+            if not paper and not already_alerted_corp_action(ticker):
+                factor = nearest_split_factor(discontinuity)
+                proposed_entry = pos['entry_price'] / factor
+                value = json.dumps({"position_id": pos['id'], "ticker": ticker, "proposed_entry_price": proposed_entry})
+                fetch_note = "" if confirmed else " (split data fetch failed -- can't rule it out, freezing to be safe)"
+                _post_message(
+                    f"⚠️ Possible corporate action — {ticker}",
+                    blocks=[
+                        {"type": "section", "text": {"type": "mrkdwn", "text": (
+                            f"⚠️ *{ticker}* — possible corporate action (ratio≈{discontinuity:.2f}, "
+                            f"nearest factor {factor}){fetch_note}.\n"
+                            f"Recorded entry: `${pos['entry_price']:.4f}`  |  Current: `${current_price:.4f}`\n"
+                            f"Proposed corrected entry: `${proposed_entry:.4f}`\n"
+                            f"SL/arm checks are frozen for this ticker until corrected."
+                        )}},
+                        {"type": "actions", "elements": [
+                            {"type": "button", "text": {"type": "plain_text", "text": "Apply Correction"},
+                             "style": "primary", "action_id": "apply_corp_action_correction", "value": value},
+                        ]},
+                    ],
+                )
+                mark_corp_action_alerted(ticker)
+            # entry_price is untrustworthy against an unadjusted corporate action --
+            # a real SL check here would be mechanically true regardless of actual
+            # performance (exactly the false-SL scenario found live with KORU
+            # 2026-07-15). No exit signal until a human confirms/re-bases the position.
+            return None, None, False
     signal_time = datetime.strptime(pos['signal_time'], '%Y-%m-%d %H:%M:%S')
     if df_hourly is None:
         df_hourly, _ = _load_cache(pos['ticker'])

@@ -175,7 +175,17 @@ REGISTRY = [
                            "mislabel a paired Opus review caught), dedup with exit_pending, and the "
                            "fewer-shares-than-tracked guard (alerts instead of auto-closing)",
          check_mechanism='coverage_events', scenario_key='automated_exit_confirmed',
-         bad_results=[],
+         # 'closed' (the other 2 call sites sharing this scenario_key) and 'qty_mismatch'
+         # (a real detected mismatch, alert-only, not a close) are both excluded -- the
+         # code now logs a genuinely distinct 'closed_via_sl_order_poll' for this exact
+         # path (fixed 2026-08-14 alongside this bad_results change; the notes below's
+         # "distinguish by detail" claim was never actually enforced by compute_status,
+         # which only ever aggregates by (mode, result), found by Opus audit). This
+         # resets this row's history: real events logged before this fix (LABD 2026-08-07,
+         # YINN 2026-08-12/13) used the old shared 'closed' result and can no longer be
+         # told apart from the sibling paths, so they no longer count -- honest, not a
+         # regression; a genuine new fill via this path will re-earn verified-live.
+         bad_results=['closed', 'qty_mismatch'],
          notes="Real incident, 2026-08-07 (LABD, soxl_ira): a 1-share, hair-trigger (fixed_sl=0.3%) "
                "position's real stop filled ~7 minutes after entry, but check_own_sell_fills/"
                "check_auto_fills only ever polled trail_state.exit_pending.order_id (which only exists "
@@ -801,6 +811,60 @@ REGISTRY = [
                "for whether this function's real order placement (as opposed to its guard logic) ever "
                "succeeds. 'blocked' (a SafetyViolation) is left out of bad_results deliberately -- it's "
                "the correct outcome when a real guard fires, not a failure of this scenario."),
+    dict(id='automated_exit_execution',
+         scenario="Automated exit (TP/SL/TIME, or a hold-time-forced TRAIL) atomically replaces the "
+                  "real resting protective order with a market SELL and actually places it (distinct "
+                  "from automated_sell_execution above, which is the ARM-time trailing-sell placement "
+                  "-- this is the later market-replace that fires once the exit condition is computed)",
+         code_path="signals_notify._attempt_automated_exit_sell",
+         offline_coverage="No dedicated fake_broker test found for this specific function's "
+                          "coverage_events wiring -- added 2026-08-14 (Opus audit found real live "
+                          "data with zero Grid row at all).",
+         check_mechanism='coverage_events', scenario_key='automated_exit_execution',
+         bad_results=['failed_unexpectedly'],
+         notes="Added 2026-08-14 -- this scenario_key had 14 real live events (incl. 6 'blocked', 2 "
+               "'failed_unexpectedly') with no corresponding REGISTRY row at all, found by an Opus "
+               "audit of this file's own history/completeness. 'blocked' (a SafetyViolation) excluded "
+               "from bad_results deliberately, same reasoning as automated_sell_execution's sibling "
+               "exclusion -- a real guard firing correctly is not a failure of this scenario. A failed "
+               "replace also triggers manual_sl_fallback_alert (its own Grid row) when a resting order "
+               "existed to fall back from."),
+    dict(id='automated_buy_execution',
+         scenario="Automated entry (trailing-buy or market-buy) actually places a real broker order "
+                  "-- distinct from market_buy_placement above, which tracks the canary-scenario "
+                  "lifecycle proof for the same underlying function; this row is the narrower "
+                  "raw-event question of whether the order-placement call itself (incl. its "
+                  "shares_too_small/exception handling) gets exercised for real",
+         code_path="signals_notify._attempt_automated_buy, _attempt_automated_market_buy",
+         offline_coverage="No dedicated fake_broker test found for this specific coverage_events "
+                          "wiring -- added 2026-08-14 (Opus audit found real live data with zero "
+                          "Grid row at all).",
+         check_mechanism='coverage_events', scenario_key='automated_buy_execution',
+         bad_results=['shares_too_small'],
+         notes="Added 2026-08-14 -- found by an Opus audit of this file's own history/completeness. "
+               "Real caveat, not fixed here: neither function logs a coverage_event on a SUCCESSFUL "
+               "placement at all (only the shares_too_small guard logs anything under this "
+               "scenario_key) -- unlike automated_exit_execution's sibling, which logs 'placed' on "
+               "success. That means this row can structurally never show verified-live from this "
+               "code alone, even given a real successful automated entry, until a 'placed' event is "
+               "added to the success path -- flagged as its own follow-up, not done tonight."),
+    dict(id='price_discontinuity_ruled_out',
+         scenario="A price ratio matching a known split factor is checked against a REAL confirmed "
+                  "split (yfinance) and genuinely ruled out -- SL/TP/TIME checks proceed normally "
+                  "instead of freezing, closing the NUGT false-positive (an ordinary ~46% rally "
+                  "coincidentally matched a 1/1.5 split ratio and froze exit protection at the "
+                  "position's peak)",
+         code_path="signals_compute.check_sell_condition (confirmed is False branch); "
+                    "signals_helpers.real_split_confirmed_since",
+         offline_coverage="tests/test_corporate_action_detection.py::"
+                          "test_check_sell_condition_does_not_freeze_when_no_real_split_confirmed",
+         check_mechanism='coverage_events', scenario_key='price_discontinuity_ruled_out',
+         bad_results=[],
+         notes="Added 2026-08-14 alongside the fix itself (paired Opus review of the same session's "
+               "diff caught this row missing entirely -- the exact 'real code, zero Grid row' gap "
+               "this same night's earlier audit found and fixed elsewhere). Logged at most once per "
+               "(ticker, day) to avoid coverage_events spam -- the ratio can hold for the whole "
+               "duration of a real rally, and this branch is reached every poll while it does."),
     dict(id='time_exit_trigger_unarmed',
          scenario="A real (non-paper/dry_run-sim) position's TIME-based exit (max_hold_hours) fires "
                   "the SELL alert while the position was NEVER armed (plain hold-time expiry, exits "
@@ -989,7 +1053,20 @@ REGISTRY = [
                            "sl_order_fills_independent_detection below (same shape, one level down), "
                            "not separately regression-tested.",
          check_mechanism='coverage_events', scenario_key='addon_exit_fill',
-         bad_results=[],
+         # The code already logs a genuinely distinct result ('sl_closed_reconcile',
+         # signals_notify.py ~2454) for this specific path -- but bad_results was still []
+         # (found by Opus audit, 2026-08-14), so any of the sibling lockstep-close results
+         # ('closed', 'closed_late_reconcile', 'dry_run_closed', all logged under this same
+         # scenario_key) counted as false proof of THIS row's independent-detection path.
+         # paired Opus review (2026-08-14) found this list was incomplete: paper_trading.py's
+         # own add-on-leg lockstep close (paper_trading.py:1584) ALSO logs this scenario_key,
+         # with result=exit_reason (the parent's real exit reason, always one of this
+         # project's small fixed exit-reason vocabulary -- SL/TP/TIME/TRAIL, never a genuine
+         # independent-detection result) -- paper's leg close is ALWAYS lockstep-only per its
+         # own docstring ("an add-on leg NEVER independently triggers its own SL/TRAIL check"),
+         # so all 4 must be excluded too, or a single paper lockstep close could flip this row
+         # to paper-only with zero real independent-detection proof.
+         bad_results=['closed', 'closed_late_reconcile', 'dry_run_closed', 'SL', 'TP', 'TIME', 'TRAIL'],
          notes="New 2026-08-07, same root cause and same review pass as the core-position "
                "sl_order_fills_independent_detection fix -- check_addon_leg_reconciliation only ever "
                "polled leg['exit_order_id'] (an order WE placed in response to the parent's already-"
@@ -1120,7 +1197,12 @@ REGISTRY = [
          code_path="active_signals._scan_buy_signals (already_held branch)",
          offline_coverage="tests/test_fake_broker_drought_handoff_scenario.py",
          check_mechanism='coverage_events', scenario_key='drought_handoff_alert_slot_preserved',
-         bad_results=[],
+         # Was bad_results=[] -- the notes below already explained why
+         # 'slot_released_pending_entry' alone shouldn't count as proof, but nothing
+         # actually excluded it (found by Opus audit, 2026-08-14): a single pending-entry
+         # release could false-flip this row to verified-live with zero real handoff-race
+         # proof on file.
+         bad_results=['slot_released_pending_entry'],
          notes="Real ordering contract: HANDOFF initiates the exit before core's scan runs, so core's "
                "entry lands on a LATER poll once the fill confirms -- without this fix the already_held "
                "branch never discards buy_alerted (unlike already_pending), permanently starving core's "
@@ -1143,7 +1225,11 @@ REGISTRY = [
          offline_coverage="tests/test_same_bar_reentry_cooldown.py (real); "
                           "tests/test_paper_trading.py (paper)",
          check_mechanism='coverage_events', scenario_key='same_bar_reentry_cooldown',
-         bad_results=[],
+         # unparseable_exit_bar is a fail-open (cooldown NOT applied) outcome, not evidence
+         # the cooldown fired -- was bad_results=[], letting a single parse failure count
+         # as proof despite the notes below already explaining why it shouldn't (found by
+         # Opus audit, 2026-08-14).
+         bad_results=['unparseable_exit_bar'],
          notes="Built 2026-08-14 after a real live incident: RETL (soxl_ira) exited via TIME at "
                "09:30:54 on 2026-08-13, a fresh trailing-buy re-entry order placed at 09:31:54 -- "
                "the same hourly bar. The backtest kernel's per-bar loop (_simulate_trail_both) "
@@ -1593,6 +1679,9 @@ BEST_HARNESS = {
     'stale_buy_button_guard': 'live',            # needs a real human Slack click on a live node
     'buy_buttons_resolve_correct_node': 'live',  # needs a real human Slack click on a live node
     'daemon_exception_survival': 'live',         # genuine fault, no config forces it
+    'automated_exit_execution': 'live',          # added 2026-08-14, Opus audit (real code, no row before)
+    'automated_buy_execution': 'live',           # added 2026-08-14, Opus audit (real code, no row before)
+    'price_discontinuity_ruled_out': 'live',     # added 2026-08-14, corp-action false-positive fix
 
     # --- canary -- everything else, listed explicitly so this dict stays a complete, auditable
     # map instead of relying on a silent default. Includes 2 rows that are harness-agnostic/

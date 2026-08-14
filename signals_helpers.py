@@ -47,6 +47,25 @@ def effectively_dry_run(account, node=None):
     return not limits.trading_enabled
 
 
+def coverage_mode(account, node=None):
+    """'dry_run'/'live' for coverage_events logging, from the real per-account
+    flag (and per-node override, if a node is given) -- shared implementation
+    of signals_notify._coverage_mode's exact logic (added here 2026-08-14 so
+    signals_compute.py can reach it too, without a signals_notify<->
+    signals_compute circular import -- same reachability shape as
+    effectively_dry_run above). Falls back to 'dry_run' (the safe/
+    conservative label) if the account isn't recognized rather than raising,
+    since logging must never interfere with the real control-flow it's
+    observing. Deliberately does NOT delegate the unrecognized-account case
+    to effectively_dry_run -- that function's own fallback (limits is None ->
+    False/"not dry-run") exists for a different caller's needs and would
+    silently invert the safe default here (see signals_notify._coverage_mode's
+    own docstring for the 2026-08-06 review finding this guards against)."""
+    if schwab_safety.ACCOUNTS.get(account) is None:
+        return "dry_run"
+    return "dry_run" if effectively_dry_run(account, node) else "live"
+
+
 def mode_tag(account, node=None):
     """'LIVE' / 'DRY-RUN' / 'UNKNOWN' display tag for an alert header -- shared
     by signals_notify.py and signals_blocks.py so every alert can show real
@@ -283,6 +302,59 @@ def get_real_splits(ticker):
         return splits
     except Exception:
         return pd.Series(dtype=float)
+
+
+_REAL_SPLIT_CACHE = {}  # (ticker, date_str) -> True/False/None, see real_split_confirmed_since
+
+
+def real_split_confirmed_since(ticker, since):
+    """Returns True/False/None -- whether a REAL confirmed split is on file for
+    `ticker` on or after `since` (a date/Timestamp), used to gate freezing real
+    exit-check protection (signals_compute.check_sell_condition) on a price-ratio
+    heuristic. Deliberately three-way, unlike get_real_splits' own two-way return
+    (an empty Series means EITHER "confirmed no split" OR "fetch failed" -- fine
+    for that function's own fail-open use (a data-correction that's skippable),
+    wrong here: silently treating an unconfirmable fetch failure as "no split,
+    don't freeze" could leave a real split's stale entry_price driving SL/TP math
+    with zero protection at all. None means "couldn't determine" -- callers must
+    treat that as "freeze" (fail closed), the opposite of get_real_splits' own
+    convention, since a false freeze (rare, human-correctable) is a far smaller
+    risk than a false all-clear on a real capital position (2026-08-14, replacing
+    detect_price_discontinuity's price-ratio-only trigger after it false-positived
+    on NUGT's ordinary ~46% rally).
+
+    Cached per (ticker, today's date) -- paired Opus review (2026-08-14) found the
+    uncached version re-introduces the exact bug shape it fixes: check_sell_condition
+    runs every poll cycle, and this call is only reached while the ratio heuristic
+    is tripped, i.e. for the WHOLE DURATION of a real rally (days/weeks) -- an
+    uncached fetch every poll risks yfinance throttling under that repeat load,
+    which would return None (fetch failed) and make the false freeze come back,
+    now intermittently. A day-granularity cache is enough: a split's existence
+    for a given ticker/date doesn't change within a day, and this only needs to
+    be fresh enough to notice a NEW split by the next calendar day, not the next
+    poll. Entire try wrapped (was only the yf call, per the same review) --
+    tz_localize/pd.Timestamp parsing on a malformed `since` must also fail closed
+    (None), not raise out of check_sell_condition into the live poll loop."""
+    import pandas as pd
+    from datetime import date as _date
+    cache_key = (ticker, _date.today().isoformat())
+    if cache_key in _REAL_SPLIT_CACHE:
+        return _REAL_SPLIT_CACHE[cache_key]
+    import yfinance as yf
+    try:
+        splits = yf.Ticker(ticker).splits
+        if splits.empty:
+            result = False
+        else:
+            splits.index = splits.index.tz_localize(None)
+            since_ts = pd.Timestamp(since)
+            if since_ts.tzinfo is not None:
+                since_ts = since_ts.tz_localize(None)
+            result = bool((splits.index >= since_ts).any())
+    except Exception:
+        result = None
+    _REAL_SPLIT_CACHE[cache_key] = result
+    return result
 
 
 def detect_one_bar_split_artifacts(df, splits, tolerance=0.03, recovery_tolerance=0.15,

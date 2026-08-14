@@ -2945,8 +2945,16 @@ def check_sl_order_fills(open_positions):
             # Already closed this same cycle by another fill-detection path
             # reading the same stale open_positions snapshot.
             continue
+        # Distinct result (was 'closed', identical to the other 2 call sites sharing this
+        # scenario_key) -- coverage_registry.py's sl_order_fills_independent_detection row
+        # exists specifically to prove THIS path (a resting SL/TRAIL order filling on its
+        # own, independent of our bar-close check), and compute_status/compute_mode_statuses
+        # aggregate by (mode, result) only, never by detail text -- 'via_sl_order_poll=1' in
+        # detail was never actually checked anywhere, so any of the sibling paths' generic
+        # 'closed' events were silently counting as proof of this one (found by Opus audit,
+        # 2026-08-14).
         db.log_coverage_event("automated_exit_confirmed", _coverage_mode(account), ticker=ticker,
-                              position_id=pos.get('id'), node_id=pos.get('wl_id'), result="closed",
+                              position_id=pos.get('id'), node_id=pos.get('wl_id'), result="closed_via_sl_order_poll",
                               detail=f"reason={reason} price={fill['price']:.4f} via_sl_order_poll=1")
         _post_message(f"🤖 {ticker} — auto-detected {reason} fill at ${fill['price']:.4f}  (P&L: {actual_pnl:+.2f}%)")
         try:

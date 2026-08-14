@@ -1,13 +1,17 @@
 """Tests for the corporate-action discontinuity check (signals_helpers.
 detect_price_discontinuity), its freeze wiring into compute_buy_signal /
 check_sell_condition, and the one-time Slack alert + correction handler."""
+import os
 import sys
+import tempfile
 import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import signals_compute as compute
+import signals_config
+import signals_db as db
 from signals_helpers import detect_price_discontinuity
 from tests.conftest import make_synthetic_csv, cleanup_csv, fake_position
 
@@ -20,10 +24,32 @@ def _no_real_slack(monkeypatch, tmp_path):
     which post to Slack on a detected discontinuity -- stub it out and isolate
     the alert-state file so tests never hit the real workspace or leak state
     between runs (a real live post to #trading happened once before this
-    fixture existed, 2026-07-15 -- see conversation_summary.md)."""
+    fixture existed, 2026-07-15 -- see conversation_summary.md).
+
+    Also isolates signals_config.DB_PATH (added 2026-08-14, real incident: the
+    price_discontinuity_ruled_out fix added a real db.log_coverage_event call to
+    check_sell_condition, and this file had NO db isolation at all -- every run
+    wrote 'TEST_CORP_ACTION'/position_id=999 rows straight into the real
+    cache/live/trading_live.db. Found live, 5 real rows cleaned up after backing
+    up the DB. test_apply_correction_clears_alert_and_updates_entry_price sets
+    its own tmp_db too (predates this fixture change) -- redundant with this,
+    not conflicting, left as-is."""
     monkeypatch.setattr(compute, '_post_message', lambda *a, **kw: (None, None))
     import signals_helpers
     monkeypatch.setattr(signals_helpers, '_CORP_ACTION_ALERT_PATH', tmp_path / "corp_action_alerts.json")
+    tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tmp_db.close()
+    monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))
+    db.ensure_tables()
+    yield
+    os.unlink(tmp_db.name)
+    # Defaults to True (a real split "confirmed") so every pre-existing test in this file
+    # keeps its original freeze-on-ratio-match behavior without needing a real yfinance
+    # call -- 2026-08-14, the freeze is now gated on real_split_confirmed_since, not the
+    # price-ratio heuristic alone (found live: NUGT's ordinary ~46% rally coincidentally
+    # matched a split ratio). Tests specifically exercising the "ratio matches but no real
+    # split" path override this per-test.
+    monkeypatch.setattr(compute, 'real_split_confirmed_since', lambda ticker, since: True)
 
 
 def test_no_discontinuity_on_ordinary_move():
@@ -86,6 +112,41 @@ def test_check_sell_condition_normal_when_no_discontinuity(capsys):
     compute.check_sell_condition(pos, current_price=95.0, now=None, df_hourly=df_hourly)
     cleanup_csv(TICKER)
     assert "Possible corporate action" not in capsys.readouterr().out
+
+
+def test_check_sell_condition_does_not_freeze_when_no_real_split_confirmed(monkeypatch, capsys):
+    """The actual NUGT fix, 2026-08-14: a price ratio matching a known split factor is no
+    longer sufficient on its own -- real_split_confirmed_since returning False (a real
+    yfinance check genuinely ruled out a split) must let the exit check proceed normally,
+    not freeze."""
+    monkeypatch.setattr(compute, 'real_split_confirmed_since', lambda ticker, since: False)
+    pos = fake_position(TICKER, 'ZScoreBreakout', entry_price=460.976)
+    make_synthetic_csv(TICKER, last_close=23.0488)
+    df_hourly, _ = compute._load_cache(TICKER)
+    reason, price, activated = compute.check_sell_condition(
+        pos, current_price=23.0488, now=None, df_hourly=df_hourly
+    )
+    cleanup_csv(TICKER)
+    assert "Possible corporate action" not in capsys.readouterr().out
+    # entry_price=460.976 -> current=23.0488 is a real ~95% drop -- the exit check must have
+    # actually run (not silently returned the frozen sentinel) and correctly fired SL.
+    assert reason == 'SL'
+
+
+def test_check_sell_condition_freezes_when_split_check_cannot_be_determined(monkeypatch, capsys):
+    """None (real_split_confirmed_since couldn't fetch/determine) must fail CLOSED (freeze),
+    the opposite of get_real_splits' own fail-open convention -- a false freeze is human-
+    correctable, a false all-clear on an undetectable real split isn't."""
+    monkeypatch.setattr(compute, 'real_split_confirmed_since', lambda ticker, since: None)
+    pos = fake_position(TICKER, 'ZScoreBreakout', entry_price=460.976)
+    make_synthetic_csv(TICKER, last_close=23.0488)
+    df_hourly, _ = compute._load_cache(TICKER)
+    reason, price, activated = compute.check_sell_condition(
+        pos, current_price=23.0488, now=None, df_hourly=df_hourly
+    )
+    cleanup_csv(TICKER)
+    assert (reason, price, activated) == (None, None, False)
+    assert "Possible corporate action" in capsys.readouterr().out
 
 
 def test_compute_buy_signal_freezes_on_discontinuity(capsys):

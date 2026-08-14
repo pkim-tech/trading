@@ -93,3 +93,91 @@ def test_time_exit_with_no_resting_order_places_a_fresh_market_sell(env, fake_br
     assert market_sells[0]['status'] == 'FILLED'
 
     assert signals_db.get_open_position(TICKER) is None  # closed on the immediate fill
+
+    # coverage_registry.py's automated_exit_execution row (added 2026-08-14, Opus audit --
+    # 14 real live events with zero Grid row until that fix) had no dedicated fake_broker
+    # assertion on this exact coverage_events wiring; this scenario is the natural home
+    # for the 'placed' (success) case since it already drives the real placement call.
+    events = signals_db.get_coverage_events(scenario_key='automated_exit_execution')
+    matches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'placed']
+    assert len(matches) == 1
+
+
+def test_exit_placement_blocked_by_kill_switch_logs_blocked_result(env, fake_broker):
+    """SafetyViolation (kill switch engaged) -- automated_exit_execution's
+    'blocked' result, deliberately excluded from bad_results in the registry
+    (a real guard firing correctly is not a failure of this scenario)."""
+    node = _node()
+    entry_time = datetime(2026, 7, 29, 5, 0, 0)
+    signals_db.open_position(node, signal_price=50.0, signal_time=entry_time,
+                              entry_price=50.0, entry_time=entry_time, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='soxl_ira' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    fake_broker.set_quote(TICKER, last=48.0, bid=47.99, ask=48.01)
+
+    schwab_safety.engage_kill_switch("test")
+    try:
+        signals_notify.notify_sell_signal(pos, 'TIME', current_price=48.0, target_price=48.0)
+    finally:
+        schwab_safety.disengage_kill_switch()
+
+    # Position stays open -- the guard correctly blocked the real order.
+    assert signals_db.get_open_position(TICKER) is not None
+    events = signals_db.get_coverage_events(scenario_key='automated_exit_execution')
+    matches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'blocked']
+    assert len(matches) == 1
+
+
+def test_time_exit_while_armed_logs_time_exit_trigger_armed(env, fake_broker):
+    """coverage_registry.py's time_exit_trigger_armed row (the historically-buggy SH,
+    2026-07-29 sub-case: hold-time expiry while a trailing-sell is still armed) had no
+    fake_broker assertion -- notify_sell_signal logs this scenario_key right at the top,
+    keyed on trail_state.exit_forced_by_hold_time, before the automated execution
+    attempt even runs."""
+    node = _node()
+    entry_time = datetime(2026, 7, 29, 5, 0, 0)
+    signals_db.open_position(node, signal_price=50.0, signal_time=entry_time,
+                              entry_price=50.0, entry_time=entry_time, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='soxl_ira' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    signals_db.update_position_trail_state(
+        pos['id'], {'trailing': True, 'peak': 55.0, 'exit_forced_by_hold_time': True})
+    pos = signals_db.get_open_position(TICKER)
+    fake_broker.set_quote(TICKER, last=48.0, bid=47.99, ask=48.01)
+
+    signals_notify.notify_sell_signal(pos, 'TIME', current_price=48.0, target_price=48.0)
+
+    events = signals_db.get_coverage_events(scenario_key='time_exit_trigger_armed')
+    matches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'alert_fired']
+    assert len(matches) == 1
+
+
+def test_exit_placement_unexpected_exception_logs_failed_unexpectedly(env, fake_broker, monkeypatch):
+    """A non-SafetyViolation exception from the real broker call -- automated_exit_execution's
+    'failed_unexpectedly' result, which IS in bad_results (not a correctly-firing guard,
+    a genuine placement failure)."""
+    node = _node()
+    entry_time = datetime(2026, 7, 29, 5, 0, 0)
+    signals_db.open_position(node, signal_price=50.0, signal_time=entry_time,
+                              entry_price=50.0, entry_time=entry_time, shares=100)
+    with signals_db._conn() as c:
+        c.execute("UPDATE open_positions SET account='soxl_ira' WHERE ticker=?", (TICKER,))
+        c.commit()
+    pos = signals_db.get_open_position(TICKER)
+    fake_broker.set_quote(TICKER, last=48.0, bid=47.99, ask=48.01)
+
+    import schwab_client
+    def _raise(*a, **kw):
+        raise RuntimeError("simulated broker outage")
+    monkeypatch.setattr(schwab_client, 'place_equity_sell', _raise)
+
+    signals_notify.notify_sell_signal(pos, 'TIME', current_price=48.0, target_price=48.0)
+
+    assert signals_db.get_open_position(TICKER) is not None
+    events = signals_db.get_coverage_events(scenario_key='automated_exit_execution')
+    matches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'failed_unexpectedly']
+    assert len(matches) == 1
