@@ -72,15 +72,27 @@ def _load(ticker):
 @contextlib.contextmanager
 def _throwaway_db():
     """check_sell_condition persists trail_state via a real DB write — give it a scratch
-    DB per replay so trail-state round-trips correctly without touching the live DB."""
+    DB per replay so trail-state round-trips correctly without touching the live DB.
+
+    Must patch signals_config.DB_PATH (via active_signals.cfg, the same shared module
+    object signals_db.py imports as `cfg`), NOT active_signals.DB_PATH -- found 2026-08-14
+    by an independent cold review after the 'id': -1 fix above shipped: active_signals.py
+    imports DB_PATH via `from signals_config import DB_PATH`, a plain name-binding copy
+    at import time, not a live reference. Reassigning active_signals.DB_PATH was a
+    complete no-op for every real DB write -- signals_db._conn() always reads
+    signals_config.DB_PATH fresh, so this script had been writing directly into the REAL
+    cache/live/trading_live.db on every run since the 'id': -1 fix, not the scratch temp
+    DB the docstring above claims. 156 real trade_log rows (wl_id=-1, AGQ/HIBL/SOXL/TQQQ)
+    were written this way and had to be cleaned up -- see docs/deep_backlog.md's matching
+    2026-08-14 entry."""
     with tempfile.TemporaryDirectory() as d:
-        orig = active_signals.DB_PATH
-        active_signals.DB_PATH = Path(d) / "parity_test.db"
+        orig = active_signals.cfg.DB_PATH
+        active_signals.cfg.DB_PATH = Path(d) / "parity_test.db"
         try:
             active_signals.ensure_tables()
             yield
         finally:
-            active_signals.DB_PATH = orig
+            active_signals.cfg.DB_PATH = orig
 
 
 def replay(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_pct,

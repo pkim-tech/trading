@@ -420,6 +420,50 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                                            result="slot_released_handoff" if _handoff_in_flight
                                                   else "slot_released_pending_entry")
             elif node.get('state') != 'paper':
+                # Same-bar re-entry cooldown (added 2026-08-14, real incident: RETL/
+                # soxl_ira exited via TIME at 09:30:54 on 2026-08-13, a fresh trailing-buy
+                # order was placed at 09:31:54 the same bar). The backtest kernel's
+                # per-bar loop (_simulate_trail_both, backtester.py) structurally cannot
+                # produce this -- an exit processed on bar i only reaches the entry-check
+                # branch on bar i+1, never the same iteration -- so live must enforce the
+                # same minimum 1-bar gap or it can trade sequences the kernel never
+                # validated. sig['last_bar'] is compute_buy_signal's own bar-close
+                # reference (last closed hourly bar in cache); last_exit_bar is this
+                # node's most recent real trade_log exit_bar_time (populated by
+                # _stash_exit_decision_bar at the moment the SELL was decided, not when
+                # the fill later confirms). None means either no prior exit or a
+                # historical exit predating this fix -- fails open (no cooldown), not
+                # closed, since refusing every entry for a node whose history predates
+                # this change would be a worse regression than the narrow gap it closes.
+                last_exit_bar = db.get_last_exit_bar_time(node['id'])
+                same_bar_cooldown = False
+                if last_exit_bar is not None and sig.get('last_bar') is not None:
+                    # Compare as real datetimes, not strings (found by cold review
+                    # 2026-08-14): sig['last_bar'] is a pandas Timestamp -- if that
+                    # index were ever tz-aware, str() would append a '-04:00'-style
+                    # suffix, making the LONGER string compare lexically greater
+                    # regardless of the actual moment in time, silently defeating
+                    # the cooldown. Every hourly bar timestamp elsewhere in this
+                    # project is naive US/Eastern (see CLAUDE.md); stripped
+                    # defensively here rather than assumed, since a bug in that
+                    # invariant elsewhere must not also break this comparison.
+                    sig_bar = sig['last_bar']
+                    if getattr(sig_bar, 'tzinfo', None) is not None:
+                        sig_bar = sig_bar.replace(tzinfo=None)
+                    try:
+                        last_exit_dt = datetime.strptime(last_exit_bar, '%Y-%m-%d %H:%M:%S')
+                        same_bar_cooldown = sig_bar <= last_exit_dt
+                    except ValueError:
+                        # Fail open, never raise into _scan_buy_signals (found by cold
+                        # review 2026-08-14): an unparseable exit_bar_time -- a format
+                        # this fix's own write side didn't anticipate, or a stray value
+                        # from before exit_bar_time was wired up -- must not abort the
+                        # entry scan for every other node this poll cycle. Missing this
+                        # one node's cooldown is a narrow, acceptable gap; a daemon-wide
+                        # crash from a bad string in one row is not.
+                        db.log_coverage_event("same_bar_reentry_cooldown", _coverage_mode(node.get('account')),
+                                               ticker=sig['ticker'], node_id=node['id'], result="unparseable_exit_bar",
+                                               detail=f"last_exit_bar={last_exit_bar!r}")
                 # pending_wl_ids alone would have prevented the 2026-07-26 DIA/IWM/
                 # QQQ/LABU duplicate-pending-buy incident (a restarted daemon forgot
                 # buy_alerted and re-fired a fresh alert/pending_buys row on top of an
@@ -428,7 +472,17 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                 # check on top for real accounts, catching drift pending_wl_ids can't
                 # (e.g. a resting order or held position the DB lost track of).
                 already_pending = node['id'] in pending_wl_ids or _real_order_or_position_exists(node, sig['ticker'])
-                if already_pending:
+                if same_bar_cooldown:
+                    # Same handling shape as already_pending below: don't burn today's
+                    # alert slot -- a genuinely new bar arriving later today must still
+                    # be able to alert, not wait for tomorrow's buy_alerted reset.
+                    buy_alerted.discard(alert_key)
+                    db.log_coverage_event("same_bar_reentry_cooldown", _coverage_mode(node.get('account')),
+                                           ticker=sig['ticker'], node_id=node['id'], result="suppressed",
+                                           detail=f"signal_bar={sig['last_bar']} last_exit_bar={last_exit_bar}")
+                    print(f"  [cooldown] BUY {sig['ticker']} suppressed — signal bar {sig['last_bar']} "
+                          f"not newer than last exit bar {last_exit_bar}")
+                elif already_pending:
                     # Don't burn today's alert slot on a suppressed signal (Opus review,
                     # 2026-07-26) -- if the resting order/position clears later today,
                     # the node must still be able to alert same-day, not wait for
@@ -502,6 +556,35 @@ def _scan_pinned_entry(target_h, target_m, watchlist, buy_alerted, open_position
     return summaries, failed_tickers
 
 
+def _stash_exit_decision_bar(pos, last_bar_ts):
+    """Persists the hourly bar a real SELL was DECIDED on (check_sell_condition returned a
+    reason) into trail_state, so close_position() -- which may run much later, once a
+    resting order's fill is actually confirmed -- can auto-derive exit_bar_time from it
+    without every close_position() call site needing to thread the bar through explicitly.
+
+    Added 2026-08-14 as part of the same-bar re-entry cooldown fix (RETL, 2026-08-13):
+    trade_log.exit_bar_time existed in the schema but no real (non-paper) exit path ever
+    populated it, so _scan_buy_signals' new cooldown check (below) had nothing to compare
+    a fresh entry signal's bar against. Re-fetches trail_state fresh rather than trusting
+    the caller's possibly-stale in-memory `pos` -- check_sell_condition may have just
+    written its own trail_state update (e.g. exit_forced_by_hold_time) that a blind
+    overwrite here would clobber (same hazard the callers' own fresh-refetch comments
+    already document for the same reason)."""
+    fresh = db.get_position_by_id(pos['id']) or pos
+    state = dict(fresh.get('trail_state') or {})
+    # .strftime, not str() (found by cold review 2026-08-14): str() on a tz-aware or
+    # sub-second-precision pandas Timestamp produces a format _scan_buy_signals'
+    # datetime.strptime(..., '%Y-%m-%d %H:%M:%S') read side cannot parse -- an
+    # uncaught ValueError there would abort the ENTIRE entry scan (every node,
+    # not just this one) inside the _guarded("scan_buy_signals", ...) wrapper.
+    # Matches the exact write convention signals_db.py's log_trade_exit/
+    # log_trade_entry already use for every other timestamp column.
+    state['exit_decision_bar'] = (last_bar_ts.strftime('%Y-%m-%d %H:%M:%S')
+                                   if hasattr(last_bar_ts, 'strftime') else str(last_bar_ts))
+    db.update_position_trail_state(pos['id'], state)
+    return fresh
+
+
 def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
     """Pinned bar-boundary exit-arm check (Part 4, Section 1b) -- collapses the
     up-to-5-minute ambient-poll detection gap on a newly-closed bar to ~2s for
@@ -555,7 +638,7 @@ def _scan_pinned_exit_arm(open_positions, sell_alerted, last_seen_bar):
             # otherwise get written straight back to the DB (clobbering the
             # just-persisted update -- found live 2026-07-31, defeated the
             # 2026-07-29/30 SH hold-time-forced fixes).
-            fresh_pos = db.get_position_by_id(pos['id']) or pos
+            fresh_pos = _stash_exit_decision_bar(pos, last_bar_ts)
             notify_sell_signal(fresh_pos, reason, cp, target)
             sell_alerted.add((pos['id'], last_bar_ts))
 
@@ -1190,7 +1273,7 @@ def run_loop(tickers: set = None):
                     # See the matching comment in _scan_pinned_exit_arm above --
                     # re-fetch fresh so this call sees check_sell_condition's
                     # just-persisted trail_state, not the stale pre-call pos.
-                    fresh_pos = db.get_position_by_id(pos['id']) or pos
+                    fresh_pos = _stash_exit_decision_bar(pos, last_bar_ts)
                     notify_sell_signal(fresh_pos, reason, cp, target)
                     sell_alerted.add((pos['id'], last_bar_ts))
 

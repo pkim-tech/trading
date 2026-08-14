@@ -1123,6 +1123,29 @@ REGISTRY = [
                "about) -- logged as a distinct result='slot_released_pending_entry' vs. "
                "'slot_released_handoff' precisely so that sub-case alone can't false-flip this row to "
                "verified-live. No live proof of the handoff case yet."),
+    dict(id='same_bar_reentry_cooldown',
+         scenario="A real (non-paper) node's fresh BUY signal is suppressed when its bar is not "
+                  "strictly newer than that node's most recent real CORE exit's bar",
+         code_path="active_signals._scan_buy_signals (same_bar_cooldown branch)",
+         offline_coverage="tests/test_same_bar_reentry_cooldown.py",
+         check_mechanism='coverage_events', scenario_key='same_bar_reentry_cooldown',
+         bad_results=[],
+         notes="Built 2026-08-14 after a real live incident: RETL (soxl_ira) exited via TIME at "
+               "09:30:54 on 2026-08-13, a fresh trailing-buy re-entry order placed at 09:31:54 -- "
+               "the same hourly bar. The backtest kernel's per-bar loop (_simulate_trail_both) "
+               "structurally cannot produce this (an exit processed on bar i only reaches the "
+               "entry-check branch on bar i+1), so live's decoupled exit-scan/entry-scan needed an "
+               "equivalent minimum-1-bar gap. get_last_exit_bar_time (signals_db.py) is scoped to "
+               "position_source='core' only, deliberately -- a drought-overlay/add-on leg sharing "
+               "the same wl_id can close through call sites that don't stash exit_decision_bar "
+               "(close_addon_leg_real_if_open, the HANDOFF close), and an unfiltered query would let "
+               "that later NULL-exit_bar_time row mask the real core exit's bar, silently disarming "
+               "the cooldown on exactly the nodes most likely to need it (RETL runs both drought and "
+               "add-on). result='unparseable_exit_bar' is a distinct, non-bad_results outcome (fails "
+               "open, never blocks/crashes) for a stored exit_bar_time the fixed-format strptime read "
+               "can't parse -- kept separate from 'suppressed' so a parse failure can't false-inflate "
+               "genuine cooldown-fired evidence. No live proof yet -- RETL's own incident predates "
+               "this fix landing, so its exit_bar_time wasn't recorded at the time."),
 ]
 
 

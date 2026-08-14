@@ -3522,6 +3522,39 @@ def closed_today(ticker, paper=False, node=None):
     return row is not None
 
 
+def get_last_exit_bar_time(wl_id, paper=False):
+    """Most recent CORE-position closed trade_log exit_bar_time (string,
+    'YYYY-MM-DD HH:MM:SS') for this node, or None if it has never closed a core
+    trade, or its most recent core close predates exit_bar_time being wired into
+    the real exit path (2026-08-14) -- either way, None means the same-bar
+    re-entry cooldown in active_signals.py's _scan_buy_signals has nothing to
+    compare against and must not block a fresh entry (fail open, not closed --
+    the kernel-gap risk this guards against is real but narrow; refusing every
+    entry for a node whose history predates this fix would be a worse regression).
+
+    position_source='core' is required, not incidental (found by contextual Opus
+    review 2026-08-14, before this shipped): drought-overlay/add-on legs share
+    the parent node's wl_id but close through call sites this fix's
+    _stash_exit_decision_bar was never added to (close_addon_leg_real_if_open,
+    the drought HANDOFF close in signals_notify.py) -- their exit_bar_time is
+    always NULL. Without this filter, a drought/addon leg closing AFTER the real
+    core exit becomes "most recent by exit_time" and its NULL exit_bar_time
+    makes this function return None -- silently disarming the cooldown on
+    exactly the nodes it exists to protect (RETL, the incident node, runs both
+    drought and add-on). exit_bar_time IS NOT NULL is also required directly in
+    the WHERE clause, not just checked on the returned row -- otherwise the most
+    recent CORE row could itself still predate this fix (NULL exit_bar_time) while
+    an older core row that does have one gets skipped by ORDER BY/LIMIT 1."""
+    _, trade_log_table = _pos_tables(paper)
+    with _conn() as c:
+        row = c.execute(
+            f"SELECT exit_bar_time FROM {trade_log_table} WHERE wl_id = ? AND position_source = 'core' "
+            f"AND exit_time IS NOT NULL AND exit_bar_time IS NOT NULL "
+            f"ORDER BY exit_time DESC LIMIT 1", (wl_id,)
+        ).fetchone()
+    return row[0] if row else None
+
+
 def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False,
                    is_dry_run_sim=False, signal_bar_time=None, position_source='core',
                    drought_confirm_days=None, drought_vol_gate=None, drought_gap_start=None,
@@ -3760,7 +3793,7 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
     positions_table, _ = _pos_tables(paper)
     with _position_lock, _conn() as c:
         row = c.execute(
-            f"SELECT trade_log_id, entry_price, ticker, wl_id, is_dry_run_sim FROM {positions_table} WHERE id = ?",
+            f"SELECT trade_log_id, entry_price, ticker, wl_id, is_dry_run_sim, trail_state FROM {positions_table} WHERE id = ?",
             (position_id,)
         ).fetchone()
         # position_lock instrumentation (2026-08-01), mirrors open_position()'s
@@ -3779,6 +3812,23 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
                                 detail="close_position")
             return False
         _mode = 'paper' if paper else ('dry_run' if row[4] else 'live')
+        if exit_bar_time is None and row[5]:
+            # Real exit paths (active_signals.py) don't know the fill-confirmation
+            # moment's bar -- they stash the bar the SELL was actually DECIDED on
+            # into trail_state['exit_decision_bar'] right when check_sell_condition
+            # returns a reason, since a later poll may confirm the fill several
+            # bars after the decision. paper_trading.py already passes exit_bar_time
+            # explicitly and never hits this branch. Added 2026-08-14 -- this
+            # column existed in the schema but no real (non-paper) exit ever
+            # populated it, which is what let RETL's real same-bar re-entry
+            # (2026-08-13) go undetected: nothing recorded which bar the prior
+            # exit belonged to for the cooldown check in _scan_buy_signals to
+            # compare against.
+            try:
+                parsed = json.loads(row[5])
+                exit_bar_time = parsed.get('exit_decision_bar') if isinstance(parsed, dict) else None
+            except (TypeError, ValueError):
+                exit_bar_time = None
         if exit_price is not None and row[0]:
             log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper,
                             exit_bar_time=exit_bar_time)

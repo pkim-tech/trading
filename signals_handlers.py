@@ -525,9 +525,14 @@ if cfg.SOCKET_MODE:
         # to find any open addon leg for it.
         pos = db.get_position_by_id(position_id)
 
+        # exit_bar_time derived directly (found by cold review 2026-08-14) -- a manual
+        # Slack "Exited" confirmation never runs check_sell_condition, so there's no
+        # exit_decision_bar already stashed for close_position() to fall back on; without
+        # this the same-bar re-entry cooldown has nothing to compare against for this exit.
         db.close_position(position_id,
                            exit_signal_price=signal_price, exit_price=exit_price,
-                           exit_time=datetime.now(), exit_reason=data.get('reason'))
+                           exit_time=datetime.now(), exit_reason=data.get('reason'),
+                           exit_bar_time=compute.current_bar_time(ticker))
         try:
             close_addon_leg_real_if_open(pos, exit_price, data.get('reason'), datetime.now())
         except Exception as e:
@@ -634,9 +639,11 @@ if cfg.SOCKET_MODE:
         # comment (docs/plans/real_order_execution_drought_addon.md 7.2).
         pos = db.get_position_by_id(position_id)
 
+        # exit_bar_time derived directly, same reason as handle_exit_price above.
         db.close_position(position_id,
                            exit_signal_price=exit_price, exit_price=exit_price,
-                           exit_time=now, exit_reason='MANUAL')
+                           exit_time=now, exit_reason='MANUAL',
+                           exit_bar_time=compute.current_bar_time(ticker))
         try:
             close_addon_leg_real_if_open(pos, exit_price, 'MANUAL', now)
         except Exception as e:

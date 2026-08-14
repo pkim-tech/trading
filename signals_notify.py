@@ -1394,8 +1394,12 @@ def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
         if just_activated_trailing:
             _post_message(f"[DRY RUN] trailing-sell would arm — {ticker}", node_id=pos.get('wl_id'))
         if reason:
+            # exit_bar_time passed directly (not via trail_state's exit_decision_bar
+            # stash active_signals.py's real exit paths use) -- a dry-run-sim close is
+            # synchronous, decided and closed in the same call, so there's no async
+            # fill-confirmation gap for a later close_position() call to need it from.
             db.close_position(pos['id'], exit_signal_price=cp, exit_price=target,
-                               exit_time=datetime.now(), exit_reason=reason)
+                               exit_time=datetime.now(), exit_reason=reason, exit_bar_time=last_bar_ts)
             db.log_coverage_event("exit_fill", "dry_run", ticker=ticker, position_id=pos['id'],
                                    node_id=pos.get('wl_id'), result=reason, detail=f"price={target:.4f}")
             _post_message(f"[DRY RUN] would have closed — {ticker}  {reason} @ ${target:.4f}", node_id=pos.get('wl_id'))
@@ -2927,9 +2931,16 @@ def check_sl_order_fills(open_positions):
         # column exists to record, matching exit_pending's own
         # current_price/fill-price split in the sibling check_own_sell_fills.
         exit_signal_price = pos.get('broker_stop_price') or fill['price']
+        # exit_bar_time passed directly, derived via compute.current_bar_time (found by
+        # cold review 2026-08-14): this exit is detected by a broker-side fill poll, not
+        # our own bar-close check_sell_condition call, so there's no exit_decision_bar
+        # already stashed in trail_state for close_position() to fall back on -- without
+        # this, the same-bar re-entry cooldown (_scan_buy_signals) silently has nothing
+        # to compare against for exactly the exits it's most likely to matter for (a
+        # resting SL/TRAIL order firing on its own, independent of our poll cadence).
         closed = db.close_position(pos['id'], exit_signal_price=exit_signal_price,
                                     exit_price=fill['price'], exit_time=datetime.now(),
-                                    exit_reason=reason)
+                                    exit_reason=reason, exit_bar_time=compute.current_bar_time(ticker))
         if not closed:
             # Already closed this same cycle by another fill-detection path
             # reading the same stale open_positions snapshot.

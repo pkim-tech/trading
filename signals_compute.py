@@ -35,6 +35,24 @@ def _load_cache(ticker):
     return df, df_daily
 
 
+def current_bar_time(ticker):
+    """Last closed hourly bar's timestamp (a pandas.Timestamp, always tz-naive US/Eastern
+    -- see _load_cache's tz_localize(None)) for `ticker`, or None if no cached data exists.
+
+    Added 2026-08-14 for the same-bar re-entry cooldown fix's real gap (found by cold
+    Opus review): a real exit that closes via a broker-side fill poll rather than our own
+    bar-close check_sell_condition call (check_sl_order_fills, a manual "Exited" Slack
+    confirmation in signals_handlers.py) has no bar already in hand to stash into
+    trail_state['exit_decision_bar'] the way active_signals.py's own check_sell_condition
+    call sites do -- this derives the same reference those sites use (df_hourly.index[-1])
+    so those paths can pass exit_bar_time to close_position() directly instead of leaving
+    it NULL and silently disarming the cooldown for that node."""
+    df_hourly, _ = _load_cache(ticker)
+    if df_hourly is None or df_hourly.empty:
+        return None
+    return df_hourly.index[-1]
+
+
 _STALE_PRICE_MAX_AGE = timedelta(minutes=90)
 
 
