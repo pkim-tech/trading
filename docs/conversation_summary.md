@@ -7578,3 +7578,19 @@ No `active_signals.py`/`signals_*.py`/`schwab_*.py`/kernel files changed this se
 Full detail: `docs/design.md`'s 2026-08-14 (late) entry.
 
 **Uncommitted at session start, from an earlier part of this same session**: `evening_status.py`/`watch_evening_status.sh`/`coverage_registry.py`'s `position_lock` fix were already committed (`8e17194`, `96aa35f`) before this portion of the session began, apparently swept up by a concurrent session's own `session close` (confirmed incidental, not a deliberate review) — flagged to the user, who confirmed it wasn't meant as approval of this session's specific work. This session's review treated that code as needing the same post-hoc scrutiny as anything still uncommitted.
+
+---
+
+## 2026-08-15 — [Research] 32-ticker "first algo portfolio" snapshot recovered; overnight sponsor/split-advance-notice sweep completed
+
+Started with `go` (found 8 uncommitted live-trading files mid-session, later confirmed absorbed into a concurrent session's commit `d4d7165` — not touched here), then `go research` per the user's redirect.
+
+**10 real-live node IDs identified**: queried `state='live' AND starting_notional > $5,000` directly against `trading_live.db` — exactly 10 rows, matching CLAUDE.md's real-live tier (DFEN/DPST/GDXU/KORU/NUGT/SOXL/SOXS/AGQ/ETHU/JNUG), joined to their real `watch_list_candidate_link` rows for `c_id`/role. Quick, no rebuild needed since the account_mod/link work already persisted this from a prior session.
+
+**Background sweep launched and completed**: full 82-candidate-ticker sponsor/advance-notice mapping (all 10 sponsors characterized — Direxion, ProShares, Volatility Shares, BMO/MicroSectors, Defiance/Tidal, REX/Tuttle, Tradr, USCF confirmed publish structured advance-notice split announcements; only QQQ/Invesco and SPY/State Street unconfirmed, both negligible-risk) and the first-ever FULL `check_stock_splits.py` sweep (was previously only spot-checked) — 266 real splits found across 1,478 cached tickers project-wide, 40/82 candidates (including live ETHU/KORU/SOXS) flagged with a split inside their cached window. Findings written to `research_log.md`/`deep_backlog.md` by the agent itself; landed in the shared working tree and got swept into the concurrent session's commit above (not a separate commit from this session).
+
+**Verified ETHU/KORU/SOXS's flagged splits are clean, not corrupted**: checked price continuity directly across each split date in the cached CSV — all ratios ~1.0 (0.906-1.062), no discontinuity, confirming yfinance's `auto_adjust` already handled these on fetch. KORU's most recent split (2026-07-15, real, 20:1 forward) and SOXS's same-date split are both correctly adjusted in cache. No action needed on these 3 real-live tickers.
+
+**Recovered the user's original "first algo portfolio" 32-ticker return-first shortlist** (nostalgia request — 8 weeks of original work, spreadsheet lost earlier) from `output/shortlist_review_20260809_210703.xlsx` (a saved intermediate report from the 2026-08-09 session, referenced only obliquely in `conversation_summary.md` as "the user's 32-ticker return-first shortlist" with no ticker list spelled out until this session pulled it directly from the file's `candidate_type == 'best safe node'` rows). Confirmed via direct DB check that all 32 are stale `v5`-only nodes with no `sweep_run_id` lineage (predates the 2026-08-11 provenance system) and 20 of 32 have since been superseded by newer `v5.1` data — user's call: don't refresh, preserve as the original historical snapshot. Exported to `output/my_first_algo_portfolio_20260809_snapshot.xlsx` and delivered.
+
+No code changes this session — pure research/reporting. No `signals_*.py`/`schwab_*.py`/kernel files touched, so no paired-Opus-review gate applies.
