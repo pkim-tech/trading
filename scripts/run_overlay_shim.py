@@ -37,7 +37,8 @@ import numpy as np
 import pandas as pd
 
 from scripts.locate_best_node import (
-    node_dict, DB_PATH, ensure_candidate_nodes_table, get_or_create_candidate_node,
+    node_dict, node_from_candidate_id, DB_PATH, ensure_candidate_nodes_table,
+    get_or_create_candidate_node, resolve_version,
 )
 from scripts.drought_overlay_test import get_trades_and_bars, find_drought_windows, simulate_overlay
 from scripts.stacked_model.add_on import generate_addon_trades
@@ -127,7 +128,8 @@ def run_for_node(conn, ticker, node, confirm_days, mechanisms=("drought", "addon
 
 
 def run_for_ticker(conn, ticker, version, confirm_days):
-    node = node_dict(conn, ticker, version)
+    resolved = version or resolve_version(conn, ticker)
+    node = node_dict(conn, ticker, resolved)
     if node is None:
         print(f"{ticker}: no backtest_cache data, skipping")
         return []
@@ -136,9 +138,19 @@ def run_for_ticker(conn, ticker, version, confirm_days):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("tickers", nargs="+")
-    ap.add_argument("--version", default="v5")
+    ap.add_argument("tickers", nargs="*")
+    ap.add_argument("--version", default=None,
+                     help="force a single version. Default: auto-resolve per ticker "
+                          "(v5.1 when the ticker has it, else v5), matching "
+                          "candidate_full_review.py's convention.")
     ap.add_argument("--confirm-days", type=int, default=10)
+    ap.add_argument("--node-id", type=int, default=None,
+                     help="run against this exact candidate_nodes id instead of "
+                          "re-deriving 'best' -- use when you need to match a specific "
+                          "row a report already displays (best_row()'s own selection "
+                          "can legitimately disagree with candidate_full_review.py's "
+                          "per-candidate-type node picks). Mutually exclusive with "
+                          "passing tickers.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -146,8 +158,15 @@ def main():
     ensure_candidate_nodes_table(conn)
     ensure_table(conn)
     all_rows = []
-    for t in args.tickers:
-        all_rows += run_for_ticker(conn, t, args.version, args.confirm_days)
+    if args.node_id is not None:
+        node = node_from_candidate_id(conn, args.node_id)
+        if node is None:
+            print(f"no candidate_nodes row with id={args.node_id}")
+            return
+        all_rows += run_for_node(conn, node["ticker"], node, args.confirm_days)
+    else:
+        for t in args.tickers:
+            all_rows += run_for_ticker(conn, t, args.version, args.confirm_days)
 
     if not all_rows:
         print("No drought/addon overlay trades found for any requested ticker.")

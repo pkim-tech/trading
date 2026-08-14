@@ -29,7 +29,20 @@ def best_safe_node(df_ticker, min_alpha=200, metric="robust_alpha"):
     # `metric` param added 2026-08-08 (later) so compare_fill_resolution_selection.py
     # can reuse this exact selection logic with alpha_vs_spy ("possible" alone)
     # instead of duplicating it -- default stays robust_alpha for every existing caller.
-    df = df_ticker.sort_values(metric, ascending=False)
+    # Tie-break matches prune_backtest_cache.py's TIEBREAK_SQL (trades DESC, stop_loss,
+    # max_hold_hours) -- an exact metric tie without this let scripts/locate_best_node.py's
+    # best_row() (used by run_overlay_shim.py) silently pick a different winning row than
+    # this function, found 2026-08-13 on ETHU (two rows tied on robust_alpha, differing
+    # only on max_hold_hours). Extended same day (paired review) to a genuine total order --
+    # 4 keys alone still left 34-69 real (ticker,version,strategy) groups tied on a real
+    # param (e.g. DPST: two rows identical except arm_sell_pct 30.0 vs 29.0), which is the
+    # exact same silent-disagreement bug shape, just not yet triggered by luck. Matches
+    # best_row()'s SQL ORDER BY key-for-key.
+    df = df_ticker.sort_values(
+        [metric, "trades", "stop_loss", "max_hold_hours", "z_score_threshold",
+         "take_profit", "trail_buy_pct", "trail_sell_pct", "entry_timing", "window"],
+        ascending=[False, False, True, True, True, True, True, True, True, True],
+    )
     candidates = df[df[metric] >= min_alpha]
     for i, (_, row) in enumerate(candidates.iterrows()):
         # trail_buy_pct/trail_sell_pct/entry_timing MUST be held exactly fixed here, not

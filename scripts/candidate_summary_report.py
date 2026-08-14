@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from top_safe_nodes import CLIFF_RADIUS
 from annualized_alpha_report import calendar_days, cagr
+from locate_best_node import resolve_version
 from verify_fill_resolution_accuracy import fill_accuracy_for_node
 from candidate_5min_report import find_candidates
 from run_overlay_shim import (
@@ -146,31 +147,6 @@ COLUMN_DEFS = {
                                   "never the limiting filter' finding) -- a great alpha number on an illiquid "
                                   "name is untradeable regardless of the rest of this row.",
 }
-
-
-def resolve_version(conn, ticker, preferred=("v5.1", "v5")):
-    """Picks which backtest_cache version backs every downstream query for
-    this ticker: v5.1 whenever it has ANY real (trades>0) rows for the
-    ticker, else falls back to v5. v5.1 is deliberately a PARTIAL resweep --
-    only the ~40 tickers whose raw hourly data changed in the 2026-08-11
-    backfill get it (see docs/backlog_cache.md's 2026-08-11 entry) -- so its
-    mere presence for a ticker already means "this is the more-complete/
-    current data," no numeric tie-break needed. Most tickers will only ever
-    have v5 rows and just fall through to it.
-
-    Deliberately does NOT blend rows from both versions in the same query --
-    worst_neighbor()'s cliff-safety search assumes one consistent, complete
-    grid at neighboring param values, and mixing versions there would search
-    a grid that was never actually swept as one campaign. This only decides
-    which single version's grid backs every query for the ticker (fixed
-    2026-08-12 -- previously every caller passed one hardcoded --version,
-    silently missing the more-current v5.1 data for tickers that had it)."""
-    c = conn.cursor()
-    for v in preferred:
-        c.execute("SELECT 1 FROM backtest_cache WHERE ticker=? AND version=? AND trades>0 LIMIT 1", (ticker, v))
-        if c.fetchone():
-            return v
-    return preferred[-1]
 
 
 def best_node_strategy(conn, ticker, version="v5"):

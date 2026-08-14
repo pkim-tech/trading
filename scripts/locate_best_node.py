@@ -33,23 +33,107 @@ NODE_COLS = ["ticker", "strategy", "window", "z_score_threshold", "arm_sell_pct"
              "max_hold_hours", "entry_timing"]
 
 
+def resolve_version(conn, ticker, preferred=("v5.1", "v5")):
+    """Picks which backtest_cache version backs every downstream query for
+    this ticker: v5.1 whenever it has ANY real (trades>0) rows for the
+    ticker, else falls back to v5. v5.1 is deliberately a PARTIAL resweep --
+    only the ~40 tickers whose raw hourly data changed in the 2026-08-11
+    backfill get it (see docs/backlog_cache.md's 2026-08-11 entry) -- so its
+    mere presence for a ticker already means "this is the more-complete/
+    current data," no numeric tie-break needed. Most tickers will only ever
+    have v5 rows and just fall through to it.
+
+    Deliberately does NOT blend rows from both versions in the same query --
+    worst_neighbor()'s cliff-safety search assumes one consistent, complete
+    grid at neighboring param values, and mixing versions there would search
+    a grid that was never actually swept as one campaign. This only decides
+    which single version's grid backs every query for the ticker (fixed
+    2026-08-12 -- previously every caller passed one hardcoded --version,
+    silently missing the more-current v5.1 data for tickers that had it).
+    Moved here from candidate_summary_report.py 2026-08-13 to fix a circular
+    import when run_overlay_shim.py needed it too -- this module has no
+    dependents of its own, so it's the right shared home."""
+    c = conn.cursor()
+    for v in preferred:
+        c.execute("SELECT 1 FROM backtest_cache WHERE ticker=? AND version=? AND trades>0 LIMIT 1", (ticker, v))
+        if c.fetchone():
+            return v
+    return preferred[-1]
+
+
 def best_row(conn: sqlite3.Connection, ticker: str, version: str = "v5") -> dict | None:
     # sweep_run_id (2026-08-11): carries the winning backtest_cache row's
     # provenance stamp (NULL for any row computed before this column existed)
     # through to node_dict()/get_or_create_candidate_node, so a real candidate
     # can be traced back to the sweep_runs row (git_commit, campaign config)
     # that computed it, not just its 'version' data tag.
+    # Tie-break matches prune_backtest_cache.py's TIEBREAK_SQL (trades DESC, stop_loss,
+    # max_hold_hours) -- found 2026-08-13 that without this, an exact robust_alpha tie
+    # (ETHU: two rows both 320.0325..., differing only on max_hold_hours 119 vs 126) let
+    # this function and top_safe_nodes.best_safe_node() (the one candidate_full_review.py
+    # actually uses) silently pick different winning rows, since neither had a
+    # deterministic secondary sort key.
+    # run_timestamp (2026-08-13): the REAL time this row's robust_alpha was
+    # actually computed -- carried through to get_or_create_candidate_node as
+    # 'computed_at' so it can stamp the true computation time instead of
+    # datetime.now() (found by paired review: an earlier version stamped
+    # "now" on every touch, which fabricated provenance on 4 real live nodes
+    # by claiming a 2026-07-20 computation happened today. Never repeat that.)
+    # Extended 2026-08-13 (paired review, MEDIUM/MEDIUM-HIGH, confirmed on real data):
+    # trades/stop_loss/max_hold_hours alone is NOT a total order -- 34-69 real
+    # (ticker,version,strategy) groups (incl. live-linked DPST/KORU) still tie on
+    # all 4 keys while differing on a real param (e.g. DPST: two rows identical
+    # except arm_sell_pct 30.0 vs 29.0). SQLite's own tie-break among those is
+    # unspecified and can flip on an index rebuild/prune -- adding the remaining
+    # real param axes makes this a genuine total order.
     cols_sql = ", ".join(NODE_COLS)
     row = conn.execute(f"""
-        SELECT {cols_sql}, stop_loss, {ROBUST_ALPHA_SQL} AS robust_alpha, trades, sweep_run_id
+        SELECT {cols_sql}, stop_loss, {ROBUST_ALPHA_SQL} AS robust_alpha, trades, sweep_run_id, run_timestamp
         FROM backtest_cache
         WHERE ticker=? AND version=? AND trades > 0
-        ORDER BY robust_alpha DESC LIMIT 1
+        ORDER BY robust_alpha DESC, trades DESC, stop_loss, max_hold_hours,
+                 z_score_threshold, COALESCE(take_profit, arm_sell_pct), trail_buy_pct,
+                 trail_sell_pct, entry_timing, strategy, window
+        LIMIT 1
     """, (ticker, version)).fetchone()
     if row is None:
         return None
-    keys = NODE_COLS + ["stop_loss", "robust_alpha", "trades", "sweep_run_id"]
+    keys = NODE_COLS + ["stop_loss", "robust_alpha", "trades", "sweep_run_id", "computed_at"]
     return dict(zip(keys, row))
+
+
+def node_from_candidate_id(conn: sqlite3.Connection, candidate_node_id: int) -> dict | None:
+    """Builds a node dict directly from an existing candidate_nodes row, shaped
+    identically to node_dict()'s output -- for callers (run_overlay_shim.py's
+    --node-id) that need to run against the EXACT node a report already
+    displays, not whatever best_row()'s own selection independently re-derives.
+    Built 2026-08-13 after best_row()/node_dict() repeatedly produced a
+    different winning node than candidate_full_review.py's own "best safe/
+    unsafe/CAGR-safe/certain" selection for the same ticker (ETHU: differing
+    max_hold_hours even after a matching tie-break fix) -- these are genuinely
+    different selection functions with no guaranteed agreement, so a caller
+    that needs one specific displayed row must ask for it by id, not by
+    re-deriving "the best" independently."""
+    row = conn.execute("""
+        SELECT ticker, strategy, version, window, z, fixed_sl, arm_pct,
+               trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing,
+               robust_alpha, trades, robust_alpha_computed_at
+        FROM candidate_nodes WHERE id=?
+    """, (candidate_node_id,)).fetchone()
+    if row is None:
+        return None
+    keys = ["ticker", "strategy", "version", "window", "z", "fixed_sl", "arm_pct",
+            "trail_buy_pct", "trail_sell_pct", "max_hold_hours", "entry_timing",
+            "robust_alpha", "trades", "computed_at"]
+    node = dict(zip(keys, row))
+    node["stop_loss"] = node["fixed_sl"]
+    # computed_at is whatever this row already honestly had (possibly None) --
+    # never fabricated here. get_or_create_candidate_node preserves it rather
+    # than stamping "now," since re-reading an existing row isn't a new
+    # computation (found by paired review: this path is maximally circular --
+    # it reads robust_alpha out of candidate_nodes and would otherwise write
+    # a fabricated "computed today" right back over it with zero real work done).
+    return node
 
 
 def node_dict(conn: sqlite3.Connection, ticker: str, version: str = "v5") -> dict | None:
@@ -120,6 +204,23 @@ def ensure_candidate_nodes_table(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE candidate_nodes ADD COLUMN pick TEXT")
     if "comment" not in cols:
         conn.execute("ALTER TABLE candidate_nodes ADD COLUMN comment TEXT")
+    # account_mod/account (2026-08-13) + provenance columns (2026-08-13) -- added
+    # out-of-band to the live DB during that session, never given a migration guard
+    # here, so any fresh DB (a test DB, a clone, another machine) crashed on the
+    # very first insert/refresh (found by paired review, reproduced in
+    # tests/test_locate_best_node.py). Fixed same pattern as pick/comment above.
+    if "account_mod" not in cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN account_mod TEXT")
+    if "account" not in cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN account TEXT")
+    if "robust_alpha_computed_at" not in cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN robust_alpha_computed_at TEXT")
+    if "years_at_computation" not in cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN years_at_computation REAL")
+    if "data_start" not in cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN data_start TEXT")
+    if "data_end" not in cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN data_end TEXT")
     conn.commit()
 
 
@@ -179,7 +280,26 @@ def get_or_create_candidate_node(conn: sqlite3.Connection, node: dict) -> int:
     # built some other way (e.g. hand-constructed), which just leaves the new
     # row's provenance NULL rather than erroring.
     sweep_run_id = node.get("sweep_run_id")
+    if isinstance(sweep_run_id, float) and sweep_run_id != sweep_run_id:
+        sweep_run_id = None  # pandas NaN (missing), not a real id -- int(nan) raises
     sweep_run_id = int(sweep_run_id) if sweep_run_id is not None else None
+    # robust_alpha_computed_at (2026-08-13, per user's explicit call after finding
+    # all 10 real live nodes' stored numbers were already stale relative to a real
+    # data backfill, with no way to know that from the DB alone): MUST be the real
+    # backtest_cache.run_timestamp the caller threaded through as node['computed_at']
+    # (best_row()/node_dict() do; node_from_candidate_id() passes through whatever
+    # the existing row already had). Fixed 2026-08-13 (paired review, CONFIRMED HIGH,
+    # already live-verified to have corrupted 4 real nodes -- SOXL/AGQ/KORU/DPST):
+    # an earlier version stamped datetime.now() unconditionally, which fabricates a
+    # "computed today" claim for a row that was actually computed weeks earlier and
+    # never recomputed just because this function happened to be called again. This
+    # is exactly the fabricated-provenance failure mode the column was built to
+    # detect, not commit. Falls back to None (honest, not "now") if the caller has
+    # no real computed_at to offer.
+    _real_computed_at = node.get("computed_at")
+    if isinstance(_real_computed_at, float) and _real_computed_at != _real_computed_at:
+        _real_computed_at = None  # pandas NaN
+
     if existing:
         existing_id, old_alpha, old_trades, old_sweep_run_id = existing
         new_alpha, new_trades = float(node["robust_alpha"]), int(node["trades"])
@@ -191,17 +311,57 @@ def get_or_create_candidate_node(conn: sqlite3.Connection, node: dict) -> int:
             print(f"[locate_best_node] candidate_nodes id={existing_id} refreshed: "
                   f"robust_alpha {old_alpha:.1f}->{new_alpha:.1f}, trades {old_trades}->{new_trades}, "
                   f"sweep_run_id {old_sweep_run_id}->{effective_sweep_run_id}")
+        # robust_alpha_computed_at updates to the real value the caller supplied
+        # (never fabricated). data_start/data_end/years_at_computation are
+        # deliberately NOT touched here -- re-touching an existing row is not a
+        # new computation, and we have no honest way to know what data window
+        # produced the (possibly unchanged) stored alpha, so leave whatever was
+        # already there (real backfilled value, or honest NULL) alone.
+        if _real_computed_at is not None:
+            conn.execute("""
+                UPDATE candidate_nodes SET robust_alpha=?, trades=?, sweep_run_id=?,
+                       robust_alpha_computed_at=? WHERE id=?
+            """, (new_alpha, new_trades, effective_sweep_run_id, _real_computed_at, existing_id))
+        else:
             conn.execute("""
                 UPDATE candidate_nodes SET robust_alpha=?, trades=?, sweep_run_id=? WHERE id=?
             """, (new_alpha, new_trades, effective_sweep_run_id, existing_id))
-            conn.commit()
+        conn.commit()
         return existing_id
+
+    # Brand-new candidate_nodes row -- but the underlying robust_alpha may still
+    # come from an OLD backtest_cache computation (best_row() just SELECTs a
+    # cached row, it doesn't compute anything). "Now" is only honestly the real
+    # data window when computed_at's own date really is today; otherwise this
+    # new registry row would still be claiming a data window nobody actually
+    # backtested against, same failure mode as the refresh-path bug above, just
+    # via INSERT instead of UPDATE. Fixed same session, same paired review.
+    import pandas as _pd
+    _now = _dt.datetime.now()
+    _now_iso = _now.isoformat(timespec="seconds")
+    _insert_computed_at = _real_computed_at if _real_computed_at is not None else _now_iso
+    _computed_today = (
+        _real_computed_at is None
+        or str(_real_computed_at)[:10] == _now.strftime("%Y-%m-%d")
+    )
+    _data_start = _data_end = _years = None
+    if _computed_today:
+        _csv_path = Path(__file__).resolve().parent.parent / "cache" / "research" / f"{node['ticker']}_1h.csv"
+        if _csv_path.exists():
+            _df = _pd.read_csv(_csv_path, index_col=0, parse_dates=True)
+            if len(_df):
+                _data_start = _df.index.min().isoformat()
+                _data_end = _df.index.max().isoformat()
+                _years = round((_df.index.max() - _df.index.min()).days / 365.25, 2)
+
     cur = conn.execute(f"""
         INSERT INTO candidate_nodes
-            (created_at, {', '.join(key_cols)}, robust_alpha, trades, sweep_run_id)
-        VALUES (?, {', '.join('?' for _ in key_cols)}, ?, ?, ?)
-    """, (_dt.datetime.now().isoformat(timespec="seconds"), *key_vals,
-          float(node["robust_alpha"]), int(node["trades"]), sweep_run_id))
+            (created_at, {', '.join(key_cols)}, robust_alpha, trades, sweep_run_id,
+             robust_alpha_computed_at, years_at_computation, data_start, data_end)
+        VALUES (?, {', '.join('?' for _ in key_cols)}, ?, ?, ?, ?, ?, ?, ?)
+    """, (_now_iso, *key_vals,
+          float(node["robust_alpha"]), int(node["trades"]), sweep_run_id, _insert_computed_at, _years,
+          _data_start, _data_end))
     conn.commit()
     return cur.lastrowid
 
