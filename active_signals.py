@@ -500,8 +500,15 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                 else:
                     notify_buy_signal(node, sig)
             elif sig['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS:
-                paper_trading.start_paper_buy(node, sig)
-                print(f"  [paper] BUY: {node['ticker']} z={sig['z_score']:+.2f} (paper-trading)")
+                if paper_trading.start_paper_buy(node, sig):
+                    # Cooldown-suppressed (see start_paper_buy's docstring) -- release
+                    # the slot so a genuinely new bar later today can still alert,
+                    # mirroring the real branch's same_bar_cooldown handling above.
+                    buy_alerted.discard(alert_key)
+                    print(f"  [cooldown] PAPER BUY {sig['ticker']} suppressed — signal bar "
+                          f"not newer than last exit decision bar")
+                else:
+                    print(f"  [paper] BUY: {node['ticker']} z={sig['z_score']:+.2f} (paper-trading)")
             else:
                 print(f"  [research] BUY: {node['ticker']} z={sig['z_score']:+.2f} (no alert)")
         else:

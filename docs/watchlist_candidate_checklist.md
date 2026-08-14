@@ -211,6 +211,24 @@ day+ with no baseline row — `signals_invariants.py` ran clean the whole time b
 only checks nodes that already have one, not "every live node." Don't rely on a clean
 `signals_invariants.py` run alone to mean full live coverage.
 
+## 15. Corporate-action / reverse-split sponsor check (REQUIRED ACTION, do this at promotion)
+Identify the candidate's ETF/ETN sponsor/issuer (Direxion, ProShares, Volatility Shares,
+Bank of Montreal/MicroSectors, or other) and check that sponsor's own press-release page
+for this ticker's reverse-split history — leveraged/inverse products decay and split far
+more often than plain-vanilla equity ETFs, and each sponsor publishes structured, dated
+advance-notice announcements (confirmed 2026-08-14 for all 4 sponsors covering the then-
+current real-capital universe: Direxion `direxion.com/press-releases`, ProShares, Volatility
+Shares `volatilityshares.com/news/`, BMO/MicroSectors `microsectors.com/insights` +
+`newsroom.bmo.com` — real example: ETHU's 2025-03-26 announcement gave 14 days' notice
+before the 2025-04-09 effective date). This groundwork feeds the live-trading corporate-
+action monitoring design (found via a real false-positive freeze on NUGT, 2026-08-14 —
+`signals_compute.detect_price_discontinuity`'s price-ratio heuristic mistook an ordinary
+46% rally for a split; the fix in design uses each sponsor's real announcement instead of
+a price guess). A candidate whose sponsor isn't yet a known, checked source has **zero**
+advance-warning coverage for a real split until that sponsor's page is added to the
+monitoring list — record the sponsor at promotion time even before the monitoring
+mechanism itself is built, so the gap is visible and trackable rather than silent.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds
@@ -225,8 +243,9 @@ only checks nodes that already have one, not "every live node." Don't rely on a 
 
 ## When to run this
 - Checks 1-13: before flipping any ticker `research`→`live`.
-- **Check 14: at the moment of promotion itself, not before** — the flip and the baseline
-  seed should happen together, same session, so a live node is never left unprotected.
+- **Checks 14-15: at the moment of promotion itself, not before** — the flip and the
+  baseline seed (14) / sponsor identification (15) should happen together, same session,
+  so a live node is never left unprotected on either front.
 - Whenever a live ticker's live behavior seems to be diverging from backtest expectations
   (the AGQ momentum discussion, 2026-07-12, is what prompted writing this down).
 - Not needed on every session — this is a promotion/investigation gate, not a routine poll.

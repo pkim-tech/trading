@@ -997,6 +997,19 @@ def ensure_tables():
             c.execute("ALTER TABLE paper_trade_log ADD COLUMN signal_bar_time TEXT")
         if 'exit_bar_time' not in ptl_cols:
             c.execute("ALTER TABLE paper_trade_log ADD COLUMN exit_bar_time TEXT")
+        if 'exit_decision_bar' not in ptl_cols:
+            # Distinct from exit_bar_time above (which check_paper_sells only
+            # populates on its at_bar_close branch, for daily-track
+            # reconciliation's exact-bar-match need -- see that function's
+            # comment) -- this column is populated UNCONDITIONALLY on every
+            # core paper exit (bar-close or mid-bar reactive alike), mirroring
+            # active_signals._stash_exit_decision_bar's real-path behavior, so
+            # paper_trading.py's own same-bar re-entry cooldown (added
+            # 2026-08-14, alongside the real fix -- LABD/soxl_ira reproduced
+            # the identical RETL bug shape in paper_trade_log) has something
+            # to compare against even for a fast reactive SL exit, which is
+            # exactly the shape LABD showed and exit_bar_time alone would miss.
+            c.execute("ALTER TABLE paper_trade_log ADD COLUMN exit_decision_bar TEXT")
         if 'position_source' not in ptl_cols:
             c.execute("ALTER TABLE paper_trade_log ADD COLUMN position_source TEXT NOT NULL DEFAULT 'core' "
                       "CHECK (position_source IN ('core', 'drought_overlay'))")
@@ -3555,6 +3568,30 @@ def get_last_exit_bar_time(wl_id, paper=False):
     return row[0] if row else None
 
 
+def get_last_paper_exit_decision_bar(wl_id):
+    """Paper-trading mirror of get_last_exit_bar_time above, added 2026-08-14
+    alongside paper_trading.py's own same-bar re-entry cooldown (LABD/soxl_ira,
+    wl_id=152, reproduced the identical RETL bug shape in paper_trade_log --
+    4 same-morning open->SL-exit round trips under ~90 seconds each on
+    2026-08-13). Deliberately reads exit_decision_bar, NOT exit_bar_time --
+    paper_trade_log's exit_bar_time is only populated on check_paper_sells'
+    at_bar_close branch (for the unrelated daily-track reconciliation exact-
+    bar-match need) and is NULL for a mid-bar reactive exit, which is exactly
+    the shape the LABD SL round-trips were. exit_decision_bar is populated
+    unconditionally on every core paper exit instead, mirroring
+    active_signals._stash_exit_decision_bar's real-path behavior. Same
+    position_source='core' + IS NOT NULL-in-WHERE reasoning as
+    get_last_exit_bar_time applies here too (drought/addon legs share wl_id
+    but never populate this column)."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT exit_decision_bar FROM paper_trade_log WHERE wl_id = ? AND position_source = 'core' "
+            "AND exit_time IS NOT NULL AND exit_decision_bar IS NOT NULL "
+            "ORDER BY exit_time DESC LIMIT 1", (wl_id,)
+        ).fetchone()
+    return row[0] if row else None
+
+
 def open_position(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False,
                    is_dry_run_sim=False, signal_bar_time=None, position_source='core',
                    drought_confirm_days=None, drought_vol_gate=None, drought_gap_start=None,
@@ -3782,7 +3819,7 @@ def correct_entry_price(ticker, entry_price):
 
 
 def close_position(position_id, exit_signal_price=None, exit_price=None, exit_time=None, exit_reason=None, paper=False,
-                    exit_bar_time=None):
+                    exit_bar_time=None, exit_decision_bar=None):
     """Returns True if this call actually closed the position, False if it was
     already gone -- callers that report a close to Slack must check this,
     same shape as open_position()'s duplicate-skip return. Guarded by the
@@ -3831,7 +3868,7 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
                 exit_bar_time = None
         if exit_price is not None and row[0]:
             log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper,
-                            exit_bar_time=exit_bar_time)
+                            exit_bar_time=exit_bar_time, exit_decision_bar=exit_decision_bar)
         c.execute(f"DELETE FROM {positions_table} WHERE id = ?", (position_id,))
         c.commit()
         # 2026-08-01 2nd Opus review finding: logged BEFORE log_trade_exit/DELETE
@@ -3876,7 +3913,7 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, sh
 
 
 def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reason, entry_price, paper=False,
-                    exit_bar_time=None):
+                    exit_bar_time=None, exit_decision_bar=None):
     _, trade_log_table = _pos_tables(paper)
     exit_time_str = exit_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(exit_time, 'strftime') else exit_time
     exit_bar_time_str = (exit_bar_time.strftime('%Y-%m-%d %H:%M:%S')
@@ -3884,13 +3921,29 @@ def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reas
     exit_drift    = (exit_price - exit_signal_price) / exit_signal_price * 100
     pnl           = (exit_price - entry_price) / entry_price * 100
     with _conn() as c:
-        c.execute(f"""
-            UPDATE {trade_log_table} SET
-                exit_signal_price = ?, exit_price = ?, exit_time = ?,
-                exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?, exit_bar_time = ?
-            WHERE id = ?
-        """, (float(exit_signal_price), float(exit_price), exit_time_str,
-              exit_drift, pnl, exit_reason, exit_bar_time_str, trade_id))
+        if paper:
+            # exit_decision_bar only exists on paper_trade_log (see
+            # ensure_tables) -- trade_log's own same-bar cooldown reuses
+            # exit_bar_time directly (no dual-purpose conflict there, see
+            # get_last_exit_bar_time), so this column/branch is paper-only.
+            exit_decision_bar_str = (exit_decision_bar.strftime('%Y-%m-%d %H:%M:%S')
+                                      if hasattr(exit_decision_bar, 'strftime') else exit_decision_bar)
+            c.execute(f"""
+                UPDATE {trade_log_table} SET
+                    exit_signal_price = ?, exit_price = ?, exit_time = ?,
+                    exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?, exit_bar_time = ?,
+                    exit_decision_bar = ?
+                WHERE id = ?
+            """, (float(exit_signal_price), float(exit_price), exit_time_str,
+                  exit_drift, pnl, exit_reason, exit_bar_time_str, exit_decision_bar_str, trade_id))
+        else:
+            c.execute(f"""
+                UPDATE {trade_log_table} SET
+                    exit_signal_price = ?, exit_price = ?, exit_time = ?,
+                    exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?, exit_bar_time = ?
+                WHERE id = ?
+            """, (float(exit_signal_price), float(exit_price), exit_time_str,
+                  exit_drift, pnl, exit_reason, exit_bar_time_str, trade_id))
         c.commit()
 
 

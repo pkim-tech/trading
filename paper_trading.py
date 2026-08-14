@@ -30,17 +30,64 @@ from signals_helpers import (
 _DROUGHT_TARGET_H0, _DROUGHT_TARGET_H1 = 9, 14
 
 
+def _paper_reentry_cooldown_active(node, sig):
+    """Same-bar re-entry cooldown, paper-trading mirror of active_signals.
+    _scan_buy_signals' real-account cooldown (added 2026-08-14, RETL/soxl_ira
+    incident) -- that fix was deliberately scoped to non-paper nodes only
+    (`elif node.get('state') != 'paper':`), and paper's own entry points
+    never got the equivalent guard. LABD's paper node (wl_id=152) reproduced
+    the identical bug shape: 4 same-morning open->SL-exit round trips under
+    ~90 seconds each on 2026-08-13, a sequence the backtest kernel's per-bar
+    loop structurally cannot produce (_simulate_trail_both, backtester.py --
+    an exit on bar i only reaches the entry-check branch on bar i+1).
+
+    Mirrors the real check's comparison logic exactly (sig_bar <= last_exit,
+    tz-strip defensively, fail open on an unparseable/missing value) but reads
+    get_last_paper_exit_decision_bar instead of get_last_exit_bar_time -- see
+    that function's docstring for why (exit_bar_time alone is NULL for
+    exactly the fast reactive-SL-exit shape LABD showed)."""
+    last_exit_bar = db.get_last_paper_exit_decision_bar(node['id'])
+    if last_exit_bar is None or sig.get('last_bar') is None:
+        return False
+    sig_bar = sig['last_bar']
+    if getattr(sig_bar, 'tzinfo', None) is not None:
+        sig_bar = sig_bar.replace(tzinfo=None)
+    try:
+        last_exit_dt = datetime.strptime(last_exit_bar, '%Y-%m-%d %H:%M:%S')
+    except (TypeError, ValueError):
+        db.log_coverage_event("same_bar_reentry_cooldown", "paper", ticker=sig['ticker'],
+                               node_id=node['id'], result="unparseable_exit_bar",
+                               detail=f"last_exit_bar={last_exit_bar!r}")
+        return False
+    cooldown = sig_bar <= last_exit_dt
+    if cooldown:
+        db.log_coverage_event("same_bar_reentry_cooldown", "paper", ticker=sig['ticker'],
+                               node_id=node['id'], result="suppressed",
+                               detail=f"signal_bar={sig['last_bar']} last_exit_bar={last_exit_bar}")
+    return cooldown
+
+
 def start_paper_buy(node, sig):
     """Called from active_signals._scan_buy_signals on a BUY for a research-mode,
     automation-enabled ticker. Dispatches to start_paper_market_buy for a
     non-trailing-buy node (Part 4, Section 7) -- a market order fills near-
-    immediately, no bounce-fill phase to simulate, unlike a trailing buy."""
+    immediately, no bounce-fill phase to simulate, unlike a trailing buy.
+
+    Returns True when the cooldown specifically suppressed this call, else None
+    -- the caller must discard the node's buy_alerted slot on True, mirroring
+    the real (non-paper) branch's same_bar_cooldown handling exactly. Found by
+    Opus review, 2026-08-14: without this, a stale-bar suppression on a
+    cross-day exit (exit yesterday, cooldown check today) burns the node's one
+    alert slot for the rest of today with nothing to ever release it -- unlike
+    already_pending/already_held, a cooldown suppression has no later event
+    (a fill, a close) that would otherwise clear it."""
     ticker = sig['ticker']
     if node.get('daily_sync_halted_at'):
         return
+    if _paper_reentry_cooldown_active(node, sig):
+        return True
     if not db._is_trailing_buy(node):
-        start_paper_market_buy(node, sig)
-        return
+        return start_paper_market_buy(node, sig)
     if db.get_paper_pending_buy(node['id']) or db.get_open_position_by_wl_id(node['id'], paper=True):
         return
     db.add_paper_pending_buy(node, sig)
@@ -56,10 +103,16 @@ def start_paper_market_buy(node, sig):
     there's no bounce-fill phase to simulate. Sizes via the same
     buy_order_sizing real code path (market_pad_pct branch) so paper trading
     faithfully dry-runs the real sizing/pad, not a simplified stand-in, and
-    opens the paper position directly."""
+    opens the paper position directly.
+
+    Returns True when the cooldown specifically suppressed this call -- see
+    start_paper_buy's docstring (its only real caller; this check is
+    redundant there but kept for any direct/test caller)."""
     ticker = sig['ticker']
     if node.get('daily_sync_halted_at'):
         return
+    if _paper_reentry_cooldown_active(node, sig):
+        return True
     if db.get_open_position_by_wl_id(node['id'], paper=True):
         return
     # Explicit target_notional (starting_notional) -- buy_order_sizing's
@@ -1814,9 +1867,17 @@ def check_paper_sells(last_seen_bar, paper_sell_alerted, load_cache):
             # genuinely does fall inside the bar the trigger action occurred in, and
             # _bar_containing on it is the correct lookup.
             exit_dt = datetime.now()
+            # exit_decision_bar: last_bar_ts unconditionally (bar-close or mid-
+            # bar reactive alike), mirroring active_signals._stash_exit_decision_bar's
+            # real-path behavior -- feeds the same-bar re-entry cooldown below
+            # (get_last_paper_exit_decision_bar), which must catch a fast reactive
+            # SL exit too, not just a bar-close-decided one. Distinct from
+            # exit_bar_time just above, which stays at_bar_close-gated for its own
+            # unrelated daily-track-reconciliation purpose.
             db.close_position(pos['id'], exit_signal_price=cp, exit_price=target,
                                exit_time=exit_dt, exit_reason=reason, paper=True,
-                               exit_bar_time=last_bar_ts if at_bar_close else None)
+                               exit_bar_time=last_bar_ts if at_bar_close else None,
+                               exit_decision_bar=last_bar_ts)
             # The core exit's own observability (coverage event + Slack alert)
             # is recorded BEFORE the add-on/skim follow-on calls below, not
             # after -- found by review, 2026-08-09: the first version ran

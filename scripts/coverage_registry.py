@@ -496,6 +496,7 @@ REGISTRY = [
                "Slack buttons for routine open/close) -- so this race is unlikely to occur in practice "
                "regardless of proof status. Still real, still worth fixing if it's ever cheap to do, "
                "just not worth flagging in routine coverage reviews going forward.",
+         demote_on_all_bad=True,
          not_prod_required_note="User's call, 2026-08-13 (see notes): only 'skipped_duplicate' would "
                                  "be real evidence of the lock resolving genuine contention, and that "
                                  "requires the poll loop and a Slack button racing the same position -- "
@@ -1130,10 +1131,17 @@ REGISTRY = [
                "'slot_released_handoff' precisely so that sub-case alone can't false-flip this row to "
                "verified-live. No live proof of the handoff case yet."),
     dict(id='same_bar_reentry_cooldown',
-         scenario="A real (non-paper) node's fresh BUY signal is suppressed when its bar is not "
-                  "strictly newer than that node's most recent real CORE exit's bar",
-         code_path="active_signals._scan_buy_signals (same_bar_cooldown branch)",
-         offline_coverage="tests/test_same_bar_reentry_cooldown.py",
+         scenario="A node's fresh BUY signal is suppressed when its bar is not strictly newer "
+                  "than that node's most recent CORE exit's bar -- real (non-paper) nodes via "
+                  "active_signals._scan_buy_signals, paper nodes via paper_trading.py's own "
+                  "mirror (added 2026-08-14 after LABD's paper node reproduced the identical bug "
+                  "shape; mode is threaded through the shared scenario_key, see compute_mode_"
+                  "statuses' per-mode breakdown, not a separate Grid row)",
+         code_path="active_signals._scan_buy_signals (same_bar_cooldown branch); "
+                   "paper_trading._paper_reentry_cooldown_active + its start_paper_buy/"
+                   "start_paper_market_buy call sites",
+         offline_coverage="tests/test_same_bar_reentry_cooldown.py (real); "
+                          "tests/test_paper_trading.py (paper)",
          check_mechanism='coverage_events', scenario_key='same_bar_reentry_cooldown',
          bad_results=[],
          notes="Built 2026-08-14 after a real live incident: RETL (soxl_ira) exited via TIME at "
@@ -1501,7 +1509,14 @@ def compute_status(row):
         # forever despite already being a deliberate, human-reviewed demotion. Found
         # 2026-08-14: the not_prod_required_note check below was unreachable for any
         # row with real event history, only ever applying to zero-event rows.
-        if row.get('not_prod_required_note'):
+        # Gated on demote_on_all_bad, a distinct explicit opt-in -- not_prod_required_note
+        # alone would silently extend this demotion to the 10 other rows that also carry
+        # that field for a genuinely different reason (a scenario that's simply never
+        # fired at all, not one that fires constantly and can never look good), masking a
+        # real future regression on any of them the moment they start firing with bad
+        # results (found by Opus review, 2026-08-14 -- only position_lock's demotion was
+        # actually reasoned through and intended here).
+        if row.get('demote_on_all_bad') and row.get('not_prod_required_note'):
             return 'not-prod-required', row['not_prod_required_note']
         return ('live-attempt-failed' if mode == 'live' else f'{mode}-attempt-failed',
                 f"{m['n']}x {mode}, all bad_results ({bad_results}), last {m['last_ts']} -- "

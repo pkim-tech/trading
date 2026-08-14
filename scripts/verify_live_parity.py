@@ -8,23 +8,23 @@ check_signal/check_exit). Reports the first divergent trade so the exact bar/rul
 pinpointed. See docs/adr/0001-live-parity-sim-vs-backtest.md for why this compares against
 active_signals.py directly instead of reimplementing the replay loop's own decision logic.
 
-KNOWN, EXPECTED mismatches as of 2026-07-03 (see docs/backlog.md "Look-ahead bias..." entry
-for full detail) — every case below currently reports MISMATCH, and that is not a live bug:
-  1. Look-ahead bias in the KERNEL, not live: run_optimization_sweep.py's df_daily includes
-     each day's own close in that day's SMA/std, and backtester.py's daily_idx looks up a
-     bar's own calendar day — so the kernel's entry signal uses same-day information no
-     intraday check could actually have. active_signals.compute_buy_signal's `today` cutoff
-     is the correct, realistic behavior; here the kernel is the one that's wrong. Affects
-     every strategy (all share the same generate_daily_indicators pattern + daily_idx
-     plumbing), so even plain ZScoreBreakout (no other known gaps) mismatches on this alone.
-  2. LimitOrderZScoreBreakout's live signal check uses current_price as a proxy for intrabar
-     low (no true low available live — see compute_buy_signal's 'low' key). The kernel uses
-     the real bar Low. This is a live-data-availability limitation, not a bug — see the ADR's
-     Consequences section.
-Until #1 is fixed (backlog item, needs a sweep rerun, out of scope for a quick patch), this
-script cannot report a clean MATCH — its value right now is catching *new, additional*
-divergence (e.g. via first-mismatch trade index/date moving in a run-to-run diff), not a
-binary pass/fail.
+RESOLVED 2026-07-03: the kernel look-ahead bias this section used to describe (df_daily
+including each day's own close in that day's SMA/std) was fixed the same day in
+backtester.prep_inputs (now maps each bar to the PRIOR day's indicator row). A clean MATCH
+is the expected outcome now, not something this script structurally can't report.
+
+Still a real, known limitation:
+  LimitOrderZScoreBreakout's live signal check uses current_price as a proxy for intrabar
+  low (no true low available live — see compute_buy_signal's 'low' key). The kernel uses
+  the real bar Low. This is a live-data-availability limitation, not a bug — see the ADR's
+  Consequences section.
+
+2026-08-14: AGQ/NUGT were showing MISMATCH, mislabeled by this docstring (before this fix)
+as the retired look-ahead bias. The real cause: replay()'s bar loop never passed
+open_price= to check_sell_condition, silently defeating the 2026-07-20 gap-through-trigger
+fill logic (ctx['open'] fell back to Close). Fixed — AGQ now reports a clean MATCH. Any
+mismatch this script reports going forward is real and should be investigated directly, not
+assumed to be expected noise.
 
 v1.9/v1.10 (TrailingBuyZScoreBreakout/TrailingBothZScoreBreakout) are absent from compare()
 below for a different reason than this docstring used to say (corrected 2026-08-14 — the
@@ -126,13 +126,21 @@ def replay(ticker, strategy_name, window, z_thresh, take_profit_pct, stop_loss_p
     with _throwaway_db():
         for i, ts in enumerate(df_hourly.index):
             row = df_hourly.iloc[i]
-            cp, low, high = row['Close'], row['Low'], row['High']
+            cp, low, high, op = row['Close'], row['Low'], row['High'], row['Open']
             df_slice = df_hourly.iloc[:i + 1]
 
             if in_trade:
                 pos = next(p for p in active_signals.get_open_positions() if p['id'] == position_id)
+                # open_price=op: all 3 real production call sites (active_signals.py x2,
+                # signals_notify.py) pass this so check_exit's gap-through-trigger fill
+                # (2026-07-20 fix) can detect the bar's Open already crossing the stop --
+                # omitting it here silently defaults ctx['open'] to Close (see
+                # check_sell_condition's open_price fallback), which can never trigger that
+                # branch. Found 2026-08-14: this made AGQ/NUGT report a false MISMATCH
+                # against the kernel on their very first trade (a real gap-through SL),
+                # misattributed to the already-fixed 2026-07-03 look-ahead bias.
                 reason, price, _ = active_signals.check_sell_condition(
-                    pos, cp, ts, at_bar_close=True, low=low, high=high, df_hourly=df_slice)
+                    pos, cp, ts, at_bar_close=True, low=low, high=high, open_price=op, df_hourly=df_slice)
                 if reason:
                     signal_time = datetime.strptime(pos['signal_time'], '%Y-%m-%d %H:%M:%S')
                     hours_held = active_signals._bars_held(df_slice, signal_time)

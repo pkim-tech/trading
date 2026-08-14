@@ -122,15 +122,10 @@ def ensure_table():
         c.commit()
 
 
-def _next_run_id():
-    with db._conn() as c:
-        row = c.execute("SELECT MAX(run_id) FROM coverage_run_snapshot").fetchone()
-    return (row[0] or 0) + 1
-
-
 def last_run_statuses():
     """Returns (run_id, ts, {scenario_id: status}) for the most recent
     logged run, or (None, None, {}) if this is the first run ever."""
+    ensure_table()
     with db._conn() as c:
         last_run_id = c.execute("SELECT MAX(run_id) FROM coverage_run_snapshot").fetchone()[0]
         if last_run_id is None:
@@ -142,14 +137,29 @@ def last_run_statuses():
     return last_run_id, ts, {r['scenario_id']: r['status'] for r in rows}
 
 
-def log_run(run_id, git_commit, rows):
+def log_run(git_commit, rows):
+    """Computes the next run_id and inserts all of this run's rows in ONE
+    transaction (ensure_table() first -- this is the only writer callers like
+    evening_status.py rely on, and it previously assumed
+    coverage_regression_watch.main() had already created the table, crashing
+    with 'no such table' otherwise). Returns the run_id actually used.
+
+    2026-08-14: was a separate _next_run_id() + executemany() pair -- two
+    concurrent callers (a watch-loop invocation and a manual one) could both
+    read the same MAX(run_id) before either inserted, silently interleaving
+    two distinct snapshots under one run_id. SQLite's own write-lock on the
+    single connection/transaction here serializes concurrent callers instead
+    (one blocks briefly, not both corrupting the same run)."""
+    ensure_table()
     with db._conn() as c:
+        run_id = (c.execute("SELECT MAX(run_id) FROM coverage_run_snapshot").fetchone()[0] or 0) + 1
         c.executemany(
             "INSERT INTO coverage_run_snapshot (run_id, git_commit, scenario_id, status, detail) "
             "VALUES (?, ?, ?, ?, ?)",
             [(run_id, git_commit, k, v[0], v[1][:200]) for k, v in rows.items()],
         )
         c.commit()
+    return run_id
 
 
 def main():
@@ -227,9 +237,8 @@ def main():
         counts[status] = counts.get(status, 0) + 1
     print(f"\n{len(today_rows)} rows total: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 
-    run_id = _next_run_id()
     git_commit, _dirty = _git_state()
-    log_run(run_id, git_commit, today_rows)
+    run_id = log_run(git_commit, today_rows)
     print(f"Logged as run #{run_id} (commit={git_commit or '?'}).")
 
 

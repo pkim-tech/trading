@@ -40,13 +40,17 @@ def _write_price_csv(check_date='2025-01-07', check_bars=None):
     """Prior daily closes (2025-01-02..2025-01-06, business days) are fixed so a
     window=3 rolling SMA/Std as of the day before check_date is always
     sma=100, std=2 -> entry threshold at z_score_threshold=1.0 is price<=98.
-    check_bars: list of (hour, close, open) tuples for check_date itself."""
+    check_bars: list of (hour, close, open[, low]) tuples for check_date itself --
+    low defaults to min(close, open) when omitted, matching real OHLC data where
+    Low is always <= both Close and Open."""
     rows = []
     for d, close in [('2025-01-02', 100.0), ('2025-01-03', 102.0), ('2025-01-06', 98.0)]:
-        rows.append((f"{d} 09:30:00", close, close))
-    for hour, close, open_ in (check_bars or []):
-        rows.append((f"{check_date} {hour:02d}:30:00", close, open_))
-    df = pd.DataFrame(rows, columns=['Datetime', 'Close', 'Open']).set_index('Datetime')
+        rows.append((f"{d} 09:30:00", close, close, close))
+    for bar in (check_bars or []):
+        hour, close, open_ = bar[0], bar[1], bar[2]
+        low = bar[3] if len(bar) > 3 else min(close, open_)
+        rows.append((f"{check_date} {hour:02d}:30:00", close, open_, low))
+    df = pd.DataFrame(rows, columns=['Datetime', 'Close', 'Open', 'Low']).set_index('Datetime')
     path = signals_config.RESEARCH_DIR / f"{TICKER}_1h.csv"
     df.to_csv(path)
     return path
@@ -70,7 +74,17 @@ def test_entry_threshold_crossed_false_when_price_never_breaches(isolated_db):
 
 
 def test_entry_threshold_crossed_true_on_close_breach(isolated_db):
-    _write_price_csv(check_bars=[(9, 99.0, 99.0), (10, 97.0, 97.0)])  # 97 <= 98
+    # hour 9 and 14 are the only bars the live daemon's 2 real signal windows (10:25-10:40,
+    # 15:25-15:40) actually correspond to -- a breach on any other hour was never real
+    # evidence the daemon could have seen it (fixed 2026-08-14, see coverage_check.py).
+    _write_price_csv(check_bars=[(9, 97.0, 97.0)])  # 97 <= 98
+    assert _entry_threshold_crossed(TICKER, _node(), '2025-01-07') is True
+
+
+def test_entry_threshold_crossed_true_on_low_breach_close_never_crosses(isolated_db):
+    # Close stays above threshold (99 > 98) but Low dips through it (97.5 <= 98) --
+    # a continuous live poll during the real signal window could have seen that dip.
+    _write_price_csv(check_bars=[(9, 99.0, 99.0, 97.5)])
     assert _entry_threshold_crossed(TICKER, _node(), '2025-01-07') is True
 
 
@@ -83,7 +97,9 @@ def test_entry_threshold_crossed_checks_open_for_open_check_node(isolated_db):
 def test_entry_threshold_crossed_ignores_open_for_close_only_node(isolated_db):
     # Same bar as above, but entry_timing='close' -- the live daemon never
     # evaluates this node's Open, so a bare Open-side breach must not count.
-    _write_price_csv(check_bars=[(9, 99.0, 97.0)])
+    # Low pinned to Close (99, non-breaching) so this isolates Open specifically,
+    # not just relying on the min(close,open) default.
+    _write_price_csv(check_bars=[(9, 99.0, 97.0, 99.0)])
     assert _entry_threshold_crossed(TICKER, _node(entry_timing='close'), '2025-01-07') is False
 
 

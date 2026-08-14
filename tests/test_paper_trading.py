@@ -213,3 +213,115 @@ def test_real_open_positions_untouched_by_paper_flow(monkeypatch, isolated_db):
 
     assert db.get_open_positions(paper=False) == []
     assert db.get_pending_buys() == []
+
+
+# ---------------------------------------------------------------------------
+# Same-bar re-entry cooldown (2026-08-14) -- paper mirror of the RETL/soxl_ira
+# real-account fix in active_signals._scan_buy_signals. Reproduces the exact
+# bug shape found live in LABD's paper node (wl_id=152): open -> SL exit ->
+# fresh open, all within the same bar / under ~90 seconds, a sequence the
+# backtest kernel's per-bar loop structurally cannot produce.
+# ---------------------------------------------------------------------------
+
+def test_paper_market_buy_reentry_blocked_same_bar_after_reactive_exit(isolated_db):
+    """The LABD shape: a mid-bar reactive SL exit (exit_bar_time=None, exactly
+    what check_paper_sells' non-at_bar_close branch writes) must still block a
+    same-bar re-entry, via exit_decision_bar rather than exit_bar_time."""
+    node = _node()
+    bar1 = datetime(2026, 8, 13, 9, 30, 0)
+    paper_trading.start_paper_market_buy(node, {'ticker': TICKER, 'current_price': 100.0,
+                                                 'z_score': -2.5, 'last_bar': bar1})
+    pos = db.get_open_positions(paper=True)[0]
+
+    db.close_position(pos['id'], exit_signal_price=99.0, exit_price=99.0,
+                       exit_time=datetime.now(), exit_reason='SL', paper=True,
+                       exit_bar_time=None, exit_decision_bar=bar1)
+    assert db.get_last_paper_exit_decision_bar(node['id']) == bar1.strftime('%Y-%m-%d %H:%M:%S')
+
+    # Same-bar re-entry attempt must be suppressed.
+    paper_trading.start_paper_market_buy(node, {'ticker': TICKER, 'current_price': 98.0,
+                                                 'z_score': -2.6, 'last_bar': bar1})
+    assert db.get_open_positions(paper=True) == []
+
+    # A genuinely later bar must be allowed through.
+    bar2 = bar1 + timedelta(hours=1)
+    paper_trading.start_paper_market_buy(node, {'ticker': TICKER, 'current_price': 98.0,
+                                                 'z_score': -2.6, 'last_bar': bar2})
+    assert len(db.get_open_positions(paper=True)) == 1
+
+
+def test_paper_market_buy_returns_true_on_cooldown_suppression(isolated_db):
+    """start_paper_market_buy/start_paper_buy must return True specifically when
+    the cooldown suppressed the call -- active_signals._scan_buy_signals relies
+    on this return value to release the node's buy_alerted slot (Opus review,
+    2026-08-14: without it, a cross-day stale-bar suppression burns the node's
+    one alert slot for the rest of that day with nothing to ever release it,
+    since a cooldown suppression -- unlike already_pending/already_held -- has
+    no later fill/close event that would naturally clear it)."""
+    node = _node()
+    bar1 = datetime(2026, 8, 13, 9, 30, 0)
+    sig1 = {'ticker': TICKER, 'current_price': 100.0, 'z_score': -2.5, 'last_bar': bar1}
+    assert paper_trading.start_paper_market_buy(node, sig1) is None
+    pos = db.get_open_positions(paper=True)[0]
+    db.close_position(pos['id'], exit_signal_price=99.0, exit_price=99.0,
+                       exit_time=datetime.now(), exit_reason='SL', paper=True,
+                       exit_bar_time=None, exit_decision_bar=bar1)
+
+    # Same-bar re-entry: suppressed, must return True (release the alert slot).
+    sig2 = {'ticker': TICKER, 'current_price': 98.0, 'z_score': -2.6, 'last_bar': bar1}
+    assert paper_trading.start_paper_market_buy(node, sig2) is True
+    assert paper_trading.start_paper_buy(node, sig2) is True
+
+    # A genuinely later bar: not suppressed, must not return True.
+    bar2 = bar1 + timedelta(hours=1)
+    sig3 = {'ticker': TICKER, 'current_price': 98.0, 'z_score': -2.6, 'last_bar': bar2}
+    assert paper_trading.start_paper_market_buy(node, sig3) is not True
+
+
+def test_paper_trailing_buy_pending_reentry_blocked_same_bar_after_reactive_exit(isolated_db):
+    """Same shape via the trailing-buy entry path (LABD's actual strategy,
+    TrailingBothZScoreBreakout) -- start_paper_buy must not even open a
+    pending-buy row for a same-bar re-entry."""
+    node = _node()
+    bar1 = datetime(2026, 8, 13, 9, 30, 0)
+    db.open_position(node, signal_price=100.0, signal_time=bar1,
+                      entry_price=100.0, entry_time=datetime.now(), shares=50, paper=True)
+    pos = db.get_open_positions(paper=True)[0]
+    db.close_position(pos['id'], exit_signal_price=99.0, exit_price=99.0,
+                       exit_time=datetime.now(), exit_reason='SL', paper=True,
+                       exit_bar_time=None, exit_decision_bar=bar1)
+
+    paper_trading.start_paper_buy(node, {'ticker': TICKER, 'current_price': 98.0,
+                                          'z_score': -2.6, 'last_bar': bar1})
+    assert db.get_paper_pending_buys() == []
+
+    bar2 = bar1 + timedelta(hours=1)
+    paper_trading.start_paper_buy(node, {'ticker': TICKER, 'current_price': 98.0,
+                                          'z_score': -2.6, 'last_bar': bar2})
+    assert len(db.get_paper_pending_buys()) == 1
+
+
+def test_check_paper_sells_populates_exit_decision_bar_on_mid_bar_exit(monkeypatch, isolated_db):
+    """Confirms check_paper_sells itself (not a hand-built close_position call)
+    writes exit_decision_bar unconditionally, unlike exit_bar_time which stays
+    NULL on the mid-bar/reactive branch."""
+    node = _node()
+    signal_time = datetime.now() - timedelta(hours=1)
+    db.open_position(node, signal_price=100.0, signal_time=signal_time,
+                      entry_price=100.0, entry_time=datetime.now(), shares=50, paper=True)
+
+    from signals_compute import _load_cache
+    last_seen_bar = {}
+    # Seed last_seen_bar so the very next call is treated as an already-seen
+    # bar (mid-bar/reactive branch), matching resolve_at_bar_close's own
+    # first-check deferral -- mirrors test_at_bar_close_deferred_on_fresh_position above.
+    paper_trading.check_paper_sells(last_seen_bar, set(), _load_cache)
+    monkeypatch.setattr(paper_trading, '_current_price', lambda t: (98.0, None))
+    paper_trading.check_paper_sells(last_seen_bar, set(), _load_cache)
+
+    with db._conn() as c:
+        trade = dict(c.execute(
+            "SELECT * FROM paper_trade_log WHERE wl_id = ? ORDER BY id DESC LIMIT 1", (node['id'],)
+        ).fetchone())
+    assert trade['exit_decision_bar'] is not None
+    assert trade['exit_bar_time'] is None

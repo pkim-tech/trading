@@ -59,8 +59,18 @@ def _entry_threshold_crossed(ticker, node, check_date):
     live against IVV: z stayed +0.8 to +2.8 across 4 straight days against a -0.1
     entry threshold -- the 'no closed trade' deviations really were just no signal).
 
-    Restricted to target_hours (9,10,11,12,13,14 anchors) matching CLAUDE.md's real
-    live signal-window scope -- the 15:30 bar is never checked live either.
+    Restricted to the 2 bars the live daemon actually evaluates (hour=9 for the
+    10:25-10:40 window, hour=14 for the 15:25-15:40 window -- active_signals.
+    _SIGNAL_WINDOWS), not every hourly bar of the day. Fixed 2026-08-14: this
+    previously checked hour.isin(range(9,15)) -- all 6 bars -- which is the
+    BACKTEST kernel's target_hours=(9,14) continuous-evaluation scope, not the
+    live daemon's actual twice-daily check. Found live: FAS/2026-08-13 showed a
+    real crossing at the bar spanning 10:30-11:30 (Close reflects the price at
+    11:30, an hour after the AM window already closed) while the real daemon
+    log for that exact window shows z staying +2.4 to +4.9, never crossing --
+    the daemon never had a chance to see it. The old scope made every such
+    off-window dip look like a "confirmed missed signal," blocking auto-explain
+    on what was actually a quiet day.
 
     Checks both bar Close AND bar Open (2026-08-08, paired-review finding) for a
     node with entry_timing='open_check' -- the live daemon's pinned entry scan
@@ -91,12 +101,21 @@ def _entry_threshold_crossed(ticker, node, check_date):
     if pd.isna(sma) or pd.isna(std) or std == 0:
         return None
 
-    bars = df[(df.index.normalize() == day) & (df.index.hour.isin(range(9, 15)))]
+    bars = df[(df.index.normalize() == day) & (df.index.hour.isin([9, 14]))]
     if bars.empty:
         return None
     check_open_too = node.get('entry_timing') == 'open_check'
     for _, bar in bars.iterrows():
+        # Close (and Open, for open_check nodes) alone under-covers what the daemon's
+        # continuous polling during the real 15-minute signal window could actually see --
+        # the window spans the tail of this bar's formation, not just its final snapshot.
+        # Low is the worst-case (most-likely-to-cross) price within the bar, so including
+        # it keeps this failing toward "don't auto-explain away a real miss" (found by
+        # Opus review, 2026-08-14: the prior Close/Open-only version could auto-explain a
+        # genuine intra-window dip-and-recover the daemon actually saw and missed).
         prices = [bar["Close"]] + ([bar["Open"]] if check_open_too and "Open" in bar else [])
+        if "Low" in bar:
+            prices.append(bar["Low"])
         for price in prices:
             if strat.check_signal(dict(sma=sma, std=std, current_price=price)) == 'BUY':
                 return True

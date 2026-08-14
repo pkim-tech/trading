@@ -38,7 +38,7 @@ import schwab_client
 import schwab_safety
 import scripts.verify_real_trades_vs_kernel as verify
 from scripts.coverage_registry import REGISTRY, compute_status, STATUS_ORDER
-from scripts.coverage_regression_watch import last_run_statuses, log_run, _next_run_id, staleness_for
+from scripts.coverage_regression_watch import last_run_statuses, log_run, staleness_for
 from scripts.capital_scaling_gate import _git_state
 from scripts.coverage_proof_matrix import classify as proof_classify
 from scripts.coverage_registry import fake_venue_proof_for
@@ -82,6 +82,13 @@ def part1():
     hits = []
     for line in log.read_text(errors='ignore').splitlines():
         if 'schwab_stream' in line:
+            continue
+        # [cooldown] lines (active_signals.py:483, added 2026-08-14) embed a real
+        # timestamp mid-line ("...last exit bar 2026-08-13 09:30:54") that isn't this
+        # line's own date/time -- _DATE_TIME_RE's unanchored search would otherwise
+        # latch onto that stale, embedded date and corrupt current_date/current_time
+        # for every unprefixed line that follows (found by Opus review, 2026-08-14).
+        if '[cooldown]' in line:
             continue
         dt_match = _DATE_TIME_RE.search(line)
         if dt_match:
@@ -605,7 +612,7 @@ def _deep_live_parity():
     outcome-vs-kernel check above: it replays active_signals.py's own compute_buy_signal/
     check_sell_condition bar-by-bar against the numba kernel, so it catches silent drift
     between the two codebases even on days with no real trades at all."""
-    print("\n--- live CODE vs kernel (scripts/verify_live_parity.py bar-by-bar replay) ---")
+    print("\n--- 4. Live CODE vs kernel (scripts/verify_live_parity.py bar-by-bar replay) ---")
     if '--skip-deep-parity' in sys.argv:
         print("NOT CHECKED this run (--skip-deep-parity passed)")
         return
@@ -623,9 +630,14 @@ def _deep_live_parity():
         print("0 nodes checkable -- live-code-vs-kernel parity NOT verified this run")
         return
 
-    # A MISMATCH is EXPECTED here (known kernel look-ahead bias, not a live bug) -- only the
-    # first-mismatch index/date MOVING between runs is a real signal. See verify_live_parity's docstring.
-    print("(mismatch expected: known kernel look-ahead bias -- watch for the index/date MOVING run-to-run)")
+    # The "expected look-ahead bias" framing was retired 2026-08-14 -- that bias was fixed
+    # in the kernel back on 2026-07-03 (backtester.prep_inputs), and AGQ/NUGT's mismatches
+    # here traced to a real bug in THIS harness (replay() never passed open_price=,
+    # silently defeating the gap-through-trigger fill logic), now fixed. AGQ reports a
+    # clean MATCH; any mismatch reported below is real and worth investigating, not noise
+    # to filter by "did the index move."
+    print("(a MATCH here is the expected outcome now -- a mismatch is real, not noise; "
+          "investigate it directly)")
     for n in supported:
         uses_fixed = strategies.uses_fixed_sl(n['strategy'])
         sl = (n.get('fixed_sl') if uses_fixed else n.get('stop_loss')) or 0
@@ -666,7 +678,7 @@ def part3():
     print(f"=== Part 3: coverage trend, paper vs kernel, live vs kernel ({TODAY}) ===")
     nodes_all_capital = real_capital_nodes()
 
-    print("--- coverage regression (vs last logged run) ---")
+    print("--- 1. Coverage/Grid trend (vs last logged run) ---")
     today_rows = {r['id']: compute_status(r) for r in REGISTRY}
 
     # Today's own state, independent of whether a prior baseline exists to diff against --
@@ -683,10 +695,25 @@ def part3():
         "SELECT scenario_key, COUNT(DISTINCT date(ts)) FROM coverage_events "
         "WHERE ts >= date('now', '-14 days') GROUP BY scenario_key"
     ).fetchall())
+    # Scoped to exactly TODAY (localtime, matching coverage_check.py's own UTC-vs-local
+    # fix) -- event_days above only tells us this scenario fires daily IN GENERAL, not
+    # that it actually fired today specifically. compute_status()/proof_classify() are
+    # both ALL-TIME status, so "not currently red" was being read as "confirmed repeated
+    # today" even when today itself was silent (found by Opus review, 2026-08-14).
+    today_events = {r[0] for r in con.execute(
+        "SELECT DISTINCT scenario_key FROM coverage_events WHERE date(ts, 'localtime') = ?", (TODAY,)
+    ).fetchall()}
     scenario_freq = dict(con.execute(
         "SELECT scenario_key, expected_frequency FROM scenario_expectations WHERE active=1"
     ).fetchall())
     con.close()
+
+    # Moved up from below (was computed after this loop) so a scenario_expectations daily
+    # row can be judged against TODAY's own check_date specifically, not compute_status's
+    # all-time 'deviation-unexplained' status (same staleness bug as coverage_events above).
+    unexplained_by_key = {}
+    for d in db.get_deviations(unexplained_only=True):
+        unexplained_by_key.setdefault(d['scenario_key'], []).append(d)
 
     daily_rows, snoozed_rows, accepted_rows, edge_rows = [], [], [], []
     for row in REGISTRY:
@@ -695,7 +722,20 @@ def part3():
         sk = row['scenario_key']
         is_daily = (scenario_freq.get(sk) == 'daily') or (event_days.get(sk, 0) >= 7)
         if is_daily:
-            daily_rows.append((row['id'], tier, status, red, detail, sk))
+            # A not-prod-required row is an accepted/demoted status regardless of firing
+            # cadence -- "did it fire today" doesn't apply to it (found live 2026-08-14:
+            # position_lock, hasn't fired since market hasn't opened yet, was printing as
+            # "NOT repeating" despite being a deliberate accepted status, not a gap).
+            # Otherwise: red if the all-time status was already bad (unchanged from
+            # before), OR if it's a currently-good status that simply hasn't happened yet
+            # today (the actual gap this fix closes).
+            if status == 'not-prod-required':
+                red_today = False
+            elif row['check_mechanism'] == 'coverage_events':
+                red_today = red or (sk not in today_events)
+            else:
+                red_today = red or any(d['check_date'] == TODAY for d in unexplained_by_key.get(sk, []))
+            daily_rows.append((row['id'], tier, status, red_today, detail, sk))
             continue
         # not-prod-required: a deliberate, already-made decision (cost of forcing this
         # scenario to a higher proof tier exceeds the value) -- not a gap, must not sit
@@ -720,13 +760,6 @@ def part3():
     print(f"Accountability Grid: {len(REGISTRY)} total scenarios "
           f"({len(daily_rows)} daily, {len(snoozed_rows)} snoozed, "
           f"{len(accepted_rows)} accepted, {len(edge_rows)} edge cases)")
-
-    # Surfacing status alone ("deviation-unexplained") forced a manual follow-up query
-    # every time -- user's call, 2026-08-14: a red row should carry enough of the real
-    # actual_summary/last-fired detail right here to judge it without asking again.
-    unexplained_by_key = {}
-    for d in db.get_deviations(unexplained_only=True):
-        unexplained_by_key.setdefault(d['scenario_key'], []).append(d)
 
     daily_red = sum(1 for _, _, _, red, _detail, _sk in daily_rows if red)
     print(f"Daily-firing scenarios: {len(daily_rows) - daily_red}/{len(daily_rows)} confirmed repeated today"
@@ -765,8 +798,15 @@ def part3():
             if stale:
                 print(f"  {rid:38s} {tier:10s} {status}")
     if total_edge_red:
+        # 'NONE' tier is nearly always empty in practice -- a red row almost always
+        # already has SOME proof (SIMULATOR/UNIT-TEST), just not enough to clear this
+        # bucket. Pointing at a fixed, usually-empty tier here was a real bug (found
+        # 2026-08-14): list the tiers that actually have red rows, from the table
+        # just printed above, instead of a hardcoded guess.
+        red_tiers = ' '.join(t for t in ('LIVE', 'CANARY', 'PAPER', 'SIMULATOR', 'UNIT-TEST', 'NONE', 'N/A')
+                              if tier_red.get(t))
         print(f"{total_edge_red} edge-case row(s) currently red -- run "
-              f"`scripts/coverage_proof_matrix.py --tier NONE` for the full list")
+              f"`scripts/coverage_proof_matrix.py --tier <TIER>` for each of: {red_tiers}")
 
     prior_run_id, prior_ts, prior_statuses = last_run_statuses()
     if prior_run_id is None:
@@ -785,20 +825,29 @@ def part3():
     # always dead-ended into "go run scripts/coverage_regression_watch.py yourself" instead
     # of just doing it (user's call, 2026-08-13 -- this is exactly the fragmentation this
     # whole evening_status.py script was built to get away from).
-    run_id = _next_run_id()
-    git_commit, _dirty = _git_state()
-    log_run(run_id, git_commit, today_rows)
-    print(f"logged as run #{run_id} (commit={git_commit or '?'})")
+    # Only ONE baseline per calendar day -- watch_evening_status.sh runs this every 60s by
+    # default; logging unconditionally would flood coverage_run_snapshot (~50 rows/minute)
+    # and make "regressed since run #N" always diff against a snapshot from a minute ago
+    # instead of the real day-over-day signal this section exists for (found by Opus
+    # review, 2026-08-14).
+    if prior_ts and prior_ts[:10] == TODAY:
+        print(f"already logged today as run #{prior_run_id} ({prior_ts}) -- not re-logging")
+    else:
+        git_commit, _dirty = _git_state()
+        run_id = log_run(git_commit, today_rows)
+        print(f"logged as run #{run_id} (commit={git_commit or '?'})")
 
     # A TODAY..TODAY window compares essentially nothing -- most nodes don't trade on any
     # given day, so nearly every node short-circuits on "no activity either side" and the
     # old "of N checked" count counted those skips as if they'd been compared.
     paper_start = (datetime.now() - timedelta(days=PAPER_WINDOW_DAYS)).strftime('%Y-%m-%d')
     active_wl = db.get_active_watchlist_id()
-    print(f"\n--- paper vs kernel (live-track nodes, watchlist {active_wl}, {paper_start}..{TODAY}) ---")
+    print(f"\n--- 2. Paper vs kernel (live-track nodes, watchlist {active_wl}, {paper_start}..{TODAY}) ---")
     paper_nodes = resolve_live_track_nodes_by_activity(active_wl)
-    flagged = compared = 0
-    errored = 0
+    # Two passes -- collect everything first so the summary line can lead (user's call,
+    # 2026-08-14: had to read every printed row before knowing the totals; a scan-only
+    # tool's most useful line is the one you'd otherwise compute by hand at the end).
+    results = []
     for node in paper_nodes:
         try:
             paper = get_paper_trades(node['id'], paper_start, TODAY)
@@ -806,20 +855,39 @@ def part3():
         except Exception as e:
             # cache/research/<ticker>_1h.csv is rewritten in place by the live daemon, so a
             # read here can transiently hit a half-written file -- don't fail the whole report.
-            errored += 1
-            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  NOT CHECKED ({type(e).__name__})")
+            results.append((node, None, None, 'error', type(e).__name__))
             continue
         if len(paper) == 0 and len(bt) == 0:
-            continue  # nothing on either side in the window -- not compared, not evidence
-        compared += 1
-        if abs(len(paper) - len(bt)) > 2:
-            flagged += 1
-            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  paper={len(paper)} kernel={len(bt)}  MISMATCH")
-    print(f"{flagged} flagged of {compared} actually compared "
-          f"({len(paper_nodes) - compared - errored}/{len(paper_nodes)} had zero activity both sides"
-          + (f", {errored} errored" if errored else "") + " -- not checked)")
+            results.append((node, 0, 0, 'quiet', None))
+            continue
+        # resolve_live_track_nodes_by_activity's own fallback (see its docstring) returns
+        # the lowest-id node for a ticker with NO real paper_trade_log/paper_positions/
+        # paper_pending_buys activity at all -- for a ticker only run as dry_run/canary/
+        # live, that's structurally never going to have paper rows, so paper=0 here is
+        # not evidence of anything. Comparing it against real kernel activity produced a
+        # false MISMATCH for FAZ/JDST/QID (2026-08-14, user caught it) -- only a genuine
+        # state='paper' node can actually diverge from what paper trading should have done.
+        if node.get('state') != 'paper':
+            results.append((node, len(paper), len(bt), 'not-paper', None))
+            continue
+        mismatch = abs(len(paper) - len(bt)) > 2
+        results.append((node, len(paper), len(bt), 'MISMATCH' if mismatch else 'ok', None))
 
-    print(f"\n--- live vs kernel (all real capital-at-stake nodes today, not just ones that traded) ---")
+    quiet = sum(1 for r in results if r[3] == 'quiet')
+    not_paper = sum(1 for r in results if r[3] == 'not-paper')
+    errored = sum(1 for r in results if r[3] == 'error')
+    flagged = sum(1 for r in results if r[3] == 'MISMATCH')
+    matched = sum(1 for r in results if r[3] == 'ok')
+    print(f"{len(paper_nodes)} total: {quiet} no activity either side, {not_paper} not a paper node "
+          f"(dry_run/canary/live -- not comparable here), {matched} matched, {flagged} issues"
+          + (f", {errored} errored" if errored else ""))
+    for node, paper_n, kernel_n, tag, err in results:
+        if tag == 'MISMATCH':
+            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  paper={paper_n} kernel={kernel_n}  MISMATCH")
+        elif tag == 'error':
+            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  NOT CHECKED ({err})")
+
+    print(f"\n--- 3. Live vs kernel (all real capital-at-stake nodes today, not just ones that traded) ---")
     # Previously scoped to wl_ids derived from TODAY's real trades only -- a node with ZERO
     # real activity today never got checked against the kernel at all, so a real missed
     # signal (kernel predicted, daemon never acted) on an otherwise-quiet node was invisible.
@@ -906,7 +974,7 @@ def _next_triggers():
     derived the same way the live exit path derives it (strategies.uses_fixed_sl +
     db._tp_or_arm_pct + entry_price/trail peak), not re-guessed here, so it can't drift from
     what check_sell_condition will actually do."""
-    print("\n--- Next real triggers ---")
+    print("\n--- 2. Next real triggers ---")
     nodes = real_capital_nodes()
     for n in nodes:
         state = db.get_real_position_state(n['id'])
@@ -962,6 +1030,7 @@ def _next_triggers():
 
 def part4():
     print("=== Part 4: readiness for tomorrow ===")
+    print("--- 1. Operational readiness (daemon, token) ---")
     pid = daemon_status._find_daemon_pid()
     if not pid:
         print("daemon: NOT RUNNING")

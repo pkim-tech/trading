@@ -6175,3 +6175,26 @@ User's own diagnosis, arrived at after an Opus challenge of an account-check-in 
 Root cause, user's framing: this project has accumulated many partial, narrow scripts each answering one specific question (verify_live_parity's synthetic 4-node replay, paper_vs_backtest_reconcile's paper-only reconciliation, `scripts/verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py`'s narrower live-vs-backtest checks per the pre-commit checklist) — none of them actually ask, or answer, the real central question. Adding another one-off script would repeat the pattern, not fix it.
 
 Not started — needs a real audit of every existing live-vs-backtest/paper-vs-backtest verification tool (what does each actually check, against what data, for which strategies), then a design decision: consolidate into one tool that reads real `trade_log` (not just paper) and replays it against the kernel for the actual strategy each node runs (not a hardcoded synthetic sample), or clearly delineate what each existing tool is/isn't for so gaps like this don't hide again. High priority — directly blocks the "trades must equal backtest" North Star from having any real instrument.
+
+## 2026-08-14/15 (overnight Research sweep) — full candidate-universe sponsor/advance-notice mapping (82 tickers) + first full `check_stock_splits.py` sweep, full detail
+**Origin**: extends the same-night NUGT/AGQ investigation (`signals_compute.detect_price_discontinuity`'s price-ratio heuristic false-positived on a 46% NUGT rally). The real fix in design keys off each sponsor's own advance-notice reverse-split announcements; that had only ever been confirmed for the 10 real-live tickers (`docs/watchlist_candidate_checklist.md` item #15). This job extended it to the full `candidate_nodes` universe (82 tickers) and ran `scripts/check_stock_splits.py` (previously spot-checked only, UVIX/NBIZ) as a genuine full sweep for the first time.
+
+**Sponsor mapping (82/82 tickers, 10 distinct sponsors, 0 unknown-issuer)**:
+- Direxion (35): CURE, CWEB, DFEN, DPST, DRIP, DRN, DUST, EDC, ERX, ERY, FAS, FAZ, GUSH, HIBL, JDST, JNUG, KORU, LABD, LABU, NAIL, NUGT, RETL, SOXL, SOXS, SPXL, SPXS, TECL, TECS, TMF, TMV, TNA, TZA, WEBL, YANG, YINN — advance-notice YES (direxion.com/press-releases)
+- ProShares (30): AGQ, BITU, BOIL, DDM, DXD, GLL, KOLD, QID, QLD, ROM, SCO, SDOW, SDS, SPXU, SQQQ, SRTY, SSG, SSO, TBT, TQQQ, TWM, UCO, UDOW, UGL, UPRO, URTY, USD, UVXY, UWM, ZSL — advance-notice YES (proshares.com)
+- BMO/MicroSectors (6): BULZ, FNGD, FNGU, GDXD, GDXU, OILU — advance-notice YES (microsectors.com/insights, newsroom.bmo.com, bmoetn.com)
+- Volatility Shares (4): BITX, ETHU, SOLT, UVIX — advance-notice YES (volatilityshares.com/news/)
+- Defiance/Tidal Financial Group (2): QPUX, SPCL — advance-notice YES, newly confirmed (GlobeNewswire/PRNewswire/Nasdaq wire, ~12-30 day notice, not on own domain)
+- REX Shares/Tuttle Capital (1): BTCZ — advance-notice YES, newly confirmed (rexshares.com press releases)
+- Tradr/Investment Managers Series Trust II (1): MQQQ — advance-notice YES, newly confirmed (PRNewswire feed + SEC Form 497 supplements + Nasdaq Corp Actions Alerts)
+- USCF Investments (1): USO — advance-notice YES, newly confirmed (PRNewswire/Nasdaq wire, ~6 day notice, e.g. USO's 2020 1-for-8)
+- Invesco (1): QQQ — **UNKNOWN/no mechanism found** (zero split history except a 2000 2:1 forward split; negligible practical risk given UIT structure/AUM)
+- State Street (1): SPY — **UNKNOWN/no mechanism found** (zero split history since 1993 inception; same negligible-risk profile)
+
+All 10 real-live tickers (DFEN, DPST, GDXU, KORU, NUGT, SOXL, SOXS, AGQ, ETHU, JNUG) sit under a confirmed-mechanism sponsor.
+
+**Full `check_stock_splits.py` sweep (1,478 cached tickers, first time run in full)**: 266 real splits found within cached history universe-wide. Filtered to the 82-candidate scope: **40/82 (49%) have a real split landing inside their cached window** — BOIL, BULZ, DDM, DRIP, DUST, ETHU, FAZ, GDXD, GLL, JDST, KOLD, KORU, LABD, LABU, MQQQ, QID, QLD, QPUX, SDOW, SDS, SOLT, SOXS, SPXS, SPXU, SQQQ, SRTY, SSG, SSO, TECS, TMF, TQQQ, TWM, TZA, UDOW, UGL, USD, UVIX, UVXY, YANG, ZSL. Of the 10 live tickers: **ETHU, KORU, SOXS flagged** (7 others — DFEN, DPST, GDXU, NUGT, SOXL, AGQ, JNUG — clean). Per the script's own docstring, a flag means the split date falls inside the cache window, not proof of live corruption — could already be correctly rescaled (e.g. a fresh bootstrap after the split). **Nothing deleted/rebuilt this session** — reported for the user's own verify-and-rebuild pass, per standing "never delete data without confirmation" convention.
+
+**Not done**: (1) actually verifying/rebuilding the 40 flagged tickers' cached CSVs (this sweep only identifies); (2) no schema change/persistence of the sponsor mapping into `trading_universe.db` (lives only in the `research_log.md` entry) — deliberately deferred to avoid an unreviewed schema migration on an unattended overnight run.
+
+Full writeup: `docs/research_log.md`'s 2026-08-14/15 (overnight Research sweep) entry.
