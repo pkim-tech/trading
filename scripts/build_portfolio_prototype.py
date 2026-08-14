@@ -269,12 +269,12 @@ for i, name in enumerate(final_cols, 1):
     width = 10 if name in ("comment", "underlier_note", "bear_note") else min(8, max(5, len(name) // 2))
     new_ws.column_dimensions[letter].width = width
 
-# single column group: worst_neighbor_pct (cliff-safety) through drought_wr_tranche
-# (cliff+fillacc+addon+drought detail), collapsed by default.
+# single column group: everything right after the freeze pane through drought_wr_tranche
+# (sector/tax/structural detail + cliff+fillacc+addon+drought detail), collapsed by default.
 # openpyxl's column_dimensions.group() only sets outlineLevel/hidden on the FIRST
 # column of the range, not the whole span (confirmed via a minimal repro 2026-08-13) --
 # looping explicitly instead of relying on that convenience method.
-group_start = col_idx["worst_neighbor_pct"]
+group_start = freeze_after + 1
 group_end = col_idx["drought_wr_tranche"]
 for i in range(group_start, group_end + 1):
     dim = new_ws.column_dimensions[get_column_letter(i)]
