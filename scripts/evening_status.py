@@ -18,6 +18,9 @@ import active_signals as a
 import signals_db as db
 import signals_helpers as helpers
 import scripts.verify_real_trades_vs_kernel as verify
+from scripts.coverage_registry import REGISTRY, compute_status, STATUS_ORDER
+from scripts.coverage_regression_watch import last_run_statuses
+from scripts.paper_vs_backtest_reconcile import resolve_live_track_nodes_by_activity, get_paper_trades
 import scripts.daemon_status as daemon_status
 
 TODAY = datetime.now().strftime('%Y-%m-%d')
@@ -81,7 +84,38 @@ def part2():
 
 
 def part3():
-    print(f"=== Part 3: trades vs kernel, coverage deviations ({TODAY}) ===")
+    print(f"=== Part 3: coverage trend, paper vs kernel, live vs kernel ({TODAY}) ===")
+
+    print("--- coverage regression (vs last logged run) ---")
+    today_rows = {r['id']: compute_status(r) for r in REGISTRY}
+    prior_run_id, prior_ts, prior_statuses = last_run_statuses()
+    if prior_run_id is None:
+        print("no prior run on file -- run scripts/coverage_regression_watch.py to establish a baseline")
+    else:
+        regressed = []
+        for k, (status, _detail) in today_rows.items():
+            old = prior_statuses.get(k)
+            if old is not None and old != status and STATUS_ORDER.get(status, 99) < STATUS_ORDER.get(old, 99):
+                regressed.append((k, old, status))
+        print(f"{len(regressed)} regressed since run #{prior_run_id} ({prior_ts})")
+        for k, old, new in sorted(regressed):
+            print(f"  {k:38s} {old} -> {new}")
+
+    print("\n--- paper vs kernel (live-track nodes with real paper activity) ---")
+    paper_nodes = resolve_live_track_nodes_by_activity(65)
+    flagged = 0
+    for node in paper_nodes:
+        paper = get_paper_trades(node['id'], TODAY, TODAY)
+        bt = verify.get_backtest_trades_in_window(node, TODAY, TODAY)
+        if len(paper) == 0 and len(bt) == 0:
+            continue
+        mismatch = abs(len(paper) - len(bt)) > 2
+        if mismatch:
+            flagged += 1
+            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  paper={len(paper)} kernel={len(bt)}  MISMATCH")
+    print(f"{flagged} node(s) flagged (of {len(paper_nodes)} checked)")
+
+    print(f"\n--- live vs kernel (real capital-at-stake trades today) ---")
     real = verify.get_real_trades(TODAY, TODAY, accounts=None)
     real = [r for r in real if r['wl_id'] and r['wl_id'] > 0]
     wl_ids = sorted({r['wl_id'] for r in real})
