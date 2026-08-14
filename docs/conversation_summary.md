@@ -7545,3 +7545,22 @@ Also fixed live, via direct user feedback: a real portability bug (script broke 
 **Not committed** — `scripts/evening_status.py` is fully built and verified working (`all` runs clean, exit 0, every number cross-checked against the real DB/broker at least once) but sitting uncommitted per explicit instruction earlier in the session (an early premature commit, made without being asked, was called out directly — "why did you say memory - this should be preset" / commits should only happen when the user asks). Next session: get explicit go-ahead to commit `scripts/evening_status.py`, then actually run the real evening check-in with it.
 
 **Standing feedback reinforced hard this session** (see `feedback_conciseness.md`, updated): verbosity in both chat responses and script output was corrected repeatedly and specifically — cut mid-task narration to 1-3 lines, don't restate diffs already visible in the tool result, don't pad print statements with explanatory paragraphs a column header or one-line comment can carry instead. Also reinforced: never treat a git commit as a "we're done, ready to clear" signal — that Stop-hook line is mechanical, not a completion claim; and never build a new one-off script when an existing one can be extended.
+
+---
+
+## 2026-08-14 (late) — [Research] Portfolio prototype column-grouping fix; evening_status.py + coverage_registry.py fixes committed from prior uncommitted work
+
+Started with `go research`: reviewed `[backtest]`-tagged backlog (29 open items, no past-due deferrals) and the latest session_cache entries (RETL cooldown, evening_status.py hardening, portfolio construction prototype).
+
+**Real fix**: `scripts/build_portfolio_prototype.py`'s collapsible column group was hardcoded to start at `worst_neighbor_pct`, leaving 23 detail columns (sector/tax/structural/candidate-type block) ungrouped and visible immediately after the frozen Keys+CAGR columns — user caught this live ("column grouping still messed up... it should start right after the freeze and go to BN"). Fixed to anchor `group_start` to `freeze_after + 1` so the group always begins exactly at the freeze boundary regardless of future column reordering. Verified: group now spans Q (sector) through BN (drought_wr_tranche), 50 columns, all `hidden=True`/`outlineLevel=1`.
+
+**Lineage question answered, no action taken**: user asked whether node lineage (backtest_cache → candidate_nodes → watch_list) is fully traceable. Confirmed live: `sweep_run_id` is NULL on all 11 currently-linked live nodes (deliberately not backfilled, 2026-08-11 decision — only new rows get it); 9 live nodes (CURE/ERX/ERY/HIBL/RETL/SPY/TMF/USD/YANG/YINN) have no candidate link at all; 5 linked nodes (JNUG/DFEN/ETHU/NUGT/GDXU) were computed on a stale 1.11yr window vs ~2.9-3yr available now (already tracked under the open "quarterly resweep" backlog item). User's call: leave it — "those are a wash, become obsolete in a few months."
+
+**Committed 3 separate commits** (user's explicit request to keep them split):
+1. `45f4ee0` — the column-grouping fix above.
+2. `8e17194` — `scripts/evening_status.py` (906 lines) + new `scripts/watch_evening_status.sh`, carried over uncommitted from the prior session's iterative-review hardening (log-warning scan bug, Part 2/3/4 gaps, price-source disagreement, undercounted same-day P&L — all already fixed pre-session, just uncommitted).
+3. `96aa35f` — `scripts/coverage_registry.py`: `position_lock`'s `not_prod_required_note` was unreachable in `compute_status()` (sat after the `good_n>0` early return), leaving it stuck in `*-attempt-failed` forever despite being a deliberate 2026-08-13 demotion. Moved the check earlier so it applies.
+
+No `active_signals.py`/`signals_*.py`/`schwab_*.py`/kernel files changed this session — no paired Opus review needed per `session wrap`'s own gate. `check_backlog_cache_lean.py` and `signals_invariants.py` both clean.
+
+**Not yet applied**: `docs/portfolio_construction_notes.md` item 13 (per-section column grouping for wf_*/sdb_*/bear_*/crash25_* blocks) and item 16 (narrower column widths) remain marked "not yet built" — untouched this session, still open per that doc.
