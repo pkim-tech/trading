@@ -4118,7 +4118,7 @@ def build_reference_table(watchlist):
                 'Ticker': ticker, 'Hold': '', 'Next Action': 'NO_DATA', 'Next Trigger $': None,
                 'Now': None, 'Proximity': None, 'Version': node.get('version'), 'Alpha': alpha,
                 'Z': None, 'Z Trigger': node.get('z_score_threshold'),
-                'TrailBuy%': node.get('trail_buy_pct'), 'Arm%': node.get('arm_sell_pct'),
+                'TrailBuy%': node.get('trail_buy_pct'), 'Arm%': db._tp_or_arm_pct(node),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
                 'Strategy': node['strategy'], 'Held': False, 'Phase': phase, 'State': node.get('state'),
                 '_node': node, '_pos': None, '_sig': None,
@@ -4150,7 +4150,7 @@ def build_reference_table(watchlist):
                 'Proximity': (now_price - trigger) / trigger * 100,
                 'Version': node.get('version'), 'Alpha': alpha, 'Z': sig['z_score'],
                 'Z Trigger': node.get('z_score_threshold'),
-                'TrailBuy%': trail_buy_pct, 'Arm%': node.get('arm_sell_pct'),
+                'TrailBuy%': trail_buy_pct, 'Arm%': db._tp_or_arm_pct(node),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
                 'Strategy': node['strategy'], 'Held': False, 'Phase': phase, 'State': node.get('state'),
                 'SL $': trigger * (1 - schwab_sl_pct / 100), 'Arm $': trigger * (1 + db._tp_or_arm_pct(node) / 100),
@@ -4164,7 +4164,12 @@ def build_reference_table(watchlist):
             hours_held = compute._bars_held(df_hourly_p, signal_time)
             hold = f"{hours_held:.0f}h/{pos['max_hold_hours']}h"
             trail_state = pos.get('trail_state') or {}
-            arm_pct = pos.get('arm_sell_pct')
+            # Column-overload: only TrailingBothZScoreBreakout stores its arm
+            # threshold in arm_sell_pct -- every other strategy (incl.
+            # TrailingExitZScoreBreakout) stores it in take_profit. Reading the
+            # raw column rendered `arm ?` for a real UDOW row. db._tp_or_arm_pct
+            # is the same resolver the 'Arm $' / arm-trigger math below uses.
+            arm_pct = db._tp_or_arm_pct(pos)
             trail_sell_pct = pos.get('trail_sell_pct')
             bsp = pos.get('broker_stop_price')
             # Broker only allows one resting sell-all order per position -- once the
@@ -4362,9 +4367,13 @@ def _position_trigger_summary(pos):
             parts.append(f"ARMED, trailing {trail_pct}% off peak ${peak:.2f} -> stop ${trail_price:.2f}")
         else:
             parts.append("ARMED, trailing")
-    elif pos.get('arm_sell_pct'):
-        arm_price = entry * (1 + pos['arm_sell_pct'] / 100)
-        parts.append(f"arms @ ${arm_price:.2f} ({pos['arm_sell_pct']}%) then trails {pos.get('trail_sell_pct') or '?'}%")
+    elif db._tp_or_arm_pct(pos):
+        # Same column overload as build_reference_table's 'Arm%' -- reading the
+        # raw arm_sell_pct column dropped this whole line from the nightly plan
+        # for every TrailingExitZScoreBreakout position (arm lives in take_profit).
+        arm_sell_pct = db._tp_or_arm_pct(pos)
+        arm_price = entry * (1 + arm_sell_pct / 100)
+        parts.append(f"arms @ ${arm_price:.2f} ({arm_sell_pct}%) then trails {pos.get('trail_sell_pct') or '?'}%")
     if pos.get('max_hold_hours'):
         parts.append(f"forced TIME exit after {pos['max_hold_hours']}h from entry")
     return " | ".join(parts)
