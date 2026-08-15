@@ -589,7 +589,11 @@ def test_send_coverage_report_reflects_explained_deviation(isolated_db, monkeypa
     captured.clear()
     signals_notify.send_coverage_report(check_date)
     assert 'No unexplained deviations' in captured['text']
-    assert '(explained)' in captured['text']
+    # The per-scenario '✗ (explained)' line was collapsed into a group rollup
+    # 2026-08-14 (the report was ~200 lines of canary status); the fact that an
+    # explained deviation is still distinguished from a met scenario is what
+    # this test is actually about, and it still is.
+    assert '1 explained' in captured['text']
 
 
 def test_send_coverage_report_does_not_collapse_rows_sharing_a_scenario_key(isolated_db, monkeypatch):
@@ -661,7 +665,9 @@ def test_send_coverage_report_clears_stale_deviation_once_met(isolated_db, monke
     captured.clear()
     signals_notify.send_coverage_report(check_date)  # second tap: now met
     assert 'UNEXPLAINED' not in captured['text']
-    assert '✓' in captured['text']
+    # The per-scenario '✓' line was collapsed into a group rollup 2026-08-14;
+    # the scenario now shows up inside the met count, which is the same fact.
+    assert '1/1 met' in captured['text']
     rows = db.get_deviations()
     assert len(rows) == 1  # row kept, not deleted
     assert rows[0]['reason']  # auto-explained, not left unexplained
