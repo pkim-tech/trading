@@ -10,7 +10,8 @@ import signals_compute as compute
 import schwab_client
 import schwab_safety
 from signals_blocks import _post_message, _price_input_block, _shares_input_block
-from signals_helpers import _existing_position_note, _last_sale_recovery, clear_corp_action_alert
+from signals_helpers import (_existing_position_note, _last_sale_recovery, clear_corp_action_alert,
+                              mode_tag)
 from signals_notify import (send_reference_report, send_coverage_report, _place_stop_loss_for_position,
                              _coverage_mode, _exit_order_resting, close_addon_leg_real_if_open)
 
@@ -576,6 +577,13 @@ if cfg.SOCKET_MODE:
         data   = json.loads(body['view']['private_metadata'])
         node   = data['node']
         ticker = node['ticker']
+        # For mode_tag ONLY -- the button payload node (_ticker_block's
+        # node_fields) deliberately carries no 'state', and
+        # effectively_dry_run treats a missing state as not-live, so passing
+        # `node` straight in would label every real Manual Open "DRY-RUN":
+        # the reassuring-wrong direction mode_tag's own docstring forbids.
+        # Falls back to the payload only if the row is gone.
+        _tag_node = db.get_watch_list_node_by_id(node.get('id')) or node
 
         price  = float(body['view']['state']['values']['price_block']['price_input']['value'])
         shares = int(body['view']['state']['values']['shares_block']['shares_input']['value'])
@@ -586,9 +594,11 @@ if cfg.SOCKET_MODE:
 
         if not opened:
             print(f"  [warn] {ticker} already has an open position — ignored duplicate Manual Open")
-            _post_message(f"{ticker} — ALREADY OPEN, this Manual Open was ignored",
+            _post_message(f"{ticker} ({node.get('account')} · {mode_tag(node.get('account'), _tag_node)}) "
+                          f"— ALREADY OPEN, this Manual Open was ignored",
                           blocks=[{"type": "section", "text": {"type": "mrkdwn",
-                          "text": f"⚠️ *{ticker}* — a position was already open, this Manual Open "
+                          "text": f"⚠️ *{ticker}* ({node.get('account')} · {mode_tag(node.get('account'), _tag_node)}) "
+                                  f"— a position was already open, this Manual Open "
                                   f"was *not* recorded (no duplicate created). {_existing_position_note(ticker, wl_id=node['id'])}"}}])
             return
 
@@ -600,8 +610,10 @@ if cfg.SOCKET_MODE:
 
         note = f"${price:.4f}  {shares} shares"
         print(f"  Position manually opened via Slack: {ticker} at {note}")
-        _post_message(f"MANUAL OPEN {ticker} — {note}", blocks=[{"type": "section", "text": {"type": "mrkdwn",
-                      "text": f"*MANUAL OPEN {ticker}* — {note}"}}])
+        _tag = f"({node.get('account')} · {mode_tag(node.get('account'), _tag_node)})"
+        _post_message(f"MANUAL OPEN {ticker} {_tag} — {note}",
+                      blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                      "text": f"*MANUAL OPEN {ticker}* {_tag} — {note}"}}])
 
     @cfg.bolt_app.action("manual_close")
     def handle_manual_close(ack, body, client):
@@ -651,8 +663,17 @@ if cfg.SOCKET_MODE:
 
         note = f"${exit_price:.4f}  (P&L: {actual_pnl:+.2f}%)"
         print(f"  Position manually closed via Slack: {ticker} at {note}")
-        _post_message(f"MANUAL CLOSE {ticker} — {note}", blocks=[{"type": "section", "text": {"type": "mrkdwn",
-                      "text": f"*MANUAL CLOSE {ticker}* — {note}"}}])
+        # pos was already re-fetched above; `or {}` guards the same
+        # position-vanished case close_addon_leg_real_if_open's try/except
+        # already tolerates, so the close confirmation can never be lost to
+        # a labeling lookup. Node passed for the same reason signals_notify's
+        # builders do: without it a node-level dry-run on a trading_enabled
+        # account mislabels as LIVE.
+        _acct = (pos or {}).get('account')
+        _tag = f"({_acct} · {mode_tag(_acct, db.get_watch_list_node_by_id((pos or {}).get('wl_id')))})"
+        _post_message(f"MANUAL CLOSE {ticker} {_tag} — {note}",
+                      blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                      "text": f"*MANUAL CLOSE {ticker}* {_tag} — {note}"}}])
 
     @cfg.bolt_app.action("resend_ref_table")
     def handle_resend_ref_table(ack, body, client):

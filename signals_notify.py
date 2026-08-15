@@ -18,7 +18,19 @@ import schwab_safety
 import schwab_client
 import schwab_stream
 from signals_charts import _chart_buy, _chart_sell, _upload_chart
-from signals_blocks import _post_message, _post_chunked, _build_buy_blocks, _build_sell_blocks
+from signals_blocks import (
+    _post_message, _post_chunked, _build_buy_blocks, _build_sell_blocks,
+    # Relocated to signals_blocks 2026-08-14 (it was the odd block-builder
+    # still living here while every sibling builder lived there). Re-imported
+    # under its original name so existing call sites in this module,
+    # active_signals.py and the tests keep working unchanged -- the same
+    # re-export-for-backward-compat convention active_signals.py already uses.
+    # NOTE: _ticker_block was NOT relocated (2026-08-15 merge) -- it carries
+    # Tranche 3's origin-column fix for bugs #54/#63-64 and stays defined
+    # directly below in this module until that fix is ported over properly;
+    # see docs/backlog_cache.md for the follow-up.
+    _trailing_order_blocks,
+)
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
     buy_order_sizing, effectively_dry_run, has_capital_at_stake, log_poll, mode_tag,
@@ -395,6 +407,37 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     return order_id
 
 
+def _throttled(store, key, seconds):
+    """Shared cooldown gate for the module's repost-suppression alerts.
+    Returns True if the caller should fire NOW (and records the firing), False
+    if `key` is still inside its cooldown window.
+
+    Consolidates four separately hand-rolled copies of the identical
+    get/compare/set dance (_RECONCILE_ALERTED, _RECONCILE_FETCH_FAIL_ALERTED,
+    _STALE_PRICE_ALERTED, _ENTRY_ABANDON_ALERTED) -- _throttled_entry_abandon_
+    alert's own docstring already pointed at _RECONCILE_ALERTED as "the right
+    pattern for exactly this", so this generalizes that one rather than
+    inventing a new shape.
+
+    The store is passed in rather than shared globally on purpose: the four
+    call sites use genuinely different key spaces (per-position-id+kind,
+    per-account, per-position-id, per-wl_id+kind), so one dict would make an
+    account name and a position id collidable in principle, and several test
+    modules reset exactly one domain's cooldown (e.g.
+    tests/test_live_state_reconciliation.py's _RECONCILE_ALERTED.clear())
+    without wanting to clear the others.
+
+    Records the firing BEFORE the caller posts, deliberately: a Slack post
+    that then raises must still consume its cooldown, otherwise a persistent
+    post failure retries unbounded every poll cycle -- the exact alert-storm
+    shape _RECONCILE_FETCH_FAIL_ALERTED was added to prevent."""
+    now = time.time()
+    if now - store.get(key, 0) < seconds:
+        return False
+    store[key] = now
+    return True
+
+
 _RECONCILE_ALERTED: dict[str, float] = {}
 _RECONCILE_COOLDOWN_SECS = 900  # 15 min -- matches the reminder-nag/section-alert cadence elsewhere
 
@@ -621,11 +664,8 @@ def _alert_reconcile_mismatch(pos, kind, text):
         ticker=pos.get('ticker'), position_id=pos.get('id'),
         node_id=pos.get('wl_id'), result=kind, detail=text
     )
-    key = f"{pos['id']}:{kind}"
-    last = _RECONCILE_ALERTED.get(key, 0)
-    if time.time() - last < _RECONCILE_COOLDOWN_SECS:
+    if not _throttled(_RECONCILE_ALERTED, f"{pos['id']}:{kind}", _RECONCILE_COOLDOWN_SECS):
         return True
-    _RECONCILE_ALERTED[key] = time.time()
     _post_message(text)
     return True
 
@@ -647,11 +687,8 @@ def alert_stale_price_exit_suppressed(pos):
     ticker = pos['ticker']
     account = pos.get('account')
     node = db.get_watch_list_node_by_id(pos.get('wl_id'))
-    key = str(pos['id'])
-    last = _STALE_PRICE_ALERTED.get(key, 0)
-    if time.time() - last < _STALE_PRICE_COOLDOWN_SECS:
+    if not _throttled(_STALE_PRICE_ALERTED, str(pos['id']), _STALE_PRICE_COOLDOWN_SECS):
         return
-    _STALE_PRICE_ALERTED[key] = time.time()
     _post_message(
         f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) exit check skipped this poll — no fresh price available\n"
         f"(`_current_price` returned None: stale/missing same-day data; position remains open, "
@@ -885,9 +922,7 @@ def check_live_state_reconciliation(open_positions, now=None):
                 result="failed_after_retries",
                 detail=f"{_RECONCILE_FETCH_RETRIES} attempts, last error: {last_exc}"
             )
-            _fetch_fail_last = _RECONCILE_FETCH_FAIL_ALERTED.get(account, 0)
-            if time.time() - _fetch_fail_last >= _RECONCILE_COOLDOWN_SECS:
-                _RECONCILE_FETCH_FAIL_ALERTED[account] = time.time()
+            if _throttled(_RECONCILE_FETCH_FAIL_ALERTED, account, _RECONCILE_COOLDOWN_SECS):
                 try:
                     _post_message(
                         f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state reconciliation "
@@ -1455,11 +1490,9 @@ def _throttled_entry_abandon_alert(wl_id, kind, text):
     _RECONCILE_COOLDOWN_SECS above, just not applied here). Keyed per
     (wl_id, kind) so a genuinely different condition on the same row still
     alerts immediately rather than being silenced by an unrelated cooldown."""
-    key = f"{wl_id}:{kind}"
-    last = _ENTRY_ABANDON_ALERTED.get(key, 0)
-    if time.time() - last < _ENTRY_ABANDON_ALERT_COOLDOWN_SECS:
+    if not _throttled(_ENTRY_ABANDON_ALERTED, f"{wl_id}:{kind}",
+                       _ENTRY_ABANDON_ALERT_COOLDOWN_SECS):
         return
-    _ENTRY_ABANDON_ALERTED[key] = time.time()
     _post_message(text)
 
 
@@ -2450,60 +2483,6 @@ def notify_sell_signal(pos, reason, current_price, target_price):
 
 
 TRAIL_REMINDER_MINUTES = 15
-
-
-def _trailing_order_blocks(pos, current_price, reminder_num=0):
-    ticker    = pos['ticker']
-    account   = pos.get('account') or 'unmapped'
-    _node     = db.get_watch_list_node_by_id(pos.get('wl_id'))
-    ep        = pos['entry_price']
-    pct       = (current_price - ep) / ep * 100
-    shares    = pos.get('shares')
-    trail_pct = pos.get('trail_sell_pct')
-    order_desc = (
-        f"SELL {shares:g} @ {trail_pct:g}% trail" if (shares and trail_pct)
-        else "SELL (shares/trail% unavailable — check the node config)"
-    )
-    # Mandatory for the automated path (_attempt_automated_sell uses an
-    # atomic replace specifically so the old SL is never left resting
-    # alongside a new trailing-sell -- both live simultaneously for the same
-    # shares is an oversell/rejected-order risk, per that function's own
-    # docstring). The manual alert never said this at all -- found via
-    # arming-logic walkthrough, 2026-07-31: a user following it literally
-    # ends up in exactly the state the automated path goes out of its way to
-    # prevent.
-    cancel_note = (
-        f" Cancel the existing stop-loss order ({pos['sl_order_id']}) first."
-        if pos.get('sl_order_id') else ""
-    )
-    header    = f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) — STILL PENDING (reminder #{reminder_num})" if reminder_num else f"🎯 *{ticker}* ({account} · {mode_tag(account, _node)}) — TRAILING ACTIVATED — action needed"
-    if reminder_num:
-        text = (
-            f"{header}\n"
-            f"{order_desc}  |  entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
-            f"Trailing stop order not yet confirmed placed at the broker.{cancel_note}"
-        )
-    else:
-        text = (
-            f"{header}\n"
-            f"{order_desc}  |  entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
-            f"Place the trailing stop order at the broker now.{cancel_note}"
-        )
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-    if cfg.INTERACTIVE:
-        value = json.dumps({"position_id": pos['id'], "ticker": ticker})
-        blocks.append({
-            "type": "actions",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "Order Placed"},
-                 "style": "primary", "action_id": "trail_order_placed", "value": value},
-            ],
-        })
-    else:
-        blocks.append({"type": "context", "elements": [
-            {"type": "mrkdwn", "text": "No interactive buttons — confirm the trailing stop order is placed in the terminal running the daemon."}
-        ]})
-    return blocks
 
 
 def _supersede_message(channel, ts, ticker):

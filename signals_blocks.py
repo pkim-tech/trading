@@ -412,3 +412,57 @@ def _build_sell_blocks(pos, reason, current_price, target_price, resting_confirm
         ]})
 
     return blocks
+
+
+def _trailing_order_blocks(pos, current_price, reminder_num=0):
+    ticker    = pos['ticker']
+    account   = pos.get('account') or 'unmapped'
+    _node     = db.get_watch_list_node_by_id(pos.get('wl_id'))
+    ep        = pos['entry_price']
+    pct       = (current_price - ep) / ep * 100
+    shares    = pos.get('shares')
+    trail_pct = pos.get('trail_sell_pct')
+    order_desc = (
+        f"SELL {shares:g} @ {trail_pct:g}% trail" if (shares and trail_pct)
+        else "SELL (shares/trail% unavailable — check the node config)"
+    )
+    # Mandatory for the automated path (_attempt_automated_sell uses an
+    # atomic replace specifically so the old SL is never left resting
+    # alongside a new trailing-sell -- both live simultaneously for the same
+    # shares is an oversell/rejected-order risk, per that function's own
+    # docstring). The manual alert never said this at all -- found via
+    # arming-logic walkthrough, 2026-07-31: a user following it literally
+    # ends up in exactly the state the automated path goes out of its way to
+    # prevent.
+    cancel_note = (
+        f" Cancel the existing stop-loss order ({pos['sl_order_id']}) first."
+        if pos.get('sl_order_id') else ""
+    )
+    header    = f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) — STILL PENDING (reminder #{reminder_num})" if reminder_num else f"🎯 *{ticker}* ({account} · {mode_tag(account, _node)}) — TRAILING ACTIVATED — action needed"
+    if reminder_num:
+        text = (
+            f"{header}\n"
+            f"{order_desc}  |  entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
+            f"Trailing stop order not yet confirmed placed at the broker.{cancel_note}"
+        )
+    else:
+        text = (
+            f"{header}\n"
+            f"{order_desc}  |  entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
+            f"Place the trailing stop order at the broker now.{cancel_note}"
+        )
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+    if cfg.INTERACTIVE:
+        value = json.dumps({"position_id": pos['id'], "ticker": ticker})
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Order Placed"},
+                 "style": "primary", "action_id": "trail_order_placed", "value": value},
+            ],
+        })
+    else:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "No interactive buttons — confirm the trailing stop order is placed in the terminal running the daemon."}
+        ]})
+    return blocks
