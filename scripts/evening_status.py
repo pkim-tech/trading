@@ -562,7 +562,7 @@ def part2():
 
     header = f"{'Ticker':6s} " + " ".join(f"{w:>9s}" for w in windows) + f" {'inception':>10s}"
     print(header)
-    per_node_results = []  # (notional, {window: pct or None}, since_incept)
+    per_node_results = []  # (notional, {window: pct or None}, since_incept, account, ticker, row_str)
     for n in nodes:
         trades = all_trades.get(n['id'], [])
         cells, results = [], {}
@@ -572,32 +572,63 @@ def part2():
             cells.append(f"{r:+8.2f}%" if r is not None else f"{'-':>9s}")
         since_incept = _since_inception(trades, n.get('added_at'))
         incept_s = f"{since_incept:+.2f}%" if since_incept is not None else "-"
-        print(f"{n['ticker']:6s} " + " ".join(cells) + f" {incept_s:>10s}")
+        row_str = f"{n['ticker']:6s} " + " ".join(cells) + f" {incept_s:>10s}"
+        print(row_str)
         ns = node_state.get(n['id'])
         mv = ns[1]['shares'] * ns[2] if ns and ns[0] == 'holding' else None
-        per_node_results.append((effective_notional(n, mv), results, since_incept))
+        per_node_results.append((effective_notional(n, mv), results, since_incept, n.get('account'), row_str))
 
     # Notional-weighted average of each ticker's OWN compounded return per window -- not a
     # chained product of unrelated trades across 3 separate accounts (the prior version's
     # bug, flagged by review: that treats simultaneous positions as sequential capital use).
+    def _weighted_row(rows):
+        """rows: iterable of (notional, results_dict, since_incept). Returns
+        (cells, incept_s) -- shared by the ALL row and each per-account row
+        below so both use the identical weighting math."""
+        cells = []
+        for w in windows:
+            weighted = [(notional, res[w]) for notional, res, _ in rows if res[w] is not None]
+            if not weighted:
+                cells.append(f"{'-':>9s}")
+                continue
+            total_notional = sum(notional for notional, _ in weighted)
+            avg = sum(notional * pct for notional, pct in weighted) / total_notional if total_notional else 0
+            cells.append(f"{avg:+8.2f}%")
+        incept_weighted = [(notional, si) for notional, _, si in rows if si is not None]
+        if incept_weighted:
+            total_notional = sum(notional for notional, _ in incept_weighted)
+            incept_avg = sum(notional * si for notional, si in incept_weighted) / total_notional if total_notional else 0
+            incept_s = f"{incept_avg:+.2f}%"
+        else:
+            incept_s = "-"
+        return cells, incept_s
+
     print("\nPortfolio (notional-weighted average across real capital-at-stake tickers):")
-    cells = []
-    for w in windows:
-        weighted = [(notional, res[w]) for notional, res, _ in per_node_results if res[w] is not None]
-        if not weighted:
-            cells.append(f"{'-':>9s}")
-            continue
-        total_notional = sum(notional for notional, _ in weighted)
-        avg = sum(notional * pct for notional, pct in weighted) / total_notional if total_notional else 0
-        cells.append(f"{avg:+8.2f}%")
-    incept_weighted = [(notional, si) for notional, _, si in per_node_results if si is not None]
-    if incept_weighted:
-        total_notional = sum(notional for notional, _ in incept_weighted)
-        incept_avg = sum(notional * si for notional, si in incept_weighted) / total_notional if total_notional else 0
-        incept_s = f"{incept_avg:+.2f}%"
-    else:
-        incept_s = "-"
+    all_rows = [(notional, res, si) for notional, res, si, _acct, _row in per_node_results]
+    cells, incept_s = _weighted_row(all_rows)
     print(f"{'ALL':6s} " + " ".join(cells) + f" {incept_s:>10s}")
+
+    # Per-account breakdown (2026-08-16 -- previously only the flat per-
+    # ticker rows above + one blended ALL row existed; the real, scoped gap
+    # left from the original portfolio-return-calc backlog item was distinct
+    # capital pools (brokerage/ira/roth/soxl_ira) having no way to see their
+    # OWN ticker rows + subtotal without hand-filtering the flat table above.
+    # Re-prints each account's own ticker rows (same row_str already printed
+    # once above, not recomputed) grouped under its own header, then the
+    # same _weighted_row math as ALL, scoped to just that account's nodes.
+    by_account = {}
+    for notional, res, si, acct, row_str in per_node_results:
+        by_account.setdefault(acct, []).append((notional, res, si, row_str))
+    if len(by_account) > 1:
+        print("\nBy account:")
+        for acct in sorted(by_account, key=lambda a: (a is None, a)):
+            rows = by_account[acct]
+            label = acct or '(no account)'
+            print(f"  {label}:")
+            for _n, _r, _s, row_str in rows:
+                print(f"    {row_str}")
+            acct_cells, acct_incept_s = _weighted_row([(n, r, s) for n, r, s, _row in rows])
+            print(f"    {'subtotal':6s} " + " ".join(acct_cells) + f" {acct_incept_s:>10s}")
 
 
 # verify_live_parity.replay() drives compute_buy_signal once per bar and opens the position on

@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][portfolio] Resolved 2026-08-16 — `evening_status.py`'s portfolio-return table gains a per-account breakdown (ticker rows + subtotal per account, `ALL` stays as grand total), closing the last gap on the original portfolio-return-calc item. Full detail: `deep_backlog.md`.
+
 ## [live-trading][coverage] Resolved 2026-08-16 — `evening_status.py` Part 3 paper-vs-kernel check gains a snooze mechanism (mirrors coverage_check.py's existing pattern); LABD snoozed 7 days, verified by rendering against real data. Full detail: `deep_backlog.md`.
 
 ## [live-trading][coverage] Resolved 2026-08-16 — Canary G retired (`scenario_expectations` 69/70 → `active=0`); 2 stale backlog items pruned (`_ticker_block` paper mislabel, SOXL/ira phantom position — both confirmed fixed by the same origin-column fix, independently by two sessions). No commit yet (uncommitted DB flip + docs edit, next in this session's batch). Full detail: `deep_backlog.md`.
