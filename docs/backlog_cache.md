@@ -200,8 +200,8 @@ Currently scattered across `docs/operational_limits.md`'s Phase 1/2 marker and `
 ## [backtest] Open (bear-market + regime items) — from the 2026-08-01 research tangent's independent Opus challenge
 Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by title: "independent Opus challenge of the 2026-08-01 research tangent"). Compounding-drag item itself is resolved.
 
-## [live-trading][security] Accepted residual risk, 2026-07-27 — `_submit_replace_with_retry`'s retry can fire a second `replace_order` against an already-replaced order_id
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+## [live-trading][security] Reopened 2026-08-15 (user reconsidered) — `_submit_replace_with_retry`'s retry can fire a second `replace_order` against an already-replaced order_id
+Originally accepted as residual risk 2026-07-27 (full original detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry). **User's call, 2026-08-15: build the real fix instead.** Scope: before retrying a `replace_order` call, check the target `order_id`'s live status at the broker first. If it's already gone (not "still resting"), attempt 1's request actually succeeded at the broker but response handling failed client-side (timeout/malformed response) — stop retrying (don't fire a second `replace_order` against a dead `order_id`) and raise a distinct "ambiguous, go verify" signal instead of a silent no-op retry or a false "nothing happened, unprotected" message. Real gap being closed: today a genuine broker-side success followed by a client-side failure looks identical to "nothing happened at all," and every caller's UNPROTECTED/manual-fallback Slack messaging asserts more certainty than that ambiguity allows (could tell the user to manually place a stop-loss when an untracked order may already be live). Not urgent, not started.
 
 
 
