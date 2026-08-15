@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Closed 2026-08-15 (backlog-cleanse batch 4, user's call) — `soxl_ira` `account_type="margin"` mislabel item: real risk resolved by a separate, already-correct mechanism (`get_leveraged_buying_power` clamps add-on sizing to Schwab's real-time `buyingPower`, which for `soxl_ira` equals `cashBalance` exactly, no leverage assumption, verified live 2026-08-12). Worst case is a broker rejection, no real financial exposure. Item removed.
+
+## [live-trading] Closed 2026-08-15 (backlog-cleanse batch 4) — GDXU stays `state='live'` decision record: one-line note with no follow-up action, already fully reflected in the DB. Item removed.
+
 ## [live-trading][coverage] Confirmed fully closed 2026-08-15 (backlog-cleanse batch 3) — drought+add-on enabled across all 11 `soxl_ira` nodes (2026-08-07); own text had no open thread. Full detail: `deep_backlog.md`.
 
 ## [testing] Confirmed fully closed 2026-08-15 (backlog-cleanse batch 2) — `test_coverage_check.py` fsync fix's backlog entry itself fully described a resolved state (`ed67909`, 67/67 passing); closed out completely rather than left with stale "not yet built" framing.
