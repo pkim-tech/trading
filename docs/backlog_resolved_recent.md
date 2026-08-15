@@ -1,5 +1,13 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Closed 2026-08-16 (backlog-cleanse, peer-batch catchup) — signal/reminder dry_run visibility + channel separation: structurally moot under capital-at-stake redesign. Full detail: `deep_backlog.md`.
+
+## [live-trading] Closed 2026-08-16 (backlog-cleanse, peer-batch catchup, remove) — v5 watchlist skews long-only / inverse counterparts idea. Full detail: `deep_backlog.md`.
+
+## [backtest][live-trading][new-strategy] Closed 2026-08-16 (backlog-cleanse, peer-batch catchup, superseded) — monthly universe rescreen + v6 momentum-exhaustion idea, and the quarterly-resweep item that superseded it (Phase 1 already spec'd in `design.md`, nothing further needed). Full detail: `deep_backlog.md`.
+
+## [backtest][live-trading] Closed 2026-08-16 (backlog-cleanse, peer-batch catchup, remove) — formalize manual-fill-vs-backtest-assumed-fills pattern idea. Full detail: `deep_backlog.md`.
+
 ## [live-trading][security] Closed 2026-08-15 (backlog-cleanse, user's call) — manual-"Filled" SL call ticker-gated but not mode-gated; structurally unreachable today, revisit trigger noted if manual confirmation ever returns. Full detail: `deep_backlog.md`.
 
 ## [live-trading] Closed 2026-08-15 (backlog-cleanse batch 4, user's call) — `soxl_ira` `account_type="margin"` mislabel item: real risk resolved by a separate, already-correct mechanism (`get_leveraged_buying_power` clamps add-on sizing to Schwab's real-time `buyingPower`, which for `soxl_ira` equals `cashBalance` exactly, no leverage assumption, verified live 2026-08-12). Worst case is a broker rejection, no real financial exposure. Item removed.

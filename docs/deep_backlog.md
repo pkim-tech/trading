@@ -4762,8 +4762,8 @@ clean, all live nodes match committed baseline.
 # Bulk migration from backlog_cache.md, 2026-08-01 (evening)
 The entries below were moved here verbatim from backlog_cache.md during a cleanup pass (that file had grown to 141 entries / 1728 lines, violating its own 1-2-line-pointer convention). Order preserved from backlog_cache.md (was roughly newest-first); not re-interleaved with the rest of this file's chronology -- search by header/date/ticker instead of assuming position in the file means anything here.
 
-## [backtest][live-trading] Open, raised 2026-08-01 — formalize/write down the pattern separating manual-fill execution reality from automated/backtest-assumed fills
-Currently scattered across `docs/operational_limits.md`'s Phase 1/2 marker and `sim_chaos_monkey.py`; not yet scoped where it should actually live.
+## ✅ [backtest][live-trading] Closed 2026-08-16 (backlog-cleanse, user's call: remove) — formalize/write down the pattern separating manual-fill execution reality from automated/backtest-assumed fills
+Was raised 2026-08-01, scattered across `docs/operational_limits.md`'s Phase 1/2 marker and `sim_chaos_monkey.py`. User decided this doesn't need a dedicated write-up — removed rather than resolved.
 
 ## ✅ [backtest] Resolved 2026-08-01 (compounding-drag item) / Open (bear-market + regime items) — independent Opus challenge of the 2026-08-01 research tangent, then a redo + user correction on the drag finding
 Full detail: `docs/research_log.md`'s five 2026-08-01 correction entries (bottom of file). Summary:
@@ -5130,8 +5130,10 @@ actually rolled this out on our specific accounts as of today (~7 weeks post-eff
 (b) decide the SELL-increment fix independent of that, (c) decide the actual bumped `daily_order_cap`
 number for `soxl_ira` (was mid-discussion, not resolved this session either).
 
-## [backtest][live-trading][new-strategy] Research idea, raised 2026-07-25 — monthly universe rescreen (recurring cadence) + a possible "v6" momentum-exhaustion-bounce strategy variant
-Two related but distinct ideas from the same discussion:
+## ✅ [backtest][live-trading][new-strategy] Closed 2026-08-16 (backlog-cleanse, user's call: superseded) — monthly universe rescreen (recurring cadence) + a possible "v6" momentum-exhaustion-bounce strategy variant
+Superseded by the quarterly resweep cadence item (raised 2026-08-11, Phase 1 spec'd 2026-08-16 in `docs/design.md`) — that item was itself also closed 2026-08-16 (user's call: "nothing to do," self-directed/infrequent, no standing action needed beyond the existing Phase 1 spec on file). This monthly-rescreen idea holds closed regardless.
+
+Original two related but distinct ideas from the same discussion:
 1. **Recurring monthly rescreen, not a one-time backlog item**: rerun the same kind of full-universe
    resweep/screen used to originally find v5 candidates on a monthly cadence, watching for tickers
    trending positively that aren't on the current watchlist yet. User's framing: this is literally how
@@ -5383,7 +5385,7 @@ not the class of bug. Low priority (hasn't recurred since; every live-node-creat
 passed `account` explicitly) — worth a cheap guard (warn or reject `add_node(mode='live',
 account=None)`) if it's ever worth the effort, not urgent enough to block anything.
 
-## [live-trading] Far-backlog, raised 2026-07-25, deprioritized same day — v5 watchlist skews long-only, consider adding inverse counterparts
+## ✅ [live-trading] Closed 2026-08-16 (backlog-cleanse, user's call: remove) — v5 watchlist skews long-only, consider adding inverse counterparts
 All 10 v5 tickers are one-directional leveraged longs (SOXL, GDXU, NUGT, HIBL, KORU, DPST, UDOW, USD,
 AGQ) except YANG (the only inverse ticker) — the whole book loses together in a broad leveraged-long
 selloff, unlike the old v4 set which had some hedge-like pairing (EDC/AGQ as SOXL/KORU hedges, per
@@ -6465,3 +6467,9 @@ Closes the "build end-of-year tax forecast script" backlog item's realized-loss-
 **Not built / genuinely out of scope per the confirmed spec**: any `ira`/`roth`/`soxl_ira` distribution tracking (explicitly excluded); a CLI command (the report only surfaces via `evening_status.py part2`, matching "report location decided: near the top of part2, not the Slack EOD message" — didn't add a `k1_tax_forecast.py` subcommand since nothing in the spec asked for one, though `k1_tax.brokerage_tax_forecast()` is a plain importable function if a CLI is wanted later); wash-sale-lot-level precision (deliberately out of scope per the calibration framing).
 
 Not committed — left for review, matching this project's default for this session's scope of work.
+
+## ✅ 2026-08-16 — Closed (backlog-cleanse, user's call: moot) — signal/reminder dry_run visibility AND live/dry_run/paper channel separation
+Both originally raised 2026-07-24 (distinct from `mode_tag(account)`, which only tags order-placement alerts): (1) signal/reminder alerts didn't show `dry_run` status, only real order-placement messages did; (2) split live/dry_run/paper notifications into separate channels to cut chattiness. **User's read, confirmed by code (2026-08-08)**: the 2026-08-08 "capital at stake" redesign (`signals_helpers.should_alert_live`/`has_capital_at_stake`) now gates ALL routine signal/reminder alerts to capital-at-stake nodes only (`state=='live'` AND account `trading_enabled=True` AND `starting_notional >= $10k`) — and `has_capital_at_stake` requires the node NOT be dry_run by definition, so a dry_run node can never produce a real-time alert anymore. The scenario both items worried about (an ambiguous, unlabeled dry_run alert cluttering the channel) can no longer occur under the current design. Closed as structurally moot rather than left "deferred indefinitely" — revisit only if `should_alert_live`'s gating logic changes, or once `roth`/`brokerage` cross the capital threshold and channel volume becomes a real problem again for genuinely live nodes.
+
+## ✅ 2026-08-16 — Closed (backlog-cleanse, found stale) — `_submit_replace_with_retry`'s retry firing a second `replace_order` against an already-replaced order_id
+Backlog text (reopened 2026-08-15, "user's call: build the real fix instead") was stale — the real fix was already built the same day, commit `0fd8fb6` (`_check_broker_before_retry`/`_find_recent_matching_order`/`_snapshot_baseline_order_ids` in `schwab_client.py`), before/alongside the reopen note being written. Both `_submit_order_with_retry` and `_submit_replace_with_retry` check the target order's live broker status before every retry attempt AND after the final attempt — a landed-but-lost-response replace is now detected and returned instead of re-firing a duplicate `replace_order`, exactly the scope this backlog item described. Verified 2026-08-16: `tests/test_fake_broker_retry_flapping_scenario.py::test_replace_path_also_prevents_a_duplicate_on_a_landed_but_lost_response` exercises this exact scenario end-to-end through `replace_order_with_stop_loss`, asserts exactly 1 real `replace_order` call and exactly 1 resting STOP order after. Full suite for this file: 6/6 passing.
