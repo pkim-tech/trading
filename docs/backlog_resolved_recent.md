@@ -7,6 +7,12 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [testing] Confirmed stale, 2026-08-15 (relayed via peer session "planner") — "2 flaky datetime.now() tests" backlog item was already resolved 2026-08-11; both named tests use a fixed synthetic 2025 date grid, never had a real clock dependency. Real cause was an unscoped pytest-xdist file race (`--dist=loadscope` fix) + a separate cross-file `schwab_safety` state-pollution gap (fixed 2026-08-16 via `conftest.py`'s autouse fixture) — see `deep_backlog.md:534`. 2 full-suite runs: 1105/1105 green both times. Entry removed.
+
+## [live-trading][coverage] Deprioritized 2026-08-15 (relayed via peer session "planner") — Trade-Flow Grid filters + direct test links; `evening_status.py`'s report already covers the visibility need, no UI work planned unless it resurfaces with a real trigger. Full detail: `deep_backlog.md`.
+
+## [live-trading][coverage] Confirmed stale, 2026-08-15 (today) — `_ticker_block` relocation to `signals_blocks.py` was actually redone (comment dates it 2026-08-15, landed in commit `0fd8fb6`) after the "reverted during merge" backlog entry was written; entry never got closed out. No code change needed — `signals_blocks.py:503` owns it, `signals_notify.py` re-imports. Backlog entry removed.
+
 ## [live-trading][tooling] Resolved 2026-08-16 — 3 findings from the full-session dual-Opus review fixed: `fast_path_fill_reconciliation`'s new `account_number_unresolved` result added to `bad_results` + fixed from hardcoded `mode="dry_run"` to `"unknown"`; `signals_blocks._ticker_block`'s local `mode_tag` variable renamed to stop shadowing the module-level function. Full detail: `deep_backlog.md`.
 
 ## [live-trading] Done 2026-08-15 (still later) — `soxl_ira` roster cleanup: SPY/HIBL/USD/YANG retired to paper, YINN repurposed as the node-disambiguation test pair (wl_id 199+228). Full detail: `deep_backlog.md`.

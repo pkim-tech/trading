@@ -1628,7 +1628,7 @@ def check_entry_abandon():
         did_cancel = False
         if order_id and not _effectively_dry_run(account, node):
             try:
-                _, status = schwab_client.cancel_order(account, ticker, order_id)
+                _, status = schwab_client.cancel_order(account, ticker, order_id, node_id=wl_id)
             except Exception as e:
                 db.log_coverage_event("entry_abandon_timeout", mode, ticker=ticker, node_id=wl_id,
                                        result="cancel_failed", detail=str(e))
@@ -2118,7 +2118,7 @@ def check_drought_handoff(node):
             return
         if order_id and limits is not None and not _effectively_dry_run(account, node):
             try:
-                _, status = schwab_client.cancel_order(account, ticker, order_id)
+                _, status = schwab_client.cancel_order(account, ticker, order_id, node_id=wl_id)
             except Exception as e:
                 db.log_coverage_event("drought_handoff_cancel", mode, ticker=ticker, node_id=wl_id,
                                        result="cancel_failed", detail=str(e))
@@ -2775,7 +2775,8 @@ def check_addon_leg_reconciliation(open_positions):
             _leg_node = db.get_watch_list_node_by_id(leg.get('wl_id'))
             if limits is not None and not _effectively_dry_run(account, _leg_node):
                 try:
-                    _, status = schwab_client.cancel_order(account, ticker, leg['entry_order_id'])
+                    _, status = schwab_client.cancel_order(
+                        account, ticker, leg['entry_order_id'], node_id=leg.get('wl_id'))
                 except Exception as e:
                     db.log_coverage_event("addon_leg_reconciliation", mode, ticker=ticker, node_id=leg.get('wl_id'),
                                            result="cancel_failed", detail=f"leg_id={leg['id']}: {e}")
@@ -2894,7 +2895,7 @@ def close_addon_leg_real_if_open(pos, exit_price, exit_reason, exit_time):
             return
         if order_id and not _effectively_dry_run(account, node):
             try:
-                _, status = schwab_client.cancel_order(account, ticker, order_id)
+                _, status = schwab_client.cancel_order(account, ticker, order_id, node_id=leg.get('wl_id'))
             except Exception as e:
                 db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
                                        result="cancel_failed", detail=f"leg_id={leg['id']}: {e}")
@@ -4782,7 +4783,7 @@ def build_reference_table(watchlist):
                 # Two triggers are simultaneously live here: SL protects right now,
                 # Arm is the next threshold that swaps SL for the trailing sell.
                 trigger = pos['entry_price'] * (1 + db._tp_or_arm_pct(pos) / 100.0)
-                next_action = f"Arm {arm_pct:g}%" if arm_pct else 'Arm'
+                next_action = f"Arm {arm_pct:g}%" if arm_pct is not None else 'Arm'
                 proximity = (trigger - now_price) / trigger * 100
                 trigger_label = 'arm'
 
@@ -4933,10 +4934,13 @@ def _position_trigger_summary(pos):
             parts.append(f"ARMED, trailing {trail_pct}% off peak ${peak:.2f} -> stop ${trail_price:.2f}")
         else:
             parts.append("ARMED, trailing")
-    elif db._tp_or_arm_pct(pos):
+    elif db._tp_or_arm_pct(pos) is not None:
         # Same column overload as build_reference_table's 'Arm%' -- reading the
         # raw arm_sell_pct column dropped this whole line from the nightly plan
         # for every TrailingExitZScoreBreakout position (arm lives in take_profit).
+        # is not None (not truthiness): take_profit/arm_sell_pct=0 is a real,
+        # deliberate config meaning "arms immediately at entry" (e.g. YINN,
+        # wl_id=199) -- 0 is falsy but not absent.
         arm_sell_pct = db._tp_or_arm_pct(pos)
         arm_price = entry * (1 + arm_sell_pct / 100)
         parts.append(f"arms @ ${arm_price:.2f} ({arm_sell_pct}%) then trails {pos.get('trail_sell_pct') or '?'}%")

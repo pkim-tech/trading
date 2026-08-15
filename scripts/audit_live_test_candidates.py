@@ -404,10 +404,13 @@ def audit_one(ticker, wl_id=None):
 
     # Arm-trigger distance -- for a deliberately-staged TIME-exit-via-SL test
     # (position should stay unarmed until max_hold_hours fires), this is the
-    # real check that the test won't accidentally arm early. arm_sell_pct is
-    # stored as take_profit for TrailingBothZScoreBreakout (see signals_db.
-    # add_node) but reads back out under pos['arm_sell_pct'].
-    arm_pct = pos.get("arm_sell_pct")
+    # real check that the test won't accidentally arm early. Column overload:
+    # TrailingBothZScoreBreakout stores its arm value in arm_sell_pct; every
+    # other strategy (incl. TrailingExitZScoreBreakout) stores it in
+    # take_profit -- a raw pos.get("arm_sell_pct") silently dropped this whole
+    # check for TrailingExit positions. db._tp_or_arm_pct is the same
+    # resolver signals_notify.py uses for the Reference Report/nightly plan.
+    arm_pct = db._tp_or_arm_pct(pos)
     if not armed and arm_pct is not None:
         arm_trigger = pos["entry_price"] * (1 + arm_pct / 100)
         pct_away = (arm_trigger - pos["entry_price"]) / pos["entry_price"] * 100

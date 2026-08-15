@@ -144,7 +144,7 @@ def test_real_account_cancel_success_message_says_cancelled_not_generic(env, mon
     node = _node()
     db.add_pending_buy(node, _sig(100.0, hours_ago=10), channel=None, ts=None, order_id=555)
     db.mark_pending_buy_placed_by_wl_id(node['id'])
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: (None, 'CANCELED'))
+    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id, node_id=None: (None, 'CANCELED'))
 
     signals_notify.check_entry_abandon()
     assert any('resting order cancelled' in m for m in env)
@@ -171,7 +171,7 @@ def test_real_account_cancels_resting_order_and_abandons(env, monkeypatch):
     db.mark_pending_buy_placed_by_wl_id(node['id'])
 
     calls = []
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: (
+    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id, node_id=None: (
         calls.append((account, ticker, order_id)), (None, 'CANCELED'))[1])
 
     signals_notify.check_entry_abandon()
@@ -187,7 +187,7 @@ def test_real_account_cancel_racing_a_fill_reconciles_instead_of_abandoning(env,
     db.add_pending_buy(node, _sig(100.0, hours_ago=10), channel=None, ts=None, order_id=555)
     db.mark_pending_buy_placed_by_wl_id(node['id'])
 
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: (None, 'FILLED'))
+    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id, node_id=None: (None, 'FILLED'))
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side, order_id=None: {'price': 101.5, 'quantity': 10})
 
@@ -204,7 +204,7 @@ def test_real_account_unconfirmed_cancel_leaves_row_for_retry(env, monkeypatch):
     db.add_pending_buy(node, _sig(100.0, hours_ago=10), channel=None, ts=None, order_id=555)
     db.mark_pending_buy_placed_by_wl_id(node['id'])
 
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: (None, None))
+    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id, node_id=None: (None, None))
 
     signals_notify.check_entry_abandon()
     assert len(db.get_pending_buys()) == 1  # not cleared -- fail closed, retry next poll
@@ -287,7 +287,7 @@ def test_account_uses_pinned_node_snapshot_not_live_watch_list_edit(env, monkeyp
     _set_account('roth')  # live node edited to a dry_run account afterward
 
     calls = []
-    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id: (
+    monkeypatch.setattr(schwab_client, 'cancel_order', lambda account, ticker, order_id, node_id=None: (
         calls.append((account, ticker, order_id)), (None, 'CANCELED'))[1])
 
     signals_notify.check_entry_abandon()

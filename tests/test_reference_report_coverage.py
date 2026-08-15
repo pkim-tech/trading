@@ -328,3 +328,26 @@ def test_reference_row_arm_pct_still_reads_arm_sell_pct_for_trailing_both_nodes(
 
     rows = signals_notify.build_reference_table([node])
     assert rows[0]['Arm%'] == 30.0
+
+
+def test_held_trailing_exit_position_with_zero_arm_still_renders(env, monkeypatch):
+    """take_profit=0 is a real, deliberate config (arms immediately at
+    entry -- e.g. the real YINN/soxl_ira node) -- 0 is falsy but not absent,
+    and must not be treated the same as no-arm-value-at-all."""
+    _stub_signal(monkeypatch)
+    signals_db.add_node(
+        ticker='ARMZERO', strategy='TrailingExitZScoreBreakout', version='v5', window=10,
+        take_profit=0, stop_loss=2, max_hold_hours=70, state='paper', account='roth',
+        trail_pct=3.0,
+    )
+    node = signals_db.get_watch_list_node(ticker='ARMZERO')
+    assert signals_db.open_position(
+        node, signal_price=105.0, signal_time='2026-08-13 14:30:00',
+        entry_price=100.0, entry_time='2026-08-14 11:00:00', shares=10, paper=True,
+    )
+    pos = signals_db.get_open_position('ARMZERO', paper=True)
+
+    rows = signals_notify.build_reference_table([node])
+    assert rows[0]['Arm%'] == 0
+    assert rows[0]['Next Action'] == 'Arm 0%'
+    assert 'arms @ $100.00 (0%)' in signals_notify._position_trigger_summary(pos)

@@ -430,7 +430,8 @@ if cfg.SOCKET_MODE:
                 resting = _exit_order_resting(pos, reason, order_id)
                 if resting is not False:
                     try:
-                        _, confirmed = schwab_client.cancel_order(pos.get('account'), ticker, order_id)
+                        _, confirmed = schwab_client.cancel_order(
+                            pos.get('account'), ticker, order_id, node_id=pos.get('wl_id'))
                     except Exception as e:
                         confirmed = None
                         cancel_note = f" — ⚠️ cancel FAILED: {e} (order may still be resting, check broker)"
@@ -588,8 +589,10 @@ if cfg.SOCKET_MODE:
         # effectively_dry_run treats a missing state as not-live, so passing
         # `node` straight in would label every real Manual Open "DRY-RUN":
         # the reassuring-wrong direction mode_tag's own docstring forbids.
-        # Falls back to the payload only if the row is gone.
-        _tag_node = db.get_watch_list_node_by_id(node.get('id')) or node
+        # Falls back to None (account-only tag), not the stateless payload,
+        # if the row is gone (found in review, 2026-08-15: `or node` silently
+        # reintroduced the exact DRY-RUN mislabel this was written to avoid).
+        _tag_node = db.get_watch_list_node_by_id(node.get('id'))
 
         price  = float(body['view']['state']['values']['price_block']['price_input']['value'])
         shares = int(body['view']['state']['values']['shares_block']['shares_input']['value'])

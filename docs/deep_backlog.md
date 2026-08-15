@@ -4957,7 +4957,9 @@ verified-live even after a real successful post; changed to log `mode="live"` un
 the report isn't scoped to any one account's dry_run flag. Full detail: `docs/live_test_coverage.md`'s
 2026-07-27 evening entry.
 
-## [live-trading][coverage] Open, raised 2026-07-27 — Trade-Flow Test Accountability Grid (`pages/14_Coverage.py`, backed by `scripts/coverage_registry.py`) needs filters + direct links to underlying tests
+## ✅ [live-trading][coverage] Deprioritized 2026-08-15 (peer session relay), raised 2026-07-27 — Trade-Flow Test Accountability Grid (`pages/14_Coverage.py`, backed by `scripts/coverage_registry.py`) needs filters + direct links to underlying tests
+**Decision, 2026-08-15**: user's call — `scripts/evening_status.py`'s report already covers the same visibility need without requiring UI work. Not building unless it comes up again with a real trigger (no revisit date set — this is a real "don't fix" decision, not a timed defer). Closed out per the backlog's own "downgraded is not a resting state" convention rather than left lingering.
+
 Built 2026-07-27: a 32-row registry of real trade-flow logic branches with status computed live
 from `coverage_events`/`coverage_deviations` (never hand-typed) — see `docs/conversation_summary.md`'s
 2026-07-27 entry for the full build/rationale (why two competing coverage systems already existed,
