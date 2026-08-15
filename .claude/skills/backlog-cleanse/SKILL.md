@@ -131,6 +131,20 @@ role, not an implementation one.
 - Read-only and no-code-changes are hard constraints, not defaults to
   override under Auto Mode — even a one-line "obviously correct" fix found
   along the way gets reported, not applied, from this session.
+- **Shared-working-tree commit hazard** (found 2026-08-16): this session does
+  sometimes commit its OWN direct edits (e.g. a new skill file, a CLAUDE.md
+  change the user explicitly asked for) — those are fine, they're not the
+  backlog-doc/code files this skill avoids editing. But a plain `git add
+  <file> && git commit` in a working tree shared with an actively-committing
+  peer session can silently sweep up whatever the peer has already staged
+  (`git add`ed but not yet committed) into your commit too — attributing
+  their in-flight work to the wrong commit message, or worse, committing it
+  before they intended to. **Always run `git status` immediately before any
+  add/commit sequence in this repo** and confirm the staged set matches
+  exactly what you intend to commit — if anything unexpected is staged,
+  investigate (whose is it, is it actually finished) before committing,
+  don't just proceed. This isn't destructive by itself, but it's a real
+  attribution/timing bug worth catching before it becomes one.
 - This skill is about **backlog accuracy and flow to the coder** — verify,
   filter out what's stale/resolved, and hand off what's ready to build with
   a real scope attached. It is not about doing the underlying work: draft
