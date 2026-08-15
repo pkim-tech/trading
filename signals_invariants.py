@@ -185,12 +185,46 @@ def check_tax_advantaged_excluded_tickers():
     guess on the account name (2026-08-11, see docs/deep_backlog.md's
     accounts-table entry). An unrecognized account alias is reported as its
     own violation below rather than letting the ValueError crash run_all().
+
+    Excluded-ticker set (2026-08-15): unions the legacy hardcoded
+    db.TAX_ADVANTAGED_EXCLUDED_TICKERS (USO/AGQ) with every ticker the real
+    research-side screener (trading_universe.db's tickers.k1_status,
+    scripts/candidate_full_review.py's K1_STATUS convention) has confirmed
+    K-1 -- so a future K-1 ticker (UCO/SCO/ZSL/UVIX are already confirmed
+    there but weren't in the hardcoded set) gets caught automatically
+    instead of needing its own hardcoded addition every time. Per the
+    2026-08-12 K-1 policy generalization (docs/backlog_cache.md), K-1 alone
+    doesn't disqualify a ticker -- it only restricts it to the taxable
+    `brokerage` account, which is exactly what this check already enforces
+    (real capital in a tax-advantaged IRA/Roth/SEP account is the actual
+    UBTI risk, not K-1 status by itself). The research DB query is
+    best-effort: if `trading_universe.db` is unavailable/locked (e.g. a
+    concurrent sweep holding it), silently falls back to the hardcoded set
+    rather than blocking daemon startup on a research-side dependency.
+    Scoped to db.get_live_nodes() (all watchlists), not get_watchlist()
+    (active watchlist only) -- real live nodes span more than one
+    watchlist, same reasoning as get_live_nodes()'s own docstring.
     """
+    excluded = set(db.TAX_ADVANTAGED_EXCLUDED_TICKERS)
+    try:
+        import sqlite3
+        import signals_config
+        conn = sqlite3.connect(f"file:{signals_config.RESEARCH_DB_PATH}?mode=ro", uri=True, timeout=2)
+        try:
+            excluded |= {
+                row[0].upper() for row in
+                conn.execute("SELECT symbol FROM tickers WHERE k1_status LIKE 'CONFIRMED K-1%'").fetchall()
+            }
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
     violations = []
-    for node in db.get_watchlist():
+    for node in db.get_live_nodes():
         ticker = (node.get('ticker') or '').upper()
         account = node.get('account') or ''
-        if node.get('state') == 'paper' or ticker not in db.TAX_ADVANTAGED_EXCLUDED_TICKERS or not account:
+        if ticker not in excluded or not account:
             continue
         try:
             is_tax_advantaged = db._is_tax_advantaged_account(account)
