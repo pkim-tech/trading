@@ -4721,16 +4721,32 @@ def _ticker_block(row):
         elements = []
         node = row.get('_node')
 
-        # 2026-08-14: replaced the per-row "Manually Open"/"Manually Close"
-        # buttons with a node-scoped automation Stop/Start. Rationale: this
-        # report's job on mobile is "something looks wrong, make it stop" --
-        # manually opening/closing a position from a phone is a rare
-        # correction path, whereas halting a node is the action actually
-        # wanted under time pressure. The manual_open/manual_close HANDLERS
-        # stay registered (signals_handlers.py) -- they're still legitimate
-        # correction paths, and old reports in Slack scrollback stay
-        # clickable indefinitely; only the buttons stop being rendered on new
-        # reports.
+        # 2026-08-14: replaced the per-row "Manually Open" button with a
+        # node-scoped automation Stop/Start (see below) -- opening a new
+        # position from a phone is a rare correction path, whereas halting a
+        # node is the action actually wanted under time pressure. The
+        # manual_open HANDLER stays registered (signals_handlers.py) for old
+        # reports in Slack scrollback.
+        #
+        # "Manually Close" is NOT replaced -- kept for a genuinely-held real
+        # position, restored here after a merge (2026-08-15) briefly dropped
+        # it along with Manually Open. It serves a different purpose than
+        # Stop: Stop only pauses future automated action, it does not touch
+        # an order already resting or close an open position now, so the
+        # correction path a misclick (or a real need to close by hand) needs
+        # still has to exist independently. Origin check (2026-08-15, bugs
+        # #54/#63-64): a paper row must never render this button -- its
+        # position_id is a paper_positions.id, but the manual_close handler
+        # resolves against open_positions, two INDEPENDENT id sequences, so
+        # the id would either miss entirely or match and close an unrelated
+        # REAL position. is_dry_run_sim is suppressed for the same underlying
+        # reason: no real broker fill exists behind that row either.
+        if row['Held']:
+            pos = row.get('_pos')
+            if pos and not pos.get('is_dry_run_sim') and pos.get('origin') != 'paper':
+                value = json.dumps({"position_id": pos['id'], "ticker": ticker, "entry_price": pos['entry_price']})
+                elements.append({"type": "button", "text": {"type": "plain_text", "text": f"Manually Close {ticker}"},
+                                  "action_id": "manual_close", "value": value})
         #
         # Only state=='live' nodes get this button. An earlier draft offered it
         # on every row with a node id, reasoning that pausing risks no capital

@@ -276,15 +276,25 @@ def test_disable_auto_fill_button_renders_once_node_is_enabled(env, interactive,
 # ---------------------------------------------------------------- item 3
 
 
-def test_manual_open_close_buttons_no_longer_render(env, interactive):
+def test_manual_open_button_no_longer_renders(env, interactive):
+    """Manually Open is superseded by Start (a live node with no position has
+    nothing to manually open into -- the action was always "wait for a real
+    signal" anyway). Manually Close is NOT superseded -- see
+    test_held_real_position_still_gets_manual_close_button below -- a Stop
+    press doesn't touch an already-open position, so the correction path a
+    misclick needs still has to exist independently."""
     node = _add_live_node('TEST_RENDER_C', 'ira', 10_000)
     flat = signals_notify._ticker_block(_row('TEST_RENDER_C', node))
+    assert 'manual_open' not in _action_ids(flat)
+
+
+def test_held_real_position_still_gets_manual_close_button(env, interactive):
+    node = _add_live_node('TEST_RENDER_C2', 'ira', 10_000)
     held = signals_notify._ticker_block(_row(
-        'TEST_RENDER_C', node, held=True,
-        pos={'id': 1, 'entry_price': 10.0, 'shares': 5, 'trail_state': {}}))
-    for blocks in (flat, held):
-        assert 'manual_open' not in _action_ids(blocks)
-        assert 'manual_close' not in _action_ids(blocks)
+        'TEST_RENDER_C2', node, held=True,
+        pos={'id': 1, 'entry_price': 10.0, 'shares': 5, 'trail_state': {}, 'origin': 'live'}))
+    assert 'manual_close' in _action_ids(held)
+    assert 'manual_open' not in _action_ids(held)
 
 
 def test_stop_button_renders_when_node_running(env, interactive):
