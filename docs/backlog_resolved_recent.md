@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][tooling] Resolved 2026-08-16 — `run_loop()` startup block cleanup built; paired review (independent-cold + contextual, both agents) caught the loop-based spec's own real ordering regression before it shipped, fixed via a plain helper called in original order instead. Full detail: `deep_backlog.md`.
+
 ## [live-trading][portfolio] Resolved 2026-08-16 — `evening_status.py`'s portfolio-return table gains a per-account breakdown (ticker rows + subtotal per account, `ALL` stays as grand total), closing the last gap on the original portfolio-return-calc item. Full detail: `deep_backlog.md`.
 
 ## [live-trading][coverage] Resolved 2026-08-16 — `evening_status.py` Part 3 paper-vs-kernel check gains a snooze mechanism (mirrors coverage_check.py's existing pattern); LABD snoozed 7 days, verified by rendering against real data. Full detail: `deep_backlog.md`.

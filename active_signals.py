@@ -701,6 +701,27 @@ _LAST_SECTION_ALERT: dict[str, float] = {}
 _SECTION_ALERT_COOLDOWN_SECS = 900  # 15 min -- matches the reminder-nag cadence elsewhere
 
 
+def _alert_violations(log_prefix: str, violations: list, slack_prefix: str):
+    """Shared join+print+try/except-wrapped-post plumbing for a startup
+    violations list -- sim_mode_check and invariants.run_all() both did the
+    identical joined-message + print + try/except _post_message pattern
+    inline (2026-08-15 cleanup). Returns early if violations is falsy (call
+    sites also guard this themselves before calling, since building a
+    caller-side log_prefix can involve len(violations) -- calling
+    unconditionally would crash on a None/empty violations list before this
+    function's own guard ever ran). Output text unchanged from the
+    pre-extraction inline version -- only the plumbing moved, callers keep
+    their own exact wording via the prefix params."""
+    if not violations:
+        return
+    _msg = "\n".join(f"- {v}" for v in violations)
+    print(f"{log_prefix}{_msg}")
+    try:
+        _post_message(f"{slack_prefix}{_msg}")
+    except Exception:
+        pass  # a Slack posting failure must not prevent daemon startup
+
+
 def _guarded(section: str, fn, *args, **kwargs):
     """Runs fn(*args, **kwargs), catching and logging any exception so one
     failing run_loop section can't crash the whole daemon (automation_principles.md
@@ -743,12 +764,7 @@ def run_loop(tickers: set = None):
     # crash-worthy one.
     _sim_mode_violations = _guarded("sim_mode_check", signals_invariants.check_sim_mode_off_for_real_daemon)
     if _sim_mode_violations:
-        _msg = "\n".join(f"- {v}" for v in _sim_mode_violations)
-        print(f"[sim_mode] {_msg}")
-        try:
-            _post_message(f"🚨 {_msg}")
-        except Exception:
-            pass  # a Slack posting failure must not prevent daemon startup
+        _alert_violations("[sim_mode] ", _sim_mode_violations, "🚨 ")
 
     # Config-invariant checks (signals_invariants.py) -- non-blocking, alerted
     # loudly rather than silently: a violation means some other code's
@@ -759,12 +775,8 @@ def run_loop(tickers: set = None):
     # able to prevent the daemon itself from starting.
     _invariant_violations = _guarded("invariants", signals_invariants.run_all)
     if _invariant_violations:
-        _msg = "\n".join(f"- {v}" for v in _invariant_violations)
-        print(f"[invariants] {len(_invariant_violations)} violation(s):\n{_msg}")
-        try:
-            _post_message(f"⚠️ Config invariant violation(s) at startup:\n{_msg}")
-        except Exception:
-            pass  # a Slack posting failure must not prevent daemon startup
+        _alert_violations(f"[invariants] {len(_invariant_violations)} violation(s):\n",
+                           _invariant_violations, "⚠️ Config invariant violation(s) at startup:\n")
 
     # Same reasoning as run_all() above -- reference_alerted (below) pre-seeds
     # every _REFERENCE_TIMES slot already past "today" as done, so the 7am-gated
@@ -786,11 +798,29 @@ def run_loop(tickers: set = None):
     if (datetime.now().hour, datetime.now().minute) >= _EOD_REPORT_TIME:
         _eod_today = datetime.now().strftime('%Y-%m-%d')
 
-        def _startup_eod_coverage():
-            cc, cts = send_coverage_report(_eod_today)
-            print(f"  [slack] startup EOD coverage report ({_eod_today}): channel={cc} ts={cts}"
-                  f"{' (no confirmed post -- check for a prior [slack error] line)' if not cc else ''}")
-        _guarded("coverage_report[EOD:startup]", _startup_eod_coverage)
+        # 2026-08-15 cleanup: of the 3 startup EOD closures, coverage and
+        # scenario_review share the same shape (call a report function
+        # returning (channel, ts), print the identical format) -- deduped via
+        # this small helper instead of a data-driven loop. A loop was the
+        # original spec, but it forces the two calls to sit adjacent, which
+        # silently reordered the 3 sections (coverage -> scenario_review ->
+        # invariants instead of coverage -> invariants -> scenario_review) --
+        # a real behavior change caught by paired review (both independent-
+        # cold and contextual agents found it), since it breaks deliberate
+        # parity with the live (non-startup) EOD path a few hundred lines
+        # down, which runs outcome-check -> readiness-recheck -> review/plan
+        # in that specific order on purpose. This helper keeps the dedup
+        # without forcing adjacency -- called individually, in the original
+        # order, straddling the still-separate invariants closure below.
+        def _run_startup_eod_report(guard_label, log_label, fn):
+            def _run(fn=fn, log_label=log_label):
+                cc, cts = fn(_eod_today)
+                print(f"  [slack] {log_label} ({_eod_today}): channel={cc} ts={cts}"
+                      f"{' (no confirmed post -- check for a prior [slack error] line)' if not cc else ''}")
+            _guarded(guard_label, _run)
+
+        _run_startup_eod_report("coverage_report[EOD:startup]", "startup EOD coverage report",
+                                 send_coverage_report)
 
         def _startup_eod_invariants():
             violations = signals_invariants.run_all()
@@ -802,11 +832,8 @@ def run_loop(tickers: set = None):
                 print("[invariants] EOD (startup): all invariants hold.")
         _guarded("invariants[EOD:startup]", _startup_eod_invariants)
 
-        def _startup_eod_scenario_review():
-            cc, cts = build_eod_scenario_review(_eod_today)
-            print(f"  [slack] startup EOD scenario review ({_eod_today}): channel={cc} ts={cts}"
-                  f"{' (no confirmed post -- check for a prior [slack error] line)' if not cc else ''}")
-        _guarded("eod_scenario_review[startup]", _startup_eod_scenario_review)
+        _run_startup_eod_report("eod_scenario_review[startup]", "startup EOD scenario review",
+                                 build_eod_scenario_review)
 
     # buffering=1 (line-buffered) -- without it this file object block-buffers
     # since it's not a tty, so console output (including any Slack post error)
