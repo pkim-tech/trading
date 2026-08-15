@@ -89,27 +89,48 @@ def mode_tag(account, node=None):
     return "DRY-RUN" if effectively_dry_run(account, node) else "LIVE"
 
 
-def automation_blockers_other_than_node(ticker):
+def automation_blockers_other_than_node(ticker, account=None):
     """The automation layers OTHER than this node's own flag that are
     currently blocking it, as human-readable strings (empty list = nothing
     else is in the way).
 
-    The real gate in schwab_safety.check_order is three independent layers --
-    kill_switch_engaged() -> node_automation_enabled(wl_id) ->
-    ticker_automation_enabled(ticker) -- and any one of them blocks. A UI that
+    check_order's real gate is more than the three layers an earlier version
+    of this docstring named -- kill_switch_engaged() and
+    ticker_automation_enabled() are only 2 of them. Also real, and added
+    2026-08-16 after paired Opus review (both independent-cold and
+    contextual reviewers found this independently): `ticker not in
+    AUTOMATION_ENABLED_TICKERS` (schwab_safety.py's ticker_not_in_
+    automation_scope_block) and an account that's missing from ACCOUNTS,
+    disabled, or not trading_enabled. This gap is not hypothetical -- DFEN/
+    ETHU/SOXS were live nodes missing from AUTOMATION_ENABLED_TICKERS for
+    real in 2026-08-11, which this function would have silently missed,
+    rendering an unqualified "🛑 Stop" and a bare "automation STARTED" for
+    nodes that could never actually place a real order either way. A UI that
     reads only the node flag will happily render "🛑 Stop" for a node that is
-    already fully halted by the kill switch, and report "STARTED" for one that
+    already fully halted by any of these, and report "STARTED" for one that
     stays blocked after resuming. Both the reference-report render
     (signals_notify._ticker_block) and the Slack handlers use this so they
-    Deliberately takes only `ticker`: the node's own flag is the caller's
-    business (they already have it), and both other layers are keyed by ticker
-    or global. Passing wl_id in would imply it's consulted here, which it
-    isn't."""
+    can't drift apart on that question.
+
+    `account` is optional (kept back-compat for any caller that genuinely
+    only has a ticker) but should be passed whenever available -- without it,
+    the account-level checks below are skipped entirely, silently narrowing
+    this back to the pre-2026-08-16 (incomplete) coverage."""
     blockers = []
     if schwab_safety.kill_switch_engaged():
         blockers.append("engine stopped")
     if not schwab_safety.ticker_automation_enabled(ticker):
         blockers.append(f"{ticker} ticker paused")
+    if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        blockers.append(f"{ticker} not in automation pilot scope (manual-only)")
+    if account is not None:
+        limits = schwab_safety.ACCOUNTS.get(account)
+        if limits is None:
+            blockers.append(f"account '{account}' unknown")
+        elif not limits.enabled:
+            blockers.append(f"account '{account}' disabled")
+        elif not limits.trading_enabled:
+            blockers.append(f"account '{account}' is dry-run (no real orders placed)")
     return blockers
 
 

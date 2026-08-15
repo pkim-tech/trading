@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import signals_config
 import signals_db as db
+import schwab_safety
 import paper_trading
 from tests.conftest import make_synthetic_csv, cleanup_csv, _synthetic_timestamps
 
@@ -37,10 +38,25 @@ _TS = _synthetic_timestamps(90)
 
 
 @pytest.fixture
-def isolated_db(monkeypatch):
+def isolated_db(monkeypatch, tmp_path):
     tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
     tmp_db.close()
     monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))
+    # NODE_AUTOMATION_PATH isolation (2026-08-16, real incident): a test here
+    # calling schwab_safety.pause_node_automation without this wrote a real
+    # entry to the actual production cache/live/schwab_node_automation.json
+    # (NODE_AUTOMATION_PATH defaults to that real path absent an explicit
+    # override -- this file has none of the DB-path isolation above protects
+    # against). Caught only because the polluted node id happened to be a
+    # harmless legacy paper node with no account; a different id could have
+    # touched something real. Every schwab_safety state file this test file
+    # might ever touch is isolated here, not just the one that already bit.
+    monkeypatch.setattr(schwab_safety, 'NODE_AUTOMATION_PATH', tmp_path / "schwab_node_automation.json")
+    monkeypatch.setattr(schwab_safety, 'TICKER_AUTOMATION_PATH', tmp_path / "schwab_ticker_automation.json")
+    monkeypatch.setattr(schwab_safety, 'KILL_SWITCH_PATH', tmp_path / "schwab_kill_switch.json")
+    monkeypatch.setattr(schwab_safety, 'AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_auto_fill_detection.json")
+    monkeypatch.setattr(schwab_safety, 'NODE_AUTO_FILL_DETECTION_PATH',
+                        tmp_path / "schwab_node_auto_fill_detection.json")
     db.ensure_tables()
     yield db
     os.unlink(tmp_db.name)
@@ -249,6 +265,27 @@ def test_addon_trigger_opens_leg_matching_core_shares_and_dedupes(core_node):
     # Re-trigger must not open a second leg.
     paper_trading.check_paper_addon_trigger(node, pos, 131.0, now)
     assert len(db.get_open_addon_legs(paper=True)) == 1
+
+
+def test_addon_trigger_honors_node_automation_pause(core_node):
+    """2026-08-16 fix (Opus contextual review): check_paper_addon_trigger was
+    a THIRD paper entry path opening NEW simulated exposure, found ungated by
+    node_automation_enabled -- unlike start_paper_buy/check_paper_drought_
+    entry, which already honor it. A "stopped" node must not still open a
+    new add-on leg; it's new exposure, not the already-open core position
+    being allowed to close (which stays ungated, matching the other two)."""
+    import schwab_safety
+    with db._conn() as c:
+        c.execute("UPDATE watch_list SET addon_enabled=1 WHERE id=?", (core_node['id'],))
+        c.commit()
+    node = db.get_watch_list_node_by_id(core_node['id'])
+    schwab_safety.pause_node_automation(node['id'], reason='test')
+    now = datetime.now()
+    db.open_position(node, 100.0, now, 100.0, now, shares=100, paper=True)
+    pos = db.get_open_position_by_wl_id(node['id'], paper=True)
+
+    paper_trading.check_paper_addon_trigger(node, pos, 130.0, now)
+    assert db.get_open_addon_leg_by_parent(pos['id'], paper=True) is None
 
 
 def test_addon_never_triggers_on_a_drought_position(core_node):

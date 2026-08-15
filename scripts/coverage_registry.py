@@ -784,7 +784,10 @@ REGISTRY = [
                "have flipped that guard to verified-live on the first tap and inflated the readiness "
                "headline (caught by paired Opus review before it shipped). Render is gated to "
                "state=='live' rows, so paper/canary rows never show the button; paper_trading honors "
-               "the same flag on its two entry paths independently."),
+               "the same flag on all three of its entry paths independently (start_paper_buy, "
+               "check_paper_drought_entry, and check_paper_addon_trigger -- the third one found "
+               "missing this gate by the same 2026-08-16 paired review that added this row's own "
+               "confirmation pass, since it opens NEW simulated exposure just like the other two)."),
     dict(id='oversell_guard_correct_position',
          scenario="check_order's oversell guard resolves the right position when 2 live nodes share a "
                   "ticker in different accounts",

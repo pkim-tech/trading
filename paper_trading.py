@@ -1576,6 +1576,16 @@ def check_paper_addon_trigger(node, pos, price, now):
     real orders are involved."""
     if not node.get('addon_enabled'):
         return
+    # Same node-level automation pause as start_paper_buy/check_paper_
+    # drought_entry (Opus review, 2026-08-16 -- found independently by the
+    # contextual reviewer: this was a THIRD paper entry path opening NEW
+    # simulated exposure, ungated, contradicting coverage_registry.py's
+    # "paper_trading honors the same flag on its two entry paths" claim).
+    # Entry-side only, same reasoning as the other two gates: this opens a
+    # brand-new add-on leg, it doesn't touch the parent core position, which
+    # must still be allowed to close normally.
+    if not schwab_safety.node_automation_enabled(node.get('id')):
+        return
     if pos.get('position_source') != 'core':
         # docs/design.md's truth-table scopes addon_leg to "core state: armed"
         # only -- a drought_overlay position arming is not an add-on trigger

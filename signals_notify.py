@@ -4769,7 +4769,7 @@ def _ticker_block(row):
             # kill switch has already halted -- the exact "reads as if it's
             # running when it isn't" failure this toggle exists to avoid.
             node_paused = not schwab_safety.node_automation_enabled(wl_id)
-            other_blockers = automation_blockers_other_than_node(ticker)
+            other_blockers = automation_blockers_other_than_node(ticker, node.get('account'))
             blocked_note = f" — note: still blocked by {', '.join(other_blockers)}" if other_blockers else ""
             auto_value = json.dumps({"ticker": ticker, "wl_id": wl_id})
             if node_paused:

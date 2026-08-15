@@ -627,8 +627,13 @@ if cfg.SOCKET_MODE:
         closes a position directly from the reference report, price-entry modal
         doubling as the confirmation step.
 
-        Unrendered on new reports since 2026-08-14, still registered -- same
-        reasoning as handle_manual_open above."""
+        Still rendered on new reports for a genuinely-held REAL position
+        (restored 2026-08-16 after a merge briefly dropped it along with
+        manual_open -- see signals_notify._ticker_block) -- Stop only pauses
+        future automated action, it doesn't touch an order already resting or
+        close an open position now, so this correction path has to exist
+        independently. Never rendered for a paper/is_dry_run_sim position
+        (the origin check in _ticker_block)."""
         ack()
         data = json.loads(body['actions'][0]['value'])
         client.views_open(
@@ -652,13 +657,31 @@ if cfg.SOCKET_MODE:
         ticker      = data['ticker']
         entry_price = data['entry_price']
 
+        # Validate BEFORE closing anything (Opus review, 2026-08-16, MEDIUM/
+        # HIGH -- both independent-cold and contextual reviewers found this
+        # independently): manual_open/manual_close buttons "stay clickable in
+        # Slack scrollback forever" per this handler's own docstring and
+        # handle_manual_open's -- and every report rendered before 2026-08-15
+        # could carry a paper row's Manually Close button, whose position_id
+        # is a paper_positions.id, a DIFFERENT id sequence than
+        # open_positions.id (bugs #54/#63-64's exact collision risk, just
+        # reachable through a stale button instead of the render path that
+        # was already fixed there). A stale/tampered payload closing the
+        # WRONG real position -- or "closing" a nonexistent one -- is a real
+        # naked-position/silent-no-op risk, not a cosmetic gap.
+        pos = db.get_position_by_id(position_id)
+        if pos is None or pos.get('ticker') != ticker or pos.get('is_dry_run_sim') or pos.get('origin') == 'paper':
+            _post_message(
+                f"⚠️ Manual Close for {ticker} ignored — button payload (position_id={position_id}) "
+                f"doesn't resolve to a real, currently-open position for this ticker (stale/paper button "
+                f"from an old report?). No position was closed — resend the reference report and use the "
+                f"current button if you meant to close a real position."
+            )
+            return
+
         exit_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
         actual_pnl = (exit_price - entry_price) / entry_price * 100
         now        = datetime.now()
-
-        # Fetch fresh BEFORE closing -- see handle_exit_price's identical
-        # comment (docs/plans/real_order_execution_drought_addon.md 7.2).
-        pos = db.get_position_by_id(position_id)
 
         # exit_bar_time derived directly, same reason as handle_exit_price above.
         db.close_position(position_id,
@@ -805,7 +828,8 @@ if cfg.SOCKET_MODE:
         # (schwab_safety.check_order). Reporting a bare "STARTED" while one of
         # those still blocks it is exactly the false-confidence case this
         # message must not create.
-        blockers = automation_blockers_other_than_node(ticker)
+        _node = db.get_watch_list_node_by_id(wl_id)
+        blockers = automation_blockers_other_than_node(ticker, (_node or {}).get('account'))
         if blockers:
             _post_message(f"▶️ {ticker} (node {wl_id}) node-level automation STARTED by {user} — "
                           f"but STILL BLOCKED by {', '.join(blockers)}, so it will not trade yet")

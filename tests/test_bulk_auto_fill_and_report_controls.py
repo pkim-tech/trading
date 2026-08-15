@@ -365,11 +365,37 @@ def test_start_confirm_warns_when_another_layer_still_blocks(env, interactive):
     assert 'still blocked' in btn['confirm']['text']['text']
 
 
-def test_clean_running_node_gets_an_unqualified_stop_label(env, interactive):
+def test_clean_running_node_gets_an_unqualified_stop_label(env, interactive, monkeypatch):
     node = _add_live_node('TEST_RENDER_CLEAN', 'ira', 10_000)
+    # Genuinely clean means clean on every gate automation_blockers_other_
+    # than_node checks, including scope (2026-08-16) -- a bare test ticker
+    # not in AUTOMATION_ENABLED_TICKERS is itself a real blocker and would
+    # correctly qualify the label, defeating the point of this test.
+    monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {'TEST_RENDER_CLEAN'})
     btn = _element(signals_notify._ticker_block(_row('TEST_RENDER_CLEAN', node)),
                    'stop_node_automation')
     assert btn['text']['text'] == '🛑 Stop TEST_RENDER_CLEAN'
+
+
+def test_scope_gap_qualifies_the_stop_label(env, interactive):
+    """The real gap this exists to catch (2026-08-16 paired review, both
+    reviewers independently): DFEN/ETHU/SOXS were real live nodes missing
+    from AUTOMATION_ENABLED_TICKERS in 2026-08-11 -- a node in that shape
+    must not render an unqualified Stop/bare "STARTED"."""
+    node = _add_live_node('TEST_RENDER_SCOPEGAP', 'ira', 10_000)
+    btn = _element(signals_notify._ticker_block(_row('TEST_RENDER_SCOPEGAP', node)),
+                   'stop_node_automation')
+    assert 'not in automation pilot scope' in btn['text']['text']
+
+
+def test_dry_run_account_qualifies_the_stop_label(env, interactive, monkeypatch):
+    """A state='live' node in a non-trading_enabled account can't place a
+    real order either -- the label must say so, not read as armed."""
+    monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {'TEST_RENDER_DRYACCT'})
+    node = _add_live_node('TEST_RENDER_DRYACCT', 'sep', 10_000)  # sep: not trading_enabled
+    btn = _element(signals_notify._ticker_block(_row('TEST_RENDER_DRYACCT', node)),
+                   'stop_node_automation')
+    assert 'dry-run' in btn['text']['text']
 
 
 @pytest.mark.parametrize('state,version', [('paper', 'v5'), ('dry_run', 'v5-canary')])
@@ -611,3 +637,83 @@ def test_manual_open_close_handlers_stay_registered(handlers):
                  'handle_manual_open_price', 'handle_manual_close_price',
                  'handle_enable_auto_fill_detection'):
         assert hasattr(signals_handlers, name), name
+
+
+def _view_body(position_id, ticker, entry_price, exit_price):
+    return {'view': {'private_metadata': json.dumps(
+                {'position_id': position_id, 'ticker': ticker, 'entry_price': entry_price}),
+            'state': {'values': {'price_block': {'price_input': {'value': str(exit_price)}}}}}}
+
+
+def test_manual_close_handler_closes_a_real_held_position(handlers, env):
+    """The golden path this handler exists for still works: a real position,
+    real ticker match -- must actually close."""
+    node = _add_live_node('TEST_HANDLER_CLOSE_A', 'ira', 10_000)
+    signals_db.open_position(node, signal_price=10.0, signal_time='2026-08-01 09:30:00',
+                              entry_price=10.0, entry_time='2026-08-01 09:31:00', shares=5)
+    pos = signals_db.get_open_position('TEST_HANDLER_CLOSE_A')
+    handlers.handle_manual_close_price(
+        _ack, _view_body(pos['id'], 'TEST_HANDLER_CLOSE_A', 10.0, 11.0), _FakeClient())
+    assert signals_db.get_open_position('TEST_HANDLER_CLOSE_A') is None
+
+
+def test_manual_close_handler_refuses_a_stale_paper_position_id(handlers, env, monkeypatch):
+    """The 2026-08-16 fix (Opus review, MEDIUM/HIGH -- found independently by
+    both the cold and contextual reviewers): a manual_close button rendered
+    on a paper row before the 2026-08-15 origin-check fix landed (still
+    clickable in Slack scrollback forever, per this handler's own docstring)
+    carries a paper_positions.id in its payload -- a DIFFERENT id sequence
+    than open_positions.id. Without this guard, get_position_by_id could
+    resolve to an unrelated REAL position sharing that id and close it,
+    exactly the bugs #54/#63-64 collision shape. Must refuse and close
+    NOTHING, not guess."""
+    real_node = _add_live_node('TEST_HANDLER_CLOSE_B', 'ira', 10_000)
+    signals_db.open_position(real_node, signal_price=20.0, signal_time='2026-08-01 09:30:00',
+                              entry_price=20.0, entry_time='2026-08-01 09:31:00', shares=3)
+    real_pos = signals_db.get_open_position('TEST_HANDLER_CLOSE_B')
+
+    paper_node = _add_live_node('TEST_HANDLER_CLOSE_PAPER', 'ira', 10_000, state='paper')
+    signals_db.open_position(paper_node, signal_price=5.0, signal_time='2026-08-01 09:30:00',
+                              entry_price=5.0, entry_time='2026-08-01 09:31:00', shares=1, paper=True)
+    paper_pos = signals_db.get_open_position('TEST_HANDLER_CLOSE_PAPER', paper=True)
+
+    posted = []
+    monkeypatch.setattr(signals_handlers, '_post_message', lambda *a, **k: posted.append(a))
+    # Stale scrollback button: paper's own id happens to collide with the
+    # real position's id would be the worst case, but even the payload
+    # simply naming a paper_positions.id that get_position_by_id resolves
+    # against open_positions must be refused -- exercise it with the id that
+    # actually matters (the real position must survive untouched either
+    # way; the point is nothing closes on a paper-ticker payload).
+    handlers.handle_manual_close_price(
+        _ack, _view_body(paper_pos['id'], 'TEST_HANDLER_CLOSE_PAPER', 5.0, 6.0), _FakeClient())
+
+    assert signals_db.get_open_position('TEST_HANDLER_CLOSE_B') is not None, (
+        "unrelated real position must be completely untouched")
+    assert posted and 'ignored' in posted[0][0]
+
+
+def test_manual_close_handler_refuses_a_ticker_mismatch(handlers, env, monkeypatch):
+    """A position_id that resolves to a REAL position, but for a different
+    ticker than the button's own payload claims, must also be refused --
+    the same collision shape, just both ids real."""
+    node = _add_live_node('TEST_HANDLER_CLOSE_C', 'ira', 10_000)
+    signals_db.open_position(node, signal_price=15.0, signal_time='2026-08-01 09:30:00',
+                              entry_price=15.0, entry_time='2026-08-01 09:31:00', shares=2)
+    pos = signals_db.get_open_position('TEST_HANDLER_CLOSE_C')
+
+    posted = []
+    monkeypatch.setattr(signals_handlers, '_post_message', lambda *a, **k: posted.append(a))
+    handlers.handle_manual_close_price(
+        _ack, _view_body(pos['id'], 'WRONG_TICKER', 15.0, 16.0), _FakeClient())
+
+    assert signals_db.get_open_position('TEST_HANDLER_CLOSE_C') is not None
+    assert posted and 'ignored' in posted[0][0]
+
+
+def test_manual_close_handler_refuses_a_nonexistent_position(handlers, env, monkeypatch):
+    posted = []
+    monkeypatch.setattr(signals_handlers, '_post_message', lambda *a, **k: posted.append(a))
+    handlers.handle_manual_close_price(
+        _ack, _view_body(999999, 'TEST_HANDLER_CLOSE_D', 10.0, 11.0), _FakeClient())
+    assert posted and 'ignored' in posted[0][0]
