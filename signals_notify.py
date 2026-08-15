@@ -5269,63 +5269,57 @@ def build_eod_scenario_review(check_date=None):
     # section below can use it too.
     prior_plan = {(row['category'], row['ticker']): row for row in db.get_daily_plan(check_date)}
 
-    lines.append("\n_Canary_ (see Coverage Report for full detail):")
+    # 2026-08-15 paired-review finding (both independent-cold and contextual
+    # agents caught this): this section covers BOTH canary_* scenarios and
+    # non-canary control scenarios (e.g. reconciliation_mismatch, which spans
+    # real soxl_ira nodes -- see coverage_report_summary.py's module
+    # docstring), so a header reading "_Canary_" would sit directly above a
+    # ":red_circle: N UNEXPLAINED on REAL node(s)" line -- exactly the
+    # canary-vs-real scope conflation a prior fix (2026-08-01 2nd Opus review,
+    # see the old deleted comment this replaced) deliberately avoided.
+    lines.append("\n_Scenario checks_ (canary + control; see Coverage Report for full detail):")
     try:
         all_results = _coverage_run_check(check_date)
-        # 2026-08-01 2nd Opus review finding: this section used to report
-        # EVERY daily/informational scenario (including non-canary control
-        # scenarios like reconciliation_mismatch), while build_tomorrow_plan's
-        # own "_Canary_" count below filters to scenario_key.startswith
-        # ('canary_') -- two sections under the same heading disagreeing on
-        # scope with no explanation. Split explicitly: canary_results feeds
-        # the count that matches the plan's scope; any non-canary control
-        # scenario still gets its own line so nothing silently drops from
-        # visibility, just not folded into the canary total.
+        # canary_results is still needed below for the stale-plan check
+        # (daily_plan rows only exist for the 'canary' category) -- unrelated
+        # to the rollup/bullet reuse just below.
         canary_results = [r for r in all_results if (r['scenario_key'] or '').startswith('canary_')]
-        other_results = [r for r in all_results if not (r['scenario_key'] or '').startswith('canary_')]
-        met = sum(1 for r in canary_results if r['status'] == 'met')
-        # 2026-08-01 Opus review finding: 'informational'-tier misses are
-        # never ticket_eligible, so the old met+deviated split silently
-        # excluded them from both counts. 2nd-review finding: a snoozed
-        # scenario (status='skipped') has the same problem -- also counted
-        # explicitly now so the four buckets always sum to the total.
-        deviated = [r for r in canary_results if r['status'] == 'deviated' and r.get('ticket_eligible', True)]
-        informational_misses = [r for r in canary_results
-                                 if r['status'] == 'deviated' and not r.get('ticket_eligible', True)]
-        skipped = [r for r in canary_results if r['status'] == 'skipped']
-        lines.append(f"  {met} met / {len(deviated)} deviation(s) / {len(informational_misses)} informational / "
-                      f"{len(skipped)} snoozed of {len(canary_results)}")
-        for r in deviated:
-            lines.append(f"    ✗ {r['scenario_key']} ({r['ticker'] or 'n/a'}): {r['summary']}")
-        # Grouped by scenario_key, not one line per raw result (2026-08-01,
-        # after reconciliation_mismatch went from 1 global row to 20 per-node
-        # rows -- see docs/backlog_cache.md's 2026-07-30 per-node breakout
-        # entry): a single-row control scenario still reads identically to
-        # before (one line), but a per-node one no longer floods this report
-        # with 20 lines every EOD run for what's routine informational
-        # status. Individual per-ticker lines only appear for a genuine
-        # ticket-eligible deviation (a real problem) -- matches the canary
-        # section's own met/deviation/informational/snoozed summary pattern
-        # immediately above, instead of introducing a second, inconsistent
-        # reporting shape for control scenarios specifically.
-        other_by_key = {}
-        for r in other_results:
-            other_by_key.setdefault(r['scenario_key'], []).append(r)
-        for key, group in sorted(other_by_key.items()):
-            met_n = sum(1 for r in group if r['status'] == 'met')
-            skipped_n = sum(1 for r in group if r['status'] == 'skipped')
-            real_deviations = [r for r in group if r['status'] == 'deviated' and r.get('ticket_eligible', True)]
-            info_misses_n = sum(1 for r in group
-                                 if r['status'] == 'deviated' and not r.get('ticket_eligible', True))
-            if len(group) == 1:
-                r = group[0]
-                status_glyph = "✓" if r['status'] == 'met' else ("~" if r['status'] == 'skipped' else "✗")
-                lines.append(f"  {status_glyph} [control] {key}: {r.get('summary', r['status'])}")
-            else:
-                lines.append(f"  [control] {key}: {met_n} met / {len(real_deviations)} deviation(s) / "
-                              f"{info_misses_n} informational / {skipped_n} snoozed of {len(group)}")
-            for r in real_deviations:
-                lines.append(f"    ✗ {key} ({r['ticker'] or 'n/a'}): {r['summary']}")
+
+        # 2026-08-15: reuse the exact classify()/rollup_lines()/
+        # split_unexplained()/unexplained_block() helpers
+        # scripts/coverage_report_summary.py already built for the Coverage
+        # Report redesign (2026-08-14), instead of a second, separately-
+        # maintained per-scenario bullet listing here (canary_ deviated
+        # bullets one line each, plus a per-key [control] breakdown +
+        # bullets for everything else, incl. reconciliation_mismatch). This
+        # report posts seconds after the Coverage Report at the same 16:05
+        # ET slot and was undoing most of that redesign's line-count
+        # reduction by re-printing the same canary/reconciliation_mismatch
+        # detail here (Opus review finding F8, 2026-08-14 -- the real pair
+        # went from ~50+83 lines down to only ~10+83, not the full win the
+        # redesign was supposed to deliver). `reasons` mirrors
+        # send_coverage_report's own lookup exactly, so "explained" status
+        # can't disagree between the two reports.
+        from scripts.coverage_report_summary import (
+            rollup_lines, split_unexplained, unexplained_block, _key as _cov_key)
+        reasons = {_cov_key(d): d['reason'] for d in db.get_deviations(check_date=check_date)}
+        lines.extend(f"  {line}" for line in rollup_lines(all_results, reasons))
+
+        # 2026-08-15 paired-review finding (both reviewers, LOW): compose()
+        # wraps this same split in its own try/except so a per-row DB lookup
+        # failure (split_unexplained -> is_canary_result -> _node_row) can't
+        # take down anything else -- it degrades to "treat every unexplained
+        # row as real" (over-report, not under-report). Mirrored here so a
+        # lookup failure doesn't also swallow the stale-plan check below via
+        # the outer except.
+        unexplained = [r for r in all_results if r['status'] == 'deviated'
+                       and r.get('ticket_eligible', True) and not reasons.get(_cov_key(r))]
+        try:
+            real, canary = split_unexplained(unexplained)
+        except Exception:
+            real, canary = unexplained, []
+        if real or canary:
+            lines.extend(f"  {line}" for line in unexplained_block(real, canary))
 
         # 2026-08-01 2nd Opus review finding: actually read back today's
         # canary daily_plan rows (written this morning/last EOD run) and flag
