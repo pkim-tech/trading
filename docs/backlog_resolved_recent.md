@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][backtest] Removed 2026-08-15 (user's call) — "expand paper trading" standalone entry, confirmed fully superseded by the harness reframe (not just marked superseded). Real answer: the fake-venue harness takes over that role, not more paper nodes. Full detail: `deep_backlog.md`'s harness reframe entry.
+
 Rolling window of resolved backlog items, most recent first, for session-handoff context only.
 Every entry here is also permanently recorded in `docs/deep_backlog.md` — this file exists so
 `go` doesn't have to re-read the full backlog history, just what's happened in roughly the last
