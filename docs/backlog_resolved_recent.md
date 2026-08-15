@@ -1,5 +1,13 @@
 # Backlog — Recently Resolved
 
+## [testing] Confirmed fully closed 2026-08-15 (backlog-cleanse batch 2) — `test_coverage_check.py` fsync fix's backlog entry itself fully described a resolved state (`ed67909`, 67/67 passing); closed out completely rather than left with stale "not yet built" framing.
+
+## [live-trading][coverage] Confirmed fully closed 2026-08-15 (backlog-cleanse batch 2) — unlinked-live-node check's own "only thing left open" (wiring into `evening_status.py`) verified built and live: `part4()` (registered in `PARTS`, actually called). Full detail: `deep_backlog.md`.
+
+## [live-trading][backtest] Confirmed fully closed 2026-08-15 (backlog-cleanse batch 2) — K-1 status generalization, both pieces (`brokerage_only` flag, `check_tax_advantaged_excluded_tickers()` generalization) built and tested, 7 pinned tests, no open threads. Full detail: `deep_backlog.md`.
+
+## [live-trading][coverage] Confirmed fully closed 2026-08-15 (backlog-cleanse batch 2) — script-based test-plan support / check_order guard-rejection staging: 10/10 rows staged and passing, registry extension built, no rework needed. Full detail: `deep_backlog.md`.
+
 ## [live-trading][tax] Built 2026-08-15 — unrealized gain/loss calculator (brokerage-only): `get_unrealized_pnl_by_ticker`/`k1_tax.unrealized_forecast`, wired into `evening_status.py` Part 2. Section 1256 MTM-liability question left informational-only, not folded into the real reserve, pending CPA confirmation. 15 new tests, rendered end-to-end against a synthetic scenario. Committed `83326af`. Full detail: `backlog_cache.md`/`design.md`.
 
 ## [testing] Fixed 2026-08-15 — `tests/test_coverage_check.py` fsync slowdown: session-scoped schema template on tmpfs. 160s -> ~11-17s under the real default config, 70-85% reduction solo, isolation deliberately regression-tested. Committed `ed67909`. Full detail: `backlog_cache.md`.
