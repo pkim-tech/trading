@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][coverage] Confirmed already resolved 2026-08-16 (targeted sweep) — `compute_status`'s clean-scenario verified-live gap (already fixed by bd8e35c), SOXS/ira stale pending BUY (confirmed cleared, no reconciliation mismatch). Full detail: `deep_backlog.md`.
+
 ## [live-trading][tooling] Resolved 2026-08-16 — `run_loop()` startup block cleanup built; paired review (independent-cold + contextual, both agents) caught the loop-based spec's own real ordering regression before it shipped, fixed via a plain helper called in original order instead. Full detail: `deep_backlog.md`.
 
 ## [live-trading][portfolio] Resolved 2026-08-16 — `evening_status.py`'s portfolio-return table gains a per-account breakdown (ticker rows + subtotal per account, `ALL` stays as grand total), closing the last gap on the original portfolio-return-calc item. Full detail: `deep_backlog.md`.

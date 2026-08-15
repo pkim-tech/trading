@@ -1,5 +1,8 @@
 # Backlog
 
+## ✅ [live-trading][coverage] Confirmed already resolved 2026-08-16 — 2 more stale backlog items found in a targeted sweep
+Same stale-handover/stale-backlog pattern as the earlier finds this session. (1) `coverage_registry.compute_status`'s scenario_expectations branch never rendering `verified-live` for a cleanly-passing scenario (HIGH, found 2026-08-13) — already fixed by the same `bd8e35c` commit as the other 2 confirmed-stale items tonight: `_scenario_expectation_recent_proof(row['scenario_key'])` now directly cross-checks real `trade_log`/`pending_buys`/`open_positions` data before falling back to the pessimistic default, exactly the described fix. `git log -S` confirms. (2) SOXS/`ira`'s stale pending BUY not resting at the broker (found 2026-08-15 via `evening_status.py`) — confirmed resolved by direct query (`pending_buys` has zero SOXS rows) and by rendering Part 2 fresh (SOXS shows clean `flat`, no `!!` mismatch warning); likely the same closure as `trading_incidents` id=7 (2026-08-14), just never pruned from `backlog_cache.md`.
+
 ## ✅ [live-trading][tooling] Resolved 2026-08-16 — `run_loop()` startup block cleanup built per spec; paired review caught a real ordering regression the loop-based spec introduced, fixed by using a plain helper instead
 Second attempt at the same spec after an earlier same-day try was written directly live and cleanly reverted (nothing committed). This time: `_alert_violations(log_prefix, violations, slack_prefix)` extracted for the sim_mode/invariants shared join+print+try/except-post plumbing (both call sites' output text verified byte-identical to the pre-extraction inline version by both review agents independently).
 
