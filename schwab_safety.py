@@ -1143,7 +1143,7 @@ ADDON_BUYING_POWER_HEADROOM_MULT = 2.0
 def check_order(
     account: str, ticker: str, quantity: int, price: float, side: str, counts: dict | None = None,
     is_gap_correction: bool = False, is_protective: bool = False, replacing_order_id: int | None = None,
-    is_addon_leg: bool = False, node_id: int | None = None,
+    is_addon_leg: bool = False, node_id: int | None = None, source: str = 'daemon',
 ) -> None:
     """Raises SafetyViolation if the order should not proceed. `counts`, if
     given, is used for the daily-cap/burst-cap/duplicate checks instead of
@@ -1193,12 +1193,19 @@ def check_order(
     resolve to each other's automation-pause state or position. Optional and
     defaults to None so any caller not yet updated still gets the old
     ticker+account-derived (ambiguous-on-collision) behavior -- not every
-    call site threads a node_id yet (e.g. manual/script-driven order calls)."""
+    call site threads a node_id yet (e.g. manual/script-driven order calls).
+    source: coverage_events write-attribution (signals_db.COVERAGE_EVENT_
+    SOURCES, Phase 1 2026-08-16) -- passed straight through to every
+    log_coverage_event call in this function. Defaults to 'daemon' since
+    that's the real caller for every production order; a fixture/staging
+    script calling check_order directly (e.g.
+    scripts/stage_check_order_guard_scenarios.py) passes its own
+    'fixture:<script_name>' explicitly."""
     if kill_switch_engaged():
         _limits = ACCOUNTS.get(account)
         _mode = "live" if (_limits and _limits.trading_enabled) else "dry_run"
         signals_db.log_coverage_event("kill_switch_block", _mode, ticker=ticker, result="blocked",
-                                       detail=kill_switch_reason())
+                                       detail=kill_switch_reason(), source=source)
         raise SafetyViolation(f"global kill switch engaged ({kill_switch_reason()})")
 
     limits = ACCOUNTS.get(account)
@@ -1208,12 +1215,12 @@ def check_order(
         # _coverage_mode's own None-account convention elsewhere.
         signals_db.log_coverage_event("unknown_account_block", "dry_run", ticker=ticker, node_id=node_id,
                                        result="blocked",
-                                       detail=f"account={account!r} not in allowlist (node_id caller-supplied, unverified)")
+                                       detail=f"account={account!r} not in allowlist (node_id caller-supplied, unverified)", source=source)
         raise SafetyViolation(f"unknown account '{account}' -- not in the allowlist")
     if not limits.enabled:
         signals_db.log_coverage_event("account_disabled_block", "dry_run" if not limits.trading_enabled else "live",
                                        ticker=ticker, node_id=node_id, result="blocked",
-                                       detail=f"account={account!r} disabled (node_id caller-supplied, unverified)")
+                                       detail=f"account={account!r} disabled (node_id caller-supplied, unverified)", source=source)
         raise SafetyViolation(f"account '{account}' is disabled in the allowlist")
     _mode = "dry_run" if not limits.trading_enabled else "live"
     if node_id is not None:
@@ -1232,7 +1239,7 @@ def check_order(
             signals_db.log_coverage_event(
                 "node_id_ticker_account_mismatch", _mode, ticker=ticker, node_id=node_id, result="fallback",
                 detail=f"node.ticker={_node_check.get('ticker')!r} node.account={_node_check.get('account')!r} "
-                       f"vs call ticker={ticker!r} account={account!r}")
+                       f"vs call ticker={ticker!r} account={account!r}", source=source)
             node_id = None
     if node_id is not None:
         _node_id = node_id
@@ -1257,12 +1264,12 @@ def check_order(
         # node/ticker automation toggles below.
         signals_db.log_coverage_event("ticker_not_live_mode_block", _mode, ticker=ticker,
                                        node_id=_node_id, result="blocked",
-                                       detail=f"'{ticker}' not in _live_ticker_accounts() at check_order time")
+                                       detail=f"'{ticker}' not in _live_ticker_accounts() at check_order time", source=source)
         raise SafetyViolation(f"'{ticker}' is not a live-mode ticker on the active watchlist")
     if account not in ticker_accounts[ticker]:
         signals_db.log_coverage_event(
             "ticker_account_assignment_mismatch", _mode, ticker=ticker, node_id=_node_id, result="blocked",
-            detail=f"account={account!r} not in assigned accounts {sorted(ticker_accounts[ticker])}")
+            detail=f"account={account!r} not in assigned accounts {sorted(ticker_accounts[ticker])}", source=source)
         raise SafetyViolation(
             f"'{ticker}' is not assigned to account '{account}' "
             f"(assigned accounts: {sorted(ticker_accounts[ticker])})"
@@ -1270,22 +1277,22 @@ def check_order(
     if len(ticker_accounts[ticker]) > 1:
         signals_db.log_coverage_event(
             "two_nodes_same_ticker_diff_accounts", _mode, ticker=ticker, node_id=_node_id, result="allowed",
-            detail=f"account={account} of {sorted(ticker_accounts[ticker])}")
+            detail=f"account={account} of {sorted(ticker_accounts[ticker])}", source=source)
     if not node_automation_enabled(_node_id):
         signals_db.log_coverage_event("node_level_automation_pause", _mode, ticker=ticker, node_id=_node_id,
-                                       result="blocked")
+                                       result="blocked", source=source)
         raise SafetyViolation(f"node id={_node_id} for '{ticker}' has automation paused")
     if ticker not in AUTOMATION_ENABLED_TICKERS:
         signals_db.log_coverage_event("ticker_not_in_automation_scope_block", _mode, ticker=ticker,
                                        node_id=_node_id, result="blocked",
-                                       detail=f"'{ticker}' not in AUTOMATION_ENABLED_TICKERS")
+                                       detail=f"'{ticker}' not in AUTOMATION_ENABLED_TICKERS", source=source)
         raise SafetyViolation(
             f"'{ticker}' is not in the automation pilot scope {AUTOMATION_ENABLED_TICKERS} "
             f"-- still manual-only"
         )
     if not ticker_automation_enabled(ticker):
         signals_db.log_coverage_event("ticker_level_automation_pause", _mode, ticker=ticker,
-                                       node_id=_node_id, result="blocked")
+                                       node_id=_node_id, result="blocked", source=source)
         raise SafetyViolation(f"'{ticker}' automation is paused (per-ticker toggle) -- resume from the reference report")
 
     # Same-day re-buy guardrail (2026-07-15): a same-day re-buy risks a real
@@ -1333,8 +1340,7 @@ def check_order(
             signals_db.log_coverage_event(
                 "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="blocked",
                 detail=f"account={account} cash_settlement_type={limits.cash_settlement_type} "
-                       f"force_same_day_block={_force_same_day_block}"
-            )
+                       f"force_same_day_block={_force_same_day_block}", source=source)
             reason = ("same-day re-buy risks a cash-account good-faith violation" if limits.cash_settlement_type == "cash"
                        else f"node id={_node_id!r}'s force_same_day_block is set -- the same-day close may have "
                             f"happened in a different account for this ticker, not necessarily this node's own")
@@ -1342,8 +1348,7 @@ def check_order(
         elif limits.cash_settlement_type == "margin" and signals_db.closed_today(ticker):
             signals_db.log_coverage_event(
                 "same_day_block", _mode, ticker=ticker, node_id=_node_id, result="skipped_margin_account",
-                detail=f"account={account} cash_settlement_type={limits.cash_settlement_type}"
-            )
+                detail=f"account={account} cash_settlement_type={limits.cash_settlement_type}", source=source)
 
     if side == "BUY":
         if node_id is not None:
@@ -1393,32 +1398,32 @@ def check_order(
             if not limits.margin_capable:
                 signals_db.log_coverage_event(
                     "addon_non_margin_account_blocked", _mode, ticker=ticker, node_id=_node_id,
-                    result="blocked", detail=f"account={account} margin_capable={limits.margin_capable}")
+                    result="blocked", detail=f"account={account} margin_capable={limits.margin_capable}", source=source)
                 raise SafetyViolation(
                     f"add-on leg refused -- '{account}' is not margin-capable "
                     f"(margin_capable={limits.margin_capable})")
             if _local_pos is None or _local_pos.get('position_source') != 'core':
                 signals_db.log_coverage_event(
                     "addon_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,
-                    result="blocked", detail="no_open_core_position")
+                    result="blocked", detail="no_open_core_position", source=source)
                 raise SafetyViolation(
                     f"add-on leg refused -- no open CORE position on file for ({ticker}, {account})")
             _trail_state = _local_pos.get('trail_state') or {}
             if _trail_state.get('trailing') is not True:
                 signals_db.log_coverage_event(
                     "addon_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,
-                    result="blocked", detail="parent_not_armed")
+                    result="blocked", detail="parent_not_armed", source=source)
                 raise SafetyViolation(
                     "add-on leg refused -- parent position is not armed (trail_state.trailing is not True)")
             if signals_db.get_open_addon_leg_by_parent(_local_pos['id']) is not None:
                 signals_db.log_coverage_event(
                     "addon_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,
-                    result="blocked", detail="leg_already_open")
+                    result="blocked", detail="leg_already_open", source=source)
                 raise SafetyViolation("add-on leg refused -- a leg is already open for this parent")
             if int(quantity) != int(_local_pos['shares']):
                 signals_db.log_coverage_event(
                     "addon_size_mismatch_blocked", _mode, ticker=ticker, node_id=_node_id,
-                    result="blocked", detail=f"quantity={quantity} parent_shares={_local_pos['shares']:g}")
+                    result="blocked", detail=f"quantity={quantity} parent_shares={_local_pos['shares']:g}", source=source)
                 raise SafetyViolation(
                     f"add-on leg refused -- quantity {quantity} must exactly equal the parent's "
                     f"{_local_pos['shares']:g} shares")
@@ -1433,7 +1438,7 @@ def check_order(
                 signals_db.log_coverage_event(
                     "addon_combined_exposure_blocked", _mode, ticker=ticker, node_id=_node_id,
                     result="blocked",
-                    detail=f"combined=${_combined_notional:,.0f} cap=${limits.notional_cap:,.0f}")
+                    detail=f"combined=${_combined_notional:,.0f} cap=${limits.notional_cap:,.0f}", source=source)
                 raise SafetyViolation(
                     f"add-on leg refused -- combined core+addon notional ${_combined_notional:,.0f} "
                     f"exceeds {account}'s ${limits.notional_cap:,.0f} cap"
@@ -1444,7 +1449,7 @@ def check_order(
                 "addon_double_buy_exemption", _mode, ticker=ticker, node_id=_node_id,
                 result="preconditions_passed",
                 detail=f"parent_shares={_local_pos['shares']:g} quantity={quantity} "
-                       f"combined_notional=${_combined_notional:,.0f}")
+                       f"combined_notional=${_combined_notional:,.0f}", source=source)
 
         # Existing-position guard (2026-08-02): closes the real gap confirmed
         # 2026-07-24 -- Schwab doesn't decrement account balance for a resting
@@ -1468,8 +1473,7 @@ def check_order(
         if _local_pos and not is_protective and not is_addon_leg:
             signals_db.log_coverage_event(
                 "buy_blocked_position_exists", _mode, ticker=ticker, node_id=_node_id, result="blocked",
-                detail=f"account={account} held_shares={_local_pos['shares']:g}"
-            )
+                detail=f"account={account} held_shares={_local_pos['shares']:g}", source=source)
             raise SafetyViolation(
                 f"'{ticker}' already has an open position ({_local_pos['shares']:g} shares) in "
                 f"'{account}' -- refusing a second real BUY (not a protective top-up)"
@@ -1484,7 +1488,7 @@ def check_order(
         # a genuine second resting BUY for this ticker.
         _dup_check = _has_open_buy_order_for_ticker if is_addon_leg else _has_open_order
         if _dup_check(orders, ticker, exclude_order_id=replacing_order_id):
-            signals_db.log_coverage_event("dup_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_same_ticker")
+            signals_db.log_coverage_event("dup_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_same_ticker", source=source)
             raise SafetyViolation(
                 f"'{ticker}' already has an open/working order in '{account}' -- refusing a second "
                 f"concurrent BUY (Schwab doesn't reserve buying power for a resting order, so nothing "
@@ -1568,7 +1572,7 @@ def check_order(
             else:
                 signals_db.log_coverage_event(
                     "addon_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,
-                    result="blocked", detail="sell_no_open_leg_for_node")
+                    result="blocked", detail="sell_no_open_leg_for_node", source=source)
                 raise SafetyViolation(
                     f"add-on leg SELL refused for '{ticker}' -- no open addon leg on file for this node"
                 )
@@ -1578,7 +1582,7 @@ def check_order(
         _leg_sl_order_id = _open_leg.get('sl_order_id') if _open_leg is not None else None
         if _has_open_sell_order(orders, ticker, exclude_order_id=replacing_order_id,
                                  exclude_order_ids={_leg_sl_order_id} if _leg_sl_order_id else None) and not _addon_sell_exempt:
-            signals_db.log_coverage_event("dup_sell_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked")
+            signals_db.log_coverage_event("dup_sell_order_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked", source=source)
             raise SafetyViolation(
                 f"'{ticker}' already has a resting SELL order in '{account}' -- refusing a second "
                 f"concurrent SELL (prevents two live exit orders stacking for the same shares)"
@@ -1619,8 +1623,7 @@ def check_order(
         if pos is None:
             signals_db.log_coverage_event(
                 "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked_no_position",
-                detail=f"quantity={quantity:g}"
-            )
+                detail=f"quantity={quantity:g}", source=source)
             raise SafetyViolation(
                 f"SELL {quantity:g} {ticker} in '{account}' -- no open position on file for this "
                 f"(ticker, account), refusing to guess a bound and place an unverified SELL"
@@ -1628,8 +1631,7 @@ def check_order(
         if quantity > pos['shares'] * 1.001:  # tolerance for float share counts
             signals_db.log_coverage_event(
                 "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked",
-                detail=f"quantity={quantity:g} held={pos['shares']:g}"
-            )
+                detail=f"quantity={quantity:g} held={pos['shares']:g}", source=source)
             raise SafetyViolation(
                 f"SELL {quantity:g} {ticker} exceeds the {pos['shares']:g} shares on file for "
                 f"'{account}' -- refusing a would-be short"
@@ -1643,8 +1645,7 @@ def check_order(
         # was simply that the POSITIVE case was never logged at all).
         signals_db.log_coverage_event(
             "sell_exceeds_position_blocked", _mode, ticker=ticker, node_id=_node_id, result="resolved",
-            detail=f"quantity={quantity:g} held={pos['shares']:g}"
-        )
+            detail=f"quantity={quantity:g} held={pos['shares']:g}", source=source)
 
     # Trading-day gate, BUY only, unconditional (including gap-correction --
     # an overnight gap only exists ahead of a real trading day, so there's no
@@ -1654,7 +1655,7 @@ def check_order(
         if not _is_trading_day(now.strftime('%Y-%m-%d')):
             signals_db.log_coverage_event("buy_trading_day_block", _mode, ticker=ticker,
                                            node_id=_node_id, result="blocked",
-                                           detail=now.strftime('%Y-%m-%d'))
+                                           detail=now.strftime('%Y-%m-%d'), source=source)
             raise SafetyViolation(
                 f"BUY blocked -- {now.strftime('%Y-%m-%d')} is not an NYSE trading day"
             )
@@ -1688,7 +1689,7 @@ def check_order(
         if not in_window:
             signals_db.log_coverage_event("buy_signal_window_block", _mode, ticker=ticker,
                                            node_id=_node_id, result="blocked",
-                                           detail=f"current time {t[0]:02d}:{t[1]:02d}")
+                                           detail=f"current time {t[0]:02d}:{t[1]:02d}", source=source)
             raise SafetyViolation(
                 f"BUY outside signal windows {all_windows} (current time {t[0]:02d}:{t[1]:02d})"
             )
@@ -1697,7 +1698,7 @@ def check_order(
     if notional > HARD_ORDER_CEILING:
         signals_db.log_coverage_event("hard_order_ceiling_block", _mode, ticker=ticker,
                                        node_id=_node_id, result="blocked",
-                                       detail=f"notional=${notional:,.0f} ceiling=${HARD_ORDER_CEILING:,.0f}")
+                                       detail=f"notional=${notional:,.0f} ceiling=${HARD_ORDER_CEILING:,.0f}", source=source)
         raise SafetyViolation(
             f"order notional ${notional:,.0f} ({ticker} x{quantity}) exceeds hard ceiling ${HARD_ORDER_CEILING:,.0f}"
         )
@@ -1712,7 +1713,7 @@ def check_order(
     if side == "BUY" and notional > limits.notional_cap:
         signals_db.log_coverage_event("notional_cap_block", _mode, ticker=ticker,
                                        node_id=_node_id, result="blocked",
-                                       detail=f"notional=${notional:,.0f} cap=${limits.notional_cap:,.0f}")
+                                       detail=f"notional=${notional:,.0f} cap=${limits.notional_cap:,.0f}", source=source)
         raise SafetyViolation(
             f"order notional ${notional:,.0f} ({ticker} x{quantity}) exceeds {account} cap ${limits.notional_cap:,.0f}"
         )
@@ -1745,7 +1746,7 @@ def check_order(
         except Exception as e:
             signals_db.log_coverage_event(
                 "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id,
-                result="failed_closed", detail=str(e))
+                result="failed_closed", detail=str(e), source=source)
             raise SafetyViolation(f"could not verify '{account}' buying power, blocking add-on order: {e}")
         # Reserve for every other ticker's resting BUY (2026-08-10, mirrors the
         # non-addon cash-aware reservation below) -- other_tickers/orders were
@@ -1767,8 +1768,7 @@ def check_order(
             signals_db.log_coverage_event(
                 "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id,
                 result="blocked_unpriced", detail=f"account={account} other_tickers={other_tickers} "
-                                                   f"unpriced={_unpriced}"
-            )
+                                                   f"unpriced={_unpriced}", source=source)
             raise SafetyViolation(
                 f"account '{account}' already has resting BUY order(s) for {other_tickers}, and a live "
                 f"price couldn't be fetched for {_unpriced} to estimate reserved buying power -- "
@@ -1780,7 +1780,7 @@ def check_order(
                 "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id,
                 result="blocked_insufficient",
                 detail=f"required=${required:,.0f} (mult={ADDON_BUYING_POWER_HEADROOM_MULT}, incl "
-                       f"${_reserved_other:,.0f} reserved for {other_tickers}) available=${buying_power:,.0f}")
+                       f"${_reserved_other:,.0f} reserved for {other_tickers}) available=${buying_power:,.0f}", source=source)
             raise SafetyViolation(
                 f"add-on order notional ${notional:,.0f} x {ADDON_BUYING_POWER_HEADROOM_MULT} headroom"
                 + (f" + ${_reserved_other:,.0f} reserved for {other_tickers}'s resting BUY(s)" if other_tickers else "")
@@ -1790,8 +1790,7 @@ def check_order(
             "addon_buying_power_check", _mode, ticker=ticker, node_id=_node_id, result="passed",
             detail=(f"required=${required:,.0f} (incl ${_reserved_other:,.0f} reserved for "
                     f"{other_tickers}) available=${buying_power:,.0f}") if other_tickers else
-                   f"required=${required:,.0f} available=${buying_power:,.0f}"
-        )
+                   f"required=${required:,.0f} available=${buying_power:,.0f}", source=source)
         if other_tickers:
             # Mirrors the non-addon `second_ticker_buy_allowed` event below --
             # makes the 2026-08-10 relaxation's payoff observable the same
@@ -1800,16 +1799,14 @@ def check_order(
                 "addon_second_ticker_buy_allowed", _mode, ticker=ticker, node_id=_node_id,
                 result="allowed_buying_power_sufficient",
                 detail=f"account={account} other_tickers={other_tickers} reserved=${_reserved_other:,.0f} "
-                       f"notional=${notional:,.0f} available=${buying_power:,.0f}"
-            )
+                       f"notional=${notional:,.0f} available=${buying_power:,.0f}", source=source)
     elif side == "BUY":
         import schwab_client  # local import: schwab_client imports this module at load time
         try:
             cash_available = schwab_client.get_account_balance(account)
         except Exception as e:
             signals_db.log_coverage_event(
-                "cash_check", _mode, ticker=ticker, node_id=_node_id, result="failed_closed", detail=str(e)
-            )
+                "cash_check", _mode, ticker=ticker, node_id=_node_id, result="failed_closed", detail=str(e), source=source)
             raise SafetyViolation(f"could not verify '{account}' cash balance, blocking order: {e}")
         # Reserve for EVERY other ticker's resting BUY found above (2026-08-07,
         # replaces the old unconditional block) -- since Schwab doesn't
@@ -1851,8 +1848,7 @@ def check_order(
             signals_db.log_coverage_event(
                 "second_ticker_buy_blocked", _mode, ticker=ticker, node_id=_node_id,
                 result="blocked_unpriced", detail=f"account={account} other_tickers={other_tickers} "
-                                                   f"unpriced={_unpriced}"
-            )
+                                                   f"unpriced={_unpriced}", source=source)
             raise SafetyViolation(
                 f"account '{account}' already has resting BUY order(s) for {other_tickers}, and a live "
                 f"price couldn't be fetched for {_unpriced} to estimate reserved cash -- refusing a "
@@ -1866,8 +1862,7 @@ def check_order(
             signals_db.log_coverage_event(
                 "cash_check", _mode, ticker=ticker, node_id=_node_id, result="blocked_insufficient",
                 detail=f"required=${required:,.0f} (incl ${_reserved_other:,.0f} reserved for "
-                       f"{other_tickers}) available=${cash_available:,.0f} margin_floor=${limits.margin_floor:,.0f}"
-            )
+                       f"{other_tickers}) available=${cash_available:,.0f} margin_floor=${limits.margin_floor:,.0f}", source=source)
             raise SafetyViolation(
                 f"order notional ${notional:,.0f}"
                 + (f" + ${_reserved_other:,.0f} reserved for {other_tickers}'s resting BUY(s)" if other_tickers else "")
@@ -1879,14 +1874,12 @@ def check_order(
             "cash_check", _mode, ticker=ticker, node_id=_node_id, result="passed",
             detail=(f"required=${required:,.0f} (incl ${_reserved_other:,.0f} reserved for "
                     f"{other_tickers}) available=${cash_available:,.0f}") if other_tickers else
-                   f"required=${required:,.0f} available=${cash_available:,.0f}"
-        )
+                   f"required=${required:,.0f} available=${cash_available:,.0f}", source=source)
         if other_tickers:
             signals_db.log_coverage_event(
                 "second_ticker_buy_allowed", _mode, ticker=ticker, node_id=_node_id, result="allowed_cash_sufficient",
                 detail=f"account={account} other_tickers={other_tickers} reserved=${_reserved_other:,.0f} "
-                       f"notional=${notional:,.0f} available=${cash_available:,.0f}"
-            )
+                       f"notional=${notional:,.0f} available=${cash_available:,.0f}", source=source)
         # Informational only, not blocking (automation_principles.md #4) -- the
         # user keeps CASH_RESERVE_WATERMARK as their own operational cash
         # reserve per account; this doesn't gate the order, just flags that
@@ -1916,19 +1909,18 @@ def check_order(
         if is_protective:
             signals_db.log_coverage_event(
                 "daily_cap_protective_bypass", _mode, ticker=ticker, node_id=_node_id, result="allowed",
-                detail=f"account={account} count={count} cap={limits.daily_order_cap} side={side}"
-            )
+                detail=f"account={account} count={count} cap={limits.daily_order_cap} side={side}", source=source)
         else:
             signals_db.log_coverage_event("daily_order_cap_block", _mode, ticker=ticker,
                                            node_id=_node_id, result="blocked",
-                                           detail=f"account={account} count={count} cap={limits.daily_order_cap}")
+                                           detail=f"account={account} count={count} cap={limits.daily_order_cap}", source=source)
             raise SafetyViolation(f"account '{account}' has hit its daily order cap ({limits.daily_order_cap})")
 
     recent = [t for t in counts.get("recent_order_timestamps", []) if time.time() - t < 60]
     if len(recent) >= GLOBAL_ORDERS_PER_MINUTE:
         signals_db.log_coverage_event("global_burst_cap_block", _mode, ticker=ticker,
                                        node_id=_node_id, result="blocked",
-                                       detail=f"recent={len(recent)} max={GLOBAL_ORDERS_PER_MINUTE}")
+                                       detail=f"recent={len(recent)} max={GLOBAL_ORDERS_PER_MINUTE}", source=source)
         raise SafetyViolation(
             f"global burst cap hit ({len(recent)} orders across all accounts in the last minute, "
             f"max {GLOBAL_ORDERS_PER_MINUTE})"
@@ -1978,13 +1970,11 @@ def check_order(
         if limits.trading_enabled and not _broker_confirms_order(_all_orders(account), ticker, side, quantity):
             signals_db.log_coverage_event(
                 "dup_order_retry_after_failure", _mode, ticker=ticker, node_id=_node_id, result="allowed_retry",
-                detail=f"side={side} qty={quantity}"
-            )
+                detail=f"side={side} qty={quantity}", source=source)
             continue
         signals_db.log_coverage_event(
             "dup_order_window_blocked", _mode, ticker=ticker, node_id=_node_id, result="blocked",
-            detail=f"side={side} qty={quantity} prior_qty={prior_qty:g}"
-        )
+            detail=f"side={side} qty={quantity} prior_qty={prior_qty:g}", source=source)
         raise SafetyViolation(
             f"duplicate order: {side} {quantity} {ticker} in {account} already submitted "
             f"{prior_qty:g} shares {time.time() - o['ts']:.0f}s ago "
@@ -1995,7 +1985,7 @@ def check_order(
 def approve_and_record(
     account: str, ticker: str, quantity: int, price: float, side: str, is_gap_correction: bool = False,
     is_protective: bool = False, replacing_order_id: int | None = None, is_addon_leg: bool = False,
-    node_dry_run: bool = False, node_id: int | None = None,
+    node_dry_run: bool = False, node_id: int | None = None, source: str = 'daemon',
 ) -> bool:
     """Call immediately before placing a real order. Raises SafetyViolation if
     blocked; otherwise records the order against the daily cap, the global
@@ -2019,13 +2009,15 @@ def approve_and_record(
     caller actually submits to the broker afterward.
     node_id: threaded straight through to check_order's node_id param (see
     its docstring) -- schwab_client's place_*/replace_* functions pass this
-    from the real node dict already in scope at their call sites."""
+    from the real node dict already in scope at their call sites.
+    source: coverage_events write-attribution -- threaded straight through to
+    check_order's source param (see its docstring); defaults to 'daemon'."""
     with _open_locked() as f:
         counts = json.loads(f.read() or "{}")
         check_order(account, ticker, quantity, price, side, counts=counts,
                     is_gap_correction=is_gap_correction, is_protective=is_protective,
                     replacing_order_id=replacing_order_id, is_addon_leg=is_addon_leg,
-                    node_id=node_id)
+                    node_id=node_id, source=source)
         key = str(date.today())
         today = counts.setdefault(key, {})
         if side == "BUY":

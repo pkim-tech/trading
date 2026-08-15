@@ -1356,6 +1356,18 @@ def ensure_tables():
             # caller doesn't pass one explicitly.
             c.execute("ALTER TABLE coverage_events ADD COLUMN strategy_type TEXT")
             c.commit()
+        if 'source' not in ce_cols:
+            # Write-attribution (docs/deep_backlog.md's "coverage_events
+            # write-attribution" entry, 2026-08-16): distinguishes a real
+            # daemon-produced row from a fixture/staging-script row without
+            # forensic timestamp correlation. No CHECK constraint (same ALTER
+            # TABLE ADD COLUMN limitation as addon_legs.entry_status above) --
+            # enforced in log_coverage_event instead. NULL for every
+            # pre-existing row and for any call site not yet threaded through
+            # (piecemeal rollout, highest-value call sites first) -- expected,
+            # not a bug. See COVERAGE_EVENT_SOURCES below for the taxonomy.
+            c.execute("ALTER TABLE coverage_events ADD COLUMN source TEXT")
+            c.commit()
 
         # scenario_expectations: the "what should this node/control do" mapping,
         # structured instead of prose (was hand-maintained in deep_backlog.md's
@@ -2504,8 +2516,36 @@ def log_automation_scope_change(old_tickers, new_tickers):
         c.commit()
 
 
+# coverage_events.source taxonomy (Phase 1, 2026-08-16 -- see
+# docs/deep_backlog.md's "coverage_events write-attribution" entry for the
+# full design). Fixed categories, not caller-typed freeform strings:
+# 'daemon' -- the real active_signals.py poll loop and everything it calls
+#   transitively in production (schwab_client/schwab_safety/signals_notify).
+#   Currently the DEFAULT for every threaded-through call site below, since
+#   that's the overwhelmingly common real caller -- a fixture/script that
+#   drives the same code path passes its own 'fixture:<name>' explicitly.
+# 'fixture:<script_or_test_name>' -- a specific staging script or pytest
+#   fixture exercising the same code path outside real trading, e.g.
+#   'fixture:stage_check_order_guard_scenarios'. The <name> names the actual
+#   file, not a category, so a given row's origin is never ambiguous.
+# Only 'daemon' and 'fixture:stage_check_order_guard_scenarios' are actually
+# wired through any call site yet (piecemeal rollout, highest-value
+# order-placement/fill call sites first, per the design's point #2) -- this
+# set will grow as more call sites are threaded, not all at once.
+COVERAGE_EVENT_SOURCES = frozenset({
+    'daemon',
+    'fixture:stage_check_order_guard_scenarios',
+})
+
+
+def _source_is_recognized(source):
+    return source in COVERAGE_EVENT_SOURCES or (
+        isinstance(source, str) and source.startswith('fixture:')
+    )
+
+
 def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, node_id=None,
-                        result='', detail='', strategy_type=None):
+                        result='', detail='', strategy_type=None, source=None):
     """Records one real firing of an automation control/phase, tagged by which
     environment exercised it. `mode` is one of 'paper'/'dry_run'/'live' -- the
     caller determines this from its own context (e.g. paper_trading.py always
@@ -2515,18 +2555,30 @@ def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, node_i
     ambiguous -- two distinct nodes can share a ticker). strategy_type (the 3rd
     coverage axis, e.g. 'TrailingBothZScoreBreakout') is derived from node_id's
     real watch_list row when the caller doesn't pass one explicitly -- existing
-    call sites don't need to change. Fire-and-forget: never raises past a
-    logging failure into the caller's real control flow."""
+    call sites don't need to change. source (write-attribution, see
+    COVERAGE_EVENT_SOURCES above) is optional and NULL by default -- only a
+    handful of call sites pass it explicitly so far. Fire-and-forget: never
+    raises past a logging failure into the caller's real control flow -- a
+    source='fixture:...'-while-mode='live' mismatch (a fixture producing a
+    real trade would be structurally wrong) is only ever a printed warning,
+    never a raise, since this function must never be able to block a real
+    order."""
     try:
+        if source is not None and not _source_is_recognized(source):
+            print(f"log_coverage_event: unrecognized source={source!r} (scenario_key={scenario_key})")
+        if source is not None and source.startswith('fixture:') and mode == 'live':
+            print(f"log_coverage_event: fixture source={source!r} logged a mode='live' event "
+                  f"(scenario_key={scenario_key}, ticker={ticker}) -- a fixture should never "
+                  f"produce a real trade")
         if strategy_type is None and node_id is not None:
             with _conn() as c:
                 row = c.execute("SELECT strategy FROM watch_list WHERE id = ?", (node_id,)).fetchone()
             strategy_type = row['strategy'] if row else None
         with _conn() as c:
             c.execute("""
-                INSERT INTO coverage_events (scenario_key, mode, ticker, position_id, node_id, result, detail, strategy_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (scenario_key, mode, ticker, position_id, node_id, result, detail, strategy_type))
+                INSERT INTO coverage_events (scenario_key, mode, ticker, position_id, node_id, result, detail, strategy_type, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (scenario_key, mode, ticker, position_id, node_id, result, detail, strategy_type, source))
             c.commit()
     except Exception:
         pass

@@ -1209,7 +1209,7 @@ _SL_PLACEMENT_RETRY_ATTEMPTS = 3
 _SL_PLACEMENT_RETRY_DELAY_SECS = 2
 
 
-def _place_stop_loss_for_position(node, ticker):
+def _place_stop_loss_for_position(node, ticker, source='daemon'):
     """Places the real resting STOP order for a freshly-opened automated
     position -- market-buy (Part 4, Section 6) or trailing-buy (extended
     2026-07-24, called from both _reconcile_buy_fill's auto-fill path and
@@ -1269,7 +1269,7 @@ def _place_stop_loss_for_position(node, ticker):
         # on a bare retry, matching _submit_order_with_retry's established
         # convention elsewhere in this module.
         db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
-                               node_id=node.get('id'), result="blocked", detail=str(e))
+                               node_id=node.get('id'), result="blocked", detail=str(e), source=source)
         _post_message(
             f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — place stop-loss SELL {shares} @ ~${stop_price:.2f}\n"
             f"(stop-loss placement blocked: {e})"
@@ -1311,7 +1311,7 @@ def _place_stop_loss_for_position(node, ticker):
                     db.log_coverage_event(
                         "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                         node_id=node.get('id'), result="blocked_on_retry",
-                        detail="already protected by a resting order")
+                        detail="already protected by a resting order", source=source)
                     return
                 except Exception as e2:
                     last_error = e2
@@ -1319,7 +1319,7 @@ def _place_stop_loss_for_position(node, ticker):
                 db.log_coverage_event(
                     "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                     node_id=node.get('id'), result="placed_as_market_already_breached",
-                    detail=f"target_stop={stop_price:.4f} current_price={current_price:.4f} attempt={attempt}")
+                    detail=f"target_stop={stop_price:.4f} current_price={current_price:.4f} attempt={attempt}", source=source)
                 # Record exit_pending so check_own_sell_fills/check_exit_reminders
                 # can actually find and close this position once the market
                 # order fills -- without this, a real order was just placed
@@ -1362,7 +1362,7 @@ def _place_stop_loss_for_position(node, ticker):
                 db.log_coverage_event(
                     "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                     node_id=node.get('id'), result="blocked_on_retry",
-                    detail="already protected by a resting order")
+                    detail="already protected by a resting order", source=source)
                 return
             except Exception as e2:
                 last_error = e2
@@ -1370,7 +1370,7 @@ def _place_stop_loss_for_position(node, ticker):
             db.log_coverage_event(
                 "sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
                 node_id=node.get('id'), result="placed_on_retry",
-                detail=f"stop_price={stop_price:.4f} attempt={attempt}")
+                detail=f"stop_price={stop_price:.4f} attempt={attempt}", source=source)
             # broker_stop_price is written unconditionally (unlike sl_order_id
             # just below, gated on extract_order_id succeeding) -- placement
             # is already confirmed successful at this point (no exception,
@@ -1387,14 +1387,14 @@ def _place_stop_loss_for_position(node, ticker):
                 db.set_sl_order_id_by_position(pos['id'], sl_order_id)
             return
         db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
-                               node_id=node.get('id'), result="failed_unexpectedly", detail=str(last_error))
+                               node_id=node.get('id'), result="failed_unexpectedly", detail=str(last_error), source=source)
         _post_message(
             f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — place stop-loss SELL {shares} @ ~${stop_price:.2f}\n"
             f"(stop-loss placement failed after {_SL_PLACEMENT_RETRY_ATTEMPTS} attempts: {last_error})"
         )
         return
     db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
-                           node_id=node.get('id'), result="placed", detail=f"stop_price={stop_price:.4f}")
+                           node_id=node.get('id'), result="placed", detail=f"stop_price={stop_price:.4f}", source=source)
     if not _dry_run_account:
         db.set_broker_stop_price_by_position(pos['id'], stop_price)
     if sl_order_id is not None:
@@ -4114,7 +4114,7 @@ def check_addon_buying_power_drift(now=None):
 
 
 def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, target_notional=None,
-                     position_source='core'):
+                     position_source='core', source='daemon'):
     """Post-fill top-up (Part 3, branch C) -- compares the real fill notional
     against target_notional (the conservative worst-case sizing pads in
     buy_order_sizing/check_gap_resize mean a real fill usually comes in under
@@ -4163,13 +4163,13 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                                                 node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
             except schwab_safety.SafetyViolation as e:
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
-                                       node_id=node.get('id'), result="blocked", detail=str(e))
+                                       node_id=node.get('id'), result="blocked", detail=str(e), source=source)
                 _post_message(f"🚫 {ticker} — top-up buy of {top_up_shares} shares blocked: {e} "
                               f"(position stays under target notional by ${delta:,.0f})")
                 return
             except Exception as e:
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
-                                       node_id=node.get('id'), result="failed_unexpectedly", detail=str(e))
+                                       node_id=node.get('id'), result="failed_unexpectedly", detail=str(e), source=source)
                 _post_message(f"⚠️ {ticker} — top-up buy of {top_up_shares} shares failed "
                               f"unexpectedly: {e} (position stays under target notional by "
                               f"${delta:,.0f})")
@@ -4177,7 +4177,7 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
             if db.top_up_position(node['id'], top_up_shares, fill_price,
                                    position_source=position_source):
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
-                                       node_id=node.get('id'), result="placed", detail=f"shares={top_up_shares} price={fill_price:.4f}")
+                                       node_id=node.get('id'), result="placed", detail=f"shares={top_up_shares} price={fill_price:.4f}", source=source)
                 _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${fill_price:.4f} "
                               f"(fill was under target notional by ${delta:,.0f})")
             else:
@@ -4188,7 +4188,7 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                 # SL/trailing-sell sizing. Must not fail silently.
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
                                        node_id=node.get('id'), result="db_update_failed_after_real_order",
-                                       detail=f"shares={top_up_shares} price={fill_price:.4f}")
+                                       detail=f"shares={top_up_shares} price={fill_price:.4f}", source=source)
                 _post_message(
                     f"🚨 {ticker} — top-up BUY of {top_up_shares} shares @ ${fill_price:.4f} was placed "
                     f"at the broker, but the position record could not be updated (no matching open "
@@ -4197,7 +4197,7 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                 )
     elif delta < -fill_price:
         db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
-                               node_id=node.get('id'), result="overspent_no_corrective_sell", detail=f"overspend=${-delta:,.0f}")
+                               node_id=node.get('id'), result="overspent_no_corrective_sell", detail=f"overspend=${-delta:,.0f}", source=source)
         _post_message(f"⚠️ {ticker} — fill exceeded target notional by ${-delta:,.0f} "
                       f"(no corrective sell placed)")
 
@@ -4457,7 +4457,7 @@ def check_gap_resize():
         _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], is_gap_correction=True, wl_id=node['id'], account=account)
 
 
-def drain_fill_queue():
+def drain_fill_queue(source='daemon'):
     """Fast-path fill detection (Part 3, branch C) -- pops all pending events off
     schwab_stream's account-activity queue and reconciles each. A no-op if
     schwab_stream was never started or has no events (the slow check_auto_fills
@@ -4573,7 +4573,7 @@ def drain_fill_queue():
                 )
                 db.log_coverage_event("orphaned_fill_detected", _coverage_mode(account), ticker=ticker,
                                        result="alerted", detail=f"order_id={order_id} "
-                                       f"price={_confirmed_fill['price']:.4f} shares={_confirmed_fill['quantity']:g}")
+                                       f"price={_confirmed_fill['price']:.4f} shares={_confirmed_fill['quantity']:g}", source=source)
         # Same opt-in gate as check_auto_fills (the slow-poll fallback) --
         # without this, the fast websocket path auto-reconciled any real fill
         # regardless of auto_fill_detection_enabled/node_auto_fill_detection_enabled,
@@ -4583,12 +4583,12 @@ def drain_fill_queue():
         # still-open list.
         if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
             db.log_coverage_event("fast_path_fill_reconciliation", _coverage_mode(account), ticker=ticker,
-                                   node_id=_node_id, result="outside_automation_scope")
+                                   node_id=_node_id, result="outside_automation_scope", source=source)
             continue
         if not (schwab_safety.auto_fill_detection_enabled(ticker)
                 and schwab_safety.node_auto_fill_detection_enabled(_node_id)):
             db.log_coverage_event("fast_path_fill_reconciliation", _coverage_mode(account), ticker=ticker,
-                                   node_id=_node_id, result="auto_fill_detection_disabled")
+                                   node_id=_node_id, result="auto_fill_detection_disabled", source=source)
             continue
         fill = None
         for _ in range(_GAP_FILL_POLL_ATTEMPTS):
@@ -4600,10 +4600,10 @@ def drain_fill_queue():
             # Order not yet FILLED at the broker -- leave it for the slow
             # check_auto_fills poll rather than acting on an unconfirmed partial.
             db.log_coverage_event("fast_path_fill_reconciliation", _coverage_mode(account), ticker=ticker,
-                                   node_id=_node_id, result="stream_event_not_yet_confirmed_filled")
+                                   node_id=_node_id, result="stream_event_not_yet_confirmed_filled", source=source)
             continue
         db.log_coverage_event("fast_path_fill_reconciliation", _coverage_mode(account), ticker=ticker,
-                               node_id=_node_id, result="confirmed_via_poll", detail=f"price={fill['price']:.4f} qty={fill['quantity']:g}")
+                               node_id=_node_id, result="confirmed_via_poll", detail=f"price={fill['price']:.4f} qty={fill['quantity']:g}", source=source)
         # _node_id is only a fuzzy ticker+account hint (get_watch_list_node's
         # documented contract is enrichment/logging, never a gate on a real
         # action) -- passing it as _reconcile_buy_fill's wl_id would let a

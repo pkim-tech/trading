@@ -183,7 +183,7 @@ def test_handle_activity_message_logs_health_after_queueing_not_before(monkeypat
     # contend with the poll loop and could stall a real fill event by seconds.
     order = []
     monkeypatch.setattr(schwab_stream.FILL_QUEUE, 'put', lambda ev: order.append('queued'))
-    monkeypatch.setattr(schwab_stream, '_log_parse_health', lambda h: order.append('logged'))
+    monkeypatch.setattr(schwab_stream, '_log_parse_health', lambda h, **kw: order.append('logged'))
     monkeypatch.setattr('builtins.print', lambda *a, **k: None)
 
     msg = _fill_message('1', 'A', 'AAA', 'Buy', '10000000', '1000000')

@@ -102,7 +102,8 @@ def _run(grid_id, patches, kwargs, account=ACCOUNT):
         for obj, attr, value in patches:
             stack.enter_context(patch.object(obj, attr, value))
         try:
-            schwab_safety.check_order(account=account, ticker=TICKER, side="BUY", **kwargs)
+            schwab_safety.check_order(account=account, ticker=TICKER, side="BUY",
+                                       source='fixture:stage_check_order_guard_scenarios', **kwargs)
             print(f"  [FAIL] {grid_id}: check_order did NOT raise -- guard did not fire")
             return False
         except schwab_safety.SafetyViolation:

@@ -129,23 +129,27 @@ def _parse_activity_message(msg: dict):
     return events, health
 
 
-def _log_parse_health(health):
+def _log_parse_health(health, source='daemon'):
     """Fire-and-forget coverage_event logging for the stream parse-success
     metric -- imported lazily to avoid schwab_stream (a low-level,
     early-imported module) taking a hard dependency on signals_db at module
     load time. Called AFTER FILL_QUEUE.put, not before -- see
-    _parse_activity_message's docstring for why."""
+    _parse_activity_message's docstring for why.
+    source: coverage_events write-attribution (signals_db.COVERAGE_EVENT_
+    SOURCES) -- defaults to 'daemon' since the real websocket connection only
+    exists in the live daemon process; a fixture driving _handle_activity_
+    message directly (e.g. the fake-venue harness) passes its own value."""
     if not health:
         return
     try:
         import signals_db
         for result, ticker in health:
-            signals_db.log_coverage_event("stream_message_parsed", "live", ticker=ticker, result=result)
+            signals_db.log_coverage_event("stream_message_parsed", "live", ticker=ticker, result=result, source=source)
     except Exception:
         pass
 
 
-def _handle_activity_message(msg: dict):
+def _handle_activity_message(msg: dict, source='daemon'):
     # Raw-message logging (2026-08-02, kept post-fix): still cheap, local-only
     # insurance against the next real shape drift going unnoticed the same
     # way this one did for 13 days.
@@ -157,7 +161,7 @@ def _handle_activity_message(msg: dict):
             FILL_QUEUE.put(event)
     else:
         print("[schwab_stream] message did not parse as a recognizable order-fill event")
-    _log_parse_health(health)
+    _log_parse_health(health, source=source)
 
 
 async def _run_stream_once():
