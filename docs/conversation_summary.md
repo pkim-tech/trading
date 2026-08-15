@@ -7792,3 +7792,23 @@ Pure coordination session ("planner") running in parallel with an executing sess
 **Process note for next session**: this session ended mid-backlog-triage (roughly 40 of ~84 remaining items reviewed) — the "research" session's `backlog_cache.md` is the live source of truth for what's still open; don't re-derive from this summary alone. `git status` clean here; all real commits happened in the "research" session's repo state, check `git log` there for the actual diff history.
 
 Full detail (design decisions, exact thresholds, code file:line evidence) is in the message history with the "research" peer session, not reproduced in full here — this summary is the pointer.
+
+---
+
+## 2026-08-15 — Massive multi-hour session: 20+ real fixes/builds shipped, fake-venue harness Phase 2 launched, heavy backlog-cleanse coordination with peer "planner" session
+
+Started from a prior-session status review, then worked two parallel tracks all session: (1) picking off scoped/approved backlog items directly or via background agents, (2) continuously relaying and applying a peer session's live backlog-cleanse pass (~15 batches, dozens of stale/resolved items verified and closed).
+
+**Real code shipped, all committed**: node archive state (`watch_list.archived_at`, `archive_node()`/`unarchive_node()`) + unlinked-live-node evening_status check; script-based test-plan registry (`SCRIPT_BASED_TESTERS`); 2 flaky-test root causes closed (both already-fixed, stale backlog wording); paired-review fixes on 3 flagged commits (Arm% falsy-zero bug hitting a real live position, mode_tag node-aware threading through 10 schwab_client call sites); 3 of 6 lower-severity dual-Opus findings (tax-forecast cross-character netting bug, query scoping, baseline seed-guard migration-safety); `coverage_events` write-attribution Phase 1 (source column + taxonomy through the real order-placement/fill chokepoints); `test_coverage_check.py` fsync fix (160s→~15s, session-scoped tmpfs schema template); tax-forecast unrealized gain/loss calculator (brokerage-only, Section 1256 MTM question deliberately left informational pending CPA confirmation); `_alert_shares_too_small` (closes the `_last_sale_recovery` basis-lock finding via detection instead of auto-recovery); `check_tax_advantaged_excluded_tickers()` generalized to K-1-driven instead of a 2-ticker hardcoded set; `brokerage_only` flag in `candidate_full_review.py`.
+
+**Fake-venue harness Phase 2 launched**: design formalized (reframe — NOT porting fake_broker scenarios, authoring new ones for stream/multi-leg gaps fake_broker structurally can't reach), first scenario `post_fill_topup` built and merged — found and fixed a real bug (top-up leg's `entry_price` could drift from its actual fill price with no downstream correction, feeds real SL/trailing-stop triggers). CLI generalized to `--scenario` dispatch. Full 11-item Category A queue logged (audited against all 89 Grid rows), items 2-11 not yet started.
+
+**In flight at session end (background agents, not yet merged)**: per-`(account,ticker)` retry lock in `schwab_client.py` (closes the retry-dedup wrong-sibling-order-id gap at the root) — still running its test sweep.
+
+**Real design discussion, unresolved**: TIER_RANK reordering in `coverage_proof_matrix.py` — proposed `LIVE > FAKE-HARNESS > CANARY > SIMULATOR > PAPER > UNIT-TEST > NONE` (PAPER never touches schwab_client so ranks below fake_broker; LIVE stays on top since it calibrates the harness's own credibility, not vice versa). User wants to rethink the table structure before applying — handed off to the peer "planner" session to continue.
+
+**Backlog-cleanse coordination**: processed ~15 batches from a peer session running a parallel read-only cleanse pass — verified each claim independently (grep/code-read) before applying removals/rewords, never took a peer's word alone. ~35+ backlog items closed, reworded, or reopened across the session.
+
+Full test coverage throughout: every real code change had its own targeted test sweep run before commit (never trusted "should work"). No full-suite run at session end given context constraints — targeted sweeps were the standard this session.
+
+**Session ended on low context** (3%) with the retry-lock background agent still in flight — will need to be checked/merged next session.
