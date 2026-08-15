@@ -1,5 +1,13 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Confirmed committed 2026-08-15 (backlog-cleanse batch 1) — node archive state (`watch_list.archived_at`) was already built+committed (`9c67711`); "BUILT... Not committed" wording was stale. Full detail: `deep_backlog.md`.
+
+## [live-trading][execution] Confirmed resolved 2026-08-15 (backlog-cleanse batch 1) — execution price-drift audit already completed 2026-08-15; HIBL's flagged ~5% drift traced to paper trading, not real execution. Full detail: `research_log.md`/`deep_backlog.md`.
+
+## [meta][process] Confirmed resolved 2026-08-15 (backlog-cleanse batch 1) — background-agent trading-hours gate: CLAUDE.md's "Background-Agent Trading-Hours Rule" section confirmed live, the "not yet added" blocker this entry cited is done. Full detail: `deep_backlog.md`.
+
+## [live-trading][security] Removed 2026-08-15 (backlog-cleanse batch 1) — `schwab_token.json` 08:10-08:32 mutation item was a verbatim duplicate already recorded in this file; stale leftover in the open-items file dropped.
+
 ## [live-trading][coverage] Removed 2026-08-15 (confirmed stale by direct code check) — `record_deviation` doesn't refresh `expected_outcome` on rerun item duplicated an already-resolved 2026-08-09 entry; `signals_db.py:2757-2766` confirms both branches already refresh `expected_outcome` on every rerun. Item removed.
 
 ## [live-trading][tax] Folded into general portfolio-construction theme 2026-08-15 (user's call) — "run SOXL in both roth and soxl_ira" item removed standalone; technically feasible now that node-level selection works, but not being pursued near-term, part of the broader capital-allocation theme instead.
