@@ -1006,6 +1006,22 @@ def run_loop(tickers: set = None):
                 # failure permanently mask a later clean result.
                 _guarded("reconcile_overlay_nodes", paper_trading.reconcile_overlay_nodes)
 
+                # 2026-08-14: nightly storage trim -- blocks_json (the full
+                # Block Kit payload of every Slack message) is 10-50x the size
+                # of `text`, and output/live_backups/ keeps 720 uncompressed
+                # hourly DB snapshots, so unbounded growth here compounds into
+                # ~720x the backup cost within a month. Nulls the column only
+                # (never the row) past a rolling 7-day window, so the
+                # text-searchable history scripts/recent_slack_messages.py
+                # reads stays queryable long-term. DB-only and idempotent
+                # (already-nulled rows are skipped), so a duplicate run after
+                # a restart-past-16:05 is a no-op -- same shape as the two
+                # reconcilers above.
+                def _trim_slack_blocks():
+                    n = db.trim_old_slack_blocks(days=7)
+                    print(f"  [db] slack_message_log blocks_json trim: {n} row(s) nulled")
+                _guarded("trim_old_slack_blocks", _trim_slack_blocks)
+
             # Separate gate from eod_report_alerted above (pre-seeded, unlike
             # it -- see eod_slack_alerted's definition) since these two post
             # to Slack: a duplicate log print is harmless, a duplicate Slack
