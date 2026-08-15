@@ -676,6 +676,207 @@ def disable_node_auto_fill_detection(node_id):
     NODE_AUTO_FILL_DETECTION_PATH.write_text(json.dumps(state))
 
 
+def _effective_notional(node) -> float:
+    """starting_notional_override (2026-08-12) first, plain starting_notional
+    otherwise -- mirrors signals_helpers._last_sale_recovery's own precedence.
+    The override is the real lever that sizes orders once a node has closed a
+    real trade, so a min_notional floor keyed to the raw column alone would
+    misjudge any node deliberately resized through it (`is not None`, not
+    `or`, so a genuine 0 override is honored rather than falling through)."""
+    override = node.get('starting_notional_override')
+    if override is not None:
+        return override
+    return node.get('starting_notional') or 0
+
+
+UNREADABLE_FLAG_STATE = object()
+
+
+def _raw_flag(path, key):
+    """The tri-state behind auto_fill_detection_enabled's boolean: None means
+    'never set', True/False mean a human (or this module) explicitly set it.
+    disable_*_auto_fill_detection writes an explicit False rather than
+    deleting the key, so the state files genuinely distinguish 'never enabled'
+    from 'deliberately turned off' -- a distinction bulk_enable must respect
+    (see its force= param).
+
+    A file that EXISTS but can't be read returns the UNREADABLE_FLAG_STATE
+    sentinel, NOT None. Collapsing that into 'never set' would fail open in
+    the worst possible direction: every explicit human Disable would become
+    invisible and a bulk apply=True would silently re-enable all of them,
+    which is precisely the emergency override this distinction protects. A
+    file that doesn't exist at all is genuinely 'no decisions recorded' and
+    still returns None -- absence is not corruption."""
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return UNREADABLE_FLAG_STATE
+    if not isinstance(state, dict):
+        return UNREADABLE_FLAG_STATE
+    if str(key) not in state:
+        return None
+    return bool(state[str(key)])
+
+
+def resolve_auto_fill_detection_targets(min_notional=None, node_ids=None, tickers=None):
+    """The real target set for bulk auto-fill-detection enablement: every
+    watch_list row that is state='live' AND whose account is trading_enabled
+    (i.e. exactly the nodes that can actually place a real order today), read
+    FRESH from the DB on every call -- never a cached/hardcoded id list, since
+    nodes get promoted/demoted between runs.
+
+    `min_notional` is an optional floor on starting_notional. `node_ids` and
+    `tickers` are FILTERS ONLY: they intersect with the set above, they can
+    never add a node that isn't already a real live+trading_enabled node. That
+    asymmetry is deliberate -- this function must not become a way to grant
+    auto-fill trust to a paper/dry-run/disabled-account node by naming it.
+
+    Note it checks `trading_enabled` and not `enabled`: `enabled=False` blocks
+    every order for the account anyway, so a fill can't happen there for the
+    flag to matter.
+
+    The live+trading_enabled test here duplicates signals_helpers.
+    effectively_dry_run's definition rather than calling it -- signals_helpers
+    imports schwab_safety, so the reuse is blocked by import direction. Two
+    known differences, both deliberate: this one excludes an unrecognized
+    account (effectively_dry_run treats it as real), which is the safe
+    direction for a function that GRANTS trust; and it reads state fresh from
+    the DB rather than from a passed-in node dict."""
+    targets = []
+    for node in signals_db.get_live_nodes():
+        account = node.get('account')
+        limits = ACCOUNTS.get(account) if account else None
+        if limits is None or not limits.trading_enabled:
+            continue
+        if min_notional is not None and _effective_notional(node) < min_notional:
+            continue
+        targets.append(node)
+
+    if node_ids is not None:
+        wanted_ids = {int(n) for n in node_ids}
+        targets = [n for n in targets if n['id'] in wanted_ids]
+    if tickers is not None:
+        wanted_tickers = {str(t).upper() for t in tickers}
+        targets = [n for n in targets if str(n.get('ticker') or '').upper() in wanted_tickers]
+    return targets
+
+
+def bulk_enable_auto_fill_detection(min_notional=None, node_ids=None, tickers=None,
+                                     apply=False, force=False):
+    """Enable auto-fill detection (BOTH the ticker-level and node-level flags,
+    since the real gate is an AND of the two) for every node
+    resolve_auto_fill_detection_targets() returns.
+
+    `apply=False` (the DEFAULT, and the whole staging gate) computes and
+    returns the exact plan while writing NOTHING to either JSON state file --
+    a human runs it again with apply=True, deliberately, once the safety-net
+    tranches have landed. Enable-only by design: there is no bulk-disable
+    sibling, because a blast-radius-wide disable is exactly the kind of
+    sweeping state change that should stay a per-node decision (the per-row
+    Slack 'Disable' button remains the emergency override).
+
+    Returns a dict: {'apply', 'force', 'targets', 'changed', 'already_enabled',
+    'explicitly_disabled'}, where 'changed' is the nodes that were (or, under
+    apply=False, would be) flipped. List values are [{'id', 'ticker',
+    'account', 'starting_notional'}] dicts, so a caller can print a preview
+    table.
+
+    'explicitly_disabled' is the safety bucket: a node whose ticker-level or
+    node-level flag is an explicit False (which is what
+    disable_*_auto_fill_detection writes -- it does not delete the key) was
+    deliberately switched off by a human, and since the Slack "Enable" button
+    is gone, "Disable" is now the emergency override. Silently undoing one in
+    a bulk sweep would defeat that, so those nodes are SKIPPED and reported
+    separately; pass force=True to include them anyway. A node that was never
+    set at all is not in this bucket -- absence is not a decision.
+
+    Caveat worth knowing before running with apply=True: the ticker-level flag
+    is shared by every node on that ticker. Enabling node A therefore also
+    flips the coarse ticker gate for a sibling node B on the same ticker. B
+    stays gated by its own node-level flag (which this only sets for real
+    targets), so no untargeted node becomes auto-fill-enabled -- but a node
+    that had been switched off via the ticker-level disable path specifically
+    would have that coarse layer restored."""
+    targets = resolve_auto_fill_detection_targets(
+        min_notional=min_notional, node_ids=node_ids, tickers=tickers)
+
+    def _summary(node):
+        # Reports the EFFECTIVE notional (override-aware), i.e. the same number
+        # min_notional filtered on -- previewing the raw column would show a
+        # different figure than the one that actually selected the node.
+        return {'id': node['id'], 'ticker': node.get('ticker'),
+                'account': node.get('account'),
+                'starting_notional': _effective_notional(node)}
+
+    # Refuse to act at all on unreadable state rather than treating it as "no
+    # decisions recorded" -- see _raw_flag's docstring. Checked once up front
+    # (not per node) so the run either proceeds on trustworthy state or stops
+    # before writing anything.
+    for path in (AUTO_FILL_DETECTION_PATH, NODE_AUTO_FILL_DETECTION_PATH):
+        if _raw_flag(path, '__probe__') is UNREADABLE_FLAG_STATE:
+            raise RuntimeError(
+                f"{path} exists but could not be parsed -- refusing to run: every explicit "
+                f"human Disable in it would be invisible, and this would silently re-enable "
+                f"them. Fix or remove the file first.")
+
+    changed, already, disabled = [], [], []
+    for node in targets:
+        ticker, wl_id = node.get('ticker'), node['id']
+        if auto_fill_detection_enabled(ticker) and node_auto_fill_detection_enabled(wl_id):
+            already.append(_summary(node))
+            continue
+        # Node-level only. The ticker-level flag is SHARED by every node on
+        # that ticker, so treating a ticker-level False as "this node was
+        # deliberately disabled" would mis-attribute one node's Disable to its
+        # siblings and wrongly skip them. The per-row Slack Disable button
+        # calls disable_node_auto_fill_detection (node-level) precisely so it
+        # doesn't affect siblings, so the node flag is the real record of a
+        # human's per-node decision.
+        if _raw_flag(NODE_AUTO_FILL_DETECTION_PATH, wl_id) is False and not force:
+            disabled.append(_summary(node))
+            continue
+        if apply:
+            enable_auto_fill_detection(ticker)
+            enable_node_auto_fill_detection(wl_id)
+        changed.append(_summary(node))
+
+    return {'apply': apply, 'force': force, 'targets': [_summary(n) for n in targets],
+            'changed': changed, 'already_enabled': already,
+            'explicitly_disabled': disabled}
+
+
+def format_bulk_enable_auto_fill_detection(result) -> str:
+    """Human-readable preview/receipt for bulk_enable_auto_fill_detection's
+    return value -- the thing a human actually reads before deciding to rerun
+    with apply=True."""
+    verb = "ENABLED" if result['apply'] else "would enable"
+    skipped = result.get('explicitly_disabled') or []
+    lines = [f"auto-fill detection: {len(result['targets'])} live+trading_enabled target node(s); "
+             f"{len(result['changed'])} {verb}, {len(result['already_enabled'])} already enabled, "
+             f"{len(skipped)} skipped (deliberately disabled)"]
+    if not result['apply']:
+        lines.append("(apply=False -- nothing was written; rerun with apply=True to commit)")
+
+    def _fmt(label, row):
+        notional = row['starting_notional']
+        notional_str = f"${notional:,.0f}" if notional is not None else "?"
+        return (f"  {label:>12}  id={row['id']:<5} {str(row['ticker'] or '?'):<6} "
+                f"{str(row['account'] or '?'):<10} {notional_str}")
+
+    for row in result['changed']:
+        lines.append(_fmt(verb, row))
+    for row in result['already_enabled']:
+        lines.append(_fmt('already on', row))
+    for row in skipped:
+        lines.append(_fmt('SKIPPED', row))
+    if skipped:
+        lines.append("  ^ these were explicitly Disabled by a human (the emergency override). "
+                     "Pass force=True to re-enable them anyway.")
+    return "\n".join(lines)
+
+
 def _open_locked():
     """Opens STATE_PATH for read+write under an exclusive flock, creating it
     first if needed. Caller must close() when done (releases the lock)."""
