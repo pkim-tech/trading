@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Persistent fake-venue harness, Phase 1 entrypoint (backlog item:
-"persistent fake-venue harness", docs/backlog_cache.md; design:
-docs/design.md's 2026-08-15 (later) / 2026-08-16 / 2026-08-16 (second pass)
-entries).
+Persistent fake-venue harness entrypoint (backlog item: "persistent
+fake-venue harness", docs/backlog_cache.md; design: docs/design.md's
+2026-08-15 (later) / 2026-08-16 / 2026-08-16 (second pass) / 2026-08-15
+Phase 2 entries).
 
 Runs the real live-trading response-handling code -- schwab_stream's
 ACCT_ACTIVITY parser, signals_notify's fill reconciliation, schwab_safety's
 check_order -- against tests/fake_broker.py's FakeBroker, in its own OS
-process with its own DB file and its own schwab_safety state dir, and proves
-`buy_fill_reconciles_correct_node` (the Grid row with no live proof, blocked
-for months on "no two live nodes share a ticker") end to end.
+process with its own DB file and its own schwab_safety state dir.
+
+Multi-scenario since Phase 2 (--scenario, SCENARIOS registry below) -- kept
+deliberately minimal (a dict, not a plugin system) since the harness only has
+2 scenarios today. Each scenario module supplies run(price, verbose) ->
+(checks, observations) and verify_proof(db_path) -> (ok, rows), matching
+fake_venue/scenarios.py's original Phase 1 shape.
 
 Isolation is asserted BEFORE any project module is imported and re-verified
 after (signals_config.DB_PATH / schwab_safety._STATE_DIR /
@@ -18,12 +22,13 @@ AUTOMATION_ENABLED_TICKERS are all import-time reads, so a late env var is
 silently ignored -- that failure mode is what the second assert catches).
 
 Usage:
-    .venv/bin/python scripts/fake_venue_harness.py                 # real live price
-    .venv/bin/python scripts/fake_venue_harness.py --price 250.0   # offline/deterministic
+    .venv/bin/python scripts/fake_venue_harness.py                                # Phase 1 scenario, real live price
+    .venv/bin/python scripts/fake_venue_harness.py --scenario post_fill_topup     # Phase 2 scenario
+    .venv/bin/python scripts/fake_venue_harness.py --price 250.0                  # offline/deterministic
     .venv/bin/python scripts/fake_venue_harness.py --db-path ... --state-dir ... --keep
 
 Exit code 0 = every required check passed AND the proof query found the real
-coverage_events row; 1 otherwise.
+coverage_events/DB row(s); 1 otherwise.
 """
 import argparse
 import json
@@ -39,9 +44,21 @@ sys.path.insert(0, str(REPO_ROOT))
 from fake_venue import isolation  # noqa: E402  (stdlib-only, safe before configure_env)
 from fake_venue import scenarios_meta  # noqa: E402  (constants only, no project imports)
 
+# name -> scenario module dotted path. Imported lazily (after configure_env)
+# in main(), not here -- importing a scenario module eagerly would drag its
+# project imports in ahead of the isolation gate, same reasoning as the
+# original single-scenario `from fake_venue import scenarios` placement.
+SCENARIOS = {
+    "buy_fill_reconciles_correct_node": "fake_venue.scenarios",
+    "post_fill_topup": "fake_venue.scenarios_post_fill_topup",
+}
+DEFAULT_SCENARIO = "buy_fill_reconciles_correct_node"  # Phase 1's scenario -- backward compat
+
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--scenario", choices=sorted(SCENARIOS), default=DEFAULT_SCENARIO,
+                    help=f"which scenario to run (default: {DEFAULT_SCENARIO})")
     ap.add_argument("--db-path", default=None,
                     help="harness DB file (default: a fresh temp dir, removed on exit)")
     ap.add_argument("--state-dir", default=None,
@@ -70,8 +87,10 @@ def main():
     isolation.assert_env_isolated(aliases, tickers)
     isolation.assert_isolation_took_effect(db_path, state_dir, tickers)  # imports happen here
 
-    from fake_venue import scenarios  # noqa: E402  (must follow configure_env)
+    import importlib
+    scenarios = importlib.import_module(SCENARIOS[args.scenario])  # noqa: E402  (must follow configure_env)
 
+    print(f"[scenario]  {args.scenario}")
     print(f"[isolation] DB        {db_path}")
     print(f"[isolation] state dir {state_dir}")
     print(f"[isolation] scope     {sorted(tickers)}  accounts {sorted(aliases)}")
@@ -95,7 +114,7 @@ def main():
         for row in proof_rows:
             print(f"  -> {row}")
         if not proof_ok:
-            print("  -> PROOF FAILED: no single 'resolved' buy_fill_reconciles_correct_node row")
+            print(f"  -> PROOF FAILED: {args.scenario}'s verify_proof() found no matching row(s)")
             failed += 1
 
     except Exception as e:

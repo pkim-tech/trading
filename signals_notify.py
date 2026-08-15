@@ -4148,7 +4148,26 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
     wl_id. Corrected after review, 2026-08-15: that one-row invariant does
     currently hold (open_position dedups on wl_id alone, regardless of
     position_source), so this is defence in depth rather than a fix for
-    observed corruption -- see db.top_up_position's own docstring."""
+    observed corruption -- see db.top_up_position's own docstring.
+    Records the top-up's own CONFIRMED fill price when available, not the
+    original entry's fill_price -- found 2026-08-16 building the fake-venue
+    harness's post_fill_topup scenario: place_equity_buy's `price` argument
+    is documented as "used only for the safety-cap notional check ... not
+    sent to the API", so the real broker fills the top-up MARKET order at
+    whatever the live quote actually is at that instant, which can differ
+    from fill_price (usually by a few cents in practice -- the two fills
+    happen seconds apart -- but nothing bounded that, and the position's
+    entry_price feeds real SL/trailing-stop trigger percentages downstream,
+    so an unbounded silent drift is real, not cosmetic). No pending_buys row
+    is ever created for the top-up order, so drain_fill_queue's stream fast
+    path can only alert on it (orphaned_fill_detected), never correct
+    entry_price -- this short synchronous poll, right after placement, is the
+    only chance to record the real price. Falls back to fill_price
+    (previous, sole behavior) if the poll doesn't confirm in time, or if the
+    poll itself raises for any reason (wrapped in a bare except -- the real
+    order is already placed by this point, a confirmation failure must never
+    block recording it) -- fails open exactly like before, no new blocking
+    risk."""
     ticker = node['ticker']
     account = node.get('account')
     if target_notional is None:
@@ -4158,9 +4177,10 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
         top_up_shares = int(delta // fill_price)
         if top_up_shares > 0:
             try:
-                schwab_client.place_equity_buy(account, ticker, top_up_shares, fill_price,
-                                                is_gap_correction=is_gap_correction, is_protective=True,
-                                                node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
+                _, top_up_order_id = schwab_client.place_equity_buy(
+                    account, ticker, top_up_shares, fill_price,
+                    is_gap_correction=is_gap_correction, is_protective=True,
+                    node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
             except schwab_safety.SafetyViolation as e:
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
                                        node_id=node.get('id'), result="blocked", detail=str(e), source=source)
@@ -4174,11 +4194,26 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                               f"unexpectedly: {e} (position stays under target notional by "
                               f"${delta:,.0f})")
                 return
-            if db.top_up_position(node['id'], top_up_shares, fill_price,
+            top_up_price = fill_price
+            if top_up_order_id is not None:  # None for dry_run -- nothing to poll
+                # Best-effort only -- any failure here (transient, or a test
+                # double that doesn't implement get_filled_order) must fall
+                # back to the fill_price approximation, not block recording
+                # the top-up at all; the real order is already placed.
+                try:
+                    for _ in range(_GAP_FILL_POLL_ATTEMPTS):
+                        confirmed = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=top_up_order_id)
+                        if confirmed is not None:
+                            top_up_price = confirmed['price']
+                            break
+                        time.sleep(_GAP_FILL_POLL_INTERVAL_SECS)
+                except Exception:
+                    pass
+            if db.top_up_position(node['id'], top_up_shares, top_up_price,
                                    position_source=position_source):
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
-                                       node_id=node.get('id'), result="placed", detail=f"shares={top_up_shares} price={fill_price:.4f}", source=source)
-                _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${fill_price:.4f} "
+                                       node_id=node.get('id'), result="placed", detail=f"shares={top_up_shares} price={top_up_price:.4f}", source=source)
+                _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${top_up_price:.4f} "
                               f"(fill was under target notional by ${delta:,.0f})")
             else:
                 # The real top-up order is already placed at the broker at this
@@ -4188,9 +4223,9 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                 # SL/trailing-sell sizing. Must not fail silently.
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
                                        node_id=node.get('id'), result="db_update_failed_after_real_order",
-                                       detail=f"shares={top_up_shares} price={fill_price:.4f}", source=source)
+                                       detail=f"shares={top_up_shares} price={top_up_price:.4f}", source=source)
                 _post_message(
-                    f"🚨 {ticker} — top-up BUY of {top_up_shares} shares @ ${fill_price:.4f} was placed "
+                    f"🚨 {ticker} — top-up BUY of {top_up_shares} shares @ ${top_up_price:.4f} was placed "
                     f"at the broker, but the position record could not be updated (no matching open "
                     f"position for this node) — open_positions.shares is now UNDERSTATED, SL/trailing-sell "
                     f"sizing will be wrong until this is corrected manually."
