@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Removed 2026-08-15 (user's call) — loss-streak circuit breaker item, an antipattern to the backtest: the backtested returns depend on the strategy staying in the market through loss streaks (mean-reversion captures the recovery/wins that follow), so a circuit breaker that halts trading after N losses would make live behavior diverge from what the backtest actually validated. Item removed.
+
 ## [portfolio][live-trading] Closed 2026-08-15 (user's call) — add-on's 100%-margin sizing "2027 problem" disproved: real policy is core positions in `brokerage` don't borrow at all, only the add-on leg does, so core sizing never touches margin and the liquidity/margin-availability constraint this item worried about doesn't apply as feared. Item removed.
 
 ## [live-trading][security] Closed 2026-08-15 (user's call) — `_last_sale_recovery` basis-lock: real detection built instead of full auto-recovery. `signals_notify._alert_shares_too_small` fires (has_capital_at_stake-gated, throttled) whenever a real node's computed share count would round to 0 -- the actual lock condition. Real risk profile (only tiny-notional test nodes hit this, real positions stay comfortably sized) means detection is sufficient. 2 new tests. Item removed.
