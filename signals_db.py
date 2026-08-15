@@ -1826,20 +1826,42 @@ def ensure_tables():
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        # One-time-seed marker (found in review, 2026-08-15): the original guard
+        # keyed re-seeding on the baseline ROW's own existence, so a user
+        # correcting the baseline via its only documented correction path
+        # (deleting the row, add_tax_realized_loss_baseline is append-only) got
+        # it silently resurrected with no audit trail on the very next
+        # ensure_tables() call (daemon startup, evening report, any staging
+        # script). This marker is separate from the baseline row itself, so
+        # deleting the row doesn't clear it.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS _seed_markers (
+                seed_key  TEXT PRIMARY KEY,
+                seeded_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
         # Real, user-confirmed baseline (2026-08-15 model): $240,000, short-term
-        # character, predates this table's existence. Seeded once -- if this exact
-        # (account, tax_year, character, amount) row already exists, don't duplicate
-        # it on every ensure_tables() call.
-        existing = c.execute(
-            "SELECT COUNT(*) FROM tax_realized_loss_baseline "
-            "WHERE account='brokerage' AND tax_year=2026 AND character='short_term'"
-        ).fetchone()[0]
-        if existing == 0:
-            c.execute("""
-                INSERT INTO tax_realized_loss_baseline (account, tax_year, amount, character, note)
-                VALUES ('brokerage', 2026, 240000, 'short_term',
-                        'Real pre-existing realized-loss baseline, predates this tracking (user-confirmed 2026-08-15)')
-            """)
+        # character, predates this table's existence. Seeded once.
+        _seed_key = 'tax_realized_loss_baseline:brokerage:2026:short_term:240000'
+        already_seeded = c.execute(
+            "SELECT 1 FROM _seed_markers WHERE seed_key=?", (_seed_key,)
+        ).fetchone()
+        if not already_seeded:
+            # Migration safety: the real production DB already has this row
+            # from the old (pre-marker) guard -- don't duplicate it just
+            # because the marker table itself is new. Still write the marker
+            # either way, so the fix takes effect going forward.
+            existing_row = c.execute(
+                "SELECT 1 FROM tax_realized_loss_baseline "
+                "WHERE account='brokerage' AND tax_year=2026 AND character='short_term'"
+            ).fetchone()
+            if not existing_row:
+                c.execute("""
+                    INSERT INTO tax_realized_loss_baseline (account, tax_year, amount, character, note)
+                    VALUES ('brokerage', 2026, 240000, 'short_term',
+                            'Real pre-existing realized-loss baseline, predates this tracking (user-confirmed 2026-08-15)')
+                """)
+            c.execute("INSERT INTO _seed_markers (seed_key) VALUES (?)", (_seed_key,))
 
         c.commit()
 

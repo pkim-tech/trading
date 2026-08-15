@@ -311,10 +311,37 @@ def brokerage_tax_forecast(year: int, realized_gains_by_ticker: dict[str, float]
     st_baseline_loss = baseline.get("short_term", 0.0)
     lt_baseline_loss = baseline.get("long_term", 0.0)
 
-    lt_gain_net = max(0.0, lt_gain_gross - lt_baseline_loss)
-    st_pool_net = max(0.0, st_pool_gross - st_baseline_loss)
-    lt_baseline_remaining = max(0.0, lt_baseline_loss - lt_gain_gross)
-    st_baseline_remaining = max(0.0, st_baseline_loss - st_pool_gross)
+    # Cross-character netting (found in review, 2026-08-15): real tax mechanics
+    # let an excess loss of one character offset a gain of the other -- this
+    # applies to THIS YEAR'S OWN trading result (lt_gain_gross/st_pool_gross,
+    # already signed sums so either can be a real net loss on its own), never
+    # to the baseline crossing characters (the baseline is a fixed prior-year
+    # carryforward, same-character-only by design -- test_long_term_baseline_
+    # only_offsets_long_term_slice_not_short_term_pool pins that). Independent
+    # per-character (gross - baseline) flooring overstated liability whenever
+    # one character was a net loss this year while the other was a net gain
+    # (e.g. AGQ's LT slice +$100k while JNUG/ETHU net -$60k ST: real netted
+    # position ~$40k taxable, the old code taxed the full $100k and reported
+    # the loss side as exactly 0 instead of contributing its excess).
+    lt_net = lt_gain_gross
+    st_net = st_pool_gross
+    if lt_net < 0 and st_net > 0:
+        st_net += lt_net
+        lt_net = 0.0
+    elif st_net < 0 and lt_net > 0:
+        lt_net += st_net
+        st_net = 0.0
+    lt_gain_net = max(0.0, lt_net - lt_baseline_loss)
+    st_pool_net = max(0.0, st_net - st_baseline_loss)
+    # baseline_remaining: how much of the ORIGINAL baseline principal is still
+    # unused. Keyed off the (already cross-netted, so never double-counts a
+    # loss that already offset the other character) per-character result,
+    # floored at 0 before subtracting from the baseline -- a real trading LOSS
+    # this year doesn't inflate how much baseline is left beyond its own
+    # principal (the old code could report MORE remaining baseline than
+    # actually exists whenever gross was negative).
+    lt_baseline_remaining = max(0.0, lt_baseline_loss - max(0.0, lt_net))
+    st_baseline_remaining = max(0.0, st_baseline_loss - max(0.0, st_net))
 
     lt_rate = rates.federal_lt_rate + rates.niit_rate + rates.state_rate + rates.city_rate
     st_rate = rates.federal_ordinary_rate + rates.niit_rate + rates.state_rate + rates.city_rate

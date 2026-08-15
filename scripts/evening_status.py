@@ -317,12 +317,26 @@ def _brokerage_tax_forecast_section():
     this function is only the realized-loss-baseline netting + reserve piece."""
     db.ensure_tables()  # idempotent; guarantees tax_realized_loss_baseline exists + is seeded
     year = int(TODAY[:4])
-    tickers = [r[0] for r in sqlite3.connect(LIVE_DB).execute(
+    # Tax realization is a property of trade_log (a closed trade this year),
+    # not current node state -- scoping to state='live' nodes only silently
+    # dropped a ticker's already-realized gains from the forecast if it was
+    # demoted to paper (or its node deleted) after realizing them earlier in
+    # the year (found in review, 2026-08-15). Union with currently-live
+    # tickers too, so a ticker with a live node but zero closed trades yet
+    # still shows up in the "no closed trades yet" case below instead of
+    # being silently invisible.
+    con = sqlite3.connect(LIVE_DB)
+    live_tickers = {r[0] for r in con.execute(
         "SELECT DISTINCT ticker FROM watch_list WHERE account='brokerage' AND state='live'"
-    ).fetchall()]
+    ).fetchall()}
+    realized_tickers = {r[0] for r in con.execute(
+        "SELECT DISTINCT ticker FROM trade_log WHERE account='brokerage' AND exit_time IS NOT NULL "
+        "AND COALESCE(is_dry_run_sim, 0) = 0 AND strftime('%Y', exit_time) = ?", (str(year),)
+    ).fetchall()}
+    tickers = sorted(live_tickers | realized_tickers)
     if not tickers:
         print("=== Tax forecast (brokerage) ===")
-        print("No real state='live' brokerage nodes found -- nothing to forecast.\n")
+        print("No real state='live' brokerage nodes or closed trades found -- nothing to forecast.\n")
         return
 
     realized = db.get_realized_pnl_by_ticker('brokerage', tickers, year)
@@ -332,7 +346,7 @@ def _brokerage_tax_forecast_section():
 
     print(f"=== Tax forecast (brokerage, {year}) -- ESTIMATOR ONLY, not filing-accuracy "
           f"(~5-10% expected error; confirm with CPA/K-1) ===")
-    print(f"Live tickers scoped: {', '.join(tickers)} "
+    print(f"Tickers scoped (live + realized-this-year): {', '.join(tickers)} "
           f"(Section 1256 60/40: {', '.join(sorted(forecast.section_1256_gain)) or 'none'}; "
           f"ordinary short-term: {', '.join(sorted(forecast.ordinary_st_gain)) or 'none'})")
     if not realized:

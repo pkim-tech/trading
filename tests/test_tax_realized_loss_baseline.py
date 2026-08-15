@@ -71,6 +71,30 @@ def test_ensure_tables_seed_is_idempotent(isolated_db):
     assert baseline == {'short_term': 240000.0}
 
 
+def test_ensure_tables_does_not_resurrect_a_deleted_baseline_row(isolated_db):
+    """The only documented correction path is deleting the seeded row
+    directly (add_tax_realized_loss_baseline is append-only) -- a later
+    ensure_tables() call (daemon startup, evening report, any staging script)
+    must not silently re-insert it with no audit trail."""
+    with db._conn() as c:
+        c.execute("DELETE FROM tax_realized_loss_baseline WHERE account='brokerage' AND tax_year=2026")
+        c.commit()
+    db.ensure_tables()
+    assert db.get_tax_realized_loss_baseline('brokerage', 2026) == {}
+
+
+def test_ensure_tables_does_not_duplicate_a_pre_marker_production_row(isolated_db):
+    """Migration safety: simulate the real production DB, which already has
+    the baseline row from before the seed-marker table existed. Dropping just
+    the marker table and re-running ensure_tables() must not double-insert."""
+    with db._conn() as c:
+        c.execute("DROP TABLE IF EXISTS _seed_markers")
+        c.commit()
+    db.ensure_tables()
+    baseline = db.get_tax_realized_loss_baseline('brokerage', 2026)
+    assert baseline == {'short_term': 240000.0}  # not 480000.0
+
+
 def test_add_tax_realized_loss_baseline_sums_multiple_rows(isolated_db):
     db.add_tax_realized_loss_baseline('brokerage', 2026, 5000, 'short_term', note='correction')
     baseline = db.get_tax_realized_loss_baseline('brokerage', 2026)
@@ -201,6 +225,44 @@ def test_long_term_baseline_only_offsets_long_term_slice_not_short_term_pool():
     assert f.lt_gain_net == pytest.approx(0.0)   # fully offset
     assert f.st_pool_net == pytest.approx(40000.0)  # untouched by the LT baseline
     assert f.liability == pytest.approx(40000.0 * ST_RATE)
+
+
+def test_cross_character_netting_offsets_st_loss_against_lt_gain():
+    """AGQ +$100k (60/40 split: lt_gain_gross=60000, contributes st=40000) but
+    JNUG/ETHU net -$100k ST -- st_pool_gross = 40000 - 100000 = -60000, a real
+    ST-character trading loss this year. Real tax mechanics let that excess ST
+    loss offset the LT gain instead of taxing the full $60000 LT slice while
+    reporting the ST side as a flat 0."""
+    realized = {'AGQ': 100000.0, 'JNUG': -60000.0, 'ETHU': -40000.0}
+    f = k1_tax.brokerage_tax_forecast(YEAR, realized, {}, rates=RATES)
+    assert f.lt_gain_gross == pytest.approx(60000.0)
+    assert f.st_pool_gross == pytest.approx(-60000.0)
+    # 60000 (LT) - 60000 (ST loss, cross-netted) = 0 net taxable
+    assert f.lt_gain_net == pytest.approx(0.0)
+    assert f.st_pool_net == pytest.approx(0.0)
+    assert f.liability == pytest.approx(0.0)
+
+
+def test_cross_character_netting_offsets_lt_loss_against_st_gain():
+    """Mirror case: a real LT-character trading loss this year offsets an ST gain."""
+    realized = {'AGQ': -100000.0, 'JNUG': 60000.0}
+    f = k1_tax.brokerage_tax_forecast(YEAR, realized, {}, rates=RATES)
+    assert f.lt_gain_gross == pytest.approx(-60000.0)
+    assert f.st_pool_gross == pytest.approx(20000.0)  # -40000 (AGQ ST slice) + 60000 (JNUG)
+    assert f.lt_gain_net == pytest.approx(0.0)
+    assert f.st_pool_net == pytest.approx(0.0)
+    assert f.liability == pytest.approx(0.0)
+
+
+def test_baseline_remaining_never_exceeds_principal_when_gross_is_a_loss():
+    """A real trading loss this year (gross negative) must never inflate
+    baseline_remaining beyond the baseline's own principal."""
+    realized = {'JNUG': -50000.0}
+    baseline = {'short_term': 240000.0}
+    f = k1_tax.brokerage_tax_forecast(YEAR, realized, baseline, rates=RATES)
+    assert f.st_pool_gross == pytest.approx(-50000.0)
+    assert f.st_baseline_remaining == pytest.approx(240000.0)  # not 290000.0
+    assert f.st_pool_net == pytest.approx(0.0)
 
 
 def test_no_section_1256_ticker_activity_classifies_correctly():
