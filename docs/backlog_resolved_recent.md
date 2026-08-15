@@ -1,5 +1,13 @@
 # Backlog — Recently Resolved
 
+## [live-trading][coverage] Closed 2026-08-15 (user's call) — `soxl_ira` staged-test node cleanup already done in practice: down to 6-7 nodes with minimal capital requirements. Item removed.
+
+## [portfolio][tax] Closed 2026-08-15 (user's call) — real realized-loss lookup already done manually; the $240k number used throughout tonight's tax-forecast work IS the answer. Item removed.
+
+## [live-trading] Closed 2026-08-15 (user's call) — `same_day_block` 7/8-tickers finding folded into normal candidate-promotion practice, not tracked as a standalone item anymore. Item removed.
+
+## [live-trading] Closed 2026-08-15 (user's call) — resync HIBL/RETL to v5 not needed; these are tuning/test nodes where version labeling doesn't matter, the only real thing that matters is RETL actually executing a trade. Item removed.
+
 ## [live-trading][backtest] Removed 2026-08-15 (user's call) — "expand paper trading" standalone entry, confirmed fully superseded by the harness reframe (not just marked superseded). Real answer: the fake-venue harness takes over that role, not more paper nodes. Full detail: `deep_backlog.md`'s harness reframe entry.
 
 Rolling window of resolved backlog items, most recent first, for session-handoff context only.

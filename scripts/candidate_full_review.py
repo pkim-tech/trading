@@ -116,6 +116,11 @@ COLUMN_DEFS = {
                  "check (issuer tax-document page) -- every other ticker honestly reads 'not checked', never "
                  "guessed from structural resemblance to a confirmed ticker.",
     "k1_tranche": "K1_CONFIRMED / CLEAN_CONFIRMED / ETN_NOT_K1 / NOT_CHECKED bucket of k1_status.",
+    "brokerage_only": "True iff k1_tranche == K1_CONFIRMED -- a real, queryable account-routing flag, distinct "
+                       "from DISQUALIFIED (see docs/backlog_cache.md's 2026-08-12 K-1 decision: K-1 alone no "
+                       "longer disqualifies a ticker, it only restricts it to the taxable brokerage account, "
+                       "since UBTI only applies in ira/roth). Previously only prose in underlier_note -- this "
+                       "derives directly and mechanically from k1_tranche so it doesn't need re-deriving by hand.",
     "underlier_count": "Number of constituent securities in the underlying index/basket, from real research "
                         "(stockanalysis.com/etf.com/issuer fact sheet) -- NULL if never researched. This "
                         "project's diversification minimum is ~20; below that is a real disqualification risk "
@@ -1411,6 +1416,7 @@ def add_tranches(rec):
         rec["k1_tranche"] = "ETN_NOT_K1"
     else:
         rec["k1_tranche"] = "NOT_CHECKED"
+    rec["brokerage_only"] = rec["k1_tranche"] == "K1_CONFIRMED"
 
     poss = rec.get("alpha_possible_pct")
     cert = rec.get("alpha_certain_pct")
