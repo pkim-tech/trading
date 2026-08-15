@@ -120,3 +120,74 @@ def test_migration_adds_column_to_preexisting_table(env):
     signals_db.log_slack_message('live', 'after migration', blocks=[{"type": "divider"}])
     row = _last()
     assert json.loads(row['blocks_json']) == [{"type": "divider"}]
+
+
+def test_logging_failure_cannot_break_the_real_send(env, monkeypatch):
+    """log_slack_message's own try/except (signals_db.py) already wraps the
+    DB write -- this pins that guarantee from _post_message's side: even if
+    the DB write raises something log_slack_message's internal try/except
+    wouldn't normally see (simulated here by breaking _conn itself, so the
+    raise happens on the `with _conn() as c:` line, still inside that
+    try/except), _post_message must still return normally rather than
+    propagating into the real Slack-posting control flow.
+
+    Asserts the broken path was actually hit (not just that the call
+    returned) -- otherwise this would pass just as green if the
+    db.log_slack_message call were ever deleted from _post_message entirely,
+    proving nothing about the guarantee it claims to pin (Opus review)."""
+    calls = []
+
+    def _broken_conn():
+        calls.append(1)
+        raise RuntimeError("simulated DB failure")
+    monkeypatch.setattr(signals_db, '_conn', _broken_conn)
+    channel, ts = _REAL_POST_MESSAGE("must not raise", blocks=[{"type": "divider"}])
+    assert calls, "the broken _conn was never reached -- test proves nothing"
+    assert (channel, ts) == (None, None)  # SOCKET_MODE/SLACK_HOOK both off in `env`
+
+
+class _FakeSlackClient:
+    def chat_postMessage(self, **kwargs):
+        return {'channel': 'C_REAL', 'ts': '123.456'}
+
+
+class _FakeBoltApp:
+    client = _FakeSlackClient()
+
+
+def test_logging_failure_cannot_corrupt_a_successful_sends_return_value(env, monkeypatch):
+    """The `env` fixture forces SOCKET_MODE/SLACK_HOOK off, so the prior test's
+    (None, None) assertion is trivially true regardless of the logging
+    failure -- it never exercises a real (channel, ts) return (Opus
+    contextual review, 2026-08-14). This drives the SOCKET_MODE branch with a
+    fake Slack client that returns a real channel/ts, with _conn still
+    broken, and confirms that real return value survives untouched."""
+    calls = []
+
+    def _broken_conn():
+        calls.append(1)
+        raise RuntimeError("simulated DB failure")
+    monkeypatch.setattr(signals_db, '_conn', _broken_conn)
+    monkeypatch.setattr(signals_config, 'SOCKET_MODE', True)
+    monkeypatch.setattr(signals_config, 'bolt_app', _FakeBoltApp())
+    channel, ts = _REAL_POST_MESSAGE("must return real channel/ts", blocks=[{"type": "divider"}])
+    assert calls, "the broken _conn was never reached -- test proves nothing"
+    assert (channel, ts) == ('C_REAL', '123.456')
+
+
+def test_sim_mode_logs_blocks_as_sent_with_markers(env, monkeypatch):
+    """The `env` fixture forces SIM_MODE off, so no existing test in this file
+    pins _post_message's comment (lines ~90-92) that blocks_json reflects the
+    payload as actually sent -- including the SIM_MODE marker blocks injected
+    at lines ~51-59, the only place _post_message mutates `blocks` before
+    logging it (Opus contextual review, 2026-08-14: a regression that logged
+    the pre-injection payload instead would pass every other test here)."""
+    monkeypatch.setattr(signals_config, 'SIM_MODE', True)
+    original = [{"type": "section", "text": {"type": "mrkdwn", "text": "*SOXL* z=-2.14"}}]
+    _REAL_POST_MESSAGE("sim mode send", blocks=original)
+    row = _last()
+    logged = json.loads(row['blocks_json'])
+    assert len(logged) == len(original) + 2  # header + original + footer markers
+    assert 'SIM MODE' in logged[0]['elements'][0]['text']
+    assert logged[1] == original[0]
+    assert 'SIM MODE END' in logged[-1]['elements'][0]['text']
