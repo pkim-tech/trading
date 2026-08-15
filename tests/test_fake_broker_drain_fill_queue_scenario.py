@@ -9,6 +9,7 @@ top-up on top of an already-wrong base). starting_notional is set close to
 the real fill value so _reconcile_fill's own top-up logic doesn't fire and
 confound the shares assertion -- that's a different, already-tested code
 path (see test_fake_broker_topup_scenario.py)."""
+import os
 import sys
 import tempfile
 from datetime import datetime
@@ -30,6 +31,12 @@ from fake_broker import fake_broker  # noqa: F401
 
 TICKER = 'TEST_DRAIN_FILL'
 ACCOUNT = 'soxl_ira'  # dry_run=False -- a real fill/reconciliation, matching what this scenario actually guards
+# FILL_QUEUE's real shape carries the raw Schwab account number, never an
+# alias (2026-08-16 AccountNumber-defect fix) -- ACCOUNT above stays the alias
+# for order-placement/DB calls, this is only for constructing the raw stream
+# tuple. Resolves back to ACCOUNT via the real .env's SCHWAB_ACCOUNT_SOXL_IRA
+# suffix (not blanked in this test module).
+RAW_ACCOUNT_NUMBER = '45110' + os.environ.get('SCHWAB_ACCOUNT_SOXL_IRA', '931')
 _IN_WINDOW_TIME = datetime(2026, 7, 29, 10, 30)
 
 
@@ -110,7 +117,7 @@ def test_polled_quantity_wins_over_stale_stream_quantity(env, fake_broker, monke
                              'price': polled_price, 'quantity': polled_shares
                          })
 
-    schwab_stream.FILL_QUEUE.put((ACCOUNT, TICKER, 'BUY', stream_price, stream_shares, order_id))
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'BUY', stream_price, stream_shares, order_id))
 
     signals_notify.drain_fill_queue()
 
@@ -152,7 +159,7 @@ def test_skip_when_auto_fill_detection_disabled(env, fake_broker, monkeypatch):
 
     monkeypatch.setattr(schwab_client, 'get_filled_order', mock_get_filled_order)
 
-    schwab_stream.FILL_QUEUE.put((ACCOUNT, TICKER, 'BUY', 50.0, 10, order_id))
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'BUY', 50.0, 10, order_id))
 
     signals_notify.drain_fill_queue()
 

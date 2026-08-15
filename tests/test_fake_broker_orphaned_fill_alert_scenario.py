@@ -13,6 +13,7 @@ poll and alerts loudly instead of silently continuing. Also proves the
 adjacent, already-correct behavior still holds: a fill that DOES match a
 pending row is unaffected by the new branch (no double-alert, normal
 reconciliation still happens)."""
+import os
 import sys
 import tempfile
 from datetime import datetime
@@ -34,6 +35,12 @@ from fake_broker import fake_broker  # noqa: F401
 
 TICKER = 'TEST_ORPHAN_FILL'
 ACCOUNT = 'soxl_ira'
+# FILL_QUEUE's real shape carries the raw Schwab account number, never an
+# alias (2026-08-16 AccountNumber-defect fix) -- ACCOUNT above stays the alias
+# for order-placement/DB calls, this is only for constructing the raw stream
+# tuple. Resolves back to ACCOUNT via the real .env's SCHWAB_ACCOUNT_SOXL_IRA
+# suffix (not blanked in this test module).
+RAW_ACCOUNT_NUMBER = '45110' + os.environ.get('SCHWAB_ACCOUNT_SOXL_IRA', '931')
 _IN_WINDOW_TIME = datetime(2026, 7, 29, 10, 30)
 
 
@@ -83,7 +90,7 @@ def test_orphaned_fill_alerts_loudly_with_no_pending_row(env, fake_broker, monke
     posted = []
     monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: (posted.append(a[0] if a else kw.get('text')), (None, None))[1])
 
-    schwab_stream.FILL_QUEUE.put((ACCOUNT, TICKER, 'BUY', 50.0, 10, order_id))
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'BUY', 50.0, 10, order_id))
     signals_notify.drain_fill_queue()
 
     assert any('NO pending_buys row matches' in m for m in posted), (
@@ -123,7 +130,7 @@ def test_matching_pending_row_does_not_trigger_the_orphan_alert(env, fake_broker
     posted = []
     monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: (posted.append(a[0] if a else kw.get('text')), (None, None))[1])
 
-    schwab_stream.FILL_QUEUE.put((ACCOUNT, TICKER, 'BUY', 50.0, 10, order_id))
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'BUY', 50.0, 10, order_id))
     signals_notify.drain_fill_queue()
 
     assert not any('NO pending_buys row matches' in m for m in posted), (

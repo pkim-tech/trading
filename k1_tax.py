@@ -226,6 +226,118 @@ def stress_test_flat_quarter(reserved_b: float, required_quarterly: float,
     }
 
 
+# ---------------------------------------------------------------------------
+# Brokerage-only realized-loss-baseline netting + reserve recommendation
+# (docs/deep_backlog.md's 2026-08-15 tax-forecast model -- distinct from the
+# Bucket A/B safe-harbor machinery above, which assumes every logged Trade is
+# already a Section-1256 PTP gain. This piece nets a real dollar realized-loss
+# baseline against a MIX of Section-1256 (60/40 split) and ordinary
+# short-term tickers, scoped to `brokerage`, the only taxable account.)
+#
+# CALIBRATION FRAMING: this is a reserve-SIZING estimator, not a
+# filing-accuracy tool. Expected error ~5-10%, not precision-to-the-dollar --
+# "we're estimating, the CPA will tell the user if they're short" (user's
+# explicit framing, 2026-08-15). Don't chase exact wash-sale-lot-level
+# precision here; per-ticker annual net realized $ is the right grain.
+# ---------------------------------------------------------------------------
+
+# Real, documented fact (not an assumption made here): AGQ is the one
+# Section-1256 futures-linked K-1 PTP trading in `brokerage` today, so its
+# annual net gain/loss splits 60% long-term / 40% short-term for character
+# purposes regardless of actual holding period. JNUG/ETHU are standard
+# '40-Act ETFs -- their entire net gain/loss is ordinary short-term. If a
+# 4th Section-1256 ticker is ever added to `brokerage`, add it here.
+SECTION_1256_TICKERS = frozenset({"AGQ"})
+
+
+@dataclass
+class BrokerageTaxForecast:
+    year: int
+    section_1256_gain: dict[str, float]      # {ticker: net $ gain/loss}, Section 1256 tickers only
+    ordinary_st_gain: dict[str, float]       # {ticker: net $ gain/loss}, ordinary short-term tickers
+    lt_gain_gross: float                     # AGQ's 60% long-term slice, pre-baseline-netting
+    st_pool_gross: float                     # JNUG/ETHU gains + AGQ's 40% short-term slice, pre-netting
+    st_baseline_loss: float                  # realized-loss baseline, short_term character
+    lt_baseline_loss: float                  # realized-loss baseline, long_term character
+    lt_gain_net: float                       # lt_gain_gross - lt_baseline_loss, floored at 0
+    st_pool_net: float                       # st_pool_gross - st_baseline_loss, floored at 0
+    st_baseline_remaining: float             # unexhausted portion of the short-term baseline
+    lt_baseline_remaining: float             # unexhausted portion of the long-term baseline
+    liability: float                         # Liability = Profit x effective_rate, post-netting
+    estimate_already_paid: float
+    reserve: float                           # Liability - estimate_already_paid, floored at 0
+    baseline_exhausted: bool                 # True once st_baseline AND lt_baseline are both used up
+    recommend_full_sweep: bool               # baseline_exhausted AND liability > 0
+    note: str
+
+
+def brokerage_tax_forecast(year: int, realized_gains_by_ticker: dict[str, float],
+                            baseline: dict[str, float], rates: RateConfig | None = None,
+                            estimate_already_paid: float = 0.0) -> BrokerageTaxForecast:
+    """Nets `brokerage`'s real per-ticker realized $ gain/loss for `year` against
+    the realized-loss baseline, then computes Liability/Reserve.
+
+    realized_gains_by_ticker: {ticker: net $ gain/loss}, e.g. from
+      signals_db.get_realized_pnl_by_ticker('brokerage', [...], year). Tickers
+      in SECTION_1256_TICKERS get the 60/40 split; everything else is treated
+      as 100% ordinary short-term.
+    baseline: {'short_term': amount, 'long_term': amount} -- positive $ amounts
+      representing a LOSS baseline, e.g. from
+      signals_db.get_tax_realized_loss_baseline('brokerage', year). A missing
+      key is treated as 0.
+    rates: reuses k1_tax's own RateConfig/blended-rate engine -- pass None to
+      load the persisted config via load_rate_config().
+
+    Netting mechanics (the whole point of this function, see module-level
+    comment above): the short-term baseline nets against the COMBINED
+    short-term pool -- ordinary-ST-ticker gains + the 40%-short-term slice of
+    every Section-1256 ticker's gain -- together, not against either side
+    alone. The Section-1256 60%-long-term slice is only reduced by a
+    long-term-character baseline (0 today, since the real baseline is 100%
+    short-term). A negative net per-ticker figure (a real realized loss this
+    year) already reduces its own pool correctly since it's a signed sum --
+    no separate "this year's own losses" handling is needed beyond summing
+    signed per-ticker gains into the two pools.
+    """
+    rates = rates or load_rate_config()
+
+    section_1256_gain = {t: g for t, g in realized_gains_by_ticker.items() if t in SECTION_1256_TICKERS}
+    ordinary_st_gain = {t: g for t, g in realized_gains_by_ticker.items() if t not in SECTION_1256_TICKERS}
+
+    lt_gain_gross = sum(g * rates.section_1256_lt_fraction for g in section_1256_gain.values())
+    st_pool_gross = (sum(g * rates.section_1256_st_fraction for g in section_1256_gain.values())
+                      + sum(ordinary_st_gain.values()))
+
+    st_baseline_loss = baseline.get("short_term", 0.0)
+    lt_baseline_loss = baseline.get("long_term", 0.0)
+
+    lt_gain_net = max(0.0, lt_gain_gross - lt_baseline_loss)
+    st_pool_net = max(0.0, st_pool_gross - st_baseline_loss)
+    lt_baseline_remaining = max(0.0, lt_baseline_loss - lt_gain_gross)
+    st_baseline_remaining = max(0.0, st_baseline_loss - st_pool_gross)
+
+    lt_rate = rates.federal_lt_rate + rates.niit_rate + rates.state_rate + rates.city_rate
+    st_rate = rates.federal_ordinary_rate + rates.niit_rate + rates.state_rate + rates.city_rate
+    liability = lt_gain_net * lt_rate + st_pool_net * st_rate
+
+    reserve = max(0.0, liability - estimate_already_paid)
+
+    baseline_exhausted = st_baseline_remaining <= 1e-9 and lt_baseline_remaining <= 1e-9
+    recommend_full_sweep = baseline_exhausted and liability > 1e-9
+
+    return BrokerageTaxForecast(
+        year=year, section_1256_gain=section_1256_gain, ordinary_st_gain=ordinary_st_gain,
+        lt_gain_gross=lt_gain_gross, st_pool_gross=st_pool_gross,
+        st_baseline_loss=st_baseline_loss, lt_baseline_loss=lt_baseline_loss,
+        lt_gain_net=lt_gain_net, st_pool_net=st_pool_net,
+        st_baseline_remaining=st_baseline_remaining, lt_baseline_remaining=lt_baseline_remaining,
+        liability=liability, estimate_already_paid=estimate_already_paid, reserve=reserve,
+        baseline_exhausted=baseline_exhausted, recommend_full_sweep=recommend_full_sweep,
+        note="ESTIMATOR ONLY -- reserve-sizing aid, not a filing-accuracy tool. "
+             "Expected error ~5-10%; confirm actual liability with your CPA/K-1.",
+    )
+
+
 def reserve_with_yield(principal: float, annual_yield_rate: float, days: int) -> float:
     """Simple interest accrual on a reserve balance held in e.g. T-bills instead of
     cash. Simple (not compounded) interest is intentional -- this is a rough

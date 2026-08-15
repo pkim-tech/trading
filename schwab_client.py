@@ -11,6 +11,7 @@ in source.
 """
 import os
 import time
+from datetime import datetime, timezone
 
 import schwab.client
 import schwab.orders.equities as equity_orders
@@ -70,48 +71,336 @@ def _get_client(interactive: bool = False):
 _ORDER_SUBMIT_RETRY_ATTEMPTS = 3
 _ORDER_SUBMIT_RETRY_INTERVAL_SECS = 2
 
+# Real broker-clock vs local-clock skew tolerance for _find_recent_matching_order's
+# since_ts cutoff -- widened backward a few seconds so a genuinely-just-placed
+# order isn't excluded for landing at the broker fractionally "before" this
+# process's own since_ts read. Small on purpose: too wide risks matching an
+# unrelated older order of the same shape (see that function's docstring).
+_RETRY_CLOCK_SKEW_BUFFER_SECS = 5
 
-def _submit_order_with_retry(account_hash, order):
+
+class _AmbiguousBrokerState(Exception):
+    """Raised by _find_recent_matching_order when more than one real order
+    could be the result of a prior retry attempt whose response was lost --
+    deliberately never auto-resolved. A retry loop that hits this stops
+    retrying and lets the exception propagate (same as any other submission
+    failure) rather than guess which candidate, if any, is the real one."""
+
+
+def _parse_broker_timestamp(ts):
+    """Tolerant ISO-8601 parser for Schwab's enteredTime field. Handles a
+    trailing 'Z' and a non-colon UTC offset (e.g. '+0000', common in
+    brokerage APIs and not accepted by Python 3.10's datetime.fromisoformat
+    without normalization) in addition to the already-valid form fake_broker
+    produces. Returns a timezone-aware datetime, or None if unparseable --
+    callers must treat None as "can't confirm, don't use this as evidence."""
+    if not ts:
+        return None
+    ts = ts.replace('Z', '+00:00')
+    if len(ts) >= 5 and ts[-5] in '+-' and ts[-3] != ':':
+        ts = ts[:-2] + ':' + ts[-2:]
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _find_recent_matching_order(account, ticker, side, quantity, order_type, since_ts, baseline_ids):
+    """Looks for a real order at the broker that could be the result of a
+    prior retry attempt whose local response was lost to a flapping
+    connection (the request landed at the broker, but the client-side
+    exception/timeout meant we never saw the confirmation) -- the gap named
+    in _submit_replace_with_retry's 2026-07-27 docstring, generalized to run
+    before EVERY retry attempt (N>1), not left as an accepted single-drop
+    risk only.
+
+    Scope is deliberately narrow -- a candidate must pass ALL of:
+      - ticker+side+quantity+orderType match exactly (order_type matters:
+        found in review, a just-placed STOP LOSS is otherwise
+        indistinguishable from a same-ticker/side/quantity TRAILING_STOP
+        resting for an unrelated reason, e.g. an addon leg's own SL placed
+        right after the parent leg's);
+      - status isn't one of schwab_safety._DUPLICATE_NOT_CONFIRMED_STATUSES
+        (CANCELED/EXPIRED/REJECTED/REPLACED -- the same "broker never
+        actually accepted/executed this" bucket the existing duplicate-
+        order guard already uses; found in review -- without this a
+        REJECTED prior attempt could be mistaken for a real success,
+        leaving a position genuinely unprotected while the caller believes
+        it succeeded);
+      - orderId not already present in `baseline_ids` (every order for this
+        ticker that existed BEFORE this call's very first attempt, snapshotted
+        once up front) -- the primary defense against matching a stale,
+        unrelated pre-existing order (found in review: relying on the
+        entered-time cutoff alone, with its several-second clock-skew
+        buffer, could match a genuinely different order placed moments
+        before this call started). `baseline_ids=None` means the baseline
+        snapshot itself couldn't be taken (e.g. the same connection trouble
+        this whole check exists to see through) -- this filter is then
+        skipped, falling back to the entered-time cutoff alone (the
+        original, slightly weaker guarantee), not to no check at all;
+      - entered no earlier than `since_ts` minus a small clock-skew buffer
+        (belt-and-suspenders alongside the baseline-id filter above, and the
+        only signal available when baseline_ids is None).
+
+    Does NOT catch exceptions from the underlying broker read (get_real_orders)
+    -- callers must handle that themselves, since only they know whether/how
+    to log the "couldn't confirm broker state" case distinctly from "confirmed
+    no match."
+
+    Returns None (no match found -- safe to proceed with a fresh retry), the
+    single matching order dict (treat as this call's own placement having
+    already succeeded), or raises _AmbiguousBrokerState if more than one
+    candidate exists (fail safe -- never guess between them)."""
+    orders = get_real_orders(account, ticker)
+    cutoff = since_ts - _RETRY_CLOCK_SKEW_BUFFER_SECS
+    candidates = []
+    for o in orders:
+        if o.get('instruction') != side:
+            continue
+        if o.get('orderType') != order_type:
+            continue
+        if o.get('status') in schwab_safety._DUPLICATE_NOT_CONFIRMED_STATUSES:
+            continue
+        try:
+            if int(o.get('quantity') or 0) != int(quantity):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if baseline_ids is not None and o.get('orderId') in baseline_ids:
+            continue
+        entered_dt = _parse_broker_timestamp(o.get('enteredTime'))
+        if entered_dt is None or entered_dt.timestamp() < cutoff:
+            continue
+        candidates.append(o)
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        raise _AmbiguousBrokerState(
+            f"{len(candidates)} matching {side} {quantity} {order_type} {ticker} orders found in "
+            f"{account} entered since {since_ts}: {[c.get('orderId') for c in candidates]}")
+    return candidates[0]
+
+
+def _check_broker_before_retry(account, ticker, side, quantity, order_type, node_id, since_ts, baseline_ids,
+                                attempt, last_exc=None):
+    """Shared by _submit_order_with_retry/_submit_replace_with_retry: called
+    right before a retry attempt (never the first attempt -- there's nothing
+    to re-check yet), and once more after the final attempt fails (see the
+    two retry functions below) -- landing-but-lost-response can happen on
+    ANY attempt, including the last one, so the check must run after it too,
+    not just before attempts 2..N. Returns an existing order_id if this
+    retry should be skipped as a duplicate, else None (safe to proceed with
+    a fresh retry, covering both "confirmed no match" and "couldn't confirm
+    broker state at all" -- the latter fails toward the pre-existing blind-
+    retry behavior, but unlike before 2026-08-15 it's now a logged, visible
+    event instead of a silent no-op). Always logs a coverage_events row,
+    matching the project's existing detection-logging convention
+    (_log_pre_action_state_verification/record_node_streak in
+    schwab_safety.py) -- 'prevented' (duplicate caught), 'ambiguous' (fail-
+    safe halt, also posts an immediate Slack alert since this is a real
+    "verify broker state directly" situation, not a routine retry), or
+    'check_failed' (broker read itself failed).
+
+    last_exc (the most recent real submission error, always set by the time
+    this is called -- there's always been at least one failed attempt by
+    then): chained onto a raised _AmbiguousBrokerState via `raise ... from`
+    so the original connection error isn't silently dropped from whatever
+    traceback/alert a caller further up eventually builds (found in review,
+    2026-08-15 -- discarding it made the ambiguous case's own root cause
+    harder to reconstruct after the fact)."""
+    try:
+        existing = _find_recent_matching_order(account, ticker, side, quantity, order_type, since_ts, baseline_ids)
+    except _AmbiguousBrokerState as e:
+        signals_db.log_coverage_event(
+            'order_retry_duplicate_prevented', mode='live', ticker=ticker, node_id=node_id,
+            result='ambiguous',
+            detail=f"retry attempt {attempt + 1}: {e}")
+        _post_message(
+            f"\U0001F6A8 AMBIGUOUS BROKER STATE {side} {quantity} {ticker} in {account} "
+            f"({mode_tag(account)}): retry attempt {attempt + 1} found multiple real orders that "
+            f"could be the result of a lost prior attempt -- halting retries rather than guessing "
+            f"which (if any) is real. Check the broker's live order book directly before taking any "
+            f"further action. ({e})", node_id=node_id)
+        raise e from last_exc
+    except Exception as e:
+        # Broker state itself is unreachable right now (e.g. the same
+        # connection flap this whole check exists to see through) -- fail
+        # toward the pre-existing behavior (retry blind) rather than block
+        # on a check that can't itself be answered, but log it so a repeat
+        # of this isn't silently invisible the way it was before 2026-08-15.
+        signals_db.log_coverage_event(
+            'order_retry_duplicate_prevented', mode='live', ticker=ticker, node_id=node_id,
+            result='check_failed',
+            detail=f"retry attempt {attempt + 1}: couldn't read broker order book ({e})")
+        return None
+    if existing is None:
+        return None
+    existing_order_id = existing.get('orderId')
+    if existing_order_id is None:
+        # Malformed/unexpected broker response shape (a match was found but
+        # it has no orderId) -- found in review, 2026-08-15: logging
+        # 'prevented' here while returning None would have been misleading
+        # (the caller falls through to a fresh blind retry regardless, since
+        # None means "not skipped," so nothing was actually prevented).
+        # Treat the same as "couldn't confirm" rather than claim a save that
+        # didn't happen.
+        signals_db.log_coverage_event(
+            'order_retry_duplicate_prevented', mode='live', ticker=ticker, node_id=node_id,
+            result='check_failed',
+            detail=f"retry attempt {attempt + 1}: matched order has no orderId ({existing})")
+        return None
+    signals_db.log_coverage_event(
+        'order_retry_duplicate_prevented', mode='live', ticker=ticker, node_id=node_id,
+        result='prevented',
+        # order_type/quantity included explicitly (2026-08-16 session-wrap
+        # review finding): a single-candidate match is adopted on
+        # ticker+side+quantity+orderType+status alone -- if a core position's
+        # SL and its add-on leg's SL land within the same retry window with
+        # matching quantities, this could adopt the wrong sibling's order id.
+        # No code change to the matching logic (user's call: the downstream
+        # live-state-reconciliation check would likely surface a real
+        # misattribution as a broker-state mismatch, and an add-on's missing
+        # "sister" order is itself a tell) -- this just makes the adopted
+        # match's exact shape inspectable after the fact if that's ever
+        # suspected, instead of only "an order was adopted."
+        detail=f"retry attempt {attempt + 1} skipped -- order {existing_order_id} "
+               f"already at broker (status={existing.get('status')}, order_type={order_type}, "
+               f"quantity={quantity})")
+    return existing_order_id
+
+
+def _snapshot_baseline_order_ids(account, ticker, can_check):
+    """Every real orderId that already exists for this ticker/account BEFORE
+    the retry loop's first attempt -- the primary defense in
+    _find_recent_matching_order against matching a stale, pre-existing order
+    instead of one this call itself just placed. Returns None (not an empty
+    set) if the snapshot itself couldn't be taken, so callers can tell
+    "confirmed nothing pre-existed" apart from "unknown" -- the latter falls
+    back to entered-time-only matching rather than skipping the whole check."""
+    if not can_check:
+        return None
+    try:
+        return {o.get('orderId') for o in get_real_orders(account, ticker)}
+    except Exception:
+        return None
+
+
+def _submit_order_with_retry(account_hash, order, account=None, ticker=None, side=None,
+                              quantity=None, order_type=None, node_id=None):
+    """account/ticker/side/quantity/order_type (added 2026-08-15): when all
+    five are given (every real call site now passes them), a retry attempt
+    (N>1), AND one final check after the last attempt fails, first checks
+    whether a PRIOR attempt's request actually landed at the broker despite
+    a locally-observed exception -- a flapping connection (up-down-up), not
+    just the single clean drop this loop already retried blind for. If a
+    matching order is already resting/filled at the broker, that's treated
+    as this call's own success (no resubmission); if broker state is
+    ambiguous, this stops retrying and raises rather than guess. See
+    _find_recent_matching_order for the exact matching rule.
+
+    Returns the order_id directly (not the raw response) -- no caller uses
+    the raw response for anything beyond Utils(...).extract_order_id(r),
+    now done internally here so the fresh-placement and duplicate-recovery
+    paths return the same shape."""
     last_exc = None
+    since_ts = time.time()
+    can_check = None not in (account, ticker, side, quantity, order_type)
+    baseline_ids = _snapshot_baseline_order_ids(account, ticker, can_check)
     for attempt in range(_ORDER_SUBMIT_RETRY_ATTEMPTS):
+        if attempt > 0 and can_check:
+            existing_id = _check_broker_before_retry(account, ticker, side, quantity, order_type,
+                                                       node_id, since_ts, baseline_ids, attempt, last_exc)
+            if existing_id is not None:
+                return existing_id
         try:
             r = _get_client().place_order(account_hash, order)
             r.raise_for_status()
-            return r
         except Exception as e:
             last_exc = e
             if attempt < _ORDER_SUBMIT_RETRY_ATTEMPTS - 1:
                 time.sleep(_ORDER_SUBMIT_RETRY_INTERVAL_SECS)
+        else:
+            # Deliberately outside the except above (found in review,
+            # 2026-08-15): a genuinely successful placement whose response
+            # extract_order_id can't parse must NOT be treated as a
+            # retryable submission failure -- that would fire a real
+            # duplicate resubmission for an order that already landed fine,
+            # the opposite of a case this whole fix exists to prevent.
+            # Matches the pre-2026-08-15 behavior, where extraction happened
+            # in the caller, entirely outside this loop's retry semantics.
+            return Utils(_get_client(), account_hash).extract_order_id(r)
+    if can_check:
+        # The LAST attempt itself could have landed at the broker with the
+        # response lost, same as any earlier attempt (found in review,
+        # 2026-08-15) -- under sustained flapping this is actually the
+        # likeliest attempt to be missed by an "only check before attempts
+        # 2..N" version of this fix, since it's the one attempt after which
+        # no further retry would otherwise re-check broker state at all.
+        existing_id = _check_broker_before_retry(account, ticker, side, quantity, order_type,
+                                                   node_id, since_ts, baseline_ids,
+                                                   _ORDER_SUBMIT_RETRY_ATTEMPTS - 1, last_exc)
+        if existing_id is not None:
+            return existing_id
     raise last_exc
 
 
-def _submit_replace_with_retry(account_hash, order_id, order):
+def _submit_replace_with_retry(account_hash, order_id, order, account=None, ticker=None,
+                                side=None, quantity=None, order_type=None, node_id=None):
     """Same retry shape as _submit_order_with_retry, for schwab-py's
-    replace_order (cancel-old + create-new as a single broker call).
+    replace_order (cancel-old + create-new as a single broker call), and the
+    same pre-retry (and post-final-attempt) broker-state check (added
+    2026-08-15 -- see _submit_order_with_retry's docstring and
+    _find_recent_matching_order).
 
-    Known residual risk, accepted 2026-07-27 (see docs/backlog_cache.md):
-    replace_order targets one specific order_id, unlike a fresh placement --
-    if attempt 1's request actually lands at the broker (old order canceled,
+    Previously-accepted residual risk (named 2026-07-27) is now closed for
+    every attempt, not just "some attempt after the first": if ANY attempt's
+    replace_order request actually lands at the broker (old order canceled,
     new one created) but the client-side response handling then raises
-    (timeout, malformed response after a real success), a retry fires a
-    SECOND replace_order against an order_id that's already dead. That call
-    fails cleanly, so the caller's final exception looks identical to
-    "nothing happened at all," when a real, untracked new order may already
-    be resting. Every caller's UNPROTECTED/manual-fallback messaging
-    currently assumes this ambiguity away. Not fixed here (Sonnet review
-    found it, user's call to accept and backlog rather than fix same
-    session) -- a real fix would check the target order_id's live status
-    before retrying rather than retrying blind."""
+    (timeout, malformed response after a real success), the very next check
+    -- whether that's before the next retry, or the final check run after
+    the last attempt exhausts -- finds the new order and returns it instead
+    of firing another replace_order against an order_id that's already dead
+    (or resubmitting a fresh, duplicate replacement).
+
+    What remains genuinely open is narrower than "an attempt this loop
+    doesn't check": it's the inherent limit of any check-then-act pattern --
+    if the broker accepts a request a moment AFTER this loop's own broker-
+    state read completes (a race, not a coverage gap), no synchronous check
+    can see that yet. This is a fundamentally different, much smaller
+    exposure window than the old "any attempt after the first could go
+    fully unverified" gap, and every caller's UNPROTECTED/manual-fallback
+    messaging already assumes some form of this residual ambiguity."""
     last_exc = None
+    since_ts = time.time()
+    can_check = None not in (account, ticker, side, quantity, order_type)
+    baseline_ids = _snapshot_baseline_order_ids(account, ticker, can_check)
     for attempt in range(_ORDER_SUBMIT_RETRY_ATTEMPTS):
+        if attempt > 0 and can_check:
+            existing_id = _check_broker_before_retry(account, ticker, side, quantity, order_type,
+                                                       node_id, since_ts, baseline_ids, attempt, last_exc)
+            if existing_id is not None:
+                return existing_id
         try:
             r = _get_client().replace_order(account_hash, order_id, order)
             r.raise_for_status()
-            return r
         except Exception as e:
             last_exc = e
             if attempt < _ORDER_SUBMIT_RETRY_ATTEMPTS - 1:
                 time.sleep(_ORDER_SUBMIT_RETRY_INTERVAL_SECS)
+        else:
+            # See _submit_order_with_retry's matching comment -- a parse
+            # failure on a genuinely successful replace must not trigger a
+            # retryable-failure resubmission.
+            return Utils(_get_client(), account_hash).extract_order_id(r)
+    if can_check:
+        existing_id = _check_broker_before_retry(account, ticker, side, quantity, order_type,
+                                                   node_id, since_ts, baseline_ids,
+                                                   _ORDER_SUBMIT_RETRY_ATTEMPTS - 1, last_exc)
+        if existing_id is not None:
+            return existing_id
     raise last_exc
 
 
@@ -258,6 +547,34 @@ def _resolve_account_hashes() -> dict:
     return _account_hashes
 
 
+def resolve_account_alias_from_number(raw_account_number: str) -> str:
+    """Reverse of the suffix match _resolve_account_hashes does above, for the
+    one caller (signals_notify.drain_fill_queue) that only has Schwab's raw
+    ACCT_ACTIVITY-stream `AccountNumber` (e.g. "45111931"), not an alias --
+    found 2026-08-16, the fast fill-reconciliation path was passing that raw
+    number straight into get_filled_order(account=...), which looks it up in
+    _resolve_account_hashes()'s dict (keyed by alias, never a raw number),
+    raising KeyError before anything could reconcile. Deliberately no new
+    lookup table/cache -- reuses the exact same SCHWAB_ACCOUNT_<ALIAS> suffix
+    env vars _resolve_account_hashes already trusts, applied directly against
+    the raw number instead of against the API's accountNumber field. Raises
+    loudly (mirroring _resolve_account_hashes's own ambiguous-match guard
+    just above) on 0 or 2+ matches rather than silently guessing."""
+    matches = [n for n in _live_nicknames()
+               if os.environ.get(f"SCHWAB_ACCOUNT_{n.upper()}")
+               and raw_account_number.endswith(os.environ[f"SCHWAB_ACCOUNT_{n.upper()}"])]
+    if len(matches) > 1:
+        raise ValueError(
+            f"AccountNumber '{raw_account_number}' matches {len(matches)} live account "
+            f"aliases ({matches}) via SCHWAB_ACCOUNT_* suffixes -- use more digits to disambiguate"
+        )
+    if not matches:
+        raise ValueError(
+            f"AccountNumber '{raw_account_number}' does not match any SCHWAB_ACCOUNT_<ALIAS> suffix"
+        )
+    return matches[0]
+
+
 def _build_market_order(side: str, ticker: str, quantity: int):
     order_fn = equity_orders.equity_buy_market if side == "BUY" else equity_orders.equity_sell_market
     return order_fn(ticker, quantity)
@@ -313,8 +630,9 @@ def _place_equity_order(
     account_hash = _resolve_account_hashes()[account]
     order = _build_market_order(side, ticker, quantity)
     try:
-        r = _submit_order_with_retry(account_hash, order)
-        order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+        order_id = _submit_order_with_retry(account_hash, order, account=account, ticker=ticker,
+                                             side=side, quantity=quantity,
+                                             order_type=OrderType.MARKET.value, node_id=node_id)
         _post_order_confirmation(
             f"{_label}{side}", account_hash, order_id, ticker, account,
             f"✅ {_label}{side} {quantity} {ticker} in {account} submitted to Schwab (~${quantity * price:,.0f})",
@@ -323,7 +641,7 @@ def _place_equity_order(
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
     schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
-    return r, order_id
+    return None, order_id
 
 
 def replace_equity_order_with_market(
@@ -383,8 +701,9 @@ def replace_equity_order_with_market(
     account_hash = _resolve_account_hashes()[account]
     order = _build_market_order(side, ticker, quantity)
     try:
-        r = _submit_replace_with_retry(account_hash, order_id, order)
-        new_order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+        new_order_id = _submit_replace_with_retry(account_hash, order_id, order, account=account,
+                                                    ticker=ticker, side=side, quantity=quantity,
+                                                    order_type=OrderType.MARKET.value, node_id=node_id)
         _post_order_confirmation(
             f"REPLACE->{_label}MARKET {side}", account_hash, new_order_id, ticker, account,
             f"✅ Replaced order {order_id} with {_label}MARKET {side} {quantity} {ticker} in {account} "
@@ -393,7 +712,7 @@ def replace_equity_order_with_market(
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
     schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
-    return r, new_order_id
+    return None, new_order_id
 
 
 def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_gap_correction: bool = False,
@@ -458,8 +777,9 @@ def _place_trailing_order(
     account_hash = _resolve_account_hashes()[account]
     order = _build_trailing_order(side, link_basis, ticker, quantity, trail_pct)
     try:
-        r = _submit_order_with_retry(account_hash, order)
-        order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+        order_id = _submit_order_with_retry(account_hash, order, account=account, ticker=ticker,
+                                             side=side, quantity=quantity,
+                                             order_type=OrderType.TRAILING_STOP.value, node_id=node_id)
         _post_order_confirmation(
             label, account_hash, order_id, ticker, account,
             f"✅ {label} {quantity} {ticker} in {account} submitted to Schwab "
@@ -468,7 +788,7 @@ def _place_trailing_order(
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
     schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
-    return r, order_id
+    return None, order_id
 
 
 def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, quantity: int, price: float,
@@ -500,8 +820,9 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
     account_hash = _resolve_account_hashes()[account]
     order = _build_trailing_order("SELL", StopPriceLinkBasis.BID, ticker, quantity, trail_pct)
     try:
-        r = _submit_replace_with_retry(account_hash, order_id, order)
-        new_order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+        new_order_id = _submit_replace_with_retry(account_hash, order_id, order, account=account,
+                                                    ticker=ticker, side="SELL", quantity=quantity,
+                                                    order_type=OrderType.TRAILING_STOP.value, node_id=node_id)
         _post_order_confirmation(
             "REPLACE->TRAILING SELL", account_hash, new_order_id, ticker, account,
             f"✅ Replaced order {order_id} with TRAILING SELL {quantity} {ticker} in {account} "
@@ -510,7 +831,7 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
     schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
-    return r, new_order_id
+    return None, new_order_id
 
 
 def place_trailing_buy(account: str, ticker: str, quantity: int, price: float, trail_pct: float,
@@ -726,8 +1047,9 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float,
     order.add_equity_leg(EquityInstruction.SELL, ticker, quantity)
 
     try:
-        r = _submit_order_with_retry(account_hash, order)
-        order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+        order_id = _submit_order_with_retry(account_hash, order, account=account, ticker=ticker,
+                                             side="SELL", quantity=quantity,
+                                             order_type=OrderType.STOP.value, node_id=node_id)
         _post_order_confirmation(
             f"{_label}STOP LOSS", account_hash, order_id, ticker, account,
             f"✅ {_label}STOP LOSS {quantity} {ticker} in {account} submitted to Schwab @ ${stop_price:.2f}", node_id=node_id)
@@ -735,7 +1057,7 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float,
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
     schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
-    return r, order_id
+    return None, order_id
 
 
 def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quantity: int, stop_price: float,
@@ -782,8 +1104,9 @@ def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quant
     order.add_equity_leg(EquityInstruction.SELL, ticker, quantity)
 
     try:
-        r = _submit_replace_with_retry(account_hash, order_id, order)
-        new_order_id = Utils(_get_client(), account_hash).extract_order_id(r)
+        new_order_id = _submit_replace_with_retry(account_hash, order_id, order, account=account,
+                                                    ticker=ticker, side="SELL", quantity=quantity,
+                                                    order_type=OrderType.STOP.value, node_id=node_id)
         _post_order_confirmation(
             "REPLACE->STOP LOSS", account_hash, new_order_id, ticker, account,
             f"✅ Replaced order {order_id} with STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.2f}",
@@ -792,7 +1115,7 @@ def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quant
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
     schwab_safety.record_node_streak(ticker, account, "order_failures", hit=False, node_id=node_id)
-    return r, new_order_id
+    return None, new_order_id
 
 
 def get_account_balance(account: str) -> float:

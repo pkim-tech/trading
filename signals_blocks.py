@@ -8,8 +8,8 @@ import schwab_safety
 import signals_config as cfg
 import signals_db as db
 from signals_helpers import (
-    _add_trading_hours, _last_sale_recovery, buy_order_sizing, mode_tag,
-    should_alert_live, stop_status,
+    _add_trading_hours, _last_sale_recovery, automation_blockers_other_than_node,
+    buy_order_sizing, mode_tag, should_alert_live, stop_status,
 )
 
 
@@ -465,4 +465,263 @@ def _trailing_order_blocks(pos, current_price, reminder_num=0):
         blocks.append({"type": "context", "elements": [
             {"type": "mrkdwn", "text": "No interactive buttons — confirm the trailing stop order is placed in the terminal running the daemon."}
         ]})
+    return blocks
+
+
+def _confirm_dialog(title, text, confirm_label, deny_label="Cancel", style=None):
+    """Block Kit `confirm` object -- the native "are you sure?" dialog Slack
+    renders before dispatching a button's action. First use of this in the
+    codebase (2026-08-14): every safety-critical control here (global kill
+    switch, per-node automation stop/start) is a one-tap, no-undo action, and
+    the reference report is read on mobile where a mis-tap is easy.
+
+    Slack's schema constraints, enforced by construction rather than trusted:
+    title/confirm/deny MUST be plain_text (mrkdwn is rejected outright), text
+    may be mrkdwn; title is capped at 100 chars and text at 300, so both are
+    truncated here instead of letting Slack reject the whole message (the same
+    failure mode as the 2026-07-22 invalid_blocks incident -- one bad field
+    kills the entire report, not just the row).
+
+    Truncation is marked with an ellipsis rather than silently clipping: these
+    dialogs carry the warning text a user is being asked to act on, and a
+    clause disappearing off the end with no visible sign is worse than an
+    obviously-cut sentence. Callers should still stay under the caps."""
+    def _clip(s, limit):
+        return s if len(s) <= limit else s[:limit - 1] + "…"
+
+    obj = {
+        "title":   {"type": "plain_text", "text": _clip(title, 100)},
+        "text":    {"type": "mrkdwn",     "text": _clip(text, 300)},
+        "confirm": {"type": "plain_text", "text": _clip(confirm_label, 30)},
+        "deny":    {"type": "plain_text", "text": _clip(deny_label, 30)},
+    }
+    if style:
+        obj["style"] = style
+    return obj
+
+
+def _ticker_block(row):
+    """Renders one row from build_reference_table as mrkdwn prose (wraps naturally
+    on mobile) instead of a fixed-width table column (unreadable on iPhone).
+    Returns a list of blocks (section + optional manual-correction actions)."""
+    ticker, version = row['Ticker'], row.get('Version') or ''
+    account = 'bro' if (row.get('Account') or '').lower() == 'brokerage' else (row.get('Account') or '')
+    account_str = f" — `{account}`" if account else ''
+    proximity = row.get('Proximity')
+
+    if row['Next Action'] == 'NO_DATA':
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}}]
+
+    phase = row.get('Phase') or ''
+    phase_str = f"{phase} " if phase else ''
+    now = row['Now']
+    trigger = row['Next Trigger $']
+
+    if row['Held']:
+        pnl = row.get('PnL %')
+        sl = row.get('SL $')
+        sl_str = f"  sl `${sl:.2f}`" if sl is not None else "  sl `cancelled (trail order live)`"
+        pct_str = lambda v: f"{v:g}%" if v is not None else '?'
+        trig_label = row.get('Trigger Label', 'trig')
+        pos = row.get('_pos')
+        shares_str = f" x `{pos['shares']:g}`" if pos and pos.get('shares') is not None else ''
+        entry_str = f"  `${pos['entry_price']:.2f}`{shares_str}" if pos else ''
+        armed = bool((pos or {}).get('trail_state', {}).get('trailing'))
+        if armed:
+            arm_ts_line = ''
+        else:
+            arm, ts = row.get('Arm%'), row.get('TrailSell%')
+            arm_ts_line = f"\narm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
+        # No real broker fill/order exists behind this row -- must never read as
+        # an actionable real position (same reasoning as the 🧪CANARY tag below,
+        # Opus review 2026-07-26 flagged this row was otherwise indistinguishable
+        # from a genuine held position).
+        sim_tag = ' 🧪DRY-RUN-SIM' if pos and pos.get('is_dry_run_sim') else ''
+        # Bug #54 (found live: AGQ). This branch tagged is_dry_run_sim but had
+        # no way at all to tell a PAPER position from a real one -- build_
+        # reference_table merges paper_positions and open_positions into one
+        # wl_id-keyed dict, which destroys the only signal of which table the
+        # row came from, so a simulated position rendered byte-identically to
+        # a real held one: same entry price, same share count, same actionable
+        # framing, no marker anywhere. Now reads the origin column stamped on
+        # the row itself (2026-08-15), the single source of truth both this and
+        # build_reference_table share, rather than each re-deriving it.
+        paper_tag = ' 📄PAPER' if pos and pos.get('origin') == 'paper' else ''
+        text = (
+            f"{phase_str}*{ticker}* `{version}`{sim_tag}{paper_tag} — {row['Hold']}{account_str}{entry_str}\n"
+            f"now `${now:.2f}` {pnl:+.1f}%  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"→ _{row['Next Action']}_{sl_str}{arm_ts_line}"
+        )
+    else:
+        overnight = row.get('Overnight %')
+        tb, arm, ts = row.get('TrailBuy%'), row.get('Arm%'), row.get('TrailSell%')
+        pct_str = lambda v: f"{v:g}%" if v is not None else '?'
+        last_sale = row.get('Last Sale $')
+        last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
+        z_trig = row.get('Z Trigger')
+        z_trig_str = f"z1 `{z_trig:g}`  " if z_trig is not None else ''
+        trig_label = row.get('Trigger Label', 'trig')
+        # Not-live rows are visible in the report (2026-07-22 fix) but must
+        # never read as an actionable live trigger -- research is the normal
+        # state right now (whole watchlist), canary is a synthetic test node
+        # not meant to be traded at all (see the "Manually Open" suppression
+        # below, automation_principles.md #0/#7).
+        # Substring, not exact-equality (2026-08-09 paired review, same gap
+        # found in the new BUY/SELL alert tags) -- misses canary-family
+        # variants like 'v5-canary-drought-addon' otherwise.
+        # Named to avoid shadowing the module-level mode_tag() function (found
+        # by session-wrap review 2026-08-16 -- this function was relocated
+        # into signals_blocks.py, which has several siblings that call
+        # mode_tag() freely; the shadow was pre-existing but is now one edit
+        # away from an UnboundLocalError on this real-money-adjacent path).
+        version_mode_tag = ' 🧪CANARY' if 'canary' in ((row.get('_node') or {}).get('version') or '') \
+            else (' (research)' if row.get('State') == 'paper' else '')
+        text = (
+            f"{phase_str}*{ticker}* `{version}`{version_mode_tag}{account_str}{last_sale_str}\n"
+            f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"→ _{row['Next Action']}_\n"
+            f"{z_trig_str}tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
+        )
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+    if cfg.INTERACTIVE:
+        # 2026-07-22: collapsed from up to 3 separate `actions` blocks per row
+        # into 1 (Slack allows up to 5 elements per actions block, we use at
+        # most 3) -- with the mode filter fix above making every watchlist row
+        # render instead of none, 16 rows x up to 4 blocks each blew past
+        # Slack's hard 50-block-per-message limit and the report failed
+        # outright (invalid_blocks). This cuts the per-row block count enough
+        # to fit the full watchlist in one message again.
+        elements = []
+        node = row.get('_node')
+
+        # 2026-08-14: replaced the per-row "Manually Open" button with a
+        # node-scoped automation Stop/Start (see below) -- opening a new
+        # position from a phone is a rare correction path, whereas halting a
+        # node is the action actually wanted under time pressure. The
+        # manual_open HANDLER stays registered (signals_handlers.py) for old
+        # reports in Slack scrollback.
+        #
+        # "Manually Close" is NOT replaced -- kept for a genuinely-held real
+        # position, restored here after a merge (2026-08-15) briefly dropped
+        # it along with Manually Open. It serves a different purpose than
+        # Stop: Stop only pauses future automated action, it does not touch
+        # an order already resting or close an open position now, so the
+        # correction path a misclick (or a real need to close by hand) needs
+        # still has to exist independently. Origin check (2026-08-15, bugs
+        # #54/#63-64): a paper row must never render this button -- its
+        # position_id is a paper_positions.id, but the manual_close handler
+        # resolves against open_positions, two INDEPENDENT id sequences, so
+        # the id would either miss entirely or match and close an unrelated
+        # REAL position. is_dry_run_sim is suppressed for the same underlying
+        # reason: no real broker fill exists behind that row either.
+        if row['Held']:
+            pos = row.get('_pos')
+            if pos and not pos.get('is_dry_run_sim') and pos.get('origin') != 'paper':
+                value = json.dumps({"position_id": pos['id'], "ticker": ticker, "entry_price": pos['entry_price']})
+                elements.append({"type": "button", "text": {"type": "plain_text", "text": f"Manually Close {ticker}"},
+                                  "action_id": "manual_close", "value": value})
+        #
+        # Only state=='live' nodes get this button. An earlier draft offered it
+        # on every row with a node id, reasoning that pausing risks no capital
+        # -- true, but it missed that the control does NOTHING for a paper or
+        # canary row: paper_trading.py runs its own simulation loop, and
+        # _ticker_block is ALSO rendered by _send_window_alert against a
+        # completely unfiltered watchlist (send_reference_report's
+        # has_capital_at_stake filter does not apply there), so a research row
+        # really would have shown a "🛑 Stop" that posted "automation STOPPED"
+        # while the sim kept opening and closing positions. paper_trading now
+        # honors the node flag on the entry side as well (see
+        # paper_trading.start_paper_buy), but a control whose effect is
+        # invisible in this report still doesn't belong on these rows.
+        wl_id = node.get('id') if node else None
+        if wl_id is not None and (node.get('state') == 'live'):
+            # Real current state across ALL THREE gates, not just this node's
+            # own flag. schwab_safety.check_order blocks on kill_switch_engaged()
+            # OR node_automation_enabled() OR ticker_automation_enabled(), so
+            # reading only the node flag would render "🛑 Stop" for a node the
+            # kill switch has already halted -- the exact "reads as if it's
+            # running when it isn't" failure this toggle exists to avoid.
+            node_paused = not schwab_safety.node_automation_enabled(wl_id)
+            other_blockers = automation_blockers_other_than_node(ticker, node.get('account'))
+            blocked_note = f" — note: still blocked by {', '.join(other_blockers)}" if other_blockers else ""
+            auto_value = json.dumps({"ticker": ticker, "wl_id": wl_id})
+            if node_paused:
+                elements.append({
+                    "type": "button", "style": "primary",
+                    "text": {"type": "plain_text", "text": f"▶️ Start {ticker}"},
+                    "action_id": "start_node_automation", "value": auto_value,
+                    "confirm": _confirm_dialog(
+                        f"Start {ticker}?",
+                        f"Resumes automation for *{ticker}* (node {wl_id}). It will place "
+                        f"real orders again on its next signal{blocked_note}.",
+                        "Start it"),
+                })
+            else:
+                # Label must not claim the node is running when another layer
+                # has already halted it.
+                suffix = f" (already halted: {other_blockers[0]})" if other_blockers else ""
+                elements.append({
+                    "type": "button", "style": "danger",
+                    "text": {"type": "plain_text", "text": f"🛑 Stop {ticker}{suffix}"},
+                    "action_id": "stop_node_automation", "value": auto_value,
+                    # Kept comfortably under _confirm_dialog's 300-char cap so
+                    # the SELL warning can't be the part that gets truncated
+                    # away (it is the whole point of this dialog).
+                    "confirm": _confirm_dialog(
+                        f"Stop {ticker}?",
+                        f"Pauses node {wl_id} only; other nodes keep running.\n"
+                        f"*Stops SELLs too* — if this node holds a position, its automated exit "
+                        f"will NOT be placed.\nResting broker orders are NOT cancelled.",
+                        "Stop it", style="danger"),
+                })
+
+        # Per-ticker automation pause/resume -- only shown for tickers actually in
+        # the automation pilot scope (see schwab_safety.AUTOMATION_ENABLED_TICKERS),
+        # so the other manual-only tickers don't show a button that does nothing.
+        if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            automation_on = schwab_safety.ticker_automation_enabled(ticker)
+            elements.append(
+                {"type": "button", "text": {"type": "plain_text", "text": f"⏸️ Pause {ticker} Automation"},
+                 "style": "danger", "action_id": "pause_ticker_automation", "value": ticker}
+                if automation_on else
+                {"type": "button", "text": {"type": "plain_text", "text": f"▶️ Resume {ticker} Automation"},
+                 "style": "primary", "action_id": "resume_ticker_automation", "value": ticker}
+            )
+
+            # Auto-fill-detection toggle -- separate from the placement toggle above and
+            # defaults off (see schwab_safety.AUTO_FILL_DETECTION_PATH comment): placement
+            # automation is proven via this session's dry-run testing, fill detection isn't
+            # exercised against a real fill yet.
+            # node-scoped (not ticker-only) -- see schwab_safety.node_auto_fill_detection_enabled's
+            # docstring: this was the ticker-only-keying gap the 2026-07-25/26 wl_id refactor
+            # missed. Every row here is built from a real watch_list node (build_reference_table),
+            # so wl_id is always resolvable; still guarded rather than assumed, since a NULL-wl_id
+            # open position (a watch_list row deleted out from under it, e.g. EDC id=15) would
+            # never render a row/button here at all and should fail closed, not toggle every node
+            # sharing the ticker.
+            wl_id = node.get('id') if node else None
+            if wl_id is not None:
+                fill_detection_on = (schwab_safety.auto_fill_detection_enabled(ticker)
+                                      and schwab_safety.node_auto_fill_detection_enabled(wl_id))
+                fd_value = json.dumps({"ticker": ticker, "wl_id": wl_id})
+                # 2026-08-14: the "Enable" button is no longer rendered -- the
+                # end state for every real live node is auto-fill-detection ON
+                # ("no manual anything"), reached deliberately in bulk via
+                # schwab_safety.bulk_enable_auto_fill_detection(apply=True),
+                # not one ad hoc tap at a time. "Disable" stays as the
+                # emergency override. The enable HANDLER stays registered
+                # (signals_handlers.py): old reports in Slack scrollback keep
+                # their Enable button forever, and a stray click on one just
+                # moves toward the intended all-on state, so unregistering it
+                # would turn a harmless click into a dead-button confusion
+                # for no safety gain.
+                if fill_detection_on:
+                    elements.append(
+                        {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Disable {ticker} Auto-Fill Detection"},
+                         "style": "danger", "action_id": "disable_auto_fill_detection", "value": fd_value})
+
+        if elements:
+            blocks.append({"type": "actions", "elements": elements})
+
     return blocks

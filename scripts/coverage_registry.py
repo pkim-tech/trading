@@ -542,13 +542,43 @@ REGISTRY = [
          offline_coverage="2 unit tests (test_schwab_safety.py)",
          check_mechanism='coverage_events', scenario_key='dup_order_retry_after_failure',
          notes="Needs a real rejected order to confirm the retry path in practice."),
+    dict(id='order_retry_duplicate_prevented',
+         scenario="A repeated flapping connection mid-order-placement (up-down-up, not just a single "
+                  "clean drop) doesn't stack multiple real orders -- the retry loop re-checks live "
+                  "broker state before each retry attempt (N>1) instead of resubmitting blind",
+         code_path="schwab_client._submit_order_with_retry / _submit_replace_with_retry "
+                    "(_find_recent_matching_order / _check_broker_before_retry)",
+         offline_coverage="2 fake_broker tests (test_fake_broker_retry_flapping_scenario.py): a "
+                           "drop-then-landed-but-lost-response sequence (asserts exactly 1 real order "
+                           "reaches the broker, not 2) and an ambiguous-multi-match sequence (asserts "
+                           "the loop raises _AmbiguousBrokerState and fails safe rather than guessing).",
+         check_mechanism='coverage_events', scenario_key='order_retry_duplicate_prevented',
+         bad_results=['ambiguous', 'check_failed'],
+         notes="Added 2026-08-15 (see docs/backlog_cache.md's now-resolved 'retry blind, no "
+               "broker-state re-check between attempts' item). 'prevented' = a genuine duplicate was "
+               "caught and skipped, the scenario working as designed; 'ambiguous' and 'check_failed' "
+               "(both in bad_results, same bad-results-vs-good-results conflation this registry exists "
+               "to catch) mean the fail-safe/fall-back-to-blind-retry paths fired instead -- real "
+               "evidence the guard is alert or that a broker read failed, but not evidence the happy "
+               "'skip the duplicate' path itself has fired live. No live/dry_run proof yet -- needs a "
+               "genuine repeated-flap incident (rare, connection-quality-dependent) to confirm outside "
+               "the fake-venue harness; the residual check-then-act race documented in "
+               "_submit_replace_with_retry's docstring (this loop's own broker-state read completing a "
+               "moment before a delayed real acceptance shows up -- narrower than the original "
+               "2026-07-27 single-clean-drop gap, which this fix closes) has no live proof either and "
+               "isn't expected to for now.",
+         not_prod_required_note="No forced live test planned -- flapping is connection-quality-"
+                                 "dependent and not something to manufacture against a real order "
+                                 "(same organic-wait posture as post_fill_topup/market_buy_placement "
+                                 "in CLAUDE.md's go-live checklist). Fake-venue coverage is considered "
+                                 "sufficient for now per the project's 3-bucket testing philosophy."),
     dict(id='fast_path_fill_reconciliation',
          scenario="Fast-path (websocket) fill reconciliation doesn't act on a partial/in-flight execution",
          code_path="signals_notify.drain_fill_queue (re-confirms via get_filled_order poll)",
          offline_coverage="5 unit tests (test_part3_gap_resize.py)",
          check_mechanism='coverage_events', scenario_key='fast_path_fill_reconciliation',
          bad_results=['outside_automation_scope', 'auto_fill_detection_disabled',
-                      'stream_event_not_yet_confirmed_filled'],
+                      'stream_event_not_yet_confirmed_filled', 'account_number_unresolved'],
          notes="Needs a real multi-execution fill to confirm the poll-reconfirm path in practice. "
                "bad_results added 2026-07-31 (review finding): auto_fill_detection is off by default, "
                "so outside_automation_scope/auto_fill_detection_disabled will be the COMMON real "
@@ -581,7 +611,7 @@ REGISTRY = [
          bad_results=['no_account'],
          notes="Instrumented 2026-07-28 at all 3 confirmation handlers. Real bug found+fixed 2026-07-25 "
                "(both Slack button payloads omitted account/id). Not yet observed against a real Slack "
-               "button click. 2026-08-14: signals_notify._ticker_block dropped from code_path -- the "
+               "button click. 2026-08-14: signals_notify._ticker_block (relocated to signals_blocks 2026-08-15) dropped from code_path -- the "
                "'Manually Open' button it rendered was replaced by the node-scoped Stop/Start "
                "automation button; handle_manual_open_price is still reachable from old reports in "
                "Slack scrollback, so the handler (and this row) stay.",
@@ -642,7 +672,15 @@ REGISTRY = [
          scenario="A real broker BUY fill reconciles against the correct node's pending_buys row when 2+ "
                   "are pending for the same ticker",
          code_path="signals_notify._reconcile_buy_fill (wl_id param, falls back to alert if ambiguous)",
-         offline_coverage="None -- no test simulates 2 concurrent real pending buys for the same ticker",
+         offline_coverage="tests/test_fake_broker_buy_button_handlers_scenario.py::"
+                           "test_buy_fill_reconciles_correct_node_with_multiple_pending (2 concurrent "
+                           "pending buys, same ticker, same account, calls _reconcile_buy_fill directly); "
+                           "plus scripts/fake_venue_harness.py (2026-08-16), which reaches the same event "
+                           "end-to-end through real check_auto_fills -> get_filled_order against a fake "
+                           "broker, with 3 pendings (two of them same-account). Corrected 2026-08-16 -- "
+                           "this field read 'None -- no test simulates 2 concurrent real pending buys' "
+                           "and was already stale before the harness existed (hand-typed field; "
+                           "offline_proof_for() is the derived one).",
          check_mechanism='coverage_events', scenario_key='buy_fill_reconciles_correct_node',
          bad_results=['no_match'],
          notes="Instrumented 2026-07-28, fires only when 2+ pendings exist for the ticker at fill time. "
@@ -770,7 +808,7 @@ REGISTRY = [
     dict(id='node_automation_pause_button',
          scenario="A human taps the reference report's per-row 🛑 Stop / ▶️ Start button and the node's "
                   "automation flag really flips (node-scoped, siblings on the same ticker unaffected)",
-         code_path="signals_notify._ticker_block (render), "
+         code_path="signals_blocks._ticker_block (render), "
                     "signals_handlers.handle_stop_node_automation/handle_start_node_automation",
          offline_coverage="tests/test_bulk_auto_fill_and_report_controls.py: "
                            "test_stop_handler_really_pauses_the_node/test_start_handler_really_resumes_the_node/"
@@ -1362,6 +1400,38 @@ REGISTRY = [
                "can't parse -- kept separate from 'suppressed' so a parse failure can't false-inflate "
                "genuine cooldown-fired evidence. No live proof yet -- RETL's own incident predates "
                "this fix landing, so its exit_bar_time wasn't recorded at the time."),
+    dict(id='abnormal_drift_alert',
+         scenario="A real (broker-filled, non-paper/non-dry-run-sim) entry or exit fill's "
+                  "entry_drift_pct/exit_drift_pct exceeds the calibrated threshold, for a node with "
+                  "real capital at stake -- alert-only, escalation-capped at 2 Slack posts/ticker/day",
+         code_path="signals_db.check_abnormal_drift (called from the single real chokepoint every "
+                   "entry/exit fill passes through, open_position()/close_position(), rather than "
+                   "threaded into each of their 15+ call sites across signals_notify.py/"
+                   "paper_trading.py/signals_handlers.py individually)",
+         offline_coverage="tests/test_fake_broker_abnormal_drift_scenario.py (6 scenarios: entry breach "
+                          "alerts, exit breach alerts, below-threshold no-op, below-capital-at-stake "
+                          "no-op, dry-run-sim fill no-op, 3rd-same-day-breach suppressed-but-logged)",
+         check_mechanism='coverage_events', scenario_key='abnormal_drift_alert',
+         bad_results=[],
+         notes="Built 2026-08-15, design settled 2026-08-14 evening (docs/backlog_cache.md's "
+               "'abnormal-drift liquidity-signal alert' item) -- direct empirical use of trade_log's "
+               "already-tracked entry_drift_pct/exit_drift_pct as evidence of real execution slippage. "
+               "Threshold calibrated off a same-day real drift-distribution audit "
+               "(docs/research_log.md's 2026-08-15 entry): excluding 3 known-anomalous backdated "
+               "catch-up entries, real drift is mean -0.3% to -0.5%, std 1.4-1.9% (n=25-33) -- the "
+               "original 0.5% placeholder would have fired on 32-52% of real trades, so replaced with "
+               "3.0% (signals_db.ABNORMAL_DRIFT_THRESHOLD_PCT, env-overridable via "
+               "ABNORMAL_DRIFT_THRESHOLD_PCT), a first-pass calibration on a small sample -- revisit as "
+               "more real trades (especially SL exits, the highest-variance exit_reason on file) "
+               "accumulate. Gated on signals_helpers.has_capital_at_stake (same gate as every routine/ "
+               "anomaly Slack alert since the 2026-08-08 redesign), so this can't fire on soxl_ira's "
+               "small proving-ground tier, a paper/research-mode node, or a dry-run-sim synthetic fill. "
+               "bad_results left empty since 'suppressed_daily_cap' is a correctly-working escalation "
+               "cap, not a failure of the check itself. Alert-only, never automatic -- same detection- "
+               "only-decide-later pattern as record_node_streak/_log_pre_action_state_verification "
+               "(user's explicit call: 'if we lose 1 set of trades it is what it is'). No live proof "
+               "yet -- not forceable via node config (an abnormal-drift event isn't a deterministic "
+               "guard-rejection scenario), same organic-only shape as daemon_exception_survival."),
 ]
 
 

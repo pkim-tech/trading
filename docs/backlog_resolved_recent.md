@@ -7,6 +7,26 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][tooling] Resolved 2026-08-16 — 3 findings from the full-session dual-Opus review fixed: `fast_path_fill_reconciliation`'s new `account_number_unresolved` result added to `bad_results` + fixed from hardcoded `mode="dry_run"` to `"unknown"`; `signals_blocks._ticker_block`'s local `mode_tag` variable renamed to stop shadowing the module-level function. Full detail: `deep_backlog.md`.
+
+## [live-trading] Done 2026-08-15 (still later) — `soxl_ira` roster cleanup: SPY/HIBL/USD/YANG retired to paper, YINN repurposed as the node-disambiguation test pair (wl_id 199+228). Full detail: `deep_backlog.md`.
+
+## [testing][security] Resolved 2026-08-15 — test suite was mutating real `cache/live/schwab_node_breaker_state.json`/`schwab_order_counts.json`; new `tests/conftest.py` autouse fixture isolates all 8 `schwab_safety` state paths for every test. `schwab_ticker_automation.json`'s dirty content traced to a deliberate manual staging script, not a bug; `schwab_token.json` mutation still unexplained (separate). Full detail: `deep_backlog.md`.
+
+## [live-trading][HIGH] Resolved 2026-08-16 — stream fast-path fill reconciliation fixed: raw `AccountNumber`→alias resolution (`schwab_client.resolve_account_alias_from_number`, reuses `_resolve_account_hashes`'s suffix-match, no new lookup table) + `SchwabOrderID` string/int mismatch (reuses `drain_fill_queue`'s existing `_order_id_int`). Proven end-to-end via the fake-venue harness (real parser → real fill → real position, plus a new idempotent-redelivery leg); paired Opus review (independent-cold + contextual) found no bugs; full suite 1105/1105 (9 pre-existing `drain_fill_queue` fake_broker tests updated to push a realistic raw account number instead of a bare alias). Full detail: `deep_backlog.md`.
+
+## [live-trading][tax] Resolved 2026-08-15 — end-of-year tax forecast script built (brokerage-only): `tax_realized_loss_baseline` table + `k1_tax.brokerage_tax_forecast()` netting/reserve math + `evening_status.py` part2 wiring, 15 pinned tests. Full detail: `deep_backlog.md`.
+
+## [tooling] Resolved 2026-08-16 — "ready to clear?" Stop hook redesigned around a marker file (touched by session_cache_update.py) instead of "a commit happened this turn"; fixes both the false-positive and false-negative. Verified via 4 direct pipe-tests. Full detail: `deep_backlog.md`.
+
+## [live-trading][security] Accepted residual risk, decided 2026-08-16 — `force_same_day_block` node-resolution fail-open: verified live (7/7 same_day_block events resolved correctly, 0 mismatches ever), closed not fixed. Full detail: `deep_backlog.md`.
+
+## [live-trading] Accepted residual risk, decided 2026-08-16 — `addon_buying_power_check` flat-1x-vs-leverage-scaled asymmetry: closing rationale is behavioral (exposure stays well under the leverage ceiling), explicit revisit trigger recorded. Full detail: `deep_backlog.md`.
+
+## [live-trading][security] Decided/skipped 2026-08-16 — don't-promote-a-2nd-live-AGQ-sibling guard: skipped, not parked; capital-scaling convention (grow the top node's notional, don't run a 2nd worse-config sibling) makes the guarded scenario structurally unlikely by design. Full detail: `deep_backlog.md`.
+
+## [live-trading] Resolved 2026-08-15 — `_submit_order_with_retry`/`_submit_replace_with_retry` retry-blind gap fixed: broker state re-checked before every retry attempt (and once more after the last one); paired Opus review found and fixed 9 real issues across 2 passes (status/orderType filtering, baseline-orderId matching, final-attempt coverage, a try/else extraction-safety fix, a test regression, 2 new regression tests). Full detail: `deep_backlog.md`.
+
 ## [live-trading][coverage] Confirmed already resolved 2026-08-16 (targeted sweep) — `compute_status`'s clean-scenario verified-live gap (already fixed by bd8e35c), SOXS/ira stale pending BUY (confirmed cleared, no reconciliation mismatch). Full detail: `deep_backlog.md`.
 
 ## [live-trading][tooling] Resolved 2026-08-16 — `run_loop()` startup block cleanup built; paired review (independent-cold + contextual, both agents) caught the loop-based spec's own real ordering regression before it shipped, fixed via a plain helper called in original order instead. Full detail: `deep_backlog.md`.

@@ -2183,6 +2183,34 @@ Same session as the harness entry above. While reviewing `soxl_ira`'s node roste
 
 Not built. Next step if picked up: the `get_watchlist()` call-site audit above, then the schema/function additions.
 
+### Addendum — `get_watchlist()` call-site audit (read-only investigation, not implemented)
+
+Grepped every `get_watchlist(` call across the repo (excluding `.claude/worktrees/`, which are ephemeral other-branch state, not live call sites): **183 call sites**, 114 across 61 files in `tests/`, 69 in production code (`active_signals.py`, `signals_*.py`, `schwab_safety.py`, `scripts/*.py`, `pages/*.py`).
+
+**Test call sites (114, 61 files) — bucketed, safe as-is.** Overwhelmingly `[n for n in db.get_watchlist() if n['ticker'] == TICKER][0]`-shaped lookups against a fresh, isolated per-test DB, immediately after the same test's own `add_node()` call. `archived_at` is NULL on every freshly-created row, so `include_archived=False` changes nothing for any existing test. Only becomes relevant once the archive feature itself gets test coverage — those new tests will need to explicitly pass `include_archived=True` to exercise the excluded branch.
+
+**Production call sites — table.** "Verdict" is SAFE (excluding archived nodes is the correct/intended behavior for that call site), UNSAFE (would silently lose something that call site needs), or LOW (diagnostic-only gap, not risk-bearing, but a real behavior change worth a conscious decision).
+
+| Call site(s) | What it currently does | Would `include_archived=False` default change behavior? | Verdict | If unsafe/low, what's needed |
+|---|---|---|---|---|
+| `active_signals.py:869,969,1133` — `startup_wl`/`_send_reference`/main-loop `watchlist` | Drives the reference-report Slack post AND (critically) `refresh_tickers`, `_send_window_alert`, and every entry-scan path below it (pinned entry, drought handoff) — this is the daemon's real entry-signal scan source | Yes — archived nodes stop being scanned for new entries and stop appearing in the reference report | SAFE — this is the intended effect. `archive_node()`'s hard gate (refuses with an open position/pending order) means an archived node can never need entry-side scanning; `get_open_positions()` (a separate, unfiltered-by-watchlist table) still drives exit-side checks (`check_sl_order_fills`, `check_live_state_reconciliation`) regardless of archive state, so an (impossible-by-construction) archived node with a lingering position would still get exit coverage | none |
+| `active_signals.py:1580` (`cmd_list`), `:1634` (`cmd_remove`) | CLI `list`/`remove` commands, human-driven | Archived nodes stop appearing in `list`, and `cmd_remove` can no longer target them | SAFE for `list` (matches "active roster" intent) — LOW for `remove`: a human wanting to hard-delete an already-archived node (e.g. cleaning up a mistake) would need `include_archived=True` wired into the CLI, or `remove_node` called by direct id instead | add an `--include-archived` flag to `cmd_remove`, or note that hard-delete-after-archive requires knowing the id directly |
+| `signals_invariants.py` — all 8 call sites (config-drift/invariant checks: `check_...` functions at lines 30, 62, 89, 123, 158, 190, 254, 473) | Config-sanity checks run at daemon startup/07:00/pre-commit, iterating the full watchlist to flag misconfiguration | Yes — archived nodes stop being checked | SAFE for 7 of 8 — a retired node's config genuinely doesn't need invariant-checking. LOW for `check_daily_sync_halted_nodes` (line 89): if a daily-track node is archived while `daily_sync_halted_at` is still set (an unresolved divergence flag), the "needs manual review" alert goes silent forever instead of just until reviewed — archiving doesn't itself require the halt to be cleared first | either add a pre-archive check for `daily_sync_halted_at` in `archive_node()` (mirroring the open-position/pending-order gate), or exempt this one check with `include_archived=True` |
+| `signals_notify.py:4021` (`check_addon_buying_power_drift`-shaped function) | Filters `state=='live' and addon_enabled` across `get_watchlist()`, builds the set of accounts needing a nightly buying-power-drift check | Yes — an archived live+addon node's account drops out of the checked set | SAFE — an archived node has no open position by construction, so there's nothing for the add-on buying-power check to protect | none |
+| `paper_trading.py:937` (`reconcile_daily_track_nodes`), `:1539` (`reconcile_overlay_nodes`) | Nightly diagnostic reconciliation of paper/daily-track nodes against a fresh backtest replay | Yes — an archived node stops getting nightly reconciled | LOW — purely diagnostic (never mutates state), but archiving doesn't check for an unreconciled trade from the same day, so the very last trade before archiving could go unreconciled and unnoticed | acceptable as-is given the diagnostic-only nature; if this bothers a future reviewer, gate `archive_node()` on "no `daily_track_reconciliation_log`/overlay row from today still pending" the same way the open-position gate works |
+| `schwab_safety.py:901` (`_live_ticker_accounts`, used inside `check_order`'s wrong-account-rejection guard) | Builds ticker→{accounts} for every non-paper watchlist row, used to reject a real order landing in an account not recognized as sanctioned for that ticker | Yes — an archived node's (ticker, account) pair drops out of the sanctioned set | SAFE, and arguably a feature — this is a real-money order-placement safety chokepoint; retiring a node should retire its account's standing to receive new orders for that ticker, not silently keep it live | none |
+| `scripts/log_manual_position.py:26`, `scripts/watchlist_status.py:71,156`, `scripts/premarket_prep.py:73`, `scripts/reference_table.py:19`, `scripts/status_check.py:96`, `scripts/liquidity_notional_yearago.py:39`, `scripts/verify_pinned_entry_vs_backtest.py:45`, `scripts/sim_open_window_volatility.py:143`, `scripts/open_fill_analysis.py:114`, `scripts/sim_recovery_race.py:29`, `pages/2_Node_Inspector.py:224,358`, `pages/3_Winners.py:100,313`, `pages/9_Entry_Delay.py:99` | Status/report/analysis views and one-off manual-position logging, all reading "what's the current active roster" | Yes | SAFE — every one of these is exactly the "active roster" view the archive feature exists to clean up | none |
+| `pages/3_Winners.py:242` (watch/unwatch toggle handler) | Builds a `wl_by_key` map from `get_watchlist(picked_wl_id)` to resolve which node id to `remove_node()` when a user unchecks "watch" | Yes — an archived node silently can't be found/removed via this UI path | SAFE (fails closed/no-op rather than crashing or double-removing) | none needed, but worth a UI affordance later (e.g. show archived nodes greyed-out with an "unarchive" action) so the toggle doesn't look broken |
+| `scripts/node_candidate_trace.py:84` | `[n for n in db.get_watchlist() if n['state'] in ('live','dry_run','paper')]` — an explicit audit/trace tool for candidate→node linkage | Yes — archived nodes drop out of the trace | **UNSAFE-leaning** — this is specifically an audit tool; a retired node's candidate-link history is exactly the kind of thing an audit trace should still be able to show | pass `include_archived=True` explicitly here |
+| `scripts/seed_baseline_config.py:143` | Seeds `staged_test_config` baseline rows for every non-paper node, for later config-drift comparison | Yes — archived nodes stop getting a baseline seeded | SAFE — no point establishing a drift baseline for a retired node | none |
+| One-shot node-creation/setup scripts: `scripts/stage_dry_run_canary_nodes.py:99,152`, `scripts/add_canary_nodes.py:115`, `scripts/build_v5_watchlist.py:60`, `scripts/setup_2026_07_24_soxl_ira_live_test.py:21`, `scripts/add_daily_track_paper_nodes.py:34,105`, `scripts/stage_overlay_test_nodes.py:92,138`, `scripts/add_labu_backup_node.py:29`, `scripts/live_test.py:75`, `scripts/paper_vs_backtest_reconcile.py:203,325`, `scripts/seed_reconciliation_mismatch_per_node.py:53` | Each creates/looks up nodes it just created in the same run; none of these target pre-existing archived nodes by design | No practical change — these scripts only ever look up nodes they themselves just inserted, never archived | SAFE | none |
+
+**Design gap found in the audit, not previously identified — the design's own premise ("`get_watchlist()` is already the shared read path nearly everything routes through") is not fully true.** Two real bypasses exist, both real-money-relevant, neither routes through `get_watchlist()` at all, so the proposed single-enforcement-point would NOT cover them:
+1. **`signals_db.get_live_nodes()`** (`signals_db.py:2001-2010`) — a deliberately separate, unfiltered `SELECT * FROM watch_list WHERE state='live'` across ALL watchlists (its own docstring explains why: real live nodes span more than one watchlist, so `get_watchlist()`'s active-watchlist-only scope can't answer "every real live node"). Its one caller, `schwab_safety.py:748` inside `resolve_auto_fill_detection_targets`, grants auto-fill-detection trust to every node it returns. If `archived_at` ships without a matching fix here, an archived-but-still-`state='live'` node would keep being granted auto-fill trust indefinitely — low practical risk today only because an archived node can't hold an open position by construction, but the *mechanism* silently ignores the new column entirely.
+2. **`scripts/evening_status.py:118-124`** (`real_capital_nodes()`) — its own docstring explains it deliberately bypasses `get_watchlist()` with a raw `sqlite3` scan for the identical cross-watchlist reason as `get_live_nodes()` above (and even documents a past bug from trying to (mis)use `get_watchlist()` for this). Same gap: would keep surfacing an archived real-capital node in the evening status report forever.
+
+**Overall verdict**: the proposed `get_watchlist(include_archived=False)` default is safe to ship for the 69 production call sites that actually route through it — the large majority are correct-by-default (an "active roster" view *should* exclude archived nodes), and the two genuinely SAFE-but-restrictive sites (`schwab_safety.py:901`, the daemon's entry-scan loop) are safe in the direction that matters most (never silently keeps trading/considering a retired node). One call site (`node_candidate_trace.py:84`) needs an explicit `include_archived=True` before shipping to stay a real audit tool. Two diagnostic-only call sites (`signals_invariants.py`'s `check_daily_sync_halted_nodes`, `paper_trading.py`'s two nightly reconcile functions) have a low-severity "silent since-archived" gap worth a conscious decision, not necessarily a blocking fix. **The one finding that must be addressed before shipping, not just noted**: `get_live_nodes()` and `evening_status.py`'s raw scan are real bypasses of the proposed single-enforcement-point — either give both an explicit `archived_at IS NULL` filter of their own, or the design's central claim ("one place to enforce this") doesn't actually hold for the two places that matter most (auto-fill trust granting, and the real-capital evening report).
+
 ## Auto-fill detection broadened to all live nodes + node-scoped Stop/Start automation buttons (2026-08-15/16, merged)
 
 Built and paired-reviewed in worktree `agent-a03c7493ecb6a6e24` (2 rounds, 10 real issues fixed), merged to `main` 2026-08-16.
@@ -2211,3 +2239,319 @@ Real motivation, from a direct conversation with the user: the 1.11yr-vs-3yr `sa
 **Trade-count-per-window visibility**: the user's own "can't go shorter than ~1yr or not enough trades" judgment should be *visible* in the report output (trade count per window, same as existing `n_trades` reporting) rather than silently enforced by the tool — a window with too few trades should be flagged, not blocked, since the user may sometimes want to look anyway.
 
 **Rollout process, not skipped**: this is kernel-adjacent work — per `.claude/skills/backtest-change-rollout/SKILL.md`, needs the staged validation this project always uses for kernel changes (single-node manual audit first, confirm a known node's date-filtered result matches hand-verification, then a biased single-ticker test, before any real campaign). The user always runs the actual sweep themselves (`run_sweep_queue.sh` pattern) — not something an agent launches. Not started; this entry is Phase 1's design only.
+
+## 2026-08-16 (second pass) — Fake-venue harness: SECOND paired design review of the post-2026-08-16 revised plan; one real correction to Phase 1's own target, several prerequisites downgraded after cross-checking current code, design now closer to build-ready but not yet
+
+Per the user's standing instruction (backlog item, `[live-trading][testing]`): a fresh Opus-level paired review (independent-cold + contextual + rebuttal) of the design **as it stands after the first 2026-08-16 review's revisions** (the 12-item prerequisite list and the corrected Phase 1 target above), before Phase 1 implementation starts. Review-only — no code written. Every finding below was checked directly against the current source (`schwab_stream.py`, `signals_notify.drain_fill_queue`, `tests/fake_broker.py`, `schwab_client._resolve_account_hashes`/`_live_nicknames`, `signals_config.py`, `schwab_safety.AUTOMATION_ENABLED_TICKERS`, `scripts/coverage_registry.py`/`scripts/evening_status.py`), not just re-read from the docs. Both passes converged; nothing needed rebuttal-exchange resolution (no contradictions between them).
+
+**HIGH — CONFIRMED, changes the Phase 1 plan again**: the corrected Phase 1 target's own description ("the fake `ACCT_ACTIVITY`/`FILL_QUEUE` emitter — feeds `schwab_stream.FILL_QUEUE` directly") is ambiguous in a way that matters, and the literal reading is wrong. `drain_fill_queue()` only ever pops pre-parsed 6-tuples off `FILL_QUEUE` (`account, ticker, side, price, shares, order_id`) — those tuples are produced by `_parse_activity_message(msg)` (`schwab_stream.py:47`), the exact function that silently failed on 100% of real messages for weeks (the bug this whole harness exists to catch: a guessed envelope shape, `content["2"]`/`content["3"]`, that never matched a real message; the 2026-08-15 fix replaced it with the real `MESSAGE_TYPE`/`MESSAGE_DATA` envelope plus fixed-point `signScale` decimal decoding — itself now the most fragile, least-tested piece of live-response code in the project). **If the emitter constructs already-parsed tuples and calls `FILL_QUEUE.put()` directly, `_parse_activity_message` gets zero exercise from the harness** — Phase 1 would again deliver no coverage of its own stated headline motivation, the same failure mode the first review's finding #5 (Grid credit) already flagged once for a different reason. Fix: the emitter must build realistic raw `msg` dicts (`{"content": [{"MESSAGE_TYPE": "OrderFillCompleted", "MESSAGE_DATA": json.dumps({...})}]}`, matching the exact nested shape `_parse_activity_message` decodes, including `signScale`-encoded price/quantity) and call `_handle_activity_message(msg)` (`schwab_stream.py:148`) — not `FILL_QUEUE.put()` directly. This also gets the `health`/`stream_message_parsed` coverage-event logging (`_log_parse_health`) exercised as a side effect, which the bypass approach would also miss.
+
+**Several 2026-08-16 prerequisites downgraded — same underlying safety story, but resolved by decisions already made rather than needing new code**:
+- **Item 9 (fake account alias collision) folds into item 1, not a separate mechanism.** Confirmed: `_resolve_account_hashes()` (`schwab_client.py:233`) sources its nickname list from `_live_nicknames()` (`schwab_client.py:216`), which reads the `accounts` table via `signals_db._conn()` — i.e. fully `TRADING_DB_PATH`-scoped. In an isolated harness DB, fake aliases live in a completely separate `accounts` table from any real nickname; collision is structurally impossible as long as the DB-isolation assert (item 1) actually runs before anything else. Simplest implementation, already precedented: `tests/fake_broker.py`'s own pytest fixture directly presets `schwab_client._account_hashes` (a plain module dict, `monkeypatch.setattr(schwab_client, '_account_hashes', {...})`) rather than relying on `_resolve_account_hashes()`'s real-broker-call path at all — the harness should do the same non-pytest equivalent, sidestepping `_live_nicknames()`/`SCHWAB_ACCOUNT_<ALIAS>` env-var plumbing entirely.
+- **Item 6 (Slack Socket Mode collision) also folds into item 1.** `SOCKET_MODE = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNEL)` (`signals_config.py:82`) is evaluated once per process at import. Since decision #4 already mandates the harness run as its own OS process (separate from the daemon), it simply doesn't need those three env vars set in its own environment — `SOCKET_MODE` is `False` by construction, no new handling code needed (contra "needs the same handling `live_sim.py` uses"). Worth an explicit assert in the entrypoint check (item 1) that these are unset, same spirit as the `TRADING_DB_PATH`/`SCHWAB_STATE_DIR` checks, but it's a one-line assert, not new logic.
+- **Item 8 (`AUTOMATION_ENABLED_TICKERS` env-global) is a launch-time env var, not new code.** `schwab_safety.AUTOMATION_ENABLED_TICKERS` (`schwab_safety.py:303`) is computed once at import from `SCHWAB_AUTOMATION_TICKERS`. Confirmed this gate is real and load-bearing for Phase 1's target specifically — `signals_notify.py` checks `ticker in AUTOMATION_ENABLED_TICKERS` at 9+ call sites gating the automated reconciliation/top-up paths `drain_fill_queue`'s downstream `_reconcile_fill` flows into, so the fake ticker genuinely needs to be in scope for Phase 1 to reach the interesting code. But since the harness is its own process (decision #4), this is satisfied by setting `SCHWAB_AUTOMATION_TICKERS=<fake-ticker>` in the harness's own launch environment — the shared `.env` file is never touched, so the real daemon's scope is never widened. Downgrade from "needs a harness-only override path (new code)" to "one env var at launch, verified as part of the item-1 entrypoint assert."
+- **Item 7 (`fake_broker` pytest-binding) is smaller than described.** Confirmed: the pytest dependency is confined entirely to the `@pytest.fixture def fake_broker(monkeypatch): ...` wrapper (`tests/fake_broker.py:347-355`, 6 lines of `monkeypatch.setattr` calls). `FakeBroker` itself (the class holding all the state/logic) has zero pytest import or dependency. A harness-side equivalent needs only a ~6-line non-pytest shim doing the same plain attribute assignment (`schwab_client._client = broker`; `schwab_client._get_client = lambda interactive=False: broker`; `schwab_client._account_hashes = {...}`; `schwab_client.Utils = FakeUtils`) at process startup. **None of the 20+ existing scenario tests need to change** — downgrade from "unbudgeted, touches 20+ tests" to "small, additive, isolated shim."
+
+**Still fully open, unchanged by this pass** (all reconfirmed against current code, no new information): item 3 (`TRAILING_STOP` auto-trigger genuinely unmodeled, `tests/fake_broker.py` ~line 152 — real new logic needed, not yet designed); item 4 (quote bridge — unseeded `get_quote()` returns `0.0`, `tests/fake_broker.py:220`, still silently wrong rather than fail-loud); item 5 (`scripts/coverage_registry.py:71` **and** `scripts/evening_status.py:51` both still hardcode `cache/live/trading_live.db` rather than reading `TRADING_DB_PATH` — confirmed unfixed, so a working Phase 1 would still show `wired-never-fired` on the real Grid and be invisible to `evening_status.py`); item 10 (thread safety — `FakeBroker`'s internal dicts still unprotected, no lock); item 11 (no pass/fail criteria or DB retention/reset policy defined); item 12 (real NYSE trading-day gate in `check_order` still blocks continuous operation — correctly scoped to Phase 2's replay/virtual-clock work, not a Phase 1 blocker).
+
+## 2026-08-15 (later still) — Closed-trade reconciliation against real broker order history: scoped design, not built
+
+Scoping the open `docs/backlog_cache.md` item ("closed-trade reconciliation: audit `trade_log` against the real broker order history after a position closes"), raised while root-causing why 6 real top-ups (RETL x4, YINN x2, `trading_incidents` id=8) never surfaced the `trade_log.shares`-goes-stale-after-top-up bug (fixed 2026-08-14, commit `484574e` — `log_trade_exit`/`close_position` now accept a corrected share count at close time; see `docs/backlog_resolved_recent.md`). That fix closed the one field this incident exposed. This item asks a broader question: would a *general* reconciliation mechanism catch the next field that drifts the same way, instead of relying on each instance being independently root-caused. Design only — nothing built, no code touched this session.
+
+**What exists today and why it doesn't already cover this**: `schwab_safety._log_pre_action_state_verification` (real broker position vs. local DB belief, logged every time a BUY/SELL is *considered*) and `record_node_streak`'s `reconciliation_mismatches` counter both check **live, in-flight** state — snapshots taken *during* a position's life, never a check of the position's full history once it's closed and `trade_log` is the only surviving record (`open_positions` rows are deleted on close).
+
+**What's actually available to reconcile against — traced through the real code, not assumed**:
+- `schwab_client.get_real_orders(account, ticker)` (`schwab_client.py:1007`) — every real order of any status touching that ticker in that account, flattened from `orderLegCollection`. Called today with no date-range args, which per the underlying `schwab-py` library (`Client.get_orders_for_account`, checked directly: `from_entered_datetime`/`to_entered_datetime` must both be set or both omitted, and **the API rejects any date-range query over 60 days**) falls back to Schwab's own undocumented default window when called bare. This matters less than it first appears — see the "when" decision below, since a nightly job on newly-closed trades is always well inside 60 days if it passes explicit `fromEnteredTime`/`toEnteredTime` pinned to the trade's own `entry_time`/`exit_time` (padded), which this design should do rather than relying on the undocumented no-args default.
+- **No `order_id` is persisted on `open_positions` or `trade_log` for the core BUY/SELL legs.** Checked directly: `open_positions.sl_order_id` exists (the protective stop only), `pending_buys.order_id` exists but that row is deleted once the buy confirms, and `addon_legs` (a *different*, newer table for the add-on overlay) already has `entry_order_id`/`exit_order_id`/`sl_order_id` — the core position/trade_log path never got the equivalent. **This forces the reconciliation method**: there is no exact order-id lookup available today, so matching must be a **time-windowed fill-sum check** (sum real `FILLED` BUY/SELL orders for that ticker/account within `[entry_time - pad, exit_time + pad]`, not "replay this specific order chain by id"). A pad of a few minutes around `entry_time`/`exit_time` covers the fill-confirmation lag already handled elsewhere in this codebase (`get_filled_order`'s own retry/poll pattern).
+- `trade_log` schema (`signals_db.py:794`): `entry_price`, `entry_time`, `exit_price`, `exit_time`, `shares`, `account`, `is_dry_run_sim` all exist as real, directly-comparable columns. **No fee/commission column exists anywhere in this schema** — Schwab equity trades are commission-free in this account structure, so this was never tracked; fees are correctly out of scope, not a gap.
+
+**Scope: real, non-dry-run trades only — confirmed by reading the placement code, not assumed.** `schwab_client._place_equity_order`/`_place_trailing_order` both early-return before the real broker call when `node_dry_run=True` (`schwab_client.py:33`'s early-return, checked directly) — a `dry_run`/`is_dry_run_sim` position never generates a real order at all, so `get_real_orders` has structurally nothing to reconcile it against. Paper trades (`paper_trade_log`) never call `schwab_client` in the first place (per `paper_trading.py`'s own design). So this reconciliation only ever applies to `trade_log` rows where `is_dry_run_sim=0` — real fills only. This isn't a design choice so much as the only case where the data being compared against exists at all.
+
+**Proposed field list to reconcile** (per closed real `trade_log` row):
+1. `shares` — sum of real `FILLED` BUY-side `quantity` in the window vs. `trade_log.shares` (the exact field the RETL/YINN incident broke).
+2. `entry_price` — volume-weighted average real BUY fill price in the window vs. `trade_log.entry_price`.
+3. `exit_price` — volume-weighted average real SELL fill price in the window vs. `trade_log.exit_price`.
+4. Sanity check: at least one real BUY and one real SELL order exists for the ticker/account/window at all (catches the position existing locally with zero real broker footprint — a different, more severe failure mode than a value mismatch).
+
+These are exact-match comparisons, not drift-tolerance ones — `entry_price`/`exit_price`/`shares` are supposed to already be the real fill values recorded at the moment `_reconcile_fill`/`log_trade_exit` ran, so any mismatch here means the *permanent record* drifted after the fact (a bug), not that live execution differed from a signal price (a different, already-tracked concept via `entry_drift_pct`/`exit_drift_pct`).
+
+**WHEN — recommendation: nightly/EOD batch, not inline at close.**
+- Inline (at `close_position()` time) catches a mismatch immediately, but: (a) adds a real broker API round-trip to the same lock-held code path `close_position()`'s own docstring already flags as latency-sensitive (`_position_lock`, shared with `open_position()`); (b) a real fill can take longer to settle/appear as `FILLED` in `get_orders_for_account` than the moment `close_position()` runs (the exact race `get_filled_order`'s poll/retry pattern already exists to handle elsewhere) — checking too early risks a false mismatch on an order that's simply still settling.
+- Nightly avoids both: by the next EOD pass, every real order from that day has had hours to settle, and this project already has a dedicated, precedented EOD slot for exactly this class of check — `scripts/evening_status.py`'s Part 3 (`real_capital_nodes()`, live-vs-kernel/paper-vs-kernel comparison, non-real-time, review-not-block). Recommend a new Part 4 in the same script: iterate real `trade_log` rows that closed **since the last run** (not full unbounded history — bounded by construction to recent closes, sidestepping the 60-day API question entirely), run the fill-sum check above, log the result.
+- This is a recommendation, not a foreclosed decision — see OPEN DECISIONS below.
+
+**On a mismatch — detection-only, matching this project's established pattern** (`_log_pre_action_state_verification`, `record_node_streak`: log real data, don't auto-correct, decide policy once real data exists):
+- Log a `coverage_events` row (new `scenario_key='closed_trade_reconciliation'`, `mode='live'`, `result='match'|'mismatch'|'no_real_orders_found'`) on every run, mirroring the existing verification-logging pattern — gives this a Grid row and `coverage_matrix.py` visibility for free, same as everything else in this family.
+- On `mismatch` or `no_real_orders_found` specifically (not on `match`, which is the routine expected case and shouldn't create tickets): `db.log_incident(...)` into `trading_incidents`, reusing the existing deviation-as-ticket model (permanent record, `resolved_ts IS NULL` = still open, `explain`/`resolve_incident` is the only way to close it) rather than a new table — this is exactly the "something real and bad may have happened to the permanent record" shape `trading_incidents` already exists for.
+- Slack: gate on `signals_helpers.has_capital_at_stake(node)`, matching this project's 2026-08-08 capital-at-stake alerting redesign — a mismatch on a real capital-at-stake node posts to Slack immediately; a mismatch on a small test-coverage `live` node (most of them, per that same convention) logs to `trading_incidents`/`coverage_events` only, reviewed at EOD/on-demand, not real-time noise.
+
+**Real scope/cost estimate — honest sizing**: this is not a one-function afternoon task. Concretely: (1) the fill-sum matching function itself (ticker/account/time-window aggregation against `get_real_orders`, handling multiple partial fills per side — the exact ambiguity `signals_notify.drain_fill_queue`'s own docstring already flags as unverified for the live fill-queue path, so this needs its own careful handling here too, independently); (2) wiring into `evening_status.py` as a new Part 4 (or a standalone script, if the "since last run" bookkeeping doesn't fit that script's existing structure cleanly — needs a look at `evening_status.py`'s current state-tracking before deciding); (3) a new `coverage_registry.py` Grid row plus a `fake_broker` regression scenario that reproduces the RETL bug class synthetically (place BUY, top-up, close, corrupt one field, confirm the check catches it) — this project's own convention (`docs/design.md`'s "Test Fixtures & Coverage-Proof Techniques" table) is that a mock-only test wouldn't have caught the original bug, so this needs the same `fake_broker` treatment; (4) a decision on how far back to backfill on first run (every real closed trade ever, or only going forward — the former needs the 60-day API cap explicitly handled with a loop, the latter is much simpler). Estimate: a real half-to-full session of focused work including tests, not a quick add-on to an existing function.
+
+### OPEN DECISIONS (for the user)
+
+1. **When**: nightly/EOD batch (recommended above) vs. inline at `close_position()` time vs. some third option (e.g. a short delay — "T+1 poll," a few hours after close rather than waiting for the full nightly cycle). Nightly is recommended for the settlement-race and latency reasons above, but the record stays technically wrong for up to ~1 day under that option — confirm that's an acceptable tradeoff.
+2. **Reconcile against what, exactly**: the time-windowed fill-sum check described above (forced by the lack of persisted `order_id`s on core positions) vs. investing first in persisting `entry_order_id`/`exit_order_id` on `open_positions`/`trade_log` (mirroring `addon_legs`, which already does this) to enable an exact order-id match later. The fill-sum approach works today with zero schema changes; the order-id approach is more precise but is itself unscoped additional work layered on top, not a quick prerequisite.
+3. **Backfill scope**: reconcile only trades closing from here forward, or also backfill every already-closed real `trade_log` row (bounded by the 60-day API window, so only recent history is even checkable — older closed trades may be structurally un-reconcilable now regardless of design).
+4. **Where it lives**: a new Part 4 in `scripts/evening_status.py` (matches the existing EOD pattern, reuses `real_capital_nodes()`) vs. a standalone script — depends on how well the "since last run" state fits `evening_status.py`'s current structure, not yet checked in detail.
+5. **Alert policy on mismatch**: `has_capital_at_stake`-gated Slack (recommended, matches existing convention) vs. always-alert vs. log-only with no Slack path at all — confirm before building, since this determines whether a future real mismatch is noticed same-day or only at next backlog/EOD review.
+
+**Net verdict**: no CRITICAL findings this pass (the isolation-assert story from the first review still holds and is, if anything, cheaper to implement than it looked — items 6/8/9 all fold into one entrypoint assert plus launch-env setup, no new safety-relevant code). One HIGH correction to Phase 1's own target (parse through `_handle_activity_message`, not around it) — without this fix, Phase 1 would ship and pass its own tests while still delivering zero coverage of the bug class that motivated the whole harness, for the second time. **Go/no-go: implementation may start on Phase 1 once the target is corrected as above** (drive the real parser, not a pre-parsed shortcut) and the entrypoint isolation assert (item 1, now explicitly covering `TRADING_DB_PATH`+`SCHWAB_STATE_DIR`+absent Slack env vars+preset `_account_hashes`+`SCHWAB_AUTOMATION_TICKERS`) is written first, before the emitter or `FakeBroker` extraction. Items 3/4/10/11 are real but don't block starting — they gate later Phase 1 milestones (trailing-stop-driven trades, realistic sizing, unattended soak runs), not the first working seed-to-reconcile round trip.
+
+---
+
+## 2026-08-15 — Script-based test-plan design: check_order guard-rejection rows (registry/tester extension designed, staging script built)
+
+Scoping the 2026-08-14 backlog item ("build script-based test-plan support ... and the
+actual staging script for the 12 check_order guard-rejection rows"), deferred that
+session for lack of design time. `docs/grid_ticker_coverage_promotion_process.md`'s
+"Testing philosophy" section is the authoritative source for the two test-plan kinds
+this builds on (ticker-based vs. script-based) — not re-derived here.
+
+### 1. Factual question resolved: does the daemon's scan gate pre-empt ticker_not_live_
+mode_block / ticker_not_in_automation_scope_block from firing organically?
+
+Traced against the real code (`active_signals.py`, `signals_notify.py`, `schwab_safety.py`),
+not guessed:
+
+- **`ticker_not_in_automation_scope_block` — YES, structurally pre-empted.** Every real
+  order-triggering call site in the codebase already gates on
+  `ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS` *before* ever reaching
+  `schwab_client`/`check_order`: `active_signals.py` lines 297, 334, 536, 572, 649, 1252
+  (all four scan functions — `_scan_buy_signals`, `_scan_pinned_entry`,
+  `_scan_pinned_exit_arm`, `_real_order_or_position_exists`), plus every automated-order
+  gate in `signals_notify.py` (lines 63, 113, 294, 871, 1148, 1873, 2012, 2051, 2590,
+  4296, 4493, 4512, 4555, 4571) and `signals_handlers.py` (212, 350). `check_order`'s own
+  version of this check (schwab_safety.py:1278) is therefore a pure defense-in-depth
+  backstop that can never organically fire from the daemon's own call paths — exactly
+  the "guard row" shape the philosophy doc describes. Needs script-forcing; included in
+  the staging script below.
+- **`ticker_not_live_mode_block` — NOT pre-empted, but rare/timing-dependent, not
+  routine.** The gate is `_live_ticker_accounts()` (schwab_safety.py:890), which includes
+  any `watch_list` row with `state != 'paper'` — i.e. both `'live'` and `'research'`
+  states pass, it's not actually a `state == 'live'` check despite the scenario_key name.
+  `check_order`'s own comment (schwab_safety.py:1250-1261) documents the real trigger: a
+  node demoted or removed from the watchlist between an earlier poll-cycle's signal
+  check and this later order-placement gate — a genuine race, not something any scan
+  filter closes off. Reachable organically (in principle), just on unpredictable timing.
+  Included in the staging script anyway since forcing it deterministically is equally
+  cheap via the same mechanism used for the other 7 — no reason to wait on a lucky race
+  when a script proves the exact same code path on demand.
+
+### 2. The 6 backlog-named "cheap" rows — design resolved, script built
+
+**Key finding that resolves nearly all remaining ambiguity**: `schwab_safety.check_order`
+can be called *directly* (not through `schwab_client`/`approve_and_record`) — it takes
+plain `(account, ticker, quantity, price, side, ...)` args, does no broker I/O itself,
+and only reads/logs; the real order-count state file is only ever *written* by
+`approve_and_record`, which callers invoke separately after `check_order` passes. A
+direct `check_order()` call is therefore inherently safe: zero broker interaction, zero
+real order-count mutation, and the only side effect is the coverage_events row the
+scenario exists to produce. This is a stronger/simpler mechanism than driving it through
+`schwab_client.place_equity_buy` (which the project's own
+`tests/test_fake_broker_check_order_guards_phase3_scenario.py` uses against `fake_broker`
+— fine for a hermetic test DB, but not what a real-DB staging script needs).
+
+**Remaining "which account/ticker" ambiguity, resolved by querying the live DB
+directly (2026-08-15)**: of the 5 real accounts (`brokerage`, `sep`, `roth`, `ira`,
+`soxl_ira`), **`sep` is the only one with `trading_enabled=0`** — `roth`/`ira` have both
+flipped to real trading since the CLAUDE.md snapshot describing them as dormant (stale
+as of this session; re-verify before trusting either doc). `sep`'s only real watch_list
+assignment (EDC) isn't in `AUTOMATION_ENABLED_TICKERS`, so no existing real (ticker,
+account) pairing clears the earlier gates far enough to reach the 6 target rows. The
+backlog item's own phrasing — "no node needed" — settles how to close this gap: **don't
+create a real watch_list row; patch the two plain module-level globals `check_order`
+actually reads** (`schwab_safety._live_ticker_accounts`, a function, and
+`schwab_safety.AUTOMATION_ENABLED_TICKERS`, a mutable `set`) in-process, scoped to a
+synthetic ticker (`STAGE_GUARD_TEST`, never a real traded symbol) that never touches the
+real `watch_list` table. `_now`/`_is_trading_day` are patched the same way the project's
+own phase3 fake_broker test already does for these exact two rows (both are
+docstring-documented "seam for tests to monkeypatch" points, not something invented for
+this script). `ticker_level_automation_pause` is the one exception — it calls the real
+`pause_ticker_automation`/`resume_ticker_automation` functions (the actual Slack-button
+code path) against the synthetic ticker, which does write to the real, daemon-shared
+`schwab_ticker_automation.json` state file; harmless (no real node ever uses that ticker
+name) and always resumed in a `try/finally`.
+
+**Built**: `scripts/stage_check_order_guard_scenarios.py` — covers all 8 rows (the 6
+backlog-named + the 2 resolved-as-forceable from question 1), each asserting both the
+`SafetyViolation` and the real `coverage_events(mode='dry_run')` row. Syntax-checked
+(`py_compile` + a plain import) but **not executed** — per the task's own conservative
+default for a new order-placement-adjacent script, even though tracing the code confirms
+it never places a real order or touches the broker. Run it directly when ready:
+`.venv/bin/python scripts/stage_check_order_guard_scenarios.py`.
+
+### 3. `unknown_account_block` / `global_burst_cap_block` / `account_disabled_block`
+
+The philosophy doc already recommends `not-prod-required` for all three, reasoning that
+forcing them costs more than the evidence is worth. Re-checked each against the real
+code rather than accepting the reasoning as-is, per the task:
+
+- **`unknown_account_block` — agree, `not-prod-required`.** The doc's reasoning here is
+  a *value* argument, not a cost one ("proves the guard exists, nothing about real
+  state") — trivially cheap to force (any nonexistent account string), but no amount of
+  forcing ever makes it more real, since the scenario is definitionally about a
+  made-up account. Recommend keeping as-is.
+- **`global_burst_cap_block` — disagree with the cost premise; recommend forcing it,
+  not marking it `not-prod-required`.** The doc assumed forcing this means "12 real
+  orders across all accounts within 60s." That's true if forced through
+  `approve_and_record` (which is what actually appends to `recent_order_timestamps`),
+  but `check_order` accepts an explicit `counts` param (schwab_safety.py:1144,
+  documented: "used for the daily-cap/burst-cap/duplicate checks instead of re-reading
+  the state file") — a script can pass a synthetic `counts` dict with
+  `recent_order_timestamps` already at/over `GLOBAL_ORDERS_PER_MINUTE`, tripping the
+  guard with **zero real orders and zero writes to the real state file** (`check_order`
+  never writes `counts` back; only `approve_and_record` does). Cheap, safe, and doesn't
+  throttle real concurrent order placement at all.
+- **`account_disabled_block` — same disagreement, same reasoning shape.** The doc
+  assumed forcing this means disabling a real production account (blocking every real
+  node sharing it). But `schwab_safety.ACCOUNTS` is a plain dict-like singleton in the
+  script's own process — once lazy-loaded, a script can insert one extra synthetic key
+  (e.g. `dict.__setitem__(schwab_safety.ACCOUNTS, 'stage_disabled_test', AccountLimits(enabled=False, ...))`)
+  without ever touching the real `accounts` table, exactly mirroring how
+  `unknown_account_block` already uses a made-up account name. No real account, no real
+  node, ever affected.
+
+**Not implemented in the staging script above** — both corrections directly override
+docs/grid_ticker_coverage_promotion_process.md's existing written guidance, which
+deserves an explicit user sign-off before either the doc or a script changes on that
+basis, rather than silently baking an expanded scope into a script built from a
+narrower backlog item. See OPEN DECISIONS.
+
+### 4. Registry/`coverage_designated_tester.py` extension — designed, not built
+
+Per the task scope, this piece stays design-only. Current shape
+(`scripts/coverage_designated_tester.py::compute_designations()`) returns
+`{grid_id: [(ticker, node_id), ...]}`, sourced from two existing real tables
+(`staged_test_config.scenario_role` + `scenario_expectations.node_id`) — a script-based
+plan has no equivalent DB row to source from, and per the philosophy doc, shouldn't
+invent one (a script IS the plan; there's no "which node" to track).
+
+**Proposed extension**: a new module-level constant in `scripts/coverage_registry.py`,
+next to `BEST_HARNESS` (same pattern — a plain dict, not a DB table, since the mapping
+is genuinely static/code-defined, not something that changes at runtime the way node
+assignments do):
+
+```python
+SCRIPT_BASED_TESTERS = {
+    'ticker_not_live_mode_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'ticker_not_in_automation_scope_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'ticker_account_assignment_mismatch': 'scripts/stage_check_order_guard_scenarios.py',
+    'ticker_level_automation_pause': 'scripts/stage_check_order_guard_scenarios.py',
+    'buy_trading_day_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'buy_signal_window_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'hard_order_ceiling_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'notional_cap_block': 'scripts/stage_check_order_guard_scenarios.py',
+}
+```
+
+`compute_designations()` gains one lookup at the end: for any `row['id']` with no
+node-based designation, check `SCRIPT_BASED_TESTERS.get(row['id'])` and — if present —
+return a distinguishable sentinel tuple (e.g. `('SCRIPT', script_path)`, reusing the
+existing 2-tuple shape rather than changing the return type, so `coverage_proof_matrix.py`
+and any other consumer of this function's output don't need updating). `main()`'s
+rendering gets one new branch: when `who[0][0] == 'SCRIPT'`, print `script: {path}`
+instead of the `TICKER(node N)` format. This is additive only — no existing row's
+output changes, and `-- none designated --` still means exactly what it does today for
+every row genuinely without any test plan of either kind.
+
+### OPEN DECISIONS (for the user)
+
+1. **Whether to adopt the `global_burst_cap_block`/`account_disabled_block` cost
+   correction from section 3.** If agreed, `docs/grid_ticker_coverage_promotion_
+   process.md`'s "When SIMULATOR is the accepted ceiling" section needs a matching
+   correction (both rows' reasoning currently states the higher, no-longer-accurate
+   cost), and `scripts/stage_check_order_guard_scenarios.py` would grow 2 more
+   scenarios using the `counts=`/`ACCOUNTS`-singleton-injection techniques described
+   above.
+2. **Whether to actually run `scripts/stage_check_order_guard_scenarios.py`.** Written
+   and syntax-checked only, not executed, per this task's conservative default — the
+   code trace shows it's safe (no broker call, no real order-count mutation, one
+   self-reversing real state-file write), but the user should confirm before it's run
+   for real, since it's the first time this technique is exercised against the live DB.
+3. **Whether to build the registry/tester extension from section 4 now**, or fold it
+   into whatever session next touches `coverage_registry.py`/`coverage_designated_
+   tester.py` — the design above is implementable directly with no further research.
+
+---
+
+## 2026-08-16 — OPEN DECISIONS 1/2 resolved: both extra scenarios staged, script run for real, 10/10 pass
+
+User approved OPEN DECISION 1 explicitly ("i'm ok with staging it safely") — both
+`global_burst_cap_block` and `account_disabled_block` added to
+`scripts/stage_check_order_guard_scenarios.py` exactly via the mechanisms designed in
+section 3 above:
+- `account_disabled_block`: a synthetic account key (`STAGE_DISABLED_ACCOUNT_TEST`,
+  never a real alias) is `dict.__setitem__`'d into `schwab_safety.ACCOUNTS` with
+  `enabled=False`, `check_order` called against it directly (bypassing `_run`'s
+  hardcoded `ACCOUNT="sep"`), then the key is removed in a `finally` block. Verified in
+  a **fresh Python process** after the run that the key is gone and `sep`'s real row is
+  byte-identical to before.
+- `global_burst_cap_block`: `check_order`'s `counts` param is handed a synthetic
+  `{"recent_order_timestamps": [time.time()] * GLOBAL_ORDERS_PER_MINUTE}` — the real
+  `cache/live/schwab_order_counts.json` file is never opened. Reaching this guard
+  requires passing the real cash check first (it sits after `notional_cap_block` in
+  `check_order`'s guard order), so `schwab_client.get_account_balance` is also patched
+  to a large fixed value for this one scenario — avoids depending on `sep`'s actual real
+  cash balance, keeps the "zero real broker dependency" invariant intact.
+
+OPEN DECISION 2 resolved: **script run for real** (`.venv/bin/python scripts/
+stage_check_order_guard_scenarios.py`), not just syntax-checked. Running it live found
+one real, pre-existing gap the earlier syntax-check pass couldn't have caught: 4 of the
+original 8 scenarios (`buy_trading_day_block`/`buy_signal_window_block`/
+`hard_order_ceiling_block`/`notional_cap_block`) failed with a real `KeyError: 'sep'` —
+`sep` has no `SCHWAB_ACCOUNT_SEP` entry in `.env`, so `schwab_client.
+_resolve_account_hashes()['sep']` raises inside `schwab_safety._open_orders`, which the
+real BUY-side dup-order guard calls unconditionally before any of those 4 guards are
+even reached. Fixed by adding `(schwab_safety, "_open_orders", lambda account: [])` to
+the shared `happy_patches` list — in-process only, zero real broker call, correct
+semantics (no resting order for a synthetic ticker that's never in any real order book).
+This also covers the new `global_burst_cap_block` scenario, which reaches the same
+dup-order guard.
+
+**Result: 10/10 scenarios PASS**, each confirmed via a real `coverage_events` row
+(`mode='dry_run'`). `scripts/coverage_registry.py`'s live output now shows both
+`account_disabled_block` and `global_burst_cap_block` as `dry_run-only` /
+`event-asserted` offline proof, matching the other 8 rows. Post-run state verification
+(fresh process, not just trusting the `finally` blocks): `STAGE_DISABLED_ACCOUNT_TEST`
+absent from `ACCOUNTS`, `sep`'s real `accounts` table row unchanged
+(`trading_enabled=0`, `notional_cap=10000.0`, `daily_order_cap=5`), `STAGE_GUARD_TEST`
+absent from `AUTOMATION_ENABLED_TICKERS`, kill switch still disengaged. The one real
+state-file write (`ticker_level_automation_pause`'s real `pause_ticker_automation`/
+`resume_ticker_automation` calls, pre-existing from the 2026-08-15 script, unchanged
+this session) leaves `schwab_ticker_automation.json` with `"STAGE_GUARD_TEST": true` —
+this is the correct **resumed/enabled** marker (`resume_ticker_automation` writes
+`True`, doesn't delete the key, by original design), not a leftover paused state; same
+behavior existed before this session's changes.
+
+Script changes not committed — left for review, per the task's instruction.
+
+## 2026-08-16 (build) — Fake-venue harness Phase 1: BUILT. `buy_fill_reconciles_correct_node` reproduced end to end against a real ACCT_ACTIVITY message, and two real production defects found in the process
+
+First actual code for the harness designed over the three entries above (2026-08-15 (later), 2026-08-16, 2026-08-16 (second pass)). New package `fake_venue/` (`isolation.py`, `venue.py`, `activity_stream.py`, `scenarios.py`, `scenarios_meta.py`), entrypoint `scripts/fake_venue_harness.py`, test `tests/test_fake_venue_harness_scenario.py`. Nothing in production code was touched — the build is purely additive (full suite 1084/1084 after).
+
+**What it does**: one process, its own DB file (`TRADING_DB_PATH`) and its own `schwab_safety` state dir (`SCHWAB_STATE_DIR`), no Slack credentials, no real account hashes, one shared `FakeBroker` (reused verbatim from `tests/fake_broker.py` via a 4-line non-pytest shim — the ~6-line shim the second-pass review predicted, and no existing test needed changing). Two fake accounts (`fv_cash` cash-settlement / `fv_margin` margin) and THREE nodes on one fake ticker: A and C both in `fv_cash` (the real same-ticker/same-account collision shape — JNUG 2026-08-10 was two nodes in `ira`, the YINN 199/228 reproduction is two nodes in `soxl_ira`; a cross-account pair alone resolves unambiguously and would prove strictly less), B in `fv_margin`.
+
+**The second-pass HIGH correction was implemented as written**: the emitter builds a full raw envelope transcribed field-by-field from a real captured message (`logs/active_signals.log`, 2026-08-07 GDXU, SchwabOrderID 1007506544737) — real `MESSAGE_TYPE`/`MESSAGE_DATA` nesting, real `signScale = scale*2 + sign_bit` fixed-point encoding including the "zero value omits `lo`" quirk, a batched non-fill entry ahead of the fill — and calls `schwab_stream._handle_activity_message()`. Nothing anywhere calls `FILL_QUEUE.put()`. `_parse_activity_message` and `_log_parse_health` both get real coverage as a result.
+
+**Proof (not a log line)**: the entrypoint re-opens the harness DB read-only with plain `sqlite3` and requires exactly one row from `coverage_events JOIN watch_list` with `scenario_key='buy_fill_reconciles_correct_node'`, `result='resolved'`, `mode='live'`, the harness ticker, the right account and `state='live'`. Real result: `{'result': 'resolved', 'node_id': 1, 'detail': '3 pending, wl_ids=[1, 2, 3]', 'account': 'fv_cash', 'strategy_type': 'TrailingBothZScoreBreakout'}`. Exit 0 requires that plus every `required` check.
+
+**Isolation, proven two ways** (item 1): (a) an entrypoint assert, run before any project import, that `TRADING_DB_PATH`/`SCHWAB_STATE_DIR` are set and non-production, no Slack env var is set, the automation scope is exactly the fake ticker and contains no real one, no fake alias collides with a real nickname, and every `SCHWAB_ACCOUNT_*` suffix is blanked — plus a POST-import re-check (the one failure an env check structurally can't see: a project module imported before the env was set, since `cfg.DB_PATH`/`_STATE_DIR`/`AUTOMATION_ENABLED_TICKERS` are all import-time reads). (b) beyond the design: a `sys.addaudithook` tripwire recording every `open`/`sqlite3.connect` under `cache/live/`, checked as a pass/fail gate. Real result: **0 production-path accesses** across the whole run — which is the empirical half the env assert can't give (a hardcoded path or a pre-captured global would slip past the env check and get caught here). Independently confirmed by a checksum snapshot of `cache/live/` before/after with the daemon stopped.
+
+**Two real, pre-existing PRODUCTION defects found — the harness's first catch, both filed in `docs/backlog_cache.md`, deliberately NOT fixed in this build** (fixing production inside a harness build is scope creep, and would erase the demonstration):
+1. **[HIGH] The stream fast path can never reconcile a real fill.** Schwab sends `AccountNumber` as a raw account number (`"45111931"` etc., 347 real messages on file); `drain_fill_queue` passes it straight to `get_filled_order`, which resolves it via `_resolve_account_hashes()[account]` — keyed by account ALIAS. KeyError, thrown after `get_nowait()` already consumed the event, so that event and everything still queued that cycle are dropped. Never seen live only because the parser produced zero events until the 2026-08-15 fix (confirmed: zero `stream_message_parsed`/`fast_path_fill_reconciliation` rows in the real DB). Correctness is backstopped by the slow poll, but the post-GDXU **orphan-fill 🚨 alert can never fire from the stream**, since that branch makes the same call.
+2. **Stream `SchwabOrderID` is a string, broker `orderId` is an int** — the exact-order lookup never matches, so even with (1) fixed the fast path always degrades to the slow poll after burning 5×3s of sleeps. Masked by (1) today.
+Both are recorded as `required=False` observations so the harness stays green once they're fixed, and the harness test asserts only that the observations were RECORDED (with an explicit "if this changes, close the backlog item, don't repair the harness" note) rather than that the bugs still exist. A 4th, deliberately unfaithful control leg (alias + numeric order id) proves everything downstream of the two defects works — without it, "the fast path is broken" and "the fast path was never wired" would be indistinguishable.
+
+**Deliberate Phase 1 omissions, each documented in the code itself, not just here**: TRAILING_STOP auto-trigger simulation (item 3) — fills are driven by `force_fill()`, defensible because the target row is a POST-fill attribution question, but required before any soak mode; the quote bridge (item 4) is a real yfinance price seeded once, failing loud instead of returning `0.0`, with `--price` for deterministic/offline test runs; `coverage_registry.py:71`/`evening_status.py:51`'s hardcoded real DB path (item 5) left alone, so harness events still get no Grid credit — the prerequisite for the Phase 2 "fake evening report"; thread safety (item 10) is moot for Phase 1 (single-threaded, `_handle_activity_message` called synchronously, not from a stream callback thread) but blocks persistent/soak mode. Entry-side state is SEEDED, not placed through the real BUY path (design decision #6's accepted caveat) — a side effect worth knowing: the only real `check_order` traffic in the run is the protective STOP (SELL), and the NYSE trading-day gate is BUY-only, which is why the scenario runs identically on a weekend. Add a real BUY leg and it becomes calendar-dependent.
+
+**Phase 2 still needs**: the replay/virtual-clock mode (the whole point of "persistent" — `check_order`'s trading-day gate plus `_in_window()`'s wall-clock checks leave Phase 1 unable to soak-test continuously), TRAILING_STOP simulation, FakeBroker thread safety, the two hardcoded-DB-path fixes for Grid/evening-report visibility, and a real repeating price feed.
+
+**Paired Opus review of the build (independent-cold + contextual + rebuttal exchange), same session** — no CRITICAL from either; the cold pass explicitly hunted for one across import order, lazily-cached `_account_hashes`, `load_dotenv` precedence, exception paths, sqlite side files, the Slack webhook fallback and real-account-hash resolution, and confirmed env-before-import plus preset `_account_hashes` genuinely makes a real order unreachable. Findings resolved:
+- **HIGH (cold, confirmed by direct repro before accepting)**: the new audit-hook tripwire only matched ABSOLUTE paths, and every hardcoded production path in this repo is written RELATIVE (`signals_config.py:17`'s own `"./cache/live/trading_live.db"` default included) — so the exact breach it exists to catch would have printed "0 accesses," a false green worse than no tripwire. Also missed the `bytes` paths `sqlite3.connect` passes. Fixed with `os.fsdecode` + `os.path.abspath` (both audit-event-free, so no hook re-entrancy), watched prefix widened from `cache/live` to all of `cache/` (picks up `cache/research/trading_universe.db`, which has no env override at all), and a pinned test that fires the hook on a relative path.
+- **MEDIUM (cold)**: tripwire verdict sat inside the `try`, i.e. skipped exactly when the scenario raises — now reported from `finally`, always, and still fails the run. Production-path equality checks widened to containment (`cache/live/anything.db` used to pass). `SCHWAB_ACCOUNT_*` aliases now also parsed from `.env` (the pre-import gate can't see them via `os.environ`) and re-asserted post-`load_dotenv`. `cfg.SLACK_HOOK` added to the post-import assert (webhook posts survive `SIM_MODE`). Node/order ticker changed from the real `XLK` to synthetic `TEST_FAKE_VENUE_SCENARIO` (real market data retained via a separate `PRICE_SOURCE_TICKER`), so harness rows can never be mistaken for real activity — which also answers the "harness `coverage_events` are written `mode='live'` with nothing marking them synthetic" finding. Emitter gained partial-fill support (`LegSubStatusPartiallyFilled`/non-zero `LeavesQuantity`), the fidelity gap both passes named as the highest-value next step; a leg driving one through reconciliation is deliberately left for the next scenario. Re-run guard added for a reused `--db-path`.
+- **MEDIUM (contextual, changed the scenario)**: two nodes in DIFFERENT accounts sidestepped the real collision shape — JNUG (2026-08-10) was two nodes in `ira`, YINN 199/228 is two in `soxl_ira`. Node C added in the SAME account as A. **Rebuttal then partially refuted the fix's own strength, and that correction is now written into `scenarios.py`'s docstring rather than glossed**: `place_stop_loss` threads `node_id`, so `check_order` takes its `node_id is not None` branch and never reaches the ambiguous-lookup fallback with the silent `node_automation_enabled(None) -> True` default — the harness RECORDS the ambiguity but no decision path consumes it yet.
+- **MEDIUM (contextual)**: the harness test hard-asserted the two production defects still exist, contradicting the scenario's own fix-tolerant `required=False` treatment — whoever fixes `get_filled_order` would have gotten a red suite and concluded they broke the harness. Now a documented known-defect tripwire that accepts the fixed behaviour and says to close the backlog item instead.
+- **LOW/confirmed-and-fixed**: misleading check name (leg 3's check asserted only that an event fired, while the observed result was `stream_event_not_yet_confirmed_filled`); `verify_proof` now asserts account/state/result, matching the pytest test's strength; thread-safety, one-shot-quote-seed, `evening_status.py:51` and cash/margin-scaffolding caveats all written into the code's own docstrings, not just here.
+- **Both passes independently confirmed the stale hand-typed Grid field** `coverage_registry.py`'s `buy_fill_reconciles_correct_node.offline_coverage` ("None -- no test simulates 2 concurrent real pending buys for the same ticker") — already false before this build (`test_fake_broker_buy_button_handlers_scenario.py::test_buy_fill_reconciles_correct_node_with_multiple_pending` does exactly that, in the same account). Corrected.
+- **Identified, deliberately not built**: a 5th leg passing a deliberately-wrong `wl_id` to exercise the row's `'no_match'` branch and its ⚠️ alert (on the `check_auto_fills` path the `wl_id` comes from the same pending row it then matches, so `'no_match'` cannot fire); a partial-fill reconciliation leg; a leg that places a real BUY through `check_order` (would make the scenario calendar-dependent, since the NYSE trading-day gate is BUY-only).
+- **Out of scope but found while verifying isolation, worth chasing**: a full `pytest -q` run mutates the PRODUCTION `cache/live/schwab_node_breaker_state.json` (real node id 1 / AGQ's streak observed resetting), reproduced with no harness process running — some newer/untracked test file is missing the `NODE_BREAKER_PATH` monkeypatch that 12+ other fake-broker tests have. Same category as the two incidents the harness's own isolation docstring cites.

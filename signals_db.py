@@ -3,6 +3,7 @@ DB layer for active_signals: watchlists, watch_list nodes, open_positions,
 pending_buys (trailing-buy lifecycle), and trade_log.
 """
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime
@@ -1805,6 +1806,41 @@ def ensure_tables():
                 UNIQUE(wl_id, role)
             )
         """)
+
+        # tax_realized_loss_baseline -- the user's real, pre-existing realized-loss
+        # baseline for `brokerage` (the one taxable account), used by k1_tax.py's
+        # brokerage_tax_forecast() to net against the year's realized gains before
+        # computing a reserve recommendation. A dedicated table rather than a
+        # synthetic trade_log row -- deliberate, see docs/deep_backlog.md's
+        # 2026-08-15 tax-forecast entry: too many trade_log consumers scan it
+        # unfiltered (per-ticker performance table, Accountability Grid,
+        # live-vs-kernel reconciliation) to safely inject a fake $240k trade there.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tax_realized_loss_baseline (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                account    TEXT NOT NULL,
+                tax_year   INTEGER NOT NULL,
+                amount     REAL NOT NULL,
+                character  TEXT NOT NULL CHECK (character IN ('short_term', 'long_term')),
+                note       TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        # Real, user-confirmed baseline (2026-08-15 model): $240,000, short-term
+        # character, predates this table's existence. Seeded once -- if this exact
+        # (account, tax_year, character, amount) row already exists, don't duplicate
+        # it on every ensure_tables() call.
+        existing = c.execute(
+            "SELECT COUNT(*) FROM tax_realized_loss_baseline "
+            "WHERE account='brokerage' AND tax_year=2026 AND character='short_term'"
+        ).fetchone()[0]
+        if existing == 0:
+            c.execute("""
+                INSERT INTO tax_realized_loss_baseline (account, tax_year, amount, character, note)
+                VALUES ('brokerage', 2026, 240000, 'short_term',
+                        'Real pre-existing realized-loss baseline, predates this tracking (user-confirmed 2026-08-15)')
+            """)
+
         c.commit()
 
 
@@ -3728,6 +3764,7 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
     if position_source == 'addon_leg':
         raise ValueError("open_position() does not support position_source='addon_leg' -- use open_addon_leg()")
     positions_table, _ = _pos_tables(paper)
+    _drift_check_args = None
     with _position_lock, _conn() as c:
         # position_lock instrumentation (2026-08-01): proves the lock is
         # actually acquired around the check-then-insert below, not just that
@@ -3786,7 +3823,25 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             drought_gap_start, drought_vol_pctile,
         ))
         c.commit()
-        return True
+        if not paper and not is_dry_run_sim:
+            # Real fills only -- a paper/dry-run-sim fill is synthesized against
+            # cached/live price data, not a real broker execution, so its drift
+            # isn't evidence of real slippage (see check_abnormal_drift's docstring).
+            entry_drift_pct = (float(entry_price) - float(signal_price)) / float(signal_price) * 100
+            _drift_check_args = (node, 'entry', entry_drift_pct, trade_log_id)
+    if _drift_check_args is not None:
+        # Deliberately called AFTER the with-block above releases _position_lock
+        # (paired Opus review, 2026-08-15, both independent-cold and contextual
+        # rounds independently flagged this): check_abnormal_drift does a real
+        # Slack HTTP POST, and _position_lock also serializes every OTHER
+        # concurrent open_position()/close_position() call across the whole
+        # daemon (poll loop vs. Slack handler thread) -- a slow/hanging Slack
+        # call inside the lock would stall unrelated real position opens/closes,
+        # not just this one. The position itself is already durably committed
+        # by this point, so releasing the lock first costs nothing.
+        node_, side_, drift_, trade_log_id_ = _drift_check_args
+        check_abnormal_drift(node_, side_, drift_, trade_log_id=trade_log_id_)
+    return True
 
 
 def open_position_from_pending(pending, signal_price, signal_time, entry_price, entry_time, shares,
@@ -3984,6 +4039,7 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
     trade_log exit (last write silently wins, possibly with the wrong
     price/reason), and only then race on the DELETE."""
     positions_table, _ = _pos_tables(paper)
+    _drift_check_args = None
     with _position_lock, _conn() as c:
         row = c.execute(
             f"SELECT trade_log_id, entry_price, ticker, wl_id, is_dry_run_sim, trail_state, shares FROM {positions_table} WHERE id = ?",
@@ -4032,7 +4088,24 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
         # for a close that never actually happened -- moved to after both succeed.
         log_coverage_event("position_lock", _mode, ticker=row[2], node_id=row[3], position_id=position_id,
                             result="closed", detail="close_position")
-        return True
+        if not paper and not row[4] and exit_price is not None and exit_signal_price is not None:
+            # Real fills only (row[4]=is_dry_run_sim) -- mirrors open_position()'s
+            # identical real-fills-only gate, see check_abnormal_drift's docstring.
+            # Node lookup/check itself deferred to after the lock releases (see below).
+            exit_drift_pct = (float(exit_price) - float(exit_signal_price)) / float(exit_signal_price) * 100
+            _drift_check_args = (row[3], exit_drift_pct, row[0])
+    if _drift_check_args is not None:
+        # Deliberately called AFTER the with-block above releases _position_lock --
+        # same rationale as open_position()'s identical deferral (paired Opus
+        # review, 2026-08-15): check_abnormal_drift does a real Slack HTTP POST,
+        # and _position_lock also serializes every OTHER concurrent
+        # open_position()/close_position() call across the daemon. The position
+        # is already durably closed (DELETE + commit above) by this point.
+        wl_id_, drift_, trade_log_id_ = _drift_check_args
+        _exit_node = get_watch_list_node_by_id(wl_id_)
+        if _exit_node is not None:
+            check_abnormal_drift(_exit_node, 'exit', drift_, trade_log_id=trade_log_id_, position_id=position_id)
+    return True
 
 
 def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, shares=None, paper=False,
@@ -4118,6 +4191,109 @@ def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reas
                 WHERE id = ?
             """, params)
         c.commit()
+
+
+# ---------------------------------------------------------------------------
+# Abnormal-drift liquidity-signal alert -- design settled 2026-08-14 evening
+# (docs/backlog_cache.md's "abnormal-drift liquidity-signal alert" item), built
+# 2026-08-15 after a real drift-distribution audit (docs/research_log.md's
+# 2026-08-15 entry) replaced the original 0.5% placeholder threshold.
+#
+# Threshold calibration: the audit pulled real (broker-filled, is_dry_run_sim=0)
+# entry_drift_pct/exit_drift_pct across 33 real trades. Excluding 3 known-
+# anomalous backdated catch-up entries (2026-07-06 KORU/SOXL/AGQ, manually
+# backdated to a missed prior signal, not live-execution slippage), real drift
+# is mean -0.46% (entry) / -0.27% (exit), std 1.40 / 1.91, n=30/25. The 0.5%
+# placeholder would have fired on 32-52% of real trades -- far too tight to be
+# a rare/high-bar signal. 3.0% sits well above routine noise (~1.5-2 std above
+# the cleaned mean) while still catching the genuine tail events already on
+# file (KORU's real -8.97% SL exit, AGQ's 22.20% exit). THIS IS A FIRST-PASS
+# CALIBRATION ON A SMALL SAMPLE (n=25-33) -- revisit as more real trades
+# accumulate, especially more SL exits (flagged in the audit as the highest-
+# variance exit_reason: mean=1.08%, std=7.49 on n=11).
+# ---------------------------------------------------------------------------
+ABNORMAL_DRIFT_THRESHOLD_PCT = float(os.environ.get("ABNORMAL_DRIFT_THRESHOLD_PCT", 3.0))
+ABNORMAL_DRIFT_MAX_ALERTS_PER_TICKER_PER_DAY = 2
+
+
+def _abnormal_drift_alerts_today(ticker):
+    """Count of 'abnormal_drift_alert' coverage_events already logged for this
+    ticker today (local time) -- same date(ts,'localtime') pattern as
+    dup_alert_suppressed_today. Includes both 'alerted' and
+    'suppressed_daily_cap' results deliberately (both represent a real
+    detected breach, whether or not the escalation cap let it actually post),
+    so a 3rd+ breach the same day keeps incrementing the count that
+    'suppressed_daily_cap' rows report, rather than the cap silently
+    resetting on the row it's about to write."""
+    with _conn() as c:
+        row = c.execute("""
+            SELECT COUNT(*) FROM coverage_events
+            WHERE ticker = ? AND scenario_key = 'abnormal_drift_alert'
+              AND date(ts, 'localtime') = date('now', 'localtime')
+        """, (ticker,)).fetchone()
+    return row[0] if row else 0
+
+
+def check_abnormal_drift(node, side, drift_pct, trade_log_id=None, position_id=None):
+    """Alert-only liquidity-signal check on real execution slippage
+    (docs/backlog_cache.md's 2026-08-14 'abnormal-drift liquidity-signal
+    alert' item). side is 'entry' or 'exit'; drift_pct is the already-computed
+    entry_drift_pct/exit_drift_pct value (same formula as log_trade_entry/
+    log_trade_exit -- (fill - signal) / signal * 100).
+
+    Scoped to nodes with real capital at stake (signals_helpers.
+    has_capital_at_stake) -- the same gate this project uses for every
+    routine/anomaly Slack alert (2026-08-08 redesign, see CLAUDE.md's Live
+    Trading section): excludes dry_run/paper/research-mode nodes and real
+    nodes sized below CAPITAL_AT_STAKE_THRESHOLD automatically, so this never
+    fires on soxl_ira's $500-2,500 proving-ground tier or a canary/paper fill.
+
+    Alert-only, never automatic -- same detection-only-decide-later pattern as
+    _log_pre_action_state_verification/schwab_safety.record_node_streak (user's
+    explicit call, 2026-08-14: "if we lose 1 set of trades it is what it is").
+    Escalation: at most ABNORMAL_DRIFT_MAX_ALERTS_PER_TICKER_PER_DAY (2) Slack
+    posts per ticker per day -- deliberately a rare/high bar, not expected to
+    fire routinely for a real (non-staged-test) ticker. A 3rd+ same-day breach
+    still logs a coverage_event (result='suppressed_daily_cap') so the data
+    isn't lost, it just doesn't re-nag Slack.
+
+    Called from the one real chokepoint every entry/exit fill passes through
+    regardless of caller module (open_position/close_position, invoked from
+    signals_notify.py, paper_trading.py, and signals_handlers.py combined --
+    15+ call sites) rather than threaded into each call site individually, so
+    coverage can't silently gap the way BUY-only/SELL-only gating has bitten
+    this project before (automation_principles.md #7).
+
+    Fire-and-forget, like log_coverage_event/record_node_streak -- must never
+    raise into open_position/close_position's real DB-write control flow."""
+    try:
+        from signals_helpers import has_capital_at_stake, mode_tag  # local import: avoid signals_db<->signals_helpers import cycle
+        if not has_capital_at_stake(node):
+            return
+        if drift_pct is None or abs(drift_pct) < ABNORMAL_DRIFT_THRESHOLD_PCT:
+            return
+        ticker = node['ticker']
+        account = node.get('account')
+        node_id = node.get('id')
+        alerts_today = _abnormal_drift_alerts_today(ticker)
+        if alerts_today >= ABNORMAL_DRIFT_MAX_ALERTS_PER_TICKER_PER_DAY:
+            log_coverage_event("abnormal_drift_alert", "live", ticker=ticker, node_id=node_id,
+                                position_id=position_id, result="suppressed_daily_cap",
+                                detail=f"side={side} drift={drift_pct:+.2f}% count_today={alerts_today}")
+            return
+        log_coverage_event("abnormal_drift_alert", "live", ticker=ticker, node_id=node_id,
+                            position_id=position_id, result="alerted",
+                            detail=f"side={side} drift={drift_pct:+.2f}% count_today={alerts_today}")
+        import schwab_client  # local import: schwab_client imports signals_db at module load time
+        schwab_client._post_message(
+            f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) {side} drift "
+            f"{drift_pct:+.2f}% (threshold ±{ABNORMAL_DRIFT_THRESHOLD_PCT:.1f}%) "
+            f"— {alerts_today + 1}/{ABNORMAL_DRIFT_MAX_ALERTS_PER_TICKER_PER_DAY} today\n"
+            f"(real fill vs. signal price slippage on {side} -- check liquidity/order sizing)",
+            node_id=node_id,
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -4451,3 +4627,62 @@ def set_skim_state(wl_id, skim_ref=_UNSET, skim_peak_before_decline=_UNSET, skim
     with _conn() as c:
         c.execute(f"UPDATE watch_list SET {', '.join(fields)} WHERE id=?", (*values, wl_id))
         c.commit()
+
+
+# ---------------------------------------------------------------------------
+# tax_realized_loss_baseline -- brokerage-only end-of-year tax forecast support
+# (see k1_tax.py's brokerage_tax_forecast() for the netting math this feeds)
+# ---------------------------------------------------------------------------
+
+def add_tax_realized_loss_baseline(account, tax_year, amount, character, note=None):
+    """Records an additional realized-loss baseline row (e.g. a future year's
+    carryforward, or a correction) -- doesn't overwrite prior rows, mirrors the
+    append-only pattern used elsewhere in this module for real financial facts."""
+    assert character in ('short_term', 'long_term')
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO tax_realized_loss_baseline (account, tax_year, amount, character, note)
+            VALUES (?, ?, ?, ?, ?)
+        """, (account, tax_year, amount, character, note))
+        c.commit()
+
+
+def get_tax_realized_loss_baseline(account, tax_year):
+    """Returns {'short_term': total_amount, 'long_term': total_amount} for the
+    given account/tax_year (sums multiple rows of the same character, if any).
+    Missing characters are omitted, not zero-filled -- callers should use
+    .get(character, 0.0)."""
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT character, SUM(amount) AS total
+            FROM tax_realized_loss_baseline
+            WHERE account=? AND tax_year=?
+            GROUP BY character
+        """, (account, tax_year)).fetchall()
+    return {r['character']: r['total'] for r in rows}
+
+
+def get_realized_pnl_by_ticker(account, tickers, year):
+    """Real closed-trade $ P&L for `account`, summed per ticker, for trades that
+    EXITED in the given calendar year -- the tax-relevant realization event.
+    Mirrors scripts/annual_pnl_report.py's dollar-P&L convention
+    ((exit_price - entry_price) * shares) and its exclusions: real trade_log
+    only (never paper_trade_log), and is_dry_run_sim=1 rows excluded (not real
+    fills). Returns {ticker: net_dollar_pnl}; a ticker with zero closed trades
+    this year is simply absent from the dict (not zero-filled)."""
+    if not tickers:
+        return {}
+    with _conn() as c:
+        rows = c.execute(f"""
+            SELECT ticker, entry_price, exit_price, shares
+            FROM trade_log
+            WHERE account=? AND ticker IN ({','.join('?' * len(tickers))})
+                  AND exit_time IS NOT NULL AND COALESCE(is_dry_run_sim, 0) = 0
+                  AND entry_price IS NOT NULL AND exit_price IS NOT NULL AND shares IS NOT NULL
+                  AND strftime('%Y', exit_time) = ?
+        """, (account, *tickers, str(year))).fetchall()
+    totals = {}
+    for r in rows:
+        pnl = (r['exit_price'] - r['entry_price']) * r['shares']
+        totals[r['ticker']] = totals.get(r['ticker'], 0.0) + pnl
+    return totals

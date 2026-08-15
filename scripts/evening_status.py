@@ -45,6 +45,7 @@ from scripts.coverage_registry import fake_venue_proof_for
 from scripts.paper_vs_backtest_reconcile import resolve_live_track_nodes_by_activity, get_paper_trades
 import scripts.daemon_status as daemon_status
 import scripts.verify_live_parity as parity
+import k1_tax
 
 TODAY = datetime.now().strftime('%Y-%m-%d')
 ACCOUNT_ORDER = {'brokerage': 0, 'roth': 1, 'ira': 2, 'soxl_ira': 3}
@@ -307,8 +308,58 @@ def _part2_activity(nodes):
         print(f"  {ts}  {line}")
 
 
+def _brokerage_tax_forecast_section():
+    """End-of-year tax reserve forecast for `brokerage` (the one taxable account) --
+    docs/deep_backlog.md's 2026-08-15 tax-forecast model. ESTIMATOR ONLY, not a
+    filing-accuracy tool: expected error ~5-10%, "close enough to plan cash
+    around," not precision-to-the-dollar -- the CPA will catch any real shortfall.
+    Reuses k1_tax.py's RateConfig/blended-rate engine and rate-config persistence;
+    this function is only the realized-loss-baseline netting + reserve piece."""
+    db.ensure_tables()  # idempotent; guarantees tax_realized_loss_baseline exists + is seeded
+    year = int(TODAY[:4])
+    tickers = [r[0] for r in sqlite3.connect(LIVE_DB).execute(
+        "SELECT DISTINCT ticker FROM watch_list WHERE account='brokerage' AND state='live'"
+    ).fetchall()]
+    if not tickers:
+        print("=== Tax forecast (brokerage) ===")
+        print("No real state='live' brokerage nodes found -- nothing to forecast.\n")
+        return
+
+    realized = db.get_realized_pnl_by_ticker('brokerage', tickers, year)
+    baseline = db.get_tax_realized_loss_baseline('brokerage', year)
+    paid = sum(amt for _, amt in k1_tax.get_payments(year))
+    forecast = k1_tax.brokerage_tax_forecast(year, realized, baseline, estimate_already_paid=paid)
+
+    print(f"=== Tax forecast (brokerage, {year}) -- ESTIMATOR ONLY, not filing-accuracy "
+          f"(~5-10% expected error; confirm with CPA/K-1) ===")
+    print(f"Live tickers scoped: {', '.join(tickers)} "
+          f"(Section 1256 60/40: {', '.join(sorted(forecast.section_1256_gain)) or 'none'}; "
+          f"ordinary short-term: {', '.join(sorted(forecast.ordinary_st_gain)) or 'none'})")
+    if not realized:
+        print("No closed brokerage trades yet this year.")
+    else:
+        for t, g in sorted(realized.items()):
+            print(f"  {t:6s} realized YTD: ${g:>12,.2f}")
+    print(f"Long-term slice (60% of Sec.1256 gain): gross=${forecast.lt_gain_gross:,.2f}  "
+          f"baseline_loss=${forecast.lt_baseline_loss:,.2f}  net_taxable=${forecast.lt_gain_net:,.2f}  "
+          f"baseline_remaining=${forecast.lt_baseline_remaining:,.2f}")
+    print(f"Short-term pool (ordinary-ST gains + 40% Sec.1256 slice): gross=${forecast.st_pool_gross:,.2f}  "
+          f"baseline_loss=${forecast.st_baseline_loss:,.2f}  net_taxable=${forecast.st_pool_net:,.2f}  "
+          f"baseline_remaining=${forecast.st_baseline_remaining:,.2f}")
+    print(f"Liability=${forecast.liability:,.2f}  estimate_already_paid=${forecast.estimate_already_paid:,.2f}  "
+          f"Reserve=${forecast.reserve:,.2f}")
+    if forecast.recommend_full_sweep:
+        print("SIGNAL: realized-loss baseline fully exhausted and profit remains -- "
+              "recommend sweeping 100% of profit to brokerage's margin buffer.")
+    elif not forecast.baseline_exhausted:
+        print(f"Baseline not yet exhausted (${forecast.st_baseline_remaining + forecast.lt_baseline_remaining:,.2f} "
+              f"remaining) -- no sweep recommendation yet.")
+    print()
+
+
 def part2():
     print(f"=== Part 2: real capital-at-stake nodes ({TODAY}) ===")
+    _brokerage_tax_forecast_section()
     nodes = real_capital_nodes()
 
     print(f"Scope: {len(nodes)} real capital-at-stake nodes")
@@ -707,6 +758,9 @@ def _deep_live_parity():
 
 def part3():
     print(f"=== Part 3: coverage trend, paper vs kernel, live vs kernel ({TODAY}) ===")
+    # Got this wrong twice (2026-08-16) -- see the print below for the rule.
+    print("--- staged-node staleness questions: use `audit_live_test_candidates.py --staged` "
+          "(see docs/grid_ticker_coverage_promotion_process.md), not ad hoc coverage_events queries ---")
     nodes_all_capital = real_capital_nodes()
 
     print("--- 1. Coverage/Grid trend (vs last logged run) ---")

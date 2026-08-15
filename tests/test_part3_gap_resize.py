@@ -2,6 +2,7 @@
 check_gap_resize), the shared fill-reconciliation helper (_reconcile_buy_fill/
 _reconcile_fill), and drain_fill_queue. Mirrors tests/test_schwab_automation.py's
 isolated-DB style: no real Schwab API calls, no real Slack posts."""
+import os
 import sys
 import tempfile
 from datetime import datetime
@@ -19,6 +20,13 @@ import schwab_client
 import schwab_stream
 
 TICKER = 'TEST_GAP_RESIZE'
+# Real ACCT_ACTIVITY messages carry the raw Schwab account number, never an
+# alias (2026-08-16 AccountNumber-defect fix) -- these tests run against the
+# real .env's SCHWAB_ACCOUNT_IRA suffix (not blanked in this test module), so
+# a raw number ending in that suffix resolves back to 'ira' through the real
+# schwab_client.resolve_account_alias_from_number() the same way a genuine
+# stream message would.
+RAW_ACCOUNT_NUMBER = '45110' + os.environ.get('SCHWAB_ACCOUNT_IRA', '256')
 
 _IN_WINDOW_TIME = datetime(2026, 7, 15, 10, 30)
 
@@ -331,7 +339,7 @@ def test_drain_fill_queue_reconciles_queued_fill(env, monkeypatch):
     _enable_auto_fill_detection()
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})
-    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'BUY', 51.0, 100, 999))
 
     signals_notify.drain_fill_queue()
 
@@ -346,7 +354,7 @@ def test_drain_fill_queue_reconciles_queued_fill(env, monkeypatch):
 def test_drain_fill_queue_ignores_sell_events(env, monkeypatch):
     _seed_pending_order(monkeypatch, order_id=999)
     _enable_auto_fill_detection()
-    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'SELL', 51.0, 100, 999))
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'SELL', 51.0, 100, 999))
 
     signals_notify.drain_fill_queue()
 
@@ -364,7 +372,7 @@ def test_drain_fill_queue_no_op_when_order_not_yet_settled(env, monkeypatch):
     _enable_auto_fill_detection()
     monkeypatch.setattr(schwab_client, 'get_filled_order', lambda account, ticker, side, order_id=None: None)
     monkeypatch.setattr(signals_notify.time, 'sleep', lambda secs: None)
-    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'BUY', 51.0, 100, 999))
 
     signals_notify.drain_fill_queue()
 
@@ -386,7 +394,7 @@ def test_drain_fill_queue_does_not_auto_reconcile_when_auto_fill_detection_disab
     _seed_pending_order(monkeypatch, order_id=999)
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})
-    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'BUY', 51.0, 100, 999))
 
     signals_notify.drain_fill_queue()
 
@@ -426,7 +434,7 @@ def test_drain_fill_queue_resolves_node_by_order_id_not_fuzzy_ticker_account_loo
     _seed_pending_order(monkeypatch, order_id=999)
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})
-    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, 999))
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'BUY', 51.0, 100, 999))
 
     signals_notify.drain_fill_queue()
 
@@ -448,7 +456,7 @@ def test_drain_fill_queue_matches_order_id_across_int_string_type_mismatch(env, 
     _seed_pending_order(monkeypatch, order_id=999)
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})
-    schwab_stream.FILL_QUEUE.put(('ira', TICKER, 'BUY', 51.0, 100, '999'))  # string, not int
+    schwab_stream.FILL_QUEUE.put((RAW_ACCOUNT_NUMBER, TICKER, 'BUY', 51.0, 100, '999'))  # string, not int
 
     signals_notify.drain_fill_queue()
 

@@ -2,8 +2,18 @@ import schwab_client
 
 
 class _FakeResponse:
-    def __init__(self, json_data=None):
+    """Mimics the subset of a real schwab-py placement response that
+    _submit_order_with_retry's internal Utils(...).extract_order_id(r) call
+    now needs (moved in-loop 2026-08-15, see schwab_client.py's retry
+    docstrings) -- is_error/status_code/headers, in addition to the
+    raise_for_status()/json() the rest of this module already used."""
+
+    def __init__(self, json_data=None, order_id=None, account_hash='hash123', is_error=False):
         self._json_data = json_data
+        self.is_error = is_error
+        self.status_code = 400 if is_error else 201
+        self.headers = ({'Location': f'https://api.schwabapi.com/trader/v1/accounts/{account_hash}/orders/{order_id}'}
+                         if order_id is not None else {})
 
     def raise_for_status(self):
         pass
@@ -33,11 +43,11 @@ def test_submit_order_with_retry_succeeds_after_transient_failures(monkeypatch):
             calls.append(1)
             if len(calls) < 3:
                 raise RuntimeError("connection reset")
-            return _FakeResponse()
+            return _FakeResponse(order_id=999)
 
     monkeypatch.setattr(schwab_client, '_get_client', lambda: FakeClient())
-    r = schwab_client._submit_order_with_retry('hash123', object())
-    assert isinstance(r, _FakeResponse)
+    order_id = schwab_client._submit_order_with_retry('hash123', object())
+    assert order_id == 999
     assert len(calls) == 3
 
 
@@ -65,10 +75,11 @@ def test_submit_order_with_retry_succeeds_first_try_no_retry_needed(monkeypatch)
     class FakeClient:
         def place_order(self, account_hash, order):
             calls.append(1)
-            return _FakeResponse()
+            return _FakeResponse(order_id=555)
 
     monkeypatch.setattr(schwab_client, '_get_client', lambda: FakeClient())
-    schwab_client._submit_order_with_retry('hash123', object())
+    order_id = schwab_client._submit_order_with_retry('hash123', object())
+    assert order_id == 555
     assert len(calls) == 1
 
 

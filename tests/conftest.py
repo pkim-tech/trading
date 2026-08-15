@@ -48,6 +48,35 @@ def _no_real_slack_posts(monkeypatch):
             monkeypatch.setattr(mod.cfg, 'INTERACTIVE', True)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_schwab_safety_state_files(monkeypatch, tmp_path):
+    """schwab_safety.py's 8 state files (order counts, kill switch, ticker/node
+    automation scope, node circuit-breaker streaks, auto-fill-detection flags)
+    are plain module-level Path constants under cache/live/, written directly
+    by schwab_client.py's real order-placement functions (e.g. every call
+    records a record_node_streak() hit/miss) -- not just by code a test author
+    would recognize as "touching schwab_safety". Found 2026-08-15: dozens of
+    tests/test_fake_broker_*_scenario.py files exercise real order-placement
+    functions via the fake_broker fixture (which fakes the broker connection
+    but not these state paths) without ever mentioning these constants by
+    name, so a plain grep for the symbol names undercounted the exposure --
+    the real suite was mutating cache/live/schwab_node_breaker_state.json
+    (a real live node's order_failures_streak) and schwab_order_counts.json
+    on every run. Patched here, once, for every test, rather than requiring
+    each test file to opt in individually (the individual-patch pattern in
+    tests/test_node_circuit_breaker.py's `env` fixture still works fine
+    alongside this -- it just re-patches to its own tmp_path, redundant but
+    harmless)."""
+    import schwab_safety
+    for name in (
+        'STATE_PATH', 'KILL_SWITCH_PATH', 'TICKER_AUTOMATION_PATH',
+        'AUTO_FILL_DETECTION_PATH', 'AUTOMATION_SCOPE_STATE_PATH',
+        'NODE_AUTOMATION_PATH', 'NODE_BREAKER_PATH',
+        'NODE_AUTO_FILL_DETECTION_PATH',
+    ):
+        monkeypatch.setattr(schwab_safety, name, tmp_path / f"{name.lower()}.json")
+
+
 def _synthetic_timestamps(days=90):
     """Same hourly-bar timestamp grid make_synthetic_csv() writes to disk --
     shared so fake_position() can place signal_time exactly N bars back from

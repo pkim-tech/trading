@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import signals_config
 import signals_db as db
-from scripts.coverage_check import _check_trade_lifecycle, _check_coverage_event, run_check
+from scripts.coverage_check import _check_trade_lifecycle, _check_coverage_event, run_check, _is_trading_day
 from scripts.coverage_registry import compute_status, compute_mode_statuses, STATUS_ORDER
 
 TICKER = 'TEST_CANARY'
@@ -133,6 +133,21 @@ def test_record_deviation_clears_system_reason_on_new_deviation(isolated_db):
     assert row['reason_by'] is None
     assert row['actual_summary'] == 'got Y again -- real new failure'
     assert len(db.get_deviations(unexplained_only=True)) == 1
+
+
+def _most_recent_trading_day():
+    """scripts.coverage_registry._scenario_expectation_recent_proof only scans
+    calendar days that _is_trading_day() accepts (weekends/holidays excluded
+    from its lookback window, matching real trade_log data -- a real trade
+    can't close on a day the market didn't open). A test hardcoding
+    datetime.now() as its trade's exit_time fails deterministically whenever
+    it happens to run on a weekend/holiday, since that day is filtered out of
+    the window before the trade can ever be found. Walk back to the real most
+    recent trading day instead, same as production would see."""
+    d = datetime.now()
+    while not _is_trading_day(d.date().isoformat()):
+        d -= timedelta(days=1)
+    return d
 
 
 def _add_closed_trade(exit_reason, entry_time, exit_time):
@@ -740,8 +755,13 @@ def test_compute_status_scenario_expectations_direct_trade_proof_is_verified(iso
     pessimistic 'wired-never-fired' in both cases. canary_time_exit (XLF/FAZ)
     had 7 real correct TIME exits on file and still read wired-never-fired.
     Fix: cross-check the real scenario_expectations row directly against
-    trade_log over a recent lookback before falling back to that default."""
-    today = datetime.now()
+    trade_log over a recent lookback before falling back to that default.
+
+    Uses the most recent real trading day (not raw datetime.now()) since
+    _scenario_expectation_recent_proof's lookback window only scans trading
+    days -- see _most_recent_trading_day's docstring for the deterministic
+    weekend/holiday failure this fixes (found 2026-08-16, a Saturday)."""
+    today = _most_recent_trading_day()
     _add_closed_trade('TIME', today, today)
     db.add_scenario_expectation(
         scenario_key='sk_reg5', expected_outcome='TIME exit', expected_frequency='daily',
