@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [testing] Fixed 2026-08-15 — `tests/test_coverage_check.py` fsync slowdown: session-scoped schema template on tmpfs. 160s -> ~11-17s under the real default config, 70-85% reduction solo, isolation deliberately regression-tested. Committed `ed67909`. Full detail: `backlog_cache.md`.
+
 ## [live-trading] Confirmed committed 2026-08-15 (backlog-cleanse batch 1) — node archive state (`watch_list.archived_at`) was already built+committed (`9c67711`); "BUILT... Not committed" wording was stale. Full detail: `deep_backlog.md`.
 
 ## [live-trading][execution] Confirmed resolved 2026-08-15 (backlog-cleanse batch 1) — execution price-drift audit already completed 2026-08-15; HIBL's flagged ~5% drift traced to paper trading, not real execution. Full detail: `research_log.md`/`deep_backlog.md`.
