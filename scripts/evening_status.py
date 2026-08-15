@@ -59,6 +59,41 @@ REAUTH_WARN_DAYS = 2
 # Part 3 sub-part 2: a TODAY..TODAY window compares almost nothing (most nodes don't trade
 # every day), so a trailing window is what actually gives this check something to compare.
 PAPER_WINDOW_DAYS = 7
+# Part 3 sub-part 4 (2026-08-15): real compounded-return divergence needs more trades to be
+# meaningful than the trade-COUNT check above -- this project's real live footprint is small
+# (1-5 real trades/month/node, confirmed via scripts/verify_real_trades_vs_kernel.py's actual
+# output), so PAPER_WINDOW_DAYS=7 would almost always show 0-1 trades, too thin to compute a
+# real compounded-return comparison. 30 days trailing is deliberately wider for this reason.
+DIVERGENCE_WINDOW_DAYS = 30
+# Provisional (2026-08-15) -- calibrated off the real spread observed the day this was built:
+# SOXL -0.28pp, RETL +1.12pp, LABD +2.76pp (real BETTER), YINN -2.49pp, SOXS -0.01pp (all real
+# minus backtest, negative = real worse). 10pp comfortably clears that whole real spread without
+# firing on any of it -- revisit once more real divergence data accumulates.
+DIVERGENCE_THRESHOLD_PP = 10.0
+DIVERGENCE_MIN_TRADES = 2
+
+
+def compute_divergence(real_rets, bt_rets):
+    """Pure compounded-return comparison, split out for testability. Not a
+    loss-streak circuit breaker (deliberately rejected 2026-08-15 -- the
+    backtest's own validated returns depend on the strategy staying in the
+    market through loss streaks, so a raw consecutive-loss counter would
+    fight the exact behavior the backtest proved out). The real signal worth
+    catching is DIVERGENCE: real compounded return meaningfully worse than
+    what a kernel replay of the SAME period says should be happening -- a
+    real loss in line with backtest is expected and should be absorbed, not
+    flagged. Reuses scripts/verify_real_trades_vs_kernel.py's own
+    real_compounded_pct/backtest_compounded_pct computation (already
+    correct, just never wired into an automated report before now).
+
+    Returns (real_comp_pct, bt_comp_pct, delta_pp) or None if either side has
+    fewer than DIVERGENCE_MIN_TRADES. delta_pp = real - bt; negative means
+    real did worse than the kernel replay predicted for the same period."""
+    if len(real_rets) < DIVERGENCE_MIN_TRADES or len(bt_rets) < DIVERGENCE_MIN_TRADES:
+        return None
+    real_comp = (float(np.prod([1 + r for r in real_rets])) - 1) * 100
+    bt_comp = (float(np.prod([1 + r for r in bt_rets])) - 1) * 100
+    return real_comp, bt_comp, real_comp - bt_comp
 
 
 _DATE_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
@@ -1096,6 +1131,32 @@ def part3():
           f"real and kernel sides (checked, not assumed)")
 
     _deep_live_parity()
+
+    print(f"\n--- 5. Real vs kernel compounded-return divergence (trailing {DIVERGENCE_WINDOW_DAYS}d) ---")
+    div_start = (datetime.now() - timedelta(days=DIVERGENCE_WINDOW_DAYS)).strftime('%Y-%m-%d')
+    div_real_all = verify.get_real_trades(div_start, TODAY, accounts=None)
+    div_wl_ids = sorted({r['wl_id'] for r in div_real_all if r['wl_id'] and r['wl_id'] > 0})
+    div_nodes, _div_skipped = verify.resolve_nodes(div_wl_ids, min_notional=5000)
+    div_flagged = 0
+    for wl_id, node in sorted(div_nodes.items()):
+        node_real = [r for r in div_real_all if r['wl_id'] == wl_id and r['pnl_pct'] is not None]
+        try:
+            bt = verify.get_backtest_trades_in_window(node, div_start, TODAY)
+        except Exception:
+            continue
+        result = compute_divergence(
+            [r['pnl_pct'] / 100.0 for r in node_real], [t['ret'] for t in bt])
+        if result is None:
+            continue
+        real_comp, bt_comp, delta_pp = result
+        if delta_pp < -DIVERGENCE_THRESHOLD_PP:
+            div_flagged += 1
+            print(f"  ⚠️  {node['ticker']:6s} {node['account'] or '':10s} wl_id={wl_id:4d}  "
+                  f"NOT MATCHING BACKTEST: real {real_comp:+.1f}% vs backtest-implied {bt_comp:+.1f}% "
+                  f"over the last {DIVERGENCE_WINDOW_DAYS}d ({-delta_pp:.1f}pp worse than backtest predicted)")
+    if not div_flagged:
+        print(f"  no node exceeds the {DIVERGENCE_THRESHOLD_PP:.0f}pp divergence threshold "
+              f"(of {len(div_nodes)} node(s) with enough trades to compare)")
 
     devs = [d for d in db.get_deviations(unexplained_only=True) if d.get('check_date') == TODAY]
     print(f"\n{len(devs)} unexplained coverage_deviation(s) today")

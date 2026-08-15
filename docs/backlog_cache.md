@@ -227,14 +227,8 @@ Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by 
 ## [live-trading][security] Downgraded 2026-08-09, not currently reachable, found by Opus review 2026-07-24 evening — manual-"Filled" SL call is ticker-gated but not mode-gated
 Add a `node.get('mode', 'live') == 'live'` guard alongside the ticker check if/when that routing changes — see `docs/deep_backlog.md`'s 2026-07-24 evening batch-fix entry. Distinct from the 2026-08-01 `handle_entry_price` SL-placement fix (different code path). **2026-08-09**: handler code (`handle_trail_buy_fill_price`) still exists, code-level reachability finding unchanged (still gated behind a routing change that hasn't happened) — but the user has confirmed moving completely away from manual button-click confirmation as an operational direction, making the one future scenario that would make this reachable even less likely to ever matter. Not closed (the code condition itself is unchanged) but deprioritized further.
 
-## [live-trading][coverage] Minor, found 2026-07-24 ~evening via Opus review — record_deviation doesn't refresh expected_outcome on rerun
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
-
-## [live-trading][tax] Idea, raised 2026-07-24 ~15:10 ET — run SOXL in both `roth` and `soxl_ira`, but `roth` needs to become limited-margin first
-`roth` is still `dry_run=True`/cash-type as of last check — precondition still unmet.
-
-## [live-trading] Open, raised 2026-07-24 ~10:55 ET — retry `check_gap_resize`'s cancel+replace test properly pre-market on a future day, not mid-day
-Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).
+## [live-trading] Open, raised 2026-07-24 ~10:55 ET, posture changed 2026-08-15 — retry `check_gap_resize`'s cancel+replace test properly pre-market on a future day, not mid-day
+Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title). **Posture changed 2026-08-15 (user's call)**: route to the fake-venue harness instead of waiting to catch a real pre-market window organically — the harness's replay capability can simulate pre-market conditions on demand.
 
 ## [live-trading] Far-backlog, raised 2026-07-25, deprioritized same day — v5 watchlist skews long-only, consider adding inverse counterparts
 Distinct from the canary `ira` account's 2026-07-29 inverse-pair additions (FAZ/SPXU/TWM/QID/SDOW/JNUG/JDST) — those are canary-only, the real v5 watchlist 65 skew is untouched. Full detail: `docs/deep_backlog.md`'s bulk-migrated 2026-08-01 entry (search by this header's title).

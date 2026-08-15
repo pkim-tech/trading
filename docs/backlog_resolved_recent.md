@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [live-trading][coverage] Removed 2026-08-15 (confirmed stale by direct code check) — `record_deviation` doesn't refresh `expected_outcome` on rerun item duplicated an already-resolved 2026-08-09 entry; `signals_db.py:2757-2766` confirms both branches already refresh `expected_outcome` on every rerun. Item removed.
+
+## [live-trading][tax] Folded into general portfolio-construction theme 2026-08-15 (user's call) — "run SOXL in both roth and soxl_ira" item removed standalone; technically feasible now that node-level selection works, but not being pursued near-term, part of the broader capital-allocation theme instead.
+
 ## [live-trading] Removed 2026-08-15 (user's call) — loss-streak circuit breaker item, an antipattern to the backtest: the backtested returns depend on the strategy staying in the market through loss streaks (mean-reversion captures the recovery/wins that follow), so a circuit breaker that halts trading after N losses would make live behavior diverge from what the backtest actually validated. Item removed.
 
 ## [portfolio][live-trading] Closed 2026-08-15 (user's call) — add-on's 100%-margin sizing "2027 problem" disproved: real policy is core positions in `brokerage` don't borrow at all, only the add-on leg does, so core sizing never touches margin and the liquidity/margin-availability constraint this item worried about doesn't apply as feared. Item removed.
