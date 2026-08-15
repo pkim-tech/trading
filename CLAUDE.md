@@ -138,6 +138,8 @@ A z-score mean reversion backtesting and optimization system targeting leveraged
 - `active_phase_grid.json` — live progress state written during sweep runs
 - `current_test.json` — temp telemetry file, deleted on sweep exit
 
+**Schema-migration smoke-test convention (2026-08-15)**: to confirm a new `ensure_tables()` migration applies cleanly against real production shape/data (not synthetic test data), copy the latest snapshot from `output/live_backups/` to a scratch/temp location first, then run `ensure_tables()`/`run_all()` against that copy — never against the live `cache/live/trading_live.db` directly, and never in-place against the backup file itself (the backup is the real disaster-recovery point and must stay pristine and untouched).
+
 ## How to Run
 ```bash
 # Install dependencies

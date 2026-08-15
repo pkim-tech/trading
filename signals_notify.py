@@ -72,6 +72,7 @@ def _attempt_automated_buy(node, sizing):
         db.log_coverage_event("automated_buy_execution", _coverage_mode(node.get('account')), ticker=ticker,
                                node_id=node.get('id'), result="shares_too_small",
                                detail=f"shares={sizing['shares']} price={sizing.get('price')}")
+        _alert_shares_too_small(node, sizing)
         return False, None
     account = node.get('account')
     try:
@@ -453,6 +454,41 @@ _RECONCILE_COOLDOWN_SECS = 900  # 15 min -- matches the reminder-nag/section-ale
 # sustained outage, exactly the alert-fatigue shape the 2026-08-08 capital-
 # at-stake redesign existed to eliminate.
 _RECONCILE_FETCH_FAIL_ALERTED: dict[str, float] = {}
+
+# Per-ticker cooldown for the shares_too_small alert below (2026-08-15) --
+# same cadence/shape as the reconcile alerts above, guards against a node
+# oscillating right at the sizing boundary across multiple signal windows in
+# one day from posting repeatedly.
+_SHARES_TOO_SMALL_ALERTED: dict[str, float] = {}
+
+
+def _alert_shares_too_small(node, sizing):
+    """Real capital-at-stake nodes should never realistically hit this --
+    signals_helpers._last_sale_recovery's compounding basis can only get
+    small enough to size 0 shares on a tiny-notional test/staged node (see
+    docs/backlog_cache.md's 2026-08-11 basis-lock finding, e.g. LABD's
+    1-share-fill-derived ~$7.66 basis); a real production-scale position's
+    compounded notional stays comfortably above one share's price even
+    through a real drawdown. If it ever DOES fire for a real node, that's
+    the actual signal something's wrong (a genuine one-way lock: the node
+    can never buy again to grow the basis back up) -- this alert exists so
+    that's visible instead of sitting silent in coverage_events forever.
+    Detection-only, no auto-recovery -- `watch_list.starting_notional_
+    override` is the existing manual reset lever once a human notices."""
+    if not has_capital_at_stake(node):
+        return
+    ticker = node['ticker']
+    account = node.get('account')
+    if not _throttled(_SHARES_TOO_SMALL_ALERTED, ticker, _RECONCILE_COOLDOWN_SECS):
+        return
+    _post_message(
+        f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — sized to 0 shares "
+        f"(price=${sizing.get('price')}), real BUY signal skipped. This node has real "
+        f"capital at stake and should never size this small -- check for a "
+        f"_last_sale_recovery basis lock (see docs/backlog_cache.md's 2026-08-11 "
+        f"basis-lock finding); watch_list.starting_notional_override resets it.",
+        node_id=node.get('id'),
+    )
 
 
 # _fresh_node (round 3) was removed 2026-07-25 -- a later Opus review pass
@@ -1152,6 +1188,7 @@ def _attempt_automated_market_buy(node, sizing):
         db.log_coverage_event("automated_buy_execution", _coverage_mode(node.get('account')), ticker=ticker,
                                node_id=node.get('id'), result="shares_too_small",
                                detail=f"shares={sizing['shares']} price={sizing.get('price')}")
+        _alert_shares_too_small(node, sizing)
         return False, None
     account = node.get('account')
     try:

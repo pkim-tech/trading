@@ -1,5 +1,11 @@
 # Backlog — Recently Resolved
 
+## [live-trading][security] Closed 2026-08-15 (user's call) — `_last_sale_recovery` basis-lock: real detection built instead of full auto-recovery. `signals_notify._alert_shares_too_small` fires (has_capital_at_stake-gated, throttled) whenever a real node's computed share count would round to 0 -- the actual lock condition. Real risk profile (only tiny-notional test nodes hit this, real positions stay comfortably sized) means detection is sufficient. 2 new tests. Item removed.
+
+## [portfolio][design] Closed 2026-08-15 (user's call) — skim's core-only equity scope item removed entirely: moot since skim itself was already descoped by the 2026-08-14 "trim" reframing (skimming was stopped as a consequence). Item removed.
+
+## [backtest] Closed 2026-08-15 (user's call) — candidate overlay results (drought/add-on) sensitivity finding removed from backlog; user already aware and accepting the risk.
+
 ## [live-trading][coverage] Closed 2026-08-15 (user's call) — `soxl_ira` staged-test node cleanup already done in practice: down to 6-7 nodes with minimal capital requirements. Item removed.
 
 ## [portfolio][tax] Closed 2026-08-15 (user's call) — real realized-loss lookup already done manually; the $240k number used throughout tonight's tax-forecast work IS the answer. Item removed.

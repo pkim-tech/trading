@@ -356,6 +356,45 @@ def test_automated_buy_skips_placement_when_shares_size_to_zero(env, monkeypatch
     assert events[0]['result'] == "shares_too_small"
 
 
+def test_shares_too_small_alerts_when_capital_at_stake(env, monkeypatch):
+    """2026-08-15: a real capital-at-stake node should never realistically hit
+    this (see docs/backlog_cache.md's 2026-08-11 _last_sale_recovery
+    basis-lock finding) -- if it ever does, that's the signal something's
+    wrong (a one-way lock), so it must alert, not just log silently."""
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET starting_notional = 50000 WHERE ticker = ?", (TICKER,))
+        c.execute("UPDATE accounts SET trading_enabled = 1 WHERE alias = 'roth'")
+        c.commit()
+    monkeypatch.setattr(signals_notify, 'buy_order_sizing',
+                         lambda *a, **kw: {'shares': 0, 'price': 100.0, 'trail_buy_pct': 1.0})
+
+    posted = []
+    monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: (posted.append((a, kw)), (None, None))[1])
+
+    signals_notify.notify_buy_signal(_node(), _sig())
+
+    matches = [p for p in posted if 'sized to 0 shares' in p[0][0]]
+    assert len(matches) == 1
+    assert TICKER in matches[0][0][0]
+
+
+def test_shares_too_small_does_not_alert_below_capital_at_stake(env, monkeypatch):
+    """Real, deliberate no-op: tiny-notional test/staged nodes (the actual
+    common case for this) must not spam Slack every signal window."""
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET starting_notional = 1 WHERE ticker = ?", (TICKER,))
+        c.commit()
+    monkeypatch.setattr(signals_notify, 'buy_order_sizing',
+                         lambda *a, **kw: {'shares': 0, 'price': 100.0, 'trail_buy_pct': 1.0})
+
+    posted = []
+    monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: (posted.append((a, kw)), (None, None))[1])
+
+    signals_notify.notify_buy_signal(_node(), _sig())
+
+    assert [p for p in posted if 'sized to 0 shares' in p[0][0]] == []
+
+
 def test_notify_sell_signal_non_time_reason_does_not_log_time_exit_event(env):
     node = _node()
     now = datetime.now()
