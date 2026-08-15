@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][coverage] Resolved 2026-08-16 (commit `435ac54`) — shadow-post Slack block content turned out already resolved by existing `blocks_json` column; 2 real test gaps in that existing coverage found and closed instead. Full detail: `deep_backlog.md`.
+
 ## [live-trading] Resolved 2026-08-16 (commits `47f6997`/`85f8187`) — auto-fill broadening + node-scoped Stop/Start Slack buttons merged to main; a real merge-conflict regression (Manually Close dropped for a real held position) caught by the full suite and fixed same day. Full detail: `deep_backlog.md`.
 
 ## [live-trading] Resolved 2026-08-14 (commit `484574e`) — `trade_log.shares` top-up staleness fixed; mobile-notification gap root-caused to a broken stream parser (0/110 real messages parsed) and fixed. Full detail: `deep_backlog.md`.
