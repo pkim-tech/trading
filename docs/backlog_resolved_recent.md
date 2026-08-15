@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][coverage] Resolved 2026-08-16 (commit `352f134`) — `build_eod_scenario_review` duplicate canary/control bullets fixed via the Coverage Report's rollup helpers, bonus bug fixed (explained deviation shown as unresolved). **Flag: shipped without knowing a concurrent planning session was holding this item for a dedupe-vs-strip-entirely decision — may need revisiting.** Full detail: `deep_backlog.md`.
+
 ## [live-trading][coverage] Resolved 2026-08-16 (commit `435ac54`) — shadow-post Slack block content turned out already resolved by existing `blocks_json` column; 2 real test gaps in that existing coverage found and closed instead. Full detail: `deep_backlog.md`.
 
 ## [live-trading] Resolved 2026-08-16 (commits `47f6997`/`85f8187`) — auto-fill broadening + node-scoped Stop/Start Slack buttons merged to main; a real merge-conflict regression (Manually Close dropped for a real held position) caught by the full suite and fixed same day. Full detail: `deep_backlog.md`.
