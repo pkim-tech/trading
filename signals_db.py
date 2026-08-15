@@ -1998,6 +1998,18 @@ def get_watchlist(watchlist_id=None):
         ).fetchall()]
 
 
+def get_live_nodes():
+    """Every state='live' watch_list row, across ALL watchlists -- deliberately
+    not get_watchlist()'s active-watchlist-only scope: real live nodes live in
+    several watchlists at once today (the v5 watchlist plus the older
+    soxl_test group), so scoping to the active one would silently miss real
+    money. Ordered by id so callers/previews are stable run to run."""
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM watch_list WHERE state = 'live' ORDER BY id"
+        ).fetchall()]
+
+
 def get_watch_list_node_by_id(node_id):
     """Real PK lookup -- unambiguous by construction, unlike get_watch_list_node's
     ticker-based best-effort matching. Returns None if node_id is None or the

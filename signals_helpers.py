@@ -89,6 +89,30 @@ def mode_tag(account, node=None):
     return "DRY-RUN" if effectively_dry_run(account, node) else "LIVE"
 
 
+def automation_blockers_other_than_node(ticker):
+    """The automation layers OTHER than this node's own flag that are
+    currently blocking it, as human-readable strings (empty list = nothing
+    else is in the way).
+
+    The real gate in schwab_safety.check_order is three independent layers --
+    kill_switch_engaged() -> node_automation_enabled(wl_id) ->
+    ticker_automation_enabled(ticker) -- and any one of them blocks. A UI that
+    reads only the node flag will happily render "🛑 Stop" for a node that is
+    already fully halted by the kill switch, and report "STARTED" for one that
+    stays blocked after resuming. Both the reference-report render
+    (signals_notify._ticker_block) and the Slack handlers use this so they
+    Deliberately takes only `ticker`: the node's own flag is the caller's
+    business (they already have it), and both other layers are keyed by ticker
+    or global. Passing wl_id in would imply it's consulted here, which it
+    isn't."""
+    blockers = []
+    if schwab_safety.kill_switch_engaged():
+        blockers.append("engine stopped")
+    if not schwab_safety.ticker_automation_enabled(ticker):
+        blockers.append(f"{ticker} ticker paused")
+    return blockers
+
+
 def has_capital_at_stake(node):
     """True only when a node is BOTH live (real order placement -- see
     effectively_dry_run) AND sized at genuinely meaningful capital. 'live'

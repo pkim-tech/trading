@@ -573,7 +573,7 @@ REGISTRY = [
     dict(id='manual_buy_confirmation_account',
          scenario="Manual BUY confirmation (Executed/Filled/Manual Open) opens a position with the real "
                   "account, not NULL",
-         code_path="signals_blocks._build_buy_blocks, signals_notify._ticker_block, "
+         code_path="signals_blocks._build_buy_blocks, "
                     "signals_handlers.handle_entry_price/handle_trail_buy_fill_price/handle_manual_open_price",
          offline_coverage="tests/test_coverage_check.py covers the node-identity plumbing, nothing exercises "
                            "the actual button->modal->handler chain end-to-end",
@@ -581,7 +581,10 @@ REGISTRY = [
          bad_results=['no_account'],
          notes="Instrumented 2026-07-28 at all 3 confirmation handlers. Real bug found+fixed 2026-07-25 "
                "(both Slack button payloads omitted account/id). Not yet observed against a real Slack "
-               "button click.",
+               "button click. 2026-08-14: signals_notify._ticker_block dropped from code_path -- the "
+               "'Manually Open' button it rendered was replaced by the node-scoped Stop/Start "
+               "automation button; handle_manual_open_price is still reachable from old reports in "
+               "Slack scrollback, so the handler (and this row) stay.",
          structural_note="Checked directly against the real code (2026-08-13): this fires only inside "
                           "handle_entry_price/handle_trail_buy_fill_price, reached exclusively by a human "
                           "tapping a real Slack Executed/Filled button. Canary/dry_run nodes never reach "
@@ -656,8 +659,12 @@ REGISTRY = [
                            "tests/test_fake_broker_check_order_guards_scenario.py: "
                            "test_node_id_disambiguates_same_ticker_account_siblings",
          check_mechanism='coverage_events', scenario_key='node_level_automation_pause',
-         notes="Instrumented 2026-07-28 (blocked branch only). No Slack button wired to it yet "
-               "(console/script-only). Fuzzy-node-lookup fail-open for 2 nodes sharing both ticker AND "
+         notes="Instrumented 2026-07-28 (blocked branch only) -- this row proves the ORDER-BLOCKING "
+               "branch (check_order raising SafetyViolation), which has still never fired live. "
+               "2026-08-14: a Slack button that TRIGGERS a pause now exists (per-row 🛑 Stop/▶️ Start, "
+               "see the node_automation_pause_button row) -- deliberately logged under its own "
+               "scenario_key, because a tap of that button is not evidence this guard blocks anything. "
+               "Fuzzy-node-lookup fail-open for 2 nodes sharing both ticker AND "
                "account was a known limitation until 2026-08-10 -- fixed via node_id threaded through "
                "schwab_client's 8 order-placement functions -> approve_and_record -> check_order; every "
                "real production call site now passes node_id, so the fuzzy ticker+account lookup is only "
@@ -760,6 +767,24 @@ REGISTRY = [
                "concern flagged the same session: ~25 hair-trigger canary nodes now share this "
                "12/min cap with real-money orders (see docs/backlog_cache.md). 'blocked' is the "
                "correct/good outcome (no bad_results)."),
+    dict(id='node_automation_pause_button',
+         scenario="A human taps the reference report's per-row 🛑 Stop / ▶️ Start button and the node's "
+                  "automation flag really flips (node-scoped, siblings on the same ticker unaffected)",
+         code_path="signals_notify._ticker_block (render), "
+                    "signals_handlers.handle_stop_node_automation/handle_start_node_automation",
+         offline_coverage="tests/test_bulk_auto_fill_and_report_controls.py: "
+                           "test_stop_handler_really_pauses_the_node/test_start_handler_really_resumes_the_node/"
+                           "test_stop_handler_scope_is_one_node_not_the_ticker/"
+                           "test_start_handler_does_not_claim_success_while_still_blocked/"
+                           "test_stop_start_handlers_log_a_coverage_event",
+         check_mechanism='coverage_events', scenario_key='node_automation_pause_button',
+         notes="Added 2026-08-14 with the button itself. Deliberately SEPARATE from "
+               "node_level_automation_pause: that row proves check_order actually blocks a real order "
+               "for a paused node, and a button tap is not evidence of that -- sharing one key would "
+               "have flipped that guard to verified-live on the first tap and inflated the readiness "
+               "headline (caught by paired Opus review before it shipped). Render is gated to "
+               "state=='live' rows, so paper/canary rows never show the button; paper_trading honors "
+               "the same flag on its two entry paths independently."),
     dict(id='oversell_guard_correct_position',
          scenario="check_order's oversell guard resolves the right position when 2 live nodes share a "
                   "ticker in different accounts",

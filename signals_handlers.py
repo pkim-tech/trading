@@ -11,7 +11,7 @@ import schwab_client
 import schwab_safety
 from signals_blocks import _post_message, _price_input_block, _shares_input_block
 from signals_helpers import (_existing_position_note, _last_sale_recovery, clear_corp_action_alert,
-                              mode_tag)
+                              automation_blockers_other_than_node, mode_tag)
 from signals_notify import (send_reference_report, send_coverage_report, _place_stop_loss_for_position,
                              _coverage_mode, _exit_order_resting, close_addon_leg_real_if_open)
 
@@ -552,7 +552,13 @@ if cfg.SOCKET_MODE:
     def handle_manual_open(ack, body, client):
         """Correction path for a misclick (e.g. hit Skipped after a real fill) --
         opens a position directly from the reference report, price-entry modal
-        doubling as the confirmation step."""
+        doubling as the confirmation step.
+
+        No longer rendered as a button on NEW reference reports as of
+        2026-08-14 (replaced by the node-scoped Stop/Start automation button
+        -- see signals_notify._ticker_block). Kept registered deliberately:
+        old reports stay clickable in Slack scrollback forever, and this is
+        still a genuine correction path worth having."""
         ack()
         data   = json.loads(body['actions'][0]['value'])
         ticker = data['node']['ticker']
@@ -619,7 +625,10 @@ if cfg.SOCKET_MODE:
     def handle_manual_close(ack, body, client):
         """Correction path for a misclick (e.g. hit Skipped after a real exit) --
         closes a position directly from the reference report, price-entry modal
-        doubling as the confirmation step."""
+        doubling as the confirmation step.
+
+        Unrendered on new reports since 2026-08-14, still registered -- same
+        reasoning as handle_manual_open above."""
         ack()
         data = json.loads(body['actions'][0]['value'])
         client.views_open(
@@ -720,6 +729,88 @@ if cfg.SOCKET_MODE:
         user = body.get('user', {}).get('username', 'someone')
         schwab_safety.resume_ticker_automation(ticker)
         _post_message(f"▶️ {ticker} automation RESUMED by {user}")
+        send_reference_report(db.get_watchlist())
+
+    def _log_node_automation_action(ticker, wl_id, result, user):
+        """Records a human tapping the per-row Stop/Start button.
+
+        Deliberately its OWN scenario_key, NOT the pre-existing
+        'node_level_automation_pause' one. That row exists to prove a
+        different thing: that check_order really raises SafetyViolation and
+        blocks a real order for a paused node (schwab_safety.py's `blocked`
+        branch). Since compute_status flips a row to 'verified-live' on the
+        first live event whose result isn't in bad_results, sharing the key
+        would have marked that guard live-proven the first time anyone tapped
+        Stop -- while the branch it exists to prove had still never fired.
+        That's exactly the "scenario_key shared across unrelated code paths"
+        trap scripts/coverage_registry.py's module docstring warns about, and
+        it would have inflated the 7am/EOD readiness headline.
+
+        Mode comes from the node's real account, not a hardcoded 'live' -- a
+        state='live' node in a non-trading_enabled account is not live."""
+        node = db.get_watch_list_node_by_id(wl_id)
+        account = (node or {}).get('account')
+        db.log_coverage_event(
+            "node_automation_pause_button",
+            _coverage_mode(account) if account else "unattributed",
+            ticker=ticker, node_id=wl_id, result=result,
+            detail=f"Slack per-row button by {user}")
+
+    def _node_automation_payload(raw, what):
+        """Shared parse for the node-scoped Stop/Start buttons. Mirrors the
+        auto-fill-detection handlers' stale-button guard exactly (same reason:
+        reference reports stay clickable in Slack scrollback indefinitely, so
+        a payload shape from before this change can arrive at any time) --
+        returns None after posting the guidance message when it can't resolve
+        a real node id, rather than guessing a target."""
+        try:
+            payload = json.loads(raw)
+            return payload['ticker'], payload['wl_id']
+        except (json.JSONDecodeError, KeyError, TypeError):
+            _post_message(f"⚠️ Stale {what} button ({raw!r}) — resend the reference report and use the new one")
+            return None
+
+    @cfg.bolt_app.action("stop_node_automation")
+    def handle_stop_node_automation(ack, body, client):
+        """Node-scoped emergency stop from a reference-report row (Block Kit
+        confirm dialog gates the tap itself). Pauses only this watch_list
+        node -- sibling nodes on the same ticker in other accounts keep
+        running; the header Stop Engine button is the everything-at-once
+        escape hatch."""
+        ack()
+        parsed = _node_automation_payload(body['actions'][0]['value'], "stop-automation")
+        if parsed is None:
+            return
+        ticker, wl_id = parsed
+        user = body.get('user', {}).get('username', 'someone')
+        schwab_safety.pause_node_automation(wl_id, reason=f"Stop button by {user}")
+        _log_node_automation_action(ticker, wl_id, "paused_by_user", user)
+        _post_message(f"🛑 {ticker} (node {wl_id}) automation STOPPED by {user} — still alerts, "
+                      f"won't place new real orders. This covers SELLs too: an automated exit "
+                      f"for this node will not be placed while stopped (resting broker orders untouched)")
+        send_reference_report(db.get_watchlist())
+
+    @cfg.bolt_app.action("start_node_automation")
+    def handle_start_node_automation(ack, body, client):
+        ack()
+        parsed = _node_automation_payload(body['actions'][0]['value'], "start-automation")
+        if parsed is None:
+            return
+        ticker, wl_id = parsed
+        user = body.get('user', {}).get('username', 'someone')
+        schwab_safety.resume_node_automation(wl_id)
+        _log_node_automation_action(ticker, wl_id, "resumed_by_user", user)
+        # Resuming the NODE flag doesn't mean the node can actually trade --
+        # the kill switch and the ticker-level pause gate it independently
+        # (schwab_safety.check_order). Reporting a bare "STARTED" while one of
+        # those still blocks it is exactly the false-confidence case this
+        # message must not create.
+        blockers = automation_blockers_other_than_node(ticker)
+        if blockers:
+            _post_message(f"▶️ {ticker} (node {wl_id}) node-level automation STARTED by {user} — "
+                          f"but STILL BLOCKED by {', '.join(blockers)}, so it will not trade yet")
+        else:
+            _post_message(f"▶️ {ticker} (node {wl_id}) automation STARTED by {user}")
         send_reference_report(db.get_watchlist())
 
     @cfg.bolt_app.action("enable_auto_fill_detection")

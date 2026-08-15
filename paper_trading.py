@@ -84,6 +84,21 @@ def start_paper_buy(node, sig):
     ticker = sig['ticker']
     if node.get('daily_sync_halted_at'):
         return
+    # Honor the node-level automation pause here too (2026-08-14). This module
+    # never consulted it before, so a node paused via pause_node_automation
+    # (Slack button, or scripts/console) kept opening and closing simulated
+    # positions while the rest of the system reported it as stopped -- a
+    # "stopped" node that visibly keeps trading is exactly the kind of
+    # believe-the-label-not-the-behavior gap that erodes trust in the control.
+    #
+    # Deliberately ENTRY-SIDE ONLY, unlike the real path (where a node pause
+    # blocks SELLs as well): an already-open paper position must still be
+    # allowed to close, or the pause silently corrupts the dataset paper
+    # trading exists to produce, leaving a trade that never exits and skewing
+    # every hold-time/P&L statistic derived from it. Stopping new simulated
+    # entries is the part that mirrors the real gate's intent.
+    if not schwab_safety.node_automation_enabled(node.get('id')):
+        return
     if _paper_reentry_cooldown_active(node, sig):
         return True
     if not db._is_trailing_buy(node):
@@ -323,6 +338,14 @@ def check_paper_drought_entry(node):
         # of the wiring diff, 2026-08-09.
         return
     if node.get('daily_sync_halted_at'):
+        return
+    # Same node-level automation pause as start_paper_buy (2026-08-14). This is
+    # a SEPARATE paper entry path, wired into the poll loop independently, so
+    # gating only start_paper_buy would still let a "stopped" node open real
+    # drought-overlay paper positions -- the exact visibly-keeps-trading gap
+    # the pause control exists to close. Entry-side only for the same reason
+    # given there (an open paper position must still be allowed to close).
+    if not schwab_safety.node_automation_enabled(node.get('id')):
         return
     decision = evaluate_drought_entry(node, paper=True)
     if decision is None:
