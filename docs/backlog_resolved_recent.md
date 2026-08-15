@@ -7,6 +7,10 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading] Resolved 2026-08-16 (commits `47f6997`/`85f8187`) — auto-fill broadening + node-scoped Stop/Start Slack buttons merged to main; a real merge-conflict regression (Manually Close dropped for a real held position) caught by the full suite and fixed same day. Full detail: `deep_backlog.md`.
+
+## [live-trading] Resolved 2026-08-14 (commit `484574e`) — `trade_log.shares` top-up staleness fixed; mobile-notification gap root-caused to a broken stream parser (0/110 real messages parsed) and fixed. Full detail: `deep_backlog.md`.
+
 ## [backtest][data] Resolved 2026-08-14/15 (overnight Research sweep) — full 82-ticker candidate-universe sponsor/advance-notice mapping done (all 10 sponsors characterized; only QQQ/Invesco and SPY/State Street have no confirmed mechanism, both negligible-risk); first-ever full `check_stock_splits.py` sweep (1,478 cached tickers) found 40/82 candidate tickers (incl. live ETHU/KORU/SOXS) with a real split inside their cached window — reported for the user to verify/rebuild, nothing deleted/rebuilt. Full detail: `deep_backlog.md`/`research_log.md`.
 
 ## [live-trading] Resolved 2026-08-14 (evening) — same-bar re-entry cooldown built and shipped for the real RETL incident; 2 paired-Opus review rounds found and fixed 5 more real bugs, including a data-corruption incident in the review tooling itself. Full detail: `deep_backlog.md`.
