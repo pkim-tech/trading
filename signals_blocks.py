@@ -378,3 +378,200 @@ def _build_sell_blocks(pos, reason, current_price, target_price, resting_confirm
         ]})
 
     return blocks
+
+
+def _trailing_order_blocks(pos, current_price, reminder_num=0):
+    ticker    = pos['ticker']
+    account   = pos.get('account') or 'unmapped'
+    _node     = db.get_watch_list_node_by_id(pos.get('wl_id'))
+    ep        = pos['entry_price']
+    pct       = (current_price - ep) / ep * 100
+    shares    = pos.get('shares')
+    trail_pct = pos.get('trail_sell_pct')
+    order_desc = (
+        f"SELL {shares:g} @ {trail_pct:g}% trail" if (shares and trail_pct)
+        else "SELL (shares/trail% unavailable — check the node config)"
+    )
+    # Mandatory for the automated path (_attempt_automated_sell uses an
+    # atomic replace specifically so the old SL is never left resting
+    # alongside a new trailing-sell -- both live simultaneously for the same
+    # shares is an oversell/rejected-order risk, per that function's own
+    # docstring). The manual alert never said this at all -- found via
+    # arming-logic walkthrough, 2026-07-31: a user following it literally
+    # ends up in exactly the state the automated path goes out of its way to
+    # prevent.
+    cancel_note = (
+        f" Cancel the existing stop-loss order ({pos['sl_order_id']}) first."
+        if pos.get('sl_order_id') else ""
+    )
+    header    = f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) — STILL PENDING (reminder #{reminder_num})" if reminder_num else f"🎯 *{ticker}* ({account} · {mode_tag(account, _node)}) — TRAILING ACTIVATED — action needed"
+    if reminder_num:
+        text = (
+            f"{header}\n"
+            f"{order_desc}  |  entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
+            f"Trailing stop order not yet confirmed placed at the broker.{cancel_note}"
+        )
+    else:
+        text = (
+            f"{header}\n"
+            f"{order_desc}  |  entry `${ep:.2f}`  |  current `${current_price:.2f}`  |  P&L `{pct:+.1f}%`\n"
+            f"Place the trailing stop order at the broker now.{cancel_note}"
+        )
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+    if cfg.INTERACTIVE:
+        value = json.dumps({"position_id": pos['id'], "ticker": ticker})
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Order Placed"},
+                 "style": "primary", "action_id": "trail_order_placed", "value": value},
+            ],
+        })
+    else:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "No interactive buttons — confirm the trailing stop order is placed in the terminal running the daemon."}
+        ]})
+    return blocks
+
+
+def _ticker_block(row):
+    """Renders one row from build_reference_table as mrkdwn prose (wraps naturally
+    on mobile) instead of a fixed-width table column (unreadable on iPhone).
+    Returns a list of blocks (section + optional manual-correction actions)."""
+    ticker, version = row['Ticker'], row.get('Version') or ''
+    account = 'bro' if (row.get('Account') or '').lower() == 'brokerage' else (row.get('Account') or '')
+    account_str = f" — `{account}`" if account else ''
+    proximity = row.get('Proximity')
+
+    if row['Next Action'] == 'NO_DATA':
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": f"⚫ *{ticker}* `{version}`  NO_DATA"}}]
+
+    phase = row.get('Phase') or ''
+    phase_str = f"{phase} " if phase else ''
+    now = row['Now']
+    trigger = row['Next Trigger $']
+
+    if row['Held']:
+        pnl = row.get('PnL %')
+        sl = row.get('SL $')
+        sl_str = f"  sl `${sl:.2f}`" if sl is not None else "  sl `cancelled (trail order live)`"
+        pct_str = lambda v: f"{v:g}%" if v is not None else '?'
+        trig_label = row.get('Trigger Label', 'trig')
+        pos = row.get('_pos')
+        shares_str = f" x `{pos['shares']:g}`" if pos and pos.get('shares') is not None else ''
+        entry_str = f"  `${pos['entry_price']:.2f}`{shares_str}" if pos else ''
+        armed = bool((pos or {}).get('trail_state', {}).get('trailing'))
+        if armed:
+            arm_ts_line = ''
+        else:
+            arm, ts = row.get('Arm%'), row.get('TrailSell%')
+            arm_ts_line = f"\narm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
+        # No real broker fill/order exists behind this row -- must never read as
+        # an actionable real position (same reasoning as the 🧪CANARY tag below,
+        # Opus review 2026-07-26 flagged this row was otherwise indistinguishable
+        # from a genuine held position).
+        sim_tag = ' 🧪DRY-RUN-SIM' if pos and pos.get('is_dry_run_sim') else ''
+        text = (
+            f"{phase_str}*{ticker}* `{version}`{sim_tag} — {row['Hold']}{account_str}{entry_str}\n"
+            f"now `${now:.2f}` {pnl:+.1f}%  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"→ _{row['Next Action']}_{sl_str}{arm_ts_line}"
+        )
+    else:
+        overnight = row.get('Overnight %')
+        tb, arm, ts = row.get('TrailBuy%'), row.get('Arm%'), row.get('TrailSell%')
+        pct_str = lambda v: f"{v:g}%" if v is not None else '?'
+        last_sale = row.get('Last Sale $')
+        last_sale_str = f"  next buy ~`${last_sale/1000:.0f}k`" if last_sale is not None else ''
+        z_trig = row.get('Z Trigger')
+        z_trig_str = f"z1 `{z_trig:g}`  " if z_trig is not None else ''
+        trig_label = row.get('Trigger Label', 'trig')
+        # Not-live rows are visible in the report (2026-07-22 fix) but must
+        # never read as an actionable live trigger -- research is the normal
+        # state right now (whole watchlist), canary is a synthetic test node
+        # not meant to be traded at all (see the "Manually Open" suppression
+        # below, automation_principles.md #0/#7).
+        # Substring, not exact-equality (2026-08-09 paired review, same gap
+        # found in the new BUY/SELL alert tags) -- misses canary-family
+        # variants like 'v5-canary-drought-addon' otherwise.
+        mode_tag = ' 🧪CANARY' if 'canary' in ((row.get('_node') or {}).get('version') or '') \
+            else (' (research)' if row.get('State') == 'paper' else '')
+        text = (
+            f"{phase_str}*{ticker}* `{version}`{mode_tag}{account_str}{last_sale_str}\n"
+            f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
+            f"→ _{row['Next Action']}_\n"
+            f"{z_trig_str}tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"
+        )
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+    if cfg.INTERACTIVE:
+        # 2026-07-22: collapsed from up to 3 separate `actions` blocks per row
+        # into 1 (Slack allows up to 5 elements per actions block, we use at
+        # most 3) -- with the mode filter fix above making every watchlist row
+        # render instead of none, 16 rows x up to 4 blocks each blew past
+        # Slack's hard 50-block-per-message limit and the report failed
+        # outright (invalid_blocks). This cuts the per-row block count enough
+        # to fit the full watchlist in one message again.
+        elements = []
+        node = row.get('_node')
+        if row['Held']:
+            pos = row.get('_pos')
+            if pos and not pos.get('is_dry_run_sim'):
+                value = json.dumps({"position_id": pos['id'], "ticker": ticker, "entry_price": pos['entry_price']})
+                elements.append({"type": "button", "text": {"type": "plain_text", "text": f"Manually Close {ticker}"},
+                                  "action_id": "manual_close", "value": value})
+        # Canary nodes are synthetic test fixtures with deliberately absurd
+        # parameters (hair-trigger z-thresholds, unreachable SL) -- never
+        # offer a real "Manually Open" button for one (automation_principles.md
+        # #0/#7: a new surface, here "research rows are now visible", must not
+        # silently inherit an action that was previously unreachable because
+        # nothing research-mode ever rendered here before 2026-07-22).
+        elif node and node.get('version') != 'canary':
+            node_fields = {k: node.get(k) for k in ('id', 'ticker', 'strategy', 'version', 'window',
+                                                      'take_profit', 'stop_loss', 'max_hold_hours',
+                                                      'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct',
+                                                      'starting_notional', 'account')}
+            value = json.dumps({"node": node_fields})
+            elements.append({"type": "button", "text": {"type": "plain_text", "text": f"Manually Open {ticker}"},
+                              "action_id": "manual_open", "value": value})
+
+        # Per-ticker automation pause/resume -- only shown for tickers actually in
+        # the automation pilot scope (see schwab_safety.AUTOMATION_ENABLED_TICKERS),
+        # so the other manual-only tickers don't show a button that does nothing.
+        if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            automation_on = schwab_safety.ticker_automation_enabled(ticker)
+            elements.append(
+                {"type": "button", "text": {"type": "plain_text", "text": f"⏸️ Pause {ticker} Automation"},
+                 "style": "danger", "action_id": "pause_ticker_automation", "value": ticker}
+                if automation_on else
+                {"type": "button", "text": {"type": "plain_text", "text": f"▶️ Resume {ticker} Automation"},
+                 "style": "primary", "action_id": "resume_ticker_automation", "value": ticker}
+            )
+
+            # Auto-fill-detection toggle -- separate from the placement toggle above and
+            # defaults off (see schwab_safety.AUTO_FILL_DETECTION_PATH comment): placement
+            # automation is proven via this session's dry-run testing, fill detection isn't
+            # exercised against a real fill yet.
+            # node-scoped (not ticker-only) -- see schwab_safety.node_auto_fill_detection_enabled's
+            # docstring: this was the ticker-only-keying gap the 2026-07-25/26 wl_id refactor
+            # missed. Every row here is built from a real watch_list node (build_reference_table),
+            # so wl_id is always resolvable; still guarded rather than assumed, since a NULL-wl_id
+            # open position (a watch_list row deleted out from under it, e.g. EDC id=15) would
+            # never render a row/button here at all and should fail closed, not toggle every node
+            # sharing the ticker.
+            wl_id = node.get('id') if node else None
+            if wl_id is not None:
+                fill_detection_on = (schwab_safety.auto_fill_detection_enabled(ticker)
+                                      and schwab_safety.node_auto_fill_detection_enabled(wl_id))
+                fd_value = json.dumps({"ticker": ticker, "wl_id": wl_id})
+                elements.append(
+                    {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Disable {ticker} Auto-Fill Detection"},
+                     "style": "danger", "action_id": "disable_auto_fill_detection", "value": fd_value}
+                    if fill_detection_on else
+                    {"type": "button", "text": {"type": "plain_text", "text": f"🤖 Enable {ticker} Auto-Fill Detection"},
+                     "action_id": "enable_auto_fill_detection", "value": fd_value}
+                )
+
+        if elements:
+            blocks.append({"type": "actions", "elements": elements})
+
+    return blocks

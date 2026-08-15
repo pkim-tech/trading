@@ -25,6 +25,17 @@ import schwab_auth
 import schwab_safety
 import signals_db
 from signals_blocks import _post_message
+# mode_tag (2026-08-14): tags the alerts below LIVE/DRY-RUN/UNKNOWN, so a
+# real-money order event is distinguishable at a glance from a simulated one.
+# Deliberately applied only where the message text itself doesn't already
+# settle the question -- every post-approval confirmation here is reachable
+# ONLY after the `if dry_run:` early-return, and says "submitted to
+# Schwab"/"FILLED"/"by Schwab" (live-only vocabulary), while the simulated
+# path always says "[DRY RUN] would ...". The SafetyViolation and cancel
+# paths have neither property, which is why they get the tag.
+# Import is safe: signals_helpers reaches only schwab_safety/signals_config/
+# signals_db, none of which import this module back.
+from signals_helpers import mode_tag
 
 _client = None
 _account_hashes = None  # nickname -> Schwab's encrypted account hash, resolved lazily
@@ -271,7 +282,7 @@ def _place_equity_order(
             is_protective=is_protective, is_addon_leg=is_addon_leg, node_dry_run=node_dry_run,
             node_id=node_id)
     except schwab_safety.SafetyViolation as e:
-        _post_message(f"\U0001F6AB BLOCKED {side} {quantity} {ticker} in {account}: {e}")
+        _post_message(f"\U0001F6AB BLOCKED {side} {quantity} {ticker} in {account} ({mode_tag(account)}): {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
@@ -326,7 +337,8 @@ def replace_equity_order_with_market(
             is_protective=is_protective, replacing_order_id=order_id, is_addon_leg=is_addon_leg,
             node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
-        _post_message(f"\U0001F6AB BLOCKED replace {order_id} with MARKET {side} {quantity} {ticker} in {account}: {e}")
+        _post_message(f"\U0001F6AB BLOCKED replace {order_id} with MARKET {side} {quantity} {ticker} "
+                      f"in {account} ({mode_tag(account)}): {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
@@ -400,7 +412,7 @@ def _place_trailing_order(
         dry_run = schwab_safety.approve_and_record(account, ticker, quantity, price, side,
                                                      node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
-        _post_message(f"\U0001F6AB BLOCKED {label} {quantity} {ticker} in {account} "
+        _post_message(f"\U0001F6AB BLOCKED {label} {quantity} {ticker} in {account} ({mode_tag(account)}) "
                       f"(trail={trail_pct}%): {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
@@ -443,7 +455,7 @@ def replace_order_with_trailing_sell(account: str, ticker: str, order_id: int, q
                                                      node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with TRAILING SELL {quantity} {ticker} "
-                      f"in {account} (trail={trail_pct}%): {e}")
+                      f"in {account} ({mode_tag(account)}) (trail={trail_pct}%): {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
@@ -595,12 +607,15 @@ def cancel_order(account: str, ticker: str, order_id: int):
     r.raise_for_status()
     status = _confirm_order_status(account_hash, order_id)
     if status == "CANCELED":
-        _post_message(f"\U0001F5D1️ confirmed cancelled resting order {order_id} ({ticker} in {account})")
+        _post_message(f"\U0001F5D1️ confirmed cancelled resting order {order_id} "
+                       f"({ticker} in {account} · {mode_tag(account)})")
     elif status is None:
-        _post_message(f"\U0001F5D1️ cancel request accepted for order {order_id} ({ticker} in {account}) "
+        _post_message(f"\U0001F5D1️ cancel request accepted for order {order_id} "
+                       f"({ticker} in {account} · {mode_tag(account)}) "
                        f"— status unconfirmed (poll failed)")
     else:
-        _post_message(f"⚠️ cancel request accepted for order {order_id} ({ticker} in {account}) but real "
+        _post_message(f"⚠️ cancel request accepted for order {order_id} "
+                       f"({ticker} in {account} · {mode_tag(account)}) but real "
                        f"status is '{status}', not CANCELED — may still be resting or already resolved")
     return r, status
 
@@ -649,7 +664,8 @@ def place_stop_loss(account: str, ticker: str, quantity: int, stop_price: float,
             account, ticker, quantity, stop_price, "SELL", is_protective=True, is_addon_leg=is_addon_leg,
             node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
-        _post_message(f"\U0001F6AB BLOCKED STOP LOSS {quantity} {ticker} in {account} @ ${stop_price:.4f}: {e}")
+        _post_message(f"\U0001F6AB BLOCKED STOP LOSS {quantity} {ticker} in {account} ({mode_tag(account)}) "
+                      f"@ ${stop_price:.4f}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
@@ -707,7 +723,7 @@ def replace_order_with_stop_loss(account: str, ticker: str, order_id: int, quant
             node_dry_run=node_dry_run, node_id=node_id)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with STOP LOSS {quantity} {ticker} "
-                      f"in {account} @ ${stop_price:.4f}: {e}")
+                      f"in {account} ({mode_tag(account)}) @ ${stop_price:.4f}: {e}")
         schwab_safety.record_node_streak(ticker, account, "order_failures", hit=True, node_id=node_id)
         raise
 
