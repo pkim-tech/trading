@@ -2975,6 +2975,39 @@ def get_slack_messages(mode=None, since=None, limit=200):
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
+def trim_old_slack_blocks(days=7):
+    """Null out blocks_json on slack_message_log rows older than a rolling
+    `days` window, keeping the row itself (text/error/ts/mode) intact forever
+    so the message history stays queryable long-term.
+
+    Known, accepted tradeoff: scripts/recent_slack_messages.py's --tickers
+    filter matches against text + blocks_json, not text alone (a signal-window
+    digest's `text` is just "Signal window -- 10:25 ET", with the tickers only
+    in the blocks) -- so ticker recall on rows past this window genuinely
+    drops to text-only. The rows themselves stay, and that search is a recent-
+    activity tool; bounding the column is worth more than deep ticker recall.
+
+    blocks_json is 10-50x the size of `text`, and output/live_backups/ keeps
+    720 uncompressed hourly snapshots of the live DB -- unbounded growth in
+    this one column compounds into ~720x the backup cost within a month.
+
+    Compares against SQLite's own datetime('now') (UTC), matching the column
+    default that writes ts in the first place -- not a local-time cutoff.
+    Idempotent: rows already nulled aren't rewritten, so a duplicate same-day
+    run is a no-op returning 0. Returns rows actually nulled."""
+    with _conn() as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(slack_message_log)").fetchall()}
+        if 'blocks_json' not in cols:
+            return 0
+        cur = c.execute(
+            "UPDATE slack_message_log SET blocks_json = NULL "
+            "WHERE blocks_json IS NOT NULL AND ts < datetime('now', ?)",
+            (f'-{int(days)} days',),
+        )
+        c.commit()
+        return cur.rowcount
+
+
 # ---------------------------------------------------------------------------
 # Open positions CRUD
 # ---------------------------------------------------------------------------
