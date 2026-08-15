@@ -7,6 +7,10 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][coverage] Confirmed already-closed 2026-08-15 (peer session "planner") — SOXS `ira` phantom-trade item was the same SOXS incident already fully closed (commit `484574e`'s session: root cause corrected, fill-reconciliation + state-consistency safety net + provenance tracking merged). Redundant backlog_cache.md entry removed.
+
+## [live-trading][coverage] Folded 2026-08-15 (user's call) — closed-trade reconciliation item no longer tracked standalone; scope now lives inside the coverage_events write-attribution/data-lineage item. Pointer added there; standalone entry removed.
+
 ## [live-trading][security] Resolved 2026-08-15 (relayed via peer session "planner") — `schwab_token.json`'s 08:10-08:32 mutation was a genuine authenticated Schwab API call, not a test-isolation defect; both original suspects cleared with hard evidence. New finding: background subagent tool calls leave zero trace in the Claude Code transcript store — 2 follow-up ideas logged. Full detail: `deep_backlog.md`.
 
 ## [testing] Confirmed stale, 2026-08-15 (relayed via peer session "planner") — "2 flaky datetime.now() tests" backlog item was already resolved 2026-08-11; both named tests use a fixed synthetic 2025 date grid, never had a real clock dependency. Real cause was an unscoped pytest-xdist file race (`--dist=loadscope` fix) + a separate cross-file `schwab_safety` state-pollution gap (fixed 2026-08-16 via `conftest.py`'s autouse fixture) — see `deep_backlog.md:534`. 2 full-suite runs: 1105/1105 green both times. Entry removed.
