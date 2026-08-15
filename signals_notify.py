@@ -4339,37 +4339,17 @@ def send_coverage_report(check_date=None):
 
     reasons = {_key(d): d['reason'] for d in db.get_deviations(check_date=check_date)}
 
-    lines = [f"*Coverage Report — {check_date}*"]
-    # ticket_eligible defaults True (absent for 'met'/'skipped' rows, and for
-    # every 'deviated' row except the 'informational'-frequency ones -- see
-    # scripts/coverage_check.py::run_check, 2026-07-30) -- an informational
-    # miss never records a coverage_deviations row, so it must never render
-    # as UNEXPLAINED here either, or the report would contradict its own
-    # no-ticket-minted behavior.
-    unexplained = [r for r in results if r['status'] == 'deviated'
-                   and r.get('ticket_eligible', True) and not reasons.get(_key(r))]
-    if unexplained:
-        lines.append(f":red_circle: {len(unexplained)} UNEXPLAINED deviation(s):")
-        for r in unexplained:
-            lines.append(f"  • {r['scenario_key']} ({r['ticker'] or 'n/a'}): {r['summary']}")
-    else:
-        lines.append(":white_check_mark: No unexplained deviations.")
-
-    lines.append("")
-    for r in results:
-        if r['status'] == 'met':
-            status = "✓"
-        elif r['status'] == 'skipped':
-            status = "?  not checked"
-        elif not r.get('ticket_eligible', True):
-            status = "✗ (informational, no ticket)"
-        elif reasons.get(_key(r)):
-            status = "✗ (explained)"
-        else:
-            status = "✗ UNEXPLAINED"
-        lines.append(f"{status}  {r['scenario_key']}  ({r['ticker'] or ''})")
-
-    return _post_message("\n".join(lines))
+    # Composition (and only composition) lives in scripts/coverage_report_summary.py
+    # as of 2026-08-14 -- what counts as a deviation is still entirely
+    # coverage_check.run_check's call, unchanged. The per-scenario block this
+    # replaced rendered ~47 lines of canary/reconciliation_mismatch status every
+    # night; it's one rollup line per group now, with the unexplained-deviation
+    # alert kept intact (ticket_eligible defaults True -- an 'informational'
+    # miss records no coverage_deviations row, so it must never render as
+    # UNEXPLAINED, see coverage_check.run_check 2026-07-30) and the full
+    # breakdown still one `scripts/coverage_check.py` run away.
+    from scripts.coverage_report_summary import compose
+    return _post_message("\n".join(compose(check_date, results, reasons)))
 
 
 def _next_trading_day(after_date):
