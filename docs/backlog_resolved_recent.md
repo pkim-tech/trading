@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [portfolio][live-trading] Closed 2026-08-15 (user's call) — add-on's 100%-margin sizing "2027 problem" disproved: real policy is core positions in `brokerage` don't borrow at all, only the add-on leg does, so core sizing never touches margin and the liquidity/margin-availability constraint this item worried about doesn't apply as feared. Item removed.
+
 ## [live-trading][security] Closed 2026-08-15 (user's call) — `_last_sale_recovery` basis-lock: real detection built instead of full auto-recovery. `signals_notify._alert_shares_too_small` fires (has_capital_at_stake-gated, throttled) whenever a real node's computed share count would round to 0 -- the actual lock condition. Real risk profile (only tiny-notional test nodes hit this, real positions stay comfortably sized) means detection is sufficient. 2 new tests. Item removed.
 
 ## [portfolio][design] Closed 2026-08-15 (user's call) — skim's core-only equity scope item removed entirely: moot since skim itself was already descoped by the 2026-08-14 "trim" reframing (skimming was stopped as a consequence). Item removed.
