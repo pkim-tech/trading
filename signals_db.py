@@ -740,6 +740,37 @@ def ensure_tables():
             # single-row lookups stay correct unmodified.
             c.execute("ALTER TABLE open_positions ADD COLUMN position_source TEXT NOT NULL DEFAULT 'core' "
                       "CHECK (position_source IN ('core', 'drought_overlay'))")
+        if 'origin' not in op_cols:
+            # Which BOOK this row belongs to -- 'live' (open_positions) or
+            # 'paper' (paper_positions). Redundant with the table name by
+            # construction, and that is exactly the point: build_reference_table
+            # merges both tables into ONE dict keyed by wl_id
+            # (`{p['wl_id']: p for p in get_open_positions(paper=True)}` then
+            # `.update(...)` with the real rows), which destroys the only
+            # signal of which table a row came from. Downstream, _ticker_block's
+            # `if row['Held']:` branch tags is_dry_run_sim but has no way to
+            # tell a paper row from a real one, so a paper position renders
+            # byte-identically to a real held position (found live: AGQ). And a
+            # stale paper row for a wl_id with NO real counterpart survives the
+            # merge entirely, rendering as a phantom real position (found live:
+            # SOXL/ira). Stamping the book on the row makes it survive any
+            # merge, so both consumers read one source of truth instead of
+            # each re-deriving it (and getting it wrong).
+            c.execute("ALTER TABLE open_positions ADD COLUMN origin TEXT NOT NULL DEFAULT 'live' "
+                      "CHECK (origin IN ('live', 'paper'))")
+        if 'provenance' not in op_cols:
+            # WHO created/reconciled this row -- a separate axis from origin,
+            # deliberately not collapsed into it. 'daemon' is the normal
+            # automated path (_reconcile_buy_fill et al); 'manual' means a
+            # human/agent reconciled this position by hand, which the
+            # 2026-07-xx design decision (docs/deep_backlog.md ~4478) says must
+            # "always alert distinctly, never silently reconcile" -- a rule
+            # that was written for automated broker-polling self-heal and never
+            # built for the case of a human directly writing sl_order_id/
+            # broker_stop_price, which is what happened during the 2026-08-14
+            # SOXS incident.
+            c.execute("ALTER TABLE open_positions ADD COLUMN provenance TEXT NOT NULL DEFAULT 'daemon' "
+                      "CHECK (provenance IN ('daemon', 'manual'))")
         if 'drought_confirm_days' not in op_cols:
             # Config snapshot at entry time, same reasoning as fixed_sl/trail_sell_pct
             # etc. above (staged_test_config's baseline-drift protection pattern) --
@@ -946,6 +977,16 @@ def ensure_tables():
             # 'addon_leg' value (see that comment) -- addon uses paper_addon_legs.
             c.execute("ALTER TABLE paper_positions ADD COLUMN position_source TEXT NOT NULL DEFAULT 'core' "
                       "CHECK (position_source IN ('core', 'drought_overlay'))")
+        if 'origin' not in pp_cols:
+            # See open_positions.origin above. Defaults to 'paper' here (not
+            # 'live') -- every row in this table is by definition a simulated
+            # position, so the default is the correct value for all 5 existing
+            # rows and no backfill is needed.
+            c.execute("ALTER TABLE paper_positions ADD COLUMN origin TEXT NOT NULL DEFAULT 'paper' "
+                      "CHECK (origin IN ('live', 'paper'))")
+        if 'provenance' not in pp_cols:
+            c.execute("ALTER TABLE paper_positions ADD COLUMN provenance TEXT NOT NULL DEFAULT 'daemon' "
+                      "CHECK (provenance IN ('daemon', 'manual'))")
         if 'drought_confirm_days' not in pp_cols:
             c.execute("ALTER TABLE paper_positions ADD COLUMN drought_confirm_days INTEGER")
         if 'drought_vol_gate' not in pp_cols:
@@ -1617,7 +1658,8 @@ def ensure_tables():
                 ts       TEXT NOT NULL DEFAULT (datetime('now')),
                 mode     TEXT NOT NULL,
                 text     TEXT NOT NULL,
-                error    TEXT
+                error    TEXT,
+                blocks_json TEXT
             )
         """)
         c.commit()
@@ -1629,6 +1671,13 @@ def ensure_tables():
         sml_cols = {r[1] for r in c.execute("PRAGMA table_info(slack_message_log)").fetchall()}
         if 'error' not in sml_cols:
             c.execute("ALTER TABLE slack_message_log ADD COLUMN error TEXT")
+        # blocks_json added 2026-08-14 -- `text` is only the fallback/notification
+        # string; for any Block Kit message (the multi-ticker signal-window digest,
+        # the morning report, every button-bearing alert) it carries almost none of
+        # what a human actually saw, so a posted message stayed unreconstructible
+        # after the fact. NULL = the call passed no blocks (plain-text message).
+        if 'blocks_json' not in sml_cols:
+            c.execute("ALTER TABLE slack_message_log ADD COLUMN blocks_json TEXT")
         c.commit()
 
         # wl_id backfill -- pending_buys/paper_pending_buys already embed node['id']
@@ -2876,15 +2925,34 @@ def get_trades_opened_on_date(check_date, paper=False):
         ).fetchall()]
 
 
-def log_slack_message(mode, text, error=None):
+def log_slack_message(mode, text, error=None, blocks=None):
     """Fire-and-forget, same pattern as log_coverage_event -- never raises past
     a logging failure into the real Slack-posting control flow. `error` is the
     caught exception/HTTP-status string from the real send attempt (None means
     no error was caught) -- call this after attempting the send, not before,
-    so a row actually reflects the outcome rather than just the intent."""
+    so a row actually reflects the outcome rather than just the intent.
+
+    `blocks` is _post_message's real Block Kit payload (None for a plain-text
+    message, stored NULL). Serialized before the DB try/except and with
+    default=str so a surprise non-JSON-serializable value degrades to a
+    still-readable blocks_json rather than taking the whole row (text/error
+    included) down with it."""
+    if blocks is None:
+        blocks_json = None
+    else:
+        try:
+            blocks_json = json.dumps(blocks, default=str)
+        except Exception as e:
+            # json.dumps, not an f-string literal -- a quote/backslash in str(e)
+            # would otherwise emit invalid JSON and break any consumer doing
+            # json.loads() on the row (Opus review, 2026-08-14).
+            blocks_json = json.dumps([f"<unserializable blocks: {e}>"])
     try:
         with _conn() as c:
-            c.execute("INSERT INTO slack_message_log (mode, text, error) VALUES (?, ?, ?)", (mode, text, error))
+            c.execute(
+                "INSERT INTO slack_message_log (mode, text, error, blocks_json) VALUES (?, ?, ?, ?)",
+                (mode, text, error, blocks_json),
+            )
             c.commit()
     except Exception:
         pass
@@ -3712,18 +3780,44 @@ def open_position_from_pending(pending, signal_price, signal_time, entry_price, 
                           paper=paper, is_dry_run_sim=is_dry_run_sim)
 
 
-def top_up_position(wl_id, additional_shares, fill_price, paper=False):
+def top_up_position(wl_id, additional_shares, fill_price, paper=False, position_source='core'):
     """Adds top-up shares to an already-open position, blending entry_price by
     share-weighted average -- used by signals_notify._reconcile_fill (Part 3,
     branch C) when a real fill under-spent target_notional relative to the
     conservative worst-case sizing pads (branch A/B). Returns False if no open
     position exists for this node (nothing to top up). Keyed on wl_id, not
     ticker -- ticker-only would blend the wrong node's shares/entry_price if
-    2+ nodes hold the same ticker concurrently."""
+    2+ nodes hold the same ticker concurrently.
+
+    position_source (2026-08-15) scopes the SELECT/UPDATE to one named leg
+    explicitly, rather than relying on the current single-row-per-wl_id
+    invariant holding forever.
+
+    NOTE, corrected after review: that invariant DOES hold today, and an
+    earlier version of this docstring claimed the opposite. A wl_id cannot
+    currently hold both a 'core' and a 'drought_overlay' open_positions row
+    at once -- open_position() (the sole INSERT INTO open_positions;
+    open_drought_overlay_position delegates to it) dedups on
+    `wl_id=? OR (wl_id IS NULL AND ticker=? AND window=?)`, with no
+    position_source in the predicate, so the second entry attempt is rejected
+    as a duplicate. See this file's position_source schema comment (~line 736)
+    and open_drought_overlay_position's own docstring, both of which state the
+    no-simultaneous-row invariant directly. So this filter is defence in depth,
+    not a fix for live corruption.
+
+    It does change one real behavior worth knowing: with an overlay row open,
+    a position_source='core' call now returns False where it previously would
+    have topped up the overlay row. That's the safer direction -- the sole
+    caller (signals_notify._reconcile_fill) threads the value through
+    correctly, and the False branch is loud (a real broker order has already
+    been placed by then, so it alerts via db_update_failed_after_real_order
+    rather than failing silently) -- but a future caller that omits the kwarg
+    gets a no-op-then-alert instead of a wrong-leg update."""
     positions_table, _ = _pos_tables(paper)
     with _conn() as c:
         row = c.execute(
-            f"SELECT shares, entry_price FROM {positions_table} WHERE wl_id=?", (wl_id,)
+            f"SELECT shares, entry_price FROM {positions_table} WHERE wl_id=? AND position_source=?",
+            (wl_id, position_source),
         ).fetchone()
         if not row or not row['shares']:
             return False
@@ -3731,8 +3825,8 @@ def top_up_position(wl_id, additional_shares, fill_price, paper=False):
         new_shares = old_shares + additional_shares
         blended_entry = (old_shares * old_entry + additional_shares * fill_price) / new_shares
         c.execute(
-            f"UPDATE {positions_table} SET shares=?, entry_price=? WHERE wl_id=?",
-            (new_shares, blended_entry, wl_id),
+            f"UPDATE {positions_table} SET shares=?, entry_price=? WHERE wl_id=? AND position_source=?",
+            (new_shares, blended_entry, wl_id, position_source),
         )
         c.commit()
     return True
@@ -3757,6 +3851,23 @@ def set_sl_order_id(ticker, sl_order_id):
     would otherwise both get the same sl_order_id written."""
     with _conn() as c:
         c.execute("UPDATE open_positions SET sl_order_id = ? WHERE ticker = ?", (sl_order_id, ticker))
+        c.commit()
+
+
+def set_position_provenance(position_id, provenance, paper=False):
+    """Marks who reconciled this position -- 'daemon' (the default, set at
+    insert) or 'manual' (a human/agent reconciled it by hand, via
+    scripts/reconcile_fill_manually.py). Read by
+    signals_notify._verify_resting_before_replace so the daemon announces
+    distinctly when it replaces a protective order a person placed, instead of
+    silently overwriting it -- the gap the 2026-08-14 SOXS incident exposed,
+    and the case the 2026-07-xx "always alert distinctly, never silently
+    reconcile" decision was never actually built for."""
+    if provenance not in ('daemon', 'manual'):
+        raise ValueError(f"invalid provenance: {provenance!r}")
+    positions_table, _ = _pos_tables(paper)
+    with _conn() as c:
+        c.execute(f"UPDATE {positions_table} SET provenance = ? WHERE id = ?", (provenance, position_id))
         c.commit()
 
 
@@ -3830,7 +3941,7 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
     positions_table, _ = _pos_tables(paper)
     with _position_lock, _conn() as c:
         row = c.execute(
-            f"SELECT trade_log_id, entry_price, ticker, wl_id, is_dry_run_sim, trail_state FROM {positions_table} WHERE id = ?",
+            f"SELECT trade_log_id, entry_price, ticker, wl_id, is_dry_run_sim, trail_state, shares FROM {positions_table} WHERE id = ?",
             (position_id,)
         ).fetchone()
         # position_lock instrumentation (2026-08-01), mirrors open_position()'s
@@ -3868,7 +3979,7 @@ def close_position(position_id, exit_signal_price=None, exit_price=None, exit_ti
                 exit_bar_time = None
         if exit_price is not None and row[0]:
             log_trade_exit(row[0], exit_signal_price, exit_price, exit_time, exit_reason, row[1], paper=paper,
-                            exit_bar_time=exit_bar_time, exit_decision_bar=exit_decision_bar)
+                            exit_bar_time=exit_bar_time, exit_decision_bar=exit_decision_bar, shares=row[6])
         c.execute(f"DELETE FROM {positions_table} WHERE id = ?", (position_id,))
         c.commit()
         # 2026-08-01 2nd Opus review finding: logged BEFORE log_trade_exit/DELETE
@@ -3913,13 +4024,22 @@ def log_trade_entry(node, signal_price, signal_time, entry_price, entry_time, sh
 
 
 def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reason, entry_price, paper=False,
-                    exit_bar_time=None, exit_decision_bar=None):
+                    exit_bar_time=None, exit_decision_bar=None, shares=None):
+    """shares (2026-08-15): the position's CURRENT share count at close time, not the
+    original entry-time count -- a same-day top_up (_reconcile_fill) corrects
+    open_positions.shares after entry, but trade_log.shares was only ever written once
+    at log_trade_entry() and never re-synced, so a topped-up position's permanent record
+    silently undercounted by exactly the top-up amount (found live: RETL trade_log
+    id=97 recorded 41 vs. the real 49 shares actually bought/sold, trading_incidents
+    id=8). None (the default) preserves old behavior for any caller that doesn't have
+    a current count handy."""
     _, trade_log_table = _pos_tables(paper)
     exit_time_str = exit_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(exit_time, 'strftime') else exit_time
     exit_bar_time_str = (exit_bar_time.strftime('%Y-%m-%d %H:%M:%S')
                           if hasattr(exit_bar_time, 'strftime') else exit_bar_time)
     exit_drift    = (exit_price - exit_signal_price) / exit_signal_price * 100
     pnl           = (exit_price - entry_price) / entry_price * 100
+    shares_clause = ", shares = ?" if shares is not None else ""
     with _conn() as c:
         if paper:
             # exit_decision_bar only exists on paper_trade_log (see
@@ -3928,22 +4048,30 @@ def log_trade_exit(trade_id, exit_signal_price, exit_price, exit_time, exit_reas
             # get_last_exit_bar_time), so this column/branch is paper-only.
             exit_decision_bar_str = (exit_decision_bar.strftime('%Y-%m-%d %H:%M:%S')
                                       if hasattr(exit_decision_bar, 'strftime') else exit_decision_bar)
+            params = [float(exit_signal_price), float(exit_price), exit_time_str,
+                      exit_drift, pnl, exit_reason, exit_bar_time_str, exit_decision_bar_str]
+            if shares is not None:
+                params.append(float(shares))
+            params.append(trade_id)
             c.execute(f"""
                 UPDATE {trade_log_table} SET
                     exit_signal_price = ?, exit_price = ?, exit_time = ?,
                     exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?, exit_bar_time = ?,
-                    exit_decision_bar = ?
+                    exit_decision_bar = ?{shares_clause}
                 WHERE id = ?
-            """, (float(exit_signal_price), float(exit_price), exit_time_str,
-                  exit_drift, pnl, exit_reason, exit_bar_time_str, exit_decision_bar_str, trade_id))
+            """, params)
         else:
+            params = [float(exit_signal_price), float(exit_price), exit_time_str,
+                      exit_drift, pnl, exit_reason, exit_bar_time_str]
+            if shares is not None:
+                params.append(float(shares))
+            params.append(trade_id)
             c.execute(f"""
                 UPDATE {trade_log_table} SET
                     exit_signal_price = ?, exit_price = ?, exit_time = ?,
-                    exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?, exit_bar_time = ?
+                    exit_drift_pct = ?, pnl_pct = ?, exit_reason = ?, exit_bar_time = ?{shares_clause}
                 WHERE id = ?
-            """, (float(exit_signal_price), float(exit_price), exit_time_str,
-                  exit_drift, pnl, exit_reason, exit_bar_time_str, trade_id))
+            """, params)
         c.commit()
 
 

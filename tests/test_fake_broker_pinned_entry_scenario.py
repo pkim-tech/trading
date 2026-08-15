@@ -75,7 +75,7 @@ def test_pinned_entry_real_signal_places_real_trailing_buy(env, fake_broker, mon
     fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
 
     watchlist = signals_db.get_watchlist()
-    summaries, failed = active_signals._scan_pinned_entry(9, 30, watchlist, set(), open_position_keys=set())
+    summaries, failed = active_signals._scan_pinned_entry(9, 30, watchlist, set(), open_position_keys={'live': set(), 'paper': set()})
 
     assert failed == set(), f"price fetch should not fail: {failed}"
 
@@ -107,7 +107,7 @@ def test_pinned_entry_no_signal_when_price_not_oversold(env, fake_broker, monkey
     fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
 
     watchlist = signals_db.get_watchlist()
-    active_signals._scan_pinned_entry(9, 30, watchlist, set(), open_position_keys=set())
+    active_signals._scan_pinned_entry(9, 30, watchlist, set(), open_position_keys={'live': set(), 'paper': set()})
 
     pendings = [p for p in signals_db.get_pending_buys() if p['ticker'] == TICKER]
     assert pendings == [], "an in-line (non-oversold) price should not produce a BUY signal"

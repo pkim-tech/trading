@@ -75,7 +75,7 @@ def test_entry_on_same_bar_as_last_exit_is_suppressed(env, monkeypatch):
                              'ticker': TICKER, 'window': n['window'], 'signal': 'BUY',
                              'z_score': -2.0, 'last_bar': exit_bar,
                          })
-    active_signals._scan_buy_signals([node], set(), {})
+    active_signals._scan_buy_signals([node], set(), {'live': set(), 'paper': set()})
 
     assert not any(p[0] == 'BUY' for p in env), "BUY should have been suppressed by the same-bar cooldown"
     events = db.get_coverage_events(scenario_key='same_bar_reentry_cooldown')
@@ -93,7 +93,7 @@ def test_entry_on_a_strictly_newer_bar_proceeds(env, monkeypatch):
                              'ticker': TICKER, 'window': n['window'], 'signal': 'BUY',
                              'z_score': -2.0, 'last_bar': later_bar,
                          })
-    active_signals._scan_buy_signals([node], set(), {})
+    active_signals._scan_buy_signals([node], set(), {'live': set(), 'paper': set()})
 
     assert any(p[0] == 'BUY' and p[1] == TICKER for p in env), "BUY on a genuinely newer bar must not be blocked"
     events = db.get_coverage_events(scenario_key='same_bar_reentry_cooldown')
@@ -110,7 +110,7 @@ def test_no_prior_exit_never_blocks_entry(env, monkeypatch):
                              'ticker': TICKER, 'window': n['window'], 'signal': 'BUY',
                              'z_score': -2.0, 'last_bar': bar,
                          })
-    active_signals._scan_buy_signals([node], set(), {})
+    active_signals._scan_buy_signals([node], set(), {'live': set(), 'paper': set()})
     assert any(p[0] == 'BUY' and p[1] == TICKER for p in env)
 
 
@@ -164,7 +164,7 @@ def test_unparseable_exit_bar_time_fails_open_without_crashing_the_scan(env, mon
                              'z_score': -2.0, 'last_bar': bar,
                          })
     # Must not raise -- this is the whole point of the test.
-    active_signals._scan_buy_signals([node], set(), {})
+    active_signals._scan_buy_signals([node], set(), {'live': set(), 'paper': set()})
     assert any(p[0] == 'BUY' and p[1] == TICKER for p in env), \
         "unparseable exit_bar_time must fail OPEN (allow the entry), not block it or crash"
     events = db.get_coverage_events(scenario_key='same_bar_reentry_cooldown')

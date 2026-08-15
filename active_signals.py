@@ -122,6 +122,7 @@ from signals_notify import (
     check_entry_abandon, build_eod_scenario_review,
     check_drought_entry, check_drought_handoff, check_addon_leg_reconciliation,
     check_intraday_risk_review, check_addon_buying_power_drift,
+    check_orphaned_broker_positions,
 )
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
@@ -188,6 +189,31 @@ def _previous_trading_day(today):
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.strftime('%Y-%m-%d')
+
+
+def _position_keys_by_book(real_positions, paper_positions):
+    """Duplicate-suppression keys split by BOOK: {'live': {...}, 'paper': {...}}.
+
+    These used to be unioned into one set, which let a simulated position
+    silently block a REAL entry. _pos_key returns pos['wl_id'], so a paper row
+    and a real row on the same node are indistinguishable once merged -- and a
+    node that flips paper->live while its paper position is still open then
+    reads as already_held forever after. That happened for real: SOXL/ira
+    wl_id=92 ($10k, state='live' since 2026-08-10) carried an open paper
+    position until 2026-08-13, so every real BUY on it was dropped silently for
+    ~3 trading days. No signal happened to fire, which is luck, not design.
+
+    Each book keeps its own (ticker, window) fallback for NULL-wl_id rows, so
+    the 2026-07-26 duplicate-suppression fix is preserved intact WITHIN each
+    book -- that fix protects real order placement against a real legacy row,
+    and a paper row was never a legitimate reason to suppress a real BUY
+    (paper_trading.py never touches open_positions, schwab_client or
+    schwab_safety, and does its own dedup via get_open_position_by_wl_id(...,
+    paper=True))."""
+    return {
+        'live': {_pos_key(p) for p in real_positions},
+        'paper': {_pos_key(p) for p in paper_positions},
+    }
 
 
 def _reminders_active(now):
@@ -366,7 +392,15 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
         # fallback must still be checked or a NULL-wl_id legacy position on
         # this exact ticker+window silently stops suppressing a duplicate BUY
         # (found by a second Opus review round, 2026-07-26).
-        already_held = node['id'] in open_position_keys or (sig['ticker'], node['window']) in open_position_keys
+        # Select the book matching this node's own state (2026-08-15). A
+        # paper node is deduped against paper positions, a live/dry_run node
+        # against real ones -- never across. dry_run correctly takes the
+        # 'live' book: its positions are synthesized into open_positions with
+        # is_dry_run_sim=1, not into paper_positions. node['state'] is already
+        # load-bearing elsewhere in this same function, so this adds no new
+        # dependency.
+        _keys = open_position_keys['paper' if node.get('state') == 'paper' else 'live']
+        already_held = node['id'] in _keys or (sig['ticker'], node['window']) in _keys
 
         # buy_alerted's once-per-day lockout structurally blocked a real,
         # quantified slice (~8% for SOXL) of a winning node's backtested
@@ -1123,8 +1157,21 @@ def run_loop(tickers: set = None):
             # every such row would let a real live node's duplicate-position
             # suppression silently stop working -- found by a second Opus review
             # round, 2026-07-26 -- so the fallback must still be checkable below.
-            open_position_keys = ({_pos_key(p) for p in open_positions}
-                                   | {_pos_key(p) for p in paper_positions})
+            # Split by BOOK, not unioned (2026-08-15). Unioning real and paper
+            # keys let a PAPER position suppress a REAL node's entry: _pos_key
+            # returns pos['wl_id'], so a paper row and a live row on the SAME
+            # node produce an identical key. This is not hypothetical -- it was
+            # armed on a real $10k live node: SOXL/ira wl_id=92 flipped
+            # paper->live on 2026-08-10 while its paper position (paper_trade_log
+            # id=36) stayed open until 2026-08-13, so for ~3 trading days every
+            # real BUY on that node hit already_held and was silently dropped
+            # (_scan_buy_signals' skip branch prints only, no Slack, no coverage
+            # event). It cost nothing purely because no signal fired in the
+            # window. Each book keeps its OWN (ticker, window) fallback intact,
+            # so the 2026-07-26 NULL-wl_id duplicate-suppression fix is fully
+            # preserved within each book -- what's removed is only paper rows'
+            # ability to masquerade as a real node's key.
+            open_position_keys = _position_keys_by_book(open_positions, paper_positions)
 
             # Pinned single-shot checks (Part 4) -- fire once per hourly bar boundary,
             # ahead of/instead of relying purely on ambient POLL_SECS-cadence detection.
@@ -1193,10 +1240,8 @@ def run_loop(tickers: set = None):
                         # open_position_keys is refreshed (Opus review, 2026-07-26).
                         retry_nodes = watchlist
                         for attempt in range(3):
-                            fresh_open_position_keys = (
-                                {_pos_key(p) for p in get_open_positions()}
-                                | {_pos_key(p) for p in get_open_positions(paper=True)}
-                            )
+                            fresh_open_position_keys = _position_keys_by_book(
+                                get_open_positions(), get_open_positions(paper=True))
                             res = _guarded(
                                 "pinned_entry", _scan_pinned_entry, ph, pm, retry_nodes,
                                 buy_alerted, fresh_open_position_keys
@@ -1317,6 +1362,16 @@ def run_loop(tickers: set = None):
             # (docs/deep_backlog.md's 2026-08-09/10 entry).
             _guarded("addon_buying_power_drift", check_addon_buying_power_drift)
 
+            # Same "called every cycle, gates itself internally" pattern as the
+            # two checks above. Stage D of the 2026-08-14 SOXS incident fix:
+            # the ground-truth broker sweep already existed and already ran at
+            # 07:00 (see the readiness block above), but 07:00 is pre-market --
+            # a fill going unreconciled at 09:30 wasn't swept for until the
+            # NEXT morning. This adds an intraday cadence (30 min, 9:45-16:00)
+            # over the SAME run_full_sweep, so the gap is half an hour instead
+            # of ~22 hours. Detect-only, never auto-corrects.
+            _guarded("orphaned_broker_positions", check_orphaned_broker_positions)
+
             # Not gated to market hours -- a GTC trailing order can fill any time it's
             # resting at the broker, and auto-fill-detection is opt-in per ticker anyway
             # (schwab_safety.auto_fill_detection_enabled, off by default).
@@ -1422,8 +1477,8 @@ def run_loop(tickers: set = None):
                     _guarded(f"drought_handoff_real[{node['ticker']}]", check_drought_handoff, node)
                     handoff_ran = True
             if handoff_ran:
-                open_position_keys = ({_pos_key(p) for p in get_open_positions()}
-                                       | {_pos_key(p) for p in get_open_positions(paper=True)})
+                open_position_keys = _position_keys_by_book(
+                    get_open_positions(), get_open_positions(paper=True))
 
             if in_open_check_window:
                 open_check_nodes = [n for n in watchlist if n.get('entry_timing') == 'open_check']

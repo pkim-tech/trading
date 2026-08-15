@@ -230,7 +230,9 @@ def test_handoff_alert_slot_preserved_while_still_pending(env, fake_broker, monk
     monkeypatch.setattr(active_signals, 'get_pending_buys', lambda: [])
 
     buy_alerted = set()  # this poll's first BUY check for this node -- slot not yet burned
-    open_position_keys = {node['id']}  # the open drought position makes core "already_held"
+    # by-book shape (2026-08-15): a live node is deduped against the 'live'
+    # book only, so a paper position can never suppress its real entry.
+    open_position_keys = {'live': {node['id']}, 'paper': set()}  # the open drought position makes core "already_held"
 
     active_signals._scan_buy_signals([node], buy_alerted, open_position_keys)
 
@@ -267,7 +269,9 @@ def test_alert_slot_burned_when_already_held_with_no_handoff_or_pending(env, fak
     assert signals_db.get_drought_pending_buy(node['id']) is None
 
     buy_alerted = set()
-    open_position_keys = {node['id']}
+    # by-book shape (2026-08-15): a live node is deduped against the 'live'
+    # book only, so a paper position can never suppress its real entry.
+    open_position_keys = {'live': {node['id']}, 'paper': set()}
 
     active_signals._scan_buy_signals([node], buy_alerted, open_position_keys)
 
@@ -309,7 +313,9 @@ def test_handoff_alert_slot_preserved_pending_entry_arm(env, fake_broker, monkey
     monkeypatch.setattr(active_signals, 'get_pending_buys', lambda: [])
 
     buy_alerted = set()
-    open_position_keys = {node['id']}
+    # by-book shape (2026-08-15): a live node is deduped against the 'live'
+    # book only, so a paper position can never suppress its real entry.
+    open_position_keys = {'live': {node['id']}, 'paper': set()}
 
     active_signals._scan_buy_signals([node], buy_alerted, open_position_keys)
 

@@ -45,49 +45,119 @@ _last_alert_at = 0.0
 
 
 def _parse_activity_message(msg: dict):
-    """Best-effort extraction of (account, ticker, side, fill_price,
-    filled_shares, order_id) from an ACCT_ACTIVITY stream message. Returns
-    None if the message isn't a recognizable order-fill event -- unrecognized
-    shapes are silently skipped, not raised, since the slow poll path is the
-    safety net. order_id (may be None if the message shape lacks it) lets the
-    caller re-confirm via schwab_client.get_filled_order's exact-order lookup
-    instead of its fuzzy ticker+side fallback -- see that function's docstring
-    for why the fuzzy fallback is a real hazard (2026-07-27 GDXU incident)."""
+    """Extraction of (account, ticker, side, fill_price, filled_shares,
+    order_id) for every recognizable order-fill event in an ACCT_ACTIVITY
+    stream message. Returns a list (possibly empty) -- a single raw message
+    can batch multiple content entries (confirmed live, 2026-08-15: batches
+    of 2+ seen routinely), so this must not stop at the first one the way the
+    original single-event version did.
+
+    2026-08-15 fix: the original implementation checked
+    `content.get("2") in ("OrderFill", "ExecutionActivity")` and parsed
+    `content["3"]` as a numeric-key-envelope JSON blob -- a guess at
+    schwab-py's documented shape that was NEVER validated against a real
+    message (see the module docstring's original caveat) and never actually
+    matched one: confirmed via logs/active_signals.log that this condition
+    had 0 successful parses across 110 real messages, including 24 genuine
+    OrderFillCompleted events. Real messages instead use a
+    `MESSAGE_TYPE`/`MESSAGE_DATA` envelope, with the fill itself under
+    `MESSAGE_DATA.BaseEvent.OrderFillCompletedEventOrderLegQuantityInfo`.
+    Price/quantity fields are fixed-point, `lo` value / 1,000,000 (confirmed
+    against multiple real fills: e.g. lo="9181300" -> $9.1813, matching the
+    real RETL fill price on file; lo="49000000" -> 49.0 shares, matching the
+    real filled quantity on file for that same order).
+
+    order_id lets the caller re-confirm via schwab_client.get_filled_order's
+    exact-order lookup instead of its fuzzy ticker+side fallback -- see that
+    function's docstring for why the fuzzy fallback is a real hazard
+    (2026-07-27 GDXU incident). The value returned here (whether cumulative
+    or per-execution) doesn't need to be authoritative -- drain_fill_queue
+    only ever uses this as a wake-up signal and re-confirms the real fill via
+    a fresh get_filled_order poll, never trusts this value directly."""
+    events = []
+    health = []  # [(result, ticker), ...] -- logged by the caller, AFTER queueing
+    # (2026-08-15 review finding, MEDIUM): a synchronous DB write here, ahead of
+    # FILL_QUEUE.put, contends with the poll loop/_position_lock on the fast
+    # path's own callback thread -- sqlite's busy-timeout could stall a real fill
+    # event by seconds. Health results are collected and returned instead, so
+    # _handle_activity_message can queue every event FIRST (latency-critical)
+    # and log health SECOND (not).
+    for content in msg.get("content", []):
+        # 'received' logged for every content entry regardless of type (2026-08-15
+        # review finding, HIGH): the original version of this metric only counted
+        # entries already recognized as MESSAGE_TYPE=='OrderFillCompleted', which
+        # means a shape-drift bug (tonight's actual original bug) would produce
+        # ZERO events either way and the metric would report "no messages seen,
+        # not an error" -- the reassuring reading, in exactly the scenario that
+        # motivated building it. Logging 'received' unconditionally lets
+        # evening_status.py tell apart: 0 messages at all (stream dead) vs. N
+        # messages, 0 ever recognized as a fill (real shape drift -- alarm) vs.
+        # N messages, M genuinely parsed (healthy).
+        health.append(('received', None))
+        if content.get("MESSAGE_TYPE") != "OrderFillCompleted":
+            continue
+        try:
+            data = json.loads(content.get("MESSAGE_DATA", "{}"))
+            fill_info = data.get("BaseEvent", {}).get("OrderFillCompletedEventOrderLegQuantityInfo", {})
+            exec_info = fill_info.get("ExecutionInfo", {})
+            order_info = fill_info.get("OrderInfoForTransactionPosting", {})
+            account = data.get("AccountNumber")
+            order_id = data.get("SchwabOrderID")
+            ticker = order_info.get("Symbol")
+            side = (order_info.get("BuySellCode") or "").upper()
+            price_field = exec_info.get("ExecutionPrice", {})
+            qty_field = exec_info.get("ExecutionQuantity", {})
+            price_raw, price_scale = price_field.get("lo"), price_field.get("signScale")
+            qty_raw, qty_scale = qty_field.get("lo"), qty_field.get("signScale")
+            if not (account and order_id and ticker and side and price_raw and qty_raw
+                    and price_scale is not None and qty_scale is not None):
+                health.append(('missing_field', None))
+                continue
+            # .NET decimal serialization: signScale = scale*2 + sign_bit -- divisor
+            # is 10**scale regardless of sign (2026-08-15 review finding: real
+            # traffic shows BOTH signScale=12 [scale 6, positive] and signScale=13
+            # [scale 6, negative, e.g. debit amounts] -- the prior hardcoded /1e6
+            # was only correct by coincidence of every observed fill using scale 6,
+            # not a validated invariant).
+            fill_price = float(price_raw) / (10 ** (int(price_scale) >> 1))
+            filled_shares = float(qty_raw) / (10 ** (int(qty_scale) >> 1))
+            events.append((account, ticker, side, fill_price, filled_shares, order_id))
+            health.append(('parsed', ticker))
+        except Exception:
+            health.append(('exception', None))
+            continue
+    return events, health
+
+
+def _log_parse_health(health):
+    """Fire-and-forget coverage_event logging for the stream parse-success
+    metric -- imported lazily to avoid schwab_stream (a low-level,
+    early-imported module) taking a hard dependency on signals_db at module
+    load time. Called AFTER FILL_QUEUE.put, not before -- see
+    _parse_activity_message's docstring for why."""
+    if not health:
+        return
     try:
-        content = msg.get("content", [{}])[0]
-        if content.get("2") not in ("OrderFill", "ExecutionActivity"):
-            return None
-        data = json.loads(content.get("3", "{}"))
-        account = data.get("accountNumber")
-        legs = data.get("orderLegCollection") or data.get("executionLegs") or []
-        if not legs:
-            return None
-        leg = legs[0]
-        ticker = leg.get("instrument", {}).get("symbol") or leg.get("symbol")
-        side = leg.get("instruction")
-        fill_price = data.get("averageFillPrice") or leg.get("price")
-        filled_shares = data.get("filledQuantity") or leg.get("quantity")
-        order_id = data.get("orderId") or data.get("order_id")
-        if not (ticker and side and fill_price and filled_shares):
-            return None
-        return account, ticker, side, float(fill_price), float(filled_shares), order_id
+        import signals_db
+        for result, ticker in health:
+            signals_db.log_coverage_event("stream_message_parsed", "live", ticker=ticker, result=result)
     except Exception:
-        return None
+        pass
 
 
 def _handle_activity_message(msg: dict):
-    # Raw-message logging (2026-08-02): _parse_activity_message's field shape
-    # is still unverified against a real Schwab payload -- this makes the next
-    # real fill on an auto-fill-detection-enabled ticker self-diagnosing via
-    # logs/active_signals.log instead of silent guesswork. Remove once the
-    # shape has been confirmed correct against a real fill.
+    # Raw-message logging (2026-08-02, kept post-fix): still cheap, local-only
+    # insurance against the next real shape drift going unnoticed the same
+    # way this one did for 13 days.
     print(f"[schwab_stream] raw ACCT_ACTIVITY message: {msg}")
-    event = _parse_activity_message(msg)
-    if event is not None:
-        print(f"[schwab_stream] parsed fill event: {event}")
-        FILL_QUEUE.put(event)
+    events, health = _parse_activity_message(msg)
+    if events:
+        for event in events:
+            print(f"[schwab_stream] parsed fill event: {event}")
+            FILL_QUEUE.put(event)
     else:
         print("[schwab_stream] message did not parse as a recognizable order-fill event")
+    _log_parse_health(health)
 
 
 async def _run_stream_once():

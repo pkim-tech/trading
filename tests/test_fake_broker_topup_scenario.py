@@ -116,3 +116,22 @@ def test_topup_places_real_order_and_updates_position_when_unblocked(env, fake_b
         "distinct from both real historical attempts which were legitimately "
         "blocked (signal-window gate, daily-order-cap)"
     )
+
+    # --- close the position and confirm trade_log.shares reflects the TOPPED-UP
+    # total, not the original pre-top-up fill (2026-08-15 fix: log_trade_exit now
+    # takes the position's current shares at close time, since close_position()
+    # previously never re-synced trade_log.shares after a same-day top_up -- found
+    # live on RETL, trade_log id=97 recorded 41 vs. the real 49 shares actually
+    # traded, trading_incidents id=8). This is the gap that let 6 real top-ups
+    # ship unnoticed: this test previously only checked pos['shares'] above, never
+    # carried the position through to close.
+    closed = signals_db.close_position(pos['id'], exit_signal_price=fill_price, exit_price=fill_price,
+                                        exit_time=datetime(2026, 7, 29, 11, 0), exit_reason='TIME')
+    assert closed
+    with signals_db._conn() as c:
+        row = c.execute("SELECT shares FROM trade_log WHERE id = ?", (pos['trade_log_id'],)).fetchone()
+    assert row is not None
+    assert row[0] == expected_total_shares, (
+        f"trade_log.shares should reflect the topped-up total ({expected_total_shares}), "
+        f"got {row[0]} -- the exact staleness bug this test now guards against"
+    )

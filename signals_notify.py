@@ -113,6 +113,14 @@ def _attempt_automated_sell(pos, current_price):
     if not shares or not trail_sell_pct:
         return False, None
     sl_order_id = pos.get('sl_order_id')
+    if sl_order_id:
+        # Bug #4 pre-replace check. Wrapped so a broker fetch failure (or any
+        # other fault in a purely advisory check) can NEVER prevent a real
+        # exit order from being placed.
+        try:
+            _verify_resting_before_replace(pos, node, account, ticker, sl_order_id, "stop-loss")
+        except Exception as e:
+            print(f"  [replace_check] {ticker}: pre-replace verification failed, proceeding: {e}")
     try:
         if sl_order_id:
             # Atomic replace (cancel-old + create-new as a single broker call)
@@ -308,6 +316,14 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
         "trailing-sell" if (hold_time_forced and resting_order_id == state.get('exit_order_id'))
         else "stop-loss"
     )
+    if resting_order_id:
+        # Bug #4 pre-replace check -- see _attempt_automated_sell's matching
+        # call. Same non-blocking contract: advisory only, never gates the exit.
+        try:
+            _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
+                                            resting_order_label)
+        except Exception as e:
+            print(f"  [replace_check] {ticker}: pre-replace verification failed, proceeding: {e}")
     try:
         if resting_order_id:
             # Atomic replace instead of cancel_order + place_equity_sell -- same
@@ -431,6 +447,155 @@ def _coverage_mode(account, node=None):
     return "dry_run" if _effectively_dry_run(account, node) else "live"
 
 
+def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id, label):
+    """Pre-replace sanity check for bug #4 (2026-08-15).
+
+    _attempt_automated_sell and _attempt_automated_exit_sell both take whatever
+    sits in pos['sl_order_id'] (or trail_state.exit_order_id) and atomically
+    replace it the moment their own exit condition fires -- with no check that
+    the order actually resting at the broker is the one the algo thinks it is.
+    That is precisely the case automation_principles.md #5 exists for, and it
+    was never applied to this mechanism. It bit for real on 2026-08-14: a human
+    placed a manual (mispriced) stop, and the daemon's own SL logic later
+    replaced it with no way for anyone to know that had happened.
+
+    DETECTION-ONLY, AND DELIBERATELY NON-BLOCKING. This never refuses the
+    replace. A mismatch means our record of the resting order is wrong -- but
+    the position still needs to exit, and refusing would strand it with a
+    stale/unknown order resting and no way out, which is strictly worse than
+    the bug being fixed. So it alerts loudly and lets the replace proceed,
+    matching the "always alert distinctly, never silently reconcile" rule from
+    the 2026-07-xx design decision (docs/deep_backlog.md ~4478) rather than
+    inventing a new blocking gate on the exit path.
+
+    Wrapped by its caller so nothing here -- a broker fetch failure included --
+    can break a real exit."""
+    expected_shares = pos.get('shares')
+
+    # Provenance FIRST, before any broker call (2026-08-15 rebuttal round).
+    # It is a property of `pos`, not of the order, and both reviewers caught
+    # that leaving it below the match-lookup made it unreachable in the exact
+    # case it was built for: a human who hand-places a replacement stop mints a
+    # NEW broker id our DB never captured, so `match is None` returned early and
+    # the daemon replaced the human's order in silence. _open_orders can also
+    # raise (the caller swallows that), which would suppress this alert too.
+    if pos.get('provenance') == 'manual':
+        db.log_coverage_event("replace_target_mismatch", _coverage_mode(account), ticker=ticker,
+                               position_id=pos.get('id'), node_id=node.get('id'),
+                               result="manual_order_replaced",
+                               detail=f"{label} id={resting_order_id} on a provenance='manual' position")
+        _post_message(
+            f"ℹ️ *{ticker}* ({account} · {mode_tag(account, node)}) — replacing a MANUALLY-placed {label} "
+            f"order ({resting_order_id}) with the algo's own exit\n(this position was reconciled by hand; "
+            f"the replace is expected, but the manual order is now gone)"
+        )
+
+    orders = schwab_safety._open_orders(account)
+    # Scope to THIS ticker's resting SELLs before matching -- _open_orders is
+    # account-wide, both sides, all symbols, and soxl_ira alone holds 8+ nodes.
+    # Without this, the id-miss fallback below could adopt a different ticker's
+    # stop entirely.
+    resting_sells = [
+        o for o in orders
+        if any(leg.get('instruction') == 'SELL'
+                and leg.get('instrument', {}).get('symbol') == ticker
+                for leg in o.get('orderLegCollection', []))
+    ]
+    match = next((o for o in resting_sells if str(o.get('orderId')) == str(resting_order_id)), None)
+    if match is None:
+        # Reuse Stage C's matcher rather than giving up: a broker-side replace
+        # mints a new id, and there are three confirmed ways our stored id goes
+        # stale while a real stop keeps resting (extract_order_id legitimately
+        # returning None on success; the hold-time-forced TRAIL path never
+        # syncing sl_order_id; a human replacing the stop). Deliberately does
+        # NOT suppress the id-miss alert below -- "your recorded id is dead" is
+        # itself worth saying -- but when a substitute IS found we check it
+        # rather than returning blind.
+        _substitute = _match_resting_order(resting_sells, None)
+        if _substitute is not None:
+            db.log_coverage_event("replace_target_mismatch", _coverage_mode(account), ticker=ticker,
+                                   position_id=pos.get('id'), node_id=node.get('id'),
+                                   result="resting_order_id_stale",
+                                   detail=f"{label} id={resting_order_id} not resting; a substitute "
+                                          f"stop {_substitute.get('orderId')} is")
+            _post_message(
+                f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — the recorded {label} order "
+                f"{resting_order_id} is NOT resting, but another stop ({_substitute.get('orderId')}) is\n"
+                f"(our order id is stale — verifying against the substitute; the replace proceeds)"
+            )
+            match = _substitute
+
+    if match is None:
+        db.log_coverage_event("replace_target_mismatch", _coverage_mode(account), ticker=ticker,
+                               position_id=pos.get('id'), node_id=node.get('id'),
+                               result="resting_order_not_found",
+                               detail=f"{label} id={resting_order_id} not among {len(orders)} open orders")
+        _post_message(
+            f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — replacing {label} order "
+            f"{resting_order_id}, but that order is NOT resting at the broker right now "
+            f"(it may have already filled or been cancelled)\n(proceeding with the replace anyway so "
+            f"the exit isn't stranded — verify the position's real state after)"
+        )
+        return
+
+    # Stop-shape and stop-PRICE checks (2026-08-15 rebuttal round). The first
+    # version verified id-existence and quantity only, so the literal
+    # 2026-08-14 defect -- a human's MISPRICED stop -- passed every branch in
+    # silence unless provenance happened to be 'manual', which it isn't when
+    # someone places a stop directly at Schwab (the column defaults to
+    # 'daemon'). And this is NOT redundant with Stage C: Stage C's price
+    # comparison is gated on `not state.get('trailing')`, so it stops looking
+    # the moment a position arms -- which is exactly when _attempt_automated_sell
+    # fires this replace. For an armed position this is the ONLY place a
+    # mispriced stop can be caught.
+    #
+    # Both scoped to the stop-loss label. A trailing-sell's stopPrice is an
+    # offset-derived moving level, so comparing it against a fixed SL would
+    # false-alarm on every hold-time-forced TRAIL replace.
+    if label == 'stop-loss':
+        _type = (match.get('orderType') or '').upper()
+        if _type and _type not in ('STOP', 'STOP_LIMIT', 'TRAILING_STOP'):
+            db.log_coverage_event("replace_target_mismatch", _coverage_mode(account), ticker=ticker,
+                                   position_id=pos.get('id'), node_id=node.get('id'),
+                                   result="not_a_stop_order",
+                                   detail=f"id={resting_order_id} is orderType={_type}, not a stop")
+            _post_message(
+                f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — the order recorded as this "
+                f"position's stop-loss ({resting_order_id}) is a {_type}, not a stop\n"
+                f"(this is what an accidental manual limit-sell looks like — the replace proceeds, but "
+                f"verify what that order actually was)"
+            )
+        _expected_stop = _expected_sl_price(pos)
+        _real_stop = match.get('stopPrice')
+        if (_expected_stop is not None and _real_stop is not None
+                and abs(float(_real_stop) - _expected_stop) > _RECONCILE_SL_PRICE_TOLERANCE):
+            db.log_coverage_event("replace_target_mismatch", _coverage_mode(account), ticker=ticker,
+                                   position_id=pos.get('id'), node_id=node.get('id'),
+                                   result="stop_price_mismatch",
+                                   detail=f"id={resting_order_id} rests at {float(_real_stop):.4f}, "
+                                          f"algo expects {_expected_stop:.4f}")
+            _post_message(
+                f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — the stop-loss being replaced rests "
+                f"at ${float(_real_stop):.4f} but the algo's own stop for this position is "
+                f"${_expected_stop:.4f}\n(it was not protecting where the algo believed — the replace "
+                f"proceeds and corrects it; verify whether it was placed or edited by hand)"
+            )
+
+    real_qty = _resting_order_quantity(match)
+    if real_qty is not None and expected_shares is not None and float(real_qty) != float(expected_shares):
+        db.log_coverage_event("replace_target_mismatch", _coverage_mode(account), ticker=ticker,
+                               position_id=pos.get('id'), node_id=node.get('id'),
+                               result="quantity_mismatch",
+                               detail=f"{label} id={resting_order_id} covers {real_qty:g}, position holds {expected_shares:g}")
+        _post_message(
+            f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — the {label} order being replaced covers "
+            f"{float(real_qty):g} shares but the position holds {expected_shares:g}\n"
+            f"(proceeding with the replace, which will be sized to {expected_shares:g} — verify no "
+            f"unexpected fill or manual trade explains the gap)"
+        )
+
+
+
 def _alert_reconcile_mismatch(pos, kind, text):
     """Posts a reconciliation mismatch alert, rate-limited per (position,
     mismatch-kind) so an already-alerted, still-unresolved mismatch doesn't
@@ -497,8 +662,122 @@ def alert_stale_price_exit_suppressed(pos):
 _RECONCILE_FETCH_RETRIES = 3
 _RECONCILE_FETCH_RETRY_DELAY_SECS = 3
 
+# Grace window before a position with NO sl_order_id at all is flagged
+# unprotected (Stage B, 2026-08-15). Must comfortably exceed
+# _place_stop_loss_for_position's own retry/confirm envelope, or normal
+# placement latency false-alarms every time: worst case there is
+# _SL_FAST_CONFIRM_ATTEMPTS(5) x _SL_FAST_CONFIRM_INTERVAL_SECS(2) = 10s of
+# fast-confirm plus _SL_PLACEMENT_RETRY_ATTEMPTS(3) x
+# _SL_PLACEMENT_RETRY_DELAY_SECS(2) = 6s of retry, ~16s total. 5 minutes is
+# ~19x that -- deliberately generous, since the cost of a late alert here is
+# minutes while the cost of a false one is alert fatigue on the single
+# loudest "you are unprotected" signal this system has.
+_RECONCILE_MISSING_SL_GRACE_SECS = 300
 
-def check_live_state_reconciliation(open_positions):
+# Tolerance for comparing the resting stop's real broker price against the
+# price the algo would compute (Stage C). Half a cent -- tight enough to catch
+# a genuinely wrong anchor (the 2026-07-31 signal_price-vs-entry_price bug
+# moved stops by whole percent), loose enough to absorb the broker's own
+# tick/rounding of a price we submitted with more precision than it accepts.
+_RECONCILE_SL_PRICE_TOLERANCE = 0.005
+
+
+def _expected_sl_price(pos):
+    """The stop price _place_stop_loss_for_position would compute for this
+    position, recomputed here from the position's OWN persisted config rather
+    than the live watch_list node -- the node's params can be edited after
+    entry, and the exit params baked onto the open_positions row at entry time
+    are what the algo's own check_exit actually uses (see CLAUDE.md's EDC
+    entry). Anchored to entry_price, matching that function exactly (the
+    2026-07-31 fix: signal_price is materially different for the trailing-buy
+    strategies and anchoring there placed real stops above market). Returns
+    None when the position has no usable SL config, so callers skip the
+    comparison rather than compare against a fabricated number."""
+    try:
+        sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos.get('strategy')) else pos.get('stop_loss')
+    except Exception:
+        return None
+    if not sl_pct or not pos.get('entry_price'):
+        return None
+    return pos['entry_price'] * (1 - sl_pct / 100)
+
+
+def _resting_order_quantity(o):
+    """Reads a resting order's share count LEG-FIRST, matching this codebase's
+    established convention for raw broker-order JSON (schwab_client.
+    get_real_orders uses `leg.get("quantity")` alongside `o.get("stopPrice")`,
+    an explicit order-vs-leg split; schwab_safety sums leg quantities in both
+    of its own readers).
+
+    This matters beyond style. `orders` here is UNNORMALIZED broker JSON from
+    schwab_safety._open_orders, and tests/fake_broker.py's _make_order emits NO
+    top-level `quantity` at all -- only orderLegCollection[0]['quantity']. So
+    an order-level-only read is a silent no-op against the project's own
+    designated regression fixture, i.e. exactly the "a per-call mock hides what
+    fake_broker was built to catch" hazard CLAUDE.md warns about. Found by the
+    cold reviewer and confirmed by the contextual one, 2026-08-15.
+
+    The order-level fallback is kept because real Schwab responses do carry a
+    top-level `quantity` -- but it's the fallback, not the primary, so the
+    fixture exercises the same path production does."""
+    for leg in o.get('orderLegCollection') or []:
+        if leg.get('instruction') == 'SELL' and leg.get('quantity') is not None:
+            return leg['quantity']
+    return o.get('quantity')
+
+
+def _match_resting_order(resting_sells, sl_order_id):
+    """Picks the resting SELL order this position's sl_order_id actually points
+    at. Falls back to the sole resting order when the id doesn't match anything
+    (a stop that was replaced at the broker keeps protecting the position under
+    a NEW id -- schwab_client's replace path mints one -- so refusing to
+    compare would blind the price/quantity checks in exactly the case where a
+    replace went wrong).
+
+    The fallback is restricted to genuinely STOP-shaped orders. An earlier
+    version fell back to ANY sole resting SELL, which both reviewers flagged
+    (2026-08-15): a manual limit SELL -- e.g. the accidental limit-sell that
+    actually closed the position in the incident this work fixes, or a
+    deliberate skim -- would be adopted as "the stop", and since a LIMIT order
+    carries no stopPrice the price check would silently skip while the
+    quantity check still fired against it, producing a spurious "partially
+    unprotected"/"OVERSELL RISK" alert about an order that was never a stop.
+
+    Returns None when 2+ stops rest and none matches by id: guessing which is
+    'the' stop there would be inventing an answer, and the shares/duplicate-
+    order guards elsewhere already cover that shape."""
+    if sl_order_id is not None:
+        for o in resting_sells:
+            if str(o.get('orderId')) == str(sl_order_id):
+                return o
+    stops = [o for o in resting_sells
+             if (o.get('orderType') or '').upper() in ('STOP', 'STOP_LIMIT', 'TRAILING_STOP')]
+    if len(stops) == 1:
+        return stops[0]
+    return None
+
+
+def _past_sl_grace(pos, now=None):
+    """True once a position is old enough that a missing stop can't still be
+    normal placement latency (see _RECONCILE_MISSING_SL_GRACE_SECS). now= is
+    injectable rather than read from the clock so tests can exercise both sides
+    of the window -- fake_broker has no clock control and freezegun isn't
+    installed (mirrors check_intraday_risk_review(now=None)'s pattern).
+    Unparseable/absent entry_time returns True: a position we can't date is
+    already anomalous, and defaulting to silence there would recreate exactly
+    the class of gap this branch exists to close."""
+    entry_time = pos.get('entry_time')
+    if not entry_time:
+        return True
+    if not hasattr(entry_time, 'strftime'):
+        try:
+            entry_time = datetime.strptime(str(entry_time), '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return True
+    return ((now or datetime.now()) - entry_time).total_seconds() >= _RECONCILE_MISSING_SL_GRACE_SECS
+
+
+def check_live_state_reconciliation(open_positions, now=None):
     """Detection-only live-state reconciliation (automation_principles.md #5,
     #1 -- backlog 2026-07-21). For each open position on an automation-scope
     ticker, compares the broker's real state against what open_positions/
@@ -622,6 +901,24 @@ def check_live_state_reconciliation(open_positions):
 
         mismatch_found = False
         expected_shares = pos.get('shares')
+        # The CORE row's own share count, deliberately kept un-widened by the
+        # add-on-leg patch below. The two numbers answer different questions
+        # and must not be conflated (both reviewers independently caught the
+        # first version of Stage C doing exactly that, 2026-08-15):
+        #   expected_shares -> "what does the BROKER hold for this ticker" =
+        #     core + leg, since a real leg is a second real fill on the same
+        #     ticker/account.
+        #   core_shares     -> "what does the core position's own resting STOP
+        #     cover" = core only, because _place_stop_loss_for_position sizes
+        #     off db.get_open_position_by_wl_id(...)['shares'] and the leg
+        #     carries its OWN separate stop (_place_stop_loss_for_addon_leg /
+        #     set_addon_leg_sl_order_id).
+        # Comparing the core stop's quantity against the widened number is
+        # structurally guaranteed to mismatch while any leg is open -- a
+        # permanent false "partially unprotected" alert that also feeds the
+        # reconciliation_mismatches streak and trips the node circuit breaker
+        # within ~3 polls on a completely correct state.
+        core_shares = pos.get('shares')
         # Add-on leg patch (Part 6.3, docs/plans/real_order_execution_drought_
         # addon.md) -- REQUIRED, not optional: with a real leg open, the
         # broker legitimately holds 2x what open_positions.shares says (core
@@ -642,10 +939,13 @@ def check_live_state_reconciliation(open_positions):
             )
 
         state = pos.get('trail_state') or {}
-        has_sell_order = any(
-            leg.get('instruction') == 'SELL' and leg.get('instrument', {}).get('symbol') == ticker
-            for o in orders for leg in o.get('orderLegCollection', [])
-        )
+        resting_sells = [
+            o for o in orders
+            if any(leg.get('instruction') == 'SELL'
+                    and leg.get('instrument', {}).get('symbol') == ticker
+                    for leg in o.get('orderLegCollection', []))
+        ]
+        has_sell_order = bool(resting_sells)
         if expected_shares is None:
             # Nothing was actually checked for this position this poll (the
             # share compare above is skipped, and so are the protective-order
@@ -710,6 +1010,93 @@ def check_live_state_reconciliation(open_positions):
                 f"is recorded but no resting SELL order found at the broker — position may be "
                 f"unprotected; suggested fix: place a stop-loss order for {expected_shares:g} shares now"
             )
+        elif (not state.get('trailing') and not pos.get('sl_order_id')
+                and not has_sell_order and _past_sl_grace(pos, now)):
+            # Stage B widening, 2026-08-15. The branch above is gated on
+            # sl_order_id ALREADY being truthy, so it structurally cannot see
+            # the strictly worse case: a position that never got a stop at
+            # all. That's not hypothetical -- it's the literal SOXS/2026-08-14
+            # condition (fill never reconciled -> _place_stop_loss_for_position
+            # never called -> no sl_order_id, no broker order, no alert from
+            # anywhere). Grace-gated off entry_time so a normal placement
+            # in flight doesn't false-alarm (see
+            # _RECONCILE_MISSING_SL_GRACE_SECS). Alert-only, like every other
+            # branch here -- never places the missing stop itself
+            # (automation_principles.md #5).
+            #
+            # _expected_sl_price can legitimately return None (its own
+            # docstring promises callers will skip rather than compare against
+            # a fabricated number) -- most reachably when the position's
+            # effective sl_pct is falsy, which is EXACTLY the state that
+            # reaches this branch, since _place_stop_loss_for_position's
+            # `if not sl_pct: return` means such a position never gets a stop
+            # at all. Formatting it directly (`f"${None:.2f}"`) raises
+            # TypeError inside this per-position loop, which _guarded catches
+            # only at whole-function granularity -- so every LATER position
+            # would silently lose its reconciliation check that cycle, and the
+            # loudest alert in the system would never post. Found by both
+            # reviewers independently, 2026-08-15; the price is omitted from
+            # the message rather than faked.
+            #
+            # Breaker interaction, deliberate: _alert_reconcile_mismatch
+            # returns True even when the 15-min Slack cooldown suppresses the
+            # post (its docstring: the streak "should reflect true state, not
+            # alert-cooldown noise"), so a persistently unprotected position
+            # keeps feeding record_node_streak and will trip the monitor-only
+            # node circuit breaker. That is the intended reading of a real
+            # unprotected position -- and record_node_streak never pauses
+            # automation itself, it only alerts once via just_tripped.
+            _never_had_sl_price = _expected_sl_price(pos)
+            mismatch_found |= _alert_reconcile_mismatch(
+                pos, "never_had_sl",
+                f"🚨 *{ticker}* ({account} · {mode_tag(account, _node)}) UNPROTECTED — no stop-loss was ever "
+                f"recorded for this position and none is resting at the broker\n"
+                f"(open since {pos.get('entry_time')}, {expected_shares:g} shares; suggested fix: place a "
+                f"stop-loss SELL for {expected_shares:g} shares"
+                f"{f' at ~${_never_had_sl_price:.2f}' if _never_had_sl_price is not None else ''} now, "
+                f"or confirm the position was already exited)"
+            )
+        if has_sell_order and not state.get('trailing') and pos.get('sl_order_id'):
+            # Stage C, 2026-08-15: until now "a SELL order is resting" was the
+            # entire protection check -- neither its price nor its quantity was
+            # ever compared against what the algo would actually compute. Both
+            # have real precedent for going wrong: the 2026-07-31 SL-anchor bug
+            # placed real stops off signal_price instead of entry_price (whole
+            # percent off, sometimes above market), and a top-up that lands
+            # after the stop is placed leaves the stop covering fewer shares
+            # than the position holds. Detection-only by explicit design --
+            # this must NOT auto-replace, or it reintroduces exactly the
+            # silent-override behavior of bug #4 that this same session is
+            # fixing elsewhere.
+            _expected_price = _expected_sl_price(pos)
+            _resting = _match_resting_order(resting_sells, pos.get('sl_order_id'))
+            if _resting is not None:
+                _real_price = _resting.get('stopPrice')
+                _real_qty = _resting_order_quantity(_resting)
+                if (_expected_price is not None and _real_price is not None
+                        and abs(float(_real_price) - _expected_price) > _RECONCILE_SL_PRICE_TOLERANCE):
+                    mismatch_found |= _alert_reconcile_mismatch(
+                        pos, "sl_price_mismatch",
+                        f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state mismatch: resting stop is at "
+                        f"${float(_real_price):.4f} but the algo's own stop for this position is "
+                        f"${_expected_price:.4f} — the broker order does not protect where the algo "
+                        f"thinks it does; suggested fix: verify whether this stop was placed/edited "
+                        f"manually, then re-place it at ${_expected_price:.4f} if not deliberate"
+                    )
+                # core_shares, NOT expected_shares -- see core_shares' own
+                # comment above. The core stop covers the core leg only; an
+                # open add-on leg has its own separate stop, so comparing
+                # against the leg-widened number would alarm every poll while
+                # any leg is open.
+                if (_real_qty is not None and core_shares is not None
+                        and float(_real_qty) != float(core_shares)):
+                    mismatch_found |= _alert_reconcile_mismatch(
+                        pos, "sl_quantity_mismatch",
+                        f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state mismatch: resting stop covers "
+                        f"{float(_real_qty):g} shares but the core position holds {core_shares:g} — "
+                        f"{'partially unprotected' if float(_real_qty) < float(core_shares) else 'OVERSELL RISK: the stop would sell more than is held'}"
+                        f"; suggested fix: cancel and re-place the stop for {core_shares:g} shares"
+                    )
         schwab_safety.record_node_streak(
             ticker, account, "reconciliation_mismatches", hit=mismatch_found, node_id=_node_id)
 
@@ -3173,16 +3560,81 @@ def check_buy_reminders():
         account = pending['node'].get('account')
         if _effectively_dry_run(account, pending['node']):
             continue
-        # Sub-capital-at-stake nodes get zero real-time Slack, including the
-        # reminder loop -- found missing by paired Opus review, 2026-08-08:
-        # notify_buy_signal mutes the INITIAL alert but still creates the
-        # pending_buys row (tracking is deliberately unconditional), so
-        # without this the reminder loop nagged every BUY_REMINDER_MINUTES
-        # for a signal the user was never shown in the first place.
-        if not has_capital_at_stake(pending['node']):
-            continue
         last_at = datetime.strptime(pending['last_reminder_at'], '%Y-%m-%d %H:%M:%S')
         if (now - last_at).total_seconds() < BUY_REMINDER_MINUTES * 60:
+            continue
+        # Real-fill re-verify (2026-08-15, corrected Stage A): before assuming "still
+        # pending" and nagging with stale/wrong state, actually check the broker.
+        # Found live, SOXS 2026-08-14: a real fill sat unrecorded for hours while 15
+        # reminders in a row all wrongly said "still pending" -- ticker/node wasn't
+        # opted into auto_fill_detection, so NOTHING else was checking. Runs
+        # regardless of has_capital_at_stake -- a confirmed-but-unreconciled real fill
+        # is an infrastructure-precondition failure, not routine per-node noise (same
+        # exemption already established for check_addon_buying_power_drift's
+        # docstring: "the whole point of the capital threshold... doesn't apply to 'a
+        # safety check's own precondition just broke'"). Only checks the broker once
+        # per BUY_REMINDER_MINUTES per pending row (the cadence gate above already
+        # throttles this), not every poll cycle.
+        #
+        # Deliberately requires a real order_id. The MANUAL placement flow
+        # (signals_handlers.handle_trail_buy_order_placed ->
+        # mark_pending_buy_placed_by_wl_id) sets order_placed=1 but never
+        # captures a broker order id, so those rows are NOT re-verified here --
+        # a known, accepted residual, confirmed by both reviewers 2026-08-15.
+        # Relaxing the gate is the wrong fix: get_filled_order's order_id=None
+        # mode is documented as a real hazard (it matched a days-old unrelated
+        # fill and corrupted a real GDXU reconciliation, 2026-07-27), and
+        # feeding that into a 🚨 CONFIRMED FILLED alert would be worse than the
+        # stale reminder it replaces. Coverage for the manual case comes from
+        # Stage D's intraday broker sweep (check_orphaned_broker_positions),
+        # which is ground-truth broker-side and needs no order_id -- so the
+        # residual window is ~30 min, not unbounded. A real fix would be
+        # upstream: have the "Trailing Buy Order Placed" handler resolve and
+        # store the order id at press time.
+        if pending['order_placed'] and pending.get('order_id'):
+            try:
+                fill = schwab_client.get_filled_order(account, pending['ticker'], 'BUY',
+                                                       order_id=pending['order_id'])
+            except Exception as e:
+                # This re-verification is an ENHANCEMENT on top of the reminder,
+                # never a new precondition for it -- a transient broker/API
+                # failure must not take the whole reminder loop down for every
+                # other pending row (the _guarded() wrapper at this function's
+                # call site catches at whole-function granularity, so an
+                # unhandled raise here would silently skip every later pending
+                # row this cycle). Falls through to the ordinary reminder below.
+                print(f"  [buy_reminders] {pending['ticker']}: fill re-verification failed, "
+                      f"falling back to the ordinary reminder: {e}")
+                fill = None
+            if fill is not None:
+                db.log_coverage_event("confirmed_fill_dropped_at_gate", _coverage_mode(account),
+                                       ticker=pending['ticker'], node_id=pending['node']['id'],
+                                       result="alerted",
+                                       detail=f"price={fill['price']:.4f} qty={fill['quantity']:g} order_id={pending['order_id']}")
+                # Supersede the prior reminder first, same as the routine path
+                # below -- without this the old "still pending" message keeps
+                # live Filled/Missed It/Cancelled buttons sitting next to the
+                # new CONFIRMED FILLED alert, and can never be superseded again
+                # once update_pending_buy_reminder overwrites the tracked
+                # channel/ts. Found by both reviewers, 2026-08-15.
+                _supersede_message(pending['reminder_channel'], pending['reminder_ts'], pending['ticker'])
+                reminder_num = pending['reminder_count'] + 1
+                blocks = _pending_buy_blocks(pending, reminder_num)
+                channel, ts = _post_message(
+                    f"🚨 {pending['ticker']} ({account} · {mode_tag(account, pending['node'])}) — CONFIRMED FILLED "
+                    f"at ${fill['price']:.4f} ({fill['quantity']:g} shares, order {pending['order_id']}) but NOT "
+                    f"reconciled — tap Filled below now",
+                    blocks=blocks)
+                db.update_pending_buy_reminder(pending['id'], channel, ts, reminder_num)
+                continue
+        # Sub-capital-at-stake nodes get zero real-time Slack, including the
+        # ROUTINE reminder loop below -- found missing by paired Opus review,
+        # 2026-08-08: notify_buy_signal mutes the INITIAL alert but still creates
+        # the pending_buys row (tracking is deliberately unconditional), so
+        # without this the reminder loop nagged every BUY_REMINDER_MINUTES for a
+        # signal the user was never shown in the first place. Deliberately does
+        # NOT gate the real-fill check above -- see that block's own comment.
+        if not has_capital_at_stake(pending['node']):
             continue
         if pending['order_placed']:
             # Fill-confirmation phase: nagging every 15min regardless of whether a fill
@@ -3332,6 +3784,214 @@ def _save_addon_buying_power_drift_state(state):
     tmp.replace(cfg.ADDON_BUYING_POWER_DRIFT_STATE_PATH)
 
 
+# Stage D (2026-08-15). The broker-side orphan sweep itself is NOT new -- see
+# scripts/check_untracked_positions.py, built 2026-08-07 after the GDXU
+# incident, already wired into active_signals.py's 07:00 readiness block. What
+# was missing is CADENCE: 07:00 is pre-market, so a fill that goes unreconciled
+# at 09:30 (SOXS, 2026-08-14) isn't swept for until 07:00 the NEXT morning,
+# ~22 hours later. That is exactly how long the real incident stayed invisible.
+# This runs the SAME sweep intraday on a throttle -- deliberately reusing
+# run_full_sweep rather than writing a parallel checker, for the same reason
+# Stage B widened check_live_state_reconciliation instead of adding one: two
+# answers to "what does the broker actually hold" will drift apart.
+ORPHAN_SWEEP_WINDOW = ((9, 45), (16, 0))
+# 30 min. Each sweep costs 2 real broker calls per account (long + short
+# positions) across every linked account, so this is deliberately far coarser
+# than POLL_SECS -- fast enough that a missed fill surfaces within half an hour
+# instead of the next morning, cheap enough not to hammer the API all day.
+# 9:45 start, not 9:30: a fill at the open needs time to reconcile normally
+# before "no local row" means anything (the same reasoning as
+# _RECONCILE_MISSING_SL_GRACE_SECS, at a coarser scale).
+ORPHAN_SWEEP_INTERVAL_SECS = 1800
+
+
+def _load_orphan_sweep_last_run():
+    """Last sweep's epoch timestamp, persisted (2026-08-15 review finding).
+    The first version kept this in a module-level list, which resets to 0 on
+    every daemon restart -- and this project restarts the daemon deliberately
+    and often (the morning restart is a documented manual step), so a restart
+    inside the window would re-sweep immediately rather than honouring the
+    30-minute interval. Impact is bounded (read-only sweep, ~2 broker calls per
+    account) but both sibling checks this function explicitly mirrors --
+    check_intraday_risk_review and check_addon_buying_power_drift -- already
+    persist their own watermarks, so not doing so was an inconsistency, not a
+    deliberate choice. A missing/corrupt file reads as 0.0, i.e. sweep now:
+    erring toward an extra read-only sweep is the safe direction."""
+    try:
+        return float(_load_orphan_sweep_state().get('last_run', 0.0))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _load_orphan_sweep_state():
+    """Whole persisted state dict for the intraday sweep: `last_run` (the
+    throttle watermark) and `prior_findings` (the previous sweep's finding set,
+    for the two-consecutive-sweep confirmation gate). A missing/corrupt file
+    reads as {} -- sweep now, and treat the prior finding set as empty, which
+    only ever DELAYS an alert by one interval rather than suppressing it."""
+    try:
+        state = json.loads(cfg.ORPHAN_SWEEP_STATE_PATH.read_text())
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def _save_orphan_sweep_state(state):
+    cfg.ORPHAN_SWEEP_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cfg.ORPHAN_SWEEP_STATE_PATH.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state))
+    tmp.replace(cfg.ORPHAN_SWEEP_STATE_PATH)
+
+
+def _save_orphan_sweep_last_run(ts):
+    state = _load_orphan_sweep_state()
+    state['last_run'] = ts
+    _save_orphan_sweep_state(state)
+
+
+def _orphan_finding_keys(findings):
+    """Flattens {account: [finding, ...]} into a stable, comparable key set for
+    the two-sweep confirmation gate. The finding strings are deterministic for
+    a given real state (they embed ticker + share counts), so an unchanged
+    condition produces an identical key on the next sweep, while a transient
+    one (a share count mid-reconciliation) produces a different key and
+    correctly fails to confirm."""
+    return {f"{account}||{f}" for account, fs in findings.items() for f in fs}
+
+
+def _is_short_finding(key):
+    """SHORT findings are exempt from the two-sweep gate -- see
+    check_orphaned_broker_positions' docstring. Matches the marker
+    scripts/check_untracked_positions.check_account emits for a real short."""
+    return 'SHORT: broker holds a SHORT position' in key
+
+
+def check_orphaned_broker_positions(now=None):
+    """Intraday cadence for the ground-truth broker sweep (Stage D).
+
+    Runs scripts/check_untracked_positions.run_full_sweep -- the existing,
+    already-reviewed sweep that asks the broker "what do you actually hold"
+    and flags anything with no local open_positions/addon_legs row (plus the
+    mirror-image STALE/MISMATCH/SHORT/NULL-account cases). Detect-only, never
+    auto-creates or corrects a row: automation_principles.md #5, and the
+    explicit 2026-08-06 user scoping call recorded at the 07:00 call site --
+    auto-correction would erase the exact signal the sweep exists to surface.
+
+    Alerts unconditionally, not gated on has_capital_at_stake -- same
+    exemption and same reasoning as check_addon_buying_power_drift below: a
+    real broker position this system has no record of is an
+    infrastructure-precondition failure, not routine per-node noise, and the
+    capital threshold's job (mute routine sub-$10k chatter) simply doesn't
+    apply to it. A fetch failure is reported as a finding by the sweep itself
+    rather than swallowed as 'clean' -- "couldn't ask" is not "nothing wrong."
+
+    TWO-CONSECUTIVE-SWEEP CONFIRMATION GATE (2026-08-15, from the cold
+    reviewer's maintained MEDIUM in round 2). Moving this sweep from 07:00
+    pre-market to an intraday cadence introduced a false-positive class the
+    original run structurally could not have: two of check_account's finding
+    kinds are TRANSIENTLY TRUE during normal market-hours operation --
+      * STALE   (local row, broker holds 0) -- true between a real exit fill
+                and close_position catching up
+      * MISMATCH (share drift) -- true between a fill and its _reconcile_fill
+                top-up, or an add-on leg fill mid-flight
+    and this function alerts unconditionally (no has_capital_at_stake gate, by
+    design), so first-sighting alerting would page the operator on ordinary
+    reconciliation lag every 30 minutes. That is precisely the alert-fatigue
+    failure the sweep's own hand-held-ticker filter was added to avoid.
+
+    So: a finding must appear in TWO CONSECUTIVE sweeps before it pages
+    anyone. The finding set is persisted in the same state file as the
+    throttle, and only the intersection of the current and prior sets is
+    alerted on. result='found' is still logged on FIRST sighting so the record
+    is complete even when the alert is withheld.
+
+    SHORT findings are EXEMPT from the gate and alert immediately on first
+    sighting -- check_account already treats any real short as unconditionally
+    finding-worthy regardless of the known-tickers filter (it's the naked/
+    accidental-short case live_sanity_check.py exists to guard against), and a
+    false positive there is worth tolerating.
+
+    Cost of the gate: worst-case detection for a SOXS-shaped incident becomes
+    two sweep intervals (~60 min) instead of one (~30 min) -- still down from
+    the ~22 hours the 07:00-only cadence gave it, which was the entire point.
+
+    now= is injectable (mirroring check_intraday_risk_review) so the window
+    gate is testable without clock manipulation."""
+    now = now or datetime.now()
+    today = now.strftime('%Y-%m-%d')
+    if not _coverage_is_trading_day(today):
+        return
+    (h0, m0), (h1, m1) = ORPHAN_SWEEP_WINDOW
+    if not ((h0, m0) <= (now.hour, now.minute) <= (h1, m1)):
+        return
+    if time.time() - _load_orphan_sweep_last_run() < ORPHAN_SWEEP_INTERVAL_SECS:
+        return
+    # Stamped BEFORE the sweep runs, deliberately: an exception mid-sweep must
+    # not leave the throttle unset and hammer the broker every poll cycle.
+    _save_orphan_sweep_last_run(time.time())
+
+    from scripts.check_untracked_positions import run_full_sweep
+    try:
+        findings = run_full_sweep()
+    except Exception as e:
+        # The sweep already converts a per-account fetch failure into a
+        # finding; this only catches something structurally broken (an import
+        # or DB error). Logged, not raised -- the poll loop's _guarded would
+        # catch it anyway, but logging it as a coverage_event means the Grid
+        # can tell "swept, clean" apart from "never actually swept."
+        db.log_coverage_event("orphaned_broker_position", "live",
+                               result="sweep_failed", detail=str(e))
+        return
+
+    # Two-consecutive-sweep confirmation gate (2026-08-15, maintained MEDIUM
+    # from the cold reviewer's round-2 rebuttal). The finding set is recorded
+    # every sweep regardless; only findings seen in BOTH this sweep and the
+    # previous one actually page anyone.
+    current_keys = _orphan_finding_keys(findings)
+    _state = _load_orphan_sweep_state()
+    prior_keys = set(_state.get('prior_findings') or [])
+    _state['prior_findings'] = sorted(current_keys)
+    _save_orphan_sweep_state(_state)
+
+    if not findings:
+        db.log_coverage_event("orphaned_broker_position", "live", result="clean",
+                               detail="intraday sweep, no untracked/mismatched real positions")
+        return
+
+    total = sum(len(f) for f in findings.values())
+    lines = []
+    for acct, acct_findings in findings.items():
+        lines.append(f"*{acct}*")
+        lines.extend(acct_findings)
+    detail = "\n".join(lines)
+    # Logged on FIRST sighting, deliberately -- the record must show what the
+    # broker actually looked like at this moment even when the alert is held
+    # back for confirmation, or the gate would erase the evidence a later
+    # investigation needs.
+    db.log_coverage_event("orphaned_broker_position", "live", result="found",
+                           detail=f"{total} finding(s): {detail}"[:2000])
+
+    confirmed = (current_keys & prior_keys) | {k for k in current_keys if _is_short_finding(k)}
+    if not confirmed:
+        print(f"  [orphan_sweep] {total} finding(s) seen for the first time — holding the alert "
+              f"until the next sweep confirms them (transient-state gate)")
+        return
+
+    confirmed_lines = []
+    for account, acct_findings in findings.items():
+        _kept = [f for f in acct_findings if f"{account}||{f}" in confirmed]
+        if _kept:
+            confirmed_lines.append(f"*{account}*")
+            confirmed_lines.extend(_kept)
+    confirmed_detail = "\n".join(confirmed_lines)
+    _held = total - len(confirmed)
+    _post_message(
+        f"🚨 Untracked/mismatched real broker position(s) — {len(confirmed)} confirmed finding(s) "
+        f"(intraday sweep {now.strftime('%H:%M')}, present in 2 consecutive sweeps)"
+        f"{f'; {_held} more seen once, awaiting confirmation' if _held else ''}\n{confirmed_detail}"
+    )
+
+
 def check_addon_buying_power_drift(now=None):
     """Daily daemon check for follow-up #1 of the 2026-08-10 add-on
     buying-power reservation fix (docs/deep_backlog.md's 2026-08-09/10
@@ -3434,7 +4094,8 @@ def check_addon_buying_power_drift(now=None):
     _save_addon_buying_power_drift_state(state)
 
 
-def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, target_notional=None):
+def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, target_notional=None,
+                     position_source='core'):
     """Post-fill top-up (Part 3, branch C) -- compares the real fill notional
     against target_notional (the conservative worst-case sizing pads in
     buy_order_sizing/check_gap_resize mean a real fill usually comes in under
@@ -3461,7 +4122,14 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
     sizing is flat starting_notional, not core's compounding recovery basis
     -- _last_sale_recovery(node, position_source='core') would otherwise
     target an unrelated (and possibly very different) core-compounded
-    notional for a drought top-up."""
+    notional for a drought top-up.
+    position_source: which of this node's legs the fill belongs to, passed
+    straight through to db.top_up_position so the top-up names its target leg
+    explicitly instead of relying on there only ever being one open row per
+    wl_id. Corrected after review, 2026-08-15: that one-row invariant does
+    currently hold (open_position dedups on wl_id alone, regardless of
+    position_source), so this is defence in depth rather than a fix for
+    observed corruption -- see db.top_up_position's own docstring."""
     ticker = node['ticker']
     account = node.get('account')
     if target_notional is None:
@@ -3487,7 +4155,8 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                               f"unexpectedly: {e} (position stays under target notional by "
                               f"${delta:,.0f})")
                 return
-            if db.top_up_position(node['id'], top_up_shares, fill_price):
+            if db.top_up_position(node['id'], top_up_shares, fill_price,
+                                   position_source=position_source):
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
                                        node_id=node.get('id'), result="placed", detail=f"shares={top_up_shares} price={fill_price:.4f}")
                 _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${fill_price:.4f} "
@@ -3639,9 +4308,10 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
                            detail=f"shares={filled_shares:g} price={fill_price:.4f} drift={drift_pct:+.2f}%")
     _post_message(f"🤖 {ticker} — auto-detected fill at ${fill_price:.4f}  "
                   f"(drift: {drift_pct:+.2f}%)  {filled_shares:g} shares")
-    _drought_target_notional = node.get('starting_notional') if pending.get('position_source') == 'drought_overlay' else None
+    _position_source = pending.get('position_source') or 'core'
+    _drought_target_notional = node.get('starting_notional') if _position_source == 'drought_overlay' else None
     _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=is_gap_correction,
-                     target_notional=_drought_target_notional)
+                     target_notional=_drought_target_notional, position_source=_position_source)
     if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         _place_stop_loss_for_position(node, ticker)
 
@@ -3986,8 +4656,18 @@ def _ticker_block(row):
         # Opus review 2026-07-26 flagged this row was otherwise indistinguishable
         # from a genuine held position).
         sim_tag = ' 🧪DRY-RUN-SIM' if pos and pos.get('is_dry_run_sim') else ''
+        # Bug #54 (found live: AGQ). This branch tagged is_dry_run_sim but had
+        # no way at all to tell a PAPER position from a real one -- build_
+        # reference_table merges paper_positions and open_positions into one
+        # wl_id-keyed dict, which destroys the only signal of which table the
+        # row came from, so a simulated position rendered byte-identically to
+        # a real held one: same entry price, same share count, same actionable
+        # framing, no marker anywhere. Now reads the origin column stamped on
+        # the row itself (2026-08-15), the single source of truth both this and
+        # build_reference_table share, rather than each re-deriving it.
+        paper_tag = ' 📄PAPER' if pos and pos.get('origin') == 'paper' else ''
         text = (
-            f"{phase_str}*{ticker}* `{version}`{sim_tag} — {row['Hold']}{account_str}{entry_str}\n"
+            f"{phase_str}*{ticker}* `{version}`{sim_tag}{paper_tag} — {row['Hold']}{account_str}{entry_str}\n"
             f"now `${now:.2f}` {pnl:+.1f}%  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_{sl_str}{arm_ts_line}"
         )
@@ -4030,7 +4710,16 @@ def _ticker_block(row):
         node = row.get('_node')
         if row['Held']:
             pos = row.get('_pos')
-            if pos and not pos.get('is_dry_run_sim'):
+            # origin check added 2026-08-15 alongside bug #54's display tag,
+            # and it is the more dangerous half of that bug. A paper row used
+            # to render a real "Manually Close" button carrying
+            # position_id=paper_positions.id, while the manual_close handler
+            # resolves against open_positions -- two INDEPENDENT id sequences,
+            # so the id would either miss entirely or, worse, match a
+            # completely unrelated REAL position and close it. Suppressed for
+            # the same reason is_dry_run_sim is: no real broker fill exists
+            # behind this row, so there is nothing legitimate to close.
+            if pos and not pos.get('is_dry_run_sim') and pos.get('origin') != 'paper':
                 value = json.dumps({"position_id": pos['id'], "ticker": ticker, "entry_price": pos['entry_price']})
                 elements.append({"type": "button", "text": {"type": "plain_text", "text": f"Manually Close {ticker}"},
                                   "action_id": "manual_close", "value": value})

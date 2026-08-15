@@ -436,10 +436,33 @@ REGISTRY = [
     dict(id='live_state_reconciliation_mismatch',
          scenario="Live-state reconciliation detects and alerts on a real mismatch",
          code_path="signals_notify.check_live_state_reconciliation, schwab_client.get_real_position",
-         offline_coverage="8 unit tests (test_live_state_reconciliation.py)",
+         offline_coverage="22 unit tests (test_live_state_reconciliation.py)",
          check_mechanism='coverage_events', scenario_key='reconciliation_mismatch',
+         result_filter={'results': ['never_had_sl', 'sl_price_mismatch', 'sl_quantity_mismatch'],
+                        'include': False},
          notes="8 real soxl_ira detections 2026-07-24 (GDXU/GDXD/LABU x2/ERY x4). 1,753 dry_run rows are "
-               "the known intentionally-seeded UDOW fake position -- expected noise, not a gap."),
+               "the known intentionally-seeded UDOW fake position -- expected noise, not a gap. "
+               "result_filter EXCLUDES the three Stage B/C branches added 2026-08-15 -- they share this "
+               "scenario_key (_alert_reconcile_mismatch hardcodes it, passing the branch as `result`) but "
+               "have their own row below; without the exclusion this row's 4,311 events for OTHER "
+               "branches would render them as live-proven despite never having fired."),
+    dict(id='sl_integrity_mismatch',
+         scenario="Reconciliation catches a position that never had a stop-loss at all, or whose resting "
+                  "stop is at the wrong price or covers the wrong share count",
+         code_path="signals_notify.check_live_state_reconciliation (never_had_sl / sl_price_mismatch / "
+                    "sl_quantity_mismatch branches, via _expected_sl_price/_match_resting_order/"
+                    "_resting_order_quantity/_past_sl_grace)",
+         offline_coverage="12 unit tests (test_live_state_reconciliation.py, Stage B/C section)",
+         check_mechanism='coverage_events', scenario_key='reconciliation_mismatch',
+         result_filter=['never_had_sl', 'sl_price_mismatch', 'sl_quantity_mismatch'],
+         notes="Split out from live_state_reconciliation_mismatch 2026-08-15 (SOXS incident). Stage B: the "
+               "pre-existing missing_sl branch is gated on sl_order_id ALREADY being truthy, so it "
+               "structurally could not catch 'never had a stop at all' -- the literal SOXS condition. "
+               "Stage C: has_sell_order checked neither price nor quantity, so a stop at the wrong level "
+               "(the 2026-07-31 signal_price-anchor bug) or covering the wrong shares read as fully "
+               "protected. Detection-only -- deliberately never auto-replaces, which would reintroduce "
+               "the silent-override behavior being fixed elsewhere in the same session. Expected to stay "
+               "wired-never-fired: every firing here is a real unprotected-position incident."),
     dict(id='trailing_arm_reread',
          scenario="Trailing-arm state survives notify_trailing_activated without re-arming next bar",
          code_path="signals_notify.notify_trailing_activated (re-reads via get_position_by_id)",
@@ -916,6 +939,71 @@ REGISTRY = [
          notes="New instrumentation, 2026-07-27 evening -- distinct from buy_fill_reconciles_correct_node "
                "above, which is about resolving the right node when 2+ are pending, not the fill math "
                "itself."),
+    dict(id='replace_target_mismatch',
+         scenario="Before atomically replacing a resting protective order, the algo verifies the order "
+                  "actually resting at the broker is the one it thinks it is (and announces distinctly "
+                  "when it is replacing a human-placed one)",
+         code_path="signals_notify._verify_resting_before_replace, called from "
+                    "_attempt_automated_sell and _attempt_automated_exit_sell",
+         offline_coverage="8 unit tests (test_replace_target_mismatch.py)",
+         check_mechanism='coverage_events', scenario_key='replace_target_mismatch',
+         notes="Bug #4 of the 2026-08-14 SOXS incident. Both automated exit paths took whatever was in "
+               "pos['sl_order_id'] / trail_state.exit_order_id and replaced it the moment their exit "
+               "condition fired, with no check that it matched what the algo expected -- exactly the "
+               "case automation_principles.md #5 exists for, never applied to this mechanism. It bit for "
+               "real: a human placed a manual (mispriced) stop and the daemon replaced it with no record "
+               "that it had been deliberate. DETECTION-ONLY AND NON-BLOCKING BY DESIGN, and that is "
+               "load-bearing: a blocking version would strand a position that needs to exit, strictly "
+               "worse than the bug. Both call sites wrap it in try/except so a broker fetch failure "
+               "cannot prevent a real exit. 'manual_order_replaced' depends on the provenance column "
+               "added the same day -- it can only fire for a position reconciled via "
+               "scripts/reconcile_fill_manually.py, so expect it to stay rare."),
+    dict(id='orphaned_broker_position',
+         scenario="An intraday ground-truth sweep confirms every real non-zero broker position has a "
+                  "matching local open_positions/addon_legs row (and the mirror-image STALE/MISMATCH/"
+                  "SHORT/NULL-account cases)",
+         code_path="signals_notify.check_orphaned_broker_positions -> "
+                    "scripts.check_untracked_positions.run_full_sweep",
+         offline_coverage="17 unit tests (test_orphaned_broker_position_sweep.py) + 7 fake_broker tests "
+                           "against the underlying sweep (test_fake_broker_untracked_position_sweep_scenario.py)",
+         check_mechanism='coverage_events', scenario_key='orphaned_broker_position',
+         bad_results=['sweep_failed'],
+         notes="The SWEEP is not new (built 2026-08-07 after the GDXU incident, wired into the 07:00 "
+               "readiness block 2026-08-08). What's new, 2026-08-15, is the intraday CADENCE and this "
+               "instrumentation. The SOXS/2026-08-14 incident showed the gap: 07:00 is pre-market, so a "
+               "fill going unreconciled at 09:30 wasn't swept for until 07:00 the NEXT morning (~22h). "
+               "Now every 30min, 9:45-16:00 on trading days. Deliberately reuses run_full_sweep rather "
+               "than adding a parallel checker -- two answers to 'what does the broker hold' would "
+               "drift. result='clean' is logged on a no-finding sweep ON PURPOSE: without it the Grid "
+               "cannot distinguish 'swept, nothing found' from 'never ran', which is exactly the "
+               "invisible state fast_path_fill_reconciliation sat in for months. So this row is "
+               "expected to go verified-live quickly via 'clean' events -- a 'found' event is a real "
+               "incident, and 'sweep_failed' is listed as bad_results so a broken sweep can't render "
+               "as proof. NOTE result='found' does NOT imply anyone was paged: a two-consecutive-sweep "
+               "confirmation gate (added same day, from the cold reviewer's maintained MEDIUM) withholds "
+               "the Slack alert until a finding is seen twice, because STALE/MISMATCH are transiently "
+               "true during normal market-hours reconciliation lag -- a false-positive class the 07:00 "
+               "pre-market cadence structurally never had. 'found' is still logged on FIRST sighting so "
+               "the record stays complete; SHORT findings bypass the gate and page immediately."),
+    dict(id='confirmed_fill_dropped_at_gate',
+         scenario="A CONFIRMED real broker fill that the auto-fill-detection opt-in gate declined to "
+                  "auto-reconcile, while a matching pending_buys row is still open, produces a distinct "
+                  "loud alert instead of a stale 'still pending' reminder",
+         code_path="signals_notify.check_buy_reminders (broker re-verification via "
+                    "schwab_client.get_filled_order, ahead of the has_capital_at_stake mute)",
+         offline_coverage="5 fake_broker tests "
+                           "(test_fake_broker_confirmed_fill_dropped_at_gate_scenario.py)",
+         check_mechanism='coverage_events', scenario_key='confirmed_fill_dropped_at_gate',
+         notes="Built 2026-08-15 in direct response to the SOXS/ira/wl_id=206 incident (2026-08-14): a "
+               "2026-08-12 trailing buy filled 09:30:05 ET and sat unreconciled for hours. BOTH "
+               "fill-detection paths (check_auto_fills poll, drain_fill_queue stream) sit behind the "
+               "same auto_fill_detection opt-in gate and SOXS was in neither flag file, so both dropped "
+               "the fill silently and identically. drain_fill_queue's pre-existing orphaned_fill_detected "
+               "alert covers only the NO-pending-row case -- the less dangerous one. This row covers the "
+               "more dangerous one. Deliberately exempt from has_capital_at_stake (same precedent as "
+               "check_addon_buying_power_drift): a confirmed-but-unreconciled real fill is an "
+               "infrastructure-precondition failure, not routine per-node noise. Expected to stay "
+               "wired-never-fired in normal operation -- every firing is a real incident."),
     dict(id='morning_report_delivery',
          scenario="The Morning Report actually posts to Slack (not just gets built)",
          code_path="signals_notify.send_reference_report (via _post_message's channel/ts return)",
@@ -1559,18 +1647,38 @@ def compute_status(row):
 
     mode_filter = row.get('mode_filter')
     bad_results = set(row.get('bad_results', []))
+    # result_filter (2026-08-15): the third axis, exactly parallel to
+    # mode_filter, for a scenario_key shared by SEVERAL distinct logic branches
+    # that are only distinguishable by their `result` value. Real case that
+    # forced it: signals_notify._alert_reconcile_mismatch hardcodes
+    # scenario_key='reconciliation_mismatch' and passes the branch name as
+    # `result`, so the three Stage B/C branches added 2026-08-15
+    # (never_had_sl/sl_price_mismatch/sl_quantity_mismatch) would have
+    # inherited verified-live status from 4,311 pre-existing events belonging
+    # to entirely different branches (shares/missing_sl/missing_trailing_sell)
+    # -- precisely the false-proof failure this registry exists to prevent.
+    # bad_results is the wrong lever for this: inverting it would land the row
+    # in *-attempt-failed rather than the truthful wired-never-fired.
+    # `include=False` gives the mirror image, so an existing row can EXCLUDE
+    # the results that were split out into a new row.
+    result_filter = row.get('result_filter')
+    _clauses = ["scenario_key = ?"]
+    _params = [row['scenario_key']]
+    if mode_filter:
+        _clauses.append("mode = ?")
+        _params.append(mode_filter)
+    if result_filter:
+        _results = list(result_filter.get('results', result_filter)
+                         if isinstance(result_filter, dict) else result_filter)
+        _include = result_filter.get('include', True) if isinstance(result_filter, dict) else True
+        _op = "IN" if _include else "NOT IN"
+        _clauses.append(f"result {_op} ({','.join('?' * len(_results))})")
+        _params.extend(_results)
     with db._conn() as c:
-        if mode_filter:
-            rows = c.execute(
-                "SELECT mode, result, COUNT(*) n, MAX(ts) last_ts FROM coverage_events "
-                "WHERE scenario_key = ? AND mode = ? GROUP BY mode, result",
-                (row['scenario_key'], mode_filter)
-            ).fetchall()
-        else:
-            rows = c.execute(
-                "SELECT mode, result, COUNT(*) n, MAX(ts) last_ts FROM coverage_events "
-                "WHERE scenario_key = ? GROUP BY mode, result", (row['scenario_key'],)
-            ).fetchall()
+        rows = c.execute(
+            "SELECT mode, result, COUNT(*) n, MAX(ts) last_ts FROM coverage_events "
+            f"WHERE {' AND '.join(_clauses)} GROUP BY mode, result", _params
+        ).fetchall()
 
     # Bucket by mode: total count/last_ts, plus whether every event in that mode
     # was a bad_results outcome (no good evidence) or at least one was good.

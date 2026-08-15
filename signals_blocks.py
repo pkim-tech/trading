@@ -43,7 +43,7 @@ def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node
             suppress = False
             print(f"  [alert gate error] {e} -- failing open, sending")
         if suppress:
-            db.log_slack_message('suppressed', text, error=None)
+            db.log_slack_message('suppressed', text, error=None, blocks=blocks)
             return None, None
     if cfg.SIM_MODE:
         scenario_suffix = f" ({cfg.SIM_SCENARIO})" if cfg.SIM_SCENARIO else ""
@@ -87,7 +87,9 @@ def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node
             print(f"  [slack error] {e}")
     # Logged after the attempt (not before) so a row reflects the real outcome
     # -- see log_slack_message's docstring for why this ordering matters.
-    db.log_slack_message(log_mode, text, error=error)
+    # blocks is logged as sent (post-SIM_MODE marker injection above), matching
+    # `text`, which is likewise logged with its SIM prefix already applied.
+    db.log_slack_message(log_mode, text, error=error, blocks=blocks)
     return channel, ts
 
 

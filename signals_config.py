@@ -46,6 +46,14 @@ INTRADAY_RISK_REVIEW_STATE_PATH = LIVE_DIR / "intraday_risk_review_state.json"
 # avoids re-checking (and potentially re-alerting) on the same day.
 ADDON_BUYING_POWER_DRIFT_STATE_PATH = LIVE_DIR / "addon_buying_power_drift_state.json"
 
+# Persisted throttle for the intraday broker orphan sweep (Stage D, 2026-08-15).
+# Same durability pattern as the two state paths above -- an in-memory-only
+# throttle resets on every daemon restart, and this project restarts the daemon
+# deliberately and often (the morning restart is a documented manual step), so a
+# within-window restart would re-sweep immediately instead of honouring the
+# 30-minute interval.
+ORPHAN_SWEEP_STATE_PATH = LIVE_DIR / "orphan_sweep_state.json"
+
 LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 HUMAN_LOG_PATH   = LOG_DIR / "active_signals.log"

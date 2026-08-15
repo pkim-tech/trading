@@ -124,12 +124,12 @@ def test_scan_buy_signals_relocks_after_real_same_day_close(db, monkeypatch):
     monkeypatch.setattr(A, 'notify_buy_signal', lambda node, sig: notified.append(sig['ticker']))
 
     buy_alerted = set()
-    A._scan_buy_signals([node], buy_alerted, open_position_keys=set())
+    A._scan_buy_signals([node], buy_alerted, open_position_keys={'live': set(), 'paper': set()})
     assert notified == [TICKER]
     assert node['id'] in buy_alerted
 
     # Still locked: same day, no close yet -- a second scan must not re-alert.
-    A._scan_buy_signals([node], buy_alerted, open_position_keys=set())
+    A._scan_buy_signals([node], buy_alerted, open_position_keys={'live': set(), 'paper': set()})
     assert notified == [TICKER]
 
     # Real open -> real same-day close (no closed_today entry until this).
@@ -142,7 +142,7 @@ def test_scan_buy_signals_relocks_after_real_same_day_close(db, monkeypatch):
     assert A.closed_today(TICKER)
 
     # Real close on file, no open position -- a fresh signal must alert again.
-    A._scan_buy_signals([node], buy_alerted, open_position_keys=set())
+    A._scan_buy_signals([node], buy_alerted, open_position_keys={'live': set(), 'paper': set()})
     assert notified == [TICKER, TICKER]
 
 
@@ -179,7 +179,7 @@ def test_scan_buy_signals_does_not_refire_while_reentry_order_still_pending(db, 
     A.add_pending_buy(node, buy_sig, channel='C1', ts='123.456')
 
     for _ in range(3):  # simulate several poll cycles while the order rests
-        A._scan_buy_signals([node], buy_alerted, open_position_keys=set())
+        A._scan_buy_signals([node], buy_alerted, open_position_keys={'live': set(), 'paper': set()})
     assert notified == []  # must not refire while the order is still pending
 
 

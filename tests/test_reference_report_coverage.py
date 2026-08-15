@@ -111,3 +111,154 @@ def test_build_reference_table_shows_a_held_paper_position(env, monkeypatch):
     assert len(rows) == 1
     assert rows[0]['Held'] is True
     assert rows[0]['Phase'] != '⚪⚪⚪⚪'
+
+
+# ---------------------------------------------------------------------------
+# origin column (2026-08-15) -- bugs #54 and #63-64, both fixed via ONE stamped
+# column both consumers read, rather than two independent patches that could
+# drift. build_reference_table merges paper_positions and open_positions into a
+# single wl_id-keyed dict, which destroys the only signal of which table a row
+# came from; origin survives that merge.
+# ---------------------------------------------------------------------------
+
+def _paper_node_with_position(ticker='PAPERORIGIN', state='paper', shares=100):
+    signals_db.add_node(
+        ticker=ticker, strategy='TrailingBothZScoreBreakout', version='v5', window=10,
+        take_profit=30.0, stop_loss=2, max_hold_hours=70, state=state, account='ira',
+        trail_buy_pct=3.0, trail_pct=1.0,
+    )
+    node = signals_db.get_watch_list_node(ticker=ticker)
+    assert signals_db.open_position(
+        node, signal_price=105.0, signal_time='2026-07-27 14:30:00',
+        entry_price=100.0, entry_time='2026-07-28 11:00:00', shares=shares, paper=True,
+    )
+    return node
+
+
+def _patch_prices(monkeypatch):
+    monkeypatch.setattr(signals_compute, '_current_price', lambda ticker: (100.0, None))
+    monkeypatch.setattr(signals_compute, 'compute_buy_signal', lambda node: {
+        'ticker': node['ticker'], 'current_price': 100.0, 'z_score': -2.5,
+        'lower_band': 95.0, 'prev_close': 98.0, 'last_daily_bar': '2026-07-28',
+    })
+
+
+def test_paper_position_row_is_stamped_origin_paper(env, monkeypatch):
+    _patch_prices(monkeypatch)
+    node = _paper_node_with_position()
+    rows = signals_notify.build_reference_table([node])
+    assert rows[0]['_pos']['origin'] == 'paper', (
+        "the column must survive build_reference_table's paper/real dict merge")
+
+
+def test_real_position_row_is_stamped_origin_live(env, monkeypatch):
+    _patch_prices(monkeypatch)
+    signals_db.add_node(
+        ticker='LIVEORIGIN', strategy='TrailingBothZScoreBreakout', version='v5', window=10,
+        take_profit=30.0, stop_loss=2, max_hold_hours=70, state='live', account='ira',
+        trail_buy_pct=3.0, trail_pct=1.0,
+    )
+    node = signals_db.get_watch_list_node(ticker='LIVEORIGIN')
+    assert signals_db.open_position(
+        node, signal_price=105.0, signal_time='2026-07-27 14:30:00',
+        entry_price=100.0, entry_time='2026-07-28 11:00:00', shares=100)
+    rows = signals_notify.build_reference_table([node])
+    assert rows[0]['_pos']['origin'] == 'live'
+
+
+def test_bug54_paper_position_renders_a_paper_tag(env, monkeypatch):
+    """Bug #54, found live on AGQ: _ticker_block's `if row['Held']:` branch
+    tagged is_dry_run_sim but had NO way to tell a paper position from a real
+    one, so a simulated position rendered byte-identically to a real held
+    position -- same entry price, same share count, same actionable framing."""
+    _patch_prices(monkeypatch)
+    node = _paper_node_with_position()
+    rows = signals_notify.build_reference_table([node])
+    blocks = signals_notify._ticker_block(rows[0])
+    text = blocks[0]['text']['text']
+    assert '📄PAPER' in text, f"a paper position must be visibly marked: {text!r}"
+
+
+def test_bug54_real_position_gets_no_paper_tag(env, monkeypatch):
+    """The tag must discriminate, not decorate everything."""
+    _patch_prices(monkeypatch)
+    signals_db.add_node(
+        ticker='LIVENOTAG', strategy='TrailingBothZScoreBreakout', version='v5', window=10,
+        take_profit=30.0, stop_loss=2, max_hold_hours=70, state='live', account='ira',
+        trail_buy_pct=3.0, trail_pct=1.0,
+    )
+    node = signals_db.get_watch_list_node(ticker='LIVENOTAG')
+    assert signals_db.open_position(
+        node, signal_price=105.0, signal_time='2026-07-27 14:30:00',
+        entry_price=100.0, entry_time='2026-07-28 11:00:00', shares=100)
+    rows = signals_notify.build_reference_table([node])
+    text = signals_notify._ticker_block(rows[0])[0]['text']['text']
+    assert '📄PAPER' not in text, text
+
+
+def test_paper_position_gets_no_manual_close_button(env, monkeypatch):
+    """The more dangerous half of bug #54. A paper row used to render a real
+    'Manually Close' button carrying position_id=paper_positions.id, while the
+    manual_close handler resolves against open_positions -- two INDEPENDENT id
+    sequences, so the id could match a completely unrelated REAL position and
+    close it."""
+    _patch_prices(monkeypatch)
+    node = _paper_node_with_position()
+    rows = signals_notify.build_reference_table([node])
+    blocks = signals_notify._ticker_block(rows[0])
+    actions = [b for b in blocks if b.get('type') == 'actions']
+    close_buttons = [e for b in actions for e in b.get('elements', [])
+                     if e.get('action_id') == 'manual_close']
+    assert close_buttons == [], (
+        f"a paper position must never offer a real close action: {close_buttons}")
+
+
+def test_real_position_still_gets_its_manual_close_button(env, monkeypatch):
+    """Regression: the suppression must not blind the real case."""
+    _patch_prices(monkeypatch)
+    signals_db.add_node(
+        ticker='LIVECLOSE', strategy='TrailingBothZScoreBreakout', version='v5', window=10,
+        take_profit=30.0, stop_loss=2, max_hold_hours=70, state='live', account='ira',
+        trail_buy_pct=3.0, trail_pct=1.0,
+    )
+    node = signals_db.get_watch_list_node(ticker='LIVECLOSE')
+    assert signals_db.open_position(
+        node, signal_price=105.0, signal_time='2026-07-27 14:30:00',
+        entry_price=100.0, entry_time='2026-07-28 11:00:00', shares=100)
+    rows = signals_notify.build_reference_table([node])
+    blocks = signals_notify._ticker_block(rows[0])
+    close_buttons = [e for b in blocks if b.get('type') == 'actions'
+                     for e in b.get('elements', []) if e.get('action_id') == 'manual_close']
+    assert len(close_buttons) == 1, blocks
+
+
+def test_bug63_64_phantom_paper_row_for_a_live_node_is_marked_not_silent(env, monkeypatch):
+    """Bugs #63-64, found live on SOXL/ira. A stale paper row for a wl_id with
+    NO real counterpart survives build_reference_table's merge (real rows only
+    overwrite on collision), so it rendered as a phantom REAL held position on
+    a live node. It now renders truthfully as paper."""
+    _patch_prices(monkeypatch)
+    node = _paper_node_with_position(ticker='PHANTOM', state='live')
+    assert signals_db.get_open_position('PHANTOM') is None, (
+        "test premise: no REAL position exists for this live node")
+
+    rows = signals_notify.build_reference_table([node])
+    assert rows[0]['Held'] is True
+    text = signals_notify._ticker_block(rows[0])[0]['text']['text']
+    assert '📄PAPER' in text, f"phantom must not read as a real position: {text!r}"
+
+
+def test_real_position_wins_over_a_colliding_paper_row(env, monkeypatch):
+    """The merge's existing precedence (real overwrites paper on a wl_id
+    collision) must be preserved -- real state must never be shadowed."""
+    _patch_prices(monkeypatch)
+    node = _paper_node_with_position(ticker='COLLIDE', state='live', shares=100)
+    assert signals_db.open_position(
+        node, signal_price=105.0, signal_time='2026-07-27 14:30:00',
+        entry_price=50.0, entry_time='2026-07-28 12:00:00', shares=7)
+
+    rows = signals_notify.build_reference_table([node])
+    assert rows[0]['_pos']['origin'] == 'live'
+    assert rows[0]['_pos']['shares'] == 7, "the REAL row must win the collision"
+    text = signals_notify._ticker_block(rows[0])[0]['text']['text']
+    assert '📄PAPER' not in text

@@ -808,6 +808,47 @@ def part3():
         print(f"{total_edge_red} edge-case row(s) currently red -- run "
               f"`scripts/coverage_proof_matrix.py --tier <TIER>` for each of: {red_tiers}")
 
+    # --- 1b. Stream fast-path parse health ---
+    # Added 2026-08-15, same session as the _parse_activity_message shape fix -- the
+    # fast path had 0 successful parses for 13 days (2026-08-02 to 2026-08-15) with the
+    # only evidence being a manual grep of logs/active_signals.log. That's the actual
+    # gap this section closes: a real, computed metric instead of something only
+    # discoverable by hand. Window matches the 14-day lookback the daily-vs-edge-case
+    # classification above already uses, for consistency.
+    #
+    # Wired into the SAME coverage_run_snapshot/regression mechanism as the Grid rows
+    # below, not left as a bare print -- a print-only metric has exactly zero protection
+    # against silently regressing back to 0% and nobody noticing, which is the precise
+    # failure shape that let the parser sit dead for 13 days in the first place (found
+    # live, 2026-08-15, when asked "checklist for coverage and evening report?" after
+    # this section first shipped as print-only). Reuses coverage_registry.STATUS_ORDER's
+    # existing scale (100% -> 'verified-live', a real live degradation -> 'live-attempt-
+    # failed', nothing observed -> 'wired-never-fired') so it participates in the exact
+    # same "N regressed since run #X" comparison below with zero new logic.
+    con2 = sqlite3.connect(LIVE_DB)
+    parse_rows = con2.execute(
+        "SELECT result, COUNT(*) FROM coverage_events WHERE scenario_key='stream_message_parsed' "
+        "AND ts >= date('now', '-14 days') GROUP BY result"
+    ).fetchall()
+    con2.close()
+    parse_counts = dict(parse_rows)
+    parsed = parse_counts.get('parsed', 0)
+    failed = parse_counts.get('missing_field', 0) + parse_counts.get('exception', 0)
+    total = parsed + failed
+    print(f"\n--- 1b. Stream fast-path parse health (last 14 days) ---")
+    if total == 0:
+        print("no OrderFillCompleted stream messages seen in this window -- can't compute a rate "
+              "(not itself an error: a quiet 14 days with no real fills is possible)")
+        parse_status = 'wired-never-fired'
+        parse_detail = 'no OrderFillCompleted stream messages in the last 14 days'
+    else:
+        rate = parsed / total * 100
+        flag = "" if rate == 100 else "  <-- was silently 0% for 13 days before the 2026-08-15 fix, watch this"
+        print(f"{parsed}/{total} ({rate:.0f}%) real fill messages parsed successfully{flag}")
+        parse_status = 'verified-live' if rate == 100 else 'live-attempt-failed'
+        parse_detail = f"{parsed}/{total} ({rate:.0f}%) parsed"
+    today_rows['stream_parse_health'] = (parse_status, parse_detail)
+
     prior_run_id, prior_ts, prior_statuses = last_run_statuses()
     if prior_run_id is None:
         print("no prior baseline -- this run establishes the first one")

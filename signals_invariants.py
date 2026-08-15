@@ -542,7 +542,42 @@ def check_all_account_values_are_known_aliases():
     return violations
 
 
+def check_paper_position_on_non_paper_node():
+    """A paper_positions row whose node is NOT state='paper'.
+
+    Cheap, DB-only, and it detects the condition behind a real defect: until
+    2026-08-15 active_signals unioned paper and real position keys into one
+    duplicate-suppression set, so a paper position on a node that had since
+    flipped to state='live' silently blocked every real BUY on it. That is not
+    hypothetical -- SOXL/ira wl_id=92 ($10k live) carried an open paper
+    position across its 2026-08-10 paper->live flip until 2026-08-13, roughly 3
+    trading days during which its real entries were dropped with no Slack
+    message and no coverage event. Only luck (no signal fired) kept it free.
+
+    The union itself is fixed (_position_keys_by_book), so this row can no
+    longer block a real entry. This check exists because NOTHING anywhere
+    reported the underlying state, and it stays anomalous for other reasons: a
+    live node accruing simulated fills is a config/lifecycle mistake worth
+    seeing. paper_trading.check_paper_sells drains such rows on their own exit
+    conditions, so no cleanup automation is needed -- only visibility."""
+    violations = []
+    with db._conn() as c:
+        rows = c.execute(
+            "SELECT pp.id, pp.ticker, pp.wl_id, pp.entry_time, wl.state, wl.account "
+            "FROM paper_positions pp LEFT JOIN watch_list wl ON wl.id = pp.wl_id "
+            "WHERE pp.wl_id IS NOT NULL AND (wl.state IS NULL OR wl.state != 'paper')"
+        ).fetchall()
+    for r in rows:
+        violations.append(
+            f"paper_positions id={r['id']} ({r['ticker']}, wl_id={r['wl_id']}) belongs to a node with "
+            f"state={r['state']!r} account={r['account']!r}, not 'paper' -- a simulated position is "
+            f"open against a non-paper node (open since {r['entry_time']})"
+        )
+    return violations
+
+
 CHECKS = [
+    check_paper_position_on_non_paper_node,
     check_live_trailing_exit_automation_scope,
     check_research_mode_ticker_with_open_position_in_automation_scope,
     check_daily_sync_halted_nodes,
