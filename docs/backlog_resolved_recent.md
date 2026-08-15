@@ -233,3 +233,7 @@ Was `"next: 10:25 or 14:55 ET"` (stale); now built dynamically (`"next: 10:25 or
 ## [live-trading][coverage] Resolved 2026-08-05 — the two real live-check bugs found 2026-08-04 very late: `get_pending_buys_for_ticker_on_date`'s exact-date match (broke `canary_overnight_carry` for SDOW/DIA) and `audit_live_test_candidates.audit_one`/`status_check.py` never checking `pending_buys` (a resting trailing-buy showed as "flat")
 Fixed via `date(signal_time) <= check_date` (a pending_buys row is deleted on resolution, so presence = still resting) and a new `get_pending_buy_by_wl_id` used in `audit_one`. Tests: `tests/test_coverage_check.py`, new `tests/test_audit_live_test_candidates.py`. 3rd bug in the same finding (cosmetic stale status-message time string) still open, see `docs/backlog_cache.md`.
 
+
+## [live-trading][tax] Closed 2026-08-15 (backlog-cleanse) — wash-sale/tax analysis precondition now false (brokerage trading_enabled 2026-08-12); verified no cross-account ticker sharing today, no active risk. Full detail: `deep_backlog.md`.
+## [portfolio][tax] Closed 2026-08-15 (backlog-cleanse) — AGQ K-1/UBTI finding superseded: its own recommendation (AGQ in brokerage) is exactly what happened.
+## [portfolio][design] Closed 2026-08-15 (backlog-cleanse) — skim-and-reserve overlay: skim work stopped for now, consistent with the 2026-08-14 "trim" reframe.
