@@ -4837,3 +4837,40 @@ def get_realized_pnl_by_ticker(account, tickers, year):
         pnl = (r['exit_price'] - r['entry_price']) * r['shares']
         totals[r['ticker']] = totals.get(r['ticker'], 0.0) + pnl
     return totals
+
+
+def get_unrealized_pnl_by_ticker(account, prices):
+    """Real open-position $ mark-to-market P&L for `account`, summed per
+    ticker -- the unrealized counterpart to get_realized_pnl_by_ticker,
+    feeding k1_tax.unrealized_forecast (docs/design.md's 2026-08-15 "Tax
+    forecast: unrealized gain/loss calculator" entry).
+
+    prices: {ticker: current/EOD price} -- supplied by the caller (this
+    function does no price fetching itself, matching get_realized_pnl_by_
+    ticker's pattern of taking already-known values, not reaching out to a
+    live API from the DB layer). A ticker with an open position but no price
+    supplied is simply skipped (absent from the returned dict), not zero-
+    filled or raised on -- same "absent means not computed" convention as
+    get_realized_pnl_by_ticker's zero-closed-trades case.
+
+    Same exclusions as get_realized_pnl_by_ticker: real open_positions only
+    (never paper_positions), is_dry_run_sim=1 rows excluded (not a real
+    position, no real unrealized tax exposure)."""
+    if not prices:
+        return {}
+    with _conn() as c:
+        rows = c.execute(f"""
+            SELECT ticker, entry_price, shares
+            FROM open_positions
+            WHERE account=? AND ticker IN ({','.join('?' * len(prices))})
+                  AND COALESCE(is_dry_run_sim, 0) = 0
+                  AND entry_price IS NOT NULL AND shares IS NOT NULL
+        """, (account, *prices.keys())).fetchall()
+    totals = {}
+    for r in rows:
+        price = prices.get(r['ticker'])
+        if price is None:
+            continue
+        pnl = (price - r['entry_price']) * r['shares']
+        totals[r['ticker']] = totals.get(r['ticker'], 0.0) + pnl
+    return totals

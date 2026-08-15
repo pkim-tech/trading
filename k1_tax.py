@@ -365,6 +365,65 @@ def brokerage_tax_forecast(year: int, realized_gains_by_ticker: dict[str, float]
     )
 
 
+@dataclass
+class UnrealizedForecast:
+    year: int
+    ordinary_unrealized: dict[str, float]           # {ticker: unrealized $}, non-1256 -- reported only, never taxable until sold
+    section_1256_unrealized: dict[str, float]        # {ticker: unrealized $}, 1256 tickers -- real year-end MTM tax exposure
+    section_1256_unrealized_lt_gross: float          # 60% slice of the 1256 unrealized total
+    section_1256_unrealized_st_gross: float          # 40% slice
+    section_1256_hypothetical_liability: float       # blended-rate tax on the 1256 slices, INFORMATIONAL ONLY
+    note: str
+
+
+def unrealized_forecast(year: int, unrealized_gains_by_ticker: dict[str, float],
+                         rates: RateConfig | None = None) -> UnrealizedForecast:
+    """Reports unrealized (mark-to-market) gain/loss on real open `brokerage`
+    positions -- extends brokerage_tax_forecast's realized-loss piece.
+
+    unrealized_gains_by_ticker: {ticker: unrealized $ gain/loss}, e.g. from
+      signals_db.get_unrealized_pnl_by_ticker('brokerage', [...], prices).
+
+    DELIBERATELY NOT combined with brokerage_tax_forecast's real liability/
+    reserve (docs/design.md's 2026-08-15 "Tax forecast: unrealized gain/loss
+    calculator" entry has the full writeup): Section 1256 contracts are
+    subject to IRS year-end mark-to-market treatment -- an OPEN 1256 position
+    is deemed sold at FMV on 12/31 regardless of whether it's actually
+    closed, so its unrealized gain/loss likely SHOULD feed the same 60/40
+    netting math as realized. A plain ordinary (non-1256) position's
+    unrealized gain is NOT taxable until actually sold, so it must stay
+    reported-only. This distinction was NOT confirmed with a tax
+    professional -- section_1256_hypothetical_liability is computed for
+    visibility only and must not be folded into a real reserve number until
+    that's confirmed; folding an unconfirmed mechanic into a real reserve
+    recommendation would be worse than not having the number at all."""
+    rates = rates or load_rate_config()
+
+    ordinary_unrealized = {t: g for t, g in unrealized_gains_by_ticker.items() if t not in SECTION_1256_TICKERS}
+    section_1256_unrealized = {t: g for t, g in unrealized_gains_by_ticker.items() if t in SECTION_1256_TICKERS}
+
+    lt_gross = sum(g * rates.section_1256_lt_fraction for g in section_1256_unrealized.values())
+    st_gross = sum(g * rates.section_1256_st_fraction for g in section_1256_unrealized.values())
+    lt_rate = rates.federal_lt_rate + rates.niit_rate + rates.state_rate + rates.city_rate
+    st_rate = rates.federal_ordinary_rate + rates.niit_rate + rates.state_rate + rates.city_rate
+    # Floor the COMBINED total, not each slice independently (the same bug
+    # shape fixed in brokerage_tax_forecast's cross-character netting, 2026-
+    # 08-15) -- an LT loss should be able to offset an ST gain here too, not
+    # get zeroed out and lose its offsetting value before combining.
+    hypothetical_liability = max(0.0, lt_gross * lt_rate + st_gross * st_rate)
+
+    return UnrealizedForecast(
+        year=year, ordinary_unrealized=ordinary_unrealized, section_1256_unrealized=section_1256_unrealized,
+        section_1256_unrealized_lt_gross=lt_gross, section_1256_unrealized_st_gross=st_gross,
+        section_1256_hypothetical_liability=hypothetical_liability,
+        note="INFORMATIONAL ONLY -- section_1256_hypothetical_liability is NOT included in "
+             "brokerage_tax_forecast's reserve/liability. Whether an open Section 1256 "
+             "position's unrealized gain must be marked-to-market at year-end (and thus "
+             "taxed the same as a realized gain) is not confirmed -- verify with a CPA "
+             "before treating this number as part of the real reserve.",
+    )
+
+
 def reserve_with_yield(principal: float, annual_yield_rate: float, days: int) -> float:
     """Simple interest accrual on a reserve balance held in e.g. T-bills instead of
     cash. Simple (not compounded) interest is intentional -- this is a rough

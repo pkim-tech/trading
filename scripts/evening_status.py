@@ -408,6 +408,26 @@ def _brokerage_tax_forecast_section():
     elif not forecast.baseline_exhausted:
         print(f"Baseline not yet exhausted (${forecast.st_baseline_remaining + forecast.lt_baseline_remaining:,.2f} "
               f"remaining) -- no sweep recommendation yet.")
+
+    open_brokerage = [p for p in db.get_open_positions() if p.get('account') == 'brokerage']
+    if not open_brokerage:
+        print("No open brokerage positions -- nothing unrealized to report.")
+    else:
+        prices = {}
+        for p in open_brokerage:
+            try:
+                prices[p['ticker']] = schwab_client.get_current_price(p['ticker'])
+            except Exception as e:
+                print(f"  {p['ticker']:6s} unrealized: NOT CHECKED ({type(e).__name__})")
+        unrealized = db.get_unrealized_pnl_by_ticker('brokerage', prices)
+        u_forecast = k1_tax.unrealized_forecast(year, unrealized)
+        print(f"Unrealized (mark-to-market, {len(open_brokerage)} open position(s)):")
+        for t, g in sorted(unrealized.items()):
+            tag = " [Sec.1256]" if t in k1_tax.SECTION_1256_TICKERS else ""
+            print(f"  {t:6s} unrealized: ${g:>12,.2f}{tag}")
+        if u_forecast.section_1256_unrealized:
+            print(f"  Sec.1256 hypothetical MTM liability (INFORMATIONAL ONLY, NOT in Reserve above): "
+                  f"${u_forecast.section_1256_hypothetical_liability:,.2f} -- {u_forecast.note}")
     print()
 
 
