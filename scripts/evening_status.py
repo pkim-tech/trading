@@ -911,6 +911,17 @@ def part3():
         if node.get('state') != 'paper':
             results.append((node, len(paper), len(bt), 'not-paper', None))
             continue
+        # Snooze check (2026-08-16, spec'd 2026-08-16 morning): unlike
+        # coverage_check.py's scenario_expectations checks (already wired to
+        # coverage_snoozes/is_snoozed), this comparison had no way to
+        # acknowledge and silence a known/understood divergence -- LABD
+        # (wl_id=152) was re-flagging every single run with no way to quiet
+        # it once the user confirmed why it diverges. Freeform scenario_key
+        # ('paper_vs_kernel_mismatch'), no new table/registration needed --
+        # matches the existing snooze_coverage.py CLI pattern directly.
+        if db.is_snoozed('paper_vs_kernel_mismatch', ticker=node['ticker'], node_id=node['id']):
+            results.append((node, len(paper), len(bt), 'snoozed', None))
+            continue
         mismatch = abs(len(paper) - len(bt)) > 2
         results.append((node, len(paper), len(bt), 'MISMATCH' if mismatch else 'ok', None))
 
@@ -919,14 +930,18 @@ def part3():
     errored = sum(1 for r in results if r[3] == 'error')
     flagged = sum(1 for r in results if r[3] == 'MISMATCH')
     matched = sum(1 for r in results if r[3] == 'ok')
+    snoozed = sum(1 for r in results if r[3] == 'snoozed')
     print(f"{len(paper_nodes)} total: {quiet} no activity either side, {not_paper} not a paper node "
           f"(dry_run/canary/live -- not comparable here), {matched} matched, {flagged} issues"
+          + (f", {snoozed} snoozed" if snoozed else "")
           + (f", {errored} errored" if errored else ""))
     for node, paper_n, kernel_n, tag, err in results:
         if tag == 'MISMATCH':
             print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  paper={paper_n} kernel={kernel_n}  MISMATCH")
         elif tag == 'error':
             print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  NOT CHECKED ({err})")
+        elif tag == 'snoozed':
+            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  paper={paper_n} kernel={kernel_n}  (snoozed)")
 
     print(f"\n--- 3. Live vs kernel (all real capital-at-stake nodes today, not just ones that traded) ---")
     # Previously scoped to wl_ids derived from TODAY's real trades only -- a node with ZERO
