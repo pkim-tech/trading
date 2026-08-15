@@ -7,6 +7,8 @@ week. **Prune entries older than ~7 days whenever adding a new one** (drop, don'
 `deep_backlog.md` already has the permanent record). See `docs/backlog_cache.md`'s header note
 for the full maintenance workflow.
 
+## [live-trading][coverage] Resolved 2026-08-16 — Canary G retired (`scenario_expectations` 69/70 → `active=0`); 2 stale backlog items pruned (`_ticker_block` paper mislabel, SOXL/ira phantom position — both confirmed fixed by the same origin-column fix, independently by two sessions). No commit yet (uncommitted DB flip + docs edit, next in this session's batch). Full detail: `deep_backlog.md`.
+
 ## [live-trading] Resolved 2026-08-16 (commit `0c87bf2`) — session-wrap dual-Opus review of the auto-fill/Stop-Start diff found and fixed 5 real issues (Stop/Start button's incomplete gate check, Manually Close handler's zero validation — a real bugs #54/#63-64 risk via stale Slack scrollback, 2 stale docstrings, a third ungated paper entry path); also found and fixed a real incident along the way — a new test wrote to the actual production `schwab_node_automation.json` due to an isolation gap. Full detail: `deep_backlog.md`.
 
 ## [live-trading][coverage] Resolved 2026-08-16 (commit `352f134`) — `build_eod_scenario_review` duplicate canary/control bullets fixed via the Coverage Report's rollup helpers, bonus bug fixed (explained deviation shown as unresolved). **Flag: shipped without knowing a concurrent planning session was holding this item for a dedupe-vs-strip-entirely decision — may need revisiting.** Full detail: `deep_backlog.md`.

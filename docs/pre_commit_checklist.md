@@ -25,6 +25,14 @@ Used by `feature wrap` and `session wrap` before committing.
       entry side, see its own docstring). Investigate any new/unexpected MISMATCH before
       committing — don't just rerun the full watchlist without `--tickers` unless something
       looks wrong, it's a slower yfinance-heavy sweep.
+- [ ] **If `active_signals.py`, any `signals_*.py` module, or any `schwab_*.py` module changed
+      this session**: run `.venv/bin/python scripts/evening_status.py all` (the real evening
+      account check-in — Part 1 log warnings, Part 2 real capital-at-stake node states, Part 3
+      trades-vs-kernel + unexplained deviations, Part 4 tomorrow's readiness) against the real
+      live DB and actually read the output, not just confirm it exits cleanly. This is the same
+      real-render requirement as the nightly-Slack-report item below, but for the tool a human
+      actually runs to sanity-check live state before/after a change — added 2026-08-16 after a
+      session shipped real live-trading code changes without running it at all.
 - [ ] **If any nightly Slack report's composition changed this session** (`scripts/
       coverage_report_summary.py`, `signals_notify.build_eod_scenario_review`/
       `build_tomorrow_plan`, or similar): actually render it against real data and read it —
