@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][security] Closed 2026-08-15 (backlog-cleanse, user's call) — manual-"Filled" SL call ticker-gated but not mode-gated; structurally unreachable today, revisit trigger noted if manual confirmation ever returns. Full detail: `deep_backlog.md`.
+
 ## [live-trading] Closed 2026-08-15 (backlog-cleanse batch 4, user's call) — `soxl_ira` `account_type="margin"` mislabel item: real risk resolved by a separate, already-correct mechanism (`get_leveraged_buying_power` clamps add-on sizing to Schwab's real-time `buyingPower`, which for `soxl_ira` equals `cashBalance` exactly, no leverage assumption, verified live 2026-08-12). Worst case is a broker rejection, no real financial exposure. Item removed.
 
 ## [live-trading] Closed 2026-08-15 (backlog-cleanse batch 4) — GDXU stays `state='live'` decision record: one-line note with no follow-up action, already fully reflected in the DB. Item removed.
