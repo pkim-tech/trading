@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][tax] Built 2026-08-15 — unrealized gain/loss calculator (brokerage-only): `get_unrealized_pnl_by_ticker`/`k1_tax.unrealized_forecast`, wired into `evening_status.py` Part 2. Section 1256 MTM-liability question left informational-only, not folded into the real reserve, pending CPA confirmation. 15 new tests, rendered end-to-end against a synthetic scenario. Committed `83326af`. Full detail: `backlog_cache.md`/`design.md`.
+
 ## [testing] Fixed 2026-08-15 — `tests/test_coverage_check.py` fsync slowdown: session-scoped schema template on tmpfs. 160s -> ~11-17s under the real default config, 70-85% reduction solo, isolation deliberately regression-tested. Committed `ed67909`. Full detail: `backlog_cache.md`.
 
 ## [live-trading] Confirmed committed 2026-08-15 (backlog-cleanse batch 1) — node archive state (`watch_list.archived_at`) was already built+committed (`9c67711`); "BUILT... Not committed" wording was stale. Full detail: `deep_backlog.md`.
