@@ -127,7 +127,12 @@ def real_capital_nodes():
     """
     con = sqlite3.connect(LIVE_DB)
     con.row_factory = sqlite3.Row
-    live_nodes = [dict(r) for r in con.execute("SELECT * FROM watch_list WHERE state='live'")]
+    # archived_at IS NULL -- same real bypass of get_watchlist() as
+    # signals_db.get_live_nodes(), a raw scan that needs its own explicit
+    # archive filter (docs/design.md's "Node archive state" entry). An
+    # archived real-capital node must stop showing in the evening report.
+    live_nodes = [dict(r) for r in con.execute(
+        "SELECT * FROM watch_list WHERE state='live' AND archived_at IS NULL")]
     con.close()
     nodes = [n for n in live_nodes if helpers.has_capital_at_stake(n)]
     nodes.sort(key=lambda n: (ACCOUNT_ORDER.get(n.get('account'), 99), n['ticker']))
@@ -1202,6 +1207,22 @@ def part4():
     print(f"\n{len(incidents)} open trading_incident(s)")
     for i in incidents:
         print(f"  #{i['id']} {i['ts']} — {i.get('title', '')}")
+
+    print("\n--- 2. Real live nodes with no watch_list_candidate_link ---")
+    # Informational only, not an alert -- was a manually-maintained static list
+    # in a doc that went stale twice; queried fresh from the DB every run
+    # instead (docs/backlog_cache.md, "watch_list_candidate_link"/"real live
+    # watch_list nodes with no" item). db.get_live_nodes() already excludes
+    # archived_at IS NOT NULL nodes, so a retired node never shows here either.
+    live_nodes = db.get_live_nodes()
+    linked_wl_ids = {link['wl_id'] for link in db.get_candidate_links()}
+    unlinked = [n for n in live_nodes if n['id'] not in linked_wl_ids]
+    unlinked.sort(key=lambda n: (ACCOUNT_ORDER.get(n.get('account'), 99), n['ticker']))
+    if not unlinked:
+        print("none -- every real live node has a recorded candidate link")
+    else:
+        for n in unlinked:
+            print(f"  {n['ticker']:6s} {n['account'] or '':10s} wl_id={n['id']}")
 
 
 PARTS = {'1': part1, '2': part2, '3': part3, '4': part4}

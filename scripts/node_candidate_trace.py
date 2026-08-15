@@ -81,7 +81,10 @@ def main():
     for link in db.get_candidate_links():
         links_by_wl.setdefault(link['wl_id'], []).append(link)
 
-    nodes = [n for n in db.get_watchlist() if n['state'] in ('live', 'dry_run', 'paper')]
+    # include_archived=True -- this is an audit/trace tool, an archived node's
+    # candidate-link history should still be visible (docs/design.md's "Node
+    # archive state" call-site audit flags this as the one UNSAFE-leaning site).
+    nodes = [n for n in db.get_watchlist(include_archived=True) if n['state'] in ('live', 'dry_run', 'paper')]
     nodes.sort(key=lambda n: (n['ticker'], n['account'] or '', n['id']))
 
     print(f"{'Ticker':7} {'Acct':10} {'State':8} {'wl_id':>6}  Candidate link")

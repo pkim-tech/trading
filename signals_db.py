@@ -656,6 +656,15 @@ def ensure_tables():
             c.execute("DROP TABLE watch_list")
             c.execute("ALTER TABLE watch_list_new RENAME TO watch_list")
 
+        wl_cols = {r[1] for r in c.execute("PRAGMA table_info(watch_list)").fetchall()}
+        if 'archived_at' not in wl_cols:
+            # 2026-08-15/16: node archive state, orthogonal to `state` (which
+            # keeps meaning "what simulation mode" -- archived_at means "retired
+            # from active consideration at all"). See docs/design.md's
+            # "Node archive state" entry. Nullable, no UNIQUE-constraint impact,
+            # so a plain ALTER suffices -- no rebuild needed.
+            c.execute("ALTER TABLE watch_list ADD COLUMN archived_at TIMESTAMP")
+
         # open_positions
         c.execute("""
             CREATE TABLE IF NOT EXISTS open_positions (
@@ -2044,16 +2053,22 @@ def set_active_watchlist(watchlist_id):
         c.commit()
 
 
-def get_watchlist(watchlist_id=None):
+def get_watchlist(watchlist_id=None, include_archived=False):
+    """include_archived=False (default) filters out archived_at IS NOT NULL rows
+    -- the single enforcement point for "node archive state"
+    (docs/design.md's "Node archive state" entry). A caller that genuinely
+    needs archived nodes too (e.g. an audit/trace tool) must opt in explicitly
+    with include_archived=True."""
     with _conn() as c:
         if watchlist_id is None:
             watchlist_id = get_active_watchlist_id()
         if watchlist_id is None:
             return []
-        return [dict(r) for r in c.execute(
-            "SELECT * FROM watch_list WHERE watchlist_id = ? ORDER BY ticker, id",
-            (watchlist_id,)
-        ).fetchall()]
+        sql = "SELECT * FROM watch_list WHERE watchlist_id = ?"
+        if not include_archived:
+            sql += " AND archived_at IS NULL"
+        sql += " ORDER BY ticker, id"
+        return [dict(r) for r in c.execute(sql, (watchlist_id,)).fetchall()]
 
 
 def get_live_nodes():
@@ -2061,10 +2076,16 @@ def get_live_nodes():
     not get_watchlist()'s active-watchlist-only scope: real live nodes live in
     several watchlists at once today (the v5 watchlist plus the older
     soxl_test group), so scoping to the active one would silently miss real
-    money. Ordered by id so callers/previews are stable run to run."""
+    money. Ordered by id so callers/previews are stable run to run.
+
+    Excludes archived_at IS NOT NULL nodes directly -- this is a real bypass
+    of get_watchlist() (its own separate query, not routed through it), so the
+    archive filter has to be applied here too, not just at get_watchlist()'s
+    default. See docs/design.md's "Node archive state" entry, the
+    get_live_nodes()-specific finding."""
     with _conn() as c:
         return [dict(r) for r in c.execute(
-            "SELECT * FROM watch_list WHERE state = 'live' ORDER BY id"
+            "SELECT * FROM watch_list WHERE state = 'live' AND archived_at IS NULL ORDER BY id"
         ).fetchall()]
 
 
@@ -2287,6 +2308,62 @@ def remove_node(watch_id):
         if row:
             _log_audit(c, 'remove_node', watchlist_id=row['watchlist_id'], watch_id=watch_id,
                        ticker=row['ticker'], detail=f"strategy={row['strategy']} version={row['version']}")
+        c.commit()
+
+
+def archive_node(watch_id):
+    """Retires a node from active consideration (get_watchlist()'s default view,
+    get_live_nodes(), evening_status.py's real_capital_nodes()) without deleting
+    its row -- distinct from remove_node()'s hard DELETE and from state (which
+    keeps meaning "what simulation mode," not "is this retired"). See
+    docs/design.md's "Node archive state" entry.
+
+    Refuses (raises) rather than silently no-opping if the node still has an
+    open position or an unresolved pending buy -- this is the exact YINN
+    problem (remove_node had zero safety check here) made a hard gate instead
+    of relying on the caller to remember."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, state, archived_at FROM watch_list WHERE id = ?",
+            (watch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"archive_node: no watch_list row with id={watch_id}")
+        open_pos = c.execute(
+            "SELECT id FROM open_positions WHERE wl_id = ?", (watch_id,)
+        ).fetchone()
+        if open_pos:
+            raise ValueError(
+                f"archive_node refused: wl_id={watch_id} ({row['ticker']}) has an open "
+                f"position (open_positions.id={open_pos['id']}) -- close it first.")
+        pending = c.execute(
+            "SELECT id FROM pending_buys WHERE wl_id = ?", (watch_id,)
+        ).fetchone()
+        if pending:
+            raise ValueError(
+                f"archive_node refused: wl_id={watch_id} ({row['ticker']}) has an "
+                f"unresolved pending buy (pending_buys.id={pending['id']}) -- resolve it first.")
+        c.execute(
+            "UPDATE watch_list SET archived_at = datetime('now') WHERE id = ?", (watch_id,)
+        )
+        _log_audit(c, 'archive_node', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                   ticker=row['ticker'], detail=f"state={row['state']}")
+        c.commit()
+
+
+def unarchive_node(watch_id):
+    """Reverses archive_node() -- clears archived_at, restoring wl_id continuity
+    (trade_log/coverage_events keep keying off the same id) instead of requiring
+    the node to be re-created from scratch."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unarchive_node: no watch_list row with id={watch_id}")
+        c.execute("UPDATE watch_list SET archived_at = NULL WHERE id = ?", (watch_id,))
+        _log_audit(c, 'unarchive_node', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                   ticker=row['ticker'], detail='')
         c.commit()
 
 
