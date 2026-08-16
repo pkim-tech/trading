@@ -4712,17 +4712,66 @@ def check_auto_fills(open_positions):
     """Polls Schwab's order book for pilot-scope tickers with auto-fill-detection
     enabled (schwab_safety.auto_fill_detection_enabled, off by default) and
     auto-records a fill instead of waiting for the human Filled/Exited click.
-    Buy side: any pending_buys row with order_placed=True. Sell side: any open
-    position with an armed trailing-sell order (trail_state.order_placed) and an
-    unresolved exit_pending. Clearing the pending_buys row / exit_pending on a
-    hit is itself the dedup marker -- no separate 'already processed' state needed."""
+    Buy side: a trailing-buy pending_buys row with order_placed=True (broker
+    confirmed the order is resting -- via the automated-placement path or the
+    manual "Trailing Buy Order Placed" button), OR a market-buy-eligible
+    pending_buys row with a real order_id on file. These are deliberately
+    different conditions, not the same check applied twice: order_placed
+    tracks a genuine "resting, awaiting fill" broker state that only exists
+    for a trailing order (GOOD_TILL_CANCEL until it bounces); a market order
+    has no comparable multi-poll-cycle resting state during regular market
+    hours -- it fills same-tick, or genuinely fails/gets rejected, or (the
+    one exception, e.g. a pre-market placement) waits for the open, in which
+    case get_filled_order simply keeps returning None until then, same as
+    any other not-yet-filled case this poll already handles safely. Either
+    way order_id is already the right, and only, signal that there's a real
+    fill outcome left to discover -- there's no meaningful intermediate
+    "resting, confirmed accepted, not yet fillable" state analogous to
+    order_placed for a market order the way there was reason to invent
+    for the trailing-buy branch. order_placed is NEVER set to 1 for
+    a market-buy node (mark_pending_buy_placed_by_wl_id is only called from
+    the trailing-buy branches of notify_buy_signal/notify_drought_buy_signal
+    and the manual trailing-buy button handler), so gating market-buy rows on
+    it made this loop dead code for every automated market-buy node -- found
+    2026-08-16 via fake_venue/scenarios_sl_async_fallback.py's Leg 1.5 (see
+    docs/backlog_cache.md), fixed here. This is genuinely the same kind of
+    gap _sync_confirm_and_protect's own timeout branch describes ("will be
+    placed once the fill is confirmed by the auto-fill poll") -- that promise
+    was false until this fix, since the poll never looked at these rows at
+    all. Sell side: any open position with an armed trailing-sell order
+    (trail_state.order_placed) and an unresolved exit_pending. Clearing the
+    pending_buys row / exit_pending on a hit is itself the dedup marker -- no
+    separate 'already processed' state needed."""
     for pending in db.get_pending_buys():
         ticker = pending['ticker']
-        if not pending['order_placed']:
-            continue
+        # Ticker-scope gate FIRST, before touching pending['node'] at all --
+        # a node_json subscript failure for an out-of-automation-scope ticker
+        # must not be able to raise out of this function and take the SELL-side
+        # loop below down with it (found by contextual review, 2026-08-16:
+        # an earlier draft dispatched on db._is_trailing_buy(node) -- a hard
+        # node['strategy'] subscript -- before this gate, widening blast radius
+        # to every pending row regardless of scope).
         if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
             continue
         node = pending['node']
+        if db._is_trailing_buy(node):
+            if not pending['order_placed']:
+                continue
+        else:
+            # Market-buy: no "resting, awaiting confirmation" broker state --
+            # a real order_id means an order was actually placed and either
+            # already filled or genuinely failed (rejected/cancelled at the
+            # broker); that's exactly the unconfirmed-fill state this
+            # fallback exists to recover. Known residual gap (both paired
+            # reviews, 2026-08-16, converged on this independently): if the
+            # order was genuinely rejected/cancelled rather than filled,
+            # get_filled_order never returns non-None and nothing ever clears
+            # this row (check_entry_abandon is trailing-buy-only) -- the row
+            # polls forever. Not fixed here (a market-buy abandon-timeout is
+            # its own design question, out of scope for this fix) -- see
+            # docs/backlog_cache.md.
+            if not pending.get('order_id'):
+                continue
         if not (schwab_safety.auto_fill_detection_enabled(ticker)
                 and schwab_safety.node_auto_fill_detection_enabled(node.get('id'))):
             continue

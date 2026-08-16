@@ -163,11 +163,21 @@ REGISTRY = [
                "still needs a real successful placement observed post-fix."),
     dict(id='sl_async_fallback',
          scenario="SL placed via async fallback (timeout path)",
-         code_path="check_auto_fills/drain_fill_queue/check_gap_resize fill poll",
-         offline_coverage="Unit test only",
+         code_path="check_auto_fills/drain_fill_queue fill poll",
+         offline_coverage="fake_venue/scenarios_sl_async_fallback.py",
          check_mechanism='coverage_events', scenario_key='sl_placement_fast_confirm_timeout',
-         notes="Timeout branch confirmed reachable live (VOO, dry_run, 2026-07-24); doesn't confirm the "
-               "fallback SL placement that follows actually succeeds."),
+         notes="NOTE: this row's status axis (scenario_key='sl_placement_fast_confirm_timeout') only "
+               "measures whether the TIMEOUT branch fires -- it can't by itself confirm the fallback SL "
+               "placement that follows actually succeeds; that part is confirmed by the fake_venue proof "
+               "below, not by compute_status(). Timeout branch confirmed reachable live (VOO, dry_run, "
+               "2026-07-24). 2026-08-16: check_auto_fills' buy-side loop was found to be dead code for "
+               "every automated market-buy node (gated on pending_buys.order_placed, never set for a "
+               "market order) -- fixed same day (branches on db._is_trailing_buy(node), a market-buy row "
+               "is gated on order_id instead). Fake-venue-confirmed end-to-end for both fallback paths "
+               "(check_auto_fills alone, and independently drain_fill_queue) -- no live proof yet that "
+               "the fallback SL placement succeeds for a real market-buy timeout. check_gap_resize "
+               "removed from code_path -- confirmed inapplicable to a market order (no resting-order "
+               "gap-through-trigger state exists for one)."),
     dict(id='sl_order_fills_independent_detection',
          scenario="A position's own resting protective stop (sl_order_id) fills independently -- "
                   "before the daemon's bar-close signal check ever computes an exit -- and gets "
