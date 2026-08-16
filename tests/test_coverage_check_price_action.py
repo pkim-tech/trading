@@ -252,3 +252,26 @@ def test_run_check_never_clobbers_a_human_authored_reason(isolated_db):
     row = db.get_deviations()[0]
     assert row['reason'] == 'confirmed real bug, entry branch never fired'
     assert row['reason_by'] == 'user'
+
+
+def test_run_check_never_clobbers_a_streamlit_authored_reason(isolated_db):
+    """Fixed 2026-08-15: the human-explained guard only checked reason_by=='user',
+    but pages/14_Coverage.py's inline Explain action writes reason_by='streamlit' --
+    so a human explanation typed into the Coverage Streamlit page could be silently
+    replaced by the generic auto-verified string on a later same-day rerun."""
+    node = _add_real_node()
+    _make_scenario(node['id'])
+    _write_price_csv(check_bars=[(9, 99.0, 99.0)])  # never crosses -- auto-explain eligible
+
+    run_check('2025-01-07')  # first pass: auto-explained by the system
+    dev_id = db.get_deviations()[0]['id']
+    # Mirrors pages/14_Coverage.py's inline Explain UPDATE (reason_by='streamlit',
+    # not 'user' -- explain_deviation's own default param is 'user', so this
+    # simulates the Streamlit call site directly).
+    db.explain_deviation(dev_id, 'confirmed real bug via Streamlit', reason_by='streamlit')
+
+    run_check('2025-01-07')  # rerun same date -- must not clobber the streamlit reason
+
+    row = db.get_deviations()[0]
+    assert row['reason'] == 'confirmed real bug via Streamlit'
+    assert row['reason_by'] == 'streamlit'

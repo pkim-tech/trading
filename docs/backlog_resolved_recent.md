@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [testing][live-trading] Fixed 2026-08-17 — `coverage_check.py`'s auto-explain guard now protects `reason_by='streamlit'` (not just `'user'`) deviation reasons from being overwritten; new regression test added. Full detail: `deep_backlog.md`.
+
+## [testing] Fixed 2026-08-17 — `tests/test_entry_abandon_truth_table.py`'s stale `cancel_order` monkeypatch (missing `node_id` param) fixed, 2 previously-failing tests now pass. Full detail: `deep_backlog.md`.
+
 ## [testing][live-trading] Fixed 2026-08-16 — `check_entry_abandon`'s `'abandoned'` coverage_event now records `did_cancel` in `detail`; missing `tests/test_fake_venue_entry_abandon_timeout_scenario.py` pytest wrapper also built. Paired review: zero findings. Full detail: `deep_backlog.md`.
 
 ## [live-trading][security] Fixed 2026-08-16 — `check_drought_handoff`'s `placed_unconfirmed` exit_pending write now includes `current_price`, closing a real deterministic KeyError in `check_own_sell_fills`. Paired review: zero blocking findings (1 MEDIUM conceded after rebuttal). Full detail: `deep_backlog.md`.
