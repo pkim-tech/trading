@@ -4,6 +4,8 @@
 
 ## [live-trading][security] Fixed 2026-08-16 — `check_drought_handoff`'s `placed_unconfirmed` exit_pending write now includes `current_price`, closing a real deterministic KeyError in `check_own_sell_fills`. Paired review: zero blocking findings (1 MEDIUM conceded after rebuttal). Full detail: `deep_backlog.md`.
 
+## [live-trading][security] Closed 2026-08-16 (paired-reviewed) — `check_auto_fills`'s buy-side fallback fixed for automated market-buy nodes (was dead code, gated on a flag never set for that population); fake_venue scenario upgraded to prove both fallback paths end-to-end. Full detail: `deep_backlog.md`.
+
 ## [live-trading][testing] Closed 2026-08-16 — fake-venue harness Phase 2 Category A queue (30 items), full 3-axis sweep, all built and verified. Full detail: `deep_backlog.md`.
 
 ## [live-trading][testing] Fixed 2026-08-15/16 (2 paired-review rounds) — `trading_incidents` id=9: `record_deviation`/`coverage_check.py` auto-explain persistence bug, 7 production rows repaired, ticket closed. Full detail: `deep_backlog.md`.

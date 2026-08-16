@@ -63,17 +63,24 @@ def test_sl_async_fallback_json_report_is_self_consistent(tmp_path):
     assert proc.returncode == 0, proc.stdout[-6000:]
     payload = json.loads([ln for ln in proc.stdout.splitlines() if ln.startswith('{"passed"')][-1])
     assert payload['passed'] is True
+    # Every check is required=True now (2026-08-16 fix): check_auto_fills'
+    # buy-side loop genuinely recovers a market-buy node's timed-out fill
+    # (Leg 1.5, node_a), and the pre-existing drain_fill_queue stream path
+    # still independently recovers a second node's timed-out fill (Leg 2,
+    # node_b) -- no documented-not-fixed gap remains in this scenario.
     assert all(c['ok'] for c in payload['checks'] if c['required'])
-    # The one required=False Check (the documented, unfixed check_auto_fills
-    # order_placed gap -- see the scenario module's docstring) must still be
-    # PRESENT and OK -- ok=False here would mean the gap somehow stopped
-    # reproducing, which is itself worth knowing, not something to hide by
-    # filtering it out of this assertion.
-    notes = [c for c in payload['checks'] if not c['required']]
-    assert len(notes) == 1 and notes[0]['ok'] is True
-    assert len(payload['proof_rows']) == 1
-    assert payload['proof_rows'][0]['sync_timeout_events'] == 1
-    assert payload['proof_rows'][0]['async_confirm_events'] == 1
-    assert payload['proof_rows'][0]['sl_placed_events'] == 1
-    assert payload['proof_rows'][0]['sl_order_id'] is not None
+    assert all(c['required'] for c in payload['checks'])
+    # Two independent nodes/fills (node_a/CASH_ALIAS via check_auto_fills,
+    # node_b/MARGIN_ALIAS via drain_fill_queue) -- see verify_proof's
+    # docstring for exactly what distinguishes each row.
+    assert len(payload['proof_rows']) == 2
+    by_account = {r['account']: r for r in payload['proof_rows']}
+    assert by_account['fv_cash']['sync_timeout_events'] == 1
+    assert by_account['fv_cash']['async_confirm_events'] == 0
+    assert by_account['fv_cash']['sl_placed_events'] == 1
+    assert by_account['fv_cash']['sl_order_id'] is not None
+    assert by_account['fv_margin']['sync_timeout_events'] == 1
+    assert by_account['fv_margin']['async_confirm_events'] == 1
+    assert by_account['fv_margin']['sl_placed_events'] == 1
+    assert by_account['fv_margin']['sl_order_id'] is not None
     assert payload['observations']['production_path_accesses'] == []
