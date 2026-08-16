@@ -106,33 +106,30 @@ unconfirmed-fill proof clean):
           run against this position, mirroring how the real daemon would
           eventually pick this fill up on a later cycle.
 
-          FOUND, NOT FIXED (2026-08-15, this scenario's first run) -- real
-          bug in signals_notify.check_drought_handoff (~line 2237): the
-          `state['exit_pending'] = {...}` dict it writes on the unconfirmed
-          branch carries only 'reason'/'order_id'/'placed_at'. Every OTHER
-          call site that ever writes exit_pending in this file (line ~1344,
-          line ~2479 -- notify_sell_signal's own TP/SL/TIME wait-for-manual-
-          confirm write) always includes 'current_price' alongside it, because
-          check_own_sell_fills (line ~3236) unconditionally reads
-          exit_pending['current_price'] when it closes the position:
+          FIXED (found 2026-08-15, fixed 2026-08-16) -- signals_notify.
+          check_drought_handoff (~line 2237)'s `state['exit_pending'] = {...}`
+          write on the unconfirmed branch used to carry only 'reason'/
+          'order_id'/'placed_at'. Every OTHER call site that ever writes
+          exit_pending in this file (line ~1344, line ~2479 -- notify_sell_
+          signal's own TP/SL/TIME wait-for-manual-confirm write) always
+          includes 'current_price' alongside it, because check_own_sell_fills
+          (line ~3236) unconditionally reads exit_pending['current_price']
+          when it closes the position:
               closed = db.close_position(pos['id'],
                             exit_signal_price=exit_pending['current_price'], ...)
-          check_drought_handoff's write is the ONE exit_pending producer that
-          omits it -- so the very poll this Grid row's own notes name as the
-          real close path (check_own_sell_fills) raises KeyError('current_price')
-          the moment it tries to close a HANDOFF position that didn't confirm
-          its fill inline. This is a genuine, unfixed production gap, not a
-          scenario bug -- per this session's standing instruction, it is
-          NOT fixed here (that requires the paired independent-cold +
-          contextual Opus review this diff is subject to, since the fix
-          would touch signals_notify.py). The check below is deliberately
-          `required=False` (reports as a loud, unmissable 'note' in the
-          harness's own report/JSON rather than silently passing OR crashing
-          the whole scenario run) -- see its Check text for the exact
-          assertion. Every other check in this scenario (the cancel chain,
-          the fill-race, the unconfirmed-branch's own persistence) is real,
-          passing, `required=True` proof and stands on its own regardless of
-          this one open item.
+          check_drought_handoff's write was the ONE exit_pending producer
+          that omitted it -- so the very poll this Grid row's own notes name
+          as the real close path (check_own_sell_fills) raised
+          KeyError('current_price') the moment it tried to close a HANDOFF
+          position that didn't confirm its fill inline. Fixed by adding
+          'current_price': price to that dict, matching every other producer's
+          shape -- paired independent-cold + contextual Opus review (required
+          since the fix touches signals_notify.py) ran clean, no confirmed
+          findings. The check below was `required=False` while this was an
+          open gap; now that it's fixed and this run reconfirms it
+          (check_own_sell_fills closes node C's position with no exception),
+          it is `required=True` -- real regression coverage against a
+          reintroduction of the bug, not just a note.
 
 Entry-side state (Node B/C's drought positions/orders) is SEEDED, not placed
 through the real BUY path -- same accepted caveat as every sibling Phase 2
@@ -430,24 +427,20 @@ def run(price=None, verbose=True):
     say(f"[node C] check_own_sell_fills(...) -> "
         f"{'raised: ' + check_own_sell_fills_error if check_own_sell_fills_error else 'completed without raising'}")
 
-    # required=False, deliberately -- see module docstring's "FOUND, NOT
-    # FIXED" note. This is a real, currently-unfixed gap in production code
-    # (signals_notify.check_drought_handoff's exit_pending write omits
-    # 'current_price', which check_own_sell_fills unconditionally reads) --
-    # NOT something this harness invocation can or should paper over. Kept
-    # as a loud non-blocking 'note' so the scenario stays a usable regression
-    # proof for the cancel/race/persistence mechanisms above (all real,
-    # passing, required=True checks) without a fix this session isn't
-    # authorized to make on its own.
+    # required=True -- see module docstring's "FIXED" note. Was required=False
+    # while check_drought_handoff's exit_pending write omitted 'current_price'
+    # (a real KeyError waiting to fire the first time this branch hit live);
+    # now that the fix landed (paired-reviewed, see docstring), this is real
+    # regression coverage against the bug being reintroduced.
     checks.append(Check(
         "node C: check_own_sell_fills closes the HANDOFF position cleanly once confirmation lands "
-        "(FOUND, NOT FIXED: signals_notify.check_drought_handoff's placed_unconfirmed exit_pending "
-        "write, ~line 2237, omits 'current_price' -- every other exit_pending producer in this file "
-        "includes it, and check_own_sell_fills (~line 3236) unconditionally reads "
-        "exit_pending['current_price'], raising KeyError for this exact real branch)",
+        "(FIXED: signals_notify.check_drought_handoff's placed_unconfirmed exit_pending write, "
+        "~line 2237, now includes 'current_price', matching every other exit_pending producer in "
+        "this file -- check_own_sell_fills (~line 3236), which unconditionally reads "
+        "exit_pending['current_price'], no longer raises KeyError for this real branch)",
         check_own_sell_fills_error is None and db.get_drought_overlay_position(node_c['id']) is None,
         f"check_own_sell_fills_error={check_own_sell_fills_error!r}",
-        required=False,
+        required=True,
     ))
 
     observations['node_a_wl_id'] = node_a['id']
@@ -461,11 +454,11 @@ def run(price=None, verbose=True):
 # ---------------------------------------------------------------------------
 # Proof-by-query: deliberately re-opens the harness DB with a plain sqlite3
 # connection and asserts on the rows themselves, rather than trusting the
-# in-process API calls above (or a log line) as evidence. Scoped to the
-# real, currently-provable mechanisms (cancel / fill-race / unconfirmed-
-# persistence) -- NOT to check_own_sell_fills' own close, since that branch
-# is a known-open production gap, not something this proof can honestly
-# assert passed (see run()'s node C section / module docstring).
+# in-process API calls above (or a log line) as evidence. Now also covers
+# node C's check_own_sell_fills close (the exit_pending['current_price'] fix
+# above) -- previously excluded here since that branch was a known-open
+# production gap; now that it's fixed, its close-via-trade_log is a real,
+# provable fact just like the other mechanisms.
 # ---------------------------------------------------------------------------
 
 PROOF_SQL = """
@@ -477,7 +470,11 @@ SELECT wl.id AS wl_id, wl.account,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='drought_handoff_exit_placement'
          AND result='failed_or_blocked' AND node_id=wl.id) AS failed_or_blocked_placements,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='drought_handoff_exit_placement'
-         AND result='placed_unconfirmed' AND node_id=wl.id) AS unconfirmed_placements
+         AND result='placed_unconfirmed' AND node_id=wl.id) AS unconfirmed_placements,
+       (SELECT COUNT(*) FROM open_positions WHERE wl_id=wl.id
+         AND position_source='drought_overlay') AS open_drought_positions,
+       (SELECT COUNT(*) FROM trade_log WHERE wl_id=wl.id
+         AND exit_reason='HANDOFF') AS handoff_closed_trades
   FROM watch_list wl
  WHERE wl.ticker = ?
  ORDER BY wl.id
@@ -489,11 +486,11 @@ def verify_proof(db_path):
     1 clean cancel; node B with 1 raced_fill AND 1 failed_or_blocked exit
     placement (the real dup-order-window collision, see module docstring --
     node B's OWN just-placed protective SL blocks its own HANDOFF replace);
-    node C with 1 placed_unconfirmed exit-placement event -- directly from
-    the harness DB. Deliberately does NOT require node C's position to be
-    closed by check_own_sell_fills (that's the known-open production gap,
-    tracked as a required=False Check in run(), not a proof-query
-    assertion)."""
+    node C with 1 placed_unconfirmed exit-placement event, zero remaining
+    open drought-overlay position, and 1 real HANDOFF-closed trade_log row --
+    directly from the harness DB. The last two assert the exit_pending
+    ['current_price'] fix's real effect (check_own_sell_fills actually
+    closing the position), not just the absence of a KeyError."""
     import sqlite3
 
     from fake_venue.scenarios_meta import TICKER as _ticker
@@ -509,5 +506,7 @@ def verify_proof(db_path):
     node_a, node_b, node_c = rows
     ok = (node_a['clean_cancels'] == 1
           and node_b['raced_fills'] == 1 and node_b['failed_or_blocked_placements'] == 1
-          and node_c['unconfirmed_placements'] == 1)
+          and node_c['unconfirmed_placements'] == 1
+          and node_c['open_drought_positions'] == 0
+          and node_c['handoff_closed_trades'] == 1)
     return ok, rows

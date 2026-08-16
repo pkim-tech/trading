@@ -10,17 +10,15 @@ wrapper's rationale: isolation.configure_env()'s env vars must be set before
 any project import, which an in-process test can't reproduce since pytest has
 already imported signals_config/schwab_safety by then.
 
-Node C's leg intentionally surfaces a REAL, currently-unfixed production gap
-(see fake_venue/scenarios_drought_handoff.py's module docstring's "FOUND, NOT
-FIXED" note: signals_notify.check_drought_handoff's placed_unconfirmed
-exit_pending write omits 'current_price', which check_own_sell_fills
-unconditionally reads) -- the scenario module itself marks that one Check
-`required=False` so the harness's overall exit code isn't gated on a fix this
-session isn't authorized to make. test_drought_handoff_known_gap_is_visible_
-not_hidden below is a pinned regression for THAT specific fact: it must keep
-failing (as a non-required 'note', not silently passing) until the real fix
-lands, at which point that test (not this file's primary pass/fail test)
-should be updated to assert success instead."""
+Node C's leg used to intentionally surface a REAL production gap (see
+fake_venue/scenarios_drought_handoff.py's module docstring's "FIXED" note,
+formerly "FOUND, NOT FIXED": signals_notify.check_drought_handoff's
+placed_unconfirmed exit_pending write omitted 'current_price', which
+check_own_sell_fills unconditionally reads). That gap is now fixed
+(paired-reviewed) and the scenario module's Check flipped to `required=True`.
+test_drought_handoff_known_gap_is_visible_not_hidden below is the pinned
+regression for that fact -- updated to assert the fix holds (required=True,
+ok=True) instead of pinning the old broken behavior."""
 import json
 import os
 import subprocess
@@ -114,29 +112,26 @@ def test_drought_handoff_cancel_and_fill_race_proven_directly(tmp_path):
 
 
 def test_drought_handoff_known_gap_is_visible_not_hidden(tmp_path):
-    """Pinned regression for the real, currently-unfixed gap this scenario's
-    first run found (see the scenario module's "FOUND, NOT FIXED" docstring
-    note): signals_notify.check_drought_handoff's placed_unconfirmed
-    exit_pending write (~line 2237) omits 'current_price', so the real
+    """Pinned regression for the real gap this scenario's first run found
+    (see the scenario module's "FIXED" docstring note, formerly "FOUND, NOT
+    FIXED"): signals_notify.check_drought_handoff's placed_unconfirmed
+    exit_pending write (~line 2237) used to omit 'current_price', so the real
     standalone poll check_own_sell_fills (~line 3236, which unconditionally
-    reads exit_pending['current_price']) raises KeyError trying to close a
+    reads exit_pending['current_price']) raised KeyError trying to close a
     HANDOFF position whose fill confirmation didn't land inline.
 
-    This test intentionally asserts the CURRENT (broken) behavior -- it must
-    keep passing (i.e. the gap must stay visible as a non-required 'note',
-    never silently disappear) until a reviewed fix to signals_notify.py
-    lands, at which point this assertion should flip to expect success and
-    the module docstring's "FOUND, NOT FIXED" note should be updated to
-    "FOUND AND FIXED" (matching this project's established convention, e.g.
-    scenarios_post_fill_topup.py's own docstring)."""
+    Now that the fix has landed (paired-reviewed) and the scenario's own
+    Check is `required=True`, this test asserts the FIXED behavior holds:
+    the Check is required and passes. If this ever regresses (required flips
+    back to False, or ok flips to False), that's a real reintroduction of
+    the KeyError bug, not a scenario artifact."""
     proc, _ = _run_harness(tmp_path, extra_args=("--json",))
-    assert proc.returncode == 0, proc.stdout[-8000:]  # non-required note, doesn't fail the run
+    assert proc.returncode == 0, proc.stdout[-8000:]
     payload = json.loads([ln for ln in proc.stdout.splitlines() if ln.startswith('{"passed"')][-1])
     gap_checks = [c for c in payload['checks'] if 'check_own_sell_fills closes the HANDOFF position' in c['name']]
     assert len(gap_checks) == 1, payload['checks']
-    assert gap_checks[0]['required'] is False, "must stay non-blocking until the real fix lands and is reviewed"
-    assert gap_checks[0]['ok'] is False, (
-        "this assertion is EXPECTED TO FAIL once signals_notify.check_drought_handoff's exit_pending "
-        "write is fixed to include 'current_price' -- when that happens, flip this to assert True and "
-        "update the scenario module's docstring from 'FOUND, NOT FIXED' to 'FOUND AND FIXED'"
+    assert gap_checks[0]['required'] is True, "the fix landed -- this should now be real, required regression coverage"
+    assert gap_checks[0]['ok'] is True, (
+        "check_own_sell_fills failed to close the HANDOFF position cleanly -- the "
+        "exit_pending['current_price'] fix in signals_notify.check_drought_handoff may have regressed"
     )

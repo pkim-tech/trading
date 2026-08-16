@@ -115,22 +115,21 @@ is what's under test, not eight isolated invocations:
      => pending row COMPLETELY UNTOUCHED: still present, order still
         WORKING at the broker (not cancelled)                            <-- checked
 
-FOUND, NOT FIXED (2026-08-16, this scenario's first run) -- a real, if minor,
-observability gap in check_entry_abandon (signals_notify.py ~1707-1711): the
-'abandoned' coverage_event's `detail` field records only
-`f"bars_held={bars_held} max={node['max_hold_hours']}"` -- it never records
+FIXED (found 2026-08-16, fixed 2026-08-16) -- a real, if minor, observability
+gap in check_entry_abandon (signals_notify.py ~1707-1711): the 'abandoned'
+coverage_event's `detail` field used to record only
+`f"bars_held={bars_held} max={node['max_hold_hours']}"` -- it never recorded
 `did_cancel` itself, even though the function computed it and used it to
 choose the Slack message wording two lines later. A coverage-query trying to
 distinguish leg A's real-cancel 'abandoned' from leg B's dry-run
 no-real-order 'abandoned' by querying coverage_events alone (rather than
-cross-referencing the posted Slack text, which this harness's own checks do
-via `notify._post_message` capture) cannot tell the two apart. Not fixed here
-per this session's standing instruction (touches signals_notify.py, needs the
-paired independent-cold + contextual Opus review this diff is subject to) --
-worth a one-line `detail=f"...did_cancel={did_cancel}"` addition in a future
-session. Checks below work around this by asserting on the captured Slack
-text instead, same technique scenarios_replace_target_mismatch.py already
-uses for its own alert-content assertions.
+cross-referencing the posted Slack text) could not tell the two apart. Fixed
+by extending `detail` to `f"...did_cancel={did_cancel}"` -- paired
+independent-cold + contextual Opus review (required since the fix touches
+signals_notify.py) ran clean, no confirmed findings. Legs A and B below now
+assert on the coverage_event `detail` field directly (in addition to the
+pre-existing posted-Slack-text checks, kept as-is since they're still real,
+independent proof of the same distinction).
 
 bars_held is never derivable from real cached data for a synthetic harness
 ticker (compute._load_cache reads a real CSV under signals_config.RESEARCH_DIR
@@ -365,8 +364,11 @@ def run(price=None, verbose=True):
 
     events = db.get_coverage_events(scenario_key="entry_abandon_timeout")
     by_node = {}
+    detail_by_node = {}
     for e in events:
         by_node.setdefault(e['node_id'], []).append(e['result'])
+        if e['result'] == 'abandoned':
+            detail_by_node[e['node_id']] = e['detail']
 
     # ---------------------------------------------------------------- A
     checks.append(Check("leg A: 'abandoned' fired for the clean-cancel node",
@@ -377,11 +379,14 @@ def run(price=None, verbose=True):
                         f"status={broker.orders[order_a]['status']}"))
     checks.append(Check("leg A: pending row cleared",
                         db.get_pending_buy_by_wl_id(node_a['id']) is None))
-    checks.append(Check("leg A: posted message claims a real order was cancelled "
-                        "(did_cancel=True path -- see FOUND-NOT-FIXED note: not itself in the "
-                        "coverage_event detail, so asserted via the real posted text instead)",
+    checks.append(Check("leg A: posted message claims a real order was cancelled",
                         any(f"{TICKER}" in p and "resting order cancelled" in p for p in posted),
                         f"posted={posted}"))
+    checks.append(Check("leg A: coverage_event 'abandoned' detail records did_cancel=True directly "
+                        "(FIXED: previously only the posted Slack text carried this distinction, "
+                        "not the coverage_events row itself -- see module docstring)",
+                        detail_by_node.get(node_a['id'], '').endswith('did_cancel=True'),
+                        f"detail={detail_by_node.get(node_a['id'])!r}"))
 
     # ---------------------------------------------------------------- B
     checks.append(Check("leg B: 'abandoned' fired for the dry-run node",
@@ -393,6 +398,11 @@ def run(price=None, verbose=True):
                         "(NOT the misleading 'resting order cancelled' claim)",
                         any(f"{TICKER}" in p and "no real order existed to cancel" in p for p in posted),
                         f"posted={posted}"))
+    checks.append(Check("leg B: coverage_event 'abandoned' detail records did_cancel=False directly "
+                        "(FIXED: distinguishes this dry-run no-op from leg A's real cancel purely via "
+                        "coverage_events, no cross-referencing the Slack text required)",
+                        detail_by_node.get(node_b['id'], '').endswith('did_cancel=False'),
+                        f"detail={detail_by_node.get(node_b['id'])!r}"))
 
     # ---------------------------------------------------------------- C
     checks.append(Check("leg C: 'no_order_id_on_file' fired",
@@ -500,6 +510,9 @@ PROOF_SQL = """
 SELECT wl.id AS wl_id, wl.version, wl.state,
        (SELECT GROUP_CONCAT(result) FROM coverage_events
          WHERE scenario_key='entry_abandon_timeout' AND node_id=wl.id) AS abandon_results,
+       (SELECT detail FROM coverage_events
+         WHERE scenario_key='entry_abandon_timeout' AND node_id=wl.id
+           AND result='abandoned' LIMIT 1) AS abandon_detail,
        (SELECT COUNT(*) FROM pending_buys WHERE wl_id=wl.id) AS pending_rows,
        (SELECT COUNT(*) FROM open_positions WHERE wl_id=wl.id) AS open_positions
   FROM watch_list wl
@@ -511,7 +524,10 @@ SELECT wl.id AS wl_id, wl.version, wl.state,
 def verify_proof(db_path):
     """Returns (ok, rows). ok requires all 8 nodes on file, with each leg's
     expected abandon_results/pending_rows/open_positions state, directly from
-    the harness DB -- not from the in-process checks above."""
+    the harness DB -- not from the in-process checks above. Legs A/B also
+    require the 'abandoned' event's own `detail` field to carry the correct
+    did_cancel value (FIXED: previously only the posted Slack text carried
+    this distinction, not the coverage_events row -- see module docstring)."""
     import sqlite3
 
     from fake_venue.scenarios_meta import TICKER as _ticker
@@ -526,20 +542,22 @@ def verify_proof(db_path):
         return False, rows
     by_suffix = {r['version'].rsplit('_', 1)[-1]: r for r in rows}
     expected = {
-        'a': dict(abandon_results='abandoned', pending_rows=0, open_positions=0),
-        'b': dict(abandon_results='abandoned', pending_rows=0, open_positions=0),
-        'c': dict(abandon_results='no_order_id_on_file', pending_rows=1, open_positions=0),
-        'd': dict(abandon_results='unrecognized_account', pending_rows=1, open_positions=0),
-        'e': dict(abandon_results='cancel_failed', pending_rows=1, open_positions=0),
-        'f': dict(abandon_results='cancel_unconfirmed', pending_rows=1, open_positions=0),
-        'g': dict(abandon_results='raced_fill', pending_rows=0, open_positions=1),
-        'h': dict(abandon_results=None, pending_rows=1, open_positions=0),
+        'a': dict(abandon_results='abandoned', pending_rows=0, open_positions=0, did_cancel='True'),
+        'b': dict(abandon_results='abandoned', pending_rows=0, open_positions=0, did_cancel='False'),
+        'c': dict(abandon_results='no_order_id_on_file', pending_rows=1, open_positions=0, did_cancel=None),
+        'd': dict(abandon_results='unrecognized_account', pending_rows=1, open_positions=0, did_cancel=None),
+        'e': dict(abandon_results='cancel_failed', pending_rows=1, open_positions=0, did_cancel=None),
+        'f': dict(abandon_results='cancel_unconfirmed', pending_rows=1, open_positions=0, did_cancel=None),
+        'g': dict(abandon_results='raced_fill', pending_rows=0, open_positions=1, did_cancel=None),
+        'h': dict(abandon_results=None, pending_rows=1, open_positions=0, did_cancel=None),
     }
     ok = all(
         suffix in by_suffix
         and by_suffix[suffix]['abandon_results'] == exp['abandon_results']
         and by_suffix[suffix]['pending_rows'] == exp['pending_rows']
         and by_suffix[suffix]['open_positions'] == exp['open_positions']
+        and (exp['did_cancel'] is None
+             or by_suffix[suffix]['abandon_detail'].endswith(f"did_cancel={exp['did_cancel']}"))
         for suffix, exp in expected.items()
     )
     return ok, rows

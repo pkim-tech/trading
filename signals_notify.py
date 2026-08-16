@@ -1708,7 +1708,7 @@ def check_entry_abandon():
         db.clear_pending_buy_by_wl_id(wl_id)
         db.log_coverage_event("entry_abandon_timeout", mode, ticker=ticker, node_id=wl_id,
                                result="abandoned",
-                               detail=f"bars_held={bars_held} max={node['max_hold_hours']}")
+                               detail=f"bars_held={bars_held} max={node['max_hold_hours']} did_cancel={did_cancel}")
         # did_cancel distinguishes a real confirmed cancel_order call from
         # every other path that reaches here with nothing real to cancel
         # (dry_run, or order_placed=False/no order ever placed) -- the
@@ -2234,7 +2234,7 @@ def check_drought_handoff(node):
     if filled is None:
         fresh = db.get_position_by_id(pos['id']) or pos
         state = dict(fresh.get('trail_state') or {})
-        state['exit_pending'] = {'reason': 'HANDOFF', 'order_id': order_id,
+        state['exit_pending'] = {'reason': 'HANDOFF', 'order_id': order_id, 'current_price': price,
                                   'placed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         db.update_position_trail_state(pos['id'], state)
         db.log_coverage_event("drought_handoff_exit_placement", mode, ticker=ticker, node_id=wl_id,
