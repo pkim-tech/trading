@@ -52,7 +52,15 @@ ADDON_BUYING_POWER_DRIFT_STATE_PATH = LIVE_DIR / "addon_buying_power_drift_state
 # deliberately and often (the morning restart is a documented manual step), so a
 # within-window restart would re-sweep immediately instead of honouring the
 # 30-minute interval.
-ORPHAN_SWEEP_STATE_PATH = LIVE_DIR / "orphan_sweep_state.json"
+# Honors SCHWAB_STATE_DIR (2026-08-16, backlog item "ORPHAN_SWEEP_STATE_PATH
+# has no env-var override") -- the same env var schwab_safety.py's own state
+# paths (STATE_PATH, KILL_SWITCH_PATH, etc., see schwab_safety.py:36) already
+# key off, even though this constant lives in signals_config.py rather than
+# schwab_safety.py: conceptually it's the same "schwab safety state" family
+# (a throttle for the broker orphan-position sweep), and reusing the existing
+# var lets fake_venue's harness isolate it automatically via configure_env()
+# instead of requiring a dedicated per-scenario monkeypatch.
+ORPHAN_SWEEP_STATE_PATH = Path(os.environ.get("SCHWAB_STATE_DIR", str(LIVE_DIR))) / "orphan_sweep_state.json"
 
 LOG_DIR = Path("./logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
