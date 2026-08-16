@@ -111,7 +111,7 @@ def test_entry_abandon_truth_table(env, monkeypatch, account_kind, order_placed,
     calls = []
     monkeypatch.setattr(
         schwab_client, 'cancel_order',
-        lambda acct, ticker, oid: (calls.append((acct, ticker, oid)), (None, 'CANCELED'))[1],
+        lambda acct, ticker, oid, node_id=None: (calls.append((acct, ticker, oid)), (None, 'CANCELED'))[1],
     )
 
     signals_notify.check_entry_abandon()

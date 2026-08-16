@@ -519,19 +519,25 @@ def run_check(check_date):
             # that happened with the WRONG outcome (no_activity=False) is
             # never eligible here either -- that's a behavioral bug, not a
             # missing-signal question.
-            # A row that already carries a HUMAN-authored reason (reason_by='user')
-            # must never be silently overwritten by this auto-explain -- found by
-            # paired Opus review 2026-08-08: record_deviation's own docstring
-            # already enforces "never clobber a human reason" on re-record, but
+            # A row that already carries a HUMAN-authored reason (reason_by='user'
+            # from a CLI --explain call, or reason_by='streamlit' from the
+            # Coverage page's inline Explain action -- pages/14_Coverage.py's
+            # explain_deviation UPDATE writes 'streamlit', not 'user') must never
+            # be silently overwritten by this auto-explain -- found by paired
+            # Opus review 2026-08-08: record_deviation's own docstring already
+            # enforces "never clobber a human reason" on re-record, but
             # explain_deviation itself has no such guard, so an unconditional call
             # here could replace real testimony (e.g. "confirmed real bug, SL
             # branch never fired") with the generic auto-verified string on a
-            # later rerun for the same date. Checked fresh, not cached from
-            # before record_deviation ran, since that call may have just touched
-            # this exact row.
+            # later rerun for the same date. The reason_by=='user'-only check
+            # missed the streamlit case for weeks (fixed 2026-08-15) -- a human
+            # explanation typed into the Coverage Streamlit page could be
+            # silently replaced. Checked fresh, not cached from before
+            # record_deviation ran, since that call may have just touched this
+            # exact row.
             with db._conn() as c:
                 row = c.execute("SELECT reason, reason_by FROM coverage_deviations WHERE id=?", (dev_id,)).fetchone()
-            already_human_explained = row is not None and row['reason_by'] == 'user'
+            already_human_explained = row is not None and row['reason_by'] in ('user', 'streamlit')
             auto_reason = None
             if no_activity and not already_human_explained:
                 node = db.get_watch_list_node_by_id(s.get('node_id')) if s.get('node_id') is not None else None
