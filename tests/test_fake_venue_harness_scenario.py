@@ -182,6 +182,33 @@ def test_post_import_gate_catches_late_configuration(tmp_path):
     assert "imported before configure_env" in proc.stdout
 
 
+def test_isolation_gate_catches_unisolated_orphan_sweep_state_path(monkeypatch, tmp_path):
+    """Regression test for the 2026-08-16 backlog gap ('ORPHAN_SWEEP_STATE_PATH
+    has no env-var override'): signals_config.ORPHAN_SWEEP_STATE_PATH is now
+    threaded into assert_isolation_took_effect's tripwire loop, the same way
+    every schwab_safety.py state path already was. This directly exercises the
+    MECHANICAL check itself -- that assert_isolation_took_effect actually
+    raises, naming this path, when it's left pointing outside the harness
+    state dir -- by monkeypatching cfg.ORPHAN_SWEEP_STATE_PATH straight to a
+    production-shaped value and confirming the check catches it. This does NOT
+    exercise the separate SCHWAB_STATE_DIR-env-var half of the 2026-08-16 fix
+    (i.e. that ORPHAN_SWEEP_STATE_PATH actually follows the env var correctly)
+    -- that's proven indirectly by every fake_venue_harness.py subprocess run
+    succeeding end to end (e.g. test_harness_run_reproduces_buy_fill_
+    reconciles_correct_node), since assert_isolation_took_effect runs inside
+    that same subprocess after a real configure_env() call and would fail here
+    too if the env-var wiring broke."""
+    isolation.configure_env(tmp_path / "fv.db", tmp_path / "state", {"XLK"})
+    import signals_config as cfg
+    # Simulate exactly the gap this guards against: everything else isolated,
+    # but ORPHAN_SWEEP_STATE_PATH still resolves under production LIVE_DIR.
+    monkeypatch.setattr(cfg, "ORPHAN_SWEEP_STATE_PATH", cfg.LIVE_DIR / "orphan_sweep_state.json")
+    with pytest.raises(isolation.IsolationError) as e:
+        isolation.assert_isolation_took_effect(str(tmp_path / "fv.db"), str(tmp_path / "state"), {"XLK"})
+    assert "ORPHAN_SWEEP_STATE_PATH" in str(e.value)
+    assert "outside the harness state dir" in str(e.value)
+
+
 # ---------------------------------------------------------------------------
 # Emitter fidelity -- the message must go through the REAL parser
 # ---------------------------------------------------------------------------

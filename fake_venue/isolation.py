@@ -234,6 +234,13 @@ def assert_isolation_took_effect(db_path, state_dir, automation_tickers):
         path = Path(getattr(schwab_safety, name)).resolve()
         if path.parent != Path(state_dir).resolve():
             problems.append(f"schwab_safety.{name} is {path} -- outside the harness state dir")
+    # signals_config.ORPHAN_SWEEP_STATE_PATH -- not a schwab_safety.py constant,
+    # but keys off the same SCHWAB_STATE_DIR var (2026-08-16 fix), so it belongs
+    # in this same tripwire loop rather than going unchecked (the gap that let
+    # an unisolated orphan-sweep test almost read/write real production state).
+    orphan_path = Path(cfg.ORPHAN_SWEEP_STATE_PATH).resolve()
+    if orphan_path.parent != Path(state_dir).resolve():
+        problems.append(f"signals_config.ORPHAN_SWEEP_STATE_PATH is {orphan_path} -- outside the harness state dir")
     if cfg.SOCKET_MODE:
         problems.append("signals_config.SOCKET_MODE is True -- real Slack credentials leaked into the harness")
     if cfg.SLACK_HOOK:

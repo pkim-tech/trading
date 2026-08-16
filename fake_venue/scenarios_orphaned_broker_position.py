@@ -65,25 +65,22 @@ persistence-and-confirm state machine):
          => sweep #2 shows this second ticker's finding set EMPTY -> its own
             'clean' contribution, no alert credited to it            <-- checked
 
-ISOLATION GAP FOUND, NOT FIXED (per this task's scope -- documented here,
-left to a real backlog/production-code session): signals_config.
-ORPHAN_SWEEP_STATE_PATH (signals_config.py:55) is `LIVE_DIR / "orphan_sweep_
-state.json"`, a HARDCODED path under cache/live/ with NO env-var override at
-all -- unlike every other schwab_safety state file (KILL_SWITCH_PATH,
-NODE_AUTOMATION_PATH, etc., all rooted at SCHWAB_STATE_DIR and asserted by
-fake_venue/isolation.py's assert_isolation_took_effect). It is also absent
-from that function's own state-path check loop. tests/test_orphaned_broker_
-position_sweep.py already works around this at the pytest level
-(`monkeypatch.setattr(signals_config, 'ORPHAN_SWEEP_STATE_PATH', tmp_path /
-...)`), and this scenario does the same at the module-attribute level (see
-`_isolate_orphan_sweep_state_path` below) -- calling the real function
-un-patched would make check_orphaned_broker_positions read/write the REAL
-cache/live/orphan_sweep_state.json, which fake_venue's own production-access
-tripwire (fake_venue/isolation.py's sys.addaudithook on cache/) is watching
-for and would correctly flag as a breach. Low real-world severity (it is a
-throttle/dedup timestamp file, not the trade DB or a Slack credential) but
-it is a genuine gap in isolation.py's coverage worth closing there directly
-in a future session, not papered over silently here.
+ISOLATION GAP -- FIXED 2026-08-16 (see docs/backlog_cache.md's resolved-item
+trail / docs/deep_backlog.md's 2026-08-16 entry): signals_config.
+ORPHAN_SWEEP_STATE_PATH (signals_config.py) now reads SCHWAB_STATE_DIR, the
+same env var every other schwab_safety state file (KILL_SWITCH_PATH,
+NODE_AUTOMATION_PATH, etc.) already keys off, falling back to the original
+`LIVE_DIR / "orphan_sweep_state.json"` when unset -- so fake_venue's
+configure_env() now isolates this path automatically, with zero
+scenario-specific code required. It's also now present in
+fake_venue/isolation.py's assert_isolation_took_effect state-path check loop,
+so a future scenario that forgets to isolate it gets caught mechanically
+instead of silently touching production. tests/test_orphaned_broker_
+position_sweep.py's pytest-level monkeypatch and this scenario's own
+`_isolate_orphan_sweep_state_path` below are both now redundant with the
+env-var fix (kept as harmless defense-in-depth -- same "individual patch
+still works fine alongside the broader mechanism" precedent as tests/
+conftest.py's schwab_safety fixture docstring).
 """
 from dataclasses import dataclass
 from datetime import datetime
@@ -140,10 +137,12 @@ def _real_filled_buy(broker, ticker, shares, price):
 
 def _isolate_orphan_sweep_state_path():
     """Repoints signals_config.ORPHAN_SWEEP_STATE_PATH at the harness's own
-    isolated state dir. See module docstring's ISOLATION GAP note: this path
-    has no env-var override in production code, unlike every schwab_safety
-    state file, so it must be patched here or the real function under test
-    would read/write cache/live/orphan_sweep_state.json."""
+    isolated state dir. Redundant as of 2026-08-16 (see module docstring's
+    ISOLATION GAP note) -- ORPHAN_SWEEP_STATE_PATH now reads SCHWAB_STATE_DIR
+    like every other schwab_safety state file, and fake_venue's configure_env()
+    already sets that var, so this path is isolated automatically without this
+    function. Kept anyway as harmless defense-in-depth, same as tests/test_
+    orphaned_broker_position_sweep.py's own pytest-level monkeypatch."""
     import schwab_safety
     import signals_config as cfg
 
@@ -177,8 +176,9 @@ def run(price=None, verbose=True):
     say(f"[setup] {TICKER} quote seeded at ${price:.4f}")
 
     orphan_state_path = _isolate_orphan_sweep_state_path()
-    say(f"[setup] ORPHAN_SWEEP_STATE_PATH repointed to {orphan_state_path} (see module docstring's "
-        f"ISOLATION GAP note -- this path has no real env-var override)")
+    say(f"[setup] ORPHAN_SWEEP_STATE_PATH repointed to {orphan_state_path} (redundant defense-in-depth "
+        f"as of 2026-08-16 -- this path now also follows SCHWAB_STATE_DIR automatically, see module "
+        f"docstring's ISOLATION GAP note)")
 
     node_a = _add_node(TICKER, 'fake_venue_orphan')
     _add_node(CONTROL_TICKER, 'fake_venue_orphan_ctrl')

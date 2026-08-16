@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [testing][security] Fixed 2026-08-16 — `ORPHAN_SWEEP_STATE_PATH` now honors `SCHWAB_STATE_DIR` like every other schwab_safety state file; `fake_venue/isolation.py`'s tripwire loop extended to cover it. Paired review: zero blocking findings (stale docs it left behind, fixed). Full detail: `deep_backlog.md`.
+
 ## [testing][live-trading] Fixed 2026-08-16 — `check_entry_abandon`'s `'abandoned'` coverage_event now records `did_cancel` in `detail`; missing `tests/test_fake_venue_entry_abandon_timeout_scenario.py` pytest wrapper also built. Paired review: zero findings. Full detail: `deep_backlog.md`.
 
 ## [live-trading][security] Fixed 2026-08-16 — `check_drought_handoff`'s `placed_unconfirmed` exit_pending write now includes `current_price`, closing a real deterministic KeyError in `check_own_sell_fills`. Paired review: zero blocking findings (1 MEDIUM conceded after rebuttal). Full detail: `deep_backlog.md`.
