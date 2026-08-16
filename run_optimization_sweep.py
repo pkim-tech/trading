@@ -3,6 +3,7 @@ import os
 import logging
 import json
 import argparse
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -471,6 +472,51 @@ def update_sweep_run(run_id, **fields):
     conn.close()
 
 
+def window_version_suffix(start_date, end_date):
+    """Single source of truth for encoding a date window into a backtest_cache
+    `version` string -- e.g. window_version_suffix('2025-06-01', '2026-06-01')
+    -> '-w2025-06-01_2026-06-01'.
+
+    backtest_cache has no date-window columns (see dispatch_parallel_grid's guard
+    below) and every real downstream consumer (_campaign_scope_sql,
+    identify_island_candidates, identify_full_mesh_candidates, db_cache.py's
+    refresh_pivot_cache/refresh_dropdown_cache/refresh_cliff_grid_cache,
+    scripts/candidate_5min_report.py, scripts/candidate_summary_report.py::
+    best_node_strategy) already scopes strictly by `version` alone -- confirmed
+    empirically before adopting this design. So a windowed campaign gets full,
+    collision-proof isolation from every other version for free just by suffixing
+    the version string, matching this project's existing v4->v5 "distinct version
+    string per incompatible campaign" precedent (no schema/PK migration needed).
+    Both dispatch_parallel_grid's guard and main()'s version construction must
+    build the suffix through this one function -- never duplicate the format
+    string, or a mismatch between the two silently defeats the guard's whole
+    purpose.
+
+    Dates are normalized to YYYY-MM-DD via pd.Timestamp before formatting (paired
+    Opus review finding, 2026-08-17): without this, '2025-6-1' and '2025-06-01' --
+    the identical window to _window_prep/compute_bh_returns, both of which already
+    go through pd.Timestamp -- would silently produce two different version
+    strings and split one campaign's cache across two disjoint, half-populated
+    namespaces with no error raised anywhere. Also gives free format validation
+    (raises loudly on an unparseable date) and normalizes a datetime.date/
+    pd.Timestamp object caller to the same string a CLI caller would produce.
+
+    Both-or-neither validated HERE, not just in the CLI arg parser (paired Opus
+    review finding, 2026-08-17): the CLI is not the only realistic caller -- the
+    planned rolling-window orchestration script (a separate peer session's work)
+    will call this programmatically per window, and a partial call (e.g. a typo
+    dropping one kwarg) should fail loudly at the one shared source of truth
+    rather than produce a nonsense suffix like '-wNone_2026-06-01' that only
+    surfaces confusingly, several calls later, inside dispatch_parallel_grid's
+    guard."""
+    if (start_date is None) != (end_date is None):
+        raise ValueError(
+            f"window_version_suffix: start_date and end_date must both be given, "
+            f"or neither (got start_date={start_date!r}, end_date={end_date!r})."
+        )
+    return f"-w{pd.Timestamp(start_date).strftime('%Y-%m-%d')}_{pd.Timestamp(end_date).strftime('%Y-%m-%d')}"
+
+
 # Per-worker-process memo: workers are long-lived across grid nodes, and dispatch
 # is one ticker at a time — without this every node re-parses the CSV and recomputes
 # indicators (~18k times per ticker in Phase 3). Indicators depend only on
@@ -696,26 +742,43 @@ def run_single_backtest_node_isolated(args):
 
 
 def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None, start_date=None, end_date=None):
-    # backtest_cache has no start_date/end_date columns and cached_map below keys
-    # purely on (tp, sl, hold, w, z, fsl, tpct) -- a windowed call would either read
-    # back a stale full-history row under an identical key, or write a windowed result
-    # that silently corrupts/collides with the full-history row at that same key.
-    # Persisting windowed results needs an explicit schema decision this Phase-1 pass
-    # doesn't make (see docs/deep_backlog.md's 2026-08-16 date-range entry, which scopes
-    # this pass to data-loading only) -- fail loudly instead of risking silent corruption.
-    # WHOEVER LIFTS THIS GUARD: the cache schema is not the only blocker -- the caller's
-    # own compute_bh_returns(ticker) call (~line 1513, no date params) must ALSO be
-    # windowed to the same start_date/end_date, or a windowed trade set gets scored
-    # against a full-history spy_bh/asset_bh benchmark, silently reintroducing the exact
-    # HIGH bug fixed 2026-08-16 (see run_single_backtest_node_isolated's own spy_bh param,
-    # which is honored correctly when windowed -- the gap is only in what the caller passes).
+    # backtest_cache has no start_date/end_date columns -- cached_map below keys purely
+    # on (tp, sl, hold, w, z, fsl, tpct) within a given (strategy, version, ticker,
+    # entry_timing) scope. A windowed call would either read back a stale full-history
+    # row under an identical key, or write a windowed result that silently corrupts/
+    # collides with the full-history row at that same key -- UNLESS the window itself is
+    # encoded into `config_version` (see window_version_suffix() above), which gives full
+    # collision-proof isolation for free since every real consumer already scopes by
+    # version alone. Rather than a schema/PK migration (seriously considered, rejected as
+    # unnecessarily risky), this assertion is the actual guard: it doesn't block a
+    # windowed call, it blocks a windowed call whose caller forgot to window the VERSION
+    # too -- the one real corruption risk left. See docs/deep_backlog.md's 2026-08-16
+    # date-range entry for the full history.
+    # WHOEVER CALLS THIS WINDOWED: the version suffix is not the only requirement -- the
+    # caller's own compute_bh_returns(ticker) call must ALSO be windowed to the same
+    # start_date/end_date, or a windowed trade set gets scored against a full-history
+    # spy_bh/asset_bh benchmark, silently reintroducing the exact HIGH bug fixed
+    # 2026-08-16 (see run_single_backtest_node_isolated's own spy_bh param, which is
+    # honored correctly when windowed -- the gap is only in what the caller passes).
     if start_date is not None or end_date is not None:
-        raise NotImplementedError(
-            "dispatch_parallel_grid: start_date/end_date not supported -- backtest_cache "
-            "has no date-window columns yet, so a windowed sweep can't be safely cached/"
-            "persisted through this path. Use _load_node_inputs + run_backtest_dispatch "
-            "directly (see scripts/audit_date_window_soxl.py) for a windowed run."
-        )
+        required_suffix = window_version_suffix(start_date, end_date)
+        # endswith, not `in` (paired Opus review finding, 2026-08-17): a substring
+        # check is a weaker guarantee than the guard's own docstring implies -- this
+        # is a fixed-width, unambiguous suffix by construction, so anchoring to the
+        # end of the string is free and closes any future false-negative shape
+        # (e.g. an already-suffixed --version with the CLI's suffix appended again
+        # would still legitimately endswith() the required suffix, so this doesn't
+        # change behavior for the real cases, it only removes the substring risk).
+        if not config_version.endswith(required_suffix):
+            raise ValueError(
+                f"dispatch_parallel_grid: windowed call (start_date={start_date!r}, "
+                f"end_date={end_date!r}) but config_version={config_version!r} does not "
+                f"contain the required suffix {required_suffix!r}. Build config_version "
+                f"via window_version_suffix(start_date, end_date) before calling this -- "
+                f"a windowed sweep must never share a version string with a full-history "
+                f"one, or cached rows from one window silently corrupt/collide with "
+                f"another's."
+            )
     conn   = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
     matrix_results  = []
@@ -1005,7 +1068,7 @@ def _campaign_scope_sql(strategy_name, fixed_sl, entry_timing):
     return " AND entry_timing=?", [entry_timing]
 
 
-def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None):
+def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None):
     z_thresholds = hp['z_score_thresholds']
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     expected = (len(z_thresholds) * len(hp['windows']) * len(hp['take_profits'])
@@ -1039,7 +1102,8 @@ def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, sp
              for tpct in trail_pcts]
 
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
-                           "Phase1-Coarse", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
+                           "Phase1-Coarse", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id,
+                           start_date=start_date, end_date=end_date)
 
 
 # ── Checkpoint 1: rank by coarse alpha, return island candidates ──────────────
@@ -1077,7 +1141,7 @@ def identify_island_candidates(config_version, strategy_name, n_index, n_stock, 
 
 # ── Phase 2: Island mesh ──────────────────────────────────────────────────────
 
-def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None):
+def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None, start_date=None, end_date=None):
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
@@ -1116,12 +1180,12 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
     logger.info(f"[{ticker}] Phase2 island mesh: {len(tasks)} tasks ({N_ISLANDS} islands ±{FINE_RADIUS})")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
                            "Phase2-Island", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing,
-                           generation=generation, run_id=run_id)
+                           generation=generation, run_id=run_id, start_date=start_date, end_date=end_date)
 
 
 # ── Phase 2.5: targeted cliff-box sweep around true best node ────────────────
 
-def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None):
+def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None):
     """Sweep ±CLIFF_RADIUS in TP/SL and ±7h in hold around the true best node from Phase 2.
     Guarantees cliff check has complete neighborhood data regardless of where the peak landed.
     For TrailingBothZScoreBreakout, also sweeps the trail_pct axis's immediate neighbors
@@ -1156,7 +1220,8 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
 
     logger.info(f"[{ticker}] Phase2.5 cliff-box: {len(tasks)} tasks around TP={tp_c} SL={sl_c} hold={hold_c}h")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
-                           "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
+                           "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id,
+                           start_date=start_date, end_date=end_date)
 
 
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
@@ -1376,7 +1441,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
 
 # ── Phase 3: Full mesh ────────────────────────────────────────────────────────
 
-def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None):
+def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None):
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     tasks = [(tp, sl, int(hold), int(w), float(z), float(tpct))
              for z    in hp['z_score_thresholds']
@@ -1388,7 +1453,8 @@ def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_
 
     logger.info(f"[{ticker}] Phase3 full mesh: {len(tasks)} tasks (cache skips coarse+island already done)")
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
-                           "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
+                           "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id,
+                           start_date=start_date, end_date=end_date)
 
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     with sqlite3.connect(DB_PATH) as conn:
@@ -1458,7 +1524,18 @@ if __name__ == "__main__":
     parser.add_argument("--skip-cache-refresh", action="store_true",
                         help="Skip dropdown/pivot/cliff-grid cache refresh at end of run "
                              "(useful when chaining multiple versions and refreshing once at the end)")
+    parser.add_argument("--start-date", dest="start_date", default=None,
+                        help="YYYY-MM-DD -- window the sweep to [start-date, end-date]. Must be given "
+                             "together with --end-date. The window is encoded into the version string "
+                             "via window_version_suffix() so windowed results never collide with a "
+                             "full-history campaign under the same base version.")
+    parser.add_argument("--end-date", dest="end_date", default=None,
+                        help="YYYY-MM-DD -- see --start-date (both-or-neither).")
     args = parser.parse_args()
+
+    if (args.start_date is None) != (args.end_date is None):
+        logger.critical("--start-date and --end-date must both be given, or neither.")
+        sys.exit(1)
 
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
     run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1476,6 +1553,34 @@ if __name__ == "__main__":
         sys.exit(1)
 
     config_version    = args.version or config.get("version", "v1.6")
+    start_date        = args.start_date
+    end_date          = args.end_date
+    # Guard against the mirror-image corruption direction (paired Opus review
+    # finding, 2026-08-17): dispatch_parallel_grid's own guard only fires when
+    # start_date/end_date are non-None, so running with an already-windowed-looking
+    # --version but WITHOUT --start-date/--end-date (a very plausible resume/extend
+    # command -- the suffixed version is exactly what shows up in log filenames,
+    # sweep_runs rows, and every phase banner, so it's the natural string to copy)
+    # would write full-history results straight into that windowed version's cache
+    # rows, silently mixing the two -- nothing downstream can tell them apart since
+    # every consumer scopes by version alone. Regex anchored to window_version_
+    # suffix's exact fixed-width format so an unrelated version containing "-w"
+    # for some other reason doesn't false-positive.
+    _WINDOW_SUFFIX_RE = re.compile(r'-w\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}$')
+    if start_date is None and _WINDOW_SUFFIX_RE.search(config_version):
+        logger.critical(
+            f"--version {config_version!r} already looks like a windowed version "
+            f"(matches window_version_suffix's format) but --start-date/--end-date "
+            f"were not given. Running like this would write FULL-HISTORY results "
+            f"into what looks like a windowed campaign's cache rows, with nothing "
+            f"downstream able to tell them apart. Pass the matching --start-date/"
+            f"--end-date, or use a different --version if a full-history run was "
+            f"actually intended."
+        )
+        sys.exit(1)
+    if start_date is not None:
+        config_version += window_version_suffix(start_date, end_date)
+        logger.info(f"Windowed run: [{start_date}, {end_date}] -- version suffixed to {config_version!r}")
     hp                = config["hyperparameters"]
     max_workers       = config.get("execution", {}).get("max_workers", 6)
     fixed_sl          = config.get("execution", {}).get("fixed_stop_loss", 0)
@@ -1535,7 +1640,25 @@ if __name__ == "__main__":
     logger.info("Precomputing B&H returns for all tickers...")
     bh_cache = {}
     for ticker in tickers:
-        asset_bh, spy_bh = compute_bh_returns(ticker)
+        # Windowed compute_bh_returns raises ValueError (not the missing-CSV None,None
+        # path) when the window falls outside this ticker's cached span -- e.g. a
+        # ticker whose data starts later than an early rolling-window step, or a stale
+        # cache. Unguarded, that ValueError propagates out of this loop and aborts the
+        # ENTIRE sweep before any phase runs (paired Opus review finding, 2026-08-17,
+        # confirmed by both independent reviewers -- real risk for the planned 9-window
+        # rolling campaign). Catch specifically ValueError (not a bare except -- a
+        # genuinely broken/corrupt CSV should still be loud) and drop the ticker into
+        # the same "not in valid_tickers" bucket the missing-cache-file path already
+        # uses, instead of crashing the run for every other ticker in scope. The
+        # exception message already includes the ticker's real cached span (see
+        # compute_bh_returns's own ValueError text), so the warning below carries
+        # enough to distinguish "window outside history" from "cache looks stale"
+        # without needing to re-derive it here.
+        try:
+            asset_bh, spy_bh = compute_bh_returns(ticker, start_date, end_date)
+        except ValueError as e:
+            logger.warning(f"[{ticker}] Skipping (compute_bh_returns): {e}")
+            continue
         if asset_bh is not None:
             bh_cache[ticker] = (asset_bh, spy_bh)
     valid_tickers = [t for t in tickers if t in bh_cache]
@@ -1554,7 +1677,7 @@ if __name__ == "__main__":
                         logger.warning(f"Unknown strategy: {name}")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
+                    run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date)
 
             logger.info("Phase 1 complete.")
 
@@ -1576,7 +1699,7 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
+                    run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date)
                 continue
 
             island_tickers = []
@@ -1602,7 +1725,7 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 2.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, generation=gen + 1, run_id=run_id)
+                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, generation=gen + 1, run_id=run_id, start_date=start_date, end_date=end_date)
 
                 logger.info(f"Phase 2 gen {gen+1} complete.")
 
@@ -1617,7 +1740,7 @@ if __name__ == "__main__":
                 if ticker not in bh_cache:
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
+                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date)
 
             # ── Checkpoint 2 ─────────────────────────────────────────────
             logger.info(f"\nCheckpoint 2: cliff check on {len(island_tickers)} island tickers [{config_version}]...")
@@ -1644,7 +1767,7 @@ if __name__ == "__main__":
                     logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id)
+                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date)
 
     if args.skip_cache_refresh:
         logger.info("\nSkipping cache refresh and index rebuild (--skip-cache-refresh).")
