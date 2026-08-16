@@ -19,16 +19,31 @@ against a windowed spy_bh via compute_bh_returns(ticker, start, end) (the fix) -
 should differ, since SPY's own buy-hold return over a ~1yr window is not the same as over
 the full multi-year cache.
 
+--cache-roundtrip additionally exercises the NEW piece added on top of Phase 1
+(window_version_suffix() + dispatch_parallel_grid's ValueError guard + CLI wiring,
+2026-08-16/17): drives this exact node's grid coordinates through the REAL
+dispatch_parallel_grid path (a ProcessPoolExecutor + real backtest_cache writes/reads
+under a windowed, suffixed version string), then compares the row read back from
+backtest_cache against a direct uncached run_backtest_dispatch call for the identical
+window/params. A second dispatch_parallel_grid call for the same task (now a guaranteed
+cache hit, 0 unvisited tasks) confirms the persisted row is stable on reread too.
+
 Usage: .venv/bin/python scripts/audit_date_window_soxl.py [--start 2025-06-01] [--end 2026-06-01]
+       .venv/bin/python scripts/audit_date_window_soxl.py --cache-roundtrip [--start ...] [--end ...]
 """
 import argparse
+import sqlite3
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import strategies
-from run_optimization_sweep import _load_node_inputs, _summarize_trades, compute_bh_returns
+from run_optimization_sweep import (
+    DB_PATH, _load_node_inputs, _summarize_trades, _warmup_worker,
+    compute_bh_returns, dispatch_parallel_grid, window_version_suffix,
+)
 from backtester import run_backtest_dispatch
 
 TICKER = 'SOXL'
@@ -67,11 +82,110 @@ def _bar_row(prep, ts):
     )
 
 
+AUDIT_VERSION_BASE = "v5-stage1audit"
+
+
+def audit_cache_roundtrip(start_date, end_date):
+    """Drives SOXL's real node params through dispatch_parallel_grid (real
+    ProcessPoolExecutor + real backtest_cache write) under a windowed+suffixed
+    version, then checks the persisted row against a direct uncached compute, and
+    again on a guaranteed-cache-hit rerun. Prints a comparison table; does not
+    itself claim correctness -- same framing as the rest of this script."""
+    config_version = AUDIT_VERSION_BASE + window_version_suffix(start_date, end_date)
+
+    # Task tuple matching run_single_backtest_node_isolated's (tp, sl, hold, w, z, tpct):
+    # for TrailingBothZScoreBreakout, tp=arm_sell_pct, sl=trail_buy_pct (sl_axis),
+    # tpct=trail_sell_pct (fourth_axis) -- see strategies.TrailingBothZScoreBreakout /
+    # resolve_axis_columns and _sl_axis_real_column's docstring.
+    tp, sl, hold, w, z, tpct = (
+        int(NODE['arm_sell_pct']), int(NODE['trail_buy_pct']), int(NODE['max_hold_hours']),
+        int(NODE['window']), float(NODE['z']), float(NODE['trail_sell_pct']),
+    )
+    fixed_sl = NODE['fixed_sl']
+    entry_timing = NODE['entry_timing']
+    task = (tp, sl, hold, w, z, tpct)
+
+    print(f"=== Cache round-trip audit: version={config_version!r} task={task} "
+          f"fixed_sl={fixed_sl} entry_timing={entry_timing} ===\n")
+
+    # Direct uncached compute -- ground truth for comparison.
+    win_trades, _ = _run(start_date, end_date)
+    _, win_spy_bh = compute_bh_returns(TICKER, start_date, end_date)
+    if win_trades:
+        direct_alpha, direct_n, direct_win_rate, direct_compounded, _ = _summarize_trades(win_trades, win_spy_bh)
+    else:
+        direct_alpha = direct_n = direct_win_rate = direct_compounded = None
+    print(f"Direct uncached (_load_node_inputs + run_backtest_dispatch): "
+          f"trades={direct_n} alpha={direct_alpha} compounded={direct_compounded} win_rate={direct_win_rate}")
+
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        conn.execute("DELETE FROM backtest_cache WHERE version=? AND ticker=? AND strategy=?",
+                     (config_version, TICKER, STRATEGY_NAME))
+        conn.commit()
+
+    with ProcessPoolExecutor(max_workers=2, initializer=_warmup_worker) as pool:
+        df1 = dispatch_parallel_grid(
+            pool, [task], TICKER, STRATEGY_NAME, config_version, "Stage1-CacheRoundtrip-Write",
+            win_spy_bh, win_spy_bh, "audit-run", fixed_sl=fixed_sl, entry_timing=entry_timing,
+            start_date=start_date, end_date=end_date,
+        )
+        print(f"\nFirst call (should compute fresh, write 1 row): {len(df1)} row(s) returned")
+        if not df1.empty:
+            r = df1.iloc[0]
+            print(f"  Trades={r['Trades']} Alpha vs SPY %={r['Alpha vs SPY %']:.4f} "
+                  f"Return %={r['Return %']:.4f} Win Rate %={r['Win Rate %']:.4f}")
+
+        df2 = dispatch_parallel_grid(
+            pool, [task], TICKER, STRATEGY_NAME, config_version, "Stage1-CacheRoundtrip-Reread",
+            win_spy_bh, win_spy_bh, "audit-run", fixed_sl=fixed_sl, entry_timing=entry_timing,
+            start_date=start_date, end_date=end_date,
+        )
+        print(f"\nSecond call (should be a pure cache hit, 0 recompute): {len(df2)} row(s) returned")
+        if not df2.empty:
+            r2 = df2.iloc[0]
+            print(f"  Trades={r2['Trades']} Alpha vs SPY %={r2['Alpha vs SPY %']:.4f} "
+                  f"Return %={r2['Return %']:.4f} Win Rate %={r2['Win Rate %']:.4f}")
+
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        row = conn.execute("""
+            SELECT trades, alpha_vs_spy, strategy_return, win_rate, version
+            FROM backtest_cache WHERE version=? AND ticker=? AND strategy=?
+              AND axis_tp=? AND trail_buy_pct=? AND max_hold_hours=? AND window=?
+              AND z_score_threshold=? AND trail_sell_pct=? AND entry_timing=?
+        """, (config_version, TICKER, STRATEGY_NAME, tp, sl, hold, w, z, tpct, entry_timing)).fetchone()
+
+    print(f"\nRaw backtest_cache row for this exact key: {row}")
+    if row is not None and direct_n is not None:
+        db_trades, db_alpha, db_compounded, db_win_rate, db_version = row
+        print(f"\n=== Comparison: direct-uncached vs backtest_cache-persisted ===")
+        print(f"  trades:      direct={direct_n}  cached={db_trades}  match={direct_n == db_trades}")
+        print(f"  alpha:       direct={direct_alpha:.6f}  cached={db_alpha:.6f}  "
+              f"match={abs(direct_alpha - db_alpha) < 1e-6}")
+        print(f"  compounded:  direct={direct_compounded:.6f}  cached={db_compounded:.6f}  "
+              f"match={abs(direct_compounded - db_compounded) < 1e-6}")
+        print(f"  win_rate:    direct={direct_win_rate:.6f}  cached={db_win_rate:.6f}  "
+              f"match={abs(direct_win_rate - db_win_rate) < 1e-6}")
+        print(f"  version isolation: persisted under {db_version!r} (base version tag "
+              f"never touched -- confirms suffix, not overwrite-in-place)")
+    elif row is None:
+        print("  !! No row found -- write did not persist as expected, investigate before trusting this path.")
+    elif direct_n is None:
+        print("  !! Direct uncached run produced zero closed trades in this window -- "
+              "nothing to compare (try a different window).")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--start', default='2025-06-01')
     ap.add_argument('--end', default='2026-06-01')
+    ap.add_argument('--cache-roundtrip', action='store_true',
+                     help='Run the dispatch_parallel_grid cache round-trip check instead of '
+                          'the prep/trade-detail audit.')
     args = ap.parse_args()
+
+    if args.cache_roundtrip:
+        audit_cache_roundtrip(args.start, args.end)
+        return
 
     full_trades, full_prep = _run()
     win_trades, win_prep = _run(args.start, args.end)
