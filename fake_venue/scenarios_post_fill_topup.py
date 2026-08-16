@@ -294,6 +294,36 @@ def run(price=None, verbose=True):
                         f"expected={(order_shares + top_up_shares) if top_up_shares else None}"))
     shares_after_leg1 = pos_after_leg1['shares'] if pos_after_leg1 else None
 
+    # Real check for the entry_price fix this scenario's first run found
+    # (see module docstring's FOUND AND FIXED note) -- without this, the
+    # scenario passed 17/17 even with the fix in signals_notify._reconcile_fill
+    # reverted (`if top_up_order_id is not None:` neutralized to `if False:`),
+    # because nothing here ever asserted entry_price itself. FakeBroker fills a
+    # MARKET order at the CURRENT quote (`price`, not `fill_price` -- see leg 2
+    # comment below), so the correct blended entry_price is the share-weighted
+    # average of the original (short) fill at fill_price and the top-up at
+    # `price`. Asserting it's NOT just fill_price alone is what actually
+    # distinguishes the fix from the pre-fix behavior.
+    if pos_after_leg1 is not None and top_up_shares is not None:
+        expected_entry_price = (
+            (order_shares * fill_price + top_up_shares * price) / (order_shares + top_up_shares)
+        )
+        actual_entry_price = pos_after_leg1['entry_price']
+        checks.append(Check(
+            "position entry_price is the real share-weighted blend of the original fill "
+            "price and the top-up's OWN confirmed fill price (not the original fill_price "
+            "alone -- the exact bug this scenario's first run found and fixed)",
+            abs(actual_entry_price - expected_entry_price) < 0.0005
+            and abs(actual_entry_price - fill_price) > 0.0005,
+            f"actual={actual_entry_price:.4f} expected_blended={expected_entry_price:.4f} "
+            f"fill_price_alone={fill_price:.4f} (actual must match blended, not fill_price_alone)"))
+    else:
+        checks.append(Check(
+            "position entry_price is the real share-weighted blend of the original fill "
+            "price and the top-up's OWN confirmed fill price (not the original fill_price "
+            "alone -- the exact bug this scenario's first run found and fixed)",
+            False, "pos_after_leg1 or top_up_shares missing -- cannot compute expected blend"))
+
     # ---------------------------------------------------------------- leg 2
     # The top-up's OWN fill, driven through the real stream path. No
     # pending_buys row exists for this order (leg 1 already cleared the
@@ -381,7 +411,7 @@ def run(price=None, verbose=True):
 # ---------------------------------------------------------------------------
 
 PROOF_SQL = """
-SELECT op.wl_id, op.shares AS final_shares, wl.account, wl.state, wl.starting_notional,
+SELECT op.wl_id, op.shares AS final_shares, op.entry_price, wl.account, wl.state, wl.starting_notional,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='top_up' AND result='placed'
          AND node_id=op.wl_id) AS top_up_placed_events,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='orphaned_fill_detected'

@@ -47,6 +47,17 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, '_now', lambda: _IN_WINDOW_TIME)
     monkeypatch.setattr(schwab_client, '_post_message', lambda *a, **kw: (None, None))
     monkeypatch.setattr(schwab_client, 'get_account_balance', lambda account: 1_000_000.0)
+    # Default no-op SL mock -- without this, any test that reaches
+    # _reconcile_buy_fill's automated-fill branch (node account='ira' below is
+    # a REAL trading_enabled account, state='live') calls the real,
+    # unmocked schwab_client.place_stop_loss, which hits schwab_auth.get_client()
+    # and a real (un-timeout-bounded) Schwab network call -- hangs for minutes
+    # in any environment without live network/valid tokens instead of failing
+    # fast. Found 2026-08-16 investigating a hung pytest run. Individual tests
+    # that care about the SL call (e.g. test_reconcile_buy_fill_places_sl_for_
+    # trailing_both_node) override this locally, which still wins (later
+    # monkeypatch.setattr calls take precedence).
+    monkeypatch.setattr(schwab_client, 'place_stop_loss', lambda *a, **kw: (None, None))
     monkeypatch.setattr(schwab_safety, '_open_orders', lambda account: [])
     monkeypatch.setattr(signals_notify, '_post_message', lambda *a, **kw: (None, None))
     monkeypatch.setattr(signals_notify, 'time', type('T', (), {'sleep': staticmethod(lambda *a: None)}))

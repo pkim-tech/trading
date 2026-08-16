@@ -29,6 +29,13 @@ import signals_db as db
 import signals_compute as compute
 import strategies
 
+# Single source of truth for this file's own auto-explain prefix, mirroring
+# signals_db.AUTO_RESOLVED_REASON_PREFIX's rationale -- keeps the string that
+# WRITES the reason, the startswith() check that reads it, and the
+# clear_system_reason() prefix that clears it from silently desyncing if
+# edited in only one place (found by review, 2026-08-15).
+AUTO_VERIFIED_REASON_PREFIX = "Auto-verified:"
+
 _NYSE_CAL = mcal.get_calendar('NYSE')
 
 
@@ -522,26 +529,42 @@ def run_check(check_date):
             # later rerun for the same date. Checked fresh, not cached from
             # before record_deviation ran, since that call may have just touched
             # this exact row.
+            with db._conn() as c:
+                row = c.execute("SELECT reason, reason_by FROM coverage_deviations WHERE id=?", (dev_id,)).fetchone()
+            already_human_explained = row is not None and row['reason_by'] == 'user'
             auto_reason = None
-            if no_activity:
-                with db._conn() as c:
-                    row = c.execute("SELECT reason_by FROM coverage_deviations WHERE id=?", (dev_id,)).fetchone()
-                already_human_explained = row is not None and row['reason_by'] == 'user'
-                if not already_human_explained:
-                    node = db.get_watch_list_node_by_id(s.get('node_id')) if s.get('node_id') is not None else None
-                    if node is not None and s.get('ticker'):
-                        crossed = _entry_threshold_crossed(s['ticker'], node, check_date)
-                        if crossed is False:
-                            auto_reason = (f"Auto-verified: {s['ticker']}'s real cached price data never "
-                                            f"crossed its entry threshold (z_score_threshold="
-                                            f"{node.get('z_score_threshold')}) on {check_date} -- no real "
-                                            f"signal to act on, not a code defect.")
+            if no_activity and not already_human_explained:
+                node = db.get_watch_list_node_by_id(s.get('node_id')) if s.get('node_id') is not None else None
+                if node is not None and s.get('ticker'):
+                    crossed = _entry_threshold_crossed(s['ticker'], node, check_date)
+                    if crossed is False:
+                        auto_reason = (f"{AUTO_VERIFIED_REASON_PREFIX} {s['ticker']}'s real cached price data never "
+                                        f"crossed its entry threshold (z_score_threshold="
+                                        f"{node.get('z_score_threshold')}) on {check_date} -- no real "
+                                        f"signal to act on, not a code defect.")
             if auto_reason:
                 db.explain_deviation(dev_id, auto_reason, reason_by='system')
                 print(f"  ○ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}  "
                       f"(auto-explained: price never crossed entry threshold)")
                 results.append(dict(base, status='deviated', auto_explained=True, summary=actual_summary))
             else:
+                # record_deviation preserves a stale system 'Auto-verified:' reason
+                # verbatim across a rerun (it can't see no_activity/crossed to judge
+                # whether that reason still holds) -- THIS pass just established it
+                # doesn't: either no_activity is now False (a real trade fired with
+                # the wrong outcome -- coverage_check.py:511's own comment calls this
+                # "a behavioral bug") or crossed is no longer explicitly False (the
+                # threshold now confirmed crossed, or data's unavailable). Clearing
+                # it here is the missing half of the trading_incidents id=9 fix
+                # (2026-08-15, 2nd paired review round): the first pass fixed
+                # record_deviation stranding a good explanation at reason=NULL on an
+                # unrelated rerun, but a naive "always preserve" would instead mask a
+                # genuinely new deviation behind a stale "nothing to see" note --
+                # this row must re-open as an unexplained ticket, not stay silently
+                # explained by a fact that's no longer true.
+                if (not already_human_explained and row is not None and row['reason']
+                        and row['reason'].startswith(AUTO_VERIFIED_REASON_PREFIX)):
+                    db.clear_system_reason(dev_id, prefix=AUTO_VERIFIED_REASON_PREFIX)
                 print(f"  ✗ {s['scenario_key']:26s} {s['ticker'] or '':6s} {actual_summary}")
                 results.append(dict(base, status='deviated', summary=actual_summary))
 

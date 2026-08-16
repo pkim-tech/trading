@@ -1,5 +1,19 @@
 # Backlog — Recently Resolved
 
+## [live-trading][testing] Closed 2026-08-16 — fake-venue harness Phase 2 Category A queue (30 items), full 3-axis sweep, all built and verified. Full detail: `deep_backlog.md`.
+
+## [live-trading][testing] Fixed 2026-08-15/16 (2 paired-review rounds) — `trading_incidents` id=9: `record_deviation`/`coverage_check.py` auto-explain persistence bug, 7 production rows repaired, ticket closed. Full detail: `deep_backlog.md`.
+
+## [testing] Fixed 2026-08-16 — `tests/test_part3_gap_resize.py` had a real, un-timeout-bounded Schwab network call: 4 of 18 tests exercised the automated-fill branch against a `state='live'`/`account='ira'` fixture without mocking `place_stop_loss`, falling through to real OAuth. Added a default no-op mock to the shared `env` fixture. 18/18 pass. Found while diagnosing an agent stuck on this exact hang.
+
+## [live-trading][security] Closed 2026-08-16 (retroactively reviewed + fixed) — post_fill_topup (908a6f0): 1 HIGH + 5 lower findings fixed across 2 rounds of paired review, incl. catching the FIRST fix's own gate logic being backwards (real premise error, verified independently by both reviewers and the coordinating session). Full detail: `deep_backlog.md`.
+
+## [backtest] Closed 2026-08-16 (negative result) — "CertainEntryTrailingSell" idea: priced correctly at bar-close (not best-possible-in-bar), the result went negative. Dead end, not deferred. Full detail: `research_log.md`/`deep_backlog.md`.
+
+## [live-trading][security] Closed 2026-08-16 (built) — per-`(account, ticker)` lock around the retry-and-confirm order-placement sequence in `schwab_client.py`, proven via a real multi-thread `fake_broker` concurrency test (max_concurrent==1). Full detail: `deep_backlog.md`.
+
+## [live-trading][security] Closed 2026-08-16 (found stale) — `_submit_replace_with_retry` double-replace "reopened, not started" backlog note was itself stale; the real fix landed same-day it was reopened (`0fd8fb6`), confirmed by test. Full detail: `deep_backlog.md`.
+
 ## [live-trading] Closed 2026-08-16 (backlog-cleanse, peer-batch catchup) — signal/reminder dry_run visibility + channel separation: structurally moot under capital-at-stake redesign. Full detail: `deep_backlog.md`.
 
 ## [live-trading] Closed 2026-08-16 (backlog-cleanse, peer-batch catchup, remove) — v5 watchlist skews long-only / inverse counterparts idea. Full detail: `deep_backlog.md`.

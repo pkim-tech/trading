@@ -9,7 +9,9 @@ Account nicknames (brokerage/sep/roth/ira) map to real account numbers via
 env vars (SCHWAB_ACCOUNT_BROKERAGE, etc.) -- never hardcode account numbers
 in source.
 """
+import contextlib
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -80,6 +82,56 @@ def _get_client(interactive: bool = False):
 # what's being retried.
 _ORDER_SUBMIT_RETRY_ATTEMPTS = 3
 _ORDER_SUBMIT_RETRY_INTERVAL_SECS = 2
+
+# One threading.Lock per (account, ticker), serializing the retry-and-confirm
+# order-placement sequence in _submit_order_with_retry/_submit_replace_with_retry
+# (baseline snapshot through the final broker-state check). Spec'd 2026-08-15,
+# built 2026-08-16: closes the retry-dedup wrong-sibling-order-id gap at the
+# concurrency root -- with only one retry loop live per (account, ticker) at a
+# time, any new order appearing during the window is unambiguously this call's
+# own, so _find_recent_matching_order's single-candidate-match adoption (see
+# its 2026-08-16 review-finding comment below) can no longer misattribute a
+# core position's SL to its add-on leg's SL, or vice versa, even if both
+# retry loops happen to fire in the same broker-outage/reconnect window.
+# Mirrors the existing open_position()/close_position() lock pattern in
+# signals_db.py (2026-07-22, same poll-loop-vs-handler-thread race shape) --
+# a plain in-process Lock is enough since the live daemon (active_signals.py)
+# is single-process/multi-thread; scripts that call schwab_client from their
+# own separate process (e.g. live_sanity_check.py, which deliberately
+# bypasses schwab_safety too) aren't covered by this lock either, same as
+# every other in-process guard here. Confirmed narrow real trigger
+# (2026-08-15): normal arm-threshold spacing means a core SL is fully resting
+# long before any add-on SL placement starts, so the only real collision path
+# is a broker outage/reconnect forcing both retry loops into the same window
+# simultaneously -- "in 5 years we never collide with it... but cheap, spec
+# it and send it" (user's framing). Locks the whole placement+confirm
+# sequence, not just the final matching step, since that's what actually
+# removes the ambiguity rather than narrowing it. Tradeoff (review finding,
+# 2026-08-16): the lock is held for the FULL retry loop, not just one
+# broker call -- under sustained flapping this can run to the order of a
+# couple minutes (3 attempts x up to schwab-py's ~30s httpx timeout, plus
+# _check_broker_before_retry's own get_real_orders calls), during which a
+# genuinely different, unrelated order for the SAME (account, ticker) --
+# e.g. a protective SL placement racing a stuck entry retry -- blocks behind
+# it. Deliberate: blocking is safer than letting that second order risk a
+# wrong-sibling-order-id misattribution, and it only bites during the exact
+# outage window this lock exists to guard.
+_retry_locks = {}
+_retry_locks_meta_lock = threading.Lock()
+
+
+def _get_retry_lock(account, ticker):
+    """Returns the shared Lock for this (account, ticker), creating it on
+    first use. _retry_locks_meta_lock only guards the dict's own
+    get-or-create moment (fast, uncontended in practice) -- it is NOT held
+    while a caller then blocks on the returned per-(account, ticker) lock."""
+    key = (account, ticker)
+    with _retry_locks_meta_lock:
+        lock = _retry_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _retry_locks[key] = lock
+        return lock
 
 # Real broker-clock vs local-clock skew tolerance for _find_recent_matching_order's
 # since_ts cutoff -- widened backward a few seconds so a genuinely-just-placed
@@ -314,7 +366,20 @@ def _submit_order_with_retry(account_hash, order, account=None, ticker=None, sid
     Returns the order_id directly (not the raw response) -- no caller uses
     the raw response for anything beyond Utils(...).extract_order_id(r),
     now done internally here so the fresh-placement and duplicate-recovery
-    paths return the same shape."""
+    paths return the same shape.
+
+    Serialized per (account, ticker) (2026-08-16, see _get_retry_lock) --
+    the entire retry-and-confirm sequence below, not just the matching step,
+    so a concurrent retry loop for the same (account, ticker) can never be
+    mid-flight while this one is checking/placing."""
+    lock = _get_retry_lock(account, ticker) if account and ticker else contextlib.nullcontext()
+    with lock:
+        return _submit_order_with_retry_locked(account_hash, order, account, ticker, side,
+                                                quantity, order_type, node_id)
+
+
+def _submit_order_with_retry_locked(account_hash, order, account, ticker, side,
+                                     quantity, order_type, node_id):
     last_exc = None
     since_ts = time.time()
     can_check = None not in (account, ticker, side, quantity, order_type)
@@ -382,7 +447,18 @@ def _submit_replace_with_retry(account_hash, order_id, order, account=None, tick
     can see that yet. This is a fundamentally different, much smaller
     exposure window than the old "any attempt after the first could go
     fully unverified" gap, and every caller's UNPROTECTED/manual-fallback
-    messaging already assumes some form of this residual ambiguity."""
+    messaging already assumes some form of this residual ambiguity.
+
+    Serialized per (account, ticker) (2026-08-16, see _get_retry_lock) --
+    same rationale as _submit_order_with_retry above."""
+    lock = _get_retry_lock(account, ticker) if account and ticker else contextlib.nullcontext()
+    with lock:
+        return _submit_replace_with_retry_locked(account_hash, order_id, order, account, ticker,
+                                                  side, quantity, order_type, node_id)
+
+
+def _submit_replace_with_retry_locked(account_hash, order_id, order, account, ticker,
+                                       side, quantity, order_type, node_id):
     last_exc = None
     since_ts = time.time()
     can_check = None not in (account, ticker, side, quantity, order_type)

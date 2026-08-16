@@ -4166,8 +4166,21 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
     (previous, sole behavior) if the poll doesn't confirm in time, or if the
     poll itself raises for any reason (wrapped in a bare except -- the real
     order is already placed by this point, a confirmation failure must never
-    block recording it) -- fails open exactly like before, no new blocking
-    risk."""
+    block recording it) -- fails open on ACCURACY exactly like before.
+    Correction (2026-08-16, paired review): the earlier claim here ("no new
+    blocking risk") was wrong -- _reconcile_buy_fill calls
+    _place_stop_loss_for_position right after this function returns, so this
+    function's poll DOES delay real protective-stop placement by up to
+    _GAP_FILL_POLL_ATTEMPTS*_GAP_FILL_POLL_INTERVAL_SECS (~15s) plus HTTP
+    round-trips whenever it runs. For is_gap_correction fills specifically
+    (check_gap_resize's pre-open path) this isn't a rare worst case -- the
+    top-up MARKET order structurally cannot have filled before 9:30, so the
+    poll would ALWAYS exhaust every attempt. The poll is therefore skipped
+    entirely (falls straight to the fill_price approximation, matching this
+    function's pre-2026-08-16 behavior) when is_gap_correction is True; the
+    accuracy improvement only applies to the normal intraday top-up, where the
+    order is very likely to fill within a couple seconds and the resulting SL
+    delay is small and bounded."""
     ticker = node['ticker']
     account = node.get('account')
     if target_notional is None:
@@ -4176,6 +4189,15 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
     if delta > fill_price:
         top_up_shares = int(delta // fill_price)
         if top_up_shares > 0:
+            # try wraps the placement call and its own tuple-unpack only --
+            # every real return of place_equity_buy today is a clean 2-tuple
+            # (_place_equity_order returns (None, None) or (None, order_id)
+            # on every path), so this can't currently mislabel a placed-then-
+            # failed-to-parse order as "never placed." Keep it that way: never
+            # add response-parsing/follow-up logic BEYOND this unpack inside
+            # this try, or a raise there would hit the "failed unexpectedly
+            # ... position stays under target notional" message below for an
+            # order that was actually placed at the broker.
             try:
                 _, top_up_order_id = schwab_client.place_equity_buy(
                     account, ticker, top_up_shares, fill_price,
@@ -4195,6 +4217,25 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                               f"${delta:,.0f})")
                 return
             top_up_price = fill_price
+            top_up_confirmed = False
+            # 2026-08-16: previously gated this poll on `not is_gap_correction`,
+            # reasoning that check_gap_resize's pre-open path places this top-up
+            # before the order could possibly have filled. That reasoning was
+            # WRONG (caught by review) -- check_gap_resize (signals_notify.py,
+            # search _GAP_FILL_POLL_ATTEMPTS in check_gap_resize) already polls
+            # and confirms the OUTER replacement order's own fill, using this
+            # same poll budget, BEFORE ever calling _reconcile_buy_fill(
+            # is_gap_correction=True). So by the time this top-up branch runs,
+            # the market has demonstrably been open and filling orders for a
+            # while -- the top-up (a second MARKET order placed moments later,
+            # same ticker, same live conditions) is very likely to confirm
+            # within this same short poll too, same as the normal intraday
+            # case. Gating on is_gap_correction bought ~no latency and
+            # reintroduced the unconfirmed-price bug specifically on the
+            # highest-price-divergence path (overnight gaps) -- reverted to
+            # unconditional polling for both paths. The genuine (bounded, rare)
+            # SL-placement delay on a poll that doesn't confirm quickly applies
+            # symmetrically to both paths now, not as an "always" tax on one.
             if top_up_order_id is not None:  # None for dry_run -- nothing to poll
                 # Best-effort only -- any failure here (transient, or a test
                 # double that doesn't implement get_filled_order) must fall
@@ -4205,6 +4246,24 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                         confirmed = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=top_up_order_id)
                         if confirmed is not None:
                             top_up_price = confirmed['price']
+                            # Actual filled quantity, not the originally-requested
+                            # count -- _order_fill only returns on a terminal
+                            # FILLED status, but a short fill is still possible;
+                            # recording the request count would overstate the
+                            # real position (found by review, 2026-08-16).
+                            # `or` not `.get(..., default)`: a present-but-None
+                            # quantity must still fall back, not propagate None
+                            # into db.top_up_position's arithmetic (found by
+                            # review, 2026-08-16 -- unreachable today since
+                            # _order_fill only returns a truthy quantity, but a
+                            # None there would otherwise raise OUTSIDE this try,
+                            # skipping SL placement entirely). int(): schwab-py
+                            # sums quantity across fill legs as a float in
+                            # practice -- a real int share count is what every
+                            # other consumer (this scenario's own regex parser,
+                            # Slack formatting) expects.
+                            top_up_shares = int(confirmed.get('quantity') or top_up_shares)
+                            top_up_confirmed = True
                             break
                         time.sleep(_GAP_FILL_POLL_INTERVAL_SECS)
                 except Exception:
@@ -4212,7 +4271,9 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
             if db.top_up_position(node['id'], top_up_shares, top_up_price,
                                    position_source=position_source):
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
-                                       node_id=node.get('id'), result="placed", detail=f"shares={top_up_shares} price={top_up_price:.4f}", source=source)
+                                       node_id=node.get('id'), result="placed",
+                                       detail=f"shares={top_up_shares} price={top_up_price:.4f} "
+                                              f"confirmed={top_up_confirmed}", source=source)
                 _post_message(f"➕ {ticker} — top-up buy {top_up_shares} shares @ ${top_up_price:.4f} "
                               f"(fill was under target notional by ${delta:,.0f})")
             else:

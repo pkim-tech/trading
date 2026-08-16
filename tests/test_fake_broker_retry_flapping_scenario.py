@@ -22,10 +22,13 @@ Two scenarios:
      guess which one is real."""
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+import schwab.orders.equities as equity_orders
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
@@ -361,3 +364,223 @@ def test_replace_path_also_prevents_a_duplicate_on_a_landed_but_lost_response(en
     assert any(e['result'] == 'prevented' for e in matches), (
         f"expected a 'prevented' coverage_events row from the replace path, got {matches}"
     )
+
+
+def test_per_account_ticker_lock_serializes_concurrent_retry_loops(env, fake_broker, monkeypatch):
+    """2026-08-16: proves _get_retry_lock's actual concurrency guarantee, not
+    just that the matching-based mitigation exists -- two threads racing
+    _submit_order_with_retry for the SAME (account, ticker) must never have
+    both inside the critical section (baseline-snapshot-through-placement)
+    at once. Drives real threads directly against _submit_order_with_retry
+    (below schwab_safety's own guards, which aren't what's under test here)
+    against the real lock, not a mock. An artificial delay inside the
+    critical section makes any real overlap observable rather than relying
+    on a race that might not manifest without it."""
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+
+    concurrent_count = []
+    max_concurrent = [0]
+    count_lock = threading.Lock()
+    original_place_order = fake_broker.place_order
+
+    def slow_place_order(account_hash, order):
+        with count_lock:
+            concurrent_count.append(1)
+            max_concurrent[0] = max(max_concurrent[0], len(concurrent_count))
+        try:
+            time.sleep(0.05)
+            return original_place_order(account_hash, order)
+        finally:
+            with count_lock:
+                concurrent_count.pop()
+
+    monkeypatch.setattr(schwab_client, '_get_client', lambda: fake_broker)
+    monkeypatch.setattr(fake_broker, 'place_order', slow_place_order)
+
+    order = equity_orders.equity_buy_market(TICKER, 1)
+
+    def _place():
+        schwab_client._submit_order_with_retry(
+            'soxl_ira_hash', order, account='soxl_ira', ticker=TICKER,
+            side='BUY', quantity=1, order_type='MARKET', node_id=None)
+
+    threads = [threading.Thread(target=_place) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    # Review finding (2026-08-16): a hung/deadlocked thread would leave
+    # max_concurrent==1 and this test would pass green for the wrong reason
+    # -- join(timeout=10) returning doesn't mean the thread finished.
+    assert not any(t.is_alive() for t in threads), (
+        "one or more threads never finished within the 10s join timeout -- "
+        "possible deadlock, not a clean serialization"
+    )
+
+    assert max_concurrent[0] == 1, (
+        f"expected the per-(account, ticker) lock to fully serialize concurrent "
+        f"_submit_order_with_retry calls, but {max_concurrent[0]} were inside "
+        f"place_order at once"
+    )
+
+    # Different (account, ticker) keys must NOT share a lock -- confirm two
+    # distinct keys get distinct Lock objects, not a global lock.
+    lock_a = schwab_client._get_retry_lock('soxl_ira', TICKER)
+    lock_b = schwab_client._get_retry_lock('ira', TICKER)
+    lock_c = schwab_client._get_retry_lock('soxl_ira', TICKER)
+    assert lock_a is not lock_b, "different (account, ticker) keys must not share a lock"
+    assert lock_a is lock_c, "the same (account, ticker) key must reuse the same lock object"
+
+
+# The 3 tests below are adapted from an abandoned prior-session background
+# agent's own implementation of this same lock (found 2026-08-16 sitting
+# uncommitted in .claude/worktrees/agent-a253add9f502cb9b2/ -- functionally
+# equivalent to the version in this file, different lock-scope style). Its
+# schwab_client.py changes were discarded (both paired-review agents
+# preferred this file's wrapper-split approach for reviewability), but these
+# 3 scenarios prove real coverage the test above doesn't: full-sequence
+# (not just place_order-call) serialization via an ordering assertion,
+# explicit cross-ticker non-blocking, and the replace path specifically.
+_DELAY_SECS = 0.2
+
+
+def _slow_place_order_ordered(fake_broker_, log, log_lock):
+    real_place_order = fake_broker_.place_order
+
+    def _slow(account_hash, order):
+        with log_lock:
+            log.append('start')
+        time.sleep(_DELAY_SECS)
+        result = real_place_order(account_hash, order)
+        with log_lock:
+            log.append('end')
+        return result
+    return _slow
+
+
+def test_same_account_ticker_retries_do_not_interleave(env, fake_broker, monkeypatch):
+    """Two threads both retrying for ('soxl_ira', TICKER) -- the lock must
+    make the second thread's first attempt wait until the first thread's
+    ENTIRE retry-and-confirm sequence (not just its one place_order call)
+    has finished, so the ordered log never shows ['start', 'start', 'end',
+    'end'] (interleaved) -- only ['start', 'end', 'start', 'end']."""
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    log = []
+    log_lock = threading.Lock()
+    monkeypatch.setattr(fake_broker, 'place_order', _slow_place_order_ordered(fake_broker, log, log_lock))
+
+    order = equity_orders.equity_buy_market(TICKER, 1)
+    results = {}
+
+    def run(label):
+        results[label] = schwab_client._submit_order_with_retry(
+            'soxl_ira_hash', order, account='soxl_ira', ticker=TICKER,
+            side='BUY', quantity=1, order_type='MARKET', node_id=None)
+
+    t1 = threading.Thread(target=run, args=('t1',))
+    t2 = threading.Thread(target=run, args=('t2',))
+    t1.start()
+    time.sleep(0.05)  # give t1 a real head start into the lock
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert not t1.is_alive() and not t2.is_alive(), "possible deadlock -- a thread never finished"
+
+    assert log == ['start', 'end', 'start', 'end'], (
+        f"expected t1's full sequence to finish before t2's first attempt started, got {log}"
+    )
+    assert results['t1'] is not None and results['t2'] is not None
+    assert results['t1'] != results['t2'], "each call should still get its own distinct real order id"
+
+
+def test_different_tickers_same_account_do_not_block_each_other(env, fake_broker, monkeypatch):
+    """Same shape as above but two DISTINCT tickers in the same account --
+    they must run concurrently, proving the lock is keyed per
+    (account, ticker), not a single global lock that would serialize every
+    ticker's retries against each other."""
+    ticker_b, ticker_c = 'TEST_RETRY_LOCK_B', 'TEST_RETRY_LOCK_C'
+    fake_broker.set_quote(ticker_b, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_quote(ticker_c, last=10.0, bid=10.0, ask=10.01)
+    log = []
+    log_lock = threading.Lock()
+    monkeypatch.setattr(fake_broker, 'place_order', _slow_place_order_ordered(fake_broker, log, log_lock))
+
+    results = {}
+
+    def run(label, ticker):
+        order = equity_orders.equity_buy_market(ticker, 1)
+        results[label] = schwab_client._submit_order_with_retry(
+            'soxl_ira_hash', order, account='soxl_ira', ticker=ticker,
+            side='BUY', quantity=1, order_type='MARKET', node_id=None)
+
+    t1 = threading.Thread(target=run, args=('t1', ticker_b))
+    t2 = threading.Thread(target=run, args=('t2', ticker_c))
+
+    started = time.monotonic()
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert not t1.is_alive() and not t2.is_alive(), "possible deadlock -- a thread never finished"
+    elapsed = time.monotonic() - started
+
+    assert log[:2] == ['start', 'start'], (
+        f"expected both threads' place_order calls to start before either finished "
+        f"(no cross-ticker blocking), got {log}"
+    )
+    assert elapsed < _DELAY_SECS * 2, (
+        f"two different-ticker retries took {elapsed:.2f}s, close to the serialized "
+        f"{_DELAY_SECS * 2:.2f}s bound -- suggests they were NOT running concurrently"
+    )
+    assert results['t1'] is not None and results['t2'] is not None
+
+
+def test_replace_retry_also_serializes_per_account_ticker(env, fake_broker, monkeypatch):
+    """Same ordering proof, through _submit_replace_with_retry -- confirms
+    the lock covers both chokepoints, not just fresh placement."""
+    ticker_d = 'TEST_RETRY_LOCK_D'
+    fake_broker.set_quote(ticker_d, last=10.0, bid=10.0, ask=10.01)
+    account_hash = fake_broker.account_hashes['soxl_ira']
+    old_id = fake_broker.seed_resting_order('soxl_ira', ticker_d, 'STOP', 'SELL', 10, stop_price=9.0)
+
+    log = []
+    log_lock = threading.Lock()
+    real_replace_order = fake_broker.replace_order
+
+    def slow_replace(account_hash_arg, order_id_arg, order):
+        with log_lock:
+            log.append('start')
+        time.sleep(_DELAY_SECS)
+        result = real_replace_order(account_hash_arg, order_id_arg, order)
+        with log_lock:
+            log.append('end')
+        return result
+
+    monkeypatch.setattr(fake_broker, 'replace_order', slow_replace)
+
+    def _call(order_id_arg):
+        order = equity_orders.equity_sell_market(ticker_d, 10)
+        return schwab_client._submit_replace_with_retry(
+            account_hash, order_id_arg, order, account='soxl_ira', ticker=ticker_d,
+            side='SELL', quantity=10, order_type='MARKET', node_id=None)
+
+    results = {}
+
+    def run(label, order_id_arg):
+        results[label] = _call(order_id_arg)
+
+    t1 = threading.Thread(target=run, args=('t1', old_id))
+    t2 = threading.Thread(target=run, args=('t2', old_id))
+    t1.start()
+    time.sleep(0.05)
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert not t1.is_alive() and not t2.is_alive(), "possible deadlock -- a thread never finished"
+
+    assert log == ['start', 'end', 'start', 'end'], (
+        f"expected t1's replace sequence to finish before t2's started, got {log}"
+    )
+    assert results['t1'] is not None and results['t2'] is not None
+

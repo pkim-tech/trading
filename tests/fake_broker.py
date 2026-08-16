@@ -83,6 +83,8 @@ class FakeBroker:
                                    # defaults to cash_balances' value, matching a real flat account)
         self.leverage_factors = {}  # ticker -> fundLeverageFactor (2026-08-12, e.g. 200.0=2x/300.0=3x;
                                      # defaults to 200.0/50% margin req, matching a real 2x fund)
+        self._reject_next_order = None  # None, or a terminal-bad status string -- see
+                                         # force_reject_next_order() below
 
     # ------------------------------------------------------------------
     # Test-side setup helpers
@@ -90,6 +92,27 @@ class FakeBroker:
 
     def set_cash_balance(self, account, cash):
         self.cash_balances[account] = cash
+
+    def force_reject_next_order(self, status='REJECTED'):
+        """One-shot: the NEXT place_order() call still succeeds at the HTTP
+        level (returns a real order_id, no exception) but the created order
+        carries `status` instead of going through the normal MARKET-fills-
+        immediately/STOP-stays-WORKING path -- deliberately modeling a
+        confirmed-async rejection, not a synchronous placement failure.
+        Calibrated to the one real observed Schwab rejection on file (see
+        schwab_client.py's _ORDER_CONFIRM_POLL_ATTEMPTS comment: an oversized
+        BUY returned HTTP 201 with no exception 2026-07-24, then resolved
+        REJECTED ~0.3-0.7s later via the async status poll) rather than
+        invented from scratch -- built without a live add-on-BUY-rejected
+        observation (still gated on a real WFH-day test, see
+        docs/backlog_cache.md), so this reuses the shape already proven live
+        for a same-class BUY rather than guessing a new one.
+        `status` should be one of schwab_client._ORDER_TERMINAL_BAD_STATUSES
+        ('REJECTED', 'CANCELED', 'EXPIRED') -- not validated against that set
+        here (this fixture doesn't import schwab_client's private constant),
+        but any other value just leaves the order looking like it's still
+        resting, silently defeating the point."""
+        self._reject_next_order = status
 
     def set_buying_power(self, account, buying_power):
         """D2 (docs/plans/real_order_execution_drought_addon.md) -- the raw
@@ -251,7 +274,14 @@ class FakeBroker:
         order_id = next(self._id_counter)
         spec = self._parse_order_builder(order)
         self.orders[order_id] = self._make_order(order_id, account, **spec)
-        self._maybe_immediate_fill(self.orders[order_id])
+        if self._reject_next_order is not None:
+            # Mirrors the real 2026-07-24 shape: the order still gets a real
+            # id (place_order itself doesn't raise) -- only the async status
+            # poll (schwab_client._confirm_order_status) sees the rejection.
+            self.orders[order_id]['status'] = self._reject_next_order
+            self._reject_next_order = None
+        else:
+            self._maybe_immediate_fill(self.orders[order_id])
         return FakeResponse(None, order_id=order_id)
 
     def replace_order(self, account_hash, order_id, order):
@@ -322,7 +352,21 @@ class FakeBroker:
             order_type=spec['orderType'],
             side=leg['instruction'],
             quantity=int(leg['quantity']),
-            stop_price=spec.get('stopPrice'),
+            # schwab_client.place_stop_loss sets stopPrice as a STRING
+            # (f"{stop_price:.2f}") -- deliberate, matches a real schwab-py
+            # deprecation requirement (see that function's own comment). Every
+            # existing test seeds a STOP order directly via
+            # seed_resting_order(stop_price=<float>), bypassing this parse
+            # path entirely -- so nothing had exercised a real
+            # place_stop_loss() call through advance_price()'s own trigger
+            # check (`real_bid <= o['stopPrice']`) until the fake-venue
+            # sl_order_fills_independent_detection scenario did, which is
+            # what surfaced this: a raw string here would TypeError on that
+            # float comparison. Coerced to float here, once, so every
+            # downstream consumer (advance_price, force_fill, this fixture's
+            # own tests) keeps seeing a real number regardless of which path
+            # created the order.
+            stop_price=float(spec['stopPrice']) if spec.get('stopPrice') is not None else None,
             trail_offset=spec.get('stopPriceOffset'),
         )
 

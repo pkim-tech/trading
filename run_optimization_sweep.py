@@ -479,8 +479,14 @@ _NODE_INPUT_CACHE = {}
 _NODE_INPUT_CACHE_MAX = 6
 
 
-def _load_node_inputs(ticker, strategy_class, strategy_name, w, z_thresh):
-    key = (ticker, strategy_name, int(w))
+def _load_node_inputs(ticker, strategy_class, strategy_name, w, z_thresh, start_date=None, end_date=None):
+    # start_date/end_date fold into the memo key deliberately -- a differently-windowed
+    # rerun must never silently serve another window's cached arrays back out (same
+    # bug shape as the disabled run_phase1_coarse row-count check and the removed
+    # campaign-level 'done' check, docs/deep_backlog.md). Indicators are still computed
+    # off the FULL cached history below regardless of window (never truncated
+    # pre-indicator) -- only the per-bar arrays get trimmed, after computation.
+    key = (ticker, strategy_name, int(w), start_date, end_date)
     hit = _NODE_INPUT_CACHE.get(key)
     if hit is not None:
         return hit
@@ -496,12 +502,74 @@ def _load_node_inputs(ticker, strategy_class, strategy_name, w, z_thresh):
         df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
         strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
         df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
-        entry = (df_hourly_raw, df_daily_processed, prep_inputs(df_hourly_raw, df_daily_processed))
+        prep = prep_inputs(df_hourly_raw, df_daily_processed)
+        if start_date is not None or end_date is not None:
+            prep = _window_prep(prep, start_date, end_date)
+        # df_hourly_raw/df_daily_processed are ALWAYS full-history, even when prep (3rd
+        # element) is windowed -- currently safe because every run_backtest_dispatch
+        # branch takes prep when supplied and ignores these first two entirely (see
+        # scripts/audit_date_window_soxl.py's call pattern). A future caller reading
+        # df_hourly_raw/df_daily_processed directly off this tuple must NOT assume they
+        # reflect start_date/end_date -- only prep does.
+        entry = (df_hourly_raw, df_daily_processed, prep)
 
     if len(_NODE_INPUT_CACHE) >= _NODE_INPUT_CACHE_MAX:
         _NODE_INPUT_CACHE.clear()
     _NODE_INPUT_CACHE[key] = entry
     return entry
+
+
+def _window_prep(prep, start_date, end_date):
+    """Trims prep_inputs()'s per-hourly-bar arrays to [start_date, end_date], leaving
+    sma_arr/std_arr/trend_arr untouched -- same technique as
+    scripts/paper_vs_backtest_reconcile.py::get_trades_and_bars_since (confirmed
+    correct there against real KORU/YANG divergence, 2026-08-12). Those three arrays
+    are indexed per calendar day via daily_idx, not by array position, so slicing them
+    too would misalign every lookup -- this is what lets indicators keep using the full
+    real prior history for warm-up while only the tradeable window shrinks.
+
+    end_date is a YYYY-MM-DD date; pd.Timestamp(end_date) is midnight, so extend by a
+    day or a trade signaling ON end_date is silently excluded (same truncation trap
+    noted in get_backtest_trades_in_window).
+
+    Cold-start bias (confirmed empirically against real SOXL data, both paired-review
+    Opus passes, 2026-08-16): the windowed run starts FLAT at start_date, so it can take
+    a trade the full-history run couldn't (the full-history run may still be holding an
+    earlier position spanning the boundary) -- produced a real, correctly-explained
+    37-vs-36 trade discrepancy in the Stage 1 audit (scripts/audit_date_window_soxl.py).
+    This is not a bug -- it's the same property get_trades_and_bars_since's reused
+    slicing pattern has by design -- but it IS an uncontrolled bias for a rolling-window
+    drift study: each window's first trade may be a flat-start artifact, and with
+    quarterly-stepped overlapping windows every window gets one.
+
+    Mirror-image bias at the OTHER boundary (found by review, 2026-08-16, undocumented
+    in the first pass of this note): a position still open when the sim runs out of bars
+    at end_date never closes within the window and drops out of the `closed` trade set
+    entirely -- the full-history run, continuing past end_date, would report it. Same
+    class of uncontrolled bias (a window can lose its real last trade, not just gain a
+    spurious first one), and it skews `compounded`/win-rate the same way.
+
+    Left unhandled deliberately (Phase 1 scope is data-loading only, see
+    docs/deep_backlog.md's 2026-08-16 entry) -- a future rolling-window campaign built on
+    this needs to account for both ends (e.g. discard/flag each window's first AND last
+    trade, or seed/carry position state across window boundaries) rather than treat
+    window-to-window trade-count deltas as pure signal."""
+    if start_date is not None and end_date is not None and pd.Timestamp(start_date) > pd.Timestamp(end_date):
+        raise ValueError(f"_window_prep: start_date {start_date} is after end_date {end_date}")
+    ts = prep['timestamps']
+    start_pos = ts.searchsorted(pd.Timestamp(start_date)) if start_date is not None else 0
+    end_pos = (ts.searchsorted(pd.Timestamp(end_date) + pd.Timedelta(days=1))
+               if end_date is not None else len(ts))
+    if start_pos >= end_pos:
+        span = f"{ts[0]} to {ts[-1]}" if len(ts) else "empty"
+        raise ValueError(
+            f"_window_prep: window [{start_date}, {end_date}] produced zero bars "
+            f"(cached data spans {span}) -- check the window is inside the cached "
+            f"data's range and start_date <= end_date")
+    windowed = dict(prep)
+    for k in ("prices", "highs", "lows", "opens", "hours", "daily_idx", "timestamps"):
+        windowed[k] = prep[k][start_pos:end_pos]
+    return windowed
 
 
 def _warmup_worker():
@@ -569,14 +637,15 @@ def _summarize_trades(closed, spy_bh):
 
 
 def run_single_backtest_node_isolated(args):
-    ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl, trail_pct_pct, entry_timing = args
+    (ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl,
+     trail_pct_pct, entry_timing, start_date, end_date) = args
 
     strategy_class = getattr(strategies, strategy_name, None)
     if not strategy_class:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "UNKNOWN_STRAT"}
 
     try:
-        inputs = _load_node_inputs(ticker, strategy_class, strategy_name, w, z_thresh)
+        inputs = _load_node_inputs(ticker, strategy_class, strategy_name, w, z_thresh, start_date, end_date)
     except Exception as e:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR", "error": repr(e)}
 
@@ -626,7 +695,27 @@ def run_single_backtest_node_isolated(args):
     }
 
 
-def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None):
+def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None, start_date=None, end_date=None):
+    # backtest_cache has no start_date/end_date columns and cached_map below keys
+    # purely on (tp, sl, hold, w, z, fsl, tpct) -- a windowed call would either read
+    # back a stale full-history row under an identical key, or write a windowed result
+    # that silently corrupts/collides with the full-history row at that same key.
+    # Persisting windowed results needs an explicit schema decision this Phase-1 pass
+    # doesn't make (see docs/deep_backlog.md's 2026-08-16 date-range entry, which scopes
+    # this pass to data-loading only) -- fail loudly instead of risking silent corruption.
+    # WHOEVER LIFTS THIS GUARD: the cache schema is not the only blocker -- the caller's
+    # own compute_bh_returns(ticker) call (~line 1513, no date params) must ALSO be
+    # windowed to the same start_date/end_date, or a windowed trade set gets scored
+    # against a full-history spy_bh/asset_bh benchmark, silently reintroducing the exact
+    # HIGH bug fixed 2026-08-16 (see run_single_backtest_node_isolated's own spy_bh param,
+    # which is honored correctly when windowed -- the gap is only in what the caller passes).
+    if start_date is not None or end_date is not None:
+        raise NotImplementedError(
+            "dispatch_parallel_grid: start_date/end_date not supported -- backtest_cache "
+            "has no date-window columns yet, so a windowed sweep can't be safely cached/"
+            "persisted through this path. Use _load_node_inputs + run_backtest_dispatch "
+            "directly (see scripts/audit_date_window_soxl.py) for a windowed run."
+        )
     conn   = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
     matrix_results  = []
@@ -703,7 +792,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
     futures_map = {
         shared_pool.submit(run_single_backtest_node_isolated,
-                           (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z, fixed_sl, tpct, entry_timing)): task
+                           (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z, fixed_sl,
+                            tpct, entry_timing, start_date, end_date)): task
         for task in unvisited_tasks
         for tp, sl, hold, w, z, tpct in [task]
     }
@@ -827,13 +917,40 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
 # ── B&H helper ────────────────────────────────────────────────────────────────
 
-def compute_bh_returns(ticker):
+def compute_bh_returns(ticker, start_date=None, end_date=None):
+    # start_date/end_date default to None -- the non-windowed call path (every existing
+    # caller) is byte-identical to before this param was added. When windowed, both legs
+    # (asset_bh AND spy_bh) get sliced to the SAME [start_date, end_date] range the trade
+    # set itself was windowed to -- same technique as
+    # scripts/train_test_split_check.py::period_spy_bh, reused rather than reinvented.
+    # Without this, a windowed trade set's alpha_calc (_summarize_trades: compounded -
+    # spy_bh) would silently diff against a full-history benchmark, which is wrong for
+    # exactly the cross-window comparison date-windowing exists to support.
     cache_path = CACHE_DIR / f"{ticker}_1h.csv"
     if not cache_path.exists():
         return None, None
     df = pd.read_csv(cache_path, index_col=0, parse_dates=True).sort_index()
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
+    if start_date is not None or end_date is not None:
+        # end_date is inclusive-through-end-of-day, matching _window_prep's convention
+        # exactly (pd.Timestamp(end_date) is midnight -- extend by a day or a bar ON
+        # end_date is silently excluded).
+        # Fail loudly on a degenerate window, matching _window_prep's ValueError
+        # convention (found by review, 2026-08-16: this used to return (None, None)
+        # here, which a caller could confuse with "no SPY cache file" instead of
+        # "you gave a bad date range").
+        if start_date is not None and end_date is not None and pd.Timestamp(start_date) > pd.Timestamp(end_date):
+            raise ValueError(f"compute_bh_returns: start_date {start_date} is after end_date {end_date}")
+        full_span = f"{df.index.min()} to {df.index.max()}" if len(df) else "empty"
+        lo = pd.Timestamp(start_date) if start_date is not None else df.index.min()
+        hi = (pd.Timestamp(end_date) + pd.Timedelta(days=1)) if end_date is not None else df.index.max() + pd.Timedelta(days=1)
+        df = df.loc[(df.index >= lo) & (df.index < hi)]
+        if len(df) < 2:
+            raise ValueError(
+                f"compute_bh_returns: window [{start_date}, {end_date}] produced too few "
+                f"bars to compute a return (cached data spans {full_span}) -- check the "
+                f"window is inside the cached data's range and start_date <= end_date")
     close_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
     asset_bh  = ((df[close_col].iloc[-1] - df[close_col].iloc[0]) / df[close_col].iloc[0]) * 100
 

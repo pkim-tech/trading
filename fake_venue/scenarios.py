@@ -205,6 +205,24 @@ def run(price=None, verbose=True):
     pos_b = db.get_open_position_by_wl_id(node_b['id'])
     checks.append(Check("position opened for node A", pos_a is not None,
                         f"shares={pos_a['shares'] if pos_a else None} entry={pos_a['entry_price'] if pos_a else None}"))
+    # buy_fill_reconciled -- fill MATH correctness (Grid row 'buy_fill_reconciled'),
+    # distinct from buy_fill_reconciles_correct_node's node-identity check above.
+    # Piggybacked here per docs/backlog_cache.md rather than a standalone
+    # scenario: check_auto_fills' slow-poll path (leg 1's own mechanism)
+    # already produces a real fill event with a known, precise expected
+    # price/quantity (fill_price_a/shares, both set explicitly by this
+    # scenario) -- nothing about the math needs its own broker/stream setup.
+    checks.append(Check("position shares/entry_price exactly match the real fill (not just node identity)",
+                        pos_a is not None and pos_a['shares'] == shares
+                        and abs(pos_a['entry_price'] - fill_price_a) < 0.0005,
+                        f"shares={pos_a['shares'] if pos_a else None} expected={shares} "
+                        f"entry={pos_a['entry_price'] if pos_a else None} expected={fill_price_a:.4f}"))
+    buy_fill_events_a = db.get_coverage_events(scenario_key="buy_fill_reconciled")
+    opened_a = [e for e in buy_fill_events_a if e['result'] == 'opened' and e['node_id'] == node_a['id']]
+    checks.append(Check("buy_fill_reconciled fired 'opened' for node A with exact shares/price in detail",
+                        len(opened_a) == 1 and f"shares={shares:g}" in opened_a[0]['detail']
+                        and f"price={fill_price_a:.4f}" in opened_a[0]['detail'],
+                        f"events={[(e['result'], e['detail']) for e in buy_fill_events_a]}"))
     checks.append(Check("node B did NOT get node A's fill", pos_b is None))
     checks.append(Check("node C (A's SAME-ACCOUNT sibling) did NOT get node A's fill",
                         db.get_open_position_by_wl_id(node_c['id']) is None))
@@ -264,6 +282,20 @@ def run(price=None, verbose=True):
     checks.append(Check("position opened for node B via the real-shaped stream fast path",
                         pos_b is not None,
                         f"shares={pos_b['shares'] if pos_b else None}"))
+    # buy_fill_reconciled -- fill math correctness for node B too, via the
+    # fast (stream) path rather than leg 1's slow-poll path, so both real
+    # reconciliation entry points are checked, not just one.
+    checks.append(Check("node B's shares/entry_price exactly match the real fill via the fast path",
+                        pos_b is not None and pos_b['shares'] == shares
+                        and abs(pos_b['entry_price'] - fill_price_b) < 0.0005,
+                        f"shares={pos_b['shares'] if pos_b else None} expected={shares} "
+                        f"entry={pos_b['entry_price'] if pos_b else None} expected={fill_price_b:.4f}"))
+    buy_fill_events_b = db.get_coverage_events(scenario_key="buy_fill_reconciled")
+    opened_b = [e for e in buy_fill_events_b if e['result'] == 'opened' and e['node_id'] == node_b['id']]
+    checks.append(Check("buy_fill_reconciled fired 'opened' for node B with exact shares/price in detail",
+                        len(opened_b) == 1 and f"shares={shares:g}" in opened_b[0]['detail']
+                        and f"price={fill_price_b:.4f}" in opened_b[0]['detail'],
+                        f"events={[(e['result'], e['detail']) for e in buy_fill_events_b]}"))
     checks.append(Check("only node C's pending buy is left (A and B both reconciled)",
                         [p['node']['id'] for p in db.get_pending_buys() if p['ticker'] == TICKER]
                         == [node_c['id']]))

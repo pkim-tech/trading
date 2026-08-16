@@ -90,6 +90,42 @@ def seed_fake_accounts(accounts):
     schwab_safety.reload_accounts()
 
 
+def age_recent_order_records(seconds):
+    """Rewinds every timestamp in schwab_safety's local recent-order dedup
+    record (STATE_PATH's 'recent_orders'/'recent_order_timestamps') by
+    `seconds` -- lets a scenario represent real elapsed wall-clock time
+    between two order-placement stages without an actual time.sleep().
+
+    Real production spacing: entry-time SL placement and any later SELL-side
+    replace (arm, or an SL/TIME/TP exit) are always >= one full POLL_SECS
+    (300s, signals_config.py) apart -- open_positions is snapshotted once per
+    poll iteration, and the exit/arm scan reads that PRE-fill snapshot, so a
+    position opened by check_auto_fills earlier in the SAME iteration can't
+    also be arm/exit-scanned until the NEXT iteration at the earliest. A
+    fake_venue scenario driving both stages back-to-back in one process (for
+    determinism/speed, not simulated realism) can otherwise trip
+    schwab_safety's DUPLICATE_ORDER_WINDOW_SECS=60s dedup guard purely as a
+    harness-compression artifact -- same class of environmental gap as
+    seed_quote's real-price bridge or the _is_trading_day fake, not a bypass
+    of the guard's own logic (it still runs for real; it just correctly sees
+    the earlier order as no longer 'recent' once its timestamp is aged past
+    the window, exactly as it would after a real 300s poll gap)."""
+    import json
+
+    import schwab_safety
+
+    if not schwab_safety.STATE_PATH.exists():
+        return
+    counts = json.loads(schwab_safety.STATE_PATH.read_text() or "{}")
+    for key in ("recent_order_timestamps",):
+        if key in counts:
+            counts[key] = [t - seconds for t in counts[key]]
+    for o in counts.get("recent_orders", []):
+        if "ts" in o:
+            o["ts"] -= seconds
+    schwab_safety.STATE_PATH.write_text(json.dumps(counts))
+
+
 class QuoteBridgeError(RuntimeError):
     """Raised when no real price could be fetched -- never fall back to 0.0."""
 

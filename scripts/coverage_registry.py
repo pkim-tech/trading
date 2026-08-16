@@ -150,8 +150,13 @@ REGISTRY = [
                "every other canary. Added to the Grid 2026-08-08."),
     dict(id='sl_sync_placement',
          scenario="SL placed at signal price after fill (sync path)",
-         code_path="_place_stop_loss_for_position via sync confirm",
-         offline_coverage="Unit test (SL anchors to signal_price)",
+         code_path="_place_stop_loss_for_position via sync confirm; also reached via the "
+                    "real stream chain (drain_fill_queue -> _reconcile_buy_fill -> "
+                    "_place_stop_loss_for_position, signals_notify.py) -- found 2026-08-16, "
+                    "this code_path text previously only named the sync caller",
+         offline_coverage="Unit test (SL anchors to signal_price); fake_venue/scenarios_sl_sync_placement.py "
+                          "+ tests/test_fake_venue_sl_sync_placement_scenario.py (2026-08-16, proves the "
+                          "stream-chain path specifically, incl. post-top-up share sizing)",
          check_mechanism='coverage_events', scenario_key='sl_placement',
          bad_results=['blocked', 'failed_unexpectedly'],
          notes="2026-07-24 real attempt was blocked by the pre-fix daily_order_cap bug (now fixed) -- "
@@ -173,7 +178,13 @@ REGISTRY = [
                            "no-exit-pending close, real post-arm TRAILING_STOP fill labeled TRAIL "
                            "(not SL), trailing=True-but-unrepointed-order still labeled SL (the "
                            "mislabel a paired Opus review caught), dedup with exit_pending, and the "
-                           "fewer-shares-than-tracked guard (alerts instead of auto-closing)",
+                           "fewer-shares-than-tracked guard (alerts instead of auto-closing); "
+                           "fake_venue/scenarios_sl_order_fills_independent_detection.py (2026-08-16 -- "
+                           "the real _place_stop_loss_for_position() placement path end to end, a "
+                           "broker-side-only fill via advance_price(), and the standalone "
+                           "check_sl_order_fills() poll closing it with zero bar-close/signal-window "
+                           "involvement anywhere in the run); tests/test_fake_venue_sl_order_fills_"
+                           "independent_detection_scenario.py (pytest subprocess wrapper)",
          check_mechanism='coverage_events', scenario_key='automated_exit_confirmed',
          # 'closed' (the other 2 call sites sharing this scenario_key) and 'qty_mismatch'
          # (a real detected mismatch, alert-only, not a close) are both excluded -- the
@@ -205,7 +216,12 @@ REGISTRY = [
     dict(id='post_fill_topup',
          scenario="Post-fill top-up places a real order",
          code_path="_reconcile_fill",
-         offline_coverage="test_part3_gap_resize.py; live_sim_harness.py::scenario_reconcile_fill_topup",
+         offline_coverage="test_part3_gap_resize.py; live_sim_harness.py::scenario_reconcile_fill_topup; "
+                          "fake_venue/scenarios_post_fill_topup.py (2026-08-15/16 -- second, independently "
+                          "placed broker order for the top-up leg, real stream/poll reconciliation of its "
+                          "own fill, entry_price blend assertion); tests/test_fake_venue_post_fill_topup_scenario.py "
+                          "(pytest wrapper, incl. a mutation test reverting the entry_price fix and confirming "
+                          "the scenario fails)",
          check_mechanism='coverage_events', scenario_key='top_up',
          bad_results=['blocked', 'failed_unexpectedly', 'db_update_failed_after_real_order',
                       'overspent_no_corrective_sell'],
@@ -548,10 +564,19 @@ REGISTRY = [
                   "broker state before each retry attempt (N>1) instead of resubmitting blind",
          code_path="schwab_client._submit_order_with_retry / _submit_replace_with_retry "
                     "(_find_recent_matching_order / _check_broker_before_retry)",
-         offline_coverage="2 fake_broker tests (test_fake_broker_retry_flapping_scenario.py): a "
+         offline_coverage="7 fake_broker tests (test_fake_broker_retry_flapping_scenario.py): a "
                            "drop-then-landed-but-lost-response sequence (asserts exactly 1 real order "
                            "reaches the broker, not 2) and an ambiguous-multi-match sequence (asserts "
-                           "the loop raises _AmbiguousBrokerState and fails safe rather than guessing).",
+                           "the loop raises _AmbiguousBrokerState and fails safe rather than guessing), "
+                           "plus the post-loop final-attempt check, a stale-preexisting-order non-block, "
+                           "a rejected-prior-order non-match, the replace path, and the per-(account, "
+                           "ticker) retry-lock serialization (3 tests). PLUS 1 fake_venue Phase 2 "
+                           "scenario (2026-08-16, fake_venue/scenarios_retry_duplicate_prevented.py, "
+                           "`--scenario order_retry_duplicate_prevented`): the same "
+                           "prevented/ambiguous/replace-path proof driven through the real "
+                           "place_equity_buy/replace_order_with_stop_loss call chain in the "
+                           "subprocess-isolated harness, not direct function calls -- fake_broker's "
+                           "tier can't reach the harness's own isolation/DB-proof boundary.",
          check_mechanism='coverage_events', scenario_key='order_retry_duplicate_prevented',
          bad_results=['ambiguous', 'check_failed'],
          notes="Added 2026-08-15 (see docs/backlog_cache.md's now-resolved 'retry blind, no "
@@ -1011,7 +1036,13 @@ REGISTRY = [
                   "when it is replacing a human-placed one)",
          code_path="signals_notify._verify_resting_before_replace, called from "
                     "_attempt_automated_sell and _attempt_automated_exit_sell",
-         offline_coverage="8 unit tests (test_replace_target_mismatch.py)",
+         offline_coverage="8 unit tests (test_replace_target_mismatch.py) + fake_venue Phase 2 scenario "
+                          "`replace_target_mismatch` (4 tests, test_fake_venue_replace_target_mismatch_"
+                          "scenario.py) -- the fake_venue scenario is what actually drives the real "
+                          "2-broker-round-trip sequence (advisory check + the real replace call's own "
+                          "independent check_order re-verification) against a real FakeBroker, including "
+                          "a TOCTOU-race leg (state mutated between the two round-trips, not before "
+                          "either) no mocked-_open_orders unit test can reach.",
          check_mechanism='coverage_events', scenario_key='replace_target_mismatch',
          notes="Bug #4 of the 2026-08-14 SOXS incident. Both automated exit paths took whatever was in "
                "pos['sl_order_id'] / trail_state.exit_order_id and replaced it the moment their exit "
@@ -1284,21 +1315,46 @@ REGISTRY = [
          scenario="A real drought HANDOFF cancels a still-resting drought entry order (Case A) -- "
                   "including the race where the cancel attempt finds the order already FILLED",
          code_path="signals_notify.check_drought_handoff",
-         offline_coverage="tests/test_fake_broker_drought_handoff_scenario.py",
+         offline_coverage="tests/test_fake_broker_drought_handoff_scenario.py (in-process, branch "
+                          "logic); fake_venue/scenarios_drought_handoff.py (2026-08-15 -- Phase 2, real "
+                          "cancel_order round-trip against FakeBroker, incl. the fill-race falling "
+                          "through to Case B in the same call); tests/"
+                          "test_fake_venue_drought_handoff_scenario.py",
          check_mechanism='coverage_events', scenario_key='drought_handoff_cancel',
          bad_results=[],
          notes="Proves the new cancel race is handled -- without this row the mechanism has no "
-               "accountability record at all. No live proof yet."),
+               "accountability record at all. No live proof yet. The fake_venue Phase 2 scenario's "
+               "own fill-race leg (node B) surfaced a REAL, unfixed interaction (not yet fixed, "
+               "left open pending review): the raced fill's own auto-placed protective SL "
+               "(_reconcile_buy_fill) collides with HANDOFF's immediate replace-attempt inside "
+               "schwab_safety's 60s dup-order-window guard, which has no exemption for this self-"
+               "collision shape (unlike the addon-leg one) -- the system fails safe (alerts, leaves "
+               "the position open+protected) but doesn't reach the ideal clean close. See that "
+               "scenario module's docstring for detail."),
     dict(id='drought_handoff_exit_placement',
          scenario="A real drought HANDOFF places a real market SELL for an open drought position "
                   "(Case B), and does not close the DB row until the fill is confirmed",
          code_path="signals_notify.check_drought_handoff",
-         offline_coverage="tests/test_fake_broker_drought_handoff_scenario.py",
+         offline_coverage="tests/test_fake_broker_drought_handoff_scenario.py (in-process, branch "
+                          "logic); fake_venue/scenarios_drought_handoff.py (2026-08-15 -- Phase 2, "
+                          "node C: a real market SELL whose OWN fill confirmation is artificially "
+                          "delayed past check_drought_handoff's poll budget, forcing the genuine "
+                          "placed_unconfirmed/persisted-exit_pending branch, then chains into the "
+                          "real check_own_sell_fills poll the way the real daemon eventually would); "
+                          "tests/test_fake_venue_drought_handoff_scenario.py",
          check_mechanism='coverage_events', scenario_key='drought_handoff_exit_placement',
          bad_results=[],
          notes="Key structural difference from paper's synchronous HANDOFF close -- real must persist "
                "trail_state['exit_pending'] and let check_own_sell_fills/check_auto_fills close it on "
-               "an unconfirmed-fill poll. No live proof yet."),
+               "an unconfirmed-fill poll. No live proof yet. FOUND, NOT FIXED (2026-08-15, the "
+               "fake_venue Phase 2 scenario's first run): check_drought_handoff's placed_unconfirmed "
+               "exit_pending write (~line 2237) omits 'current_price' -- every other exit_pending "
+               "producer in signals_notify.py includes it, and check_own_sell_fills (~line 3236) "
+               "unconditionally reads exit_pending['current_price'], so it raises KeyError trying to "
+               "close a HANDOFF position whose fill confirmation didn't land inline. Real production "
+               "gap, deliberately not fixed inline (would touch signals_notify.py, needs the paired "
+               "review); tracked as a required=False Check in the scenario so it stays visible without "
+               "blocking the rest of the scenario's proof."),
     dict(id='addon_entry_placement',
          scenario="A real margin add-on-at-arm leg places a real MARKET BUY for exactly the parent "
                   "core position's share count, despite the core's own resting protective SELL",
@@ -1718,8 +1774,8 @@ def compute_status(row):
             # zero of them genuine. Only the 'Auto-resolved:' prefix is real proof.
             system_resolved = c.execute(
                 "SELECT COUNT(*) n, MAX(ts) last_ts FROM coverage_deviations "
-                "WHERE scenario_key = ? AND reason_by = 'system' AND reason LIKE 'Auto-resolved:%'",
-                (row['scenario_key'],)
+                "WHERE scenario_key = ? AND reason_by = 'system' AND reason LIKE ?",
+                (row['scenario_key'], db.AUTO_RESOLVED_REASON_PREFIX + '%')
             ).fetchone()
             if system_resolved['n'] > 0:
                 return 'verified-live', (
@@ -2028,8 +2084,8 @@ def compute_mode_statuses(row):
                 system_resolved = c.execute(
                     "SELECT COUNT(*) n, MAX(ts) last_ts FROM coverage_deviations "
                     "WHERE scenario_key = ? AND mode = ? AND reason_by = 'system' "
-                    "AND reason LIKE 'Auto-resolved:%'",
-                    (row['scenario_key'], m)).fetchone()
+                    "AND reason LIKE ?",
+                    (row['scenario_key'], m, db.AUTO_RESOLVED_REASON_PREFIX + '%')).fetchone()
                 if system_resolved['n'] > 0:
                     result[m] = ('verified',
                                  f"{system_resolved['n']}x auto-resolved, last {system_resolved['last_ts']}")

@@ -118,7 +118,7 @@ def build_fill_message_data(account_number, order_id, ticker, side, price, quant
 
 def build_activity_message(account_number, order_id, ticker, side, price, quantity,
                             with_noise_entries=True, scale=6, order_id_as_string=True,
-                            leaves_quantity=0.0):
+                            leaves_quantity=0.0, order_quantity=None):
     """A full raw ACCT_ACTIVITY websocket message, batching the fill entry
     behind an unrelated non-fill entry -- real messages routinely carry 2+
     content entries, and the parser's per-entry loop plus its unconditional
@@ -145,7 +145,8 @@ def build_activity_message(account_number, order_id, ticker, side, price, quanti
         "MESSAGE_TYPE": "OrderFillCompleted",
         "MESSAGE_DATA": json.dumps(build_fill_message_data(
             account_number, order_id, ticker, side, price, quantity, scale=scale,
-            order_id_as_string=order_id_as_string, leaves_quantity=leaves_quantity)),
+            order_id_as_string=order_id_as_string, leaves_quantity=leaves_quantity,
+            order_quantity=order_quantity)),
     })
     return {
         "service": "ACCT_ACTIVITY",

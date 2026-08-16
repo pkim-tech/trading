@@ -2777,35 +2777,55 @@ def get_scenario_expectations(expected_frequency=None, active_only=True):
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
+# Single source of truth for the one string clear_deviation_if_resolved writes as
+# genuine same-day-resolution proof -- record_deviation's reset guard and
+# coverage_registry.py's read-side 'LIKE' queries must all agree on this exact
+# prefix, or a text edit in one place silently desyncs the others (found by
+# review, 2026-08-15).
+AUTO_RESOLVED_REASON_PREFIX = 'Auto-resolved:'
+
+
 def record_deviation(check_date, scenario_key, expected_outcome, actual_summary, ticker=None,
                       node_id=None, mode=None):
     """Upsert a deviation row for this (check_date, scenario_key, node_id, ticker, mode).
     Leaves a HUMAN-authored reason in place if the row already exists (re-running the
     daily check shouldn't clobber a reason a person already attached) but refreshes
-    actual_summary/ts so the row reflects the latest observation. A SYSTEM-authored
-    reason (from clear_deviation_if_resolved's auto-resolution) is different: it's not
-    testimony about this specific new observation, just a note that an earlier
-    same-day deviation resolved itself -- if the scenario deviates again the same day,
-    that auto-resolution note must be cleared back to unexplained, or a genuine new
-    failure would silently hide behind a stale "auto-resolved" reason and vanish from
-    get_deviations(unexplained_only=True) (found by Opus review, 2026-07-27, the same
-    session clear_deviation_if_resolved switched from delete to auto-explain). See
-    add_scenario_expectation for why this is an explicit COALESCE-based check-then-
-    upsert rather than a UNIQUE-backed ON CONFLICT.
+    actual_summary/ts so the row reflects the latest observation.
+
+    A SYSTEM-authored reason resets only when it's clear_deviation_if_resolved's
+    'Auto-resolved: ...' (evidence about a PRIOR same-day resolution that a NEW
+    deviation genuinely invalidates) -- NOT coverage_check.py's own price-action
+    auto-explain 'Auto-verified: ...' (evidence about THIS observation, which
+    record_deviation has no visibility into re-evaluating: it doesn't know whether
+    THIS call's actual_summary still supports the stored explanation). Found
+    2026-08-15 (trading_incidents id=9): resetting on ANY reason_by='system' row
+    stranded rows 156/165 (VOO/FAS) at reason=NULL after a rerun whose own
+    auto-explain condition no longer held. The inverse bug (fixed 2026-08-15, same
+    investigation, paired review): naively PRESERVING every 'Auto-verified:' reason
+    on rerun instead masks a later pass that finds a real problem (wrong exit_reason,
+    or the threshold now confirmed crossed) behind a stale "nothing to see" note --
+    coverage_check.py owns clearing a now-stale 'Auto-verified:' reason itself
+    (it has the actual no_activity/crossed facts this function doesn't), immediately
+    before it would otherwise leave the row incorrectly explained.
+    AUTO_RESOLVED_REASON_PREFIX is the single source of truth for the exact prefix,
+    shared with coverage_registry.py's read-side queries -- keep them in sync.
+    See add_scenario_expectation for why this is an explicit COALESCE-based
+    check-then-upsert rather than a UNIQUE-backed ON CONFLICT.
 
     Returns the row's id (2026-08-08, needed by coverage_check.py's price-action
     auto-explain: it must immediately call explain_deviation on this exact row right
     after recording it, not rely on a later re-check)."""
     with _conn() as c:
         existing = c.execute("""
-            SELECT id, reason_by FROM coverage_deviations
+            SELECT id, reason, reason_by FROM coverage_deviations
             WHERE check_date = ? AND scenario_key = ?
               AND COALESCE(node_id, -1) = COALESCE(?, -1)
               AND COALESCE(ticker, '') = COALESCE(?, '')
               AND COALESCE(mode, '') = COALESCE(?, '')
         """, (check_date, scenario_key, node_id, ticker, mode)).fetchone()
         if existing:
-            if existing['reason_by'] == 'system':
+            if (existing['reason_by'] == 'system' and existing['reason']
+                    and existing['reason'].startswith(AUTO_RESOLVED_REASON_PREFIX)):
                 c.execute("""
                     UPDATE coverage_deviations
                     SET expected_outcome=?, actual_summary=?, ts=datetime('now'), reason=NULL, reason_by=NULL, reason_ts=NULL
@@ -2842,15 +2862,36 @@ def clear_deviation_if_resolved(check_date, scenario_key, ticker=None, node_id=N
     identical "never clobber a reason" rule). No-op if no matching
     unexplained row exists (the common case on a first, clean run)."""
     with _conn() as c:
-        c.execute("""
+        c.execute(f"""
             UPDATE coverage_deviations
-            SET reason = 'Auto-resolved: scenario was met on a later same-day check.',
+            SET reason = '{AUTO_RESOLVED_REASON_PREFIX} scenario was met on a later same-day check.',
                 reason_by = 'system', reason_ts = datetime('now')
             WHERE check_date = ? AND scenario_key = ? AND reason IS NULL
               AND COALESCE(node_id, -1) = COALESCE(?, -1)
               AND COALESCE(ticker, '') = COALESCE(?, '')
               AND COALESCE(mode, '') = COALESCE(?, '')
         """, (check_date, scenario_key, node_id, ticker, mode))
+        c.commit()
+
+
+def clear_system_reason(deviation_id, prefix):
+    """Resets reason/reason_by/reason_ts back to unexplained for one specific
+    deviation row, but ONLY if its current reason_by is 'system' AND its reason
+    starts with the given prefix -- a caller (coverage_check.py's price-action
+    auto-explain) that just determined its own prior explanation no longer holds
+    uses this to re-open the ticket, rather than leaving a now-stale reason in
+    place. The double guard (reason_by AND prefix, checked in SQL, not just by
+    the caller) means this can never touch a HUMAN-authored reason (reason_by=
+    'user'/'streamlit') even if called with a wrong id -- deliberately narrower
+    than a bare UPDATE by id, since accidentally clearing real human testimony
+    would be a real regression, not just a missed re-open (found 2026-08-15,
+    same session as trading_incidents id=9's 2-round fix)."""
+    with _conn() as c:
+        c.execute("""
+            UPDATE coverage_deviations
+            SET reason = NULL, reason_by = NULL, reason_ts = NULL
+            WHERE id = ? AND reason_by = 'system' AND reason LIKE ?
+        """, (deviation_id, prefix + '%'))
         c.commit()
 
 

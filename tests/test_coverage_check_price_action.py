@@ -173,6 +173,68 @@ def test_run_check_does_not_auto_explain_when_threshold_actually_crossed(isolate
     assert len(db.get_deviations(unexplained_only=True)) == 1
 
 
+def test_run_check_price_action_auto_explain_survives_a_rerun_that_still_qualifies(isolated_db):
+    """trading_incidents id=9, round 1 (2026-08-15): record_deviation's reset-on-
+    'system'-reason branch used to fire for ANY reason_by='system' row, not just
+    clear_deviation_if_resolved's 'Auto-resolved:' ones -- so a second same-day
+    run_check() call for the SAME still-not-crossed price data would blank out a
+    price-action auto-explain ('Auto-verified: ... never crossed entry threshold')
+    back to reason=NULL, and since record_deviation can't see no_activity/crossed
+    itself, nothing re-explains a rerun whose own auto-explain condition happens to
+    land differently that pass (real scenario: intraday price data updates between
+    a 7am readiness check and a 4pm EOD outcome check, per CLAUDE.md's coverage-
+    report split). Real production symptom: coverage_deviations rows 156/165
+    (VOO/FAS, canary_market_buy_exit) stuck at reason=NULL after a rerun, confirmed
+    via direct DB query, not inferred from log text."""
+    node = _add_real_node()
+    _make_scenario(node['id'])
+    _write_price_csv(check_bars=[(9, 99.0, 99.0), (14, 99.5, 99.5)])  # never breaches 98
+
+    run_check('2025-01-07')  # first pass: auto-explained ('Auto-verified: ...')
+    dev_id = db.get_deviations()[0]['id']
+    row = db.get_deviations()[0]
+    assert row['reason_by'] == 'system' and row['reason'].startswith('Auto-verified:')
+
+    run_check('2025-01-07')  # second pass, SAME price data -- still doesn't cross
+
+    row = db.get_deviations()[0]
+    assert row['id'] == dev_id
+    assert row['reason_by'] == 'system' and row['reason'].startswith('Auto-verified:'), (
+        f"a same-day rerun that still doesn't qualify must not strand the row at reason=NULL, got {row}")
+
+
+def test_run_check_price_action_auto_explain_clears_when_rerun_finds_a_real_problem(isolated_db):
+    """trading_incidents id=9, round 2 (2026-08-15, paired review): the round-1 fix
+    above over-corrected into ALWAYS preserving a stale 'Auto-verified:' reason on
+    rerun -- which masks a later pass that finds a real problem (the threshold now
+    genuinely crossed, per coverage_check.py's own comment: 'it DID cross but still
+    no trade -- a real bug') behind a stale 'nothing to see' explanation, hiding a
+    genuine deviation from get_deviations(unexplained_only=True) and the daily
+    report. The row must re-open as unexplained once the fact that justified the
+    explanation is no longer true -- coverage_check.py owns this (it has the actual
+    no_activity/crossed facts; record_deviation structurally can't judge it)."""
+    node = _add_real_node()
+    _make_scenario(node['id'])
+    _write_price_csv(check_bars=[(9, 99.0, 99.0), (14, 99.5, 99.5)])  # never breaches 98
+
+    run_check('2025-01-07')  # first pass: auto-explained ('Auto-verified: ...')
+    dev_id = db.get_deviations()[0]['id']
+    row = db.get_deviations()[0]
+    assert row['reason_by'] == 'system' and row['reason'].startswith('Auto-verified:')
+
+    # Second same-day rerun where price data now genuinely crosses the threshold --
+    # the FIRST pass's "never crossed" explanation is no longer true.
+    _write_price_csv(check_bars=[(9, 97.0, 97.0)])  # now breaches 98 -- crossed=True
+    run_check('2025-01-07')
+
+    row = db.get_deviations()[0]
+    assert row['id'] == dev_id
+    assert row['reason'] is None and row['reason_by'] is None, (
+        f"a rerun that finds the threshold now genuinely crossed must re-open the "
+        f"ticket, not leave it masked behind the stale explanation, got {row}")
+    assert len(db.get_deviations(unexplained_only=True)) == 1
+
+
 def test_run_check_never_clobbers_a_human_authored_reason(isolated_db):
     """The HIGH bug the paired Opus review found 2026-08-08: a rerun of the
     daily check for a past date must not silently replace a human's real
