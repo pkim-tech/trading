@@ -126,6 +126,54 @@ role, not an implementation one.
    conversation ran), not something to blow through in one shot even
    though nothing here is destructive.
 
+## Dispatch message checklist
+
+Found 2026-08-16: real dispatch messages tonight kept needing a follow-up
+correction — the trading-hours confirmation, the background-execution
+instruction, and explicit per-item test-creation requirements were each
+added as a SEPARATE message after the original dispatch went out, instead
+of being in it the first time. None of these were forgotten because they
+weren't known — every one was already a standing rule this session knew
+about — they were forgotten because there was no checklist forcing them
+into the SAME message as the scope itself. Run through this list for
+**every** `SendMessage` that asks the peer session to build or fix
+something (not just backlog-closure handoffs) — before sending, not as a
+follow-up:
+
+- [ ] **Concrete scope with evidence** — file:line, the real finding, not
+  a vague pointer to "the thing we discussed."
+- [ ] **Test-creation requirement, explicit per item** — "add a test" is
+  not enough; say whether it extends an existing harness scenario
+  (name it), needs a new harness scenario, or is plain-pytest-shaped
+  (doesn't touch broker/stream mechanics, so the harness's machinery adds
+  nothing — matches the distinction in `docs/deep_backlog.md`'s 2026-08-16
+  entries). Don't leave this to inference.
+- [ ] **Review-Gate Persistence Rule reminder** (CLAUDE.md) if the work
+  touches `active_signals.py`/any `signals_*.py` module/`schwab_*.py`/a
+  backtest kernel module — independent-cold + contextual Opus review with
+  a rebuttal exchange, outcome recorded on file before it counts as done.
+  State this explicitly even if you already sent it earlier in the
+  session — a long session's attention narrows to the immediate
+  sub-problem, don't rely on it being remembered from several turns back.
+- [ ] **Background-Agent Trading-Hours confirmation** — state today's
+  actual date/day explicitly (re-derive it, don't assume) and confirm
+  it's within the established weekend/off-hours window, or that the user
+  gave explicit in-the-moment go-ahead if it's a real trading day.
+- [ ] **Run as background, don't block the peer's own foreground turn** —
+  state this explicitly; don't assume it's the default.
+- [ ] **Current concurrency cap**, if one is in effect — state the number
+  and whether it's a hard rule or a soft target the user is actively
+  tuning (it may have changed since the last message).
+- [ ] **Don't commit / don't self-mark-done on production code without a
+  clean paired review** — flag back and stop instead. Restate even though
+  it's also in the Review-Gate rule; the two are related but distinct
+  failure modes (skipping review vs. committing before review lands).
+
+Not every item applies to every message (a pure backlog-doc-closure
+message doesn't need the trading-hours/background/concurrency items) —
+but for anything that dispatches real build/fix work, treat this as a
+single pre-send pass, not something to patch in after the fact.
+
 ## Scope notes
 
 - Read-only and no-code-changes are hard constraints, not defaults to
