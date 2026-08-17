@@ -6,7 +6,10 @@ import yfinance as yf
 from pathlib import Path
 from datetime import datetime
 
-from signals_helpers import detect_price_discontinuity, fix_one_bar_split_artifacts, get_real_splits
+from signals_helpers import (
+    detect_price_discontinuity, fix_one_bar_split_artifacts, get_real_splits,
+    real_split_confirmed_since,
+)
 import db_cache
 
 # Create a local directory named 'cache' to store data files
@@ -168,7 +171,18 @@ def fetch_live_data_smart(ticker):
         overlap = df_local.index.intersection(df_delta.index)
         if len(overlap) >= 1:
             ratios = df_local.loc[overlap, "Close"] / df_delta.loc[overlap, "Close"]
-            consistent = len(overlap) == 1 or (ratios.std() / ratios.mean()) < 0.05
+            if len(overlap) == 1:
+                # Can't compute a std-dev-based consistency check from a single point --
+                # was previously hardcoded True here, meaning one corrupted/artifact bar
+                # landing in a 1-bar overlap window could itself drive a spurious
+                # whole-history rescale if its price ratio also happened to look like a
+                # split factor (found 2026-08-16, docs/backlog_cache.md). Reuses the same
+                # real-split-confirmed gate _apply_split_artifact_fix/get_real_splits
+                # already established for the same-pull artifact case -- fail-closed
+                # (None/False both block the rescale) per that helper's own convention.
+                consistent = real_split_confirmed_since(ticker, since=overlap[0] - pd.Timedelta(days=1)) is True
+            else:
+                consistent = (ratios.std() / ratios.mean()) < 0.05
             split_ratio = detect_price_discontinuity(current_price=1.0, reference_price=ratios.mean())
             if consistent and split_ratio is not None:
                 factor = ratios.mean()

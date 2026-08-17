@@ -119,7 +119,7 @@ from signals_notify import (
     _REF_TABLE_COLS, build_reference_table, format_reference_table, _STRATEGY_LABELS,
     send_reference_report, send_coverage_report, build_phased_monitors_report,
     update_dry_run_buys, update_real_pending_buys_running_low, check_dry_run_sim_sells,
-    check_entry_abandon, build_eod_scenario_review,
+    check_entry_abandon, check_market_buy_rejected, build_eod_scenario_review,
     check_drought_entry, check_drought_handoff, check_addon_leg_reconciliation,
     check_intraday_risk_review, check_addon_buying_power_drift,
     check_orphaned_broker_positions,
@@ -1445,6 +1445,7 @@ def run_loop(tickers: set = None):
             _guarded("dry_run_update_buys", update_dry_run_buys)
             _guarded("real_pending_buys_running_low", update_real_pending_buys_running_low)
             _guarded("check_entry_abandon", check_entry_abandon)
+            _guarded("check_market_buy_rejected", check_market_buy_rejected)
 
             if not watchlist:
                 print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")

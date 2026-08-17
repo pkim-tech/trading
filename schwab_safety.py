@@ -1108,7 +1108,8 @@ def _has_open_buy_order_for_ticker(orders: list, ticker: str, exclude_order_id: 
     return False
 
 
-def _broker_confirms_order(orders: list, ticker: str, side: str, quantity: int) -> bool:
+def _broker_confirms_order(orders: list, ticker: str, side: str, quantity: int,
+                            exclude_order_id: int | None = None) -> bool:
     """True if the real order book (all statuses, see _all_orders) has an
     order for this exact (ticker, side, quantity within tolerance) that the
     broker genuinely accepted -- i.e. not CANCELED/EXPIRED/REJECTED/REPLACED.
@@ -1117,8 +1118,18 @@ def _broker_confirms_order(orders: list, ticker: str, side: str, quantity: int) 
     approve_and_record() writes the local record before the real place_order
     call happens, so a failed/rejected broker call still looks like a
     submitted duplicate to the old purely-local check -- this lets a
-    legitimate retry through when nothing actually reached the broker."""
+    legitimate retry through when nothing actually reached the broker.
+    exclude_order_id -- same rationale as _has_open_order/_has_open_sell_order's
+    own param (2026-08-17): an atomic replace call's own target order is real
+    and genuinely resting, but it must not count as broker CONFIRMATION of a
+    duplicate -- of course it's resting, it's the exact order about to be
+    swapped out. A genuinely separate confirming order still correctly blocks
+    (the fingerprint loop itself isn't skipped); only a fingerprint whose ONLY
+    broker-side match is the replace's own target falls through to the
+    allowed_retry branch instead of being wrongly treated as confirmed."""
     for o in orders:
+        if exclude_order_id is not None and o.get("orderId") == exclude_order_id:
+            continue
         if o.get("status") in _DUPLICATE_NOT_CONFIRMED_STATUSES:
             continue
         for leg in o.get("orderLegCollection", []):
@@ -1144,6 +1155,7 @@ def check_order(
     account: str, ticker: str, quantity: int, price: float, side: str, counts: dict | None = None,
     is_gap_correction: bool = False, is_protective: bool = False, replacing_order_id: int | None = None,
     is_addon_leg: bool = False, node_id: int | None = None, source: str = 'daemon',
+    is_handoff_exit: bool = False,
 ) -> None:
     """Raises SafetyViolation if the order should not proceed. `counts`, if
     given, is used for the daily-cap/burst-cap/duplicate checks instead of
@@ -1200,7 +1212,15 @@ def check_order(
     that's the real caller for every production order; a fixture/staging
     script calling check_order directly (e.g.
     scripts/stage_check_order_guard_scenarios.py) passes its own
-    'fixture:<script_name>' explicitly."""
+    'fixture:<script_name>' explicitly.
+    is_handoff_exit: a REQUEST, not a trust token (mirrors is_addon_leg's
+    contract) -- verified fresh below (SELL block) against a real open
+    drought-overlay position on file AND a non-null replacing_order_id
+    before exempting from the dup-order-window guard. Closes the real,
+    deterministic self-collision where check_drought_handoff's own exit
+    replace races the protective SL _reconcile_buy_fill just placed for the
+    same newly-opened drought position, milliseconds apart, well inside
+    DUPLICATE_ORDER_WINDOW_SECS (2026-08-16 finding, 2026-08-17 fix)."""
     if kill_switch_engaged():
         _limits = ACCOUNTS.get(account)
         _mode = "live" if (_limits and _limits.trading_enabled) else "dry_run"
@@ -1944,10 +1964,63 @@ def check_order(
     # the OTHER leg's genuinely-resting SELL as proof this is a confirmed
     # duplicate retry, when it's actually proof a second, different, wanted
     # order is deliberately being placed alongside it.
-    _skip_dup_window = is_addon_leg
+    # replacing_order_id: hybrid, not a blanket skip (2026-08-17, backlog item
+    # found alongside the drought-addon exemptions above; corrected same day
+    # after paired review found a first-draft blanket skip too broad -- see
+    # tests/test_replacing_order_id_dup_window_exemption_scenario.py's module
+    # docstring for the full history). For a trading_enabled account there IS
+    # a real broker book to check against, so the fingerprint loop below stays
+    # live and replacing_order_id is threaded into _broker_confirms_order as
+    # exclude_order_id instead -- a genuinely separate confirming order still
+    # blocks, only the replace's own known target is excused from counting as
+    # confirmation. Only for a non-trading_enabled (dry_run) account, with no
+    # broker book to check, does this fall back to a blanket skip.
+    _skip_dup_window = is_addon_leg or (replacing_order_id is not None and not limits.trading_enabled)
     if side == "SELL" and not _skip_dup_window and _node_id is not None:
         if signals_db.get_open_addon_leg_by_wl_id(_node_id) is not None:
             _skip_dup_window = True
+
+    # HANDOFF-side fingerprint exemption (2026-08-17, mirrors the addon-leg
+    # case immediately above): check_drought_handoff's own exit replace can
+    # race _reconcile_buy_fill's just-placed protective SL for the SAME
+    # newly-opened drought position -- identical (account, ticker, side,
+    # quantity) fingerprint, milliseconds apart, well inside
+    # DUPLICATE_ORDER_WINDOW_SECS. Unlike is_addon_leg, the caller's own
+    # is_handoff_exit flag is NOT trusted alone -- verified fresh against a
+    # real open drought position on file AND a non-null replacing_order_id
+    # (HANDOFF's exit always goes through the atomic replace path; a flag
+    # set without a real replace target is either a caller bug or a genuinely
+    # unrelated SELL that happens to be mislabeled, and must not silently
+    # skip the guard). Failing either check falls through to the normal
+    # duplicate-window logic below rather than raising immediately -- the
+    # underlying order may still be legitimate on its own merits (e.g. the
+    # broker-confirmation fallback a few lines down).
+    if side == "SELL" and not _skip_dup_window and is_handoff_exit and replacing_order_id is not None \
+            and _node_id is not None:
+        _drought_pos = signals_db.get_drought_overlay_position(_node_id)
+        # Not just "some drought position exists" -- replacing_order_id must match
+        # THAT position's own resting order (sl_order_id, or trail_state's
+        # exit_order_id for the hold-time-forced path -- see
+        # _attempt_automated_exit_sell's identical resolution logic) before
+        # exempting. Found by independent-cold + contextual review, 2026-08-17:
+        # presence-only was safe today only by coincidence of the single call
+        # site deriving replacing_order_id from this same position.
+        _drought_order_id = None
+        if _drought_pos is not None:
+            _drought_order_id = _drought_pos.get('sl_order_id') or \
+                (_drought_pos.get('trail_state') or {}).get('exit_order_id')
+        if _drought_pos is not None and replacing_order_id == _drought_order_id:
+            _skip_dup_window = True
+        else:
+            signals_db.log_coverage_event(
+                "drought_handoff_precondition_blocked", _mode, ticker=ticker, node_id=_node_id,
+                result="not_exempted",
+                detail=f"is_handoff_exit=True but replacing_order_id={replacing_order_id} doesn't match "
+                       f"the open drought position's own order (wl_id={_node_id}, "
+                       f"drought_position={'none' if _drought_pos is None else 'found'}, "
+                       f"drought_order_id={_drought_order_id})",
+                source=source)
+
     for o in ([] if _skip_dup_window else counts.get("recent_orders", [])):
         prior_qty = o.get("quantity")
         qty_matches = (
@@ -1967,7 +2040,8 @@ def check_order(
         # before blocking -- ground truth, not a local heuristic
         # (automation_principles.md #1). Dry-run accounts have no broker book
         # to check against, so keep the pure local-record behavior.
-        if limits.trading_enabled and not _broker_confirms_order(_all_orders(account), ticker, side, quantity):
+        if limits.trading_enabled and not _broker_confirms_order(_all_orders(account), ticker, side, quantity,
+                                                                    exclude_order_id=replacing_order_id):
             signals_db.log_coverage_event(
                 "dup_order_retry_after_failure", _mode, ticker=ticker, node_id=_node_id, result="allowed_retry",
                 detail=f"side={side} qty={quantity}", source=source)
@@ -1986,6 +2060,7 @@ def approve_and_record(
     account: str, ticker: str, quantity: int, price: float, side: str, is_gap_correction: bool = False,
     is_protective: bool = False, replacing_order_id: int | None = None, is_addon_leg: bool = False,
     node_dry_run: bool = False, node_id: int | None = None, source: str = 'daemon',
+    is_handoff_exit: bool = False,
 ) -> bool:
     """Call immediately before placing a real order. Raises SafetyViolation if
     blocked; otherwise records the order against the daily cap, the global
@@ -2011,13 +2086,15 @@ def approve_and_record(
     its docstring) -- schwab_client's place_*/replace_* functions pass this
     from the real node dict already in scope at their call sites.
     source: coverage_events write-attribution -- threaded straight through to
-    check_order's source param (see its docstring); defaults to 'daemon'."""
+    check_order's source param (see its docstring); defaults to 'daemon'.
+    is_handoff_exit: threaded straight through to check_order's is_handoff_exit
+    param (see its docstring)."""
     with _open_locked() as f:
         counts = json.loads(f.read() or "{}")
         check_order(account, ticker, quantity, price, side, counts=counts,
                     is_gap_correction=is_gap_correction, is_protective=is_protective,
                     replacing_order_id=replacing_order_id, is_addon_leg=is_addon_leg,
-                    node_id=node_id, source=source)
+                    node_id=node_id, source=source, is_handoff_exit=is_handoff_exit)
         key = str(date.today())
         today = counts.setdefault(key, {})
         if side == "BUY":

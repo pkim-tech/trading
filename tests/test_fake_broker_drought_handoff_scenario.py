@@ -109,10 +109,17 @@ def test_handoff_cancels_resting_unfilled_drought_entry_order(env, fake_broker, 
 
 def test_handoff_cancel_race_to_filled_falls_through_to_case_b(env, fake_broker, monkeypatch):
     """Cancel attempt finds the order already FILLED -- reconciles as a real
-    drought fill, then falls through and (since there's no core signal for
-    the resulting open drought position to be re-checked against on THIS
-    call) simply leaves it open, correctly reconciled, for HANDOFF's own
-    next poll to close."""
+    drought fill, then falls through to Case B's own exit attempt in the
+    SAME call. _reconcile_buy_fill auto-places a real protective SL inline
+    for the newly-opened position; Case B's immediate replace-with-market-
+    sell then races that SAME order milliseconds later. Before the 2026-08-17
+    fix (schwab_safety.check_order's is_handoff_exit dup-order-window
+    exemption), that replace was deterministically BLOCKED as a false
+    duplicate, leaving the position open-but-protected for a later poll to
+    close. Now it succeeds, closing the position in this same call -- the
+    correct, better outcome (the fake_venue harness's NODE B scenario
+    proves this end-to-end; this unit test just confirms the fill itself
+    was reconciled correctly, not dropped, before Case B ever runs)."""
     node = _node()
     fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
     fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
@@ -129,10 +136,24 @@ def test_handoff_cancel_race_to_filled_falls_through_to_case_b(env, fake_broker,
     signals_notify.check_drought_handoff(node)
 
     assert signals_db.get_drought_pending_buy(node['id']) is None
-    pos = signals_db.get_drought_overlay_position(node['id'])
-    assert pos is not None, "the raced fill must be reconciled into a real drought position, not dropped"
     events = signals_db.get_coverage_events(scenario_key='drought_handoff_cancel')
-    assert any(e['ticker'] == TICKER and e['result'] == 'raced_fill' for e in events)
+    assert any(e['ticker'] == TICKER and e['result'] == 'raced_fill' for e in events), \
+        "the raced fill must be reconciled as a real drought fill, not dropped, before Case B runs"
+    pos = signals_db.get_drought_overlay_position(node['id'])
+    assert pos is None, "Case B's replace-the-just-placed-SL now succeeds (is_handoff_exit exemption), closing the position in this same call"
+    # Positive proof the position was actually OPENED and then CLOSED via a real
+    # HANDOFF exit, not just absent because the fill was silently dropped somewhere
+    # in _reconcile_buy_fill (found by independent-cold review, 2026-08-17 --
+    # proven empirically that a stubbed silent-drop of _reconcile_buy_fill would
+    # otherwise still pass every assertion above).
+    with signals_db._conn() as c:
+        trade = c.execute(
+            "SELECT entry_price, shares, exit_reason FROM trade_log WHERE wl_id=? AND exit_reason='HANDOFF'",
+            (node['id'],)
+        ).fetchone()
+    assert trade is not None, "expected a real trade_log row proving the position was opened AND closed via HANDOFF, not silently dropped"
+    assert trade['entry_price'] == pytest.approx(50.2)
+    assert trade['shares'] == 40
 
 
 def test_handoff_does_nothing_without_a_core_buy_signal(env, fake_broker, monkeypatch):

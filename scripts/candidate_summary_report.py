@@ -27,9 +27,12 @@ Usage:
 """
 import argparse
 import csv
+import re
 import sqlite3
 import sys
 from pathlib import Path
+
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -181,13 +184,37 @@ def load_ticker_df(conn, ticker, version, strategy):
     return df
 
 
-def annualized_excess(ticker, strategy_return, spy_bh_full_window):
-    """CAGR-based excess return over the ticker's full cached-data calendar
-    span -- see annualized_alpha_report.py's docstring for why raw alpha_vs_spy
-    isn't cross-ticker comparable (different tickers have very different
-    amounts of cached history) and why this annualizes over the full window
-    rather than invested-only time (user's explicit call, 2026-08-08)."""
-    days = calendar_days(ticker)
+def _window_days_from_version(version):
+    """Real calendar-day span encoded in a windowed version string (see
+    run_optimization_sweep.window_version_suffix -- `-w{start}_{end}`,
+    e.g. 'v5-w2025-07-01_2026-06-30'), or None if `version` isn't windowed.
+    Uses the LAST match so a double-suffixed version (the run_quarterly_
+    soxl_sweep.sh bug, 2026-08-15 -- --version already windowed AND
+    --start-date/--end-date passed, so run_optimization_sweep.py appends
+    its own suffix on top) still parses the correct real window, not a
+    truncated partial match."""
+    if not version:
+        return None
+    matches = re.findall(r"-w(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})", version)
+    if not matches:
+        return None
+    start, end = matches[-1]
+    return (pd.Timestamp(end) - pd.Timestamp(start)).days
+
+
+def annualized_excess(ticker, strategy_return, spy_bh_full_window, version=None):
+    """CAGR-based excess return over the real calendar span the backtest
+    actually ran over: the windowed span encoded in `version` when this is a
+    date-windowed campaign (run_quarterly_soxl_sweep.sh etc.), otherwise the
+    ticker's full cached-data calendar span -- see annualized_alpha_report.py's
+    docstring for why raw alpha_vs_spy isn't cross-ticker comparable and why
+    this annualizes over the full window rather than invested-only time
+    (user's explicit call, 2026-08-08). Bug fixed 2026-08-16: before this,
+    every windowed campaign's CAGR/ann_excess were silently wrong -- always
+    divided by the ticker's full cached-history span (e.g. SOXL's ~3.06y)
+    regardless of the actual (e.g. 1y) window the return was computed over,
+    understating CAGR by ~3x for a 1-year window on a 3-year-history ticker."""
+    days = _window_days_from_version(version) or calendar_days(ticker)
     strat_cagr = cagr(strategy_return, days)
     spy_cagr = cagr(spy_bh_full_window, days)
     if strat_cagr is None or spy_cagr is None:
@@ -463,7 +490,7 @@ def build_rows_for_ticker(conn, ticker, version, min_alpha, skip_5min, skip_over
                              node['trail_buy_pct'], node['trail_sell_pct'],
                              metric=WN_METRIC_BY_LABEL.get(raw_label, "robust_alpha"))
         cliff = "CLIFF" if (wn is not None and wn < 0) else ("SAFE" if wn is not None else "?")
-        days, ann_excess = annualized_excess(ticker, node['return'], spy_bh)
+        days, ann_excess = annualized_excess(ticker, node['return'], spy_bh, version=version)
         years = round(days / 365.25, 2) if days else None
         fill_acc = None if skip_5min else fill_accuracy_summary(
             ticker, strategy, node['window'], node['z'], node['trail_buy_pct'], node['hold'])

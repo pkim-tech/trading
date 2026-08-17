@@ -268,6 +268,31 @@ REGISTRY = [
                "not yet observed against a genuinely resting real (non-dry_run) order live. As of "
                "build time, DIA/SDOW (dry_run 'ira') are the only real pending rows exercising the "
                "no-real-order-to-cancel path."),
+    dict(id='market_buy_order_terminated',
+         scenario="A market-buy-eligible node's pending_buys row whose real broker order comes back "
+                  "REJECTED/CANCELED/EXPIRED gets cleared and alerted (zero-fill case) or preserved and "
+                  "alerted (a real partial fill happened first), instead of polling forever with no "
+                  "termination path",
+         code_path="signals_notify.check_market_buy_rejected",
+         offline_coverage="tests/test_fake_broker_market_buy_rejected_scenario.py",
+         check_mechanism='coverage_events', scenario_key='market_buy_order_terminated',
+         bad_results=['partial_fill_preserved', 'unconfirmable'],
+         notes="Built 2026-08-17, found by paired review of the check_auto_fills market-buy fallback "
+               "fix (2026-08-16) -- get_filled_order only ever reports a status=='FILLED' order, so a "
+               "genuinely rejected/cancelled market-buy order previously had no clearing path at all. "
+               "First version (same day) had a real HIGH gap, found by its own paired review: a "
+               "terminal-bad status doesn't mean zero shares executed (Schwab reports a partially-"
+               "filled-then-killed order as CANCELED, not FILLED), so clearing unconditionally could "
+               "silently discard evidence of real unprotected shares. Fixed via "
+               "schwab_client.get_order_detail/_order_executed_quantity -- a nonzero-fill terminal-bad "
+               "order now alerts and PRESERVES the row (result='partial_fill_preserved') instead of "
+               "clearing. Also added a 1h-unconfirmable-status fallback alert (result='unconfirmable') "
+               "for permanently-unresolvable get_order_detail failures (unrecognized account, order id "
+               "aged past Schwab's retention) -- previously those polled forever with zero alert, same "
+               "shape as the original bug just relocated. Gated on AUTOMATION_ENABLED_TICKERS only "
+               "(deliberately not auto_fill_detection_enabled -- see the function's own docstring for "
+               "why). No live proof yet for any of the three result paths -- needs a real market-buy "
+               "order to genuinely terminate, which hasn't happened organically."),
     # 'kernel_fill_parity' removed 2026-08-13 -- this row asked a categorically different question
     # than everything else in the Grid: does the backtest kernel's fill-resolution math agree with
     # the live code's own version of the same math (a code-consistency check between two Python
@@ -1209,6 +1234,22 @@ REGISTRY = [
                "_scan_buy_signals call) -- an independent review of the wiring found the first "
                "attempt missed the pinned-bar path entirely, since that's the primary real entry "
                "mechanism for every current drought candidate."),
+    dict(id='drought_handoff_precondition_blocked',
+         scenario="HANDOFF's exit replace requests the is_handoff_exit dup-order-window exemption "
+                  "(schwab_safety.check_order) but the precondition fails -- no open drought position "
+                  "on file for the node, or replacing_order_id doesn't match that position's own "
+                  "resting order",
+         code_path="schwab_safety.check_order (real)",
+         offline_coverage="none",
+         check_mechanism='coverage_events', scenario_key='drought_handoff_precondition_blocked',
+         bad_results=[],
+         notes="Added 2026-08-17 alongside the is_handoff_exit exemption itself (mirrors is_addon_leg's "
+               "own 'verified, not trusted' contract). result='not_exempted', NOT 'blocked' -- this only "
+               "means the exemption didn't apply, the order still falls through to normal (non-exempted) "
+               "duplicate-window handling and may still be allowed on its own merits. No offline test "
+               "exercises either precondition-failure branch yet (found by independent-cold review) -- a "
+               "real gap, same shape as the sibling addon_precondition_blocked exemption (also unregistered "
+               "here), not fixed in this pass."),
     dict(id='addon_entry_fill',
          scenario="Margin add-on-at-arm leg opens the moment a core position's "
                   "trailing-sell arms, sized to match the core position's current shares",

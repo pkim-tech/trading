@@ -134,7 +134,7 @@ def scenario_pinned_entry_trailing_buy(posted):
     node = make_node(ticker, 'TrailingBothZScoreBreakout', entry_timing='open_check')
     with patch.object(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {ticker}), \
          patch.object(schwab_client, 'get_session_open_price', return_value=(last_close, True)):
-        A._scan_pinned_entry(9, 30, [node], set(), set())
+        A._scan_pinned_entry(9, 30, [node], set(), A._position_keys_by_book([], []))
     pending = [p for p in db.get_pending_buys() if p['ticker'] == ticker]
     assert pending, "expected a pending_buys row after a trailing-buy BUY signal"
     assert pending[0]['order_placed'], "trailing-buy order should auto-place (dry_run) and mark placed"
@@ -273,7 +273,7 @@ def scenario_ambient_market_buy_entry(posted):
          patch.object(schwab_safety, '_open_orders', return_value=[]), \
          patch.object(schwab_safety, '_all_orders', return_value=[]), \
          patch.object(schwab_client, 'get_filled_order', return_value={'price': last_close, 'quantity': 100}):
-        A._scan_buy_signals([node], set(), set())
+        A._scan_buy_signals([node], set(), A._position_keys_by_book([], []))
     pos = db.get_open_position(ticker)
     assert pos is not None, "expected an open position after the automated market-buy fill-confirm chain"
     assert any('auto-detected fill' in m.lower() for m in posted), "expected the fill-detected Slack message"

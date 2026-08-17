@@ -568,6 +568,37 @@ def get_order_status(account, order_id):
         return None
 
 
+def get_order_detail(account, order_id):
+    """Same single, non-retrying fetch as get_order_status, but returns the full raw
+    order dict instead of just the status string -- needed to distinguish a terminal-
+    bad status with ZERO real execution from one with a REAL partial fill. Schwab
+    reports a partially-executed-then-killed order as CANCELED (not FILLED), and a
+    partially-filled day order left resting past the close as EXPIRED -- get_order_status
+    alone can't tell these apart from a genuine zero-fill rejection/cancel, and
+    get_filled_order/_order_fill can't recover it either (both require status=='FILLED'
+    exactly). Returns None on any failure -- same fail-toward-cautious convention as
+    get_order_status (found 2026-08-17, paired review of check_market_buy_rejected)."""
+    try:
+        account_hash = _resolve_account_hashes()[account]
+        r = _get_client().get_order(order_id, account_hash)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def _order_executed_quantity(o):
+    """Real executed share count for an order regardless of its overall terminal
+    status -- unlike _order_fill (schwab_client.py), which requires status=='FILLED'
+    exactly and therefore returns None for a partially-filled-then-CANCELED/EXPIRED
+    order even though real shares executed. Returns 0 if no execution legs exist."""
+    exec_legs = [
+        el for activity in o.get("orderActivityCollection", [])
+        for el in activity.get("executionLegs", [])
+    ]
+    return sum(el.get("quantity", 0) for el in exec_legs)
+
+
 def _post_order_confirmation(label, account_hash, order_id, ticker, account, submitted_msg, node_id=None):
     """Shared by every real placement call site: polls the real status and posts
     an accurate Slack message instead of always claiming success. A confirmed
@@ -678,6 +709,9 @@ def _place_equity_order(
     exemption (docs/plans/real_order_execution_drought_addon.md 3.1) and tags
     the Slack confirmation so a real add-on fill is distinguishable from the
     core position's own order at a glance.
+    No is_handoff_exit param -- this is always a FRESH placement (never a
+    replace), so it never has a replacing_order_id, which that exemption
+    requires. See place_equity_sell's docstring for why.
     node_dry_run: per-node dry_run override (additive with the account-level
     flag, see schwab_safety.approve_and_record's docstring)."""
     try:
@@ -733,7 +767,7 @@ def _place_equity_order(
 def replace_equity_order_with_market(
     account: str, ticker: str, order_id: int, side: str, quantity: int, price: float,
     is_gap_correction: bool = False, is_protective: bool = False, is_addon_leg: bool = False,
-    node_dry_run: bool = False, node_id: int | None = None,
+    node_dry_run: bool = False, node_id: int | None = None, is_handoff_exit: bool = False,
 ):
     """Atomically replaces a resting order (e.g. a protective STOP) with a
     plain MARKET order of the given side/quantity, via schwab-py's
@@ -757,7 +791,7 @@ def replace_equity_order_with_market(
         dry_run = schwab_safety.approve_and_record(
             account, ticker, quantity, price, side, is_gap_correction=is_gap_correction,
             is_protective=is_protective, replacing_order_id=order_id, is_addon_leg=is_addon_leg,
-            node_dry_run=node_dry_run, node_id=node_id)
+            node_dry_run=node_dry_run, node_id=node_id, is_handoff_exit=is_handoff_exit)
     except schwab_safety.SafetyViolation as e:
         _post_message(f"\U0001F6AB BLOCKED replace {order_id} with MARKET {side} {quantity} {ticker} "
                       f"in {account} ({_mode_tag_for(account, node_id)}): {e}", node_id=node_id)
@@ -811,6 +845,16 @@ def place_equity_buy(account: str, ticker: str, quantity: int, price: float, is_
 
 def place_equity_sell(account: str, ticker: str, quantity: int, price: float, is_addon_leg: bool = False,
                        node_dry_run: bool = False, node_id: int | None = None):
+    # No is_handoff_exit param here (removed 2026-08-17, found by independent-cold
+    # review) -- this is a FRESH placement, never a replace, so it never has a
+    # replacing_order_id, which check_order's is_handoff_exit exemption requires.
+    # A HANDOFF exit only reaches this function when its own protective SL
+    # placement itself already failed/never happened (no resting order to
+    # replace) -- a real, narrower, still-open gap (a failed SL attempt still
+    # writes a recent_orders fingerprint via approve_and_record, which could
+    # self-collide the same way) that needs its own precondition design (match
+    # against a FAILED prior attempt, not a live resting order) -- see
+    # docs/backlog_cache.md, not fixed here to avoid a false sense of completeness.
     return _place_equity_order("SELL", account, ticker, quantity, price, is_addon_leg=is_addon_leg,
                                 node_dry_run=node_dry_run, node_id=node_id)
 

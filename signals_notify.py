@@ -339,6 +339,15 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
                                             resting_order_label)
         except Exception as e:
             print(f"  [replace_check] {ticker}: pre-replace verification failed, proceeding: {e}")
+    # HANDOFF's exit races schwab_safety.check_order's dup-order-window guard
+    # against its own just-placed protective SL (_reconcile_buy_fill auto-
+    # places one inline for a newly-opened drought position, then HANDOFF's
+    # own fall-through tries to replace that SAME order milliseconds later --
+    # both fingerprint identically, well inside DUPLICATE_ORDER_WINDOW_SECS).
+    # Derived here (not passed in) since `reason` is already in scope and this
+    # is the exact call site the replace/place happens from -- mirrors
+    # is_addon_leg's shape (2026-08-17, see docs/deep_backlog.md).
+    _is_handoff_exit = (reason == 'HANDOFF')
     try:
         if resting_order_id:
             # Atomic replace instead of cancel_order + place_equity_sell -- same
@@ -348,8 +357,14 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
             # between (found 2026-07-27, raised directly by the user).
             _, order_id = schwab_client.replace_equity_order_with_market(
                 account, ticker, resting_order_id, "SELL", shares, current_price,
-                node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
+                node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'),
+                is_handoff_exit=_is_handoff_exit)
         else:
+            # No is_handoff_exit here -- place_equity_sell never has a
+            # replacing_order_id (see its docstring), so the exemption can't
+            # apply on this branch regardless (only reached when HANDOFF's own
+            # protective SL placement itself already failed -- a real, narrower,
+            # still-open gap, see place_equity_sell's docstring).
             _, order_id = schwab_client.place_equity_sell(account, ticker, shares, current_price,
                                                             node_dry_run=(node.get('state') != 'live'),
                                                             node_id=node.get('id'))
@@ -1720,6 +1735,115 @@ def check_entry_abandon():
         _post_message(f"⏱️ *{ticker}* ({account} · {mode_tag(account, node)}) — trailing buy never bounced "
                       f"within {node['max_hold_hours']}h — entry abandoned, {cancelled_note}. "
                       f"No position opened.")
+
+
+_MARKET_BUY_STATUS_UNKNOWN_SINCE: dict[int, float] = {}
+_MARKET_BUY_UNKNOWN_ALERT_AFTER_SECS = 3600  # 1h -- long enough to not fire on a transient blip
+_MARKET_BUY_UNKNOWN_ALERTED: dict[str, float] = {}
+_MARKET_BUY_UNKNOWN_ALERT_COOLDOWN_SECS = 3600  # matches the escalation threshold -- one alert/hour max
+
+
+def check_market_buy_rejected():
+    """Live check for a market-buy-eligible node's pending_buys row whose real broker
+    order has terminated as REJECTED/CANCELED/EXPIRED (schwab_client.
+    _ORDER_TERMINAL_BAD_STATUSES). Without this, such a row polls forever with no
+    termination path: schwab_client.get_filled_order only ever reports something for
+    a status=='FILLED' order, so a rejected/cancelled one never satisfies the only
+    other clearing path in the codebase (check_auto_fills, which gates market-buy
+    rows on order_id alone since the 2026-08-16 fix) -- correctness-safe (no wrong
+    reconciliation, no money at risk) but a genuine silent-staleness + wasted-
+    broker-API-traffic gap, found by paired review of that same fix.
+
+    Complements check_entry_abandon, which explicitly skips this population
+    (db._is_trailing_buy() only, since a market-buy node's pending row has no bounce
+    phase to abandon) -- this checks a genuinely different condition (a definitive
+    broker-side terminal status, not a hold-time timeout).
+
+    Gated on schwab_safety.AUTOMATION_ENABLED_TICKERS only (unlike check_auto_fills,
+    which also requires auto_fill_detection_enabled/node_auto_fill_detection_enabled)
+    -- deliberate: those two flags opt IN to auto-detecting a successful fill instead
+    of waiting for a human's manual click, a different concern from "this order can
+    never fill, stop tracking it," which should apply regardless of whether the human
+    wants auto-fill-detection on for the success path.
+
+    PARTIAL-FILL SAFETY (fixed 2026-08-17, paired review's HIGH finding on the first
+    version): a terminal-bad status does NOT mean zero shares executed -- Schwab
+    reports a partially-filled-then-killed order as CANCELED (not FILLED), and a
+    partially-filled day order left resting past the close as EXPIRED. The first
+    version only read the status string (schwab_client.get_order_status) and cleared
+    the row unconditionally on any terminal-bad status, which would have silently
+    discarded evidence of real, unprotected shares and blocked the operator's manual
+    "Executed" recovery path (handle_entry_price's stale-button guard needs the row to
+    still exist). Now fetches the full order detail (schwab_client.get_order_detail)
+    and checks schwab_client._order_executed_quantity -- a nonzero fill on a
+    terminal-bad order is alerted and the row is PRESERVED (never cleared), matching
+    check_entry_abandon's own no_order_id_on_file fail-safe pattern, not resolved
+    automatically here (a real partial fill needs a human to confirm the exact
+    reconciliation, same reasoning _reconcile_buy_fill's manual paths already use).
+    Only a genuine zero-fill terminal-bad order is cleared outright.
+
+    UNCONFIRMABLE-STATUS FALLBACK (added 2026-08-17, paired review's MEDIUM finding):
+    get_order_detail returning None isn't always a transient network blip -- an
+    unrecognized/renamed account or an order id aged past Schwab's retention window
+    is PERMANENTLY unconfirmable, and without this fallback such a row would poll
+    forever with zero alert ever, the exact symptom this whole function exists to
+    close, just relocated. _MARKET_BUY_STATUS_UNKNOWN_SINCE tracks how long a given
+    row has been returning None; past _MARKET_BUY_UNKNOWN_ALERT_AFTER_SECS, alerts
+    (throttled) without clearing the row -- still fails toward the cautious/manual
+    path, just doesn't stay silent forever."""
+    for pb in db.get_pending_buys():
+        wl_id = pb.get('wl_id')
+        if not wl_id:
+            continue
+        node = pb['node']
+        ticker = pb['ticker']
+        if ticker not in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+            continue
+        if db._is_trailing_buy(node):
+            continue  # check_entry_abandon's population, not this one
+        order_id = pb.get('order_id')
+        if not order_id:
+            continue  # nothing to check status of (manual-placement flow, or never placed)
+        account = node.get('account')
+        if _effectively_dry_run(account, node):
+            continue  # no real broker order exists for a dry_run row
+        mode = _coverage_mode(account)
+
+        order = schwab_client.get_order_detail(account, order_id)
+        if order is None:
+            first_seen = _MARKET_BUY_STATUS_UNKNOWN_SINCE.setdefault(wl_id, time.time())
+            if time.time() - first_seen >= _MARKET_BUY_UNKNOWN_ALERT_AFTER_SECS:
+                if _throttled(_MARKET_BUY_UNKNOWN_ALERTED, str(wl_id), _MARKET_BUY_UNKNOWN_ALERT_COOLDOWN_SECS):
+                    db.log_coverage_event("market_buy_order_terminated", mode, ticker=ticker, node_id=wl_id,
+                                           result="unconfirmable", detail=f"order_id={order_id}")
+                    _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — market-buy order "
+                                  f"{order_id}'s status has been unconfirmable for over "
+                                  f"{_MARKET_BUY_UNKNOWN_ALERT_AFTER_SECS // 60}min (unrecognized account or "
+                                  f"order too old to look up) — verify manually at the broker.", node_id=wl_id)
+            continue
+        _MARKET_BUY_STATUS_UNKNOWN_SINCE.pop(wl_id, None)
+
+        status = order.get("status")
+        if status not in schwab_client._ORDER_TERMINAL_BAD_STATUSES:
+            continue
+
+        executed = schwab_client._order_executed_quantity(order)
+        if executed > 0:
+            db.log_coverage_event("market_buy_order_terminated", mode, ticker=ticker, node_id=wl_id,
+                                   result="partial_fill_preserved", detail=f"status={status} executed={executed}")
+            _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) — market-buy order "
+                          f"{order_id} was {status} by Schwab AFTER partially executing "
+                          f"{executed:g} shares — tracking PRESERVED, no auto-clear. Verify the real "
+                          f"position at the broker and reconcile manually (a protective stop may be "
+                          f"needed).", node_id=wl_id)
+            continue
+
+        db.clear_pending_buy_by_wl_id(wl_id)
+        db.log_coverage_event("market_buy_order_terminated", mode, ticker=ticker, node_id=wl_id,
+                               result="cleared", detail=f"status={status}")
+        _post_message(f"\U0001F6AB *{ticker}* ({account} · {mode_tag(account, node)}) — market-buy order "
+                      f"{order_id} was {status} by Schwab, not resting — pending tracking cleared, no "
+                      f"position resulted. Verify at the broker if this was unexpected.", node_id=wl_id)
 
 
 # ---------------------------------------------------------------------------

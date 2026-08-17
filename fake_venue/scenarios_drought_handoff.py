@@ -47,43 +47,34 @@ unconfirmed-fill proof clean):
           => the raced fill is reconciled as a real drought position (never
              silently discarded) -- confirmed via buy_fill_reconciled        <-- checked
 
-          REAL FINDING (2026-08-15, this scenario's first run), not a bug in
-          the sense of broken/incorrect behavior -- the failure-closed
-          handling below is exactly what test_handoff_case_b_exit_failure_
-          is_logged_and_alerted (fake_broker tier) already proves is
-          CORRECT, just reached via a different, more realistic real trigger
-          than that test's synthetic kill-switch: _reconcile_buy_fill (the
-          same fill-reconciliation function every automated fill goes
-          through) auto-places a real protective SL for the newly-opened
-          drought position INLINE, in the same call, since the ticker is in
-          AUTOMATION_ENABLED_TICKERS -- this is real, intended behavior
-          (post_fill_topup's own leg 1 note: "check_auto_fills' single call
-          also triggers _place_stop_loss_for_position"). Case B's immediate
-          fall-through then tries to REPLACE that SAME just-placed SL with a
-          market sell, milliseconds later -- well inside schwab_safety's own
-          60s DUPLICATE_ORDER_WINDOW_SECS. The dup-order-window guard
-          (schwab_safety.check_order, ~line 1948) has an explicit SELL-side
-          fingerprint exemption for one known self-collision shape already
-          (is_addon_leg / an open addon leg, ~line 1929's comment: "a leg's
-          own SELL... always has the exact same (account, ticker, side,
-          quantity) as the parent core position's own SELL") -- but NOT for
-          this one (HANDOFF's own replace of its own just-placed SL), so it
-          genuinely, deterministically (not a timing flake -- the window is
-          60s, this collision is milliseconds) blocks Case B's replace as if
-          it were an unrelated duplicate SELL. The system fails SAFE here:
-          automated_exit_execution logs 'blocked', drought_handoff_exit_
-          placement logs 'failed_or_blocked', the position is NOT silently
-          dropped (still open, still protected by the SL that just placed),
-          and a human is alerted to close it manually. Left open as a
-          possible future enhancement (a HANDOFF-side dup-window exemption
-          mirroring the addon-leg one) -- NOT fixed here, since it would
-          touch schwab_safety.py and needs the same paired review as any
-          other signals_*/schwab_*.py change.
-          => coverage_events['drought_handoff_exit_placement'] =
-             'failed_or_blocked'                                             <-- checked (real trigger)
-          => coverage_events['automated_exit_execution'] = 'blocked',
-             detail containing 'duplicate order'                             <-- checked
-          => manual_sl_fallback_alert fires -- position stays open, protected <-- checked
+          REAL FINDING (2026-08-15, this scenario's first run), FIXED
+          2026-08-17: _reconcile_buy_fill (the same fill-reconciliation
+          function every automated fill goes through) auto-places a real
+          protective SL for the newly-opened drought position INLINE, in the
+          same call, since the ticker is in AUTOMATION_ENABLED_TICKERS --
+          this is real, intended behavior (post_fill_topup's own leg 1 note:
+          "check_auto_fills' single call also triggers
+          _place_stop_loss_for_position"). Case B's immediate fall-through
+          then REPLACES that SAME just-placed SL with a market sell,
+          milliseconds later -- well inside schwab_safety's own 60s
+          DUPLICATE_ORDER_WINDOW_SECS. The dup-order-window guard
+          (schwab_safety.check_order) had an explicit SELL-side fingerprint
+          exemption for one known self-collision shape already (is_addon_leg
+          / an open addon leg -- "a leg's own SELL... always has the exact
+          same (account, ticker, side, quantity) as the parent core
+          position's own SELL") but not for this one -- genuinely,
+          deterministically (not a timing flake -- the window is 60s, this
+          collision is milliseconds) blocked Case B's replace as if it were
+          an unrelated duplicate SELL. **Fixed via a new is_handoff_exit
+          exemption** (check_order, mirrors is_addon_leg's own "verified,
+          not trusted" contract -- the caller's flag alone isn't enough,
+          it's checked against a real open drought position on file AND a
+          non-null replacing_order_id before exempting): Case B's replace
+          now succeeds, closing the position synchronously in this same
+          call instead of leaving it blocked for a human to resolve.
+          => coverage_events['drought_handoff'] = 'closed'                   <-- checked (real trigger)
+          => coverage_events['automated_exit_execution'] no longer 'blocked' <-- checked
+          => manual_sl_fallback_alert does NOT fire -- no human needed       <-- checked
 
   NODE C  Case B, THE UNCONFIRMED-FILL WINDOW -- what the Grid row's own
           notes flag as untested, and node C's own account keeps it clear of
@@ -305,36 +296,39 @@ def run(price=None, verbose=True):
                         "call) -- this is what Case B's immediate replace-attempt collides with below",
                         len(sl_placed_b) == 1, f"events={[(e['result'], e['detail']) for e in sl_events_b]}"))
 
-    # REAL FINDING (see module docstring): Case B's immediate fall-through
-    # tries to replace that just-placed SL milliseconds later -- well inside
-    # schwab_safety's 60s dup-order-window, which has no exemption for this
-    # self-collision shape (unlike the addon-leg one it does have). This is
-    # NOT the ideal outcome, but IS the correctly-designed failure-closed
-    # behavior -- proven below, not papered over.
+    # FIXED 2026-08-17 (was a real finding, see module docstring): Case B's
+    # immediate fall-through replaces that just-placed SL milliseconds
+    # later -- well inside schwab_safety's 60s dup-order-window. Before the
+    # fix this was deterministically BLOCKED (a real self-collision, no
+    # exemption existed for it, unlike the addon-leg case). check_order's
+    # new is_handoff_exit exemption (verified against a real open drought
+    # position + a non-null replacing_order_id, mirroring is_addon_leg's
+    # own verified-not-trusted contract) now lets the replace through, so
+    # Case B closes the position cleanly in this same call instead of
+    # leaving it blocked for a human to resolve manually.
     exec_events_b = db.get_coverage_events(scenario_key="automated_exit_execution")
     blocked_b = [e for e in exec_events_b if e['node_id'] == node_b['id'] and e['result'] == 'blocked']
-    checks.append(Check("node B: Case B's replace-the-just-placed-SL attempt was correctly BLOCKED by "
-                        "schwab_safety's dup-order-window guard (a real, deterministic self-collision -- "
-                        "see module docstring's node B finding), not silently ignored or mis-executed",
-                        len(blocked_b) == 1 and 'duplicate order' in (blocked_b[0]['detail'] or ''),
+    checks.append(Check("node B: Case B's replace-the-just-placed-SL attempt is NO LONGER blocked by "
+                        "schwab_safety's dup-order-window guard (is_handoff_exit exemption, 2026-08-17)",
+                        len(blocked_b) == 0,
                         f"events={[(e['result'], e['detail']) for e in exec_events_b]}"))
-    exit_events_b = db.get_coverage_events(scenario_key="drought_handoff_exit_placement")
-    failed_b = [e for e in exit_events_b if e['node_id'] == node_b['id'] and e['result'] == 'failed_or_blocked']
-    checks.append(Check("node B: drought_handoff_exit_placement fired 'failed_or_blocked' -- the "
-                        "failure-closed branch, reached via a real (not synthetic) trigger",
-                        len(failed_b) == 1, f"events={[(e['result']) for e in exit_events_b]}"))
+    handoff_events_b = db.get_coverage_events(scenario_key="drought_handoff")
+    closed_b = [e for e in handoff_events_b if e['node_id'] == node_b['id'] and e['result'] == 'closed']
+    checks.append(Check("node B: drought_handoff fired 'closed' -- the real replace succeeded and the "
+                        "confirmed fill closed the position synchronously in this same call",
+                        len(closed_b) == 1, f"events={[(e['result']) for e in handoff_events_b]}"))
     fallback_b = db.get_coverage_events(scenario_key="manual_sl_fallback_alert")
     alerted_b = [e for e in fallback_b if e['node_id'] == node_b['id'] and e['result'] == 'alerted']
-    checks.append(Check("node B: manual_sl_fallback_alert fired -- a human is told to verify/close "
-                        "manually, exactly as the failure-closed contract requires",
-                        len(alerted_b) == 1, f"events={[(e['result'], e['detail']) for e in fallback_b]}"))
-    checks.append(Check("node B: the drought position is NOT silently dropped -- still open, still "
-                        "protected by the SL that was just placed (never left naked)",
-                        db.get_drought_overlay_position(node_b['id']) is not None))
+    checks.append(Check("node B: manual_sl_fallback_alert did NOT fire -- no human intervention needed, "
+                        "the automated replace succeeded",
+                        len(alerted_b) == 0, f"events={[(e['result'], e['detail']) for e in fallback_b]}"))
+    checks.append(Check("node B: the drought position is CLOSED -- HANDOFF's exit succeeded and the "
+                        "confirmed fill closed it in this same call",
+                        db.get_drought_overlay_position(node_b['id']) is None))
     sells_b = _resting_sells(broker, CASH_ALIAS, TICKER)
-    checks.append(Check("node B: exactly one resting SELL remains (the auto-placed protective SL, "
-                        "un-replaced since the replace attempt was blocked) -- no orphan/duplicate order",
-                        len(sells_b) == 1, f"resting={[o['orderId'] for o in sells_b]}"))
+    checks.append(Check("node B: zero resting SELLs remain (the SL was atomically replaced by the "
+                        "market sell, which filled immediately) -- no orphan/duplicate order",
+                        len(sells_b) == 0, f"resting={[o['orderId'] for o in sells_b]}"))
 
     # ============================================================== NODE C
     say("[node C] Case B, the unconfirmed-fill window -- an OPEN drought position (own account, "
@@ -483,14 +477,17 @@ SELECT wl.id AS wl_id, wl.account,
 
 def verify_proof(db_path):
     """Returns (ok, rows). ok requires exactly 3 nodes (A, B, C): node A with
-    1 clean cancel; node B with 1 raced_fill AND 1 failed_or_blocked exit
-    placement (the real dup-order-window collision, see module docstring --
-    node B's OWN just-placed protective SL blocks its own HANDOFF replace);
-    node C with 1 placed_unconfirmed exit-placement event, zero remaining
-    open drought-overlay position, and 1 real HANDOFF-closed trade_log row --
-    directly from the harness DB. The last two assert the exit_pending
-    ['current_price'] fix's real effect (check_own_sell_fills actually
-    closing the position), not just the absence of a KeyError."""
+    1 clean cancel; node B with 1 raced_fill, ZERO failed_or_blocked exit
+    placements (fixed 2026-08-17 -- schwab_safety.check_order's
+    is_handoff_exit exemption now lets node B's own just-placed protective
+    SL be replaced by its own HANDOFF exit instead of self-colliding), and 1
+    real HANDOFF-closed trade_log row (the replace succeeded and closed the
+    position in the same call); node C with 1 placed_unconfirmed exit-
+    placement event, zero remaining open drought-overlay position, and 1
+    real HANDOFF-closed trade_log row -- directly from the harness DB. Node
+    C's assertions confirm the exit_pending['current_price'] fix's real
+    effect (check_own_sell_fills actually closing the position), not just
+    the absence of a KeyError."""
     import sqlite3
 
     from fake_venue.scenarios_meta import TICKER as _ticker
@@ -505,7 +502,8 @@ def verify_proof(db_path):
         return False, rows
     node_a, node_b, node_c = rows
     ok = (node_a['clean_cancels'] == 1
-          and node_b['raced_fills'] == 1 and node_b['failed_or_blocked_placements'] == 1
+          and node_b['raced_fills'] == 1 and node_b['failed_or_blocked_placements'] == 0
+          and node_b['handoff_closed_trades'] == 1
           and node_c['unconfirmed_placements'] == 1
           and node_c['open_drought_positions'] == 0
           and node_c['handoff_closed_trades'] == 1)
