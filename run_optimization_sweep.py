@@ -517,6 +517,30 @@ def window_version_suffix(start_date, end_date):
     return f"-w{pd.Timestamp(start_date).strftime('%Y-%m-%d')}_{pd.Timestamp(end_date).strftime('%Y-%m-%d')}"
 
 
+def min_hold_version_suffix(min_hold_hours):
+    """Single source of truth for encoding a min_hold_hours compliance-hold floor
+    into a backtest_cache `version` string -- e.g. min_hold_version_suffix(112)
+    -> '-minhold112'. Same rationale/precedent as window_version_suffix() above
+    (2026-08-16/17): min_hold_hours is a campaign-level constant (fixed for the
+    whole run, not swept within it, same as fixed_sl/entry_timing), and every real
+    downstream consumer of backtest_cache already scopes by `version` alone -- so
+    a distinct version suffix gives full, collision-proof isolation from every
+    non-floored campaign for free, without a schema/PK migration. min_hold_hours=0
+    (no floor, the default) gets NO suffix -- it must stay byte-identical to every
+    pre-existing campaign's version string, since 0 reproduces prior kernel
+    behavior exactly (see backtester.py::_simulate_trail_both's docstring) and a
+    0-floor row is not a new/distinct thing that needs its own namespace.
+    Both dispatch_parallel_grid's guard and main()'s version construction must
+    build the suffix through this one function, mirroring window_version_suffix's
+    own warning about not duplicating the format string."""
+    n = int(min_hold_hours)
+    if n < 0:
+        raise ValueError(f"min_hold_version_suffix: min_hold_hours must be >= 0, got {n}.")
+    if n == 0:
+        return ""
+    return f"-minhold{n}"
+
+
 # Per-worker-process memo: workers are long-lived across grid nodes, and dispatch
 # is one ticker at a time — without this every node re-parses the CSV and recomputes
 # indicators (~18k times per ticker in Phase 3). Indicators depend only on
@@ -684,7 +708,7 @@ def _summarize_trades(closed, spy_bh):
 
 def run_single_backtest_node_isolated(args):
     (ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl,
-     trail_pct_pct, entry_timing, start_date, end_date) = args
+     trail_pct_pct, entry_timing, start_date, end_date, min_hold_hours) = args
 
     strategy_class = getattr(strategies, strategy_name, None)
     if not strategy_class:
@@ -704,7 +728,7 @@ def run_single_backtest_node_isolated(args):
             strategy_class, df_hourly_raw, df_daily_processed, ticker,
             take_profit=tp, sl_raw=sl, max_hours_to_hold=hold_hours, z_score_threshold=z_thresh,
             fixed_sl=fixed_sl, trail_pct_pct=trail_pct_pct, entry_timing=entry_timing,
-            return_bounds=True, prep=prep
+            return_bounds=True, prep=prep, min_hold_hours=min_hold_hours
         )
         # pessimistic/certain bounds only exist for TrailingBothZScoreBreakout —
         # every other strategy's dispatch branch ignores return_bounds and returns
@@ -741,7 +765,7 @@ def run_single_backtest_node_isolated(args):
     }
 
 
-def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None, start_date=None, end_date=None):
+def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version, phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None, start_date=None, end_date=None, min_hold_hours=0):
     # backtest_cache has no start_date/end_date columns -- cached_map below keys purely
     # on (tp, sl, hold, w, z, fsl, tpct) within a given (strategy, version, ticker,
     # entry_timing) scope. A windowed call would either read back a stale full-history
@@ -778,6 +802,21 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                 f"a windowed sweep must never share a version string with a full-history "
                 f"one, or cached rows from one window silently corrupt/collide with "
                 f"another's."
+            )
+    # min_hold_hours (2026-08-17): same rationale as the start_date/end_date guard
+    # above, deliberately NOT combined-and-tested with date-windowing in the same
+    # call -- if a future campaign ever needs both, verify the ordering/interaction
+    # of the two suffixes before trusting it, don't assume this guard covers that.
+    if int(min_hold_hours) != 0:
+        required_minhold_suffix = min_hold_version_suffix(min_hold_hours)
+        if not config_version.endswith(required_minhold_suffix):
+            raise ValueError(
+                f"dispatch_parallel_grid: min_hold_hours={min_hold_hours} but "
+                f"config_version={config_version!r} does not end with the required "
+                f"suffix {required_minhold_suffix!r}. Build config_version via "
+                f"min_hold_version_suffix(min_hold_hours) before calling this -- a "
+                f"floored campaign must never share a version string with a "
+                f"non-floored one, or cached rows silently corrupt/collide."
             )
     conn   = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
@@ -856,7 +895,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
     futures_map = {
         shared_pool.submit(run_single_backtest_node_isolated,
                            (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z, fixed_sl,
-                            tpct, entry_timing, start_date, end_date)): task
+                            tpct, entry_timing, start_date, end_date, min_hold_hours)): task
         for task in unvisited_tasks
         for tp, sl, hold, w, z, tpct in [task]
     }
@@ -1068,7 +1107,7 @@ def _campaign_scope_sql(strategy_name, fixed_sl, entry_timing):
     return " AND entry_timing=?", [entry_timing]
 
 
-def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None):
+def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None, min_hold_hours=0):
     z_thresholds = hp['z_score_thresholds']
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     expected = (len(z_thresholds) * len(hp['windows']) * len(hp['take_profits'])
@@ -1103,7 +1142,7 @@ def run_phase1_coarse(shared_pool, ticker, strategy_name, config_version, hp, sp
 
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
                            "Phase1-Coarse", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id,
-                           start_date=start_date, end_date=end_date)
+                           start_date=start_date, end_date=end_date, min_hold_hours=min_hold_hours)
 
 
 # ── Checkpoint 1: rank by coarse alpha, return island candidates ──────────────
@@ -1141,7 +1180,7 @@ def identify_island_candidates(config_version, strategy_name, n_index, n_stock, 
 
 # ── Phase 2: Island mesh ──────────────────────────────────────────────────────
 
-def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None, start_date=None, end_date=None):
+def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', generation=None, run_id=None, start_date=None, end_date=None, min_hold_hours=0):
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
@@ -1180,12 +1219,13 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
     logger.info(f"[{ticker}] Phase2 island mesh: {len(tasks)} tasks ({N_ISLANDS} islands ±{FINE_RADIUS})")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
                            "Phase2-Island", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing,
-                           generation=generation, run_id=run_id, start_date=start_date, end_date=end_date)
+                           generation=generation, run_id=run_id, start_date=start_date, end_date=end_date,
+                           min_hold_hours=min_hold_hours)
 
 
 # ── Phase 2.5: targeted cliff-box sweep around true best node ────────────────
 
-def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None):
+def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None, min_hold_hours=0):
     """Sweep ±CLIFF_RADIUS in TP/SL and ±7h in hold around the true best node from Phase 2.
     Guarantees cliff check has complete neighborhood data regardless of where the peak landed.
     For TrailingBothZScoreBreakout, also sweeps the trail_pct axis's immediate neighbors
@@ -1221,7 +1261,7 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
     logger.info(f"[{ticker}] Phase2.5 cliff-box: {len(tasks)} tasks around TP={tp_c} SL={sl_c} hold={hold_c}h")
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
                            "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id,
-                           start_date=start_date, end_date=end_date)
+                           start_date=start_date, end_date=end_date, min_hold_hours=min_hold_hours)
 
 
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
@@ -1441,7 +1481,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
 
 # ── Phase 3: Full mesh ────────────────────────────────────────────────────────
 
-def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None):
+def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None, min_hold_hours=0):
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     tasks = [(tp, sl, int(hold), int(w), float(z), float(tpct))
              for z    in hp['z_score_thresholds']
@@ -1454,7 +1494,7 @@ def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_
     logger.info(f"[{ticker}] Phase3 full mesh: {len(tasks)} tasks (cache skips coarse+island already done)")
     dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_version,
                            "Phase3-Full", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id,
-                           start_date=start_date, end_date=end_date)
+                           start_date=start_date, end_date=end_date, min_hold_hours=min_hold_hours)
 
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     with sqlite3.connect(DB_PATH) as conn:
@@ -1531,7 +1571,41 @@ if __name__ == "__main__":
                              "full-history campaign under the same base version.")
     parser.add_argument("--end-date", dest="end_date", default=None,
                         help="YYYY-MM-DD -- see --start-date (both-or-neither).")
+    parser.add_argument("--min-hold-hours", dest="min_hold_hours", type=int, default=0,
+                        help="Research/backtest-only compliance-hold floor (see backtester.py::"
+                             "_simulate_trail_both) -- blocks ALL exits (incl. SL) until this many "
+                             "hourly bars have elapsed since entry. Only TrailingBothZScoreBreakout "
+                             "supports it (run_backtest_dispatch raises for any other strategy). "
+                             "0 (default) reproduces prior kernel behavior exactly and gets no "
+                             "version suffix. A nonzero value is encoded into the version string via "
+                             "min_hold_version_suffix() so floored results never collide with a "
+                             "non-floored campaign under the same base version.")
     args = parser.parse_args()
+
+    if args.min_hold_hours < 0:
+        logger.critical("--min-hold-hours must be >= 0.")
+        sys.exit(1)
+
+    # Paired session-wrap review (2026-08-17, both independent-cold and
+    # contextual) found combining --min-hold-hours with --start-date/--end-date
+    # has real gaps: the window suffix gets appended before the minhold suffix,
+    # so (a) a bare --start-date/--end-date run against an already-minhold-
+    # suffixed --version silently bypasses the minhold resume guard (it only
+    # checks when min_hold_hours != 0), and (b) the two flags together hard-
+    # crash deep inside Phase 1 with a misleading "you forgot the suffix"
+    # message, AND the window resume guard's own $-anchored regex fails to
+    # match a version carrying a trailing minhold suffix, defeating ITS resume
+    # guard too. Neither suffix helper is designed to compose safely with the
+    # other yet -- reject the combination outright rather than let either
+    # bypass reach a real sweep.
+    if args.min_hold_hours != 0 and (args.start_date is not None or args.end_date is not None):
+        logger.critical(
+            "--min-hold-hours and --start-date/--end-date cannot be combined -- "
+            "window_version_suffix() and min_hold_version_suffix() are not "
+            "designed to compose safely yet (see run_optimization_sweep.py's "
+            "2026-08-17 comments). Run them as separate campaigns."
+        )
+        sys.exit(1)
 
     if (args.start_date is None) != (args.end_date is None):
         logger.critical("--start-date and --end-date must both be given, or neither.")
@@ -1581,6 +1655,25 @@ if __name__ == "__main__":
     if start_date is not None:
         config_version += window_version_suffix(start_date, end_date)
         logger.info(f"Windowed run: [{start_date}, {end_date}] -- version suffixed to {config_version!r}")
+
+    min_hold_hours = args.min_hold_hours
+    # Same resume-safety guard as the window regex above, mirrored for min_hold_hours.
+    _MINHOLD_SUFFIX_RE = re.compile(r'-minhold\d+$')
+    if min_hold_hours == 0 and _MINHOLD_SUFFIX_RE.search(config_version):
+        logger.critical(
+            f"--version {config_version!r} already looks like a min-hold-floored version "
+            f"(matches min_hold_version_suffix's format) but --min-hold-hours was not given "
+            f"(or given as 0). Running like this would write NON-FLOORED results into what "
+            f"looks like a floored campaign's cache rows, with nothing downstream able to "
+            f"tell them apart. Pass the matching --min-hold-hours, or use a different "
+            f"--version if a non-floored run was actually intended."
+        )
+        sys.exit(1)
+    if min_hold_hours != 0:
+        config_version += min_hold_version_suffix(min_hold_hours)
+        logger.info(f"Compliance-hold-floored run: min_hold_hours={min_hold_hours} -- "
+                    f"version suffixed to {config_version!r}")
+
     hp                = config["hyperparameters"]
     max_workers       = config.get("execution", {}).get("max_workers", 6)
     fixed_sl          = config.get("execution", {}).get("fixed_stop_loss", 0)
@@ -1593,6 +1686,45 @@ if __name__ == "__main__":
     if not tickers:
         logger.error("No tickers in config.")
         sys.exit(1)
+
+    # Paired session-wrap review (2026-08-17, contextual) found this reachable
+    # TODAY, not theoretical: run_backtest_dispatch's min_hold_hours guard
+    # raises ValueError inside a pool worker, which run_single_backtest_node_
+    # isolated's blanket except turns into a SIM_ERROR status per-node -- the
+    # whole campaign then completes "successfully" with zero rows written, no
+    # non-zero exit code, nothing but a buried per-node warning. Fail fast at
+    # startup instead, before any worker is even spun up.
+    if args.min_hold_hours != 0:
+        for name in strategy_names:
+            cls = getattr(strategies, name, None)
+            if cls is None or not issubclass(cls, strategies.TrailingBothZScoreBreakout):
+                logger.critical(
+                    f"--min-hold-hours={args.min_hold_hours} was given but active_strategies "
+                    f"includes {name!r}, which doesn't support the compliance-hold floor "
+                    f"(only TrailingBothZScoreBreakout does). Without this check the campaign "
+                    f"would silently fail every node and complete with zero rows written -- "
+                    f"fix config.json's active_strategies or drop --min-hold-hours."
+                )
+                sys.exit(1)
+
+    # Real methodology bug this session fell into and had to diagnose by hand,
+    # 2026-08-17: whenever a swept max_hours_to_hold value is below
+    # min_hold_hours, the TIME-exit condition fires early and then sits
+    # blocked until the floor -- every such hold_time_caps value collapses
+    # into byte-identical trade sets (confirmed empirically: 16 of 20 default
+    # grid values tied under a 112h floor). Not a hard error (a campaign
+    # deliberately probing this collapse is a legitimate, if unusual, thing to
+    # run) -- just a loud warning so it can't happen silently again.
+    if args.min_hold_hours != 0:
+        low_caps = [h for h in hp.get('hold_time_caps', []) if h < args.min_hold_hours]
+        if low_caps:
+            logger.warning(
+                f"--min-hold-hours={args.min_hold_hours} but hold_time_caps includes "
+                f"{len(low_caps)} value(s) below it ({sorted(low_caps)}) -- every one of "
+                f"these will collapse into the same degenerate 'wait exactly until the "
+                f"floor' behavior (see docs/research_log.md's 2026-08-17 entry). Consider "
+                f"restricting hold_time_caps to values >= min_hold_hours."
+            )
 
     init_idempotent_db()
 
@@ -1677,7 +1809,7 @@ if __name__ == "__main__":
                         logger.warning(f"Unknown strategy: {name}")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date)
+                    run_phase1_coarse(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date, min_hold_hours=min_hold_hours)
 
             logger.info("Phase 1 complete.")
 
@@ -1699,7 +1831,7 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date)
+                    run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date, min_hold_hours=min_hold_hours)
                 continue
 
             island_tickers = []
@@ -1725,7 +1857,7 @@ if __name__ == "__main__":
                         logger.warning(f"[{ticker}] No B&H data, skipping Phase 2.")
                         continue
                     asset_bh, spy_bh = bh_cache[ticker]
-                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, generation=gen + 1, run_id=run_id, start_date=start_date, end_date=end_date)
+                    run_phase2_island(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, generation=gen + 1, run_id=run_id, start_date=start_date, end_date=end_date, min_hold_hours=min_hold_hours)
 
                 logger.info(f"Phase 2 gen {gen+1} complete.")
 
@@ -1740,7 +1872,7 @@ if __name__ == "__main__":
                 if ticker not in bh_cache:
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date)
+                run_phase25_cliff_box(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date, min_hold_hours=min_hold_hours)
 
             # ── Checkpoint 2 ─────────────────────────────────────────────
             logger.info(f"\nCheckpoint 2: cliff check on {len(island_tickers)} island tickers [{config_version}]...")
@@ -1767,7 +1899,7 @@ if __name__ == "__main__":
                     logger.warning(f"[{ticker}] No B&H data, skipping Phase 3.")
                     continue
                 asset_bh, spy_bh = bh_cache[ticker]
-                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date)
+                run_phase3_full(shared_pool, ticker, name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id, start_date=start_date, end_date=end_date, min_hold_hours=min_hold_hours)
 
     if args.skip_cache_refresh:
         logger.info("\nSkipping cache refresh and index rebuild (--skip-cache-refresh).")

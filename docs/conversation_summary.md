@@ -7874,3 +7874,61 @@ Ran as the executing/merging session in a two-way coordination with peer session
 **Session-wrap checks**: `signals_invariants.py` clean. `check_backlog_cache_lean.py` flagged 2 over-length `backlog_cache.md` entries (one from tonight's Stage 2 work, one pre-existing from 2026-08-15) — both relocated verbatim to `deep_backlog.md` per convention, one-line pointers left behind (confirmed with the user directly after they asked why content had "disappeared" — nothing was lost, just relocated, same as every other resolved-item convention in this project). `scripts/evening_status.py all`: 0 unexplained deviations, daemon not running (expected, user-managed lifecycle, not touched), no new trading incidents. `scripts/live_sim_harness.py`: 5/7 scenarios pass; 2 failures (`scenario_pinned_entry_trailing_buy`, `scenario_ambient_market_buy_entry`, both `TypeError: 'set' object is not subscriptable` at `active_signals.py:402`) confirmed pre-existing and unrelated — `active_signals.py` has zero diff across the entire session (`git diff <session-start>..HEAD -- active_signals.py` is empty), so nothing this session touched could have caused it; logged as a new backlog item rather than silently ignored. Confirmed no new `scenario_key`/`log_coverage_event` call sites were added this session (checked the diff directly, not just trusted agent self-reports) — no new Grid row needed.
 
 **Not committed as of this entry**: the `check_backlog_cache_lean.py`-driven doc relocations (`docs/backlog_cache.md`/`docs/deep_backlog.md`) are staged for this session's own wrap commit, immediately following. `config.json` (a real sweep-campaign staging edit, confirmed as planner's/the user's WIP for the quarterly SOXL sweep) and the untracked `scripts/run_quarterly_soxl_sweep.sh` are deliberately left uncommitted and untouched — not this session's to commit.
+
+---
+
+## 2026-08-17 — [Research] min_hold_hours compliance-hold floor: built, paired-reviewed twice, swept 3 tickers, parked
+
+Real backlog item (relayed via peer session "planner"): a firm compliance policy requires a
+16-trading-day minimum hold on positions, blocking ALL exits (incl. SL) during the window —
+research/backtest-only, no live-automation path ever (real execution needs manual compliance
+sign-off on both entry AND exit per trade).
+
+**Kernel**: new `min_hold_hours` param on `backtester.py::_simulate_trail_both`/`run_backtest_v110`
+(default 0 = byte-identical to prior behavior, verified via differential testing across 3,072 real
+configs by the session-wrap reviewer). First paired Opus review (independent-cold + contextual)
+found and fixed 2 real bugs before any sweep ran: HIGH (a blocked SL fell through the `elif` chain
+into TP-arming, permanently disabling the stop instead of delaying the exit) and MEDIUM
+(peak/trail_stop tracking silently froze on a blocked gap-exit bar, contradicting the code's own
+docstring). Both empirically re-verified fixed.
+
+**Sweep engine**: `run_optimization_sweep.py` wired via a version-string-suffix isolation pattern
+(`min_hold_version_suffix`, mirroring the existing `window_version_suffix` date-windowing
+precedent — no `backtest_cache` schema/PK migration). Ran real Phase1→2→2.5 sweeps: SOXL first
+(`v5-minhold112`) surfaced a real methodology bug (not a code bug) — every top node shared
+`max_hold_hours=21`, well below the floor, because `max_hold_hours < min_hold_hours` collapses the
+entire `hold_time_caps` axis below the floor into one degenerate behavior. Corrected
+(`hold_time_caps` raised to 112h-252h, `v5-widehold-minhold112`) and reswept SOXL, then SPCL/QPUX.
+
+**Checklist review** (`scripts/candidate_full_review.py`) on SOXL's best cliff-safe node (30 trades,
++729.4% alpha) found real problems cliff-safety alone missed: walk-forward MARGINAL (3/5 out-of-time
+folds positive), max drawdown -73.3% (severe given SL is locked out the whole hold), same-day-block
+LOW_RETENTION, drought overlay FRAGILE. QPUX/SPCL both too data-thin (2-4 trades either floored or
+unconstrained) to trust either way, and neither cleared the project's +200% alpha bar.
+
+**Outcome**: parked, user's call — "the 15 days really makes this strategy hard to use." None of the
+three tickers justified the real compliance friction. Kernel change stays in the codebase, not
+reverted.
+
+**Session-wrap paired review** (independent-cold + contextual, against the full current diff of both
+`backtester.py` and `run_optimization_sweep.py`) found 4 more real issues before commit, all fixed:
+(1) MEDIUM — the min-hold resume-safety CLI guard was bypassable when combined with
+`--start-date`/`--end-date` (checked after the window suffix was already appended); (2) MEDIUM — a
+non-supporting strategy's `ValueError` from `run_backtest_dispatch` was getting swallowed into a
+per-node `SIM_ERROR` by a blanket except, so a whole campaign could complete "successfully" with zero
+rows written if `config.json`'s `active_strategies` didn't support the floor (confirmed reachable
+today given the concurrent quarterly-sweep session's real `config.json` state); (3) LOW — an
+imprecise docstring claim about TP-arming not being gated (a genuinely new, narrow reachable state
+under the floor); (4) MEDIUM (coverage) — zero test coverage for the whole feature, including the two
+bugs fixed in round 1. Fixed: reject `--min-hold-hours` + date-windowing combination outright at CLI
+parse time; fail-fast startup validation that every active strategy supports the floor before any
+worker spins up; a startup warning when `hold_time_caps` includes values below the floor (the exact
+trap this session hit by hand); corrected docstring; new `tests/test_min_hold_hours.py` (3 tests)
+pinning both round-1 bugs plus the `min_hold=0` no-op guarantee.
+
+Full detail: `docs/research_log.md`'s 2026-08-17 entry, `docs/design.md`'s 2026-08-17 entry,
+`docs/backlog_cache.md`'s "Parked" entry.
+
+New files: `backtester.py`, `run_optimization_sweep.py` (modified); `scripts/audit_min_hold_hours.py`,
+`scripts/run_soxl_minhold_sweep.sh`, `scripts/run_soxl_minhold112_widehold_sweep.sh`,
+`scripts/run_spcl_qpux_minhold112_sweep.sh`, `tests/test_min_hold_hours.py` (new).
