@@ -33,6 +33,17 @@ Used by `feature wrap` and `session wrap` before committing.
       real-render requirement as the nightly-Slack-report item below, but for the tool a human
       actually runs to sanity-check live state before/after a change — added 2026-08-16 after a
       session shipped real live-trading code changes without running it at all.
+- [ ] **If `active_signals.py`, any `signals_*.py` module, or any `schwab_*.py` module changed
+      this session**: explicitly check whether the change could affect the future execution of
+      an order or position that's already in flight right now (a resting order, an open
+      position, a pending buy, an armed trail state) — not just new orders placed after the
+      change lands. A behavior change that's correct for fresh state can still misfire against
+      state that was written under the old code/assumptions (e.g. a schema/field-meaning change,
+      a changed threshold, a changed reconciliation path). Check real current state first
+      (`scripts/open_positions_status.py`, `scripts/watchlist_status.py`, a direct query of
+      `pending_buys`/`open_positions`) before concluding nothing is in flight — don't assume from
+      memory. If something is in flight and could be affected, state explicitly what happens to
+      it under the new code, not just that new trades will behave correctly.
 - [ ] **If any nightly Slack report's composition changed this session** (`scripts/
       coverage_report_summary.py`, `signals_notify.build_eod_scenario_review`/
       `build_tomorrow_plan`, or similar): actually render it against real data and read it —
