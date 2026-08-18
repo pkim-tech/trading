@@ -292,4 +292,4 @@ Fixed via `date(signal_time) <= check_date` (a pending_buys row is deleted on re
 
 ## [live-trading][tax] Closed 2026-08-15 (backlog-cleanse) — wash-sale/tax analysis precondition now false (brokerage trading_enabled 2026-08-12); verified no cross-account ticker sharing today, no active risk. Full detail: `deep_backlog.md`.
 ## [portfolio][tax] Closed 2026-08-15 (backlog-cleanse) — AGQ K-1/UBTI finding superseded: its own recommendation (AGQ in brokerage) is exactly what happened.
-## [portfolio][design] Closed 2026-08-15 (backlog-cleanse) — skim-and-reserve overlay: skim work stopped for now, consistent with the 2026-08-14 "trim" reframe.
+## [portfolio][design] Closed 2026-08-15 (backlog-cleanse) — skim-and-reserve overlay: skim work stopped for now, consistent with the 2026-08-14 "trim" reframe.## [live-trading][security] Accepted risk 2026-08-17 — HANDOFF exit_pending reminder-loop gap: user's call ("I'll survive"), no fix planned. Full detail: `deep_backlog.md`.
