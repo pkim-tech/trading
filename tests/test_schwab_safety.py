@@ -933,6 +933,24 @@ def test_pre_action_state_verification_logs_mismatch(env, monkeypatch):
     assert 'real_shares=42' in mismatches[0]['detail']
 
 
+def test_pre_action_state_verification_threads_source(env, monkeypatch):
+    # 2026-08-18 fix: check_order's `source` kwarg reaches every OTHER
+    # log_coverage_event call in the function, but _log_pre_action_state_
+    # verification was the one call left behind -- so a fixture-driven
+    # check_order() call (e.g. scripts/stage_check_order_guard_scenarios.py's
+    # source='fixture:...' runs) tagged every guard-block row correctly but
+    # left this function's own fetch_failed/match/mismatch rows at
+    # source=NULL, making check_intraday_risk_review/coverage_registry.py's
+    # fixture-source filters both no-ops against exactly the rows they were
+    # built to exclude (paired-review finding).
+    monkeypatch.setattr(schwab_client, 'get_real_position', lambda account, ticker: 0.0)
+    schwab_safety.check_order('roth', TICKER, 5, 50.0, 'BUY', source='fixture:test_marker')
+    events = signals_db.get_coverage_events(scenario_key='pre_action_state_verification')
+    matches = [e for e in events if e['ticker'] == TICKER and e['result'] == 'match']
+    assert matches, f"expected a 'match' event, got: {events}"
+    assert matches[0]['source'] == 'fixture:test_marker'
+
+
 def test_pre_action_state_verification_fetch_failure_does_not_block(env, monkeypatch):
     """A broken/erroring real-position fetch must never block a real order --
     this is observability, not a gate."""

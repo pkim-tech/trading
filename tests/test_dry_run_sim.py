@@ -105,6 +105,39 @@ def test_update_dry_run_buys_fills_on_bounce_and_opens_real_position_tagged(env,
     assert row['is_dry_run_sim'] == 1
 
 
+def test_update_dry_run_buys_drought_pending_fills_as_drought_overlay_not_core(env, monkeypatch):
+    # 2026-08-18 fix: _fill_dry_run_buy used to call db.open_position()
+    # directly (always position_source='core', regardless of what the
+    # pending row actually was), bypassing open_position_from_pending's
+    # dispatch entirely -- db.get_pending_buys() (this function's own source)
+    # has no position_source filter, so a drought_overlay pending row for a
+    # dry_run/trading-disabled node landed here just as easily as a core one.
+    # Real, currently-reachable: 4 real state='dry_run' nodes have
+    # drought_overlay_enabled=1 today. Consequence of the bug: the resulting
+    # open_positions row was tagged position_source='core' with NULL
+    # drought_confirm_days/vol_gate/gap_start/vol_pctile, so
+    # get_drought_overlay_position() could never find it (defeating
+    # check_drought_handoff's Case B) and drought_*_pct_override resolution
+    # never ran for this path either.
+    node = _node()
+    db.add_pending_buy(node, _sig(100.0), channel=None, ts=None, position_source='drought_overlay',
+                        drought_confirm_days=3, drought_vol_gate=0.4)
+    monkeypatch.setattr(signals_notify.compute, '_current_price', lambda t: (90.0, None))
+    signals_notify.update_dry_run_buys()
+    monkeypatch.setattr(signals_notify.compute, '_current_price', lambda t: (92.0, None))  # >= 1% above 90
+    signals_notify.update_dry_run_buys()
+
+    assert db.get_pending_buys() == []
+    positions = db.get_open_positions()
+    assert len(positions) == 1
+    pos = positions[0]
+    assert pos['is_dry_run_sim'] == 1
+    assert pos['position_source'] == 'drought_overlay'
+    assert pos['drought_confirm_days'] == 3
+    assert pos['drought_vol_gate'] == 0.4
+    assert db.get_drought_overlay_position(node['id']) is not None
+
+
 def test_check_dry_run_sim_sells_closes_immediately_without_slack_button(env, monkeypatch):
     node = _node()
     signal_time = datetime.now() - timedelta(hours=1)

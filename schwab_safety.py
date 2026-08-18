@@ -923,7 +923,7 @@ def _all_orders(account: str) -> list:
     return r.json()
 
 
-def _log_pre_action_state_verification(account, ticker, node_id, mode, side, local_shares):
+def _log_pre_action_state_verification(account, ticker, node_id, mode, side, local_shares, source='daemon'):
     """Detection-only pre-action live-state check (2026-07-29 backlog item,
     deferred from the 2026-07-28 fix session): compares the real broker
     position against what our own DB believes, at the exact moment a real
@@ -938,14 +938,26 @@ def _log_pre_action_state_verification(account, ticker, node_id, mode, side, loc
     always ground truth (automation_principles.md #1).
     Never raises past a fetch failure into the real order-approval flow --
     this is observability, not a gate, so a network blip here must not be
-    able to block a legitimate real order."""
+    able to block a legitimate real order.
+    source (2026-08-18 fix): both real call sites in check_order() already
+    have their own `source` param threaded through every OTHER
+    log_coverage_event call in that function -- this was the one call left
+    behind, so a fixture-driven check_order() call (e.g.
+    scripts/stage_check_order_guard_scenarios.py's source='fixture:...' runs)
+    tagged every guard-block row correctly but left the concerning
+    fetch_failed/mismatch rows from THIS function at source=NULL, making
+    coverage_registry.py/check_intraday_risk_review's fixture-source filters
+    both no-ops against exactly the rows they were built to exclude. Default
+    'daemon' matches check_order's own default so a caller that doesn't pass
+    it explicitly (there are none today, but future ones might) still gets
+    a correctly-attributed row rather than reverting to NULL."""
     try:
         import schwab_client  # local import: schwab_client imports this module at load time
         real_shares = schwab_client.get_real_position(account, ticker)
     except Exception as e:
         signals_db.log_coverage_event(
             "pre_action_state_verification", mode, ticker=ticker, node_id=node_id,
-            result="fetch_failed", detail=f"side={side}: {e}")
+            result="fetch_failed", detail=f"side={side}: {e}", source=source)
         return
     if local_shares is None:
         matched = real_shares == 0
@@ -954,7 +966,7 @@ def _log_pre_action_state_verification(account, ticker, node_id, mode, side, loc
     signals_db.log_coverage_event(
         "pre_action_state_verification", mode, ticker=ticker, node_id=node_id,
         result="match" if matched else "mismatch",
-        detail=f"side={side} real_shares={real_shares:g} local_shares={local_shares}")
+        detail=f"side={side} real_shares={real_shares:g} local_shares={local_shares}", source=source)
 
 
 def _open_orders(account: str) -> list:
@@ -1390,7 +1402,7 @@ def check_order(
             _local_pos = signals_db.get_open_position_for_account(ticker, account)
         _log_pre_action_state_verification(
             account, ticker, _node_id, _mode, "BUY",
-            _local_pos['shares'] if _local_pos else None)
+            _local_pos['shares'] if _local_pos else None, source=source)
 
         if is_addon_leg:
             # Five preconditions, verified fresh against the DB -- NOT trusted
@@ -1562,7 +1574,7 @@ def check_order(
             _presell_pos = signals_db.get_open_position_for_account(ticker, account)
         _log_pre_action_state_verification(
             account, ticker, _node_id, _mode, "SELL",
-            _presell_pos['shares'] if _presell_pos else None)
+            _presell_pos['shares'] if _presell_pos else None, source=source)
         orders = _open_orders(account)
         _log_guard_input(account, ticker, "SELL", orders, replacing_order_id)
         # Addon leg lookup, NODE-scoped (via _node_id, already resolved above

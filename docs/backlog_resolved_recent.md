@@ -1,5 +1,11 @@
 # Backlog — Recently Resolved
 
+## [live-trading][security] Resolved 2026-08-18 — drought overlay's `_pct_override` triplet: `_PENDING_BUY_NODE_KEYS` now carries the 3 override columns forward, and `open_position_from_pending`'s drought_overlay branch routes through `open_drought_overlay_position` (was calling `open_position` directly, silently skipping override resolution on the real fill path). Paired-reviewed (2 rounds), regression test verified to fail pre-fix. Full detail: `deep_backlog.md`.
+
+## [live-trading][tooling] Resolved 2026-08-18 — check_intraday_risk_review's 3 remaining noise gaps closed: fixture filter was a no-op against real fixture rows (`_log_pre_action_state_verification` now threads `source`), grouping key now includes `mode`+`node_id` (real live-DB collisions confirmed for both), and a persisted cross-cycle cooldown stops a multi-poll-cycle incident from reposting every ~5min (was: a real 51-window storm would've posted 51 messages). 2-round paired review (independent-cold + contextual, both rounds rebutted). Full detail: `deep_backlog.md`.
+
+## [live-trading][security] Resolved 2026-08-18 — `_fill_dry_run_buy` was opening drought-overlay pending buys as core positions (direct `open_position()` call, no `position_source` dispatch) for 4 real `state='dry_run'`/`drought_overlay_enabled=1` nodes; found during the drought-overlay fix's paired review, now routes through `open_position_from_pending`. Full detail: `deep_backlog.md`.
+
 ## [testing][coverage] Resolved 2026-08-18 — coverage_registry.py fixture-source filter: compute_status() now excludes source='fixture:...' rows from counting as Grid proof; caught a real trap before implementing (9,482/9,534 real events have source IS NULL, a naive NOT LIKE filter would have broken the Grid almost entirely). Reviewed, verified pure no-op on today's data (0 fixture rows exist yet), 2 new tests. Full detail: `deep_backlog.md`.
 
 ## [live-trading][coverage] Resolved 2026-08-18 — check_intraday_risk_review watermark gap: since_id pagination replaces the plain limit bump (which a review proved didn't actually close the gap), plus message-length caps for both coverage-events and incidents; a second review round found the fix's own watermark still only advanced on concerning events (HIGH, fixed) before shipping. Full detail: `deep_backlog.md`.

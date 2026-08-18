@@ -2155,8 +2155,26 @@ def _fill_dry_run_buy(node, pb, price):
     # function's other caller), since that fill happens near-immediately
     # after the signal anyway.
     fill_time = datetime.now()
-    opened = db.open_position(node, pb['signal_price'], fill_time, price, fill_time,
-                               shares=shares, is_dry_run_sim=True)
+    # Routes through open_position_from_pending (2026-08-18 fix), not a
+    # direct open_position() call -- `pb` (from db.get_pending_buys(), a bare
+    # SELECT * with no position_source filter) already carries the real
+    # position_source + drought_* columns needed to dispatch correctly; the
+    # old direct call always defaulted to position_source='core' regardless
+    # of what the pending row actually was. Real, currently-reachable bug
+    # (not hypothetical): 4 real state='dry_run' nodes have
+    # drought_overlay_enabled=1 today (192 SOXL/brokerage, 193 AGQ/brokerage,
+    # 195 USD/brokerage, 212 FAS/soxl_ira) -- a drought entry on any of them
+    # was silently writing a core-tagged open_positions row with NULL
+    # drought_confirm_days/vol_gate/gap_start/vol_pctile, which both
+    # defeated check_drought_handoff's Case B (get_drought_overlay_position
+    # filters on position_source='drought_overlay', so it could never find
+    # this row) and skipped the drought_*_pct_override resolution Fix B
+    # (signals_db.open_position_from_pending/open_drought_overlay_position)
+    # closed for the real (non-dry_run) fill path -- this was the one
+    # remaining consumer still bypassing it. Found by paired review while
+    # verifying Fix B's completeness, same session.
+    opened = db.open_position_from_pending(pb, pb['signal_price'], fill_time, price, fill_time,
+                                            shares=shares, is_dry_run_sim=True)
     db.clear_pending_buy_by_wl_id(node['id'])
     if not opened:
         # Already open for this node (e.g. a prior poll's fill already landed) --
@@ -4342,6 +4360,34 @@ _CONCERNING_RESULT_SUBSTRINGS = (
     "fail", "reject", "mismatch", "tripped", "orphaned", "overspent", "unrecognized_account",
 )
 
+# Gap-2 dedup (2026-08-18): scenario_keys verified, by direct code read of
+# every concerning-result log_coverage_event call site in this module, to
+# ALWAYS route through one shared, unconditionally-attempted (cooldown-
+# throttled, not diversity-throttled) dedicated Slack alert at the exact
+# moment the event is logged -- so a burst of this scenario_key in the
+# catch-up review adds no information the user didn't already get in real
+# time. Real motivating case: ERY/YINN's 2026-08-16 ~13-minute Schwab outage
+# produced 24 near-identical reconciliation_fetch_failed rows, each already
+# covered by _RECONCILE_FETCH_FAIL_ALERTED's own throttled alert (see
+# check_live_state_reconciliation).
+#
+# Deliberately narrow, NOT a general "this scenario_key looks like it has an
+# alert nearby" heuristic: the same audit found several scenario_keys where
+# only SOME of the key's own result values post a dedicated alert and others
+# fall through silently with no Slack notice at all (e.g. addon_leg_merge's
+# "cancel_failed" branch, addon_leg_reconciliation's "cancel_failed" branch,
+# addon_exit_placement's "cancel_failed" branch, orphaned_broker_position's
+# "sweep_failed" exception branch) -- including a key like that here would
+# wrongly de-prioritize what may be a genuine first-notice event with zero
+# other Slack coverage. Only add a key here after confirming EVERY code path
+# that can log it with a concerning result funnels through a shared
+# always-attempted alert helper, the way _alert_reconcile_mismatch does for
+# every reconciliation_mismatch call site.
+_DEDICATED_ALERT_SCENARIO_KEYS = frozenset({
+    "reconciliation_fetch_failed",
+    "reconciliation_mismatch",
+})
+
 # Per-call safety cap on the since_id drain loop below (2026-08-18 rework) --
 # module level (not inline) so tests can monkeypatch it down to exercise the
 # multi-batch drain path cheaply, matching _CONCERNING_RESULT_SUBSTRINGS'
@@ -4369,6 +4415,12 @@ _COVERAGE_EVENT_FETCH_LIMIT = 5000
 #   Coverage-event line worst case ~320 chars/line
 #     (measured 294-316, rounded up for margin):
 #     24,500 / 320 = 76.6 -> rounded down             75 events
+#   Burst-note suffix (2026-08-18, e.g. " (1170x)") adds up to ~8 chars/line
+#     on top of the 320 above (worst case 75 * 328 = 24,600, ~100 over this
+#     sub-budget) -- not re-derived, since grouping only ever REDUCES the
+#     number of lines actually rendered for a given raw-event count, and the
+#     ~100-char overage is still comfortably inside the 500-char safety
+#     margin above.
 _MAX_RENDERED_INCIDENTS = 30
 _MAX_RENDERED_COVERAGE_EVENTS = 75
 _INCIDENT_TITLE_TRUNC = 200
@@ -4377,19 +4429,32 @@ _EVENT_DETAIL_TRUNC = 200
 
 
 def _select_diverse_events(events, cap):
-    """Pick which of `events` (already filtered to concerning-only) to render
-    when there are more than `cap`. A plain newest-N or oldest-N selection can
-    let a single flood (reviewer's real example: 1,009 reconciliation_mismatch
-    rows from one ticker) crowd out every OTHER, possibly more serious, kind
-    of event for the whole render -- regardless of whether the flood landed
-    at the start or end of the window. Instead: walk events newest-first,
-    keep the first (most recent) event seen for each distinct
-    (scenario_key, ticker) pair, then fill any remaining slots with the next
-    most-recent events overall (which may repeat a kind already shown). This
-    guarantees every distinct kind of concerning event gets at least one
-    rendered row before any kind gets a second, while still favoring recency
-    within that constraint. Returned oldest-first, matching the prior
-    contract (chronological render order)."""
+    """Pick which of `events` to render when there are more than `cap`
+    RENDERED LINES worth. A plain newest-N or oldest-N selection can let a
+    single flood (real example, corrected 2026-08-18 -- the original
+    "1,009 reconciliation_mismatch rows" attribution was itself wrong: the
+    actual flood on file is addon_buying_power_drift_check/fetch_failed/
+    ticker='brokerage', 1,170 rows, 2026-08-11) crowd out every OTHER,
+    possibly more serious, kind of event for the whole render -- regardless
+    of whether the flood landed at the start or end of the window. Instead:
+    walk events newest-first, keep the first (most recent) event seen for
+    each distinct (scenario_key, ticker) pair, then fill any remaining slots
+    with the next most-recent events overall (which may repeat a kind
+    already shown). This guarantees every distinct kind of concerning event
+    gets at least one rendered row before any kind gets a second, while
+    still favoring recency within that constraint. Returned oldest-first,
+    matching the prior contract (chronological render order).
+
+    Input contract (2026-08-18, burst-grouping rework): `events` is no longer
+    raw individual coverage_events rows -- callers now pass it
+    _group_event_bursts' OUTPUT, one representative pseudo-event per already-
+    collapsed (scenario_key, ticker, result, mode) group, optionally carrying
+    a '_burst_count' tag. This function's own diversity key, (scenario_key,
+    ticker), is coarser than the grouping key, so it's still meaningful post-
+    grouping (multiple distinct `result` groups on one ticker still compete
+    for the same 'first slot'), just operating one level up from raw events
+    -- `cap` bounds rendered LINES (each worth 1+ raw events), not raw event
+    count."""
     if len(events) <= cap:
         return sorted(events, key=lambda e: e['id'])
     newest_first = sorted(events, key=lambda e: e['id'], reverse=True)
@@ -4405,6 +4470,89 @@ def _select_diverse_events(events, cap):
     if len(selected) < cap:
         selected += rest[:cap - len(selected)]
     return sorted(selected, key=lambda e: e['id'])
+
+
+def _group_event_bursts(events):
+    """Collapse events sharing (scenario_key, ticker, result, mode) into one
+    representative line each -- real shape: a single outage/retry-storm logs
+    many near-identical rows (the 2026-08-16 ERY/YINN ~13-minute outage
+    produced 24 reconciliation_fetch_failed rows, all result=
+    'failed_after_retries', in one batch). Distinct from
+    _DEDICATED_ALERT_SCENARIO_KEYS' full suppression above -- that only
+    covers scenario_keys proven to ALWAYS route through their own dedicated
+    alert; this applies to every OTHER scenario_key too (e.g.
+    addon_leg_merge/addon_leg_reconciliation/addon_exit_placement's
+    "cancel_failed" branches, named in that constant's own comment as
+    lacking a dedicated alert of its own) -- a burst there still deserves
+    exactly ONE rendered line, not N raw duplicates and not zero.
+
+    `result` IS part of the grouping key, not just scenario_key+ticker --
+    found via this rework's own test suite: a coarser (scenario_key, ticker)
+    key silently collapsed 500 events carrying 500 DISTINCT result values
+    (a pre-existing render-cap stress test) into a single misleading line,
+    which would just as easily hide a genuinely different anomaly on the
+    same ticker/scenario behind an unrelated burst's "(Nx)" summary in
+    production.
+
+    `mode` is ALSO part of the key (2026-08-18, paired-review finding) --
+    without it, a real (`mode='live'`) event and a synthetic (`mode='dry_run'`
+    canary/dry_run-sim) event sharing scenario_key/ticker/result collapse
+    into ONE line, and since the representative is the newest of the group,
+    a same-ticker dry_run retry logged after a real anomaly can silently
+    replace the real event's `detail` with the synthetic one's -- confirmed
+    not hypothetical: real same-ticker live+dry_run node pairs exist today
+    (JNUG, SOXL, AGQ, SOXS, GDXU, DPST, KORU across soxl_ira/ira/brokerage),
+    and the live DB already has a concerning-result collision on an
+    otherwise-identical key triple (`pre_action_state_verification`/FAZ/
+    `fetch_failed` spanning both `dry_run` and `live`).
+
+    `node_id` is ALSO part of the key (2026-08-18, paired-review rebuttal
+    round -- found while verifying the `mode` fix above was sufficient, it
+    wasn't) -- two DIFFERENT nodes can share ticker+scenario_key+result+mode
+    when the same ticker runs in more than one account, which this project's
+    account model explicitly allows (many nodes per account, tickers reused
+    across accounts). Confirmed not hypothetical either: FAZ runs as node 148
+    (`ira`, dry_run) alongside nodes 213/215/217/219/221/223 (`soxl_ira`,
+    also dry_run) -- same ticker, same mode, different accounts, so a
+    concerning event on both would collapse into one line and cross-suppress
+    under the cross-cycle cooldown below without this. Only truly identical
+    (scenario_key, ticker, result, mode, node_id) rows collapse. `node_id`
+    can legitimately be None (e.g. a scenario_key logged without node
+    context) -- two None-node_id events with an otherwise-identical key
+    still collapse together, which is correct (there's no finer identity to
+    distinguish them by).
+
+    Keeps the newest event in each group as the representative (matches
+    _select_diverse_events' own newest-first convention, and its `id` is
+    what that function's cap/selection logic sorts on) and tags it with
+    '_burst_count' so the caller can render "(Nx)" and compute an accurate
+    omitted-count. A lone event (no burst) passes through unchanged --
+    '_burst_count' is only present on collapsed groups, never set to 1."""
+    by_key = {}
+    for e in sorted(events, key=lambda e: e['id']):
+        by_key.setdefault(
+            (e.get('scenario_key'), e.get('ticker'), e.get('result'), e.get('mode'), e.get('node_id')),
+            []).append(e)
+    grouped = []
+    for group in by_key.values():
+        if len(group) == 1:
+            grouped.append(group[0])
+        else:
+            newest = dict(group[-1])
+            newest['_burst_count'] = len(group)
+            grouped.append(newest)
+    return grouped
+
+
+def _burst_repeat_key(e):
+    """String form of the same (scenario_key, ticker, result, mode, node_id)
+    tuple _group_event_bursts groups on -- used as a dict key in the
+    persisted intraday-review state (JSON, so a plain string, not the tuple
+    itself)."""
+    return json.dumps([e.get('scenario_key'), e.get('ticker'), e.get('result'), e.get('mode'), e.get('node_id')])
+
+
+_INTRADAY_BURST_REPEAT_COOLDOWN_SECS = 900  # 15 min -- matches _RECONCILE_COOLDOWN_SECS elsewhere
 
 
 def _load_intraday_risk_review_state():
@@ -4481,7 +4629,21 @@ def check_intraday_risk_review(now=None):
     that post fails, the watermark is not saved at all this cycle (see
     _save_intraday_risk_review_state below only being reached after the
     branch), so a genuine post failure still retries the whole batch next
-    time, same safety property the incident side keeps."""
+    time, same safety property the incident side keeps.
+
+    Noise reduction (2026-08-18, closing the 3 gaps found in the
+    2026-08-17-dated backlog item of the same title): (1) fixture-sourced
+    rows (source starts with 'fixture:') are excluded entirely, never
+    counted or rendered -- see the filter's own comment for the NULL-safety
+    trap. (2) same-(scenario_key, ticker) events are grouped into one line
+    each via _group_event_bursts BEFORE the render cap is applied, not just
+    when the cap is hit -- a retry-storm burst under the cap would otherwise
+    still render as N raw duplicate lines. (3) scenario_keys proven (by
+    direct code read of every call site) to always route through their own
+    separately-throttled dedicated alert (_DEDICATED_ALERT_SCENARIO_KEYS)
+    are excluded from the render entirely -- they still count toward the
+    header total, just not repeated here, since their dedicated alert
+    already gave a human-readable account in real time."""
     now = now or datetime.now()
     today = now.strftime('%Y-%m-%d')
     if not _coverage_is_trading_day(today):
@@ -4543,14 +4705,77 @@ def check_intraday_risk_review(now=None):
         cursor_id = max(e['id'] for e in batch)
         if len(batch) < _COVERAGE_EVENT_FETCH_LIMIT:
             break
+    # Fixture-source filter (2026-08-18, gap 1): scripts/stage_check_order_
+    # guard_scenarios.py's deliberate synthetic runs tag their coverage_events
+    # rows source='fixture:stage_check_order_guard_scenarios' -- without this
+    # filter those rows render here as if they were real anomalies, mixed in
+    # with genuine ones. Same NULL-safety trap as scripts/coverage_registry.py
+    # ::compute_status's identical fix (commit 5152043): 9,482 of ~9,534 real
+    # coverage_events rows have source IS NULL (partial rollout, most call
+    # sites don't pass it), so `(e.get('source') or '')` is required -- a bare
+    # `e['source'].startswith(...)` would crash on every NULL row, and a bare
+    # `e['source']` truthiness check done wrong could just as easily exclude
+    # them instead. `or ''` makes a NULL source compare equal to '', which
+    # does not start with 'fixture:', so NULL-source rows are correctly kept.
     new_events = sorted(
         (e for e in all_new_events
-         if any(s in (e.get('result') or '') for s in _CONCERNING_RESULT_SUBSTRINGS)),
+         if any(s in (e.get('result') or '') for s in _CONCERNING_RESULT_SUBSTRINGS)
+         and not (e.get('source') or '').startswith('fixture:')),
         key=lambda e: e['id'])
 
-    if new_incidents or new_events:
+    # Gap 2: split off events whose scenario_key is known to already have its
+    # own dedicated alert (_DEDICATED_ALERT_SCENARIO_KEYS above) -- those still
+    # count toward the header total (so the review isn't silently hiding that
+    # something happened) but are excluded from the diversity-selected render,
+    # since their dedicated alert already gave a human-readable account in
+    # real time and repeating them here adds nothing.
+    already_alerted_events = [e for e in new_events if e.get('scenario_key') in _DEDICATED_ALERT_SCENARIO_KEYS]
+    renderable_events = [e for e in new_events if e.get('scenario_key') not in _DEDICATED_ALERT_SCENARIO_KEYS]
+    # Burst grouping (general case, distinct from the dedicated-alert dedup
+    # above): collapse same-scenario_key+ticker renderable events down to one
+    # line each BEFORE diversity selection, not just when the render cap is
+    # hit -- without this, a burst under the cap (e.g. 24 events with a
+    # 75-event cap) renders as 24 raw duplicate lines, reproducing the exact
+    # noise this function exists to avoid. See _group_event_bursts' docstring.
+    grouped_events = _group_event_bursts(renderable_events)
+
+    # Cross-cycle burst suppression (2026-08-18, paired-review finding):
+    # _group_event_bursts only collapses duplicates WITHIN this one poll
+    # cycle's batch -- a real incident spanning MULTIPLE 5-minute poll cycles
+    # (confirmed against the live DB: a real addon_buying_power_drift_check
+    # storm spanned 51 distinct review-window cycles) would otherwise still
+    # produce one Slack message PER CYCLE it touches, each with its own small
+    # "(Nx)" line -- the exact "N raw duplicates" noise this function exists
+    # to eliminate, just spread across messages instead of within one.
+    # Persisted in the same state file as the id watermarks (not the
+    # in-memory _throttled()/_RECONCILE_ALERTED pattern used elsewhere in
+    # this file) so it survives a daemon restart the same way they do. Keyed
+    # on the SAME tuple _group_event_bursts groups on, via _burst_repeat_key,
+    # so a burst that's still genuinely ongoing re-alerts once per cooldown
+    # window (matching the existing _RECONCILE_COOLDOWN_SECS-throttled-alert
+    # convention elsewhere in this file) rather than going silent forever
+    # after its first mention.
+    burst_last_alerted = state.get('burst_last_alerted', {})
+    now_ts = now.timestamp()
+    fresh_groups, cooling_down_groups = [], []
+    for e in grouped_events:
+        last = burst_last_alerted.get(_burst_repeat_key(e))
+        if last is not None and now_ts - last < _INTRADAY_BURST_REPEAT_COOLDOWN_SECS:
+            cooling_down_groups.append(e)
+        else:
+            fresh_groups.append(e)
+    cooling_down_raw_count = sum(e.get('_burst_count', 1) for e in cooling_down_groups)
+
+    if new_incidents or fresh_groups:
+        already_alerted_note = (
+            f" ({len(already_alerted_events)} already had a dedicated alert)"
+            if already_alerted_events else "")
+        cooling_down_note = (
+            f" ({cooling_down_raw_count} recently reported, still within cooldown)"
+            if cooling_down_raw_count else "")
         lines = [f"🚨 Intraday risk review — {len(new_incidents)} new incident(s), "
-                 f"{len(new_events)} concerning coverage event(s) since last check:"]
+                 f"{len(new_events)} concerning coverage event(s)"
+                 f"{already_alerted_note}{cooling_down_note} since last check:"]
         # Incident render cap (2026-08-18, finding #2) -- newest-first, same
         # direction as the diverse coverage-event selection below, since a
         # real reviewer measurement found 200 real incidents renders to
@@ -4573,11 +4798,21 @@ def check_intraday_risk_review(now=None):
         # flood (any scenario_key/ticker pair) crowd out every other kind of
         # concerning event for the whole render, wherever in the window the
         # flood happens to land. See _select_diverse_events' docstring.
-        rendered = _select_diverse_events(new_events, _MAX_RENDERED_COVERAGE_EVENTS)
+        rendered = _select_diverse_events(fresh_groups, _MAX_RENDERED_COVERAGE_EVENTS)
         for e in rendered:
-            lines.append(f"  [coverage_event #{e['id']}] {e['scenario_key']} result={e['result']} "
+            burst_count = e.get('_burst_count')
+            burst_note = f" ({burst_count}x)" if burst_count else ""
+            lines.append(f"  [coverage_event #{e['id']}] {e['scenario_key']} result={e['result']}{burst_note} "
                          f"{e.get('ticker') or ''} — {(e.get('detail') or '')[:_EVENT_DETAIL_TRUNC]}")
-        events_omitted = len(new_events) - len(rendered)
+        # Omitted count is in raw-event terms (matches the header total),
+        # not grouped-line terms -- a rendered burst line still accounts for
+        # every raw event it collapsed, and a cooling-down line accounts for
+        # its own group's raw count too (already subtracted via
+        # cooling_down_raw_count, see the header note above) -- only the
+        # truly unrendered, non-cooling-down remainder (fresh groups that
+        # didn't make the render cap) counts as omitted here.
+        rendered_raw_count = sum(e.get('_burst_count', 1) for e in rendered)
+        events_omitted = len(renderable_events) - rendered_raw_count - cooling_down_raw_count
         if events_omitted > 0:
             lines.append(f"  ... and {events_omitted} more (see coverage_events directly)")
         channel, ts = _post_message("\n".join(lines))
@@ -4586,6 +4821,13 @@ def check_intraday_risk_review(now=None):
                 state['last_seen_incident_id'] = max(i['id'] for i in new_incidents)
             if all_new_events:
                 state['last_seen_coverage_event_id'] = max(e['id'] for e in all_new_events)
+            # Only start/refresh the cooldown for groups actually SHOWN this
+            # cycle -- a fresh group that didn't make the render cap wasn't
+            # actually communicated, so it must stay eligible to render
+            # immediately next cycle rather than silently entering cooldown.
+            for e in rendered:
+                burst_last_alerted[_burst_repeat_key(e)] = now_ts
+            state['burst_last_alerted'] = burst_last_alerted
     elif all_new_events:
         # Nothing concerning this cycle -- still advance past the full batch
         # so a non-concerning flood can't permanently wedge pagination (the

@@ -226,6 +226,39 @@ def test_drought_pending_buy_fill_opens_a_drought_overlay_position_not_core(env,
     assert signals_db.get_drought_pending_buy(node['id']) is None
 
 
+def test_drought_pending_buy_fill_resolves_pct_overrides_onto_the_real_position(env, fake_broker, monkeypatch):
+    """2026-08-18 fix: the real fill path (this test's own dispatch chain --
+    check_drought_entry -> _reconcile_buy_fill -> open_position_from_pending)
+    used to call open_position() directly for a drought_overlay fill, which
+    never read drought_sl_pct_override/drought_arm_pct_override/
+    drought_trail_pct_override at all -- only paper_trading.py's call to
+    open_drought_overlay_position exercised that resolution logic. Latent
+    (zero live nodes set these columns as of the fix), but sits on the real
+    SL/arm/trailing-stop TRIGGER PERCENTAGE path, not just position sizing.
+    Sets drought_sl_pct_override to a value DISTINCT from the node's own
+    fixed_sl (1.0, from fixed_sl_override in the env fixture) so a silent
+    fall-through to the node's core default would be caught."""
+    monkeypatch.setattr(paper_trading, 'evaluate_drought_entry', lambda node, paper=False: dict(_DECISION))
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET drought_sl_pct_override=2.5 WHERE ticker=?", (TICKER,))
+        c.commit()
+    fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    node = _node()
+    assert node['fixed_sl'] == 1.0  # sanity: override is distinct from the node's own default
+    signals_notify.check_drought_entry(node)
+    orders = _real_orders(fake_broker, TICKER, side='BUY')
+    order_id = orders[0]['orderId']
+
+    fake_broker.force_fill(order_id, price=50.5)
+    signals_notify._reconcile_buy_fill(TICKER, 50.5, 100, wl_id=node['id'])
+
+    pos = signals_db.get_open_position(TICKER)
+    assert pos is not None
+    assert pos['position_source'] == 'drought_overlay'
+    assert pos['fixed_sl'] == 2.5, "drought_sl_pct_override was not resolved onto the real fill's SL trigger"
+
+
 def test_drought_entry_places_real_market_buy_for_trailingexit_node(env, fake_broker, monkeypatch):
     """Market-buy variant of the trailing-buy test above -- notify_drought_
     buy_signal dispatches on db._is_trailing_buy(node), so a TrailingExitZScoreBreakout

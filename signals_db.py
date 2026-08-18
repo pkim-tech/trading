@@ -3510,7 +3510,8 @@ def get_held_tickers():
 _PENDING_BUY_NODE_KEYS = ('id', 'ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
                           'max_hold_hours', 'label', 'trail_sell_pct', 'fixed_sl', 'trail_buy_pct',
                           'arm_sell_pct', 'account', 'starting_notional', 'starting_notional_override',
-                          'state')
+                          'state', 'drought_sl_pct_override', 'drought_arm_pct_override',
+                          'drought_trail_pct_override')
 
 
 def add_pending_buy(node, sig, channel, ts, order_id=None, position_source='core',
@@ -4135,13 +4136,29 @@ def open_position_from_pending(pending, signal_price, signal_time, entry_price, 
     must not assume signal_time == entry_time."""
     node = pending['node']
     if pending.get('position_source') == 'drought_overlay':
-        return open_position(
-            node, signal_price, signal_time, entry_price, entry_time, shares=shares, paper=paper,
-            is_dry_run_sim=is_dry_run_sim, position_source='drought_overlay',
-            drought_confirm_days=pending.get('drought_confirm_days'),
-            drought_vol_gate=pending.get('drought_vol_gate'),
-            drought_gap_start=pending.get('drought_gap_start'),
-            drought_vol_pctile=pending.get('drought_vol_pctile'),
+        # Routes through open_drought_overlay_position (2026-08-18 fix), not a
+        # direct open_position() call -- that wrapper is what actually resolves
+        # node's drought_sl_pct_override/drought_arm_pct_override/
+        # drought_trail_pct_override columns onto the position's real SL/arm/
+        # trail trigger percentages (see its own docstring's resolution-order
+        # paragraph). Before this fix, the real fill path (this function, the
+        # ONLY consumer of it for real/dry_run accounts) called open_position()
+        # directly and those override columns were silently never read -- only
+        # paper_trading.py exercised the resolution logic. Latent as of the fix
+        # (verified: zero live nodes set any of the three columns), but sits on
+        # the SL/arm/trailing-stop TRIGGER PERCENTAGE path, not just sizing --
+        # found 2026-08-18 during the RETL top-up sizing-bug paired review,
+        # which caught the identical missing-tuple-field shape on
+        # _PENDING_BUY_NODE_KEYS above (now also fixed to carry the 3 override
+        # columns forward from add_pending_buy time, since node here is the
+        # FROZEN pending_buys.node_json snapshot, not a fresh watch_list read).
+        return open_drought_overlay_position(
+            node, signal_price, signal_time, entry_price, entry_time,
+            confirm_days=pending.get('drought_confirm_days'),
+            vol_gate=pending.get('drought_vol_gate'),
+            gap_start=pending.get('drought_gap_start'),
+            vol_pctile=pending.get('drought_vol_pctile'),
+            shares=shares, paper=paper, is_dry_run_sim=is_dry_run_sim,
         )
     return open_position(node, signal_price, signal_time, entry_price, entry_time, shares=shares,
                           paper=paper, is_dry_run_sim=is_dry_run_sim)

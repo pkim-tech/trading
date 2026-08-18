@@ -65,6 +65,31 @@ here.
    it's a live trading window. This applies to what the RECEIVING session
    might spawn, not just what you're spawning directly.
 
+7. **Track the dispatch with `TaskCreate`/`TaskUpdate`, not a hand-rolled
+   status file.** Built 2026-08-18 after a real incident: a session built a
+   real fix (fixture filter + dedup for `check_intraday_risk_review`) fully
+   passing tests, then ended (context/session boundary) before reaching
+   review or commit — with zero trace anywhere of what was done, whether it
+   was reviewed, or that it was even in progress. The next session had to
+   reverse-engineer the status from git forensics (mtimes, reflog, diff
+   content referencing a later commit hash) instead of just reading it. Two
+   file-based fixes were considered and rejected: a gitignored file in the
+   main tree doesn't help (worktree-isolated work is a separate checkout),
+   and a committed shared-path status file guarantees merge conflicts on top
+   of the real ones (two worktrees already collided on `signals_notify.py`
+   itself once, see `docs/conversation_summary.md`'s 2026-08-17 entry).
+   **Use the harness's own `TaskCreate` instead** — it's not a repo file, so
+   it can't merge-conflict, doesn't need a worktree path looked up to find
+   it, and already has the right shape: `description` holds the plan/scope
+   (files touched, whether the review-gate applies), `status`
+   (`pending`/`in_progress`/`completed`) tracks real progress instead of
+   prose that goes stale, and `metadata` can record
+   `review_status`/`reviewed_by` explicitly. Create the task before
+   dispatching, update its status/metadata as the peer's work progresses
+   (built → tested → reviewed → committed), and only mark `completed` once
+   the CLAUDE.md review-gate (item 2 above) has actually been satisfied —
+   never mark a task `completed` with a paired review still outstanding.
+
 ## Checking in on a stalled queue
 
 If a peer session goes idle with items still outstanding (confirm via
@@ -72,7 +97,9 @@ If a peer session goes idle with items still outstanding (confirm via
 — don't trust an idle status alone as evidence nothing happened), ask directly
 whether the queue was received and what's blocking it, rather than re-sending
 the same items cold. Restate the priority order in the check-in — don't make
-the peer re-derive it from scrollback.
+the peer re-derive it from scrollback. **Also check `TaskList`/`TaskGet`
+first** — the dispatched task's status/metadata may already answer "what's
+the status" without needing a round-trip.
 
 ## What NOT to do
 
