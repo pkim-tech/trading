@@ -1005,16 +1005,27 @@ REGISTRY = [
          code_path="active_signals.py run_loop exit-check branch (cp is None, trading-hours gate) -> "
                     "signals_notify.alert_stale_price_exit_suppressed",
          offline_coverage="tests/test_stale_price_exit_alert.py (3 tests: alert fires, 15-min "
-                           "per-position cooldown, cooldown keyed per position not shared)",
+                           "per-position cooldown, cooldown keyed per position not shared); "
+                           "tests/test_incident_alert_gate.py (3 more: coverage_snoozes lever "
+                           "suppresses BOTH the event row and the alert, a non-matching snooze "
+                           "scope still fires, an expired snooze resumes firing -- added "
+                           "2026-08-17 with the snooze check itself)",
          check_mechanism='coverage_events', scenario_key='stale_price_exit_check_skipped',
+         bad_results=['skipped_snoozed'],
          notes="Added 2026-08-17 alongside the coverage_events wiring itself (the Slack alert existed "
                "since the 2026-07-22 HIBL stale-cache incident with no coverage_events trace at all, "
-               "so a persistent data outage left no queryable record). The log call is deliberately "
-               "UNCONDITIONAL -- ahead of the alert's own 15-min throttle -- per should_alert_live's "
-               "contract that suppression only costs real-time visibility, never the record. Only "
-               "result value is 'skipped'; there is no success counterpart (a normal poll simply "
-               "doesn't reach this branch), so this row reads 'has a real stale-data outage happened "
-               "on a real position yet', not a pass/fail health check."),
+               "so a persistent data outage left no queryable record). The log call is UNCONDITIONAL "
+               "-- ahead of the alert's own 15-min throttle -- per should_alert_live's contract that "
+               "suppression only costs real-time visibility, never the record. A coverage_snoozes "
+               "row (added same day) suppresses only the Slack alert; the event is still written, "
+               "tagged result='skipped_snoozed' and listed in bad_results so an acknowledged "
+               "condition stops inflating this row's counts without erasing the record that a real "
+               "position really did go unmonitored for that poll. This deliberately diverges from "
+               "reconciliation_mismatch, where a snooze skips the row entirely -- there a snooze "
+               "acknowledges a known FALSE POSITIVE, here it acknowledges something genuinely true. "
+               "Otherwise the only result value is 'skipped'; there is no success counterpart (a "
+               "normal poll simply doesn't reach this branch), so this row reads 'has a real "
+               "stale-data outage happened on a real position yet', not a pass/fail health check."),
     dict(id='price_discontinuity_ruled_out',
          scenario="A price ratio matching a known split factor is checked against a REAL confirmed "
                   "split (yfinance) and genuinely ruled out -- SL/TP/TIME checks proceed normally "

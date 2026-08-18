@@ -85,7 +85,7 @@ def _attempt_automated_buy(node, sizing):
         db.log_coverage_event("automated_buy_execution", _coverage_mode(account), ticker=ticker,
                                node_id=node.get('id'), result="failed_unexpectedly", detail=str(e))
         _post_message(f"⚠️ {ticker} automated order placement failed unexpectedly: {e} — falling back to manual",
-                       node_id=node.get('id'), incident=True)
+                       node_id=node.get('id'), incident=True, node=node)
         return False, None
     return True, order_id
 
@@ -172,11 +172,11 @@ def _attempt_automated_sell(pos, current_price):
             _post_message(
                 f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — {price_note}\n"
                 f"(auto trailing-sell replace of stop-loss {sl_order_id} failed: {e})",
-                node_id=pos.get('wl_id'), incident=True,
+                node_id=pos.get('wl_id'), incident=True, pos=pos,
             )
         elif not isinstance(e, schwab_safety.SafetyViolation):
             _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual",
-                           node_id=pos.get('wl_id'), incident=True)
+                           node_id=pos.get('wl_id'), incident=True, pos=pos)
         return False, None
     db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed",
@@ -387,11 +387,11 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
             _post_message(
                 f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — {price_note}\n"
                 f"(auto {reason} exit replace of {resting_order_label} {resting_order_id} failed: {e})",
-                node_id=pos.get('wl_id'), incident=True,
+                node_id=pos.get('wl_id'), incident=True, pos=pos,
             )
         elif not isinstance(e, schwab_safety.SafetyViolation):
             _post_message(f"⚠️ {ticker} automated {reason} exit placement failed unexpectedly: {e} — falling back to manual",
-                           node_id=pos.get('wl_id'), incident=True)
+                           node_id=pos.get('wl_id'), incident=True, pos=pos)
         return None
     db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed", detail=f"reason={reason} shares={shares}")
@@ -591,7 +591,7 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
             f"ℹ️ *{ticker}* ({account} · {mode_tag(account, node)}) — replacing a MANUALLY-placed {label} "
             f"order ({resting_order_id}) with the algo's own exit\n(this position was reconciled by hand; "
             f"the replace is expected, but the manual order is now gone)",
-            node_id=node.get('id'), incident=True,
+            node_id=node.get('id'), incident=True, pos=pos,
         )
 
     orders = schwab_safety._open_orders(account)
@@ -626,7 +626,7 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — the recorded {label} order "
                 f"{resting_order_id} is NOT resting, but another stop ({_substitute.get('orderId')}) is\n"
                 f"(our order id is stale — verifying against the substitute; the replace proceeds)",
-                node_id=node.get('id'), incident=True,
+                node_id=node.get('id'), incident=True, pos=pos,
             )
             match = _substitute
 
@@ -640,7 +640,7 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
             f"{resting_order_id}, but that order is NOT resting at the broker right now "
             f"(it may have already filled or been cancelled)\n(proceeding with the replace anyway so "
             f"the exit isn't stranded — verify the position's real state after)",
-            node_id=node.get('id'), incident=True,
+            node_id=node.get('id'), incident=True, pos=pos,
         )
         return
 
@@ -670,7 +670,7 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
                 f"position's stop-loss ({resting_order_id}) is a {_type}, not a stop\n"
                 f"(this is what an accidental manual limit-sell looks like — the replace proceeds, but "
                 f"verify what that order actually was)",
-                node_id=node.get('id'), incident=True,
+                node_id=node.get('id'), incident=True, pos=pos,
             )
         _expected_stop = _expected_sl_price(pos)
         _real_stop = match.get('stopPrice')
@@ -686,7 +686,7 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
                 f"at ${float(_real_stop):.4f} but the algo's own stop for this position is "
                 f"${_expected_stop:.4f}\n(it was not protecting where the algo believed — the replace "
                 f"proceeds and corrects it; verify whether it was placed or edited by hand)",
-                node_id=node.get('id'), incident=True,
+                node_id=node.get('id'), incident=True, pos=pos,
             )
 
     real_qty = _resting_order_quantity(match)
@@ -700,7 +700,7 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
             f"{float(real_qty):g} shares but the position holds {expected_shares:g}\n"
             f"(proceeding with the replace, which will be sized to {expected_shares:g} — verify no "
             f"unexpected fill or manual trade explains the gap)",
-            node_id=node.get('id'), incident=True,
+            node_id=node.get('id'), incident=True, pos=pos,
         )
 
 
@@ -732,7 +732,7 @@ def _alert_reconcile_mismatch(pos, kind, text):
     )
     if not _throttled(_RECONCILE_ALERTED, f"{pos['id']}:{kind}", _RECONCILE_COOLDOWN_SECS):
         return True
-    _post_message(text, node_id=pos.get('wl_id'), incident=True)
+    _post_message(text, node_id=pos.get('wl_id'), incident=True, pos=pos)
     return True
 
 
@@ -749,9 +749,30 @@ def alert_stale_price_exit_suppressed(pos):
     position at all for this poll (backlog item, HIBL incident writeup: a
     real position's stale-guard suppression previously produced only a
     `log_poll` trace line, no Slack alert). Rate-limited per position so a
-    persistent same-day data outage doesn't repost every poll cycle."""
+    persistent same-day data outage doesn't repost every poll cycle.
+
+    Checked against coverage_snoozes (2026-08-17): without it a known,
+    human-acknowledged persistent stale-data condition had no snooze lever at
+    all, so it kept inflating this scenario's daily/all-time counts on the
+    accountability grid with a condition someone had already explained. Snoozes
+    are time-bounded by design (is_snoozed compares against
+    datetime('now','localtime')), so one can't silently persist -- it expires
+    and resumes alerting rather than silencing the scenario forever.
+
+    DELIBERATELY DIVERGES from _alert_reconcile_mismatch, which skips its
+    coverage_events row entirely while snoozed: there, a snooze acknowledges a
+    known FALSE POSITIVE, so suppressing the record loses nothing. Here the
+    event records something that genuinely happened -- a real position went
+    unmonitored for that poll -- and dropping it would leave only the log_poll
+    trace, while also contradicting the unconditional-logging contract stated
+    just below. So the row is still written, tagged result='skipped_snoozed'
+    so the Grid can exclude it from its counts (scripts/coverage_registry.py's
+    bad_results for this row); only the Slack alert is suppressed (both
+    reviewers, rebuttal round, 2026-08-17)."""
     ticker = pos['ticker']
     account = pos.get('account')
+    _snoozed = db.is_snoozed("stale_price_exit_check_skipped", ticker=ticker,
+                              account=account, node_id=pos.get('wl_id'))
     node = db.get_watch_list_node_by_id(pos.get('wl_id'))
     # Logged BEFORE the throttle check, deliberately -- should_alert_live's own
     # docstring requires every caller's coverage_events/log_incident call to
@@ -761,14 +782,17 @@ def alert_stale_price_exit_suppressed(pos):
     # (15-min-cooldown) alert itself. Matches _alert_reconcile_mismatch's own
     # ordering (paired review finding, 2026-08-17).
     db.log_coverage_event("stale_price_exit_check_skipped", _coverage_mode(account), ticker=ticker,
-                           position_id=pos.get('id'), node_id=pos.get('wl_id'), result="skipped")
+                           position_id=pos.get('id'), node_id=pos.get('wl_id'),
+                           result="skipped_snoozed" if _snoozed else "skipped")
+    if _snoozed:
+        return
     if not _throttled(_STALE_PRICE_ALERTED, str(pos['id']), _STALE_PRICE_COOLDOWN_SECS):
         return
     _post_message(
         f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) exit check skipped this poll — no fresh price available\n"
         f"(`_current_price` returned None: stale/missing same-day data; position remains open, "
         f"unmonitored until the next successful refresh)",
-        node_id=pos.get('wl_id'), incident=True,
+        node_id=pos.get('wl_id'), incident=True, pos=pos,
     )
 
 
@@ -1250,7 +1274,7 @@ def _attempt_automated_market_buy(node, sizing):
         db.log_coverage_event("automated_buy_execution", _coverage_mode(account), ticker=ticker,
                                node_id=node.get('id'), result="failed_unexpectedly", detail=str(e))
         _post_message(f"⚠️ {ticker} automated market-buy placement failed unexpectedly: {e} — falling back to manual",
-                       node_id=node.get('id'), incident=True)
+                       node_id=node.get('id'), incident=True, node=node)
         return False, None
     return True, order_id
 
@@ -1325,7 +1349,7 @@ def _place_stop_loss_for_position(node, ticker, source='daemon'):
         _post_message(
             f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — place stop-loss SELL {shares} @ ~${stop_price:.2f}\n"
             f"(stop-loss placement blocked: {e})",
-            node_id=node.get('id'), incident=True,
+            node_id=node.get('id'), incident=True, pos=pos,
         )
         return
     except Exception as e:
@@ -1405,7 +1429,7 @@ def _place_stop_loss_for_position(node, ticker, source='daemon'):
                     f"🤖 *{ticker}* ({account} · {mode_tag(account, node)}) SL already breached by the time it could be "
                     f"placed — market SELL {shares} submitted @ ~${current_price:.2f} instead "
                     f"(target stop was ${stop_price:.2f})",
-                    node_id=node.get('id'), incident=True,
+                    node_id=node.get('id'), incident=True, pos=pos,
                 )
                 return
             try:
@@ -1445,7 +1469,7 @@ def _place_stop_loss_for_position(node, ticker, source='daemon'):
         _post_message(
             f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — place stop-loss SELL {shares} @ ~${stop_price:.2f}\n"
             f"(stop-loss placement failed after {_SL_PLACEMENT_RETRY_ATTEMPTS} attempts: {last_error})",
-            node_id=node.get('id'), incident=True,
+            node_id=node.get('id'), incident=True, pos=pos,
         )
         return
     db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
@@ -1490,7 +1514,7 @@ def _sync_confirm_and_protect(ticker, node, order_id=None):
                       f"{_SL_FAST_CONFIRM_ATTEMPTS * _SL_FAST_CONFIRM_INTERVAL_SECS}s — position may be "
                       f"temporarily UNPROTECTED (no stop-loss resting). Will be placed once the fill is "
                       f"confirmed by the auto-fill poll or account-activity stream.",
-                      node_id=node.get('id'), incident=True)
+                      node_id=node.get('id'), incident=True, node=node)
         return
     _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'], account=account)
 
@@ -1869,7 +1893,7 @@ def check_market_buy_rejected():
                                   f"{order_id}'s status has been unconfirmable for over "
                                   f"{_MARKET_BUY_UNKNOWN_ALERT_AFTER_SECS // 60}min (unrecognized account or "
                                   f"order too old to look up) — verify manually at the broker.",
-                                  node_id=wl_id, incident=True)
+                                  node_id=wl_id, incident=True, node=node, real_order=True)
             continue
         _MARKET_BUY_STATUS_UNKNOWN_SINCE.pop(wl_id, None)
 
@@ -1885,7 +1909,7 @@ def check_market_buy_rejected():
                           f"{order_id} was {status} by Schwab AFTER partially executing "
                           f"{executed:g} shares — tracking PRESERVED, no auto-clear. Verify the real "
                           f"position at the broker and reconcile manually (a protective stop may be "
-                          f"needed).", node_id=wl_id, incident=True)
+                          f"needed).", node_id=wl_id, incident=True, node=node, real_order=True)
             continue
 
         db.clear_pending_buy_by_wl_id(wl_id)
@@ -1894,7 +1918,7 @@ def check_market_buy_rejected():
         _post_message(f"\U0001F6AB *{ticker}* ({account} · {mode_tag(account, node)}) — market-buy order "
                       f"{order_id} was {status} by Schwab, not resting — pending tracking cleared, no "
                       f"position resulted. Verify at the broker if this was unexpected.",
-                      node_id=wl_id, incident=True)
+                      node_id=wl_id, incident=True, node=node, real_order=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1990,6 +2014,17 @@ def _fill_dry_run_buy(node, pb, price):
     db.log_coverage_event("entry_fill", "dry_run", ticker=ticker, node_id=node.get('id'),
                            result="sim_filled", detail=f"shares={shares} price={price:.4f}")
     label = "TRAILING BUY" if trailing_buy else "MARKET BUY"
+    # DELIBERATELY INERT: node_id with no incident=True means _post_message's
+    # gate falls to should_alert_live. Genuinely unreachable here: this
+    # function's only callers (update_dry_run_buys) re-check
+    # _effectively_dry_run against a freshly-read node every poll, and
+    # effectively_dry_run being False is a precondition of
+    # has_capital_at_stake, so should_alert_live can never be True on this
+    # path. Never posts, by design (2026-08-08: dry_run chatter must never
+    # alert live). The log_slack_message('suppressed') row is the only
+    # artifact -- _post_message has NO console branch, so a suppressed
+    # message prints nothing anywhere. Do NOT "fix" this into firing by
+    # adding incident=True.
     _post_message(f"[DRY RUN] would have filled {label} — {ticker}  {shares}sh @ ${price:.4f}", node_id=node.get('id'))
 
 
@@ -2026,6 +2061,18 @@ def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
             pos, cp, datetime.now(), at_bar_close=at_bar_close, low=low, high=high, open_price=op,
             df_hourly=df_hourly)
         if just_activated_trailing:
+            # DELIBERATELY INERT IN PRACTICE: node_id with no incident=True means
+            # _post_message's gate falls to should_alert_live, which is gated on
+            # the NODE's current state -- and the loop above selects on the
+            # POSITION's is_dry_run_sim without constraining that. So this is
+            # suppressed for every realistic case but is NOT a hard invariant:
+            # a canary node later promoted to live at >= the capital-at-stake
+            # threshold with a stale sim position still open would make
+            # should_alert_live True and post this for real (rebuttal round,
+            # 2026-08-17 -- an earlier version of this comment wrongly asserted
+            # it could never fire). Intended to stay silent (2026-08-08:
+            # dry_run chatter must never alert live). Do NOT "fix" this into
+            # firing by adding incident=True.
             _post_message(f"[DRY RUN] trailing-sell would arm — {ticker}", node_id=pos.get('wl_id'))
         if reason:
             # exit_bar_time passed directly (not via trail_state's exit_decision_bar
@@ -2036,6 +2083,18 @@ def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
                                exit_time=datetime.now(), exit_reason=reason, exit_bar_time=last_bar_ts)
             db.log_coverage_event("exit_fill", "dry_run", ticker=ticker, position_id=pos['id'],
                                    node_id=pos.get('wl_id'), result=reason, detail=f"price={target:.4f}")
+            # DELIBERATELY INERT IN PRACTICE: node_id with no incident=True means
+            # _post_message's gate falls to should_alert_live, which is gated on
+            # the NODE's current state -- and the loop above selects on the
+            # POSITION's is_dry_run_sim without constraining that. So this is
+            # suppressed for every realistic case but is NOT a hard invariant:
+            # a canary node later promoted to live at >= the capital-at-stake
+            # threshold with a stale sim position still open would make
+            # should_alert_live True and post this for real (rebuttal round,
+            # 2026-08-17 -- an earlier version of this comment wrongly asserted
+            # it could never fire). Intended to stay silent (2026-08-08:
+            # dry_run chatter must never alert live). Do NOT "fix" this into
+            # firing by adding incident=True.
             _post_message(f"[DRY RUN] would have closed — {ticker}  {reason} @ ${target:.4f}", node_id=pos.get('wl_id'))
             dry_run_sell_alerted.add((pos['id'], last_bar_ts))
             try:
@@ -2327,7 +2386,7 @@ def check_drought_handoff(node):
             _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — core signal fired again but "
                           f"the resting drought entry order has no broker id on file (placed manually) — "
                           f"cannot auto-cancel. Cancel it manually if still resting.",
-                          node_id=wl_id, incident=True)
+                          node_id=wl_id, incident=True, node=node)
             return
         if order_id and limits is not None and not _effectively_dry_run(account, node):
             try:
@@ -2337,7 +2396,7 @@ def check_drought_handoff(node):
                                        result="cancel_failed", detail=str(e))
                 _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — drought HANDOFF cancel "
                               f"request failed ({e}) — resting order may still be live, verify manually.",
-                              node_id=wl_id, incident=True)
+                              node_id=wl_id, incident=True, node=node)
                 return
             if status == 'FILLED':
                 # Raced a real fill landing the instant we tried to cancel --
@@ -2350,7 +2409,7 @@ def check_drought_handoff(node):
                     _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — drought HANDOFF cancel "
                                   f"found status FILLED but the fill lookup itself failed — verify and "
                                   f"reconcile manually.",
-                                  node_id=wl_id, incident=True)
+                                  node_id=wl_id, incident=True, node=node)
                     return
                 _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=wl_id, account=account)
                 pos = db.get_drought_overlay_position(wl_id, paper=False)
@@ -2396,7 +2455,7 @@ def check_drought_handoff(node):
         _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — core signal fired again but the "
                       f"real drought HANDOFF exit order could not be placed automatically — verify and "
                       f"close the drought position manually.",
-                      node_id=wl_id, incident=True)
+                      node_id=wl_id, incident=True, pos=pos)
         return
     # The DB row must NOT close until the fill is confirmed -- follow
     # notify_sell_signal's own poll pattern. Only close on a confirmed fill;
@@ -2836,7 +2895,7 @@ def check_addon_trigger_real(pos, current_price):
                                detail=f"account={account!r}")
         _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — add-on skipped: "
                       f"'{account}' is not margin-capable",
-                      node_id=pos.get('wl_id'), incident=True)
+                      node_id=pos.get('wl_id'), incident=True, pos=pos)
         return
     shares = int(pos['shares'])
     if shares < 1:
@@ -2868,7 +2927,7 @@ def check_addon_trigger_real(pos, current_price):
                                node_id=pos.get('wl_id'), result="failed_unexpectedly", detail=str(e))
         _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — add-on leg placement failed "
                       f"unexpectedly: {e}",
-                      node_id=pos.get('wl_id'), incident=True)
+                      node_id=pos.get('wl_id'), incident=True, pos=pos)
         return
     if order_id is None:
         # dry_run ACCOUNT (distinct from is_dry_run_sim above, which is a
@@ -2923,7 +2982,7 @@ def check_addon_trigger_real(pos, current_price):
         # earlier tonight.
         _post_message(f"⏱️ *{ticker}* ({account} · {mode_tag(account, node)}) — add-on leg order placed but not "
                       f"yet confirmed filled — check_addon_leg_reconciliation will retry.",
-                      node_id=pos.get('wl_id'), incident=True)
+                      node_id=pos.get('wl_id'), incident=True, pos=pos)
         return
     db.set_addon_leg_entry_filled(leg_id, filled['price'])
     db.log_coverage_event("addon_entry_fill", _mode, ticker=ticker, position_id=pos.get('id'),
@@ -2965,7 +3024,7 @@ def _place_stop_loss_for_addon_leg(leg_id, parent_pos, node):
         _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) ADD-ON LEG UNPROTECTED — "
                       f"stop-loss placement failed: {e} (place a stop-loss SELL {int(leg['shares'])} shares "
                       f"@ ~${stop_price:.2f} manually)",
-                      node_id=parent_pos.get('wl_id'), incident=True)
+                      node_id=parent_pos.get('wl_id'), incident=True, pos=parent_pos)
         return
     # order_id is None for a genuine dry_run account (schwab_client already
     # ran every real guard and only short-circuited the broker call, same
@@ -3065,7 +3124,7 @@ def check_addon_leg_reconciliation(open_positions):
             _post_message(f"⏱️ *{ticker}* ({account} · {mode_tag(account, _leg_node)}) — add-on leg entry order "
                           f"({leg['id']}) never filled past {_ADDON_LEG_ENTRY_TIMEOUT_MINUTES}min — {_cancel_note}, "
                           f"marked abandoned. Never sold shares never bought.",
-                          node_id=leg.get('wl_id'), incident=not did_cancel)
+                          node_id=leg.get('wl_id'), incident=not did_cancel, node=_leg_node)
             continue
 
         # Same gap check_sl_order_fills exists to close for the core
@@ -3098,7 +3157,7 @@ def check_addon_leg_reconciliation(open_positions):
                 _post_message(f"🤖 *{ticker}* ({account} · {mode_tag(account, _leg_node)}) — add-on leg "
                               f"({leg['id']}) protective stop filled at ${fill['price']:.4f}, closed via "
                               f"reconciliation poll",
-                              node_id=leg.get('wl_id'), incident=True)
+                              node_id=leg.get('wl_id'), incident=True, node=_leg_node)
                 continue
 
         # A real exit SELL was placed (close_addon_leg_real_if_open) but
@@ -3131,7 +3190,7 @@ def check_addon_leg_reconciliation(open_positions):
                 _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account, _leg_node)}) — add-on leg ({leg['id']}) "
                               f"is still open but its parent core position has already closed — the real "
                               f"lockstep close was missed. Verify and close the leg manually; NOT auto-closed.",
-                              node_id=leg.get('wl_id'), incident=True)
+                              node_id=leg.get('wl_id'), incident=True, node=_leg_node)
 
 
 def close_addon_leg_real_if_open(pos, exit_price, exit_reason, exit_time):
@@ -3165,7 +3224,7 @@ def close_addon_leg_real_if_open(pos, exit_price, exit_reason, exit_time):
             _post_message(f"⚠️ *{ticker}* ({account!r}) — add-on leg ({leg['id']}) core position closed but "
                           f"the account isn't recognized — cannot determine whether a real entry order needs "
                           f"cancelling. Verify manually.",
-                          node_id=leg.get('wl_id'), incident=True)
+                          node_id=leg.get('wl_id'), incident=True, pos=pos)
             return
         if order_id and not _effectively_dry_run(account, node):
             try:
@@ -3220,7 +3279,7 @@ def close_addon_leg_real_if_open(pos, exit_price, exit_reason, exit_time):
                                result="failed", detail=f"leg_id={leg['id']}: {e}")
         _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) — add-on leg ({leg['id']}) exit SELL "
                       f"failed: {e} — verify and close manually.",
-                      node_id=leg.get('wl_id'), incident=True)
+                      node_id=leg.get('wl_id'), incident=True, pos=pos)
         return
     if order_id is None:
         # dry_run account (or an is_dry_run_sim leg, which is always on a
@@ -3573,7 +3632,7 @@ def check_sl_order_fills(open_positions):
                 f"⚠️ *{ticker}* ({account}) SL/TRAIL order {sl_order_id} filled for "
                 f"{fill['quantity']} shares but open_positions tracks {pos['shares']} -- "
                 f"not auto-closing, needs manual reconciliation",
-                node_id=pos.get('wl_id'), incident=True,
+                node_id=pos.get('wl_id'), incident=True, pos=pos,
             )
             db.log_coverage_event("automated_exit_confirmed", _coverage_mode(account), ticker=ticker,
                                   position_id=pos.get('id'), node_id=pos.get('wl_id'), result="qty_mismatch",
@@ -4458,7 +4517,7 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                                        node_id=node.get('id'), result="blocked", detail=str(e), source=source)
                 _post_message(f"🚫 {ticker} — top-up buy of {top_up_shares} shares blocked: {e} "
                               f"(position stays under target notional by ${delta:,.0f})",
-                              node_id=node.get('id'), incident=True)
+                              node_id=node.get('id'), incident=True, node=node)
                 return
             except Exception as e:
                 db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
@@ -4466,7 +4525,7 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                 _post_message(f"⚠️ {ticker} — top-up buy of {top_up_shares} shares failed "
                               f"unexpectedly: {e} (position stays under target notional by "
                               f"${delta:,.0f})",
-                              node_id=node.get('id'), incident=True)
+                              node_id=node.get('id'), incident=True, node=node)
                 return
             top_up_price = fill_price
             top_up_confirmed = False
@@ -4543,14 +4602,14 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
                     f"at the broker, but the position record could not be updated (no matching open "
                     f"position for this node) — open_positions.shares is now UNDERSTATED, SL/trailing-sell "
                     f"sizing will be wrong until this is corrected manually.",
-                    node_id=node.get('id'), incident=True,
+                    node_id=node.get('id'), incident=True, node=node,
                 )
     elif delta < -fill_price:
         db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
                                node_id=node.get('id'), result="overspent_no_corrective_sell", detail=f"overspend=${-delta:,.0f}", source=source)
         _post_message(f"⚠️ {ticker} — fill exceeded target notional by ${-delta:,.0f} "
                       f"(no corrective sell placed)",
-                      node_id=node.get('id'), incident=True)
+                      node_id=node.get('id'), incident=True, node=node)
 
 
 def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=False, wl_id=None, account=None):
@@ -4761,7 +4820,7 @@ def check_gap_resize():
             db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                    node_id=node.get('id'), result="price_lookup_failed", detail=str(e))
             _post_message(f"⚠️ {ticker} gap-check price lookup failed: {e}",
-                          node_id=node.get('id'), incident=True)
+                          node_id=node.get('id'), incident=True, node=node)
             continue
         if current_price < buy_trigger:
             continue
@@ -4797,20 +4856,20 @@ def check_gap_resize():
             db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                    node_id=node.get('id'), result="blocked", detail=str(e))
             _post_message(f"🚫 {ticker} gap-correction MARKET order blocked: {e}",
-                          node_id=node.get('id'), incident=True)
+                          node_id=node.get('id'), incident=True, node=node)
             continue
         except schwab_client.OrderRejected as e:
             db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                    node_id=node.get('id'), result="rejected", detail=str(e))
             _post_message(f"🚫 {ticker} gap-correction MARKET order was rejected by Schwab: {e}",
-                          node_id=node.get('id'), incident=True)
+                          node_id=node.get('id'), incident=True, node=node)
             db.clear_pending_buy_by_wl_id(node['id'])
             continue
         except Exception as e:
             db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                    node_id=node.get('id'), result="replace_failed", detail=str(e))
             _post_message(f"⚠️ {ticker} gap-correction replace failed: {e} — leaving resting order/pending row as-is",
-                          node_id=node.get('id'), incident=True)
+                          node_id=node.get('id'), incident=True, node=node)
             continue
         db.log_coverage_event("gap_resize", _coverage_mode(account), ticker=ticker,
                                node_id=node.get('id'), result="replaced", detail=f"shares={shares} price={current_price:.4f}")
@@ -4829,7 +4888,7 @@ def check_gap_resize():
             _post_message(f"⚠️ {ticker} gap-correction order placed but fill not confirmed after "
                           f"{_GAP_FILL_POLL_ATTEMPTS * _GAP_FILL_POLL_INTERVAL_SECS}s — "
                           f"will be caught by the next check_auto_fills poll",
-                          node_id=node.get('id'), incident=True)
+                          node_id=node.get('id'), incident=True, node=node)
             continue
 
         _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], is_gap_correction=True, wl_id=node['id'], account=account)
