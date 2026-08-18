@@ -303,8 +303,9 @@ def check_starting_notional_within_account_notional_cap():
 
 
 def check_open_position_config_matches_live_node():
-    """An open position's snapshotted max_hold_hours/fixed_sl should match its
-    node's current live watch_list config, unless deliberately diverged.
+    """An open position's snapshotted max_hold_hours/fixed_sl/account should
+    match its node's current live watch_list config, unless deliberately
+    diverged.
 
     Depends on this: an already-open position's real exit-check logic
     (signals_compute.check_sell_condition) reads pos['max_hold_hours']/
@@ -319,11 +320,53 @@ def check_open_position_config_matches_live_node():
     Informational, not necessarily wrong -- a deliberate mid-flight config
     change to only the node (for future entries) or only the position (a
     manual one-off override) is a legitimate, real use case this project
-    does on purpose. The point is visibility, not a hard rule."""
+    does on purpose. The point is visibility, not a hard rule.
+
+    account (added 2026-08-18) is the same staleness shape but with sharper
+    real-money consequences: several signals_notify.py call sites (e.g.
+    _place_stop_loss_for_position) read node.get('account') rather than
+    pos.get('account') when acting on an already-open position, so a node
+    whose account column changed after entry could route a real protective
+    stop-order ATTEMPT at the WRONG account -- one that doesn't hold the
+    shares (check_order's own position/oversell guards would likely block
+    the attempt rather than let it silently succeed, but "likely blocked" is
+    not a substitute for never routing wrong in the first place). Confirmed
+    2026-08-17 that no real/production code path currently mutates
+    watch_list.account in place on a node with an open position -- only 2
+    test/sandbox scripts mutate account at all -- but a raw
+    `UPDATE watch_list SET account=...` is itself an established idiom in
+    this codebase (see the dominant node-creation path's own post-insert
+    account assignment), just one that currently only ever runs pre-position.
+    That's a timing accident, not a structural guard, so this check is a
+    real backstop, not insurance against a purely hypothetical future
+    script. String comparison, not the numeric fields' abs()-based one --
+    account has no meaningful "close enough" representation-difference case
+    the way a float does.
+
+    node is None (2026-08-18): a position whose node was hard-deleted (e.g.
+    remove_node(), which has no open-position guard -- see its docstring)
+    is flagged as its own violation rather than silently skipped. Found
+    during paired review of the account-drift addition above: the
+    project's OWN documented account-move convention is "retire the old
+    node, create a fresh one" -- and "retire" here means remove_node()'s
+    unguarded DELETE, not a state flip. Doing that while a position is open
+    leaves the position's wl_id dangling with zero visibility anywhere else
+    in this file (verified: no other check in CHECKS covers an orphaned
+    open_positions row). This blind spot predates the account field above
+    (it silently swallowed max_hold_hours/fixed_sl drift the same way since
+    2026-07-29) but is called out now because the account docstring above
+    specifically leans on "retire-and-recreate is the safe path" -- which is
+    exactly the path this blind spot hid."""
     violations = []
     for pos in db.get_open_positions():
         node = db.get_watch_list_node_by_id(pos.get('wl_id'))
         if node is None:
+            violations.append(
+                f"{pos['ticker']} (position id={pos['id']}, wl_id={pos.get('wl_id')}) -- "
+                f"this open position's node no longer exists in watch_list (likely deleted via "
+                f"remove_node() while the position was still open) -- no config/account comparison "
+                f"is possible, and the real exit-check may be running with nothing to compare against."
+            )
             continue
         for field in ('max_hold_hours', 'fixed_sl'):
             pos_val, node_val = pos.get(field), node.get(field)
@@ -336,6 +379,15 @@ def check_open_position_config_matches_live_node():
                     f"position snapshot={pos_val} vs node's current live config={node_val} -- "
                     f"the open position's real exit-check still runs on the snapshotted value."
                 )
+        pos_account, node_account = pos.get('account'), node.get('account')
+        if pos_account is not None and node_account is not None and pos_account != node_account:
+            violations.append(
+                f"{pos['ticker']} (position id={pos['id']}, wl_id={node['id']}) account: "
+                f"position pinned to {pos_account!r} vs node's current account={node_account!r} -- "
+                f"a real protective-stop placement reading node.get('account') could attempt to route "
+                f"to the WRONG account for this position (check_order's own guards would likely block "
+                f"the attempt rather than let it silently succeed, but should never be the only defense)."
+            )
     return violations
 
 
