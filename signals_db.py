@@ -3555,6 +3555,24 @@ def set_pending_buy_order_id_by_wl_id(wl_id, order_id):
         c.commit()
 
 
+def set_pending_buy_order_id_by_id(pending_id, order_id):
+    """Row-scoped counterpart to set_pending_buy_order_id_by_wl_id -- a node
+    can hold two simultaneous pending_buys rows sharing the same wl_id (a
+    core row and a position_source='drought_overlay' row, see add_pending_buy),
+    and the wl_id-keyed UPDATE stamps the SAME order_id onto both, corrupting
+    whichever row it wasn't actually found for. Found 2026-08-18 paired review
+    of the pending_buy_order_id_backfill feature: a core-row backfill could
+    silently overwrite a drought row's real order_id, which
+    check_drought_handoff's Case A then uses to cancel_order -- a wrong id
+    there risks cancelling the wrong resting order. Callers with a specific
+    pending_buys.id in hand (signals_notify._backfill_pending_buy_order_id)
+    must use this, not the wl_id-keyed version, whenever more than one row
+    for the node could exist."""
+    with _conn() as c:
+        c.execute("UPDATE pending_buys SET order_id=? WHERE id=?", (order_id, pending_id))
+        c.commit()
+
+
 def mark_gap_resize_attempted(pending_id, date_str):
     """Persisted idempotency guard -- see ensure_tables' gap_resize_date comment.
     Called once check_gap_resize has confirmed a row's gap condition and is about
@@ -3598,6 +3616,34 @@ def get_pending_buy_by_wl_id(wl_id):
         c.row_factory = sqlite3.Row
         row = c.execute("SELECT * FROM pending_buys WHERE wl_id = ? ORDER BY id DESC LIMIT 1",
                          (wl_id,)).fetchone()
+    if row is None:
+        return None
+    r = dict(row)
+    r['node'] = json.loads(r['node_json'])
+    return r
+
+
+def get_pending_buy_by_channel_ts(channel, ts):
+    """Resolves the EXACT pending_buys row a Slack button click belongs to,
+    using the (channel, ts) of the message the button was attached to --
+    reminder_channel/reminder_ts double as the original message's identity
+    until the first reminder overwrites them (see add_pending_buy/
+    update_pending_buy_reminder), so this always matches the message
+    currently on screen. Needed because wl_id alone is NOT enough to
+    disambiguate: a node can have two simultaneous pending_buys rows (core +
+    position_source='drought_overlay', see add_pending_buy) with two
+    separate Slack messages, and the button's own JSON value never carried
+    position_source. Built 2026-08-18 for
+    signals_handlers.handle_trail_buy_order_placed's order_id backfill call,
+    so it operates on the one specific row the human actually confirmed,
+    never a same-wl_id sibling row."""
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        row = c.execute(
+            "SELECT * FROM pending_buys WHERE reminder_channel = ? AND reminder_ts = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (channel, ts),
+        ).fetchone()
     if row is None:
         return None
     r = dict(row)

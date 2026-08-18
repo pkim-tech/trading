@@ -11,9 +11,10 @@ import schwab_client
 import schwab_safety
 from signals_blocks import _post_message, _price_input_block, _shares_input_block
 from signals_helpers import (_existing_position_note, _last_sale_recovery, clear_corp_action_alert,
-                              automation_blockers_other_than_node, mode_tag)
+                              automation_blockers_other_than_node, effectively_dry_run, mode_tag)
 from signals_notify import (send_reference_report, send_coverage_report, _place_stop_loss_for_position,
-                             _coverage_mode, _exit_order_resting, close_addon_leg_real_if_open)
+                             _coverage_mode, _exit_order_resting, close_addon_leg_real_if_open,
+                             _backfill_pending_buy_order_id)
 
 if cfg.SOCKET_MODE:
 
@@ -40,15 +41,21 @@ if cfg.SOCKET_MODE:
     def handle_trail_buy_order_placed(ack, body, client):
         """Order resting at the broker -- no position yet (broker tracks the
         bounce-above-running-low entry itself, still no live state machine for
-        it). Just flips pending_buys.order_placed=True (stops the 'is it placed'
-        nag) and swaps to Filled/Cancelled buttons; open_position() only runs
-        once a real fill is separately confirmed via handle_trail_buy_filled."""
+        it). Flips pending_buys.order_placed=True (stops the 'is it placed'
+        nag), backfills the real broker order_id via the unambiguous
+        resting-BUY-order lookup (2026-08-18, closes the KEY backlog item
+        raised 2026-08-17 evening after the SOXS/ira/wl_id=206 outage -- the
+        button IS the "I already placed it at the broker" confirmation, so
+        the order should already be resting by press time), and swaps to
+        Filled/Cancelled buttons; open_position() only runs once a real fill
+        is separately confirmed via handle_trail_buy_filled."""
         ack()
         data    = json.loads(body['actions'][0]['value'])
         channel = body['channel']['id']
         ts      = body['message']['ts']
         ticker  = data['node']['ticker']
-        db.mark_pending_buy_placed_by_wl_id(data['node']['id'])
+        wl_id   = data['node']['id']
+        db.mark_pending_buy_placed_by_wl_id(wl_id)
         client.chat_update(
             channel=channel, ts=ts,
             text=f"BUY {ticker} — order placed, waiting for fill",
@@ -65,6 +72,27 @@ if cfg.SOCKET_MODE:
                 ]},
             ],
         )
+        # Placed AFTER the chat_update confirmation above, deliberately --
+        # same ordering rationale as handle_entry_price's
+        # _place_stop_loss_for_position call (2026-08-01 precedent): the user
+        # sees "order placed, waiting for fill" recorded first, a broker-side
+        # extra like this backfill can't hold that up or block it. Wrapped in
+        # a bare try/except (matching the same precedent) so nothing in it
+        # can leave order_placed=1 stuck behind an unhandled exception --
+        # this call sits entirely on top of already-successful state (the
+        # order_placed write and the button-swap above), never a
+        # precondition for either. Skipped outright for an effectively-dry-
+        # run node/account (2026-08-18 review finding) -- a dry-run node has
+        # no real resting order to look up, so this would just be a real
+        # broker read (and, on a false match, a real foreign order_id write
+        # onto a simulated row) for zero benefit.
+        if not effectively_dry_run(data['node'].get('account'), data['node']):
+            try:
+                pending = db.get_pending_buy_by_channel_ts(channel, ts)
+                if pending is not None:
+                    _backfill_pending_buy_order_id(pending, source='press_time')
+            except Exception as e:
+                print(f"  [warn] {ticker} — unexpected error in _backfill_pending_buy_order_id: {e}")
 
     @cfg.bolt_app.action("trail_buy_filled")
     def handle_trail_buy_filled(ack, body, client):

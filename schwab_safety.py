@@ -1618,8 +1618,37 @@ def check_order(
         # reach the broker as a would-be short.
         # is_addon_leg bounds against the LEG's own recorded shares, not the
         # (possibly already-closed) core position's -- see the _open_leg
-        # lookup rationale above.
-        pos = {'shares': _open_leg['shares']} if (is_addon_leg and _open_leg is not None) else _presell_pos
+        # lookup rationale above. A non-addon-leg (core) SELL with an open
+        # leg on file is widened to core+leg shares -- Part 8's arm-time
+        # merge (docs/backlog_cache.md, 2026-08-17) legitimately folds the
+        # leg's shares into the core's own single exit order, so a merged
+        # quantity is expected to exceed the core's own recorded shares by
+        # exactly the leg's share count. Same widening principle as
+        # check_live_state_reconciliation's existing expected_shares patch
+        # for the entry side (signals_notify.py) -- without it, EVERY merged
+        # exit would be rejected here as a false "would-be short" before
+        # Part 8 could ever place a single real order.
+        #
+        # Gated on `not _open_leg.get('sl_order_id')`, NOT just `_open_leg is
+        # not None` (HIGH finding, paired Opus review 2026-08-17/18): a
+        # widened bound must only apply once the leg's OWN resting stop is
+        # actually gone -- otherwise the guard permits core+leg worth of SELL
+        # orders while core+leg worth of stops are simultaneously resting
+        # (the leg's own still-live stop, plus a widened core order), a real
+        # naked-short exposure this guard exists to prevent. Confirmed
+        # correct against _attempt_automated_sell's real ordering
+        # (signals_notify.py): it clears set_addon_leg_sl_order_id(leg['id'],
+        # None) BEFORE attempting the merged placement, so by the time this
+        # check runs during that merge attempt, the leg's sl_order_id is
+        # already None -- the widened bound applies exactly then, not before.
+        # `merged_into_core` itself can't be the gate: it's only set AFTER
+        # placement succeeds, so it's still 0/false at check-time too.
+        if is_addon_leg and _open_leg is not None:
+            pos = {'shares': _open_leg['shares']}
+        elif _presell_pos is not None and _open_leg is not None and not _open_leg.get('sl_order_id'):
+            pos = {'shares': _presell_pos['shares'] + _open_leg['shares']}
+        else:
+            pos = _presell_pos
         # Fail closed when no local position row is found at all (automation_
         # principles.md #2) -- this branch used to only ever fire when `pos`
         # was truthy, silently skipping the bound entirely with no local

@@ -139,6 +139,77 @@ def _attempt_automated_sell(pos, current_price):
             _verify_resting_before_replace(pos, node, account, ticker, sl_order_id, "stop-loss")
         except Exception as e:
             print(f"  [replace_check] {ticker}: pre-replace verification failed, proceeding: {e}")
+
+    # Part 8 (docs/backlog_cache.md, 2026-08-17): fold an open addon leg's
+    # own real resting stop into THIS SAME trailing-sell order instead of
+    # maintaining two independent resting orders for the same ticker/account
+    # -- user's explicit call, rejecting a separate-independent-trailing-
+    # order design for the leg since that guarantees an orderType+quantity
+    # collision (add-on always sizes shares == core's shares) rather than
+    # today's conditional one. Only merges when the leg has a real resting
+    # stop on file (leg['sl_order_id']) -- an is_dry_run_sim leg, or one not
+    # yet protected (fill confirmed but _place_stop_loss_for_addon_leg
+    # hasn't landed yet), has nothing to fold in and falls through to the
+    # ordinary single-quantity path unchanged (this is also the deliberate
+    # "still needed pre-arm" case -- see _place_stop_loss_for_addon_leg's
+    # docstring).
+    # Re-arm defensive guard (paired review follow-up, 2026-08-17/18):
+    # reviewers flagged that a SECOND call to this function against an
+    # already-merged leg would find leg['sl_order_id'] falsy (cleared at
+    # merge time, below) and fall through with merge_leg=None -- silently
+    # replacing the currently-resting MERGED order (core+leg shares) with a
+    # smaller core-only order, dropping the leg's shares off the resting
+    # order without ever re-cancelling them. Verified NOT reachable in
+    # current code: this function is only called from notify_trailing_
+    # activated, gated on just_activated_trailing (signals_compute.py), and
+    # state['trailing'] is set but never reset anywhere in strategies.py --
+    # it's a monotonic one-way flag, so the False->True transition (and thus
+    # this function) fires at most once per position lifecycle. Guarded
+    # anyway, cheaply, in case that invariant ever changes (a future re-arm
+    # design, a test driving this function directly): an already-merged leg
+    # is folded in by its recorded shares even though there's nothing left
+    # to cancel, so the replacement order can never come out SMALLER than
+    # what's actually resting.
+    merge_leg = None
+    leg = db.get_open_addon_leg_by_parent(pos['id'])
+    if leg is not None and leg.get('merged_into_core'):
+        merge_leg = leg
+        db.log_coverage_event("addon_leg_merge", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="already_merged_reused",
+                               detail=f"leg_id={leg['id']} -- defensive guard, not expected to fire live "
+                                      f"(state['trailing'] is monotonic)")
+    elif leg is not None and leg.get('sl_order_id'):
+        try:
+            _, cancel_status = schwab_client.cancel_order(account, ticker, leg['sl_order_id'], node_id=node.get('id'))
+        except Exception as e:
+            cancel_status = None
+            db.log_coverage_event("addon_leg_merge", _mode, ticker=ticker, position_id=pos.get('id'),
+                                   node_id=pos.get('wl_id'), result="cancel_failed",
+                                   detail=f"leg_id={leg['id']}: {e}")
+        if cancel_status == 'CANCELED':
+            # Confirmed gone -- safe to fold its shares into the merged
+            # order below. Clear the leg's own order id in the DB now
+            # (rather than only on merge-placement success) so a subsequent
+            # failure in the merged placement (except block below) doesn't
+            # leave a stale sl_order_id pointing at a dead cancelled order.
+            db.set_addon_leg_sl_order_id(leg['id'], None, broker_stop_price=None)
+            merge_leg = leg
+        elif cancel_status == 'FILLED':
+            # Raced a real fill of the leg's own stop -- not a merge
+            # candidate this cycle; the leg's own fill-reconciliation path
+            # (check_addon_leg_reconciliation / the leg-close call sites)
+            # handles it independently. Leave the leg's DB row untouched.
+            db.log_coverage_event("addon_leg_merge", _mode, ticker=ticker, position_id=pos.get('id'),
+                                   node_id=pos.get('wl_id'), result="cancel_saw_fill", detail=f"leg_id={leg['id']}")
+        else:
+            # Unconfirmed cancel (None/anything else) -- don't guess at the
+            # leg's real broker state. Skip merging this cycle and leave the
+            # leg's own resting order exactly as recorded (today's status
+            # quo, still safe on its own).
+            db.log_coverage_event("addon_leg_merge", _mode, ticker=ticker, position_id=pos.get('id'),
+                                   node_id=pos.get('wl_id'), result="cancel_unconfirmed", detail=f"leg_id={leg['id']}")
+    merged_shares = shares + merge_leg['shares'] if merge_leg is not None else shares
+
     try:
         if sl_order_id:
             # Atomic replace (cancel-old + create-new as a single broker call)
@@ -147,10 +218,10 @@ def _attempt_automated_sell(pos, current_price):
             # blocked new placement, leaving nothing resting at the broker in
             # between (found 2026-07-27, raised directly by the user).
             _, exit_order_id = schwab_client.replace_order_with_trailing_sell(
-                account, ticker, sl_order_id, shares, current_price, trail_sell_pct,
+                account, ticker, sl_order_id, merged_shares, current_price, trail_sell_pct,
                 node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
         else:
-            _, exit_order_id = schwab_client.place_trailing_sell(account, ticker, shares, current_price,
+            _, exit_order_id = schwab_client.place_trailing_sell(account, ticker, merged_shares, current_price,
                                                                    trail_sell_pct, node_dry_run=(node.get('state') != 'live'),
                                                                    node_id=node.get('id'))
     except Exception as e:
@@ -177,10 +248,32 @@ def _attempt_automated_sell(pos, current_price):
         elif not isinstance(e, schwab_safety.SafetyViolation):
             _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual",
                            node_id=pos.get('wl_id'), incident=True, pos=pos)
+        if merge_leg is not None:
+            # The leg's own stop was already confirmed cancelled (above) in
+            # anticipation of the merge that just failed -- it is genuinely
+            # unprotected now, distinct from the core's own UNPROTECTED alert
+            # above. No automatic recovery here either, same reasoning as the
+            # core's own failure branch.
+            db.log_coverage_event("addon_leg_merge", _mode, ticker=ticker, position_id=pos.get('id'),
+                                   node_id=pos.get('wl_id'), result="merge_placement_failed",
+                                   detail=f"leg_id={merge_leg['id']}: {e}")
+            _post_message(
+                f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) ADD-ON LEG UNPROTECTED — its stop "
+                f"was cancelled for a merge into the core's exit order, and that merge then failed: {e} "
+                f"(place a stop-loss SELL {int(merge_leg['shares'])} shares manually)",
+                node_id=pos.get('wl_id'), incident=True, pos=pos,
+            )
         return False, None
     db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed",
-                           detail=f"shares={shares} trail_sell_pct={trail_sell_pct}")
+                           detail=f"shares={merged_shares} trail_sell_pct={trail_sell_pct}" +
+                                  (f" merged_leg_id={merge_leg['id']}" if merge_leg is not None else ""))
+    if merge_leg is not None:
+        db.set_addon_leg_merged_into_core(merge_leg['id'])
+        db.log_coverage_event("addon_leg_merge", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="merged",
+                               detail=f"leg_id={merge_leg['id']} core_shares={shares} "
+                                      f"leg_shares={merge_leg['shares']} merged_shares={merged_shares}")
     if exit_order_id is not None:
         # sl_order_id (open_positions column, distinct from trail_state.exit_order_id)
         # always tracks whatever real order is currently resting -- point it at the
@@ -312,6 +405,31 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     shares = pos.get('shares')
     if not shares:
         return None
+    # CRITICAL fix (paired Opus review 2026-08-17/18, both reviewers
+    # independently traced this via different reasoning): this function had
+    # ZERO add-on-leg awareness. Part 8's arm-time merge
+    # (_attempt_automated_sell, docs/backlog_cache.md 2026-08-17) folds an
+    # open leg's shares into the core's SAME resting trailing-sell order
+    # (merged_into_core=1 on the leg, leg's own sl_order_id cleared). A
+    # force-replace exit through THIS function (hold-time-forced TIME is the
+    # concrete real repro both reviewers traced, but every other TP/SL/TIME
+    # reason routes through here too) used to replace that merged order with
+    # a market SELL sized at core-only shares -- the difference (the leg's
+    # shares) then has NO resting order at all, orphaned and unprotected,
+    # while close_addon_leg_real_if_open's merged_into_core branch (correctly,
+    # once this quantity is fixed) treats the fill as covering both share
+    # counts and closes the leg's DB row as if its shares sold too. Net
+    # result pre-fix: real shares held at the broker, falsely booked closed.
+    #
+    # Gated on merged_into_core (NOT sl_order_id, which is already None post-
+    # merge by design) so this only widens the quantity for a leg that is
+    # ACTUALLY folded into the resting order right now -- an unmerged leg
+    # (still pre-arm, own independent stop) is closed independently by
+    # close_addon_leg_real_if_open's own real SELL, untouched by this.
+    merge_leg = db.get_open_addon_leg_by_parent(pos['id'])
+    if merge_leg is not None and not merge_leg.get('merged_into_core'):
+        merge_leg = None
+    exit_shares = shares + merge_leg['shares'] if merge_leg is not None else shares
     # For a hold-time-forced TRAIL exit, the real resting order is normally
     # the trailing-sell placed at arm time (exit_order_id) -- sl_order_id is
     # stale/dead in that case, replaced by the trailing-sell when the
@@ -361,7 +479,7 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
             # blocked new placement, leaving nothing resting at the broker in
             # between (found 2026-07-27, raised directly by the user).
             _, order_id = schwab_client.replace_equity_order_with_market(
-                account, ticker, resting_order_id, "SELL", shares, current_price,
+                account, ticker, resting_order_id, "SELL", exit_shares, current_price,
                 node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'),
                 is_handoff_exit=_is_handoff_exit)
         else:
@@ -370,18 +488,21 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
             # apply on this branch regardless (only reached when HANDOFF's own
             # protective SL placement itself already failed -- a real, narrower,
             # still-open gap, see place_equity_sell's docstring).
-            _, order_id = schwab_client.place_equity_sell(account, ticker, shares, current_price,
+            _, order_id = schwab_client.place_equity_sell(account, ticker, exit_shares, current_price,
                                                             node_dry_run=(node.get('state') != 'live'),
                                                             node_id=node.get('id'))
     except Exception as e:
         db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                                node_id=pos.get('wl_id'),
                                result="blocked" if isinstance(e, schwab_safety.SafetyViolation) else "failed_unexpectedly",
-                               detail=f"reason={reason}: {e}")
+                               detail=f"reason={reason} exit_shares={exit_shares}" +
+                                      (f" merged_leg_id={merge_leg['id']}" if merge_leg is not None else "") + f": {e}")
         if resting_order_id:
             sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos.get('stop_loss')
             sl_price = pos['signal_price'] * (1 - sl_pct / 100) if sl_pct else None
-            price_note = f"place stop-loss SELL {shares} @ ~${sl_price:.2f}" if sl_price else "place a stop-loss SELL manually"
+            price_note = f"place stop-loss SELL {exit_shares} @ ~${sl_price:.2f}" if sl_price else "place a stop-loss SELL manually"
+            if merge_leg is not None:
+                price_note += f" (includes {int(merge_leg['shares'])} merged add-on leg shares, leg_id={merge_leg['id']})"
             db.log_coverage_event("manual_sl_fallback_alert", _mode, ticker=ticker, position_id=pos.get('id'),
                                    node_id=pos.get('wl_id'), result="alerted", detail=price_note)
             _post_message(
@@ -394,7 +515,9 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
                            node_id=pos.get('wl_id'), incident=True, pos=pos)
         return None
     db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
-                           node_id=pos.get('wl_id'), result="placed", detail=f"reason={reason} shares={shares}")
+                           node_id=pos.get('wl_id'), result="placed",
+                           detail=f"reason={reason} shares={exit_shares}" +
+                                  (f" merged_leg_id={merge_leg['id']} core_shares={shares}" if merge_leg is not None else ""))
     if resting_order_id and resting_order_id == pos.get('sl_order_id') and order_id is not None:
         # Same staleness fix as _attempt_automated_sell's success path: whatever
         # was actually replaced here (a genuine TP/SL/TIME exit's SL, or the
@@ -1149,6 +1272,38 @@ def check_live_state_reconciliation(open_positions, now=None):
                 f"no resting SELL order found at the broker — position may be unprotected; "
                 f"suggested fix: place a trailing-sell order for {expected_shares:g} shares now"
             )
+        elif state.get('trailing') and state.get('order_placed') and has_sell_order:
+            # Part 8 quantity check (MEDIUM finding #3, paired Opus review
+            # 2026-08-17/18): every check above/below this is presence-only
+            # (has_sell_order = bool(resting_sells)) -- never comparing the
+            # resting order's actual quantity against what a merged core+leg
+            # exit is supposed to cover. That's exactly the detection gap
+            # that let the CRITICAL _attempt_automated_exit_sell bug (a
+            # force-replace silently shrinking a merged order to core-only
+            # shares, orphaning the leg's shares) go unnoticed by every
+            # existing check. Mirrors Stage C's pre-arm sl_quantity_mismatch
+            # check just below (same _match_resting_order/_resting_order_
+            # quantity helpers), but keyed off merged_into_core instead of
+            # core_shares -- an un-merged post-arm position (no leg, or a
+            # leg that never merged) has nothing extra to verify here and is
+            # correctly skipped.
+            _merge_leg_check = db.get_open_addon_leg_by_parent(pos['id'])
+            if _merge_leg_check is not None and _merge_leg_check.get('merged_into_core'):
+                _merged_expected = core_shares + _merge_leg_check.get('shares', 0)
+                _resting_trail = _match_resting_order(resting_sells, pos.get('sl_order_id'))
+                if _resting_trail is not None:
+                    _real_qty = _resting_order_quantity(_resting_trail)
+                    if _real_qty is not None and float(_real_qty) != float(_merged_expected):
+                        mismatch_found |= _alert_reconcile_mismatch(
+                            pos, "merged_trailing_sell_quantity_mismatch",
+                            f"🚨 *{ticker}* ({account} · {mode_tag(account, _node)}) live-state mismatch: resting "
+                            f"trailing-sell covers {float(_real_qty):g} shares but the merged core+add-on-leg "
+                            f"position expects {_merged_expected:g} (core={core_shares:g} "
+                            f"leg={_merge_leg_check.get('shares', 0):g}, leg_id={_merge_leg_check['id']}) — "
+                            f"{'add-on leg shares may be ORPHANED/unprotected' if float(_real_qty) < _merged_expected else 'OVERSELL RISK: the order would sell more than is held'}; "
+                            f"suggested fix: verify the add-on leg's real shares at the broker, then "
+                            f"cancel and re-place the trailing-sell for {_merged_expected:g} shares"
+                        )
         elif not state.get('trailing') and pos.get('sl_order_id') and not has_sell_order:
             mismatch_found |= _alert_reconcile_mismatch(
                 pos, "missing_sl",
@@ -3003,7 +3158,18 @@ def _place_stop_loss_for_addon_leg(leg_id, parent_pos, node):
     independent exit rule/model, its only job is to track the parent's real
     stop level so an unstopped margin position is never the failure mode).
     Mirrors _place_stop_loss_for_position's retry/fallback shape but against
-    addon_legs instead of open_positions."""
+    addon_legs instead of open_positions.
+
+    Still needed even after Part 8's arm-time merge (docs/backlog_cache.md,
+    2026-08-17): the core position isn't necessarily armed/trailing yet when
+    the leg's own fill confirms (an add-on can trigger before the parent has
+    ever crossed its arm threshold), and until arm the core's own resting
+    order is still a plain STOP, not the trailing-sell _attempt_automated_
+    sell later merges into -- the leg needs its OWN real protection for that
+    whole pre-arm window. _attempt_automated_sell folds this leg's stop into
+    the core's own order (cancels this one, merged_into_core=1) the moment
+    the core actually arms; until then this is the leg's only real
+    protection, unchanged from before Part 8."""
     ticker = parent_pos['ticker']
     account = parent_pos.get('account')
     _mode = _coverage_mode(account)
@@ -3213,6 +3379,47 @@ def close_addon_leg_real_if_open(pos, exit_price, exit_reason, exit_time):
     mode = _coverage_mode(account)
     limits = schwab_safety.ACCOUNTS.get(account) if account else None
     node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+
+    if leg.get('merged_into_core'):
+        # Part 8 (docs/backlog_cache.md, 2026-08-17): the leg's own real stop
+        # was already cancelled and its shares folded into the CORE's own
+        # trailing-sell order at arm time (_attempt_automated_sell) -- this
+        # exit is the one real fill covering both share counts together,
+        # there is no second broker order to place. Bookkeeping only, same
+        # exit_price/exit_time/exit_reason the core itself just closed at
+        # (real fill price -- both share counts genuinely filled in the same
+        # execution, so there's no separate-slippage case to log here the
+        # way the un-merged branches below document).
+        #
+        # Positioned ahead of the entry_status=='placed' cancel branch below
+        # -- verified NOT an ordering hazard (finding #4, paired review
+        # 2026-08-17/18): merged_into_core can only ever become true via
+        # _attempt_automated_sell's merge, which requires leg['sl_order_id']
+        # to already be set -- and a real stop is only ever placed
+        # (_place_stop_loss_for_addon_leg) after the leg's entry has
+        # confirmed FILLED. So merged_into_core=1 and entry_status=='placed'
+        # are mutually exclusive by construction; this branch and the
+        # 'placed' cancel branch can never both apply to the same leg.
+        #
+        # Known residual (finding #4, same review, deliberately not fixed
+        # this pass): merged_into_core has no clearing/un-merge path if the
+        # merged order is later replaced/cancelled by something other than a
+        # genuine exit fill (e.g. a human cancels it directly at the broker
+        # out-of-band). Not treated as auto-correctable -- this codebase's
+        # established reconciliation pattern (check_live_state_reconciliation,
+        # _verify_resting_before_replace) is detection-only by design, since
+        # guessing at *why* a resting order changed and silently updating our
+        # own bookkeeping in response has already caused real bugs elsewhere
+        # in this project. The new merged_trailing_sell_quantity_mismatch
+        # check (check_live_state_reconciliation, finding #3) gives this
+        # drift a real detection path going forward -- a stale merged_into_
+        # core=1 against an order that no longer covers core+leg shares now
+        # surfaces there every poll, rather than staying silent forever.
+        db.close_addon_leg(leg['id'], exit_price, exit_time, exit_reason)
+        db.log_coverage_event("addon_exit_fill", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                               result="merged_closed",
+                               detail=f"leg_id={leg['id']} price={exit_price:.4f} reason={exit_reason}")
+        return
 
     if leg.get('entry_status') == 'placed':
         # Still resting, unfilled -- cancel it, never sell shares never
@@ -3866,6 +4073,136 @@ def _pending_buy_blocks(pending, reminder_num):
     return blocks
 
 
+_ORDER_ID_BACKFILL_AMBIGUOUS_ALERTED: dict[str, float] = {}
+_ORDER_ID_BACKFILL_AMBIGUOUS_COOLDOWN_SECS = 900  # 15 min -- matches _ENTRY_ABANDON_ALERT_COOLDOWN_SECS
+
+
+def _order_id_backfill_fingerprint_ok(order, pending):
+    """Guards against treating an unrelated resting BUY as ground truth
+    (2026-08-18 paired review finding): resolve_resting_buy_orders' "at most
+    one resting BUY per ticker/account" safety argument only holds for
+    DAEMON-placed orders (schwab_safety._has_open_buy_order_for_ticker,
+    inside check_order) -- this feature specifically serves the MANUAL
+    placement path, which never goes through that guard. A human's own
+    unrelated resting BUY in the same account/ticker (a long-standing
+    discretionary order, say) would otherwise match as "the" order with zero
+    pushback. Requires orderType=='TRAILING_STOP' (this feature only ever
+    applies to trailing-buy pending_buys rows, db._is_trailing_buy) and a
+    quantity within DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT of what
+    buy_order_sizing would have shown the user in the original BUY alert --
+    same tolerance schwab_safety's own order-matching (duplicate-order guard)
+    already uses for "is this really the same order", reused here rather
+    than inventing a new threshold."""
+    if order.get("orderType") != "TRAILING_STOP":
+        return False
+    qty = order.get("quantity")
+    if not qty:
+        return False
+    node = pending['node']
+    sig_like = {'ticker': pending['ticker'], 'current_price': pending['signal_price']}
+    try:
+        target_notional = _last_sale_recovery(node, position_source=pending.get('position_source') or 'core')
+        expected_shares = buy_order_sizing(node, sig_like, target_notional=target_notional)['shares']
+    except Exception:
+        return False
+    if not expected_shares:
+        return False
+    tol = schwab_safety.DUPLICATE_ORDER_QUANTITY_TOLERANCE_PCT / 100 * max(qty, expected_shares)
+    return abs(qty - expected_shares) <= tol
+
+
+def _backfill_pending_buy_order_id(pending, source):
+    """Fills the pending_buys.order_id gap left by the manual 'Trailing Buy
+    Order Placed' Slack flow (handle_trail_buy_order_placed ->
+    mark_pending_buy_placed_by_wl_id, signals_handlers.py), which sets
+    order_placed=True but never captures the real broker order id -- the
+    2026-08-17 KEY backlog item (SOXS/ira/wl_id=206 outage). Uses
+    schwab_client.resolve_resting_buy_orders (raw lookup) plus
+    _order_id_backfill_fingerprint_ok (order-shape/size sanity check, added
+    2026-08-18 after paired review -- resolve_resting_buy_orders' own
+    docstring explains why a single match still isn't automatically ground
+    truth for a manually-placed order).
+
+    `pending` is a full pending_buys row (as returned by db.get_pending_buys()/
+    get_pending_buy_by_wl_id()/get_pending_buy_by_channel_ts(), NOT just a
+    node dict) -- callers must pass the SPECIFIC row this backfill is for, not
+    just a wl_id, since a node can hold two simultaneous pending_buys rows
+    (core + position_source='drought_overlay', see add_pending_buy) and the
+    2026-08-18 review found the old wl_id-keyed write silently stamped the
+    core's order_id onto the drought row too (db.
+    set_pending_buy_order_id_by_id fixes this -- see its docstring).
+
+    Called from two places: press-time (signals_handlers.handle_trail_buy_
+    order_placed, source='press_time' -- the order should already be resting
+    by the time the user taps the button, since the button IS the "I already
+    placed it at the broker" confirmation) and as a periodic backstop inside
+    check_buy_reminders (source='reminder_backstop', for the case the order
+    genuinely wasn't visible yet at press time, or the handler's own call
+    failed/was skipped).
+
+    Always logs a coverage_events row (scenario_key='pending_buy_order_id_
+    backfill') regardless of outcome, so the fix's own operation is visible/
+    auditable -- this is deliberately NOT gated behind has_capital_at_stake,
+    same rationale as check_buy_reminders' real-fill re-verify block: an
+    infrastructure-precondition gap, not routine per-node noise.
+
+    result='backfilled' (found exactly 1 fingerprint-confirmed match, wrote
+    it -- the safe, mechanical, expected-common case) gets no incident/Slack
+    alert, deliberately: writing the real order_id we already confirmed isn't
+    a judgment call, it's just recording ground truth. result='not_found' (0
+    matches, OR a single match that failed the fingerprint check -- treated
+    identically, never guessed) also gets no alert -- benign, will retry next
+    reminder cycle via the periodic backstop, or resolve itself once
+    Filled/Cancelled is tapped. result='ambiguous' (>1 fingerprint-confirmed
+    match) means either a genuinely benign cause (a sibling drought/core row's
+    own still-resting order also fingerprint-matched, or two real candidates
+    exist) or, less likely, that the double-buy guard invariant this lookup
+    partly depends on is itself broken -- worth a human's attention either
+    way, so it raises a throttled (15 min cooldown, matching
+    _ENTRY_ABANDON_ALERT_COOLDOWN_SECS) trading_incidents row + Slack alert,
+    distinct from the other two outcomes."""
+    node = pending['node']
+    ticker = pending['ticker']
+    wl_id = pending['wl_id']
+    pending_id = pending['id']
+    account = node.get('account')
+    mode = _coverage_mode(account, node)
+    raw_matches = schwab_client.resolve_resting_buy_orders(account, ticker)
+    matches = [o for o in raw_matches if _order_id_backfill_fingerprint_ok(o, pending)]
+    if len(matches) == 1:
+        order_id = matches[0]['orderId']
+        db.set_pending_buy_order_id_by_id(pending_id, order_id)
+        db.log_coverage_event("pending_buy_order_id_backfill", mode, ticker=ticker, node_id=wl_id,
+                               result="backfilled", detail=f"source={source} order_id={order_id}")
+        return order_id
+    elif len(matches) == 0:
+        db.log_coverage_event("pending_buy_order_id_backfill", mode, ticker=ticker, node_id=wl_id,
+                               result="not_found", detail=f"source={source} raw_matches={len(raw_matches)}")
+        return None
+    else:
+        order_ids = [m.get('orderId') for m in matches]
+        db.log_coverage_event("pending_buy_order_id_backfill", mode, ticker=ticker, node_id=wl_id,
+                               result="ambiguous", detail=f"source={source} order_ids={order_ids}")
+        if _throttled(_ORDER_ID_BACKFILL_AMBIGUOUS_ALERTED, str(pending_id),
+                      _ORDER_ID_BACKFILL_AMBIGUOUS_COOLDOWN_SECS):
+            db.log_incident(
+                title=f"{ticker} ({account}) — {len(matches)} resting BUY orders found during order_id backfill",
+                detail=(f"pending_buy_order_id_backfill (source={source}, pending_id={pending_id}, "
+                        f"position_source={pending.get('position_source')}) found {len(matches)} "
+                        f"fingerprint-matched resting BUY orders for {ticker}/{account}, expected at "
+                        f"most 1. Likely benign causes: a sibling core/drought pending_buys row for the "
+                        f"same node has its own still-resting order that also fingerprint-matched, or a "
+                        f"genuine second real candidate exists -- less likely, the 2026-07-24 double-buy "
+                        f"guard invariant this lookup partly relies on could be broken. order_ids={order_ids}"),
+                ticker=ticker, account=account, node_id=wl_id, real_money_impact=False,
+            )
+            _post_message(
+                f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — {len(matches)} resting BUY orders "
+                f"found, expected at most 1 (order_ids={order_ids}). Logged as incident, needs manual review.",
+                node_id=wl_id, incident=True, node=node)
+        return None
+
+
 def check_buy_reminders():
     """Nags every BUY_REMINDER_MINUTES until a trailing-buy is fully resolved
     (Filled or Skipped) -- without this, a stalled trailing-buy at the broker is
@@ -3904,21 +4241,33 @@ def check_buy_reminders():
         # per BUY_REMINDER_MINUTES per pending row (the cadence gate above already
         # throttles this), not every poll cycle.
         #
-        # Deliberately requires a real order_id. The MANUAL placement flow
-        # (signals_handlers.handle_trail_buy_order_placed ->
-        # mark_pending_buy_placed_by_wl_id) sets order_placed=1 but never
-        # captures a broker order id, so those rows are NOT re-verified here --
-        # a known, accepted residual, confirmed by both reviewers 2026-08-15.
-        # Relaxing the gate is the wrong fix: get_filled_order's order_id=None
-        # mode is documented as a real hazard (it matched a days-old unrelated
-        # fill and corrupted a real GDXU reconciliation, 2026-07-27), and
-        # feeding that into a 🚨 CONFIRMED FILLED alert would be worse than the
-        # stale reminder it replaces. Coverage for the manual case comes from
-        # Stage D's intraday broker sweep (check_orphaned_broker_positions),
-        # which is ground-truth broker-side and needs no order_id -- so the
-        # residual window is ~30 min, not unbounded. A real fix would be
-        # upstream: have the "Trailing Buy Order Placed" handler resolve and
-        # store the order id at press time.
+        # Deliberately requires a real order_id -- get_filled_order's
+        # order_id=None fuzzy-match mode is a documented real hazard (matched
+        # a days-old unrelated fill and corrupted a real GDXU reconciliation,
+        # 2026-07-27), and feeding that into a 🚨 CONFIRMED FILLED alert would
+        # be worse than the stale reminder it replaces.
+        #
+        # 2026-08-18: the MANUAL placement flow (signals_handlers.handle_
+        # trail_buy_order_placed -> mark_pending_buy_placed_by_wl_id) used to
+        # leave order_id permanently NULL, so those rows were never
+        # re-verified here (a known, accepted residual, confirmed by both
+        # reviewers 2026-08-15) -- coverage for that gap came only from Stage
+        # D's intraday broker sweep (check_orphaned_broker_positions), a
+        # ground-truth broker-side check that needs no order_id but only runs
+        # on its own cadence. Closed the same way the comment above always
+        # said it should be: the handler now backfills order_id at press time
+        # via _backfill_pending_buy_order_id (schwab_client.
+        # resolve_resting_buy_orders -- safe because the 2026-07-24 double-buy
+        # guard makes a resting-BUY-order match unambiguous, unlike
+        # get_filled_order's unbounded FILLED-history fuzzy match). This is
+        # the periodic backstop for the case press-time backfill didn't find
+        # the order yet (e.g. a brief broker-side visibility lag) -- retried
+        # once per BUY_REMINDER_MINUTES cycle, same cadence as the rest of
+        # this loop, until it resolves or the row clears via Filled/Cancelled.
+        if pending['order_placed'] and not pending.get('order_id'):
+            backfilled = _backfill_pending_buy_order_id(pending, source='reminder_backstop')
+            if backfilled is not None:
+                pending['order_id'] = backfilled
         if pending['order_placed'] and pending.get('order_id'):
             try:
                 fill = schwab_client.get_filled_order(account, pending['ticker'], 'BUY',
@@ -4610,6 +4959,15 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
         _post_message(f"⚠️ {ticker} — fill exceeded target notional by ${-delta:,.0f} "
                       f"(no corrective sell placed)",
                       node_id=node.get('id'), incident=True, node=node)
+    else:
+        # Real incident, 2026-08-17: RETL's fill landed within this tolerance
+        # band (roughly +-1 share of target) and left ZERO trace anywhere --
+        # no alert, no coverage_event -- because neither branch above fires
+        # for a delta this small. Log it so a within-band fill is visible
+        # ground truth too, not just an absence of evidence.
+        db.log_coverage_event("top_up", _coverage_mode(account), ticker=ticker,
+                               node_id=node.get('id'), result="within_tolerance",
+                               detail=f"delta=${delta:,.2f} target=${target_notional:,.2f}", source=source)
 
 
 def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=False, wl_id=None, account=None):

@@ -1506,6 +1506,31 @@ def filter_resting_orders(orders: list) -> list:
     return [o for o in orders if o["status"] not in schwab_safety._OPEN_ORDER_STATUSES_EXCLUDED]
 
 
+def resolve_resting_buy_orders(account: str, ticker: str) -> list:
+    """Real resting (unfilled) BUY orders for `ticker` in `account`, read
+    fresh from the broker -- the unambiguous lookup behind the 2026-08-17
+    pending_buys.order_id backfill (docs/backlog_cache.md's KEY item raised
+    that evening, SOXS/ira/wl_id=206 outage). Deliberately narrower than
+    get_filled_order's order_id=None fuzzy-match mode, which is a known real
+    hazard (2026-07-27 GDXU incident: matched a days-old unrelated FILLED
+    order out of unbounded historical order history). This only looks at
+    RESTING orders, and schwab_safety._has_open_buy_order_for_ticker's
+    2026-07-24 double-buy guard already guarantees at most one resting BUY
+    can exist per ticker per account at any time (a second is blocked before
+    placement) -- so a single match here is never ambiguous the way a FILLED
+    lookup would be. Returns whatever it finds (0, 1, or -- if the guard
+    invariant is somehow broken -- more than 1); callers decide what each
+    count means, this function only reads. Never raises past a broker/network
+    failure -- returns [] instead, since this is reconciliation on top of
+    already-working state, not a new precondition for anything."""
+    try:
+        orders = filter_resting_orders(get_real_orders(account, ticker))
+    except Exception as e:
+        print(f"resolve_resting_buy_orders({account}, {ticker}): lookup failed: {e}")
+        return []
+    return [o for o in orders if o.get("instruction") == "BUY"]
+
+
 def get_current_price(ticker: str) -> float:
     """Primary: Schwab's own get_quote, extended.lastPrice -- confirmed
     real-time (realtime: true, live quoteTime) unlike yfinance's pre-market

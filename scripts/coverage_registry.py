@@ -1568,6 +1568,34 @@ REGISTRY = [
                "(user's explicit call: 'if we lose 1 set of trades it is what it is'). No live proof "
                "yet -- not forceable via node config (an abnormal-drift event isn't a deterministic "
                "guard-rejection scenario), same organic-only shape as daemon_exception_survival."),
+    dict(id='pending_buy_order_id_backfill',
+         scenario="A manually-confirmed 'Trailing Buy Order Placed' pending_buys row has its real "
+                  "broker order_id backfilled (never captured at press time before this fix) so "
+                  "check_buy_reminders' real-fill re-verification can actually run against it, "
+                  "instead of the row sitting permanently order_id=NULL and unreverified until "
+                  "Filled/Cancelled is tapped or Stage D's broker sweep catches it",
+         code_path="signals_notify._backfill_pending_buy_order_id, called from "
+                   "signals_handlers.handle_trail_buy_order_placed (press time) and "
+                   "signals_notify.check_buy_reminders (periodic backstop) -- both via "
+                   "schwab_client.resolve_resting_buy_orders",
+         offline_coverage="tests/test_fake_broker_pending_buy_order_id_backfill_scenario.py",
+         check_mechanism='coverage_events', scenario_key='pending_buy_order_id_backfill',
+         bad_results=['not_found', 'ambiguous'],
+         notes="Built 2026-08-18, closing the KEY backlog item raised 2026-08-17 evening (SOXS/ira/"
+               "wl_id=206 Schwab-outage incident). result='backfilled' (exactly 1 fingerprint-confirmed "
+               "resting BUY order found, safe/mechanical, no alert) is the only clean outcome. "
+               "result='not_found' (0 matches, or a single match that failed the "
+               "_order_id_backfill_fingerprint_ok orderType/quantity check -- order not yet visible at "
+               "the broker, already resolved by the time this ran, or a genuinely unrelated resting "
+               "order was correctly rejected) and result='ambiguous' (>1 fingerprint-confirmed match --  "
+               "either a sibling core/drought pending_buys row's own resting order, or the 2026-07-24 "
+               "double-buy guard invariant this lookup partly relies on being broken) are both real "
+               "misses of the backfill's own job (the row stays order_id=NULL either way) -- added to "
+               "bad_results 2026-08-18 paired review so a run of not_found/ambiguous results doesn't "
+               "silently render as verified-live on the Grid. 'ambiguous' also still raises its own "
+               "throttled trading_incidents row + Slack alert at the point it happens, in addition to "
+               "counting here. No live proof yet -- fake_broker-confirmed only; will earn verified-live "
+               "off the next real manual trailing-buy placement."),
 ]
 
 
