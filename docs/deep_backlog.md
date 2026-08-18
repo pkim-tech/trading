@@ -6817,3 +6817,14 @@ Original finding (2026-08-17): `get_coverage_events(limit=500)` could silently d
 - [LOW] Zero-watermark bootstrap edge case fixed via an explicit one-shot bootstrap flag (a literal `since_id==0` re-trigger-on-every-call approach was tried and rejected -- it broke an existing test by silently marking a table's very first real event "seen" without ever alerting).
 
 Full suite 1272/1272 (re-verified directly by the orchestrating session, not just agent-reported), `live_sim_harness.py` 7/7 (re-verified directly), `signals_invariants.py` clean.
+
+## [testing][coverage] Resolved 2026-08-18 — coverage_registry.py fixture-source filter ✅
+`compute_status()` had no filter excluding `source='fixture:...'` rows (from `scripts/stage_check_order_guard_scenarios.py`'s deliberate synthetic runs), so a fixture-sourced event could count as real dry_run/live proof for whatever `scenario_key` it's tagged with. Fixed via `_clauses.append("(source IS NULL OR source NOT LIKE 'fixture:%')")` in `compute_status`'s coverage_events query.
+
+**Real subtlety caught before implementing**: 9,482 of ~9,534 real `coverage_events` rows have `source IS NULL` (partial rollout, most call sites don't pass it yet) -- a naive `source NOT LIKE 'fixture:%'` without the `OR source IS NULL` disjunct would have silently excluded nearly every real row under SQL's three-valued logic, breaking the Grid almost entirely. Caught by direct DB query before writing any code, not discovered via review.
+
+Reviewed (this file isn't in CLAUDE.md's strict paired-review gate list -- not a `signals_*.py`/`schwab_*.py`/kernel module -- but got a review pass anyway per this session's established caution): clause placement/precedence/param-alignment confirmed correct, verified a pure no-op across all 93 real Grid rows on the live DB (0 fixture-sourced rows exist today), confirmed no cross-mode leak (fixture-tagged mode correctly excluded while a real event in a different mode still reports). Reviewer also confirmed the fix is more load-bearing than "0 rows today" suggests: all 10 scenario_keys `stage_check_order_guard_scenarios.py` stages are real Grid rows that would have flipped from `wired-never-fired` to false `dry_run-only` proof the next time that script runs (it just hasn't run since `source` was threaded through).
+
+Found and deferred (separate item, `backlog_cache.md`): `scripts/coverage_check.py`'s daily checker has the identical unfiltered gap, currently unreachable but becomes live the moment a fixture scenario_key overlaps a seeded expectation key.
+
+2 new tests in `tests/test_coverage_check.py` (`test_compute_status_excludes_fixture_sourced_events`, `test_compute_status_null_source_events_still_count`); 69/69 in that file.

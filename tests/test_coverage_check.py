@@ -894,6 +894,37 @@ def test_compute_status_bad_results_downgrades_verified(isolated_db):
     assert status == 'verified-live'
 
 
+def test_compute_status_excludes_fixture_sourced_events(isolated_db):
+    """Found 2026-08-17: compute_status had no filter on the source column,
+    so scripts/stage_check_order_guard_scenarios.py's deliberate synthetic
+    fixture runs (source='fixture:...') counted as real dry_run/live proof
+    for whatever scenario_key they were tagged with. A fixture-only row must
+    NOT render as verified-live."""
+    db.log_coverage_event('sk_reg_fixture', 'live', result='placed',
+                           source='fixture:stage_check_order_guard_scenarios')
+    row = dict(check_mechanism='coverage_events', scenario_key='sk_reg_fixture')
+    status, detail = compute_status(row)
+    assert status == 'wired-never-fired'
+
+    # A real (non-fixture) event alongside it must still count.
+    db.log_coverage_event('sk_reg_fixture', 'live', result='placed', source='daemon')
+    status, detail = compute_status(row)
+    assert status == 'verified-live'
+
+
+def test_compute_status_null_source_events_still_count(isolated_db):
+    """Regression guard: source is NULL for the vast majority of historical
+    coverage_events rows (partial rollout) -- a naive `source NOT LIKE
+    'fixture:%'` filter would silently exclude every NULL row too under
+    SQL's three-valued logic, breaking the Grid almost entirely. A NULL-
+    source event (the normal case for most real daemon events today) must
+    still count as real proof."""
+    db.log_coverage_event('sk_reg_nullsrc', 'live', result='placed')
+    row = dict(check_mechanism='coverage_events', scenario_key='sk_reg_nullsrc')
+    status, detail = compute_status(row)
+    assert status == 'verified-live'
+
+
 def test_check_coverage_event_met_when_good_result_fires_today(isolated_db):
     check_date = datetime.now().strftime('%Y-%m-%d')
     db.log_coverage_event('cov_daily_a', 'live', result='placed')

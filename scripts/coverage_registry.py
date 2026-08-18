@@ -1926,6 +1926,17 @@ def compute_status(row):
     result_filter = row.get('result_filter')
     _clauses = ["scenario_key = ?"]
     _params = [row['scenario_key']]
+    # Exclude fixture-sourced rows (scripts/stage_check_order_guard_scenarios.py's
+    # deliberate synthetic runs) from counting as real dry_run/live proof --
+    # same underlying goal as fake_broker_proof_for (don't let synthetic
+    # evidence count as live proof), though that function greps test files
+    # and shares no mechanism with this source-column check. source is
+    # NULL for the vast majority of historical rows (partial rollout, see
+    # signals_db.log_coverage_event's docstring) -- SQL's three-valued logic
+    # makes a bare `source NOT LIKE 'fixture:%'` silently exclude every NULL
+    # row too, which would have broken the Grid for ~9.5k of ~9.5k events.
+    # `source IS NULL` must be explicitly kept in.
+    _clauses.append("(source IS NULL OR source NOT LIKE 'fixture:%')")
     if mode_filter:
         _clauses.append("mode = ?")
         _params.append(mode_filter)

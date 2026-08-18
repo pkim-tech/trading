@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [testing][coverage] Resolved 2026-08-18 — coverage_registry.py fixture-source filter: compute_status() now excludes source='fixture:...' rows from counting as Grid proof; caught a real trap before implementing (9,482/9,534 real events have source IS NULL, a naive NOT LIKE filter would have broken the Grid almost entirely). Reviewed, verified pure no-op on today's data (0 fixture rows exist yet), 2 new tests. Full detail: `deep_backlog.md`.
+
 ## [live-trading][coverage] Resolved 2026-08-18 — check_intraday_risk_review watermark gap: since_id pagination replaces the plain limit bump (which a review proved didn't actually close the gap), plus message-length caps for both coverage-events and incidents; a second review round found the fix's own watermark still only advanced on concerning events (HIGH, fixed) before shipping. Full detail: `deep_backlog.md`.
 
 ## [live-trading][security] Resolved 2026-08-18 — pending_buys.order_id auto-reconciliation (KEY item): row-scoped writes + order fingerprinting fixed 2 HIGH paired-review findings (wl_id cross-contamination between core/drought rows, unfingerprinted match reproducing the GDXU bug shape) before shipping. Full detail: `deep_backlog.md`.
