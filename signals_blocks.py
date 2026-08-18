@@ -9,11 +9,11 @@ import signals_config as cfg
 import signals_db as db
 from signals_helpers import (
     _add_trading_hours, _last_sale_recovery, automation_blockers_other_than_node,
-    buy_order_sizing, mode_tag, should_alert_live, stop_status,
+    buy_order_sizing, effectively_dry_run, mode_tag, should_alert_live, stop_status,
 )
 
 
-def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node_id=None):
+def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node_id=None, incident=False):
     """Returns (channel, ts) when posted via the Socket Mode client (None, None
     otherwise) so callers can track a message for later reminder/supersede.
 
@@ -26,19 +26,41 @@ def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node
     silently lost, only its real-time visibility, same contract as
     has_capital_at_stake's other consumers. Omitting node_id (the default)
     always sends -- system-wide messages (EOD/coverage reports, generic
-    errors) aren't ticker-scoped and were never in scope for this gate."""
+    errors) aren't ticker-scoped and were never in scope for this gate.
+
+    incident: when True, uses the more permissive effectively_dry_run(account,
+    node) check instead of should_alert_live/has_capital_at_stake -- i.e. "did
+    a real order get placed at all," not "is this >= the capital-at-stake
+    threshold" (cfg.CAPITAL_AT_STAKE_THRESHOLD, $5,000 default -- note
+    CLAUDE.md still says $10k, a stale doc claim, backlogged separately).
+    Added 2026-08-17 after should_alert_live's stricter gate got
+    applied to per-position error/incident alerts (UNPROTECTED, reconciliation
+    mismatches, placement failures) and would have suppressed RETL's own real
+    (if small, ~$400 soxl_ira) UNPROTECTED alert -- the exact incident that
+    motivated adding the gate to these call sites in the first place. User's
+    explicit call: soxl_ira's small live nodes place real (if tiny) orders and
+    their errors are useful early-warning signal ("free dry runs for prod"),
+    distinct from a canary/dry_run node's purely synthetic activity, which
+    should stay suppressed. Routine alerts (BUY SIGNAL, reminders) are
+    unaffected -- they keep the original should_alert_live/$10k gate."""
     if node_id is not None:
         # Deliberately isolated in its own try/except, unlike the rest of this
         # function relying on each callee's own internal safety -- everything
-        # this calls today (get_watch_list_node_by_id, should_alert_live) is
-        # already defensively coded, but nothing about a noise-reduction
-        # filter should ever be able to newly raise past this point and block
-        # the actual Slack send (let alone anything upstream of it), the way
-        # a real Slack outage/rejection already can't (both send paths below
-        # have their own try/except). Fails toward sending on any surprise.
+        # this calls today (get_watch_list_node_by_id, should_alert_live,
+        # effectively_dry_run) is already defensively coded, but nothing about
+        # a noise-reduction filter should ever be able to newly raise past this
+        # point and block the actual Slack send (let alone anything upstream of
+        # it), the way a real Slack outage/rejection already can't (both send
+        # paths below have their own try/except). Fails toward sending on any
+        # surprise.
         try:
             node = db.get_watch_list_node_by_id(node_id)
-            suppress = node is not None and not should_alert_live(node)
+            if node is None:
+                suppress = False
+            elif incident:
+                suppress = effectively_dry_run(node.get('account'), node)
+            else:
+                suppress = not should_alert_live(node)
         except Exception as e:
             suppress = False
             print(f"  [alert gate error] {e} -- failing open, sending")
