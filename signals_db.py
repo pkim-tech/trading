@@ -1322,6 +1322,17 @@ def ensure_tables():
             # set_addon_leg_entry_filled/open_addon_leg instead. NULL for every
             # pre-existing (paper) row; real rows always set this explicitly.
             c.execute("ALTER TABLE addon_legs ADD COLUMN entry_status TEXT")
+        if 'merged_into_core' not in al_cols:
+            # Part 8 (docs/backlog_cache.md, 2026-08-17): 1 once the leg's own
+            # real resting stop has been cancelled and its shares folded into
+            # the core position's own trailing-sell order at arm time (see
+            # _attempt_automated_sell/set_addon_leg_merged_into_core below).
+            # close_addon_leg_real_if_open reads this to skip placing a
+            # second real exit order for a leg that already closed as part
+            # of the core's single merged fill. Real-execution-only, same as
+            # the other columns in this block -- paper never merges (paper
+            # legs never place a real order to merge in the first place).
+            c.execute("ALTER TABLE addon_legs ADD COLUMN merged_into_core INTEGER NOT NULL DEFAULT 0")
         c.commit()
 
         # coverage_events: one row per real firing of an automation control/phase
@@ -3483,7 +3494,8 @@ def get_held_tickers():
 
 _PENDING_BUY_NODE_KEYS = ('id', 'ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
                           'max_hold_hours', 'label', 'trail_sell_pct', 'fixed_sl', 'trail_buy_pct',
-                          'arm_sell_pct', 'account', 'starting_notional', 'state')
+                          'arm_sell_pct', 'account', 'starting_notional', 'starting_notional_override',
+                          'state')
 
 
 def add_pending_buy(node, sig, channel, ts, order_id=None, position_source='core',
@@ -3774,10 +3786,12 @@ _PAPER_PENDING_BUY_NODE_KEYS = _PENDING_BUY_NODE_KEYS  # starting_notional now i
 def add_paper_pending_buy(node, sig):
     """No reminder machinery, unlike add_pending_buy -- a paper fill is
     auto-detected every poll (paper_trading.update_paper_buys), never confirmed
-    by a human click. Keeps starting_notional (unlike the real pending_buys node
-    subset) since update_paper_buys sizes the simulated fill directly off it,
-    with no live watch_list node to fall back on the way the real Filled-button
-    flow does."""
+    by a human click. _PAPER_PENDING_BUY_NODE_KEYS is a direct alias of
+    _PENDING_BUY_NODE_KEYS (not a separate subset) -- paper and real snapshots
+    carry the identical field set, including starting_notional_override, which
+    update_paper_buys needs to size the simulated fill correctly since there's
+    no live watch_list node to fall back on the way the real Filled-button flow
+    does."""
     node_subset = {k: node.get(k) for k in _PAPER_PENDING_BUY_NODE_KEYS}
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with _conn() as c:
@@ -4646,6 +4660,21 @@ def set_addon_leg_sl_order_id(leg_id, order_id, broker_stop_price=None):
     with _conn() as c:
         c.execute("UPDATE addon_legs SET sl_order_id=?, broker_stop_price=? WHERE id=?",
                    (order_id, broker_stop_price, leg_id))
+        c.commit()
+
+
+def set_addon_leg_merged_into_core(leg_id):
+    """Part 8 (docs/backlog_cache.md, 2026-08-17): marks a leg's own real
+    resting stop as folded into the core position's single trailing-sell
+    order at arm time (_attempt_automated_sell). addon_legs only -- paper
+    never places a real order to merge in the first place. Deliberately does
+    NOT touch sl_order_id/broker_stop_price here -- the caller
+    (_attempt_automated_sell) already clears both right after confirming the
+    leg's own stop was cancelled, before attempting the merged placement, so
+    a subsequent failure in that placement doesn't leave a stale id pointing
+    at an already-dead order."""
+    with _conn() as c:
+        c.execute("UPDATE addon_legs SET merged_into_core=1 WHERE id=?", (leg_id,))
         c.commit()
 
 
