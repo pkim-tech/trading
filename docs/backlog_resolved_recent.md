@@ -1,5 +1,13 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Fixed 2026-08-17 — the 5 remaining ungated per-position `_post_message` clusters in `signals_notify.py` (add-on leg, drought-HANDOFF, `_reconcile_fill` top-up, `check_gap_resize`, auto-detected-fill notices): 29 call sites gated `node_id=` (+`incident=True` on the 15 error/anomaly ones), 1 deliberately left ungated (`check_gap_resize`'s no-account-on-file alert — its own subject is broken attribution). Paired independent-cold + contextual Opus review with rebuttal found no CRITICAL/HIGH and 4 confirmed real fixes applied: a missing `log_coverage_event` at `check_auto_fills`' SELL loop (broke `should_alert_live`'s unconditional-logging contract), a genuinely ungated `notify_limit_fill`, an add-on-leg "cancelled" message that could claim a never-attempted cancel, and audit-script false positives. New `scripts/audit_post_message_gating.py` + 16 regression tests. Full detail: `deep_backlog.md`.
+
+## [live-trading][tooling] Fixed 2026-08-17 — `check_intraday_risk_review` collapsed 48 raw undifferentiated coverage_event lines down to 9: fixture-source filter, burst grouping (derived from `_RECONCILE_COOLDOWN_SECS`), and dedup against events already covered by their own dedicated alert. Paired-reviewed, 28 tests. Full detail: `deep_backlog.md`.
+
+## [testing][naming] Fixed 2026-08-17 — `coverage_registry.py`'s `fake_venue_proof`/`_scan_fake_venue_proof` renamed to `fake_broker_proof`/`_scan_fake_broker_proof` (accurate — it only ever scanned the `fake_broker` pytest fixture, not the newer `fake_venue/` package). Pure rename, no behavior change. Full detail: `deep_backlog.md`.
+
+## [docs] Fixed 2026-08-17 — CLAUDE.md's capital-at-stake threshold said "$10k default", real code default (`signals_config.py:37`) is $5,000 (lowered 2026-08-13); doc-only fix, no code change.
+
 ## [live-trading][security] Confirmed resolved 2026-08-17 (backlog audit) — rejected/cancelled market-buy `pending_buys` row termination gap; `check_market_buy_rejected` was already built/shipped this same week, backlog entry was just stale. Full detail: `deep_backlog.md`.
 
 ## [tooling][security] Confirmed resolved-by-drift 2026-08-17 (backlog audit) — brokerage-threshold drift-alert gap; `CAPITAL_AT_STAKE_THRESHOLD` moved to $5k, all 3 real `brokerage` nodes ($6k notional) now clear it. Sibling finding (add-on-leg drift bypass) still open, tracked in `backlog_cache.md`. Full detail: `deep_backlog.md`.

@@ -110,7 +110,7 @@ def test_sl_fill_with_no_exit_pending_closes_the_position(env, fake_broker):
     # this file exercised the real behavior (position closes correctly) but
     # never asserted the log_coverage_event call itself, so the event line
     # could be silently deleted and nothing here would catch it (found
-    # 2026-08-13, fake_venue_proof_for scan).
+    # 2026-08-13, fake_broker_proof_for scan).
     # result is now 'closed_via_sl_order_poll' (was 'closed', identical to 2 sibling call
     # sites sharing this scenario_key -- coverage_registry.py's bad_results couldn't
     # actually distinguish them by detail text, so a sibling event was silently counting

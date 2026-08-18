@@ -172,7 +172,7 @@ def test_fake_broker_diverging_buying_power_and_cash_alerts(env, fake_broker):
     monkeypatches schwab_client.get_account_balance/get_account_buying_power
     per-call, which proves the drift-detection LOGIC but never drives the
     real Client.get_account() call schwab_client.py actually makes (found
-    2026-08-13, fake_venue_proof_for scan: this file had zero fake_broker
+    2026-08-13, fake_broker_proof_for scan: this file had zero fake_broker
     coverage despite being a real order-adjacent check). fake_broker patches
     at the schwab-py client boundary instead, so this exercises the genuine
     get_account_balance/get_account_buying_power code paths end to end."""

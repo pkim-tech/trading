@@ -1,7 +1,7 @@
 """Proof-tier matrix over scripts/coverage_registry.py's REGISTRY -- answers
 "what kind of evidence exists for this scenario, and what's the real gap to
 the next tier" in one pass, instead of reading compute_status/compute_mode_
-statuses/offline_proof_for/fake_venue_proof_for separately per row.
+statuses/offline_proof_for/fake_broker_proof_for separately per row.
 
 Built 2026-08-13 directly in response to the question "broken down by
 simulator-proven, canary-proven, or live-proven (or n/a) -- what's the gap."
@@ -13,7 +13,7 @@ Tiers, highest first:
                 node -- see _proof_node_state)
   PAPER      -- paper-only evidence (paper_trading.py, never touches schwab_client)
   SIMULATOR  -- fake_broker test asserts the real event-logging call fires
-                (event-asserted fake_venue_proof), but zero real/dry_run/paper
+                (event-asserted fake_broker_proof), but zero real/dry_run/paper
                 evidence exists yet
   UNIT-TEST  -- a plain unit test asserts the event call, but no fake_broker
                 test drives it through simulated broker order-placement
@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import signals_db as db
 from scripts.coverage_registry import (
-    REGISTRY, compute_status, compute_mode_statuses, offline_proof_for, fake_venue_proof_for,
+    REGISTRY, compute_status, compute_mode_statuses, offline_proof_for, fake_broker_proof_for,
 )
 
 TIER_RANK = {'LIVE': 0, 'CANARY': 1, 'PAPER': 2, 'SIMULATOR': 3, 'UNIT-TEST': 4, 'NONE': 5, 'N/A': 6}
@@ -106,7 +106,7 @@ def classify(row):
     elif modes.get('paper', (None,))[0] == 'verified':
         tier = 'PAPER'
     else:
-        fv = fake_venue_proof_for(row['scenario_key'])[0]
+        fv = fake_broker_proof_for(row['scenario_key'])[0]
         op = offline_proof_for(row['scenario_key'])[0]
         if status == 'structural-gap':
             tier = 'SIMULATOR' if fv == 'event-asserted' else 'UNIT-TEST' if op == 'event-asserted' else 'NONE'

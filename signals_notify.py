@@ -82,7 +82,10 @@ def _attempt_automated_buy(node, sizing):
     except schwab_safety.SafetyViolation:
         return False, None
     except Exception as e:
-        _post_message(f"⚠️ {ticker} automated order placement failed unexpectedly: {e} — falling back to manual")
+        db.log_coverage_event("automated_buy_execution", _coverage_mode(account), ticker=ticker,
+                               node_id=node.get('id'), result="failed_unexpectedly", detail=str(e))
+        _post_message(f"⚠️ {ticker} automated order placement failed unexpectedly: {e} — falling back to manual",
+                       node_id=node.get('id'), incident=True)
         return False, None
     return True, order_id
 
@@ -168,10 +171,12 @@ def _attempt_automated_sell(pos, current_price):
                                    node_id=pos.get('wl_id'), result="alerted", detail=price_note)
             _post_message(
                 f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — {price_note}\n"
-                f"(auto trailing-sell replace of stop-loss {sl_order_id} failed: {e})"
+                f"(auto trailing-sell replace of stop-loss {sl_order_id} failed: {e})",
+                node_id=pos.get('wl_id'), incident=True,
             )
         elif not isinstance(e, schwab_safety.SafetyViolation):
-            _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual")
+            _post_message(f"⚠️ {ticker} automated trailing-sell placement failed unexpectedly: {e} — falling back to manual",
+                           node_id=pos.get('wl_id'), incident=True)
         return False, None
     db.log_coverage_event("automated_sell_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed",
@@ -381,10 +386,12 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
                                    node_id=pos.get('wl_id'), result="alerted", detail=price_note)
             _post_message(
                 f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — {price_note}\n"
-                f"(auto {reason} exit replace of {resting_order_label} {resting_order_id} failed: {e})"
+                f"(auto {reason} exit replace of {resting_order_label} {resting_order_id} failed: {e})",
+                node_id=pos.get('wl_id'), incident=True,
             )
         elif not isinstance(e, schwab_safety.SafetyViolation):
-            _post_message(f"⚠️ {ticker} automated {reason} exit placement failed unexpectedly: {e} — falling back to manual")
+            _post_message(f"⚠️ {ticker} automated {reason} exit placement failed unexpectedly: {e} — falling back to manual",
+                           node_id=pos.get('wl_id'), incident=True)
         return None
     db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                            node_id=pos.get('wl_id'), result="placed", detail=f"reason={reason} shares={shares}")
@@ -583,7 +590,8 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
         _post_message(
             f"ℹ️ *{ticker}* ({account} · {mode_tag(account, node)}) — replacing a MANUALLY-placed {label} "
             f"order ({resting_order_id}) with the algo's own exit\n(this position was reconciled by hand; "
-            f"the replace is expected, but the manual order is now gone)"
+            f"the replace is expected, but the manual order is now gone)",
+            node_id=node.get('id'), incident=True,
         )
 
     orders = schwab_safety._open_orders(account)
@@ -617,7 +625,8 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
             _post_message(
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — the recorded {label} order "
                 f"{resting_order_id} is NOT resting, but another stop ({_substitute.get('orderId')}) is\n"
-                f"(our order id is stale — verifying against the substitute; the replace proceeds)"
+                f"(our order id is stale — verifying against the substitute; the replace proceeds)",
+                node_id=node.get('id'), incident=True,
             )
             match = _substitute
 
@@ -630,7 +639,8 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
             f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — replacing {label} order "
             f"{resting_order_id}, but that order is NOT resting at the broker right now "
             f"(it may have already filled or been cancelled)\n(proceeding with the replace anyway so "
-            f"the exit isn't stranded — verify the position's real state after)"
+            f"the exit isn't stranded — verify the position's real state after)",
+            node_id=node.get('id'), incident=True,
         )
         return
 
@@ -659,7 +669,8 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — the order recorded as this "
                 f"position's stop-loss ({resting_order_id}) is a {_type}, not a stop\n"
                 f"(this is what an accidental manual limit-sell looks like — the replace proceeds, but "
-                f"verify what that order actually was)"
+                f"verify what that order actually was)",
+                node_id=node.get('id'), incident=True,
             )
         _expected_stop = _expected_sl_price(pos)
         _real_stop = match.get('stopPrice')
@@ -674,7 +685,8 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
                 f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — the stop-loss being replaced rests "
                 f"at ${float(_real_stop):.4f} but the algo's own stop for this position is "
                 f"${_expected_stop:.4f}\n(it was not protecting where the algo believed — the replace "
-                f"proceeds and corrects it; verify whether it was placed or edited by hand)"
+                f"proceeds and corrects it; verify whether it was placed or edited by hand)",
+                node_id=node.get('id'), incident=True,
             )
 
     real_qty = _resting_order_quantity(match)
@@ -687,7 +699,8 @@ def _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,
             f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — the {label} order being replaced covers "
             f"{float(real_qty):g} shares but the position holds {expected_shares:g}\n"
             f"(proceeding with the replace, which will be sized to {expected_shares:g} — verify no "
-            f"unexpected fill or manual trade explains the gap)"
+            f"unexpected fill or manual trade explains the gap)",
+            node_id=node.get('id'), incident=True,
         )
 
 
@@ -719,7 +732,7 @@ def _alert_reconcile_mismatch(pos, kind, text):
     )
     if not _throttled(_RECONCILE_ALERTED, f"{pos['id']}:{kind}", _RECONCILE_COOLDOWN_SECS):
         return True
-    _post_message(text)
+    _post_message(text, node_id=pos.get('wl_id'), incident=True)
     return True
 
 
@@ -740,12 +753,22 @@ def alert_stale_price_exit_suppressed(pos):
     ticker = pos['ticker']
     account = pos.get('account')
     node = db.get_watch_list_node_by_id(pos.get('wl_id'))
+    # Logged BEFORE the throttle check, deliberately -- should_alert_live's own
+    # docstring requires every caller's coverage_events/log_incident call to
+    # stay unconditional so nothing is silently lost, only its real-time Slack
+    # visibility. Placing it after the _throttled() early-return would have
+    # made the record of a persistent same-day data outage as sparse as the
+    # (15-min-cooldown) alert itself. Matches _alert_reconcile_mismatch's own
+    # ordering (paired review finding, 2026-08-17).
+    db.log_coverage_event("stale_price_exit_check_skipped", _coverage_mode(account), ticker=ticker,
+                           position_id=pos.get('id'), node_id=pos.get('wl_id'), result="skipped")
     if not _throttled(_STALE_PRICE_ALERTED, str(pos['id']), _STALE_PRICE_COOLDOWN_SECS):
         return
     _post_message(
         f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) exit check skipped this poll — no fresh price available\n"
         f"(`_current_price` returned None: stale/missing same-day data; position remains open, "
-        f"unmonitored until the next successful refresh)"
+        f"unmonitored until the next successful refresh)",
+        node_id=pos.get('wl_id'), incident=True,
     )
 
 
@@ -977,6 +1000,17 @@ def check_live_state_reconciliation(open_positions, now=None):
             )
             if _throttled(_RECONCILE_FETCH_FAIL_ALERTED, account, _RECONCILE_COOLDOWN_SECS):
                 try:
+                    # NOT node_id-gated, deliberately -- this alert is keyed and
+                    # throttled per ACCOUNT (a broker-connectivity problem, not a
+                    # per-node condition), but should_alert_live is a per-node
+                    # decision. Gating this on whichever position happens to be
+                    # first in the poll's iteration order would let a sub-threshold
+                    # node's failure consume the account's cooldown window and
+                    # silently swallow the identical alert for a real capital-at-
+                    # stake position on the same account (paired review finding,
+                    # 2026-08-17). Left ungated until the throttle key itself is
+                    # split per (account, node_id) or per-account capital-at-stake
+                    # is computed some other way.
                     _post_message(
                         f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state reconciliation "
                         f"fetch failed {_RECONCILE_FETCH_RETRIES}x in a row this cycle — could not verify "
@@ -1213,7 +1247,10 @@ def _attempt_automated_market_buy(node, sizing):
     except schwab_safety.SafetyViolation:
         return False, None
     except Exception as e:
-        _post_message(f"⚠️ {ticker} automated market-buy placement failed unexpectedly: {e} — falling back to manual")
+        db.log_coverage_event("automated_buy_execution", _coverage_mode(account), ticker=ticker,
+                               node_id=node.get('id'), result="failed_unexpectedly", detail=str(e))
+        _post_message(f"⚠️ {ticker} automated market-buy placement failed unexpectedly: {e} — falling back to manual",
+                       node_id=node.get('id'), incident=True)
         return False, None
     return True, order_id
 
@@ -1287,7 +1324,8 @@ def _place_stop_loss_for_position(node, ticker, source='daemon'):
                                node_id=node.get('id'), result="blocked", detail=str(e), source=source)
         _post_message(
             f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — place stop-loss SELL {shares} @ ~${stop_price:.2f}\n"
-            f"(stop-loss placement blocked: {e})"
+            f"(stop-loss placement blocked: {e})",
+            node_id=node.get('id'), incident=True,
         )
         return
     except Exception as e:
@@ -1366,7 +1404,8 @@ def _place_stop_loss_for_position(node, ticker, source='daemon'):
                 _post_message(
                     f"🤖 *{ticker}* ({account} · {mode_tag(account, node)}) SL already breached by the time it could be "
                     f"placed — market SELL {shares} submitted @ ~${current_price:.2f} instead "
-                    f"(target stop was ${stop_price:.2f})"
+                    f"(target stop was ${stop_price:.2f})",
+                    node_id=node.get('id'), incident=True,
                 )
                 return
             try:
@@ -1405,7 +1444,8 @@ def _place_stop_loss_for_position(node, ticker, source='daemon'):
                                node_id=node.get('id'), result="failed_unexpectedly", detail=str(last_error), source=source)
         _post_message(
             f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — place stop-loss SELL {shares} @ ~${stop_price:.2f}\n"
-            f"(stop-loss placement failed after {_SL_PLACEMENT_RETRY_ATTEMPTS} attempts: {last_error})"
+            f"(stop-loss placement failed after {_SL_PLACEMENT_RETRY_ATTEMPTS} attempts: {last_error})",
+            node_id=node.get('id'), incident=True,
         )
         return
     db.log_coverage_event("sl_placement", _coverage_mode(account), ticker=ticker, position_id=pos.get('id'),
@@ -1449,7 +1489,8 @@ def _sync_confirm_and_protect(ticker, node, order_id=None):
         _post_message(f"\U0001F6A8 {ticker_label} — market buy placed but fill not confirmed after "
                       f"{_SL_FAST_CONFIRM_ATTEMPTS * _SL_FAST_CONFIRM_INTERVAL_SECS}s — position may be "
                       f"temporarily UNPROTECTED (no stop-loss resting). Will be placed once the fill is "
-                      f"confirmed by the auto-fill poll or account-activity stream.")
+                      f"confirmed by the auto-fill poll or account-activity stream.",
+                      node_id=node.get('id'), incident=True)
         return
     _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'], account=account)
 
@@ -1547,6 +1588,14 @@ def _throttled_entry_abandon_alert(wl_id, kind, text):
     if not _throttled(_ENTRY_ABANDON_ALERTED, f"{wl_id}:{kind}",
                        _ENTRY_ABANDON_ALERT_COOLDOWN_SECS):
         return
+    # NOT node_id-gated, deliberately -- check_entry_abandon's whole design
+    # reads account/config from the PINNED pending_buys snapshot (pb['node']),
+    # never a live watch_list re-fetch, specifically so a later account/config
+    # edit can't silently steer a real cancel_order call at the wrong account
+    # (see check_entry_abandon's own docstring). Passing node_id here would
+    # have _post_message's gate re-resolve the LIVE node instead, so a
+    # real-order-in-flight alert could go silent based on config the resting
+    # order predates (paired review finding, 2026-08-17).
     _post_message(text)
 
 
@@ -1819,7 +1868,8 @@ def check_market_buy_rejected():
                     _post_message(f"⚠️ *{ticker}* ({account} · {mode_tag(account, node)}) — market-buy order "
                                   f"{order_id}'s status has been unconfirmable for over "
                                   f"{_MARKET_BUY_UNKNOWN_ALERT_AFTER_SECS // 60}min (unrecognized account or "
-                                  f"order too old to look up) — verify manually at the broker.", node_id=wl_id)
+                                  f"order too old to look up) — verify manually at the broker.",
+                                  node_id=wl_id, incident=True)
             continue
         _MARKET_BUY_STATUS_UNKNOWN_SINCE.pop(wl_id, None)
 
@@ -1835,7 +1885,7 @@ def check_market_buy_rejected():
                           f"{order_id} was {status} by Schwab AFTER partially executing "
                           f"{executed:g} shares — tracking PRESERVED, no auto-clear. Verify the real "
                           f"position at the broker and reconcile manually (a protective stop may be "
-                          f"needed).", node_id=wl_id)
+                          f"needed).", node_id=wl_id, incident=True)
             continue
 
         db.clear_pending_buy_by_wl_id(wl_id)
@@ -1843,7 +1893,8 @@ def check_market_buy_rejected():
                                result="cleared", detail=f"status={status}")
         _post_message(f"\U0001F6AB *{ticker}* ({account} · {mode_tag(account, node)}) — market-buy order "
                       f"{order_id} was {status} by Schwab, not resting — pending tracking cleared, no "
-                      f"position resulted. Verify at the broker if this was unexpected.", node_id=wl_id)
+                      f"position resulted. Verify at the broker if this was unexpected.",
+                      node_id=wl_id, incident=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2877,7 +2928,8 @@ def _place_stop_loss_for_addon_leg(leg_id, parent_pos, node):
                                node_id=parent_pos.get('wl_id'), result="failed", detail=f"addon_leg={leg_id}: {e}")
         _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) ADD-ON LEG UNPROTECTED — "
                       f"stop-loss placement failed: {e} (place a stop-loss SELL {int(leg['shares'])} shares "
-                      f"@ ~${stop_price:.2f} manually)")
+                      f"@ ~${stop_price:.2f} manually)",
+                      node_id=parent_pos.get('wl_id'), incident=True)
         return
     # order_id is None for a genuine dry_run account (schwab_client already
     # ran every real guard and only short-circuited the broker call, same

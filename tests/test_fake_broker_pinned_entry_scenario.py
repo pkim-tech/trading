@@ -11,7 +11,7 @@ session-Open price fetch, and a real trailing-buy order reaching fake_broker.
 
 Note: this scenario's real check_mechanism is 'scenario_expectations' (a
 daily trade_lifecycle check against trade_log), not 'coverage_events' --
-scripts/coverage_registry.py's fake_venue_proof/offline_proof detectors only
+scripts/coverage_registry.py's fake_broker_proof/offline_proof detectors only
 recognize get_coverage_events(scenario_key=...) assertions, so this test
 will NOT move that registry column even though it's real, working proof.
 That's a structural blind spot in the registry's own proof-scanner for any

@@ -41,7 +41,7 @@ from scripts.coverage_registry import REGISTRY, compute_status, STATUS_ORDER
 from scripts.coverage_regression_watch import last_run_statuses, log_run, staleness_for
 from scripts.capital_scaling_gate import _git_state
 from scripts.coverage_proof_matrix import classify as proof_classify
-from scripts.coverage_registry import fake_venue_proof_for
+from scripts.coverage_registry import fake_broker_proof_for
 from scripts.paper_vs_backtest_reconcile import resolve_live_track_nodes_by_activity, get_paper_trades
 import scripts.daemon_status as daemon_status
 import scripts.verify_live_parity as parity
@@ -913,7 +913,7 @@ def part3():
         if tier in ('LIVE', 'CANARY') and not red and not is_stale:
             snoozed_rows.append((row['id'], tier, status))
         else:
-            fb = fake_venue_proof_for(row['scenario_key'])[0] == 'event-asserted'
+            fb = fake_broker_proof_for(row['scenario_key'])[0] == 'event-asserted'
             edge_rows.append((row['id'], tier, status, red, is_stale, fb))
 
     print(f"Accountability Grid: {len(REGISTRY)} total scenarios "

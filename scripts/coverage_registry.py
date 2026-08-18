@@ -997,6 +997,24 @@ REGISTRY = [
                "success. That means this row can structurally never show verified-live from this "
                "code alone, even given a real successful automated entry, until a 'placed' event is "
                "added to the success path -- flagged as its own follow-up, not done tonight."),
+    dict(id='stale_price_exit_check_skipped',
+         scenario="A real (non-paper) open position's mid-bar exit check is skipped entirely for a "
+                  "poll because signals_compute._current_price returned None (stale/missing same-day "
+                  "data) -- the position is genuinely unmonitored for SL/trailing-stop/TIME that "
+                  "cycle, and that fact gets recorded (and, for a real-order node, alerted)",
+         code_path="active_signals.py run_loop exit-check branch (cp is None, trading-hours gate) -> "
+                    "signals_notify.alert_stale_price_exit_suppressed",
+         offline_coverage="tests/test_stale_price_exit_alert.py (3 tests: alert fires, 15-min "
+                           "per-position cooldown, cooldown keyed per position not shared)",
+         check_mechanism='coverage_events', scenario_key='stale_price_exit_check_skipped',
+         notes="Added 2026-08-17 alongside the coverage_events wiring itself (the Slack alert existed "
+               "since the 2026-07-22 HIBL stale-cache incident with no coverage_events trace at all, "
+               "so a persistent data outage left no queryable record). The log call is deliberately "
+               "UNCONDITIONAL -- ahead of the alert's own 15-min throttle -- per should_alert_live's "
+               "contract that suppression only costs real-time visibility, never the record. Only "
+               "result value is 'skipped'; there is no success counterpart (a normal poll simply "
+               "doesn't reach this branch), so this row reads 'has a real stale-data outage happened "
+               "on a real position yet', not a pass/fail health check."),
     dict(id='price_discontinuity_ruled_out',
          scenario="A price ratio matching a known split factor is checked against a REAL confirmed "
                   "split (yfinance) and genuinely ruled out -- SL/TP/TIME checks proceed normally "
@@ -1217,7 +1235,7 @@ REGISTRY = [
                "instrumentation gap fixed 2026-08-13: signals_notify.check_drought_entry computed the "
                "same shared evaluate_drought_entry decision as paper but never logged this scenario_key "
                "itself (only the downstream drought_entry_placement) -- no fake_broker test could have "
-               "asserted an event the real code never logged, which is why fake_venue_proof read 'none' "
+               "asserted an event the real code never logged, which is why fake_broker_proof read 'none' "
                "despite drought_entry_placement's sibling test already covering the same real code path."),
     dict(id='drought_handoff',
          scenario="An open drought-overlay position closes the moment the node's own "
@@ -1666,10 +1684,10 @@ def _mode_filter_match(scenario_key, mode_filter):
 # real bugs (the resting-order self-block bug, the TIME-while-armed bug) hide
 # behind a fully green suite -- see docs/backlog_cache.md's 2026-07-28 (night)
 # stateful-fake-order-book-fixture entry, and tests/fake_broker.py's docstring.
-_FAKE_VENUE_CACHE = None
+_FAKE_BROKER_CACHE = None
 
 # A test file mentioning the string "fake_broker" (an import, a docstring, a
-# comment) used to be enough to count as fake-venue proof -- gamed 2026-08-01:
+# comment) used to be enough to count as fake_broker proof -- gamed 2026-08-01:
 # 2 real test files admitted in their own docstrings to importing fake_broker
 # for no reason other than to satisfy this exact check, the same false-green
 # shape as the already-fixed 2026-07-26 coverage_events text-scan bug, one
@@ -1686,18 +1704,18 @@ def _uses_fake_broker_fixture(text):
     )
 
 
-def _scan_fake_venue_proof():
+def _scan_fake_broker_proof():
     """Mirrors _scan_offline_proof(), scoped to only files where at least one
     test function actually takes fake_broker as a fixture argument (real
     usage), not just any file that mentions the string."""
-    global _FAKE_VENUE_CACHE
-    if _FAKE_VENUE_CACHE is not None:
-        return _FAKE_VENUE_CACHE
+    global _FAKE_BROKER_CACHE
+    if _FAKE_BROKER_CACHE is not None:
+        return _FAKE_BROKER_CACHE
     all_keys = {r['scenario_key'] for r in REGISTRY if r.get('scenario_key')}
     event_asserted, mentioned = set(), set()
     if not _TESTS_DIR.is_dir():
-        _FAKE_VENUE_CACHE = (event_asserted, mentioned)
-        return _FAKE_VENUE_CACHE
+        _FAKE_BROKER_CACHE = (event_asserted, mentioned)
+        return _FAKE_BROKER_CACHE
     for path in sorted(_TESTS_DIR.glob("test_*.py")):
         text = path.read_text()
         if not _uses_fake_broker_fixture(text):
@@ -1712,11 +1730,11 @@ def _scan_fake_venue_proof():
         for key in all_keys:
             if _quoted(key).search(text):
                 mentioned.add(key)
-    _FAKE_VENUE_CACHE = (event_asserted, mentioned)
-    return _FAKE_VENUE_CACHE
+    _FAKE_BROKER_CACHE = (event_asserted, mentioned)
+    return _FAKE_BROKER_CACHE
 
 
-def fake_venue_proof_for(scenario_key):
+def fake_broker_proof_for(scenario_key):
     """Returns (proof_str, detail_str) -- 'event-asserted', 'behavior-only', or
     'none' -- same three-tier shape as offline_proof_for(), but scoped to only
     tests/fake_broker.py-based tests. No mode_filter handling: fake-broker
@@ -1725,7 +1743,7 @@ def fake_venue_proof_for(scenario_key):
     offline_proof_for's mode_filter exists to solve."""
     if scenario_key is None:
         return 'none', 'No scenario_key to search fake_broker test files for.'
-    event_asserted, mentioned = _scan_fake_venue_proof()
+    event_asserted, mentioned = _scan_fake_broker_proof()
     if scenario_key in event_asserted:
         return 'event-asserted', 'A fake_broker test asserts get_coverage_events() for this scenario_key.'
     if scenario_key in mentioned:
@@ -1995,6 +2013,14 @@ BEST_HARNESS = {
     'automated_exit_execution': 'live',          # added 2026-08-14, Opus audit (real code, no row before)
     'automated_buy_execution': 'live',           # added 2026-08-14, Opus audit (real code, no row before)
     'price_discontinuity_ruled_out': 'live',     # added 2026-08-14, corp-action false-positive fix
+    'stale_price_exit_check_skipped': 'live',    # added 2026-08-17; also luck-adjacent: needs a genuine
+                                                 # same-day data-refresh failure. Checked against the real
+                                                 # code: active_signals' exit loop `continue`s on every
+                                                 # is_dry_run_sim position before reaching this branch, so
+                                                 # no SYNTHESIZED dry_run position can produce it (a
+                                                 # manually-opened position on a dry_run node still could,
+                                                 # signals_handlers.py -- but a canary can't manufacture
+                                                 # the stale-data outage itself either way).
 
     # --- canary -- everything else, listed explicitly so this dict stays a complete, auditable
     # map instead of relying on a silent default. Includes 2 rows that are harness-agnostic/
@@ -2186,11 +2212,11 @@ if __name__ == '__main__':
     for r in REGISTRY:
         status, detail = compute_status(r)
         proof, _ = offline_proof_for(r.get('scenario_key'), r.get('mode_filter'))
-        fake_venue, _ = fake_venue_proof_for(r.get('scenario_key'))
-        rows.append((STATUS_ORDER[status], status, r['id'], detail, proof, fake_venue))
+        fake_broker, _ = fake_broker_proof_for(r.get('scenario_key'))
+        rows.append((STATUS_ORDER[status], status, r['id'], detail, proof, fake_broker))
     rows.sort()
-    for _, status, rid, detail, proof, fake_venue in rows:
-        print(f"{status:18s} {proof:15s} {fake_venue:15s} {rid:35s} {detail}")
+    for _, status, rid, detail, proof, fake_broker in rows:
+        print(f"{status:18s} {proof:15s} {fake_broker:15s} {rid:35s} {detail}")
     counts = {}
     for _, status, _, _, _, _ in rows:
         counts[status] = counts.get(status, 0) + 1
@@ -2199,7 +2225,7 @@ if __name__ == '__main__':
     for _, _, _, _, proof, _ in rows:
         proof_counts[proof] = proof_counts.get(proof, 0) + 1
     print("offline_proof: " + ", ".join(f"{k}={v}" for k, v in proof_counts.items()))
-    fake_venue_counts = {}
-    for _, _, _, _, _, fake_venue in rows:
-        fake_venue_counts[fake_venue] = fake_venue_counts.get(fake_venue, 0) + 1
-    print("fake_venue_proof: " + ", ".join(f"{k}={v}" for k, v in fake_venue_counts.items()))
+    fake_broker_counts = {}
+    for _, _, _, _, _, fake_broker in rows:
+        fake_broker_counts[fake_broker] = fake_broker_counts.get(fake_broker, 0) + 1
+    print("fake_broker_proof: " + ", ".join(f"{k}={v}" for k, v in fake_broker_counts.items()))

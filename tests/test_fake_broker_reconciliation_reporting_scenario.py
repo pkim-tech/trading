@@ -14,7 +14,7 @@ morning report delivery proof:
    already exercises this via open_price_quality_log assertions, but the
    coverage_registry.py's _EVENT_ASSERTED_RE regex only recognizes
    get_coverage_events(scenario_key=...) calls, so that existing test won't
-   move the fake_venue_proof column. This is a structural blind spot in the
+   move the fake_broker_proof column. This is a structural blind spot in the
    registry's proof-detector for any scenario_expectations-mechanism row."""
 import sys
 import tempfile
