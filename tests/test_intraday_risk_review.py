@@ -121,3 +121,147 @@ def test_non_trading_day_is_a_no_op(env, monkeypatch):
     signals_db.log_incident("Weekend incident", "detail")
     signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
     assert posted == []
+
+
+def _log_n_concerning(n, ticker='SOXL', detail_prefix='broker rejected order'):
+    for i in range(n):
+        signals_db.log_coverage_event("sl_placement", "live", ticker=ticker, result="failed_unexpectedly",
+                                       detail=f"{detail_prefix} {i}")
+
+
+def test_watermark_advances_past_all_new_events_even_when_message_truncated(env, monkeypatch):
+    # More concerning events than the render cap -- the Slack message must
+    # truncate its display, but the watermark must still cover every event
+    # found this cycle, not just the rendered subset, so none of the
+    # truncated-but-real ones get silently re-examined on the next poll.
+    posted = _posted(monkeypatch)
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)  # bootstrap
+    _log_n_concerning(150)
+    all_events = signals_db.get_coverage_events(scenario_key='sl_placement')
+    max_id = max(e['id'] for e in all_events)
+
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 1
+    assert f"... and {150 - signals_notify._MAX_RENDERED_COVERAGE_EVENTS} more" in posted[0][0]
+
+    state = json.loads(signals_config.INTRADAY_RISK_REVIEW_STATE_PATH.read_text())
+    assert state['last_seen_coverage_event_id'] == max_id
+
+    # Next poll: nothing new left to find, no re-post of the "truncated" ones.
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 1
+
+
+def test_truncated_message_stays_under_slack_length_limit(env, monkeypatch):
+    # 2026-08-18 rework (finding #4): the original version used ~24-char
+    # details, too short to exercise a per-line-length regression -- the
+    # review measured real worst-case coverage-event lines at 294-316 chars.
+    # Use a long detail (well past the truncation cap) plus long
+    # scenario_key/result/ticker strings so this test actually renders lines
+    # near that real worst case and would catch a regression in either the
+    # per-field truncation or the render cap.
+    posted = _posted(monkeypatch)
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)  # bootstrap
+    long_detail = "x" * 400
+    long_ticker = "VERYLONGTICKERSYM"
+    for i in range(500):
+        signals_db.log_coverage_event(
+            "some_unusually_long_scenario_key_name_for_worst_case", "live",
+            ticker=long_ticker, result=f"failed_unexpectedly_with_a_long_reason_code_{i}",
+            detail=long_detail)
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 1
+    msg = posted[0][0]
+    assert len(msg) < 40000
+    omitted = 500 - signals_notify._MAX_RENDERED_COVERAGE_EVENTS
+    assert f"... and {omitted} more (see coverage_events directly)" in msg
+    # Confirm the per-line truncation is actually engaged, not just the count.
+    longest_line = max(msg.split("\n"), key=len)
+    assert len(longest_line) < 400
+
+
+def test_non_concerning_flood_between_two_concerning_events_does_not_lose_the_second(env, monkeypatch):
+    # Real repro from the 2026-08-18 review (HIGH finding #1): a concerning
+    # event, then a large run of NON-concerning events (e.g. a
+    # reconciliation_mismatch-adjacent flood of routine blocked_* results),
+    # then a second concerning event. The old watermark logic only advanced
+    # past the CONCERNING subset's max id, and only on a successful post --
+    # so a poll cycle that found zero concerning events (all mid-flood) never
+    # advanced the watermark at all, and a large enough flood could wedge the
+    # since_id-capped fetch on the same stale rows forever, permanently
+    # hiding the second concerning event behind it.
+    posted = _posted(monkeypatch)
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)  # bootstrap
+
+    signals_db.log_coverage_event("sl_placement", "live", ticker="SOXL", result="failed_unexpectedly",
+                                   detail="first real failure")
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 1  # first concerning event alerted
+
+    # A flood of non-concerning events -- must not itself alert, but must
+    # still let the watermark progress.
+    for i in range(50):
+        signals_db.log_coverage_event("same_day_block", "live", ticker="SOXL", result="blocked_same_ticker",
+                                       detail=f"routine guard {i}")
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 1  # still no new alert -- nothing concerning in the flood
+
+    signals_db.log_coverage_event("sl_placement", "live", ticker="SOXL", result="failed_unexpectedly",
+                                   detail="second real failure, must not be lost")
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 2, "the second concerning event was silently dropped behind the non-concerning flood"
+    assert "second real failure" in posted[1][0]
+
+
+def test_drain_loop_pages_through_a_backlog_exceeding_one_fetch_limit(env, monkeypatch):
+    # Finding #1's optional drain-loop addition: if a single since_id fetch
+    # comes back exactly at the per-call cap, there may be more behind it --
+    # one poll cycle should keep paging until it genuinely catches up, not
+    # just advance by one cap's worth per poll. Monkeypatch the cap down so
+    # this is cheap to exercise without logging thousands of real rows.
+    monkeypatch.setattr(signals_notify, '_COVERAGE_EVENT_FETCH_LIMIT', 5)
+    posted = _posted(monkeypatch)
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)  # bootstrap
+    _log_n_concerning(12)  # more than 2x the artificially small cap of 5
+    all_events = signals_db.get_coverage_events(scenario_key='sl_placement')
+    max_id = max(e['id'] for e in all_events)
+
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 1
+    assert "12 concerning coverage event(s)" in posted[0][0]  # all 12 found in ONE poll cycle
+
+    state = json.loads(signals_config.INTRADAY_RISK_REVIEW_STATE_PATH.read_text())
+    assert state['last_seen_coverage_event_id'] == max_id
+
+
+def test_incident_overflow_stays_under_budget_and_caps_count(env, monkeypatch):
+    # Finding #2: incident rendering was completely uncapped -- the review
+    # measured 200 real incidents rendering to 101,386 chars. Long
+    # title/detail plus a real overflow count (well past _MAX_RENDERED_INCIDENTS).
+    posted = _posted(monkeypatch)
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)  # bootstrap
+    long_title = "A" * 250  # past the real measured 154-char worst case
+    long_detail = "B" * 400
+    for i in range(200):
+        signals_db.log_incident(long_title, long_detail, ticker="SOXL", account="soxl_ira",
+                                 real_money_impact=True)
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 1
+    msg = posted[0][0]
+    assert len(msg) < 40000
+    omitted = 200 - signals_notify._MAX_RENDERED_INCIDENTS
+    assert f"... and {omitted} more incident(s)" in msg
+
+
+def test_since_id_pagination_used_not_plain_limit(env, monkeypatch):
+    # Regression guard for the original bug: watermark bootstrap must not
+    # require pulling a large fixed-limit batch just to find the max id.
+    posted = _posted(monkeypatch)
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)  # bootstrap
+    _log_n_concerning(3)
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 1
+    assert "3 concerning coverage event(s)" in posted[0][0]
+    # Nothing new -- must stay silent (proves watermark tracks id, not count).
+    signals_notify.check_intraday_risk_review(now=TRADING_HOURS_NOON)
+    assert len(posted) == 1

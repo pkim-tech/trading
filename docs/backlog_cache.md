@@ -280,9 +280,6 @@ Real firm compliance policy: 16-trading-day minimum hold (112h), blocks ALL exit
 ## [testing][coverage] Found 2026-08-17 (check_intraday_risk_review fix review) — `coverage_registry.py` doesn't filter `source LIKE 'fixture:%'`, so staged guard-scenario events still count toward live/dry_run Grid proof
 `scripts/stage_check_order_guard_scenarios.py`'s deliberate fixture runs (synthetic `sep`/`STAGE_GUARD_TEST` combo) are correctly excluded from the intraday risk review's live-paging scan now (2026-08-17 fix), but the Accountability Grid itself (`coverage_registry.py`'s `compute_status()`) has no equivalent filter — a fixture-sourced `coverage_events` row still counts as real dry_run/live proof for whatever `scenario_key` it's tagged with. Not fixed — separate scope from the alert-noise fix.
 
-## [live-trading][coverage] Found 2026-08-17 (check_intraday_risk_review fix review), fix chosen same evening — `get_coverage_events(limit=500)` can silently drop real events if >500 land between poll cycles
-The intraday risk review's watermark advances past whatever it fetched even if more than 500 new rows landed since the last check — a burst exceeding the cap loses the excess events from that review's visibility (they stay in `coverage_events`, just never surfaced here). Pre-existing, not introduced by the 2026-08-17 fix. **User's call: bump the limit to 2000** rather than a paginated/`id > watermark` fetch — comfortably above any realistic burst (worst observed: 24 events in a 13-minute outage, 2026-08-16). Not started.
-
 ## [tooling] Idea, raised 2026-08-17 — periodic scripts/ directory cleanup/archival
 `scripts/` has grown to 78+ files (`scripts/list_scripts.py`); no process yet for archiving one-off/research scripts that are no longer applicable (superseded tooling, dead research threads) vs. the repeatable ones worth keeping discoverable. Not scoped: archive location/convention, cadence, criteria for "no longer applicable."
 

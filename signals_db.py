@@ -2612,7 +2612,19 @@ def dup_alert_suppressed_today(node_id):
     return row is not None
 
 
-def get_coverage_events(scenario_key=None, mode=None, strategy_type=None, limit=500):
+def get_coverage_events(scenario_key=None, mode=None, strategy_type=None, since_id=None, limit=500):
+    """since_id (2026-08-18): pages forward through the id space rather than
+    just returning the most recent `limit` rows. A plain limit fetch has a
+    fixed floor -- anything older than the newest `limit` rows falls below it
+    every single call, so a caller watermarking off the returned rows'
+    max id can silently strand older unexamined rows forever once the
+    watermark jumps past them (real gap found in check_intraday_risk_review).
+    since_id closes that: pass the last-seen id and this returns the oldest
+    unseen rows first (ORDER BY id ASC), so repeated calls walk forward
+    through a backlog instead of jumping to "now" and abandoning anything
+    behind. `limit` is still honored as a safety cap against an unbounded
+    single-call fetch (e.g. a flooding node), not as the primary filter.
+    Without since_id, behavior is unchanged (most-recent-N, DESC)."""
     q = "SELECT * FROM coverage_events"
     clauses, params = [], []
     if scenario_key:
@@ -2624,9 +2636,12 @@ def get_coverage_events(scenario_key=None, mode=None, strategy_type=None, limit=
     if strategy_type:
         clauses.append("strategy_type = ?")
         params.append(strategy_type)
+    if since_id is not None:
+        clauses.append("id > ?")
+        params.append(since_id)
     if clauses:
         q += " WHERE " + " AND ".join(clauses)
-    q += " ORDER BY id DESC LIMIT ?"
+    q += " ORDER BY id ASC LIMIT ?" if since_id is not None else " ORDER BY id DESC LIMIT ?"
     params.append(limit)
     with _conn() as c:
         return [dict(r) for r in c.execute(q, params).fetchall()]

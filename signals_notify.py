@@ -4342,6 +4342,70 @@ _CONCERNING_RESULT_SUBSTRINGS = (
     "fail", "reject", "mismatch", "tripped", "orphaned", "overspent", "unrecognized_account",
 )
 
+# Per-call safety cap on the since_id drain loop below (2026-08-18 rework) --
+# module level (not inline) so tests can monkeypatch it down to exercise the
+# multi-batch drain path cheaply, matching _CONCERNING_RESULT_SUBSTRINGS'
+# existing convention (was previously the untestable inline 5000 literal).
+_COVERAGE_EVENT_FETCH_LIMIT = 5000
+
+# Render caps for the Slack message below (2026-08-18 rework, replacing the
+# original single 120-line coverage-event-only cap). Both moved to module
+# level -- same rationale as _COVERAGE_EVENT_FETCH_LIMIT above -- so tests can
+# monkeypatch them (finding #7 of the 2026-08-18 review).
+#
+# Math (review found the real worst-case coverage-event line is 294-316
+# chars, not the originally-claimed 290; incidents were completely uncapped
+# and measured 101,386 chars for 200 real incidents):
+#   Total Slack budget:                              40,000 chars
+#   Header line + 2 "... and N more" tail lines
+#     + safety margin:                               -   500 chars
+#   Remaining for content:                             39,500 chars
+#   Incident section (worst case ~500 chars/incident:
+#     "  [incident #999999] [REAL MONEY] TICKER
+#     (account) -- " overhead (~60) + title (capped
+#     200) + detail line "    " + detail (capped 200)):
+#     30 incidents * 500 chars/incident              -  15,000 chars
+#   Remaining for coverage events:                      24,500 chars
+#   Coverage-event line worst case ~320 chars/line
+#     (measured 294-316, rounded up for margin):
+#     24,500 / 320 = 76.6 -> rounded down             75 events
+_MAX_RENDERED_INCIDENTS = 30
+_MAX_RENDERED_COVERAGE_EVENTS = 75
+_INCIDENT_TITLE_TRUNC = 200
+_INCIDENT_DETAIL_TRUNC = 200
+_EVENT_DETAIL_TRUNC = 200
+
+
+def _select_diverse_events(events, cap):
+    """Pick which of `events` (already filtered to concerning-only) to render
+    when there are more than `cap`. A plain newest-N or oldest-N selection can
+    let a single flood (reviewer's real example: 1,009 reconciliation_mismatch
+    rows from one ticker) crowd out every OTHER, possibly more serious, kind
+    of event for the whole render -- regardless of whether the flood landed
+    at the start or end of the window. Instead: walk events newest-first,
+    keep the first (most recent) event seen for each distinct
+    (scenario_key, ticker) pair, then fill any remaining slots with the next
+    most-recent events overall (which may repeat a kind already shown). This
+    guarantees every distinct kind of concerning event gets at least one
+    rendered row before any kind gets a second, while still favoring recency
+    within that constraint. Returned oldest-first, matching the prior
+    contract (chronological render order)."""
+    if len(events) <= cap:
+        return sorted(events, key=lambda e: e['id'])
+    newest_first = sorted(events, key=lambda e: e['id'], reverse=True)
+    seen_keys, diverse, rest = set(), [], []
+    for e in newest_first:
+        key = (e.get('scenario_key'), e.get('ticker'))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            diverse.append(e)
+        else:
+            rest.append(e)
+    selected = diverse[:cap]
+    if len(selected) < cap:
+        selected += rest[:cap - len(selected)]
+    return sorted(selected, key=lambda e: e['id'])
+
 
 def _load_intraday_risk_review_state():
     try:
@@ -4387,12 +4451,37 @@ def check_intraday_risk_review(now=None):
     main poll loop) calls this unconditionally every cycle, the
     window/trading-day gating happens in here.
 
-    Both watermarks: on a missing/corrupt state file, seed to the CURRENT
+    Incident watermark: on a missing/corrupt state file, seed to the CURRENT
     max id (not 0) so a fresh start doesn't dump every historical row
     (including already-resolved incidents) as "new" -- found by paired Opus
-    review. Watermarks only advance on a CONFIRMED post (channel and ts both
-    truthy) -- a failed/unconfirmed Slack post must not silently mark a real
-    incident as reviewed, found by the same review round."""
+    review. Only advances on a CONFIRMED post (channel and ts both truthy) --
+    a failed/unconfirmed Slack post must not silently mark a real incident as
+    reviewed, found by the same review round. get_incidents() returns ALL
+    open incidents (not pre-filtered to a "concerning" subset the way
+    coverage events are), so there's no analogous flood-hides-a-later-row gap
+    to close here -- the only cap is the render cap below.
+
+    Coverage-event watermark (reworked 2026-08-18 after a paired review found
+    the original version could silently strand a real event behind a
+    non-concerning flood): advances to the max id of the FULL fetched batch
+    (concerning and non-concerning alike) every cycle a batch was fetched,
+    regardless of whether any concerning events were found or whether the
+    Slack post succeeds. This is deliberately NOT gated on a confirmed post,
+    unlike the incident watermark above -- gating it the same way is exactly
+    what caused the bug: with the old "only advance past the concerning
+    subset, only on a successful post" rule, a run of non-concerning events
+    (no post attempted at all) left the watermark frozen, and since since_id
+    fetches are ALSO capped per call (_COVERAGE_EVENT_FETCH_LIMIT), a large
+    enough non-concerning run could permanently wedge the same first N rows
+    into every subsequent fetch, with a later concerning event stuck beyond
+    the cap never reached. Advancing the watermark to the full batch's max id
+    on every batch closes that: a batch with zero concerning events has
+    nothing to lose by advancing past it (there was nothing to alert on), and
+    a batch WITH concerning events still gets its post attempted first -- if
+    that post fails, the watermark is not saved at all this cycle (see
+    _save_intraday_risk_review_state below only being reached after the
+    branch), so a genuine post failure still retries the whole batch next
+    time, same safety property the incident side keeps."""
     now = now or datetime.now()
     today = now.strftime('%Y-%m-%d')
     if not _coverage_is_trading_day(today):
@@ -4410,32 +4499,99 @@ def check_intraday_risk_review(now=None):
     new_incidents = sorted(
         (i for i in all_incidents if i['id'] > last_seen_incident_id), key=lambda i: i['id'])
 
-    all_events = db.get_coverage_events(limit=500)
-    if 'last_seen_coverage_event_id' not in state:
-        state['last_seen_coverage_event_id'] = max((e['id'] for e in all_events), default=0)
-    last_seen_event_id = state['last_seen_coverage_event_id']
+    # Bootstrap guard (2026-08-18, finding #6, adapted -- see reasoning
+    # below). Uses an explicit one-shot flag rather than re-checking whether
+    # the stored watermark value itself is falsy: a legitimately-0 watermark
+    # (coverage_events was genuinely empty at the very first-ever call) is a
+    # real, meaningful "nothing seen yet" state, not a signal to re-bootstrap
+    # -- re-triggering the seed fetch every time the stored value happens to
+    # be 0 would swallow the very first real event that ever arrives (that
+    # event's id is 1, so the reseed "jump to current max" lands right back
+    # on it and marks it seen without alerting -- caught by this rework's own
+    # test suite). What finding #6 is actually guarding against is since_id
+    # ever reaching db.get_coverage_events() as None (which get_coverage_events
+    # treats as "no filter, most-recent-N" rather than "since the beginning",
+    # a silent-skip bug, not a dump) or a genuinely stale/migrated state where
+    # 0 doesn't mean "verified empty" -- both are closed by (a) the flag below
+    # guaranteeing the seed fetch runs exactly once per fresh state file, and
+    # (b) the `or 0` fallback guaranteeing since_id is always a real int, never
+    # None, on every call after that.
+    if not state.get('coverage_event_bootstrapped'):
+        # Bootstrap: seed to the current max id via a tiny DESC fetch (no
+        # since_id yet -- there's nothing to page forward from on first run).
+        seed_events = db.get_coverage_events(limit=1)
+        state['last_seen_coverage_event_id'] = max((e['id'] for e in seed_events), default=0)
+        state['coverage_event_bootstrapped'] = True
+    last_seen_event_id = state.get('last_seen_coverage_event_id') or 0
+
+    # since_id pagination, not a plain limit fetch (2026-08-18 fix) -- see
+    # get_coverage_events' docstring. Drain loop (2026-08-18 rework): a
+    # single call is still capped at _COVERAGE_EVENT_FETCH_LIMIT rows as a
+    # safety ceiling against an unbounded single fetch, but if a batch comes
+    # back exactly at that cap there may be more behind it, so keep paging
+    # forward within this same poll cycle until a batch returns short of the
+    # cap (i.e. genuinely caught up) -- lets one poll cycle actually drain a
+    # true backlog instead of only ever advancing by one cap's worth per
+    # 5-minute poll.
+    all_new_events = []
+    cursor_id = last_seen_event_id
+    while True:
+        batch = db.get_coverage_events(since_id=cursor_id, limit=_COVERAGE_EVENT_FETCH_LIMIT)
+        if not batch:
+            break
+        all_new_events.extend(batch)
+        cursor_id = max(e['id'] for e in batch)
+        if len(batch) < _COVERAGE_EVENT_FETCH_LIMIT:
+            break
     new_events = sorted(
-        (e for e in all_events
-         if e['id'] > last_seen_event_id
-         and any(s in (e.get('result') or '') for s in _CONCERNING_RESULT_SUBSTRINGS)),
+        (e for e in all_new_events
+         if any(s in (e.get('result') or '') for s in _CONCERNING_RESULT_SUBSTRINGS)),
         key=lambda e: e['id'])
 
     if new_incidents or new_events:
         lines = [f"🚨 Intraday risk review — {len(new_incidents)} new incident(s), "
                  f"{len(new_events)} concerning coverage event(s) since last check:"]
-        for i in new_incidents:
+        # Incident render cap (2026-08-18, finding #2) -- newest-first, same
+        # direction as the diverse coverage-event selection below, since a
+        # real reviewer measurement found 200 real incidents renders to
+        # 101,386 chars uncapped (title alone was seen up to 154 chars,
+        # schema-unbounded). See the module-level cap constants' comment for
+        # the full budget math.
+        incidents_by_recency = sorted(new_incidents, key=lambda i: i['id'], reverse=True)
+        rendered_incidents = sorted(
+            incidents_by_recency[:_MAX_RENDERED_INCIDENTS], key=lambda i: i['id'])
+        for i in rendered_incidents:
             money = " [REAL MONEY]" if i.get('real_money_impact') else ""
-            lines.append(f"  [incident #{i['id']}]{money} {i['ticker'] or ''} ({i.get('account') or 'n/a'}) — {i['title']}")
-            lines.append(f"    {i['detail'][:300]}")
-        for e in new_events:
+            title = (i['title'] or '')[:_INCIDENT_TITLE_TRUNC]
+            lines.append(f"  [incident #{i['id']}]{money} {i['ticker'] or ''} ({i.get('account') or 'n/a'}) — {title}")
+            lines.append(f"    {(i['detail'] or '')[:_INCIDENT_DETAIL_TRUNC]}")
+        incidents_omitted = len(new_incidents) - len(rendered_incidents)
+        if incidents_omitted > 0:
+            lines.append(f"  ... and {incidents_omitted} more incident(s) (see trading_incidents directly)")
+        # Coverage-event render cap -- diversity-first selection (2026-08-18,
+        # finding #3): a plain oldest-N or newest-N slice can let a single
+        # flood (any scenario_key/ticker pair) crowd out every other kind of
+        # concerning event for the whole render, wherever in the window the
+        # flood happens to land. See _select_diverse_events' docstring.
+        rendered = _select_diverse_events(new_events, _MAX_RENDERED_COVERAGE_EVENTS)
+        for e in rendered:
             lines.append(f"  [coverage_event #{e['id']}] {e['scenario_key']} result={e['result']} "
-                         f"{e.get('ticker') or ''} — {(e.get('detail') or '')[:200]}")
+                         f"{e.get('ticker') or ''} — {(e.get('detail') or '')[:_EVENT_DETAIL_TRUNC]}")
+        events_omitted = len(new_events) - len(rendered)
+        if events_omitted > 0:
+            lines.append(f"  ... and {events_omitted} more (see coverage_events directly)")
         channel, ts = _post_message("\n".join(lines))
         if channel and ts:
             if new_incidents:
                 state['last_seen_incident_id'] = max(i['id'] for i in new_incidents)
-            if new_events:
-                state['last_seen_coverage_event_id'] = max(e['id'] for e in new_events)
+            if all_new_events:
+                state['last_seen_coverage_event_id'] = max(e['id'] for e in all_new_events)
+    elif all_new_events:
+        # Nothing concerning this cycle -- still advance past the full batch
+        # so a non-concerning flood can't permanently wedge pagination (the
+        # core 2026-08-18 fix, see the coverage-event watermark docstring
+        # paragraph above). No post to confirm here since nothing was posted.
+        state['last_seen_coverage_event_id'] = max(e['id'] for e in all_new_events)
 
     _save_intraday_risk_review_state(state)
 
