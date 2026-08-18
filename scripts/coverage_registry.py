@@ -997,6 +997,35 @@ REGISTRY = [
                "success. That means this row can structurally never show verified-live from this "
                "code alone, even given a real successful automated entry, until a 'placed' event is "
                "added to the success path -- flagged as its own follow-up, not done tonight."),
+    dict(id='stale_price_exit_check_skipped',
+         scenario="A real (non-paper) open position's mid-bar exit check is skipped entirely for a "
+                  "poll because signals_compute._current_price returned None (stale/missing same-day "
+                  "data) -- the position is genuinely unmonitored for SL/trailing-stop/TIME that "
+                  "cycle, and that fact gets recorded (and, for a real-order node, alerted)",
+         code_path="active_signals.py run_loop exit-check branch (cp is None, trading-hours gate) -> "
+                    "signals_notify.alert_stale_price_exit_suppressed",
+         offline_coverage="tests/test_stale_price_exit_alert.py (3 tests: alert fires, 15-min "
+                           "per-position cooldown, cooldown keyed per position not shared); "
+                           "tests/test_incident_alert_gate.py (3 more: coverage_snoozes lever "
+                           "suppresses BOTH the event row and the alert, a non-matching snooze "
+                           "scope still fires, an expired snooze resumes firing -- added "
+                           "2026-08-17 with the snooze check itself)",
+         check_mechanism='coverage_events', scenario_key='stale_price_exit_check_skipped',
+         bad_results=['skipped_snoozed'],
+         notes="Added 2026-08-17 alongside the coverage_events wiring itself (the Slack alert existed "
+               "since the 2026-07-22 HIBL stale-cache incident with no coverage_events trace at all, "
+               "so a persistent data outage left no queryable record). The log call is UNCONDITIONAL "
+               "-- ahead of the alert's own 15-min throttle -- per should_alert_live's contract that "
+               "suppression only costs real-time visibility, never the record. A coverage_snoozes "
+               "row (added same day) suppresses only the Slack alert; the event is still written, "
+               "tagged result='skipped_snoozed' and listed in bad_results so an acknowledged "
+               "condition stops inflating this row's counts without erasing the record that a real "
+               "position really did go unmonitored for that poll. This deliberately diverges from "
+               "reconciliation_mismatch, where a snooze skips the row entirely -- there a snooze "
+               "acknowledges a known FALSE POSITIVE, here it acknowledges something genuinely true. "
+               "Otherwise the only result value is 'skipped'; there is no success counterpart (a "
+               "normal poll simply doesn't reach this branch), so this row reads 'has a real "
+               "stale-data outage happened on a real position yet', not a pass/fail health check."),
     dict(id='price_discontinuity_ruled_out',
          scenario="A price ratio matching a known split factor is checked against a REAL confirmed "
                   "split (yfinance) and genuinely ruled out -- SL/TP/TIME checks proceed normally "
@@ -1995,6 +2024,14 @@ BEST_HARNESS = {
     'automated_exit_execution': 'live',          # added 2026-08-14, Opus audit (real code, no row before)
     'automated_buy_execution': 'live',           # added 2026-08-14, Opus audit (real code, no row before)
     'price_discontinuity_ruled_out': 'live',     # added 2026-08-14, corp-action false-positive fix
+    'stale_price_exit_check_skipped': 'live',    # added 2026-08-17; also luck-adjacent: needs a genuine
+                                                 # same-day data-refresh failure. Checked against the real
+                                                 # code: active_signals' exit loop `continue`s on every
+                                                 # is_dry_run_sim position before reaching this branch, so
+                                                 # no SYNTHESIZED dry_run position can produce it (a
+                                                 # manually-opened position on a dry_run node still could,
+                                                 # signals_handlers.py -- but a canary can't manufacture
+                                                 # the stale-data outage itself either way).
 
     # --- canary -- everything else, listed explicitly so this dict stays a complete, auditable
     # map instead of relying on a silent default. Includes 2 rows that are harness-agnostic/

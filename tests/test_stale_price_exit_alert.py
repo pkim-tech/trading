@@ -62,6 +62,14 @@ def test_alerts_when_price_suppressed(env):
     assert TICKER in env[0]
     assert 'ira' in env[0]
     assert '_current_price' in env[0]
+    # Asserts the real coverage_events row, not just the Slack text -- the Grid
+    # row (scripts/coverage_registry.py, 'stale_price_exit_check_skipped')
+    # cites this file as its offline proof, and offline_proof_for() only scores
+    # that 'event-asserted' when the log call itself is actually asserted.
+    events = signals_db.get_coverage_events(scenario_key='stale_price_exit_check_skipped')
+    assert len(events) == 1
+    assert events[0]['ticker'] == TICKER
+    assert events[0]['result'] == 'skipped'
 
 
 def test_alert_rate_limited(env):

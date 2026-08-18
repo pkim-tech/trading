@@ -9,11 +9,12 @@ import signals_config as cfg
 import signals_db as db
 from signals_helpers import (
     _add_trading_hours, _last_sale_recovery, automation_blockers_other_than_node,
-    buy_order_sizing, mode_tag, should_alert_live, stop_status,
+    buy_order_sizing, effectively_dry_run, mode_tag, should_alert_live, stop_status,
 )
 
 
-def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node_id=None):
+def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node_id=None, incident=False,
+                   pos=None, node=None, real_order=False):
     """Returns (channel, ts) when posted via the Socket Mode client (None, None
     otherwise) so callers can track a message for later reminder/supersede.
 
@@ -26,19 +27,132 @@ def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node
     silently lost, only its real-time visibility, same contract as
     has_capital_at_stake's other consumers. Omitting node_id (the default)
     always sends -- system-wide messages (EOD/coverage reports, generic
-    errors) aren't ticker-scoped and were never in scope for this gate."""
-    if node_id is not None:
+    errors) aren't ticker-scoped and were never in scope for this gate.
+
+    incident: when True, uses the more permissive effectively_dry_run(account,
+    node) check instead of should_alert_live/has_capital_at_stake -- i.e. "did
+    a real order get placed at all," not "is this >= the capital-at-stake
+    threshold" (cfg.CAPITAL_AT_STAKE_THRESHOLD, $5,000 default -- note
+    CLAUDE.md still says $10k, a stale doc claim, backlogged separately).
+    Added 2026-08-17 after should_alert_live's stricter gate got
+    applied to per-position error/incident alerts (UNPROTECTED, reconciliation
+    mismatches, placement failures) and would have suppressed RETL's own real
+    (if small, ~$400 soxl_ira) UNPROTECTED alert -- the exact incident that
+    motivated adding the gate to these call sites in the first place. User's
+    explicit call: soxl_ira's small live nodes place real (if tiny) orders and
+    their errors are useful early-warning signal ("free dry runs for prod"),
+    distinct from a canary/dry_run node's purely synthetic activity, which
+    should stay suppressed. Routine alerts (BUY SIGNAL, reminders) are
+    unaffected -- they keep the original should_alert_live/$10k gate.
+
+    pos: the real open_positions row, for the position-keyed incident alerts
+    (UNPROTECTED, reconciliation mismatch, stale-price exit suppression,
+    replace-target mismatch, SL placement failure). When given alongside
+    incident=True it REPLACES the effectively_dry_run(node) lookup entirely,
+    gating instead on the position's own is_dry_run_sim flag -- the ground
+    truth recorded AT ENTRY TIME about whether this position was genuinely
+    opened for real (2026-08-17, closing the latent gap that motivated the
+    incident flag's own backlog entry). effectively_dry_run re-derives from
+    the node's CURRENT state/account, so a node demoted to paper/dry_run --
+    or an account deliberately stopped -- while a real (is_dry_run_sim=0)
+    position and real resting broker orders remain would have gone silent on
+    exactly that position's UNPROTECTED/reconciliation alerts, precisely when
+    a human has just intervened and most needs visibility. A position that
+    was real when opened does not retroactively become synthetic because
+    someone changed config afterwards. This also removes the node-lookup's
+    staleness on `account` (the gate consulted the node's current `account`
+    column rather than the account pinned on the position at order time) --
+    the account is no longer consulted at all on this path.
+
+    node: the caller's OWN in-hand node dict, used instead of re-resolving
+    node_id fresh from the DB. For an incident alert with no position yet
+    there is still usually a pinned anchor -- check_market_buy_rejected reads
+    `pb['node']`, the frozen pending_buys.node_json snapshot, and gates its
+    own "is this a real broker order" decision on it (_effectively_dry_run at
+    the top of its loop), so re-resolving the LIVE node here made the loop
+    decide "real order, worth polling" from pinned truth while this gate
+    decided "synthetic, suppress" from current truth. That function polls a
+    resting order across poll cycles and days, which is exactly the window a
+    demotion lands in; its partial-fill branch ("tracking PRESERVED... a
+    protective stop may be needed") means real shares sitting at the broker
+    with no stop and no local position row, and would have gone silent
+    (2026-08-17, both reviewers + a live-DB check finding real pending_buys
+    rows carrying pinned state/account). Placement-attempt sites
+    (_attempt_automated_buy, _attempt_automated_market_buy,
+    _sync_confirm_and_protect) pass their own in-hand node for the same
+    reason, though they have no real staleness window -- they alert
+    milliseconds after their own attempt, against the very node that drove
+    it. Same principle as `pos` above, just anchored to the pinned ORDER
+    rather than the pinned POSITION.
+
+    real_order: the caller has already PROVEN, from evidence stronger than
+    any node snapshot, that a real broker order exists for this alert -- it
+    holds a real broker order_id it is actively querying. `node` alone is not
+    sufficient for that claim: it pins the node's `state`, but
+    effectively_dry_run ALSO reads the account's CURRENT
+    schwab_safety.ACCOUNTS[...].trading_enabled, which nothing freezes into
+    node_json. So "the account was deliberately stopped while a real
+    market-buy order still rests at the broker" would still have gone dark on
+    a `node=`-only fix -- the account half of the same staleness bug (paired
+    review rebuttal round, 2026-08-17). check_market_buy_rejected is the one
+    caller: it refuses dry-run rows (_effectively_dry_run on the pinned
+    snapshot) and requires a real order_id before it ever reaches its alerts,
+    so realness is already established there and no re-derivation can improve
+    on it. Never set this from a node/account lookup -- only from real
+    evidence of a real order.
+
+    Precedence when more than one is given: real_order (strongest -- a real
+    broker order is proven to exist) > pos (a real fill happened) > node (a
+    pinned/in-hand snapshot) > a fresh node_id lookup (weakest -- current
+    config, correct only when genuinely nothing is pinned yet).
+
+    NOTE: `node` also feeds the NON-incident path (should_alert_live ->
+    has_capital_at_stake -> _last_sale_recovery), where a frozen node_json
+    could carry a stale starting_notional. Latent only -- no caller passes
+    `node=` with incident=False today."""
+    if node_id is not None or pos is not None or node is not None:
         # Deliberately isolated in its own try/except, unlike the rest of this
         # function relying on each callee's own internal safety -- everything
-        # this calls today (get_watch_list_node_by_id, should_alert_live) is
-        # already defensively coded, but nothing about a noise-reduction
-        # filter should ever be able to newly raise past this point and block
-        # the actual Slack send (let alone anything upstream of it), the way
-        # a real Slack outage/rejection already can't (both send paths below
-        # have their own try/except). Fails toward sending on any surprise.
+        # this calls today (get_watch_list_node_by_id, should_alert_live,
+        # effectively_dry_run) is already defensively coded, but nothing about
+        # a noise-reduction filter should ever be able to newly raise past this
+        # point and block the actual Slack send (let alone anything upstream of
+        # it), the way a real Slack outage/rejection already can't (both send
+        # paths below have their own try/except). Fails toward sending on any
+        # surprise.
         try:
-            node = db.get_watch_list_node_by_id(node_id)
-            suppress = node is not None and not should_alert_live(node)
+            if incident and real_order:
+                # Proven-real broker order -- nothing to re-derive. See the
+                # real_order param note above for why `node` alone can't
+                # carry this (it pins state, not the account's live
+                # trading_enabled flag).
+                suppress = False
+            elif incident and pos is not None:
+                # Truthiness, not `== 1` -- open_positions.is_dry_run_sim is
+                # INTEGER NOT NULL DEFAULT 0, but a hand-built/legacy dict
+                # missing the key must fail toward SENDING, matching this
+                # block's fail-open contract above.
+                # `origin` is a pure API guard: nothing writes origin='paper'
+                # into open_positions today (the column is DEFAULT 'live' and
+                # no INSERT sets it), and all 16 call sites use paper=False
+                # lookups, so no current caller can reach it. Kept because
+                # build_reference_table merges both books into one wl_id-keyed
+                # dict and destroys the table-of-origin signal -- if an
+                # incident alert is ever fed from a merged/report-side dict,
+                # is_dry_run_sim alone reads a paper row as real.
+                suppress = bool(pos.get('is_dry_run_sim')) or pos.get('origin') == 'paper'
+            else:
+                # A caller-supplied node wins over a fresh lookup -- see the
+                # `node` param note above. Only fall back to the DB when the
+                # caller genuinely has nothing pinned.
+                _node = node if node is not None else (
+                    db.get_watch_list_node_by_id(node_id) if node_id is not None else None)
+                if _node is None:
+                    suppress = False
+                elif incident:
+                    suppress = effectively_dry_run(_node.get('account'), _node)
+                else:
+                    suppress = not should_alert_live(_node)
         except Exception as e:
             suppress = False
             print(f"  [alert gate error] {e} -- failing open, sending")
