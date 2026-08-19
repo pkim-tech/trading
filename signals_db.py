@@ -665,6 +665,100 @@ def ensure_tables():
             # so a plain ALTER suffices -- no rebuild needed.
             c.execute("ALTER TABLE watch_list ADD COLUMN archived_at TIMESTAMP")
 
+        # entry_timing/fixed_sl weren't part of the UNIQUE constraint above -- found to be
+        # the real root cause of the 2026-08-13 "Scenario C" collision (two genuinely
+        # distinct nodes, same ticker/strategy/window/etc. but different entry_timing or
+        # fixed_sl, got treated as duplicates and had to be worked around via a
+        # max_hold_hours=47 hack instead of fixed at the source). Same rebuild pattern as
+        # the account/paper_role fixes above (SQLite can't ALTER a UNIQUE constraint in
+        # place). fixed_sl is nullable (non-uses_fixed_sl strategies leave it NULL), so
+        # this is a genuine COALESCE-worthy dedup field, matching the Python-level check
+        # in add_node() below.
+        wl_schema_sql = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='watch_list'"
+        ).fetchone()[0]
+        if 'entry_timing' not in wl_schema_sql.split('UNIQUE(')[-1]:
+            c.execute("DROP TABLE IF EXISTS watch_list_new")
+            c.executescript("""
+                CREATE TABLE watch_list_new (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    watchlist_id       INTEGER NOT NULL,
+                    state              TEXT NOT NULL DEFAULT 'paper',
+                    ticker             TEXT NOT NULL,
+                    strategy           TEXT NOT NULL,
+                    version            TEXT NOT NULL,
+                    window             INTEGER NOT NULL,
+                    take_profit        INTEGER,
+                    stop_loss          INTEGER NOT NULL,
+                    max_hold_hours     INTEGER NOT NULL,
+                    z_score_threshold  REAL NOT NULL DEFAULT 2.0,
+                    label              TEXT DEFAULT '',
+                    added_at           TEXT DEFAULT (datetime('now')),
+                    trail_sell_pct     REAL,
+                    fixed_sl           REAL,
+                    trail_buy_pct      REAL,
+                    arm_sell_pct       REAL,
+                    cached_avg_vol_10d REAL,
+                    account            TEXT,
+                    alpha              REAL,
+                    entry_timing       TEXT NOT NULL DEFAULT 'close',
+                    starting_notional  REAL NOT NULL DEFAULT 50000,
+                    annotation         TEXT,
+                    paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
+                    paper_role         TEXT,
+                    daily_sync_halted_at TEXT,
+                    daily_track_bookmark_signal_bar TEXT,
+                    drought_overlay_enabled INTEGER NOT NULL DEFAULT 0,
+                    drought_confirm_days INTEGER,
+                    drought_vol_gate   REAL,
+                    drought_sl_pct_override REAL,
+                    drought_arm_pct_override REAL,
+                    drought_trail_pct_override REAL,
+                    addon_enabled      INTEGER NOT NULL DEFAULT 0,
+                    skim_enabled       INTEGER NOT NULL DEFAULT 0,
+                    skim_step          REAL,
+                    skim_frac          REAL,
+                    skim_reserve_balance REAL NOT NULL DEFAULT 0,
+                    skim_ref           REAL,
+                    skim_peak_before_decline REAL,
+                    skim_min_since_peak REAL,
+                    skim_declining     INTEGER NOT NULL DEFAULT 0,
+                    skim_alert_sent_at TEXT,
+                    skim_alert_80_sent INTEGER NOT NULL DEFAULT 0,
+                    skim_alert_100_sent INTEGER NOT NULL DEFAULT 0,
+                    skim_strategy_value REAL,
+                    skim_last_mark_time TEXT,
+                    force_same_day_block INTEGER NOT NULL DEFAULT 0,
+                    starting_notional_override REAL,
+                    archived_at        TIMESTAMP,
+                    UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
+                           stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
+                           trail_sell_pct, account, paper_role, entry_timing, fixed_sl)
+                );
+            """)
+            live_cols_list = [r[1] for r in c.execute("PRAGMA table_info(watch_list)")]
+            new_cols_set = {r[1] for r in c.execute("PRAGMA table_info(watch_list_new)")}
+            missing = set(live_cols_list) - new_cols_set
+            if missing:
+                # Paired-review finding, 2026-08-19: this migration's CREATE TABLE
+                # watch_list_new above is a hardcoded column list, not derived from
+                # live_cols -- if a future ALTER TABLE ADD COLUMN lands above this
+                # block without being mirrored into that CREATE, the INSERT below
+                # would raise a bare "no such column" deep inside ensure_tables(),
+                # i.e. at daemon startup, with no clue what's wrong. Fail loud and
+                # specific instead.
+                raise RuntimeError(
+                    f"ensure_tables() entry_timing/fixed_sl migration: live watch_list has "
+                    f"column(s) {sorted(missing)} not present in the CREATE TABLE watch_list_new "
+                    f"statement above -- that hardcoded column list is stale (likely a newer "
+                    f"ALTER TABLE ADD COLUMN was added above this block without being mirrored "
+                    f"here). Add the missing column(s) to CREATE TABLE watch_list_new before "
+                    f"retrying.")
+            live_cols = ', '.join(live_cols_list)
+            c.execute(f"INSERT INTO watch_list_new ({live_cols}) SELECT {live_cols} FROM watch_list")
+            c.execute("DROP TABLE watch_list")
+            c.execute("ALTER TABLE watch_list_new RENAME TO watch_list")
+
         # open_positions
         c.execute("""
             CREATE TABLE IF NOT EXISTS open_positions (
@@ -2290,6 +2384,13 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
         # identical strategy params in *different* accounts are genuinely
         # distinct (the whole point of the wl_id refactor); only same-account
         # duplicates should be treated as real dedup hits.
+        # entry_timing/fixed_sl are included too (2026-08-19) -- root cause of the
+        # 2026-08-13 "Scenario C" collision: two genuinely distinct nodes (same
+        # ticker/strategy/window/etc., different entry_timing or fixed_sl) were
+        # silently treated as duplicates, worked around at the time via a
+        # max_hold_hours=47 hack instead of fixed here. fixed_sl is nullable
+        # (non-uses_fixed_sl strategies leave it NULL) so it gets the same
+        # COALESCE treatment as arm_sell_pct/trail_buy_pct/trail_sell_pct above.
         existing = c.execute("""
             SELECT id FROM watch_list
             WHERE watchlist_id = ? AND ticker = ? AND strategy = ? AND version = ?
@@ -2300,10 +2401,12 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
               AND COALESCE(trail_sell_pct, -1) = COALESCE(?, -1)
               AND COALESCE(account, '') = COALESCE(?, '')
               AND COALESCE(paper_role, '') = COALESCE(?, '')
+              AND COALESCE(entry_timing, 'close') = COALESCE(?, 'close')
+              AND COALESCE(fixed_sl, -1) = COALESCE(?, -1)
         """, (watchlist_id, ticker, strategy, version, int(window), stored_take_profit,
               int(stop_loss), int(max_hold_hours),
               stored_arm_sell_pct, stored_trail_buy_pct, stored_trail_sell_pct, account,
-              paper_role)).fetchone()
+              paper_role, entry_timing, fixed_sl)).fetchone()
         if existing:
             return
         cur = c.execute("""
