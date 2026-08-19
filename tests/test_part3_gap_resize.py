@@ -401,7 +401,10 @@ def test_drain_fill_queue_does_not_auto_reconcile_when_auto_fill_detection_disab
     node_auto_fill_detection_enabled -- the exact opt-in gate check_auto_fills
     (the slow-poll fallback) already respects. Default-off (neither flag
     enabled here), matching what a real never-opted-in ticker/node looks
-    like."""
+    like. add_node now defaults new nodes' flags to ON (2026-08-19 fix), so
+    they're explicitly turned off here to reproduce that state."""
+    schwab_safety.disable_auto_fill_detection(TICKER)
+    schwab_safety.disable_node_auto_fill_detection(_node()['id'])
     _seed_pending_order(monkeypatch, order_id=999)
     monkeypatch.setattr(schwab_client, 'get_filled_order',
                          lambda account, ticker, side, order_id=None: {'price': 52.0, 'quantity': 150})

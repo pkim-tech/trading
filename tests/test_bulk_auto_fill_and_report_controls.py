@@ -57,6 +57,28 @@ def env(monkeypatch, tmp_path):
     os.unlink(tmp_db.name)
 
 
+def _clear_auto_fill_flags(ticker, node_id):
+    """Restore the true 'never opted in' state -- add_node's 2026-08-19
+    default-enable fix (schwab_safety.initialize_auto_fill_detection_for_new_node)
+    now pre-populates both flags True for every new node, but this whole test
+    file's premise is the pre-opt-in baseline the resolver/bulk-enable
+    targeting logic operates on. Deletes the key entirely rather than writing
+    an explicit False, since an explicit False is itself a recorded human
+    'disable' decision that changes bulk_enable_auto_fill_detection's own
+    skip-logic (see its 'explicitly_disabled' bucket) -- absence must stay
+    genuinely absent."""
+    for path, key in ((schwab_safety.AUTO_FILL_DETECTION_PATH, ticker),
+                       (schwab_safety.NODE_AUTO_FILL_DETECTION_PATH, str(node_id))):
+        if path.exists():
+            state = json.loads(path.read_text())
+            if key in state:
+                del state[key]
+                if state:
+                    path.write_text(json.dumps(state))
+                else:
+                    path.unlink()  # no keys left -- restore true file-absent state
+
+
 def _add_live_node(ticker, account, notional, state='live', version='v5'):
     signals_db.add_node(ticker, 'TrailingBothZScoreBreakout', version, window=20,
                         take_profit=10, stop_loss=5, max_hold_hours=56,
@@ -64,6 +86,7 @@ def _add_live_node(ticker, account, notional, state='live', version='v5'):
     rows = [n for n in signals_db.get_watchlist()
             if n['ticker'] == ticker and n['account'] == account and n['version'] == version]
     assert len(rows) == 1, f"expected exactly one fresh node for {ticker}/{account}/{version}"
+    _clear_auto_fill_flags(ticker, rows[0]['id'])
     return rows[0]
 
 
