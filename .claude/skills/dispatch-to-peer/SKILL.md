@@ -90,6 +90,33 @@ here.
    the CLAUDE.md review-gate (item 2 above) has actually been satisfied —
    never mark a task `completed` with a paired review still outstanding.
 
+## Clearing a peer session
+
+Two safe-to-clear states — don't conflate them:
+
+- **Task complete**: the feature-wrap commit is on `main` (check
+  `TaskGet`/`git log`, not memory or the peer's last message alone). Every
+  feature is built, reviewed, and committed as one complete unit (item 3) —
+  never partial/incremental commits mid-build — so there's no in-between
+  state to preserve.
+- **Task blocked on a question**: the peer raised an open question it can't
+  resolve itself and is now idling, waiting on a reply. Idle-with-a-pending-
+  question is NOT a reason to keep the session alive — a session sitting
+  parked accumulates nothing useful, its context just ages (stale cache,
+  bigger re-brief cost whenever it does resume). Blocked is a reason TO
+  clear, not to wait. Before clearing in this state: write the open question
+  (and, once answered, the decision) into the Task's metadata via
+  `TaskUpdate`, and into `docs/backlog_cache.md` too if it's a standing
+  design question that might outlive this exchange. Once that's durably
+  captured, clear it — resuming always means a full re-brief per item 1
+  regardless of whether the session was cleared or not, so nothing is
+  actually lost by clearing while blocked.
+
+The one state that's NOT safe to clear: **actively building** (`ListAgents`
+shows `busy`, `TaskGet` shows `in_progress` with no open question posted).
+That's real in-flight work with nothing durable yet — clearing there loses
+it. Check both `ListAgents` and `TaskGet` before ever clearing a peer.
+
 ## Checking in on a stalled queue
 
 If a peer session goes idle with items still outstanding (confirm via
