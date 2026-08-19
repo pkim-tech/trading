@@ -6321,16 +6321,17 @@ def build_eod_scenario_review(check_date=None):
     # proof per branch, no separate tracking needed) so "how close" is never
     # staler than one trading day, and every day's post to slack_message_log
     # doubles as a durable trend history without a new table.
-    # 2026-08-01 Opus review finding: this list is unbounded (grows with
-    # REGISTRY) and used to render immediately below the headline, ahead of
-    # the live/paper activity and tomorrow's plan -- against real data the
-    # whole message ran ~7KB/69 lines, and if Slack ever truncates a long
-    # single-text post (as it did to the Morning Report via a hard block
-    # limit, 2026-07-23), what gets cut is the tail: the only actionable
-    # content. Capped here and the detailed listing moved below the
-    # canary/live/paper/plan sections so a truncation risks losing the least
-    # essential part first.
-    _READINESS_DETAIL_CAP = 10
+    # 2026-08-18: the itemized per-scenario "blocking readiness" listing that
+    # used to render near the end of this message (below tomorrow's plan) was
+    # removed -- it duplicated scripts/evening_status.py's Part 3
+    # Accountability Grid breakdown (lines ~841-960), which the user already
+    # reads interactively every evening and, for daily-firing/stale rows, is
+    # more detailed (tier/staleness/fake-broker columns this report never
+    # had) -- its one edge-case bucket shows per-tier counts with a
+    # `coverage_proof_matrix.py --tier` pointer rather than inline ids, so
+    # it's not a strict superset in every branch, but the itemized listing
+    # here was still pure duplication of what's already reachable. `untested`
+    # is kept only to feed the headline's raw count below.
     untested = []
     try:
         from scripts.coverage_registry import REGISTRY, compute_status
@@ -6483,13 +6484,6 @@ def build_eod_scenario_review(check_date=None):
         lines.append("\n" + build_tomorrow_plan(_next_trading_day(check_date)))
     except Exception as e:
         lines.append(f"\n⚠️ tomorrow's plan failed to build: {e}")
-
-    if untested:
-        shown = untested[:_READINESS_DETAIL_CAP]
-        lines.append(f"\n_{len(untested)} blocking readiness (top {len(shown)}, "
-                      f"see `scripts/coverage_registry.py` for the rest):_")
-        for rid, status, detail in shown:
-            lines.append(f"  ✗ [{status}] {rid}: {detail}")
 
     return _post_message("\n".join(lines))
 
