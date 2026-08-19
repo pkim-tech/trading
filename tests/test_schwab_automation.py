@@ -430,11 +430,54 @@ def test_automated_sell_falls_back_when_no_matching_node(env):
 # Auto-fill-detection toggle (default off)
 # ---------------------------------------------------------------------------
 
-def test_auto_fill_detection_defaults_off(env):
-    assert schwab_safety.auto_fill_detection_enabled(TICKER) is False
+def test_auto_fill_detection_defaults_on_for_new_node(env):
+    """Since the 2026-08-19 fix (closing the 2026-08-17 systemic-gap incident,
+    see schwab_safety.initialize_auto_fill_detection_for_new_node), add_node
+    now auto-enables both flags for a brand-new node -- this used to assert
+    the opposite (default off)."""
+    assert schwab_safety.auto_fill_detection_enabled(TICKER) is True
+    assert schwab_safety.node_auto_fill_detection_enabled(_node()['id']) is True
+
+
+def test_auto_fill_detection_raw_default_still_off_for_unknown_ticker(env):
+    """The underlying auto_fill_detection_enabled/node_auto_fill_detection_enabled
+    functions' own fallback (nothing ever recorded) is unchanged -- still False.
+    Only add_node's new call proactively opts a freshly-created node in; a
+    ticker/node_id with no watch_list row at all still has no recorded decision."""
+    assert schwab_safety.auto_fill_detection_enabled('TEST_NO_SUCH_TICKER') is False
+    assert schwab_safety.node_auto_fill_detection_enabled(999999) is False
+
+
+def test_initialize_auto_fill_detection_refuses_to_touch_unreadable_state_file(env):
+    """Paired-review HIGH fix, 2026-08-19: enable_auto_fill_detection/
+    enable_node_auto_fill_detection silently wipe their entire state file
+    (`except: state = {}`) on a corrupt/unreadable read -- reachable on every
+    single add_node call now, not just an occasional Slack button tap.
+    A pre-existing, real human Disable for another ticker/node must survive
+    a corrupt file at initialization time, not get silently erased."""
+    other_ticker = 'TEST_OTHER_TICKER_PRESERVED'
+    schwab_safety.disable_auto_fill_detection(other_ticker)
+    schwab_safety.disable_node_auto_fill_detection(424242)
+    schwab_safety.AUTO_FILL_DETECTION_PATH.write_text('{not valid json')
+    schwab_safety.NODE_AUTO_FILL_DETECTION_PATH.write_text('{not valid json')
+
+    schwab_safety.initialize_auto_fill_detection_for_new_node('TEST_NEW_TICKER', 555555)
+
+    # The new node's flags are left unset (not silently forced True), and --
+    # the actual point of this test -- the corrupt files were never rewritten,
+    # so they're still exactly as corrupt as before, not silently "fixed" by
+    # being wiped to a fresh {}.
+    assert schwab_safety._raw_flag(
+        schwab_safety.AUTO_FILL_DETECTION_PATH, 'TEST_NEW_TICKER') is schwab_safety.UNREADABLE_FLAG_STATE
+    assert schwab_safety._raw_flag(
+        schwab_safety.NODE_AUTO_FILL_DETECTION_PATH, '555555') is schwab_safety.UNREADABLE_FLAG_STATE
 
 
 def test_check_auto_fills_noop_when_toggle_off(env, monkeypatch):
+    # add_node now defaults this node's flags to ON -- explicitly turn them
+    # off to exercise the toggle-off path this test is actually about.
+    schwab_safety.disable_auto_fill_detection(TICKER)
+    schwab_safety.disable_node_auto_fill_detection(_node()['id'])
     signals_notify.notify_buy_signal(_node(), _sig())
     assert _pending()['order_placed'] == 1
 

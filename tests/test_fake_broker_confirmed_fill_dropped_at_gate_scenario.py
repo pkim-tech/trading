@@ -117,6 +117,11 @@ def _seed_resting_buy(fake_broker, price, qty):
 
 def test_confirmed_fill_dropped_at_optin_gate_alerts_and_logs(env, fake_broker, monkeypatch):
     node = _node()
+    # add_node now defaults new nodes' flags to ON (2026-08-19 fix) -- the
+    # real 2026-08-14 incident this test reproduces depended on SOXS being in
+    # NEITHER flag file, so turn both back off explicitly here.
+    schwab_safety.disable_auto_fill_detection(TICKER)
+    schwab_safety.disable_node_auto_fill_detection(node['id'])
     order_id = _seed_resting_buy(fake_broker, price=40.60, qty=19.0)
     _seed_pending_with_stale_reminder(node, order_id=order_id)
     fake_broker.force_fill(order_id, price=40.60)

@@ -2422,6 +2422,17 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
         _log_audit(c, 'add_node', watchlist_id=watchlist_id, watch_id=cur.lastrowid,
                    ticker=ticker, detail=f"strategy={strategy} version={version} state={state}")
         c.commit()
+        new_node_id = cur.lastrowid
+
+    # Closes the 2026-08-17 auto-fill-detection systemic gap (see
+    # schwab_safety.initialize_auto_fill_detection_for_new_node's docstring):
+    # a brand-new node now opts in by default instead of silently inheriting
+    # the manual-confirm-only gap from scratch. Local import -- schwab_safety
+    # imports signals_db at module level, so a module-level import here would
+    # be circular. Pure JSON-state-file writes, not a DB column, so this runs
+    # safely outside the `with _conn()` block above.
+    import schwab_safety
+    schwab_safety.initialize_auto_fill_detection_for_new_node(ticker, new_node_id)
 
 
 def remove_node(watch_id):

@@ -676,6 +676,70 @@ def disable_node_auto_fill_detection(node_id):
     NODE_AUTO_FILL_DETECTION_PATH.write_text(json.dumps(state))
 
 
+def initialize_auto_fill_detection_for_new_node(ticker: str, node_id):
+    """Called by signals_db.add_node when a brand-new node is created --
+    closes the 2026-08-17 systemic gap where a newly added node would
+    silently inherit auto_fill_detection_enabled/node_auto_fill_detection_enabled's
+    OFF-by-default (only 2 of 17 live automation-scoped nodes actually had it
+    on before that incident's same-night manual fix flipped all 17 by hand;
+    the code-level DEFAULT itself was left OFF, so any future new node would
+    recreate the same gap from scratch).
+
+    Sets the NODE-level flag unconditionally to True -- node_id is brand new,
+    so there is no prior human decision on it to respect. Sets the
+    TICKER-level flag to True too UNLESS a human already explicitly disabled
+    it for this ticker (_raw_flag(...) is False) -- mirrors
+    bulk_enable_auto_fill_detection's own 'explicitly_disabled' safety
+    bucket, so creating a new node for an existing ticker can't silently
+    undo a deliberate per-ticker opt-out.
+
+    Deliberately unconditional otherwise -- no state/mode/account gate here.
+    Paired-review correction (2026-08-19): the original docstring here claimed
+    setting these flags for a paper/research/canary node "has no live effect
+    unless/until that ticker is later automation-scoped" -- that's WRONG for
+    19 of the 36 AUTOMATION_ENABLED_TICKERS (mostly canary/dry_run, e.g.
+    FAS/FAZ) which are already automation-scoped today, just deliberately
+    excluded from the 2026-08-17 17-node incident fix (no state='live' node
+    on any of them). A new canary/dry_run node created on one of THOSE
+    tickers genuinely does become auto-fill-enabled under this function --
+    a real, if much smaller (one new node at a time, not 19 tickers' worth
+    retroactively), version of the exact outcome a blanket default flip was
+    rejected to avoid. This does not retroactively change behavior for any
+    EXISTING ticker or node -- only the brand-new node_id, and only the
+    ticker-level flag if it wasn't already explicitly set to False.
+
+    Unreadable-state handling (paired-review HIGH fix, 2026-08-19): both
+    enable_auto_fill_detection/enable_node_auto_fill_detection silently wipe
+    their entire state file (`except: state = {}`) if it exists but fails to
+    parse -- existing, pre-this-diff behavior in those Slack-button-handler
+    functions, rarely reachable before now. This function calls them on
+    EVERY new node creation, making that latent wipe far more reachable, so
+    it checks _raw_flag's UNREADABLE_FLAG_STATE sentinel first and refuses
+    to write (loudly, via print) rather than silently destroying every
+    existing ticker/node flag -- including every explicit human Disable --
+    the same reasoning bulk_enable_auto_fill_detection already applies via
+    its own explicit RuntimeError on this exact condition."""
+    ticker_flag = _raw_flag(AUTO_FILL_DETECTION_PATH, ticker)
+    if ticker_flag is UNREADABLE_FLAG_STATE:
+        print(f"initialize_auto_fill_detection_for_new_node({ticker!r}, {node_id}): "
+              f"{AUTO_FILL_DETECTION_PATH} exists but is unreadable/corrupt -- refusing to "
+              f"touch it (would silently wipe every existing ticker flag, including any real "
+              f"human Disable). Ticker-level auto-fill-detection flag left UNSET for this new "
+              f"node -- fix the file manually, then re-enable via the Slack button if needed.")
+    elif ticker_flag is not False:
+        enable_auto_fill_detection(ticker)
+
+    node_flag = _raw_flag(NODE_AUTO_FILL_DETECTION_PATH, str(node_id))
+    if node_flag is UNREADABLE_FLAG_STATE:
+        print(f"initialize_auto_fill_detection_for_new_node({ticker!r}, {node_id}): "
+              f"{NODE_AUTO_FILL_DETECTION_PATH} exists but is unreadable/corrupt -- refusing "
+              f"to touch it (would silently wipe every existing node flag). Node-level "
+              f"auto-fill-detection flag left UNSET for this new node -- fix the file "
+              f"manually, then re-enable via the Slack button if needed.")
+    else:
+        enable_node_auto_fill_detection(node_id)
+
+
 def _effective_notional(node) -> float:
     """starting_notional_override (2026-08-12) first, plain starting_notional
     otherwise -- mirrors signals_helpers._last_sale_recovery's own precedence.

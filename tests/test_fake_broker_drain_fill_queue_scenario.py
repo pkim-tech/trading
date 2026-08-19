@@ -149,7 +149,10 @@ def test_skip_when_auto_fill_detection_disabled(env, fake_broker, monkeypatch):
     r, order_id = schwab_client.place_equity_buy(ACCOUNT, TICKER, 10, 50.0)
     signals_db.add_pending_buy(node, sig, channel='C0TEST', ts='1234.5', order_id=order_id)
     signals_db.mark_pending_buy_placed(TICKER)
-    # DO NOT enable auto_fill_detection -- leave it OFF (the default)
+    # add_node now defaults new nodes' flags to ON (2026-08-19 fix) -- turn
+    # them off explicitly to exercise the disabled path this test is about.
+    schwab_safety.disable_auto_fill_detection(TICKER)
+    schwab_safety.disable_node_auto_fill_detection(node['id'])
 
     get_filled_order_called = []
 
