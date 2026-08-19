@@ -1702,9 +1702,12 @@ def update_real_pending_buys_running_low():
     feed a real-time check.
 
     Sanity-bounds each update against implausible single-print moves --
-    get_current_price prefers `quote.extended.lastPrice` (deliberately, so
-    this function can track a genuine overnight/pre-market price fall ahead
-    of check_gap_resize's pre-open check, see e.g.
+    get_current_price prefers `quote.extended.lastPrice` only when its
+    tradeTime is genuinely newer than the regular session's (fixed
+    2026-08-18 -- previously unconditional, which could serve an 11%+
+    stale extended print during real market hours), so this function can
+    still track a genuine overnight/pre-market price fall ahead of
+    check_gap_resize's pre-open check (see e.g.
     tests/test_fake_broker_gap_resize_scenario.py's Phase 1), but extended
     hours are thin/wide-spread enough that a single anomalous print (bad
     tick, one illiquid odd-lot trade) can otherwise permanently ratchet

@@ -137,11 +137,21 @@ class FakeBroker:
         (2x/50% margin requirement) if never set explicitly."""
         self.leverage_factors[ticker] = factor
 
-    def set_quote(self, ticker, last, bid=None, ask=None):
+    def set_quote(self, ticker, last, bid=None, ask=None, trade_time=None,
+                   extended_last=None, extended_trade_time=None):
+        """trade_time/extended_trade_time (ms epoch) let a scenario exercise
+        get_current_price's fresher-extended-wins branch (2026-08-18 fix,
+        schwab_client.py) -- default None on both sides leaves them at 0/0,
+        so quote.lastPrice always wins by default, matching every scenario
+        written before this parameter existed. extended_last defaults to
+        `last` (old fixture behavior: extended always mirrors regular)."""
         self.quotes[ticker] = {
             'lastPrice': last,
             'bidPrice': bid if bid is not None else last,
             'askPrice': ask if ask is not None else last,
+            'tradeTime': trade_time or 0,
+            'extendedLastPrice': extended_last if extended_last is not None else last,
+            'extendedTradeTime': extended_trade_time or 0,
         }
 
     def seed_resting_order(self, account, ticker, order_type, side, quantity,
@@ -242,9 +252,18 @@ class FakeBroker:
     def get_quote(self, ticker):
         q = self.quotes.get(ticker, {'lastPrice': 0.0, 'bidPrice': 0.0, 'askPrice': 0.0})
         leverage = self.leverage_factors.get(ticker, 200.0)
+        ext_last = q.get('extendedLastPrice', q['lastPrice'])
         return FakeResponse({ticker: {
-            'quote': dict(q),
-            'extended': {'lastPrice': q['lastPrice']},
+            'quote': {
+                'lastPrice': q['lastPrice'],
+                'bidPrice': q['bidPrice'],
+                'askPrice': q['askPrice'],
+                'tradeTime': q.get('tradeTime', 0),
+            },
+            'extended': {
+                'lastPrice': ext_last,
+                'tradeTime': q.get('extendedTradeTime', 0),
+            },
             'fundamental': {'fundLeverageFactor': leverage},
         }})
 

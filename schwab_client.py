@@ -1532,18 +1532,41 @@ def resolve_resting_buy_orders(account: str, ticker: str) -> list:
 
 
 def get_current_price(ticker: str) -> float:
-    """Primary: Schwab's own get_quote, extended.lastPrice -- confirmed
-    real-time (realtime: true, live quoteTime) unlike yfinance's pre-market
-    feed, which can run tens of minutes stale (Part 3 design, docs/research_log.md
-    2026-07-21). Falls back to yfinance's fast_info.last_price (the existing
-    live-price path used elsewhere, e.g. pages/10_Open_Positions.py) on any
-    Schwab-side error -- standard primary/fallback resilience, not a signal
-    Schwab's feed is untrusted."""
+    """Primary: Schwab's own get_quote, preferring extended.lastPrice only
+    when it's actually fresher than the regular-session quote (real bug,
+    confirmed live 2026-08-18: extended can be a stale leftover from a prior
+    session -- extended.quoteTime=0, tradeTime ~14h old, bid/ask/size all
+    zeroed -- while extended.lastPrice is still truthy, so the old unconditional
+    `or` picked an 11%+ stale price during a real SOXL move. A genuine
+    pre-market/after-hours tick with a newer timestamp than the last regular
+    trade still wins, preserving the original intent (Part 3 design,
+    docs/research_log.md 2026-07-21). Compares `tradeTime` on both sides only
+    (not `quoteTime`) -- `lastPrice` is a trade price, and mixing a quote-update
+    stamp into the comparison on either side can invert the decision (e.g. a
+    fresh bid/ask quote with no new trade yet, or a regular-session quoteTime
+    that keeps ticking after-hours with no new print) -- paired Opus review,
+    2026-08-18. Falls through to quote.lastPrice, then extended.lastPrice, then
+    yfinance if neither side has a usable price (e.g. a halted or not-yet-open
+    symbol reporting lastPrice=0/None) -- the old `or` chain covered this
+    fallback and it's preserved here rather than risking a real 0.0 price
+    reaching SL/gap-resize/top-up sizing. Falls back to yfinance's
+    fast_info.last_price (the existing live-price path used elsewhere, e.g.
+    pages/10_Open_Positions.py) on any Schwab-side error -- standard
+    primary/fallback resilience, not a signal Schwab's feed is untrusted."""
     try:
         r = _get_client().get_quote(ticker)
         r.raise_for_status()
-        quote = r.json()[ticker]
-        price = quote.get("extended", {}).get("lastPrice") or quote["quote"]["lastPrice"]
+        data = r.json()[ticker]
+        extended = data.get("extended") or {}
+        quote = data.get("quote") or {}
+        ext_price = extended.get("lastPrice")
+        ext_time = extended.get("tradeTime") or 0
+        quote_time = quote.get("tradeTime") or 0
+        if ext_price and ext_time > quote_time:
+            return float(ext_price)
+        price = quote.get("lastPrice") or ext_price
+        if not price:
+            raise ValueError(f"no valid lastPrice in quote payload for {ticker}")
         return float(price)
     except Exception:
         import yfinance as yf
