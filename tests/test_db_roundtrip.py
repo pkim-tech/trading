@@ -11,8 +11,11 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import sqlite3
+
 import active_signals as A
 import signals_config
+import signals_db as db_module
 from tests.conftest import make_synthetic_csv, cleanup_csv
 
 TICKER = 'TEST_ROUNDTRIP'
@@ -77,6 +80,208 @@ def test_add_node_does_not_collapse_distinct_arm_sell_pct_configs(db):
     watchlist = [n for n in A.get_watchlist() if n['ticker'] == TICKER]
     assert len(watchlist) == 2
     assert {n['arm_sell_pct'] for n in watchlist} == {20.0, 30.0}
+
+
+def test_add_node_does_not_collapse_distinct_entry_timing_configs(db):
+    """Real root cause of the 2026-08-13 'Scenario C' collision: two genuinely
+    distinct nodes (same ticker/strategy/window/etc., different entry_timing)
+    were silently treated as duplicates by the pre-fix dedup key, worked
+    around at the time via a max_hold_hours=47 hack instead of fixed here."""
+    A = db
+    A.add_node(TICKER, 'ZScoreBreakout', 'test', window=20, take_profit=10, stop_loss=5,
+               max_hold_hours=56, entry_timing='close')
+    A.add_node(TICKER, 'ZScoreBreakout', 'test', window=20, take_profit=10, stop_loss=5,
+               max_hold_hours=56, entry_timing='open_check')
+    watchlist = [n for n in A.get_watchlist() if n['ticker'] == TICKER]
+    assert len(watchlist) == 2
+    assert {n['entry_timing'] for n in watchlist} == {'close', 'open_check'}
+
+
+def test_add_node_does_not_collapse_distinct_fixed_sl_configs(db):
+    """Same collision shape as entry_timing above, but for fixed_sl -- two
+    uses_fixed_sl-strategy nodes with the same ticker/strategy/window/etc. but
+    different fixed_sl_override values are genuinely distinct real SL configs,
+    not duplicates."""
+    A = db
+    A.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=20,
+               stop_loss=5, max_hold_hours=24, trail_buy_pct=3.0, trail_pct=1.0,
+               fixed_sl_override=1.0)
+    A.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=20,
+               stop_loss=5, max_hold_hours=24, trail_buy_pct=3.0, trail_pct=1.0,
+               fixed_sl_override=2.0)
+    watchlist = [n for n in A.get_watchlist() if n['ticker'] == TICKER]
+    assert len(watchlist) == 2
+    assert {n['fixed_sl'] for n in watchlist} == {1.0, 2.0}
+
+
+def test_add_node_still_dedupes_genuinely_identical_nodes_incl_new_fields(db):
+    """Regression check: two calls identical in every field, including the
+    newly-added entry_timing/fixed_sl, must still collapse to one row -- the
+    widened dedup key must not turn into a no-op that stops deduping at all."""
+    A = db
+    for _ in range(3):
+        A.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=20,
+                   stop_loss=5, max_hold_hours=24, trail_buy_pct=3.0, trail_pct=1.0,
+                   entry_timing='open_check', fixed_sl_override=1.0)
+    watchlist = [n for n in A.get_watchlist() if n['ticker'] == TICKER]
+    assert len(watchlist) == 1
+    assert watchlist[0]['entry_timing'] == 'open_check'
+    assert watchlist[0]['fixed_sl'] == 1.0
+
+
+def test_entry_timing_fixed_sl_migration_preserves_populated_old_shape_table(monkeypatch):
+    """Paired-review finding, 2026-08-19: the 3 tests above all run against a
+    freshly-created DB (ensure_tables() on an empty file takes the plain
+    CREATE-with-current-schema path, never the migration branch), so the
+    riskiest half of the entry_timing/fixed_sl fix -- the actual watch_list_new
+    rebuild against REAL, PRE-EXISTING rows in the OLD UNIQUE shape -- had zero
+    coverage. Hand-builds an old-shape watch_list table (UNIQUE lacking
+    entry_timing/fixed_sl, matching the shape before this fix), seeds real
+    rows, runs the real ensure_tables(), and asserts every row/column survives
+    exactly, the new UNIQUE constraint is in place, and a second ensure_tables()
+    call is a correct no-op (idempotency)."""
+    tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tmp_db.close()
+    try:
+        conn = sqlite3.connect(tmp_db.name)
+        conn.executescript("""
+            CREATE TABLE watch_list (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                watchlist_id       INTEGER NOT NULL,
+                state              TEXT NOT NULL DEFAULT 'paper',
+                ticker             TEXT NOT NULL,
+                strategy           TEXT NOT NULL,
+                version            TEXT NOT NULL,
+                window             INTEGER NOT NULL,
+                take_profit        INTEGER,
+                stop_loss          INTEGER NOT NULL,
+                max_hold_hours     INTEGER NOT NULL,
+                z_score_threshold  REAL NOT NULL DEFAULT 2.0,
+                label              TEXT DEFAULT '',
+                added_at           TEXT DEFAULT (datetime('now')),
+                trail_sell_pct     REAL,
+                fixed_sl           REAL,
+                trail_buy_pct      REAL,
+                arm_sell_pct       REAL,
+                cached_avg_vol_10d REAL,
+                account            TEXT,
+                alpha              REAL,
+                entry_timing       TEXT NOT NULL DEFAULT 'close',
+                starting_notional  REAL NOT NULL DEFAULT 50000,
+                annotation         TEXT,
+                paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
+                paper_role         TEXT,
+                UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
+                       stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
+                       trail_sell_pct, account, paper_role)
+            );
+        """)
+        conn.execute(
+            "INSERT INTO watch_list (watchlist_id, state, ticker, strategy, version, window, "
+            "take_profit, stop_loss, max_hold_hours, label, trail_sell_pct, fixed_sl, "
+            "trail_buy_pct, arm_sell_pct, account, entry_timing, starting_notional) "
+            "VALUES (1, 'live', 'MIGTEST1', 'TrailingBothZScoreBreakout', 'test', 10, NULL, "
+            "5, 24, 'pre-migration row 1', 1.0, 2.0, 3.0, 15.0, 'ira', 'close', 12345.0)")
+        conn.execute(
+            "INSERT INTO watch_list (watchlist_id, state, ticker, strategy, version, window, "
+            "take_profit, stop_loss, max_hold_hours, label, entry_timing, starting_notional) "
+            "VALUES (1, 'paper', 'MIGTEST2', 'ZScoreBreakout', 'test', 20, 10, 5, 56, "
+            "'pre-migration row 2', 'open_check', 5000.0)")
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))
+        db_module.ensure_tables()
+
+        with db_module._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM watch_list WHERE ticker LIKE 'MIGTEST%' ORDER BY ticker"
+            ).fetchall()
+            assert len(rows) == 2, "migration must preserve every pre-existing row"
+            r1, r2 = dict(rows[0]), dict(rows[1])
+            assert r1['ticker'] == 'MIGTEST1'
+            assert r1['label'] == 'pre-migration row 1'
+            assert r1['fixed_sl'] == 2.0
+            assert r1['trail_buy_pct'] == 3.0
+            assert r1['arm_sell_pct'] == 15.0
+            assert r1['account'] == 'ira'
+            assert r1['starting_notional'] == 12345.0
+            assert r2['ticker'] == 'MIGTEST2'
+            assert r2['entry_timing'] == 'open_check'
+            assert r2['starting_notional'] == 5000.0
+
+            schema_sql = c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='watch_list'"
+            ).fetchone()[0]
+            unique_clause = schema_sql.split('UNIQUE(')[-1]
+            assert 'entry_timing' in unique_clause
+            assert 'fixed_sl' in unique_clause
+            before_snapshot = [dict(r) for r in rows]
+
+        # Idempotency: a second ensure_tables() call must be a correct no-op --
+        # not re-migrate, not error, not duplicate/drop any row, and not change
+        # any column value (full-row comparison, not just a count).
+        db_module.ensure_tables()
+        with db_module._conn() as c:
+            rows_after = [dict(r) for r in c.execute(
+                "SELECT * FROM watch_list WHERE ticker LIKE 'MIGTEST%' ORDER BY ticker"
+            ).fetchall()]
+            assert rows_after == before_snapshot
+    finally:
+        os.unlink(tmp_db.name)
+
+
+def test_entry_timing_fixed_sl_migration_guard_fires_on_stale_column_list(monkeypatch):
+    """Negative-path coverage for the paired-review-added safety guard: if the
+    live watch_list somehow has a column the migration's hardcoded CREATE
+    TABLE watch_list_new list doesn't know about, ensure_tables() must raise a
+    specific, actionable RuntimeError -- not a bare sqlite3.OperationalError
+    ('no such column') at daemon startup with no clue what's wrong."""
+    tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tmp_db.close()
+    try:
+        conn = sqlite3.connect(tmp_db.name)
+        conn.executescript("""
+            CREATE TABLE watch_list (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                watchlist_id       INTEGER NOT NULL,
+                state              TEXT NOT NULL DEFAULT 'paper',
+                ticker             TEXT NOT NULL,
+                strategy           TEXT NOT NULL,
+                version            TEXT NOT NULL,
+                window             INTEGER NOT NULL,
+                take_profit        INTEGER,
+                stop_loss          INTEGER NOT NULL,
+                max_hold_hours     INTEGER NOT NULL,
+                z_score_threshold  REAL NOT NULL DEFAULT 2.0,
+                label              TEXT DEFAULT '',
+                added_at           TEXT DEFAULT (datetime('now')),
+                trail_sell_pct     REAL,
+                fixed_sl           REAL,
+                trail_buy_pct      REAL,
+                arm_sell_pct       REAL,
+                cached_avg_vol_10d REAL,
+                account            TEXT,
+                alpha              REAL,
+                entry_timing       TEXT NOT NULL DEFAULT 'close',
+                starting_notional  REAL NOT NULL DEFAULT 50000,
+                annotation         TEXT,
+                paper_alert_verbose INTEGER NOT NULL DEFAULT 0,
+                paper_role         TEXT,
+                totally_unmirrored_future_column TEXT,
+                UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
+                       stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
+                       trail_sell_pct, account, paper_role)
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))
+        with pytest.raises(RuntimeError, match='totally_unmirrored_future_column'):
+            db_module.ensure_tables()
+    finally:
+        os.unlink(tmp_db.name)
 
 
 def _add_node_and_open_position(A, entry_price=101.0):
