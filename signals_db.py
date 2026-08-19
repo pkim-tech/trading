@@ -3507,6 +3507,14 @@ def get_held_tickers():
     return {p['ticker'] for p in get_open_positions()}
 
 
+# Single source of truth for "which watch_list fields get snapshotted off a live
+# node" -- used both for the pending_buys.node_json snapshot below AND for the
+# Slack BUY-button's embedded `value` JSON (signals_blocks.py's _build_buy_blocks),
+# which used to hand-maintain its own separate, shorter tuple. Both independently
+# went stale missing starting_notional_override during the 2026-08-18 RETL
+# incident review (handle_entry_price/handle_trail_buy_fill_price read it off the
+# Slack-button node snapshot via _last_sale_recovery) -- see
+# tests/test_pending_buy_node_keys_consistency.py for the regression guard.
 _PENDING_BUY_NODE_KEYS = ('id', 'ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
                           'max_hold_hours', 'label', 'trail_sell_pct', 'fixed_sl', 'trail_buy_pct',
                           'arm_sell_pct', 'account', 'starting_notional', 'starting_notional_override',
