@@ -530,7 +530,8 @@ def _scan_buy_signals(nodes, buy_alerted, open_position_keys, price_overrides=No
                                            ticker=sig['ticker'], node_id=node['id'], result="suppressed")
                     if not already_alerted_today:
                         _post_message(f"🔇 {sig['ticker']} ({node.get('account')} · {_account_mode_tag(node.get('account'), node)}) "
-                                      f"BUY signal suppressed — already pending/resting at broker or in pending_buys")
+                                      f"BUY signal suppressed — already pending/resting at broker or in pending_buys",
+                                      node_id=node['id'])
                 else:
                     notify_buy_signal(node, sig)
             elif sig['ticker'] in schwab_safety.AUTOMATION_ENABLED_TICKERS:
