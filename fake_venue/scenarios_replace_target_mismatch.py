@@ -170,6 +170,17 @@ def run(price=None, verbose=True):
             "Phase 2 scenario uses)")
         schwab_safety._is_trading_day = lambda date_str: True
 
+    # 2026-08-19: signals_notify._attempt_automated_exit_sell now gates on
+    # _market_session_open_now() (incident #13's market-hours-close guard),
+    # clocked off schwab_safety._now() -- orthogonal to what this scenario
+    # actually tests (a replace-target race), but a real wall-clock run
+    # outside 9:30-16:00 ET would silently short-circuit both replace
+    # attempts before either the pre-replace advisory check or the fresh
+    # broker read (the mechanisms this scenario proves) ever runs. Pinned to
+    # a fixed in-session moment, same orthogonal-override pattern as
+    # _is_trading_day above.
+    schwab_safety._now = lambda: datetime(2026, 8, 19, 15, 30, 0)
+
     posted = []
 
     def _capture(text=None, *a, **kw):

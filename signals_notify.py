@@ -312,6 +312,39 @@ def _attempt_automated_sell(pos, current_price):
     return True, exit_order_id
 
 
+def _market_session_open_now(now=None):
+    """Whether a MARKET order submitted right now could actually fill in the
+    current regular session -- the guard incident #13 (docs/deep_backlog.md,
+    2026-08-19) needed and didn't have. A bar-close SELL decision landed at
+    16:00:52 ET, 52s after the 16:00:00 close, and _attempt_automated_exit_sell
+    replaced a real resting protective STOP with a MARKET SELL anyway -- Schwab
+    held it PENDING_ACTIVATION for hours (market closed, nothing to fill
+    against), leaving a real position with neither a working stop nor a
+    completed exit. Hardcoded 9:30:00/16:00:00 regular-session bounds,
+    matching this file's existing window idiom (_trail_alert_should_post_now,
+    INTRADAY_RISK_REVIEW_WINDOW, ORPHAN_SWEEP_WINDOW all do the same rather
+    than querying mcal's per-day open/close) -- known gap: a real NYSE
+    early-close day (e.g. day after Thanksgiving, 13:00 ET) isn't specially
+    detected, same limitation those other windows already carry. Deliberately
+    compared at second granularity, not (hour, minute) like those other
+    windows -- the incident this guards against happened at 16:00:52, which a
+    minute-only comparison would still read as "16:00", inside the window.
+    Upper bound is exclusive (< 16:00:00, not <=) for the same reason: the
+    close is an instant, not a minute. Fails toward closed (blocks the market
+    order) on any doubt, since the failure mode here is real-money unprotected
+    time, not a missed alert. Clocked off schwab_safety._now() (not
+    datetime.now() directly) -- the project-wide test seam every fake_broker/
+    fake_venue scenario already monkeypatches to simulate a fixed in-window
+    moment (schwab_safety.check_order's own trading-day/window gates use the
+    same seam); using a different clock here would silently desync this new
+    guard from every existing scenario's intended in-window setup."""
+    now = now or schwab_safety._now()
+    if not _coverage_is_trading_day(now.strftime('%Y-%m-%d')):
+        return False
+    secs_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
+    return 9 * 3600 + 30 * 60 <= secs_since_midnight < 16 * 3600
+
+
 def _attempt_automated_exit_sell(pos, reason, current_price):
     """Places a real MARKET sell for a TP/SL/TIME exit signal, mirroring what
     the backtest kernel assumes happens: an exact bar-close exit fill, not a
@@ -454,6 +487,33 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
         "trailing-sell" if (hold_time_forced and resting_order_id == state.get('exit_order_id'))
         else "stop-loss"
     )
+    if not _market_session_open_now():
+        # Incident #13 fix (docs/deep_backlog.md, 2026-08-19): a MARKET order
+        # submitted outside the regular session genuinely cannot fill right
+        # now -- Schwab holds it PENDING_ACTIVATION until the next session
+        # opens. Replacing a resting protective order (the STOP in the real
+        # incident) with one of these left a real position with neither a
+        # working stop NOR a filled exit for hours. Deliberate no-op, not a
+        # cancel-then-nothing: resting_order_id (if any) is left exactly as
+        # is -- still resting, still real overnight protection, just not the
+        # discretion-free bar-close exit the strategy intends. No separate
+        # "retry at next open" flag is needed: the first bar-close check
+        # after the next session's 9:30 open re-evaluates the exit condition
+        # from scratch and calls this function again if it's still true,
+        # taking the normal in-session replace-to-market path below, inside
+        # a session that can actually fill it. (For an SL-triggered defer
+        # specifically, that also means a real overnight price recovery
+        # above the stop level is honored, not overridden -- the position
+        # simply continues on its still-resting STOP; TIME/hold-time-forced
+        # exits always re-fire regardless.) Returning None routes to notify_sell_signal's
+        # existing manual-fallback alert (same path any other placement
+        # failure takes), so the human still gets a SELL SIGNAL alert now --
+        # only the market-order submission itself is deferred.
+        db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="skipped",
+                               detail=f"reason={reason} exit_shares={exit_shares} market session closed, "
+                                      f"leaving {resting_order_label} {resting_order_id} untouched")
+        return None
     if resting_order_id:
         # Bug #4 pre-replace check -- see _attempt_automated_sell's matching
         # call. Same non-blocking contract: advisory only, never gates the exit.
@@ -2624,6 +2684,19 @@ def check_drought_handoff(node):
     # the atomic replace_equity_order_with_market, repoints sl_order_id,
     # clears broker_stop_price.
     price = sig['current_price']
+    if not _market_session_open_now():
+        # Incident #13 guard (2026-08-19): _attempt_automated_exit_sell
+        # returns None both on a genuine failure AND on a deliberate
+        # after-close no-op -- checked here, before calling it, so the two
+        # can be told apart. A market-hours defer is not a real HANDOFF
+        # failure and must not mint an incident ticket (the position's own
+        # resting stop is untouched either way, same as the core case). The
+        # next poll where sig is still BUY re-enters this same branch and
+        # retries once a MARKET order can actually fill; if the signal
+        # reverts to HOLD before then, HANDOFF simply isn't needed anymore.
+        db.log_coverage_event("drought_handoff_exit_placement", mode, ticker=ticker, node_id=wl_id,
+                               result="skipped", detail="market session closed")
+        return
     order_id = _attempt_automated_exit_sell(pos, 'HANDOFF', price)
     if order_id is None:
         db.log_coverage_event("drought_handoff_exit_placement", mode, ticker=ticker, node_id=wl_id,
@@ -3376,7 +3449,8 @@ def check_addon_leg_reconciliation(open_positions):
                 _leg_node = db.get_watch_list_node_by_id(leg.get('wl_id'))
                 _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account, _leg_node)}) — add-on leg ({leg['id']}) "
                               f"is still open but its parent core position has already closed — the real "
-                              f"lockstep close was missed. Verify and close the leg manually; NOT auto-closed.",
+                              f"lockstep close hasn't happened (a genuine miss, or deferred past market close "
+                              f"and awaiting the next session). Verify and close the leg manually; NOT auto-closed.",
                               node_id=leg.get('wl_id'), incident=True, node=_leg_node)
 
 
@@ -3488,6 +3562,28 @@ def close_addon_leg_real_if_open(pos, exit_price, exit_reason, exit_time):
     # parent core position's own exit.
     shares = int(leg['shares'])
     resting_order_id = leg.get('sl_order_id')
+    if not _market_session_open_now():
+        # Incident #13 fix (2026-08-19), mirrored here from
+        # _attempt_automated_exit_sell: same identical bug shape -- a real
+        # MARKET order submitted after the 16:00 close (or before 9:30, or
+        # on a non-trading day) genuinely cannot fill, and replacing the
+        # leg's own resting stop (resting_order_id) with one leaves the leg
+        # unprotected for hours. Deliberate no-op, resting_order_id left
+        # untouched. Unlike the core-position case, this leg has NO natural
+        # re-trigger -- close_addon_leg_real_if_open is called once,
+        # synchronously, right after the PARENT core position's own exit
+        # already closed (see this function's docstring), so the parent is
+        # already gone by the time this runs and nothing re-invokes this
+        # function for the same leg. check_addon_leg_reconciliation's
+        # existing case 2 (parent's trade_log row closed but the leg is
+        # still open -- ALERT LOUDLY, no auto-close, same detection-only
+        # stance as the rest of this reconciliation sweep) picks this up on
+        # the next poll instead: not a silent retry, but not a silent
+        # orphan either -- a human is alerted to close the leg manually.
+        db.log_coverage_event("addon_exit_placement", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                               result="skipped", detail=f"leg_id={leg['id']} market session closed, "
+                                                         f"leaving resting_order_id={resting_order_id} untouched")
+        return
     # is_addon_leg=True: this is the LEG's own SELL, not the parent's --
     # without it, check_order's ordinary resting-SELL dup guard sees the
     # parent core position's own resting protective order (a real, separate,
