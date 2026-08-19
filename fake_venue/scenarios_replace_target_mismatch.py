@@ -37,20 +37,31 @@ Three legs, two nodes:
          shape. Between leg 0 and leg A, broker state is mutated OUTSIDE any
          call this scenario is timing (i.e. before round-trip 1 even runs):
          the order leg 0 left resting is canceled and a human-shaped
-         mispriced stop takes its place under a NEW id. Round-trip 1 catches
-         it (stale id + a real substitute + a mispriced substitute) and
-         alerts loudly but does not block. Round-trip 2 (the real replace
-         call, using the STALE recorded id) then hits check_order's own
-         independent _has_open_sell_order guard, which sees the human's
-         order still resting and refuses a second concurrent SELL --
-         converting to the manual UNPROTECTED fallback rather than either
-         silently adopting the human's order OR leaving two live sells
-         resting.
-         => coverage_events['replace_target_mismatch'] has
-            resting_order_id_stale + stop_price_mismatch for node A      <-- checked
-         => coverage_events['automated_exit_execution']='blocked'        <-- checked
-         => the human's order is untouched (still WORKING, not REPLACED),
+         mispriced stop takes its place under a NEW id.
+
+         UPDATED 2026-08-19 (Task #1, same-day follow-up dispatch):
+         _attempt_automated_exit_sell's reason='SL' handling no longer
+         attempts a replace at all when a resting stop is (or was) recorded
+         -- it verifies the recorded id is genuinely still resting first
+         (round-trip 1, now _exit_order_resting rather than
+         _verify_resting_before_replace); when it is NOT, it looks for a
+         substitute the same way _verify_resting_before_replace always did,
+         and -- if found -- ADOPTS it (repoints sl_order_id, alerts
+         informationally) instead of ever reaching a replace call at all.
+         There is no round-trip 2 for this leg any more: the whole point of
+         the redesign is that a genuinely resting stop (the human's,
+         mispriced or not) is left exactly as it is, not replaced. This is a
+         strictly narrower, safer behavior than the old
+         detect-then-replace-anyway design -- the human's order is never
+         touched, and no second live order is ever placed.
+         => coverage_events['sl_exit_resting_noop'] has ONE
+            result='adopted_substitute' event for node A                  <-- checked
+         => coverage_events['automated_exit_execution'] has NO events at
+            all for node A in this leg -- no placement was ever attempted <-- checked
+         => the human's order is untouched (still WORKING, never REPLACED),
             exactly one resting SELL for the ticker in this account       <-- checked
+         => pos_a['sl_order_id'] is repointed to the human's order, not
+            left pointing at the dead canceled id                        <-- checked
 
   LEG B  (node B, fresh; _attempt_automated_sell / TRAIL-arm call site) --
          THE RACE round-trip 1 cannot see: state is unchanged and correct at
@@ -247,29 +258,23 @@ def run(price=None, verbose=True):
         f"@ ${mispriced_stop:.4f} (algo expects ${expected_stop:.4f})")
 
     new_id_a = notify._attempt_automated_exit_sell(pos_a, reason='SL', current_price=price)
-    checks.append(Check("leg A: round-trip 2 was BLOCKED, not silently succeeded or silently adopted",
-                        new_id_a is None, f"result={new_id_a}"))
+    checks.append(Check("leg A: the human's substitute was ADOPTED (its id returned), no replace ever "
+                        "attempted",
+                        new_id_a == human_order, f"result={new_id_a} expected={human_order}"))
 
-    mismatch_a = db.get_coverage_events(scenario_key='replace_target_mismatch')
-    results_a = sorted(e['result'] for e in mismatch_a if e['node_id'] == node_a['id'])
-    checks.append(Check("leg A: round-trip 1 (the advisory check) caught BOTH the stale id and the "
-                        "mispriced substitute",
-                        results_a == ['resting_order_id_stale', 'stop_price_mismatch'],
-                        f"results={results_a}"))
-    checks.append(Check("leg A: round-trip 2's own independent guard (check_order's "
-                        "_has_open_sell_order) blocked the replace -- the human's still-resting order "
-                        "is what actually prevented a wrong-target/duplicate order, not the advisory "
-                        "check alone",
-                        any('BLOCKED replace' in p and str(stale_id) in p for p in posted),
-                        f"posted={posted}"))
-    checks.append(Check("leg A: the UNPROTECTED manual-fallback alert fired with the correct algo SL "
-                        "price (not the human's mispriced one)",
-                        any('UNPROTECTED' in p and f"{expected_stop:.2f}" in p for p in posted),
+    noop_a = db.get_coverage_events(scenario_key='sl_exit_resting_noop')
+    results_a = sorted(e['result'] for e in noop_a if e['node_id'] == node_a['id'])
+    checks.append(Check("leg A: sl_exit_resting_noop logged the stale-id substitute-adoption outcome",
+                        results_a == ['adopted_substitute'], f"results={results_a}"))
+    checks.append(Check("leg A: the informational adoption alert named both the stale id and the "
+                        "substitute",
+                        any(str(stale_id) in p and str(human_order) in p for p in posted),
                         f"posted={posted}"))
     exec_events_a = db.get_coverage_events(scenario_key='automated_exit_execution')
-    blocked_a = [e for e in exec_events_a if e['result'] == 'blocked' and e['node_id'] == node_a['id']]
-    checks.append(Check("leg A: automated_exit_execution logged 'blocked' for node A",
-                        len(blocked_a) == 1, f"events={[(e['result'], e['detail']) for e in exec_events_a]}"))
+    node_a_exec = [e for e in exec_events_a if e['node_id'] == node_a['id']]
+    checks.append(Check("leg A: automated_exit_execution logged NOTHING for node A -- no placement "
+                        "was ever attempted, so there's nothing to block or fail",
+                        node_a_exec == [], f"events={[(e['result'], e['detail']) for e in node_a_exec]}"))
     checks.append(Check("leg A: the human's order is untouched -- still WORKING, never REPLACED by us",
                         broker.orders[human_order]['status'] == 'WORKING',
                         f"status={broker.orders[human_order]['status']}"))
@@ -279,10 +284,10 @@ def run(price=None, verbose=True):
                         len(resting_after_lega) == 1 and resting_after_lega[0]['orderId'] == human_order,
                         f"resting={[o['orderId'] for o in resting_after_lega]} expected=[{human_order}]"))
     pos_a_after = db.get_open_position_by_wl_id(node_a['id'])
-    checks.append(Check("leg A: sl_order_id was NOT overwritten by a failed replace (still points at "
-                        "the dead, canceled id -- correctly reflects that nothing new was placed)",
-                        pos_a_after['sl_order_id'] == stale_id,
-                        f"sl_order_id={pos_a_after['sl_order_id']} expected={stale_id}"))
+    checks.append(Check("leg A: sl_order_id was repointed to the human's genuinely-resting order, not "
+                        "left pointing at the dead, canceled id",
+                        pos_a_after['sl_order_id'] == human_order,
+                        f"sl_order_id={pos_a_after['sl_order_id']} expected={human_order}"))
 
     # ============================================================== LEG B
     say("[leg B] node B: round-trip 1 reads a genuinely clean, correctly-matched state -- then a "
@@ -364,12 +369,14 @@ def run(price=None, verbose=True):
 
 PROOF_SQL = """
 SELECT wl.id AS wl_id, wl.account,
+       (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='sl_exit_resting_noop'
+         AND result='adopted_substitute' AND node_id=wl.id) AS adopted_events,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='replace_target_mismatch'
          AND node_id=wl.id) AS mismatch_events,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='automated_sell_execution'
          AND result='blocked' AND node_id=wl.id) AS sell_blocked,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='automated_exit_execution'
-         AND result='blocked' AND node_id=wl.id) AS exit_blocked
+         AND node_id=wl.id) AS exit_events
   FROM watch_list wl
  WHERE wl.ticker = ?
  ORDER BY wl.id
@@ -378,8 +385,10 @@ SELECT wl.id AS wl_id, wl.account,
 
 def verify_proof(db_path):
     """Returns (ok, rows). ok requires exactly 2 nodes (A, B) on file, node A
-    logging 2 replace_target_mismatch events (leg A's detected case) plus one
-    blocked automated_exit_execution (leg A), and node B logging ZERO
+    logging one sl_exit_resting_noop/adopted_substitute event (leg A's
+    detected-stale-id-adopts-substitute case) and ZERO automated_exit_execution
+    events (no placement was ever attempted, per the 2026-08-19 SL-redesign --
+    see this scenario's module docstring), and node B logging ZERO
     replace_target_mismatch events (the honest TOCTOU gap in leg B) plus one
     blocked automated_sell_execution (leg B) -- directly from the harness
     DB, not from the in-process checks above."""
@@ -396,6 +405,6 @@ def verify_proof(db_path):
     if len(rows) != 2:
         return False, rows
     node_a, node_b = rows[0], rows[1]
-    ok = (node_a['mismatch_events'] == 2 and node_a['exit_blocked'] == 1
+    ok = (node_a['adopted_events'] == 1 and node_a['exit_events'] == 0
           and node_b['mismatch_events'] == 0 and node_b['sell_blocked'] == 1)
     return ok, rows

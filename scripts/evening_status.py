@@ -1308,17 +1308,50 @@ def part4():
 
 PARTS = {'1': part1, '2': part2, '3': part3, '4': part4}
 
+RUN_LOG_PATH = ROOT / "logs" / "evening_status_runs.log"
+
+
+class _Tee:
+    """Writes to both the real stream (so the terminal still sees normal output)
+    and a buffer -- used to log a full copy of a run's output, not just the
+    fact that it happened. Found 2026-08-19: nothing recorded whether/when this
+    entirely-manual script (no crontab, no daemon wiring -- see backlog) was
+    actually run on a given evening, so a real divergence could go unnoticed
+    with zero way to later confirm whether anyone looked."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
 
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else 'all'
-    if arg == 'all':
-        for p in PARTS.values():
-            p()
-            print()
-    elif arg in PARTS:
-        PARTS[arg]()
-    else:
-        print(__doc__)
+    buf = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = _Tee(real_stdout, buf)
+    try:
+        if arg == 'all':
+            for p in PARTS.values():
+                p()
+                print()
+        elif arg in PARTS:
+            PARTS[arg]()
+        else:
+            print(__doc__)
+    finally:
+        sys.stdout = real_stdout
+
+    RUN_LOG_PATH.parent.mkdir(exist_ok=True)
+    with open(RUN_LOG_PATH, "a") as f:
+        f.write(f"\n{'=' * 70}\n=== {datetime.now().isoformat(timespec='seconds')} "
+                f"run=evening_status.py {arg} ===\n{'=' * 70}\n")
+        f.write(buf.getvalue())
 
 
 if __name__ == '__main__':

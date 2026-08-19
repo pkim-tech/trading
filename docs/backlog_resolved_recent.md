@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][security] Resolved 2026-08-19 — SL exit redesign: a genuinely resting stop is never actively replaced (was: false SL price read → needless market-replace, the same-day SOXS incident's structural cause). Paired review found+fixed 3 HIGH (bug #4 replace-target-mismatch bypass, `exit_pending` poisoning blocking later exits, `check_sl_order_fills`'s FILLED-only detection gap). Full detail: `deep_backlog.md`.
+
 ## [live-trading][security] Resolved 2026-08-18 — drought overlay's `_pct_override` triplet: `_PENDING_BUY_NODE_KEYS` now carries the 3 override columns forward, and `open_position_from_pending`'s drought_overlay branch routes through `open_drought_overlay_position` (was calling `open_position` directly, silently skipping override resolution on the real fill path). Paired-reviewed (2 rounds), regression test verified to fail pre-fix. Full detail: `deep_backlog.md`.
 
 ## [live-trading][tooling] Resolved 2026-08-18 — check_intraday_risk_review's 3 remaining noise gaps closed: fixture filter was a no-op against real fixture rows (`_log_pre_action_state_verification` now threads `source`), grouping key now includes `mode`+`node_id` (real live-DB collisions confirmed for both), and a persisted cross-cycle cooldown stops a multi-poll-cycle incident from reposting every ~5min (was: a real 51-window storm would've posted 51 messages). 2-round paired review (independent-cold + contextual, both rounds rebutted). Full detail: `deep_backlog.md`.

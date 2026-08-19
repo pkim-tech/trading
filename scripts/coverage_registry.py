@@ -981,6 +981,61 @@ REGISTRY = [
                "guard, _market_session_open_now) -- a real after-close/pre-open deferral never "
                "actually exercises the replace-to-market mechanism this row proves, so it must not "
                "count as live proof the same way a genuine 'placed' event does."),
+    dict(id='sl_exit_resting_noop',
+         scenario="A reason='SL' exit signal with a genuinely resting protective stop (pos['sl_order_id'] "
+                  "set, confirmed genuinely still resting via _exit_order_resting) is left alone -- no "
+                  "market-replace attempted (result='noop'). check_sl_order_fills polls that exact order "
+                  "independently and detects a real fill on its own. When the recorded id is NOT "
+                  "confirmed resting (terminal at the broker, or the status check itself failed) but a "
+                  "genuine substitute IS found resting (the bug #4 replace_target_mismatch shape -- a "
+                  "human replaced the stop under a new id), the substitute is ADOPTED instead "
+                  "(result='adopted_substitute', sl_order_id repointed) rather than blindly attempting a "
+                  "second placement schwab_safety's duplicate-resting-SELL guard would just block anyway. "
+                  "Distinct from automated_exit_execution above, which still fires the market-replace "
+                  "path for TP/TIME/hold-time-forced TRAIL -- only SL takes this branch.",
+         code_path="signals_notify._attempt_automated_exit_sell",
+         offline_coverage="tests/test_fake_broker_sl_resting_noop_scenario.py -- asserts no new/replaced "
+                           "order appears at the broker and the original resting STOP is untouched "
+                           "(result='noop'), plus notify_sell_signal-level regression coverage that the "
+                           "no-op does NOT write trail_state['exit_pending'] (would poison the generic "
+                           "pending_order_id reuse guard for every later exit reason) and does not block "
+                           "a later genuine TIME exit. fake_venue/scenarios_replace_target_mismatch.py's "
+                           "leg A (tests/test_fake_venue_replace_target_mismatch_scenario.py) is the real "
+                           "two-broker-round-trip proof of the 'adopted_substitute' result specifically.",
+         check_mechanism='coverage_events', scenario_key='sl_exit_resting_noop',
+         notes="Added 2026-08-19 (Task #1 dispatch), root incident SOXS/ira same day: a stale cached "
+               "price fed a false SL classification and the pre-fix code market-replaced a resting "
+               "stop that had never actually been breached. A resting stop is safe to leave alone; a "
+               "market SELL is the wrong tool for restoring protection that isn't actually missing. "
+               "'adopted_substitute' added same day after paired review found the naive no-op design "
+               "(trusting pos['sl_order_id'] blindly) silently defeated bug #4's replace-target-mismatch "
+               "detection for the exact 2026-08-14 SOXS shape (a human's stale-id-substitute replacement) "
+               "-- see fake_venue/scenarios_replace_target_mismatch.py's module docstring for the full "
+               "before/after."),
+    dict(id='sl_stop_restored',
+         scenario="A reason='SL' exit signal with NO resting protective stop (pos['sl_order_id'] is "
+                  "None -- entry-time placement failed, or was otherwise cleared) places a fresh "
+                  "protective STOP order instead of a market SELL, then repoints sl_order_id/"
+                  "broker_stop_price at it so the next poll's check hits the resting-order no-op above.",
+         code_path="signals_notify._attempt_automated_exit_sell",
+         offline_coverage="tests/test_fake_broker_sl_resting_noop_scenario.py -- asserts a real STOP "
+                           "order (not MARKET) is placed and the position's sl_order_id is repointed "
+                           "(test_sl_with_no_resting_stop_places_a_stop_not_a_market_sell), plus the "
+                           "already-breached self-correcting fallback firing a real MARKET sell when "
+                           "the restore-stop placement itself fails and a fresh price recheck confirms "
+                           "the target is already crossed "
+                           "(test_sl_restore_stop_placement_failure_falls_back_to_market_when_already_breached "
+                           "-- that fallback's own success logs under automated_exit_execution's "
+                           "'placed_as_market_already_breached' result, not this scenario_key, but the "
+                           "test exercises this row's own placement-failure branch directly).",
+         check_mechanism='coverage_events', scenario_key='sl_stop_restored',
+         bad_results=['failed_unexpectedly', 'skipped'],
+         notes="Added 2026-08-19, same dispatch/incident as sl_exit_resting_noop above. 'skipped' "
+               "(added same day, cold-review finding) covers the defensive no-sl_pct-configured guard -- "
+               "shouldn't be reachable in practice since check_sell_condition can't produce reason='SL' "
+               "without a configured stop_loss/fixed_sl, but bails rather than placing a stop at "
+               "current_price (an immediately-triggerable stop, functionally the market SELL this "
+               "whole branch exists to avoid)."),
     dict(id='automated_buy_execution',
          scenario="Automated entry (trailing-buy or market-buy) actually places a real broker order "
                   "-- distinct from market_buy_placement above, which tracks the canary-scenario "
@@ -1029,6 +1084,26 @@ REGISTRY = [
                "Otherwise the only result value is 'skipped'; there is no success counterpart (a "
                "normal poll simply doesn't reach this branch), so this row reads 'has a real "
                "stale-data outage happened on a real position yet', not a pass/fail health check."),
+    dict(id='exit_check_decision',
+         scenario="Every real/dry_run-sim exit-check poll's exact inputs and outcome (at_bar_close, "
+                  "which price path fed the decision, entry_price, cp/low/high/op, and the resulting "
+                  "reason or HOLD) is recorded as a structured, queryable row -- built after the "
+                  "2026-08-19 SOXS stale-price incident took a multi-tool-call log-archaeology session "
+                  "to diagnose, with zero durable trace beyond a free-text log_poll line in a "
+                  "multi-hundred-MB file",
+         code_path="active_signals.py run_loop's exit-check branch; "
+                    "signals_notify.check_dry_run_sim_sells",
+         offline_coverage="No dedicated test asserts this event fires -- added alongside the "
+                          "resolve_live_exit_price fix itself, not independently tested.",
+         check_mechanism='coverage_events', scenario_key='exit_check_decision',
+         notes="Added 2026-08-19. Deliberately fires on EVERY poll of every open real/dry_run-sim "
+               "position, including result='HOLD' (no exit condition true) -- this is an always-on "
+               "audit trail, not a pass/fail scenario check, so there is no bad_results list and this "
+               "row is never expected to show 'verified-live' the way a scenario-outcome row does. "
+               "Flagged by cold Opus review, 2026-08-19: at POLL_SECS cadence this will dominate "
+               "coverage_events' row count within weeks (no pruning exists for this table) -- "
+               "acceptable for now given the debugging value that motivated it, but worth revisiting "
+               "if coverage_matrix.py/this registry's own query performance degrades."),
     dict(id='price_discontinuity_ruled_out',
          scenario="A price ratio matching a known split factor is checked against a REAL confirmed "
                   "split (yfinance) and genuinely ruled out -- SL/TP/TIME checks proceed normally "

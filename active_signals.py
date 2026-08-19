@@ -104,7 +104,7 @@ from signals_blocks import (
 )
 from signals_helpers import (
     _add_trading_hours, _proximity_emoji, _last_sale_recovery, _phase_emoji, log_poll, _pos_key,
-    resolve_at_bar_close, mode_tag as _account_mode_tag,
+    resolve_at_bar_close, resolve_live_exit_price, mode_tag as _account_mode_tag,
 )
 from signals_notify import (
     notify_buy_signal, notify_limit_fill, notify_sell_signal,
@@ -1342,19 +1342,26 @@ def run_loop(tickers: set = None):
                     bar = df_hourly.iloc[-1]
                     cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
                 else:
-                    cp, _ = _current_price(pos['ticker'])
+                    # resolve_live_exit_price (real Schwab quote), NOT
+                    # _current_price (cached hourly bar Close) -- found live
+                    # 2026-08-19, SOXS: an 18-minute-stale cached Close fed a
+                    # false SL classification on a brand-new position that
+                    # was never actually below its stop. See
+                    # resolve_live_exit_price's docstring for the full
+                    # incident. A None return (network/quote failure) is
+                    # still handled the same fail-safe way as the old
+                    # _current_price None case below.
+                    cp = resolve_live_exit_price(pos['ticker'])
                     if cp is None:
-                        # Widening _current_price's staleness guard to an age
-                        # check (2026-07-31) means it now legitimately returns
-                        # None almost every off-hours poll -- there's nothing
-                        # actionable about that overnight/weekend, so only
-                        # alert during real trading hours (found live: would
-                        # otherwise repost every 15min, all night/weekend, per
-                        # open position). NOT _reminders_active's 9:00 window --
-                        # the day's first bar isn't even fresh yet until ~9:35
-                        # (9:30 bar + poll/refresh lag), so reusing that window
-                        # verbatim would still fire 2-3 pure-noise alerts every
-                        # trading morning (Opus review, 2026-07-31).
+                        # There's nothing actionable about a failed live quote
+                        # off-hours -- only alert during real trading hours
+                        # (found live: would otherwise repost every 15min, all
+                        # night/weekend, per open position). NOT
+                        # _reminders_active's 9:00 window -- the day's first
+                        # bar isn't even fresh yet until ~9:35 (9:30 bar +
+                        # poll/refresh lag), so reusing that window verbatim
+                        # would still fire 2-3 pure-noise alerts every trading
+                        # morning (Opus review, 2026-07-31).
                         if _is_trading_day(today) and (9, 35) <= (now.hour, now.minute) <= (16, 0):
                             alert_stale_price_exit_suppressed(pos)
                         return
@@ -1363,6 +1370,20 @@ def run_loop(tickers: set = None):
                          f"cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
                 reason, target, just_activated_trailing = check_sell_condition(
                     pos, cp, now, at_bar_close=at_bar_close, low=low, high=high, open_price=op, df_hourly=df_hourly)
+                # Structured, queryable record of the exact inputs and outcome of
+                # every real exit-check decision -- added 2026-08-19 after the
+                # SOXS stale-price incident took a multi-tool-call log-archaeology
+                # session to diagnose, with zero durable trace beyond a free-text
+                # log_poll line in a multi-hundred-MB file. price_source records
+                # WHICH of the two price paths fed this decision (the actual root
+                # cause of that incident was silent otherwise) -- entry_price is
+                # included so a future SL/TP misfire is auditable without a
+                # separate trade_log join.
+                db.log_coverage_event(
+                    "exit_check_decision", _coverage_mode(pos.get('account')), ticker=pos['ticker'],
+                    position_id=pos.get('id'), node_id=pos.get('wl_id'), result=reason or "HOLD",
+                    detail=f"at_bar_close={at_bar_close} price_source={'bar_close' if at_bar_close else 'live_quote'} "
+                           f"entry_price={pos.get('entry_price')} cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
                 if just_activated_trailing:
                     notify_trailing_activated(pos, cp)
                 if reason:

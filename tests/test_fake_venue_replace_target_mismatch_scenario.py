@@ -82,11 +82,20 @@ def test_replace_target_mismatch_asserts_node_a_detected_and_node_b_did_not(tmp_
     proc, db_path = _run_harness(tmp_path)
     assert proc.returncode == 0, f"harness failed:\n{proc.stdout[-8000:]}\n{proc.stderr[-4000:]}"
 
+    # UPDATED 2026-08-19 (Task #1): node A's leg no longer flows through
+    # _attempt_automated_exit_sell's replace path at all -- reason='SL' with
+    # a stale recorded id now detects the human's substitute and ADOPTS it
+    # (sl_exit_resting_noop/adopted_substitute) instead of ever attempting a
+    # replace (which used to log replace_target_mismatch). See
+    # fake_venue/scenarios_replace_target_mismatch.py's module docstring for
+    # the full updated leg A narrative.
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
             "SELECT wl.id AS wl_id, wl.account, "
+            "  (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='sl_exit_resting_noop' "
+            "    AND result='adopted_substitute' AND node_id=wl.id) AS adopted_events, "
             "  (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='replace_target_mismatch' "
             "    AND node_id=wl.id) AS mismatch_events "
             "FROM watch_list wl WHERE wl.ticker=? ORDER BY wl.id", (meta.TICKER,),
@@ -95,16 +104,27 @@ def test_replace_target_mismatch_asserts_node_a_detected_and_node_b_did_not(tmp_
         conn.close()
     assert len(rows) == 2, rows
     node_a, node_b = dict(rows[0]), dict(rows[1])
-    assert node_a['account'] == meta.CASH_ALIAS and node_a['mismatch_events'] == 2, node_a
+    assert node_a['account'] == meta.CASH_ALIAS and node_a['adopted_events'] == 1, node_a
     assert node_b['account'] == meta.MARGIN_ALIAS and node_b['mismatch_events'] == 0, node_b
 
 
 # ---------------------------------------------------------------------------
-# Real check that removing the pre-replace advisory check (round-trip 1)
+# Real check that removing the SL stale-order/substitute-adoption detection
 # entirely still leaves the scenario able to tell something changed --
 # specifically, that leg A's detection (results captured while the check
 # still ran) would go missing. Patches a temp copy of the repo, never the
 # real project source.
+#
+# UPDATED 2026-08-19 (Task #1): this used to target
+# _verify_resting_before_replace's call site, which leg A no longer reaches
+# at all (see the sibling test above) -- retargeted at the gate that now
+# actually decides leg A's outcome: _attempt_automated_exit_sell's
+# `if reason == 'SL' and not hold_time_forced and resting_order_id:` block,
+# which verifies the recorded stop is genuinely still resting and, if not,
+# looks for and adopts a substitute. Disabling the gate (never entering the
+# block) makes reason='SL' fall straight through to the old blind-replace
+# path against the stale, canceled id -- a real behavior change the harness
+# should catch.
 # ---------------------------------------------------------------------------
 
 def test_replace_target_mismatch_scenario_fails_if_the_advisory_check_is_removed(tmp_path):
@@ -114,16 +134,11 @@ def test_replace_target_mismatch_scenario_fails_if_the_advisory_check_is_removed
                                                     ".venv", "cache", "logs", "output"))
     target = repo_copy / "signals_notify.py"
     text = target.read_text()
-    needle = ('        try:\n'
-              '            _verify_resting_before_replace(pos, node, account, ticker, resting_order_id,\n'
-              '                                            resting_order_label)\n'
-              '        except Exception as e:\n')
-    assert needle in text, "_attempt_automated_exit_sell's pre-replace check call moved -- update this test"
+    needle = "if reason == 'SL' and not hold_time_forced and resting_order_id:"
+    assert needle in text, "_attempt_automated_exit_sell's SL substitute-detection gate moved -- update this test"
     reverted = text.replace(
         needle,
-        '        try:\n'
-        '            pass  # advisory check removed for this test\n'
-        '        except Exception as e:\n',
+        "if False:  # SL substitute-detection gate disabled for this test",
         1,
     )
     assert reverted != text

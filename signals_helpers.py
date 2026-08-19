@@ -549,6 +549,75 @@ def _pos_key(pos):
     return pos['wl_id'] if pos.get('wl_id') is not None else (pos['ticker'], pos['window'])
 
 
+def resolve_live_exit_price(ticker):
+    """Genuinely live quote for the off-bar-close exit-check fallback (real
+    SL/TP/TIME evaluation between bar closes, active_signals._check_position_exit
+    / signals_notify.check_dry_run_sim_sells) -- NOT signals_compute._current_price,
+    which reads the cached hourly bar's Close and can lag real price by many
+    minutes during a fast intrabar move. Confirmed live 2026-08-19 (SOXS): a
+    drought-overlay entry's reference price (43.45, itself read via
+    _current_price at signal time) was still being served unchanged 18 minutes
+    later by the SAME cached read, well after price had round-tripped from
+    $42.49 up through $46+ -- producing a false SL classification (43.45 below
+    the $45.54 stop) on a brand-new position that was never actually below its
+    stop at any point after it opened. Same reasoning already established for
+    update_real_pending_buys_running_low (2026-07-29, signals_notify.py): the
+    whole point of an off-bar-close check is catching intra-hour movement an
+    hourly cache can't show, so it needs a real quote, not the same cache the
+    bar-close branch already reads directly off df_hourly.
+
+    Gated to the regular trading session (real NYSE calendar via
+    scripts.coverage_check._is_trading_day, 9:30:00-16:00:00 ET) -- found by
+    BOTH the independent-cold and contextual paired review of the first
+    version of this fix (2026-08-19): the function it replaced,
+    signals_compute._current_price, had a 90-minute cached-bar staleness
+    guard that WAS the off-hours no-op every caller (including
+    alert_stale_price_exit_suppressed) already depended on -- see its own
+    docstring's "off-hours callers already handle a None return by skipping
+    that poll's exit check." schwab_client.get_current_price has no such
+    bound (it deliberately prefers a genuine after-hours print when newer,
+    by design for its OTHER callers like update_real_pending_buys_running_low
+    which need exactly that) and schwab_safety.check_order's trading-day gate
+    is BUY-only -- so without this guard, a thin overnight/weekend print
+    could reach a real, ungated SELL. Returns None outside the session (same
+    fail-safe contract every caller already built around _current_price's
+    None return) rather than trying to also sanity-clamp the quote itself --
+    simpler and matches the exact prior behavior this replaces, not a new
+    policy.
+
+    Also rejects a non-finite/non-positive price (NaN, 0, negative) --
+    float(nan) doesn't raise, so without this check a NaN yfinance fallback
+    (schwab_client.get_current_price's own error path) would silently pass
+    the `is not None` check every caller uses and then fail every SL/TP/TIME
+    comparison as False, permanently disabling that position's exit checks
+    with zero signal anywhere (found by independent-cold review)."""
+    # Local imports -- schwab_client imports signals_blocks, which imports
+    # signals_helpers, so a top-level import is a real circular import
+    # (confirmed: ImportError on collection). Kept inside the try (not just
+    # above it) so an import failure also honors the "returns None on any
+    # failure" contract literally, not just failures inside get_current_price
+    # itself (independent-cold review nit).
+    try:
+        import schwab_client
+        from scripts.coverage_check import _is_trading_day
+        now = schwab_safety._now()
+        if not _is_trading_day(now.strftime('%Y-%m-%d')):
+            log_poll(f"{ticker} resolve_live_exit_price SKIPPED -- not a trading day ({now:%Y-%m-%d})")
+            return None
+        secs_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
+        if not (9 * 3600 + 30 * 60 <= secs_since_midnight < 16 * 3600):
+            log_poll(f"{ticker} resolve_live_exit_price SKIPPED -- outside regular session ({now:%H:%M:%S})")
+            return None
+        price = float(schwab_client.get_current_price(ticker))
+        if not (price == price) or price <= 0:  # price == price is False only for NaN
+            log_poll(f"{ticker} resolve_live_exit_price SKIPPED -- non-finite/non-positive quote ({price})")
+            return None
+        return price
+    except Exception as e:
+        log_poll(f"{ticker} resolve_live_exit_price FAILED -- {e}")
+        return None
+
+
 def resolve_at_bar_close(pos, last_bar_ts, last_seen_bar):
     """Shared at_bar_close bookkeeping for the three exit-check loops (real,
     paper, dry_run_sim). A position with no last_seen_bar entry yet is either

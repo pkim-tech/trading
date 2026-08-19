@@ -36,7 +36,8 @@ from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
     automation_blockers_other_than_node, buy_order_sizing, effectively_dry_run,
     has_capital_at_stake, log_poll, mode_tag,
-    resolve_at_bar_close, should_alert_live, stop_status, MAX_RUNNING_LOW_DROP_PCT,
+    resolve_at_bar_close, should_alert_live, stop_status,
+    MAX_RUNNING_LOW_DROP_PCT,
 )
 # scripts/ has no __init__.py but is still importable as a Python 3 implicit
 # namespace package as long as repo root is on sys.path (true whenever this
@@ -487,6 +488,73 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
         "trailing-sell" if (hold_time_forced and resting_order_id == state.get('exit_order_id'))
         else "stop-loss"
     )
+    if reason == 'SL' and not hold_time_forced and resting_order_id:
+        # A protective stop is already recorded as resting -- verify it's
+        # GENUINELY still there before deciding what to do, rather than
+        # trusting pos['sl_order_id'] blindly (found by paired review,
+        # 2026-08-19: check_sl_order_fills only detects a FILLED status on
+        # this exact order id -- a cancelled/rejected/replaced order would
+        # never be noticed, silently defeating the "independent poll covers
+        # it" premise this no-op design depends on).
+        _sl_confirmed_resting = _exit_order_resting(pos, 'SL', resting_order_id)
+        if _sl_confirmed_resting is True:
+            # Genuinely resting -- do nothing. check_sl_order_fills polls
+            # this exact order every cycle and will detect a real fill on
+            # its own, with zero dependency on this function's own
+            # (possibly stale/wrong) price read. A market SELL is the wrong
+            # tool for a stop that's already doing its job. Root incident:
+            # SOXS/ira, 2026-08-19 -- a stale cached price fed a false SL
+            # read and this function market-replaced a resting stop that
+            # had never actually been breached, filling only because of a
+            # lucky fast recovery. See docs/deep_backlog.md's 2026-08-19 entry.
+            db.log_coverage_event("sl_exit_resting_noop", _mode, ticker=ticker,
+                                   position_id=pos.get('id'), node_id=pos.get('wl_id'), result="noop",
+                                   detail=f"sl_order_id={resting_order_id} confirmed resting, no replace attempted")
+            return resting_order_id
+        # Not confirmed resting (terminal at the broker, or the status check
+        # itself failed/was ambiguous -- _exit_order_resting's own contract
+        # says treat non-True the same as "may be unmanaged"). Don't just
+        # place a brand-new stop blind, either -- a human may have replaced
+        # it with a DIFFERENT still-resting order (the exact 2026-08-14 SOXS
+        # replace_target_mismatch shape: our recorded id goes stale while a
+        # real stop keeps resting under a new id). Look for a substitute the
+        # same way this module's pre-replace advisory check (defined further
+        # down, called from the replace path just below) already does, and
+        # adopt it rather than attempting a second stop
+        # that schwab_safety's duplicate-resting-SELL guard would just block
+        # anyway.
+        try:
+            _open_orders_now = schwab_safety._open_orders(account)
+            _resting_sells_now = [
+                o for o in _open_orders_now
+                if any(leg.get('instruction') == 'SELL'
+                       and leg.get('instrument', {}).get('symbol') == ticker
+                       for leg in o.get('orderLegCollection', []))
+            ]
+            _substitute = _match_resting_order(_resting_sells_now, None)
+        except Exception as _e:
+            print(f"  [replace_check] {ticker}: substitute lookup for stale SL failed, "
+                  f"treating as no resting order: {_e}")
+            _substitute = None
+        if _substitute is not None:
+            _sub_id = _substitute.get('orderId')
+            db.log_coverage_event("sl_exit_resting_noop", _mode, ticker=ticker,
+                                   position_id=pos.get('id'), node_id=pos.get('wl_id'),
+                                   result="adopted_substitute",
+                                   detail=f"recorded sl_order_id={resting_order_id} not confirmed resting; "
+                                          f"adopting substitute {_sub_id} instead, no replace attempted")
+            _post_message(
+                f"ℹ️ *{ticker}* ({account} · {mode_tag(account, node)}) — the recorded stop-loss order "
+                f"{resting_order_id} is not resting, but a different order ({_sub_id}) is\n"
+                f"(adopting it as this position's protective stop -- our record was stale, "
+                f"no replace attempted; verify it was placed/edited by hand)",
+                node_id=pos.get('wl_id'), incident=True, pos=pos,
+            )
+            db.set_sl_order_id_by_position(pos['id'], _sub_id)
+            return _sub_id
+        # Genuinely nothing resting -- fall through to the restore-stop
+        # branch below exactly as if sl_order_id had been None all along.
+        resting_order_id = None
     if not _market_session_open_now():
         # Incident #13 fix (docs/deep_backlog.md, 2026-08-19): a MARKET order
         # submitted outside the regular session genuinely cannot fill right
@@ -531,6 +599,11 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
     # is the exact call site the replace/place happens from -- mirrors
     # is_addon_leg's shape (2026-08-17, see docs/deep_backlog.md).
     _is_handoff_exit = (reason == 'HANDOFF')
+    # Only meaningful for the reason=='SL' + no-resting-order branch below --
+    # kept in this outer scope (not local to the try block) so both the
+    # success path and the exception's already-breached fallback can read
+    # the exact target this attempt was for.
+    stop_price = None
     try:
         if resting_order_id:
             # Atomic replace instead of cancel_order + place_equity_sell -- same
@@ -542,6 +615,38 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
                 account, ticker, resting_order_id, "SELL", exit_shares, current_price,
                 node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'),
                 is_handoff_exit=_is_handoff_exit)
+        elif reason == 'SL':
+            # No resting stop at all -- entry-time placement failed, or was
+            # otherwise cleared (the "resting order already covers this"
+            # early-return above only fires when sl_order_id IS set). Restore
+            # a protective stop instead of falling back to a market SELL --
+            # same reasoning as the no-op branch above: a stop is passive/
+            # risk-reducing and safe to place liberally, a market SELL is
+            # active/risk-creating and is the wrong tool for "restore
+            # protection." Anchored to entry_price, matching
+            # _place_stop_loss_for_position's own basis and strategies.py's
+            # own check_exit SL comparison -- NOT signal_price (the older,
+            # already-fixed-elsewhere anchor; see that function's docstring
+            # for why signal_price is wrong for the trailing-buy strategies).
+            sl_pct = pos.get('fixed_sl') if strategies.uses_fixed_sl(pos['strategy']) else pos.get('stop_loss')
+            if not sl_pct:
+                # Defensive only -- check_sell_condition can't produce
+                # reason='SL' without a configured stop_loss/fixed_sl to
+                # compare against, so this shouldn't be reachable in
+                # practice. Bail rather than inventing a stop_price at
+                # current_price, which would place an immediately-
+                # triggerable stop -- functionally the market SELL this
+                # whole branch exists to avoid (found by cold Opus review,
+                # 2026-08-19). Matches _place_stop_loss_for_position's own
+                # `if not sl_pct: return` precedent.
+                db.log_coverage_event("sl_stop_restored", _mode, ticker=ticker, position_id=pos.get('id'),
+                                       node_id=pos.get('wl_id'), result="skipped",
+                                       detail="no configured sl_pct -- cannot compute a restore-stop price")
+                return None
+            stop_price = pos['entry_price'] * (1 - sl_pct / 100)
+            _, order_id = schwab_client.place_stop_loss(account, ticker, exit_shares, stop_price,
+                                                          node_dry_run=(node.get('state') != 'live'),
+                                                          node_id=node.get('id'))
         else:
             # No is_handoff_exit here -- place_equity_sell never has a
             # replacing_order_id (see its docstring), so the exemption can't
@@ -552,6 +657,45 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
                                                             node_dry_run=(node.get('state') != 'live'),
                                                             node_id=node.get('id'))
     except Exception as e:
+        if reason == 'SL' and resting_order_id is None:
+            # Placing the restore-stop itself failed. If price has already
+            # crossed the target while we were trying, a resting STOP would
+            # just reject again on any retry (broker: "stop must be on the
+            # correct side of the market") -- exit now via a real market SELL
+            # instead, same self-correcting principle as
+            # _place_stop_loss_for_position's own entry-time fallback. If
+            # price hasn't crossed it, don't retry inline here -- this
+            # function is invoked fresh from every bar-close/off-bar-close
+            # poll while the SL condition stays true, so the next poll cycle
+            # already re-attempts the stop placement naturally; a sleep-based
+            # retry loop like the entry-time version isn't needed here.
+            try:
+                recheck_price = schwab_client.get_current_price(ticker)
+            except Exception:
+                recheck_price = None
+            if recheck_price is not None and stop_price is not None and recheck_price <= stop_price:
+                try:
+                    _, market_order_id = schwab_client.place_equity_sell(
+                        account, ticker, exit_shares, recheck_price,
+                        node_dry_run=(node.get('state') != 'live'), node_id=node.get('id'))
+                except Exception as e2:
+                    db.log_coverage_event(
+                        "automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
+                        node_id=pos.get('wl_id'), result="failed_unexpectedly",
+                        detail=f"reason=SL restore-stop placement failed ({e}), already-breached "
+                               f"market fallback also failed: {e2}")
+                    _post_message(
+                        f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — "
+                        f"place SELL {exit_shares} manually, market already through stop ~${stop_price:.2f}\n"
+                        f"(restore-stop placement failed: {e}; market fallback also failed: {e2})",
+                        node_id=pos.get('wl_id'), incident=True, pos=pos,
+                    )
+                    return None
+                db.log_coverage_event(
+                    "automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
+                    node_id=pos.get('wl_id'), result="placed_as_market_already_breached",
+                    detail=f"reason=SL target_stop={stop_price:.4f} current_price={recheck_price:.4f}")
+                return market_order_id
         db.log_coverage_event("automated_exit_execution", _mode, ticker=ticker, position_id=pos.get('id'),
                                node_id=pos.get('wl_id'),
                                result="blocked" if isinstance(e, schwab_safety.SafetyViolation) else "failed_unexpectedly",
@@ -568,6 +712,22 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
             _post_message(
                 f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — {price_note}\n"
                 f"(auto {reason} exit replace of {resting_order_label} {resting_order_id} failed: {e})",
+                node_id=pos.get('wl_id'), incident=True, pos=pos,
+            )
+        elif reason == 'SL' and stop_price is not None and not isinstance(e, schwab_safety.SafetyViolation):
+            # Restore-stop placement failed and the already-breached fallback
+            # above didn't apply (price hadn't crossed stop_price, or the
+            # recheck itself failed) -- this position is genuinely unprotected
+            # right now, same severity as the resting_order_id UNPROTECTED
+            # branch above, just for the "nothing was resting to begin with"
+            # case instead of "a replace failed."
+            db.log_coverage_event("manual_sl_fallback_alert", _mode, ticker=ticker, position_id=pos.get('id'),
+                                   node_id=pos.get('wl_id'), result="alerted",
+                                   detail=f"place stop-loss SELL {exit_shares} @ ~${stop_price:.2f}")
+            _post_message(
+                f"🚨 *{ticker}* ({account} · {mode_tag(account, node)}) UNPROTECTED — "
+                f"place stop-loss SELL {exit_shares} @ ~${stop_price:.2f}\n"
+                f"(restore-stop placement failed: {e})",
                 node_id=pos.get('wl_id'), incident=True, pos=pos,
             )
         elif not isinstance(e, schwab_safety.SafetyViolation):
@@ -599,6 +759,20 @@ def _attempt_automated_exit_sell(pos, reason, current_price):
         # needed" for a position now protected only by an unconfirmed
         # market-sell exit.
         db.set_broker_stop_price_by_position(pos['id'], None)
+    if reason == 'SL' and resting_order_id is None and stop_price is not None and order_id is not None:
+        # Restored a genuinely-missing protective stop (nothing was resting
+        # before this call) -- point sl_order_id at it so the very next
+        # bar-close SL check hits the resting-order no-op branch above
+        # instead of trying to place ANOTHER stop every poll. Mirrors
+        # _place_stop_loss_for_position's own success writes (same dry-run
+        # guard: broker_stop_price should only claim a real stop exists for a
+        # non-dry_run account).
+        db.log_coverage_event("sl_stop_restored", _mode, ticker=ticker, position_id=pos.get('id'),
+                               node_id=pos.get('wl_id'), result="placed",
+                               detail=f"stop_price={stop_price:.4f} shares={exit_shares}")
+        db.set_sl_order_id_by_position(pos['id'], order_id)
+        if not _effectively_dry_run(account, node):
+            db.set_broker_stop_price_by_position(pos['id'], stop_price)
     if hold_time_forced:
         # The just-replaced order (trailing-sell or, on the failed-placement
         # fallback above, the original SL) is now dead -- point exit_order_id
@@ -2287,6 +2461,19 @@ def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
             bar = df_hourly.iloc[-1]
             cp, low, high, op = float(bar['Close']), float(bar['Low']), float(bar['High']), float(bar['Open'])
         else:
+            # Deliberately STILL compute._current_price (cached hourly bar
+            # Close), NOT resolve_live_exit_price -- considered switching this
+            # to match active_signals._check_position_exit's 2026-08-19 fix
+            # (same SOXS incident), then reverted: an is_dry_run_sim position
+            # has zero real capital and no real order at the broker at all --
+            # it's pure coverage/Grid simulation, and giving it a real
+            # schwab_client.get_current_price network dependency (broker API
+            # calls, rate budget, a real failure mode) for a code path that's
+            # supposed to be fully self-contained is a real architectural
+            # change this incident doesn't justify. The cached price is
+            # consistent with how the rest of this simulation already prices
+            # (paper_trading.py's daily_sync branch does the same). Existing
+            # tests (tests/test_dry_run_sim.py) assert this exact price source.
             cp, _ = compute._current_price(ticker)
             if cp is None:
                 continue
@@ -2296,6 +2483,21 @@ def check_dry_run_sim_sells(last_seen_bar, dry_run_sell_alerted, load_cache):
         reason, target, just_activated_trailing = compute.check_sell_condition(
             pos, cp, datetime.now(), at_bar_close=at_bar_close, low=low, high=high, open_price=op,
             df_hourly=df_hourly)
+        # See active_signals._check_position_exit's matching exit_check_decision
+        # event -- same structured, queryable record, same 2026-08-19 incident.
+        db.log_coverage_event(
+            "exit_check_decision", "dry_run", ticker=ticker,
+            position_id=pos.get('id'), node_id=pos.get('wl_id'), result=reason or "HOLD",
+            # 'cached_bar_close' on BOTH branches here (not 'live_quote' for
+            # at_bar_close=False) -- unlike active_signals._check_position_exit's
+            # matching event, this function's off-bar-close branch deliberately
+            # still reads compute._current_price (the cached hourly bar Close,
+            # see the comment above), never a live broker quote. Found by cold
+            # Opus review, 2026-08-19: the field whose entire purpose is
+            # recording which price path fed the decision was recording the
+            # wrong answer on the one branch it exists to disambiguate.
+            detail=f"at_bar_close={at_bar_close} price_source=cached_bar_close "
+                   f"entry_price={pos.get('entry_price')} cp={cp:.4f} low={low:.4f} high={high:.4f} op={op:.4f}")
         if just_activated_trailing:
             # DELIBERATELY INERT IN PRACTICE: node_id with no incident=True means
             # _post_message's gate falls to should_alert_live, which is gated on
@@ -2853,7 +3055,46 @@ def notify_sell_signal(pos, reason, current_price, target_price):
     # order_id -- if confirmed, close now and skip the manual alert entirely;
     # a real fill confirmed by order_id is unambiguous (we know exactly which
     # order it is and its full share count), so no human tap is needed.
+    # Captured BEFORE the call so the no-op detection below compares against
+    # what was actually resting going in, not whatever _attempt_automated_exit_sell
+    # may have since written (e.g. the substitute-adoption branch repoints
+    # sl_order_id to a different id and returns THAT -- still a genuine no-op,
+    # just not equal to the pre-call value, so this comparison alone doesn't
+    # catch it; see sl_resting_noop below for the actual detection).
+    _pre_call_sl_order_id = pos.get('sl_order_id')
     order_id = _attempt_automated_exit_sell(pos, reason, current_price)
+    # Detects BOTH of _attempt_automated_exit_sell's SL no-op outcomes (genuine
+    # resting order left alone, or a stale record silently adopting a human's
+    # substitute) via the sl_exit_resting_noop coverage event it just logged
+    # for this exact position/order -- more reliable than re-deriving from
+    # order_id alone, and avoids a second live broker call here just to
+    # re-confirm what that function already just confirmed.
+    sl_resting_noop = False
+    if reason == 'SL' and order_id is not None:
+        _noop_events = db.get_coverage_events(scenario_key='sl_exit_resting_noop')
+        sl_resting_noop = any(
+            e['ticker'] == ticker and e.get('position_id') == pos.get('id')
+            and e['result'] in ('noop', 'adopted_substitute')
+            for e in _noop_events[-5:]
+        )
+    if sl_resting_noop:
+        # Not really "an exit in progress" -- this is the standing protective
+        # stop continuing to do its job, unchanged (or a stale record just
+        # silently repointed to whatever it actually is). Must NOT flow into
+        # exit_pending: this function's own generic pending_order_id reuse
+        # guard (see its docstring) would otherwise short-circuit every LATER
+        # call for this position -- including a genuine TIME/TP exit that
+        # fires on a subsequent poll -- straight back to this same resting
+        # order id, permanently blocking the real exit (found by contextual
+        # Opus review, 2026-08-19: the pre-fix version of this redesign wrote
+        # exit_pending unconditionally here, exactly like every other reason).
+        # No alert either -- routine, same "the broker is already handling
+        # this" rationale the whole redesign exists for; _attempt_automated_exit_sell
+        # already posts its own informational alert on the adopted-substitute
+        # path specifically, which is the only sub-case worth telling a human
+        # about.
+        print(f"  SL exit routine (resting stop {order_id} left in place / re-confirmed) -- no alert, no exit_pending write")
+        return
     filled = None
     if order_id is not None:
         account = pos.get('account')

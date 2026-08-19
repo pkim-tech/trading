@@ -15,7 +15,21 @@ manual-fallback alert any other placement failure already takes. This mirrors
 test_fake_broker_exit_fresh_scenario.py's structure (a real, non-dry_run
 order-book sequence, not a per-call mock) -- exactly the shape needed to
 prove BOTH that no order was submitted AND that the pre-existing resting STOP
-survives untouched, which a per-function mock can't verify simultaneously."""
+survives untouched, which a per-function mock can't verify simultaneously.
+
+UPDATED 2026-08-19 (Task #1, same-day follow-up dispatch): the original
+scenario here (reason='SL' with a resting stop already in place) is now
+structurally impossible to reach this guard at all -- _attempt_automated_exit_sell's
+reason='SL' branch no-ops on a resting stop unconditionally (see
+tests/test_fake_broker_sl_resting_noop_scenario.py), before ever reaching
+_market_session_open_now(), regardless of time of day. That's a strictly
+stronger fix for the SL case (the market-hours race this file's incident
+exposed can't recur if SL never attempts an active replace in the first
+place). This file's tests now use reason='TIME' instead of 'SL' against the
+same resting-order setup, to keep real regression coverage of
+_market_session_open_now() itself -- still the live guard for TP/TIME/a
+hold-time-forced TRAIL, and for SL's own no-resting-stop restore-stop
+placement (see coverage_registry.py's sl_stop_restored row)."""
 import sys
 import tempfile
 from datetime import datetime
@@ -95,7 +109,8 @@ def _market_sells(fake_broker):
 
 
 def test_sell_signal_after_close_does_not_replace_resting_stop_with_market_order(env, fake_broker, monkeypatch):
-    """Incident #13 repro: SELL SIGNAL (SL) decision arrives at 16:00:52 ET,
+    """Incident #13 repro shape, reason='TIME' (see module docstring for why SL
+    moved to its own file): SELL SIGNAL decision arrives at 16:00:52 ET,
     52s after the 16:00:00 close. Must NOT submit a MARKET order, and the
     pre-existing resting STOP must be left exactly as it was -- still WORKING,
     same order id, not REPLACED/CANCELED."""
@@ -103,7 +118,7 @@ def test_sell_signal_after_close_does_not_replace_resting_stop_with_market_order
     fake_broker.set_quote(TICKER, last=123.86, bid=123.86, ask=123.96)
     monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 8, 19, 16, 0, 52))
 
-    signals_notify.notify_sell_signal(pos, 'SL', current_price=123.86, target_price=126.18)
+    signals_notify.notify_sell_signal(pos, 'TIME', current_price=123.86, target_price=126.18)
 
     assert len(_market_sells(fake_broker)) == 0, "no MARKET order should be submitted after the 16:00 close"
     assert fake_broker.orders[sl_order_id]['status'] == 'WORKING', \
@@ -126,7 +141,7 @@ def test_sell_signal_before_open_does_not_replace_resting_stop_with_market_order
     fake_broker.set_quote(TICKER, last=123.86, bid=123.86, ask=123.96)
     monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 8, 19, 9, 15, 0))
 
-    signals_notify.notify_sell_signal(pos, 'SL', current_price=123.86, target_price=126.18)
+    signals_notify.notify_sell_signal(pos, 'TIME', current_price=123.86, target_price=126.18)
 
     assert len(_market_sells(fake_broker)) == 0
     assert fake_broker.orders[sl_order_id]['status'] == 'WORKING'
@@ -141,7 +156,7 @@ def test_sell_signal_intraday_still_replaces_resting_stop_with_market_order(env,
     fake_broker.set_quote(TICKER, last=123.86, bid=123.86, ask=123.96)
     monkeypatch.setattr(schwab_safety, '_now', lambda: datetime(2026, 8, 19, 14, 32, 0))
 
-    signals_notify.notify_sell_signal(pos, 'SL', current_price=123.86, target_price=126.18)
+    signals_notify.notify_sell_signal(pos, 'TIME', current_price=123.86, target_price=126.18)
 
     assert fake_broker.orders[sl_order_id]['status'] == 'REPLACED'
     sells = _market_sells(fake_broker)
