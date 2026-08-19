@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import signals_config
 import signals_db as db
-from scripts.coverage_check import _check_trade_lifecycle, _check_coverage_event, run_check, _is_trading_day
+from scripts.coverage_check import (_check_trade_lifecycle, _check_coverage_event,
+                                     _last_hit_by_mode, run_check, _is_trading_day)
 from scripts.coverage_registry import compute_status, compute_mode_statuses, STATUS_ORDER
 
 TICKER = 'TEST_CANARY'
@@ -940,6 +941,39 @@ def test_check_coverage_event_not_met_when_no_events_today(isolated_db):
     met, summary, _no_activity = _check_coverage_event(scenario, check_date)
     assert met is False
     assert 'no coverage_events' in summary
+
+
+def test_check_coverage_event_excludes_fixture_sourced_events(isolated_db):
+    """Mirrors coverage_registry.py's test_compute_status_excludes_fixture_
+    sourced_events (2026-08-18) -- _check_coverage_event had the identical
+    unfiltered-source gap: a fixture-staged scenario_key (source=
+    'fixture:...') could be misread as real daily-scenario proof. A
+    fixture-only event must NOT count as met."""
+    check_date = datetime.now().strftime('%Y-%m-%d')
+    db.log_coverage_event('cov_daily_fixture', 'live', result='placed',
+                           source='fixture:stage_check_order_guard_scenarios')
+    scenario = dict(scenario_key='cov_daily_fixture', check_params='{}')
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
+    assert met is False
+    assert 'no coverage_events' in summary
+
+    # A real (non-fixture) event alongside it must still count.
+    db.log_coverage_event('cov_daily_fixture', 'live', result='placed', source='daemon')
+    met, summary, _no_activity = _check_coverage_event(scenario, check_date)
+    assert met is True
+
+
+def test_last_hit_by_mode_excludes_fixture_sourced_events(isolated_db):
+    """Same filter, applied to _last_hit_by_mode -- display-only (doesn't gate
+    a check outcome) but must not surface a fixture run as the 'most recent'
+    real hit for a mode."""
+    db.log_coverage_event('cov_last_hit_fixture', 'live', result='placed',
+                           source='fixture:stage_check_order_guard_scenarios')
+    assert _last_hit_by_mode('cov_last_hit_fixture') == {}
+
+    db.log_coverage_event('cov_last_hit_fixture', 'live', result='placed', source='daemon')
+    hits = _last_hit_by_mode('cov_last_hit_fixture')
+    assert 'live' in hits
 
 
 def test_compute_mode_statuses_splits_independently_per_mode(isolated_db):

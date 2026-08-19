@@ -234,7 +234,13 @@ def _check_coverage_event(scenario, check_date):
     # have date(ts) != date(ts, 'localtime'). date(ts, 'localtime') converts
     # to the server's local zone (America/New_York) before comparing, keeping
     # this consistent with the other checker.
-    q = "SELECT result, COUNT(*) n FROM coverage_events WHERE scenario_key = ? AND date(ts, 'localtime') = ?"
+    # Exclude fixture-sourced rows (scripts/stage_check_order_guard_scenarios.py's
+    # deliberate synthetic runs) from counting as real daily proof -- same gap,
+    # same fix, as scripts/coverage_registry.py's compute_status() (2026-08-18,
+    # see that function's comment for the full reasoning). source is NULL for
+    # the vast majority of rows -- `source IS NULL` must stay in.
+    q = ("SELECT result, COUNT(*) n FROM coverage_events WHERE scenario_key = ? "
+         "AND date(ts, 'localtime') = ? AND (source IS NULL OR source NOT LIKE 'fixture:%')")
     args = [scenario['scenario_key'], check_date]
     if mode_filter:
         q += " AND mode = ?"
@@ -306,7 +312,8 @@ def _last_hit_by_mode(scenario_key):
     with db._conn() as c:
         rows = c.execute(
             "SELECT mode, ticker, MAX(ts) as last_ts FROM coverage_events "
-            "WHERE scenario_key=? GROUP BY mode", (scenario_key,)
+            "WHERE scenario_key=? AND (source IS NULL OR source NOT LIKE 'fixture:%') "
+            "GROUP BY mode", (scenario_key,)
         ).fetchall()
     return {r['mode']: dict(ticker=r['ticker'], ts=r['last_ts']) for r in rows}
 
