@@ -68,6 +68,18 @@ def main():
     args = parser.parse_args()
     today = args.date
 
+    if today != str(date.today()):
+        print(
+            f"error: --date {today} is not today ({date.today()}). compute_status() only "
+            "computes LIVE status right now -- it can't reconstruct historical status -- so "
+            "passing a past/future date would silently write TODAY's live status mislabeled "
+            f"under snapshot_date='{today}'. Refusing to proceed. --date only controls which "
+            "prior stored snapshot the diff compares against; it does not select a historical "
+            "compute date.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     conn = sqlite3.connect(DB_PATH)
     ensure_table(conn)
     today_rows = compute_today(conn, today)
