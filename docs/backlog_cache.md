@@ -36,6 +36,9 @@
 > a past date, so a future session reading the item should ask the user directly whether the
 > condition now holds, rather than assuming a stale-looking item is dead.
 
+## [live-trading] Watch-item, raised 2026-08-19 (from auto_fill_detection default paired review, commit `86a161e`) — .env SCHWAB_AUTOMATION_TICKERS additions bypass the new-node default
+`initialize_auto_fill_detection_for_new_node` only fires from `signals_db.add_node` (a brand-new node). The other way a ticker enters automation scope — adding it to `SCHWAB_AUTOMATION_TICKERS` in `.env` (how DFEN/ETHU/SOXS were scoped 2026-08-11) — instantly automation-scopes that ticker's EXISTING nodes without ever calling `add_node`, so those nodes still silently inherit the OFF default this fix was built to close. Neither this fix nor the originally-considered blanket flip closes this path. No known current instance; worth a backlog line or a `signals_invariants` check (e.g. "flag any automation-scoped ticker with a live node and no recorded auto-fill-detection decision") when picked up.
+
 ## [live-trading] Follow-up, raised 2026-08-19 (from add_node dedup-key paired review, commit `594882a`) — revert FAS/FAZ canary nodes' max_hold_hours 47→48
 The `entry_timing`/`fixed_sl` dedup-key widening makes the 2026-08-13 workaround unnecessary: id 222/223 (FAS/FAZ, `soxl_ira`, `canary_pinned_entry`) had `max_hold_hours=47` (siblings all 48) purely to force uniqueness against a sibling node, since `entry_timing` alone wasn't part of the dedup key at the time. Contextual review confirmed reverting to 48 collides with nothing under the new widened key. Deliberately not bundled into the dedup-key commit — real capital-adjacent canary config change (alters `canary_pinned_entry`'s observable hold-time behavior) deserving its own review/Grid check, not a drive-by edit.
 
