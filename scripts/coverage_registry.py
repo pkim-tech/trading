@@ -970,14 +970,17 @@ REGISTRY = [
                           "coverage_events wiring -- added 2026-08-14 (Opus audit found real live "
                           "data with zero Grid row at all).",
          check_mechanism='coverage_events', scenario_key='automated_exit_execution',
-         bad_results=['failed_unexpectedly'],
+         bad_results=['failed_unexpectedly', 'skipped'],
          notes="Added 2026-08-14 -- this scenario_key had 14 real live events (incl. 6 'blocked', 2 "
                "'failed_unexpectedly') with no corresponding REGISTRY row at all, found by an Opus "
                "audit of this file's own history/completeness. 'blocked' (a SafetyViolation) excluded "
                "from bad_results deliberately, same reasoning as automated_sell_execution's sibling "
                "exclusion -- a real guard firing correctly is not a failure of this scenario. A failed "
                "replace also triggers manual_sl_fallback_alert (its own Grid row) when a resting order "
-               "existed to fall back from."),
+               "existed to fall back from. 'skipped' added 2026-08-19 (incident #13's market-hours "
+               "guard, _market_session_open_now) -- a real after-close/pre-open deferral never "
+               "actually exercises the replace-to-market mechanism this row proves, so it must not "
+               "count as live proof the same way a genuine 'placed' event does."),
     dict(id='automated_buy_execution',
          scenario="Automated entry (trailing-buy or market-buy) actually places a real broker order "
                   "-- distinct from market_buy_placement above, which tracks the canary-scenario "
@@ -1423,8 +1426,13 @@ REGISTRY = [
                           "real check_own_sell_fills poll the way the real daemon eventually would); "
                           "tests/test_fake_venue_drought_handoff_scenario.py",
          check_mechanism='coverage_events', scenario_key='drought_handoff_exit_placement',
-         bad_results=[],
-         notes="Key structural difference from paper's synchronous HANDOFF close -- real must persist "
+         bad_results=['skipped'],
+         notes="'skipped' added 2026-08-19 (incident #13's market-hours guard, "
+               "_market_session_open_now, checked separately in check_drought_handoff before calling "
+               "_attempt_automated_exit_sell so a deliberate after-close defer doesn't get misread as "
+               "the same 'failed_or_blocked' a genuine placement failure produces) -- a real defer "
+               "never actually exercises the real market SELL this row proves, so it must not count "
+               "as live proof. Key structural difference from paper's synchronous HANDOFF close -- real must persist "
                "trail_state['exit_pending'] and let check_own_sell_fills/check_auto_fills close it on "
                "an unconfirmed-fill poll. No live proof yet. FOUND, NOT FIXED (2026-08-15, the "
                "fake_venue Phase 2 scenario's first run): check_drought_handoff's placed_unconfirmed "
@@ -1463,10 +1471,13 @@ REGISTRY = [
          code_path="signals_notify.close_addon_leg_real_if_open",
          offline_coverage="tests/test_fake_broker_addon_lockstep_exit_scenario.py",
          check_mechanism='coverage_events', scenario_key='addon_exit_placement',
-         bad_results=[],
+         bad_results=['skipped'],
          notes="Divergence from paper is deliberate and logged: real closes at the leg's OWN fill "
                "price/reason (slippage will differ from the parent's exact exit price), not the "
-               "parent's exact values paper uses. No live proof yet."),
+               "parent's exact values paper uses. No live proof yet. 'skipped' added 2026-08-19 "
+               "(incident #13's market-hours guard, mirrored into this function) -- a real after-close "
+               "deferral never actually places the leg's real exit order, so it must not count as live "
+               "proof of this mechanism the way a genuine placement does."),
     dict(id='addon_leg_reconciliation',
          scenario="A real add-on leg still entry_status='placed' past a timeout is polled/cancelled/"
                   "marked abandoned; an open leg whose parent already closed (missed lockstep) is "

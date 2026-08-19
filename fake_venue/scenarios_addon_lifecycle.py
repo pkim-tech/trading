@@ -153,6 +153,15 @@ def run(price=None, verbose=True):
             "True for this run (see module docstring: orthogonal to the mechanism under test)")
         schwab_safety._is_trading_day = lambda date_str: True
 
+    # 2026-08-19: signals_notify.close_addon_leg_real_if_open now gates on
+    # _market_session_open_now() (incident #13's market-hours-close guard,
+    # mirrored from _attempt_automated_exit_sell into the addon-leg exit
+    # path) -- orthogonal to what this scenario tests, but a real wall-clock
+    # run outside 9:30-16:00 ET would silently short-circuit the leg exit
+    # this scenario exercises. Pinned to a fixed in-session moment, same
+    # orthogonal-override pattern as _is_trading_day above.
+    schwab_safety._now = lambda: datetime(2026, 8, 19, 15, 30, 0)
+
     # ============================================================= cycle A
     now = datetime.now()
     entry_price_a = round(price * 0.98, 4)
