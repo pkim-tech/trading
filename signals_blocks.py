@@ -367,11 +367,18 @@ def _build_buy_blocks(node, sig, auto_placed=False):
     if cfg.INTERACTIVE:
         value = json.dumps({
             "type":         "buy",
-            "node":         {k: node.get(k) for k in ('id', 'ticker', 'strategy', 'version', 'window',
-                                                        'take_profit', 'stop_loss', 'max_hold_hours', 'label',
-                                                        'trail_sell_pct', 'fixed_sl', 'trail_buy_pct', 'arm_sell_pct',
-                                                        'starting_notional', 'starting_notional_override',
-                                                        'account', 'state')},
+            # Shares db._PENDING_BUY_NODE_KEYS as the single field list (2026-08-19,
+            # closing the recurring-duplication bug -- both lists independently went
+            # stale missing starting_notional_override, see that constant's docstring).
+            # Paired-review correction: this is a preventive/regression-guard fix, not
+            # closing a currently-live gap -- handle_entry_price/handle_trail_buy_fill_
+            # price re-fetch a fresh pending_buys row (db.open_position_from_pending)
+            # and read drought overrides off ITS node_json snapshot, not this button
+            # payload, so the 3 drought_*_override fields this now carries (vs. the
+            # old hand-typed tuple) are currently unread on this path -- carried for
+            # lockstep-by-construction symmetry with the DB-side snapshot, in case a
+            # future handler path ever does read off the button's own node dict.
+            "node":         {k: node.get(k) for k in db._PENDING_BUY_NODE_KEYS},
             "signal_price": price,
             "signal_time":  sig['last_bar'].strftime('%Y-%m-%d %H:%M:%S'),
             "lower_band":   sig['lower_band'],
