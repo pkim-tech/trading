@@ -1271,6 +1271,127 @@ def _past_sl_grace(pos, now=None):
     return ((now or datetime.now()) - entry_time).total_seconds() >= _RECONCILE_MISSING_SL_GRACE_SECS
 
 
+def _reconcile_auto_close_flat_position(pos, account, ticker, node):
+    """Auto-closes a local open_positions row for the ONE reconciliation
+    mismatch shape narrow/unambiguous enough to safely self-correct (Task
+    #6, 2026-08-19) -- see check_live_state_reconciliation's call site for
+    the exact gating condition (real_shares==0, no open add-on leg,
+    sl_order_id's own fetched status is exactly FILLED or CANCELED -- see
+    that call site's own comment for why REJECTED/EXPIRED/REPLACED are
+    deliberately excluded, narrower than _exit_order_resting's general
+    "any terminal status" tri-state). Every other mismatch this function
+    detects stays alert-only, unchanged -- this is a deliberate, narrow
+    carve-out from automation_principles.md #5's general
+    detection-only-never-self-heals rule, not a reversal of it.
+
+    Prefers a real confirmed fill for the recorded sl_order_id (the exact
+    same lookup check_sl_order_fills already trusts) so the recorded exit
+    price/P&L is accurate -- this is the common case: the order genuinely
+    filled but the normal fill-detection polls (check_sl_order_fills/
+    check_own_sell_fills) missed it (daemon restart/gap, the real SOXL
+    incident's shape). exit_reason is derived from ORDER IDENTITY, the
+    exact same logic check_sl_order_fills already uses (sl_order_id gets
+    REPOINTED to the trailing-sell order's id at arm time -- see
+    _attempt_automated_sell -- so an armed position's "sl_order_id" is
+    actually the trailing-sell order; hardcoding 'SL' here mislabeled a
+    real TRAIL/TIME exit as SL, caught by paired review, 2026-08-19).
+
+    Falls back to a fresh current-price marker (clearly labeled as
+    approximate in both the coverage event and the alert, and recorded
+    under a DISTINCT exit_reason='RECONCILED' -- not SL/TRAIL/TIME, since
+    none of those would be true; found by paired review: an unmarked
+    approximation in trade_log is exactly what _last_sale_recovery reads to
+    size the NEXT real order, so a fabricated price silently propagates)
+    only when no fill record exists for that order at all -- broker shares
+    are still 0, so SOMETHING closed the position for real, just not
+    attributable to this specific order id. If even a fresh quote fails,
+    this does NOT auto-close at all (falls through to the normal alert-only
+    path instead, same as before this feature existed) -- fabricating a
+    price at pos['entry_price'] (a fake breakeven, found by paired review)
+    is worse than staying alert-only for one more poll cycle; the real
+    1h40min-unresolved incident this fixes was a repeated alert with no
+    resolution path, not a single delayed one.
+
+    Returns True if the position was actually closed, False if it declined
+    (no price available) -- the caller must fall back to the normal
+    _alert_reconcile_mismatch path on False, not silently `continue`
+    (found by paired review: a bare `continue` regardless of this return
+    value would leave a declined position with NEITHER an auto-close NOR a
+    mismatch alert, recreating the exact "silently stuck" failure this
+    whole feature exists to close, just through a new door)."""
+    _mode = _coverage_mode(account)
+    sl_order_id = pos.get('sl_order_id')
+    state = pos.get('trail_state') or {}
+    fill = None
+    try:
+        fill = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=sl_order_id)
+    except Exception as e:
+        print(f"  [reconcile] {ticker}: get_filled_order lookup failed during auto-close, "
+              f"falling back to a price approximation: {e}")
+    if fill is not None:
+        exit_price = fill['price']
+        price_note = f"confirmed fill @ ${exit_price:.4f} (order {sl_order_id})"
+        result = "closed_via_confirmed_fill"
+        # Mirrors check_sl_order_fills' exact derivation -- see that
+        # function's own docstring for why this must be order-identity-
+        # based (sl_order_id == trail_state.exit_order_id), not
+        # state['trailing'] (persisted before the arm-time order placement
+        # is even attempted, so it's not proof this specific fill IS that
+        # order).
+        if state.get('exit_forced_by_hold_time'):
+            exit_reason = 'TIME'
+        elif sl_order_id == state.get('exit_order_id'):
+            exit_reason = 'TRAIL'
+        else:
+            exit_reason = 'SL'
+    else:
+        try:
+            exit_price = schwab_client.get_current_price(ticker)
+        except Exception:
+            exit_price = None
+        if exit_price is None:
+            db.log_coverage_event(
+                "reconciliation_auto_close", _mode, ticker=ticker, position_id=pos.get('id'),
+                node_id=pos.get('wl_id'), result="skipped_no_price",
+                detail=f"broker confirmed 0 shares, sl_order_id={sl_order_id} confirmed terminal, "
+                       f"but no fill record AND a fresh quote both failed -- not auto-closing on a "
+                       f"fabricated price, falling through to the normal alert-only path")
+            print(f"  [reconcile] {ticker}: auto-close declined -- no fill record and no fresh quote "
+                  f"available, falling through to the normal alert path")
+            return False
+        price_note = (f"⚠️ APPROXIMATED at current quote ${exit_price:.4f} (no fill record found for "
+                       f"order {sl_order_id}, which is confirmed terminal but never shows a fill -- "
+                       f"the position closed via some other real mechanism) -- verify real P&L manually")
+        result = "closed_via_broker_zero_shares_no_fill_found"
+        # Distinct from SL/TRAIL/TIME on purpose -- none of those would be a
+        # true claim (we don't know what actually closed this), and an
+        # unmarked exit_reason here would be silently trusted downstream
+        # the same way a real SL/TRAIL/TIME row is (_last_sale_recovery's
+        # order-sizing read, coverage_registry, verify_live_parity.py).
+        exit_reason = 'RECONCILED'
+    exit_time = datetime.now()
+    closed = db.close_position(pos['id'], exit_signal_price=exit_price, exit_price=exit_price,
+                                exit_time=exit_time, exit_reason=exit_reason,
+                                exit_bar_time=compute.current_bar_time(ticker))
+    db.log_coverage_event(
+        "reconciliation_auto_close", _mode, ticker=ticker, position_id=pos.get('id'),
+        node_id=pos.get('wl_id'), result=result if closed else "already_closed",
+        detail=f"broker confirmed 0 shares, sl_order_id={sl_order_id} confirmed terminal, "
+               f"exit_reason={exit_reason}; {price_note}")
+    if not closed:
+        print(f"  [reconcile] {ticker}: auto-close skipped, already closed by another path this cycle")
+        return True  # already gone -- the caller should still not alert on a closed position
+    _post_message(
+        f"🤖 *{ticker}* ({account} · {mode_tag(account, node)}) auto-closed via live-state reconciliation "
+        f"(exit_reason={exit_reason}) — broker confirmed 0 shares and the recorded order is confirmed "
+        f"terminal, {price_note}\n"
+        f"(P&L: {(exit_price - pos['entry_price']) / pos['entry_price'] * 100:+.2f}%)",
+        node_id=pos.get('wl_id'), incident=True, pos=pos,
+    )
+    print(f"  [reconcile] {ticker}: auto-closed via reconciliation ({result}, exit_reason={exit_reason}), {price_note}")
+    return True
+
+
 def check_live_state_reconciliation(open_positions, now=None):
     """Detection-only live-state reconciliation (automation_principles.md #5,
     #1 -- backlog 2026-07-21). For each open position on an automation-scope
@@ -1433,13 +1554,78 @@ def check_live_state_reconciliation(open_positions, now=None):
             if _open_leg is not None:
                 expected_shares = expected_shares + _open_leg.get('shares', 0)
         if expected_shares is not None and real_shares != expected_shares:
-            mismatch_found |= _alert_reconcile_mismatch(
-                pos, "shares",
-                f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state mismatch: `open_positions` tracks "
-                f"{expected_shares:g} shares, broker shows {real_shares:g} — broker is ground "
-                f"truth; suggested fix: verify no unexpected fill/manual trade explains the gap, "
-                f"then correct `open_positions.shares` to {real_shares:g}"
+            # Task #6 (2026-08-19), real incident: SOXL/ira sat with this
+            # exact mismatch unresolved for 1h40min, tripping the node
+            # circuit breaker twice, before a human manually reconciled it.
+            # ONE specific shape of this generic mismatch is unambiguous
+            # enough to auto-close safely, unlike every other reconciliation
+            # finding in this function (which stays alert-only by design,
+            # per automation_principles.md #5 -- a false-positive "fix"
+            # would be a new automated-trading decision layer): broker
+            # shows ZERO shares (the position is definitively flat, no
+            # partial-fill/oversell ambiguity to reason about) AND the
+            # position's own recorded sl_order_id's own fetched status is
+            # EXACTLY FILLED or CANCELED -- deliberately narrower than
+            # _exit_order_resting's general tri-state (which treats ANY
+            # terminal status, incl. REJECTED/EXPIRED/REPLACED, as "not
+            # resting"): a REJECTED/EXPIRED order was never truly live in
+            # the first place, and REPLACED means some OTHER order (not
+            # this one) is the real story -- neither is the clean
+            # "this specific order is what closed it" signal FILLED/
+            # CANCELED gives, and this auto-close's whole safety case rests
+            # on that specificity (paired review finding, 2026-08-19). Not
+            # just "absent from the open-orders list" either, which could
+            # also mean a transient fetch gap or a substitute order under a
+            # different id (_verify_resting_before_replace's own concern,
+            # not reachable here since a truly-absent-status order returns
+            # None, not FILLED/CANCELED). _open_leg (not re-fetched --
+            # already computed above under the same `expected_shares is not
+            # None` guard this whole branch is already inside) makes the
+            # core-vs-leg attribution of a single combined ticker-level
+            # share count genuinely ambiguous when present, so that case is
+            # excluded and falls through to the normal alert-only path
+            # unchanged.
+            _sl_status_for_reconcile = None
+            if pos.get('sl_order_id'):
+                try:
+                    _sl_status_for_reconcile = schwab_client.get_order_status(account, pos['sl_order_id'])
+                except Exception as _e:
+                    print(f"  [reconcile] {ticker}: order-status fetch failed during auto-close check, "
+                          f"treating as unconfirmed: {_e}")
+            _sl_confirmed_terminal = (
+                real_shares == 0 and _open_leg is None and pos.get('sl_order_id')
+                and _sl_status_for_reconcile in ('FILLED', 'CANCELED')
             )
+            _auto_closed = _sl_confirmed_terminal and _reconcile_auto_close_flat_position(pos, account, ticker, _node)
+            if _auto_closed:
+                # The position is now closed -- every check below this point
+                # (armed/missing_sl/sl_price/quantity mismatches) reads
+                # `pos`/`state`/`has_sell_order`, all snapshotted BEFORE the
+                # close above, and would fire spurious/stale alerts against
+                # a position that no longer exists (found while testing:
+                # without this, the FILLED sl_order_id that triggered the
+                # auto-close above also reads as "no resting SELL order
+                # found" to the missing_sl branch a few lines down, doubly
+                # alerting on the exact thing that was just resolved).
+                # record_node_streak still runs -- same as the normal
+                # end-of-loop call this replaces for this position.
+                schwab_safety.record_node_streak(
+                    ticker, account, "reconciliation_mismatches", hit=True, node_id=_node_id)
+                continue
+            else:
+                # Also reached when _sl_confirmed_terminal was True but
+                # _reconcile_auto_close_flat_position itself declined (no
+                # fill record AND no fresh quote available) -- must fall
+                # back to the normal alert here, not silently drop through,
+                # or a declined auto-close is neither closed nor alerted
+                # (found by paired review, 2026-08-19).
+                mismatch_found |= _alert_reconcile_mismatch(
+                    pos, "shares",
+                    f"⚠️ *{ticker}* ({account} · {mode_tag(account, _node)}) live-state mismatch: `open_positions` tracks "
+                    f"{expected_shares:g} shares, broker shows {real_shares:g} — broker is ground "
+                    f"truth; suggested fix: verify no unexpected fill/manual trade explains the gap, "
+                    f"then correct `open_positions.shares` to {real_shares:g}"
+                )
 
         state = pos.get('trail_state') or {}
         resting_sells = [
@@ -6282,9 +6468,21 @@ def _send_window_alert(label, watchlist):
     the morning report -- correct per-position trigger (buy/arm/trailing-sell,
     not always the buy-side lower_band). Minimal by design: only tickers within
     5% of their next trigger, rendered as mobile-readable prose, not the full
-    watchlist table."""
+    watchlist table.
+
+    Gated on has_capital_at_stake (Task #4, 2026-08-19), matching every other
+    real-time Slack alert per the 2026-08-08 capital-at-stake redesign --
+    build_reference_table deliberately shows every node regardless of mode
+    (correct for the Morning Report, its original purpose, see that
+    function's own docstring), but this real-time push had no mode/capital
+    filter at all before this fix: a canary (TWM) or paper node within 5% of
+    its own trigger rode along into the real-time "Signal window" push
+    alongside real positions, confirmed live 2026-08-19. build_reference_table
+    itself is untouched -- only this function's own `hot` filter changed."""
     ref_rows = build_reference_table(watchlist)
-    hot = [r for r in ref_rows if isinstance(r.get('Proximity'), (int, float)) and r['Proximity'] < 5]
+    hot = [r for r in ref_rows
+           if isinstance(r.get('Proximity'), (int, float)) and r['Proximity'] < 5
+           and has_capital_at_stake(r.get('_node'))]
     alert_level = "🔶 *HIGH ALERT*" if hot else "✅ algo running, nothing within range"
     header = f"⏱ *Signal window — {label} ET* | {alert_level}"
     if not hot:
@@ -6593,40 +6791,42 @@ def _position_trigger_summary(pos):
 def build_tomorrow_plan(next_date=None):
     """Writes signals_db.daily_plan rows for the next trading day and returns
     the formatted text -- the 'reset the whole thing for the next day' half
-    of the nightly cycle (2026-08-01, user's explicit design). Three
-    categories, matching how the user actually reviews the account:
-      - canary: a same-day copy of the static scenario_expectations rows
-        (deterministic by design, doesn't depend on today's activity).
-      - live: real (is_dry_run_sim=0) open positions carrying into tomorrow,
-        with their real SL/arm/trail/TIME triggers.
-      - paper: paper_positions carrying into tomorrow, same trigger shape.
+    of the nightly cycle (2026-08-01, user's explicit design).
+
+    Real capital-at-stake positions only (Task #5, 2026-08-19, user: "at EOD
+    I'm only going to care about real positions") -- the canary and paper
+    categories this used to also plan around are dropped entirely, not just
+    hidden: canary's static scenario_expectations copy is already fully
+    covered by the Coverage Report (see build_eod_scenario_review's own
+    docstring for the redundancy this relies on), and paper carries zero
+    real capital by definition. 'live' is additionally filtered to
+    has_capital_at_stake nodes, not just is_dry_run_sim=0 -- a real order at
+    soxl_ira's $500-$2,500 test-tier notional is still real, but the user's
+    "only real positions" framing here means real AND material, matching
+    every other real-time alert's existing capital-at-stake gate.
+
     A position that hasn't opened yet has no plan row -- this only plans
     around what's already on the books, not predicted new entries (mean
     reversion signals aren't predictable a day ahead)."""
-    check_date = datetime.now().strftime('%Y-%m-%d')
-    next_date = next_date or _next_trading_day(check_date)
+    next_date = next_date or _next_trading_day(datetime.now().strftime('%Y-%m-%d'))
     db.clear_daily_plan(next_date)
 
     lines = [f"*Tomorrow's Plan — {next_date}*"]
 
-    canary_scenarios = [s for s in db.get_scenario_expectations(active_only=True)
-                         if (s['scenario_key'] or '').startswith('canary_')]
-    lines.append(f"\n_Canary_ ({len(canary_scenarios)} scenarios):")
-    for s in canary_scenarios:
-        db.add_daily_plan_row(next_date, 'canary', s['expected_outcome'],
-                               ticker=s['ticker'], node_id=s.get('node_id'))
-        lines.append(f"  • {s['ticker']}: {s['expected_outcome']}")
-
-    for category, paper in (('live', False), ('paper', True)):
-        positions = [p for p in db.get_open_positions(paper=paper) if not p.get('is_dry_run_sim')]
-        lines.append(f"\n_{category.capitalize()}_ ({len(positions)} open position(s) carrying in):")
-        if not positions:
-            lines.append("  (none)")
-        for p in positions:
-            summary = _position_trigger_summary(p)
-            db.add_daily_plan_row(next_date, category, summary,
-                                   ticker=p['ticker'], node_id=p.get('wl_id'))
-            lines.append(f"  • {p['ticker']}: {summary}")
+    positions = [p for p in db.get_open_positions() if not p.get('is_dry_run_sim')]
+    # _node is None fails toward INCLUDING the row (visibility), not muting
+    # it -- same rationale as every other has_capital_at_stake gate in this
+    # module (a deleted/unresolvable node behind a still-real, still-open
+    # position must not silently lose its only visibility).
+    positions = [p for p in positions
+                 if (_n := db.get_watch_list_node_by_id(p.get('wl_id'))) is None or has_capital_at_stake(_n)]
+    lines.append(f"\n_Live_ ({len(positions)} open position(s) carrying in):")
+    if not positions:
+        lines.append("  (none)")
+    for p in positions:
+        summary = _position_trigger_summary(p)
+        db.add_daily_plan_row(next_date, 'live', summary, ticker=p['ticker'], node_id=p.get('wl_id'))
+        lines.append(f"  • {p['ticker']}: {summary}")
 
     return "\n".join(lines)
 
@@ -6637,14 +6837,24 @@ def build_eod_scenario_review(check_date=None):
     prior sessions of this not sticking as a repeatable habit -- codified
     here as real code + a CLAUDE.md session command, not just conversation).
 
-    Canary reuses coverage_check.py's existing scenario_expectations-based
-    check (already the right shape). Live/paper have no per-ticker designed
-    expectation the way canary does -- a real/paper position's entry depends
-    on today's actual z-score crossing, not a predictable schedule -- so
-    these sections report real activity (opened/closed today, still open)
-    rather than expected-vs-actual, diffed against yesterday's daily_plan
-    row for that ticker when one exists (so a position planned to carry
-    overnight that instead closed, or vice versa, is visible)."""
+    Real capital-at-stake only (Task #5, 2026-08-19, user: "at EOD I'm only
+    going to care about real positions") -- the canary scenario-check
+    section and the paper activity section are dropped entirely, not just
+    hidden. Neither loses real visibility: canary/control scenario checks
+    (incl. real-node control scenarios like reconciliation_mismatch, which
+    this section used to also carry for line-budget reasons -- see the
+    removed section's own 2026-08-15 comment) are already fully covered by
+    the separate Coverage Report (send_coverage_report), which posts
+    seconds before this one at the same 16:05 ET slot; paper carries zero
+    real capital by definition. The remaining live-activity section reports
+    real activity (opened/closed today, still open) rather than
+    expected-vs-actual (a real position's entry depends on today's actual
+    z-score crossing, not a predictable schedule the way canary is),
+    diffed against yesterday's daily_plan row for that ticker when one
+    exists (so a position planned to carry overnight that instead closed,
+    or vice versa, is visible), and filtered to has_capital_at_stake nodes
+    -- matching build_tomorrow_plan's identical filter, since this
+    function's own tomorrow's-plan call below already applies it."""
     check_date = check_date or datetime.now().strftime('%Y-%m-%d')
     if not _coverage_is_trading_day(check_date):
         return _post_message(f"EOD Scenario Review — {check_date} is not a trading day, nothing to review.")
@@ -6687,104 +6897,48 @@ def build_eod_scenario_review(check_date=None):
     except Exception as e:
         lines.append(f"\n_Code-path coverage_: ⚠️ failed to compute: {e}")
 
-    # Keyed by (category, ticker), not ticker alone -- 2026-08-01 Opus review
-    # finding: a ticker-only key collapses canary/live/paper plan rows for the
-    # same ticker (e.g. FAZ is both a canary scenario ticker and a real open
-    # live position), so one category's plan row silently shadows another's.
-    # Moved above the canary block (2nd review finding: canary daily_plan rows
-    # were written every day but never read back -- exactly what let the
-    # JNUG staleness bug from earlier tonight go unnoticed) so the canary
-    # section below can use it too.
+    # Keyed by (category, ticker), not ticker alone -- a ticker-only key
+    # could still collapse two different categories' plan rows for the same
+    # ticker (e.g. a real live position and a since-retired canary row that
+    # predates Task #5). Only 'live' rows are written by build_tomorrow_plan
+    # any more (Task #5, 2026-08-19) -- kept as a (category, ticker) dict
+    # anyway rather than narrowing to a ticker-only key, since a stale
+    # 'canary'/'paper' row from before this change could still be sitting in
+    # a not-yet-overwritten daily_plan table on the very first day this runs.
     prior_plan = {(row['category'], row['ticker']): row for row in db.get_daily_plan(check_date)}
 
-    # 2026-08-15 paired-review finding (both independent-cold and contextual
-    # agents caught this): this section covers BOTH canary_* scenarios and
-    # non-canary control scenarios (e.g. reconciliation_mismatch, which spans
-    # real soxl_ira nodes -- see coverage_report_summary.py's module
-    # docstring), so a header reading "_Canary_" would sit directly above a
-    # ":red_circle: N UNEXPLAINED on REAL node(s)" line -- exactly the
-    # canary-vs-real scope conflation a prior fix (2026-08-01 2nd Opus review,
-    # see the old deleted comment this replaced) deliberately avoided.
-    lines.append("\n_Scenario checks_ (canary + control; see Coverage Report for full detail):")
-    try:
-        all_results = _coverage_run_check(check_date)
-        # canary_results is still needed below for the stale-plan check
-        # (daily_plan rows only exist for the 'canary' category) -- unrelated
-        # to the rollup/bullet reuse just below.
-        canary_results = [r for r in all_results if (r['scenario_key'] or '').startswith('canary_')]
+    # Canary/control scenario-check section removed (Task #5, 2026-08-19,
+    # user: "at EOD I'm only going to care about real positions") -- fully
+    # covered by the separate Coverage Report (send_coverage_report), which
+    # posts seconds before this one at the same 16:05 ET slot; see this
+    # function's own docstring for the full rationale. If that report's
+    # cadence/existence ever changes, this real-only EOD review would need a
+    # fallback path for canary/control visibility -- flagged here rather than
+    # assumed permanently redundant.
 
-        # 2026-08-15: reuse the exact classify()/rollup_lines()/
-        # split_unexplained()/unexplained_block() helpers
-        # scripts/coverage_report_summary.py already built for the Coverage
-        # Report redesign (2026-08-14), instead of a second, separately-
-        # maintained per-scenario bullet listing here (canary_ deviated
-        # bullets one line each, plus a per-key [control] breakdown +
-        # bullets for everything else, incl. reconciliation_mismatch). This
-        # report posts seconds after the Coverage Report at the same 16:05
-        # ET slot and was undoing most of that redesign's line-count
-        # reduction by re-printing the same canary/reconciliation_mismatch
-        # detail here (Opus review finding F8, 2026-08-14 -- the real pair
-        # went from ~50+83 lines down to only ~10+83, not the full win the
-        # redesign was supposed to deliver). `reasons` mirrors
-        # send_coverage_report's own lookup exactly, so "explained" status
-        # can't disagree between the two reports.
-        from scripts.coverage_report_summary import (
-            rollup_lines, split_unexplained, unexplained_block, _key as _cov_key)
-        reasons = {_cov_key(d): d['reason'] for d in db.get_deviations(check_date=check_date)}
-        lines.extend(f"  {line}" for line in rollup_lines(all_results, reasons))
-
-        # 2026-08-15 paired-review finding (both reviewers, LOW): compose()
-        # wraps this same split in its own try/except so a per-row DB lookup
-        # failure (split_unexplained -> is_canary_result -> _node_row) can't
-        # take down anything else -- it degrades to "treat every unexplained
-        # row as real" (over-report, not under-report). Mirrored here so a
-        # lookup failure doesn't also swallow the stale-plan check below via
-        # the outer except.
-        unexplained = [r for r in all_results if r['status'] == 'deviated'
-                       and r.get('ticket_eligible', True) and not reasons.get(_cov_key(r))]
-        try:
-            real, canary = split_unexplained(unexplained)
-        except Exception:
-            real, canary = unexplained, []
-        if real or canary:
-            lines.extend(f"  {line}" for line in unexplained_block(real, canary))
-
-        # 2026-08-01 2nd Opus review finding: actually read back today's
-        # canary daily_plan rows (written this morning/last EOD run) and flag
-        # when the frozen plan text no longer matches the LIVE
-        # scenario_expectations text for that same ticker -- catches a config/
-        # expectation change that happened after the plan was built (exactly
-        # what let JNUG's stale "E mirrored" text sit undetected in the
-        # 2026-08-03 plan earlier tonight).
-        live_expected = {(s['scenario_key'], s['ticker']): s['expected_outcome']
-                          for s in db.get_scenario_expectations(active_only=True)}
-        stale_plans = []
-        for r in canary_results:
-            plan_row = prior_plan.get(('canary', r['ticker']))
-            if plan_row is None:
-                continue
-            live_text = live_expected.get((r['scenario_key'], r['ticker']))
-            if live_text is not None and plan_row['expected_outcome'] != live_text:
-                stale_plans.append(r['ticker'])
-        if stale_plans:
-            lines.append(f"  ⚠️ {len(stale_plans)} canary plan row(s) stale vs. current "
-                          f"scenario_expectations (config changed since the plan was built): "
-                          f"{', '.join(stale_plans)}")
-    except Exception as e:
-        lines.append(f"  ⚠️ canary check failed to run: {e}")
+    # has_capital_at_stake gate (Task #5, 2026-08-19) -- None node fails
+    # toward INCLUDING the row (visibility), same rationale as every other
+    # such gate in this module. trade_log's wl_id column postdates some
+    # historical rows, so a None here is a real, expected case (an old
+    # trade), not just a hypothetical deleted-node edge case.
+    def _real_capital(row):
+        _n = db.get_watch_list_node_by_id(row.get('wl_id'))
+        return _n is None or has_capital_at_stake(_n)
 
     try:
-        for category, paper in (('live', False), ('paper', True)):
-            closed = [t for t in db.get_trades_closed_on_date(check_date, paper=paper) if not t.get('is_dry_run_sim')]
+        for category, paper in (('live', False),):
+            closed = [t for t in db.get_trades_closed_on_date(check_date, paper=paper)
+                      if not t.get('is_dry_run_sim') and _real_capital(t)]
             # 2026-08-01 2nd Opus review finding: unlike its two neighbors
             # (closed/still_open), this wasn't is_dry_run_sim-filtered -- a
             # dry-run-sim entry today could mask a real carried-in position's
             # unplanned close as a routine "new entry today", hiding exactly
             # the anomalous case that annotation exists to surface.
             opened_today = {t['ticker'] for t in db.get_trades_opened_on_date(check_date, paper=paper)
-                             if not t.get('is_dry_run_sim')}
+                             if not t.get('is_dry_run_sim') and _real_capital(t)}
             still_open = [p for p in db.get_open_positions(paper=paper)
-                          if not p.get('is_dry_run_sim') and p['ticker'] not in {t['ticker'] for t in closed}]
+                          if not p.get('is_dry_run_sim') and _real_capital(p)
+                          and p['ticker'] not in {t['ticker'] for t in closed}]
             lines.append(f"\n_{category.capitalize()}_:")
             if not closed and not still_open:
                 lines.append("  (no activity today)")

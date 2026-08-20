@@ -2605,3 +2605,42 @@ Real backlog item (compliance policy requiring a firm minimum hold, blocking ALL
 **Real methodology bug found mid-campaign (not a code bug)**: the first SOXL sweep (`v5-minhold112`) picked every top node with `max_hold_hours=21`, well below the 112h floor. Trade-by-trade replay confirmed: whenever `max_hold_hours < min_hold_hours`, the TIME-exit condition trivially fires early and then sits blocked until the floor — collapsing the entire swept `hold_time_caps` axis below 112h into one degenerate "wait exactly until the floor" behavior, wasting most of that axis's compute on indistinguishable configs. Corrected by resweeping with `hold_time_caps` raised into 112h-252h (`v5-widehold-minhold112`), applied to SOXL then SPCL/QPUX under the same version (safe — `backtest_cache` scopes by ticker too, no collision).
 
 **Outcome**: parked, user's call — none of the three tickers produced a result that justified the real compliance friction (manual sign-off on both entry and exit, every trade). SOXL was the only one with a large enough sample (30 trades) to evaluate seriously, and it failed walk-forward (3/5 folds) and had a severe -73% max drawdown with SL locked out the whole time. SPCL/QPUX were both too data-thin (2-4 trades) either floored or unconstrained. Full writeup: `docs/research_log.md`'s 2026-08-17 entry. Kernel change itself is sound and stays in the codebase, not reverted — just not pursued further right now.
+
+## 2026-08-19 — real-time/EOD alert capital-at-stake gating (Tasks #4/#5); narrow reconciliation auto-close carve-out (Task #6)
+Dispatched by a peer `planner` session, all in `signals_notify.py`, batched into one paired review.
+
+**Task #4**: `_send_window_alert` (the real-time "Signal window — HH:MM ET" push at the 10:25/15:25 ET
+signal windows) gained a `has_capital_at_stake` gate on its `hot` filter — previously ungated, a canary
+(TWM) or paper node within 5% of trigger rode along into the real-time push alongside real positions
+(YINN), confirmed live 2026-08-19. `build_reference_table` itself is untouched (its full-visibility
+behavior across every node/mode is intentional, shared with the Morning Report).
+
+**Task #5, supersedes the 2026-08-01 addendum's description of `build_eod_scenario_review`/`build_tomorrow_plan`**:
+per the user's explicit call ("at EOD I'm only going to care about real positions"), both functions are
+now real-capital-only. `build_tomorrow_plan` dropped its 3-category structure (canary/live/paper) down to
+a single `'live'` category, additionally filtered to `has_capital_at_stake` (not just `is_dry_run_sim=0`).
+`build_eod_scenario_review` dropped its canary/control scenario-check section entirely (relies on the
+separate Coverage Report, `send_coverage_report`, for that visibility — verified by paired review to fire
+at the same 16:05 ET slot and to genuinely cover real-node control scenarios like `reconciliation_mismatch`,
+not just canary) and the paper activity section entirely; its remaining live-activity section is filtered
+to `has_capital_at_stake`. The JNUG-motivated canary stale-plan-vs-live-scenario_expectations check (added
+2026-08-01 2nd review) is gone with no replacement, a deliberate scope trade-off, not an oversight — flagged
+by paired review as worth knowing about if canary staleness ever needs surfacing again.
+
+**Task #6**: `check_live_state_reconciliation` (detection-only by design, `automation_principles.md #5`)
+gained one narrow, deliberate carve-out: `_reconcile_auto_close_flat_position` auto-closes a local
+`open_positions` row when broker confirms 0 shares, there's no open add-on leg, and the position's own
+recorded `sl_order_id` has a real fetched broker status of exactly FILLED or CANCELED (not the broader
+"any terminal status" _exit_order_resting normally treats as not-resting -- REJECTED/EXPIRED/REPLACED are
+deliberately excluded here, narrower than the dispatch's own first framing, per paired review). Prefers a
+real confirmed fill for exit price/reason (`exit_reason` derived by order-identity exactly like
+`check_sl_order_fills`, since an armed position's `sl_order_id` is actually the trailing-sell order id --
+paired review caught a first-draft hardcoded `'SL'` mislabeling real TRAIL/TIME exits); falls back to a
+fresh current-price approximation tagged with a distinct `exit_reason='RECONCILED'` (not a fabricated
+SL/TRAIL/TIME claim) when no fill record exists for that order; declines to auto-close at all (falls
+through to the normal alert path) rather than fabricate a price at `entry_price` when even a fresh quote
+fails. Real incident: SOXL/ira sat with exactly this mismatch unresolved 1h40min, tripping the node
+circuit breaker twice, before manual reconciliation.
+
+Full suite 1342+ passed at each stage. Full backlog/incident writeups: `docs/deep_backlog.md`'s 2026-08-19
+entries.

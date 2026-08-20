@@ -514,6 +514,43 @@ REGISTRY = [
                "protected. Detection-only -- deliberately never auto-replaces, which would reintroduce "
                "the silent-override behavior being fixed elsewhere in the same session. Expected to stay "
                "wired-never-fired: every firing here is a real unprotected-position incident."),
+    dict(id='reconciliation_auto_close',
+         scenario="The one reconciliation-mismatch shape unambiguous enough to safely self-correct: "
+                  "broker confirms 0 shares AND the position's recorded sl_order_id's own fetched broker "
+                  "status is exactly FILLED or CANCELED (not the broader 'any terminal status' "
+                  "_exit_order_resting normally treats as not-resting) -- the local open_positions row is "
+                  "auto-closed instead of just alerted, using a real confirmed fill for that order if one "
+                  "exists (exit_reason derived by order-identity, matching check_sl_order_fills exactly -- "
+                  "an armed position's sl_order_id is actually the trailing-sell order id), or a "
+                  "clearly-labeled price approximation tagged exit_reason='RECONCILED' if the order is "
+                  "terminal with no fill (the position closed via some other real mechanism). Declines to "
+                  "auto-close at all (falls back to the normal alert path) if even a fresh quote fails, "
+                  "rather than fabricate a price at entry_price. Every other mismatch shape stays "
+                  "detection-only, unchanged (automation_principles.md #5).",
+         code_path="signals_notify._reconcile_auto_close_flat_position, "
+                    "check_live_state_reconciliation's shares-mismatch branch",
+         offline_coverage="tests/test_fake_broker_reconciliation_auto_close_scenario.py -- 6 tests: "
+                           "confirmed-fill close with the real exit_reason ('SL' for an unarmed position, "
+                           "'TRAIL' for an armed one -- the exact mislabeling paired review caught in the "
+                           "first draft), no-fill-record close (labeled approximation, exit_reason= "
+                           "'RECONCILED', asserted directly against the trade_log row), a negative case "
+                           "(ambiguous/unconfirmed order status must NOT auto-close), and a case where "
+                           "auto-close correctly DECLINES (no fill record and no fresh quote) rather than "
+                           "fabricate an entry-price breakeven.",
+         check_mechanism='coverage_events', scenario_key='reconciliation_auto_close',
+         bad_results=['already_closed', 'skipped_no_price'],
+         notes="Added 2026-08-19 (Task #6), real incident: SOXL/ira sat with exactly this mismatch "
+               "unresolved for 1h40min, tripping the node circuit breaker twice, before a human manually "
+               "reconciled it. A narrow, deliberate carve-out from the general detection-only rule, not a "
+               "reversal of it -- gated on real_shares==0 (no partial-fill/oversell ambiguity), an actual "
+               "fetched FILLED/CANCELED order status (not mere absence, which could be a transient fetch "
+               "gap or a substitute order under a different id; REJECTED/EXPIRED/REPLACED deliberately "
+               "excluded, narrower than the dispatch's first framing -- paired review, 2026-08-19), and no "
+               "open add-on leg (core-vs-leg attribution of a combined ticker-level share count would be "
+               "genuinely ambiguous). 'skipped_no_price' added same day: when the auto-close decision "
+               "itself declines (no fill record and a fresh quote also fails), the caller falls back to "
+               "the normal _alert_reconcile_mismatch path rather than silently continuing -- a first-draft "
+               "version left the position neither closed nor alerted in that case, caught by paired review."),
     dict(id='trailing_arm_reread',
          scenario="Trailing-arm state survives notify_trailing_activated without re-arming next bar",
          code_path="signals_notify.notify_trailing_activated (re-reads via get_position_by_id)",

@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Resolved 2026-08-19 — Tasks #4/#5/#6: real-time/EOD alerts gated on has_capital_at_stake (canary/paper no longer ride along), narrow reconciliation auto-close (broker 0 shares + confirmed FILLED/CANCELED sl_order_id). Paired review found+fixed 2 HIGH in the auto-close (exit_reason mislabeling an armed position's TRAIL exit as SL; unmarked price-approximation in trade_log) plus a caller bug that could leave a declined auto-close neither closed nor alerted. Full detail: `deep_backlog.md`.
+
 ## [live-trading][security] Resolved 2026-08-19 — SL exit redesign: a genuinely resting stop is never actively replaced (was: false SL price read → needless market-replace, the same-day SOXS incident's structural cause). Paired review found+fixed 3 HIGH (bug #4 replace-target-mismatch bypass, `exit_pending` poisoning blocking later exits, `check_sl_order_fills`'s FILLED-only detection gap). Full detail: `deep_backlog.md`.
 
 ## [live-trading][security] Resolved 2026-08-18 — drought overlay's `_pct_override` triplet: `_PENDING_BUY_NODE_KEYS` now carries the 3 override columns forward, and `open_position_from_pending`'s drought_overlay branch routes through `open_drought_overlay_position` (was calling `open_position` directly, silently skipping override resolution on the real fill path). Paired-reviewed (2 rounds), regression test verified to fail pre-fix. Full detail: `deep_backlog.md`.
