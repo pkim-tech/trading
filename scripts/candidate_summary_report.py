@@ -298,6 +298,17 @@ def compounded(rets):
     return (prod - 1) * 100
 
 
+def _native(v):
+    """numpy.int64/float64 -> native Python type. sqlite3 has no adapter for
+    numpy scalars and silently binds them as a BLOB instead of a number --
+    same bug/fix as candidate_full_review.py's overlay_robustness() (see its
+    docstring), found 2026-08-19 in this function's sibling query, which is
+    what actually feeds addon_n/drought_n (overlay_robustness feeds a
+    different set of columns -- the verdict/robustness ones -- so fixing
+    only that one left this one still silently blank)."""
+    return v.item() if hasattr(v, "item") else v
+
+
 def liquidity_dollars_per_day(conn, ticker):
     """Real dollar liquidity, this project's standard formula (see
     campaign_comparison_table.py) -- avg_vol_10d*last_price*0.01, confirmed
@@ -333,8 +344,9 @@ def overlay_summary_for_node(conn, ticker, strategy, version, mechanism, node):
                   SELECT MAX(cor2.run_timestamp) FROM candidate_overlay_results cor2
                   WHERE cor2.candidate_node_id = cor.candidate_node_id AND cor2.mechanism = cor.mechanism
               )
-    """, (ticker, mechanism, strategy, version, node['window'], node['z'], node['sl'], node['arm_pct'],
-          node['trail_buy_pct'], node['trail_sell_pct'], node['hold'], node['entry_timing']))
+    """, (ticker, mechanism, strategy, version, _native(node['window']), _native(node['z']),
+          _native(node['sl']), _native(node['arm_pct']), _native(node['trail_buy_pct']),
+          _native(node['trail_sell_pct']), _native(node['hold']), node['entry_timing']))
     rets = [r[0] for r in c.fetchall()]
     if not rets:
         return None
