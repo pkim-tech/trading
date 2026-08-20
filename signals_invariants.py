@@ -662,6 +662,101 @@ def check_paper_position_on_non_paper_node():
     return violations
 
 
+def check_live_node_missing_candidate_link():
+    """Every state='live' watch_list node should have a recorded
+    watch_list_candidate_link row (any role) tracing it back to the real
+    candidate_nodes row it was actually promoted from.
+
+    Promoted from scripts/evening_status.py's Part 2 report (2026-08-19,
+    Task #7) -- that section only ever PRINTED the gap for a human to notice
+    during an interactive read, so a real live node could go untraced
+    indefinitely with nothing forcing anyone to look. Depends on this:
+    watch_list_candidate_link exists specifically so a node's real
+    core-strategy provenance is never re-derived by guessing (see that
+    table's own CREATE TABLE comment for the 2026-08-11 incident that
+    motivated it -- exact-param-tuple guessing got it wrong multiple times).
+    An unlinked live node means that protection doesn't apply to it: any
+    future question about "what candidate was this promoted from, and does
+    the current live config still match" has no answer on file. Does NOT
+    itself imply the node is mis-configured -- only that its provenance
+    isn't recorded. get_live_nodes() already excludes archived_at IS NOT
+    NULL nodes, matching evening_status.py's existing scope exactly."""
+    violations = []
+    linked_wl_ids = {link['wl_id'] for link in db.get_candidate_links()}
+    for node in db.get_live_nodes():
+        if node['id'] not in linked_wl_ids:
+            violations.append(
+                f"{node['ticker']} (wl_id={node['id']}, account={node.get('account')!r}) is state='live' "
+                f"with no watch_list_candidate_link row -- its real candidate-promotion provenance "
+                f"isn't traceable on file."
+            )
+    return violations
+
+
+def check_live_overlay_missing_validation_link():
+    """Every state='live' watch_list node with drought_overlay_enabled=1 or
+    addon_enabled=1 should have a matching watch_list_overlay_link row for
+    that overlay_type, pointing at where its parameters were actually
+    validated.
+
+    Built 2026-08-19 (Task #7), real incident: SOXS/ira (wl_id=206,
+    real $10k) had drought_overlay_enabled=1/confirm_days=1 since 2026-08-12
+    with ZERO validation ever run -- set_drought_config is a raw DB write,
+    no gate anywhere required docs/overlay_parameter_robustness_process.md's
+    real methodology (fit-half search, single-trade-removal stress test) to
+    have actually run first. Later research (a peer session's Task #2)
+    confirmed no confirm_days value 1-20 works for SOXS at all -- the `1`
+    traced to an unrelated 2026-08-12 staged-test batch (FAS/TMF also set to
+    confirm_days=1 that day, both genuinely tiny-notional staged-test nodes
+    where a fast-triggering value makes sense) that SOXS apparently
+    inherited without separate calibration for its real-capital role.
+    watch_list_overlay_link exists so this can't happen silently again --
+    see that table's own CREATE TABLE comment for the full design. Checks
+    drought_overlay and addon independently (a node can have one, both, or
+    neither enabled); a node with neither enabled is correctly skipped
+    entirely, not flagged as "missing" a link it has no need for.
+
+    A link with verdict='NO_REAL_SELECTION' is flagged SEPARATELY and more
+    loudly, not treated as satisfied -- found by paired review, 2026-08-19:
+    the real KORU/roth (wl_id=202, $10k) case is exactly this shape (its
+    drought config was found to be a pure overfitting artifact and
+    REJECTED, per docs/research_log.md, yet the node is still live with it
+    enabled). A live node running a config the validation process
+    explicitly rejected is a WORSE state than "never checked", and the
+    original version of this check treated both identically (any row at
+    all silenced it), which would have hidden the more urgent case behind
+    the more routine one. Includes each violation's starting_notional so a
+    genuinely real node (SOXS, $10k) doesn't read identically to a
+    deliberately-detuned staged-test node (TMF, $50) that will never have
+    (or need) a formal fit-half/stress-test validation -- found by both
+    reviewers: without this, ~half the real violations today are staged-
+    test noise indistinguishable from the real-capital ones the dispatch
+    was actually motivated by."""
+    violations = []
+    linked = {(link['wl_id'], link['overlay_type']): link for link in db.get_overlay_links()}
+    for node in db.get_live_nodes():
+        for column, overlay_type in (('drought_overlay_enabled', 'drought_overlay'),
+                                      ('addon_enabled', 'addon')):
+            if not node.get(column):
+                continue
+            key = (node['id'], overlay_type)
+            notional = f"${node.get('starting_notional'):,.0f}" if node.get('starting_notional') else "unknown $"
+            base = (f"{node['ticker']} (wl_id={node['id']}, account={node.get('account')!r}, "
+                    f"starting_notional={notional}) is state='live' with {column}=1")
+            if key not in linked:
+                violations.append(
+                    f"{base} but no watch_list_overlay_link row for overlay_type={overlay_type!r} -- "
+                    f"this overlay's parameters have no recorded validation."
+                )
+            elif (linked[key].get('verdict') or '').strip().upper() == 'NO_REAL_SELECTION':
+                violations.append(
+                    f"🚨 {base} whose linked validation (overlay_type={overlay_type!r}) has verdict="
+                    f"'NO_REAL_SELECTION' -- this node is running a config the validation process "
+                    f"EXPLICITLY REJECTED, not just an unvalidated one: {linked[key]['validation_ref']}"
+                )
+    return violations
+
+
 CHECKS = [
     check_paper_position_on_non_paper_node,
     check_live_trailing_exit_automation_scope,
@@ -678,10 +773,45 @@ CHECKS = [
     check_all_account_values_are_known_aliases,
 ]
 
+# TRACEABILITY_CHECKS: deliberately NOT in CHECKS/run_all() (2026-08-19,
+# paired review finding, both independent-cold and contextual reviewers
+# converged): every other CHECKS member is a "should always be zero, a
+# violation means something is already broken" invariant, and run_all()'s
+# every caller (daemon startup/07:00/EOD Slack alerts, this module's own
+# __main__ sys.exit(1) pre-commit gate) treats ANY violation as something to
+# page/fail loudly on. These two checks are structurally different: as of
+# 2026-08-19 they surface 21 REAL, ALREADY-KNOWN backlog gaps (7 candidate-
+# link, 14 overlay-validation) that will take real research/promotion work
+# to close, not a config bug to fix same-session -- folding them into
+# run_all() would have gone from a genuinely clean "all invariants hold"
+# signal straight to a permanent 21-line Slack wall repeated 3x/day (daemon
+# startup + 07:00 + EOD) with no acknowledgment mechanism (this project's
+# existing pattern for exactly this shape -- a known, explained, expected-
+# to-persist-for-a-while condition -- is coverage_deviations'
+# explain_deviation ticket model, which run_all()'s callers don't have).
+# Run standalone (this module's __main__, below) so a human running the
+# documented pre-commit check still sees them, clearly separated and
+# non-blocking (does NOT affect the sys.exit(1) exit code) -- surfaced, not
+# silenced, but not turned into unbounded daemon Slack noise either. Wiring
+# these into the daemon's automatic alert path is a real follow-up worth
+# its own decision (an ack/exemption mechanism, or dedup-on-change instead
+# of dedup-never), not decided here.
+TRACEABILITY_CHECKS = [
+    check_live_node_missing_candidate_link,
+    check_live_overlay_missing_validation_link,
+]
+
 
 def run_all():
     violations = []
     for check in CHECKS:
+        violations.extend(check())
+    return violations
+
+
+def run_traceability_checks():
+    violations = []
+    for check in TRACEABILITY_CHECKS:
         violations.extend(check())
     return violations
 
@@ -695,5 +825,16 @@ if __name__ == "__main__":
         print(f"{len(found)} invariant violation(s):")
         for v in found:
             print(f"  - {v}")
+
+    print()
+    traceability_gaps = run_traceability_checks()
+    if traceability_gaps:
+        print(f"{len(traceability_gaps)} traceability gap(s) (backlog items, non-blocking):")
+        for v in traceability_gaps:
+            print(f"  - {v}")
+    else:
+        print("No traceability gaps.")
+
+    if found:
         sys.exit(1)
     print("All invariants hold.")

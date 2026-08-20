@@ -1933,6 +1933,70 @@ def ensure_tables():
             )
         """)
 
+        # watch_list_overlay_link, added 2026-08-19 (Task #7) -- the overlay-level
+        # sibling of watch_list_candidate_link above: a real, explicit link from a
+        # node's overlay mechanism (drought/addon) to WHERE that specific overlay's
+        # parameters were actually validated. Built because there was no
+        # traceability at all for the overlay axis -- `set_drought_config`/
+        # `set_addon_config` are raw DB writes with no gate requiring
+        # docs/overlay_parameter_robustness_process.md's real methodology (fit-half
+        # search, single-trade-removal stress test) to have actually run first, and
+        # the real SOXS incident (drought_overlay_enabled=1/confirm_days=1 since
+        # 2026-08-12, inherited from an unrelated staged-test batch, zero
+        # validation ever run, later found by research to not work at ANY
+        # confirm_days 1-20) is exactly the gap this closes.
+        #
+        # validation_ref is free text, not a rigid FK, deliberately mirroring
+        # watch_list_candidate_link's candidate_node_id "soft reference" precedent
+        # but looser still: unlike a candidate promotion (always one specific
+        # candidate_nodes row), overlay validation evidence lives in genuinely
+        # different places depending on how the work was done -- a
+        # docs/research_log.md narrative entry (SOXL's confirm_days=3/vol_gate=0.4
+        # finding), a candidate_nodes row's own IE-verdict (REAL_SELECTION/
+        # NO_REAL_SELECTION, from candidate_full_review.py's included-vs-excluded
+        # challenge), or a docs/deep_backlog.md resolved-item writeup -- and there
+        # is no single table that already indexes all of those. A rigid FK would
+        # undercount real validations that only exist as prose. verdict is a
+        # SEPARATE optional column (not folded into validation_ref) specifically so
+        # "does this overlay have a REAL_SELECTION verdict on file" is a plain SQL
+        # filter, not a text search -- expected values mirror
+        # candidate_full_review.py's own vocabulary (REAL_SELECTION/
+        # NO_REAL_SELECTION) but this is NOT enforced by a CHECK constraint, since
+        # a narrative-only validation (no formal IE-verdict computed) is a real,
+        # legitimate case with no verdict to record.
+        #
+        # overlay_type matches the watch_list *_enabled column it validates
+        # ('drought_overlay', 'addon') rather than a generic label, so a future
+        # third overlay mechanism (skim, when it goes live) extends this the same
+        # way rather than needing a new table.
+        #
+        # KNOWN LIMITATION (flagged by independent-cold review, 2026-08-19,
+        # not fixed this session -- a real follow-up, not an oversight): this
+        # link is keyed by (wl_id, overlay_type) only, NOT by the specific
+        # parameter values that were validated. set_drought_config/
+        # set_addon_config are still raw DB writes that neither read nor
+        # invalidate this table -- so a node can be validated once (e.g. SOXL
+        # at confirm_days=3/vol_gate=0.4), stay linked, and then have its
+        # live config silently changed to something never validated (the
+        # exact SOXS shape, just happening to an already-linked node instead
+        # of a never-linked one) with check_live_overlay_missing_validation_link
+        # staying green throughout. Closing this fully would mean storing the
+        # validated param values here and diffing them against the node's
+        # current watch_list columns -- scoped out of this session's build,
+        # left as an explicit gap rather than a silent one.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS watch_list_overlay_link (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                wl_id          INTEGER NOT NULL REFERENCES watch_list(id),
+                overlay_type   TEXT NOT NULL,
+                validation_ref TEXT NOT NULL,
+                verdict        TEXT,
+                linked_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                note           TEXT,
+                UNIQUE(wl_id, overlay_type)
+            )
+        """)
+
         # tax_realized_loss_baseline -- the user's real, pre-existing realized-loss
         # baseline for `brokerage` (the one taxable account), used by k1_tax.py's
         # brokerage_tax_forecast() to net against the year's realized gains before
@@ -2109,6 +2173,67 @@ def get_candidate_links(wl_id=None):
             ).fetchall()]
         return [dict(r) for r in c.execute(
             "SELECT * FROM watch_list_candidate_link ORDER BY wl_id, role"
+        ).fetchall()]
+
+
+def set_overlay_link(wl_id, overlay_type, validation_ref, verdict=None, note=None):
+    """Records that a node's overlay mechanism (drought_overlay/addon) has a
+    real, on-file validation -- see watch_list_overlay_link's own CREATE TABLE
+    comment for the full design rationale (candidate_link's sibling, looser
+    validation_ref shape).
+
+    wl_id must be a real watch_list row -- same trust posture as
+    set_candidate_link (this table exists specifically so a future session
+    doesn't have to re-derive whether an overlay was validated by re-reading
+    prose; a wrong link here is worse than no link, since it would read as
+    authoritative). overlay_type is case/whitespace-normalized (mirrors
+    set_candidate_link's identical role normalization -- found by cold
+    review, 2026-08-19: without it, 'Drought_Overlay' silently creates a
+    SECOND row alongside 'drought_overlay' and never satisfies the
+    check, which compares against the literal lowercase tuple). note is
+    preserved (not blanked) when a re-link omits it. validation_ref is
+    required (there is no such thing as a validation link with no pointer to
+    what validated it). verdict is ALSO preserved (not cleared) when a
+    re-link omits it -- found by cold review, 2026-08-19: the first version
+    used excluded.verdict directly, so re-linking to update just
+    validation_ref (with no verdict= passed) silently NULLed a previously-set
+    REAL_SELECTION verdict, defeating the whole point of verdict being a
+    separate plain-SQL-filterable column. verdict=None always means
+    'unchanged' (matching note's existing convention) -- there is
+    deliberately no way to CLEAR a previously-set verdict through this
+    function; do it via direct SQL if a wrong verdict genuinely needs
+    correcting, same rare-enough-to-not-need-a-shortcut posture as any
+    other data-correction edit in this codebase."""
+    with _conn() as c:
+        node = c.execute("SELECT ticker FROM watch_list WHERE id=?", (wl_id,)).fetchone()
+        if node is None:
+            raise ValueError(f"set_overlay_link: no watch_list row with id={wl_id}")
+        if not validation_ref or not validation_ref.strip():
+            raise ValueError("set_overlay_link: validation_ref is required -- a validation link must "
+                              "point at what actually validated it")
+        overlay_type = overlay_type.strip().lower()
+        c.execute("""
+            INSERT INTO watch_list_overlay_link (wl_id, overlay_type, validation_ref, verdict, note)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(wl_id, overlay_type) DO UPDATE SET
+                validation_ref=excluded.validation_ref,
+                verdict=COALESCE(excluded.verdict, watch_list_overlay_link.verdict),
+                linked_at=datetime('now'),
+                note=COALESCE(excluded.note, watch_list_overlay_link.note)
+        """, (wl_id, overlay_type, validation_ref.strip(), verdict, note))
+        c.commit()
+
+
+def get_overlay_links(wl_id=None):
+    """All recorded overlay validation links, or every link for one node when
+    wl_id is given."""
+    with _conn() as c:
+        if wl_id is not None:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM watch_list_overlay_link WHERE wl_id=? ORDER BY overlay_type", (wl_id,)
+            ).fetchall()]
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM watch_list_overlay_link ORDER BY wl_id, overlay_type"
         ).fetchall()]
 
 

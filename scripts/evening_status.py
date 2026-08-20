@@ -36,6 +36,7 @@ import signals_compute as compute
 import strategies
 import schwab_client
 import schwab_safety
+import signals_invariants
 import scripts.verify_real_trades_vs_kernel as verify
 from scripts.coverage_registry import REGISTRY, compute_status, STATUS_ORDER
 from scripts.coverage_regression_watch import last_run_statuses, log_run, staleness_for
@@ -1304,6 +1305,21 @@ def part4():
     else:
         for n in unlinked:
             print(f"  {n['ticker']:6s} {n['account'] or '':10s} wl_id={n['id']}")
+
+    print("\n--- 2b. Real live nodes with an overlay enabled but no validation link ---")
+    # Added 2026-08-19 (Task #7) -- the overlay-level sibling of the section
+    # above. Calls signals_invariants.check_live_overlay_missing_validation_link
+    # directly (not a re-derived query) so this print can't drift from the
+    # real check's own logic -- that check also runs standalone via
+    # `.venv/bin/python signals_invariants.py` (non-blocking there, see its
+    # own TRACEABILITY_CHECKS comment for why it's kept out of the
+    # loud/blocking run_all() path).
+    overlay_gaps = signals_invariants.check_live_overlay_missing_validation_link()
+    if not overlay_gaps:
+        print("none -- every live node's enabled overlay has a recorded validation link")
+    else:
+        for g in overlay_gaps:
+            print(f"  {g}")
 
 
 PARTS = {'1': part1, '2': part2, '3': part3, '4': part4}
