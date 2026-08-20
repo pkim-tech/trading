@@ -688,6 +688,20 @@ def win_rate(rets):
     return sum(1 for r in rets if r > 0) / len(rets) * 100
 
 
+def _native(v):
+    """numpy.int64/float64 -> native Python type. sqlite3 has no adapter for
+    numpy scalars and silently binds them as a BLOB instead of a number (same
+    bug class get_or_create_candidate_node's own cast already guards against,
+    see its docstring) -- found 2026-08-19: candidate_type_membership()'s
+    'best safe'/'CAGR-safe' node dicts happen to carry native Python
+    int/float (best_safe_node() casts them), but 'best unsafe'/'best
+    possible'/'best certain' pull z/arm_pct straight from the pandas
+    DataFrame as numpy dtypes -- silently zeroing every addon_n/drought_n
+    match for those three candidate types across the whole report, not just
+    a few rows missing overlay data outright."""
+    return v.item() if hasattr(v, "item") else v
+
+
 def overlay_robustness(conn, ticker, strategy, version, mechanism, node):
     """Looks up the exact candidate_node_id for this row's params (same match
     as candidate_summary_report.overlay_summary_for_node), pulls its
@@ -727,8 +741,9 @@ def overlay_robustness(conn, ticker, strategy, version, mechanism, node):
                   WHERE cor2.candidate_node_id = cor.candidate_node_id AND cor2.mechanism = cor.mechanism
               )
         ORDER BY cor.entry_time
-    """, (ticker, mechanism, strategy, version, node['window'], node['z'], node['sl'], node['arm_pct'],
-          node['trail_buy_pct'], node['trail_sell_pct'], node['hold'], node['entry_timing']))
+    """, (ticker, mechanism, strategy, version, _native(node['window']), _native(node['z']),
+          _native(node['sl']), _native(node['arm_pct']), _native(node['trail_buy_pct']),
+          _native(node['trail_sell_pct']), _native(node['hold']), node['entry_timing']))
     trades = c.fetchall()
     if len(trades) < 2:
         return None
@@ -825,8 +840,9 @@ def drought_included_excluded_check(conn, ticker, strategy, version, node, vol_g
               AND cn.trail_buy_pct=? AND cn.trail_sell_pct=? AND cn.max_hold_hours=? AND cn.entry_timing=?
         ORDER BY cor.run_timestamp DESC
         LIMIT 1
-    """, (ticker, strategy, version, node['window'], node['z'], node['sl'], node['arm_pct'],
-          node['trail_buy_pct'], node['trail_sell_pct'], node['hold'], node['entry_timing']))
+    """, (ticker, strategy, version, _native(node['window']), _native(node['z']),
+          _native(node['sl']), _native(node['arm_pct']), _native(node['trail_buy_pct']),
+          _native(node['trail_sell_pct']), _native(node['hold']), node['entry_timing']))
     row = c.fetchone()
     confirm_days = row[0] if row and row[0] is not None else 10  # run_overlay_shim.py's own CLI default
 
