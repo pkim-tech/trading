@@ -15,6 +15,7 @@ import signals_config as cfg
 import signals_db as db
 from signals_helpers import (
     detect_price_discontinuity, nearest_split_factor, real_split_confirmed_since,
+    corporate_action_confirmed_since,
     already_alerted_corp_action, mark_corp_action_alerted, log_poll, coverage_mode,
 )
 
@@ -245,14 +246,57 @@ def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override
         current_price = price_override
     else:
         current_price = _live_tick_price(ticker, close_series.iloc[-1])
+    prev_close_date = daily_closes.index[-1] if not daily_closes.empty else None
+    _entry_mode = coverage_mode(node.get('account'))
+    # Price-ratio guess checked FIRST -- the corporate_actions table only
+    # CONFIRMS a suspected discontinuity (skipping the yfinance rule-out when
+    # it does), it never originates one independent of price behavior. See
+    # check_sell_condition's identical pattern/comment for the full history
+    # (paired review, 2026-08-19/20, two rounds): checking the table
+    # unconditionally was first behaviorally inert, then (once fixed) could
+    # freeze forever independent of price once a stale prev_close/date range
+    # kept matching. Less exposed here than the exit side (prev_close_date is
+    # always yesterday's bar, self-limiting), but gated identically for
+    # consistency and defense in depth.
     discontinuity = detect_price_discontinuity(current_price, prev_close)
+    corp_action = None
+    if discontinuity and prev_close_date is not None:
+        corp_action = corporate_action_confirmed_since(ticker, prev_close_date)
+    if corp_action is not None:
+        discontinuity = corp_action['split_ratio']
+        confirmed = True
+    else:
+        # Entry side previously had NO split-confirmation gate at all (unlike
+        # check_sell_condition's real_split_confirmed_since gate, added 2026-08-14) --
+        # the gap that let GDXU's 2026-03-03/05 false-positive freeze slip through
+        # unnoticed until the 2026-08-19 evening_status.py replay review (see
+        # docs/backlog_cache.md's 2026-08-19/20 entry). This is the remaining
+        # rule-out path when the corporate_actions table above has nothing on
+        # file. Same fail-closed philosophy as the exit side: only a confirmed
+        # False (genuinely ruled out) skips the freeze.
+        confirmed = real_split_confirmed_since(ticker, prev_close_date) if (discontinuity and prev_close_date is not None) else None
     if discontinuity:
-        print(f"⚠️ Possible corporate action for {ticker}: prev_close={prev_close:.4f} "
-              f"current={current_price:.4f} ratio={discontinuity:.2f} -- freezing new signals")
-        # prev_close/SMA/Std are all computed against pre-event history, so any
-        # signal here would be comparing today's real price to a stale baseline
-        # (exactly what let KORU's split slip through undetected 2026-07-15).
-        return None
+        if confirmed is False:
+            # Same dedup set as check_sell_condition's ruled-out logging -- one entry
+            # per (ticker, mode, today) regardless of which side (entry/exit) first
+            # rules it out, since it's the same real-world fact either way. `mode` is
+            # part of the key (2026-08-19/20 fix) so an entry-side ruling can't
+            # suppress a same-day live exit-side event for the Accountability Grid.
+            dedup_key = (ticker, _entry_mode, date.today().isoformat())
+            if dedup_key not in _ruled_out_logged_today:
+                _ruled_out_logged_today.add(dedup_key)
+                db.log_coverage_event("price_discontinuity_ruled_out", _entry_mode,
+                                    ticker=ticker, node_id=node.get('id'), result="no_real_split",
+                                    detail=f"ratio={discontinuity:.2f} prev_close={prev_close:.4f} "
+                                           f"current={current_price:.4f}")
+        else:
+            print(f"⚠️ Possible corporate action for {ticker}: prev_close={prev_close:.4f} "
+                  f"current={current_price:.4f} ratio={discontinuity:.2f} -- freezing new signals "
+                  f"(real-split-confirmed={confirmed})")
+            # prev_close/SMA/Std are all computed against pre-event history, so any
+            # signal here would be comparing today's real price to a stale baseline
+            # (exactly what let KORU's split slip through undetected 2026-07-15).
+            return None
     sma           = last_row['SMA']
     std           = last_row['Std']
     hurst, adf_p  = _hurst_adf(ticker, df_hourly)
@@ -295,9 +339,31 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
     strategy_cls = getattr(strategies, pos['strategy'], None)
     if strategy_cls is None:
         return None, None, False
+    ticker = pos['ticker']
+    entry_time = pos.get('entry_time') or pos.get('signal_time')
+    _mode = 'paper' if paper else coverage_mode(pos.get('account'))
+    # Price-ratio guess checked FIRST -- the corporate_actions table only
+    # CONFIRMS a suspected discontinuity, it never originates one independent
+    # of price behavior. Paired review, 2026-08-19/20 (two rounds): an earlier
+    # version checked the table first/unconditionally, which was (a) initially
+    # behaviorally inert (a table hit and miss were indistinguishable to every
+    # caller, so a curated real split could still get overridden to "don't
+    # freeze" by the lower-authority yfinance check below -- fixed by having a
+    # table hit skip yfinance entirely), then (b) once THAT was fixed, a real
+    # correction-can't-clear bug: the table's [since, today] range has no price
+    # awareness, so after a human applies "Apply Correction" (rescaling
+    # entry_price), the table would keep matching and keep freezing forever --
+    # unlike the price-ratio guess, which naturally stops matching once
+    # entry_price is corrected to track current price again. Gating the table
+    # check behind a live ratio match restores that self-clearing property.
     discontinuity = detect_price_discontinuity(current_price, pos['entry_price'])
-    if discontinuity:
-        ticker = pos['ticker']
+    corp_action = None
+    if discontinuity and entry_time:
+        corp_action = corporate_action_confirmed_since(ticker, entry_time)
+    if corp_action is not None:
+        discontinuity = corp_action['split_ratio']
+        confirmed = True
+    else:
         # Gated on a REAL confirmed split (2026-08-14), not the price-ratio heuristic
         # alone -- found live on NUGT: an ordinary ~46% rally coincidentally matched a
         # 1/1.5 split ratio within tolerance, freezing SL/TP/TIME protection right
@@ -305,20 +371,23 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
         # returns False (don't freeze) only when a split is genuinely ruled out;
         # True (real split) or None (fetch failed, can't rule it out) both still
         # freeze -- a false freeze is human-correctable, a false all-clear on a real
-        # split isn't.
-        entry_time = pos.get('entry_time') or pos.get('signal_time')
-        confirmed = real_split_confirmed_since(ticker, entry_time) if entry_time else None
+        # split isn't. This is the remaining, lower-authority rule-out path for when
+        # the corporate_actions table above has nothing on file.
+        confirmed = real_split_confirmed_since(ticker, entry_time) if (discontinuity and entry_time) else None
+    if discontinuity:
         if confirmed is False:
-            # Once per (ticker, today) -- the ratio can hold for the whole duration of a
-            # real rally (days/weeks), and this branch is reached every poll while it
+            # Once per (ticker, mode, today) -- the ratio can hold for the whole duration
+            # of a real rally (days/weeks), and this branch is reached every poll while it
             # does; logging unconditionally would write thousands of identical rows to
             # coverage_events for the exact case this fix says is a non-event (found by
             # paired Opus review, 2026-08-14 -- the same review that added this dedup
-            # also added the missing price_discontinuity_ruled_out Grid row).
-            dedup_key = (ticker, date.today().isoformat())
+            # also added the missing price_discontinuity_ruled_out Grid row). `mode` is
+            # part of the key (2026-08-19/20 fix) -- without it, a paper or entry-side
+            # firing for this ticker could suppress the day's only LIVE exit-side event,
+            # understating live evidence in the Accountability Grid.
+            dedup_key = (ticker, _mode, date.today().isoformat())
             if dedup_key not in _ruled_out_logged_today:
                 _ruled_out_logged_today.add(dedup_key)
-                _mode = 'paper' if paper else coverage_mode(pos.get('account'))
                 db.log_coverage_event("price_discontinuity_ruled_out", _mode, ticker=ticker,
                                     position_id=pos.get('id'), node_id=pos.get('wl_id'), result="no_real_split",
                                     detail=f"ratio={discontinuity:.2f} entry_price={pos['entry_price']:.4f} "
@@ -331,16 +400,26 @@ def check_sell_condition(pos, current_price, now, at_bar_close=True, low=None, h
             # assumes a real open_positions id, and this is scoring infrastructure, not
             # real capital, so a plain freeze (no self-heal button) is an acceptable gap.
             if not paper and not already_alerted_corp_action(ticker):
-                factor = nearest_split_factor(discontinuity)
+                # Table-confirmed: use the exact recorded ratio directly, not
+                # nearest_split_factor's clean-round-number snap -- that snap exists to
+                # correct a NOISY guessed ratio onto the nearest plausible split factor,
+                # which would distort an already-exact, manually-verified real ratio
+                # (paired review, 2026-08-19/20).
+                factor = discontinuity if corp_action is not None else nearest_split_factor(discontinuity)
                 proposed_entry = pos['entry_price'] / factor
                 value = json.dumps({"position_id": pos['id'], "ticker": ticker, "proposed_entry_price": proposed_entry})
-                fetch_note = "" if confirmed else " (split data fetch failed -- can't rule it out, freezing to be safe)"
+                if corp_action is not None:
+                    fetch_note = " (confirmed via corporate_actions table)"
+                    factor_label = "confirmed factor"
+                else:
+                    fetch_note = "" if confirmed else " (split data fetch failed -- can't rule it out, freezing to be safe)"
+                    factor_label = "nearest factor"
                 _post_message(
                     f"⚠️ Possible corporate action — {ticker}",
                     blocks=[
                         {"type": "section", "text": {"type": "mrkdwn", "text": (
                             f"⚠️ *{ticker}* — possible corporate action (ratio≈{discontinuity:.2f}, "
-                            f"nearest factor {factor}){fetch_note}.\n"
+                            f"{factor_label} {factor}){fetch_note}.\n"
                             f"Recorded entry: `${pos['entry_price']:.4f}`  |  Current: `${current_price:.4f}`\n"
                             f"Proposed corrected entry: `${proposed_entry:.4f}`\n"
                             f"SL/arm checks are frozen for this ticker until corrected."

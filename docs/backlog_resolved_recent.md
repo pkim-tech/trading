@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Resolved 2026-08-20 — 3 `planner`-dispatched items, each paired-reviewed 2 rounds: `corporate_actions` table + `detect_price_discontinuity` fix (closes the GDXU 2026-03-03/05 false-positive freeze), `auto_fill_detection_enabled`/`node_auto_fill_detection_enabled` default flip False→True (closes the `.env`-additions-bypass watch-item too), early-close market-hours guard (`_market_session_open_now`, closes finding (1) of the incident #13 deferred items). Full detail: `deep_backlog.md`.
+
 ## [testing][coverage] Confirmed resolved-by-drift 2026-08-20 (backlog review) — `coverage_check.py`'s unfiltered-`source` gap; was already fixed 2026-08-19 (`34b913b`, Task #7), backlog entry just never closed. Both `_check_coverage_event` and `_last_hit_by_mode` filter `source IS NULL OR source NOT LIKE 'fixture:%'` — verified directly in code.
 
 ## [live-trading] Resolved 2026-08-19 (night) — SOXS/ira (wl_id=206) sunset as part of the portfolio reselection; 3 open SOXS-specific backlog items (drought confirm_days=1 uncalibrated, real-vs-kernel divergence watch-item, drought-trade kernel-tooling-gap example) close as moot — node archived 2026-08-20 03:17:24 UTC. `confirm_days=1` was separately validated and rejected outright before the sunset (research: no confirm_days value 1-20 clears the cliff-safety bar, `38dc2e4`). Full detail: `deep_backlog.md`.

@@ -51,12 +51,14 @@ KILL_SWITCH_PATH = _STATE_DIR / "schwab_kill_switch.json"
 TICKER_AUTOMATION_PATH = _STATE_DIR / "schwab_ticker_automation.json"
 
 # Auto-fill-detection toggle (2026-07-17) -- separate from ticker_automation_enabled
-# above (which gates order *placement*) and opposite default: placement automation
-# is on-by-default within AUTOMATION_ENABLED_TICKERS scope, but polling Schwab's
-# order book to auto-record a fill (skipping the human Filled/Exited click) is a
-# distinct, newer capability that stays off until explicitly enabled per ticker,
-# since schwab_client.get_filled_order's field parsing hasn't been confirmed
-# against a real fill response yet.
+# above (which gates order *placement*). Polling Schwab's order book to
+# auto-record a fill (skipping the human Filled/Exited click) is a distinct
+# capability from placement automation. Originally opposite-default (off until
+# explicitly enabled per ticker, since schwab_client.get_filled_order's field
+# parsing hadn't been confirmed against a real fill response yet); DEFAULT
+# FLIPPED to on-by-default 2026-08-19/20 (see auto_fill_detection_enabled's
+# own docstring for the full motivation) once that confirmation gap closed and
+# a real incident showed the off-by-default was itself creating gaps.
 AUTO_FILL_DETECTION_PATH = _STATE_DIR / "schwab_auto_fill_detection.json"
 
 # Mirrors active_signals._SIGNAL_WINDOWS + _OPEN_CHECK_WINDOWS -- kept as separate
@@ -577,17 +579,37 @@ def record_node_streak(ticker: str, account: str, kind: str, hit: bool, node_id=
 
 
 def auto_fill_detection_enabled(ticker: str) -> bool:
-    """False unless a persisted per-ticker override has explicitly enabled it --
-    opposite default from ticker_automation_enabled (see AUTO_FILL_DETECTION_PATH
-    comment above)."""
-    if AUTO_FILL_DETECTION_PATH.exists():
-        try:
-            state = json.loads(AUTO_FILL_DETECTION_PATH.read_text())
-            if ticker in state:
-                return bool(state[ticker])
-        except (json.JSONDecodeError, OSError):
-            pass
-    return False
+    """True unless a persisted per-ticker override has explicitly disabled it.
+
+    Default flipped False->True 2026-08-19/20 (planner-dispatched, user-decided
+    policy reversal of the OFF-by-default design this function originally
+    documented). Two real gaps motivated the reversal, both closed by this one
+    code-level default: (1) the 2026-08-17 incident found only 2 of 17 live
+    automation-scoped nodes actually had this flag on -- fixed by hand that
+    night for the then-current 17, but the code default itself stayed OFF, so
+    every future new node/ticker would recreate the same gap from scratch;
+    (2) a ticker added to .env's SCHWAB_AUTOMATION_TICKERS (not through
+    signals_db.add_node) never goes through initialize_auto_fill_detection_for_
+    new_node at all, so it silently inherited OFF regardless of the 2026-08-17
+    fix. A ticker/node with an explicit persisted False (a real human Disable,
+    or `_raw_flag`'s UNREADABLE_FLAG_STATE handling refusing to touch a corrupt
+    file) is UNCHANGED by this flip -- only the "never decided" case moves from
+    False to True. See docs/backlog_cache.md's 2026-08-19/20 entry.
+
+    Routes through _raw_flag (paired-review HIGH fix, 2026-08-19/20 continued):
+    the original inline try/except here collapsed BOTH "file doesn't exist"
+    and "file exists but is corrupt/unreadable" into the same silent fallback
+    -- fine when that fallback was False, but after this flip a corrupt state
+    file would return True for every ticker, silently re-granting auto-fill
+    trust to every real human Disable recorded in it (the exact failure
+    _raw_flag's own docstring warns is "the worst possible direction").
+    UNREADABLE_FLAG_STATE now explicitly maps to False, not True."""
+    flag = _raw_flag(AUTO_FILL_DETECTION_PATH, ticker)
+    if flag is UNREADABLE_FLAG_STATE:
+        return False
+    if flag is None:
+        return True
+    return flag
 
 
 def enable_auto_fill_detection(ticker: str):
@@ -627,22 +649,30 @@ def node_auto_fill_detection_enabled(node_id) -> bool:
     node's Slack row (e.g. a soxl_ira position) would silently also auto-detect
     fills for any other node sharing the same ticker (e.g. DPST/GDXU's
     live+research pairing) that was never actually vetted for it.
-    Defaults False (node_id=None included) -- opposite direction from
-    node_automation_enabled's fail-open default, since this flag *grants* extra
-    trust rather than restricting it; missing node identity must not silently
-    grant it. Real gate is `auto_fill_detection_enabled(ticker) AND
-    node_auto_fill_detection_enabled(wl_id)` -- both layers must explicitly
-    agree."""
+
+    Default flipped False->True for a real, identified node with no recorded
+    decision, 2026-08-19/20 (same policy reversal as auto_fill_detection_enabled
+    above -- see that docstring and docs/backlog_cache.md's 2026-08-19/20 entry
+    for the full motivation). node_id=None is DELIBERATELY UNCHANGED and still
+    returns False -- that's an identity-resolution failure (the caller couldn't
+    even determine which node it means), not a "never decided" case, so it
+    stays fail-closed regardless of this flip. A node with an explicit
+    persisted False (a real human Disable) is also unchanged. Real gate is
+    `auto_fill_detection_enabled(ticker) AND node_auto_fill_detection_enabled(wl_id)`
+    -- both layers must explicitly agree.
+
+    Routes through _raw_flag (paired-review HIGH fix, 2026-08-19/20 continued) --
+    same corrupt-file-fails-open bug as auto_fill_detection_enabled's original
+    inline try/except; see that function's docstring for the full reasoning.
+    UNREADABLE_FLAG_STATE maps to False, not True."""
     if node_id is None:
         return False
-    if NODE_AUTO_FILL_DETECTION_PATH.exists():
-        try:
-            state = json.loads(NODE_AUTO_FILL_DETECTION_PATH.read_text())
-            if str(node_id) in state:
-                return bool(state[str(node_id)])
-        except (json.JSONDecodeError, OSError):
-            pass
-    return False
+    flag = _raw_flag(NODE_AUTO_FILL_DETECTION_PATH, node_id)
+    if flag is UNREADABLE_FLAG_STATE:
+        return False
+    if flag is None:
+        return True
+    return flag
 
 
 def enable_node_auto_fill_detection(node_id):
@@ -678,12 +708,23 @@ def disable_node_auto_fill_detection(node_id):
 
 def initialize_auto_fill_detection_for_new_node(ticker: str, node_id):
     """Called by signals_db.add_node when a brand-new node is created --
-    closes the 2026-08-17 systemic gap where a newly added node would
+    originally closed the 2026-08-17 systemic gap where a newly added node would
     silently inherit auto_fill_detection_enabled/node_auto_fill_detection_enabled's
     OFF-by-default (only 2 of 17 live automation-scoped nodes actually had it
     on before that incident's same-night manual fix flipped all 17 by hand;
     the code-level DEFAULT itself was left OFF, so any future new node would
-    recreate the same gap from scratch).
+    recreate the same gap from scratch). **2026-08-19/20: the code-level
+    default itself was flipped to True (see auto_fill_detection_enabled's
+    docstring)**, so a brand-new node/ticker with no recorded decision is now
+    auto-fill-enabled even without this function ever running (e.g. a ticker
+    added only via .env's SCHWAB_AUTOMATION_TICKERS, which never calls
+    add_node). This function still runs on every add_node call and still
+    matters: it EXPLICITLY PERSISTS True rather than relying on the default,
+    which (a) makes the decision visible/auditable in the state files instead
+    of implicit, and (b) still respects an existing human Disable on the
+    ticker (see below) -- the default flip alone can't do that, since a bare
+    default has no way to distinguish "never decided" from a real override
+    once one exists.
 
     Sets the NODE-level flag unconditionally to True -- node_id is brand new,
     so there is no prior human decision on it to respect. Sets the
@@ -702,11 +743,18 @@ def initialize_auto_fill_detection_for_new_node(ticker: str, node_id):
     excluded from the 2026-08-17 17-node incident fix (no state='live' node
     on any of them). A new canary/dry_run node created on one of THOSE
     tickers genuinely does become auto-fill-enabled under this function --
-    a real, if much smaller (one new node at a time, not 19 tickers' worth
-    retroactively), version of the exact outcome a blanket default flip was
-    rejected to avoid. This does not retroactively change behavior for any
-    EXISTING ticker or node -- only the brand-new node_id, and only the
-    ticker-level flag if it wasn't already explicitly set to False.
+    at the time, a real, if much smaller (one new node at a time, not 19
+    tickers' worth retroactively), version of the outcome a blanket default
+    flip was then rejected to avoid. **Superseded 2026-08-19/20**: that
+    blanket flip is what actually shipped (see auto_fill_detection_enabled's
+    docstring) -- the user's own later call, after two more real gaps (the
+    2026-08-17 incident's code-level default never actually being fixed, plus
+    the .env-only-ticker gap this function can't reach at all) made the
+    narrower per-new-node approach look insufficient rather than the safer
+    choice it was originally judged to be. This does not retroactively write
+    anything for any EXISTING ticker or node either way -- only the brand-new
+    node_id, and only the ticker-level flag if it wasn't already explicitly
+    set to False.
 
     Unreadable-state handling (paired-review HIGH fix, 2026-08-19): both
     enable_auto_fill_detection/enable_node_auto_fill_detection silently wipe
@@ -888,7 +936,16 @@ def bulk_enable_auto_fill_detection(min_notional=None, node_ids=None, tickers=No
     changed, already, disabled = [], [], []
     for node in targets:
         ticker, wl_id = node.get('ticker'), node['id']
-        if auto_fill_detection_enabled(ticker) and node_auto_fill_detection_enabled(wl_id):
+        # Raw/explicit state, NOT the effective auto_fill_detection_enabled/
+        # node_auto_fill_detection_enabled booleans (2026-08-19/20 fix) -- those
+        # now default True for a "never decided" ticker/node (see their own
+        # docstrings for the policy reversal), but this function's entire job is
+        # explicit persistence/audit: a never-set node must still fall through
+        # to the write-and-report-as-`changed` path below, not get silently
+        # skipped as "already enabled" just because the runtime default happens
+        # to already agree with the target outcome.
+        if _raw_flag(AUTO_FILL_DETECTION_PATH, ticker) is True and \
+           _raw_flag(NODE_AUTO_FILL_DETECTION_PATH, wl_id) is True:
             already.append(_summary(node))
             continue
         # Node-level only. The ticker-level flag is SHARED by every node on

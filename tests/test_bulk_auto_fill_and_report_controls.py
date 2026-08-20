@@ -139,9 +139,13 @@ def test_apply_false_previews_without_writing_anything(env):
     # The whole staging gate: no state file may exist at all afterwards.
     assert not schwab_safety.AUTO_FILL_DETECTION_PATH.exists()
     assert not schwab_safety.NODE_AUTO_FILL_DETECTION_PATH.exists()
+    # Raw/explicit state (2026-08-19/20: NOT the effective auto_fill_detection_enabled/
+    # node_auto_fill_detection_enabled booleans, which now default True for a
+    # never-set node/ticker -- see those functions' docstrings) -- nothing was
+    # written, so nothing should be explicitly recorded either way.
     for node in (a, b, c):
-        assert schwab_safety.auto_fill_detection_enabled(node['ticker']) is False
-        assert schwab_safety.node_auto_fill_detection_enabled(node['id']) is False
+        assert schwab_safety._raw_flag(schwab_safety.AUTO_FILL_DETECTION_PATH, node['ticker']) is None
+        assert schwab_safety._raw_flag(schwab_safety.NODE_AUTO_FILL_DETECTION_PATH, node['id']) is None
     # And the preview text renders without blowing up.
     assert 'would enable' in schwab_safety.format_bulk_enable_auto_fill_detection(result)
 
@@ -158,9 +162,11 @@ def test_apply_true_flips_both_flags_for_targets_only(env):
         assert schwab_safety.node_auto_fill_detection_enabled(node['id']) is True
 
     # Below the floor, wrong account, wrong state -- all untouched on BOTH axes.
+    # Raw/explicit state, not the effective (now default-True) booleans -- see
+    # the 2026-08-19/20 comment on the previous test.
     for node in (c, d, e):
-        assert schwab_safety.auto_fill_detection_enabled(node['ticker']) is False
-        assert schwab_safety.node_auto_fill_detection_enabled(node['id']) is False
+        assert schwab_safety._raw_flag(schwab_safety.AUTO_FILL_DETECTION_PATH, node['ticker']) is None
+        assert schwab_safety._raw_flag(schwab_safety.NODE_AUTO_FILL_DETECTION_PATH, node['id']) is None
 
     # Raw file contents: only the two intended node ids present and True.
     node_state = json.loads(schwab_safety.NODE_AUTO_FILL_DETECTION_PATH.read_text())
@@ -216,8 +222,13 @@ def test_never_set_is_not_treated_as_deliberately_disabled(env):
 
 def test_sibling_node_on_same_ticker_stays_gated_by_its_own_flag(env):
     """The docstring's ticker-sharing caveat, asserted: enabling node A flips
-    the SHARED ticker-level gate, but sibling B must stay off via its own
-    node-level flag."""
+    the SHARED ticker-level gate, but sibling B must stay explicitly untouched
+    via its own node-level flag -- bulk_enable never wrote a decision for it.
+
+    2026-08-19/20: node_auto_fill_detection_enabled's default flipped
+    False->True for a never-set node, so the EFFECTIVE boolean for B is now
+    True too (by default, not because anything leaked) -- checking raw/
+    explicit state is what actually proves bulk_enable didn't touch B."""
     a = _add_live_node('TEST_SHARED', 'ira', 10_000)
     b = _add_live_node('TEST_SHARED', 'soxl_ira', 100, version='v4')
 
@@ -225,7 +236,7 @@ def test_sibling_node_on_same_ticker_stays_gated_by_its_own_flag(env):
 
     assert schwab_safety.auto_fill_detection_enabled('TEST_SHARED') is True   # shared, now on
     assert schwab_safety.node_auto_fill_detection_enabled(a['id']) is True
-    assert schwab_safety.node_auto_fill_detection_enabled(b['id']) is False   # still gated
+    assert schwab_safety._raw_flag(schwab_safety.NODE_AUTO_FILL_DETECTION_PATH, b['id']) is None
 
 
 def test_apply_true_is_idempotent_and_reports_already_enabled(env):
@@ -280,8 +291,26 @@ def test_enable_auto_fill_button_is_never_rendered(env, interactive, monkeypatch
     blocks = signals_notify._ticker_block(_row('TEST_RENDER_A', node))
     ids = _action_ids(blocks)
     assert 'enable_auto_fill_detection' not in ids
-    # Not enabled yet, so no Disable button either -- the row just has no
-    # fill-detection control at all.
+    # 2026-08-19/20: auto_fill_detection_enabled/node_auto_fill_detection_enabled's
+    # default flipped False->True for a "never decided" ticker/node -- a fresh
+    # node is now effectively enabled by default, so the Disable button DOES
+    # render (see test_disable_auto_fill_button_renders_for_never_set_node_too
+    # below). This used to assert the opposite (no button at all).
+    assert 'disable_auto_fill_detection' in ids
+
+
+def test_disable_auto_fill_button_hidden_when_explicitly_disabled(env, interactive, monkeypatch):
+    """The genuine "no fill-detection control" case post-flip: a node/ticker
+    that was EXPLICITLY disabled (a real human Disable, or a raw False some
+    other way) must still render with no button -- fill_detection_on is
+    correctly False, not just "never decided"."""
+    node = _add_live_node('TEST_RENDER_A2', 'ira', 10_000)
+    monkeypatch.setattr(schwab_safety, 'AUTOMATION_ENABLED_TICKERS', {'TEST_RENDER_A2'})
+    schwab_safety.disable_node_auto_fill_detection(node['id'])
+
+    blocks = signals_notify._ticker_block(_row('TEST_RENDER_A2', node))
+    ids = _action_ids(blocks)
+    assert 'enable_auto_fill_detection' not in ids
     assert 'disable_auto_fill_detection' not in ids
 
 

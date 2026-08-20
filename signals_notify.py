@@ -43,7 +43,10 @@ from signals_helpers import (
 # namespace package as long as repo root is on sys.path (true whenever this
 # module is reached via active_signals.py, run from repo root) -- same
 # import tests/test_coverage_check.py already uses.
-from scripts.coverage_check import run_check as _coverage_run_check, _is_trading_day as _coverage_is_trading_day
+from scripts.coverage_check import (
+    run_check as _coverage_run_check, _is_trading_day as _coverage_is_trading_day,
+    market_close_et as _coverage_market_close_et,
+)
 
 
 def _attempt_automated_buy(node, sizing):
@@ -321,29 +324,46 @@ def _market_session_open_now(now=None):
     replaced a real resting protective STOP with a MARKET SELL anyway -- Schwab
     held it PENDING_ACTIVATION for hours (market closed, nothing to fill
     against), leaving a real position with neither a working stop nor a
-    completed exit. Hardcoded 9:30:00/16:00:00 regular-session bounds,
-    matching this file's existing window idiom (_trail_alert_should_post_now,
-    INTRADAY_RISK_REVIEW_WINDOW, ORPHAN_SWEEP_WINDOW all do the same rather
-    than querying mcal's per-day open/close) -- known gap: a real NYSE
-    early-close day (e.g. day after Thanksgiving, 13:00 ET) isn't specially
-    detected, same limitation those other windows already carry. Deliberately
-    compared at second granularity, not (hour, minute) like those other
-    windows -- the incident this guards against happened at 16:00:52, which a
-    minute-only comparison would still read as "16:00", inside the window.
-    Upper bound is exclusive (< 16:00:00, not <=) for the same reason: the
-    close is an instant, not a minute. Fails toward closed (blocks the market
-    order) on any doubt, since the failure mode here is real-money unprotected
-    time, not a missed alert. Clocked off schwab_safety._now() (not
-    datetime.now() directly) -- the project-wide test seam every fake_broker/
-    fake_venue scenario already monkeypatches to simulate a fixed in-window
-    moment (schwab_safety.check_order's own trading-day/window gates use the
-    same seam); using a different clock here would silently desync this new
-    guard from every existing scenario's intended in-window setup."""
+    completed exit. Lower bound (9:30:00 ET) stays hardcoded, matching this
+    file's existing window idiom (_trail_alert_should_post_now,
+    INTRADAY_RISK_REVIEW_WINDOW, ORPHAN_SWEEP_WINDOW) -- the regular session
+    always opens at 9:30 ET, NYSE early closes only ever move the CLOSE.
+    Upper bound now uses the real per-day close from scripts.coverage_check's
+    already-instantiated _NYSE_CAL (market_close_et, one mcal call, memoized
+    nowhere further since this already only runs once per exit-sell attempt)
+    instead of a hardcoded 16:00:00 -- closes the known gap flagged when this
+    guard was first built (docs/backlog_cache.md's "Deferred 2026-08-19 (from
+    market-hours-guard paired review)" finding (1)): a real NYSE early-close
+    day (day after Thanksgiving, Christmas Eve, ~2x/year, 13:00 ET) used to
+    read as still-open for a full extra 3 hours, reproducing incident #13's
+    exact shape. Deliberately compared at second granularity, not (hour,
+    minute) like those other windows -- the incident this guards against
+    happened at 16:00:52, which a minute-only comparison would still read as
+    "16:00", inside the window. Upper bound is exclusive (< close, not <=)
+    for the same reason: the close is an instant, not a minute. Fails toward
+    closed (blocks the market order) on any doubt, since the failure mode
+    here is real-money unprotected time, not a missed alert -- if
+    market_close_et can't resolve a close for a day _coverage_is_trading_day
+    already confirmed is a trading day (should not happen, but the two are
+    separate mcal calls), this returns False rather than guessing. Clocked
+    off schwab_safety._now() (not datetime.now() directly) -- the
+    project-wide test seam every fake_broker/fake_venue scenario already
+    monkeypatches to simulate a fixed in-window moment (schwab_safety.
+    check_order's own trading-day/window gates use the same seam); using a
+    different clock here would silently desync this new guard from every
+    existing scenario's intended in-window setup."""
     now = now or schwab_safety._now()
-    if not _coverage_is_trading_day(now.strftime('%Y-%m-%d')):
+    # A single _NYSE_CAL call, not two: market_close_et already returns None
+    # for a non-trading day (same schedule() lookup a separate _is_trading_day
+    # call would make), so a second check here would only risk exactly the
+    # two-separate-calendar-calls inconsistency this function's own docstring
+    # already hedges about, for no benefit (cold-review suggestion, 2026-08-19/20).
+    close = _coverage_market_close_et(now.strftime('%Y-%m-%d'))
+    if close is None:
         return False
     secs_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
-    return 9 * 3600 + 30 * 60 <= secs_since_midnight < 16 * 3600
+    close_secs = close.hour * 3600 + close.minute * 60 + close.second
+    return 9 * 3600 + 30 * 60 <= secs_since_midnight < close_secs
 
 
 def _attempt_automated_exit_sell(pos, reason, current_price):

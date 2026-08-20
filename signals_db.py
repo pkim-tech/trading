@@ -2053,6 +2053,63 @@ def ensure_tables():
                 """)
             c.execute("INSERT INTO _seed_markers (seed_key) VALUES (?)", (_seed_key,))
 
+        # corporate_actions -- curated, manually-populated record of real sponsor
+        # splits/reverse-splits, built 2026-08-19/20 to close a confirmed false-
+        # positive class in signals_helpers.detect_price_discontinuity: the price-
+        # ratio-only heuristic mistakes an ordinary large move for a split (NUGT
+        # 2026-08-14, GDXU 2026-08-19 -- both real incidents, see docs/backlog_cache.md).
+        # Population is manual/periodic (every few days, WebSearch + mirror sources --
+        # direxion.com/proshares.com Cloudflare-block direct fetches), NOT automated --
+        # user's explicit call, since a scheduled scraper can't reach the source sites
+        # and a scheduled cloud agent was rejected in favor of a human-in-the-loop
+        # cadence. UNIQUE(ticker, effective_date) makes re-running a manual population
+        # pass idempotent instead of duplicating rows.
+        # split_ratio CHECK(>0), added after paired review (2026-08-19/20) caught
+        # that an unvalidated 0/negative value would make detect_price_discontinuity
+        # return falsy and silently skip freezing a REAL recorded split -- fail-open
+        # on real capital. add_corporate_action also validates before insert (belt
+        # and suspenders, since a CHECK violation raises sqlite3.IntegrityError,
+        # which callers should never need to catch for a manual CLI-driven insert).
+        # Migration (paired review, 2026-08-19/20): the very first version of this
+        # table (briefly live against cache/live/trading_live.db while this feature
+        # was under construction, before the CHECK was added) has no CHECK
+        # constraint -- IF NOT EXISTS alone would leave it that way forever, so the
+        # Python-level validation in add_corporate_action would be the only real
+        # guard, silently unenforced for any other writer. Detected by checking
+        # sqlite_master for the CHECK text (the sqlite3 stdlib client has no
+        # cheaper column-constraint introspection); only rebuilt if the table is
+        # both wrongly-shaped AND empty (real corporate_actions rows are never
+        # supposed to be routinely deleted/recreated -- if it's ever non-empty ,
+        # this leaves it alone and just warns, matching the project's
+        # never-silently-drop-data convention).
+        _existing_sql = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='corporate_actions'"
+        ).fetchone()
+        if _existing_sql is not None and 'CHECK' not in _existing_sql[0]:
+            _row_count = c.execute("SELECT COUNT(*) FROM corporate_actions").fetchone()[0]
+            if _row_count == 0:
+                c.execute("DROP TABLE corporate_actions")
+            else:
+                print(f"ensure_tables(): corporate_actions exists without its split_ratio "
+                      f"CHECK constraint and has {_row_count} row(s) -- not auto-migrating "
+                      f"(would need a real data-preserving rebuild). Python-level validation "
+                      f"in add_corporate_action is still enforced; only a non-Python writer "
+                      f"could bypass it on this un-migrated table.")
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS corporate_actions (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker         TEXT NOT NULL,
+                sponsor        TEXT,
+                split_ratio    REAL NOT NULL CHECK (split_ratio > 0),
+                announced_date TEXT,
+                effective_date TEXT NOT NULL,
+                source_url     TEXT,
+                created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(ticker, effective_date)
+            )
+        """)
+
         c.commit()
 
 
@@ -2072,6 +2129,90 @@ def get_watchlist_audit(limit=200):
         return [dict(r) for r in c.execute(
             "SELECT * FROM watch_list_audit ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Corporate actions (manually-populated split/reverse-split record)
+# ---------------------------------------------------------------------------
+
+def add_corporate_action(ticker, split_ratio, effective_date, sponsor=None,
+                          announced_date=None, source_url=None):
+    """Records a real, confirmed corporate action found via the manual WebSearch
+    + mirror-source review process (docs/backlog_cache.md's 2026-08-19/20 entry).
+    INSERT OR IGNORE on (ticker, effective_date) so re-running a periodic review
+    pass over the same announcement is a no-op, not a duplicate row.
+
+    `split_ratio` convention: reference_price / current_price, matching
+    detect_price_discontinuity's own return value exactly -- e.g. a 2-for-1
+    forward split (price halves) is `2.0`, a 1-for-10 reverse split (price
+    10x's) is `0.1`. Validated >0 here (raises ValueError) in addition to the
+    table's own CHECK constraint (paired review, 2026-08-19/20): a 0/negative
+    value would make detect_price_discontinuity return falsy and silently skip
+    freezing a real recorded split -- fail-open on real capital, worth a clear
+    error at entry time rather than a raised IntegrityError deep in the CLI.
+    `effective_date` is validated as a parseable date (raises ValueError
+    otherwise) and stored in canonical YYYY-MM-DD form, so a malformed manual
+    entry doesn't silently become an unmatchable dead row."""
+    import pandas as pd
+    if split_ratio is None or split_ratio <= 0:
+        raise ValueError(f"split_ratio must be > 0, got {split_ratio!r}")
+    effective_date = pd.Timestamp(effective_date).strftime('%Y-%m-%d')
+    if announced_date is not None:
+        announced_date = pd.Timestamp(announced_date).strftime('%Y-%m-%d')
+    with _conn() as c:
+        c.execute("""
+            INSERT OR IGNORE INTO corporate_actions
+                (ticker, sponsor, split_ratio, announced_date, effective_date, source_url)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (ticker, sponsor, split_ratio, announced_date, effective_date, source_url))
+        c.commit()
+
+
+def get_corporate_actions(ticker=None):
+    with _conn() as c:
+        if ticker:
+            rows = c.execute(
+                "SELECT * FROM corporate_actions WHERE ticker=? ORDER BY effective_date DESC",
+                (ticker,)
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM corporate_actions ORDER BY ticker, effective_date DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def find_corporate_action_since(ticker, since, until=None):
+    """Returns the most recent corporate_actions row (dict) for `ticker` whose
+    effective_date falls in [since, until] (until defaults to today), or None
+    if nothing's on file. Range-based, not a symmetric window around a single
+    date -- paired-review fix, 2026-08-19/20, of the original find_corporate_
+    action_near's ±10-day-around-`since` design: a real split can happen any
+    time between a reference date (a position's entry_time, or a prior bar's
+    close) and now, and a held position routinely spans far more than 10 days
+    (max_hold_hours reaches 112 trading hours on some nodes), so a symmetric
+    window centered on the OLD date could never match a split that happened
+    well after it. `since`/`until` are compared at day granularity, consistent
+    with the table's day-only date columns."""
+    import pandas as pd
+    since_ts = pd.Timestamp(since)
+    if since_ts.tzinfo is not None:
+        since_ts = since_ts.tz_localize(None)
+    until_ts = pd.Timestamp(until) if until is not None else pd.Timestamp.now()
+    if until_ts.tzinfo is not None:
+        until_ts = until_ts.tz_localize(None)
+    since_str = since_ts.strftime('%Y-%m-%d')
+    until_str = until_ts.strftime('%Y-%m-%d')
+    with _conn() as c:
+        row = c.execute("""
+            SELECT * FROM corporate_actions
+            WHERE ticker = ?
+              AND date(effective_date) >= date(?)
+              AND date(effective_date) <= date(?)
+            ORDER BY effective_date DESC
+            LIMIT 1
+        """, (ticker, since_str, until_str)).fetchone()
+        return dict(row) if row else None
 
 
 _DROUGHT_OVERRIDE_UNSET = object()

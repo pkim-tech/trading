@@ -53,6 +53,21 @@ def _is_trading_day(check_date):
     return not _NYSE_CAL.schedule(start_date=check_date, end_date=check_date).empty
 
 
+def market_close_et(check_date):
+    """Real NYSE market-close time (ET, tz-naive) for check_date, or None if
+    check_date isn't a trading day. Built for signals_notify._market_session_
+    open_now (docs/backlog_cache.md's "Deferred 2026-08-19 (from market-hours-
+    guard paired review)" finding (1)): that function hardcoded a 16:00:00
+    regular-session close, missing a real NYSE early-close day (day after
+    Thanksgiving, Christmas Eve, ~2x/year, 13:00 ET) -- reusing this module's
+    already-instantiated _NYSE_CAL (same one _is_trading_day uses, one line
+    above) instead of re-deriving anything new."""
+    sched = _NYSE_CAL.schedule(start_date=check_date, end_date=check_date)
+    if sched.empty:
+        return None
+    return sched['market_close'].iloc[0].tz_convert('America/New_York').tz_localize(None)
+
+
 def _entry_threshold_crossed(ticker, node, check_date):
     """Returns True/False if node's real entry (BUY) threshold provably did/didn't
     cross on check_date, using the SAME check_signal() the live daemon runs -- not a

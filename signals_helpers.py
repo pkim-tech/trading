@@ -311,7 +311,20 @@ def detect_price_discontinuity(current_price, reference_price, tolerance=0.03):
     Detection only -- callers decide what to do with a hit; this doesn't
     freeze/block/notify on its own. (Found live 2026-07-15: KORU's ~20:1
     split silently passed every SL/arm check since nothing compared current
-    price against the stale reference price.)"""
+    price against the stale reference price.)
+
+    Pure price-ratio guess ONLY -- deliberately does not consult the
+    corporate_actions table (see corporate_action_confirmed_since below).
+    An earlier version (2026-08-19/20) folded a table lookup in here behind
+    an optional ticker/since pair, but paired review (independent-cold +
+    contextual, same day) found it was behaviorally inert: a table hit and a
+    table miss both returned a truthy ratio, so no caller could actually tell
+    them apart, and a curated real split could still get overridden to
+    "don't freeze" by the lower-authority yfinance check downstream -- the
+    opposite of the table's whole purpose. Fixed by moving the table check to
+    caller level (corporate_action_confirmed_since), checked FIRST and able to
+    short-circuit the guess+yfinance chain entirely, instead of being wedged
+    inside it."""
     if not current_price or not reference_price:
         return None
     ratio = reference_price / current_price
@@ -319,6 +332,43 @@ def detect_price_discontinuity(current_price, reference_price, tolerance=0.03):
         if abs(ratio - r) / r < tolerance or abs(ratio - 1 / r) / (1 / r) < tolerance:
             return ratio
     return None
+
+
+def corporate_action_confirmed_since(ticker, since):
+    """Returns the corporate_actions table row (dict, with a real 'split_ratio')
+    for `ticker` with effective_date in [since, today], or None if nothing's on
+    file, or if `since` can't be parsed as a date.
+
+    Callers should only consult this AFTER detect_price_discontinuity's
+    price-ratio guess has already fired (paired-review correction, 2026-08-19/20:
+    an earlier version had this checked independent of/before the ratio guess,
+    which meant a table row for a ticker/date range never actually clears once
+    the position's entry_price is corrected -- `since`/`until=today` is a pure
+    date range with no price awareness, so it would keep matching, and thus
+    keep freezing, forever after a real Apply Correction. Gating on the ratio
+    guess first means the freeze naturally stops once the corrected entry_price
+    no longer looks discontinuous against the current price -- the same
+    self-clearing behavior the price-ratio-only check has always had). A hit
+    here is a real, manually-verified corporate action (docs/backlog_cache.md's
+    2026-08-19/20 entry) -- callers should treat it as authoritative and
+    freeze/correct without a further real_split_confirmed_since (yfinance)
+    check, since that check exists specifically for when the table has nothing
+    on file, not to second-guess a curated confirmation.
+
+    Thin wrapper around signals_db.find_corporate_action_since, kept here for
+    the same reason real_split_confirmed_since lives in this module:
+    signals_compute.py's corporate-action call sites import their
+    split-confirmation helpers from signals_helpers, not signals_db directly.
+    Fails closed to None (not an exception) on any lookup error -- this sits
+    ahead of real_split_confirmed_since on the live poll loop's exit-check
+    path, which is explicitly documented as never allowed to raise out of
+    check_sell_condition; a malformed `since` must degrade to 'nothing on
+    file' (falls through to the yfinance/ratio-guess path), not crash the
+    poll cycle."""
+    try:
+        return db.find_corporate_action_since(ticker, since)
+    except Exception:
+        return None
 
 
 def nearest_split_factor(ratio):

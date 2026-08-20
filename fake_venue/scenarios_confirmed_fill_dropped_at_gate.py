@@ -156,13 +156,20 @@ def run(price=None, verbose=True):
                         "scenario exists to prove)", not notify.has_capital_at_stake(node),
                         f"starting_notional={node['starting_notional']}"))
 
-    # THE SOXS PRECONDITION, reproduced by omission: unlike every other
-    # fake_venue scenario, neither enable_auto_fill_detection(TICKER) nor
-    # enable_node_auto_fill_detection(node['id']) is called here. TICKER is
-    # still in AUTOMATION_ENABLED_TICKERS (isolation.configure_env seeds it
-    # from scenarios_meta.TICKER unconditionally), so both fill-detection
-    # code paths run at all -- they just decline to auto-reconcile, exactly
-    # as SOXS's real node did on 2026-08-14.
+    # THE SOXS PRECONDITION: unlike every other fake_venue scenario, this one
+    # needs auto-fill-detection explicitly OFF. Originally reproduced by
+    # omission (never calling enable_auto_fill_detection/
+    # enable_node_auto_fill_detection) back when the default itself was OFF --
+    # 2026-08-19/20's default flip (auto_fill_detection_enabled/
+    # node_auto_fill_detection_enabled now default True for "never decided")
+    # means omission alone no longer reproduces it, so this now calls
+    # disable_* explicitly. TICKER is still in AUTOMATION_ENABLED_TICKERS
+    # (isolation.configure_env seeds it from scenarios_meta.TICKER
+    # unconditionally), so both fill-detection code paths run at all -- they
+    # just decline to auto-reconcile, exactly as SOXS's real node did on
+    # 2026-08-14.
+    schwab_safety.disable_auto_fill_detection(TICKER)
+    schwab_safety.disable_node_auto_fill_detection(node['id'])
     checks.append(Check("ticker is in automation scope (so both fill-detection paths actually run, "
                         "rather than being skipped for a different, uninteresting reason)",
                         TICKER in schwab_safety.AUTOMATION_ENABLED_TICKERS))

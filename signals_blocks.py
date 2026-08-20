@@ -811,10 +811,9 @@ def _ticker_block(row):
                  "style": "primary", "action_id": "resume_ticker_automation", "value": ticker}
             )
 
-            # Auto-fill-detection toggle -- separate from the placement toggle above and
-            # defaults off (see schwab_safety.AUTO_FILL_DETECTION_PATH comment): placement
-            # automation is proven via this session's dry-run testing, fill detection isn't
-            # exercised against a real fill yet.
+            # Auto-fill-detection toggle -- separate from the placement toggle above.
+            # Defaults ON as of 2026-08-19/20 (see schwab_safety.auto_fill_detection_enabled's
+            # docstring for the policy-reversal history; was off-by-default before that).
             # node-scoped (not ticker-only) -- see schwab_safety.node_auto_fill_detection_enabled's
             # docstring: this was the ticker-only-keying gap the 2026-07-25/26 wl_id refactor
             # missed. Every row here is built from a real watch_list node (build_reference_table),

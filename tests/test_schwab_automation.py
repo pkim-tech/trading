@@ -439,13 +439,49 @@ def test_auto_fill_detection_defaults_on_for_new_node(env):
     assert schwab_safety.node_auto_fill_detection_enabled(_node()['id']) is True
 
 
-def test_auto_fill_detection_raw_default_still_off_for_unknown_ticker(env):
-    """The underlying auto_fill_detection_enabled/node_auto_fill_detection_enabled
-    functions' own fallback (nothing ever recorded) is unchanged -- still False.
-    Only add_node's new call proactively opts a freshly-created node in; a
-    ticker/node_id with no watch_list row at all still has no recorded decision."""
-    assert schwab_safety.auto_fill_detection_enabled('TEST_NO_SUCH_TICKER') is False
-    assert schwab_safety.node_auto_fill_detection_enabled(999999) is False
+def test_auto_fill_detection_raw_default_now_on_for_unknown_ticker(env):
+    """2026-08-19/20: the underlying auto_fill_detection_enabled/
+    node_auto_fill_detection_enabled functions' own fallback (nothing ever
+    recorded) was flipped False->True (a deliberate, user-decided policy
+    reversal -- see their docstrings and docs/backlog_cache.md's 2026-08-19/20
+    entry) -- this test used to assert the opposite (default off). A real,
+    identified ticker/node_id with no recorded decision is now auto-fill-
+    enabled by default, same as a freshly add_node'd one. node_id=None stays
+    False regardless (identity-resolution failure, not "never decided") --
+    see test_node_auto_fill_detection_none_stays_false below."""
+    assert schwab_safety.auto_fill_detection_enabled('TEST_NO_SUCH_TICKER') is True
+    assert schwab_safety.node_auto_fill_detection_enabled(999999) is True
+
+
+def test_corrupt_auto_fill_state_file_fails_closed_not_open(env):
+    """Paired-review HIGH fix, 2026-08-19/20: a corrupt/unreadable state file
+    must NOT return the new True default -- that would silently re-grant
+    auto-fill trust to every ticker/node explicitly recorded False in the
+    file, the exact 'worst possible direction' _raw_flag's own docstring
+    warns against. Both readers now route through _raw_flag and map its
+    UNREADABLE_FLAG_STATE sentinel to False, not the never-set default."""
+    schwab_safety.disable_auto_fill_detection('TEST_WAS_DISABLED')
+    schwab_safety.disable_node_auto_fill_detection(777)
+    schwab_safety.AUTO_FILL_DETECTION_PATH.write_text('{not valid json')
+    schwab_safety.NODE_AUTO_FILL_DETECTION_PATH.write_text('{not valid json')
+
+    # A real prior Disable, now unreadable, must stay effectively disabled.
+    assert schwab_safety.auto_fill_detection_enabled('TEST_WAS_DISABLED') is False
+    assert schwab_safety.node_auto_fill_detection_enabled(777) is False
+    # A ticker/node never even mentioned in the (now-corrupt) file must also
+    # fail closed, not fall through to the never-set True default.
+    assert schwab_safety.auto_fill_detection_enabled('TEST_NEVER_MENTIONED') is False
+    assert schwab_safety.node_auto_fill_detection_enabled(888) is False
+
+
+def test_non_dict_json_state_file_fails_closed(env):
+    """A syntactically valid but structurally wrong state file (e.g. a JSON
+    list instead of an object) must also fail closed via _raw_flag's
+    isinstance check, not raise or silently return True."""
+    schwab_safety.AUTO_FILL_DETECTION_PATH.write_text('[1, 2, 3]')
+    schwab_safety.NODE_AUTO_FILL_DETECTION_PATH.write_text('[1, 2, 3]')
+    assert schwab_safety.auto_fill_detection_enabled('TEST_ANY_TICKER') is False
+    assert schwab_safety.node_auto_fill_detection_enabled(555) is False
 
 
 def test_initialize_auto_fill_detection_refuses_to_touch_unreadable_state_file(env):
@@ -513,9 +549,17 @@ def test_check_auto_fills_records_buy_fill_when_enabled(env, monkeypatch):
 def test_node_auto_fill_detection_does_not_leak_to_sibling_node_same_ticker(env):
     """The exact gap this feature was missing after the wl_id refactor: enabling
     fill-detection from one node's Slack row must not silently enable it for a
-    different node sharing the same ticker (e.g. DPST/GDXU's live+research pairing)."""
+    different node sharing the same ticker (e.g. DPST/GDXU's live+research pairing).
+
+    2026-08-19/20: node_auto_fill_detection_enabled's default flipped False->True
+    for a NEVER-SET node, so node B (never explicitly decided) is no longer a
+    useful proof of isolation on its own -- it now reads True regardless of
+    node A, by default, not because anything leaked. The real isolation proof
+    now needs node B EXPLICITLY disabled: enabling node A must not silently
+    clear that explicit decision."""
     node_a_id, node_b_id = 101, 202
     schwab_safety.enable_auto_fill_detection(TICKER)
+    schwab_safety.disable_node_auto_fill_detection(node_b_id)
     schwab_safety.enable_node_auto_fill_detection(node_a_id)
 
     assert schwab_safety.node_auto_fill_detection_enabled(node_a_id) is True
@@ -523,6 +567,14 @@ def test_node_auto_fill_detection_does_not_leak_to_sibling_node_same_ticker(env)
     # ticker-level alone (the old, buggy gate) is on, proving the node-level
     # layer is what's actually protecting node B here, not a ticker-wide off-switch.
     assert schwab_safety.auto_fill_detection_enabled(TICKER) is True
+
+
+def test_node_auto_fill_detection_defaults_true_for_never_set_node(env):
+    """The 2026-08-19/20 default flip itself, at the node level: a real,
+    identified node with no recorded decision at all is now auto-fill-enabled
+    by default -- distinct from node_id=None (test below), which stays False
+    regardless (identity-resolution failure, not "never decided")."""
+    assert schwab_safety.node_auto_fill_detection_enabled(303) is True
 
 
 def test_node_auto_fill_detection_none_id_defaults_closed(env):

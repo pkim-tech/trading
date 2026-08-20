@@ -677,12 +677,18 @@ REGISTRY = [
          bad_results=['outside_automation_scope', 'auto_fill_detection_disabled',
                       'stream_event_not_yet_confirmed_filled', 'account_number_unresolved'],
          notes="Needs a real multi-execution fill to confirm the poll-reconfirm path in practice. "
-               "bad_results added 2026-07-31 (review finding): auto_fill_detection is off by default, "
-               "so outside_automation_scope/auto_fill_detection_disabled will be the COMMON real "
-               "result once this scenario starts firing live -- without listing them, compute_status "
-               "would render this row verified-live off events that only prove the opt-in gate fired, "
-               "not that the real poll-reconfirm path ran (the same sl_placement/top_up blocked-vs-"
-               "succeeded conflation this registry was built to catch).",
+               "bad_results added 2026-07-31 (review finding): auto_fill_detection was off by default at "
+               "the time, so outside_automation_scope/auto_fill_detection_disabled were expected to be the "
+               "COMMON real result once this scenario started firing live -- without listing them, "
+               "compute_status would render this row verified-live off events that only prove the opt-in "
+               "gate fired, not that the real poll-reconfirm path ran (the same sl_placement/top_up "
+               "blocked-vs-succeeded conflation this registry was built to catch). Stale as of 2026-08-20: "
+               "auto_fill_detection now defaults ON (see schwab_safety.auto_fill_detection_enabled's "
+               "docstring) -- auto_fill_detection_disabled should now be the UNCOMMON result (only an "
+               "explicit human Disable), though outside_automation_scope can still fire routinely. Keeping "
+               "both bad_results as-is (still real possible non-events, just a different real/live ratio "
+               "expected going forward) rather than removing one, since removing auto_fill_detection_"
+               "disabled would make a genuine explicit-Disable event render as a false verified-live.",
          not_prod_required_note="User's call, 2026-08-13: known edge case (needs a genuine multi-"
                                  "execution partial fill from the real broker, pure luck -- could "
                                  "realistically go a year without a hit), not planning to force-test it. "

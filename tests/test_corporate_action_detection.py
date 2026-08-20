@@ -200,3 +200,122 @@ def test_apply_correction_clears_alert_and_updates_entry_price(monkeypatch, tmp_
     assert round(pos['entry_price'], 4) == 23.0488
     assert already_alerted_corp_action(node_ticker) is False
     os.unlink(tmp_db.name)
+
+
+# ---------------------------------------------------------------------------
+# corporate_actions table (2026-08-19/20, paired-review fixes applied)
+# ---------------------------------------------------------------------------
+
+def test_add_corporate_action_rejects_non_positive_ratio():
+    """Paired review, 2026-08-19/20: an unvalidated 0/negative split_ratio would
+    make detect_price_discontinuity return falsy and silently skip freezing a
+    REAL recorded split -- fail-open on real capital."""
+    with pytest.raises(ValueError):
+        db.add_corporate_action('TEST_BAD_RATIO', 0, '2025-03-01')
+    with pytest.raises(ValueError):
+        db.add_corporate_action('TEST_BAD_RATIO', -2.0, '2025-03-01')
+
+
+def test_find_corporate_action_since_matches_beyond_old_symmetric_window():
+    """Paired review, 2026-08-19/20: find_corporate_action_since replaced the
+    original find_corporate_action_near's +/-10-day window centered on `since`
+    -- a real split can happen any time between `since` (a position's
+    entry_time) and now, and routinely does for positions held weeks. A split
+    effective 30 business days after `since` (well outside the old +/-10-day
+    window, well within [since, today]) must still be found."""
+    db.add_corporate_action('TEST_RANGE_TICKER', 20.0, '2025-02-12',
+                             sponsor='Test Sponsor', source_url='http://example.com')
+    result = db.find_corporate_action_since('TEST_RANGE_TICKER', '2025-01-01')
+    assert result is not None
+    assert result['split_ratio'] == 20.0
+    # Before the action's effective_date -- must not match (no time-travel).
+    assert db.find_corporate_action_since('TEST_RANGE_TICKER', '2025-01-01', until='2025-02-01') is None
+    # A different, unrelated ticker must never match.
+    assert db.find_corporate_action_since('TEST_UNRELATED_TICKER', '2025-01-01') is None
+
+
+def test_check_sell_condition_corporate_actions_table_overrides_yfinance(monkeypatch, capsys):
+    """The real fix this session's paired review demanded: a curated
+    corporate_actions table hit must be authoritative and short-circuit the
+    yfinance rule-out entirely -- NOT get overridden to 'don't freeze' by
+    real_split_confirmed_since returning False, which is exactly what the
+    earlier (inert) version of this fix would have allowed."""
+    def _fail_if_called(ticker, since):
+        raise AssertionError("real_split_confirmed_since must not be called when "
+                              "the corporate_actions table already confirmed the split")
+    monkeypatch.setattr(compute, 'real_split_confirmed_since', _fail_if_called)
+
+    pos = fake_position(TICKER, 'ZScoreBreakout', entry_price=460.976, hours_ago=10)
+    # Effective date well after entry_time (~2025-05, 10 bars back from the 90-day
+    # fixture) but long before "today" -- exercises the range fix (test above)
+    # at the same time: outside the old +/-10-day-around-entry_time window,
+    # inside the new [entry_time, today] range.
+    db.add_corporate_action(TICKER, 20.0, '2025-06-01', sponsor='Test Sponsor')
+    make_synthetic_csv(TICKER, last_close=23.0488)
+    df_hourly, _ = compute._load_cache(TICKER)
+    reason, price, activated = compute.check_sell_condition(
+        pos, current_price=23.0488, now=None, df_hourly=df_hourly
+    )
+    cleanup_csv(TICKER)
+    assert (reason, price, activated) == (None, None, False)
+    out = capsys.readouterr().out
+    assert "Possible corporate action" in out
+    assert "real-split-confirmed=True" in out
+
+
+def test_compute_buy_signal_corporate_actions_table_overrides_yfinance(monkeypatch, capsys):
+    """Entry-side mirror of the exit-side test above -- compute_buy_signal must
+    also treat a corporate_actions table hit as authoritative and never reach
+    real_split_confirmed_since for it."""
+    def _fail_if_called(ticker, since):
+        raise AssertionError("real_split_confirmed_since must not be called when "
+                              "the corporate_actions table already confirmed the split")
+    monkeypatch.setattr(compute, 'real_split_confirmed_since', _fail_if_called)
+    monkeypatch.setattr(compute, 'corporate_action_confirmed_since',
+                         lambda ticker, since: {'split_ratio': 20.0, 'sponsor': 'Test Sponsor'})
+
+    from tests.conftest import fake_node
+    make_synthetic_csv(TICKER, last_close=100.0)
+    node = fake_node(TICKER, 'ZScoreBreakout')
+    result = compute.compute_buy_signal(node, price_override=5.0)
+    cleanup_csv(TICKER)
+    assert result is None
+    out = capsys.readouterr().out
+    assert "Possible corporate action" in out
+    assert "real-split-confirmed=True" in out
+
+
+def test_check_sell_condition_corp_action_table_stops_freezing_after_price_correction(monkeypatch, capsys):
+    """The correction-can't-clear HIGH bug found in the second review round,
+    2026-08-19/20: a corporate_actions table row for (ticker, [entry_time,
+    today]) has no price awareness on its own -- if the table check ran
+    unconditionally, it would keep matching (and keep freezing) forever after
+    a real Apply Correction, since the date range doesn't change. Fixed by
+    gating the table check behind a live price-ratio match: once entry_price
+    is corrected to track current price again, detect_price_discontinuity
+    stops firing and the table is never even consulted -- the freeze clears,
+    matching the pre-existing (price-only) self-clearing behavior."""
+    db.add_corporate_action(TICKER, 20.0, '2025-06-01', sponsor='Test Sponsor')
+    make_synthetic_csv(TICKER, last_close=23.0488)
+    df_hourly, _ = compute._load_cache(TICKER)
+
+    # Before correction: entry_price still reflects the pre-split price -- the
+    # ratio guess fires, the table confirms, freeze.
+    pos = fake_position(TICKER, 'ZScoreBreakout', entry_price=460.976, hours_ago=10)
+    reason, price, activated = compute.check_sell_condition(
+        pos, current_price=23.0488, now=None, df_hourly=df_hourly
+    )
+    assert (reason, price, activated) == (None, None, False)
+    assert "Possible corporate action" in capsys.readouterr().out
+
+    # After correction: entry_price now tracks current price (as Apply
+    # Correction would set it) -- the ratio guess no longer fires at all, so
+    # the table (still holding the same row, same date range) is never
+    # consulted, and the freeze must not re-trigger (the exit check runs
+    # normally instead, whatever its actual SL/TRAIL/TIME verdict is).
+    pos['entry_price'] = 23.10
+    compute.check_sell_condition(
+        pos, current_price=23.0488, now=None, df_hourly=df_hourly
+    )
+    cleanup_csv(TICKER)
+    assert "Possible corporate action" not in capsys.readouterr().out
