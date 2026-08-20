@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][testing] Confirmed resolved-by-drift 2026-08-20 (Task #4 dispatch) — `_PENDING_BUY_NODE_KEYS` unification was already done+shipped 2026-08-19 (`ce94cdc`), backlog entry just never closed. `signals_blocks.py`'s Slack BUY-button snapshot sources `db._PENDING_BUY_NODE_KEYS` directly; `tests/test_pending_buy_node_keys_consistency.py` asserts exact set-equality via the real call path. Paired-reviewed at the time. No new work needed — verified directly (grep + `git log` + reran both tests, 2/2 pass).
+
 ## [live-trading] Resolved 2026-08-20 — 3 `planner`-dispatched items, each paired-reviewed 2 rounds: `corporate_actions` table + `detect_price_discontinuity` fix (closes the GDXU 2026-03-03/05 false-positive freeze), `auto_fill_detection_enabled`/`node_auto_fill_detection_enabled` default flip False→True (closes the `.env`-additions-bypass watch-item too), early-close market-hours guard (`_market_session_open_now`, closes finding (1) of the incident #13 deferred items). Full detail: `deep_backlog.md`.
 
 ## [testing][coverage] Confirmed resolved-by-drift 2026-08-20 (backlog review) — `coverage_check.py`'s unfiltered-`source` gap; was already fixed 2026-08-19 (`34b913b`, Task #7), backlog entry just never closed. Both `_check_coverage_event` and `_last_hit_by_mode` filter `source IS NULL OR source NOT LIKE 'fixture:%'` — verified directly in code.
