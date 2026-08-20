@@ -229,6 +229,36 @@ advance-warning coverage for a real split until that sponsor's page is added to 
 monitoring list — record the sponsor at promotion time even before the monitoring
 mechanism itself is built, so the gap is visible and trackable rather than silent.
 
+## 16. Wash-sale check (REQUIRED ACTION, do this whenever a promotion moves a ticker between accounts of different tax status)
+Wash-sale rules apply at the SECURITY level across every account the taxpayer holds, not
+by this project's internal node/wl_id bookkeeping — a loss on the same ticker in a
+*different* watch_list node/account still counts if it was a real taxable sale. The risky
+direction specifically is a **taxable loss (brokerage) followed by a same-security
+repurchase in an IRA/Roth within 30 days** — that permanently disallows the loss (worse
+than a normal wash sale, which just defers it). The reverse direction (an IRA/Roth-side
+loss followed by a taxable repurchase) has no tax consequence, since an IRA/Roth sale
+never generates a reportable capital loss in the first place — nothing to disallow.
+Procedure: for any ticker whose promotion account differs from its current live account's
+tax status (taxable `brokerage` vs. tax-advantaged `ira`/`roth`/`soxl_ira`/`sep`), pull
+`trade_log` for that ticker across ALL accounts (not just the one node being replaced) for
+recent closes, and check whether a real taxable-side loss sits within 30 days of the move.
+Found 2026-08-19: a promotion pass initially checked only the exact wl_id being replaced
+and concluded "different node, doesn't matter" — wrong; the correct check is ticker-wide.
+
+## 17. Open positions / open orders check (REQUIRED ACTION, do this immediately before any live flip)
+Query `open_positions` AND `pending_buys` for the exact `wl_id`(s) about to be
+reconfigured or replaced — not just whether the ticker is flat. A resting order placed
+under the OLD config (trail_buy_pct, running_low, etc.) left mid-flight when the node's
+params change creates a real mismatch between what's actually resting at the broker and
+what the node now believes its own config is. Found 2026-08-19: a 12-ticker promotion
+pass's "no open positions" check only covered 9 of the 12 tickers on the first pass (the
+other 4 -- AGQ/SOXL/KORU/DPST -- were checked separately after the gap was noticed), and
+even then only checked `open_positions` (filled), missing that SOXL and DPST both had
+real resting trailing-buy orders placed THAT SAME DAY in `pending_buys`. If a node has a
+resting order, hold that specific node's flip until the order resolves (fills or is
+cancelled/times out) rather than reconfiguring underneath it -- proceed with the rest of
+a multi-ticker promotion pass in the meantime if the other nodes are clear.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds
@@ -246,6 +276,11 @@ mechanism itself is built, so the gap is visible and trackable rather than silen
 - **Checks 14-15: at the moment of promotion itself, not before** — the flip and the
   baseline seed (14) / sponsor identification (15) should happen together, same session,
   so a live node is never left unprotected on either front.
+- **Check 16 (wash sale): whenever a promotion moves a ticker's account across the
+  taxable/tax-advantaged boundary** — check before the flip, ticker-wide across accounts.
+- **Check 17 (open positions/orders): immediately before flipping each specific node** —
+  re-check right before, not earlier in the session, since a resting order can appear
+  between when the promotion list was decided and when the flip actually runs.
 - Whenever a live ticker's live behavior seems to be diverging from backtest expectations
   (the AGQ momentum discussion, 2026-07-12, is what prompted writing this down).
 - Not needed on every session — this is a promotion/investigation gate, not a routine poll.
