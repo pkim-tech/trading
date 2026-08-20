@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [testing][coverage] Confirmed resolved-by-drift 2026-08-20 (backlog review) — `coverage_check.py`'s unfiltered-`source` gap; was already fixed 2026-08-19 (`34b913b`, Task #7), backlog entry just never closed. Both `_check_coverage_event` and `_last_hit_by_mode` filter `source IS NULL OR source NOT LIKE 'fixture:%'` — verified directly in code.
+
+## [live-trading] Resolved 2026-08-19 (night) — SOXS/ira (wl_id=206) sunset as part of the portfolio reselection; 3 open SOXS-specific backlog items (drought confirm_days=1 uncalibrated, real-vs-kernel divergence watch-item, drought-trade kernel-tooling-gap example) close as moot — node archived 2026-08-20 03:17:24 UTC. `confirm_days=1` was separately validated and rejected outright before the sunset (research: no confirm_days value 1-20 clears the cliff-safety bar, `38dc2e4`). Full detail: `deep_backlog.md`.
+
 ## [live-trading][testing] Resolved 2026-08-19 — Task #7: new watch_list_overlay_link table + 2 signals_invariants traceability checks (real live nodes missing candidate/overlay validation links), kept out of run_all()'s loud alert path (paired review HIGH finding) and run standalone/from evening_status.py instead. Backfilled SOXL (REAL_SELECTION) and KORU (NO_REAL_SELECTION, flagged distinctly) against real DB. Full detail: `deep_backlog.md`.
 
 ## [live-trading] Resolved 2026-08-19 — Tasks #4/#5/#6: real-time/EOD alerts gated on has_capital_at_stake (canary/paper no longer ride along), narrow reconciliation auto-close (broker 0 shares + confirmed FILLED/CANCELED sl_order_id). Paired review found+fixed 2 HIGH in the auto-close (exit_reason mislabeling an armed position's TRAIL exit as SL; unmarked price-approximation in trade_log) plus a caller bug that could leave a declined auto-close neither closed nor alerted. Full detail: `deep_backlog.md`.

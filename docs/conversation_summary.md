@@ -8087,3 +8087,26 @@ AGQ paper-node cleanup: found 5 duplicate live-track/daily-sync pairs, confirmed
 No `signals_*.py`/`schwab_*.py`/backtest-kernel code was modified this session — the promotion itself was done via existing, unmodified `signals_db.py` functions writing real `watch_list` state; `candidate_full_review.py`/`candidate_summary_report.py` (research/reporting tooling, the overlay-bug fix) aren't in scope for the review-gate. `signals_invariants.py` clean (0 violations) as of end of session. Full writeup: `docs/deep_backlog.md`'s 2026-08-19/20 entries.
 
 Note: a concurrent session has real uncommitted WIP in `signals_compute.py`/`signals_db.py`/`signals_helpers.py`/`docs/backlog_resolved_recent.md` at session-wrap time — deliberately left untouched, not part of this session's commit.
+
+---
+
+## 2026-08-20 — Post-promotion backlog review + cleanup; 4 items dispatched to `coder` (2 running in parallel)
+
+**SOXS/ETHU sunset confirmed and backlog closed out**: verified SOXS/ira (wl_id=206) archived 2026-08-20 03:17:24 UTC as part of `research`'s 12-ticker real-money promotion pass. Closed 3 open SOXS-specific backlog items as moot (confirm_days=1 uncalibrated, real-vs-kernel divergence watch-item, drought-trade kernel-tooling-gap example) — routed the doc edits through `research` first, then directly once no collision was confirmed (caught mid-session: shouldn't have edited docs `research` was actively mid-write-loop on without messaging first; no actual collision occurred).
+
+**Portfolio promotion verified**: `research`'s 12-ticker pass (brokerage: AGQ/GDXU/UGL/WEBL; ira: SOXL/NUGT/HIBL/DPST/LABU; roth: DFEN/JNUG/KORU) confirmed complete via `watch_list_audit` + direct query — all newly-promoted `state='live'` nodes already have both auto-fill-detection flags (ticker+node level) set True via the existing `add_node` hook. No paired review needed for the promotion itself (pure DB-state writes via existing `signals_db.py` functions, correctly so per `research`'s own accounting). Full writeup landed in `deep_backlog.md` (`73d7381`, `ad678ae`) before `research` session-wrapped and cleared clean.
+
+**Test coverage for the prior night's SL-redesign/alert-gating work confirmed adequate**: both `43f3cc5` (SL exit redesign) and `f5994ac` (capital-at-stake alert gating + reconciliation auto-close) shipped with dedicated fake_broker/fake_venue scenario tests, full suite passing (1334/1344), `live_sim_harness.py` 7/7, paired Opus review with rebuttal on both.
+
+**Backlog re-triage found one stale entry**: `coverage_check.py`'s unfiltered-`source` gap (found 2026-08-18) was actually already fixed 2026-08-19 (`34b913b`, Task #7 of that overnight batch) — verified directly in code (`_check_coverage_event` and `_last_hit_by_mode` both already filter `source IS NULL OR source NOT LIKE 'fixture:%'`). Backlog entry was never closed after the fix landed — closed now.
+
+**4 items dispatched to `coder` tonight** (Tasks #1-4, tracked via TaskCreate/TaskUpdate, not a hand-rolled file), told to run 2 in parallel rather than strictly serial given the context budget:
+1. `corporate_actions` table + `detect_price_discontinuity` fix (GDXU false-positive corporate-action freeze, real $5k brokerage node)
+2. Auto-fill-detection code-level default flip (`schwab_safety.py`, False→True) — deliberate policy reversal of the existing docstring's stated False-default rationale, flagged explicitly for reviewers
+3. NYSE early-close guard fix (`_market_session_open_now`, threads `market_close` from `coverage_check.py`'s existing `_NYSE_CAL.schedule()` call instead of hardcoding 16:00:00)
+4. Unify `_PENDING_BUY_NODE_KEYS`/signals_blocks duplicate tuple (tier-2 cleanup, recurring bug shape — both were independently missing `starting_notional_override` in the 2026-08-18 RETL fix)
+All 4 carry the review-gate instruction explicitly (touch `signals_*.py`/`schwab_*.py`, paired independent-cold + contextual Opus review with rebuttal required before done). As of session close, `coder` has uncommitted WIP across `schwab_safety.py`/`signals_compute.py`/`signals_db.py`/`signals_helpers.py`/new `scripts/corporate_actions.py`/several test files — in progress, not reviewed, not committed by this session (deliberately left alone).
+
+**FAS/FAZ canary `max_hold_hours` 47→48 revert attempted, blocked**: a direct `UPDATE` against `cache/live/trading_live.db` was blocked by the permission classifier (no sanctioned setter function exists for `max_hold_hours`). Left open, trivial one-line state fix, not urgent — user or a future session with the right permission can pick it up.
+
+**Next session**: (1) check `coder`'s Task #1-4 progress/review status via TaskList, (2) daemon restart (user's, tomorrow, to pick up all of last night's SL-redesign/alert-gating/traceability changes — still STALE), (3) FAS/FAZ revert (blocked tonight, still open), (4) `evening_status.py` Part 3 persistence design (leaning toward persisting output for later parsing, not yet scoped), (5) confirm no file-collision issues from `coder`'s parallel task execution once things land.
