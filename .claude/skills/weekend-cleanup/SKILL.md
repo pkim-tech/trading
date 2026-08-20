@@ -119,6 +119,22 @@ when prompted.
    user has already said "yes, write them" in the same conversation, proceed
    directly -- don't re-ask for a decision already made.)
 
+## CLAUDE.md staleness check
+
+Added 2026-08-19, after a 2026-08-04 CLAUDE.md note ("USO... unlike the
+standard '40-Act/1099 structure of SOXL/AGQ/etc.") turned out to be flatly
+wrong -- AGQ/ZSL are confirmed K-1 too -- because a later policy change
+(K-1 generalized 2026-08-12 from "disqualifying" to "restricts to
+brokerage") was never reconciled against the older, now-contradicted claim.
+
+Run `.venv/bin/python scripts/claude_md_staleness_check.py` (cheap, no
+DB writes) and read through any flagged lines. It's a heuristic K-1-claim
+matcher, not a general fact-checker -- every hit needs a human read, and it
+will have false positives on dense/long lines. Report findings the same
+way as staged-item drift above; fix confirmed-stale lines directly in
+CLAUDE.md (no separate confirmation needed for a factual correction, unlike
+the backlog-file edits above which do need confirmation first).
+
 ## Scope notes
 
 - This is specifically about **staged** items (passive, waiting-on-a-
