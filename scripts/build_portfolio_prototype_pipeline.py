@@ -12,7 +12,14 @@ Default ticker universe: distinct tickers in watch_list_candidate_link (the real
 explicit node->candidate link table, not a hardcoded list) -- exactly the 10 real
 live tickers as of 2026-08-19 (AGQ/DFEN/DPST/ETHU/GDXU/JNUG/KORU/NUGT/SOXL/SOXS).
 Override with --tickers to scope to a subset (e.g. just the 6 tickers whose v5.1
-data postdates their original pick).
+data postdates their original pick), or pass --universe to widen to every
+liquidity-screened candidate on file (candidate_nodes' full ticker list, minus
+sweep_tranches' real disqualifications -- concentration/diversification/weak-CAGR
+removals -- and USO, excluded per CLAUDE.md's 2026-08-04 standing K-1/UBTI decision,
+distinct from the general K1-restricts-to-brokerage policy the rest of the universe
+gets tagged with, not excluded from). Built 2026-08-19 per the user's explicit call
+("we might end up picking a ticker not in the top 10 / not in the current watchlist")
+-- portfolio construction shouldn't be scoped to only the tickers already promoted.
 
 Each step's own auto-resolution (candidate_full_review.py resolves v5 vs v5.1 per
 ticker, picking whichever has data) means this always reflects whatever the most
@@ -33,6 +40,18 @@ LIVE_DB = "cache/live/trading_live.db"
 PYTHON = ".venv/bin/python"
 
 
+RESEARCH_DB = "cache/research/trading_universe.db"
+
+# sweep_tranches rows with active=0 whose removal was a data-management artifact,
+# not a real disqualification (DFEN was moved to its own tranche for a targeted
+# resweep after a bad-tick fix -- it's one of the 10 real live tickers, not excluded).
+BOOKKEEPING_ONLY_REMOVALS = {"DFEN"}
+# CLAUDE.md 2026-08-04: confirmed K-1 oil futures commodity pool, real UBTI exposure
+# in IRA/Roth -- "candidacy is dead on this basis," a harder exclusion than the
+# general K1-restricts-to-brokerage policy the rest of the universe gets tagged with.
+HARD_EXCLUDED = {"USO"}
+
+
 def default_tickers():
     conn = sqlite3.connect(LIVE_DB)
     conn.row_factory = sqlite3.Row
@@ -48,15 +67,33 @@ def default_tickers():
     return sorted(r["ticker"] for r in rows)
 
 
+def universe_tickers():
+    """Every liquidity-screened candidate on file (candidate_nodes' full ticker
+    list), minus real sweep_tranches disqualifications and USO."""
+    conn = sqlite3.connect(RESEARCH_DB)
+    all_tickers = {r[0] for r in conn.execute("SELECT DISTINCT ticker FROM candidate_nodes")}
+    removed = {r[0] for r in conn.execute("SELECT ticker FROM sweep_tranches WHERE active=0")}
+    conn.close()
+    excluded = (removed - BOOKKEEPING_ONLY_REMOVALS) | HARD_EXCLUDED
+    return sorted(all_tickers - excluded)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tickers", nargs="*", default=None,
                      help="defaults to every ticker in watch_list_candidate_link (the real live set)")
+    ap.add_argument("--universe", action="store_true",
+                     help="widen to every liquidity-screened candidate on file instead of just the real live set")
     ap.add_argument("--base-name", default="portfolio_prototype",
                      help="base name for the raw candidate_full_review.py xlsx (timestamp auto-appended)")
     args = ap.parse_args()
 
-    tickers = args.tickers or default_tickers()
+    if args.tickers:
+        tickers = args.tickers
+    elif args.universe:
+        tickers = universe_tickers()
+    else:
+        tickers = default_tickers()
     if not tickers:
         print("No tickers resolved (empty watch_list_candidate_link and none passed via --tickers)", file=sys.stderr)
         sys.exit(1)
