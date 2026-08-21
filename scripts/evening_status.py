@@ -97,6 +97,42 @@ def compute_divergence(real_rets, bt_rets):
     return real_comp, bt_comp, real_comp - bt_comp
 
 
+def event_days_by_scenario(con):
+    """{scenario_key: distinct ET calendar days it fired on, over the trailing
+    ~14 days} -- feeds part3's daily-vs-edge-case classification (>=7 of 14 =
+    "daily"). Split out for testability, same rationale as compute_divergence
+    above.
+
+    coverage_events.ts is stored UTC (SQLite's datetime('now') default) -- the
+    per-day grouping uses date(ts, 'localtime') (system TZ confirmed ET),
+    matching part3's today_events query a few lines below this call site's
+    original location, so a scenario firing close to midnight ET buckets into
+    the correct calendar day instead of a raw-UTC one (same UTC-vs-ET bug
+    class as coverage_check.py's run_check and coverage_ticket_table.py's
+    timing check -- see docs/deep_backlog.md's 2026-08-21 entries; this
+    function's grouping was itself fixed 2026-08-21, previously
+    `COUNT(DISTINCT date(ts))` with no 'localtime' conversion).
+
+    The WHERE bound also converts via 'localtime' now (fixed same session,
+    after review found the original "leave it UTC, the skew is harmless"
+    reasoning was empirically wrong against the real DB): a plain
+    `date('now','-14 days')` bound resolves to UTC midnight of day-14, which
+    is 20:00 ET on day-15 -- not a rounding-error-scale skew, an extra ~4-hour
+    ET slice (20:00-23:59 ET) that real coverage_events data actually lands
+    in (a real local spike at hour 20 ET), and since several real scenarios
+    sit at exactly the >=7-day "daily" threshold, that extra slice could
+    flip a genuine edge-case scenario to falsely read as daily -- exactly the
+    kind of thing this report exists to surface, not hide. It also made the
+    window's width itself vary by up to a full ET day depending on what time
+    of evening this ET-named script happens to run. `date('now','localtime',
+    '-14 days')` fixes both: an exact, run-time-stable 14 ET-day window."""
+    return dict(con.execute(
+        "SELECT scenario_key, COUNT(DISTINCT date(ts, 'localtime')) FROM coverage_events "
+        "WHERE date(ts, 'localtime') >= date('now', 'localtime', '-14 days') "
+        "GROUP BY scenario_key"
+    ).fetchall())
+
+
 _DATE_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
 _TIME_RE = re.compile(r'^\[(\d{2}):(\d{2}):(\d{2})\]')
 _DATE_TIME_RE = re.compile(r'\d{4}-\d{2}-\d{2}\s+(\d{2}):(\d{2})')
@@ -851,10 +887,7 @@ def part3():
     # "daily" if it fired on >=7 of the last 14 calendar days; a scenario_expectations-
     # mechanism row uses its own real expected_frequency column ('daily'/'informational').
     con = sqlite3.connect(LIVE_DB)
-    event_days = dict(con.execute(
-        "SELECT scenario_key, COUNT(DISTINCT date(ts)) FROM coverage_events "
-        "WHERE ts >= date('now', '-14 days') GROUP BY scenario_key"
-    ).fetchall())
+    event_days = event_days_by_scenario(con)
     # Scoped to exactly TODAY (localtime, matching coverage_check.py's own UTC-vs-local
     # fix) -- event_days above only tells us this scenario fires daily IN GENERAL, not
     # that it actually fired today specifically. compute_status()/proof_classify() are
