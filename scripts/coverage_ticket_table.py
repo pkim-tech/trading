@@ -95,9 +95,26 @@ def check_timing_discrepancies():
     before the node existed; the deviation's own log ts was same-day, after creation,
     so comparing ts alone misses this -- check_date is the column that matters here).
 
-    added_at is stored via SQLite's datetime('now') -- UTC -- while check_date is an ET
-    trading-calendar date; compared here via 'localtime' (system TZ confirmed ET), same
-    fix as coverage_check.py's run_check guard (found by the same Opus review).
+    The two branches need different comparisons because their columns have different
+    types, not because either needs a timezone conversion the other doesn't:
+    coverage_events.ts and watch_list.added_at are BOTH full-precision UTC timestamps
+    (SQLite's datetime('now') default) -- compared directly, no 'localtime' conversion
+    needed or wanted, since converting both sides by the same offset can't change which
+    one is earlier. coverage_deviations.check_date is an ET trading-calendar DATE
+    (date-only, no time component) written by application code -- comparing it against
+    added_at requires converting added_at to its ET calendar date first (same fix as
+    coverage_check.py's run_check guard) because the two columns are different grains,
+    not different timezones as such.
+
+    The coverage_events branch previously (mistakenly) applied the same
+    'localtime'-date conversion as the coverage_deviations branch, comparing
+    date(ts,'localtime') against date(added_at,'localtime') -- correct in direction but
+    needlessly coarse (day-granularity), reintroducing a smaller version of the exact
+    false-negative shape this check exists to catch: an event logged genuinely hours
+    before its node existed, but on the same ET calendar day, would still pass
+    undetected. Fixed 2026-08-21 to compare the two raw UTC timestamps directly instead
+    (found by paired review of the coverage_events UTC/ET doc fix, docs/deep_backlog.md's
+    2026-08-21 entries).
 
     Returns (unexplained, historical) -- unexplained are new problems needing attention
     (reason IS NULL); historical already carry an explanation (from this same class of
@@ -105,19 +122,21 @@ def check_timing_discrepancies():
     read as permanent noise on every future run."""
     unexplained, historical = [], []
     with db._conn() as c:
-        node_created = {r['id']: r['d'] for r in c.execute(
+        node_created_ts = {r['id']: r['added_at'] for r in c.execute(
+            "SELECT id, added_at FROM watch_list WHERE added_at IS NOT NULL")}
+        node_created_date = {r['id']: r['d'] for r in c.execute(
             "SELECT id, date(added_at, 'localtime') AS d FROM watch_list WHERE added_at IS NOT NULL")}
         rows = c.execute(
             "SELECT id, node_id, ts FROM coverage_events WHERE node_id IS NOT NULL").fetchall()
         for r in rows:
-            created = node_created.get(r['node_id'])
+            created = node_created_ts.get(r['node_id'])
             if created and r['ts'] < created:
                 unexplained.append(('coverage_events', r['id'], r['node_id'], r['ts'], created))
         rows = c.execute(
             "SELECT id, node_id, check_date, reason FROM coverage_deviations "
             "WHERE node_id IS NOT NULL AND check_date IS NOT NULL").fetchall()
         for r in rows:
-            created = node_created.get(r['node_id'])
+            created = node_created_date.get(r['node_id'])
             if created and r['check_date'] < created:
                 entry = ('coverage_deviations (check_date)', r['id'], r['node_id'],
                           r['check_date'], created)
