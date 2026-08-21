@@ -1333,6 +1333,33 @@ def ensure_tables():
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_overlay_reconcile_wl_date "
                   "ON overlay_reconciliation_log(wl_id, check_date)")
+
+        # divergence_check_log -- persists evening_status.py Part 3 sub-part 5's real-vs-
+        # kernel compounded-return divergence check (docs/backlog_cache.md, specced
+        # 2026-08-20), the first durable record of that check's result -- previously
+        # print-only, so nothing survived past the terminal it ran in. One row per node
+        # per night, mirroring overlay_reconciliation_log's shape (UNIQUE + INSERT OR
+        # REPLACE so a same-day restart-triggered rerun refreshes the row instead of
+        # duplicating or getting masked by an earlier transient result).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS divergence_check_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts           TEXT NOT NULL DEFAULT (datetime('now')),
+                wl_id        INTEGER NOT NULL REFERENCES watch_list(id),
+                ticker       TEXT NOT NULL,
+                account      TEXT,
+                check_date   TEXT NOT NULL,
+                window_days  INTEGER NOT NULL,
+                real_comp_pct REAL NOT NULL,
+                bt_comp_pct   REAL NOT NULL,
+                delta_pp      REAL NOT NULL,
+                flagged       INTEGER NOT NULL,
+                UNIQUE(wl_id, check_date)
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_divergence_check_wl_date "
+                  "ON divergence_check_log(wl_id, check_date)")
+
         c.execute("CREATE INDEX IF NOT EXISTS idx_open_positions_source "
                   "ON open_positions(position_source)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_paper_positions_source "
@@ -1427,6 +1454,40 @@ def ensure_tables():
             # the other columns in this block -- paper never merges (paper
             # legs never place a real order to merge in the first place).
             c.execute("ALTER TABLE addon_legs ADD COLUMN merged_into_core INTEGER NOT NULL DEFAULT 0")
+        if 'orphan_alerted' in al_cols:
+            # Same-night correction (2026-08-20): the original INTEGER boolean
+            # flag (added earlier tonight, 0 real rows ever used it) alerted
+            # once per orphan episode and then went silent FOREVER until the
+            # leg closed -- a paired Opus review (both independent-cold and
+            # contextual, converged) found this silences the ONLY recovery
+            # signal for a genuine missed lockstep close, not just the
+            # deferred-to-next-session case it was built for (see
+            # check_addon_leg_reconciliation's orphan branch below and
+            # signals_db.coverage_snoozes' own schema comment arguing against
+            # indefinite code-set snoozes). Replaced with orphan_alerted_date
+            # below (re-arms once per calendar day) before this ever shipped.
+            c.execute("ALTER TABLE addon_legs DROP COLUMN orphan_alerted")
+        # Re-query fresh -- al_cols was computed before the DROP COLUMN above (if it ran),
+        # and this column never existed under the old name, so al_cols alone can't answer
+        # "does orphan_alerted_date exist right now."
+        if 'orphan_alerted_date' not in {r[1] for r in c.execute("PRAGMA table_info(addon_legs)").fetchall()}:
+            # backlog_cache.md 2026-08-20 (market-hours-guard paired review,
+            # finding 2 of 2): check_addon_leg_reconciliation's
+            # orphaned-addon-leg branch (parent closed, leg still open) used to
+            # re-alert every poll for the whole time the leg sat unresolved --
+            # a legitimate case since the 2026-08-20 early-close guard, since a
+            # leg's lockstep close can be deliberately deferred to the next
+            # session. Stores the date (YYYY-MM-DD) the branch last alerted
+            # for this leg's current open episode -- a poll on the SAME date
+            # stays silent (log-only), but a new calendar day re-arms the
+            # alert automatically, so a genuine multi-day miss keeps
+            # escalating instead of going silent forever. Cleared (see
+            # close_addon_leg) once the leg actually closes, so a later leg
+            # row (new id) or a genuinely new orphan episode on this row is
+            # never silently permanently suppressed -- addon_legs only, same
+            # as merged_into_core (paper legs are never left open unresolved
+            # this way).
+            c.execute("ALTER TABLE addon_legs ADD COLUMN orphan_alerted_date TEXT")
         c.commit()
 
         # coverage_events: one row per real firing of an automation control/phase
@@ -2578,9 +2639,10 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
     For v3.x trailing-both/trailing-exit nodes, the stop_loss arg is not a real
     swept value (backtest_cache stores config.execution.fixed_stop_loss there,
     a constant) — pass whatever backtest_cache's stop_loss column shows, it's vestigial.
-    fixed_sl_override: pass the real per-node SL (e.g. a v4 SL-sweep value) directly —
-    without it, uses_fixed_sl strategies always fall back to config.json's stale global
-    default, which is wrong for any node whose real SL differs from that default.
+    fixed_sl_override: required for any uses_fixed_sl strategy — pass the real per-node
+    SL (e.g. a v4 SL-sweep value) directly. Raises ValueError if omitted; the old silent
+    fallback to config.json's stale global default was removed 2026-08-20 since it was
+    wrong for any node whose real SL differs from that default.
     state: 'paper' / 'dry_run' / 'live' (see ensure_tables()'s schema comment) —
     replaces the old separate mode='live'/'research' + node-level dry_run override."""
     if state not in ('paper', 'dry_run', 'live'):
@@ -2595,7 +2657,17 @@ def add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold
     if watchlist_id is None:
         watchlist_id = get_active_watchlist_id()
     if strategies.uses_fixed_sl(strategy):
-        fixed_sl = fixed_sl_override if fixed_sl_override is not None else _config_fixed_stop_loss()
+        # fixed_sl_override was previously optional, silently falling back to
+        # config.json's global execution.fixed_stop_loss default when omitted -- stale/
+        # unreliable by design (that default drifts independently of any node's real SL).
+        # Made required 2026-08-20 (docs/backlog_cache.md, specced 2026-08-20): every real
+        # seeding script already passes it explicitly; only harness test scaffolding relied
+        # on the fallback (scripts/live_sim_harness.py's make_node, fixed alongside this).
+        if fixed_sl_override is None:
+            raise ValueError(
+                f"add_node: fixed_sl_override is required for {strategy!r} (uses_fixed_sl) -- "
+                f"pass the real per-node SL explicitly, don't rely on config.json's global default")
+        fixed_sl = fixed_sl_override
         if trail_buy_pct is None and trail_pct is None:
             sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy)
             if sl_axis_col == 'trail_buy_pct':
@@ -2855,6 +2927,24 @@ def set_starting_notional(watch_id, starting_notional):
         if row:
             _log_audit(c, 'set_starting_notional', watchlist_id=row['watchlist_id'], watch_id=watch_id,
                        ticker=row['ticker'], detail=f"{row['starting_notional']} -> {starting_notional}")
+        c.commit()
+
+
+def set_max_hold_hours(watch_id, max_hold_hours):
+    """No prior sanctioned setter existed -- a direct UPDATE was blocked by the permission
+    classifier (docs/backlog_cache.md, specced 2026-08-20, re: FAS/FAZ ids 222/223's
+    max_hold_hours=47 workaround becoming unnecessary once entry_timing/fixed_sl joined the
+    add_node dedup key). Mirrors set_starting_notional's shape exactly."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, max_hold_hours FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"set_max_hold_hours: no watch_list row with id={watch_id}")
+        c.execute("UPDATE watch_list SET max_hold_hours = ? WHERE id = ?",
+                   (int(max_hold_hours), watch_id))
+        _log_audit(c, 'set_max_hold_hours', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                   ticker=row['ticker'], detail=f"{row['max_hold_hours']} -> {max_hold_hours}")
         c.commit()
 
 
@@ -4133,6 +4223,36 @@ def get_overlay_reconciliation_log(wl_id=None, mechanism=None, limit=200):
     return [dict(r) for r in rows]
 
 
+def log_divergence_check(wl_id, ticker, account, check_date, window_days,
+                          real_comp_pct, bt_comp_pct, delta_pp, flagged):
+    """One row per node per night -- see divergence_check_log's table comment in
+    ensure_tables(). INSERT OR REPLACE respects UNIQUE(wl_id, check_date), same
+    same-day-rerun-refreshes reasoning as log_overlay_reconciliation."""
+    with _conn() as c:
+        c.execute("""
+            INSERT OR REPLACE INTO divergence_check_log
+                (wl_id, ticker, account, check_date, window_days,
+                 real_comp_pct, bt_comp_pct, delta_pp, flagged)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (wl_id, ticker, account, check_date, window_days,
+              real_comp_pct, bt_comp_pct, delta_pp, 1 if flagged else 0))
+        c.commit()
+
+
+def get_divergence_check_log(wl_id=None, limit=200):
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        q = "SELECT * FROM divergence_check_log WHERE 1=1"
+        params = []
+        if wl_id is not None:
+            q += " AND wl_id=?"
+            params.append(wl_id)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = c.execute(q, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 def set_daily_sync_halted(wl_id, halted=True):
     """Halts (or clears) a daily-track node's paper entry -- set when a nightly reconcile
     finds an unexplained divergence (see reconcile_daily_track_nodes' docstring). Clearing
@@ -5144,6 +5264,22 @@ def set_addon_leg_merged_into_core(leg_id):
         c.commit()
 
 
+def set_addon_leg_orphan_alerted(leg_id, alert_date):
+    """Snooze marker for check_addon_leg_reconciliation's orphaned-addon-leg
+    branch (backlog_cache.md 2026-08-20, market-hours-guard paired review
+    finding 2 of 2) -- stamps the date (YYYY-MM-DD) that branch last alerted
+    for this leg's current open episode, so a same-day poll stays silent
+    (log-only) but a new calendar day re-arms the alert automatically.
+    Same-night correction: an earlier boolean version of this flag silenced
+    the branch FOREVER once set (both paired-review agents converged on this
+    being a real safety gap -- it's the only recovery signal for a genuine
+    missed lockstep close, not just the deferred-to-next-session case it was
+    built for). addon_legs only, mirrors set_addon_leg_merged_into_core."""
+    with _conn() as c:
+        c.execute("UPDATE addon_legs SET orphan_alerted_date=? WHERE id=?", (alert_date, leg_id))
+        c.commit()
+
+
 def get_open_addon_leg_by_parent(parent_position_id, paper=False):
     table = _addon_table(paper)
     with _conn() as c:
@@ -5198,8 +5334,16 @@ def close_addon_leg(leg_id, exit_price, exit_time, exit_reason, paper=False):
         if row is None:
             return False
         pnl = (exit_price - row['entry_price']) / row['entry_price'] * 100 - _ADDON_MARGIN_COST_FLAT_PCT
+        # orphan_alerted_date reset here too (real-execution-only column, so a
+        # no-op UPDATE on paper_addon_legs -- harmless, that table has no such
+        # column and this f-string never references it): the leg row itself
+        # is never reused after closing, but resetting keeps the flag's
+        # invariant ("non-NULL only while this specific open episode is
+        # unacknowledged") honest rather than relying solely on the
+        # status='open' filter in get_open_addon_legs to make it moot.
+        _orphan_reset_sql = ", orphan_alerted_date=NULL" if table == 'addon_legs' else ""
         c.execute(f"""
-            UPDATE {table} SET status='closed', exit_price=?, exit_time=?, exit_reason=?, pnl_pct=?
+            UPDATE {table} SET status='closed', exit_price=?, exit_time=?, exit_reason=?, pnl_pct=?{_orphan_reset_sql}
             WHERE id=?
         """, (float(exit_price), exit_time_str, exit_reason, pnl, leg_id))
         c.commit()

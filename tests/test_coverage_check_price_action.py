@@ -131,7 +131,7 @@ def _make_scenario(node_id):
 def _add_real_node():
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=3, take_profit=1.0,
                 stop_loss=1.0, max_hold_hours=48, state='live', account='ira',
-                z_score_threshold=1.0, entry_timing='close')
+                z_score_threshold=1.0, entry_timing='close', fixed_sl_override=15)
     with db._conn() as c:
         # added_at set well before this file's fixed check_date (2025-01-07) -- run_check's
         # node-predates-check_date guard (2026-08-13, closes the FAS/FAZ backfill-artifact bug

@@ -1086,18 +1086,25 @@ REGISTRY = [
                   "raw-event question of whether the order-placement call itself (incl. its "
                   "shares_too_small/exception handling) gets exercised for real",
          code_path="signals_notify._attempt_automated_buy, _attempt_automated_market_buy",
-         offline_coverage="No dedicated fake_broker test found for this specific coverage_events "
-                          "wiring -- added 2026-08-14 (Opus audit found real live data with zero "
-                          "Grid row at all).",
+         offline_coverage="tests/test_fake_broker_entry_scenario.py -- both success-path 'placed' "
+                          "events asserted directly (trailing-buy and market-buy), plus a dedicated "
+                          "dry_run-node regression proving mode is derived from the node's real "
+                          "state, not just the account's trading_enabled flag.",
          check_mechanism='coverage_events', scenario_key='automated_buy_execution',
-         bad_results=['shares_too_small'],
+         bad_results=['shares_too_small', 'failed_unexpectedly'],
          notes="Added 2026-08-14 -- found by an Opus audit of this file's own history/completeness. "
-               "Real caveat, not fixed here: neither function logs a coverage_event on a SUCCESSFUL "
-               "placement at all (only the shares_too_small guard logs anything under this "
-               "scenario_key) -- unlike automated_exit_execution's sibling, which logs 'placed' on "
-               "success. That means this row can structurally never show verified-live from this "
-               "code alone, even given a real successful automated entry, until a 'placed' event is "
-               "added to the success path -- flagged as its own follow-up, not done tonight."),
+               "Fixed 2026-08-20: neither function used to log a coverage_event on a SUCCESSFUL "
+               "placement at all (only the failure branches did), so this row could never show "
+               "verified-live from real activity no matter how many automated entries succeeded. "
+               "Both success paths now log result='placed' via _coverage_mode(account, node) -- "
+               "the node-aware form, not account-only, per a 2026-08-20 paired-review finding "
+               "(both independent-cold and contextual agents converged): an account-only mode "
+               "lookup would mislabel a dry_run canary's simulated (never-placed-at-the-broker) "
+               "order as mode='live', fabricating proof off a simulated order -- the same failure "
+               "class this file's own history already caught twice (2026-08-13 market_buy_placement, "
+               "2026-07-27 inverted-deviation). bad_results now also excludes failed_unexpectedly, "
+               "matching automated_exit_execution's sibling row (was previously missing here, so a "
+               "real exception-path event would also have counted as good proof)."),
     dict(id='stale_price_exit_check_skipped',
          scenario="A real (non-paper) open position's mid-bar exit check is skipped entirely for a "
                   "poll because signals_compute._current_price returned None (stale/missing same-day "
@@ -1163,7 +1170,10 @@ REGISTRY = [
                "diff caught this row missing entirely -- the exact 'real code, zero Grid row' gap "
                "this same night's earlier audit found and fixed elsewhere). Logged at most once per "
                "(ticker, day) to avoid coverage_events spam -- the ratio can hold for the whole "
-               "duration of a real rally, and this branch is reached every poll while it does."),
+               "duration of a real rally, and this branch is reached every poll while it does. "
+               "2026-08-20: the existing test asserted only the behavioral side effect (SL still "
+               "fires, doesn't freeze) -- now also asserts the real get_coverage_events call directly "
+               "(ticker/mode/result/position_id), closing a behavior-only-vs-event-asserted gap."),
     dict(id='time_exit_trigger_unarmed',
          scenario="A real (non-paper/dry_run-sim) position's TIME-based exit (max_hold_hours) fires "
                   "the SELL alert while the position was NEVER armed (plain hold-time expiry, exits "
@@ -1239,7 +1249,19 @@ REGISTRY = [
                "worse than the bug. Both call sites wrap it in try/except so a broker fetch failure "
                "cannot prevent a real exit. 'manual_order_replaced' depends on the provenance column "
                "added the same day -- it can only fire for a position reconciled via "
-               "scripts/reconcile_fill_manually.py, so expect it to stay rare."),
+               "scripts/reconcile_fill_manually.py, so expect it to stay rare. "
+               "2026-08-20: the fake_venue scenario's original 3 legs never actually drove "
+               "_verify_resting_before_replace's own mismatch-logging branches -- leg A's stale-id case "
+               "goes through _attempt_automated_exit_sell's separate stale-id handling instead, which "
+               "logs a DIFFERENT scenario_key (sl_exit_resting_noop, result=adopted_substitute), not "
+               "this one. New LEG C drives the ARM-time call site (_attempt_automated_sell) via a real "
+               "quantity_mismatch (resting order id stays valid, only quantity drifts, so round-trip 2's "
+               "replace still succeeds while round-trip 1 finds and logs the mismatch) -- first real "
+               "fake-venue-confirmed replace_target_mismatch event, distinct from leg A's proof. "
+               "resting_order_id_stale/not_a_stop_order/manual_order_replaced/stop_price_mismatch still "
+               "have no dedicated event-triggering leg of their own (stop_price_mismatch fires "
+               "incidentally in leg C's pre-fix construction but isn't isolated/asserted as its own "
+               "leg) -- a real remaining gap, not claimed closed here."),
     dict(id='orphaned_broker_position',
          scenario="An intraday ground-truth sweep confirms every real non-zero broker position has a "
                   "matching local open_positions/addon_legs row (and the mirror-image STALE/MISMATCH/"
@@ -1390,16 +1412,22 @@ REGISTRY = [
                   "on file for the node, or replacing_order_id doesn't match that position's own "
                   "resting order",
          code_path="schwab_safety.check_order (real)",
-         offline_coverage="none",
+         offline_coverage="fake_venue scenarios_drought_handoff.py, Node D (2026-08-20) -- drives "
+                          "_attempt_automated_exit_sell(reason='HANDOFF') with a fabricated "
+                          "replacing_order_id that doesn't match the real open drought position's own "
+                          "resting order, confirming the mismatch is logged (result=not_exempted) and "
+                          "falls through to the real dup_order_window_blocked guard rather than being "
+                          "trusted -- zero resting orders reach the broker.",
          check_mechanism='coverage_events', scenario_key='drought_handoff_precondition_blocked',
          bad_results=[],
          notes="Added 2026-08-17 alongside the is_handoff_exit exemption itself (mirrors is_addon_leg's "
                "own 'verified, not trusted' contract). result='not_exempted', NOT 'blocked' -- this only "
                "means the exemption didn't apply, the order still falls through to normal (non-exempted) "
-               "duplicate-window handling and may still be allowed on its own merits. No offline test "
-               "exercises either precondition-failure branch yet (found by independent-cold review) -- a "
-               "real gap, same shape as the sibling addon_precondition_blocked exemption (also unregistered "
-               "here), not fixed in this pass."),
+               "duplicate-window handling and may still be allowed on its own merits. 2026-08-20: the "
+               "mismatch branch is now fake-venue-confirmed (see offline_coverage) -- no production bug "
+               "found while building it, the 2026-08-17 check behaves exactly as documented. The sibling "
+               "addon_precondition_blocked exemption's own precondition-failure branch is still "
+               "unregistered/untested -- a real remaining gap, not fixed in this pass."),
     dict(id='addon_entry_fill',
          scenario="Margin add-on-at-arm leg opens the moment a core position's "
                   "trailing-sell arms, sized to match the core position's current shares",
@@ -1461,40 +1489,6 @@ REGISTRY = [
                "addon_exit_fill scenario_key with the lockstep-close row above -- distinguish by "
                "result='sl_closed_reconcile'. No fake_broker regression test written for this specific "
                "branch (unlike the core-position sibling, which has 5) -- open follow-up."),
-    dict(id='skim_fire',
-         scenario="Skim moves skim_frac of the currently-deployed strategy value into "
-                  "the reserve on a new equity high >= skim_step above the last skim reference",
-         code_path="paper_trading.check_paper_skim",
-         offline_coverage="tests/test_overlay_paper_trading.py: "
-                           "test_skim_fires_on_new_high_and_amount_shrinks_each_time, "
-                           "test_skim_never_fires_on_a_wiggle_at_the_peak, "
-                           "test_skim_reserve_pool_actually_gains_real_shares",
-         check_mechanism='coverage_events', scenario_key='skim_fire',
-         bad_results=[],
-         notes="A paired review found the first version's skim amount diverged from the validated "
-               "model (scripts/stacked_model/skim_reserve.py's manual_redeploy_overlay) in the "
-               "WRONG DIRECTION -- it recomputed off the full undiluted notional every time instead "
-               "of a shrinking fraction of the already-reduced deployed sleeve, so later skims grew "
-               "instead of shrinking. Fixed via a real skim_strategy_value/skim_reserve_balance dollar "
-               "ledger, marked to a real cached SPY price at every call (the reserve was never "
-               "actually modeled at all in the first version)."),
-    dict(id='skim_redeploy_alert',
-         scenario="Alert-only (never automated) notification when equity recovers past "
-                  "80% or 100% of its pre-decline peak, only if a real non-empty reserve exists",
-         code_path="paper_trading.check_paper_skim",
-         offline_coverage="tests/test_overlay_paper_trading.py: "
-                           "test_redeploy_alert_never_fires_against_an_empty_reserve, "
-                           "test_redeploy_alerts_fire_exactly_twice_across_a_real_decline_recovery_cycle",
-         check_mechanism='coverage_events', scenario_key='skim_redeploy_alert',
-         bad_results=[],
-         notes="A paired review found the first version dropped the reference's `w_spy > 0` guard "
-               "entirely -- differential testing against the reference over 500 random equity paths "
-               "showed this ONE missing guard explained 100% of the divergence (alerts firing against "
-               "a genuinely empty reserve). Fixed via an explicit skim_reserve_balance>0 check on both "
-               "the 80% and 100% branches. Carries forward the 2026-08-08 CRITICAL anti-wiggle fix "
-               "(a threshold may only fire on real recovery from a real decline, never a sub-decline "
-               "wiggle at a new high) unchanged."),
-
     # Real-only control points, added with the real drought/add-on order-
     # placement build (docs/plans/real_order_execution_drought_addon.md,
     # Part 8) -- no paper analogue, since paper never calls schwab_client/
@@ -1603,9 +1597,13 @@ REGISTRY = [
          code_path="signals_notify.check_addon_leg_reconciliation",
          offline_coverage="tests/test_fake_broker_addon_lockstep_exit_scenario.py",
          check_mechanism='coverage_events', scenario_key='addon_leg_reconciliation',
-         bad_results=[],
+         bad_results=['suppressed_leg_orphan_snoozed'],
          notes="Pure observation for the orphaned-leg case, matching reconcile_daily_track_nodes' own "
-               "stance -- never auto-closes. No live proof yet.",
+               "stance -- never auto-closes. No live proof yet. suppressed_leg_orphan_snoozed "
+               "(2026-08-20, the per-day re-alert snooze) is the ABSENCE of an alert, not evidence the "
+               "alert path works -- same reasoning as addon_exit_placement's 'skipped' above -- and at "
+               "POLL_SECS cadence a single real orphan episode would otherwise render as hundreds of "
+               "false 'live firings'.",
          not_prod_required_note="User's call, 2026-08-13: known edge case (needs a genuinely orphaned/"
                                  "timed-out addon leg, not a normal successful entry-fill-exit cycle), "
                                  "not planning to force-test it. Lowered out of the active red bucket, "
@@ -2268,14 +2266,6 @@ BEST_HARNESS = {
     # -- these two rows have zero incremental dry_run reachability of their own.
     'paper_entry_fill': 'paper',
     'paper_exit_fill': 'paper',
-    # skim_fire/skim_redeploy_alert corrected 2026-08-13 (Opus review) -- unlike the two rows
-    # above, these have NO dry_run reachability at all, not even incidentally: check_paper_skim
-    # (paper_trading.py) never calls schwab_client/schwab_safety, is only ever invoked from
-    # check_paper_sells' paper-position-close path, and hardcodes mode="paper" in its two
-    # log_coverage_event calls. A dry_run node's real/dry_run core position close never reaches
-    # this function at all -- 'canary' was factually wrong, not just an imprecise label.
-    'skim_fire': 'paper',
-    'skim_redeploy_alert': 'paper',
     'oversell_guard_correct_position': 'canary',
     'morning_report_delivery': 'canary',          # harness-agnostic, scheduled
     'automated_sell_mode_skip': 'canary',         # trigger is specifically state=='paper'

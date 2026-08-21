@@ -36,7 +36,7 @@ def env(monkeypatch, tmp_path):
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
                          stop_loss=5, max_hold_hours=7, state='live',
-                         trail_buy_pct=1.0, trail_pct=1.0)
+                         trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=15)
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ?", (TICKER,))
         c.commit()
@@ -230,7 +230,7 @@ def test_second_position_same_down_account_skips_retry_sleep(env, monkeypatch):
     pos1 = _open_pos(shares=100)
     signals_db.add_node('TEST_RECONCILE_TWO', 'TrailingBothZScoreBreakout', 'test', window=20,
                          take_profit=7, stop_loss=5, max_hold_hours=7, state='live',
-                         trail_buy_pct=1.0, trail_pct=1.0)
+                         trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=15)
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account='ira' WHERE ticker='TEST_RECONCILE_TWO'")
         c.commit()

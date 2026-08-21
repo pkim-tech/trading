@@ -51,7 +51,7 @@ def test_hardcoded_agq_still_flagged_in_ira(env):
     # check exists to catch (a raw UPDATE reassigning account after the
     # fact, the dominant real path per the check's own docstring).
     db.add_node(ticker='AGQ', strategy='TrailingBothZScoreBreakout', version='v5', window=10, take_profit=30,
-                stop_loss=2, max_hold_hours=48, state='live', account='brokerage')
+                stop_loss=2, max_hold_hours=48, state='live', account='brokerage', fixed_sl_override=15)
     with db._conn() as c:
         c.execute("UPDATE watch_list SET account='ira' WHERE ticker='AGQ'")
         c.commit()
@@ -64,7 +64,7 @@ def test_agq_clean_in_brokerage_not_flagged(env):
     """Real 2026-08-12 policy: K-1 alone doesn't disqualify a ticker, only
     restricts it to the taxable brokerage account -- this must stay clean."""
     db.add_node(ticker='AGQ', strategy='TrailingBothZScoreBreakout', version='v5', window=10, take_profit=30,
-                stop_loss=2, max_hold_hours=48, state='live', account='brokerage')
+                stop_loss=2, max_hold_hours=48, state='live', account='brokerage', fixed_sl_override=15)
     assert signals_invariants.check_tax_advantaged_excluded_tickers() == []
 
 
@@ -76,7 +76,7 @@ def test_research_confirmed_k1_ticker_not_in_hardcoded_set_is_still_flagged(env)
     assert 'UCO' not in db.TAX_ADVANTAGED_EXCLUDED_TICKERS
     _seed_research_k1(signals_config.RESEARCH_DB_PATH, 'UCO', 'CONFIRMED K-1 (uscfinvestments.com)')
     db.add_node(ticker='UCO', strategy='TrailingBothZScoreBreakout', version='v5', window=10, take_profit=30,
-                stop_loss=2, max_hold_hours=48, state='live', account='roth')
+                stop_loss=2, max_hold_hours=48, state='live', account='roth', fixed_sl_override=15)
     violations = signals_invariants.check_tax_advantaged_excluded_tickers()
     assert len(violations) == 1
     assert 'UCO' in violations[0]
@@ -85,14 +85,14 @@ def test_research_confirmed_k1_ticker_not_in_hardcoded_set_is_still_flagged(env)
 def test_research_clean_confirmed_ticker_not_flagged(env):
     _seed_research_k1(signals_config.RESEARCH_DB_PATH, 'SOXL', 'confirmed clean, standard 1099')
     db.add_node(ticker='SOXL', strategy='TrailingBothZScoreBreakout', version='v5', window=10, take_profit=30,
-                stop_loss=2, max_hold_hours=48, state='live', account='roth')
+                stop_loss=2, max_hold_hours=48, state='live', account='roth', fixed_sl_override=15)
     assert signals_invariants.check_tax_advantaged_excluded_tickers() == []
 
 
 def test_missing_research_db_falls_back_to_hardcoded_set_without_crashing(env, monkeypatch):
     monkeypatch.setattr(signals_config, 'RESEARCH_DB_PATH', Path('/nonexistent/path/trading_universe.db'))
     db.add_node(ticker='AGQ', strategy='TrailingBothZScoreBreakout', version='v5', window=10, take_profit=30,
-                stop_loss=2, max_hold_hours=48, state='live', account='brokerage')
+                stop_loss=2, max_hold_hours=48, state='live', account='brokerage', fixed_sl_override=15)
     with db._conn() as c:
         c.execute("UPDATE watch_list SET account='ira' WHERE ticker='AGQ'")
         c.commit()
@@ -103,7 +103,7 @@ def test_missing_research_db_falls_back_to_hardcoded_set_without_crashing(env, m
 
 def test_paper_mode_node_never_flagged(env):
     db.add_node(ticker='AGQ', strategy='TrailingBothZScoreBreakout', version='v5', window=10, take_profit=30,
-                stop_loss=2, max_hold_hours=48, state='paper', account='ira')
+                stop_loss=2, max_hold_hours=48, state='paper', account='ira', fixed_sl_override=15)
     assert signals_invariants.check_tax_advantaged_excluded_tickers() == []
 
 
@@ -112,7 +112,7 @@ def test_scans_across_watchlists_not_just_active_one(env):
     real live nodes span more than one watchlist."""
     other_wl = db.create_watchlist('other_wl')
     db.add_node(ticker='AGQ', strategy='TrailingBothZScoreBreakout', version='v5', window=10, take_profit=30,
-                stop_loss=2, max_hold_hours=48, state='live', account='brokerage', watchlist_id=other_wl)
+                stop_loss=2, max_hold_hours=48, state='live', account='brokerage', watchlist_id=other_wl, fixed_sl_override=15)
     with db._conn() as c:
         c.execute("UPDATE watch_list SET account='ira' WHERE ticker='AGQ'")
         c.commit()

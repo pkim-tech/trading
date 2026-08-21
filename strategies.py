@@ -38,8 +38,12 @@ def resolve_axis_columns(strategy_name):
 
 
 def uses_fixed_sl(strategy_name):
-    """Whether this strategy's real SL comes from config.execution.fixed_stop_loss
-    rather than a swept grid axis — see BaseStrategy.uses_fixed_sl."""
+    """Whether this strategy's SL is a fixed (non-swept) value rather than a swept
+    grid axis — see BaseStrategy.uses_fixed_sl. config.execution.fixed_stop_loss is
+    only a default used during backtesting; signals_db.add_node() requires the real
+    per-node SL to be passed explicitly via fixed_sl_override when creating a node
+    for a strategy where this returns True, rather than silently trusting that
+    config default."""
     cls = globals().get(strategy_name)
     return cls is not None and issubclass(cls, BaseStrategy) and cls.uses_fixed_sl
 

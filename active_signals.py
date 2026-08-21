@@ -55,11 +55,13 @@ if __name__ == '__main__':
 
 import sys
 import time
+import subprocess
 import threading
 import contextlib
 import functools
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas_market_calendars as mcal
 
@@ -1068,6 +1070,40 @@ def run_loop(tickers: set = None):
                 # failure permanently mask a later clean result.
                 _guarded("reconcile_overlay_nodes", paper_trading.reconcile_overlay_nodes)
 
+                # 2026-08-20 (docs/backlog_cache.md, specced 2026-08-20): Part 3's real-vs-
+                # kernel divergence check was never wired into anything automated -- confirmed
+                # nobody ran it 2026-08-18 evening. Run via subprocess, not a direct import:
+                # scripts/evening_status.py does `import active_signals as a` at module level,
+                # so a direct import here would be circular. Log-only (evening_status.py itself
+                # persists structured results to signals_db.divergence_check_log and its own
+                # RUN_LOG_PATH), no Slack post -- matches this block's other reconcilers. 30d
+                # trailing window means once/day is correct, no value running more often.
+                #
+                # Paired Opus review (2026-08-20, independent-cold + contextual, both agreed)
+                # caught two real gaps in the first version: (1) a non-zero returncode was only
+                # printed, never raised -- _guarded's Slack alert + coverage_event only fire on
+                # an actual exception, so a persistently-failing run looked wired forever while
+                # producing nothing; now raises so _guarded catches it properly. (2) the
+                # subprocess ran the WHOLE of part3() (5 sub-parts), and the one sub-part that
+                # actually writes divergence_check_log (sub-part 5) runs LAST, behind the
+                # slowest piece (_deep_live_parity's bar-by-bar replay, sub-part 4) -- a slow
+                # night could exhaust the timeout before the intended output is ever written.
+                # --skip-deep-parity (an existing flag evening_status.py already supports)
+                # protects the actual target of this item; a human can still run the full
+                # `evening_status.py 3` manually anytime for the deep-parity check. Absolute
+                # path (not a cwd-relative one) since the daemon's cwd isn't guaranteed to be
+                # the repo root.
+                def _run_evening_status_part3():
+                    script = str(Path(__file__).resolve().parent / "scripts" / "evening_status.py")
+                    r = subprocess.run([sys.executable, script, "3", "--skip-deep-parity"],
+                                        capture_output=True, text=True, timeout=300)
+                    if r.returncode != 0:
+                        raise RuntimeError(
+                            f"evening_status.py 3 exited rc={r.returncode}: {r.stderr[-500:]}")
+                    print("  [evening_status] Part 3 divergence check: ran, "
+                          "see logs/evening_status_runs.log and divergence_check_log")
+                _guarded("evening_status_part3", _run_evening_status_part3)
+
                 # 2026-08-14: nightly storage trim -- blocks_json (the full
                 # Block Kit payload of every Slack message) is 10-50x the size
                 # of `text`, and output/live_backups/ keeps 720 uncompressed
@@ -1647,7 +1683,11 @@ def cmd_add():
     max_hold_hours    = int(input("  max_hold_hours: ").strip())
     z_score_threshold = float(input("  z_score_threshold [2.0]: ").strip() or "2.0")
     label             = input("  label (optional): ").strip()
-    add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label, z_score_threshold)
+    fixed_sl_override = None
+    if strategies.uses_fixed_sl(strategy):
+        fixed_sl_override = float(input("  fixed_sl_override (real per-node SL %): ").strip())
+    add_node(ticker, strategy, version, window, take_profit, stop_loss, max_hold_hours, label, z_score_threshold,
+             fixed_sl_override=fixed_sl_override)
     print(f"Added {ticker} (w={window} TP={take_profit} SL={stop_loss} hold={max_hold_hours}h Z={z_score_threshold}) label='{label}'.")
 
 

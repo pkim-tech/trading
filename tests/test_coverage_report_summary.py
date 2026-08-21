@@ -36,7 +36,7 @@ def isolated_db(monkeypatch):
 def _add_node(ticker, notional=500.0, account='soxl_ira'):
     db.add_node(ticker, 'TrailingBothZScoreBreakout', 'canary', window=5,
                 take_profit=0.1, stop_loss=0, max_hold_hours=48, account=account,
-                starting_notional=notional)
+                starting_notional=notional, fixed_sl_override=15)
     return [x for x in db.get_watchlist() if x['ticker'] == ticker][0]
 
 

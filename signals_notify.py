@@ -91,6 +91,19 @@ def _attempt_automated_buy(node, sizing):
         _post_message(f"⚠️ {ticker} automated order placement failed unexpectedly: {e} — falling back to manual",
                        node_id=node.get('id'), incident=True, node=node)
         return False, None
+    # _coverage_mode(account, node) -- NOT account-only -- 2026-08-20 paired review (both
+    # independent-cold and contextual agents converged): node_dry_run (what the broker call
+    # above actually used) is keyed on node['state'], not the account's trading_enabled flag,
+    # so an account-only mode lookup mislabels a dry_run canary's simulated (never-placed)
+    # order as mode='live', which would falsely flip this Grid row to verified-live off a
+    # simulated order -- the same class of fabricated-proof bug this file's own history
+    # already caught twice (2026-08-13 market_buy_placement, 2026-07-27 inverted-deviation).
+    # order_id in detail lets a human distinguish a real broker ack from a dry-run
+    # simulation from the raw event row alone, independent of whether mode is right.
+    db.log_coverage_event("automated_buy_execution", _coverage_mode(account, node), ticker=ticker,
+                           node_id=node.get('id'), result="placed",
+                           detail=f"shares={sizing['shares']} price={sizing['price']} "
+                                  f"trail_buy_pct={sizing['trail_buy_pct']} order_id={order_id}")
     return True, order_id
 
 
@@ -1871,6 +1884,11 @@ def _attempt_automated_market_buy(node, sizing):
         _post_message(f"⚠️ {ticker} automated market-buy placement failed unexpectedly: {e} — falling back to manual",
                        node_id=node.get('id'), incident=True, node=node)
         return False, None
+    # See the identical fix's comment in _attempt_automated_buy above -- same 2026-08-20
+    # paired-review finding, same reasoning: node, not account, decides node_dry_run above.
+    db.log_coverage_event("automated_buy_execution", _coverage_mode(account, node), ticker=ticker,
+                           node_id=node.get('id'), result="placed",
+                           detail=f"shares={sizing['shares']} price={sizing['price']} order_id={order_id}")
     return True, order_id
 
 
@@ -3891,14 +3909,44 @@ def check_addon_leg_reconciliation(open_positions):
                     (leg['parent_trade_log_id'],)
                 ).fetchone() is not None
             if _parent_closed:
+                _today_str = datetime.now().strftime('%Y-%m-%d')
+                if leg.get('orphan_alerted_date') == _today_str:
+                    # backlog_cache.md 2026-08-20 (market-hours-guard paired
+                    # review, finding 2 of 2): the 2026-08-20 early-close
+                    # guard can legitimately defer a leg's lockstep close to
+                    # the next session, so this branch can otherwise fire
+                    # every poll cycle all night for an expected-wait leg, not
+                    # an escalating incident. Snooze per calendar day, not a
+                    # counted cap and NOT indefinite (both paired-review
+                    # agents converged: an earlier same-night boolean version
+                    # silenced this forever once set, which is the only
+                    # recovery signal for a genuine missed lockstep close --
+                    # see set_addon_leg_orphan_alerted's docstring). A poll on
+                    # the SAME day as the last alert stays silent; a new day
+                    # re-arms automatically.
+                    db.log_coverage_event("addon_leg_reconciliation", mode, ticker=ticker, node_id=leg.get('wl_id'),
+                                           result="suppressed_leg_orphan_snoozed", detail=f"leg_id={leg['id']}")
+                    continue
                 db.log_coverage_event("addon_leg_reconciliation", mode, ticker=ticker, node_id=leg.get('wl_id'),
                                        result="orphaned_leg_parent_closed", detail=f"leg_id={leg['id']}")
                 _leg_node = db.get_watch_list_node_by_id(leg.get('wl_id'))
-                _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account, _leg_node)}) — add-on leg ({leg['id']}) "
+                _ch, _ts = _post_message(f"🚨 *{ticker}* ({account} · {mode_tag(account, _leg_node)}) — add-on leg ({leg['id']}) "
                               f"is still open but its parent core position has already closed — the real "
                               f"lockstep close hasn't happened (a genuine miss, or deferred past market close "
                               f"and awaiting the next session). Verify and close the leg manually; NOT auto-closed.",
                               node_id=leg.get('wl_id'), incident=True, node=_leg_node)
+                # Only arm the snooze on a CONFIRMED post OR a deliberate gate
+                # suppression (canary/dry_run) -- both paired-review agents flagged
+                # that _post_message swallows a real Slack send failure internally
+                # and returns (None, None) identically to a suppressed send, so a
+                # naive "always set the flag" would let one transient Slack outage
+                # silently eat the only alert for the whole episode with no retry.
+                # effectively_dry_run mirrors _post_message's own internal gate
+                # check for incident=True + node= (see signals_blocks._post_message),
+                # letting this distinguish "gated, nothing was ever attempted" (safe
+                # to snooze) from "attempted and failed" (must retry next poll).
+                if (_ch and _ts) or effectively_dry_run(_leg_node.get('account') if _leg_node else account, _leg_node):
+                    db.set_addon_leg_orphan_alerted(leg['id'], _today_str)
 
 
 def close_addon_leg_real_if_open(pos, exit_price, exit_reason, exit_time):

@@ -82,7 +82,7 @@ def _clear_auto_fill_flags(ticker, node_id):
 def _add_live_node(ticker, account, notional, state='live', version='v5'):
     signals_db.add_node(ticker, 'TrailingBothZScoreBreakout', version, window=20,
                         take_profit=10, stop_loss=5, max_hold_hours=56,
-                        state=state, account=account, starting_notional=notional)
+                        state=state, account=account, starting_notional=notional, fixed_sl_override=15)
     rows = [n for n in signals_db.get_watchlist()
             if n['ticker'] == ticker and n['account'] == account and n['version'] == version]
     assert len(rows) == 1, f"expected exactly one fresh node for {ticker}/{account}/{version}"

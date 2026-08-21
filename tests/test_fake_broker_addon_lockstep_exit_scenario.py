@@ -250,6 +250,49 @@ def test_orphaned_leg_alerted_loudly_never_auto_closed(env, fake_broker):
     assert any(e['ticker'] == TICKER and e['result'] == 'orphaned_leg_parent_closed' for e in events)
 
 
+def test_orphaned_leg_alert_snoozes_same_day_then_rearms_next_day(env, fake_broker, monkeypatch):
+    """2026-08-20 paired-review fix: the orphan alert must fire once per calendar
+    day (not every poll, not never again). Locally overrides env's permanent
+    _post_message noop with a fake confirmed send -- the flag is only supposed
+    to arm on a confirmed post (or a suppressed/dry_run one), and env's default
+    noop always returns (None, None) exactly like a failed send, so it can never
+    exercise the snooze itself."""
+    sent = []
+
+    def _fake_confirmed_post(text, *a, **kw):
+        sent.append(text)
+        return ('C123', '999.111')
+    monkeypatch.setattr(signals_notify, '_post_message', _fake_confirmed_post)
+
+    node = _node()
+    fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    pos = _open_core_position(node)
+    leg_id = signals_db.open_addon_leg(pos, shares=20, entry_price=51.0, entry_time=datetime.now(),
+                                        paper=False, entry_status='filled')
+    signals_db.close_position(pos['id'], exit_signal_price=53.0, exit_price=53.0,
+                               exit_time=datetime.now(), exit_reason='SL')
+
+    signals_notify.check_addon_leg_reconciliation([])
+    assert len(sent) == 1, "expected exactly one alert on first detection"
+    leg = signals_db.get_open_addon_legs(paper=False)[0]
+    assert leg['orphan_alerted_date'] is not None, "flag must arm on a confirmed post"
+
+    # Second poll, same day -- must snooze, no second alert.
+    signals_notify.check_addon_leg_reconciliation([])
+    assert len(sent) == 1, "same-day re-poll must not re-alert"
+    events = signals_db.get_coverage_events(scenario_key='addon_leg_reconciliation')
+    assert any(e['result'] == 'suppressed_leg_orphan_snoozed' for e in events)
+
+    # Simulate a new calendar day by backdating the stamp -- must re-arm.
+    with signals_db._conn() as c:
+        c.execute("UPDATE addon_legs SET orphan_alerted_date='2020-01-01' WHERE id=?",
+                   (leg['id'],))
+        c.commit()
+    signals_notify.check_addon_leg_reconciliation([])
+    assert len(sent) == 2, "a new calendar day must re-arm the alert for a still-unresolved orphan"
+
+
 def test_placed_leg_past_timeout_is_cancelled_and_marked_abandoned(env, fake_broker, monkeypatch):
     node = _node()
     fake_broker.set_quote(TICKER, last=52.0, bid=51.99, ask=52.01)

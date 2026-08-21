@@ -231,7 +231,8 @@ if selected_rows:
                      z_score_threshold=float(r['z_score_threshold']),
                      watchlist_id=picked_wl_id,
                      trail_buy_pct=float(r['trail_buy_pct']) if _has_new_cols else None,
-                     trail_pct=float(r['trail_pct']) if _has_new_cols else None)
+                     trail_pct=float(r['trail_pct']) if _has_new_cols else None,
+                     fixed_sl_override=int(r['stop_loss']))
             st.cache_data.clear()
             st.rerun()
         elif not watch_val and is_watched:

@@ -1170,7 +1170,14 @@ def part3():
         if result is None:
             continue
         real_comp, bt_comp, delta_pp = result
-        if delta_pp < -DIVERGENCE_THRESHOLD_PP:
+        flagged = delta_pp < -DIVERGENCE_THRESHOLD_PP
+        # Persisted 2026-08-20 (docs/backlog_cache.md, specced 2026-08-20) -- this was
+        # print-only before, so nothing survived past whatever terminal ran it. Logs every
+        # node with a computed comparison (not just flagged ones), so a later session can
+        # see the full picture, not just the alarms.
+        db.log_divergence_check(wl_id, node['ticker'], node['account'], TODAY,
+                                 DIVERGENCE_WINDOW_DAYS, real_comp, bt_comp, delta_pp, flagged)
+        if flagged:
             div_flagged += 1
             print(f"  ⚠️  {node['ticker']:6s} {node['account'] or '':10s} wl_id={wl_id:4d}  "
                   f"NOT MATCHING BACKTEST: real {real_comp:+.1f}% vs backtest-implied {bt_comp:+.1f}% "
@@ -1178,6 +1185,13 @@ def part3():
     if not div_flagged:
         print(f"  no node exceeds the {DIVERGENCE_THRESHOLD_PP:.0f}pp divergence threshold "
               f"(of {len(div_nodes)} node(s) with enough trades to compare)")
+    # Run-level marker (2026-08-20, from paired Opus review of the EOD-wiring diff) -- the
+    # per-node divergence_check_log rows above only exist when a node has enough trades to
+    # compare, so on a thin-trading night zero rows is indistinguishable from "never ran" or
+    # "crashed before reaching here." This coverage_event fires every run regardless, so a
+    # later session can tell "ran, N node(s) checked, M flagged" apart from silence.
+    db.log_coverage_event("divergence_check_run", "live", None,
+                           result="completed", detail=f"checked={len(div_nodes)} flagged={div_flagged}")
 
     devs = [d for d in db.get_deviations(unexplained_only=True) if d.get('check_date') == TODAY]
     print(f"\n{len(devs)} unexplained coverage_deviation(s) today")

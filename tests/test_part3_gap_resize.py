@@ -66,7 +66,7 @@ def env(monkeypatch, tmp_path):
     signals_db.ensure_tables()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=20, take_profit=7,
                          stop_loss=5, max_hold_hours=7, state='live',
-                         trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000)
+                         trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000, fixed_sl_override=15)
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ?", (TICKER,))
         c.commit()
@@ -238,7 +238,7 @@ def test_reconcile_buy_fill_resolves_correct_sibling_node(env, monkeypatch):
     node_a = _node()
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test_sibling', window=20,
                          take_profit=7, stop_loss=5, max_hold_hours=7, state='live',
-                         trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000, account='ira')
+                         trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000, account='ira', fixed_sl_override=15)
     node_b = [n for n in signals_db.get_watchlist() if n['ticker'] == TICKER and n['version'] == 'test_sibling'][0]
     signals_db.add_pending_buy(node_b, _sig(), channel='C1', ts='999.1')
 
@@ -440,7 +440,7 @@ def test_drain_fill_queue_resolves_node_by_order_id_not_fuzzy_ticker_account_loo
     # one instead of the real pending buy's node, the gate would wrongly fail.
     signals_db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test2', window=25, take_profit=8,
                          stop_loss=6, max_hold_hours=9, state='live',
-                         trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000)
+                         trail_buy_pct=1.0, trail_pct=1.0, starting_notional=50000, fixed_sl_override=15)
     with signals_db._conn() as c:
         c.execute("UPDATE watch_list SET account = 'ira' WHERE ticker = ? AND version = 'test2'", (TICKER,))
         c.commit()

@@ -39,7 +39,7 @@ def isolated_db(monkeypatch):
 
 def _add_canary_node(ticker=TICKER, state='live'):
     db.add_node(ticker, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=1.0, max_hold_hours=48, state=state, account='ira')
+                stop_loss=1.0, max_hold_hours=48, state=state, account='ira', fixed_sl_override=15)
     with db._conn() as c:
         row = c.execute("SELECT * FROM watch_list WHERE ticker=? AND version='canary'", (ticker,)).fetchone()
     return dict(row)
@@ -56,7 +56,7 @@ def _open_pos(node, is_dry_run_sim=True, entry_price=95.0):
 def test_list_canary_nodes_excludes_non_canary(isolated_db):
     _add_canary_node()
     db.add_node('TEST_RESTAGE_NONCANARY', 'TrailingBothZScoreBreakout', 'v5', window=5,
-                take_profit=0.1, stop_loss=1.0, max_hold_hours=48, state='live', account='ira')
+                take_profit=0.1, stop_loss=1.0, max_hold_hours=48, state='live', account='ira', fixed_sl_override=15)
     nodes = list_canary_nodes()
     tickers = [n['ticker'] for n in nodes]
     assert TICKER in tickers

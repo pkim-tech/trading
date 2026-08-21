@@ -43,7 +43,7 @@ def _fake_sig(price=85.0):
 
 def _add_node(version, account='ira', state='live'):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', version, window=5, take_profit=0.1,
-                stop_loss=1.0, max_hold_hours=48, state=state, account=account)
+                stop_loss=1.0, max_hold_hours=48, state=state, account=account, fixed_sl_override=15)
     with db._conn() as c:
         row = c.execute("SELECT * FROM watch_list WHERE ticker=? AND version=?", (TICKER, version)).fetchone()
     node = dict(row)

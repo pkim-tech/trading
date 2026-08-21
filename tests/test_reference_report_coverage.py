@@ -98,7 +98,7 @@ def test_build_reference_table_shows_a_held_paper_position(env, monkeypatch):
     signals_db.add_node(
         ticker='PAPERTEST', strategy='TrailingBothZScoreBreakout', version='v5', window=10,
         take_profit=30.0, stop_loss=2, max_hold_hours=70, state='paper', account='ira',
-        trail_buy_pct=3.0, trail_pct=1.0,
+        trail_buy_pct=3.0, trail_pct=1.0, fixed_sl_override=15,
     )
     node = signals_db.get_watch_list_node(ticker='PAPERTEST')
     opened = signals_db.open_position(
@@ -125,7 +125,7 @@ def _paper_node_with_position(ticker='PAPERORIGIN', state='paper', shares=100):
     signals_db.add_node(
         ticker=ticker, strategy='TrailingBothZScoreBreakout', version='v5', window=10,
         take_profit=30.0, stop_loss=2, max_hold_hours=70, state=state, account='ira',
-        trail_buy_pct=3.0, trail_pct=1.0,
+        trail_buy_pct=3.0, trail_pct=1.0, fixed_sl_override=15,
     )
     node = signals_db.get_watch_list_node(ticker=ticker)
     assert signals_db.open_position(
@@ -156,7 +156,7 @@ def test_real_position_row_is_stamped_origin_live(env, monkeypatch):
     signals_db.add_node(
         ticker='LIVEORIGIN', strategy='TrailingBothZScoreBreakout', version='v5', window=10,
         take_profit=30.0, stop_loss=2, max_hold_hours=70, state='live', account='ira',
-        trail_buy_pct=3.0, trail_pct=1.0,
+        trail_buy_pct=3.0, trail_pct=1.0, fixed_sl_override=15,
     )
     node = signals_db.get_watch_list_node(ticker='LIVEORIGIN')
     assert signals_db.open_position(
@@ -185,7 +185,7 @@ def test_bug54_real_position_gets_no_paper_tag(env, monkeypatch):
     signals_db.add_node(
         ticker='LIVENOTAG', strategy='TrailingBothZScoreBreakout', version='v5', window=10,
         take_profit=30.0, stop_loss=2, max_hold_hours=70, state='live', account='ira',
-        trail_buy_pct=3.0, trail_pct=1.0,
+        trail_buy_pct=3.0, trail_pct=1.0, fixed_sl_override=15,
     )
     node = signals_db.get_watch_list_node(ticker='LIVENOTAG')
     assert signals_db.open_position(
@@ -219,7 +219,7 @@ def test_real_position_still_gets_its_manual_close_button(env, monkeypatch):
     signals_db.add_node(
         ticker='LIVECLOSE', strategy='TrailingBothZScoreBreakout', version='v5', window=10,
         take_profit=30.0, stop_loss=2, max_hold_hours=70, state='live', account='ira',
-        trail_buy_pct=3.0, trail_pct=1.0,
+        trail_buy_pct=3.0, trail_pct=1.0, fixed_sl_override=15,
     )
     node = signals_db.get_watch_list_node(ticker='LIVECLOSE')
     assert signals_db.open_position(
@@ -281,7 +281,7 @@ def test_reference_row_arm_pct_reads_take_profit_for_trailing_exit_nodes(env, mo
     signals_db.add_node(
         ticker='ARMTEST', strategy='TrailingExitZScoreBreakout', version='v5', window=10,
         take_profit=1.0, stop_loss=2, max_hold_hours=70, state='paper', account='roth',
-        trail_pct=3.0,
+        trail_pct=3.0, fixed_sl_override=15,
     )
     node = signals_db.get_watch_list_node(ticker='ARMTEST')
     assert node['arm_sell_pct'] is None and node['take_profit'] == 1.0
@@ -300,7 +300,7 @@ def test_held_trailing_exit_position_renders_its_real_arm_level(env, monkeypatch
     signals_db.add_node(
         ticker='ARMHELD', strategy='TrailingExitZScoreBreakout', version='v5', window=10,
         take_profit=1.0, stop_loss=2, max_hold_hours=70, state='paper', account='roth',
-        trail_pct=3.0,
+        trail_pct=3.0, fixed_sl_override=15,
     )
     node = signals_db.get_watch_list_node(ticker='ARMHELD')
     assert signals_db.open_position(
@@ -321,7 +321,7 @@ def test_reference_row_arm_pct_still_reads_arm_sell_pct_for_trailing_both_nodes(
     signals_db.add_node(
         ticker='ARMBOTH', strategy='TrailingBothZScoreBreakout', version='v5', window=10,
         take_profit=30.0, stop_loss=2, max_hold_hours=70, state='paper', account='roth',
-        trail_buy_pct=3.0, trail_pct=1.0,
+        trail_buy_pct=3.0, trail_pct=1.0, fixed_sl_override=15,
     )
     node = signals_db.get_watch_list_node(ticker='ARMBOTH')
     assert node['take_profit'] is None and node['arm_sell_pct'] == 30.0
@@ -338,7 +338,7 @@ def test_held_trailing_exit_position_with_zero_arm_still_renders(env, monkeypatc
     signals_db.add_node(
         ticker='ARMZERO', strategy='TrailingExitZScoreBreakout', version='v5', window=10,
         take_profit=0, stop_loss=2, max_hold_hours=70, state='paper', account='roth',
-        trail_pct=3.0,
+        trail_pct=3.0, fixed_sl_override=15,
     )
     node = signals_db.get_watch_list_node(ticker='ARMZERO')
     assert signals_db.open_position(

@@ -20,7 +20,7 @@ mocked value reused twice. That gap matters because the two reads can
 disagree -- broker state can move between them -- and nothing in the unit
 suite proves what happens when it does.
 
-Three legs, two nodes:
+Four legs, two nodes:
 
   LEG 0  (node A, _attempt_automated_sell / TRAIL-arm call site) -- baseline,
          nothing has drifted. Round-trip 1 finds the recorded sl_order_id
@@ -84,6 +84,44 @@ Three legs, two nodes:
          => coverage_events['automated_sell_execution']='blocked'        <-- checked
          => the human's order is untouched, exactly one resting SELL for
             the ticker in this account, no orphan third order created     <-- checked
+
+  LEG C  (node A, continuing; _attempt_automated_sell / TRAIL-arm call site
+         again) -- added 2026-08-20 to close a real Grid gap: legs 0/A/B
+         above never actually drive round-trip 1 against a resting order
+         that is ALREADY drifted before round-trip 1 even reads it, from the
+         ARM call site specifically. Leg A proves the id-miss-with-
+         substitute shape from the EXIT call site, but 2026-08-19's SL
+         redesign means that path logs sl_exit_resting_noop, not
+         replace_target_mismatch -- so the scenario as a whole ran green
+         with zero real replace_target_mismatch events ever logged, despite
+         exercising a conceptually adjacent case. Leg C mutates broker state
+         entirely before round-trip 1 runs (the human's still-resting order
+         from leg A gets its resting quantity changed, id/price untouched),
+         then calls _attempt_automated_sell -- the ARM path, genuinely
+         reaching _verify_resting_before_replace's quantity check at line
+         ~1072, which is one of the branches that logs
+         scenario_key='replace_target_mismatch' directly.
+
+         Deliberately quantity_mismatch, not the id-miss-with-substitute
+         branch leg A already covers (at the EXIT call site): an earlier
+         draft tried mirroring leg A's cancel-and-substitute shape here too,
+         but _attempt_automated_sell's round-trip 2 always replaces the
+         position's own RECORDED sl_order_id (the function never returns its
+         found substitute back to the caller -- it's advisory-only), so
+         replacing an already-canceled id left the substitute as a genuine
+         second resting SELL that check_order correctly refused to duplicate
+         against (a real, valid BLOCKED outcome, same shape as leg B, but
+         not what this leg is for). Keeping the SAME still-resting order's id
+         valid -- only its quantity drifts -- lets round-trip 2 succeed
+         cleanly while round-trip 1 still finds and logs the mismatch.
+         => coverage_events['replace_target_mismatch'] has ONE
+            result='quantity_mismatch' event for node A                    <-- checked
+         => the mismatch alert names the resting order's real quantity vs.
+            what the position actually holds                               <-- checked
+         => round-trip 2 still succeeds (advisory-only, never blocks) --
+            the resized order REPLACED, exactly one resting SELL afterward,
+            correctly resized back to the position's real share count       <-- checked
+         => pos_a's sl_order_id repointed to the new resting order          <-- checked
 
 Entry-side state is SEEDED throughout (sl_order_id/resting orders inserted
 directly), matching every other Phase 2 scenario's accepted caveat -- this
@@ -352,6 +390,85 @@ def run(price=None, verbose=True):
     checks.append(Check("leg B: automated_sell_execution logged 'blocked' for node B",
                         len(blocked_b) == 1, f"events={[(e['result'], e['detail']) for e in exec_events_b]}"))
 
+    # ============================================================== LEG C
+    # UPDATED 2026-08-20 (Grid gap closure): legs 0/A/B above prove
+    # _verify_resting_before_replace's id-miss-with-substitute branch fires
+    # correctly from the EXIT call site (_attempt_automated_exit_sell, via
+    # the separate _exit_order_resting/adopt-substitute path that logs
+    # sl_exit_resting_noop, NOT replace_target_mismatch -- see the 2026-08-19
+    # redesign note above), and prove the honest TOCTOU gap from the ARM call
+    # site (_attempt_automated_sell) when round-trip 1's own read is clean.
+    # Neither leg ever drives _attempt_automated_sell against a resting order
+    # that IS already stale/mismatched BEFORE round-trip 1 even reads it --
+    # the one shape that actually logs scenario_key='replace_target_mismatch'
+    # itself, per this function's own code (line ~1072, the quantity check).
+    # This leg closes that: continues node A's position (same real-incident
+    # narrative -- the human who mispriced SOXS's stop on 2026-08-14 could
+    # just as easily have modified its size before an ARM fires as before an
+    # SL exit fires), mutates the human's still-resting order's quantity
+    # OUTSIDE any timed round-trip, then calls _attempt_automated_sell.
+    #
+    # Deliberately quantity_mismatch, not resting_order_id_stale: an earlier
+    # draft of this leg canceled the resting order and seeded a same-priced
+    # substitute under a new id (mirroring leg A's shape) -- but
+    # _attempt_automated_sell's round-trip 2 always replaces the position's
+    # OWN RECORDED sl_order_id (_verify_resting_before_replace never returns
+    # its found substitute back to the caller, by design -- it's advisory-
+    # only). Replacing an already-canceled id left the substitute as a
+    # genuine second resting SELL that check_order's _has_open_sell_order
+    # correctly refused to duplicate against -- a real, valid BLOCKED outcome
+    # (the honest TOCTOU-closed case, same shape as leg B), but not what this
+    # leg is for. Mutating the SAME still-resting order's quantity instead
+    # keeps round-trip 2's target id valid and resting, so the replace still
+    # succeeds cleanly while round-trip 1 still finds and logs the mismatch.
+    say("[leg C] node A (continuing): the human's still-resting order from leg A is corrected back "
+        "to the algo's expected price and gets resized (quantity drifts from what the position "
+        "holds) before a genuine TRAIL-arm fires")
+    human_order_leg = broker.orders[human_order]
+    # Leg A deliberately left this order mispriced (mispriced_stop) to prove the price-mismatch
+    # branch there indirectly (via the exit-side noop path, which doesn't check price at all).
+    # Reset it to the algo's own expected price here so leg C isolates JUST the quantity-mismatch
+    # branch -- otherwise stop_price_mismatch would also fire alongside it, muddying the proof.
+    human_order_leg['stopPrice'] = expected_stop
+    real_shares_c = human_order_leg['orderLegCollection'][0]['quantity']
+    mismatched_shares_c = real_shares_c + 5
+    human_order_leg['orderLegCollection'][0]['quantity'] = mismatched_shares_c
+    say(f"[leg C] broker: order {human_order}'s stopPrice corrected to ${expected_stop:.4f}; resting "
+        f"quantity changed {real_shares_c:g} -> {mismatched_shares_c:g} (position still holds "
+        f"{real_shares_c:g}); order id untouched")
+
+    ok_c, new_id_c = notify._attempt_automated_sell(pos_a_after, current_price=price)
+    checks.append(Check("leg C: the arm-time replace still succeeded (advisory-only check never "
+                        "blocks -- round-trip 2 replaced the same, still-valid id cleanly)",
+                        ok_c and new_id_c is not None, f"ok={ok_c} new_id={new_id_c}"))
+
+    mismatch_c = [e for e in db.get_coverage_events(scenario_key='replace_target_mismatch')
+                  if e['node_id'] == node_a['id']]
+    results_c = sorted(e['result'] for e in mismatch_c)
+    checks.append(Check("leg C: replace_target_mismatch logged exactly the quantity-mismatch outcome "
+                        "for node A -- the arm-time call site, not the exit-time one",
+                        results_c == ['quantity_mismatch'], f"results={results_c}"))
+    checks.append(Check("leg C: the mismatch alert named the resting order's real quantity vs. the "
+                        "position's actual shares",
+                        any(f"covers {mismatched_shares_c:g} shares" in p
+                            and f"holds {real_shares_c:g}" in p for p in posted),
+                        f"posted={posted}"))
+    checks.append(Check("leg C: the resized order is now REPLACED (round-trip 2 targeted the same id "
+                        "the advisory check flagged, not a different one)",
+                        broker.orders[human_order]['status'] == 'REPLACED',
+                        f"status={broker.orders[human_order]['status']}"))
+    resting_after_legc = _resting_sells(broker, CASH_ALIAS, TICKER)
+    checks.append(Check("leg C: exactly one resting SELL afterward, at the id round-trip 2 returned, "
+                        "correctly resized back to the position's real share count",
+                        len(resting_after_legc) == 1 and resting_after_legc[0]['orderId'] == new_id_c
+                        and notify._resting_order_quantity(resting_after_legc[0]) == real_shares_c,
+                        f"resting={[(o['orderId'], notify._resting_order_quantity(o)) for o in resting_after_legc]} "
+                        f"expected=[({new_id_c}, {real_shares_c})]"))
+    pos_a_final = db.get_open_position_by_wl_id(node_a['id'])
+    checks.append(Check("leg C: position's sl_order_id repointed to the new resting order",
+                        pos_a_final['sl_order_id'] == new_id_c,
+                        f"sl_order_id={pos_a_final['sl_order_id']} expected={new_id_c}"))
+
     observations['node_a_wl_id'] = node_a['id']
     observations['node_b_wl_id'] = node_b['id']
     observations['price'] = price
@@ -373,6 +490,8 @@ SELECT wl.id AS wl_id, wl.account,
          AND result='adopted_substitute' AND node_id=wl.id) AS adopted_events,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='replace_target_mismatch'
          AND node_id=wl.id) AS mismatch_events,
+       (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='replace_target_mismatch'
+         AND result='quantity_mismatch' AND node_id=wl.id) AS qty_mismatch_events,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='automated_sell_execution'
          AND result='blocked' AND node_id=wl.id) AS sell_blocked,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='automated_exit_execution'
@@ -386,8 +505,14 @@ SELECT wl.id AS wl_id, wl.account,
 def verify_proof(db_path):
     """Returns (ok, rows). ok requires exactly 2 nodes (A, B) on file, node A
     logging one sl_exit_resting_noop/adopted_substitute event (leg A's
-    detected-stale-id-adopts-substitute case) and ZERO automated_exit_execution
-    events (no placement was ever attempted, per the 2026-08-19 SL-redesign --
+    detected-stale-id-adopts-substitute case at the EXIT call site) AND one
+    replace_target_mismatch/quantity_mismatch event (leg C, a conceptually
+    adjacent drift shape at the ARM call site, _attempt_automated_sell --
+    added 2026-08-20 to close the real Grid gap: leg A's shape logs
+    sl_exit_resting_noop, not replace_target_mismatch, since the 2026-08-19
+    SL redesign, so replace_target_mismatch itself had zero live-proof events
+    despite the scenario running green) and ZERO automated_exit_execution
+    events (no placement was ever attempted for leg A, per that redesign --
     see this scenario's module docstring), and node B logging ZERO
     replace_target_mismatch events (the honest TOCTOU gap in leg B) plus one
     blocked automated_sell_execution (leg B) -- directly from the harness
@@ -406,5 +531,6 @@ def verify_proof(db_path):
         return False, rows
     node_a, node_b = rows[0], rows[1]
     ok = (node_a['adopted_events'] == 1 and node_a['exit_events'] == 0
+          and node_a['mismatch_events'] == 1 and node_a['qty_mismatch_events'] == 1
           and node_b['mismatch_events'] == 0 and node_b['sell_blocked'] == 1)
     return ok, rows

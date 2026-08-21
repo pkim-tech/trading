@@ -133,3 +133,39 @@ def test_manual_buy_confirmation_account_no_account_logs_unattributed(env):
     assert len(events) == 1
     assert events[0]['result'] == "no_account"
     assert events[0]['mode'] == "unattributed"
+
+
+def _node_button_body(ticker, wl_id, username='someone'):
+    return {
+        'actions': [{'value': json.dumps({'ticker': ticker, 'wl_id': wl_id})}],
+        'user': {'username': username},
+    }
+
+
+def test_stop_node_automation_button_logs_coverage_event(env):
+    node = _add_node(account='ira')
+
+    body = _node_button_body(TICKER, node['id'], username='alice')
+    signals_handlers.handle_stop_node_automation(_ack, body, _FakeClient())
+
+    events = signals_db.get_coverage_events(scenario_key="node_automation_pause_button")
+    assert len(events) == 1
+    assert events[0]['result'] == "paused_by_user"
+    assert events[0]['node_id'] == node['id']
+    assert events[0]['ticker'] == TICKER
+    assert events[0]['mode'] in ("live", "dry_run")
+    assert events[0]['detail'] == "Slack per-row button by alice"
+
+
+def test_start_node_automation_button_logs_coverage_event(env):
+    node = _add_node(account='ira')
+    schwab_safety.pause_node_automation(node['id'], reason="test setup")
+
+    body = _node_button_body(TICKER, node['id'], username='bob')
+    signals_handlers.handle_start_node_automation(_ack, body, _FakeClient())
+
+    events = signals_db.get_coverage_events(scenario_key="node_automation_pause_button")
+    assert len(events) == 1
+    assert events[0]['result'] == "resumed_by_user"
+    assert events[0]['node_id'] == node['id']
+    assert events[0]['detail'] == "Slack per-row button by bob"

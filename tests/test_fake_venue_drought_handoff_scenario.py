@@ -73,8 +73,9 @@ def test_drought_handoff_json_report_is_self_consistent(tmp_path):
     payload = json.loads([ln for ln in proc.stdout.splitlines() if ln.startswith('{"passed"')][-1])
     assert payload['passed'] is True
     assert all(c['ok'] for c in payload['checks'] if c['required'])
-    # Three watch_list rows (node A, B, C) -- see the scenario's own PROOF_SQL.
-    assert len(payload['proof_rows']) == 3
+    # Four watch_list rows (node A, B, C, D -- D added 2026-08-20 for the
+    # drought_handoff_precondition_blocked mismatch case) -- see the scenario's own PROOF_SQL.
+    assert len(payload['proof_rows']) == 4
     assert payload['observations']['production_path_accesses'] == []
 
 
@@ -104,8 +105,11 @@ def test_drought_handoff_cancel_and_fill_race_proven_directly(tmp_path):
         ).fetchall()
     finally:
         conn.close()
-    assert len(rows) == 3, rows
-    node_a, node_b, node_c = (dict(r) for r in rows)
+    # Four nodes now (node D added 2026-08-20 for the drought_handoff_precondition_blocked
+    # mismatch case) -- this test only pins A/B/C's cancel/race/unconfirmed behavior, D's
+    # own precondition-mismatch behavior is pinned separately.
+    assert len(rows) == 4, rows
+    node_a, node_b, node_c, _node_d = (dict(r) for r in rows)
     assert node_a['clean_cancels'] == 1, node_a
     assert node_b['raced_fills'] == 1, node_b
     assert node_c['unconfirmed'] == 1, node_c

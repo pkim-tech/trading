@@ -60,7 +60,7 @@ def test_add_node_dedupes_trailing_both_null_take_profit(db):
     A = db
     for _ in range(3):
         A.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=20,
-                   stop_loss=5, max_hold_hours=24, trail_buy_pct=3.0, trail_pct=1.0)
+                   stop_loss=5, max_hold_hours=24, trail_buy_pct=3.0, trail_pct=1.0, fixed_sl_override=15)
     watchlist = [n for n in A.get_watchlist() if n['ticker'] == TICKER]
     assert len(watchlist) == 1
     assert watchlist[0]['strategy'] == 'TrailingBothZScoreBreakout'
@@ -74,9 +74,9 @@ def test_add_node_does_not_collapse_distinct_arm_sell_pct_configs(db):
     take_profit=NULL, different arm_sell_pct) must NOT collapse to one."""
     A = db
     A.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=20,
-               stop_loss=5, max_hold_hours=24, trail_buy_pct=3.0, trail_pct=1.0)
+               stop_loss=5, max_hold_hours=24, trail_buy_pct=3.0, trail_pct=1.0, fixed_sl_override=15)
     A.add_node(TICKER, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=30,
-               stop_loss=5, max_hold_hours=24, trail_buy_pct=3.0, trail_pct=1.0)
+               stop_loss=5, max_hold_hours=24, trail_buy_pct=3.0, trail_pct=1.0, fixed_sl_override=15)
     watchlist = [n for n in A.get_watchlist() if n['ticker'] == TICKER]
     assert len(watchlist) == 2
     assert {n['arm_sell_pct'] for n in watchlist} == {20.0, 30.0}

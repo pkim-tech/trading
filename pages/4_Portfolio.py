@@ -465,7 +465,8 @@ with st.expander("Research nodes (from DB)", expanded=False):
                                      z_score_threshold=float(r_row['z_score_threshold']),
                                      watchlist_id=picked_wl_id,
                                      trail_buy_pct=float(r_row['trail_buy_pct']) if _has_new_cols else None,
-                                     trail_pct=float(r_row['trail_pct']) if _has_new_cols else None)
+                                     trail_pct=float(r_row['trail_pct']) if _has_new_cols else None,
+                                     fixed_sl_override=int(r_row['stop_loss']))
                             st.cache_data.clear()
                             st.rerun()
                     with ac2:

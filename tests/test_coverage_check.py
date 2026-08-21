@@ -210,7 +210,7 @@ def _most_recent_trading_day():
 
 def _add_closed_trade(exit_reason, entry_time, exit_time):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5,
-                take_profit=0.1, stop_loss=0, max_hold_hours=48)
+                take_profit=0.1, stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
     db.open_position(n, signal_price=100.0, signal_time=entry_time, entry_price=101.0,
                       entry_time=entry_time, shares=10)
@@ -257,7 +257,7 @@ def test_check_trade_lifecycle_exit_reason_met_by_still_open_position(isolated_d
     explain path."""
     now = datetime.now()
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
     db.open_position(n, signal_price=100.0, signal_time=now, entry_price=101.0,
                       entry_time=now, shares=10)
@@ -274,7 +274,7 @@ def test_check_trade_lifecycle_exit_reason_met_by_pending_buy(isolated_db):
     is also real, unresolved activity -- must not read as 'no activity'."""
     now = datetime.now()
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
     sig = dict(current_price=100.0, last_bar=now)
     db.add_pending_buy(n, sig, channel='C123', ts='123.456')
@@ -289,7 +289,7 @@ def test_check_trade_lifecycle_exit_reason_met_by_pending_buy(isolated_db):
 def test_check_trade_lifecycle_pending_carryover_met_by_pending_row(isolated_db):
     now = datetime.now()
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
     sig = dict(current_price=100.0, last_bar=now)
     db.add_pending_buy(n, sig, channel='C123', ts='123.456')
@@ -316,7 +316,7 @@ def test_check_trade_lifecycle_pending_carryover_met_by_still_open_position(isol
     get_open_positions_for_ticker_on_date's docstring)."""
     now = datetime.now()
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
     db.open_position(n, signal_price=100.0, signal_time=now, entry_price=101.0,
                       entry_time=now, shares=10)
@@ -335,7 +335,7 @@ def test_check_trade_lifecycle_pending_carryover_met_when_signal_predates_check_
     signal_time is never today's date for a genuine overnight carryover."""
     yesterday = datetime.now() - timedelta(days=1)
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
     sig = dict(current_price=100.0, last_bar=yesterday)
     db.add_pending_buy(n, sig, channel='C123', ts='123.456')
@@ -353,9 +353,9 @@ def test_check_trade_lifecycle_scopes_to_node_not_just_ticker(isolated_db):
     node's trade -- ticker alone is not enough."""
     today = datetime.now()
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=10,
-                take_profit=5.0, stop_loss=1, max_hold_hours=48)
+                take_profit=5.0, stop_loss=1, max_hold_hours=48, fixed_sl_override=15)
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'soxl_test', window=20,
-                take_profit=5.0, stop_loss=1, max_hold_hours=48)
+                take_profit=5.0, stop_loss=1, max_hold_hours=48, fixed_sl_override=15)
     node_a, node_b = [n for n in db.get_watchlist() if n['ticker'] == TICKER]
     _set_account(node_a['id'], 'ira')
     _set_account(node_b['id'], 'soxl_ira')
@@ -407,15 +407,15 @@ def _add_two_nodes_same_ticker():
     arm_sell_pct (take_profit's real meaning for this strategy) -- the exact
     shape that broke the old ticker-only dedup."""
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=5,
-                take_profit=5.0, stop_loss=1, max_hold_hours=48)
+                take_profit=5.0, stop_loss=1, max_hold_hours=48, fixed_sl_override=15)
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=5,
-                take_profit=10.0, stop_loss=1, max_hold_hours=48)
+                take_profit=10.0, stop_loss=1, max_hold_hours=48, fixed_sl_override=15)
     return [n for n in db.get_watchlist() if n['ticker'] == TICKER]
 
 
 def test_get_watch_list_node_resolves_unique_match(isolated_db):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=5,
-                take_profit=5.0, stop_loss=1, max_hold_hours=48)
+                take_profit=5.0, stop_loss=1, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
     _set_account(node['id'], 'ira')
     found = db.get_watch_list_node(ticker=TICKER, account='ira')
@@ -462,7 +462,7 @@ def test_get_watch_list_node_scopes_to_active_watchlist(isolated_db):
     active_id = db.get_active_watchlist_id()
     old_id = db.create_watchlist('old_archived')
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v3', window=5,
-                take_profit=5.0, stop_loss=1, max_hold_hours=48, watchlist_id=old_id)
+                take_profit=5.0, stop_loss=1, max_hold_hours=48, watchlist_id=old_id, fixed_sl_override=15)
     old_node = [n for n in db.get_watchlist(old_id) if n['ticker'] == TICKER][0]
     _set_account(old_node['id'], 'ira')
     # not on the active watchlist at all -- must not resolve by default
@@ -535,7 +535,7 @@ def test_pending_buy_node_json_round_trips_id(isolated_db):
     node.get('id') is None, silently making ~14 of the node_id call-site edits
     dead code."""
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=5,
-                take_profit=5.0, stop_loss=1, max_hold_hours=48)
+                take_profit=5.0, stop_loss=1, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
     _set_account(node['id'], 'ira')
     node = db.get_watch_list_node(ticker=TICKER, account='ira')
@@ -555,7 +555,7 @@ def test_pending_buy_node_account_stays_pinned_to_signal_time_snapshot(isolated_
     order's real account is fixed at broker-placement time and must NOT
     silently follow a later watch_list reassignment (the real IVV incident)."""
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=5,
-                take_profit=5.0, stop_loss=1, max_hold_hours=48)
+                take_profit=5.0, stop_loss=1, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
     _set_account(node['id'], 'brokerage')
     fresh_node = db.get_watch_list_node(ticker=TICKER, account='brokerage')
@@ -591,7 +591,7 @@ def test_run_check_skips_scenario_when_node_predates_check_date(isolated_db):
     auto-explained with a fabricated 'price never crossed entry threshold' reason. Must be
     skipped, not deviated, and must never call the underlying checker at all."""
     db.add_node('TEST_TIMING_NODE', 'TrailingBothZScoreBreakout', 'v4', window=10,
-                take_profit=1.0, stop_loss=2.0, max_hold_hours=48, account='ira', state='dry_run')
+                take_profit=1.0, stop_loss=2.0, max_hold_hours=48, account='ira', state='dry_run', fixed_sl_override=15)
     with db._conn() as c:
         node = c.execute("SELECT id FROM watch_list WHERE ticker='TEST_TIMING_NODE'").fetchone()
         node_id = node['id']

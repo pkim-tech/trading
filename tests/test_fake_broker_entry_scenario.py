@@ -109,6 +109,20 @@ def test_trailing_buy_entry_places_a_real_resting_order(env, fake_broker):
     assert order['orderLegCollection'][0]['instruction'] == 'BUY'
     assert order['orderLegCollection'][0]['instrument']['symbol'] == TRAILING_TICKER
 
+    # Regression for coverage_registry.py's 'automated_buy_execution' row:
+    # before this fix, _attempt_automated_buy's success path logged nothing
+    # at all -- only its two failure branches did -- so this scenario_key
+    # could never show a successful outcome no matter how many real
+    # automated buys succeeded live.
+    placed_events = [e for e in signals_db.get_coverage_events(scenario_key='automated_buy_execution')
+                      if e['ticker'] == TRAILING_TICKER and e['result'] == 'placed']
+    assert len(placed_events) == 1
+    assert placed_events[0]['mode'] == 'live'
+    assert placed_events[0]['node_id'] == node['id']
+    # See test_trailing_buy_entry_dry_run_node_logs_dry_run_mode_not_live below for the
+    # regression that actually distinguishes account-only vs node-aware mode lookup --
+    # this node is state='live' in a trading-enabled account, so both forms agree here.
+
 
 def test_market_buy_entry_fills_and_protects_with_a_real_stop(env, fake_broker):
     """Market-buy entry: a real MARKET order fills immediately (fake_broker's
@@ -144,3 +158,40 @@ def test_market_buy_entry_fills_and_protects_with_a_real_stop(env, fake_broker):
     assert len(stop_orders) == 1
     assert stop_orders[0]['status'] == 'WORKING'
     assert pos['sl_order_id'] == stop_orders[0]['orderId']
+
+    # Same regression as test_trailing_buy_entry_places_a_real_resting_order
+    # above, for _attempt_automated_market_buy's success path.
+    placed_events = [e for e in signals_db.get_coverage_events(scenario_key='automated_buy_execution')
+                      if e['ticker'] == MARKET_TICKER and e['result'] == 'placed']
+    assert len(placed_events) == 1
+
+
+def test_trailing_buy_entry_dry_run_node_logs_dry_run_mode_not_live(env, fake_broker):
+    """2026-08-20 paired-review finding (both independent-cold and contextual agents,
+    same conclusion): _coverage_mode(account) alone (no node) reads the ACCOUNT's
+    trading_enabled flag, not the NODE's real state -- soxl_ira is trading-enabled, so
+    a dry_run node's simulated (never-placed-at-the-broker) order would be logged
+    mode='live', falsely flipping scripts/coverage_registry.py's automated_buy_execution
+    row to verified-live off a simulated order. The two tests above use state='live'
+    nodes, where account-only and node-aware modes happen to agree -- this is the one
+    that actually distinguishes them."""
+    dry_run_ticker = 'TEST_ENTRY_TRAILING_DRYRUN'
+    schwab_safety.AUTOMATION_ENABLED_TICKERS.add(dry_run_ticker)
+    signals_db.add_node(dry_run_ticker, 'TrailingBothZScoreBreakout', 'test', window=10, take_profit=16.0,
+                         stop_loss=1, max_hold_hours=105, state='dry_run',
+                         trail_buy_pct=1.0, trail_pct=1.0, fixed_sl_override=1.0)
+    with signals_db._conn() as c:
+        c.execute("UPDATE watch_list SET account='soxl_ira', starting_notional=800 WHERE ticker=?",
+                   (dry_run_ticker,))
+        c.commit()
+    fake_broker.set_quote(dry_run_ticker, last=10.15, bid=10.14, ask=10.16)
+    node = _node(dry_run_ticker)
+    sig = _sig(dry_run_ticker, 10.15)
+
+    signals_notify.notify_buy_signal(node, sig)
+
+    placed_events = [e for e in signals_db.get_coverage_events(scenario_key='automated_buy_execution')
+                      if e['ticker'] == dry_run_ticker and e['result'] == 'placed']
+    assert len(placed_events) == 1
+    assert placed_events[0]['mode'] == 'dry_run', \
+        "a dry_run node's simulated order must never log mode='live'"

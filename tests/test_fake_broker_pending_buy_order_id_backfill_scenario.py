@@ -94,7 +94,7 @@ def _add_node(version='test', account='ira', starting_notional=STARTING_NOTIONAL
         ticker=TICKER, strategy='TrailingBothZScoreBreakout', version=version,
         window=20, take_profit=10, stop_loss=5, max_hold_hours=56,
         state='live', account=account, trail_buy_pct=1.0, trail_pct=1.0,
-        starting_notional=starting_notional,
+        starting_notional=starting_notional, fixed_sl_override=15,
     )
     return [n for n in signals_db.get_watchlist() if n['ticker'] == TICKER and n['version'] == version][0]
 

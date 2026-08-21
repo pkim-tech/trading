@@ -63,18 +63,21 @@ for ticker in ('FAS', 'FAZ'):
 
 # Scenario C: pinned/open_check entry timing. Was IWM. Same arm/SL shape as A
 # (practically unreachable) -- entry_timing is the thing under test, not the
-# exit path. NOTE: add_node's dedup key is (ticker, strategy, version, window,
-# take_profit, stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
-# trail_sell_pct, account, paper_role) -- entry_timing and fixed_sl are NOT in
-# it, so an otherwise-identical row silently no-ops as a "duplicate" of
-# Scenario A instead of inserting. Confirmed this bit us twice (first with
-# fixed_sl_override alone, still didn't help since fixed_sl isn't in the key
-# either) -- max_hold_hours=47 (not 48) is what actually makes this row
-# distinct in the real dedup key, 2026-08-13.
+# exit path. NOTE (stale 2026-08-13 note corrected 2026-08-20): add_node's dedup
+# key WAS (ticker, strategy, version, window, take_profit, stop_loss,
+# max_hold_hours, arm_sell_pct, trail_buy_pct, trail_sell_pct, account,
+# paper_role) -- entry_timing/fixed_sl were NOT in it, so this scenario needed
+# max_hold_hours=47 (not 48) purely to stay distinct from Scenario A in the
+# dedup check. That widening landed 2026-08-19 (entry_timing/fixed_sl joined
+# the real key), making the 47 workaround unnecessary -- reverted to 48
+# 2026-08-20 (docs/backlog_cache.md) after a contextual review confirmed it
+# collides with nothing under the new key. Re-running this script now correctly
+# no-ops against the real FAS/FAZ ids 222/223 rows instead of creating a
+# duplicate pair at 47.
 for ticker in ('FAS', 'FAZ'):
     db.add_node(
         ticker=ticker, strategy='TrailingBothZScoreBreakout', version='canary',
-        window=5, take_profit=0.1, stop_loss=0, max_hold_hours=47,
+        window=5, take_profit=0.1, stop_loss=0, max_hold_hours=48,
         label='CANARY-pinned-entry (was IWM)', z_score_threshold=0.1,
         watchlist_id=WATCHLIST_ID, state=STATE, account=ACCOUNT,
         trail_buy_pct=0.1, trail_pct=0.1, entry_timing='open_check',

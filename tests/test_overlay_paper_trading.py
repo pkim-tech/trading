@@ -73,7 +73,7 @@ def core_node(isolated_db):
     make_synthetic_csv(TICKER, last_close=100.0)
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', 20, 30, 2, 48,
                 trail_buy_pct=1.0, trail_pct=7.0, account='test_acct',
-                entry_timing='open_check', starting_notional=10000, state='paper')
+                entry_timing='open_check', starting_notional=10000, state='paper', fixed_sl_override=15)
     with db._conn() as c:
         wl_id = c.execute("SELECT id FROM watch_list WHERE ticker=?", (TICKER,)).fetchone()[0]
     yield db.get_watch_list_node_by_id(wl_id)
@@ -440,10 +440,10 @@ def test_daily_track_overlay_config_invariant_flags_a_real_mismatch(isolated_db)
     make_synthetic_csv(TICKER, last_close=100.0)
     try:
         db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', 20, 30, 2, 48,
-                    trail_buy_pct=1.0, trail_pct=7.0, account='a', watchlist_id=1)
+                    trail_buy_pct=1.0, trail_pct=7.0, account='a', watchlist_id=1, fixed_sl_override=15)
         db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', 20, 30, 2, 48,
                     trail_buy_pct=1.0, trail_pct=7.0, account='a', watchlist_id=1,
-                    paper_role='daily_sync')
+                    paper_role='daily_sync', fixed_sl_override=15)
         with db._conn() as c:
             live_id = c.execute(
                 "SELECT id FROM watch_list WHERE ticker=? AND paper_role IS NULL", (TICKER,)
@@ -463,10 +463,10 @@ def test_daily_track_overlay_config_invariant_silent_when_synced(isolated_db):
     make_synthetic_csv(TICKER, last_close=100.0)
     try:
         db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', 20, 30, 2, 48,
-                    trail_buy_pct=1.0, trail_pct=7.0, account='a', watchlist_id=1)
+                    trail_buy_pct=1.0, trail_pct=7.0, account='a', watchlist_id=1, fixed_sl_override=15)
         db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', 20, 30, 2, 48,
                     trail_buy_pct=1.0, trail_pct=7.0, account='a', watchlist_id=1,
-                    paper_role='daily_sync')
+                    paper_role='daily_sync', fixed_sl_override=15)
         with db._conn() as c:
             c.execute("UPDATE watch_list SET drought_overlay_enabled=1, drought_confirm_days=3")
             c.commit()

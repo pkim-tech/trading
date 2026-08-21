@@ -112,6 +112,12 @@ def make_node(ticker, strategy, **overrides):
         window=20, take_profit=10, stop_loss=5, max_hold_hours=56,
         state='live', trail_buy_pct=1.0, trail_pct=1.0, entry_timing='close',
         starting_notional=50000,
+        # signals_db.add_node now requires fixed_sl_override explicitly for any
+        # uses_fixed_sl strategy (2026-08-20, docs/backlog_cache.md) -- default here
+        # covers the scenario calls that previously relied on add_node's now-removed
+        # silent config.json fallback; scenarios needing a different real SL already
+        # pass fixed_sl_override explicitly via **overrides, which wins over this.
+        fixed_sl_override=5,
     )
     kwargs.update(overrides)
     db.add_node(ticker, strategy, 'harness', **kwargs)

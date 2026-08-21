@@ -53,7 +53,7 @@ def _fake_sig(price=85.0):
 
 def test_slack_buy_button_node_snapshot_matches_pending_buy_node_keys(isolated_db, monkeypatch):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=5, take_profit=0.1,
-                stop_loss=1.0, max_hold_hours=48, state='live', account='ira')
+                stop_loss=1.0, max_hold_hours=48, state='live', account='ira', fixed_sl_override=15)
     db.set_starting_notional_override(_node_id(), 400.0)
     with db._conn() as c:
         c.execute("UPDATE watch_list SET drought_sl_pct_override=?, drought_arm_pct_override=?, "

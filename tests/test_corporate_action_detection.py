@@ -131,6 +131,16 @@ def test_check_sell_condition_does_not_freeze_when_no_real_split_confirmed(monke
     # entry_price=460.976 -> current=23.0488 is a real ~95% drop -- the exit check must have
     # actually run (not silently returned the frozen sentinel) and correctly fired SL.
     assert reason == 'SL'
+    # Grid coverage: check_sell_condition's real_split_confirmed_since==False branch must
+    # actually log price_discontinuity_ruled_out (signals_compute.py's dedup_key logging),
+    # not just produce the right behavior -- a real gap found 2026-08-20 where this test
+    # asserted the behavioral side effect only, and zero real events were ever logged.
+    events = db.get_coverage_events(scenario_key="price_discontinuity_ruled_out")
+    assert len(events) == 1
+    assert events[0]['ticker'] == TICKER
+    assert events[0]['mode'] == 'dry_run'
+    assert events[0]['result'] == 'no_real_split'
+    assert events[0]['position_id'] == 999
 
 
 def test_check_sell_condition_freezes_when_split_check_cannot_be_determined(monkeypatch, capsys):

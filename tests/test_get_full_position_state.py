@@ -78,7 +78,7 @@ def _set_account_and_state(node_id, account, state):
 
 def _make_node(account='TEST_REAL_ACCT', state='live'):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=5,
-                take_profit=5.0, stop_loss=1, max_hold_hours=48)
+                take_profit=5.0, stop_loss=1, max_hold_hours=48, fixed_sl_override=15)
     n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
     _set_account_and_state(n['id'], account, state)
     return db.get_watch_list_node_by_id(n['id'])
@@ -86,7 +86,7 @@ def _make_node(account='TEST_REAL_ACCT', state='live'):
 
 def test_no_account_short_circuits_to_local_only(isolated_db):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'v5', window=5,
-                take_profit=5.0, stop_loss=1, max_hold_hours=48)
+                take_profit=5.0, stop_loss=1, max_hold_hours=48, fixed_sl_override=15)
     n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
     state = get_full_position_state(n['id'])
     assert state['broker_shares'] is None

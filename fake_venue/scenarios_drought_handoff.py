@@ -1,10 +1,11 @@
-"""Phase 2 scenario: `drought_handoff_cancel` / `drought_handoff_exit_placement`,
-the real cancel/replace chain `signals_notify.check_drought_handoff` (Part 5)
-drives once a node's own core signal fires again while a drought-overlay
-entry/position is still live. Both Grid rows are covered in ONE file
-(shared handoff-chain fixtures/state) rather than split -- exact precedent:
-scenarios_replace_target_mismatch.py covers 2 Grid rows in one module for
-the identical reason (one real code path, two accountability rows).
+"""Phase 2 scenario: `drought_handoff_cancel` / `drought_handoff_exit_placement`
+/ `drought_handoff_precondition_blocked`, the real cancel/replace chain
+`signals_notify.check_drought_handoff` (Part 5) drives once a node's own core
+signal fires again while a drought-overlay entry/position is still live.
+Three Grid rows are covered in ONE file (shared handoff-chain fixtures/state)
+rather than split -- exact precedent: scenarios_replace_target_mismatch.py
+covers 2 Grid rows in one module for the identical reason (one real code
+path, several accountability rows).
 
 Real gap this proves against: entry-side drought (`drought_entry_placement`)
 has real live proof (RETL, 2026-08-10, see CLAUDE.md) but HANDOFF itself --
@@ -122,7 +123,53 @@ unconfirmed-fill proof clean):
           it is `required=True` -- real regression coverage against a
           reintroduction of the bug, not just a note.
 
-Entry-side state (Node B/C's drought positions/orders) is SEEDED, not placed
+  NODE D  THE MISMATCH CASE -- schwab_safety.check_order's own 2026-08-17
+          verified-not-trusted precondition (immediately above the dup-window
+          loop this whole module already exercises via node B/C): is_handoff_
+          exit=True is a REQUEST, not a trust token -- replacing_order_id must
+          match the real open drought position's OWN resting order (sl_order_id
+          or trail_state's exit_order_id) before the dup-window exemption is
+          granted. Nodes A/B/C above all drive the MATCHING case implicitly
+          (replacing_order_id is always correctly derived from the same real
+          position by the real call site) -- none of them ever exercise the
+          refusal leg. Node D calls signals_notify._attempt_automated_exit_sell
+          directly with a deliberately WRONG replacing_order_id (same style as
+          scenarios_replace_target_mismatch.py's own LEG A, which calls the
+          identical function directly rather than driving the full daemon
+          wrapper) -- exact precedent for testing this file's sibling gap the
+          same shape.
+
+          Node D's own drought position is seeded OPEN with no real sl_order_id
+          on file at all (mirrors node C's seeding style), so the check_order's
+          EARLIER, unconditional `_has_open_sell_order` guard (which excludes
+          only replacing_order_id, regardless of is_handoff_exit) has nothing
+          real to block on and lets the call reach the is_handoff_exit
+          precondition check at all -- if a real resting SL existed for this
+          ticker/account and replacing_order_id pointed elsewhere, THAT earlier
+          guard would raise `dup_sell_order_blocked` before this leg's own
+          target code ever ran (confirmed by tracing check_order's real branch
+          order, not assumed).
+
+          The fabricated replacing_order_id is deliberately still a real
+          collision risk, not a no-op: node D reuses MARGIN_ALIAS right after
+          node C's own leg finishes, and node C's own real market SELL (the
+          Case B exit above) is still within schwab_safety's 60s
+          DUPLICATE_ORDER_WINDOW_SECS as a genuine 'recent_orders' record for
+          this exact (account, ticker, side, quantity) -- the same account is
+          reused deliberately (matching this file's own established pattern:
+          MARGIN_ALIAS was given to node C specifically so it wouldn't collide
+          with node B's leftover state; node D now deliberately DOES collide
+          with node C's leftover state, to prove the fallthrough dup-window
+          guard -- not just the log line -- actually catches the mismatch).
+          => coverage_events['drought_handoff_precondition_blocked'] =
+             'not_exempted'                                              <-- TARGET
+          => coverage_events['dup_order_window_blocked'] fires (the REAL
+             fallthrough mechanism, not a new special-cased rejection)   <-- checked
+          => coverage_events['automated_exit_execution'] = 'blocked'     <-- checked
+          => coverage_events['manual_sl_fallback_alert'] = 'alerted'     <-- checked
+          => the drought position is still open, no order was placed          <-- checked
+
+Entry-side state (Node B/C/D's drought positions/orders) is SEEDED, not placed
 through the real BUY path -- same accepted caveat as every sibling Phase 2
 scenario; this scenario's target is the HANDOFF cancel/exit chain, not
 drought entry placement (already separately live-proven).
@@ -446,9 +493,94 @@ def run(price=None, verbose=True):
         required=True,
     ))
 
+    # ============================================================== NODE D
+    say("[node D] the MISMATCH case -- is_handoff_exit=True but replacing_order_id does not match the "
+        "real open drought position's own resting order (schwab_safety.check_order's own 2026-08-17 "
+        "verified-not-trusted precondition). Reuses MARGIN_ALIAS now that node C's leg has fully closed "
+        "(no leftover resting order of its own to collide with) -- but node C's own real market SELL "
+        "is still a fresh 'recent_orders' record for this account/ticker, which is exactly what this leg "
+        "needs to prove the fallthrough dup-window guard, not just the precondition log line, catches "
+        "the mismatch.")
+    node_d = _add_node('d', account=MARGIN_ALIAS)
+    entry_price_d = round(price * 0.98, 4)
+    now_d = datetime.now()
+    opened_d = db.open_drought_overlay_position(node_d, entry_price_d, now_d, entry_price_d, now_d,
+                                                 confirm_days=DROUGHT_CONFIRM_DAYS, shares=shares)
+    checks.append(Check("node D setup: real open drought-overlay position, no real sl_order_id on file",
+                        opened_d is not None))
+    pos_d = db.get_drought_overlay_position(node_d['id'])
+    checks.append(Check("node D setup: position has no resting order on file (sl_order_id and "
+                        "trail_state.exit_order_id both unset) -- so the EARLIER, unconditional "
+                        "_has_open_sell_order guard has nothing real to block on regardless of the "
+                        "fabricated replacing_order_id below, and this leg's own target code is what "
+                        "actually gets exercised",
+                        pos_d is not None and pos_d.get('sl_order_id') is None
+                        and not (pos_d.get('trail_state') or {}).get('exit_order_id'),
+                        f"sl_order_id={pos_d.get('sl_order_id') if pos_d else None} "
+                        f"trail_state={pos_d.get('trail_state') if pos_d else None}"))
+    resting_before_d = _resting_sells(broker, MARGIN_ALIAS, TICKER)
+    checks.append(Check("node D setup: no resting SELL currently exists for this ticker/account either "
+                        "(node C's own SELL already filled) -- confirms the early guard passes because "
+                        "there's genuinely nothing to match, not because the fabricated id happens to "
+                        "exclude something real",
+                        resting_before_d == [], f"resting={[o['orderId'] for o in resting_before_d]}"))
+
+    # Fabricated -- never issued by the fake broker, and deliberately NOT the
+    # id of anything real on file. Stands in for a caller holding a stale/
+    # wrong reference (a caller bug, or a genuinely unrelated SELL mislabeled
+    # is_handoff_exit=True) -- exactly the "not just presence-only" gap
+    # check_order's own docstring names.
+    bogus_order_id = 9_999_999
+    pos_d_corrupted = dict(pos_d)
+    pos_d_corrupted['sl_order_id'] = bogus_order_id
+
+    # Direct call to the same real function check_drought_handoff's own Case B
+    # calls -- same precedent as scenarios_replace_target_mismatch.py's LEG A,
+    # which drives _attempt_automated_exit_sell directly rather than the full
+    # daemon wrapper, to isolate exactly the mechanism under test.
+    order_id_d = notify._attempt_automated_exit_sell(pos_d_corrupted, 'HANDOFF', price)
+    checks.append(Check("node D: the mismatched replace was refused -- no order_id returned",
+                        order_id_d is None, f"order_id_d={order_id_d}"))
+
+    precondition_events = db.get_coverage_events(scenario_key="drought_handoff_precondition_blocked")
+    blocked_d = [e for e in precondition_events if e['node_id'] == node_d['id'] and e['result'] == 'not_exempted']
+    checks.append(Check("node D: drought_handoff_precondition_blocked fired 'not_exempted' -- the TARGET "
+                        "this leg exists to prove (is_handoff_exit=True alone is NOT trusted; "
+                        "replacing_order_id must match the real open drought position's own resting "
+                        "order before the dup-window exemption is granted)",
+                        len(blocked_d) == 1, f"events={[(e['result'], e['detail']) for e in precondition_events]}"))
+
+    dup_events_d = db.get_coverage_events(scenario_key="dup_order_window_blocked")
+    dup_blocked_d = [e for e in dup_events_d if e['node_id'] == node_d['id']]
+    checks.append(Check("node D: dup_order_window_blocked (the REAL, ordinary fallthrough mechanism) is "
+                        "what actually caught it -- not exempted really did mean 'evaluated normally,' "
+                        "not a new special-cased rejection, and not silently waved through either",
+                        len(dup_blocked_d) == 1, f"events={[(e['result'], e['detail']) for e in dup_events_d]}"))
+
+    exec_events_d = db.get_coverage_events(scenario_key="automated_exit_execution")
+    exec_blocked_d = [e for e in exec_events_d if e['node_id'] == node_d['id'] and e['result'] == 'blocked']
+    checks.append(Check("node D: automated_exit_execution logged 'blocked' -- the mismatch was NOT "
+                        "silently exempted from the duplicate-order guard",
+                        len(exec_blocked_d) == 1, f"events={[(e['result'], e['detail']) for e in exec_events_d]}"))
+
+    fallback_d = db.get_coverage_events(scenario_key="manual_sl_fallback_alert")
+    alerted_d = [e for e in fallback_d if e['node_id'] == node_d['id'] and e['result'] == 'alerted']
+    checks.append(Check("node D: manual_sl_fallback_alert fired -- a human is now correctly asked to "
+                        "verify, since the automated replace was (correctly) refused",
+                        len(alerted_d) == 1, f"events={[(e['result'], e['detail']) for e in fallback_d]}"))
+
+    checks.append(Check("node D: the drought position is still open -- the mismatched HANDOFF attempt "
+                        "did not close it (correctly refused rather than wrongly exempted)",
+                        db.get_drought_overlay_position(node_d['id']) is not None))
+    resting_after_d = _resting_sells(broker, MARGIN_ALIAS, TICKER)
+    checks.append(Check("node D: still zero resting SELLs -- the blocked replace never reached the "
+                        "broker at all, no order was placed against either the bogus id or anything else",
+                        resting_after_d == [], f"resting={[o['orderId'] for o in resting_after_d]}"))
+
     observations['node_a_wl_id'] = node_a['id']
     observations['node_b_wl_id'] = node_b['id']
     observations['node_c_wl_id'] = node_c['id']
+    observations['node_d_wl_id'] = node_d['id']
     observations['price'] = price
     observations['shares'] = shares
     return checks, observations
@@ -474,6 +606,10 @@ SELECT wl.id AS wl_id, wl.account,
          AND result='failed_or_blocked' AND node_id=wl.id) AS failed_or_blocked_placements,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='drought_handoff_exit_placement'
          AND result='placed_unconfirmed' AND node_id=wl.id) AS unconfirmed_placements,
+       (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='drought_handoff_precondition_blocked'
+         AND result='not_exempted' AND node_id=wl.id) AS precondition_mismatches,
+       (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='dup_order_window_blocked'
+         AND node_id=wl.id) AS dup_window_blocks,
        (SELECT COUNT(*) FROM open_positions WHERE wl_id=wl.id
          AND position_source='drought_overlay') AS open_drought_positions,
        (SELECT COUNT(*) FROM trade_log WHERE wl_id=wl.id
@@ -485,18 +621,23 @@ SELECT wl.id AS wl_id, wl.account,
 
 
 def verify_proof(db_path):
-    """Returns (ok, rows). ok requires exactly 3 nodes (A, B, C): node A with
-    1 clean cancel; node B with 1 raced_fill, ZERO failed_or_blocked exit
-    placements (fixed 2026-08-17 -- schwab_safety.check_order's
+    """Returns (ok, rows). ok requires exactly 4 nodes (A, B, C, D): node A
+    with 1 clean cancel; node B with 1 raced_fill, ZERO failed_or_blocked
+    exit placements (fixed 2026-08-17 -- schwab_safety.check_order's
     is_handoff_exit exemption now lets node B's own just-placed protective
     SL be replaced by its own HANDOFF exit instead of self-colliding), and 1
     real HANDOFF-closed trade_log row (the replace succeeded and closed the
     position in the same call); node C with 1 placed_unconfirmed exit-
     placement event, zero remaining open drought-overlay position, and 1
-    real HANDOFF-closed trade_log row -- directly from the harness DB. Node
-    C's assertions confirm the exit_pending['current_price'] fix's real
-    effect (check_own_sell_fills actually closing the position), not just
-    the absence of a KeyError."""
+    real HANDOFF-closed trade_log row; node D with 1 precondition-mismatch
+    event, 1 real dup_order_window_blocked (the mismatch fell through to and
+    was actually caught by the ordinary fallthrough guard, not just logged),
+    and its drought position still open (0 handoff-closed trades) -- directly
+    from the harness DB. Node C's assertions confirm the
+    exit_pending['current_price'] fix's real effect (check_own_sell_fills
+    actually closing the position), not just the absence of a KeyError. Node
+    D's assertions confirm the mismatch is genuinely refused, not just logged
+    -- a real fallthrough block, not a no-op precondition check."""
     import sqlite3
 
     from fake_venue.scenarios_meta import TICKER as _ticker
@@ -507,13 +648,17 @@ def verify_proof(db_path):
         rows = [dict(r) for r in conn.execute(PROOF_SQL, (_ticker,)).fetchall()]
     finally:
         conn.close()
-    if len(rows) != 3:
+    if len(rows) != 4:
         return False, rows
-    node_a, node_b, node_c = rows
+    node_a, node_b, node_c, node_d = rows
     ok = (node_a['clean_cancels'] == 1
           and node_b['raced_fills'] == 1 and node_b['failed_or_blocked_placements'] == 0
           and node_b['handoff_closed_trades'] == 1
           and node_c['unconfirmed_placements'] == 1
           and node_c['open_drought_positions'] == 0
-          and node_c['handoff_closed_trades'] == 1)
+          and node_c['handoff_closed_trades'] == 1
+          and node_d['precondition_mismatches'] == 1
+          and node_d['dup_window_blocks'] == 1
+          and node_d['open_drought_positions'] == 1
+          and node_d['handoff_closed_trades'] == 0)
     return ok, rows

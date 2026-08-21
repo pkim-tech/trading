@@ -32,7 +32,7 @@ def isolated_db(monkeypatch):
 
 def test_audit_one_reports_pending_buy_instead_of_flat(isolated_db, capsys):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
     sig = dict(current_price=100.0, last_bar=datetime.now())
     db.add_pending_buy(node, sig, channel='C123', ts='123.456')
@@ -72,7 +72,7 @@ def _make_staged_node(role, expected_config):
     price data (a.compute_buy_signal) this synthetic test ticker doesn't
     have, and returns before ever reaching _print_staged_config."""
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
     db.set_staged_test_config(node['id'], TICKER, role, expected_config, notes='test')
     now = datetime.now()
@@ -158,7 +158,7 @@ def test_stale_banner_requires_all_mapped_grid_ids_verified(isolated_db, capsys)
 
 def test_set_staged_test_config_does_not_clobber_other_roles(isolated_db):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
 
     db.set_staged_test_config(node['id'], TICKER, 'time_exit_via_sl', dict(fixed_sl=50), notes='role A')
@@ -171,7 +171,7 @@ def test_set_staged_test_config_does_not_clobber_other_roles(isolated_db):
 
 def test_set_staged_test_config_updates_in_place_for_same_role(isolated_db):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
 
     db.set_staged_test_config(node['id'], TICKER, 'addon', dict(addon_enabled=1), notes='v1')
@@ -184,7 +184,7 @@ def test_set_staged_test_config_updates_in_place_for_same_role(isolated_db):
 
 def test_clear_staged_test_config_with_role_removes_only_that_role(isolated_db):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
     db.set_staged_test_config(node['id'], TICKER, 'time_exit_via_sl', dict(fixed_sl=50))
     db.set_staged_test_config(node['id'], TICKER, 'addon', dict(addon_enabled=1))
@@ -198,7 +198,7 @@ def test_clear_staged_test_config_with_role_removes_only_that_role(isolated_db):
 
 def test_clear_staged_test_config_without_role_removes_all(isolated_db):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
     db.set_staged_test_config(node['id'], TICKER, 'time_exit_via_sl', dict(fixed_sl=50))
     db.set_staged_test_config(node['id'], TICKER, 'addon', dict(addon_enabled=1))
@@ -211,7 +211,7 @@ def test_clear_staged_test_config_without_role_removes_all(isolated_db):
 
 def test_audit_one_prints_every_role_for_a_multi_role_node(isolated_db, capsys):
     db.add_node(TICKER, 'TrailingBothZScoreBreakout', 'canary', window=5, take_profit=0.1,
-                stop_loss=0, max_hold_hours=48)
+                stop_loss=0, max_hold_hours=48, fixed_sl_override=15)
     node = [n for n in db.get_watchlist() if n['ticker'] == TICKER][0]
     db.set_staged_test_config(node['id'], TICKER, 'time_exit_via_sl',
                                dict(arm_sell_pct=0.3, fixed_sl=50, trail_sell_pct=50, max_hold_hours=31))
