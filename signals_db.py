@@ -1313,7 +1313,9 @@ def ensure_tables():
         # paper can't be told apart in the Grid; without the UNIQUE, an EOD
         # catch-up re-run after a restart silently duplicates the night's row
         # instead of upserting (the same gap daily_track_reconciliation_log has,
-        # not inherited here on purpose).
+        # not inherited here on purpose). ts is a UTC audit stamp only (same
+        # datetime('now') default/gap as coverage_events -- see that table's
+        # comment) -- check_date is the real, already-ET, authoritative field.
         c.execute("""
             CREATE TABLE IF NOT EXISTS overlay_reconciliation_log (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1340,7 +1342,9 @@ def ensure_tables():
         # print-only, so nothing survived past the terminal it ran in. One row per node
         # per night, mirroring overlay_reconciliation_log's shape (UNIQUE + INSERT OR
         # REPLACE so a same-day restart-triggered rerun refreshes the row instead of
-        # duplicating or getting masked by an earlier transient result).
+        # duplicating or getting masked by an earlier transient result). ts is a UTC
+        # audit stamp only (same pattern/reasoning as overlay_reconciliation_log
+        # above) -- check_date is the real, already-ET, authoritative field.
         c.execute("""
             CREATE TABLE IF NOT EXISTS divergence_check_log (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1495,6 +1499,25 @@ def ensure_tables():
         # tagged by which environment exercised it -- lets live_test_coverage.md's
         # scenario ledger (automation_principles.md #10) be answered by query
         # instead of hand-maintained status text.
+        #
+        # ts is UTC (SQLite's datetime('now') default -- log_coverage_event never
+        # overrides it) while trade_log/open_positions timestamps (entry_time,
+        # exit_time, etc.) are ET wall-clock, written by application code via Python's
+        # datetime.now() on a server whose OS tz is America/New_York. Comparing raw ts
+        # against those, or eyeballing a raw ts value as if it were ET, silently
+        # misreads the time by the UTC offset (real incident, 2026-08-21: a live SOXL
+        # anomaly investigation misread coverage_events.ts as ET and concluded a
+        # nonexistent "third transaction" 4 hours later than the real trade -- see
+        # docs/deep_backlog.md's 2026-08-21 entry). The load-bearing "today"-boundary
+        # consumers already compensate via `date(ts, 'localtime')` (converts to the
+        # server's local zone before comparing) -- see scripts/coverage_check.py's
+        # run_check, scripts/evening_status.py's line 864 (its earlier line 856
+        # does NOT -- known gap, see docs/deep_backlog.md's 2026-08-21 entry), and
+        # signals_notify.py's check_intraday_risk_review window scans. Not every
+        # ts consumer in the codebase does this correctly -- see that same
+        # deep_backlog.md entry for the ones that don't yet. Use
+        # utc_ts_to_local() below for ad hoc/one-off investigation instead of
+        # re-deriving this by hand.
         c.execute("""
             CREATE TABLE IF NOT EXISTS coverage_events (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1727,6 +1750,11 @@ def ensure_tables():
         # is a bug by definition, not an acceptable end state (2026-07-24 reframe).
         # Same node_id/mode rationale and no-UNIQUE-on-nullable-columns rule as
         # scenario_expectations above.
+        #
+        # ts (and reason_ts) is a UTC audit stamp only (same datetime('now') default
+        # as coverage_events -- see that table's comment) -- check_date is the real,
+        # already-ET, authoritative field for any date-boundary logic. Don't derive
+        # "today" from ts here.
         c.execute("""
             CREATE TABLE IF NOT EXISTS coverage_deviations (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1779,6 +1807,13 @@ def ensure_tables():
         # NULL means still open. Distinct from coverage_deviations (daily
         # scenario-expectation misses) and backlog_cache.md (planning/design
         # notes) -- this is specifically "something real and bad happened."
+        #
+        # ts/resolved_ts are UTC (same SQLite datetime('now') default/gap as
+        # coverage_events above -- see that table's comment for the full
+        # UTC-vs-ET reasoning). scripts/coverage_report_summary.py's incident_lines
+        # already converts correctly (`date(?, 'localtime')`) before comparing
+        # against an ET check_date; use utc_ts_to_local() below for any new
+        # ad hoc read.
         c.execute("""
             CREATE TABLE IF NOT EXISTS trading_incidents (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3023,6 +3058,46 @@ def _source_is_recognized(source):
     return source in COVERAGE_EVENT_SOURCES or (
         isinstance(source, str) and source.startswith('fixture:')
     )
+
+
+def utc_ts_to_local(ts):
+    """Converts a UTC timestamp string -- as stored by any table using SQLite's
+    datetime('now') default (coverage_events.ts, trading_incidents.ts/resolved_ts,
+    coverage_deviations.ts, watch_list.added_at, overlay_reconciliation_log.ts,
+    divergence_check_log.ts, etc.) -- to the server's local zone (currently
+    America/New_York -- this follows the host OS tz, same as every other
+    'localtime' use in this file, so it silently stops converting anything on a
+    host configured to UTC) for correct comparison against ET-native app
+    timestamps (trade_log.entry_time, open_positions.signal_time, etc., written
+    via Python's datetime.now()). Same conversion already used ad hoc in
+    coverage_check.py, evening_status.py, and signals_notify.py -- call this
+    instead of re-deriving the SQL each time, especially for one-off/ad hoc
+    investigation queries, where it's easy to forget the conversion (real
+    incident, 2026-08-21: a live SOXL anomaly investigation misread raw
+    coverage_events.ts values as ET and concluded a nonexistent "third
+    transaction" -- see docs/deep_backlog.md's 2026-08-21 entry).
+
+    Only pass a value from a column documented as UTC-stored above -- an
+    already-local value (trade_log.entry_time, coverage_snoozes.snoozed_until,
+    which is itself written via datetime('now','localtime')) gets silently
+    double-shifted, with no way for this function to detect the mistake.
+
+    Returns a full 'YYYY-MM-DD HH:MM:SS' local datetime string, NOT a bare
+    date -- slice `[:10]` (or use `date(ts, 'localtime')` directly in SQL) if
+    you need a date-only value for a check_date-style comparison.
+
+    Returns None for a None/empty input; raises ValueError for any other
+    input SQLite's datetime() can't parse (a non-empty malformed/mistyped
+    value silently returning None -- or, for a bare int, a nonsense Julian-day
+    date -- would be exactly the kind of silent wrong answer this helper
+    exists to prevent)."""
+    if not ts:
+        return None
+    with sqlite3.connect(':memory:') as c:
+        result = c.execute("SELECT datetime(?, 'localtime')", (ts,)).fetchone()[0]
+    if result is None:
+        raise ValueError(f"utc_ts_to_local: could not parse {ts!r} as a timestamp")
+    return result
 
 
 def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, node_id=None,
