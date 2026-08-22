@@ -308,6 +308,66 @@ workers for about a minute before being caught and killed. Already fully explain
 time; re-raised as a concern later due to a relay error, then re-confirmed closed (checked
 dmesg/journalctl/crontab directly — nothing external).
 
+## v6 scope decision, 2026-08-22 — narrow sunset, signal mechanics unchanged
+
+Real goal clarified: v6 sunsets v5/v5.1 entirely (not a parallel option), and doing so is
+also a deliberate forcing function to exercise/refactor the candidate-promotion pipeline
+(Phase 4 tooling: candidate reports, `top_safe_nodes.py`, promotion checklist) rather than
+just plumbing to view GT numbers.
+
+**Scope decided narrow, not broad**: v6 keeps v5.0's trade **signal mechanics** byte-for-byte
+— GT only fixes **fill/execution modeling**, not when a decision fires. Precisely:
+
+- **Stays v5.0-identical (trigger timing)**: buy (2 daily windows, hourly z-score,
+  `entry_timing` open_check/close semantics), arm (`strategies.py`'s `at_bar_close` gate),
+  and TIME (`hours_held >= max_hours_to_hold`, same gate — though TIME isn't really a
+  choice, it's definitional: `max_hold_hours` is hour-denominated by construction, so it
+  rides along regardless of bar resolution elsewhere).
+- **Goes full GT (fill/execution modeling)**: entry fill price/timing (continuous
+  broker-tracked trailing-buy, not bar-sampled), SL (continuous resting-stop with real
+  overnight gap-through), TRAIL (continuous peak/stop tracking once armed — note: for the
+  live `TrailingBothZScoreBreakout` strategy, reaching `tp_price` does NOT return a `'TP'`
+  exit, `strategies.py:439-442` — it only sets `state['trailing']=True` and arms the
+  trailing mechanism; the actual exit is TRAIL, continuous, not bar-gated. Other strategy
+  classes, e.g. `TrailingExitZScoreBreakout`, do have a real bar-close-gated TP exit —
+  irrelevant here since TrailingBoth is the live default).
+- Real worked example confirming this split against actual live data: SOXL `ira`/wl_id=92,
+  signal window 2026-08-18 15:25-15:40, actual fill 15:59:35 @ $128.755 (continuous
+  trailing-buy tracking — the ~34min signal-to-fill gap is exactly what GT models),
+  overnight hold, SL exit 2026-08-19 @ $125.18 (below the nominal ~$126.18 stop — consistent
+  with a real gap-through at the open, which GT's continuous SL modeling captures and the
+  old kernel's bar-sampled assumption could not).
+
+**Explicit non-goal for v6, deferred to v6.1 below**: a discomfort with higher trading
+frequency (user's direct call) rules out any timing-architecture direction that means
+checking/trading more often — this bounds what v6.1 can even explore, not just what v6
+does.
+
+## v6.1 parking lot — timing-architecture variations (separate future backtest, not v6)
+
+Explicitly NOT part of the v6 sunset — folding the sunset (bounded, has a finish line: match
+v5's candidates under real fills) together with an open-ended timing-parameter search would
+turn v6 into a project with no natural stopping point ("we could get stuck in v6.1 for days
+until we even finish a backtest" — user's own framing). Candidates to explore once v6 ships
+and proves itself, each requiring its own real backtest validation, not a config tweak:
+
+1. **Arm: bar-close gate → continuous.** Currently only re-checked once/hour at bar close
+   (`strategies.py:439`); a continuous check (matching how SL/TRAIL already work) could arm
+   on a better intrabar peak instead of missing a spike that reverts before close. Real
+   backtest question, not a fill-modeling fix — changes which trades even get armed.
+2. **Buy: frequency-as-risk-control, independent of the original manual-trading reason.**
+   The 2-window structure was originally motivated by wanting to limit *manual* trading
+   effort (`project_immediate_entry_motivation` memory) — automation removes that
+   justification, but throttling entry frequency may still be a real, deliberately-kept risk
+   control on its own merits (caps capital committed per day), not just a leftover
+   constraint to remove now that it's technically unnecessary.
+
+Both require a genuinely new backtest (trade selection/count changes, not just re-priced
+fills on the same trade list) — same category as this plan's other deferred
+`[new-strategy]` ideas, not something GT absorbs. **Bounded by the trading-frequency
+constraint above**: any v6.1 direction that means trading more often is off the table
+regardless of what a parameter search might otherwise suggest.
+
 ## Follow-on (separate future project, not this plan)
 
 Folding together three previously-separate deferred backlog items, all sharing the same
