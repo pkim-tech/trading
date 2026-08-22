@@ -382,7 +382,9 @@ adding more overloaded columns per strategy. Triggered by yet another instance o
 root cause (a column meaning different things per strategy causing a real interpretation
 bug) — same failure family as the `take_profit` overload (arm-sell-pct vs. real take-profit
 vs. drought-arm-override, 4 confirmed instances now) that motivated deferring this in the
-first place.
+first place. Same dispatch also covers a query-optimization pass over everything reading
+`backtest_cache`, to optimize real table usage once the JSON-parameter-definition shape
+lands (not a separate ask — same underlying schema change, same session).
 
 **Core+overlay joint kernel optimization has moved OUT of this Follow-on bucket** —
 folded into the main v6 sunset scope instead (see the "v6 scope decision" section above),
