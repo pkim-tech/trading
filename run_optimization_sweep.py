@@ -2545,6 +2545,367 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
     return results
 
 
+# ── GT candidate-report enrichment (2026-08-22) ──────────────────────────────
+# Checks 1/4/8/9/11/13 of docs/watchlist_candidate_checklist.md, ported from
+# scripts/checklist_v65.py to GT's Return-based trade format, built ONLY for the up-to-9
+# already-selected Phase2.5-GT candidates per campaign (NOT the full grid -- see
+# build_candidate_report_ground_truth's own docstring). Two robustness bars are used
+# throughout this codebase for two different purposes and are NOT interchangeable:
+# PHASE25_ISLAND_CAGR_MIN (50%) gates whether an island is even worth cliff-boxing in the
+# first place (candidate-quality bar); GT_ROBUSTNESS_CAGR_MIN (20%) is the established
+# "does this survive a perturbation" bar applied to checks 9/13 below (robustness bar).
+GT_ROBUSTNESS_CAGR_MIN = 20
+GT_FLUKE_MIN_TRADES = 10  # same "too few to trust" threshold as checklist_v65.check4_stability
+GT_WALK_FORWARD_FOLDS = 5  # same fold count as checklist_v65.FOLDS
+
+
+def _check1_macro_gt(ticker, start_date, end_date, data_source="yahoo"):
+    """Check 1 (macro/trend) -- ticker's own 30d/90d return off its already-loaded hourly
+    bars resampled to daily closes, within the campaign's own window. Same loading
+    convention as _campaign_years_for_window (duplicated rather than shared -- see that
+    function's own docstring for why -- and the same 21/63-trading-day approximation for
+    30/90 calendar days checklist_v65.check1_macro uses)."""
+    if data_source == "massive":
+        import db_cache
+        try:
+            df_hourly_raw = db_cache.get_massive_hourly_ohlcv(ticker)
+        except ValueError:
+            return None, None
+    else:
+        cache_path = CACHE_DIR / f"{ticker}_1h.csv"
+        if not cache_path.exists():
+            return None, None
+        df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        df_hourly_raw.index = pd.to_datetime(df_hourly_raw.index).tz_localize(None)
+        df_hourly_raw = df_hourly_raw.sort_index()
+    df_windowed = df_hourly_raw
+    if start_date is not None or end_date is not None:
+        lo = pd.Timestamp(start_date) if start_date is not None else None
+        hi = (pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)) if end_date is not None else None
+        df_windowed = df_hourly_raw.loc[lo:hi]
+    if df_windowed.empty:
+        return None, None
+    close_col = 'Adj Close' if 'Adj Close' in df_windowed.columns else 'Close'
+    df_daily = df_windowed.resample('D').last().dropna(subset=[close_col])
+    close = df_daily[close_col]
+    r30 = float((close.iloc[-1] / close.iloc[-21] - 1) * 100) if len(close) > 21 else None
+    r90 = float((close.iloc[-1] / close.iloc[-63] - 1) * 100) if len(close) > 63 else None
+    return r30, r90
+
+
+def _check4_stability_gt(trades):
+    """Check 4 (70/30 win-rate stability), ported from checklist_v65.check4_stability --
+    same split convention: trades sorted chronologically by Entry Time, then cut by
+    COUNT at the 70th percentile index (`cut = int(n * 0.7)`), not by an equal-time-span
+    cut -- matching the original function exactly (corrected 2026-08-22 paired-review
+    docstring finding: an earlier version of this docstring said "by TIME not count",
+    which described check13's fold-slicing, not this function's own split). Adapted from
+    the hourly kernel's Result-label wins (Result in WIN/TWIN) to GT's Return-based
+    win/loss (Return > 0), matching how _summarize_trades_ground_truth's own win_rate is
+    defined. Returns (None, None) below the same too-few-to-trust threshold
+    check4_stability itself uses."""
+    if len(trades) < GT_FLUKE_MIN_TRADES:
+        return None, None
+    df = pd.DataFrame(trades).sort_values("Entry Time")
+    n = len(df)
+    cut = int(n * 0.7)
+    early, late = df.iloc[:cut], df.iloc[cut:]
+    early_wr = float((early["Return"] > 0).mean() * 100) if len(early) else None
+    late_wr = float((late["Return"] > 0).mean() * 100) if len(late) else None
+    return early_wr, late_wr
+
+
+def _check8_fluke_gt(trades):
+    """Check 8 (trade-count fluke), ported from checklist_v65.check8_fluke -- single-
+    biggest-trade-removal compounded-return comparison, plus a too_few_trades flag using
+    the same GT_FLUKE_MIN_TRADES threshold check4_stability's own trades<10 check uses
+    (the task's "reuse the same number" instruction)."""
+    n = len(trades)
+    if n == 0:
+        return {'n_trades': 0, 'too_few_trades': True, 'compounded_pct': None,
+                'compounded_without_best_pct': None, 'best_trade_share_pct': None}
+    df = pd.DataFrame(trades)
+    compounded_total = float(((df["Return"] + 1).prod() - 1) * 100)
+    best_i = df["Return"].idxmax()
+    without_best = df.drop(best_i)
+    compounded_wo = float(((without_best["Return"] + 1).prod() - 1) * 100) if len(without_best) else 0.0
+    return {
+        'n_trades': n,
+        'too_few_trades': n < GT_FLUKE_MIN_TRADES,
+        'compounded_pct': compounded_total,
+        'compounded_without_best_pct': compounded_wo,
+        'best_trade_share_pct': compounded_total - compounded_wo,
+    }
+
+
+def _check11_max_drawdown_gt(trades):
+    """Check 11 (max drawdown), same convention as scripts/v4_max_drawdown.max_drawdown --
+    pure function of the compounded equity curve (cumulative product of 1+Return per
+    trade in chronological order). Returns (max_dd_pct [<=0], peak_time, trough_time)."""
+    df = pd.DataFrame(trades).sort_values("Entry Time")
+    equity, peak, peak_time = 100.0, 100.0, None
+    max_dd, dd_peak_time, dd_trough_time = 0.0, None, None
+    for _, t in df.iterrows():
+        if peak_time is None:
+            peak_time = t["Entry Time"]
+        equity *= (1.0 + t["Return"])
+        if equity >= peak:
+            peak = equity
+            peak_time = t["Exit Time"]
+        else:
+            dd = (equity - peak) / peak
+            if dd < max_dd:
+                max_dd, dd_peak_time, dd_trough_time = dd, peak_time, t["Exit Time"]
+    return max_dd * 100.0, dd_peak_time, dd_trough_time
+
+
+def _check13_walk_forward_gt(trades, robustness_cagr_min=GT_ROBUSTNESS_CAGR_MIN):
+    """Check 13 (walk-forward N-fold), ported from checklist_v65.check13_walk_forward --
+    same equal-TIME-span 5-fold slicing. Reports each fold's own CAGR (GT trades carry
+    Return directly, no alpha-vs-SPY split needed the way the hourly path's possible/
+    pessimistic/certain triple required) and flags a fold 'fragile' at CAGR<=20%
+    (GT_ROBUSTNESS_CAGR_MIN, the project's established robustness bar) -- NOT the 50%
+    PHASE25_ISLAND_CAGR_MIN candidate-quality bar used elsewhere in this pipeline; the
+    two are deliberately different thresholds for two different purposes."""
+    if len(trades) < GT_WALK_FORWARD_FOLDS:
+        return []
+    df = pd.DataFrame(trades).sort_values("Entry Time")
+    dates_min, dates_max = df["Entry Time"].min(), df["Exit Time"].max()
+    span = dates_max - dates_min
+    edges = [dates_min + span * i / GT_WALK_FORWARD_FOLDS for i in range(GT_WALK_FORWARD_FOLDS + 1)]
+    rows = []
+    for i in range(GT_WALK_FORWARD_FOLDS):
+        start, end = edges[i], edges[i + 1]
+        sub = df[(df["Entry Time"] >= start) & (df["Entry Time"] < end)]
+        if sub.empty:
+            rows.append({'fold': i + 1, 'n': 0, 'compounded_pct': None, 'cagr': None, 'fragile': None})
+            continue
+        compounded = float(((sub["Return"] + 1).prod() - 1) * 100)
+        fold_years = (end - start).total_seconds() / (365.25 * 86400)
+        cagr = _cagr_from_total_return(compounded, fold_years)
+        # A fold with real trades but cagr=None means _cagr_from_total_return hit its
+        # total_return<=-100% guard (a fold that's fully wiped out) -- that is at least
+        # as fragile as a low-but-computable CAGR, not "unknown"/unflagged (paired-review
+        # finding, 2026-08-22: the worst fold rendering as unflagged 'n/a' was worse than
+        # silent, since a reader would read no marker as "this fold was fine"). Only a
+        # genuinely empty fold (n=0, no trades at all) stays 'unknown'.
+        fragile = True if cagr is None else (cagr <= robustness_cagr_min)
+        rows.append({'fold': i + 1, 'n': len(sub), 'compounded_pct': compounded, 'cagr': cagr, 'fragile': fragile})
+    return rows
+
+
+def build_candidate_report_ground_truth(ticker, strategy_name, config_version, hp,
+                                         start_date, end_date, fixed_sl=0,
+                                         entry_timing='open_check', data_source="yahoo",
+                                         cliff_radius=None):
+    """Full enriched candidate report for a completed GT campaign's up-to-9 Phase2.5-GT
+    candidates (2026-08-22 candidate-report build-out). Reuses derive_phase25_candidates_
+    ground_truth (candidate derivation -- NOT re-derived here) and run_addon_cliff_safety_
+    ground_truth (core_cliff/addon_cliff verdicts -- NOT re-derived here) rather than
+    duplicating either. Adds checks 1/4/8/11/13 (see module comment above check1) computed
+    against each candidate's OWN real trade list (same_bar_reentry=True, matching the real
+    Phase1/2/2.5-GT dispatch convention every cached row in this campaign was computed
+    under -- unlike run_addon_cliff_safety_ground_truth's own same_bar_reentry=False cells,
+    which exist for a different, cheaper, add-on-safety-only purpose).
+
+    Check 9 (same-day-block sensitivity) is NOT built: `run_backtest_ground_truth`/
+    `_simulate_trail_ground_truth` (backtester.py) have no same_day_block parameter at
+    all (same finding checklist_v65.py already documented for the legacy TE kernel) --
+    inventing new kernel behavior to support it is out of scope for this report, so this
+    is reported as a plain finding via the 'check9_same_day_block' key (None) rather than silently
+    dropped.
+
+    Only computes checks 1/4/8/11/13 for the up-to-9 selected candidates, NOT the full
+    grid (~164k+ cells) -- computing these across the whole mesh would be prohibitively
+    expensive and isn't what they're for (this pipeline's other pieces already rank the
+    full grid; this report explains the finalists).
+
+    Returns a dict: {ticker, strategy_name, config_version, macro_r30_pct, macro_r90_pct,
+    same_day_block_check9: None (see above), candidates: [ {candidate, n_trades,
+    check4_early_wr/late_wr, check8, check11_max_drawdown_pct/peak/trough, check13_folds,
+    core_cliff, addon_cliff, core_addon_disagreement}, ... ], winner_index,
+    drought: {...} or None}."""
+    candidates = derive_phase25_candidates_ground_truth(
+        ticker, strategy_name, config_version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
+    if not candidates:
+        return {'ticker': ticker, 'strategy_name': strategy_name, 'config_version': config_version,
+                'candidates': [], 'error': 'No Phase2.5-GT candidates found for this campaign scope.'}
+
+    asset_bh, spy_bh = compute_bh_returns(ticker, start_date=start_date, end_date=end_date, data_source=data_source)
+    years = _campaign_years_for_window(ticker, start_date, end_date, data_source=data_source)
+    r30, r90 = _check1_macro_gt(ticker, start_date, end_date, data_source=data_source)
+
+    addon_results = run_addon_cliff_safety_ground_truth(
+        ticker, strategy_name, config_version, hp, candidates, spy_bh, fixed_sl=fixed_sl,
+        entry_timing=entry_timing, start_date=start_date, end_date=end_date, years=years,
+        data_source=data_source, cliff_radius=cliff_radius)
+
+    strategy_class = getattr(strategies, strategy_name)
+    is_both = strategy_name == 'TrailingBothZScoreBreakout'
+
+    rows = []
+    for cand, addon in zip(candidates, addon_results):
+        inputs = _load_node_inputs_ground_truth(
+            ticker, strategy_class, strategy_name, cand['window'], cand['z_score_threshold'],
+            start_date, end_date, data_source=data_source)
+        trades = []
+        if inputs is not None:
+            _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+            if not df_hourly_windowed.empty:
+                if is_both:
+                    trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = (
+                        float(cand['stop_loss']), float(cand['tpct']), float(cand['take_profit']))
+                else:
+                    trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = (
+                        0.0, float(cand['stop_loss']), float(cand['take_profit']))
+                trades = run_backtest_ground_truth(
+                    df_hourly_windowed, df_daily_processed, ticker, minute_df,
+                    fixed_sl=fixed_sl, arm_pct=arm_pct_arg, trail_buy_pct=trail_buy_pct_arg,
+                    trail_sell_pct=trail_sell_pct_arg, max_hours_to_hold=cand['max_hold_hours'],
+                    z_score_threshold=cand['z_score_threshold'], is_both=is_both,
+                    open_check_entry_timing=(entry_timing == 'open_check'), same_bar_reentry=True,
+                    prep=prep, mprep=mprep, need_times=True,
+                )
+
+        c4_early_wr, c4_late_wr = _check4_stability_gt(trades) if trades else (None, None)
+        c8 = _check8_fluke_gt(trades)
+        dd_pct, dd_peak, dd_trough = _check11_max_drawdown_gt(trades) if trades else (None, None, None)
+        c13_folds = _check13_walk_forward_gt(trades) if trades else []
+
+        core_cliff = addon['core_cliff']
+        addon_cliff = addon['addon_cliff']
+        disagreement = (core_cliff is not None and addon_cliff is not None and core_cliff != addon_cliff)
+
+        rows.append({
+            'candidate': cand,
+            'n_trades': len(trades),
+            'check4_early_wr_pct': c4_early_wr, 'check4_late_wr_pct': c4_late_wr,
+            'check8_fluke': c8,
+            'check11_max_drawdown_pct': dd_pct, 'check11_dd_peak_time': dd_peak, 'check11_dd_trough_time': dd_trough,
+            'check13_folds': c13_folds,
+            'core_safe': None if core_cliff is None else (not core_cliff),
+            'addon_safe': None if addon_cliff is None else (not addon_cliff),
+            'core_addon_disagreement': disagreement,
+            'addon_detail': addon,
+        })
+
+    winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['robust_alpha'])
+    drought = None
+    # drought_skip_reason distinguishes "strategy isn't TrailingBoth" from "compute_
+    # drought_eval ran but returned None" (no cached inputs / empty windowed bars / zero
+    # core trades for the winner's own cell) -- paired-review finding (2026-08-22, 3 of 4
+    # reviewers independently): collapsing both into one hardcoded print message would
+    # misreport a real data/compute failure as a strategy-type mismatch.
+    drought_skip_reason = None
+    if is_both:
+        import scripts.gt_addon_winner_drought_eval as drought_mod
+        drought = drought_mod.compute_drought_eval(
+            ticker, strategy_name, start_date, end_date, fixed_sl,
+            entry_timing, candidates[winner_index], data_source=data_source)
+        if drought is None:
+            drought_skip_reason = ("compute_drought_eval returned no result for the winning "
+                                    "cell (no cached inputs, empty windowed bars, or zero core "
+                                    "GT trades) -- not a strategy-type mismatch.")
+    else:
+        drought_skip_reason = (f"winner's strategy is {strategy_name!r}, not "
+                                f"TrailingBothZScoreBreakout -- gt_addon_winner_drought_eval's "
+                                f"mechanism assumes TrailingBoth.")
+
+    return {
+        'ticker': ticker, 'strategy_name': strategy_name, 'config_version': config_version,
+        'macro_r30_pct': r30, 'macro_r90_pct': r90,
+        'check9_same_day_block': None,  # see docstring -- no same_day_block param exists in the GT kernel
+        'candidates': rows,
+        'winner_index': winner_index,
+        'drought': drought,
+        'drought_skip_reason': drought_skip_reason,
+    }
+
+
+def print_candidate_report_ground_truth(report):
+    """Renders build_candidate_report_ground_truth's dict as a readable text report --
+    separate from the builder so a caller can also consume the dict programmatically
+    (e.g. a future Streamlit page) without re-parsing printed text."""
+    print(f"\n{'='*100}\nGT Candidate Report -- {report['ticker']} / {report['strategy_name']} / {report['config_version']}\n{'='*100}")
+    if report.get('error'):
+        print(report['error'])
+        return
+    r30, r90 = report['macro_r30_pct'], report['macro_r90_pct']
+    print(f"Check 1 (macro/trend): 30d={r30:+.1f}%  90d={r90:+.1f}%" if r30 is not None and r90 is not None
+          else "Check 1 (macro/trend): insufficient daily history")
+    print("Check 9 (same-day-block sensitivity): SKIPPED -- run_backtest_ground_truth has no "
+          "same_day_block parameter (matches checklist_v65.py's own finding for the legacy TE kernel).")
+    print(f"{len(report['candidates'])} candidate(s):\n")
+
+    for i, row in enumerate(report['candidates']):
+        c = row['candidate']
+        marker = " <-- OVERALL WINNER" if i == report['winner_index'] else ""
+        print(f"--- Candidate {i+1}{marker} ---")
+        print(f"  island(TP={c['island_tp']} SL={c['island_sl']})  cell TP={c['take_profit']} "
+              f"SL={c['stop_loss']} hold={c['max_hold_hours']}h w={c['window']} z={c['z_score_threshold']} "
+              f"tpct={c['tpct']}  robust_alpha={c['robust_alpha']:.2f}  cagr={c['cagr']:.1f}%  n_trades={row['n_trades']}")
+
+        core_s = "SAFE" if row['core_safe'] else ("CLIFF" if row['core_safe'] is False else "UNKNOWN")
+        addon_s = "SAFE" if row['addon_safe'] else ("CLIFF" if row['addon_safe'] is False else "UNKNOWN")
+        flag = "  *** CORE/ADD-ON DISAGREEMENT ***" if row['core_addon_disagreement'] else ""
+        print(f"  Verdicts: core-safe={core_s}  add-on-safe={addon_s}{flag}")
+
+        if row['check4_early_wr_pct'] is not None:
+            print(f"  Check 4 (70/30 win-rate stability): early={row['check4_early_wr_pct']:.1f}%  "
+                  f"late={row['check4_late_wr_pct']:.1f}%")
+        else:
+            print(f"  Check 4 (70/30 win-rate stability): skipped (< {GT_FLUKE_MIN_TRADES} trades)")
+
+        c8 = row['check8_fluke']
+        if c8['compounded_pct'] is not None:
+            # "(same_bar_reentry=True)" label added (paired-review finding, 2026-08-22):
+            # this number and the drought block's own "core=" figure below are BOTH
+            # "compounded return for [effectively] this same node" but computed under
+            # different same_bar_reentry settings (this one matches the real campaign
+            # dispatch; the drought/add-on-safety path below always uses False per its
+            # own documented compute-halving convention) -- unlabeled, a reader could
+            # mistake one for a contradiction of the other rather than two different,
+            # both-correct numbers.
+            print(f"  Check 8 (trade-count fluke, same_bar_reentry=True): n={c8['n_trades']}"
+                  f"{' [TOO FEW]' if c8['too_few_trades'] else ''}  "
+                  f"compounded={c8['compounded_pct']:+.1f}%  w/o best trade={c8['compounded_without_best_pct']:+.1f}%  "
+                  f"best-trade share={c8['best_trade_share_pct']:+.1f}pp")
+        else:
+            print("  Check 8 (trade-count fluke): no trades")
+
+        if row['check11_max_drawdown_pct'] is not None:
+            print(f"  Check 11 (max drawdown): {row['check11_max_drawdown_pct']:.1f}%")
+
+        folds = row['check13_folds']
+        if folds:
+            fold_parts = []
+            for f in folds:
+                if f['cagr'] is None and f['n'] > 0:
+                    cagr_str, frag_str = 'n/a', '[WIPED OUT]'
+                elif f['cagr'] is None:
+                    cagr_str, frag_str = 'n/a', ''
+                else:
+                    cagr_str = f"{f['cagr']:.0f}%"
+                    frag_str = '[FRAGILE]' if f['fragile'] else ''
+                fold_parts.append(f"F{f['fold']}:n={f['n']},cagr={cagr_str}{frag_str}")
+            fold_str = "  ".join(fold_parts)
+            print(f"  Check 13 (walk-forward {GT_WALK_FORWARD_FOLDS}-fold, robustness bar <= {GT_ROBUSTNESS_CAGR_MIN}% CAGR): {fold_str}")
+        print()
+
+    d = report.get('drought')
+    if d is not None:
+        drought_only_str = 'n/a' if d['drought_compounded_pct'] is None else f"{d['drought_compounded_pct']:+.1f}%"
+        combined_str = 'n/a' if d['combined_compounded_pct'] is None else f"{d['combined_compounded_pct']:+.1f}%"
+        # "(same_bar_reentry=False)" label -- see the Check 8 comment above; this core=
+        # figure is NOT the same number as this same node's Check 8 compounded_pct.
+        print(f"Drought overlay (winner only, informational, same_bar_reentry=False): "
+              f"core={d['core_compounded_pct']:+.1f}%  "
+              f"drought_windows={d['n_drought_windows']} (simulated={d['n_drought_simulated']})  "
+              f"drought_only={drought_only_str}  combined={combined_str}")
+    elif report['candidates']:
+        print(f"Drought overlay: skipped ({report.get('drought_skip_reason', 'no reason recorded')})")
+
+
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
 
 def identify_full_mesh_candidates(config_version, strategy_name, island_tickers, n_index, n_stock, fixed_sl=0, entry_timing='close'):

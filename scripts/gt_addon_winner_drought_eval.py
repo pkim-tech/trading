@@ -42,6 +42,80 @@ def trades_to_bar_indices(trades, df_hourly_windowed):
     return out
 
 
+def compute_drought_eval(ticker, strategy_name, start_date, end_date,
+                          fixed_sl, entry_timing, winner, data_source="yahoo",
+                          confirm_days=CONFIRM_DAYS):
+    """Reusable core of this script's own __main__ block (2026-08-22 candidate-report
+    build-out) -- same drought-overlay-on-the-winning-node computation, factored out so
+    run_optimization_sweep.build_candidate_report_ground_truth can call it for whichever
+    ticker/campaign's own winner it's reporting on, instead of only SOXL's hardcoded
+    2023-07-24..2026-08-21 window. `winner` is one of derive_phase25_candidates_ground_
+    truth's own candidate dicts (island_tp/take_profit/stop_loss/max_hold_hours/window/
+    z_score_threshold/tpct/robust_alpha/cagr) -- the caller picks which one counts as
+    "the overall winner" (e.g. max by robust_alpha), same convention this script's own
+    __main__ already used. (config_version dropped from the signature 2026-08-22,
+    paired-review finding: it was accepted but never read -- this function only needs
+    the winner's own cell coordinates and the campaign window/params, not its version
+    string.)
+
+    is_both is assumed True (TrailingBothZScoreBreakout) -- same assumption this script's
+    __main__ always made. `winner['stop_loss']` (the TrailingBoth trail_buy_pct axis) IS
+    used, but only in the run_backtest_ground_truth call below that reconstructs the
+    winner's own CORE trade list -- it is deliberately NOT passed to simulate_overlay
+    (the drought-window-only simulation a few lines down), since drought entries are a
+    fresh signal-triggered entry, not a trailing-buy re-entry off the core mechanism; only
+    the exit-side mechanism (fixed_sl/arm_pct/trail_sell_pct) applies there. Returns a
+    dict (n_core_trades, n_drought_windows, n_drought_simulated, core_compounded_pct,
+    drought_compounded_pct, combined_compounded_pct) or None if no core GT trades exist
+    for the winner's cell."""
+    strategy_class = getattr(ros.strategies, strategy_name)
+    inputs = ros._load_node_inputs_ground_truth(
+        ticker, strategy_class, strategy_name, winner['window'], winner['z_score_threshold'],
+        start_date, end_date, data_source=data_source)
+    if inputs is None:
+        return None
+    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+    if df_hourly_windowed.empty:
+        return None
+
+    trades = ros.run_backtest_ground_truth(
+        df_hourly_windowed, df_daily_processed, ticker, minute_df,
+        fixed_sl=fixed_sl, arm_pct=winner['take_profit'], trail_buy_pct=winner['stop_loss'],
+        trail_sell_pct=winner['tpct'], max_hours_to_hold=winner['max_hold_hours'],
+        z_score_threshold=winner['z_score_threshold'], is_both=True,
+        open_check_entry_timing=(entry_timing == 'open_check'), same_bar_reentry=False,
+        prep=prep, mprep=mprep, need_times=True,
+    )
+    if not trades:
+        return None
+
+    bar_trades = trades_to_bar_indices(trades, df_hourly_windowed)
+    windows = find_drought_windows(bar_trades, df_hourly_windowed, confirm_days)
+
+    drought_rets = []
+    for entry_i, backstop_i in windows:
+        res = simulate_overlay(df_hourly_windowed, entry_i, backstop_i,
+                                fixed_sl_pct=fixed_sl, arm_pct=winner['take_profit'],
+                                trail_sell_pct=winner['tpct'])
+        if res is not None:
+            drought_rets.append(res['ret'])
+
+    core_compounded = ((1 + pd.Series([t['Return'] for t in trades])).prod() - 1) * 100
+    result = {
+        'n_core_trades': len(trades),
+        'n_drought_windows': len(windows),
+        'n_drought_simulated': len(drought_rets),
+        'core_compounded_pct': float(core_compounded),
+        'drought_compounded_pct': None,
+        'combined_compounded_pct': None,
+    }
+    if drought_rets:
+        result['drought_compounded_pct'] = float((1 + pd.Series(drought_rets)).prod() - 1) * 100
+        result['combined_compounded_pct'] = float(
+            (1 + pd.Series([t['Return'] for t in trades] + drought_rets)).prod() - 1) * 100
+    return result
+
+
 def main():
     ticker = "SOXL"
     strategy_name = "TrailingBothZScoreBreakout"
@@ -67,43 +141,17 @@ def main():
           f"hold={winner['max_hold_hours']}h w={winner['window']} z={winner['z_score_threshold']} "
           f"tpct={winner['tpct']} core_cagr={winner['cagr']:.1f}%")
 
-    strategy_class = ros.strategies.TrailingBothZScoreBreakout
-    inputs = ros._load_node_inputs_ground_truth(
-        ticker, strategy_class, strategy_name, winner['window'], winner['z_score_threshold'],
-        start_date, end_date, data_source="yahoo")
-    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
-
-    trades = ros.run_backtest_ground_truth(
-        df_hourly_windowed, df_daily_processed, ticker, minute_df,
-        fixed_sl=fixed_sl, arm_pct=winner['take_profit'], trail_buy_pct=winner['stop_loss'],
-        trail_sell_pct=winner['tpct'], max_hours_to_hold=winner['max_hold_hours'],
-        z_score_threshold=winner['z_score_threshold'], is_both=True,
-        open_check_entry_timing=(entry_timing == 'open_check'), same_bar_reentry=False,
-        prep=prep, mprep=mprep, need_times=True,
-    )
-    print(f"Core GT trades: {len(trades)}")
-
-    bar_trades = trades_to_bar_indices(trades, df_hourly_windowed)
-    windows = find_drought_windows(bar_trades, df_hourly_windowed, CONFIRM_DAYS)
-    print(f"Drought windows found (confirm_days={CONFIRM_DAYS}): {len(windows)}")
-
-    drought_rets = []
-    for entry_i, backstop_i in windows:
-        res = simulate_overlay(df_hourly_windowed, entry_i, backstop_i,
-                                fixed_sl_pct=fixed_sl, arm_pct=winner['take_profit'],
-                                trail_sell_pct=winner['tpct'])
-        if res is not None:
-            drought_rets.append(res['ret'])
-
-    core_compounded = ((1 + pd.Series([t['Return'] for t in trades])).prod() - 1) * 100 \
-        if drought_rets or trades else 0.0
-    print(f"Drought-eligible windows actually simulated: {len(drought_rets)}")
-    if drought_rets:
-        drought_compounded = ((1 + pd.Series(drought_rets)).prod() - 1) * 100
-        combined_compounded = ((1 + pd.Series([t['Return'] for t in trades] + drought_rets)).prod() - 1) * 100
-        print(f"Core-only compounded return: {core_compounded:+.1f}%")
-        print(f"Drought-only compounded return (extra trades): {drought_compounded:+.1f}%")
-        print(f"Core+drought combined compounded return: {combined_compounded:+.1f}%")
+    result = compute_drought_eval(ticker, strategy_name, start_date, end_date,
+                                   fixed_sl, entry_timing, winner, data_source="yahoo")
+    if result is None:
+        raise SystemExit("No core GT trades for the winning node -- nothing to evaluate.")
+    print(f"Core GT trades: {result['n_core_trades']}")
+    print(f"Drought windows found (confirm_days={CONFIRM_DAYS}): {result['n_drought_windows']}")
+    print(f"Drought-eligible windows actually simulated: {result['n_drought_simulated']}")
+    if result['n_drought_simulated']:
+        print(f"Core-only compounded return: {result['core_compounded_pct']:+.1f}%")
+        print(f"Drought-only compounded return (extra trades): {result['drought_compounded_pct']:+.1f}%")
+        print(f"Core+drought combined compounded return: {result['combined_compounded_pct']:+.1f}%")
     else:
         print("No drought windows produced a simulated trade -- nothing to add.")
 
