@@ -138,14 +138,28 @@ def is_staged_or_manual(ticker, entry_time, exit_reason):
     exit_reason='MANUAL' is a direct, reliable signal (that column is real trade_log data).
     The coverage_events check is a heuristic: staged_live_test rows carry ticker but not
     node_id, so this joins on ticker + a window around entry_time (the real fill) rather than an
-    exact position_id match (trade_log itself has no position_id column to join on post-close)."""
+    exact position_id match (trade_log itself has no position_id column to join on post-close).
+
+    entry_time is ET-native (trade_log, written by application code via Python's
+    datetime.now()); coverage_events.ts is UTC (SQLite's datetime('now') default) -- same
+    UTC-vs-ET bug class as coverage_check.py's run_check, coverage_ticket_table.py's
+    timing check, and evening_status.py's event_days classification (see
+    docs/deep_backlog.md's 2026-08-21 entries). Fixed 2026-08-21 to
+    convert ts via 'localtime' before comparing (system TZ confirmed ET) -- previously
+    compared raw UTC ts directly against an entry_time-anchored window with no conversion.
+    At STAGED_TEST_WINDOW_HOURS=24 the ~4-5h offset doesn't usually change the outcome
+    (the window is wide relative to the offset), but a coverage_events row near either
+    edge (roughly the 20-28h mark either side of entry_time) could be misclassified in
+    either direction: a genuinely staged/manual trade reading as unmatched (false
+    negative, the offset shrinks the window's forward edge), or a genuinely organic trade
+    reading as staged (false positive, the offset widens the window's backward edge)."""
     if exit_reason == "MANUAL":
         return True
     con = sqlite3.connect(LIVE_DB)
     row = con.execute(
         """SELECT 1 FROM coverage_events
            WHERE ticker = ? AND scenario_key IN ('staged_live_test', 'gap_resize')
-             AND ts BETWEEN datetime(?, ?) AND datetime(?, ?) LIMIT 1""",
+             AND datetime(ts, 'localtime') BETWEEN datetime(?, ?) AND datetime(?, ?) LIMIT 1""",
         (ticker, entry_time, f"-{STAGED_TEST_WINDOW_HOURS} hours",
          entry_time, f"+{STAGED_TEST_WINDOW_HOURS} hours"),
     ).fetchone()

@@ -1509,15 +1509,19 @@ def ensure_tables():
         # anomaly investigation misread coverage_events.ts as ET and concluded a
         # nonexistent "third transaction" 4 hours later than the real trade -- see
         # docs/deep_backlog.md's 2026-08-21 entry). The load-bearing "today"-boundary
-        # consumers already compensate via `date(ts, 'localtime')` (converts to the
-        # server's local zone before comparing) -- see scripts/coverage_check.py's
-        # run_check, scripts/evening_status.py's line 864 (its earlier line 856
-        # does NOT -- known gap, see docs/deep_backlog.md's 2026-08-21 entry), and
-        # signals_notify.py's check_intraday_risk_review window scans. Not every
-        # ts consumer in the codebase does this correctly -- see that same
-        # deep_backlog.md entry for the ones that don't yet. Use
-        # utc_ts_to_local() below for ad hoc/one-off investigation instead of
-        # re-deriving this by hand.
+        # consumers compensate via `date(ts, 'localtime')` (converts to the server's
+        # local zone before comparing) -- see scripts/coverage_check.py's run_check,
+        # scripts/evening_status.py's event_days_by_scenario/today_events, and
+        # signals_notify.py's check_intraday_risk_review window scans.
+        # scripts/coverage_ticket_table.py's timing check and
+        # scripts/verify_real_trades_vs_kernel.py's is_staged_or_manual were both found
+        # NOT converting and fixed the same day -- the full same-day UTC/ET fix chain
+        # (this doc fix, coverage_ticket_table.py, evening_status.py,
+        # verify_real_trades_vs_kernel.py, and the wl_id-backfill migration below) is
+        # recorded in docs/deep_backlog.md's 2026-08-21 entries, and as of that date no
+        # further un-converted `coverage_events`/`watch_list.added_at` consumer of this
+        # exact shape is known to remain. Use utc_ts_to_local() below for ad hoc/
+        # one-off investigation instead of re-deriving this by hand.
         c.execute("""
             CREATE TABLE IF NOT EXISTS coverage_events (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1985,7 +1989,35 @@ def ensure_tables():
                     # correctly nulls those back out -- same "acceptable, leave
                     # NULL" convention this migration already uses for a genuinely
                     # unmatchable row, not a regression.
-                    candidates = [cand for cand in candidates if cand['added_at'] <= r['entry_time']]
+                    #
+                    # added_at is UTC (SQLite's datetime('now') default); entry_time is
+                    # ET-native (trade_log/open_positions convention, written via Python's
+                    # datetime.now()) -- same UTC-vs-ET bug class as coverage_events
+                    # elsewhere in this file (see utc_ts_to_local's docstring, and
+                    # docs/deep_backlog.md's 2026-08-21 entries). Fixed 2026-08-21:
+                    # comparing the two directly without conversion made this filter TOO
+                    # STRICT (UTC reads ~4-5h ahead of ET, so a candidate's real ET
+                    # creation time could be genuinely before entry_time while its raw
+                    # UTC-stamped added_at string compared as later) -- excluding a real
+                    # candidate down to wl_id=NULL (this migration's own existing "can't
+                    # determine it" convention). Not strictly fail-safe as originally
+                    # characterized here, though: this filter sits ahead of the
+                    # `len(candidates) == 1` assignment below, so the OLD, needlessly
+                    # strict version could in principle have collapsed a genuine
+                    # multi-candidate tie (e.g. the live-track/daily-track duplicates
+                    # described above) down to a single arbitrary survivor purely because
+                    # of the ~4h timezone artifact, not real evidence -- a real
+                    # mis-assignment path, not just an under-assignment one (found by
+                    # independent-cold review; not observed in production data, but not
+                    # provably impossible either). This fix's WIDER candidate set can only
+                    # reduce that specific risk (a wider set is less likely to collapse to
+                    # exactly 1), never introduce a new instance of it.
+                    #
+                    # See _added_at_precedes_entry's own docstring for how a null/
+                    # unparseable added_at is handled (kept as a candidate, not
+                    # excluded or raised).
+                    candidates = [cand for cand in candidates
+                                  if _added_at_precedes_entry(cand['added_at'], r['entry_time'])]
                 if len(candidates) == 1:
                     c.execute(f"UPDATE {tbl} SET wl_id=? WHERE id=?", (candidates[0]['id'], r['id']))
         c.commit()
@@ -3098,6 +3130,24 @@ def utc_ts_to_local(ts):
     if result is None:
         raise ValueError(f"utc_ts_to_local: could not parse {ts!r} as a timestamp")
     return result
+
+
+def _added_at_precedes_entry(added_at, entry_time):
+    """True if a UTC-stored added_at (e.g. watch_list.added_at) is at-or-before an
+    ET-native entry_time (e.g. trade_log.entry_time), used by ensure_tables()'s
+    wl_id-backfill migration to filter out candidate nodes that didn't exist yet at
+    trade entry. Both a missing/None added_at and an unparseable one are treated as
+    "can't disprove this candidate" (returns True, keeping it in the candidate set)
+    rather than excluding it or raising -- ensure_tables() runs unguarded at every DB
+    open including live daemon startup, so letting utc_ts_to_local's ValueError
+    propagate here would permanently brick every future startup over a best-effort
+    backfill of a row that's already living with wl_id=NULL either way."""
+    if not added_at:
+        return True
+    try:
+        return utc_ts_to_local(added_at) <= entry_time
+    except ValueError:
+        return True
 
 
 def log_coverage_event(scenario_key, mode, ticker=None, position_id=None, node_id=None,
