@@ -1590,6 +1590,89 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
                            min_hold_hours=min_hold_hours)
 
 
+def _require_full_gt_hp(hp, strategy_name, caller_name):
+    """Validates hp carries every axis Phase1's own `expected` formula needs, each as a
+    genuinely NON-EMPTY sequence (not just present) — found by the paired-review
+    independent-cold pass on this guard itself (2026-08-22): an empty list (e.g.
+    take_profits=[]) satisfies a bare `key in hp` check while making `expected` come out
+    0, so `done(0) < expected(0)` is False and the completeness guard silently passes
+    against a Phase1 that never ran. Also found: `trail_pcts` was missing from the
+    original required-key list entirely -- the exact same silent-fallback failure shape
+    that produced 9ab807a's bogus smoke-test numbers (_trail_pcts_for_strategy defaults
+    to config.json's value when the key is absent, understating `expected`)."""
+    required = ['take_profits', 'stop_losses', 'hold_time_caps', 'windows', 'z_score_thresholds']
+    _, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    if fourth_axis_col == 'trail_pct':
+        required.append('trail_pcts')
+    for key in required:
+        val = hp.get(key)
+        if not val:
+            raise ValueError(
+                f"{caller_name}: hp['{key}'] is missing or empty -- pass the FULL, non-empty "
+                f"campaign hp dict (same shape as run_phase1_coarse's), not a reduced one, so "
+                f"Phase1-Coarse-GT completeness can actually be verified before this reads "
+                f"island centers from it."
+            )
+
+
+def _phase1_coarse_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl):
+    """(done_count, expected_count) of real-minute-kernel cells computed for this exact
+    campaign scope, regardless of which phase wrote them. Caller must have already
+    validated hp via _require_full_gt_hp (expected can't come out 0 as a result).
+
+    Deliberately NOT filtered to phase='Phase1-Coarse-GT' (found by the paired-review
+    independent-cold pass, 2026-08-22): backtest_cache's PK excludes both `phase` and
+    `kernel_version`, and every dispatch write is INSERT OR REPLACE using whatever
+    phase_label the caller passed -- so a cell Phase2-GT computes that happens to fall
+    inside Phase1's own task grid gets silently RELABELED if Phase1 (re)computes that
+    same coordinate later, and if Phase1 restarts and treats that coordinate as already-
+    cached (its own cached_map lookup, keyed on the cell's values not its phase), it never
+    relabels it back -- permanently capping `done` below `expected` with no way to clear
+    it short of deleting rows. Counting ANY ground_truth_v6 row at these coordinates
+    (whichever phase last wrote it) is what actually answers "has every cell in this
+    scope been computed," which is the real question -- not "which phase's name is
+    currently stamped on it." Mirrors run_phase1_coarse's own pre-check query
+    (run_optimization_sweep.py:~1485) for the WHERE-scoping shape.
+
+    IMPORTANT: `done` is also constrained to axis_tp/sl-axis-column/max_hold_hours/4th-axis
+    (trail_sell_pct, when the strategy has one) values that are literally IN Phase1's own
+    hp lists (not just z/window/scope-scoped) — without this, Phase2/2.5's fine mesh
+    (which explores full-integer tp/sl neighborhoods, not just Phase1's sparse coarse-grid
+    values) would get counted as generic "done" cells too, letting `done` climb past
+    `expected` from off-grid cells while genuine Phase1 grid coordinates are still
+    unfilled -- a false-complete pass. The 4th-axis constraint was originally missing from
+    this fix (paired-review verification pass, 2026-08-22, found it as a live-demonstrable
+    gap: narrowing trail_pcts to a subset already covered by broader real data made `done`
+    count rows outside the narrowed set, again risking a false-complete pass) -- not yet
+    live-triggerable in practice (every real trail_sell_pct value on file is already
+    inside the campaign's own trail_pcts list), but fixed defensively before it could be."""
+    trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    expected = (len(hp['z_score_thresholds']) * len(hp['windows']) * len(hp['take_profits'])
+                * len(hp['stop_losses']) * len(hp['hold_time_caps']) * len(trail_pcts))
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    tpct_filter, tpct_params = "", []
+    if fourth_axis_col == 'trail_pct':
+        tpct_filter = f" AND trail_sell_pct IN ({','.join('?' * len(trail_pcts))})"
+        tpct_params = [float(v) for v in trail_pcts]
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        z_ph = ','.join('?' * len(hp['z_score_thresholds']))
+        w_ph = ','.join('?' * len(hp['windows']))
+        tp_ph = ','.join('?' * len(hp['take_profits']))
+        sl_ph = ','.join('?' * len(hp['stop_losses']))
+        hold_ph = ','.join('?' * len(hp['hold_time_caps']))
+        done = conn.execute(
+            f"SELECT COUNT(*) FROM backtest_cache WHERE strategy=? AND version=? AND ticker=?"
+            f" AND kernel_version='ground_truth_v6'"
+            f" AND z_score_threshold IN ({z_ph}) AND window IN ({w_ph})"
+            f" AND axis_tp IN ({tp_ph}) AND {_sl_axis_real_column(sl_axis_col)} IN ({sl_ph})"
+            f" AND max_hold_hours IN ({hold_ph}) {scope_sql} {tpct_filter}",
+            (strategy_name, config_version, ticker, *hp['z_score_thresholds'], *hp['windows'],
+             *hp['take_profits'], *hp['stop_losses'], *hp['hold_time_caps'], *scope_params, *tpct_params)
+        ).fetchone()[0]
+    return done, expected
+
+
 def run_phase2_island_ground_truth(shared_pool, ticker, strategy_name, config_version, hp, spy_bh,
                                     asset_bh, run_timestamp, fixed_sl=0, entry_timing='open_check',
                                     same_bar_reentry=True, generation=None, run_id=None,
@@ -1601,7 +1684,25 @@ def run_phase2_island_ground_truth(shared_pool, ticker, strategy_name, config_ve
     know or care which kernel produced a row). Only the final dispatch call differs:
     dispatch_parallel_grid_ground_truth instead of dispatch_parallel_grid. Requires
     Phase1-coarse-GT to have already been run for the same (ticker, strategy,
-    config_version) — reads its rows to find islands."""
+    config_version) — reads its rows to find islands.
+
+    HARD-BLOCKS if Phase1-Coarse-GT isn't complete for this scope (found by the paired-
+    review pass on 9ab807a: running this against a still-growing Phase1 grid would
+    silently mesh around provisional/wrong centers, with no signal anything was wrong —
+    the fix is to fail loudly, not to warn-and-continue). `hp` MUST be the full campaign
+    hp dict (take_profits/stop_losses included, matching run_phase1_coarse's own shape) —
+    passing a reduced hp (as an earlier smoke test did) will raise here rather than
+    silently under-checking completeness."""
+    _require_full_gt_hp(hp, strategy_name, "run_phase2_island_ground_truth")
+    done, expected = _phase1_coarse_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
+    if done < expected:
+        raise RuntimeError(
+            f"[{ticker}] Phase2-GT blocked: Phase1-Coarse-GT is incomplete for this campaign "
+            f"scope ({done:,}/{expected:,} cells). Reading island centers from a still-growing "
+            f"Phase1 grid would silently mesh around provisional/wrong centers -- wait for "
+            f"Phase1-Coarse-GT to actually finish before calling this."
+        )
+
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
@@ -1693,14 +1794,36 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
     """v6 counterpart to run_phase25_cliff_box — same shape (±CLIFF_RADIUS in TP/SL,
     ±7h in hold, ±1 trail_pct neighbor around the true best node), task-generation SQL
     unchanged apart from the added kernel_version filter (kernel-agnostic query pattern,
-    same rationale as run_phase2_island_ground_truth above)."""
+    same rationale as run_phase2_island_ground_truth above).
+
+    HARD-BLOCKS on two independent checks, per the paired-review independent-cold pass
+    (2026-08-22), which found the original phase-label-only check gave a live FALSE PASS:
+    (1) Phase1-Coarse-GT itself must be complete for this scope (same
+    _require_full_gt_hp/_phase1_coarse_gt_status check as run_phase2_island_ground_truth
+    -- checked first here since it's cheap and catches the exact scenario that produced
+    the false pass: a real best-row with phase='Phase2-Island-GT' existing in the DB from
+    an early smoke test run against a Phase1 grid that was only ~3% complete at the time).
+    (2) the current best row must itself carry phase='Phase2-Island-GT' -- kept as a
+    second, cheap sanity check (not a substitute for (1): Phase2's mesh size is data-
+    dependent, so it can't be verified for completeness the way Phase1's fixed grid can,
+    but confirming the top-ranked row is Phase2-derived at all is still worth asserting)."""
+    _require_full_gt_hp(hp, strategy_name, "run_phase25_cliff_box_ground_truth")
+    p1_done, p1_expected = _phase1_coarse_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
+    if p1_done < p1_expected:
+        raise RuntimeError(
+            f"[{ticker}] Phase2.5-GT blocked: Phase1-Coarse-GT is incomplete for this campaign "
+            f"scope ({p1_done:,}/{p1_expected:,} cells) -- Phase2.5 refines around Phase2's best "
+            f"point, which itself depends on Phase1 having actually finished. Wait for "
+            f"Phase1-Coarse-GT to finish before calling this."
+        )
+
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(f"""
             SELECT axis_tp, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, window, z_score_threshold,
-                   {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct
+                   {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct, phase
             FROM backtest_cache
             WHERE version=? AND ticker=? AND strategy=? AND trades > 0
               AND kernel_version='ground_truth_v6' {scope_sql}
@@ -1708,6 +1831,13 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
         """, (config_version, ticker, strategy_name, *scope_params)).fetchone()
     if not row:
         return
+    if row[6] != 'Phase2-Island-GT':
+        raise RuntimeError(
+            f"[{ticker}] Phase2.5-GT blocked: the current best row (phase={row[6]!r}) didn't "
+            f"come from Phase2-Island-GT -- Phase2.5 exists to refine around Phase2's true "
+            f"best point, not Phase1's coarse one. Run run_phase2_island_ground_truth for "
+            f"this scope first."
+        )
     tp_c, sl_c, hold_c, w_c, z_c, tpct_c = int(row[0]), int(row[1]), int(row[2]), int(row[3]), float(row[4]), float(row[5])
 
     if fourth_axis_col == 'trail_pct' and tpct_c in trail_pcts:
