@@ -368,9 +368,112 @@ fills on the same trade list) — same category as this plan's other deferred
 constraint above**: any v6.1 direction that means trading more often is off the table
 regardless of what a parameter search might otherwise suggest.
 
+## Full game-plan shape, 2026-08-22 (session discussion, not yet started beyond Phase 1)
+
+1. **Data foundation** (in progress, `coder`): fixing windows + new data pipeline for
+   minute/hourly derived data, ahead of a longer backfill (4-4.75yr lookback leaning,
+   preserving at least one held-out quarter for rebalance testing — user's call, not
+   swept).
+2. **Sweep methodology**: throughput confirmed fine (the 3.66/s vs 823/s scare was a
+   pre-fix log, real cause was uncached repeat-compute, already fixed) — reduced-density
+   grid + extra Phase2 generation stay optional fallbacks, not required.
+2.5. **Independent-simulator cross-validation, decided 2026-08-22 — runs BEFORE Phase 3,
+   not after.** Extend the from-scratch independent reimplementation
+   (`sim_minute_groundtruth_independent.py`, already validated SOXL/HIBL to <0.06% against
+   real `trade_log` fills) to the other 10 Tranche-1 tickers with real live trade history.
+   Cheap (replays real trades, not a full grid sweep) and it's the strongest available
+   evidence GT's fill modeling matches reality, not just that the numba port matches the
+   Python prototype (Step 2a's parity gate already proved that, separately). De-risks
+   trusting Phase 3's full sweep output before spending real compute on it.
+3. **Run the real triage sweep** across the universe once 1, 2, and 2.5 settle.
+4. **Build the GT-aware tooling**: candidate-report pipeline, `top_safe_nodes.py`
+   kernel-version-aware selection, promotion checklist's 3 GT-dependent checks (9/10/13).
+   **Alpha removed entirely** (not just de-prioritized) from schema/reports/ranking —
+   CAGR (or GT worst-neighbor-CAGR) is the sole metric going forward. **Core+overlay
+   joint optimization folded in here** (moved from the old Follow-on bucket, see below) —
+   `ensure_overlay_for_node`/`run_overlay_shim.run_for_node` confirmed to only compute one
+   fixed drought variant (confirm_days=10, vol_gate=off) + one addon variant, automatically
+   but only for whichever core node already won on core-only CAGR, never searched jointly.
+   Real deployability constraint: add-on needs margin-borrowed capital (`brokerage`-only,
+   Reg-T margin), not available in `ira`/`roth`/`sep` (cash accounts) — the joint sweep
+   scopes add-on to `brokerage`-bound nodes only; drought has no such constraint and
+   applies universe-wide. `kernel_version` added as a real schema column (future-proofs
+   the data model for eventual multi-strategy use) but no general pluggable-kernel
+   selector built — no second kernel needs one yet. **Review-gate applies**: alpha
+   removal touches `ROBUST_ALPHA_SQL`/`run_optimization_sweep.py`, a backtest kernel
+   module under CLAUDE.md's mandatory paired independent-cold + contextual Opus review —
+   flag explicitly here rather than relying on session-wrap to catch it after the fact,
+   per this project's own `908a6f0` incident (shipped once without review because
+   attention was on a narrower sub-problem, same risk shape as this megaproject).
+5. **Pick new v6 candidates, sunset v5/v5.1** — no re-derivation of old picks, straight
+   fresh selection via Phase 4's tooling against Phase 3's sweep output. **Rollback
+   posture, decided 2026-08-22**: if a v6 candidate turns out wrong post-promotion,
+   disable trading first (safe stop, not a config revert) — v5 configs stay recoverable
+   by candidate node id if truly needed, but treated as a last-resort stopgap, not a real
+   "safe" fallback, since the whole premise of v6 is that v5 probably wasn't the best node
+   to begin with.
+6. **Promote + harness/script cleanup**: run the real promotion process
+   (`docs/watchlist_candidate_checklist.md` etc.) for each new v6 candidate; triage-then-fix
+   the real surface found by direct grep — 22 non-test source files + 20 test files with
+   hardcoded `'v5'` string references, 6 of 7 candidate/promotion pipeline files with
+   baked-in hourly-only trade generation (`get_trades_and_bars`/
+   `simulate_trail_both_annotated`) — most of the pipeline files get fixed as a byproduct
+   of Phase 4, several of the source files are dead one-off research scripts that should
+   be archived (ties into the existing `[tooling]` scripts/-cleanup backlog item) rather
+   than "fixed." **Biggest single item**: `evening_status.py` Part 3's real-vs-kernel
+   divergence check (`compute_divergence`/`get_backtest_trades_in_window`, writes to the
+   persisted `divergence_check_log` table) is the literal decision mechanism the
+   already-resolved quarterly-rebalance item said to watch (30d trailing, 10pp threshold,
+   "hold current config, watch this instead"). Swapping the replay to GT changes what
+   "predicted" means, so the threshold needs real recalibration, not just a code swap, or
+   the daemon's own drift detection goes silent or false-alarms on normal GT-vs-real noise.
+   **Review-gate applies**: promotion logic and any `signals_*.py`/`schwab_*.py` touch
+   here needs the same paired review — flag explicitly, same reasoning as Phase 4 above.
+   **Wash-sale risk, flagged 2026-08-22 (adversarial review)**: sunsetting a v5 position
+   and opening a v6 position on the same ticker is precisely the GDXU incident's shape
+   (`trading_incident #2`) — `docs/watchlist_candidate_checklist.md` check #16 (commit
+   `3a88c1d`) already covers taxable-loss-then-IRA-repurchase-within-30-days at promotion
+   time, but it's a manual step with no code enforcement (see the still-open
+   `[live-trading][tax]` backlog item). **Decided: run check #16 explicitly for every
+   v5→v6 sunset transition**, not just new-ticker promotions — the checklist already
+   covers this, the sunset just needs to actually invoke it every time, not skip it
+   because "this ticker's already live, it's not really a new promotion."
+   **CLAUDE.md staleness, flagged 2026-08-22 (adversarial review, agreed)**: the "Live
+   Trading — Current State" section's strategy-version conventions (references to v5/v5.1
+   as live defaults) will go stale the moment v6 replaces them — capturing here explicitly
+   so session-wrap's "reconcile older bullets on the same topic" step doesn't miss it the
+   way the 2026-08-04 USO K-1 bullet went stale/self-contradicting before someone caught it.
+7. **Test-harness alignment** (paper/dry_run/harness, "the backtest is still our
+   principle" — user's framing): checked directly, 2026-08-22 — paper trading
+   (`paper_trading.py`'s `update_paper_buys()`) and dry_run
+   (`signals_notify.py`'s buy-update loop /`_fill_dry_run_buy`) already independently
+   implement continuous every-poll trailing-buy tracking (`compute._current_price` +
+   running-low/trigger), matching GT's core premise (continuous, not bar-sampled) —
+   **not a structural gap**, just needs fine-grained calibration against GT (poll
+   cadence, running-low definition edge cases), which drift metrics can catch. The real
+   gap is `tests/fake_broker.py`: zero autonomous fill-timing model at all — `MARKET`
+   fills instantly at whatever quote is set, `STOP`/`TRAILING_STOP` orders sit `WORKING`
+   until the test itself calls `advance_price()`/`force_fill()`, entirely hand-scripted
+   per test. **Decided scope, not a harness rewrite**: audit existing
+   `advance_price()`/`force_fill()` sequences across the test suite against what GT
+   considers realistic (e.g. a trailing-buy scenario should script a continuous
+   multi-tick convergence, not a single-jump fill), and require new scenarios follow that
+   convention going forward. Explicitly rejected as out of scope: having the harness
+   itself validate backtest predictions (a different question, already owned by the
+   evening_status divergence checks) or blurring canary/fake_broker's existing role as
+   execution-mechanics proof (kernel-independent by design, confirmed unaffected by GT
+   earlier this session) into candidate-quality proof.
+8. **Live-trading execution backlog** (was "Phase 6" before this got renumbered): runs in
+   parallel throughout, unaffected — dispatched via `research`/`coder2` as normal,
+   doesn't wait on any of the above.
+
+**v6.1 boundary applies throughout**: no direction in any phase above should mean trading
+*more often* — the user's explicit discomfort with higher frequency bounds what's even
+worth exploring, separate from what a parameter search might suggest.
+
 ## Follow-on (separate future project, not this plan)
 
-Folding together three previously-separate deferred backlog items, all sharing the same
+Folding together two previously-separate deferred backlog items, all sharing the same
 real trigger condition ("a new strategy variant/kernel architecture is actually being
 designed"): the `backtest_cache` overloaded-columns schema definition (2026-08-07,
 deferred), kernel versioning (`project_kernel_versioning_idea` memory, 2026-07-20, a

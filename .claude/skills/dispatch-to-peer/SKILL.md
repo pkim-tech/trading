@@ -90,6 +90,21 @@ here.
    the CLAUDE.md review-gate (item 2 above) has actually been satisfied —
    never mark a task `completed` with a paired review still outstanding.
 
+8. **Collision check on shared surface, before writing the dispatch prompt.**
+   Added 2026-08-22 after a real near-miss: this session, `coder`, and
+   `backtester-kernel-audit` all edited `db_cache.py`/`backtest_cache`
+   schema/`docs/backlog_cache.md` concurrently in the same evening, only
+   caught by accident when staging a commit (a `git status` showed another
+   session's uncommitted diff already sitting in the working tree). Before
+   dispatching work that touches a specific file/table with real collision
+   risk (schema files, `run_optimization_sweep.py`, shared docs like
+   `backlog_cache.md`/`deep_backlog.md`), run `git status`/`git diff` on that
+   path first to see if another session already has uncommitted changes
+   there, and check `TaskList` for whether another dispatched task already
+   claims that scope. A 2-command check before writing the prompt, not a new
+   process to maintain — agents do exactly what they're dispatched to do,
+   so the actual fix is upstream, at dispatch time.
+
 ## Clearing a peer session
 
 Two safe-to-clear states — don't conflate them:
