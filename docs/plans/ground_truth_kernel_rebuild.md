@@ -374,5 +374,23 @@ Folding together three previously-separate deferred backlog items, all sharing t
 real trigger condition ("a new strategy variant/kernel architecture is actually being
 designed"): the `backtest_cache` overloaded-columns schema definition (2026-08-07,
 deferred), kernel versioning (`project_kernel_versioning_idea` memory, 2026-07-20, a
-`KERNEL_VERSION` column so a cached row self-documents which kernel logic produced it),
-and core+overlay joint kernel optimization (this session, 2026-08-21).
+`KERNEL_VERSION` column so a cached row self-documents which kernel logic produced it).
+
+**Status, 2026-08-22: schema rework now IN PROGRESS** (dispatched to the `backtester`
+session) — refactoring `backtest_cache` to a JSON parameter-definition column instead of
+adding more overloaded columns per strategy. Triggered by yet another instance of the same
+root cause (a column meaning different things per strategy causing a real interpretation
+bug) — same failure family as the `take_profit` overload (arm-sell-pct vs. real take-profit
+vs. drought-arm-override, 4 confirmed instances now) that motivated deferring this in the
+first place.
+
+**Core+overlay joint kernel optimization has moved OUT of this Follow-on bucket** —
+folded into the main v6 sunset scope instead (see the "v6 scope decision" section above),
+per 2026-08-22 discussion: `ensure_overlay_for_node`/`run_overlay_shim.run_for_node`
+confirmed to only compute a single fixed drought variant (confirm_days=10, vol_gate=off)
++ single addon variant, automatically but only for whichever core node already won on
+core-only CAGR — never searched jointly with core params. Real deployability constraint
+found in the same discussion: add-on requires margin-borrowed capital (`brokerage`-only,
+Reg-T margin), not available in `ira`/`roth`/`sep` (cash accounts) — the joint sweep must
+scope add-on consideration to `brokerage`-bound nodes only; drought has no such constraint
+and applies universe-wide.
