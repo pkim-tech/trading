@@ -15,7 +15,8 @@ from tqdm import tqdm
 
 from backtester import (run_backtest_dispatch,
                         prep_inputs, _simulate, _simulate_limit, _simulate_trail, _simulate_trail_buy,
-                        _simulate_trail_both, _simulate_limit_trail, _simulate_close_limitexit)
+                        _simulate_trail_both, _simulate_limit_trail, _simulate_close_limitexit,
+                        run_backtest_ground_truth)
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
@@ -241,6 +242,22 @@ def init_idempotent_db():
     # forward get stamped.
     try:
         cursor.execute("ALTER TABLE backtest_cache ADD COLUMN sweep_run_id INTEGER")
+    except Exception:
+        pass
+    # kernel_version (2026-08-21): self-documents which kernel logic produced a row --
+    # the already-designed-but-unbuilt idea from project_kernel_versioning_idea memory,
+    # triggered now by docs/plans/ground_truth_kernel_rebuild.md's v6 campaign (real
+    # minute-resolution kernel, backtester.run_backtest_ground_truth) landing alongside
+    # the existing hourly kernel (backtester.run_backtest_dispatch). Nullable, no PK
+    # change, NO BACKFILL (same convention as phase/generation/sweep_run_id above) --
+    # every pre-2026-08-21 row predates this column and stays NULL (implicitly "hourly",
+    # the only kernel that existed then); only a v6 campaign's writes get stamped
+    # 'ground_truth_v6' explicitly. Plain data column, not part of version scoping --
+    # 'v6' as a version string already isolates ground-truth rows from v4/v5 hourly
+    # rows at the (strategy, version, ticker, ...) cache-key level; this column is the
+    # self-documentation the plan asked for, not a second isolation mechanism.
+    try:
+        cursor.execute("ALTER TABLE backtest_cache ADD COLUMN kernel_version TEXT")
     except Exception:
         pass
 
@@ -704,6 +721,353 @@ def _summarize_trades(closed, spy_bh):
     compounded = float(((df_tr['Return'] + 1).prod() - 1) * 100)
     alpha_calc = float(compounded - spy_bh)
     return alpha_calc, len(df_tr), win_rate, compounded, win_twin_rate
+
+
+# ═══════════════ v6 ground-truth kernel wiring (docs/plans/ground_truth_kernel_rebuild.md
+# Step 3) — mirrors the hourly-kernel machinery above (_load_node_inputs/
+# run_single_backtest_node_isolated/dispatch_parallel_grid) but calls
+# backtester.run_backtest_ground_truth (real per-minute resolution) instead of
+# run_backtest_dispatch. Deliberately a SEPARATE, self-contained path rather than
+# threading a `kernel` flag through the existing heavily-guarded functions (the
+# start_date/end_date/min_hold_hours version-suffix assertions in particular) — smaller,
+# more reviewable diff, and this scope doesn't need windowing/min_hold_hours yet. Reuses
+# identify_island_candidates/identify_full_mesh_candidates/pick_island_centers UNCHANGED
+# (they're kernel-agnostic, working off backtest_cache columns generically) and
+# ROBUST_ALPHA_SQL UNCHANGED (v6 rows leave alpha_vs_spy_pessimistic/_certain NULL, so
+# MIN(alpha_vs_spy, COALESCE(NULL,alpha_vs_spy), COALESCE(NULL,alpha_vs_spy)) collapses
+# to plain alpha_vs_spy automatically — exactly the plan's "job (2) disappears" cliff-
+# safety redefinition, no extra code needed). Scope: TrailingBothZScoreBreakout /
+# TrailingExitZScoreBreakout only, matching backtester.run_backtest_ground_truth's own
+# scope (see its docstring's Step-3 interface-convention warning before extending this).
+
+MINUTE_DIR = CACHE_DIR / "minute_data"
+_MINUTE_DF_CACHE = {}
+_MINUTE_DF_CACHE_MAX = 3  # minute CSVs are large (~500k-600k rows); cap tighter than
+                          # _NODE_INPUT_CACHE_MAX since a worker process holds both.
+_NODE_INPUT_CACHE_GT = {}
+
+
+def _load_minute_df(ticker):
+    hit = _MINUTE_DF_CACHE.get(ticker)
+    if hit is not None:
+        return hit
+    df = pd.read_csv(MINUTE_DIR / f"{ticker}_1m.csv")
+    ts = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("US/Eastern").dt.tz_localize(None)
+    df = df.set_index(ts).sort_index()
+    t = df.index.time
+    keep = (t >= pd.Timestamp("09:30").time()) & (t < pd.Timestamp("16:00").time())
+    df = df.loc[keep, ["Open", "High", "Low", "Close"]]
+    if len(_MINUTE_DF_CACHE) >= _MINUTE_DF_CACHE_MAX:
+        _MINUTE_DF_CACHE.clear()
+    _MINUTE_DF_CACHE[ticker] = df
+    return df
+
+
+def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh):
+    """Same per-worker-process memo pattern as _load_node_inputs. Indicators depend only
+    on (ticker, strategy, window) — z_thresh is a kernel arg, not baked into df_daily_
+    processed, so it's not part of the cache key (matches _load_node_inputs's own key,
+    which also omits z_thresh for the same reason)."""
+    key = (ticker, strategy_name, int(w))
+    hit = _NODE_INPUT_CACHE_GT.get(key)
+    if hit is not None:
+        return hit
+
+    cache_path = CACHE_DIR / f"{ticker}_1h.csv"
+    df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+    df_hourly_raw.index = pd.to_datetime(df_hourly_raw.index).tz_localize(None)
+    df_hourly_raw = df_hourly_raw.sort_index()
+    if df_hourly_raw.empty:
+        entry = None
+    else:
+        close_col = 'Adj Close' if 'Adj Close' in df_hourly_raw.columns else 'Close'
+        df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
+        strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
+        df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
+        minute_df = _load_minute_df(ticker)
+        entry = (df_hourly_raw, df_daily_processed, minute_df)
+
+    if len(_NODE_INPUT_CACHE_GT) >= _NODE_INPUT_CACHE_MAX:
+        _NODE_INPUT_CACHE_GT.clear()
+    _NODE_INPUT_CACHE_GT[key] = entry
+    return entry
+
+
+def _summarize_trades_ground_truth(trades, spy_bh):
+    """Ground-truth trades carry 'Return' directly, no Result/WIN-LOSS/TWIN-TLOSS code
+    (backtester.run_backtest_ground_truth's exit_reason is SL/TRAIL/TIME, a mechanism
+    label, not a profitability label) — win_twin_rate exists in _summarize_trades
+    specifically to fold TWIN (profitable TIME exit) back into "did this trade make
+    money," which Return>0 already answers directly here with no split to correct for.
+
+    CAUTION when comparing a v6 row's win_rate against an hourly (v4/v5) row's win_rate
+    (flagged by the paired-review independent-cold pass, 2026-08-21): the hourly kernel's
+    win_rate (_summarize_trades, Result=='WIN') EXCLUDES profitable TIME exits (TWIN) --
+    this function's win_rate does not make that distinction (Return>0 regardless of exit
+    mechanism), so it's definitionally the hourly path's win_twin_rate, not its win_rate.
+    A side-by-side v5-vs-v6 comparison should read v6's win_rate against v5's
+    win_twin_rate column, not v5's win_rate."""
+    df_tr = pd.DataFrame(trades)
+    win_rate = float((df_tr['Return'] > 0).mean() * 100)
+    compounded = float(((df_tr['Return'] + 1).prod() - 1) * 100)
+    alpha_calc = float(compounded - spy_bh)
+    return alpha_calc, len(df_tr), win_rate, compounded, win_rate
+
+
+def run_single_backtest_node_ground_truth_isolated(args):
+    (ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl,
+     trail_pct_pct, entry_timing, same_bar_reentry, start_date, end_date) = args
+
+    strategy_class = getattr(strategies, strategy_name, None)
+    if strategy_name not in ('TrailingBothZScoreBreakout', 'TrailingExitZScoreBreakout') or not strategy_class:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "UNKNOWN_STRAT"}
+
+    try:
+        inputs = _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh)
+    except Exception as e:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR", "error": repr(e)}
+
+    if inputs is None:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
+    df_hourly_raw, df_daily_processed, minute_df = inputs
+    # df_daily_processed (indicators) ALWAYS stays full-history, even when windowed --
+    # matches _load_node_inputs/_window_prep's convention (never truncate pre-indicator).
+    # Only the hourly bars actually fed to the kernel get sliced, mirroring the parity
+    # test's own fix (tests/test_ground_truth_kernel_parity.py) for the identical
+    # window-boundary state-leak risk.
+    if start_date is not None or end_date is not None:
+        # Found by paired-review independent-cold pass (2026-08-21): `end_date + " ..."`
+        # crashes on a one-sided window (end_date=None) or a non-str caller (datetime.date/
+        # pd.Timestamp), unlike window_version_suffix's own more permissive contract.
+        # Unreachable via dispatch_parallel_grid_ground_truth (its guard requires both
+        # dates to build a valid suffix first) but a direct caller could hit this -- use
+        # pd.Timestamp slicing, which tolerates None on either side, instead.
+        lo = pd.Timestamp(start_date) if start_date is not None else None
+        hi = (pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)) if end_date is not None else None
+        df_hourly_raw = df_hourly_raw.loc[lo:hi]
+        if df_hourly_raw.empty:
+            return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
+
+    is_both = strategy_name == 'TrailingBothZScoreBreakout'
+    # Axis meaning mirrors strategies.resolve_axis_columns for these two strategies:
+    # TrailingBoth sweeps trail_buy_pct(=sl)/arm(=tp)/trail_sell_pct(=tpct);
+    # TrailingExit sweeps trail_sell_pct(=sl)/arm-or-tp(=tp), no trail_buy_pct.
+    if is_both:
+        trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = float(sl), float(trail_pct_pct), float(tp)
+    else:
+        trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = 0.0, float(sl), float(tp)
+
+    try:
+        trades = run_backtest_ground_truth(
+            df_hourly_raw, df_daily_processed, ticker, minute_df,
+            fixed_sl=fixed_sl, arm_pct=arm_pct_arg, trail_buy_pct=trail_buy_pct_arg,
+            trail_sell_pct=trail_sell_pct_arg, max_hours_to_hold=hold_hours,
+            z_score_threshold=z_thresh, is_both=is_both,
+            open_check_entry_timing=(entry_timing == 'open_check'),
+            same_bar_reentry=same_bar_reentry,
+        )
+    except Exception as e:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "SIM_ERROR", "error": repr(e)}
+
+    if not trades:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "NO_TRADES"}
+
+    alpha_calc, n_trades, win_rate, compounded, win_twin_rate = _summarize_trades_ground_truth(trades, spy_bh)
+    return {
+        "coords":  (tp, sl, hold_hours),
+        "payload": (alpha_calc, n_trades, win_rate, compounded, win_twin_rate),
+        "window":  w, "z_thresh": z_thresh, "status": "SUCCESS"
+    }
+
+
+def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_name, config_version,
+                                         phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0,
+                                         entry_timing='close', same_bar_reentry=True, generation=None,
+                                         run_id=None, start_date=None, end_date=None):
+    """v6 counterpart to dispatch_parallel_grid — same cache-lookup/dispatch/write shape,
+    calling run_single_backtest_node_ground_truth_isolated instead. No min_hold_hours
+    support (not needed for the v6 Tranche-1 scope). Writes alpha_vs_spy_pessimistic/
+    _certain as NULL always (no resolution-ambiguity hedging with real minute data — see
+    module docstring) and kernel_version='ground_truth_v6'.
+
+    start_date/end_date reuse dispatch_parallel_grid's own window_version_suffix guard —
+    a windowed call whose config_version doesn't carry the matching suffix is REJECTED,
+    same rationale as the hourly path: a windowed result must never share a cache key
+    with a full-history one (found live in this session: SOXL_1h.csv's actual full-
+    history window has grown since older v4/v5 campaigns ran, so 'full history' is not a
+    stable, comparable window across time — an explicit window is what makes a ground-
+    truth-vs-hourly-kernel comparison apples-to-apples).
+
+    CAUTION (paired-review independent-cold pass, 2026-08-21): same_bar_reentry is a real
+    behavioral kernel arg with no backtest_cache column and no version-suffix guard of its
+    own -- flipping it under an unchanged config_version would silently serve rows computed
+    at the OTHER setting back out of the cache (same failure shape window_version_suffix/
+    min_hold_version_suffix exist to prevent for their own axes). Do not vary
+    same_bar_reentry within a single version string; every caller today passes True."""
+    if start_date is not None or end_date is not None:
+        required_suffix = window_version_suffix(start_date, end_date)
+        if not config_version.endswith(required_suffix):
+            raise ValueError(
+                f"dispatch_parallel_grid_ground_truth: windowed call (start_date={start_date!r}, "
+                f"end_date={end_date!r}) but config_version={config_version!r} does not end with "
+                f"the required suffix {required_suffix!r}. Build config_version via "
+                f"window_version_suffix(start_date, end_date) before calling this."
+            )
+
+    conn   = sqlite3.connect(DB_PATH, timeout=60.0)
+    cursor = conn.cursor()
+    matrix_results  = []
+    unvisited_tasks = []
+
+    uses_fixed_sl = strategies.uses_fixed_sl(strategy_name)
+    stored_fsl = float(fixed_sl) if uses_fixed_sl else 0.0
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+
+    cached_map = {}
+    cursor.execute("""
+        SELECT window, max_hold_hours, axis_tp, stop_loss, z_score_threshold, fixed_sl,
+               trail_buy_pct, trail_sell_pct, trades, win_rate, strategy_return, alpha_vs_spy, win_twin_rate
+        FROM backtest_cache
+        WHERE strategy=? AND version=? AND ticker=? AND entry_timing=? AND kernel_version='ground_truth_v6'
+    """, (strategy_name, config_version, ticker, entry_timing))
+    for r in cursor.fetchall():
+        if r[4] is None:
+            continue
+        row_fsl = float(r[5]) if (uses_fixed_sl and r[5] is not None) else 0.0
+        if sl_axis_col == 'trail_buy_pct':
+            row_sl_raw = float(r[6])
+        elif sl_axis_col == 'trail_pct':
+            row_sl_raw = float(r[7])
+        else:
+            row_sl_raw = float(r[3])
+        row_tpct_raw = float(r[7]) if fourth_axis_col == 'trail_pct' else 0.0
+        cached_map[(int(r[2]), row_sl_raw, int(r[1]), int(r[0]), float(r[4]), row_fsl, row_tpct_raw)] = \
+            (r[8], r[9], r[10], r[11], r[12] if r[12] is not None else 0.0)
+
+    for t in tasks:
+        tp, sl, hold_hours, w, z_thresh, tpct = t
+        cached_row = cached_map.get((int(tp), float(sl), int(hold_hours), int(w), float(z_thresh), stored_fsl, float(tpct)))
+        if cached_row:
+            matrix_results.append({
+                "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
+                "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
+                "Z Threshold": z_thresh,
+                "Trades": cached_row[0], "Win Rate %": cached_row[1], "Return %": cached_row[2],
+                "Alpha vs SPY %": cached_row[3], "Win+TWin Rate %": cached_row[4],
+                "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
+            })
+        else:
+            unvisited_tasks.append(t)
+
+    logger.info(f"[{ticker}] {phase_label} (ground_truth_v6): {len(matrix_results):,} cached, "
+                f"{len(unvisited_tasks):,} to compute (of {len(tasks):,} total)")
+
+    if not unvisited_tasks:
+        conn.close()
+        return pd.DataFrame(matrix_results)
+
+    futures_map = {
+        shared_pool.submit(run_single_backtest_node_ground_truth_isolated,
+                           (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z,
+                            fixed_sl, tpct, entry_timing, same_bar_reentry, start_date, end_date)): task
+        for task in unvisited_tasks
+        for tp, sl, hold, w, z, tpct in [task]
+    }
+
+    progress_bar = tqdm(
+        as_completed(futures_map), total=len(futures_map),
+        desc=f"[{ticker}] {phase_label} (gt)", unit="node",
+        mininterval=15.0, maxinterval=30.0
+    )
+
+    fail_counts = {}
+    buffer = []
+    batch_size = 5000
+
+    for future in progress_bar:
+        tp, sl, hold_hours, w, z_thresh, tpct = futures_map[future]
+        try:
+            res = future.result()
+            status = res.get("status")
+            if status not in ("SUCCESS", "NO_TRADES"):
+                fail_counts[status] = fail_counts.get(status, 0) + 1
+                if sum(fail_counts.values()) == 1:
+                    logger.warning(f"[{ticker}] {phase_label} first failed node TP={tp} SL={sl}: "
+                                   f"{status} {res.get('error', '')}")
+                continue
+
+            if status == "SUCCESS":
+                alpha, num_trades, wr, comp_ret, wtw = res["payload"]
+            else:
+                alpha, num_trades, wr, comp_ret, wtw = 0.0, 0, 0.0, 0.0, 0.0
+
+            progress_bar.set_postfix({"Alpha": f"{alpha:+.1f}%", "Trades": num_trades})
+
+            if status == "SUCCESS":
+                matrix_results.append({
+                    "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
+                    "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
+                    "Z Threshold": z_thresh,
+                    "Trades": num_trades, "Win Rate %": wr, "Return %": comp_ret,
+                    "Alpha vs SPY %": alpha, "Win+TWin Rate %": wtw,
+                    "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
+                })
+
+            if sl_axis_col == 'trail_buy_pct':
+                row_stop_loss, row_trail_buy_pct = int(round(stored_fsl)), float(sl)
+                row_trail_pct = float(tpct) if fourth_axis_col == 'trail_pct' else 0.0
+            elif sl_axis_col == 'trail_pct':
+                row_stop_loss, row_trail_buy_pct, row_trail_pct = int(round(stored_fsl)), 0.0, float(sl)
+            else:
+                row_stop_loss, row_trail_buy_pct, row_trail_pct = int(sl), 0.0, 0.0
+
+            if strategy_name == 'TrailingBothZScoreBreakout':
+                row_take_profit, row_arm_sell_pct = None, float(tp)
+            else:
+                row_take_profit, row_arm_sell_pct = int(tp), None
+
+            buffer.append((strategy_name, config_version, ticker, w, hold_hours, row_take_profit, row_stop_loss,
+                           num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
+                           stored_fsl, row_trail_buy_pct, row_trail_pct, wtw, row_arm_sell_pct, float(tp),
+                           entry_timing, None, None, None, None, phase_label, generation, run_id,
+                           'ground_truth_v6'))
+
+            if len(buffer) >= batch_size:
+                cursor.executemany(
+                    """INSERT OR REPLACE INTO backtest_cache
+                       (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
+                        trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
+                        run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
+                        win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
+                        strategy_return_pessimistic, alpha_vs_spy_pessimistic,
+                        strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
+                        kernel_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    buffer
+                )
+                buffer = []
+                conn.commit()
+
+        except Exception as e:
+            logger.error(f"Worker crashed TP={tp} SL={sl}: {e}")
+
+    if buffer:
+        cursor.executemany(
+            """INSERT OR REPLACE INTO backtest_cache
+               (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
+                trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
+                run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
+                win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
+                strategy_return_pessimistic, alpha_vs_spy_pessimistic,
+                strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
+                kernel_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            buffer
+        )
+        conn.commit()
+
+    conn.close()
+    return pd.DataFrame(matrix_results)
 
 
 def run_single_backtest_node_isolated(args):
