@@ -259,6 +259,16 @@ resting order, hold that specific node's flip until the order resolves (fills or
 cancelled/times out) rather than reconfiguring underneath it -- proceed with the rest of
 a multi-ticker promotion pass in the meantime if the other nodes are clear.
 
+**Extended 2026-08-22 (ground-truth kernel rebuild plan, adversarial review) for
+strategy-version sunsets, not just param reconfigs**: when a promotion replaces a node's
+underlying strategy/kernel version entirely (e.g. a v5/v5.1 node sunsetting to a v6 pick,
+not just a parameter tweak on the same version), also check `watch_list` itself for the
+ticker -- confirm the old node is correctly archived (not left `state='live'` alongside
+the new one, no duplicate/orphaned rows for the same ticker), in addition to the
+open_positions/pending_buys check above. Orders, positions, and watch_list rows are all
+interrelated state that can drift out of sync specifically at a strategy-version
+transition, not just a config-param change.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds
