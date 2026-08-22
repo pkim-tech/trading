@@ -224,6 +224,90 @@ assume one kernel per version.
    they were compensating for no longer has that limitation. Not a separate project; falls
    out naturally once Tranche 1's core ground-truth results exist.
 
+## Step 3 progress addendum (2026-08-21/22 night, real-time handoff note)
+
+Written directly into this doc rather than left in conversation, specifically so a
+`coder2` context-clear doesn't lose it — none of this is in git history yet since most of
+it is decided-but-not-yet-built.
+
+**Built and committed**: `_load_node_inputs_ground_truth`/`run_single_backtest_node_ground_truth_isolated`/
+`dispatch_parallel_grid_ground_truth` (Step 3 core dispatch, `d864b55`), Phase2/2.5-GT
+wrapper functions (`9ab807a`, `cf810ba` — corrected a bogus fork-reported smoke test caused
+by a missing `trail_pcts` key silently falling back to config.json's default), and a
+Phase1-must-finish-before-Phase2-reads ordering guard (`aac8ae8`, after 5 real HIGH/MEDIUM
+bugs across 2 review rounds — see that commit for the full list; the guard itself needed as
+much scrutiny as the thing it guards).
+
+**Running now (background, detached, survives session-clear)**: SOXL Phase1-coarse-GT full
+grid (164,640 cells, 8 workers, `logs/ground_truth_phase1_soxl.log`) — this is the
+reference/proof-of-concept full-density run, deliberately left untouched. A neighborhood-check
+batch (1 worker, `logs/ground_truth_neighborhood_batch.log`) sequentially covering the other
+11 Tranche-1 tickers, user-authorized 2026-08-22.
+
+**Real finding so far (SOXL, from the early neighborhood check, before the full sweep
+result exists)**: live config (arm=30%/trail_buy=3%/hold=70h) shows ~58.5% ground-truth
+CAGR, but worst-neighbor CAGR in its immediate ±2 box is only ~12.0% — fails the plan's
+20%-worst-neighbor-CAGR bar. Diagonal-specific: trail_buy_pct alone or hold alone both hold
+up fine (~29-31%); only the combination together craters it. Next-best swept config
+(arm=30/trail_buy=5/hold=77h, 81.6%) sits at the edge of the swept box — real island search
+needed to know if something better exists just outside it. **Not yet resolved by a real
+Phase2/2.5-GT run** — the 574.1% "interior peak" number reported earlier was retracted, it
+was computed against a Phase1 dataset that was only ~3% complete (a bug in the ordering
+guard's first draft let it through; fixed in `aac8ae8`).
+
+**Decided but NOT yet built** (this is the part that would be lost on a clear):
+- **Timeline problem**: full Phase1-coarse-GT at current density is ~9-15h/ticker
+  (observed rate 3-4.3 nodes/s @ 8 workers, not the isolated 1.6s/cell benchmark — real
+  contention from running 3 concurrent CPU-bound processes on a 12-core box) — ~3 weeks
+  serial for 21 tickers, not viable.
+- **Reduced-density grid, spec'd, not yet coded**: halve SL axis (14→7), TP axis (14→7),
+  and `max_hold_hours` axis (20→10 values, 7h→14h step — confirmed this is **hourly bars**,
+  not calendar days, via `config.json`'s `hold_time_caps`). Combined: 164,640→20,580 cells,
+  exactly 8.0x fewer. ~1.86h @ 8 workers at the real observed rate. `trail_pct` axis (7
+  values) left untouched.
+- **Known risk of the reduced grid, accepted not solved**: `pick_island_centers` is a pure
+  greedy rank-and-separate with no interpolation — halving the coarse sample count doesn't
+  hurt Phase2's coverage near a chosen center (mesh is always a fixed ±4 unit-density box
+  regardless of Phase1 density), but does raise variance in the ranking itself, risking a
+  center-selection miss with no compute-side signal anything went wrong. This is the SAME
+  risk category as the ordering-guard bugs just found — a silent-wrong-number risk, not a
+  crash risk.
+- **Extra Phase2 generation, decided as a partial mitigation**: helps the "true peak just
+  outside the ±4 window, reachable by hopping" failure mode; does NOT help "true peak never
+  sampled densely enough to seed as a candidate center at all" (structural — Phase2 never
+  globally re-explores the original coarse space). Cost: ~1-3h extra per ticker on the
+  reduced grid. **Decision: add it as standard** for the reduced-density runs (not yet
+  wired into code).
+- **Window-shortening for the discovery pass, spec'd, not yet coded**: use a shorter window
+  (6mo-1yr vs the validated 2024-08-21..2026-08-20 ~2yr) ONLY for Phase1-coarse-GT
+  discovery/triage, then re-run Phase2/2.5-GT refinement on the FULL validated 2yr window
+  for whichever islands survive triage — avoids the regime-bias risk of trusting a short
+  window's ranking as final. Day-skipping/subsampling (as opposed to window-shortening) was
+  evaluated and **rejected outright** — breaks rolling-indicator computation and
+  hold-time/trailing-peak state continuity, not just noisier.
+- **Net plan once built**: reduced-density-grid + shortened-window Phase1-coarse triage
+  across all 21 tickers (~1-2h each, likely doable same-night), full-density
+  Phase2/2.5-GT-with-extra-generation confirmation only for whichever tickers/islands the
+  triage flags as promising or fragile — not a blanket full-density campaign.
+- **Not yet authorized**: which tickers beyond SOXL get treated as "flagged, needs full
+  confirmation" — that's a call for once real triage numbers exist, not decided in advance.
+- **2yr vs 5yr window, flagged 2026-08-22 (early AM)**: all current GT campaigns/benchmarks
+  are scoped to the 2yr window validated by the Step 2a parity gate
+  (2024-08-21..2026-08-20), NOT the full 5yr minute data already purchased/fetched for all
+  82 tickers (see the 2026-08-21 "very late" session_cache entry). Whatever real
+  nodes/s rate gets confirmed for the 2yr window will drop ~2.5x (proportional to total
+  bars) once/if campaigns expand to the full 5yr window — a real, expected scaling factor,
+  not a bug. Not deciding now which tickers/campaigns need 5yr vs 2yr — flagging so it's not
+  forgotten when that question comes up.
+
+**Process note**: the silent-process-restart scare earlier tonight was NOT an unexplained
+external event — it was `coder2`'s own deliberate `kill <parent_pid>` (moving logs out of
+job tmp/ into `logs/`) not cascading to `ProcessPoolExecutor` worker children as expected
+(POSIX SIGTERM doesn't propagate to a process pool by default), briefly orphaning the old
+workers for about a minute before being caught and killed. Already fully explained at the
+time; re-raised as a concern later due to a relay error, then re-confirmed closed (checked
+dmesg/journalctl/crontab directly — nothing external).
+
 ## Follow-on (separate future project, not this plan)
 
 Folding together three previously-separate deferred backlog items, all sharing the same
