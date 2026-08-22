@@ -191,6 +191,8 @@ def cmd_build():
     conn.execute("CREATE INDEX IF NOT EXISTS pruned.idx_bc_version_ticker_strategy ON backtest_cache(version, ticker, strategy)")
     conn.execute("CREATE INDEX IF NOT EXISTS pruned.idx_bc_version_return ON backtest_cache(version, strategy_return)")
     conn.execute("CREATE INDEX IF NOT EXISTS pruned.idx_bc_ticker ON backtest_cache(ticker)")
+    conn.execute("CREATE INDEX IF NOT EXISTS pruned.idx_bc_cagr_candidates "
+                 "ON backtest_cache(version, strategy, ticker, cagr) WHERE cagr > 50")
     conn.commit()
 
     conn.close()

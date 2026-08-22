@@ -16,7 +16,8 @@ from tqdm import tqdm
 from backtester import (run_backtest_dispatch,
                         prep_inputs, _simulate, _simulate_limit, _simulate_trail, _simulate_trail_buy,
                         _simulate_trail_both, _simulate_limit_trail, _simulate_close_limitexit,
-                        run_backtest_ground_truth, prep_minute_inputs)
+                        run_backtest_ground_truth, prep_minute_inputs,
+                        apply_addon_overlay_ground_truth)
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
@@ -29,6 +30,10 @@ FINE_RADIUS    = 4
 N_ISLANDS      = 3
 ISLAND_MIN_SEP = 6
 CLIFF_RADIUS   = 2
+# Same threshold as idx_bc_cagr_candidates' partial index (rebuild_indexes()) -- an
+# island whose own best cell doesn't clear this isn't worth cliff-boxing regardless of
+# how it ranks against other islands (2026-08-22, run_phase25_cliff_box_ground_truth).
+PHASE25_ISLAND_CAGR_MIN = 50
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,7 +79,6 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE backtest_cache ADD COLUMN win_twin_rate REAL DEFAULT 0")
     except Exception:
         pass
-
     # v3.x reparameterization (2026-07-05): stop_loss now always means real SL;
     # trail_buy_pct/trail_pct get real columns instead of overloading stop_loss.
     # PK must be rebuilt to add them (SQLite can't ALTER a PRIMARY KEY in place) —
@@ -260,6 +264,34 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE backtest_cache ADD COLUMN kernel_version TEXT")
     except Exception:
         pass
+    try:
+        # cagr (2026-08-22): real, properly-annualized CAGR -- alpha_vs_spy/
+        # strategy_return are raw over-the-window returns, not annualized, so they
+        # aren't comparable across campaigns with different window lengths and
+        # overstate a multi-year window's apparent edge relative to a 1yr one.
+        # v6-only (NULL for pre-v6 rows, not backfilled -- see feedback_backtest_
+        # cache_axis_column_remapping memory / the 2026-08-07 deferred schema item
+        # for why this project treats v6 as the clean cutover point rather than
+        # migrating historical rows). Computed in Python at write time (same
+        # formula as scripts/annualized_alpha_report.py::cagr()), not a SQL
+        # expression -- ordinary stored column, ordinary index, no generated-
+        # column/JSON complexity needed for this one. Placed here (after all PK
+        # rebuild migrations, alongside phase/generation/sweep_run_id/kernel_version)
+        # rather than earlier in this function, since those rebuilds' explicit
+        # column lists would otherwise silently drop a plain ALTER-added column
+        # added before them on any DB that still needs to run them.
+        #
+        # NULL cagr means one of three things, not just "pre-v6 row": (1) a row
+        # written before this column existed (pre-v6 AND early v6, until a
+        # cache-hit self-heal or fresh recompute backfills it -- see the
+        # cached_map read path in dispatch_parallel_grid_ground_truth), (2) a v6
+        # NO_TRADES/error node (span_days/years never computed), or (3) a v6 node
+        # with a degenerate zero-or-negative-span window (years<=0) or an
+        # unrepresentable (OverflowError) annualization. Don't use `cagr IS NULL`
+        # as a clean "is this pre-v6" discriminator -- check kernel_version too.
+        cursor.execute("ALTER TABLE backtest_cache ADD COLUMN cagr REAL")
+    except Exception:
+        pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sl_sweep_summary (
@@ -413,6 +445,16 @@ def rebuild_indexes():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_ticker_strategy ON backtest_cache(version, ticker, strategy)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_version_return ON backtest_cache(version, strategy_return)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_ticker ON backtest_cache(ticker)")
+    # cagr partial index (2026-08-22): candidate-selection real value is filtering
+    # signal from noise, not raw query speed (candidate selection runs post-sweep,
+    # not on any daily/nightly cadence -- see feedback_backtest_cache_axis_column_
+    # remapping-adjacent 2026-08-22 conversation). Real data: only ~0.94% of a real
+    # 164,640-cell SOXL campaign clears CAGR>50 -- a partial index only over rows
+    # that clear the bar is a cheap, low-write-cost way to make "show me real
+    # candidates" queries fast as a side effect, without needing a full-table
+    # index. v6-only (cagr is NULL for pre-v6 rows, so they're naturally excluded).
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bc_cagr_candidates "
+                   "ON backtest_cache(version, strategy, ticker, cagr) WHERE cagr > 50")
     conn.commit()
     conn.close()
 
@@ -747,29 +789,51 @@ _MINUTE_DF_CACHE_MAX = 3  # minute CSVs are large (~500k-600k rows); cap tighter
 _NODE_INPUT_CACHE_GT = {}
 
 
-def _load_minute_df(ticker):
-    hit = _MINUTE_DF_CACHE.get(ticker)
+def _load_minute_df(ticker, data_source="yahoo"):
+    """data_source='yahoo' (default, unchanged): reads the raw, UNADJUSTED minute CSV,
+    same as before this param existed. data_source='massive': reads db_cache.
+    get_massive_minute_ohlcv(ticker) instead -- dividend-adjusted minute bars,
+    consistent with the data_source='massive' hourly leg (see db_cache.py's
+    massive_minute_derived table docstring; fixed 2026-08-22, previously the minute
+    leg stayed on the raw unadjusted CSV even under --data-source massive, a real
+    ~1.6%+ inconsistency vs. the adjusted hourly bars that grows further back in time).
+    Folded into the memo key so a mixed-source run never reuses the other source's
+    cached minute frame."""
+    key = (ticker, data_source)
+    hit = _MINUTE_DF_CACHE.get(key)
     if hit is not None:
         return hit
-    df = pd.read_csv(MINUTE_DIR / f"{ticker}_1m.csv")
-    ts = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("US/Eastern").dt.tz_localize(None)
-    df = df.set_index(ts).sort_index()
-    t = df.index.time
-    keep = (t >= pd.Timestamp("09:30").time()) & (t < pd.Timestamp("16:00").time())
-    df = df.loc[keep, ["Open", "High", "Low", "Close"]]
+    if data_source == "massive":
+        import db_cache
+        df = db_cache.get_massive_minute_ohlcv(ticker)
+    else:
+        df = pd.read_csv(MINUTE_DIR / f"{ticker}_1m.csv")
+        ts = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("US/Eastern").dt.tz_localize(None)
+        df = df.set_index(ts).sort_index()
+        t = df.index.time
+        keep = (t >= pd.Timestamp("09:30").time()) & (t < pd.Timestamp("16:00").time())
+        df = df.loc[keep, ["Open", "High", "Low", "Close"]]
     if len(_MINUTE_DF_CACHE) >= _MINUTE_DF_CACHE_MAX:
         _MINUTE_DF_CACHE.clear()
-    _MINUTE_DF_CACHE[ticker] = df
+    _MINUTE_DF_CACHE[key] = df
     return df
 
 
 def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
-                                    start_date=None, end_date=None):
+                                    start_date=None, end_date=None, data_source="yahoo"):
     """Same per-worker-process memo pattern as _load_node_inputs. Indicators depend only
     on (ticker, strategy, window) — z_thresh is a kernel arg, not baked into df_daily_
     processed, so it's not part of the cache key (matches _load_node_inputs's own key,
     which also omits z_thresh for the same reason). start_date/end_date DO fold into the
     key (mirroring _load_node_inputs) — required below.
+
+    data_source='yahoo' (default, unchanged): reads cache/research/{ticker}_1h.csv, same
+    as before this param existed. data_source='massive': reads db_cache.
+    get_massive_hourly_ohlcv(ticker) instead — dividend/split-adjusted hourly bars
+    derived from Massive.com minute data, back to ~2021-08-23 for most tickers vs.
+    yahoo's ~2023-07-24 floor (see db_cache.py's massive_hourly_derived table
+    docstring). Folded into the memo key so a mixed-source campaign never reuses the
+    other source's cached prep/mprep.
 
     Also caches the derived prep/mprep arrays (prep_inputs()/prep_minute_inputs() output)
     for the ACTUAL (possibly windowed) hourly bars fed to the kernel, same as
@@ -782,21 +846,25 @@ def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_t
 
     First cut of this fix (2026-08-22, paired-review contextual pass) only cached the
     full-history case and fell back to recomputing per-cell whenever start_date/end_date
-    was set — missed that BOTH real GT campaign entry points (run_ground_truth_phase1_
-    soxl.py, run_ground_truth_neighborhood.py) always call windowed, so the fast path
+    was set — missed that BOTH real GT campaign entry points (run_ground_truth_phase1.py,
+    run_ground_truth_neighborhood.py) always call windowed, so the fast path
     never fired in production. Slicing df_hourly to the window BEFORE computing prep/
     mprep (below) — rather than nulling them out — restores the cache hit for the actual
     workload: every cell in a windowed campaign shares the same (ticker, strategy, w,
     start_date, end_date) key and reuses one sliced prep/mprep pair."""
-    key = (ticker, strategy_name, int(w), start_date, end_date)
+    key = (ticker, strategy_name, int(w), start_date, end_date, data_source)
     hit = _NODE_INPUT_CACHE_GT.get(key)
     if hit is not None:
         return hit
 
-    cache_path = CACHE_DIR / f"{ticker}_1h.csv"
-    df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-    df_hourly_raw.index = pd.to_datetime(df_hourly_raw.index).tz_localize(None)
-    df_hourly_raw = df_hourly_raw.sort_index()
+    if data_source == "massive":
+        import db_cache
+        df_hourly_raw = db_cache.get_massive_hourly_ohlcv(ticker)
+    else:
+        cache_path = CACHE_DIR / f"{ticker}_1h.csv"
+        df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        df_hourly_raw.index = pd.to_datetime(df_hourly_raw.index).tz_localize(None)
+        df_hourly_raw = df_hourly_raw.sort_index()
     if df_hourly_raw.empty:
         entry = None
     else:
@@ -804,7 +872,7 @@ def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_t
         df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
         strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
         df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
-        minute_df = _load_minute_df(ticker)
+        minute_df = _load_minute_df(ticker, data_source=data_source)
 
         df_hourly_windowed = df_hourly_raw
         if start_date is not None or end_date is not None:
@@ -828,7 +896,7 @@ def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_t
     return entry
 
 
-def _summarize_trades_ground_truth(trades, spy_bh):
+def _summarize_trades_ground_truth(trades, spy_bh, years):
     """Ground-truth trades carry 'Return' directly, no Result/WIN-LOSS/TWIN-TLOSS code
     (backtester.run_backtest_ground_truth's exit_reason is SL/TRAIL/TIME, a mechanism
     label, not a profitability label) — win_twin_rate exists in _summarize_trades
@@ -846,12 +914,83 @@ def _summarize_trades_ground_truth(trades, spy_bh):
     win_rate = float((df_tr['Return'] > 0).mean() * 100)
     compounded = float(((df_tr['Return'] + 1).prod() - 1) * 100)
     alpha_calc = float(compounded - spy_bh)
-    return alpha_calc, len(df_tr), win_rate, compounded, win_rate
+    node_cagr = _cagr_from_total_return(compounded, years)
+    return alpha_calc, len(df_tr), win_rate, compounded, win_rate, node_cagr
+
+
+def _cagr_from_total_return(total_return_pct, years):
+    """Real, properly-annualized CAGR -- same formula as scripts/annualized_alpha_
+    report.py::cagr(), duplicated here (not imported) since that's a script, not a
+    shared module, and this is a small, pure, one-line formula. Returns None if
+    years<=0 (can't annualize a zero-span window), so callers can distinguish
+    "not computed" from a real 0% CAGR. Also returns None on OverflowError -- a
+    very short window (years<<1) combined with a large total return raises
+    OverflowError on the fractional power (confirmed reproducible, e.g.
+    total_return_pct=700, years=1/365.25) -- the node's other stats (alpha,
+    trades, compounded return) are still real and shouldn't be discarded just
+    because CAGR can't be represented for this specific window.
+
+    Also returns None for total_return_pct <= -100 (2026-08-22, paired-review finding
+    on the new GT add-on overlay: unlike a core-only compounded return -- always > -100%
+    since every individual core trade's Return is bounded below by -fixed_sl%, so the
+    running product of (1+r) factors stays positive -- an add-on-blended trade's Return
+    has no such floor (the add-on leg has no independent stop-loss; a severe gap-down
+    past half the arm-to-entry price move can push a single trade's blended Return below
+    -100%), which can drive the overall compounded product to <= 0. `(1+x)**(1/years)`
+    for x <= -1 and a non-integer exponent silently returns a COMPLEX number in Python,
+    not an exception -- undetected by the existing `except OverflowError` and liable to
+    crash the first place that later `.2f`-formats it. Guarded here, not at the caller,
+    so every caller (core and add-on alike) gets the same protection for free."""
+    if years is None or years <= 0:
+        return None
+    if total_return_pct <= -100.0:
+        return None
+    try:
+        return ((1.0 + total_return_pct / 100.0) ** (1.0 / years) - 1.0) * 100.0
+    except OverflowError:
+        return None
+
+
+def _campaign_years_for_window(ticker, start_date, end_date, data_source="yahoo"):
+    """Real simulated-window span in years, for a whole (ticker, start_date, end_date)
+    campaign -- same slicing convention as _load_node_inputs_ground_truth's
+    df_hourly_windowed (real bar range, not the raw requested dates), duplicated here
+    rather than reusing that function since df_hourly_windowed's min/max doesn't depend
+    on w/z_thresh/strategy (only on the date-range slice), so this can be computed once
+    per campaign instead of once per node. Used only to backfill `cagr` for cache-hit
+    rows written before this column existed (or before a since-fixed bug prevented it
+    from being computed) -- see dispatch_parallel_grid_ground_truth's cached_map read.
+
+    data_source must match the campaign's own data_source (paired review, 2026-08-22) --
+    reading the yahoo CSV's span to backfill cagr for massive-sourced rows would compute
+    the wrong window span (yahoo's ~2023-07-24 floor vs massive's ~2021-08-23)."""
+    if data_source == "massive":
+        import db_cache
+        try:
+            df_hourly_raw = db_cache.get_massive_hourly_ohlcv(ticker)
+        except ValueError:
+            return None
+    else:
+        cache_path = CACHE_DIR / f"{ticker}_1h.csv"
+        if not cache_path.exists():
+            return None
+        df_hourly_raw = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        df_hourly_raw.index = pd.to_datetime(df_hourly_raw.index).tz_localize(None)
+        df_hourly_raw = df_hourly_raw.sort_index()
+    df_hourly_windowed = df_hourly_raw
+    if start_date is not None or end_date is not None:
+        lo = pd.Timestamp(start_date) if start_date is not None else None
+        hi = (pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)) if end_date is not None else None
+        df_hourly_windowed = df_hourly_raw.loc[lo:hi]
+    if df_hourly_windowed.empty:
+        return None
+    span_days = (df_hourly_windowed.index.max() - df_hourly_windowed.index.min()).days
+    return span_days / 365.25 if span_days > 0 else None
 
 
 def run_single_backtest_node_ground_truth_isolated(args):
     (ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl,
-     trail_pct_pct, entry_timing, same_bar_reentry, start_date, end_date) = args
+     trail_pct_pct, entry_timing, same_bar_reentry, start_date, end_date, data_source) = args
 
     strategy_class = getattr(strategies, strategy_name, None)
     if strategy_name not in ('TrailingBothZScoreBreakout', 'TrailingExitZScoreBreakout') or not strategy_class:
@@ -859,7 +998,7 @@ def run_single_backtest_node_ground_truth_isolated(args):
 
     try:
         inputs = _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
-                                                 start_date, end_date)
+                                                 start_date, end_date, data_source=data_source)
     except Exception as e:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR", "error": repr(e)}
 
@@ -873,7 +1012,7 @@ def run_single_backtest_node_ground_truth_isolated(args):
     # the identical window-boundary state-leak risk. prep/mprep above are already sliced
     # to match df_hourly_windowed (computed inside the loader, cached per (ticker,
     # strategy, w, start_date, end_date)) -- both real GT campaign entry points
-    # (run_ground_truth_phase1_soxl.py, run_ground_truth_neighborhood.py) call windowed,
+    # (run_ground_truth_phase1.py, run_ground_truth_neighborhood.py) call windowed,
     # so this is the actual hot path, not a fallback.
     if df_hourly_windowed.empty:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
@@ -903,10 +1042,16 @@ def run_single_backtest_node_ground_truth_isolated(args):
     if not trades:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "NO_TRADES"}
 
-    alpha_calc, n_trades, win_rate, compounded, win_twin_rate = _summarize_trades_ground_truth(trades, spy_bh)
+    # CAGR needs the real window span in years -- df_hourly_windowed's own actual bar
+    # range (not the requested start_date/end_date, which can exceed the real cached
+    # data's coverage) is the honest source of truth for what was actually simulated.
+    span_days = (df_hourly_windowed.index.max() - df_hourly_windowed.index.min()).days
+    years = span_days / 365.25 if span_days > 0 else None
+    alpha_calc, n_trades, win_rate, compounded, win_twin_rate, node_cagr = _summarize_trades_ground_truth(
+        trades, spy_bh, years)
     return {
         "coords":  (tp, sl, hold_hours),
-        "payload": (alpha_calc, n_trades, win_rate, compounded, win_twin_rate),
+        "payload": (alpha_calc, n_trades, win_rate, compounded, win_twin_rate, node_cagr),
         "window":  w, "z_thresh": z_thresh, "status": "SUCCESS"
     }
 
@@ -914,11 +1059,17 @@ def run_single_backtest_node_ground_truth_isolated(args):
 def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_name, config_version,
                                          phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0,
                                          entry_timing='close', same_bar_reentry=True, generation=None,
-                                         run_id=None, start_date=None, end_date=None):
+                                         run_id=None, start_date=None, end_date=None, data_source="yahoo"):
     """v6 counterpart to dispatch_parallel_grid — same cache-lookup/dispatch/write shape,
     calling run_single_backtest_node_ground_truth_isolated instead. No min_hold_hours
     support (not needed for the v6 Tranche-1 scope). Writes alpha_vs_spy_pessimistic/
     _certain as NULL always (no resolution-ambiguity hedging with real minute data — see
+
+    data_source='yahoo' (default, unchanged): every existing caller (including
+    run_phase2_island_ground_truth/run_phase25_cliff_box_ground_truth) keeps reading
+    cache/research/{ticker}_1h.csv exactly as before this param existed.
+    data_source='massive' is opt-in, currently wired only from
+    scripts/run_ground_truth_phase1.py's --data-source flag — see
     module docstring) and kernel_version='ground_truth_v6'.
 
     start_date/end_date reuse dispatch_parallel_grid's own window_version_suffix guard —
@@ -945,6 +1096,21 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
                 f"window_version_suffix(start_date, end_date) before calling this."
             )
 
+    # data_source is NOT its own backtest_cache column (paired review, 2026-08-22, same
+    # failure shape as the same_bar_reentry CAUTION above) -- a massive-sourced run over a
+    # config_version already swept on yahoo (or vice versa) would silently serve/overwrite
+    # the other source's rows as cache hits. Require the marker in config_version itself
+    # (mirroring window_version_suffix's own enforced-suffix convention) rather than trust
+    # every caller to remember -- cheaper than a real schema column for how rarely
+    # data_source varies today.
+    if data_source == "massive" and "-massive" not in config_version:
+        raise ValueError(
+            f"dispatch_parallel_grid_ground_truth: data_source='massive' but "
+            f"config_version={config_version!r} carries no '-massive' marker -- append "
+            f"'-massive' to config_version so massive-sourced rows can never collide with "
+            f"yahoo-sourced rows under the same version string."
+        )
+
     conn   = sqlite3.connect(DB_PATH, timeout=60.0)
     cursor = conn.cursor()
     matrix_results  = []
@@ -955,9 +1121,11 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
 
     cached_map = {}
+    _missing_cagr_rows = []  # cache-hit rows with strategy_return but no cagr -- backfilled below
     cursor.execute("""
         SELECT window, max_hold_hours, axis_tp, stop_loss, z_score_threshold, fixed_sl,
-               trail_buy_pct, trail_sell_pct, trades, win_rate, strategy_return, alpha_vs_spy, win_twin_rate
+               trail_buy_pct, trail_sell_pct, trades, win_rate, strategy_return, alpha_vs_spy, win_twin_rate,
+               cagr
         FROM backtest_cache
         WHERE strategy=? AND version=? AND ticker=? AND entry_timing=? AND kernel_version='ground_truth_v6'
     """, (strategy_name, config_version, ticker, entry_timing))
@@ -974,6 +1142,33 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
         row_tpct_raw = float(r[7]) if fourth_axis_col == 'trail_pct' else 0.0
         cached_map[(int(r[2]), row_sl_raw, int(r[1]), int(r[0]), float(r[4]), row_fsl, row_tpct_raw)] = \
             (r[8], r[9], r[10], r[11], r[12] if r[12] is not None else 0.0)
+        if r[13] is None and r[10] is not None:
+            _missing_cagr_rows.append(r)
+
+    if _missing_cagr_rows:
+        # cagr is cheaply derivable from the already-cached strategy_return + the
+        # campaign's real window span -- no re-simulation needed. Self-heals rows
+        # written before the cagr column existed (or before this backfill was added)
+        # every time this ticker/version/strategy combo is dispatched again.
+        campaign_years = _campaign_years_for_window(ticker, start_date, end_date, data_source=data_source)
+        if campaign_years is not None:
+            backfill_params = []
+            for r in _missing_cagr_rows:
+                node_cagr = _cagr_from_total_return(r[10], campaign_years)
+                if node_cagr is not None:
+                    backfill_params.append((node_cagr, strategy_name, config_version, ticker,
+                                             r[0], r[1], r[2], r[3], r[4], r[6], r[7], entry_timing))
+            if backfill_params:
+                cursor.executemany(
+                    """UPDATE backtest_cache SET cagr=?
+                       WHERE strategy=? AND version=? AND ticker=? AND window=? AND max_hold_hours=?
+                         AND axis_tp=? AND stop_loss=? AND z_score_threshold=?
+                         AND trail_buy_pct=? AND trail_sell_pct=? AND entry_timing=?""",
+                    backfill_params
+                )
+                conn.commit()
+                logger.info(f"[{ticker}] {phase_label}: backfilled cagr for "
+                            f"{len(backfill_params)} pre-existing cache rows")
 
     for t in tasks:
         tp, sl, hold_hours, w, z_thresh, tpct = t
@@ -1000,7 +1195,8 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
     futures_map = {
         shared_pool.submit(run_single_backtest_node_ground_truth_isolated,
                            (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z,
-                            fixed_sl, tpct, entry_timing, same_bar_reentry, start_date, end_date)): task
+                            fixed_sl, tpct, entry_timing, same_bar_reentry, start_date, end_date,
+                            data_source)): task
         for task in unvisited_tasks
         for tp, sl, hold, w, z, tpct in [task]
     }
@@ -1028,9 +1224,9 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
                 continue
 
             if status == "SUCCESS":
-                alpha, num_trades, wr, comp_ret, wtw = res["payload"]
+                alpha, num_trades, wr, comp_ret, wtw, node_cagr = res["payload"]
             else:
-                alpha, num_trades, wr, comp_ret, wtw = 0.0, 0, 0.0, 0.0, 0.0
+                alpha, num_trades, wr, comp_ret, wtw, node_cagr = 0.0, 0, 0.0, 0.0, 0.0, None
 
             progress_bar.set_postfix({"Alpha": f"{alpha:+.1f}%", "Trades": num_trades})
 
@@ -1061,7 +1257,7 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
                            num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
                            stored_fsl, row_trail_buy_pct, row_trail_pct, wtw, row_arm_sell_pct, float(tp),
                            entry_timing, None, None, None, None, phase_label, generation, run_id,
-                           'ground_truth_v6'))
+                           'ground_truth_v6', node_cagr))
 
             if len(buffer) >= batch_size:
                 cursor.executemany(
@@ -1072,8 +1268,8 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
                         win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                         strategy_return_pessimistic, alpha_vs_spy_pessimistic,
                         strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
-                        kernel_version)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        kernel_version, cagr)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     buffer
                 )
                 buffer = []
@@ -1091,8 +1287,8 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
                 win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                 strategy_return_pessimistic, alpha_vs_spy_pessimistic,
                 strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
-                kernel_version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                kernel_version, cagr)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             buffer
         )
         conn.commit()
@@ -1415,7 +1611,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
 
 # ── B&H helper ────────────────────────────────────────────────────────────────
 
-def compute_bh_returns(ticker, start_date=None, end_date=None):
+def compute_bh_returns(ticker, start_date=None, end_date=None, data_source="yahoo"):
     # start_date/end_date default to None -- the non-windowed call path (every existing
     # caller) is byte-identical to before this param was added. When windowed, both legs
     # (asset_bh AND spy_bh) get sliced to the SAME [start_date, end_date] range the trade
@@ -1424,10 +1620,23 @@ def compute_bh_returns(ticker, start_date=None, end_date=None):
     # Without this, a windowed trade set's alpha_calc (_summarize_trades: compounded -
     # spy_bh) would silently diff against a full-history benchmark, which is wrong for
     # exactly the cross-window comparison date-windowing exists to support.
-    cache_path = CACHE_DIR / f"{ticker}_1h.csv"
-    if not cache_path.exists():
-        return None, None
-    df = pd.read_csv(cache_path, index_col=0, parse_dates=True).sort_index()
+    #
+    # data_source='yahoo' (default, unchanged): both legs read cache/research/*_1h.csv,
+    # exactly as before this param existed. data_source='massive': both legs (asset AND
+    # SPY benchmark) read db_cache.get_massive_hourly_ohlcv instead, so a
+    # massive-sourced trade set is benchmarked apples-to-apples against a
+    # massive-sourced SPY B&H, not a Yahoo one.
+    if data_source == "massive":
+        import db_cache
+        try:
+            df = db_cache.get_massive_hourly_ohlcv(ticker)
+        except ValueError:
+            return None, None
+    else:
+        cache_path = CACHE_DIR / f"{ticker}_1h.csv"
+        if not cache_path.exists():
+            return None, None
+        df = pd.read_csv(cache_path, index_col=0, parse_dates=True).sort_index()
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
     if start_date is not None or end_date is not None:
@@ -1452,10 +1661,17 @@ def compute_bh_returns(ticker, start_date=None, end_date=None):
     close_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
     asset_bh  = ((df[close_col].iloc[-1] - df[close_col].iloc[0]) / df[close_col].iloc[0]) * 100
 
-    spy_bh    = 0.0
-    spy_cache = CACHE_DIR / "SPY_1h.csv"
-    if spy_cache.exists():
-        spy_df = pd.read_csv(spy_cache, index_col=0, parse_dates=True).sort_index()
+    spy_bh = 0.0
+    if data_source == "massive":
+        import db_cache
+        try:
+            spy_df = db_cache.get_massive_hourly_ohlcv("SPY")
+        except ValueError:
+            spy_df = None
+    else:
+        spy_cache = CACHE_DIR / "SPY_1h.csv"
+        spy_df = pd.read_csv(spy_cache, index_col=0, parse_dates=True).sort_index() if spy_cache.exists() else None
+    if spy_df is not None:
         if spy_df.index.tz is not None:
             spy_df.index = spy_df.index.tz_localize(None)
         sliced = spy_df.loc[df.index.min():df.index.max()]
@@ -1704,6 +1920,131 @@ def _phase1_coarse_gt_status(ticker, strategy_name, config_version, hp, entry_ti
     return done, expected
 
 
+def _phase2_island_gt_tasks(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl):
+    """Task set (tp, sl, hold, w, z, tpct) that Phase2-Island-GT's own island-mesh
+    generation builds for this exact campaign scope. Factored out of
+    run_phase2_island_ground_truth so _phase2_island_gt_status can compare "what SHOULD
+    have been computed" against real backtest_cache rows using the IDENTICAL mesh-
+    generation logic (island centers off Phase1's ground_truth_v6 rows, ±FINE_RADIUS),
+    not a re-derived approximation -- Phase2's mesh size is data-dependent (unlike
+    Phase1's fixed grid), so there's no formula for `expected`, only rebuilding the
+    actual mesh. Caller must have already confirmed Phase1-Coarse-GT is complete.
+
+    The center-detection query is deliberately restricted to axis_tp/sl values that are
+    literally IN Phase1's own coarse-grid lists (hp['take_profits']/hp['stop_losses']) --
+    found by paired-review (2026-08-22, Opus independent-cold + Fable independent-cold,
+    both converged on this): without this filter, calling this function AFTER Phase2 has
+    already run (as _phase2_island_gt_status does, to check completeness) would pick
+    centers off a df_wz that now also includes Phase2's own fine-mesh rows, which very
+    commonly shifts the top robust-alpha cell to a refined (tp, sl) the coarse grid never
+    had -- producing a DIFFERENT, larger mesh than the one Phase2 actually dispatched, so
+    the completeness check would false-block a Phase2 run that genuinely finished.
+    Restricting to Phase1's own grid values makes center detection depend only on
+    Phase1-Coarse-GT's rows, which are identical whether this runs before or after Phase2
+    -- matching the ORIGINAL real-dispatch call site's behavior exactly (before this
+    filter existed, Phase1-Coarse-GT's rows were the only ground_truth_v6 rows in scope
+    at that call time anyway, so this filter is a no-op there and only changes behavior
+    for the new reuse-after-Phase2-completes case)."""
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    tp_ph = ','.join('?' * len(hp['take_profits']))
+    sl_ph = ','.join('?' * len(hp['stop_losses']))
+    tasks = set()
+    with sqlite3.connect(DB_PATH) as conn:
+        for z in hp['z_score_thresholds']:
+            for w in hp['windows']:
+                for tpct in trail_pcts:
+                    params = [config_version, ticker, strategy_name, float(z), int(w),
+                              *hp['take_profits'], *hp['stop_losses'], *scope_params]
+                    tpct_filter = ""
+                    if fourth_axis_col == 'trail_pct':
+                        tpct_filter = "AND trail_sell_pct=?"
+                        params.append(float(tpct))
+                    df_wz = pd.read_sql(f"""
+                        SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, alpha_vs_spy,
+                               {ROBUST_ALPHA_SQL} AS robust_alpha
+                        FROM backtest_cache
+                        WHERE version=? AND ticker=? AND strategy=?
+                          AND z_score_threshold=? AND window=? AND trades > 0
+                          AND axis_tp IN ({tp_ph}) AND {_sl_axis_real_column(sl_axis_col)} IN ({sl_ph})
+                          AND kernel_version='ground_truth_v6' {scope_sql} {tpct_filter}
+                    """, conn, params=params)
+
+                    if df_wz.empty:
+                        continue
+
+                    centers = pick_island_centers(df_wz)
+                    for (tp_c, sl_c) in centers:
+                        for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
+                            for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
+                                for hold in hp['hold_time_caps']:
+                                    tasks.add((tp, sl, int(hold), int(w), float(z), float(tpct)))
+    return tasks
+
+
+def _phase2_island_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl):
+    """(done_count, expected_count) for Phase2-Island-GT's own mesh, for this exact
+    campaign scope. `expected` is Phase2's own island-mesh size, rebuilt via
+    _phase2_island_gt_tasks -- not a fixed-grid formula like Phase1's, since island
+    centers are data-dependent and there's no way to know the mesh size without
+    literally regenerating it the same way run_phase2_island_ground_truth does.
+
+    `done` is deliberately NOT filtered to phase='Phase2-Island-GT'. Corrected during
+    paired review (2026-08-22, Opus contextual pass): the original wording here claimed
+    dispatch_parallel_grid_ground_truth's cache-hit path relabels an existing coordinate
+    on a later rerun -- verified false, it skips any coordinate already in cached_map and
+    never rewrites it. The REAL reason not to filter on phase is the same one this whole
+    fix exists for: a coordinate can be genuinely computed and inside Phase2's own mesh
+    while still legitimately carrying an earlier phase's label (e.g. it happened to also
+    be one of Phase1's coarse-grid cells, which Phase2 cache-hits rather than
+    recomputing/relabeling). What matters is whether the exact
+    (tp, sl, hold, w, z, tpct) coordinate has ANY ground_truth_v6 row, not which
+    phase's name currently happens to be stamped on it -- this is also exactly the
+    scenario this check exists to unblock: the true best row for a scope can
+    legitimately still carry phase='Phase1-Coarse-GT' if Phase2's mesh confirmed
+    nothing nearby beats it.
+
+    Caller must have already confirmed Phase1-Coarse-GT is complete for this scope
+    (island centers are read off Phase1's own backtest_cache rows)."""
+    tasks = _phase2_island_gt_tasks(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
+    if not tasks:
+        return 0, 0
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    zs = sorted({t[4] for t in tasks})
+    ws = sorted({t[3] for t in tasks})
+    holds = sorted({t[2] for t in tasks})
+    z_ph = ','.join('?' * len(zs))
+    w_ph = ','.join('?' * len(ws))
+    hold_ph = ','.join('?' * len(holds))
+    tpct_filter, tpct_params = "", []
+    tpct_select = ""
+    if fourth_axis_col == 'trail_pct':
+        tpcts = sorted({t[5] for t in tasks})
+        tpct_filter = f" AND trail_sell_pct IN ({','.join('?' * len(tpcts))})"
+        tpct_params = [float(v) for v in tpcts]
+        tpct_select = ", trail_sell_pct"
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        rows = conn.execute(
+            f"SELECT axis_tp, {_sl_axis_real_column(sl_axis_col)}, max_hold_hours, window, z_score_threshold"
+            f"{tpct_select} FROM backtest_cache WHERE strategy=? AND version=? AND ticker=?"
+            f" AND kernel_version='ground_truth_v6'"
+            f" AND z_score_threshold IN ({z_ph}) AND window IN ({w_ph})"
+            f" AND max_hold_hours IN ({hold_ph}) {scope_sql} {tpct_filter}",
+            (strategy_name, config_version, ticker, *zs, *ws, *holds, *scope_params, *tpct_params)
+        ).fetchall()
+    done_coords = set()
+    for r in rows:
+        if fourth_axis_col == 'trail_pct':
+            tp, sl, hold, w, z, tpct = r
+        else:
+            tp, sl, hold, w, z = r
+            tpct = 0.0
+        done_coords.add((int(tp), int(sl), int(hold), int(w), float(z), float(tpct)))
+    return len(tasks & done_coords), len(tasks)
+
+
 def run_phase2_island_ground_truth(shared_pool, ticker, strategy_name, config_version, hp, spy_bh,
                                     asset_bh, run_timestamp, fixed_sl=0, entry_timing='open_check',
                                     same_bar_reentry=True, generation=None, run_id=None,
@@ -1734,38 +2075,7 @@ def run_phase2_island_ground_truth(shared_pool, ticker, strategy_name, config_ve
             f"Phase1-Coarse-GT to actually finish before calling this."
         )
 
-    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
-    trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
-    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
-    tasks = set()
-    with sqlite3.connect(DB_PATH) as conn:
-        for z in hp['z_score_thresholds']:
-            for w in hp['windows']:
-                for tpct in trail_pcts:
-                    params = [config_version, ticker, strategy_name, float(z), int(w), *scope_params]
-                    tpct_filter = ""
-                    if fourth_axis_col == 'trail_pct':
-                        tpct_filter = "AND trail_sell_pct=?"
-                        params.append(float(tpct))
-                    df_wz = pd.read_sql(f"""
-                        SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, alpha_vs_spy,
-                               {ROBUST_ALPHA_SQL} AS robust_alpha
-                        FROM backtest_cache
-                        WHERE version=? AND ticker=? AND strategy=?
-                          AND z_score_threshold=? AND window=? AND trades > 0
-                          AND kernel_version='ground_truth_v6' {scope_sql} {tpct_filter}
-                    """, conn, params=params)
-
-                    if df_wz.empty:
-                        continue
-
-                    centers = pick_island_centers(df_wz)
-                    for (tp_c, sl_c) in centers:
-                        for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
-                            for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
-                                for hold in hp['hold_time_caps']:
-                                    tasks.add((tp, sl, int(hold), int(w), float(z), float(tpct)))
-
+    tasks = _phase2_island_gt_tasks(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
     if not tasks:
         logger.warning(f"[{ticker}] Phase2-GT: no island tasks generated.")
         return
@@ -1822,22 +2132,49 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
 def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, config_version, hp, spy_bh,
                                         asset_bh, run_timestamp, fixed_sl=0, entry_timing='open_check',
                                         same_bar_reentry=True, run_id=None, start_date=None, end_date=None):
-    """v6 counterpart to run_phase25_cliff_box — same shape (±CLIFF_RADIUS in TP/SL,
-    ±7h in hold, ±1 trail_pct neighbor around the true best node), task-generation SQL
-    unchanged apart from the added kernel_version filter (kernel-agnostic query pattern,
-    same rationale as run_phase2_island_ground_truth above).
+    """v6 counterpart to run_phase25_cliff_box — same per-candidate box shape
+    (±CLIFF_RADIUS in TP/SL, ±7h in hold, ±1 trail_pct neighbor), but unlike the legacy
+    function (deliberately untouched, see isolate-new-code-from-settled-paths convention),
+    this GT version does NOT collapse to a single global-best cell before cliff-checking.
 
-    HARD-BLOCKS on two independent checks, per the paired-review independent-cold pass
-    (2026-08-22), which found the original phase-label-only check gave a live FALSE PASS:
-    (1) Phase1-Coarse-GT itself must be complete for this scope (same
+    Real-candidate-selection rationale (2026-08-22 design decision): a node that's #1 by
+    raw robust-alpha/CAGR across the whole campaign scope might not be the best real
+    candidate once factors this pipeline doesn't sweep (overlay effects like drought/
+    add-on) are considered later. Collapsing to one winner before cliff-checking throws
+    away that information. Instead: re-derive up to N_ISLANDS distinct (tp, sl) island
+    centers across the FULL scope (all z/window/trail_pct combos flattened together, via
+    the same pick_island_centers min-separation logic Phase2 uses -- see module docstring
+    on pick_island_centers), then cliff-box each island's own top-3 robust-alpha-ranked
+    cells within that island's own ±FINE_RADIUS region (not top-3 overall across islands).
+    Up to N_ISLANDS * 3 cliff-boxes total, merged into one deduped task set and dispatched
+    in a single call (same mechanism, phase_label unchanged, so downstream consumers
+    filtering on "Phase2.5-CliffBox-GT" are unaffected).
+
+    Center detection is restricted to rows whose (tp, sl) are literally in Phase1's own
+    coarse-grid lists (hp['take_profits']/hp['stop_losses']) -- same rerun-safety
+    rationale as _phase2_island_gt_tasks (see its docstring): without this, a RERUN of
+    this function would pick up its own previously-dispatched Phase2.5-CliffBox-GT rows
+    (which fall inside the fine-mesh, off Phase1's coarse grid) and could shift centers
+    between calls. Once centers are fixed, each island's actual top-3 candidates are
+    still selected from the FULL scope data (Phase2's fine mesh included), since that's
+    the refined data the ranking is supposed to use.
+
+    HARD-BLOCKS on two independent completeness checks, per two paired-review passes on
+    2026-08-22: (1) Phase1-Coarse-GT itself must be complete for this scope (same
     _require_full_gt_hp/_phase1_coarse_gt_status check as run_phase2_island_ground_truth
-    -- checked first here since it's cheap and catches the exact scenario that produced
-    the false pass: a real best-row with phase='Phase2-Island-GT' existing in the DB from
-    an early smoke test run against a Phase1 grid that was only ~3% complete at the time).
-    (2) the current best row must itself carry phase='Phase2-Island-GT' -- kept as a
-    second, cheap sanity check (not a substitute for (1): Phase2's mesh size is data-
-    dependent, so it can't be verified for completeness the way Phase1's fixed grid can,
-    but confirming the top-ranked row is Phase2-derived at all is still worth asserting)."""
+    -- checked first here since it's cheap and catches an early smoke-test-against-a-
+    still-growing-Phase1-grid scenario). (2) Phase2-Island-GT's own mesh must be complete
+    for this scope (_phase2_island_gt_status, mirroring (1)'s completeness-vs-fixed-label
+    pattern) -- this REPLACES an earlier version of this guard that instead required the
+    current best-robust-alpha row to literally carry phase='Phase2-Island-GT'. That
+    label-equality check was itself a false block: dispatch_parallel_grid_ground_truth's
+    cache-hit path never relabels a coordinate it skips because it's already cached, and
+    Phase2's own island centers are, by construction, Phase1's own local best points -- so
+    if Phase2's mesh search genuinely confirms nothing beats Phase1's center, the true
+    best row legitimately stays labeled 'Phase1-Coarse-GT' even though Phase2 completed
+    correctly and did its job. Checking mesh completeness instead of the winning row's
+    label fixes this: once Phase2 is confirmed complete for the scope, proceed regardless
+    of which phase label the current best row happens to carry."""
     _require_full_gt_hp(hp, strategy_name, "run_phase25_cliff_box_ground_truth")
     p1_done, p1_expected = _phase1_coarse_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
     if p1_done < p1_expected:
@@ -1847,48 +2184,365 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
             f"point, which itself depends on Phase1 having actually finished. Wait for "
             f"Phase1-Coarse-GT to finish before calling this."
         )
+    p2_done, p2_expected = _phase2_island_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
+    if p2_done < p2_expected:
+        raise RuntimeError(
+            f"[{ticker}] Phase2.5-GT blocked: Phase2-Island-GT is incomplete for this campaign "
+            f"scope ({p2_done:,}/{p2_expected:,} cells) -- Phase2.5 refines around the true best "
+            f"point, which depends on Phase2's island mesh having actually finished. Wait for "
+            f"Phase2-Island-GT to finish before calling this."
+        )
 
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    tp_ph = ','.join('?' * len(hp['take_profits']))
+    sl_ph = ','.join('?' * len(hp['stop_losses']))
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(f"""
-            SELECT axis_tp, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, window, z_score_threshold,
-                   {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct, phase
+        df = pd.read_sql(f"""
+            SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
+                   max_hold_hours, window, z_score_threshold,
+                   {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct,
+                   {ROBUST_ALPHA_SQL} AS robust_alpha, cagr
             FROM backtest_cache
             WHERE version=? AND ticker=? AND strategy=? AND trades > 0
               AND kernel_version='ground_truth_v6' {scope_sql}
-            ORDER BY {ROBUST_ALPHA_SQL} DESC LIMIT 1
-        """, (config_version, ticker, strategy_name, *scope_params)).fetchone()
-    if not row:
+        """, conn, params=(config_version, ticker, strategy_name, *scope_params))
+        df_centers = pd.read_sql(f"""
+            SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
+                   {ROBUST_ALPHA_SQL} AS robust_alpha
+            FROM backtest_cache
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+              AND axis_tp IN ({tp_ph}) AND {_sl_axis_real_column(sl_axis_col)} IN ({sl_ph})
+              AND kernel_version='ground_truth_v6' {scope_sql}
+        """, conn, params=(config_version, ticker, strategy_name, *hp['take_profits'],
+                            *hp['stop_losses'], *scope_params))
+    if df.empty or df_centers.empty:
+        logger.warning(f"[{ticker}] Phase2.5-GT: no ground_truth_v6 rows in scope -- nothing to cliff-box.")
         return
-    if row[6] != 'Phase2-Island-GT':
-        raise RuntimeError(
-            f"[{ticker}] Phase2.5-GT blocked: the current best row (phase={row[6]!r}) didn't "
-            f"come from Phase2-Island-GT -- Phase2.5 exists to refine around Phase2's true "
-            f"best point, not Phase1's coarse one. Run run_phase2_island_ground_truth for "
-            f"this scope first."
-        )
-    tp_c, sl_c, hold_c, w_c, z_c, tpct_c = int(row[0]), int(row[1]), int(row[2]), int(row[3]), float(row[4]), float(row[5])
 
-    if fourth_axis_col == 'trail_pct' and tpct_c in trail_pcts:
-        idx = trail_pcts.index(tpct_c)
-        tpct_neighbors = trail_pcts[max(0, idx - 1): idx + 2]
-    else:
-        tpct_neighbors = [tpct_c]
+    centers = pick_island_centers(df_centers)
 
     tasks = set()
-    for tp in range(max(1, tp_c - CLIFF_RADIUS), min(30, tp_c + CLIFF_RADIUS) + 1):
-        for sl in range(max(1, sl_c - CLIFF_RADIUS), min(30, sl_c + CLIFF_RADIUS) + 1):
-            for hold in [h for h in hp['hold_time_caps'] if abs(h - hold_c) <= 7]:
-                for tpct in tpct_neighbors:
-                    tasks.add((tp, sl, hold, w_c, z_c, float(tpct)))
+    for tp_c, sl_c in centers:
+        region = df[(df['take_profit'] - tp_c).abs().le(FINE_RADIUS) &
+                    (df['stop_loss'] - sl_c).abs().le(FINE_RADIUS)]
+        if region.empty:
+            continue
+        region = region.sort_values('robust_alpha', ascending=False)
 
-    logger.info(f"[{ticker}] Phase2.5-GT cliff-box: {len(tasks)} tasks around TP={tp_c} SL={sl_c} hold={hold_c}h")
+        top_cagr = region.iloc[0]['cagr']
+        if pd.isna(top_cagr):
+            # NULL cagr means "not yet computed" (pre-column row, or a cache-hit that
+            # hasn't been backfilled -- see the schema-migration comment near
+            # PHASE25_ISLAND_CAGR_MIN's definition), NOT "fails the quality bar". Safe
+            # today only because the standard Phase1->2->2.5 call path always backfills
+            # cagr for the whole scope before Phase2.5 runs -- flagged loud in case a
+            # future standalone/resume-from-phase call skips that backfill.
+            logger.error(f"[{ticker}] Phase2.5-GT: island(TP={tp_c} SL={sl_c})'s top cell has "
+                         f"NULL cagr (unknown, not sub-{PHASE25_ISLAND_CAGR_MIN}) -- skipping "
+                         f"this island rather than risk cliff-boxing an unranked cell. If this "
+                         f"fires outside the standard Phase1->2->2.5 chain, run Phase1 for this "
+                         f"scope first to backfill cagr.")
+            continue
+        if top_cagr <= PHASE25_ISLAND_CAGR_MIN:
+            logger.info(f"[{ticker}] Phase2.5-GT: skipping island(TP={tp_c} SL={sl_c}) -- "
+                        f"top cell cagr={top_cagr:.2f} does not clear the {PHASE25_ISLAND_CAGR_MIN}% "
+                        f"candidate-quality bar (idx_bc_cagr_candidates' threshold).")
+            continue
+
+        for _, cand in region.head(3).iterrows():
+            tp_c2, sl_c2, hold_c, w_c, z_c = (int(cand['take_profit']), int(cand['stop_loss']),
+                                              int(cand['max_hold_hours']), int(cand['window']),
+                                              float(cand['z_score_threshold']))
+            tpct_c = float(cand['tpct'])
+            if fourth_axis_col == 'trail_pct' and tpct_c in trail_pcts:
+                idx = trail_pcts.index(tpct_c)
+                tpct_neighbors = trail_pcts[max(0, idx - 1): idx + 2]
+            else:
+                tpct_neighbors = [tpct_c]
+
+            logger.info(f"[{ticker}] Phase2.5-GT cliff-box candidate: island(TP={tp_c} SL={sl_c}) "
+                        f"cell TP={tp_c2} SL={sl_c2} hold={hold_c}h w={w_c} z={z_c} tpct={tpct_c} "
+                        f"robust_alpha={cand['robust_alpha']:.4f} cagr={cand['cagr']}")
+
+            for tp in range(max(1, tp_c2 - CLIFF_RADIUS), min(30, tp_c2 + CLIFF_RADIUS) + 1):
+                for sl in range(max(1, sl_c2 - CLIFF_RADIUS), min(30, sl_c2 + CLIFF_RADIUS) + 1):
+                    for hold in [h for h in hp['hold_time_caps'] if abs(h - hold_c) <= 7]:
+                        for tpct in tpct_neighbors:
+                            tasks.add((tp, sl, hold, w_c, z_c, float(tpct)))
+
+    if not tasks:
+        logger.warning(f"[{ticker}] Phase2.5-GT: no cliff-box tasks generated from {len(centers)} island center(s).")
+        return
+
+    logger.info(f"[{ticker}] Phase2.5-GT cliff-box: {len(tasks)} tasks across {len(centers)} island(s)")
     dispatch_parallel_grid_ground_truth(shared_pool, list(tasks), ticker, strategy_name, config_version,
                                         "Phase2.5-CliffBox-GT", spy_bh, asset_bh, run_timestamp, fixed_sl,
                                         entry_timing, same_bar_reentry=same_bar_reentry, run_id=run_id,
                                         start_date=start_date, end_date=end_date)
+
+
+# ── Add-on overlay evaluation for Phase2.5-GT candidates (2026-08-22) ────────
+# Purely additive / read-only against already-populated backtest_cache core data --
+# does NOT dispatch anything through dispatch_parallel_grid_ground_truth (no
+# ProcessPoolExecutor sweep, no backtest_cache writes), and does NOT change how
+# core-only candidate selection works. Every cell evaluated here is computed
+# in-process via a direct run_backtest_ground_truth call (reusing
+# _load_node_inputs_ground_truth's per-(ticker,strategy,window) prep/mprep memo), then
+# passed through backtester.apply_addon_overlay_ground_truth for the blended number.
+# same_bar_reentry is always False here (user's explicit compute-halving direction for
+# this addon-safety pass specifically -- core candidate selection itself is unaffected).
+
+def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version, hp,
+                                            fixed_sl=0, entry_timing='open_check'):
+    """Read-only re-derivation of run_phase25_cliff_box_ground_truth's own up-to-
+    (N_ISLANDS * 3) candidate list, against whatever Phase1/Phase2-GT rows already exist
+    in backtest_cache -- does NOT dispatch anything (no Phase2.5-CliffBox-GT rows are
+    required or produced). Same completeness guards, same center/top-3-per-island
+    selection logic, same PHASE25_ISLAND_CAGR_MIN gate -- kept in exact lockstep with
+    that function's own candidate-selection block since a divergence here would compute
+    add-on safety for a candidate set the real Phase2.5-GT dispatch wouldn't recognize.
+
+    Returns a list of dicts: {island_tp, island_sl, take_profit, stop_loss,
+    max_hold_hours, window, z_score_threshold, tpct, robust_alpha, cagr}."""
+    _require_full_gt_hp(hp, strategy_name, "derive_phase25_candidates_ground_truth")
+    p1_done, p1_expected = _phase1_coarse_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
+    if p1_done < p1_expected:
+        raise RuntimeError(f"[{ticker}] derive_phase25_candidates_ground_truth blocked: "
+                            f"Phase1-Coarse-GT incomplete ({p1_done:,}/{p1_expected:,}).")
+    p2_done, p2_expected = _phase2_island_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
+    if p2_done < p2_expected:
+        raise RuntimeError(f"[{ticker}] derive_phase25_candidates_ground_truth blocked: "
+                            f"Phase2-Island-GT incomplete ({p2_done:,}/{p2_expected:,}).")
+
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    tp_ph = ','.join('?' * len(hp['take_profits']))
+    sl_ph = ','.join('?' * len(hp['stop_losses']))
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql(f"""
+            SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
+                   max_hold_hours, window, z_score_threshold,
+                   {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct,
+                   {ROBUST_ALPHA_SQL} AS robust_alpha, cagr
+            FROM backtest_cache
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+              AND kernel_version='ground_truth_v6' {scope_sql}
+        """, conn, params=(config_version, ticker, strategy_name, *scope_params))
+        df_centers = pd.read_sql(f"""
+            SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
+                   {ROBUST_ALPHA_SQL} AS robust_alpha
+            FROM backtest_cache
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+              AND axis_tp IN ({tp_ph}) AND {_sl_axis_real_column(sl_axis_col)} IN ({sl_ph})
+              AND kernel_version='ground_truth_v6' {scope_sql}
+        """, conn, params=(config_version, ticker, strategy_name, *hp['take_profits'],
+                            *hp['stop_losses'], *scope_params))
+    if df.empty or df_centers.empty:
+        return []
+
+    centers = pick_island_centers(df_centers)
+    candidates = []
+    for tp_c, sl_c in centers:
+        region = df[(df['take_profit'] - tp_c).abs().le(FINE_RADIUS) &
+                    (df['stop_loss'] - sl_c).abs().le(FINE_RADIUS)]
+        if region.empty:
+            continue
+        region = region.sort_values('robust_alpha', ascending=False)
+        top_cagr = region.iloc[0]['cagr']
+        if pd.isna(top_cagr) or top_cagr <= PHASE25_ISLAND_CAGR_MIN:
+            continue
+        for _, cand in region.head(3).iterrows():
+            candidates.append({
+                'island_tp': tp_c, 'island_sl': sl_c,
+                'take_profit': int(cand['take_profit']), 'stop_loss': int(cand['stop_loss']),
+                'max_hold_hours': int(cand['max_hold_hours']), 'window': int(cand['window']),
+                'z_score_threshold': float(cand['z_score_threshold']), 'tpct': float(cand['tpct']),
+                'robust_alpha': float(cand['robust_alpha']), 'cagr': float(cand['cagr']),
+            })
+    return candidates
+
+
+def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_hours, w, z_thresh,
+                                            fixed_sl, tpct, entry_timing, start_date, end_date,
+                                            spy_bh, years, data_source="yahoo"):
+    """One (tp, sl, hold, w, z, tpct) cell, evaluated in-process (no ProcessPoolExecutor,
+    no backtest_cache write) with same_bar_reentry=False -- returns core AND add-on-
+    adjusted alpha/CAGR side by side. Reuses run_single_backtest_node_ground_truth_
+    isolated's exact axis-mapping convention (trail_buy_pct/trail_sell_pct/arm_pct from
+    tp/sl/tpct) so a cell computed here matches what the real sweep would have computed
+    for the same coordinates."""
+    strategy_class = getattr(strategies, strategy_name)
+    is_both = strategy_name == 'TrailingBothZScoreBreakout'
+    inputs = _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
+                                             start_date, end_date, data_source=data_source)
+    if inputs is None:
+        return None
+    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+    if df_hourly_windowed.empty:
+        return None
+    if is_both:
+        trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = float(sl), float(tpct), float(tp)
+    else:
+        trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = 0.0, float(sl), float(tp)
+
+    trades = run_backtest_ground_truth(
+        df_hourly_windowed, df_daily_processed, ticker, minute_df,
+        fixed_sl=fixed_sl, arm_pct=arm_pct_arg, trail_buy_pct=trail_buy_pct_arg,
+        trail_sell_pct=trail_sell_pct_arg, max_hours_to_hold=hold_hours,
+        z_score_threshold=z_thresh, is_both=is_both,
+        open_check_entry_timing=(entry_timing == 'open_check'),
+        same_bar_reentry=False, prep=prep, mprep=mprep, need_times=False,
+    )
+    if not trades:
+        return None
+    core_alpha, n_trades, _, core_ret, _, core_cagr = _summarize_trades_ground_truth(trades, spy_bh, years)
+    addon_trades = apply_addon_overlay_ground_truth(trades)
+    n_armed = sum(1 for t in trades if t.get('armed'))
+    # Paired-review CRITICAL finding (2026-08-22, both Sonnet- and Opus-independent
+    # passes): a blended add-on Return can go below -100% (no independent stop on the
+    # add-on leg, unlike core), which flips the sign of the compounded product and can
+    # silently corrupt addon_alpha/addon_cagr into a garbage number (nan/complex) with
+    # no exception. Detected here via apply_addon_overlay_ground_truth's own
+    # 'return_below_floor' flag -- when ANY trade in the cell breaches it, this cell's
+    # addon stats are reported as None/flagged rather than aggregated, so a poisoned
+    # cell can never silently look like a real number to a caller.
+    floor_breached = any(t.get('return_below_floor') for t in addon_trades)
+    if floor_breached:
+        addon_alpha, addon_ret, addon_cagr = None, None, None
+    else:
+        addon_alpha, _, _, addon_ret, _, addon_cagr = _summarize_trades_ground_truth(addon_trades, spy_bh, years)
+    return {
+        'coords': (tp, sl, hold_hours, w, z_thresh, tpct),
+        'n_trades': n_trades, 'n_armed': n_armed,
+        'core_alpha': core_alpha, 'core_return': core_ret, 'core_cagr': core_cagr,
+        'addon_alpha': addon_alpha, 'addon_return': addon_ret, 'addon_cagr': addon_cagr,
+        'addon_return_floor_breached': floor_breached,
+    }
+
+
+def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, hp, candidates,
+                                         spy_bh, fixed_sl=0, entry_timing='open_check',
+                                         start_date=None, end_date=None, years=None,
+                                         data_source="yahoo", cliff_radius=None):
+    """For each candidate from derive_phase25_candidates_ground_truth, computes the
+    add-on-adjusted alpha/CAGR at the candidate's own cell AND across the same cliff-box
+    neighborhood shape Phase2.5-GT's own dispatch would generate (±cliff_radius in
+    TP/SL, ±7h hold neighbors from hp['hold_time_caps'], adjacent trail_pct for
+    TrailingBoth) -- then applies the SAME cliff-safety verdict convention this codebase
+    already uses (identify_full_mesh_candidates: cliff iff worst-neighbor robust-alpha-
+    equivalent < 0), computed on the add-on-adjusted alpha instead of the core one.
+
+    cliff_radius defaults to CLIFF_RADIUS (the same radius core's own Phase2.5-GT cliff-
+    box uses) -- overridable to a smaller radius for a cheaper smoke-test pass; this
+    function does zero backtest_cache writes and never touches
+    dispatch_parallel_grid_ground_truth, so there is no risk of colliding with a real
+    sweep's data regardless of radius chosen.
+
+    Real compute: each cell here is one direct run_backtest_ground_truth call
+    (~seconds warm, per docs/plans/ground_truth_kernel_rebuild.md's own benchmark note)
+    -- a full 9-candidate x full cliff-box pass is real, possibly slow work, same
+    caution as any other GT campaign call in this file.
+
+    KNOWN LIMITATIONS (paired-review findings, 2026-08-22, not fixed -- read before
+    treating `addon_cliff`/`addon_cagr` as a real-money go/no-go signal on their own):
+    (1) `addon_cliff` reuses the SAME absolute worst-neighbor<0 bar the core (unlevered)
+    metric uses, applied to a series that carries ~2x exposure through the armed window
+    -- a node whose armed trades are net positive will structurally look "safer" with
+    add-on than without, by construction, not because the extra margin exposure is
+    actually safer. (2) `addon_cagr` compounds the add-on leg's borrowed capital as if
+    financing were free (no margin interest, no maintenance requirement, no ceiling as
+    the account grows) -- an upper bound on real add-on CAGR, not a realizable one.
+    (3) The simulation assumes the add-on leg always exits at the exact same time/price
+    as core; the REAL leg carries its own independent stop (signals_notify.py's
+    _place_stop_loss_for_addon_leg, anchored to the PARENT's entry price, not the arm
+    price) that can fire first, and can also fail to open at all (non-margin account,
+    ticker/node automation gates, a SafetyViolation, or an entry-timeout ABANDONED leg)
+    -- this pass assumes a 100% fill rate. (4) same_bar_reentry=False here does not
+    match the True setting every real campaign dispatch uses, so `core_alpha`/
+    `core_cliff` in each result are NOT the same numbers the real Phase2.5-GT dispatch
+    would have produced for that candidate (see the 'same_bar_reentry' field on each
+    result, and compare against `candidate['robust_alpha']` if an apples-to-apples
+    check is needed). None of these make the add-on-vs-core COMPARISON invalid (both
+    sides of that comparison share the same same_bar_reentry/fill-rate/financing
+    assumptions) -- they matter if this output is used for an absolute, not relative,
+    verdict."""
+    radius = CLIFF_RADIUS if cliff_radius is None else cliff_radius
+    trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    # Same fourth-axis test run_phase25_cliff_box_ground_truth itself uses (NOT a
+    # hand-inlined strategy-name check) -- paired-review finding (2026-08-22, Opus
+    # independent-cold): re-deriving "does this strategy have a trail_pct 4th axis" by
+    # comparing strategy_name directly is the exact pattern that produced a documented
+    # CRITICAL elsewhere in this file (identify_full_mesh_candidates' trail_sell_pct
+    # mix-up). resolve_axis_columns is the single source of truth for this.
+    _, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    results = []
+    for cand in candidates:
+        tp_c, sl_c, hold_c, w_c, z_c, tpct_c = (cand['take_profit'], cand['stop_loss'],
+                                                 cand['max_hold_hours'], cand['window'],
+                                                 cand['z_score_threshold'], cand['tpct'])
+        if fourth_axis_col == 'trail_pct' and tpct_c in trail_pcts:
+            idx = trail_pcts.index(tpct_c)
+            tpct_neighbors = trail_pcts[max(0, idx - 1): idx + 2]
+        else:
+            tpct_neighbors = [tpct_c]
+
+        own = _evaluate_cell_ground_truth_with_addon(
+            ticker, strategy_name, tp_c, sl_c, hold_c, w_c, z_c, fixed_sl, tpct_c,
+            entry_timing, start_date, end_date, spy_bh, years, data_source=data_source)
+
+        neighbor_addon_alphas = []
+        neighbor_core_alphas = []
+        for tp in range(max(1, tp_c - radius), min(30, tp_c + radius) + 1):
+            for sl in range(max(1, sl_c - radius), min(30, sl_c + radius) + 1):
+                for hold in [h for h in hp['hold_time_caps'] if abs(h - hold_c) <= 7]:
+                    for tpct in tpct_neighbors:
+                        cell = _evaluate_cell_ground_truth_with_addon(
+                            ticker, strategy_name, tp, sl, hold, w_c, z_c, fixed_sl, tpct,
+                            entry_timing, start_date, end_date, spy_bh, years, data_source=data_source)
+                        if cell is not None:
+                            # addon_alpha is None when apply_addon_overlay_ground_truth
+                            # flagged a return_below_floor breach for this cell (see
+                            # _evaluate_cell_ground_truth_with_addon) -- excluded from the
+                            # worst-neighbor min() rather than crashing on a None/float
+                            # comparison or, worse, being silently treated as the most
+                            # negative value. core_alpha is never None (core Return is
+                            # always >= -1, so core aggregation can't hit this failure
+                            # mode) but included in the same None-guard for symmetry.
+                            if cell['addon_alpha'] is not None:
+                                neighbor_addon_alphas.append(cell['addon_alpha'])
+                            if cell['core_alpha'] is not None:
+                                neighbor_core_alphas.append(cell['core_alpha'])
+
+        # Fail CLOSED (None/"unknown"), not open to "safe", when nothing was evaluated --
+        # paired-review finding (2026-08-22, all 4 review passes converged on this
+        # independently): this is the exact failure shape identify_full_mesh_candidates'
+        # own comments (run_optimization_sweep.py, its `else 0.0` fix) already document
+        # as having fabricated a "safe" verdict for every TrailingExit row historically.
+        worst_neighbor = min(neighbor_addon_alphas) if neighbor_addon_alphas else None
+        worst_neighbor_core = min(neighbor_core_alphas) if neighbor_core_alphas else None
+        addon_cliff = None if worst_neighbor is None else (worst_neighbor < 0)
+        core_cliff = None if worst_neighbor_core is None else (worst_neighbor_core < 0)
+        results.append({
+            'candidate': cand, 'own_cell': own,
+            'n_neighbors_evaluated': len(neighbor_addon_alphas),
+            'worst_neighbor_addon_alpha': worst_neighbor,
+            'worst_neighbor_core_alpha': worst_neighbor_core,
+            'core_cliff': core_cliff,
+            'addon_cliff': addon_cliff,
+            # Paired-review finding (2026-08-22): this pass always evaluates with
+            # same_bar_reentry=False (the user's explicit compute-halving direction for
+            # add-on safety specifically), which will generally differ from whatever
+            # same_bar_reentry the candidate's own cached core row (from
+            # derive_phase25_candidates_ground_truth, i.e. real Phase1/Phase2-GT data)
+            # was computed under. `core_alpha`/`core_cliff` above are NOT guaranteed to
+            # match the cached `candidate['robust_alpha']` for this reason -- this flag
+            # travels with the result so a consumer can't mistake one for the other.
+            'same_bar_reentry': False,
+        })
+    return results
 
 
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────

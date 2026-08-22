@@ -1838,6 +1838,18 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
     exit_mj     = np.empty(MAX_TRADES, dtype=np.int64)
     exit_p      = np.empty(MAX_TRADES, dtype=np.float64)
     reason      = np.empty(MAX_TRADES, dtype=np.int64)
+    # Add-on-overlay support (2026-08-22, additive-only -- see
+    # run_ground_truth_addon_overlay): records whether/where THIS trade
+    # actually armed (state==STATE_ARMED reached before exit), independent
+    # of its eventual exit reason (TRAIL always armed; TIME can be either;
+    # SL never arms). arm_price_out mirrors `peak`'s own initialization
+    # (peak = c at the HOLD->ARMED transition below) -- the real live
+    # add-on leg's entry fill price is that same bar-close price, so this
+    # is exactly the number a post-processing add-on simulation needs, with
+    # zero re-simulation of the core state machine.
+    armed_out     = np.zeros(MAX_TRADES, dtype=np.int64)
+    arm_bar_out   = np.full(MAX_TRADES, -1, dtype=np.int64)
+    arm_price_out = np.zeros(MAX_TRADES, dtype=np.float64)
     count = 0
 
     STATE_IDLE, STATE_WAIT, STATE_HOLD, STATE_ARMED = 0, 1, 2, 3
@@ -1852,6 +1864,9 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
     fill_bar = -1
     fill_mj = -1
     fill_partial = False
+    cur_armed = 0
+    cur_arm_bar = -1
+    cur_arm_price = 0.0
 
     n = len(closes)
     for i in range(n):
@@ -1882,6 +1897,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                 fill_bar = i
                 fill_mj = GT_MJ_BAR_OPEN_FIRST_MINUTE
                 fill_partial = False
+                cur_armed = 0; cur_arm_bar = -1; cur_arm_price = 0.0
 
         # ── (2) continuous minute-level resolution ──
         if state != STATE_IDLE and m_count > 0:
@@ -1899,6 +1915,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         arm_price = cur_entry_price * (1.0 + arm_pct / 100.0)
                         state = STATE_HOLD
                         fill_bar = i; fill_mj = j; fill_partial = False
+                        cur_armed = 0; cur_arm_bar = -1; cur_arm_price = 0.0
                         continue
                     if ml < running_low:
                         running_low = ml
@@ -1910,6 +1927,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         arm_price = cur_entry_price * (1.0 + arm_pct / 100.0)
                         state = STATE_HOLD
                         fill_bar = i; fill_mj = j; fill_partial = True
+                        cur_armed = 0; cur_arm_bar = -1; cur_arm_price = 0.0
                         continue
 
                 elif state == STATE_HOLD:
@@ -1920,6 +1938,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         exit_bar[count] = i; exit_mj[count] = j
                         entry_p[count] = cur_entry_price; exit_p[count] = mo
                         reason[count] = GT_SL
+                        armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
                         count += 1; state = STATE_IDLE
                         continue
                     if ml <= stop_price:
@@ -1927,6 +1946,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         exit_bar[count] = i; exit_mj[count] = j
                         entry_p[count] = cur_entry_price; exit_p[count] = stop_price
                         reason[count] = GT_SL
+                        armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
                         count += 1; state = STATE_IDLE
                         continue
 
@@ -1937,6 +1957,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         exit_bar[count] = i; exit_mj[count] = j
                         entry_p[count] = cur_entry_price; exit_p[count] = mo
                         reason[count] = GT_TRAIL
+                        armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
                         count += 1; state = STATE_IDLE
                         continue
                     if mh > peak:
@@ -1947,6 +1968,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         exit_bar[count] = i; exit_mj[count] = j
                         entry_p[count] = cur_entry_price; exit_p[count] = stop
                         reason[count] = GT_TRAIL
+                        armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
                         count += 1; state = STATE_IDLE
                         continue
 
@@ -1958,17 +1980,20 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
             if c >= arm_price:
                 state = STATE_ARMED
                 peak = c
+                cur_armed = 1; cur_arm_bar = i; cur_arm_price = c
             elif held >= max_hours_to_hold:
                 entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
                 exit_bar[count] = i; exit_mj[count] = GT_MJ_BAR_CLOSE
                 entry_p[count] = cur_entry_price; exit_p[count] = c
                 reason[count] = GT_TIME
+                armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
                 count += 1; state = STATE_IDLE
         elif state == STATE_ARMED and (i - cur_entry_bar) >= max_hours_to_hold:
             entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
             exit_bar[count] = i; exit_mj[count] = GT_MJ_BAR_CLOSE
             entry_p[count] = cur_entry_price; exit_p[count] = c
             reason[count] = GT_TIME
+            armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
             count += 1; state = STATE_IDLE
 
         # ── (4) close_check signal detection ──
@@ -1984,9 +2009,11 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                 arm_price = cur_entry_price * (1.0 + arm_pct / 100.0)
                 state = STATE_HOLD
                 fill_bar = -1; fill_mj = -1; fill_partial = False
+                cur_armed = 0; cur_arm_bar = -1; cur_arm_price = 0.0
 
     return (entry_bar[:count], entry_mj[:count], entry_p[:count],
-            exit_bar[:count], exit_mj[:count], exit_p[:count], reason[:count])
+            exit_bar[:count], exit_mj[:count], exit_p[:count], reason[:count],
+            armed_out[:count], arm_bar_out[:count], arm_price_out[:count])
 
 
 _GT_REASON_NAMES = {GT_SL: 'SL', GT_TRAIL: 'TRAIL', GT_TIME: 'TIME'}
@@ -2026,7 +2053,7 @@ def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df,
     prep = prep or prep_inputs(df_hourly, df_daily_indicators)
     mprep = mprep or prep_minute_inputs(minute_df, df_hourly)
 
-    eb, emj, ep, xb, xmj, xp, rs = _simulate_trail_ground_truth(
+    eb, emj, ep, xb, xmj, xp, rs, armed, ab, ap = _simulate_trail_ground_truth(
         prep['opens'], prep['highs'], prep['lows'], prep['prices'], prep['hours'], prep['daily_idx'],
         prep['sma_arr'], prep['std_arr'],
         mprep['min_o'], mprep['min_h'], mprep['min_l'], mprep['min_c'],
@@ -2045,6 +2072,10 @@ def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df,
                 'Exit Price': float(xp[k]),
                 'exit_reason': _GT_REASON_NAMES[int(rs[k])],
                 'Return': (float(xp[k]) - float(ep[k])) / float(ep[k]),
+                # Add-on-overlay support -- see run_ground_truth_addon_overlay.
+                # 'armed' is independent of exit_reason (TIME can be either).
+                'armed': bool(armed[k]),
+                'Arm Price': float(ap[k]) if armed[k] else None,
             })
         return trades
 
@@ -2076,5 +2107,67 @@ def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df,
             'Exit Price': float(xp[k]),
             'exit_reason': _GT_REASON_NAMES[int(rs[k])],
             'Return': (float(xp[k]) - float(ep[k])) / float(ep[k]),
+            # Add-on-overlay support -- see run_ground_truth_addon_overlay.
+            'armed': bool(armed[k]),
+            'Arm Time': resolve_time(int(ab[k]), GT_MJ_BAR_CLOSE) if armed[k] else None,
+            'Arm Price': float(ap[k]) if armed[k] else None,
         })
     return trades
+
+
+def apply_addon_overlay_ground_truth(trades):
+    """Post-processing pass (2026-08-22) over a run_backtest_ground_truth trade list --
+    NOT a re-simulation -- that synthesizes the real add-on-at-arm mechanism's per-trade
+    blended return (signals_notify.check_addon_trigger_real: on arm, a real market BUY
+    for the SAME share count as the core position opens at the arm bar's own price, then
+    closes at the exact same time/price as the core leg's own exit).
+
+    Math (verified by hand against a worked example in this session's report): with N
+    shares each leg, entry price E, arm price A, exit price X --
+        core-only P&L/share   = X - E
+        add-on P&L/share      = X - A          (only exists post-arm)
+        blended P&L/share     = (X - E) + (X - A) = 2X - E - A
+        blended return        = (2X - E - A) / E
+
+    This is NOT 2x the core return: the add-on leg only doubles the ARM-TO-EXIT dollar
+    P&L (its own capital base is the arm price A, not entry price E), so the blended
+    return equals core_return + (X - A) / E, not 2 * core_return. The return is expressed
+    on E (the core leg's own capital) because the add-on leg is real-money margin-funded
+    on TOP of that capital, not drawn from it -- same convention as every other GT trade's
+    'Return', which is always relative to that trade's own entry price.
+
+    Only trades carrying armed=True get an add-on leg; SL and never-armed TIME exits are
+    returned with their own core 'Return' unchanged (exit_reason=='SL' can never be armed;
+    exit_reason=='TIME' can be either, which is exactly why 'armed' has to be read off the
+    trade dict directly rather than inferred from exit_reason -- see run_backtest_ground_
+    truth's own docstring on this same ambiguity).
+
+    return_below_floor (2026-08-22, paired-review CRITICAL finding, both Sonnet- and
+    Opus-independent passes converged on this independently): unlike a core-only trade
+    (Return is always >= -1, since exit_price >= 0 and Return = (X-E)/E >= -E/E = -1), a
+    blended trade has NO such floor -- (2X-E-A)/E can go below -1 whenever the exit price
+    gaps far enough below the arm price (e.g. an overnight gap-down on a leveraged ETF,
+    or the hold-time-forced TIME exit while still armed and deep underwater). This is not
+    a pure math artifact: it's the real economics of a margin-funded add-on leg (a bad
+    enough move really can wipe out more than the core leg's own capital), but it also
+    means naive downstream compounding (prod(1+Return) across trades) silently breaks --
+    a single such trade flips the sign of the whole product and can drive
+    _cagr_from_total_return's fractional power into a complex/nan result with no
+    exception raised. Flagged here (not clamped -- clamping would hide a real, not
+    fabricated, loss) so every caller can decide how to handle it explicitly rather than
+    silently aggregating a poisoned number."""
+    out = []
+    for t in trades:
+        t2 = dict(t)
+        t2['Return_core'] = t['Return']
+        if t.get('armed'):
+            entry, exitp, arm = t['Entry Price'], t['Exit Price'], t['Arm Price']
+            blended = (2.0 * exitp - entry - arm) / entry
+            t2['Return'] = blended
+            t2['addon_applied'] = True
+            t2['return_below_floor'] = blended < -1.0
+        else:
+            t2['addon_applied'] = False
+            t2['return_below_floor'] = False
+        out.append(t2)
+    return out

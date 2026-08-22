@@ -143,14 +143,31 @@ def load_nodes(node_ids=LIVE_NODE_IDS):
     return rows
 
 
-def load_hourly(ticker):
+def load_hourly(ticker, data_source="yahoo"):
+    """data_source='yahoo' (default, unchanged): the Yahoo-sourced hourly CSV,
+    ~2023-07-24 onward. data_source='massive': dividend/split-adjusted hourly bars
+    derived from Massive.com minute data (db_cache.get_massive_hourly_ohlcv),
+    back to ~2021-08-23 for most tickers -- see db_cache.py's
+    massive_hourly_derived table docstring. Same column/dtype/index shape either
+    way, so callers don't need to branch."""
+    if data_source == "massive":
+        import db_cache
+        return db_cache.get_massive_hourly_ohlcv(ticker)
     df = pd.read_csv(os.path.join(HOURLY_DIR, f"{ticker}_1h.csv"), index_col=0, parse_dates=True)
     df.index = pd.to_datetime(df.index).tz_localize(None)
     return df.sort_index()
 
 
-def load_minutes(ticker):
-    """Regular-session (09:30:00-15:59:59 ET) 1-minute bars, tz-naive ET index."""
+def load_minutes(ticker, data_source="yahoo"):
+    """Regular-session (09:30:00-15:59:59 ET) 1-minute bars, tz-naive ET index.
+    data_source='yahoo' (default, unchanged): raw, UNADJUSTED minute CSV, same as
+    before this param existed. data_source='massive': db_cache.
+    get_massive_minute_ohlcv(ticker) instead -- dividend-adjusted, consistent with
+    the data_source='massive' hourly leg (fixed 2026-08-22 -- previously this stayed
+    on the raw unadjusted CSV even under --data-source massive)."""
+    if data_source == "massive":
+        import db_cache
+        return db_cache.get_massive_minute_ohlcv(ticker)
     df = pd.read_csv(os.path.join(MINUTE_DIR, f"{ticker}_1m.csv"))
     ts = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("US/Eastern").dt.tz_localize(None)
     df = df.set_index(ts).sort_index()
@@ -313,11 +330,11 @@ class Sim:
                 self._close(t_close, stop, "TRAIL", bar_i)
 
 
-def coverage_report(ticker, start, end):
+def coverage_report(ticker, start, end, data_source="yahoo"):
     """Falsifiable test of the missing-minute policy: does the minute feed's own
     per-hour [min Low, max High] contain the independent hourly bar's range?"""
-    dfh = load_hourly(ticker).loc[start:end + " 23:59:59"]
-    m = load_minutes(ticker).loc[start:end + " 23:59:59"]
+    dfh = load_hourly(ticker, data_source=data_source).loc[start:end + " 23:59:59"]
+    m = load_minutes(ticker, data_source=data_source).loc[start:end + " 23:59:59"]
     mi = m.index
     b = pd.DatetimeIndex(np.where(mi.minute >= 30, mi.floor("h") + pd.Timedelta(minutes=30),
                                   mi.floor("h") - pd.Timedelta(minutes=30)))
@@ -467,6 +484,10 @@ def main():
     ap.add_argument("--no-same-bar-reentry", action="store_true",
                     help="suppress the close_check signal on a bar where a position already "
                          "opened (kernel behaviour); default allows it, matching real live")
+    ap.add_argument("--data-source", choices=["yahoo", "massive"], default="yahoo",
+                    help="hourly data source (default: yahoo, unchanged behavior). "
+                         "'massive' reads db_cache.get_massive_hourly_ohlcv, which goes "
+                         "back to ~2021-08-23 vs yahoo's ~2023-07-24 floor.")
     a = ap.parse_args()
 
     nodes = load_nodes()
@@ -478,15 +499,15 @@ def main():
         print(f"{'Ticker':7s} {'hourly bars':>11s} {'minute fill':>11s} {'bars w/o min':>12s} "
               f"{'Low uncovered':>13s} {'High uncovered':>14s}")
         for n in sorted(nodes, key=lambda x: x["ticker"]):
-            r = coverage_report(n["ticker"], a.start, a.end)
+            r = coverage_report(n["ticker"], a.start, a.end, data_source=a.data_source)
             print(f"{r['ticker']:7s} {r['bars']:11d} {r['minute_fill']:10.1%} "
                   f"{r['no_minutes']:12d} {r['low_uncovered']:13d} {r['high_uncovered']:14d}")
         return
 
     rows = []
     for n in sorted(nodes, key=lambda x: x["ticker"]):
-        dfh = load_hourly(n["ticker"])
-        mdf = load_minutes(n["ticker"])
+        dfh = load_hourly(n["ticker"], data_source=a.data_source)
+        mdf = load_minutes(n["ticker"], data_source=a.data_source)
         gt = simulate(n, dfh, mdf, a.start, a.end, a.intrabar, a.backstop,
                       same_bar_reentry=not a.no_same_bar_reentry)
         kt = kernel_trades(n, dfh, a.start, a.end)

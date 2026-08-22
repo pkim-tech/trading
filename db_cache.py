@@ -388,6 +388,429 @@ def refresh_best_nodes_cache():
     print(f"Best nodes cache refreshed for {len(versions)} versions")
 
 
+def _ensure_massive_dividends_table(conn):
+    # massive_dividends_raw: cached copy of Massive.com's /stocks/v1/dividends
+    # results, per ticker -- raw, untouched, never mutated. Avoids re-fetching
+    # (and re-burning rate-limit budget) every time build_massive_hourly_derived.py
+    # runs. Only historical_adjustment_factor is needed downstream (per Massive's
+    # documented rule: for a bar on date D, find the first dividend whose
+    # ex_dividend_date is after D and multiply price by that dividend's factor --
+    # cumulative, so only the nearest future one is ever applied).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS massive_dividends_raw (
+            ticker                        TEXT NOT NULL,
+            ex_dividend_date              TEXT NOT NULL,
+            historical_adjustment_factor  REAL NOT NULL,
+            cash_amount                   REAL,
+            fetched_at                    TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (ticker, ex_dividend_date)
+        )
+    """)
+
+
+def cache_massive_dividends(ticker, records):
+    """records: list of dicts from the Massive dividends API response (raw
+    'results' array). Upserts by (ticker, ex_dividend_date) -- a rerun for the
+    same ticker just refreshes factors rather than duplicating rows."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_massive_dividends_table(conn)
+        for r in records:
+            conn.execute("""
+                INSERT INTO massive_dividends_raw
+                    (ticker, ex_dividend_date, historical_adjustment_factor, cash_amount, fetched_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(ticker, ex_dividend_date) DO UPDATE SET
+                    historical_adjustment_factor=excluded.historical_adjustment_factor,
+                    cash_amount=excluded.cash_amount, fetched_at=excluded.fetched_at
+            """, (ticker, r["ex_dividend_date"], r["historical_adjustment_factor"], r.get("cash_amount")))
+
+
+def get_massive_dividends(ticker):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_massive_dividends_table(conn)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT ex_dividend_date, historical_adjustment_factor FROM massive_dividends_raw "
+            "WHERE ticker=? ORDER BY ex_dividend_date", (ticker,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _migrate_massive_hourly_tables_to_build_id(conn):
+    """One-time migration (2026-08-22): massive_hourly_derived/massive_hourly_
+    corrections originally had no build_id column (single-vintage, overwrite-in-
+    place design). Renames the old tables aside rather than dropping them -- they
+    hold pre-fix data from the killed 19-ticker batch (SOXL/KORU are the only
+    ones already rebuilt under the corrected pipeline; the other 17 are still the
+    known-buggy pre-fix rows) -- preserved for inspection, not needed for
+    reconstruction (that only needs the untouched raw minute/dividend caches)."""
+    for table in ("massive_hourly_derived", "massive_hourly_corrections"):
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if cols and "build_id" not in cols:
+            old_name = f"{table}_pre_build_id_migration"
+            # No DROP here (found by paired review 2026-08-22): if this migration
+            # ever re-triggered for any reason, a DROP would destroy the exact
+            # preserved data it exists to protect. Not currently reachable (the
+            # guard above requires a build_id-less table, and the new schema
+            # always has one), but the old drop-then-rename was one accidental
+            # re-run away from being destructive. Suffix-increment instead.
+            n = 1
+            target = old_name
+            existing = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+                (f"{old_name}%",)).fetchall()}
+            while target in existing:
+                n += 1
+                target = f"{old_name}_{n}"
+            conn.execute(f"ALTER TABLE {table} RENAME TO {target}")
+
+
+def _ensure_massive_hourly_derived_table(conn):
+    _migrate_massive_hourly_tables_to_build_id(conn)
+    # massive_hourly_derived: the DERIVED hourly series built from Massive minute
+    # data (dividend+split adjusted, resampled) -- this is what the GT/hourly
+    # kernels should read for a ticker's full history, per the 2026-08-22 pipeline
+    # decision (Massive is the sole source across the full range; Yahoo hourly
+    # stays separate, audit-only, never consumed). `build_id` (added 2026-08-22,
+    # references massive_hourly_derived_builds.id) tags every row with which
+    # rebuild produced it -- every vintage's full price series is kept
+    # permanently side by side, never overwritten in place (measured cost: ~64MB
+    # for one full 88-ticker vintage, ~650MB for 10 accumulated vintages -- trivial
+    # against this DB's existing multi-GB size, so no reason to throw old vintages
+    # away). Read the CURRENT vintage via get_massive_hourly_derived() (joins to
+    # the latest build_id per ticker); pass an explicit build_id to read an older
+    # one for reproducing what a past backtest campaign actually saw.
+    # `corrected`=1 marks a bar whose Open/High/Low/Close was adjusted by the
+    # spike-correction step -- see massive_hourly_corrections for the full detail.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS massive_hourly_derived (
+            ticker     TEXT NOT NULL,
+            build_id   INTEGER NOT NULL,
+            ts         TEXT NOT NULL,
+            open       REAL NOT NULL,
+            high       REAL NOT NULL,
+            low        REAL NOT NULL,
+            close      REAL NOT NULL,
+            volume     REAL,
+            corrected  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (ticker, build_id, ts)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS massive_hourly_corrections (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker      TEXT NOT NULL,
+            build_id    INTEGER NOT NULL,
+            ts          TEXT NOT NULL,
+            field       TEXT NOT NULL,
+            raw_value   REAL NOT NULL,
+            new_value   REAL NOT NULL,
+            reason      TEXT NOT NULL,
+            detected_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    # massive_hourly_derived_builds: the vintage/provenance record for each per-
+    # ticker rebuild -- two independent freshness axes (2026-08-22 design), since
+    # they change independently: a new dividend can trigger a re-adjustment with NO
+    # new raw data pulled, and new raw minute bars can be pulled with no new
+    # dividend. raw_data_pulled_at is a best-effort proxy (the {ticker}_1m.csv file's
+    # own mtime) for existing files that predate this tracking -- going forward,
+    # any script that pulls NEW raw minute data should record a real pull timestamp
+    # instead of relying on mtime, which isn't a reliable provenance signal.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS massive_hourly_derived_builds (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker                TEXT NOT NULL,
+            label                 TEXT NOT NULL,
+            built_at              TEXT NOT NULL DEFAULT (datetime('now')),
+            raw_data_pulled_at    TEXT,
+            raw_data_start        TEXT,
+            raw_data_end          TEXT,
+            dividend_data_asof    TEXT,
+            row_count             INTEGER,
+            correction_count      INTEGER
+        )
+    """)
+
+
+def _connect_or_reuse(conn):
+    """Returns (connection, owns_it). When conn is None (every existing standalone
+    caller, unchanged), opens+returns a fresh connection the caller must use as its
+    own context manager (owns_it=True). When conn is provided (2026-08-22, added to
+    let build_ticker() wrap build-row + hourly + corrections + minute writes in ONE
+    atomic transaction -- paired review found the previous one-connection-per-write
+    design could leave the hourly leg on a newer build_id than the minute leg if the
+    process died mid-build, silently pairing two different dividend/raw-data
+    vintages with no error), the caller manages commit/rollback itself."""
+    if conn is not None:
+        return conn, False
+    return sqlite3.connect(DB_PATH), True
+
+
+def write_massive_hourly_derived(ticker, build_id, df, conn=None):
+    """df: DataFrame indexed by tz-naive hourly timestamp, columns
+    Open/High/Low/Close/Volume/corrected (corrected optional, defaults 0). Inserts
+    a fresh, permanent row set under this build_id -- never deletes or overwrites
+    a prior build_id's rows (every vintage kept side by side, see table docstring
+    above). build_id must come from record_massive_hourly_build()'s return value.
+    Pass conn to participate in a caller-managed transaction (see _connect_or_reuse);
+    default (conn=None) is the original standalone-connection behavior, unchanged."""
+    c, owns = _connect_or_reuse(conn)
+    try:
+        _ensure_massive_hourly_derived_table(c)
+        rows = [
+            (ticker, build_id, ts.strftime("%Y-%m-%d %H:%M:%S"), float(r["Open"]), float(r["High"]),
+             float(r["Low"]), float(r["Close"]), float(r.get("Volume", 0) or 0),
+             int(r.get("corrected", 0)))
+            for ts, r in df.iterrows()
+        ]
+        c.executemany("""
+            INSERT INTO massive_hourly_derived (ticker, build_id, ts, open, high, low, close, volume, corrected)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        if owns:
+            c.commit()
+    finally:
+        if owns:
+            c.close()
+
+
+def log_massive_hourly_correction(ticker, build_id, ts, field, raw_value, new_value, reason, conn=None):
+    c, owns = _connect_or_reuse(conn)
+    try:
+        _ensure_massive_hourly_derived_table(c)
+        c.execute("""
+            INSERT INTO massive_hourly_corrections (ticker, build_id, ts, field, raw_value, new_value, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, build_id, ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else ts,
+              field, float(raw_value), float(new_value), reason))
+        if owns:
+            c.commit()
+    finally:
+        if owns:
+            c.close()
+
+
+def record_massive_hourly_build(ticker, label, raw_data_pulled_at, raw_data_start,
+                                 raw_data_end, dividend_data_asof, row_count, correction_count,
+                                 conn=None):
+    """One row per rebuild -- the vintage/provenance record. Every rebuild is its
+    own permanent history entry (matches data_mutation_log's append-only
+    philosophy) and its own build_id, which write_massive_hourly_derived() and
+    log_massive_hourly_correction() tag their rows with -- every vintage's full
+    price series and corrections are kept side by side, never overwritten.
+    Returns the new build_id."""
+    c, owns = _connect_or_reuse(conn)
+    try:
+        _ensure_massive_hourly_derived_table(c)
+        cur = c.execute("""
+            INSERT INTO massive_hourly_derived_builds
+                (ticker, label, raw_data_pulled_at, raw_data_start, raw_data_end,
+                 dividend_data_asof, row_count, correction_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, label, raw_data_pulled_at, raw_data_start, raw_data_end,
+              dividend_data_asof, row_count, correction_count))
+        build_id = cur.lastrowid
+        if owns:
+            c.commit()
+        return build_id
+    finally:
+        if owns:
+            c.close()
+
+
+def get_latest_massive_hourly_build(ticker):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_massive_hourly_derived_table(conn)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM massive_hourly_derived_builds WHERE ticker=? ORDER BY id DESC LIMIT 1",
+            (ticker,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_massive_hourly_derived(ticker, build_id=None):
+    """Returns the CURRENT vintage (latest build_id THAT ACTUALLY HAS PRICE ROWS)
+    by default. Pass an explicit build_id (from massive_hourly_derived_builds) to
+    reproduce what an older vintage looked like -- e.g. to exactly recreate the
+    inputs a past backtest campaign actually saw.
+
+    record_massive_hourly_build()/write_massive_hourly_derived() are two separate,
+    uncoordinated writes (build_ticker() calls the former first to obtain a
+    build_id, then the latter) -- if a process dies in between (confirmed to have
+    actually happened this session, from the killed 19-ticker batch: SOXL build_id
+    1 and KORU build_id 2 both exist in massive_hourly_derived_builds with zero
+    matching rows in massive_hourly_derived), a naive "highest id" pick would
+    silently return an empty DataFrame instead of falling back to the last build
+    that actually has data (paired review 2026-08-22). The EXISTS check below
+    picks the latest build with real rows, skipping any orphan."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_massive_hourly_derived_table(conn)
+        import pandas as pd
+        if build_id is None:
+            row = conn.execute("""
+                SELECT b.id FROM massive_hourly_derived_builds b
+                WHERE b.ticker=? AND EXISTS (
+                    SELECT 1 FROM massive_hourly_derived d
+                    WHERE d.ticker=b.ticker AND d.build_id=b.id
+                )
+                ORDER BY b.id DESC LIMIT 1
+            """, (ticker,)).fetchone()
+            if row is None:
+                return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume", "corrected"])
+            build_id = row[0]
+        df = pd.read_sql_query(
+            "SELECT ts, open AS Open, high AS High, low AS Low, close AS Close, "
+            "volume AS Volume, corrected FROM massive_hourly_derived WHERE ticker=? AND build_id=? ORDER BY ts",
+            conn, params=(ticker, build_id), parse_dates=["ts"])
+        return df.set_index("ts")
+
+
+def _ensure_massive_minute_derived_table(conn):
+    # massive_minute_derived: the dividend-adjusted MINUTE series, the sibling of
+    # massive_hourly_derived (2026-08-22 fix -- build_ticker() computed the adjusted
+    # minute dataframe all along but only ever persisted its hourly resample; the
+    # GT kernel's intrabar SL/TP/TRAIL fill-price checks were left reading raw,
+    # UNADJUSTED minute CSVs regardless of --data-source, a real ~1.6%+ inconsistency
+    # vs. the adjusted hourly leg that grows further back in time). Shares
+    # massive_hourly_derived_builds' build_id/provenance record rather than a
+    # separate builds table -- one build_ticker() run produces both artifacts from
+    # the exact same dividend/raw-data vintage in one pass, so they're never out of
+    # sync. Regular-session-only (09:30-16:00 ET), matching every real consumer's own
+    # filter (sim_minute_groundtruth_independent.load_minutes,
+    # run_optimization_sweep._load_minute_df) -- no reason to persist the extended-
+    # hours rows nothing downstream reads. No 'corrected' column: the spike-correction
+    # step only ever operates on the hourly aggregate, never the source minute bars --
+    # KNOWN RESIDUAL GAP (flagged by paired review 2026-08-22, both contextual-Opus and
+    # Fable-cold): a bar the hourly leg neutralizes as a fabricated spike still has its
+    # ORIGINAL (uncorrected) prices in this table, so a GT kernel intrabar SL/TP/TRAIL
+    # check reading the massive-source minute leg could still fire on the same bad tick
+    # the hourly leg declared fake. Not fixed here -- correcting the same event at
+    # minute resolution needs its own detection pass (the round-trip/wick detectors in
+    # build_massive_hourly_derived.py operate on hourly aggregates, not raw minutes) and
+    # is out of scope for the dividend-adjustment fix this table exists for. In practice
+    # bounded: SOXL's full build had 10 corrections across 8,755 hourly bars (~0.1%).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS massive_minute_derived (
+            ticker     TEXT NOT NULL,
+            build_id   INTEGER NOT NULL,
+            ts         TEXT NOT NULL,
+            open       REAL NOT NULL,
+            high       REAL NOT NULL,
+            low        REAL NOT NULL,
+            close      REAL NOT NULL,
+            PRIMARY KEY (ticker, build_id, ts)
+        )
+    """)
+
+
+def write_massive_minute_derived(ticker, build_id, df, conn=None):
+    """df: DataFrame indexed by tz-naive minute timestamp, columns Open/High/Low/
+    Close (dividend-adjusted). Same permanent, never-overwritten-in-place, multi-
+    vintage convention as write_massive_hourly_derived -- build_id must come from
+    record_massive_hourly_build()'s return value (shared with the hourly leg of
+    the same build). Pass conn to participate in a caller-managed transaction (see
+    _connect_or_reuse); default (conn=None) opens/commits/closes its own connection.
+
+    Builds the row tuples via zip() over numpy arrays rather than df.iterrows()
+    (found slow -- iterrows() boxes every row into a Series -- over the ~500k-1M
+    rows a full minute history has; zip over raw arrays avoids that per-row cost)."""
+    c, owns = _connect_or_reuse(conn)
+    try:
+        _ensure_massive_minute_derived_table(c)
+        ts_str = df.index.strftime("%Y-%m-%d %H:%M:%S")
+        rows = list(zip([ticker] * len(df), [build_id] * len(df), ts_str,
+                         df["Open"].astype(float), df["High"].astype(float),
+                         df["Low"].astype(float), df["Close"].astype(float)))
+        c.executemany("""
+            INSERT INTO massive_minute_derived (ticker, build_id, ts, open, high, low, close)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        if owns:
+            c.commit()
+    finally:
+        if owns:
+            c.close()
+
+
+def get_massive_minute_derived(ticker, build_id=None):
+    """Returns the CURRENT vintage (latest build_id THAT ACTUALLY HAS MINUTE ROWS)
+    by default, same orphan-build-id fallback as get_massive_hourly_derived (a
+    build_id can exist in massive_hourly_derived_builds with no matching rows here
+    if the process died between record_massive_hourly_build() and
+    write_massive_minute_derived()). Pass an explicit build_id to reproduce an
+    older vintage exactly."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_massive_minute_derived_table(conn)
+        if build_id is None:
+            row = conn.execute("""
+                SELECT b.id FROM massive_hourly_derived_builds b
+                WHERE b.ticker=? AND EXISTS (
+                    SELECT 1 FROM massive_minute_derived d
+                    WHERE d.ticker=b.ticker AND d.build_id=b.id
+                )
+                ORDER BY b.id DESC LIMIT 1
+            """, (ticker,)).fetchone()
+            if row is None:
+                return pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+            build_id = row[0]
+        df = pd.read_sql_query(
+            "SELECT ts, open AS Open, high AS High, low AS Low, close AS Close "
+            "FROM massive_minute_derived WHERE ticker=? AND build_id=? ORDER BY ts",
+            conn, params=(ticker, build_id), parse_dates=["ts"])
+        return df.set_index("ts")
+
+
+def get_massive_minute_ohlcv(ticker, build_id=None):
+    """Drop-in replacement for sim_minute_groundtruth_independent.load_minutes() /
+    run_optimization_sweep._load_minute_df()'s raw-CSV read (same Open/High/Low/
+    Close columns, same tz-naive DatetimeIndex, sorted ascending) -- except
+    dividend-adjusted, unlike the raw minute CSV. Raises if the ticker has no
+    minute build at all, matching get_massive_hourly_ohlcv's loud-failure
+    convention (a silent empty frame here would look identical to "no minutes
+    traded" to every downstream intrabar check)."""
+    df = get_massive_minute_derived(ticker, build_id=build_id)
+    if df.empty:
+        raise ValueError(
+            f"get_massive_minute_ohlcv: no massive_minute_derived rows for ticker={ticker!r} "
+            f"(build_id={build_id!r}) -- run scripts/build_massive_hourly_derived.py first."
+        )
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = df.sort_index()
+    df.index.name = "timestamp"
+    return df
+
+
+def get_massive_hourly_ohlcv(ticker, build_id=None):
+    """Drop-in replacement for `pd.read_csv(f"{ticker}_1h.csv", index_col=0,
+    parse_dates=True)` (the Yahoo-sourced hourly CSV every GT/hourly caller currently
+    loads) -- same column set (Open/High/Low/Close/Volume), same tz-naive DatetimeIndex,
+    sorted ascending, Volume cast to int64 to match the CSV's dtype exactly. Built
+    2026-08-22 to wire massive_hourly_derived (dividend+split-adjusted, back to
+    2021-08-23 for most tickers vs. Yahoo hourly's ~2023-07-24 floor) in as an
+    opt-in alternate data source -- see --data-source flags in
+    scripts/sim_minute_groundtruth_independent.py and the GT dispatch scripts.
+
+    Drops the 'corrected' provenance column (not part of the CSV shape) and any
+    all-NaN Volume rows' NaN (fills 0, matching write_massive_hourly_derived's own
+    NULL->0 coercion) before the cast. Raises if the ticker has no build at all --
+    a silent empty-frame return here would look identical to "no trades happened"
+    several callers downstream, which is worse than a loud failure at load time."""
+    df = get_massive_hourly_derived(ticker, build_id=build_id)
+    if df.empty:
+        raise ValueError(
+            f"get_massive_hourly_ohlcv: no massive_hourly_derived rows for ticker={ticker!r} "
+            f"(build_id={build_id!r}) -- run scripts/build_massive_hourly_derived.py first."
+        )
+    df = df.drop(columns=["corrected"])
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = df.sort_index()
+    df["Volume"] = df["Volume"].fillna(0).astype("int64")
+    df.index.name = "Datetime"
+    return df
+
+
 if __name__ == "__main__":
     refresh_dropdown_cache()
     refresh_pivot_cache()

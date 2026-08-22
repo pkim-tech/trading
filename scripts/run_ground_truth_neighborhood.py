@@ -39,7 +39,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from run_optimization_sweep import (
-    init_idempotent_db, dispatch_parallel_grid_ground_truth, compute_bh_returns,
+    init_idempotent_db, rebuild_indexes, dispatch_parallel_grid_ground_truth, compute_bh_returns,
     window_version_suffix, CLIFF_RADIUS, DB_PATH,
 )
 
@@ -72,7 +72,19 @@ def main():
     ap.add_argument("--start", default=DEFAULT_START)
     ap.add_argument("--end", default=DEFAULT_END)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--data-source", choices=["yahoo", "massive"], default="yahoo",
+                     help="hourly data source (default: yahoo, unchanged behavior). 'massive' "
+                          "reads db_cache.get_massive_hourly_ohlcv (back to ~2021-08-23 vs "
+                          "yahoo's ~2023-07-24 floor).")
     args = ap.parse_args()
+    if args.data_source == "massive":
+        # CONFIRMED BLOCKER (paired review, 2026-08-22) -- see run_ground_truth_phase1.py's
+        # matching warning: massive_hourly_derived is dividend/split-adjusted but the minute
+        # feed used to resolve SL/TP/TRAIL intrabar isn't, causing a systematic price
+        # mismatch. Not yet trustworthy for a real go/no-go decision.
+        print("WARNING: --data-source massive uses an unadjusted minute feed against "
+              "adjusted hourly bars -- SL/TP/TRAIL exit prices will be systematically off. "
+              "Do not trust these results for a live-trading decision yet.")
 
     n = load_live_node(args.ticker)
     is_both = n["strategy"] == "TrailingBothZScoreBreakout"
@@ -86,7 +98,12 @@ def main():
           f"4th_axis={tpct_c}% hold={hold_c}h entry_timing={n['entry_timing']}")
 
     init_idempotent_db()
-    version = "v6" + window_version_suffix(args.start, args.end)
+    rebuild_indexes()
+    # '-massive' marker (paired review, 2026-08-22): dispatch_parallel_grid_ground_truth
+    # hard-requires this in config_version whenever data_source='massive', so a massive run
+    # can never collide with/overwrite yahoo-sourced rows sharing the same window suffix.
+    version = "v6" + window_version_suffix(args.start, args.end) + (
+        "-massive" if args.data_source == "massive" else "")
     run_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
     tasks = set()
@@ -98,7 +115,14 @@ def main():
     print(f"{len(tasks)} neighborhood cells around arm/tp={tp_c} sl_axis={sl_c} hold={hold_c}h, "
           f"window=[{args.start}, {args.end}]")
 
-    spy_bh, asset_bh = compute_bh_returns(args.ticker, start_date=args.start, end_date=args.end)
+    asset_bh, spy_bh = compute_bh_returns(args.ticker, start_date=args.start, end_date=args.end,
+                                           data_source=args.data_source)
+    if asset_bh is None:
+        raise SystemExit(
+            f"compute_bh_returns returned None for {args.ticker} under "
+            f"data_source={args.data_source!r} -- no massive_hourly_derived build exists "
+            f"for this ticker (or SPY). Run scripts/build_massive_hourly_derived.py first."
+        )
 
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
@@ -106,6 +130,7 @@ def main():
             pool, tasks, args.ticker, n["strategy"], version, f"GT-{args.ticker}-Neighborhood",
             spy_bh, asset_bh, run_timestamp, fixed_sl=n["fixed_sl"], entry_timing=n["entry_timing"],
             same_bar_reentry=True, start_date=args.start, end_date=args.end,
+            data_source=args.data_source,
         )
     print(f"done in {time.time()-t0:.1f}s")
 
