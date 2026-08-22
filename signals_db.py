@@ -3675,6 +3675,51 @@ def get_closed_trades_for_ticker_on_date(ticker, check_date, strategy=None, vers
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
+def get_closed_trades_exited_on_date(ticker, check_date, strategy=None, version=None,
+                                      window=None, account=None, wl_id=None):
+    """trade_log rows that EXITED on check_date (YYYY-MM-DD), regardless of which
+    day they entered -- the ticker-scoped, disambiguated sibling of
+    get_closed_trades_for_ticker_on_date (same-day-only) needed for a genuine
+    overnight-carry trade (entry and exit on different calendar days). 4th
+    recurrence of coverage_check.py's "real activity happened, no lookup covers
+    this exact lifecycle state" bug shape (see get_open_positions_for_ticker_on_date's
+    and get_pending_buys_for_ticker_on_date's docstrings for the first 2; this is
+    a state closed-but-not-same-day: pending_buys/open_positions are
+    already resolved by the time a multi-day trade closes, and
+    get_closed_trades_for_ticker_on_date's same-day requirement excludes it on
+    either the entry or the exit day. Real incident, 2026-08-21: FAZ wl_id=217
+    (`canary_overnight_carry`, deliberately built for a multi-day hold via
+    trail_buy_pct=5.0) entered 2026-08-20 10:00:52, exited 2026-08-21 09:31:02
+    (TRAIL) -- a real, correct trade -- and _check_trade_lifecycle reported a
+    false 'no activity' deviation for 2026-08-21 because no existing lookup
+    covered this state. See docs/deep_backlog.md's 2026-08-21 entries.
+
+    Same RESTAGED exclusion, disambiguation params, and wl_id fallback pattern
+    as get_closed_trades_for_ticker_on_date -- see that function's docstring
+    for the full reasoning on each; not re-derived here."""
+    q = ("SELECT * FROM trade_log WHERE ticker = ? AND date(exit_time) = ? "
+         "AND (exit_reason IS NULL OR exit_reason != 'RESTAGED')")
+    params = [ticker, check_date]
+    if strategy:
+        q += " AND strategy = ?"
+        params.append(strategy)
+    if version:
+        q += " AND version = ?"
+        params.append(version)
+    if window is not None:
+        q += " AND window = ?"
+        params.append(window)
+    if account:
+        q += " AND account = ?"
+        params.append(account)
+    if wl_id is not None:
+        q += " AND (wl_id = ? OR wl_id IS NULL)"
+        params.append(wl_id)
+    q += " ORDER BY id DESC"
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
 def get_open_positions_for_ticker_on_date(ticker, check_date, strategy=None, version=None,
                                            window=None, account=None, wl_id=None):
     """open_positions rows entered on or before check_date and still open --

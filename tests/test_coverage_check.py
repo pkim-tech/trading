@@ -387,6 +387,128 @@ def test_check_trade_lifecycle_scopes_to_node_not_just_ticker(isolated_db):
     assert 'no closed trade' in summary_b
 
 
+def _prior_trading_day(d):
+    d = d - timedelta(days=1)
+    while not _is_trading_day(d.date().isoformat()):
+        d -= timedelta(days=1)
+    return d
+
+
+def test_check_trade_lifecycle_exit_reason_met_by_overnight_carry_close(isolated_db):
+    """4th recurrence of the missing-a-real-state bug shape (2026-08-21, real
+    incident: FAZ wl_id=213's canary_full_lifecycle scenario, 08-17->08-18).
+    A trade that entered on an EARLIER trading day and exited on check_date
+    (a genuine overnight carry) is invisible to get_closed_trades_for_ticker_
+    on_date's same-day requirement, and by the time this check runs,
+    pending_buys/open_positions are already resolved (row deleted on
+    fill/close) -- neither of the other 3 lookups covers this state. Must be
+    evaluated for real (met/not-met against expect_exit_reason), not just
+    reported as 'activity occurred'."""
+    exit_day = _most_recent_trading_day()
+    entry_day = _prior_trading_day(exit_day)
+    _add_closed_trade('TRAIL', entry_day, exit_day)
+    check_date = exit_day.date().isoformat()
+    scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["TRAIL"]}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is True
+    assert no_activity is False
+    assert 'overnight carry' in summary
+    assert 'TRAIL' in summary
+
+
+def test_check_trade_lifecycle_exit_reason_not_met_by_overnight_carry_close_wrong_reason(isolated_db):
+    """Same overnight-carry lookup, but the real outcome doesn't match the
+    designed scenario -- must report a real behavioral deviation (met=False,
+    no_activity=False, eligible to mint a real coverage_deviations ticket),
+    not silently pass or misclassify as 'no activity'."""
+    exit_day = _most_recent_trading_day()
+    entry_day = _prior_trading_day(exit_day)
+    _add_closed_trade('SL', entry_day, exit_day)
+    check_date = exit_day.date().isoformat()
+    scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["TRAIL"]}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is False
+    assert no_activity is False
+    assert 'overnight carry' in summary
+    assert 'SL' in summary
+
+
+def test_check_trade_lifecycle_pending_carryover_met_by_overnight_carry_close(isolated_db):
+    """Direct regression for the real production incident: FAZ wl_id=217,
+    canary_overnight_carry, entered 2026-08-20 10:00:52, exited 2026-08-21
+    09:31:02 (TRAIL) -- a real, correct trade that _check_trade_lifecycle
+    reported as false 'no activity' for 2026-08-21 before this fix, because
+    pending_buys/open_positions were already resolved and the same-day
+    closed-trade lookup requires same-day entry too. A closed overnight
+    trade under the carryover scenario isn't the designed outcome (a
+    still-pending order), but it IS real activity -- same treatment as the
+    carryover branch's existing same-day-fill-instead-of-carryover case."""
+    exit_day = _most_recent_trading_day()
+    entry_day = _prior_trading_day(exit_day)
+    _add_closed_trade('TRAIL', entry_day, exit_day)
+    check_date = exit_day.date().isoformat()
+    scenario = dict(ticker=TICKER, check_params='{"expect_pending_carryover": true}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is True
+    assert no_activity is False
+    assert 'overnight carry' in summary or 'closed trade exited today' in summary
+    assert 'TRAIL' in summary
+
+
+def test_check_trade_lifecycle_exit_reason_prefers_same_day_over_overnight_carry(isolated_db):
+    """When BOTH a same-day trade and a genuine overnight-carry trade exist
+    for the same ticker/node on check_date, the same-day lookup (checked
+    first, unchanged) must still win -- the new overnight-carry fallback
+    should never shadow the primary, more-specific same-day match."""
+    exit_day = _most_recent_trading_day()
+    entry_day = _prior_trading_day(exit_day)
+    # Overnight-carry trade (entered entry_day, exited exit_day) -- a wrong
+    # exit_reason, to prove it's NOT what the assertion below is keying off.
+    _add_closed_trade('SL', entry_day, exit_day)
+    # Same-day trade (entered and exited exit_day) -- the correct exit_reason.
+    n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
+    db.open_position(n, signal_price=100.0, signal_time=exit_day, entry_price=101.0,
+                      entry_time=exit_day, shares=10)
+    pos = db.get_open_position(TICKER)
+    db.close_position(pos['id'], exit_signal_price=105.0, exit_price=105.0, exit_time=exit_day,
+                       exit_reason='TRAIL')
+    check_date = exit_day.date().isoformat()
+    scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["TRAIL"]}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is True
+    assert no_activity is False
+    assert 'overnight carry' not in summary
+    assert 'TRAIL' in summary
+
+
+def test_check_trade_lifecycle_exit_reason_overnight_carry_not_masked_by_same_day_reentry(isolated_db):
+    """Real gap found by paired review of the overnight-carry fix itself
+    (2026-08-21, reproduced with a probe by the contextual reviewer): a node
+    that closes an overnight carry with the WRONG exit_reason and then
+    re-enters the SAME day must still report the real deviation -- an
+    in-progress re-entry (open_positions) is not more important than a
+    CONCLUDED, gradable outcome (the overnight exit), and checking it first
+    would silently swallow a real behavioral bug behind "position still
+    open." The overnight-carry lookup is checked BEFORE pending/open_pos in
+    this branch specifically for this reason (see _check_trade_lifecycle's
+    own comment)."""
+    exit_day = _most_recent_trading_day()
+    entry_day = _prior_trading_day(exit_day)
+    _add_closed_trade('SL', entry_day, exit_day)  # wrong reason, expects TRAIL
+    # Same-day re-entry, still open as of check_date -- must not mask the
+    # already-concluded (and wrong) overnight exit above.
+    n = [x for x in db.get_watchlist() if x['ticker'] == TICKER][0]
+    db.open_position(n, signal_price=100.0, signal_time=exit_day, entry_price=101.0,
+                      entry_time=exit_day, shares=10)
+    check_date = exit_day.date().isoformat()
+    scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["TRAIL"]}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is False, f"expected the real SL-vs-TRAIL deviation, got: {summary!r}"
+    assert no_activity is False
+    assert 'SL' in summary
+    assert 'still open' not in summary
+
+
 # ---------------------------------------------------------------------------
 # node_id / mode identity -- 2026-07-24 late-night migration off ticker-only
 # identity (proven ambiguous: two distinct watch_list nodes can share a

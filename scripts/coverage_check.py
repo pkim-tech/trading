@@ -190,6 +190,24 @@ def _check_trade_lifecycle(scenario, check_date):
         trades = db.get_closed_trades_for_ticker_on_date(ticker, check_date, **disambig)
         if trades:
             return True, f"same-day fill instead of carryover (exit_reason={trades[0]['exit_reason']}) -- not the designed scenario but real activity occurred", False
+        # Another recurrence of this bug shape (2026-08-21, FAZ wl_id=217): a trade
+        # that entered on an earlier day and exited today (a genuine overnight
+        # carry, or -- here -- a same-day carryover node that happened to close
+        # on a later day than expected) is real activity neither the same-day
+        # lookup above nor pending/open_pos can see. See
+        # get_closed_trades_exited_on_date's docstring for the full history.
+        exited_trades = db.get_closed_trades_exited_on_date(ticker, check_date, **disambig)
+        if exited_trades:
+            # entry_time's date is guaranteed < check_date here: the same-day
+            # lookup above (identical disambig) already ruled out entry==exit==
+            # check_date, and exit>=entry always, so a match reaching this point
+            # necessarily entered before check_date -- this IS the designed
+            # overnight-carry scenario, just also resolved rather than still
+            # resting. "instead of carryover" (the same-day-fill case's wording
+            # above) would be factually wrong here (found by contextual review,
+            # 2026-08-21) -- the carry itself is exactly what was expected.
+            return True, (f"overnight carry completed and closed (exit_reason="
+                          f"{exited_trades[0]['exit_reason']}, entered {exited_trades[0]['entry_time']})"), False
         return False, f"no pending_buys row, no open position, and no closed trade found for {ticker} on {check_date}", True
 
     expect_reasons = params.get('expect_exit_reason', [])
@@ -207,6 +225,35 @@ def _check_trade_lifecycle(scenario, check_date):
         # eligible for the no_activity price-action auto-explain (which would
         # incorrectly reason about *today's* entry signal for a position that
         # already entered on an earlier day).
+        # Another recurrence of this bug shape (2026-08-21, node 213's 08-17->08-18
+        # canary_full_lifecycle deviation): a genuine overnight-carry trade
+        # (entered an earlier day, exited today) has already been resolved out
+        # of pending/open_pos by the time this check runs, and the same-day
+        # lookup above never covered it either -- real activity, and a real
+        # evaluable outcome (unlike the carryover branch above, this scenario's
+        # whole point IS the exit_reason, so it's checked against
+        # expect_reasons here too, not just reported as "activity occurred").
+        # See get_closed_trades_exited_on_date's docstring for the full history.
+        #
+        # Checked BEFORE pending/open_pos, not after -- a CONCLUDED outcome
+        # (this lookup) must outrank an IN-PROGRESS one (pending/open_pos) for
+        # this branch specifically, since this branch's whole point is grading
+        # an outcome. Checking it last (as originally shipped) let a same-day
+        # re-entry mask a real overnight exit_reason deviation behind "position
+        # still open" -- found by paired review (independent-cold + contextual,
+        # both converged, contextual reproduced it with a probe): a node that
+        # exits an overnight carry with the WRONG exit_reason and re-enters the
+        # same day would report false met=True instead of the real deviation.
+        # (No such reordering is needed in the carryover branch above -- every
+        # one of its branches already returns the same met=True verdict
+        # regardless of which lookup fires, so order there only changes the
+        # message text, never the verdict.)
+        trades = db.get_closed_trades_exited_on_date(ticker, check_date, **disambig)
+        if trades:
+            reason = trades[0]['exit_reason']
+            if reason in expect_reasons:
+                return True, f"exit_reason={reason} (overnight carry, entered {trades[0]['entry_time']})", False
+            return False, f"exit_reason={reason} (overnight carry, entered {trades[0]['entry_time']}), expected one of {expect_reasons}", False
         pending = db.get_pending_buys_for_ticker_on_date(ticker, check_date, **disambig)
         if pending:
             return True, f"pending_buys row present (order_placed={pending[0]['order_placed']}) -- entry not yet resolved", False
