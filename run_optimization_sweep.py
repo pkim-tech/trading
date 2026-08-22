@@ -16,7 +16,7 @@ from tqdm import tqdm
 from backtester import (run_backtest_dispatch,
                         prep_inputs, _simulate, _simulate_limit, _simulate_trail, _simulate_trail_buy,
                         _simulate_trail_both, _simulate_limit_trail, _simulate_close_limitexit,
-                        run_backtest_ground_truth)
+                        run_backtest_ground_truth, prep_minute_inputs)
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
@@ -763,12 +763,32 @@ def _load_minute_df(ticker):
     return df
 
 
-def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh):
+def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
+                                    start_date=None, end_date=None):
     """Same per-worker-process memo pattern as _load_node_inputs. Indicators depend only
     on (ticker, strategy, window) — z_thresh is a kernel arg, not baked into df_daily_
     processed, so it's not part of the cache key (matches _load_node_inputs's own key,
-    which also omits z_thresh for the same reason)."""
-    key = (ticker, strategy_name, int(w))
+    which also omits z_thresh for the same reason). start_date/end_date DO fold into the
+    key (mirroring _load_node_inputs) — required below.
+
+    Also caches the derived prep/mprep arrays (prep_inputs()/prep_minute_inputs() output)
+    for the ACTUAL (possibly windowed) hourly bars fed to the kernel, same as
+    _load_node_inputs caches prep — otherwise run_backtest_ground_truth recomputes both
+    from scratch on every single grid cell, dominated by prep_minute_inputs' pure-Python/
+    pandas groupby (measured ~1.0-1.3s/call on SOXL even windowed, ~3.65s/call full-
+    history, vs ~9.6ms/call for the hourly-only prep_inputs) even though neither depends
+    on the tp/sl/hold axes being swept. Found 2026-08-22 diagnosing the v6 GT sweep's ~4
+    nodes/s rate.
+
+    First cut of this fix (2026-08-22, paired-review contextual pass) only cached the
+    full-history case and fell back to recomputing per-cell whenever start_date/end_date
+    was set — missed that BOTH real GT campaign entry points (run_ground_truth_phase1_
+    soxl.py, run_ground_truth_neighborhood.py) always call windowed, so the fast path
+    never fired in production. Slicing df_hourly to the window BEFORE computing prep/
+    mprep (below) — rather than nulling them out — restores the cache hit for the actual
+    workload: every cell in a windowed campaign shares the same (ticker, strategy, w,
+    start_date, end_date) key and reuses one sliced prep/mprep pair."""
+    key = (ticker, strategy_name, int(w), start_date, end_date)
     hit = _NODE_INPUT_CACHE_GT.get(key)
     if hit is not None:
         return hit
@@ -785,7 +805,22 @@ def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_t
         strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
         df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
         minute_df = _load_minute_df(ticker)
-        entry = (df_hourly_raw, df_daily_processed, minute_df)
+
+        df_hourly_windowed = df_hourly_raw
+        if start_date is not None or end_date is not None:
+            # Same pd.Timestamp-slicing convention as the (now-removed) inline windowing
+            # this replaced — tolerates None on either side, unlike
+            # window_version_suffix's stricter contract.
+            lo = pd.Timestamp(start_date) if start_date is not None else None
+            hi = (pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)) if end_date is not None else None
+            df_hourly_windowed = df_hourly_raw.loc[lo:hi]
+
+        if df_hourly_windowed.empty:
+            entry = (df_hourly_raw, df_daily_processed, minute_df, df_hourly_windowed, None, None)
+        else:
+            prep = prep_inputs(df_hourly_windowed, df_daily_processed)
+            mprep = prep_minute_inputs(minute_df, df_hourly_windowed)
+            entry = (df_hourly_raw, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep)
 
     if len(_NODE_INPUT_CACHE_GT) >= _NODE_INPUT_CACHE_MAX:
         _NODE_INPUT_CACHE_GT.clear()
@@ -823,30 +858,25 @@ def run_single_backtest_node_ground_truth_isolated(args):
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "UNKNOWN_STRAT"}
 
     try:
-        inputs = _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh)
+        inputs = _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
+                                                 start_date, end_date)
     except Exception as e:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR", "error": repr(e)}
 
     if inputs is None:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
-    df_hourly_raw, df_daily_processed, minute_df = inputs
+    df_hourly_raw, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
     # df_daily_processed (indicators) ALWAYS stays full-history, even when windowed --
     # matches _load_node_inputs/_window_prep's convention (never truncate pre-indicator).
-    # Only the hourly bars actually fed to the kernel get sliced, mirroring the parity
-    # test's own fix (tests/test_ground_truth_kernel_parity.py) for the identical
-    # window-boundary state-leak risk.
-    if start_date is not None or end_date is not None:
-        # Found by paired-review independent-cold pass (2026-08-21): `end_date + " ..."`
-        # crashes on a one-sided window (end_date=None) or a non-str caller (datetime.date/
-        # pd.Timestamp), unlike window_version_suffix's own more permissive contract.
-        # Unreachable via dispatch_parallel_grid_ground_truth (its guard requires both
-        # dates to build a valid suffix first) but a direct caller could hit this -- use
-        # pd.Timestamp slicing, which tolerates None on either side, instead.
-        lo = pd.Timestamp(start_date) if start_date is not None else None
-        hi = (pd.Timestamp(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)) if end_date is not None else None
-        df_hourly_raw = df_hourly_raw.loc[lo:hi]
-        if df_hourly_raw.empty:
-            return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
+    # Only the hourly bars actually fed to the kernel (df_hourly_windowed) get sliced,
+    # mirroring the parity test's own fix (tests/test_ground_truth_kernel_parity.py) for
+    # the identical window-boundary state-leak risk. prep/mprep above are already sliced
+    # to match df_hourly_windowed (computed inside the loader, cached per (ticker,
+    # strategy, w, start_date, end_date)) -- both real GT campaign entry points
+    # (run_ground_truth_phase1_soxl.py, run_ground_truth_neighborhood.py) call windowed,
+    # so this is the actual hot path, not a fallback.
+    if df_hourly_windowed.empty:
+        return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
 
     is_both = strategy_name == 'TrailingBothZScoreBreakout'
     # Axis meaning mirrors strategies.resolve_axis_columns for these two strategies:
@@ -859,12 +889,13 @@ def run_single_backtest_node_ground_truth_isolated(args):
 
     try:
         trades = run_backtest_ground_truth(
-            df_hourly_raw, df_daily_processed, ticker, minute_df,
+            df_hourly_windowed, df_daily_processed, ticker, minute_df,
             fixed_sl=fixed_sl, arm_pct=arm_pct_arg, trail_buy_pct=trail_buy_pct_arg,
             trail_sell_pct=trail_sell_pct_arg, max_hours_to_hold=hold_hours,
             z_score_threshold=z_thresh, is_both=is_both,
             open_check_entry_timing=(entry_timing == 'open_check'),
             same_bar_reentry=same_bar_reentry,
+            prep=prep, mprep=mprep, need_times=False,
         )
     except Exception as e:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "SIM_ERROR", "error": repr(e)}

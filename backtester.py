@@ -1996,12 +1996,21 @@ def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df,
                                fixed_sl, arm_pct, trail_buy_pct, trail_sell_pct,
                                max_hours_to_hold, z_score_threshold, is_both,
                                target_hours=(9, 14), open_check_entry_timing=True,
-                               same_bar_reentry=True, prep=None):
+                               same_bar_reentry=True, prep=None, mprep=None, need_times=True):
     """Python wrapper: prep + kernel call + trade reconstruction (real timestamps, not
     the kernel's bar/minute-offset indices) for the v6 ground-truth kernel. `minute_df`
     must already be regular-session-filtered/tz-naive (sim_minute_groundtruth_independent
     .load_minutes()). Not wired into run_backtest_dispatch/the sweep engine yet —
     that's Step 3, gated on the parity check (2a) passing first.
+
+    need_times=False skips resolve_time() (pd.Timestamp construction per trade) and
+    returns trades without 'Entry Time'/'Exit Time' keys -- for the Phase1-coarse sweep-
+    grid path, which only ever reads 'Return' (_summarize_trades_ground_truth) and never
+    consumes timestamps. Found 2026-08-22: the mandatory byte-identical parity gate
+    (tests/test_ground_truth_kernel_parity.py) asserts entry_time/exit_time, so this
+    MUST stay True there (it doesn't pass need_times, so it's unaffected) -- this flag
+    exists to let the sweep grid skip work the parity gate genuinely needs and the grid
+    genuinely doesn't, not to weaken the gate itself.
 
     WHEN WIRING INTO run_backtest_dispatch (Step 3), READ THIS FIRST (flagged by the
     paired-review contextual pass, 2026-08-21): `fixed_sl`/`arm_pct`/`trail_buy_pct`/
@@ -2015,7 +2024,7 @@ def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df,
     (every threshold 100x too small) and pass the wrong type. Call this with raw
     percentages and a bool, not a second /100.0."""
     prep = prep or prep_inputs(df_hourly, df_daily_indicators)
-    mprep = prep_minute_inputs(minute_df, df_hourly)
+    mprep = mprep or prep_minute_inputs(minute_df, df_hourly)
 
     eb, emj, ep, xb, xmj, xp, rs = _simulate_trail_ground_truth(
         prep['opens'], prep['highs'], prep['lows'], prep['prices'], prep['hours'], prep['daily_idx'],
@@ -2026,6 +2035,18 @@ def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df,
         int(max_hours_to_hold), float(z_score_threshold), int(target_hours[0]), int(target_hours[1]),
         bool(open_check_entry_timing), bool(is_both), bool(same_bar_reentry),
     )
+
+    if not need_times:
+        trades = []
+        for k in range(len(eb)):
+            trades.append({
+                'Ticker': ticker,
+                'Entry Price': float(ep[k]),
+                'Exit Price': float(xp[k]),
+                'exit_reason': _GT_REASON_NAMES[int(rs[k])],
+                'Return': (float(xp[k]) - float(ep[k])) / float(ep[k]),
+            })
+        return trades
 
     idx = df_hourly.index
     bar_ts = mprep['bar_min_ts']
