@@ -1206,6 +1206,7 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                trail_buy_pct, trail_sell_pct, trades, win_rate, strategy_return, alpha_vs_spy, win_twin_rate
         FROM backtest_cache
         WHERE strategy=? AND version=? AND ticker=? AND entry_timing=?
+          AND (kernel_version IS NULL OR kernel_version<>'ground_truth_v6')
     """, (strategy_name, config_version, ticker, entry_timing))
     for r in cursor.fetchall():
         if r[4] is None:
@@ -1519,7 +1520,8 @@ def identify_island_candidates(config_version, strategy_name, n_index, n_stock, 
                    t.index_underlier, t.stock_underlier
             FROM backtest_cache b
             LEFT JOIN tickers t ON t.symbol = b.ticker
-            WHERE b.version=? AND b.strategy=? AND b.trades > 0 {scope_sql}
+            WHERE b.version=? AND b.strategy=? AND b.trades > 0
+              AND (b.kernel_version IS NULL OR b.kernel_version<>'ground_truth_v6') {scope_sql}
         """
         params = [config_version, strategy_name, *scope_params]
         if allowed_tickers:
@@ -1563,7 +1565,8 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
                                {ROBUST_ALPHA_SQL} AS robust_alpha
                         FROM backtest_cache
                         WHERE version=? AND ticker=? AND strategy=?
-                          AND z_score_threshold=? AND window=? AND trades > 0 {scope_sql} {tpct_filter}
+                          AND z_score_threshold=? AND window=? AND trades > 0
+                          AND (kernel_version IS NULL OR kernel_version<>'ground_truth_v6') {scope_sql} {tpct_filter}
                     """, conn, params=params)
 
                     if df_wz.empty:
@@ -1657,7 +1660,8 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
             SELECT axis_tp, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, window, z_score_threshold,
                    {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct
             FROM backtest_cache
-            WHERE version=? AND ticker=? AND strategy=? AND trades > 0 {scope_sql}
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+              AND (kernel_version IS NULL OR kernel_version<>'ground_truth_v6') {scope_sql}
             ORDER BY {ROBUST_ALPHA_SQL} DESC LIMIT 1
         """, (config_version, ticker, strategy_name, *scope_params)).fetchone()
     if not row:
@@ -1741,7 +1745,8 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                        stop_loss AS literal_stop_loss, trail_buy_pct AS literal_trail_buy_pct,
                        trail_sell_pct AS literal_trail_sell_pct
                 FROM backtest_cache
-                WHERE version=? AND ticker=? AND strategy=? AND trades > 0 {scope_sql}
+                WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+                  AND (kernel_version IS NULL OR kernel_version<>'ground_truth_v6') {scope_sql}
                 ORDER BY robust_alpha DESC LIMIT 1
             """, (config_version, ticker, strategy_name, *scope_params)).fetchone()
             if not row:
@@ -1786,6 +1791,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                   AND max_hold_hours BETWEEN ? AND ?
                   {scope_sql} {tpct_filter}
                   AND trades > 0
+                  AND (kernel_version IS NULL OR kernel_version<>'ground_truth_v6')
             """, (config_version, ticker, strategy_name,
                   win_c, z_c,
                   tp_c - CLIFF_RADIUS, tp_c + CLIFF_RADIUS,
@@ -1858,6 +1864,7 @@ def identify_full_mesh_candidates(config_version, strategy_name, island_tickers,
                           AND trail_sell_pct = ?
                           AND entry_timing   = ?
                           AND trades > 0
+                          AND (kernel_version IS NULL OR kernel_version<>'ground_truth_v6')
                     """, (config_version, ticker, strategy_name,
                           win_c, z_c,
                           axis_tp_f - CLIFF_RADIUS_I3, axis_tp_f + CLIFF_RADIUS_I3,
@@ -1967,7 +1974,8 @@ def run_phase3_full(shared_pool, ticker, strategy_name, config_version, hp, spy_
         """, (config_version, ticker, strategy_name, *scope_params)).fetchone()[0]
         overall = conn.execute(f"""
             SELECT MAX({ROBUST_ALPHA_SQL}) FROM backtest_cache
-            WHERE version=? AND ticker=? AND strategy=? AND trades > 0 {scope_sql}
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+              AND (kernel_version IS NULL OR kernel_version<>'ground_truth_v6') {scope_sql}
         """, (config_version, ticker, strategy_name, *scope_params)).fetchone()[0]
     pre_phase3 = float(pre_phase3) if pre_phase3 is not None else None
     overall    = float(overall) if overall is not None else None
