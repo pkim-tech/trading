@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from numba import njit
 
 # Result codes
@@ -1735,3 +1736,324 @@ def run_backtest_dispatch(strategy_class, df_hourly, df_daily_indicators, ticker
     return run_backtest(df_hourly, df_daily_indicators, ticker,
         take_profit=tp, stop_loss=float(sl_raw) / 100.0, max_hours_to_hold=hold,
         z_score_threshold=z, prep=prep)
+
+
+# ═══════════════════════ Ground-truth (v6) minute-resolution kernel ═══════════════════════
+# Added 2026-08-21 per docs/plans/ground_truth_kernel_rebuild.md, Step 2. Ports the
+# validated logic from scripts/sim_minute_groundtruth_independent.py (NOT redesigned —
+# see that module's docstring for the full reasoning on why each choice was made:
+# entry/exit are resolved on REAL 1-minute bars instead of guessing intrabar Low-vs-High
+# ordering on hourly bars; signal DETECTION and arm/TP/TIME checks stay bar-close-gated,
+# matching live's actual `at_bar_close` behavior). NOT a redesign — every behavior choice
+# here mirrors the Python prototype line-for-line; do not "improve" anything here without
+# updating the prototype first and re-running the parity gate (2a).
+#
+# Scope: TrailingBothZScoreBreakout (is_both=True) and TrailingExitZScoreBreakout
+# (is_both=False) only — the two live-default strategies, per the plan. No trend filter
+# (the validated prototype doesn't implement one either — matching it exactly is the
+# parity bar, not a scope gap to "fix" here).
+#
+# Minute data is passed as flat float64 arrays (min_o/min_h/min_l/min_c) plus, per hourly
+# bar, an (offset, count) pair into those arrays (bar_min_start/bar_min_count) — numba
+# njit cannot take a dict-of-DataFrames the way the Python prototype's `m_by_bar` does, so
+# prep_minute_inputs() below does that grouping once in plain Python and hands the kernel
+# flat arrays, mirroring how prep_inputs() already does this for the hourly kernels.
+#
+# Exit reason codes (distinct from the WIN/LOSS/TWIN/TLOSS module-level codes above, which
+# encode profitability, not mechanism): this kernel returns the actual exit REASON since
+# that's what the parity gate checks trade-by-trade against the prototype's Trade.reason.
+GT_SL    = 0
+GT_TRAIL = 1
+GT_TIME  = 2
+
+# Minute-offset sentinels for the two "no ambiguity" fill cases the prototype uses (bar-
+# close fill has no minute to point at; open_check market-buy fills at the bar's own Open,
+# which is provably the bar's first minute — see the prototype's _open() comment).
+GT_MJ_BAR_CLOSE = -2
+GT_MJ_BAR_OPEN_FIRST_MINUTE = -3
+
+
+def prep_minute_inputs(minute_df, df_hourly):
+    """Groups a ticker's real 1-minute bars by the hourly bar that owns them (bar H:30
+    owns [H:30, H+1:30)), matching sim_minute_groundtruth_independent.py's own bucketing
+    exactly. Returns flat float64 minute OHLC arrays plus, per df_hourly row, the
+    (start_offset, count) slice into those arrays — 0-count for hours with no real minute
+    prints. minute_df must already be regular-session-filtered (09:30-16:00 ET), tz-naive,
+    sorted, with Open/High/Low/Close columns (see load_minutes() in the prototype)."""
+    idx = df_hourly.index
+    n = len(idx)
+    if len(minute_df) == 0:
+        empty = np.zeros(0, dtype=np.float64)
+        return dict(min_o=empty, min_h=empty, min_l=empty, min_c=empty,
+                    bar_min_start=np.zeros(n, dtype=np.int64),
+                    bar_min_count=np.zeros(n, dtype=np.int64),
+                    bar_min_ts=np.zeros(0, dtype='datetime64[ns]'))
+
+    mi = minute_df.index
+    bucket = pd.DatetimeIndex(np.where(mi.minute >= 30, mi.floor("h") + pd.Timedelta(minutes=30),
+                                       mi.floor("h") - pd.Timedelta(minutes=30)))
+    grouped = {k: v for k, v in minute_df.groupby(bucket)}
+
+    min_o_parts, min_h_parts, min_l_parts, min_c_parts, ts_parts = [], [], [], [], []
+    bar_min_start = np.zeros(n, dtype=np.int64)
+    bar_min_count = np.zeros(n, dtype=np.int64)
+    offset = 0
+    for i, t0 in enumerate(idx):
+        g = grouped.get(t0)
+        bar_min_start[i] = offset
+        if g is None or len(g) == 0:
+            bar_min_count[i] = 0
+            continue
+        bar_min_count[i] = len(g)
+        min_o_parts.append(g["Open"].to_numpy(np.float64))
+        min_h_parts.append(g["High"].to_numpy(np.float64))
+        min_l_parts.append(g["Low"].to_numpy(np.float64))
+        min_c_parts.append(g["Close"].to_numpy(np.float64))
+        ts_parts.append(g.index.to_numpy())
+        offset += len(g)
+
+    def cat(parts):
+        return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float64)
+
+    all_ts = np.concatenate(ts_parts) if ts_parts else np.zeros(0, dtype='datetime64[ns]')
+    return dict(min_o=cat(min_o_parts), min_h=cat(min_h_parts), min_l=cat(min_l_parts),
+                min_c=cat(min_c_parts), bar_min_start=bar_min_start,
+                bar_min_count=bar_min_count, bar_min_ts=all_ts)
+
+
+@njit(cache=True)
+def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, sma_arr, std_arr,
+                                  min_o, min_h, min_l, min_c, bar_min_start, bar_min_count,
+                                  fixed_sl, arm_pct, trail_buy_pct, trail_sell_pct,
+                                  max_hours_to_hold, z_thresh, target_h0, target_h1,
+                                  open_check_entry_timing, is_both, same_bar_reentry):
+    """Direct port of sim_minute_groundtruth_independent.py's Sim/simulate() state
+    machine. See that module's docstring for WHY each choice was made; this function
+    must not diverge from it behaviorally (mandatory byte-identical parity gate,
+    docs/plans/ground_truth_kernel_rebuild.md Step 2a) — see module-level comment above."""
+    entry_bar   = np.empty(MAX_TRADES, dtype=np.int64)
+    entry_mj    = np.empty(MAX_TRADES, dtype=np.int64)
+    entry_p     = np.empty(MAX_TRADES, dtype=np.float64)
+    exit_bar    = np.empty(MAX_TRADES, dtype=np.int64)
+    exit_mj     = np.empty(MAX_TRADES, dtype=np.int64)
+    exit_p      = np.empty(MAX_TRADES, dtype=np.float64)
+    reason      = np.empty(MAX_TRADES, dtype=np.int64)
+    count = 0
+
+    STATE_IDLE, STATE_WAIT, STATE_HOLD, STATE_ARMED = 0, 1, 2, 3
+    state = STATE_IDLE
+    running_low = 0.0
+    wait_bar0 = 0
+    cur_entry_price = 0.0
+    cur_entry_bar = 0
+    stop_price = 0.0
+    arm_price = 0.0
+    peak = 0.0
+    fill_bar = -1
+    fill_mj = -1
+    fill_partial = False
+
+    n = len(closes)
+    for i in range(n):
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        m_start, m_count = bar_min_start[i], bar_min_count[i]
+
+        # band_at(i)
+        band = np.nan
+        if hours[i] == target_h0 or hours[i] == target_h1:
+            di = daily_idx[i]
+            if di >= 0 and std_arr[di] != 0.0:
+                band = sma_arr[di] - std_arr[di] * z_thresh
+
+        # ── (1) open_check signal detection ──
+        opened_this_bar = False
+        if state == STATE_IDLE and not np.isnan(band) and open_check_entry_timing and o <= band:
+            opened_this_bar = True
+            if is_both:
+                state = STATE_WAIT
+                running_low = o
+                wait_bar0 = i
+            else:
+                cur_entry_price = o
+                cur_entry_bar = i
+                stop_price = cur_entry_price * (1.0 - fixed_sl / 100.0)
+                arm_price = cur_entry_price * (1.0 + arm_pct / 100.0)
+                state = STATE_HOLD
+                fill_bar = i
+                fill_mj = GT_MJ_BAR_OPEN_FIRST_MINUTE
+                fill_partial = False
+
+        # ── (2) continuous minute-level resolution ──
+        if state != STATE_IDLE and m_count > 0:
+            tbp = trail_buy_pct / 100.0
+            tsp = trail_sell_pct / 100.0
+            for j in range(m_count):
+                mo, mh, ml, mc = min_o[m_start + j], min_h[m_start + j], min_l[m_start + j], min_c[m_start + j]
+
+                if state == STATE_WAIT:
+                    trig_prior = running_low * (1.0 + tbp)
+                    if mo >= trig_prior:
+                        cur_entry_price = mo
+                        cur_entry_bar = i
+                        stop_price = cur_entry_price * (1.0 - fixed_sl / 100.0)
+                        arm_price = cur_entry_price * (1.0 + arm_pct / 100.0)
+                        state = STATE_HOLD
+                        fill_bar = i; fill_mj = j; fill_partial = False
+                        continue
+                    if ml < running_low:
+                        running_low = ml
+                    trig = running_low * (1.0 + tbp)
+                    if mh >= trig:
+                        cur_entry_price = trig
+                        cur_entry_bar = i
+                        stop_price = cur_entry_price * (1.0 - fixed_sl / 100.0)
+                        arm_price = cur_entry_price * (1.0 + arm_pct / 100.0)
+                        state = STATE_HOLD
+                        fill_bar = i; fill_mj = j; fill_partial = True
+                        continue
+
+                elif state == STATE_HOLD:
+                    if fill_partial and fill_bar == i and fill_mj == j:
+                        continue
+                    if mo <= stop_price:
+                        entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
+                        exit_bar[count] = i; exit_mj[count] = j
+                        entry_p[count] = cur_entry_price; exit_p[count] = mo
+                        reason[count] = GT_SL
+                        count += 1; state = STATE_IDLE
+                        continue
+                    if ml <= stop_price:
+                        entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
+                        exit_bar[count] = i; exit_mj[count] = j
+                        entry_p[count] = cur_entry_price; exit_p[count] = stop_price
+                        reason[count] = GT_SL
+                        count += 1; state = STATE_IDLE
+                        continue
+
+                elif state == STATE_ARMED:
+                    gap = peak * (1.0 - tsp)
+                    if mo <= gap:
+                        entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
+                        exit_bar[count] = i; exit_mj[count] = j
+                        entry_p[count] = cur_entry_price; exit_p[count] = mo
+                        reason[count] = GT_TRAIL
+                        count += 1; state = STATE_IDLE
+                        continue
+                    if mh > peak:
+                        peak = mh
+                    stop = peak * (1.0 - tsp)
+                    if ml <= stop:
+                        entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
+                        exit_bar[count] = i; exit_mj[count] = j
+                        entry_p[count] = cur_entry_price; exit_p[count] = stop
+                        reason[count] = GT_TRAIL
+                        count += 1; state = STATE_IDLE
+                        continue
+
+        # ── (3) bar-close-gated events ──
+        if state == STATE_WAIT and (i - wait_bar0) >= max_hours_to_hold:
+            state = STATE_IDLE
+        elif state == STATE_HOLD:
+            held = i - cur_entry_bar
+            if c >= arm_price:
+                state = STATE_ARMED
+                peak = c
+            elif held >= max_hours_to_hold:
+                entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
+                exit_bar[count] = i; exit_mj[count] = GT_MJ_BAR_CLOSE
+                entry_p[count] = cur_entry_price; exit_p[count] = c
+                reason[count] = GT_TIME
+                count += 1; state = STATE_IDLE
+        elif state == STATE_ARMED and (i - cur_entry_bar) >= max_hours_to_hold:
+            entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
+            exit_bar[count] = i; exit_mj[count] = GT_MJ_BAR_CLOSE
+            entry_p[count] = cur_entry_price; exit_p[count] = c
+            reason[count] = GT_TIME
+            count += 1; state = STATE_IDLE
+
+        # ── (4) close_check signal detection ──
+        if state == STATE_IDLE and not np.isnan(band) and c <= band and not (opened_this_bar and not same_bar_reentry):
+            if is_both:
+                state = STATE_WAIT
+                running_low = c
+                wait_bar0 = i
+            else:
+                cur_entry_price = c
+                cur_entry_bar = i
+                stop_price = cur_entry_price * (1.0 - fixed_sl / 100.0)
+                arm_price = cur_entry_price * (1.0 + arm_pct / 100.0)
+                state = STATE_HOLD
+                fill_bar = -1; fill_mj = -1; fill_partial = False
+
+    return (entry_bar[:count], entry_mj[:count], entry_p[:count],
+            exit_bar[:count], exit_mj[:count], exit_p[:count], reason[:count])
+
+
+_GT_REASON_NAMES = {GT_SL: 'SL', GT_TRAIL: 'TRAIL', GT_TIME: 'TIME'}
+
+
+def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df, *,
+                               fixed_sl, arm_pct, trail_buy_pct, trail_sell_pct,
+                               max_hours_to_hold, z_score_threshold, is_both,
+                               target_hours=(9, 14), open_check_entry_timing=True,
+                               same_bar_reentry=True, prep=None):
+    """Python wrapper: prep + kernel call + trade reconstruction (real timestamps, not
+    the kernel's bar/minute-offset indices) for the v6 ground-truth kernel. `minute_df`
+    must already be regular-session-filtered/tz-naive (sim_minute_groundtruth_independent
+    .load_minutes()). Not wired into run_backtest_dispatch/the sweep engine yet —
+    that's Step 3, gated on the parity check (2a) passing first.
+
+    WHEN WIRING INTO run_backtest_dispatch (Step 3), READ THIS FIRST (flagged by the
+    paired-review contextual pass, 2026-08-21): `fixed_sl`/`arm_pct`/`trail_buy_pct`/
+    `trail_sell_pct` here are taken as RAW PERCENTAGES (e.g. 2.0 for 2%, matching the real
+    watch_list row and the parity test's `n["fixed_sl"]`) and divided by 100 INSIDE this
+    function's njit call — unlike run_backtest_dispatch's existing TrailingBoth/TrailingExit
+    branches, which pre-divide by 100 before calling run_backtest_v110/v18 (e.g.
+    `stop_loss=float(fixed_sl) / 100.0`). `open_check_entry_timing` is also a resolved bool
+    here, not the raw `entry_timing` string those branches pass through. Copy-pasting the
+    existing dispatch pattern for this function would silently pre-divide a second time
+    (every threshold 100x too small) and pass the wrong type. Call this with raw
+    percentages and a bool, not a second /100.0."""
+    prep = prep or prep_inputs(df_hourly, df_daily_indicators)
+    mprep = prep_minute_inputs(minute_df, df_hourly)
+
+    eb, emj, ep, xb, xmj, xp, rs = _simulate_trail_ground_truth(
+        prep['opens'], prep['highs'], prep['lows'], prep['prices'], prep['hours'], prep['daily_idx'],
+        prep['sma_arr'], prep['std_arr'],
+        mprep['min_o'], mprep['min_h'], mprep['min_l'], mprep['min_c'],
+        mprep['bar_min_start'], mprep['bar_min_count'],
+        float(fixed_sl), float(arm_pct), float(trail_buy_pct), float(trail_sell_pct),
+        int(max_hours_to_hold), float(z_score_threshold), int(target_hours[0]), int(target_hours[1]),
+        bool(open_check_entry_timing), bool(is_both), bool(same_bar_reentry),
+    )
+
+    idx = df_hourly.index
+    bar_ts = mprep['bar_min_ts']
+
+    def resolve_time(bar_i, mj):
+        # GT_MJ_BAR_OPEN_FIRST_MINUTE and GT_MJ_BAR_CLOSE both resolve to the hourly
+        # bar's own timestamp (idx[bar_i]), not that bar's first printed minute —
+        # the prototype records entry_time=t0 for an open_check market-buy fill too
+        # (sim_minute_groundtruth_independent.py's _open(t0, o, ...) call), only ever
+        # passing the minute as fill_minute for the (here-unused, since fill_partial
+        # =False on this path) skip-check, never as the trade's recorded time. Found
+        # by the paired-review independent-cold pass (2026-08-21): resolving to the
+        # bar's first REAL minute print instead diverges whenever that minute isn't
+        # exactly H:30 (reproduced live on AGQ/GDXU/NUGT/DFEN/WEBL/UGL).
+        if mj == GT_MJ_BAR_CLOSE or mj == -1 or mj == GT_MJ_BAR_OPEN_FIRST_MINUTE:
+            return idx[bar_i]
+        start = mprep['bar_min_start'][bar_i]
+        return pd.Timestamp(bar_ts[start + mj])
+
+    trades = []
+    for k in range(len(eb)):
+        trades.append({
+            'Ticker': ticker,
+            'Entry Time': resolve_time(int(eb[k]), int(emj[k])),
+            'Entry Price': float(ep[k]),
+            'Exit Time': resolve_time(int(xb[k]), int(xmj[k])),
+            'Exit Price': float(xp[k]),
+            'exit_reason': _GT_REASON_NAMES[int(rs[k])],
+            'Return': (float(xp[k]) - float(ep[k])) / float(ep[k]),
+        })
+    return trades
