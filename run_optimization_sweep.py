@@ -1587,6 +1587,61 @@ def run_phase2_island(shared_pool, ticker, strategy_name, config_version, hp, sp
                            min_hold_hours=min_hold_hours)
 
 
+def run_phase2_island_ground_truth(shared_pool, ticker, strategy_name, config_version, hp, spy_bh,
+                                    asset_bh, run_timestamp, fixed_sl=0, entry_timing='open_check',
+                                    same_bar_reentry=True, generation=None, run_id=None,
+                                    start_date=None, end_date=None):
+    """v6 counterpart to run_phase2_island. Task-GENERATION logic (island-center detection
+    off backtest_cache, ±FINE_RADIUS mesh) is IDENTICAL to the hourly version, copied
+    rather than shared, because it's genuinely kernel-agnostic (queries backtest_cache
+    generically by version/strategy/ticker — ROBUST_ALPHA_SQL/pick_island_centers don't
+    know or care which kernel produced a row). Only the final dispatch call differs:
+    dispatch_parallel_grid_ground_truth instead of dispatch_parallel_grid. Requires
+    Phase1-coarse-GT to have already been run for the same (ticker, strategy,
+    config_version) — reads its rows to find islands."""
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    tasks = set()
+    with sqlite3.connect(DB_PATH) as conn:
+        for z in hp['z_score_thresholds']:
+            for w in hp['windows']:
+                for tpct in trail_pcts:
+                    params = [config_version, ticker, strategy_name, float(z), int(w), *scope_params]
+                    tpct_filter = ""
+                    if fourth_axis_col == 'trail_pct':
+                        tpct_filter = "AND trail_sell_pct=?"
+                        params.append(float(tpct))
+                    df_wz = pd.read_sql(f"""
+                        SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, alpha_vs_spy,
+                               {ROBUST_ALPHA_SQL} AS robust_alpha
+                        FROM backtest_cache
+                        WHERE version=? AND ticker=? AND strategy=?
+                          AND z_score_threshold=? AND window=? AND trades > 0
+                          AND kernel_version='ground_truth_v6' {scope_sql} {tpct_filter}
+                    """, conn, params=params)
+
+                    if df_wz.empty:
+                        continue
+
+                    centers = pick_island_centers(df_wz)
+                    for (tp_c, sl_c) in centers:
+                        for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
+                            for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
+                                for hold in hp['hold_time_caps']:
+                                    tasks.add((tp, sl, int(hold), int(w), float(z), float(tpct)))
+
+    if not tasks:
+        logger.warning(f"[{ticker}] Phase2-GT: no island tasks generated.")
+        return
+
+    logger.info(f"[{ticker}] Phase2-GT island mesh: {len(tasks)} tasks ({N_ISLANDS} islands ±{FINE_RADIUS})")
+    dispatch_parallel_grid_ground_truth(shared_pool, list(tasks), ticker, strategy_name, config_version,
+                                        "Phase2-Island-GT", spy_bh, asset_bh, run_timestamp, fixed_sl,
+                                        entry_timing, same_bar_reentry=same_bar_reentry, generation=generation,
+                                        run_id=run_id, start_date=start_date, end_date=end_date)
+
+
 # ── Phase 2.5: targeted cliff-box sweep around true best node ────────────────
 
 def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp, spy_bh, asset_bh, run_timestamp, fixed_sl=0, entry_timing='close', run_id=None, start_date=None, end_date=None, min_hold_hours=0):
@@ -1626,6 +1681,49 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
     dispatch_parallel_grid(shared_pool, list(tasks), ticker, strategy_name, config_version,
                            "Phase2.5-CliffBox", spy_bh, asset_bh, run_timestamp, fixed_sl, entry_timing, run_id=run_id,
                            start_date=start_date, end_date=end_date, min_hold_hours=min_hold_hours)
+
+
+def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, config_version, hp, spy_bh,
+                                        asset_bh, run_timestamp, fixed_sl=0, entry_timing='open_check',
+                                        same_bar_reentry=True, run_id=None, start_date=None, end_date=None):
+    """v6 counterpart to run_phase25_cliff_box — same shape (±CLIFF_RADIUS in TP/SL,
+    ±7h in hold, ±1 trail_pct neighbor around the true best node), task-generation SQL
+    unchanged apart from the added kernel_version filter (kernel-agnostic query pattern,
+    same rationale as run_phase2_island_ground_truth above)."""
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(f"""
+            SELECT axis_tp, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, window, z_score_threshold,
+                   {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct
+            FROM backtest_cache
+            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
+              AND kernel_version='ground_truth_v6' {scope_sql}
+            ORDER BY {ROBUST_ALPHA_SQL} DESC LIMIT 1
+        """, (config_version, ticker, strategy_name, *scope_params)).fetchone()
+    if not row:
+        return
+    tp_c, sl_c, hold_c, w_c, z_c, tpct_c = int(row[0]), int(row[1]), int(row[2]), int(row[3]), float(row[4]), float(row[5])
+
+    if fourth_axis_col == 'trail_pct' and tpct_c in trail_pcts:
+        idx = trail_pcts.index(tpct_c)
+        tpct_neighbors = trail_pcts[max(0, idx - 1): idx + 2]
+    else:
+        tpct_neighbors = [tpct_c]
+
+    tasks = set()
+    for tp in range(max(1, tp_c - CLIFF_RADIUS), min(30, tp_c + CLIFF_RADIUS) + 1):
+        for sl in range(max(1, sl_c - CLIFF_RADIUS), min(30, sl_c + CLIFF_RADIUS) + 1):
+            for hold in [h for h in hp['hold_time_caps'] if abs(h - hold_c) <= 7]:
+                for tpct in tpct_neighbors:
+                    tasks.add((tp, sl, hold, w_c, z_c, float(tpct)))
+
+    logger.info(f"[{ticker}] Phase2.5-GT cliff-box: {len(tasks)} tasks around TP={tp_c} SL={sl_c} hold={hold_c}h")
+    dispatch_parallel_grid_ground_truth(shared_pool, list(tasks), ticker, strategy_name, config_version,
+                                        "Phase2.5-CliffBox-GT", spy_bh, asset_bh, run_timestamp, fixed_sl,
+                                        entry_timing, same_bar_reentry=same_bar_reentry, run_id=run_id,
+                                        start_date=start_date, end_date=end_date)
 
 
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────
