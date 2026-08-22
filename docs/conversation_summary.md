@@ -8206,3 +8206,19 @@ None of the 3 options fully closes the gap. Not yet decided or shipped. Next ste
 **Not touched this session**: `docs/research_log.md` has an uncommitted diff from the same-bar-SL thread (now split to a separate session per the user's request) — deliberately left alone, not committed here, since that session may still be actively writing to it.
 
 **Next**: same-bar-SL thread continues in its own separate session. No other open items from tonight's evening-report review.
+
+---
+
+## 2026-08-21 (very late, 2nd wrap) — Paper-vs-backtest fidelity gap surfaced: existing check is count-only, not trade-level; backlogged, not built
+
+**Trigger**: a peer session told the user "paper trading can't actually match backtest." Verified directly rather than accepted at face value — checked `evening_status.py`'s existing paper-vs-kernel comparison (Part 3, section 2) and confirmed it's a trade-COUNT check with a ±2 tolerance, never validating individual trade dates/prices/exit reasons. Tonight's report showed "7 matched, 0 issues" under this check, which is much weaker evidence than "matched" sounds.
+
+**Real hypothesis, not yet proven**: paper trading polls/simulates fills continuously (same mechanism as real live trading), so it plausibly has the same structural divergence from the two-fixed-daily-window backtest kernel that's already being characterized in the parallel same-bar-SL session — just never verified because the existing check is too coarse to catch it.
+
+**Bug-catching history check** (user asked "have we caught any bugs?" then "or has live just done a better job?"): confirmed paper trading has caught several real bugs historically (HIBL stale-cache race 2026-07-22, SOXL cached-vs-live-tick pricing gap, an `at_bar_close` bookkeeping bug fixed across all 4 exit-check loops including the real live path, a shared `check_exit` gap-through-trigger omission). But most predate the `fake_broker` harness's existence (built 2026-07-29); the harness itself only catches what someone thought to write a scenario for (the same-bar re-entry cooldown gap postdated the harness but was still found via a real incident first, not the harness). Honest ranking surfaced: real incidents > deliberate paired Opus review > harness scenarios > paper trading, with paper trading behind partly because `paper_alert_verbose` defaults off (silent by design) — though the user correctly pushed back that the evening report DOES review paper trading nightly; the real gap is that the review method itself (count-only) is too loose to catch the kind of bug that's actually likely.
+
+**Memory updated**: `feedback_prove_dont_claim_verified` generalized from "backtest-change audits" to "any monitoring/review check that reduces a real question to a count or aggregate stat" — user's own framing: "paper trading tests need to be evaluated not at the count level but actual trade level."
+
+**Backlogged, not built** (user's call — "we're going to shake things up," ending here): a real trade-by-trade paper-vs-kernel comparison, same style as the SOXL 5-min-mimic tooling. New `docs/backlog_cache.md` entry filed. Likely picked up alongside whatever the same-bar-SL session concludes about live execution fidelity, since it's the same underlying question applied to paper instead of live.
+
+**No production code touched this session** — paired-Opus review gate doesn't apply; this wrap is docs + backlog + session-cache only.
