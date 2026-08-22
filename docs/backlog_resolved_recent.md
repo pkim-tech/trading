@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][tax] Resolved 2026-08-21 (evening) — `trading_incident #2` (GDXU wash-sale, permanent loss disallowance) closed; mitigation was already in place (node demoted, checklist item #16 added since); codified/automated wash-sale protection filed as a new, separate backlog item.
+
 ## [live-trading] Resolved 2026-08-21 — full same-day UTC/ET timestamp-comparison bug-class chain closed (5 fixes, all paired-reviewed): coverage_events.ts docs + `utc_ts_to_local()` helper (7e2255d), `coverage_ticket_table.py` timing false negative (47faf77), `evening_status.py` event_days classification skew (1472684), `verify_real_trades_vs_kernel.py` staged-window misclassification + `signals_db.py` `wl_id`-backfill migration (final commit). Started from a real SOXL misdiagnosis. Full detail: `deep_backlog.md`.
 
 ## [testing][coverage] Resolved 2026-08-20 (night) — 5 Trade-Flow Accountability Grid gaps closed (`coder2`): `automated_buy_execution` success-path logging (paired review caught a real HIGH mode-mislabeling bug — dry_run canary orders would've falsely counted as live proof), `node_automation_pause_button` (already covered, dispatch premise stale), `replace_target_mismatch`/`drought_handoff_precondition_blocked` fake_venue refusal-case legs, `price_discontinuity_ruled_out` event-assertion. Full detail: `deep_backlog.md`.
