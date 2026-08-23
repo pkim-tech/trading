@@ -114,6 +114,27 @@ def _island_rowids_for_group(conn, ticker, strategy, version, window, z_score_th
     return [r[0] for r in c.fetchall()]
 
 
+def _refuse_if_v6_present(conn):
+    """Hard guard, added 2026-08-23: this module's _groups()/_island_rowids_for_group()
+    have zero kernel_version filtering -- they enumerate and would silently apply
+    legacy (non-GT-aware) pruning/tiebreak logic to real kernel_version='ground_truth_v6'
+    rows if ever run against a ticker with GT data. That's silent-corruption risk, not a
+    missing-feature gap -- the correct, already-fixed tool for v6 is
+    scripts/prune_backtest_cache_ground_truth.py. Refuse loudly rather than silently
+    skip/filter v6 rows out of scope, which could mask a real problem instead of
+    surfacing it."""
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT ticker FROM backtest_cache WHERE kernel_version='ground_truth_v6'")
+    tickers = sorted(r[0] for r in c.fetchall())
+    if tickers:
+        shown = ', '.join(tickers[:10]) + ('...' if len(tickers) > 10 else '')
+        print(f"Refusing to proceed -- kernel_version='ground_truth_v6' rows found for "
+              f"{len(tickers)} ticker(s) ({shown}). This legacy tool has no GT-aware "
+              f"pruning/tiebreak logic and would silently corrupt v6 islands if run "
+              f"against them. Use scripts/prune_backtest_cache_ground_truth.py instead.")
+        sys.exit(1)
+
+
 def _compute_keep_rowids(conn):
     c = conn.cursor()
     c.execute("SELECT DISTINCT ticker FROM backtest_cache")
@@ -127,6 +148,7 @@ def _compute_keep_rowids(conn):
 
 def cmd_dry_run():
     conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    _refuse_if_v6_present(conn)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM backtest_cache")
     total_before = c.fetchone()[0]
@@ -139,9 +161,10 @@ def cmd_dry_run():
 
 
 def cmd_build():
+    conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    _refuse_if_v6_present(conn)
     if PRUNED_PATH.exists():
         PRUNED_PATH.unlink()
-    conn = sqlite3.connect(DB_PATH, timeout=60.0)
     keep = _compute_keep_rowids(conn)
     print(f"Computed {len(keep):,} rows to keep.")
 
@@ -260,6 +283,9 @@ def cmd_swap():
               "would silently discard that new data. Refusing to swap. Re-run the "
               "validator against the current live DB first.")
         sys.exit(1)
+    conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    _refuse_if_v6_present(conn)
+    conn.close()
     # DB_PATH runs in WAL journal mode -- shutil.move() below only renames the
     # main .db file, not its -wal/-shm sidecars. Found 2026-08-12 the hard way:
     # a swap that ran while another process (a read-only diagnostic query) still

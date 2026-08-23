@@ -97,6 +97,7 @@ def _group_fingerprints(db_path, rowids=None):
 def main():
     live = str(pbc.DB_PATH)
     conn = sqlite3.connect(live, timeout=60.0)
+    pbc._refuse_if_v6_present(conn)
     c = conn.cursor()
     c.execute("SELECT COUNT(DISTINCT ticker) FROM backtest_cache")
     n_tickers = c.fetchone()[0]

@@ -1715,7 +1715,14 @@ def main():
 
     out_rows = []
     for ticker in tickers:
-        version = args.version or resolve_version(conn, ticker)
+        try:
+            version = args.version or resolve_version(conn, ticker)
+        except RuntimeError as e:
+            # resolve_version() refuses tickers with real GT (ground_truth_v6) data
+            # rather than silently falling back to stale v5/v5.1 -- added 2026-08-23.
+            # Skip just this ticker instead of aborting the whole default (all-tickers) run.
+            print(f"Skipping {ticker}: {e}")
+            continue
         best = best_node_strategy(conn, ticker, version)
         membership = {}
         label_to_node = {}

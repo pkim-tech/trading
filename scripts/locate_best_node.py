@@ -52,8 +52,29 @@ def resolve_version(conn, ticker, preferred=("v5.1", "v5")):
     silently missing the more-current v5.1 data for tickers that had it).
     Moved here from candidate_summary_report.py 2026-08-13 to fix a circular
     import when run_overlay_shim.py needed it too -- this module has no
-    dependents of its own, so it's the right shared home."""
+    dependents of its own, so it's the right shared home.
+
+    Hard-errors instead of resolving to v5/v5.1 if the ticker has any real
+    kernel_version='ground_truth_v6' rows -- added 2026-08-23. v5/v5.1 data
+    predates the GT kernel's fixes and is no longer the relevant answer for a
+    ticker GT has actually swept; silently falling back to it here would feed
+    every caller (candidate_summary_report.py's legacy mode, run_overlay_shim.py,
+    candidate_full_review.py, and fill_overlay_gaps.py/sweep_drought_confirm_days.py
+    indirectly via run_overlay_shim.py) stale results with no indication anything
+    was wrong. Use the GT-aware path instead (query
+    kernel_version='ground_truth_v6' directly, e.g. as
+    scripts/prune_backtest_cache_ground_truth.py and
+    candidate_summary_report.py's GT mode do)."""
     c = conn.cursor()
+    c.execute("SELECT 1 FROM backtest_cache WHERE ticker=? AND kernel_version='ground_truth_v6' "
+              "AND trades>0 LIMIT 1", (ticker,))
+    if c.fetchone():
+        raise RuntimeError(
+            f"resolve_version(): {ticker} has real kernel_version='ground_truth_v6' rows -- "
+            f"refusing to resolve to legacy v5/v5.1 data. Use the GT-aware path instead "
+            f"(kernel_version='ground_truth_v6' scoping, e.g. "
+            f"scripts/prune_backtest_cache_ground_truth.py or "
+            f"candidate_summary_report.py's GT mode).")
     for v in preferred:
         c.execute("SELECT 1 FROM backtest_cache WHERE ticker=? AND version=? AND trades>0 LIMIT 1", (ticker, v))
         if c.fetchone():

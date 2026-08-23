@@ -11,15 +11,16 @@ def _conn():
     conn = sqlite3.connect(":memory:")
     conn.execute("""
         CREATE TABLE backtest_cache (
-            strategy TEXT, version TEXT, ticker TEXT, trades INTEGER
+            strategy TEXT, version TEXT, ticker TEXT, trades INTEGER, kernel_version TEXT
         )
     """)
     return conn
 
 
-def _insert(conn, ticker, version, trades=10):
-    conn.execute("INSERT INTO backtest_cache (strategy, version, ticker, trades) VALUES (?, ?, ?, ?)",
-                  ("TrailingBothZScoreBreakout", version, ticker, trades))
+def _insert(conn, ticker, version, trades=10, kernel_version=None):
+    conn.execute("INSERT INTO backtest_cache (strategy, version, ticker, trades, kernel_version) "
+                 "VALUES (?, ?, ?, ?, ?)",
+                  ("TrailingBothZScoreBreakout", version, ticker, trades, kernel_version))
     conn.commit()
 
 
@@ -49,3 +50,25 @@ def test_ignores_v51_rows_with_zero_trades():
 def test_defaults_to_last_preferred_when_ticker_has_no_data_at_all():
     conn = _conn()
     assert resolve_version(conn, "NODATA") == "v5"
+
+
+def test_refuses_when_real_ground_truth_v6_rows_present():
+    """A ticker GT has actually swept must never silently resolve to stale
+    v5/v5.1 data -- see scripts/locate_best_node.py's resolve_version()."""
+    conn = _conn()
+    _insert(conn, "AGQ", "v5")
+    _insert(conn, "AGQ", "v6", kernel_version="ground_truth_v6")
+    try:
+        resolve_version(conn, "AGQ")
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "ground_truth_v6" in str(e)
+
+
+def test_does_not_refuse_on_zero_trade_ground_truth_v6_rows():
+    """A v6 row that never computed a real trade shouldn't count as 'this
+    ticker has GT data' -- matches the trades>0 condition used everywhere else."""
+    conn = _conn()
+    _insert(conn, "AGQ", "v5")
+    _insert(conn, "AGQ", "v6", trades=0, kernel_version="ground_truth_v6")
+    assert resolve_version(conn, "AGQ") == "v5"
