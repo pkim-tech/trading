@@ -14,6 +14,11 @@ export_trades.simulate_trail_both_ohlc_aware. Check 5 (open positions) is n/a
 Check 9/10 (same-day-block sensitivity) only apply to TB -- backtester._simulate_trail
 (TE's kernel) has no same_day_block parameter at all.
 
+Any node whose ticker has real kernel_version='ground_truth_v6' backtest_cache rows is
+refused and excluded from the output CSV (added 2026-08-23) -- replay() below is the
+legacy hourly kernel with zero kernel_version awareness and would silently misreport a
+GT-swept ticker. See _has_ground_truth_v6().
+
 Usage: .venv/bin/python scripts/checklist_v65.py
 """
 import sys
@@ -36,9 +41,24 @@ from backtester import WIN, LOSS, TWIN, TLOSS
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = REPO_ROOT / "cache" / "research"
 LIVE_DIR = REPO_ROOT / "cache" / "live"
+RESEARCH_DB_PATH = CACHE_DIR / "trading_universe.db"
 WATCHLIST_ID = 65
 FOLDS = 5
 CLOSED = ["WIN", "LOSS", "TWIN", "TLOSS"]
+
+
+def _has_ground_truth_v6(research_conn, ticker):
+    """Same query pattern as locate_best_node.py's resolve_version() v6 guard
+    (added 2026-08-23): a ticker with real kernel_version='ground_truth_v6' rows
+    has been swept by the GT kernel, which fixed real bugs replay() below doesn't
+    know about (replay() is the legacy hourly possible/pessimistic/certain path,
+    zero kernel_version awareness). Silently replaying such a ticker's live node
+    through replay() would produce wrong checklist numbers with no indication
+    anything was wrong."""
+    c = research_conn.cursor()
+    c.execute("SELECT 1 FROM backtest_cache WHERE ticker=? AND kernel_version='ground_truth_v6' "
+              "AND trades>0 LIMIT 1", (ticker,))
+    return c.fetchone() is not None
 
 
 def get_nodes():
@@ -145,9 +165,25 @@ def check13_walk_forward(closed, closed_p, closed_c, dates_min, dates_max, is_tb
 
 def main():
     nodes = get_nodes()
+    research_conn = sqlite3.connect(RESEARCH_DB_PATH, timeout=60.0)
+    try:
+        _run(nodes, research_conn)
+    finally:
+        research_conn.close()
+
+
+def _run(nodes, research_conn):
     all_rows = []
     for node in nodes:
         ticker = node["ticker"]
+        if _has_ground_truth_v6(research_conn, ticker):
+            print(f"[refuse] {ticker}: has real kernel_version='ground_truth_v6' data -- "
+                  f"replay() below is the legacy hourly kernel with zero kernel_version "
+                  f"awareness and would silently produce wrong results for a GT-swept ticker. "
+                  f"Use the GT-aware path instead (note: run_optimization_sweep.py's "
+                  f"build_candidate_report_ground_truth is candidate-scoped, not live-node-scoped, "
+                  f"and only covers checks 1/4/8/11/13 -- see its own docstring).")
+            continue
         is_tb = node["strategy"] == "TrailingBothZScoreBreakout"
         try:
             df_hourly, df_daily = load(ticker)
