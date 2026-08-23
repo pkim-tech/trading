@@ -42,7 +42,8 @@ separate completeness check is needed in this script.
 legacy pipeline's own --max-phase convention.
 
 Usage: .venv/bin/python scripts/run_ground_truth_phase1.py --ticker SOXL [--workers 8] [--start YYYY-MM-DD] [--end YYYY-MM-DD] [--max-phase {1,2,2.5}]
-Writes to cache/research/trading_universe.db, version='v6-w<start>_<end>'.
+Writes to cache/research/trading_universe.db, version='v6-w<start>_<end>' (yahoo) or
+'v6-massive-w<start>_<end>' (--data-source massive).
 """
 import argparse
 import os
@@ -80,41 +81,31 @@ def main():
                      help="Run phases up through this one, then stop (default: 2.5, full "
                           "Phase1-Coarse-GT -> Phase2-Island-GT -> Phase2.5-CliffBox-GT chain). "
                           "'1' stops after the coarse grid; '2' stops after the island mesh.")
+    ap.add_argument("--skip-cache-refresh", action="store_true",
+                     help="skip rebuild_indexes() -- pass this on EVERY ticker in a "
+                          "multi-ticker loop (see scripts/run_ground_truth_sweep_queue.sh), "
+                          "then call rebuild_indexes() once separately after the whole "
+                          "batch finishes, matching run_sweep_queue.sh's convention.")
     ap.add_argument("--data-source", choices=["yahoo", "massive"], default="yahoo",
-                     help="hourly data source (default: yahoo, unchanged behavior). 'massive' "
-                          "reads db_cache.get_massive_hourly_ohlcv (back to ~2021-08-23 vs "
-                          "yahoo's ~2023-07-24 floor), wired only into Phase1-Coarse-GT/"
-                          "compute_bh_returns so far -- run_phase2_island_ground_truth/"
-                          "run_phase25_cliff_box_ground_truth aren't data_source-aware yet, "
-                          "so 'massive' requires --max-phase 1.")
+                     help="hourly+minute data source (default: yahoo, unchanged behavior). "
+                          "'massive' reads db_cache.get_massive_hourly_ohlcv/"
+                          "get_massive_minute_ohlcv (dividend-adjusted, back to ~2021-08-23 "
+                          "vs yahoo's ~2023-07-24 floor) -- fully wired through Phase1/2/2.5 "
+                          "as of 2026-08-22, no --max-phase restriction.")
     args = ap.parse_args()
     TICKER = args.ticker
     START, END = args.start, args.end
     max_phase = args.max_phase
     data_source = args.data_source
-    if data_source == "massive" and max_phase != "1":
-        raise SystemExit(
-            "--data-source massive currently requires --max-phase 1: "
-            "run_phase2_island_ground_truth/run_phase25_cliff_box_ground_truth "
-            "aren't wired for an alternate data source yet, so chaining into them "
-            "here would silently mix a massive-sourced Phase1 with a yahoo-sourced "
-            "Phase2/2.5."
-        )
-    if data_source == "massive":
-        # CONFIRMED BLOCKER (paired review, 2026-08-22): massive_hourly_derived is
-        # dividend/split-adjusted, but the minute feed run_backtest_ground_truth resolves
-        # SL/TP/TRAIL intrabar triggers against (_load_minute_df -> {ticker}_1m.csv) is
-        # NOT adjusted -- measured on SOXL: raw-minute-vs-massive-hourly price ratio drifts
-        # from ~1.03 at 2021-08-23 to ~1.00 at 2026-08-21 (dividend depth grows going back
-        # in time). Entry prices come from the adjusted hourly frame while exits are
-        # resolved against unadjusted minute bars -- a systematic, silent price mismatch
-        # bigger than most swept SL/TP thresholds (1-6%). A massive-sourced GT result is
-        # NOT yet trustworthy for a real go/no-go decision until the minute feed gets the
-        # same dividend adjustment applied. Fine for wiring/shape smoke-tests; not fine for
-        # a real 5yr comparison campaign.
-        print("WARNING: --data-source massive uses an unadjusted minute feed against "
-              "adjusted hourly bars -- SL/TP/TRAIL exit prices will be systematically off. "
-              "Do not trust these results for a live-trading decision yet.")
+    # Both blockers below (max_phase restriction + minute/hourly adjustment-basis
+    # mismatch warning) were real as of the original --data-source wiring diff, but
+    # both are now resolved: run_phase2_island_ground_truth/run_phase25_cliff_box_
+    # ground_truth accept and thread data_source through to dispatch_parallel_grid_
+    # ground_truth (2026-08-22), and _load_minute_df reads db_cache.get_massive_
+    # minute_ohlcv (dividend-adjusted, consistent with the hourly leg) under
+    # data_source='massive' (fixed 2026-08-22, verified via a real 24/24 byte-identical
+    # 5yr comparison across all 12 real live tickers -- see scripts/compare_all_live_
+    # 5yr_massive.py). No remaining restriction on --max-phase for massive runs.
 
     n = load_live_node(TICKER)
     print(f"Live node: {n}")
@@ -130,11 +121,19 @@ def main():
     )
 
     init_idempotent_db()
-    rebuild_indexes()
+    if args.skip_cache_refresh:
+        print("Skipping rebuild_indexes() (--skip-cache-refresh).")
+    else:
+        rebuild_indexes()
     # '-massive' marker (paired review, 2026-08-22): dispatch_parallel_grid_ground_truth
     # hard-requires this in config_version whenever data_source='massive', so a massive run
     # can never collide with/overwrite yahoo-sourced rows sharing the same window suffix.
-    version = "v6" + window_version_suffix(START, END) + ("-massive" if data_source == "massive" else "")
+    # '-massive' marker must come BEFORE the window suffix, not after --
+    # dispatch_parallel_grid_ground_truth's own guard requires config_version to END
+    # WITH window_version_suffix(...) exactly (real, confirmed-by-review bug: appending
+    # '-massive' after the suffix broke that check and made every massive dispatch call
+    # raise ValueError immediately, before writing a single row).
+    version = "v6" + ("-massive" if data_source == "massive" else "") + window_version_suffix(START, END)
     run_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
     tasks = [(int(tp), int(sl), int(hold), int(w), float(z), float(tpct))
@@ -186,7 +185,7 @@ def main():
         run_phase2_island_ground_truth(
             pool, TICKER, n["strategy"], version, hp, spy_bh, asset_bh, run_timestamp,
             fixed_sl=n["fixed_sl"], entry_timing=ENTRY_TIMING, same_bar_reentry=True,
-            start_date=START, end_date=END,
+            start_date=START, end_date=END, data_source=data_source,
         )
         print(f"Phase2-Island-GT done in {(time.time()-t1)/3600:.2f}h")
 
@@ -198,7 +197,7 @@ def main():
         run_phase25_cliff_box_ground_truth(
             pool, TICKER, n["strategy"], version, hp, spy_bh, asset_bh, run_timestamp,
             fixed_sl=n["fixed_sl"], entry_timing=ENTRY_TIMING, same_bar_reentry=True,
-            start_date=START, end_date=END,
+            start_date=START, end_date=END, data_source=data_source,
         )
         print(f"Phase2.5-CliffBox-GT done in {(time.time()-t2)/3600:.2f}h")
 

@@ -2048,7 +2048,7 @@ def _phase2_island_gt_status(ticker, strategy_name, config_version, hp, entry_ti
 def run_phase2_island_ground_truth(shared_pool, ticker, strategy_name, config_version, hp, spy_bh,
                                     asset_bh, run_timestamp, fixed_sl=0, entry_timing='open_check',
                                     same_bar_reentry=True, generation=None, run_id=None,
-                                    start_date=None, end_date=None):
+                                    start_date=None, end_date=None, data_source="yahoo"):
     """v6 counterpart to run_phase2_island. Task-GENERATION logic (island-center detection
     off backtest_cache, ±FINE_RADIUS mesh) is IDENTICAL to the hourly version, copied
     rather than shared, because it's genuinely kernel-agnostic (queries backtest_cache
@@ -2084,7 +2084,8 @@ def run_phase2_island_ground_truth(shared_pool, ticker, strategy_name, config_ve
     dispatch_parallel_grid_ground_truth(shared_pool, list(tasks), ticker, strategy_name, config_version,
                                         "Phase2-Island-GT", spy_bh, asset_bh, run_timestamp, fixed_sl,
                                         entry_timing, same_bar_reentry=same_bar_reentry, generation=generation,
-                                        run_id=run_id, start_date=start_date, end_date=end_date)
+                                        run_id=run_id, start_date=start_date, end_date=end_date,
+                                        data_source=data_source)
 
 
 # ── Phase 2.5: targeted cliff-box sweep around true best node ────────────────
@@ -2131,7 +2132,8 @@ def run_phase25_cliff_box(shared_pool, ticker, strategy_name, config_version, hp
 
 def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, config_version, hp, spy_bh,
                                         asset_bh, run_timestamp, fixed_sl=0, entry_timing='open_check',
-                                        same_bar_reentry=True, run_id=None, start_date=None, end_date=None):
+                                        same_bar_reentry=True, run_id=None, start_date=None, end_date=None,
+                                        data_source="yahoo"):
     """v6 counterpart to run_phase25_cliff_box — same per-candidate box shape
     (±CLIFF_RADIUS in TP/SL, ±7h in hold, ±1 trail_pct neighbor), but unlike the legacy
     function (deliberately untouched, see isolate-new-code-from-settled-paths convention),
@@ -2280,7 +2282,7 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
     dispatch_parallel_grid_ground_truth(shared_pool, list(tasks), ticker, strategy_name, config_version,
                                         "Phase2.5-CliffBox-GT", spy_bh, asset_bh, run_timestamp, fixed_sl,
                                         entry_timing, same_bar_reentry=same_bar_reentry, run_id=run_id,
-                                        start_date=start_date, end_date=end_date)
+                                        start_date=start_date, end_date=end_date, data_source=data_source)
 
 
 # ── Add-on overlay evaluation for Phase2.5-GT candidates (2026-08-22) ────────
