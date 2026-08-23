@@ -1,5 +1,73 @@
 # Backlog
 
+## ✅ [backtest] Resolved 2026-08-23 (later still) — `ground_truth_kernel_rebuild.md` Step 4 ("alpha removed entirely, CAGR is the sole GT ranking metric") actually implemented end to end
+
+Standing decision from the GT rebuild plan, written down but never executed — a full
+read-only audit confirmed the entire GT candidate-selection pipeline still ranked/selected
+on `robust_alpha`/`alpha_vs_spy` at every decision point, root-causing KORU's confusing
+`worst_neighbor_pct` reading below -100% (raw alpha differences are unbounded below -100%;
+CAGR, a real compounded/annualized return, is bounded there). Switched to CAGR, GT-scoped
+only (legacy/v5 ranking, real live capital, untouched):
+
+1. `pick_island_centers` (`run_optimization_sweep.py`) got a new optional `rank_col` param
+   — GT callers pass `rank_col='cagr'`, legacy callers pass nothing (unchanged fallback).
+2. `run_phase25_cliff_box_ground_truth`/`derive_phase25_candidates_ground_truth`'s
+   within-island top-3 tiebreak now sorts on `cagr` first (was `robust_alpha` first),
+   `GT_CANDIDATE_TIEBREAK` columns unchanged as secondary keys.
+3. `run_addon_cliff_safety_ground_truth`'s cliff-safety worst-neighbor computation now
+   uses `core_cagr`/`addon_cagr` instead of `core_alpha`/`addon_alpha` — the actual KORU
+   bug fix. Dict keys deliberately kept their old `_alpha` suffix (documented mismatch,
+   not renamed, to keep the diff reviewable).
+4. `build_candidate_report_ground_truth`'s `winner_index` now picks by `cagr` — the single
+   most consequential ranking line in the pipeline.
+5. `top_safe_nodes.py --metric` / `candidate_summary_report.py --metric` now default to
+   `cagr` when GT-scoped, `robust_alpha` otherwise (legacy default unchanged).
+6. `candidate_full_review.py`/`candidate_summary_report.py` glossary text (`core_alpha_pct`,
+   `worst_neighbor_pct`, `status`, `is_winner`, `core_safe`/`addon_safe` in `GT_COLUMN_DEFS`)
+   corrected to describe GT rows' real CAGR-based semantics instead of stale alpha wording.
+
+**Paired review (independent-cold + contextual Opus, both real, both against the actual
+diff) found real gaps beyond the original 6-item list, all fixed before close-out:**
+- CRITICAL (both reviewers independently): `scripts/prune_backtest_cache_ground_truth.py`
+  (`island_centers_for_scope`, `center_anchor_rowid`) and its independent validator
+  (`scripts/prune_backtest_cache_ground_truth_validate.py`) still ranked/anchored by
+  `robust_alpha` — a prune run could have deleted the defining rows of CAGR-picked
+  centers, permanently breaking the "reproduces identically pre/post prune" invariant, and
+  the validator's Method A/B cross-check would have silently diverged. Both switched to
+  `rank_col='cagr'` / `ORDER BY cagr DESC`.
+- HIGH: new NaN-`cagr` risk — `robust_alpha` was never NULL, `cagr` can be (unbackfilled
+  rows), and `max(..., key=lambda i: candidates[i]['cagr'])` is unreliable with NaN
+  present (Python NaN comparisons are always False). Fixed by dropping NULL-cagr rows
+  from the candidate region before ranking in `derive_phase25_candidates_ground_truth`,
+  matching the validator's own pre-existing explicit skip.
+- HIGH (both reviewers): the `worst_neighbor < 0` cliff/safe threshold's MEANING silently
+  shifted from "underperforms SPY" (alpha units) to "loses money outright" (CAGR units) —
+  a materially looser bar. This is real and deliberate (explicit in the original task's
+  own framing), documented explicitly in `run_addon_cliff_safety_ground_truth`'s
+  docstring; NOT resolved by changing the threshold itself (that's a separate open design
+  question — see the `docs/backlog_cache.md` entry on whether the plan's own stated
+  "worst-neighbor ground-truth CAGR > 20%" bar should apply here).
+- Independent-cold review's mathematical observation, corroborated: for GT rows,
+  `robust_alpha` ≡ `alpha_vs_spy` = `compounded - spy_bh`, and `cagr` is a strictly
+  increasing function of `compounded` with `spy_bh`/`years` constant within one scope —
+  so ranking by `cagr` vs `robust_alpha` is mathematically IDENTICAL within a scope except
+  for float-precision ties and the new NaN-handling difference above. The real substantive
+  fix is the cliff-safety boundedness/threshold-semantics change, not a reordering of
+  which candidate wins most of the time. Confirmed via a real before/after check against 3
+  live GT scopes (KORU, SOXL: unchanged winner; AGQ: winner shifted tp=31→tp=30 on a
+  bit-identical-cagr tie, exactly the predicted tiebreak mechanism, not an anomaly).
+- HIGH finding (both reviewers) about `candidate_full_review.py`'s `node_id`/`pick`/
+  `comment`/`get_or_create_candidate_node` DB-write wiring is a PRE-EXISTING uncommitted
+  change from a different session (confirmed via `git status` before this session's own
+  edits began) — not part of this fix, left untouched/unresolved by this entry, flagged
+  separately for whoever owns that WIP.
+
+Legacy (`--kernel legacy`) confirmed unaffected both by code inspection (every touched
+function's legacy branch/call-site untouched, `pick_island_centers`'s `rank_col is None`
+fallback preserves the exact original logic) and the paired reviewers' own explicit checks.
+No test suite covers `run_optimization_sweep.py`/`top_safe_nodes.py`/
+`candidate_summary_report.py`/`candidate_full_review.py` currently (checked — none exist).
+
 ## ✅ [backtest] Resolved 2026-08-23 (late) — GT sweep engine's Phase2/Phase2.5 unnecessarily diverged from v5, causing a cascade of real bugs; fixed by reuse instead of rebuild
 
 Direct continuation of the earlier 2026-08-23 entry (multi-generation search silently

@@ -132,13 +132,17 @@ def main():
                               "run_optimization_sweep.PHASE25_ISLAND_CAGR_MIN's GT "
                               "candidate-quality bar -- use 0 or negative to search for "
                               "the best cliff-safe node regardless of any return bar).")
-    parser.add_argument("--metric", choices=["robust_alpha", "cagr"], default="robust_alpha",
-                         help="Ranking/candidate-floor metric (default robust_alpha). "
-                              "cagr is a real, properly-annualized figure -- only "
-                              "meaningful for kernel_version='ground_truth_v6' rows "
-                              "(NULL for legacy rows, see run_optimization_sweep.py's "
-                              "cagr column docstring); comparable across different-length "
-                              "campaign windows in a way raw alpha_vs_spy is not.")
+    parser.add_argument("--metric", choices=["robust_alpha", "cagr"], default=None,
+                         help="Ranking/candidate-floor metric. Default: cagr when "
+                              "--kernel-version ground_truth_v6 is passed (2026-08-23, "
+                              "ground_truth_kernel_rebuild.md Step 4 -- CAGR is the sole "
+                              "GT selection metric, alpha is diagnostic-only for GT); "
+                              "robust_alpha otherwise (legacy default unchanged). cagr is "
+                              "a real, properly-annualized figure -- only meaningful for "
+                              "kernel_version='ground_truth_v6' rows (NULL for legacy "
+                              "rows, see run_optimization_sweep.py's cagr column "
+                              "docstring); comparable across different-length campaign "
+                              "windows in a way raw alpha_vs_spy is not.")
     parser.add_argument("--kernel-version", choices=["ground_truth_v6", "legacy"], default=None,
                          help="Scope to GT rows only (kernel_version='ground_truth_v6') or "
                               "legacy rows only (kernel_version IS NULL OR <>'ground_truth_v6') "
@@ -149,6 +153,10 @@ def main():
                               "version string could in principle collide across kernels, "
                               "so pass this explicitly whenever that's a real risk.")
     args = parser.parse_args()
+    if args.metric is None:
+        # GT-scoped default is cagr (2026-08-23, ground_truth_kernel_rebuild.md Step 4).
+        # Unscoped/legacy-scoped default stays robust_alpha -- unchanged.
+        args.metric = "cagr" if args.kernel_version == "ground_truth_v6" else "robust_alpha"
     if args.min_alpha is None:
         args.min_alpha = 50 if args.metric == "cagr" else 200
 

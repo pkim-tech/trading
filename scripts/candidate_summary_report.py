@@ -87,7 +87,8 @@ GT_COLUMN_DEFS = {
     "candidate_rank": "1-based position in derive_phase25_candidates_ground_truth's own returned candidate list "
                        "for this scope (up to 9 -- top-3-per-island across up to 3 islands).",
     "is_winner": "True for the single candidate build_candidate_report_ground_truth picked as the scope's overall "
-                 "winner (highest robust_alpha among the shortlisted candidates).",
+                 "winner (highest cagr_pct among the shortlisted candidates -- 2026-08-23, "
+                 "ground_truth_kernel_rebuild.md Step 4, CAGR replaced alpha as the GT selection metric).",
     "take_profit": "Candidate's take_profit/arm_sell_pct cell value (see run_optimization_sweep.py's take_profit "
                     "column meaning per strategy).",
     "stop_loss": "Candidate's stop_loss/trail_buy_pct cell value.",
@@ -100,9 +101,11 @@ GT_COLUMN_DEFS = {
     "cagr_pct": "Real annualized CAGR for this candidate's own cell (same source as robust_alpha_pct).",
     "n_trades": "Real trade count from this candidate's own same_bar_reentry=True trade list (build_candidate_"
                 "report_ground_truth's own re-simulation, matching the real live dispatch convention).",
-    "core_safe": "True/False/None(unknown) -- cliff-safety verdict on the CORE (unlevered) alpha, same worst-"
-                 "neighbor<0 convention this project uses everywhere else.",
-    "addon_safe": "Same cliff-safety verdict, computed on the ADD-ON-adjusted alpha instead (see "
+    "core_safe": "True/False/None(unknown) -- cliff-safety verdict on the CORE (unlevered) CAGR (2026-08-23, "
+                 "ground_truth_kernel_rebuild.md Step 4 -- alpha replaced by CAGR for GT), same worst-neighbor<0 "
+                 "convention this project uses everywhere else. NOTE units: for GT this threshold means 'a "
+                 "nearby parameter nudge lost money outright', a looser bar than legacy's 'underperformed SPY'.",
+    "addon_safe": "Same cliff-safety verdict, computed on the ADD-ON-adjusted CAGR instead (see "
                   "run_addon_cliff_safety_ground_truth's docstring for its known limitations before treating "
                   "this as an absolute go/no-go signal).",
     "core_addon_disagreement": "True when core_safe and addon_safe disagree for this candidate.",
@@ -905,9 +908,11 @@ def main():
     ap.add_argument("--tranche", type=int, default=None,
                      help="--kernel gt only: source tickers from scripts/gt_tranches.txt's tranche N "
                           "instead of positional args.")
-    ap.add_argument("--metric", choices=["robust_alpha", "cagr"], default="robust_alpha",
+    ap.add_argument("--metric", choices=["robust_alpha", "cagr"], default=None,
                      help="--kernel gt only: metric for the top_safe_nodes cross-check (see that script's "
-                          "own --metric help).")
+                          "own --metric help). Default: cagr under --kernel gt (2026-08-23, "
+                          "ground_truth_kernel_rebuild.md Step 4 -- CAGR is the sole GT selection metric); "
+                          "robust_alpha under --kernel legacy (unchanged).")
     ap.add_argument("--version", default=None,
                      help="force a single version for every ticker (old behavior). Default: auto-resolve "
                           "per ticker via resolve_version() -- v5.1 when the ticker has it, else v5.")
@@ -926,6 +931,10 @@ def main():
                      help="write output/<name>.xlsx (Candidates sheet + Column Definitions glossary sheet) "
                           "instead of the wide terminal table")
     args = ap.parse_args()
+    if args.metric is None:
+        # GT default is cagr (2026-08-23, ground_truth_kernel_rebuild.md Step 4);
+        # legacy default stays robust_alpha -- unchanged.
+        args.metric = "cagr" if args.kernel == "gt" else "robust_alpha"
 
     if args.kernel == "gt":
         # Resolve tickers (may raise ValueError for an unknown --tranche) BEFORE opening

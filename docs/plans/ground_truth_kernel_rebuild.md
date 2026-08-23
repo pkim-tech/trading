@@ -393,7 +393,18 @@ regardless of what a parameter search might otherwise suggest.
 4. **Build the GT-aware tooling**: candidate-report pipeline, `top_safe_nodes.py`
    kernel-version-aware selection, promotion checklist's 3 GT-dependent checks (9/10/13).
    **Alpha removed entirely** (not just de-prioritized) from schema/reports/ranking —
-   CAGR (or GT worst-neighbor-CAGR) is the sole metric going forward.
+   CAGR (or GT worst-neighbor-CAGR) is the sole metric going forward. **Implemented
+   2026-08-23** (was decided here but not actually executed until a later audit caught
+   it) — `pick_island_centers`/Phase2.5-GT tiebreak/`run_addon_cliff_safety_ground_truth`/
+   `build_candidate_report_ground_truth`'s `winner_index`/`top_safe_nodes.py`'s and
+   `candidate_summary_report.py`'s `--metric` defaults all switched to CAGR, GT-scoped
+   only (legacy/v5 unaffected); paired-reviewed (independent-cold + contextual Opus,
+   found and fixed 2 real gaps: `prune_backtest_cache_ground_truth.py`/its validator
+   still alpha-ranked, a new NaN-cagr risk in winner selection). Full detail:
+   `docs/deep_backlog.md`. The "Cliff-safety redefinition" section below's own stated 20%
+   worst-neighbor-CAGR bar was NOT applied to `run_addon_cliff_safety_ground_truth`'s
+   `core_safe`/`addon_safe` threshold (kept at the pre-existing `< 0`) — left as an open,
+   explicitly-flagged design question in `docs/backlog_cache.md` rather than decided here.
 
    **Core+overlay joint optimization, clarified 2026-08-23 (supersedes the original framing
    below)**: today's pipeline (`ensure_overlay_for_node`/`run_overlay_shim.run_for_node`,

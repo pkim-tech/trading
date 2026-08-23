@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest] Resolved 2026-08-23 (later still) — `ground_truth_kernel_rebuild.md` Step 4 (alpha removed, CAGR sole GT ranking metric) implemented end to end, paired-reviewed (2 CRITICAL/HIGH findings fixed: prune script + validator still alpha-ranked, new NaN-cagr risk in winner_index). Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-08-23 (same night, stale by the time flagged in backlog_cache.md) — `scripts/checklist_v65.py`'s v6 kernel-routing gap already fixed
 Commit `63d37de` added `_has_ground_truth_v6()`: refuses/excludes any ticker with real `kernel_version='ground_truth_v6'` backtest_cache rows before the legacy hourly `replay()` touches it. The backlog_cache.md entry describing this as open was written from the earlier GT-dependency-audit finding and never reconciled against the same-night fix — caught and closed this session via direct `git log`/docstring check, not assumed from the backlog text.
 

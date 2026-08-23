@@ -1730,7 +1730,7 @@ GT_CANDIDATE_TIEBREAK = [
 ]
 
 
-def pick_island_centers(df, n=N_ISLANDS, min_sep=ISLAND_MIN_SEP):
+def pick_island_centers(df, n=N_ISLANDS, min_sep=ISLAND_MIN_SEP, rank_col=None):
     """Greedily picks up to n island centers by descending rank, skipping any coordinate
     within min_sep of an already-picked center.
 
@@ -1758,8 +1758,16 @@ def pick_island_centers(df, n=N_ISLANDS, min_sep=ISLAND_MIN_SEP):
     `derive_phase25_candidates_ground_truth`'s full top-9-per-scope candidate list)
     reproduces identically pre- and post-prune across all 16 real ground_truth_v6 scopes
     in the production DB, including the previously-divergent SOXL scope above.
+
+    rank_col (2026-08-23, ground_truth_kernel_rebuild.md Step 4): explicit override for
+    which column to rank centers by. GT callers pass rank_col='cagr' -- CAGR (bounded,
+    real compounded return) is the sole GT selection metric now, alpha is diagnostic-only
+    for GT. Legacy (non-GT) callers never pass this, so they keep the original
+    robust_alpha/alpha_vs_spy fallback unchanged below -- this is a pure additive
+    override, no legacy behavior change.
     """
-    rank_col = 'robust_alpha' if 'robust_alpha' in df.columns else 'alpha_vs_spy'
+    if rank_col is None:
+        rank_col = 'robust_alpha' if 'robust_alpha' in df.columns else 'alpha_vs_spy'
     centers = []
     df_sorted = df.sort_values([rank_col, 'take_profit', 'stop_loss'],
                                 ascending=[False, True, True])
@@ -2020,7 +2028,7 @@ def _phase2_island_gt_tasks(ticker, strategy_name, config_version, hp, entry_tim
                         params.append(float(tpct))
                     df_wz = pd.read_sql(f"""
                         SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, alpha_vs_spy,
-                               {ROBUST_ALPHA_SQL} AS robust_alpha
+                               {ROBUST_ALPHA_SQL} AS robust_alpha, cagr
                         FROM backtest_cache
                         WHERE version=? AND ticker=? AND strategy=?
                           AND z_score_threshold=? AND window=? AND trades > 0
@@ -2030,7 +2038,11 @@ def _phase2_island_gt_tasks(ticker, strategy_name, config_version, hp, entry_tim
                     if df_wz.empty:
                         continue
 
-                    centers = pick_island_centers(df_wz)
+                    # rank_col='cagr' (2026-08-23, ground_truth_kernel_rebuild.md Step 4):
+                    # this is real GT task-generation logic (matches actual Phase2-GT
+                    # dispatch), so it must rank centers the same way the rest of the GT
+                    # pipeline now does -- CAGR, not alpha.
+                    centers = pick_island_centers(df_wz, rank_col='cagr')
                     for (tp_c, sl_c) in centers:
                         for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
                             for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
@@ -2221,7 +2233,9 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
     # (run_phase25_cliff_box) queries its single global-best row with no
     # tp/sl restriction at all, so this restores real v5 parity rather than the
     # GT-only restriction that made the generation loop's discoveries unreachable.
-    centers = pick_island_centers(df)
+    # rank_col='cagr' (2026-08-23, ground_truth_kernel_rebuild.md Step 4): CAGR is the
+    # sole GT selection metric now -- see pick_island_centers' own docstring.
+    centers = pick_island_centers(df, rank_col='cagr')
 
     tasks = set()
     for tp_c, sl_c in centers:
@@ -2230,12 +2244,15 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
         if region.empty:
             continue
         # GT_CANDIDATE_TIEBREAK (module-level, see its own comment) resolves ties on
-        # robust_alpha deterministically. Note: pandas ignores `kind` for a multi-column
+        # cagr deterministically. Note: pandas ignores `kind` for a multi-column
         # sort_values (it always uses a stable lexsort internally regardless), so no
         # `kind=` argument is needed here for stability -- residual ties past the full
         # tiebreak column set are already impossible in practice since that column set
         # fully identifies a cache cell within a scope.
-        _tb_cols = ['robust_alpha'] + [c for c, _ in GT_CANDIDATE_TIEBREAK]
+        # Ranked on cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md
+        # Step 4 -- CAGR is the sole GT selection metric now; robust_alpha stays in the
+        # dataframe/output as a diagnostic column only, never the sort key).
+        _tb_cols = ['cagr'] + [c for c, _ in GT_CANDIDATE_TIEBREAK]
         _tb_asc = [False] + [asc for _, asc in GT_CANDIDATE_TIEBREAK]
         region = region.sort_values(_tb_cols, ascending=_tb_asc)
 
@@ -2348,20 +2365,35 @@ def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version
     # Center detection unrestricted (2026-08-23 redesign, matches run_phase25_cliff_box_
     # ground_truth's own fix) -- sees whatever any Phase2 generation actually wrote,
     # not just Phase1's original coarse grid.
-    centers = pick_island_centers(df)
+    # rank_col='cagr' (2026-08-23, ground_truth_kernel_rebuild.md Step 4): CAGR is the
+    # sole GT selection metric now -- see pick_island_centers' own docstring.
+    centers = pick_island_centers(df, rank_col='cagr')
     candidates = []
     for tp_c, sl_c in centers:
         region = df[(df['take_profit'] - tp_c).abs().le(FINE_RADIUS) &
                     (df['stop_loss'] - sl_c).abs().le(FINE_RADIUS)]
         if region.empty:
             continue
+        # Drop NULL-cagr rows before ranking (2026-08-23, ground_truth_kernel_rebuild.md
+        # Step 4, paired-review HIGH finding): a NULL cagr means "not yet computed", not
+        # "worst possible" -- a rankable-by-alpha row that happens to have NULL cagr must
+        # NOT silently enter the cagr sort/head(3)/winner_index selection (robust_alpha
+        # was never NULL, so this NaN path is new with the cagr switch). Matches
+        # prune_backtest_cache_ground_truth_validate.py's independent Method B, which
+        # already does this same explicit skip.
+        region = region[region['cagr'].notna()]
+        if region.empty:
+            continue
         # GT_CANDIDATE_TIEBREAK (module-level, see its own comment) resolves ties on
-        # robust_alpha deterministically. Note: pandas ignores `kind` for a multi-column
+        # cagr deterministically. Note: pandas ignores `kind` for a multi-column
         # sort_values (it always uses a stable lexsort internally regardless), so no
         # `kind=` argument is needed here for stability -- residual ties past the full
         # tiebreak column set are already impossible in practice since that column set
         # fully identifies a cache cell within a scope.
-        _tb_cols = ['robust_alpha'] + [c for c, _ in GT_CANDIDATE_TIEBREAK]
+        # Ranked on cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md
+        # Step 4 -- CAGR is the sole GT selection metric now; robust_alpha stays in the
+        # dataframe/output as a diagnostic column only, never the sort key).
+        _tb_cols = ['cagr'] + [c for c, _ in GT_CANDIDATE_TIEBREAK]
         _tb_asc = [False] + [asc for _, asc in GT_CANDIDATE_TIEBREAK]
         region = region.sort_values(_tb_cols, ascending=_tb_asc)
         top_cagr = region.iloc[0]['cagr']
@@ -2581,6 +2613,21 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
     assumptions) -- they matter if this output is used for an absolute, not relative,
     verdict.
 
+    CAGR-based worst-neighbor (2026-08-23, ground_truth_kernel_rebuild.md Step 4,
+    paired-review HIGH finding): `worst_neighbor`/`worst_neighbor_core` are now computed
+    from `core_cagr`/`addon_cagr` (bounded at -100%) instead of `core_alpha`/`addon_alpha`
+    (unbounded raw alpha differences -- the KORU sub-(-100%) worst_neighbor_pct bug).
+    This is a real, DELIBERATE threshold-semantics change, not just a units swap: the
+    `< 0` cliff/safe boundary used to mean "a neighbor underperforms SPY" (alpha units);
+    it now means "a neighbor loses money outright" (CAGR units) -- a materially LOOSER
+    safety bar (a neighbor at, say, +5% CAGR while SPY does +60% was CLIFF before, is SAFE
+    now). This diff intentionally does NOT introduce a nonzero CAGR floor to compensate
+    (e.g. the plan doc's own separately-stated "worst-neighbor ground-truth CAGR > 20%"
+    selection-bar framing, ground_truth_kernel_rebuild.md's "Cliff-safety redefinition"
+    section) -- that's a real open design question (what should the safe/cliff CAGR
+    threshold actually be for THIS specific check) left for explicit user decision, not
+    something to default silently here. See docs/backlog_cache.md.
+
     addon_eligible (2026-08-23, GT Phase 4; corrected same day): threaded straight
     through to every _evaluate_cell_ground_truth_with_addon call (own cell and every
     neighbor) as a pure ANNOTATION -- it does NOT gate whether addon_alpha/addon_cliff
@@ -2616,8 +2663,8 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
             entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
             addon_eligible=addon_eligible)
 
-        neighbor_addon_alphas = []
-        neighbor_core_alphas = []
+        neighbor_addon_cagrs = []
+        neighbor_core_cagrs = []
         for tp in range(max(1, tp_c - radius), min(30, tp_c + radius) + 1):
             for sl in range(max(1, sl_c - radius), min(30, sl_c + radius) + 1):
                 for hold in [h for h in hp['hold_time_caps'] if abs(h - hold_c) <= 7]:
@@ -2627,31 +2674,41 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
                             entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
                             addon_eligible=addon_eligible)
                         if cell is not None:
-                            # addon_alpha is None when apply_addon_overlay_ground_truth
+                            # cagr, not alpha (2026-08-23, ground_truth_kernel_rebuild.md
+                            # Step 4): raw alpha differences are unbounded below -100%
+                            # (confirmed root cause of KORU's confusing sub-(-100%)
+                            # worst_neighbor_pct reading) -- cagr is the bounded,
+                            # real-compounded-return figure already computed on the same
+                            # cell dict, just unused for this purpose until now.
+                            # addon_cagr is None when apply_addon_overlay_ground_truth
                             # flagged a return_below_floor breach for this cell (see
                             # _evaluate_cell_ground_truth_with_addon) -- excluded from the
                             # worst-neighbor min() rather than crashing on a None/float
                             # comparison or, worse, being silently treated as the most
-                            # negative value. core_alpha is never None (core Return is
+                            # negative value. core_cagr is never None (core Return is
                             # always >= -1, so core aggregation can't hit this failure
                             # mode) but included in the same None-guard for symmetry.
-                            if cell['addon_alpha'] is not None:
-                                neighbor_addon_alphas.append(cell['addon_alpha'])
-                            if cell['core_alpha'] is not None:
-                                neighbor_core_alphas.append(cell['core_alpha'])
+                            if cell['addon_cagr'] is not None:
+                                neighbor_addon_cagrs.append(cell['addon_cagr'])
+                            if cell['core_cagr'] is not None:
+                                neighbor_core_cagrs.append(cell['core_cagr'])
 
         # Fail CLOSED (None/"unknown"), not open to "safe", when nothing was evaluated --
         # paired-review finding (2026-08-22, all 4 review passes converged on this
         # independently): this is the exact failure shape identify_full_mesh_candidates'
         # own comments (run_optimization_sweep.py, its `else 0.0` fix) already document
         # as having fabricated a "safe" verdict for every TrailingExit row historically.
-        worst_neighbor = min(neighbor_addon_alphas) if neighbor_addon_alphas else None
-        worst_neighbor_core = min(neighbor_core_alphas) if neighbor_core_alphas else None
+        worst_neighbor = min(neighbor_addon_cagrs) if neighbor_addon_cagrs else None
+        worst_neighbor_core = min(neighbor_core_cagrs) if neighbor_core_cagrs else None
         addon_cliff = None if worst_neighbor is None else (worst_neighbor < 0)
         core_cliff = None if worst_neighbor_core is None else (worst_neighbor_core < 0)
         results.append({
             'candidate': cand, 'own_cell': own,
-            'n_neighbors_evaluated': len(neighbor_addon_alphas),
+            'n_neighbors_evaluated': len(neighbor_addon_cagrs),
+            # NOTE: these two dict keys keep their original "_alpha" suffix (not renamed,
+            # 2026-08-23 CAGR-ranking fix -- kept the diff minimal/reviewable per task
+            # scope) but now hold CAGR values, not alpha. worst_neighbor/worst_neighbor_core
+            # above are themselves CAGR-based (min of neighbor_*_cagrs).
             'worst_neighbor_addon_alpha': worst_neighbor,
             'worst_neighbor_core_alpha': worst_neighbor_core,
             'core_cliff': core_cliff,
@@ -2989,7 +3046,10 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             'drought_ie': drought_ie,
         })
 
-    winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['robust_alpha'])
+    # cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md Step 4): CAGR is
+    # the sole GT selection metric now -- this is the single most consequential ranking
+    # line in the pipeline (decides which candidate gets labeled the overall winner).
+    winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['cagr'])
 
     return {
         'ticker': ticker, 'strategy_name': strategy_name, 'config_version': config_version,

@@ -154,7 +154,11 @@ COLUMN_DEFS = {
                                   "untradeable regardless of the rest of this row.",
     "liquidity_tranche": "Liquidity bucketed at $50k/$100k/$500k/$1M boundaries.",
     "core_alpha_pct": "robust_alpha for this row's node: MIN(possible, pessimistic, certain) fill-resolution "
-                       "alpha vs SPY, over the ticker's full cached-data window. WITH SPY subtracted.",
+                       "alpha vs SPY, over the ticker's full cached-data window. WITH SPY subtracted. For "
+                       "legacy rows this is the real selection metric. For GT (--kernel gt) rows it is "
+                       "DIAGNOSTIC ONLY (2026-08-23, ground_truth_kernel_rebuild.md Step 4) -- GT candidate/"
+                       "winner selection is CAGR-based; see ann_excess_pct for the real GT selection-relevant "
+                       "number.",
     "abs_return_pct": "This node's own RAW compounded return (SPY NOT subtracted) over the same window.",
     "strategy_cagr_pct": "Annualized (CAGR) version of abs_return_pct, over the real cached-data years span.",
     "cagr_tranche": "strategy_cagr_pct bucketed (negative / 0-50% / 50-100% / 100-200% / 200%+).",
@@ -183,12 +187,16 @@ COLUMN_DEFS = {
     "trades": "Number of completed trades in this row's node's backtest.",
     "trades_tranche": "trades bucketed (<10 / 10-25 / 25-50 / 50-100 / 100+). A low count here is the first "
                        "thing to check before trusting a big alpha number -- see core_fluke_verdict too.",
-    "worst_neighbor_pct": "Cliff-safety check: the worst robust_alpha found among nearby grid values "
-                           "(CLIFF_RADIUS=3 steps on take_profit/stop_loss, +/-7 on max_hold_hours), holding "
-                           "every other axis fixed. Negative means a nearby parameter nudge would have lost "
-                           "money.",
+    "worst_neighbor_pct": "Cliff-safety check: the worst value found among nearby grid values (CLIFF_RADIUS=3 "
+                           "steps on take_profit/stop_loss, +/-7 on max_hold_hours), holding every other axis "
+                           "fixed. For legacy rows this is robust_alpha (SPY-adjusted) -- negative means a "
+                           "nearby parameter nudge would have underperformed SPY. For GT rows (2026-08-23, "
+                           "ground_truth_kernel_rebuild.md Step 4) this is CAGR (real compounded/annualized "
+                           "return, NOT SPY-adjusted) -- negative means a nearby parameter nudge would have "
+                           "LOST MONEY outright, a materially looser bar than the legacy underperform-SPY one.",
     "status": "CLIFF (worst_neighbor_pct < 0, fragile to small parameter changes) or SAFE (>= 0), computed "
-              "fresh for THIS row's own node.",
+              "fresh for THIS row's own node. See worst_neighbor_pct's own entry for the legacy-vs-GT units "
+              "difference this threshold is applied to.",
     "cliff_tranche": "Clean alias of status, for consistent _tranche column naming in a pivot table.",
     "fillacc_possible_win_pct": "Of this node's real trailing-buy entry signals in the last ~58 days "
                                  "(yfinance's 5-min history cap), the % where the 'possible' fill resolution "
@@ -1641,7 +1649,6 @@ GT_SKIP_LABEL = "not computed for GT (see legacy report)"
 GT_SKIP_COLUMNS = (
     [c for c in COLUMN_DEFS if c.startswith("bear_")] +
     [c for c in COLUMN_DEFS if c.startswith("crash25_")] + ["crash_2025_tranche"] +
-    ["node_id", "pick", "comment"] +
     ["fillacc_possible_win_pct", "fillacc_possible_mean_err_pct", "fillacc_n",
      "exit_fillacc_win_pct", "exit_fillacc_mean_err_pct", "exit_fillacc_n"] +
     ["sdb_trade_retention_pct", "sdb_alpha_retention_pct", "sdb_alpha_unblocked_pct",
@@ -1718,7 +1725,9 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
     check.py does) -- again a real, documented divergence, not an approximation dressed up
     as the legacy metric. max_drawdown_pct is real (check11); current_drawdown_pct has no
     GT building block yet and is skipped. bear_market/crash25/fillacc/exit_fillacc/sdb/
-    node_id-pick-comment/calendar_years_pct are skipped per GT_SKIP_COLUMNS.
+    calendar_years_pct are skipped per GT_SKIP_COLUMNS. node_id/pick/comment are REAL
+    (wired 2026-08-23 via get_or_create_candidate_node, same as the legacy path) --
+    version already disambiguates a GT row's candidate_nodes entry from a legacy one.
 
     Returns [] (not raising) if this scope's build_candidate_report_ground_truth call
     fails or finds no candidates -- matches gt_rows_for_scope's own per-scope-must-not-
@@ -1782,6 +1791,12 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
                                   else f"GT candidate (rank {i + 1})")
         rec["also_matches"] = [rec["candidate_type"]]
 
+        # core_alpha_pct is DIAGNOSTIC-ONLY for GT rows (2026-08-23, ground_truth_kernel_
+        # rebuild.md Step 4): the GT candidate/winner selection itself
+        # (build_candidate_report_ground_truth's winner_index, run_optimization_sweep.py)
+        # is now CAGR-based, not this alpha figure. ann_excess_pct below (c["cagr"] minus
+        # SPY's CAGR) is the real selection-relevant number for GT -- read that, not this,
+        # when judging why a GT row ranked where it did.
         rec["core_alpha_pct"] = c["robust_alpha"]
         abs_return_pct = compounded([t["Return"] for t in trades]) if trades else None
         rec["abs_return_pct"] = abs_return_pct
@@ -1902,7 +1917,27 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
         }
         rec["bear_market"] = None  # legacy-hourly-only -- GT_SKIP_COLUMNS
         rec["exit_fill_acc"] = None  # GT resolves real minute-level fills directly -- GT_SKIP_COLUMNS
-        rec["node_id"] = rec["pick"] = rec["comment"] = None  # GT_SKIP_COLUMNS
+
+        # node_id: get_or_create_candidate_node is NOT hourly-kernel-specific -- its key_cols
+        # already include `version`, and GT versions (e.g. 'v6-massive-w2021-08-23_2026-08-21')
+        # are already distinct strings from legacy 'v5'/'v5.1', so a GT candidate naturally gets
+        # its own candidate_nodes row rather than colliding with a legacy one. Was previously
+        # hard-set to None here -- a wiring gap, not a structural limitation (found 2026-08-23).
+        # arm_pct/trail_buy_pct/trail_sell_pct mapping matches build_candidate_report_ground_truth's
+        # own is_both branch exactly (run_optimization_sweep.py) -- do not diverge from it.
+        is_both = (strategy == "TrailingBothZScoreBreakout")
+        gt_trail_buy_pct = float(c["stop_loss"]) if is_both else 0.0
+        gt_trail_sell_pct = float(c["tpct"]) if is_both else float(c["stop_loss"])
+        node_id = get_or_create_candidate_node(conn, {
+            "ticker": ticker, "strategy": strategy, "version": version,
+            "window": c["window"], "z": c["z_score_threshold"], "fixed_sl": fixed_sl,
+            "arm_pct": float(c["take_profit"]), "trail_buy_pct": gt_trail_buy_pct,
+            "trail_sell_pct": gt_trail_sell_pct, "max_hold_hours": c["max_hold_hours"],
+            "entry_timing": entry_timing, "robust_alpha": c["robust_alpha"], "trades": row["n_trades"],
+            "sweep_run_id": None,
+        })
+        rec["node_id"] = node_id
+        rec["pick"], rec["comment"] = get_pick_comment(conn, node_id)
         rec["calendar_years_pct"] = None  # legacy-only opt-in feature -- GT_SKIP_COLUMNS
 
         add_tranches(rec)
@@ -2066,6 +2101,7 @@ def main():
                   "ticker' set here).")
             return
         conn = sqlite3.connect(args.db)
+        ensure_candidate_nodes_table(conn)
         run_gt_full_review(conn, args.tickers, args.csv, args.xlsx, vol_gate=args.vol_gate)
         conn.close()
         return

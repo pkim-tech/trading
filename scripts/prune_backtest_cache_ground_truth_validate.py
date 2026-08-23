@@ -171,15 +171,19 @@ def independent_candidates_for_scope(ticker, strategy_name, version, entry_timin
     conn = sqlite3.connect(ros.DB_PATH, timeout=60.0)
     try:
         centers_rows = conn.execute(f"""
-            SELECT axis_tp, {sl_col}, {ros.ROBUST_ALPHA_SQL}
+            SELECT axis_tp, {sl_col}, {ros.ROBUST_ALPHA_SQL}, cagr
             FROM backtest_cache
             WHERE ticker=? AND strategy=? AND version=? AND trades > 0
               AND kernel_version='{pbcg.KERNEL_VERSION}' {scope_sql}
         """, (ticker, strategy_name, version, *scope_params)).fetchall()
         if not centers_rows:
             return []
-        df_centers = pd.DataFrame(centers_rows, columns=['take_profit', 'stop_loss', 'robust_alpha'])
-        centers = ros.pick_island_centers(df_centers)
+        df_centers = pd.DataFrame(centers_rows, columns=['take_profit', 'stop_loss', 'robust_alpha', 'cagr'])
+        # rank_col='cagr' (2026-08-23, ground_truth_kernel_rebuild.md Step 4, paired-review
+        # CRITICAL finding): must match Method A's (derive_phase25_candidates_ground_truth's)
+        # own pick_island_centers call, or this independent cross-check silently validates
+        # against the wrong (stale, alpha-ranked) center list instead of catching real drift.
+        centers = ros.pick_island_centers(df_centers, rank_col='cagr')
 
         # Independently-expressed version of the same GT_CANDIDATE_TIEBREAK contract
         # Method A's pandas sort applies (see run_optimization_sweep.py's own comment on
@@ -209,8 +213,12 @@ def independent_candidates_for_scope(ticker, strategy_name, version, entry_timin
         # constant across the region is a no-op anyway (same as it is for Method A's
         # pandas sort on the equally-constant `tpct` column), so the term is dropped
         # rather than special-cased into a non-ordinal SQL expression.
+        # Leading term is cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md
+        # Step 4, paired-review CRITICAL finding): must match Method A's own within-island
+        # sort (run_optimization_sweep.py's derive_phase25_candidates_ground_truth /
+        # run_phase25_cliff_box_ground_truth, both now `_tb_cols = ['cagr'] + ...`).
         order_by = ', '.join(
-            [f"{ros.ROBUST_ALPHA_SQL} DESC"] +
+            ["cagr DESC"] +
             [f"{_tiebreak_sql_col[col]} {'ASC' if asc else 'DESC'}" for col, asc in ros.GT_CANDIDATE_TIEBREAK
              if _tiebreak_sql_col[col] != '0']
         )

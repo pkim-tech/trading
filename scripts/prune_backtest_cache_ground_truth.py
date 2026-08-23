@@ -218,15 +218,21 @@ def island_centers_for_scope(conn, ticker, strategy_name, version, entry_timing,
     sl_col = _sl_axis_real_column(sl_axis_col)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     rows = conn.execute(f"""
-        SELECT axis_tp, {sl_col}, {ros.ROBUST_ALPHA_SQL}
+        SELECT axis_tp, {sl_col}, {ros.ROBUST_ALPHA_SQL}, cagr
         FROM backtest_cache
         WHERE ticker=? AND strategy=? AND version=? AND trades > 0
           AND kernel_version='{KERNEL_VERSION}' {scope_sql}
     """, [ticker, strategy_name, version, *scope_params]).fetchall()
     if not rows:
         return []
-    df_centers = pd.DataFrame(rows, columns=['take_profit', 'stop_loss', 'robust_alpha'])
-    return pick_island_centers(df_centers)
+    df_centers = pd.DataFrame(rows, columns=['take_profit', 'stop_loss', 'robust_alpha', 'cagr'])
+    # rank_col='cagr' (2026-08-23, ground_truth_kernel_rebuild.md Step 4, paired-review
+    # CRITICAL finding on the original CAGR-reranking commit): MUST match
+    # derive_phase25_candidates_ground_truth's own pick_island_centers call exactly, or
+    # this function's whole anchoring purpose (see docstring above) silently breaks --
+    # it would anchor the alpha-picked centers while the real candidate list is now
+    # cagr-picked, which can delete rows a cagr-picked center actually depends on.
+    return pick_island_centers(df_centers, rank_col='cagr')
 
 
 def cliff_box_rowids_for_candidate(conn, ticker, strategy_name, version, fixed_sl, entry_timing, cand, hp):
@@ -288,9 +294,14 @@ def center_anchor_rowid(conn, ticker, strategy_name, version, fixed_sl, entry_ti
     units away, outside CLIFF_RADIUS=2 of the center itself).
 
     No tiebreak needed here (unlike the legacy tool's winner-selection query) -- any row
-    tied for the max robust_alpha value at this exact coordinate reproduces the same
-    (island_tp, island_sl, robust_alpha) triple pick_island_centers actually used; WHICH
-    physical row achieves it doesn't matter for center reproduction, only the value."""
+    tied for the max cagr value at this exact coordinate reproduces the same
+    (island_tp, island_sl, cagr) triple pick_island_centers actually used; WHICH
+    physical row achieves it doesn't matter for center reproduction, only the value.
+
+    ORDER BY cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md Step 4,
+    paired-review CRITICAL finding): must match island_centers_for_scope's own
+    rank_col='cagr' pick_island_centers call -- same reasoning as that function's own
+    comment."""
     sl_axis_col, _ = strategies.resolve_axis_columns(strategy_name)
     sl_col = _sl_axis_real_column(sl_axis_col)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
@@ -299,7 +310,7 @@ def center_anchor_rowid(conn, ticker, strategy_name, version, fixed_sl, entry_ti
         SELECT rowid FROM backtest_cache
         WHERE ticker=? AND strategy=? AND version=? AND kernel_version='{KERNEL_VERSION}' {scope_sql}
           AND trades > 0 AND axis_tp=? AND {sl_col}=?
-        ORDER BY {ros.ROBUST_ALPHA_SQL} DESC LIMIT 1
+        ORDER BY cagr DESC LIMIT 1
     """, [ticker, strategy_name, version, *scope_params, island_tp, island_sl])
     row = c.fetchone()
     return row[0] if row else None
