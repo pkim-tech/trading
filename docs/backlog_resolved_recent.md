@@ -1,5 +1,8 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Resolved 2026-08-23 (same night, stale by the time flagged in backlog_cache.md) — `scripts/checklist_v65.py`'s v6 kernel-routing gap already fixed
+Commit `63d37de` added `_has_ground_truth_v6()`: refuses/excludes any ticker with real `kernel_version='ground_truth_v6'` backtest_cache rows before the legacy hourly `replay()` touches it. The backlog_cache.md entry describing this as open was written from the earlier GT-dependency-audit finding and never reconciled against the same-night fix — caught and closed this session via direct `git log`/docstring check, not assumed from the backlog text.
+
 ## [live-trading][testing] Resolved 2026-08-22 (weekend cleanup) — `pinned_entry_trigger` and `buy_fill_reconciles_correct_node` Grid rows confirmed verified-live (real IWM/soxl_ira proof); FAS canary_market_buy_exit deviation (id=179) explained, same wick-shape non-defect as its FAZ siblings. Full detail: `deep_backlog.md`.
 
 ## [live-trading][tax] Resolved 2026-08-21 (evening) — `trading_incident #2` (GDXU wash-sale, permanent loss disallowance) closed; mitigation was already in place (node demoted, checklist item #16 added since); codified/automated wash-sale protection filed as a new, separate backlog item.
