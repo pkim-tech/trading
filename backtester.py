@@ -2171,3 +2171,165 @@ def apply_addon_overlay_ground_truth(trades):
             t2['return_below_floor'] = False
         out.append(t2)
     return out
+
+
+def simulate_drought_overlay_ground_truth(trades, df_hourly_windowed, ticker, fixed_sl,
+                                           arm_pct, trail_sell_pct,
+                                           confirm_days_grid=None, vol_gate_grid=None):
+    """GT-kernel drought overlay (2026-08-23, Phase 4 of docs/plans/ground_truth_kernel_
+    rebuild.md), replacing scripts/gt_addon_winner_drought_eval.py's post-hoc single-
+    fixed-confirm_days pass. Real drought design/mechanism UNCHANGED (see
+    scripts/drought_overlay_test.py's own docstring) -- once a drought is confirmed
+    (confirm_days no-signal trading days), buy the underlying and manage it with the
+    same fixed-SL/trailing-stop primitives the core strategy already uses, handing off
+    at the strategy's own next real signal if neither fires first. What changed here:
+    (1) confirm_days x vol_gate is swept per candidate (scripts/drought_overlay_sweep.py's
+    own CONFIRM_DAYS_GRID/VOL_GATE_GRID, reused as-is, not invented) instead of a single
+    hardcoded confirm_days=3, and (2) this is called once per shortlisted Phase2.5-GT
+    candidate directly off the SAME `trades` list build_candidate_report_ground_truth
+    already computed for that candidate's checks 4/8/11/13 -- no second
+    run_backtest_ground_truth call to reconstruct the core trade list a second time (the
+    old script's own redundant "reconstructs the winner's own CORE trade list" step).
+
+    `trades` must carry real 'Entry Time'/'Exit Time' Timestamps (need_times=True) --
+    converted to bar-index positions in df_hourly_windowed via .get_loc, exactly like the
+    old script's trades_to_bar_indices (GT always resolves entry/exit to a real index
+    label in that same frame, so a lookup miss here would indicate a real bug upstream,
+    not an expected case -- silently skipped per-trade like the original, not raised,
+    since one skipped trade shouldn't block the other N-1 from finding real drought
+    windows). Scope: TrailingBothZScoreBreakout candidates only, matching the legacy
+    script's own "is_both assumed True" restriction and simulate_overlay's own
+    proven-only-for-that-shape SL/arm/trail semantics -- callers must gate on is_both
+    themselves (this function doesn't re-derive it) before calling.
+
+    vol_gate reuses drought_overlay_sweep.py's real intraday-realized-vol entry gate
+    (get_ivol_series/_entry_vol_pctile), which reads a fixed cache/research/{ticker}_1h.csv
+    regardless of the campaign's own data_source -- a known limitation carried forward
+    from the legacy script, not fixed here (out of scope: generalizing that helper to be
+    data_source-aware). If that CSV is missing, every vol_gate!=None cell is skipped
+    (silently, not fabricated) -- only vol_gate=None (the original ungated behavior)
+    still gets evaluated in that case, never a hard failure.
+
+    No cliff-safety pass is computed here (user's explicit call, carried forward from the
+    legacy script's own docstring: "drought does not need its own cliff-safety pass right
+    now, we'll end up doing a second sweep on the winner nodes"). The winning
+    (confirm_days, vol_gate) pair is picked by the best resulting core+drought combined
+    compounded return -- not cliff-safety-screened.
+
+    Returns None if fewer than 2 real core trades exist (no drought windows are possible
+    with 0 or 1 signals) or none of the input trades map onto df_hourly_windowed's index.
+    Otherwise a dict: {n_core_trades, core_compounded_pct, best_confirm_days,
+    best_vol_gate, n_drought_windows, n_drought_simulated, drought_compounded_pct,
+    combined_compounded_pct, n_grid_cells_evaluated} -- drought_compounded_pct/
+    combined_compounded_pct are None (not NaN) when the grid produced zero real drought
+    windows at every (confirm_days, vol_gate) pair (e.g. a ticker with too few gaps
+    between real signals to ever confirm a drought)."""
+    if len(trades) < 2:
+        return None
+    # Lazy import (matches this file's existing lazy-import convention for the add-on
+    # overlay's own consumer in run_optimization_sweep.py): scripts/drought_overlay_test.py
+    # imports `from backtester import prep_inputs, OPEN` at module level, so a top-level
+    # import here would be a real circular import, not just a layering nicety.
+    from scripts.drought_overlay_test import find_drought_windows, simulate_overlay
+    from scripts.drought_overlay_sweep import (
+        CONFIRM_DAYS_GRID, VOL_GATE_GRID, get_ivol_series, _entry_vol_pctile)
+
+    confirm_days_grid = confirm_days_grid if confirm_days_grid is not None else CONFIRM_DAYS_GRID
+    vol_gate_grid = vol_gate_grid if vol_gate_grid is not None else VOL_GATE_GRID
+
+    idx = df_hourly_windowed.index
+    n_bars = len(idx)
+    # CRITICAL fix (2026-08-23, paired-review independent-cold finding, empirically
+    # confirmed against real SOXL trades before this fix: only 2/101 real trades
+    # matched via idx.get_loc, silently collapsing this whole function to a near-
+    # permanent None). The original assumption (copied from the now-superseded
+    # scripts/gt_addon_winner_drought_eval.py's own docstring, never independently
+    # verified) was that GT always resolves entry/exit to a real index LABEL in this
+    # frame -- false: run_backtest_ground_truth's resolve_time() returns a real
+    # MINUTE timestamp (not an hourly bar label) for any intrabar trail-buy fill or
+    # SL/TRAIL exit (backtester.py's own GT_MJ_BAR_CLOSE/-1/GT_MJ_BAR_OPEN_FIRST_MINUTE
+    # special-casing only covers bar-close/open-first-minute events). Fixed by
+    # floor-mapping each real timestamp onto the hourly bar that OWNS it (bar H:30
+    # owns [H:30, H+1:30), same bucketing prep_minute_inputs already uses) via
+    # searchsorted instead of an exact-label get_loc -- this also sidesteps get_loc's
+    # ambiguous-match behavior on a duplicate index label (a separate LOW finding
+    # from the same review round).
+    def _floor_bar(ts):
+        pos = int(idx.searchsorted(ts, side='right')) - 1
+        return pos if 0 <= pos < n_bars else None
+
+    bar_trades = []
+    for t in trades:
+        signal_i = _floor_bar(t['Entry Time'])
+        exit_i = _floor_bar(t['Exit Time'])
+        if signal_i is None or exit_i is None:
+            continue  # entry/exit fell entirely before df_hourly_windowed's own index -- skip
+        bar_trades.append({'signal_i': signal_i, 'exit_i': exit_i})
+    if len(bar_trades) < 2:
+        return None
+
+    core_rets = [t['Return'] for t in trades]
+    core_compounded = float((pd.Series(core_rets) + 1).prod() - 1) * 100
+
+    ivol_series = None
+    if any(vg is not None for vg in vol_gate_grid):
+        try:
+            ivol_series = get_ivol_series(ticker)
+        except (FileNotFoundError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError):
+            # Missing/malformed/columnless CSV (LOW finding, paired review 2026-08-23) --
+            # every vol_gate!=None cell is skipped below, never fabricated; only
+            # vol_gate=None still gets evaluated.
+            ivol_series = None
+
+    cells = {}
+    windows_by_cd = {}
+    for confirm_days in confirm_days_grid:
+        windows = find_drought_windows(bar_trades, df_hourly_windowed, confirm_days)
+        if not windows:
+            continue
+        windows_by_cd[confirm_days] = windows
+        for vol_gate in vol_gate_grid:
+            if vol_gate is None:
+                gated = windows
+            elif ivol_series is None:
+                continue  # vol gate requested but no ivol data available -- skip, don't fabricate
+            else:
+                gated = []
+                for entry_i, backstop_i in windows:
+                    entry_time = idx[entry_i + 1] if entry_i + 1 < len(idx) else idx[entry_i]
+                    pctile = _entry_vol_pctile(entry_time, ivol_series)
+                    if pctile is not None and pctile < vol_gate:
+                        gated.append((entry_i, backstop_i))
+            if not gated:
+                continue
+            rets = [simulate_overlay(df_hourly_windowed, entry_i, backstop_i,
+                                      fixed_sl_pct=fixed_sl, arm_pct=arm_pct,
+                                      trail_sell_pct=trail_sell_pct)['ret']
+                    for entry_i, backstop_i in gated]
+            cells[(confirm_days, vol_gate)] = rets
+
+    if not cells:
+        return {
+            'n_core_trades': len(trades), 'core_compounded_pct': core_compounded,
+            'best_confirm_days': None, 'best_vol_gate': None,
+            'n_drought_windows': 0, 'n_drought_simulated': 0,
+            'drought_compounded_pct': None, 'combined_compounded_pct': None,
+            'n_grid_cells_evaluated': 0,
+        }
+
+    def _combined_compounded(rets):
+        return float((pd.Series(core_rets + rets) + 1).prod() - 1) * 100
+
+    best_key = max(cells, key=lambda k: _combined_compounded(cells[k]))
+    best_cd, best_vg = best_key
+    best_rets = cells[best_key]
+    drought_compounded = float((pd.Series(best_rets) + 1).prod() - 1) * 100
+    return {
+        'n_core_trades': len(trades), 'core_compounded_pct': core_compounded,
+        'best_confirm_days': best_cd, 'best_vol_gate': best_vg,
+        'n_drought_windows': len(windows_by_cd.get(best_cd, [])),
+        'n_drought_simulated': len(best_rets),
+        'drought_compounded_pct': drought_compounded,
+        'combined_compounded_pct': _combined_compounded(best_rets),
+        'n_grid_cells_evaluated': len(cells),
+    }

@@ -17,7 +17,7 @@ from backtester import (run_backtest_dispatch,
                         prep_inputs, _simulate, _simulate_limit, _simulate_trail, _simulate_trail_buy,
                         _simulate_trail_both, _simulate_limit_trail, _simulate_close_limitexit,
                         run_backtest_ground_truth, prep_minute_inputs,
-                        apply_addon_overlay_ground_truth)
+                        apply_addon_overlay_ground_truth, simulate_drought_overlay_ground_truth)
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
@@ -2440,15 +2440,102 @@ def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version
     return candidates
 
 
+def addon_margin_eligible_ticker(ticker):
+    """Real add-on-leg DEPLOYABILITY check for a ticker, 2026-08-23 (GT Phase 4) --
+    checks the ACTUAL live enforcement gate (schwab_safety.py's approve_and_record,
+    is_addon_leg branch, ~line 1551: `if not limits.margin_capable: raise
+    SafetyViolation(...)`), NOT a literal "brokerage account" check. Corrected
+    mid-build: the original dispatch for this task claimed gt_addon_winner_drought_
+    eval.py already reasoned about a brokerage-only constraint -- verified false, that
+    file has zero brokerage/margin/account references. There was no existing gate to
+    carry forward; this is new.
+
+    Also corrected against CLAUDE.md's own "Account type: brokerage=margin; sep/roth/ira=
+    cash" framing in its Live Trading section -- that line is stale (predates the
+    2026-08-11 roth cash->margin correction documented in signals_db.py's `accounts`
+    table seed comment). The real `accounts` table has margin_capable=True for
+    brokerage/roth/ira/soxl_ira and False only for sep -- confirmed directly against
+    signals_db.py's ensure_tables() seed rows and schwab_safety.py's own real BUY-time
+    check before writing this, not assumed from the doc.
+
+    IMPORTANT (corrected same day per direct user instruction, after both paired-review
+    passes converged on flagging the original version's behavior): this function is
+    ANNOTATION-ONLY -- it does NOT gate whether the add-on backtest number gets
+    computed anywhere in this file. The add-on CAGR is a real INPUT to a future
+    account-assignment decision (strong add-on upside argues for promoting a new
+    candidate into a margin-capable account, not just describing an account it's
+    already in) -- gating the computation on today's account would hide exactly the
+    number that decision needs for every not-yet-promoted candidate. Every
+    _evaluate_cell_ground_truth_with_addon call always computes addon_alpha/addon_cagr
+    regardless of this function's result.
+
+    Looks up the ticker's real watch_list account(s) (any watchlist, any mode/state --
+    excludes only `paper_role` clone rows, e.g. the 'daily_sync' daily-track clones per
+    signals_db.get_watch_list_node's own established convention, matching that
+    function's own broader-than-the-single-named-case exclusion -- and archived rows)
+    and cross-references schwab_safety.ACCOUNTS[account].margin_capable for each.
+    Reports NOT eligible (with a reason string distinguishing "no watch_list node yet"
+    from "known non-margin account(s)" from "ambiguous across accounts") if no node is
+    found for the ticker, the DB lookup fails, or the ticker's own nodes disagree across
+    accounts -- "not eligible today" is explicitly NOT the same claim as "this number
+    isn't real" (see the IMPORTANT note above); a not-yet-promoted candidate with a
+    strong add-on CAGR is exactly the case this reason string exists to label, not hide.
+
+    Returns (eligible: bool, reason: str)."""
+    import signals_db
+    import schwab_safety
+    # sqlite3.Connection's own context manager only commits/rolls back on exit, it does
+    # NOT close (stdlib gotcha) -- explicit close in finally instead (connection-leak
+    # finding from paired review). NOT nested inside a `with conn:` block -- that
+    # would call conn.commit() on an already-closed connection in its own __exit__,
+    # raising "Cannot operate on a closed database" (caught while fixing this).
+    c = None
+    try:
+        c = signals_db._conn()
+        rows = c.execute(
+            "SELECT DISTINCT account FROM watch_list WHERE ticker = ? "
+            "AND account IS NOT NULL AND (paper_role IS NULL) "
+            "AND (archived_at IS NULL)", (ticker,)).fetchall()
+    except Exception as e:
+        return False, f"watch_list lookup failed: {e}"
+    finally:
+        if c is not None:
+            c.close()
+    accounts = sorted({r['account'] for r in rows})
+    if not accounts:
+        return False, f"no watch_list node found for {ticker!r} yet -- not a real ineligibility, just not yet promoted/assigned an account"
+    capable = [bool(schwab_safety.ACCOUNTS.get(a) and schwab_safety.ACCOUNTS[a].margin_capable)
+               for a in accounts]
+    if all(capable):
+        return True, f"account(s) {accounts} all margin_capable"
+    if not any(capable):
+        return False, f"account(s) {accounts} not margin_capable"
+    return False, f"ambiguous margin capability across accounts {accounts}"
+
+
 def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_hours, w, z_thresh,
                                             fixed_sl, tpct, entry_timing, start_date, end_date,
-                                            spy_bh, years, data_source="yahoo"):
+                                            spy_bh, years, data_source="yahoo", addon_eligible=True):
     """One (tp, sl, hold, w, z, tpct) cell, evaluated in-process (no ProcessPoolExecutor,
     no backtest_cache write) with same_bar_reentry=False -- returns core AND add-on-
     adjusted alpha/CAGR side by side. Reuses run_single_backtest_node_ground_truth_
     isolated's exact axis-mapping convention (trail_buy_pct/trail_sell_pct/arm_pct from
     tp/sl/tpct) so a cell computed here matches what the real sweep would have computed
-    for the same coordinates."""
+    for the same coordinates.
+
+    addon_eligible (2026-08-23, GT Phase 4; corrected same day -- see below): purely an
+    ANNOTATION carried through to the return dict, never a gate on whether the add-on
+    blended computation runs. The add-on backtest number (what CAGR it WOULD produce)
+    has no dependency on which account a ticker currently lives in -- it's pure
+    simulation off the same core `trades` list, no watch_list/account lookup needed for
+    the number itself. Real reason this field exists: the add-on CAGR is a real INPUT
+    to a future account-assignment decision (a strong add-on number is an argument for
+    promoting a new candidate into a margin-capable account rather than ira/roth/sep,
+    not just a property of an account already assigned) -- gating the computation on
+    today's account would hide exactly the number a promotion decision needs for every
+    not-yet-promoted candidate. (Earlier same-day version of this function DID gate on
+    addon_eligible and skipped the computation entirely for a non-eligible/unknown
+    account -- corrected per direct user instruction before this shipped.)"""
     strategy_class = getattr(strategies, strategy_name)
     is_both = strategy_name == 'TrailingBothZScoreBreakout'
     inputs = _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
@@ -2474,8 +2561,10 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
     if not trades:
         return None
     core_alpha, n_trades, _, core_ret, _, core_cagr = _summarize_trades_ground_truth(trades, spy_bh, years)
-    addon_trades = apply_addon_overlay_ground_truth(trades)
     n_armed = sum(1 for t in trades if t.get('armed'))
+    # Always computed regardless of addon_eligible (see docstring correction above) --
+    # the number itself has no account dependency.
+    addon_trades = apply_addon_overlay_ground_truth(trades)
     # Paired-review CRITICAL finding (2026-08-22, both Sonnet- and Opus-independent
     # passes): a blended add-on Return can go below -100% (no independent stop on the
     # add-on leg, unlike core), which flips the sign of the compounded product and can
@@ -2495,13 +2584,15 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
         'core_alpha': core_alpha, 'core_return': core_ret, 'core_cagr': core_cagr,
         'addon_alpha': addon_alpha, 'addon_return': addon_ret, 'addon_cagr': addon_cagr,
         'addon_return_floor_breached': floor_breached,
+        'addon_eligible': addon_eligible,
     }
 
 
 def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, hp, candidates,
                                          spy_bh, fixed_sl=0, entry_timing='open_check',
                                          start_date=None, end_date=None, years=None,
-                                         data_source="yahoo", cliff_radius=None):
+                                         data_source="yahoo", cliff_radius=None,
+                                         addon_eligible=True):
     """For each candidate from derive_phase25_candidates_ground_truth, computes the
     add-on-adjusted alpha/CAGR at the candidate's own cell AND across the same cliff-box
     neighborhood shape Phase2.5-GT's own dispatch would generate (±cliff_radius in
@@ -2543,7 +2634,18 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
     check is needed). None of these make the add-on-vs-core COMPARISON invalid (both
     sides of that comparison share the same same_bar_reentry/fill-rate/financing
     assumptions) -- they matter if this output is used for an absolute, not relative,
-    verdict."""
+    verdict.
+
+    addon_eligible (2026-08-23, GT Phase 4; corrected same day): threaded straight
+    through to every _evaluate_cell_ground_truth_with_addon call (own cell and every
+    neighbor) as a pure ANNOTATION -- it does NOT gate whether addon_alpha/addon_cliff
+    get computed (corrected per direct user instruction: the add-on number has no
+    account dependency and is a real input to a FUTURE account-assignment decision for
+    not-yet-promoted candidates, so gating it on TODAY's account would hide exactly the
+    number that decision needs). Every result in the returned list carries the same
+    'addon_eligible' value (whatever the ticker's real watch_list account status was at
+    call time) purely so a caller/report can label the number's current deployability
+    without having to re-derive it."""
     radius = CLIFF_RADIUS if cliff_radius is None else cliff_radius
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     # Same fourth-axis test run_phase25_cliff_box_ground_truth itself uses (NOT a
@@ -2566,7 +2668,8 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
 
         own = _evaluate_cell_ground_truth_with_addon(
             ticker, strategy_name, tp_c, sl_c, hold_c, w_c, z_c, fixed_sl, tpct_c,
-            entry_timing, start_date, end_date, spy_bh, years, data_source=data_source)
+            entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
+            addon_eligible=addon_eligible)
 
         neighbor_addon_alphas = []
         neighbor_core_alphas = []
@@ -2576,7 +2679,8 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
                     for tpct in tpct_neighbors:
                         cell = _evaluate_cell_ground_truth_with_addon(
                             ticker, strategy_name, tp, sl, hold, w_c, z_c, fixed_sl, tpct,
-                            entry_timing, start_date, end_date, spy_bh, years, data_source=data_source)
+                            entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
+                            addon_eligible=addon_eligible)
                         if cell is not None:
                             # addon_alpha is None when apply_addon_overlay_ground_truth
                             # flagged a return_below_floor breach for this cell (see
@@ -2616,6 +2720,7 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
             # match the cached `candidate['robust_alpha']` for this reason -- this flag
             # travels with the result so a consumer can't mistake one for the other.
             'same_bar_reentry': False,
+            'addon_eligible': addon_eligible,
         })
     return results
 
@@ -2796,10 +2901,27 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     full grid; this report explains the finalists).
 
     Returns a dict: {ticker, strategy_name, config_version, macro_r30_pct, macro_r90_pct,
-    same_day_block_check9: None (see above), candidates: [ {candidate, n_trades,
-    check4_early_wr/late_wr, check8, check11_max_drawdown_pct/peak/trough, check13_folds,
-    core_cliff, addon_cliff, core_addon_disagreement}, ... ], winner_index,
-    drought: {...} or None}."""
+    same_day_block_check9: None (see above), addon_eligible, addon_eligibility_reason,
+    candidates: [ {candidate, n_trades, check4_early_wr/late_wr, check8,
+    check11_max_drawdown_pct/peak/trough, check13_folds, core_cliff, addon_cliff,
+    core_addon_disagreement, drought: {...} or None}, ... ], winner_index}.
+
+    Drought/add-on architecture (2026-08-23, GT Phase 4 -- replaces the old post-hoc
+    single-fixed-confirm_days bolt-on, scripts/gt_addon_winner_drought_eval.py, which is
+    no longer called from here): each candidate's own core `trades` list (computed once
+    below, same_bar_reentry=True) now feeds BOTH the checks 4/8/11/13 AND a per-candidate
+    drought confirm_days x vol_gate sweep (backtester.simulate_drought_overlay_ground_
+    truth) in the same pass -- one run_backtest_ground_truth call per candidate instead
+    of a second one just to re-derive the winner's own trade list a second time. Drought
+    is computed for EVERY shortlisted candidate now, not just the overall winner. Add-on
+    (run_addon_cliff_safety_ground_truth, unchanged mechanism) is ALWAYS computed for
+    every candidate regardless of the ticker's current account -- the add-on number has
+    no account dependency and is a real input to a FUTURE account-assignment decision
+    (a strong add-on CAGR argues for promoting a candidate into a margin-capable account,
+    not just describing one it's already in). addon_margin_eligible_ticker(ticker) is
+    computed ONCE for the whole campaign purely to ANNOTATE the number with its current
+    real-world deployability ('addon_eligible'/'addon_eligibility_reason' at the report
+    level) -- it never gates or blanks the computation itself."""
     candidates = derive_phase25_candidates_ground_truth(
         ticker, strategy_name, config_version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
     if not candidates:
@@ -2810,13 +2932,23 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     years = _campaign_years_for_window(ticker, start_date, end_date, data_source=data_source)
     r30, r90 = _check1_macro_gt(ticker, start_date, end_date, data_source=data_source)
 
+    addon_eligible, addon_eligibility_reason = addon_margin_eligible_ticker(ticker)
+
     addon_results = run_addon_cliff_safety_ground_truth(
         ticker, strategy_name, config_version, hp, candidates, spy_bh, fixed_sl=fixed_sl,
         entry_timing=entry_timing, start_date=start_date, end_date=end_date, years=years,
-        data_source=data_source, cliff_radius=cliff_radius)
+        data_source=data_source, cliff_radius=cliff_radius, addon_eligible=addon_eligible)
 
     strategy_class = getattr(strategies, strategy_name)
     is_both = strategy_name == 'TrailingBothZScoreBreakout'
+    # Drought's SL/arm/trail overlay mechanism was only ever validated against
+    # TrailingBoth's own arm-then-trail risk parameters (scripts/drought_overlay_test.py
+    # -- the legacy script this replaces made the identical "is_both assumed True"
+    # restriction, carried forward unchanged rather than newly generalizing an
+    # unvalidated TrailingExit drought overlay in this same change).
+    drought_skip_reason = None if is_both else (
+        f"strategy is {strategy_name!r}, not TrailingBothZScoreBreakout -- the drought "
+        f"overlay mechanism is only validated for TrailingBoth's arm-then-trail shape.")
 
     rows = []
     for cand, addon in zip(candidates, addon_results):
@@ -2824,6 +2956,7 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             ticker, strategy_class, strategy_name, cand['window'], cand['z_score_threshold'],
             start_date, end_date, data_source=data_source)
         trades = []
+        df_hourly_windowed = None
         if inputs is not None:
             _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
             if not df_hourly_windowed.empty:
@@ -2847,6 +2980,12 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
         dd_pct, dd_peak, dd_trough = _check11_max_drawdown_gt(trades) if trades else (None, None, None)
         c13_folds = _check13_walk_forward_gt(trades) if trades else []
 
+        drought = None
+        if is_both and trades and df_hourly_windowed is not None:
+            drought = simulate_drought_overlay_ground_truth(
+                trades, df_hourly_windowed, ticker, fixed_sl,
+                arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']))
+
         core_cliff = addon['core_cliff']
         addon_cliff = addon['addon_cliff']
         disagreement = (core_cliff is not None and addon_cliff is not None and core_cliff != addon_cliff)
@@ -2862,37 +3001,19 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             'addon_safe': None if addon_cliff is None else (not addon_cliff),
             'core_addon_disagreement': disagreement,
             'addon_detail': addon,
+            'drought': drought,
         })
 
     winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['robust_alpha'])
-    drought = None
-    # drought_skip_reason distinguishes "strategy isn't TrailingBoth" from "compute_
-    # drought_eval ran but returned None" (no cached inputs / empty windowed bars / zero
-    # core trades for the winner's own cell) -- paired-review finding (2026-08-22, 3 of 4
-    # reviewers independently): collapsing both into one hardcoded print message would
-    # misreport a real data/compute failure as a strategy-type mismatch.
-    drought_skip_reason = None
-    if is_both:
-        import scripts.gt_addon_winner_drought_eval as drought_mod
-        drought = drought_mod.compute_drought_eval(
-            ticker, strategy_name, start_date, end_date, fixed_sl,
-            entry_timing, candidates[winner_index], data_source=data_source)
-        if drought is None:
-            drought_skip_reason = ("compute_drought_eval returned no result for the winning "
-                                    "cell (no cached inputs, empty windowed bars, or zero core "
-                                    "GT trades) -- not a strategy-type mismatch.")
-    else:
-        drought_skip_reason = (f"winner's strategy is {strategy_name!r}, not "
-                                f"TrailingBothZScoreBreakout -- gt_addon_winner_drought_eval's "
-                                f"mechanism assumes TrailingBoth.")
 
     return {
         'ticker': ticker, 'strategy_name': strategy_name, 'config_version': config_version,
         'macro_r30_pct': r30, 'macro_r90_pct': r90,
         'check9_same_day_block': None,  # see docstring -- no same_day_block param exists in the GT kernel
+        'addon_eligible': addon_eligible,
+        'addon_eligibility_reason': addon_eligibility_reason,
         'candidates': rows,
         'winner_index': winner_index,
-        'drought': drought,
         'drought_skip_reason': drought_skip_reason,
     }
 
@@ -2925,6 +3046,34 @@ def print_candidate_report_ground_truth(report):
         flag = "  *** CORE/ADD-ON DISAGREEMENT ***" if row['core_addon_disagreement'] else ""
         print(f"  Verdicts: core-safe={core_s}  add-on-safe={addon_s}{flag}")
 
+        # Add-on CAGR (2026-08-23, GT Phase 4; corrected same day per direct user
+        # instruction): ALWAYS computed and surfaced prominently here, regardless of
+        # whether the ticker is currently on a margin-capable account -- this number is
+        # a real INPUT to a future account-assignment decision for a not-yet-promoted
+        # candidate (a strong add-on CAGR argues FOR assigning it a margin-capable
+        # account), not just a property of an account it already happens to be in.
+        # Deliberately not buried as a footnote -- earlier same-day versions of this
+        # report gated the computation itself on today's account (fixed) and then
+        # buried the label as a single campaign-wide footnote (also fixed here: the
+        # deployability label is now per-candidate, right next to the number it
+        # qualifies, since 'addon_eligible' is the same for every candidate in a
+        # campaign but a reader shouldn't have to scroll to the bottom to connect them).
+        own = row['addon_detail']['own_cell']
+        addon_cagr = own['addon_cagr'] if own else None
+        core_cagr_own = own['core_cagr'] if own else None
+        if report['addon_eligible']:
+            deploy_note = "deployable now -- already on a margin-capable account"
+        else:
+            deploy_note = f"NOT YET DEPLOYABLE -- {report['addon_eligibility_reason']}"
+        if addon_cagr is not None:
+            delta = (addon_cagr - core_cagr_own) if core_cagr_own is not None else None
+            delta_str = f", {delta:+.1f}pp vs core's own {core_cagr_own:.1f}%" if delta is not None else ""
+            print(f"  Add-on CAGR if placed in a margin-capable account: {addon_cagr:+.1f}%{delta_str}  [{deploy_note}]")
+        elif own is None:
+            print("  Add-on CAGR: unavailable (no cell data for this candidate)")
+        else:
+            print("  Add-on CAGR: unavailable (return_below_floor breach -- see addon_return_floor_breached)")
+
         if row['check4_early_wr_pct'] is not None:
             print(f"  Check 4 (70/30 win-rate stability): early={row['check4_early_wr_pct']:.1f}%  "
                   f"late={row['check4_late_wr_pct']:.1f}%")
@@ -2933,14 +3082,14 @@ def print_candidate_report_ground_truth(report):
 
         c8 = row['check8_fluke']
         if c8['compounded_pct'] is not None:
-            # "(same_bar_reentry=True)" label added (paired-review finding, 2026-08-22):
-            # this number and the drought block's own "core=" figure below are BOTH
-            # "compounded return for [effectively] this same node" but computed under
-            # different same_bar_reentry settings (this one matches the real campaign
-            # dispatch; the drought/add-on-safety path below always uses False per its
-            # own documented compute-halving convention) -- unlabeled, a reader could
-            # mistake one for a contradiction of the other rather than two different,
-            # both-correct numbers.
+            # "(same_bar_reentry=True)" label -- this candidate's own drought block below
+            # now reuses this SAME same_bar_reentry=True trades list (2026-08-23 GT Phase
+            # 4 change), so its 'core=' figure matches this compounded_pct exactly, unlike
+            # the old post-hoc drought script which recomputed core trades with
+            # same_bar_reentry=False. add-on's own same_bar_reentry=False cliff-safety
+            # pass (Verdicts line above) is still computed separately and can legitimately
+            # differ from this number -- see run_addon_cliff_safety_ground_truth's own
+            # docstring on that pass's same_bar_reentry convention.
             print(f"  Check 8 (trade-count fluke, same_bar_reentry=True): n={c8['n_trades']}"
                   f"{' [TOO FEW]' if c8['too_few_trades'] else ''}  "
                   f"compounded={c8['compounded_pct']:+.1f}%  w/o best trade={c8['compounded_without_best_pct']:+.1f}%  "
@@ -2965,20 +3114,23 @@ def print_candidate_report_ground_truth(report):
                 fold_parts.append(f"F{f['fold']}:n={f['n']},cagr={cagr_str}{frag_str}")
             fold_str = "  ".join(fold_parts)
             print(f"  Check 13 (walk-forward {GT_WALK_FORWARD_FOLDS}-fold, robustness bar <= {GT_ROBUSTNESS_CAGR_MIN}% CAGR): {fold_str}")
-        print()
 
-    d = report.get('drought')
-    if d is not None:
-        drought_only_str = 'n/a' if d['drought_compounded_pct'] is None else f"{d['drought_compounded_pct']:+.1f}%"
-        combined_str = 'n/a' if d['combined_compounded_pct'] is None else f"{d['combined_compounded_pct']:+.1f}%"
-        # "(same_bar_reentry=False)" label -- see the Check 8 comment above; this core=
-        # figure is NOT the same number as this same node's Check 8 compounded_pct.
-        print(f"Drought overlay (winner only, informational, same_bar_reentry=False): "
-              f"core={d['core_compounded_pct']:+.1f}%  "
-              f"drought_windows={d['n_drought_windows']} (simulated={d['n_drought_simulated']})  "
-              f"drought_only={drought_only_str}  combined={combined_str}")
-    elif report['candidates']:
-        print(f"Drought overlay: skipped ({report.get('drought_skip_reason', 'no reason recorded')})")
+        d = row.get('drought')
+        if d is not None:
+            drought_only_str = 'n/a' if d['drought_compounded_pct'] is None else f"{d['drought_compounded_pct']:+.1f}%"
+            combined_str = 'n/a' if d['combined_compounded_pct'] is None else f"{d['combined_compounded_pct']:+.1f}%"
+            print(f"  Drought overlay (confirm_days x vol_gate swept, same_bar_reentry=True): "
+                  f"core={d['core_compounded_pct']:+.1f}%  "
+                  f"best(confirm_days={d['best_confirm_days']}, vol_gate={d['best_vol_gate']})  "
+                  f"windows={d['n_drought_windows']} (simulated={d['n_drought_simulated']}, "
+                  f"grid_cells={d['n_grid_cells_evaluated']})  "
+                  f"drought_only={drought_only_str}  combined={combined_str}")
+        elif report['strategy_name'] == 'TrailingBothZScoreBreakout':
+            print(f"  Drought overlay: no result (< 2 core trades, or none mapped onto "
+                  f"df_hourly_windowed's index).")
+        elif report.get('drought_skip_reason'):
+            print(f"  Drought overlay: skipped ({report['drought_skip_reason']})")
+        print()
 
 
 # ── Checkpoint 2: cliff check, return full-mesh candidates ───────────────────

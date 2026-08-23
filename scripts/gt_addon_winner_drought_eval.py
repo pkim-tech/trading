@@ -45,11 +45,20 @@ def trades_to_bar_indices(trades, df_hourly_windowed):
 def compute_drought_eval(ticker, strategy_name, start_date, end_date,
                           fixed_sl, entry_timing, winner, data_source="yahoo",
                           confirm_days=CONFIRM_DAYS):
-    """Reusable core of this script's own __main__ block (2026-08-22 candidate-report
+    """SUPERSEDED 2026-08-23 (GT Phase 4, docs/plans/ground_truth_kernel_rebuild.md):
+    run_optimization_sweep.build_candidate_report_ground_truth no longer calls this --
+    it now uses backtester.simulate_drought_overlay_ground_truth directly (per-candidate,
+    confirm_days x vol_gate swept, reusing the trades list already computed for checks
+    4/8/11/13 instead of a second run_backtest_ground_truth call). This module has no
+    remaining callers; kept only for its own __main__ ad hoc usage. Original docstring
+    below, describing the now-replaced call path, left for history:
+
+    Reusable core of this script's own __main__ block (2026-08-22 candidate-report
     build-out) -- same drought-overlay-on-the-winning-node computation, factored out so
-    run_optimization_sweep.build_candidate_report_ground_truth can call it for whichever
-    ticker/campaign's own winner it's reporting on, instead of only SOXL's hardcoded
-    2023-07-24..2026-08-21 window. `winner` is one of derive_phase25_candidates_ground_
+    run_optimization_sweep.build_candidate_report_ground_truth [NO LONGER DOES, see
+    above] can call it for whichever ticker/campaign's own winner it's reporting on,
+    instead of only SOXL's hardcoded 2023-07-24..2026-08-21 window. `winner` is one of
+    derive_phase25_candidates_ground_
     truth's own candidate dicts (island_tp/take_profit/stop_loss/max_hold_hours/window/
     z_score_threshold/tpct/robust_alpha/cagr) -- the caller picks which one counts as
     "the overall winner" (e.g. max by robust_alpha), same convention this script's own
