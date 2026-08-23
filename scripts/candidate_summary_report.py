@@ -59,13 +59,13 @@ from run_overlay_shim import (
 )
 from datetime import datetime as _datetime
 
-import campaign_config
-from run_optimization_sweep import (
-    derive_phase25_candidates_ground_truth,
-    build_candidate_report_ground_truth,
-    print_candidate_report_ground_truth,
-)
-from prune_backtest_cache_ground_truth import discover_all_gt_scopes, _hp_for_strategy
+# run_optimization_sweep/campaign_config/prune_backtest_cache_ground_truth (GT-mode-only
+# deps) are deliberately NOT imported at module level -- run_optimization_sweep.py runs
+# logging.basicConfig(handlers=[FileHandler(...), StreamHandler(sys.stdout)]) at import
+# time (its own module top), which would otherwise fire on every invocation of THIS file,
+# including plain --kernel legacy runs that never touch GT at all, and could interleave
+# root INFO logging with the legacy fixed-width terminal table. Imported lazily inside
+# run_gt_mode() instead (paired-review finding, 2026-08-23, against commit 7ec4663).
 
 DB_PATH = "cache/research/trading_universe.db"
 ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_vs_spy), "
@@ -83,7 +83,7 @@ GT_COLUMN_DEFS = {
     "strategy": "TrailingBothZScoreBreakout or TrailingExitZScoreBreakout -- this scope's real GT campaign strategy.",
     "config_version": "The real backtest_cache `version` string this scope's GT rows were computed under.",
     "entry_timing": "'open_check' or 'close' -- this scope's real GT campaign entry timing.",
-    "fixed_sl": "Fixed stop-loss %% for strategies that use one (TrailingExitZScoreBreakout); 0 otherwise.",
+    "fixed_sl": "Fixed stop-loss % for strategies that use one (TrailingExitZScoreBreakout); 0 otherwise.",
     "candidate_rank": "1-based position in derive_phase25_candidates_ground_truth's own returned candidate list "
                        "for this scope (up to 9 -- top-3-per-island across up to 3 islands).",
     "is_winner": "True for the single candidate build_candidate_report_ground_truth picked as the scope's overall "
@@ -115,7 +115,6 @@ GT_COLUMN_DEFS = {
     "error": "Set instead of the above when this scope/candidate couldn't be evaluated (e.g. Phase1/2-GT campaign "
              "not complete yet, or a build_candidate_report_ground_truth failure) -- see the message for why.",
 }
-GT_CSV_COLUMNS = list(GT_COLUMN_DEFS.keys())
 
 # Relabels find_candidates()'s internal keys to the user's requested wording
 # 2026-08-08 (later) -- kept as a separate map (not renamed at the source in
@@ -612,34 +611,77 @@ def gt_scopes_for_tickers(conn, tickers):
     these tickers, restricted to strategies with a known campaign_config.STRATEGIES hp
     grid (a scope with no known grid can't be passed to derive_phase25_candidates_
     ground_truth at all) -- reuses prune_backtest_cache_ground_truth's own scope
-    discovery/hp-grid-construction rather than re-deriving either."""
+    discovery/hp-grid-construction rather than re-deriving either. A (ticker, strategy)
+    scope with no known grid is dropped, not silently -- logged explicitly (paired-review
+    finding, 2026-08-23: the caller's own "no scope at all" notice only fires when a
+    ticker has ZERO surviving scopes, so a ticker with one known-grid scope plus one
+    unknown-strategy scope would otherwise lose the latter with no output at all)."""
+    import campaign_config
+    from prune_backtest_cache_ground_truth import discover_all_gt_scopes
     wanted = set(tickers)
     scopes = [s for s in discover_all_gt_scopes(conn) if s[0] in wanted]
-    return [s for s in scopes if s[1] in campaign_config.STRATEGIES]
+    kept, dropped = [], []
+    for s in scopes:
+        (kept if s[1] in campaign_config.STRATEGIES else dropped).append(s)
+    for ticker, strategy, version, entry_timing, fixed_sl in dropped:
+        print(f"  {ticker}/{strategy}/{version}: dropped -- no known campaign_config.STRATEGIES "
+              f"hp grid for strategy {strategy!r}.")
+    return kept
 
 
-def gt_current_best_node(conn, ticker, strategy, version, metric):
+def gt_current_best_node(conn, ticker, strategy, version, entry_timing, fixed_sl, metric, min_alpha_arg):
     """Independent second opinion via top_safe_nodes.best_safe_node, scoped to
-    kernel_version='ground_truth_v6' rows only -- mirrors top_safe_nodes.py's own
-    --kernel-version ground_truth_v6 / --metric CLI scoping (CLI-only there,
-    reproduced here for inline/structured use, same query shape as load_ticker_df
-    above but GT-scoped and with the cagr column)."""
-    df = pd.read_sql("""
+    kernel_version='ground_truth_v6' rows for this EXACT scope (version/strategy/ticker/
+    entry_timing, plus stop_loss=fixed_sl for strategies that use a fixed SL) -- mirrors
+    top_safe_nodes.py's own --kernel-version ground_truth_v6 / --metric CLI scoping (CLI-
+    only there, reproduced here for inline/structured use).
+
+    entry_timing/fixed_sl scoping added 2026-08-23 (paired-review finding against the
+    original version of this function, confirmed against real backtest_cache rows): a
+    version+strategy pair can have MULTIPLE distinct GT scopes differing only in
+    entry_timing or fixed_sl (run_optimization_sweep._campaign_scope_sql's own real
+    dispatch scoping) -- without this filter, this cross-check could silently mix rows
+    from a different campaign than the one whose candidates are printed alongside it.
+
+    KNOWN RESIDUAL LIMITATION (not fixed here, same review): for TrailingBothZScoreBreakout
+    GT rows, the real swept "SL-like" axis is trail_buy_pct (strategies.resolve_axis_columns'
+    sl_axis_col) -- `stop_loss` is just this scope's fixed_sl constant, not a swept value
+    (confirmed via real DB query: it's identical across every row once scoped as above).
+    best_safe_node()'s neighbor mask holds trail_buy_pct/trail_sell_pct exactly fixed and
+    perturbs take_profit/stop_loss +/-CLIFF_RADIUS -- so for TrailingBoth scopes this cross-
+    check's cliff-safety search never actually varies the real 2nd axis, degenerating to a
+    TP x hold-time-only neighbor check. This does NOT produce a wrong verdict (core_safe/
+    addon_safe on the real GT candidate report rows are computed correctly, via
+    run_addon_cliff_safety_ground_truth's own resolve_axis_columns-aware neighbor search) --
+    it only means THIS SECONDARY informational cross-check is weaker than intended for
+    TrailingBoth. A proper fix needs a GT-aware neighbor function that honors
+    resolve_axis_columns, not a reuse of best_safe_node's legacy-schema assumption; left as
+    a known gap rather than half-fixed under this pass."""
+    import strategies
+    sql_kernel_scope = "AND kernel_version='ground_truth_v6' AND entry_timing=?"
+    params = [version, strategy, ticker, entry_timing]
+    if strategies.uses_fixed_sl(strategy):
+        sql_kernel_scope += " AND stop_loss=?"
+        params.append(fixed_sl)
+    df = pd.read_sql(f"""
         SELECT ticker, COALESCE(take_profit, arm_sell_pct) AS take_profit,
                stop_loss, max_hold_hours, window,
                z_score_threshold, trail_buy_pct, trail_sell_pct, entry_timing,
                alpha_vs_spy, alpha_vs_spy_pessimistic, alpha_vs_spy_certain,
                strategy_return, trades, win_rate, cagr
         FROM backtest_cache
-        WHERE version=? AND strategy=? AND ticker=? AND trades > 0
-          AND kernel_version='ground_truth_v6'
-    """, conn, params=(version, strategy, ticker))
+        WHERE version=? AND strategy=? AND ticker=? AND trades > 0 {sql_kernel_scope}
+    """, conn, params=params)
     if df.empty:
         return None
     pess = df["alpha_vs_spy_pessimistic"].fillna(df["alpha_vs_spy"])
     cert = df["alpha_vs_spy_certain"].fillna(df["alpha_vs_spy"])
     df["robust_alpha"] = pd.concat([df["alpha_vs_spy"], pess, cert], axis=1).min(axis=1)
-    min_alpha = 50 if metric == "cagr" else 200
+    # Same "user didn't override --min-alpha" default-substitution top_safe_nodes.py's own
+    # CLI applies (its --min-alpha default is None, not a fixed number) -- 200 is this
+    # file's --min-alpha argparse default for the (unrelated) legacy cliff-safety search,
+    # reused here as the "not explicitly overridden" sentinel.
+    min_alpha = 50 if (metric == "cagr" and min_alpha_arg == 200) else min_alpha_arg
     return best_safe_node(df, min_alpha=min_alpha, metric=metric)
 
 
@@ -650,36 +692,67 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
     backtester.py drought-overlay dependency as of 2026-08-23), returns row(s)
     with only 'error' populated (plus raw candidate cells when derive_phase25_
     candidates_ground_truth itself succeeded) rather than raising -- callers
-    loop over many scopes and must not have one bad scope kill the batch."""
+    loop over many scopes and must not have one bad scope kill the batch.
+
+    DB_PATH sync (paired-review finding, 2026-08-23): derive_phase25_candidates_
+    ground_truth/build_candidate_report_ground_truth connect via run_optimization_
+    sweep's OWN module-level DB_PATH, not any connection this file holds -- so a
+    caller running against a non-default --db would otherwise silently derive
+    candidates from the wrong file. Same try/finally sync prune_backtest_cache_
+    ground_truth.candidates_for_scope already uses (see that function's own
+    docstring for the "production re-derivation" incident this guards against)."""
+    import run_optimization_sweep as ros
+    from run_optimization_sweep import (
+        derive_phase25_candidates_ground_truth,
+        build_candidate_report_ground_truth,
+        print_candidate_report_ground_truth,
+    )
+    from prune_backtest_cache_ground_truth import _hp_for_strategy
+
     base = {"ticker": ticker, "strategy": strategy, "config_version": version,
             "entry_timing": entry_timing, "fixed_sl": fixed_sl}
     hp = _hp_for_strategy(strategy)
+    _orig_db_path = ros.DB_PATH
     try:
-        candidates = derive_phase25_candidates_ground_truth(
-            ticker, strategy, version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
-    except Exception as e:
-        print(f"  [GT candidate report] SKIPPED -- derive_phase25_candidates_ground_truth raised: {e}")
-        return [{**base, "error": f"derive_phase25_candidates_ground_truth: {e}"}]
-    if not candidates:
-        print("  [GT candidate report] SKIPPED -- no Phase2.5-GT candidates for this scope.")
-        return [{**base, "error": "no Phase2.5-GT candidates for this scope"}]
+        ros.DB_PATH = DB_PATH
+        try:
+            candidates = derive_phase25_candidates_ground_truth(
+                ticker, strategy, version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
+        except RuntimeError as e:
+            print(f"  [GT candidate report] SKIPPED -- derive_phase25_candidates_ground_truth raised: {e}")
+            return [{**base, "error": f"derive_phase25_candidates_ground_truth: {e}"}]
+        if not candidates:
+            print("  [GT candidate report] SKIPPED -- no Phase2.5-GT candidates for this scope.")
+            return [{**base, "error": "no Phase2.5-GT candidates for this scope"}]
 
-    try:
-        report = build_candidate_report_ground_truth(
-            ticker, strategy, version, hp, start_date=None, end_date=None,
-            fixed_sl=fixed_sl, entry_timing=entry_timing)
-    except Exception as e:
-        # Known-in-progress dependency (backtester.py drought-overlay fix, in flight
-        # in another session as of this change) -- log and return the raw candidate
-        # cells so the batch/export still records what WAS derived successfully.
-        print(f"  [GT candidate report] FAILED (expected while the kernel fix is in flight) -- "
-              f"{len(candidates)} raw candidates were derived successfully: {e}")
-        return [{**base, "candidate_rank": i + 1, "take_profit": c['take_profit'],
-                 "stop_loss": c['stop_loss'], "max_hold_hours": c['max_hold_hours'],
-                 "window": c['window'], "z_score_threshold": c['z_score_threshold'],
-                 "tpct": c['tpct'], "robust_alpha_pct": c['robust_alpha'], "cagr_pct": c['cagr'],
-                 "error": f"build_candidate_report_ground_truth failed: {e}"}
-                for i, c in enumerate(candidates)]
+        try:
+            report = build_candidate_report_ground_truth(
+                ticker, strategy, version, hp, start_date=None, end_date=None,
+                fixed_sl=fixed_sl, entry_timing=entry_timing)
+        except Exception as e:
+            # Broad on purpose -- the in-progress backtester.py drought-overlay fix could
+            # legitimately fail with any exception shape while it's mid-fix, not just
+            # RuntimeError, and one bad scope must not kill the whole batch. But this must
+            # NOT read as "known, expected, nothing to see" -- a real NEW bug in this path
+            # would raise exactly the same way, so the full traceback is surfaced (not just
+            # str(e)) and the wording doesn't assert the cause (paired-review finding,
+            # 2026-08-23: an earlier version of this message asserted "(expected while the
+            # kernel fix is in flight)" unconditionally, which would mask a genuine new
+            # defect behind a reassuring label).
+            import traceback
+            tb = traceback.format_exc()
+            print(f"  [GT candidate report] build_candidate_report_ground_truth RAISED for "
+                  f"{len(candidates)} successfully-derived raw candidates (may be the known "
+                  f"in-flight backtester.py dependency, or may be a new bug -- see traceback):\n{tb}")
+            return [{**base, "candidate_rank": i + 1, "take_profit": c['take_profit'],
+                     "stop_loss": c['stop_loss'], "max_hold_hours": c['max_hold_hours'],
+                     "window": c['window'], "z_score_threshold": c['z_score_threshold'],
+                     "tpct": c['tpct'], "robust_alpha_pct": c['robust_alpha'], "cagr_pct": c['cagr'],
+                     "error": f"build_candidate_report_ground_truth failed: {e}"}
+                    for i, c in enumerate(candidates)]
+    finally:
+        ros.DB_PATH = _orig_db_path
+
     if report.get("error"):
         print(f"  [GT candidate report] {report['error']}")
         return [{**base, "error": report["error"]}]
@@ -705,13 +778,16 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
     return rows
 
 
-def run_gt_mode(conn, tickers, metric, csv_name, xlsx_name):
+def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name):
     """--kernel gt entry point: loops every real GT scope for `tickers`, printing
     each scope's full candidate report (print_candidate_report_ground_truth) plus
     a top_safe_nodes cross-check to the terminal, and returns the flat GT_COLUMN_
-    DEFS row list for optional --csv/--xlsx export. A per-scope exception is caught
-    inside gt_rows_for_scope/gt_current_best_node's own SQL (no bare try/except
-    needed here) -- gt_rows_for_scope never raises."""
+    DEFS row list for optional --csv/--xlsx export. gt_rows_for_scope itself never
+    raises (it catches its own real failure modes and returns error rows instead),
+    but this loop's own per-scope work (the cross-check call, row accumulation) is
+    ALSO wrapped per-scope -- a scope-level exception here logs and continues rather
+    than losing every already-accumulated row before a --csv/--xlsx write (paired-
+    review finding, 2026-08-23, against an earlier version with no such guard)."""
     scopes = gt_scopes_for_tickers(conn, tickers)
     found = {s[0] for s in scopes}
     for ticker in tickers:
@@ -723,14 +799,18 @@ def run_gt_mode(conn, tickers, metric, csv_name, xlsx_name):
     for ticker, strategy, version, entry_timing, fixed_sl in scopes:
         print(f"\n{'#'*100}\n{ticker} / {strategy} / {version} / entry_timing={entry_timing} "
               f"/ fixed_sl={fixed_sl}\n{'#'*100}")
-        node = gt_current_best_node(conn, ticker, strategy, version, metric)
-        if node is None:
-            print(f"  [top_safe_nodes cross-check] no cliff-safe node found for {metric} floor")
-        else:
-            print(f"  [top_safe_nodes cross-check] best {metric}: arm/tp={node['arm_pct']} sl={node['sl']} "
-                  f"hold={node['hold']}h window={node['window']} z={node['z']} "
-                  f"robust_alpha={node['alpha']:+.1f}% cagr={node['cagr']}")
-        all_rows.extend(gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl))
+        try:
+            node = gt_current_best_node(conn, ticker, strategy, version, entry_timing, fixed_sl,
+                                         metric, min_alpha_arg)
+            if node is None:
+                print(f"  [top_safe_nodes cross-check] no cliff-safe node found for {metric} floor")
+            else:
+                print(f"  [top_safe_nodes cross-check] best {metric}: arm/tp={node['arm_pct']} sl={node['sl']} "
+                      f"hold={node['hold']}h window={node['window']} z={node['z']} "
+                      f"robust_alpha={node['alpha']:+.1f}% cagr={node['cagr']}")
+            all_rows.extend(gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl))
+        except Exception as e:
+            print(f"  UNEXPECTED error on this scope, skipping: {e}")
 
     if csv_name:
         _write_csv(csv_name, all_rows, col_defs=GT_COLUMN_DEFS, to_record=lambda r: r)
@@ -771,18 +851,24 @@ def main():
                           "instead of the wide terminal table")
     args = ap.parse_args()
 
-    conn = sqlite3.connect(args.db)
-
     if args.kernel == "gt":
+        # Resolve tickers (may raise ValueError for an unknown --tranche) BEFORE opening
+        # conn -- paired-review finding, 2026-08-23: the earlier version opened conn first,
+        # so an unknown --tranche's ValueError left it unclosed (harmless at process exit,
+        # but the only GT exit path without a close()).
         tickers = load_gt_tranche(args.tranche) if args.tranche is not None else args.tickers
         if not tickers:
             print("--kernel gt requires --tranche N or an explicit ticker list.")
-            conn.close()
             return
         print(f"Tickers: {' '.join(tickers)}")
-        run_gt_mode(conn, tickers, args.metric, args.csv, args.xlsx)
-        conn.close()
+        conn = sqlite3.connect(args.db)
+        try:
+            run_gt_mode(conn, tickers, args.metric, args.min_alpha, args.csv, args.xlsx)
+        finally:
+            conn.close()
         return
+
+    conn = sqlite3.connect(args.db)
 
     ensure_candidate_nodes_table(conn)
     ensure_overlay_table(conn)
