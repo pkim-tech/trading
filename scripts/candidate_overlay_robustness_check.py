@@ -78,21 +78,35 @@ def main():
         elif len(node_options) == 1:
             args.node_id = node_options[0][0]
 
+    # run_overlay_shim.py is pure INSERT and never deletes prior rows for a
+    # re-shimmed node -- a node/mechanism pair can accumulate dozens of
+    # historical run_timestamps (found 2026-08-23: node 105 had 52 drought
+    # runs pooled together). Always scope to the latest run per node.
     if args.node_id is not None:
         c.execute("""
             SELECT cor.entry_time, cor.exit_time, cor.exit_reason, cor.ret
             FROM candidate_overlay_results cor
             WHERE cor.candidate_node_id=? AND cor.mechanism=?
+              AND cor.run_timestamp = (
+                  SELECT MAX(run_timestamp) FROM candidate_overlay_results
+                  WHERE candidate_node_id=? AND mechanism=?
+              )
             ORDER BY cor.entry_time
-        """, (args.node_id, args.mechanism))
+        """, (args.node_id, args.mechanism, args.node_id, args.mechanism))
     else:
         c.execute("""
             SELECT cor.entry_time, cor.exit_time, cor.exit_reason, cor.ret
             FROM candidate_overlay_results cor
             JOIN candidate_nodes cn ON cn.id = cor.candidate_node_id
             WHERE cn.ticker=? AND cor.mechanism=?
+              AND cor.run_timestamp = (
+                  SELECT MAX(cor2.run_timestamp)
+                  FROM candidate_overlay_results cor2
+                  JOIN candidate_nodes cn2 ON cn2.id = cor2.candidate_node_id
+                  WHERE cn2.ticker=? AND cor2.mechanism=?
+              )
             ORDER BY cor.entry_time
-        """, (args.ticker, args.mechanism))
+        """, (args.ticker, args.mechanism, args.ticker, args.mechanism))
     trades = c.fetchall()
     conn.close()
 
