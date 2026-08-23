@@ -794,7 +794,17 @@ def main():
 
     rows = []
     for ticker in tickers:
-        version = args.version or resolve_version(conn, ticker)
+        try:
+            version = args.version or resolve_version(conn, ticker)
+        except RuntimeError as e:
+            # resolve_version() refuses tickers with real GT (ground_truth_v6) data rather
+            # than silently falling back to stale v5/v5.1 -- added 2026-08-23. Skip just
+            # this ticker instead of aborting the whole default (all-tickers) run -- same
+            # fix as candidate_full_review.py's Task #5 (found via a post-hoc review of
+            # this file's own --kernel gt addition asking whether this loop shared that
+            # all-tickers-abort bug shape; it did, pre-existing, unrelated to --kernel gt).
+            print(f"Skipping {ticker}: {e}")
+            continue
         rows.extend(build_rows_for_ticker(conn, ticker, version, args.min_alpha, args.skip_5min,
                                            args.skip_overlay))
 
