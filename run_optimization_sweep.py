@@ -1721,9 +1721,39 @@ GT_CANDIDATE_TIEBREAK = [
 
 
 def pick_island_centers(df, n=N_ISLANDS, min_sep=ISLAND_MIN_SEP):
+    """Greedily picks up to n island centers by descending rank, skipping any coordinate
+    within min_sep of an already-picked center.
+
+    Deterministic tiebreak on (take_profit, stop_loss) added 2026-08-23 -- found by the
+    GT-kernel prune-validation gate's first real-data end-to-end run: a real SOXL/
+    TrailingBoth scope (v6-w2026-06-01_2026-08-01) has 15 rows spanning 3 distinct
+    coordinates -- (21,3), (24,3), (27,3) -- tied at the exact same bit-identical
+    top-of-scope robust_alpha. Without a tiebreak, `df.sort_values(rank_col,
+    ascending=False)` alone leaves the winner among exact ties decided by incidental
+    DataFrame row order, which is NOT invariant under an operation that changes which
+    physical rows are present (e.g. re-deriving centers post-prune, or re-running a sweep
+    after new unrelated rows land in the same scope) even though every candidate row's
+    OWN robust_alpha value is unchanged. This produced a real, reproducible divergence:
+    `pick_island_centers` returned `[(24,3),(15,2),(30,3)]` against the live DB and
+    `[(27,3),(21,3),(15,2)]` against the exact same scope's pruned copy. Same bug class as
+    GT_CANDIDATE_TIEBREAK (top-3-within-island pick, fixed 2026-08-22) and the legacy
+    prune_backtest_cache.py's TIEBREAK_SQL (2026-08-07) -- all three are "pandas/SQL sort
+    on a column with real ties and no secondary key" instances found via this same
+    project's real campaign data. take_profit/stop_loss ASC (rather than reusing the full
+    GT_CANDIDATE_TIEBREAK column list) is deliberately minimal here: this function ranks
+    COORDINATES across the whole scope (window/z/hold/tpct not yet chosen), so only the
+    axes it actually receives are available to break a tie on; once a center coordinate is
+    picked, GT_CANDIDATE_TIEBREAK's fuller column set resolves the *within-island* pick.
+    Verified 2026-08-23: with this tiebreak, `pick_island_centers` (and therefore
+    `derive_phase25_candidates_ground_truth`'s full top-9-per-scope candidate list)
+    reproduces identically pre- and post-prune across all 16 real ground_truth_v6 scopes
+    in the production DB, including the previously-divergent SOXL scope above.
+    """
     rank_col = 'robust_alpha' if 'robust_alpha' in df.columns else 'alpha_vs_spy'
     centers = []
-    for _, row in df.sort_values(rank_col, ascending=False).iterrows():
+    df_sorted = df.sort_values([rank_col, 'take_profit', 'stop_loss'],
+                                ascending=[False, True, True])
+    for _, row in df_sorted.iterrows():
         tp, sl = int(row['take_profit']), int(row['stop_loss'])
         if all(abs(tp - c[0]) >= min_sep or abs(sl - c[1]) >= min_sep for c in centers):
             centers.append((tp, sl))
