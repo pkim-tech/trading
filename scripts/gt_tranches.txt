@@ -1,0 +1,34 @@
+# GT-kernel (v6) permutation-sweep tranche priority list -- distinct from
+# scripts/liquidity_tranches.txt (the legacy hourly-kernel campaign's own tranche
+# system, DB-backed via db_cache.sweep_tranches, untouched by this file).
+#
+# Ordering rationale (2026-08-22): real capital-at-stake accounts first (these
+# tend to have had significant alpha in prior runs), by account, then the
+# remaining liquidity-screened universe split up same as before.
+# TMF excluded (user's call, 2026-08-22): added to soxl_ira specifically as a
+# low-volatility drought-overlay test vehicle, not a real alpha candidate --
+# not worth a GT permutation sweep.
+#
+# Tranches 1-4 (real live tickers) were likely already exercised today via
+# earlier GT campaign runs (SOXL full chain, KORU/AGQ smoke tests, the 12-
+# ticker 3yr/5yr comparisons) -- tranche 5+ is the real new/untested ground.
+#
+# Tranches: "<number> <space-separated tickers>"
+1 AGQ GDXU UGL WEBL
+2 DFEN JNUG KORU
+3 DPST HIBL LABU NUGT SOXL
+4 CURE ERX ERY RETL YINN
+5 SQQQ
+6 TZA SPXL TNA SPXU SPXS
+7 TECL ETHU
+8 OILU BOIL
+9 GUSH
+10 SOLT ROM SSG MQQQ TECS
+11 SRTY FAZ LABD
+12 SDOW CWEB TWM
+13 DXD
+14 KOLD URTY FAS
+15 DRN DDM UWM JDST
+16 EDC
+17 BTCZ BITU BITX
+18 SOXS

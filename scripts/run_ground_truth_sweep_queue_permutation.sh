@@ -12,21 +12,43 @@
 # config.json is never touched (the GT engine doesn't read it at all, unlike the
 # legacy campaign_config.py patch step run_sweep_queue.sh needs for the hourly kernel).
 #
-# Usage:
+# Usage (flat mode -- unchanged from before, still the default):
 #   TICKERS="AGQ SOXL" STRATEGIES="TrailingBothZScoreBreakout" FIXED_SLS="1 2" \
 #     START=2021-08-23 END=2026-08-21 DATA_SOURCE=massive WORKERS=10 MAX_PHASE=1 \
 #     ./scripts/run_ground_truth_sweep_queue_permutation.sh [--skip-cache-refresh]
 #
-# Defaults: 12 real live tickers (same set as run_ground_truth_sweep_queue.sh, state=
-# 'live', archived_at IS NULL, starting_notional>=5000, verified fresh 2026-08-22),
-# both strategies, FIXED_SLS="1 2 3" (matches legacy run_sweep_queue.sh's default),
-# full 5yr massive window, 10 workers, MAX_PHASE=1 (coarse-only first cut -- override to
-# 2.5 for the full Phase1->2->2.5 chain once promising combos are known; 72 combos at
-# the full chain is expensive for a first discovery pass). Flag for coordinator: this ticker universe is
-# a judgment call (could instead be the broader Tranche-1/liquidity-screened set) --
-# confirm/adjust if a wider net is wanted for permutation/candidate-discovery specifically,
-# since that's a different question ("what SHOULD be live") than the validation queue's
-# ("does the kernel match what IS live").
+# Usage (tranche mode, added 2026-08-23 -- mirrors run_liquidity_tranches.sh's
+# resumability mechanics exactly, see scripts/gt_tranches.txt for membership):
+#   ./scripts/run_ground_truth_sweep_queue_permutation.sh --tranches
+#       # runs all tranches from scripts/gt_tranches.txt not yet marked done, in order
+#   ./scripts/run_ground_truth_sweep_queue_permutation.sh --tranches --status
+#       # prints done/pending per tranche, does nothing else
+#   ./scripts/run_ground_truth_sweep_queue_permutation.sh --tranches --reset
+#       # clears all tranche markers, next --tranches run starts over from tranche 1
+#   TRANCHE=5 ./scripts/run_ground_truth_sweep_queue_permutation.sh --tranches
+#       # scopes to a single tranche instead of the "all not-done" default
+#
+# Design notes on gt_tranches.txt vs. the legacy liquidity_tranches.txt format:
+# the legacy file also carries VERSION=/FIXED_SLS=/STRATEGIES=/ENTRY_TIMING= metadata
+# lines, hard-required by run_liquidity_tranches.sh. gt_tranches.txt deliberately does
+# NOT carry those: run_ground_truth_phase1.py auto-derives `version` from
+# data_source+window (window_version_suffix) rather than accepting it as an input, and
+# ENTRY_TIMING is a hardcoded constant ("open_check") inside that script, not a CLI
+# flag -- neither is a real overridable knob for the GT engine, so embedding them in
+# the tranche file would just be dead metadata. STRATEGIES/FIXED_SLS ARE real knobs,
+# but they already have sensible script-level env-var defaults (see below) matching
+# this script's own pre-existing convention -- tranche mode reuses those same env
+# vars unchanged rather than duplicating them per-tranche-file-line. gt_tranches.txt's
+# job is purely tranche membership/ordering.
+#
+# Tranche mode reuses the exact same per-combo failure-isolation loop as flat mode
+# (one bad combo logs and continues, never aborts the batch) -- a tranche's .done
+# marker is only written if every combo in that tranche's ticker list succeeded,
+# matching run_liquidity_tranches.sh's "marker only after everything finishes
+# cleanly" contract. A tranche with any failed combo is left pending (marker not
+# written) so a rerun retries it, and the script moves on to the next tranche rather
+# than aborting the whole multi-hour run (same isolation philosophy as combo-level
+# failures already had).
 
 set -eo pipefail
 cd "$(dirname "$0")/.."
@@ -45,25 +67,82 @@ WORKERS="${WORKERS:-10}"
 # promising (ticker,strategy,fixed_sl) combos are known.
 MAX_PHASE="${MAX_PHASE:-1}"
 
+STATE_DIR="logs/.gt_tranche_state"
+TRANCHES_FILE="scripts/gt_tranches.txt"
+
+tranche_mode=0
+status_flag=0
+reset_flag=0
 skip_refresh_flag=""
-[ "$1" = "--skip-cache-refresh" ] && skip_refresh_flag="--skip-cache-refresh"
+for arg in "$@"; do
+  case "$arg" in
+    --tranches) tranche_mode=1 ;;
+    --status) status_flag=1 ;;
+    --reset) reset_flag=1 ;;
+    --skip-cache-refresh) skip_refresh_flag="--skip-cache-refresh" ;;
+  esac
+done
+
+# --status/--reset only mean anything in tranche mode -- imply tranche_mode
+# rather than silently falling through to a full (expensive) flat-mode sweep
+# if --tranches was forgotten (real bug caught in paired review, 2026-08-23).
+if [ "$status_flag" = "1" ] || [ "$reset_flag" = "1" ]; then
+  tranche_mode=1
+fi
+
+if [ "$tranche_mode" = "1" ]; then
+  declare -A TRANCHE_TICKERS
+  ALL_TRANCHES=""
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    if [[ "$line" =~ ^([0-9]+)\ (.+)$ ]]; then
+      TRANCHE_TICKERS[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+      ALL_TRANCHES="$ALL_TRANCHES ${BASH_REMATCH[1]}"
+    fi
+  done < "$TRANCHES_FILE"
+  ALL_TRANCHES="${ALL_TRANCHES# }"
+
+  mkdir -p logs "$STATE_DIR"
+
+  if [ "$reset_flag" = "1" ]; then
+    rm -f "$STATE_DIR"/tranche_*.done
+    echo "Cleared GT tranche markers -- next run starts from tranche 1."
+    exit 0
+  fi
+
+  if [ "$status_flag" = "1" ]; then
+    for n in $ALL_TRANCHES; do
+      if [ -f "$STATE_DIR/tranche_${n}.done" ]; then
+        echo "tranche $n: done ($(cat "$STATE_DIR/tranche_${n}.done"))"
+      else
+        echo "tranche $n: pending"
+      fi
+    done
+    exit 0
+  fi
+
+  # TRANCHE=<n> scopes to a single tranche; default (unset) runs all not-yet-done
+  # tranches, matching run_liquidity_tranches.sh's default convention.
+  if [ -n "$TRANCHE" ]; then
+    RUN_TRANCHES="$TRANCHE"
+  else
+    RUN_TRANCHES="$ALL_TRANCHES"
+  fi
+fi
 
 mkdir -p logs
 LOG="logs/gt_sweep_queue_permutation_$(date +%Y%m%d_%H%M%S).log"
 echo "Logging to $LOG (console + file via tee)"
 
-{
-  echo "======================================================"
-  echo " GT permutation sweep queue start -- $(date)"
-  echo " Tickers: $TICKERS"
-  echo " Strategies: $STRATEGIES"
-  echo " Fixed SLs: $FIXED_SLS"
-  echo " Window: $START..$END  data_source=$DATA_SOURCE  workers=$WORKERS"
-  echo "======================================================"
-
-  failed_combos=""
+# Runs the strategy x ticker x fixed_sl loop against a given ticker list; sets
+# COMBO_FAILURES (space-separated ticker/strategy/sl triples) on return. Shared by
+# both flat mode (called once with $TICKERS) and tranche mode (called once per
+# tranche with that tranche's ticker list).
+run_combo_set() {
+  local tickers="$1"
+  COMBO_FAILURES=""
   for strategy in $STRATEGIES; do
-    for ticker in $TICKERS; do
+    for ticker in $tickers; do
       for sl in $FIXED_SLS; do
         echo ""
         echo "=== $ticker | $strategy | fixed_sl=$sl -- $(date) ==="
@@ -75,11 +154,74 @@ echo "Logging to $LOG (console + file via tee)"
             --data-source "$DATA_SOURCE" --start "$START" --end "$END" \
             --workers "$WORKERS" --skip-cache-refresh; then
           echo "!!! $ticker | $strategy | fixed_sl=$sl FAILED -- continuing with remaining combos !!!"
-          failed_combos="$failed_combos ${ticker}/${strategy}/${sl}"
+          COMBO_FAILURES="$COMBO_FAILURES ${ticker}/${strategy}/${sl}"
         fi
       done
     done
   done
+}
+
+{
+  failed_combos=""
+
+  if [ "$tranche_mode" = "1" ]; then
+    echo "======================================================"
+    echo " GT permutation TRANCHE sweep start -- $(date)"
+    echo " Tranches to run: $RUN_TRANCHES"
+    echo " Strategies: $STRATEGIES"
+    echo " Fixed SLs: $FIXED_SLS"
+    echo " Window: $START..$END  data_source=$DATA_SOURCE  workers=$WORKERS"
+    echo "======================================================"
+
+    for n in $RUN_TRANCHES; do
+      marker="$STATE_DIR/tranche_${n}.done"
+      tranche_tickers="${TRANCHE_TICKERS[$n]}"
+
+      # Guard against a typo'd/stale TRANCHE=<n> (or a bad tranche file) --
+      # without this, an empty ticker list runs zero combos, COMBO_FAILURES
+      # stays empty, and the tranche gets falsely marked done (real bug
+      # caught in paired review, 2026-08-23).
+      if [ -z "$tranche_tickers" ]; then
+        echo ""
+        echo "!!! Tranche $n has no tickers in $TRANCHES_FILE -- skipping, NOT marking done. !!!"
+        failed_combos="$failed_combos tranche_${n}/unknown-tranche"
+        continue
+      fi
+
+      if [ -f "$marker" ]; then
+        echo ""
+        echo "--- Tranche $n already done ($(cat "$marker")) -- skipping. ---"
+        continue
+      fi
+
+      echo ""
+      echo "------------------------------------------------------"
+      echo " Tranche $n start -- $(date)"
+      echo " Tickers: $tranche_tickers"
+      echo "------------------------------------------------------"
+
+      run_combo_set "$tranche_tickers"
+
+      if [ -z "$COMBO_FAILURES" ]; then
+        date > "$marker"
+        echo "--- Tranche $n complete -- $(date). ---"
+      else
+        echo "--- Tranche $n had failures, NOT marking done:$COMBO_FAILURES ---"
+        failed_combos="$failed_combos $COMBO_FAILURES"
+      fi
+    done
+  else
+    echo "======================================================"
+    echo " GT permutation sweep queue start -- $(date)"
+    echo " Tickers: $TICKERS"
+    echo " Strategies: $STRATEGIES"
+    echo " Fixed SLs: $FIXED_SLS"
+    echo " Window: $START..$END  data_source=$DATA_SOURCE  workers=$WORKERS"
+    echo "======================================================"
+
+    run_combo_set "$TICKERS"
+    failed_combos="$COMBO_FAILURES"
+  fi
 
   if [ "$skip_refresh_flag" = "--skip-cache-refresh" ]; then
     echo ""
