@@ -143,6 +143,103 @@ the peer re-derive it from scrollback. **Also check `TaskList`/`TaskGet`
 first** — the dispatched task's status/metadata may already answer "what's
 the status" without needing a round-trip.
 
+## Multi-tier Agent-tool dispatch (coordinator → subagent → subagent's own reviewers)
+
+Added 2026-08-22 after a real session that dispatched via the `Agent` tool (not
+`SendMessage` to a peer session) turned far more interactive and expensive than
+intended — the user's own framing: "usually I'd dispatch tasks from another
+session and you'd orchestrate the background processes, but this got
+challenging." Same underlying checklist above still applies (review-gate,
+feature-wrap sequencing, collision checks), but `Agent`-tool subagents add a
+real second layer: a dispatched builder often spawns its OWN 4-way review
+round, so "I launched 2 things" can silently mean 2 + 8 = 10 concurrent agents
+actually running. Lessons from that session:
+
+- **Never use `subagent_type: "fork"` for this.** It inherits the entire
+  conversation and re-processes it as real input tokens on every spawn — at a
+  cache discount, not for free. On a long session this is unpredictable and
+  large (one fork alone hit ~420k tokens; could as easily have been 800k).
+  Default to a fresh `general-purpose` (or more specific) agent with a
+  complete, self-contained prompt instead — write out whatever context the
+  task actually needs explicitly. See `feedback_no_fork_subagents` memory.
+  Reserve fork-like reasoning only for something genuinely inseparable from
+  live in-turn conversation state, not just "it saves me writing the spec."
+
+- **State the full close-out convention in the FIRST prompt, every time**:
+  build → run its own paired/adversarial review round → self-commit if clean
+  or CONFIRMED findings are fixed (this project's `feature wrap` steps,
+  self-applied — no `session close`/`session wrap`, since a single-feature
+  dispatch has no conversation to log) → if genuinely stuck, raise back to
+  the coordinator or file a `docs/backlog_cache.md` entry, don't force
+  through uncertainty. Don't default to "don't commit, just report" — that
+  just adds a manual commit round-trip for the coordinator to do later for
+  no benefit, once the review has already cleared. See
+  `feedback_dispatched_agent_wrap_convention` memory.
+
+- **Get the full spec right in the initial dispatch, not via mid-flight
+  follow-up messages.** A same-session correction (e.g. "also add a CAGR>50
+  filter") sent via `SendMessage` to an already-running agent can get lost or
+  misattributed — in one real case, the agent's own final report claimed it
+  had "fabricated" a requirement that was actually relayed by the
+  coordinator, and discarded the whole feature rather than fixing bugs its
+  reviewers found in the implementation. If a follow-up correction is
+  unavoidable, make it unmistakably an explicit coordinator instruction, not
+  a soft suggestion, and re-verify after completion that it actually landed
+  (don't assume delivery = incorporation).
+
+- **Track real concurrency with `ListAgents`, not memory of what you
+  dispatched.** A dispatched builder's own spawned review round doesn't show
+  up until you check — in one real instance the coordinator believed 2
+  agents were running when `ListAgents` showed 7 (2 directly dispatched + 4
+  from one task's internal review swarm + 1 more). Check `ListAgents`
+  whenever asked "what's running" or before dispatching anything new — don't
+  answer from what you remember launching.
+
+- **Sequence dispatches that touch the same file; don't parallelize by
+  default.** Beyond the collision check in item 8 above (checking for
+  ALREADY-uncommitted changes before dispatching), two NEW dispatches that
+  will both edit the same kernel file concurrently is a live risk even when
+  each is individually well-scoped — one real session saw an unrelated
+  accidental bundled fix from one concurrent task's edits show up in
+  another's diff. If two queued tasks share a file, run them one after the
+  other rather than in parallel, even if their described scopes don't
+  obviously overlap.
+
+- **This is an orchestrator duty, not something to leave to the agents to
+  self-report.** Before writing multiple dispatch prompts (whether launching
+  them together or queuing them), explicitly reason through — for EACH
+  pair of planned/in-flight tasks — which functions/files each will realistically
+  touch, based on their stated scope, not just whether they're topically
+  related. If two plausibly overlap, decide up front: serialize them, or
+  scope one narrowly enough to provably avoid the other's area, and say so
+  in the prompt. Don't wait for `git status` to reveal a collision after the
+  fact, and don't assume a clean `git diff` at dispatch time means no
+  collision risk — that only rules out conflict with ALREADY-committed
+  state, not with another task about to start. After a batch of concurrent
+  or sequential dispatches lands, also plan the retest step explicitly: if
+  task B's diff touches code task A's tests exercised, rerun A's tests
+  (parity suite, etc.) against the merged result, don't assume A's
+  once-passing result still holds once B's changes are stacked on top.
+
+- **Instruct agents explicitly not to end a turn on an unverified "waiting" —
+  and explain WHY backgrounding-then-stopping doesn't work for a subagent.**
+  Seen repeatedly in one session: an agent ran something via `run_in_
+  background: true` (or launched a bash job with `&`) and then ended its
+  turn saying "I'll wait for the batch to complete" or "pausing until the
+  notification arrives." The real mechanism: task-notifications on job
+  completion are specific to the coordinator's own `Agent`-tool parent→child
+  relationship — a subagent backgrounding its OWN `Bash` call and ending its
+  turn has no guarantee anything wakes it back up when that job finishes.
+  "I'll wait" is a dead end there, not just bad practice; the job may finish
+  with nobody ever checking it again. State directly in every dispatch
+  prompt: **never background your own verification/build steps and then end
+  your turn** — either run it in the foreground (blocking, same tool call,
+  wait for the real result before proceeding) or, if a step is genuinely
+  long, explicitly poll it to completion (a real wait-loop checking `ps`/a
+  result file) before ending the turn. Don't end a turn on a bare "waiting"
+  with nothing concrete backing it — either produce a real result or report
+  a concrete, specific failure.
+
 ## What NOT to do
 
 - Don't assume a peer session (even one with full project context) applies
