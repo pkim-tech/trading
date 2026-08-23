@@ -205,19 +205,24 @@ def island_centers_for_scope(conn, ticker, strategy_name, version, entry_timing,
     shorter candidate list with that slot's suppression effect gone -- which can let a
     DIFFERENT row get promoted into a center slot it was never actually entitled to
     pre-prune, silently shifting the whole rest of the center list. Anchoring every
-    picked center (not just candidate-producing ones) closes this."""
+    picked center (not just candidate-producing ones) closes this.
+
+    Center detection unrestricted (2026-08-23 redesign): matches derive_phase25_
+    candidates_ground_truth's own 2026-08-23 fix -- Phase1-grid-only center restriction
+    removed there because it made a genuinely-discovered fine-mesh/multi-generation
+    island invisible to candidate selection. This function anchors whatever centers
+    THAT function actually picks, so it must query the same unrestricted scope or the
+    anchor list silently stops matching the real candidate list -- exactly the bug this
+    function's own anchoring logic exists to prevent, just one level up."""
     sl_axis_col, _ = strategies.resolve_axis_columns(strategy_name)
     sl_col = _sl_axis_real_column(sl_axis_col)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
-    tp_ph = ','.join('?' * len(hp['take_profits']))
-    sl_ph = ','.join('?' * len(hp['stop_losses']))
     rows = conn.execute(f"""
         SELECT axis_tp, {sl_col}, {ros.ROBUST_ALPHA_SQL}
         FROM backtest_cache
         WHERE ticker=? AND strategy=? AND version=? AND trades > 0
           AND kernel_version='{KERNEL_VERSION}' {scope_sql}
-          AND axis_tp IN ({tp_ph}) AND {sl_col} IN ({sl_ph})
-    """, [ticker, strategy_name, version, *scope_params, *hp['take_profits'], *hp['stop_losses']]).fetchall()
+    """, [ticker, strategy_name, version, *scope_params]).fetchall()
     if not rows:
         return []
     df_centers = pd.DataFrame(rows, columns=['take_profit', 'stop_loss', 'robust_alpha'])

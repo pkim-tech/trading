@@ -34,14 +34,16 @@ live/source DB) and POST (against the freshly --build'd pruned file):
   Method A: run_optimization_sweep.derive_phase25_candidates_ground_truth itself -- the
   real function the actual Phase2.5-GT dispatch and prune_backtest_cache_ground_truth.py
   both already trust as "what counts as a real candidate". Against the PRUNED file this
-  can't run unmodified -- its own completeness guards require the FULL Phase1 coarse grid
-  and the FULL Phase2 +/-FINE_RADIUS island mesh to still be present, which a
-  deliberately-shrunk archive by definition no longer has.
-  `_call_method_a_bypassing_completeness_gates()` monkeypatches ONLY those two guard
-  calls to "yes, complete" for the duration of one call, so the exact same core selection
-  code runs against the pruned file too -- this is a validation-only technique with no
+  can't run unmodified -- its own completeness guard requires the FULL Phase1 coarse grid
+  to still be present, which a deliberately-shrunk archive by definition no longer has.
+  `_call_method_a_bypassing_completeness_gates()` monkeypatches that ONE guard call to
+  "yes, complete" for the duration of one call, so the exact same core selection code
+  runs against the pruned file too -- this is a validation-only technique with no
   production equivalent (see prune_backtest_cache_ground_truth.py's module docstring's
-  "production re-derivation" note for why that's intentional, not a gap).
+  "production re-derivation" note for why that's intentional, not a gap). Only one guard
+  exists as of 2026-08-23 -- the former Phase2-completeness guard was removed from
+  derive_phase25_candidates_ground_truth entirely, not just re-tuned, after being measured
+  against real production data to falsely block genuinely-complete scopes.
 
   Method B: a SEPARATELY-WRITTEN raw-SQL top-3-per-island query
   (`independent_candidates_for_scope`) -- does NOT call derive_phase25_candidates_ground_
@@ -125,12 +127,16 @@ def _fingerprint_entries(db_path, entries):
 
 def _call_method_a_bypassing_completeness_gates(ticker, strategy_name, version, hp, fixed_sl, entry_timing):
     """Calls the REAL derive_phase25_candidates_ground_truth against whatever ros.DB_PATH
-    currently points at, with its two completeness guards patched to always report
+    currently points at, with its Phase1-completeness guard patched to always report
     "complete" -- see module docstring for why this is necessary (and safe: it doesn't
-    change the guards for any real caller, only for this validator's own process, only
-    for the duration of this one call)."""
-    with patch.object(ros, '_phase1_coarse_gt_status', return_value=(1, 1)), \
-         patch.object(ros, '_phase2_island_gt_status', return_value=(1, 1)):
+    change the guard for any real caller, only for this validator's own process, only
+    for the duration of this one call). Only one guard to patch now (2026-08-23): the
+    Phase2-completeness guard this used to also patch was removed from
+    derive_phase25_candidates_ground_truth entirely (measured against real production
+    data to falsely block 5/6 genuinely-complete scopes -- see that function's own
+    docstring), not just re-tuned, so patching the now-deleted symbol would raise
+    AttributeError."""
+    with patch.object(ros, '_phase1_coarse_gt_status', return_value=(1, 1)):
         return ros.derive_phase25_candidates_ground_truth(
             ticker, strategy_name, version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
 
@@ -149,17 +155,18 @@ def _independent_scope_sql(strategy_name, fixed_sl, entry_timing):
 
 def independent_candidates_for_scope(ticker, strategy_name, version, entry_timing, fixed_sl, hp):
     """Method B -- genuinely separate implementation of "top-3-robust-alpha cells within
-    +/-FINE_RADIUS of each of up to N_ISLANDS island centers, centers restricted to
-    Phase1's own coarse-grid tp/sl values, islands below PHASE25_ISLAND_CAGR_MIN dropped"
-    -- expressed as a per-island SQL ORDER BY/LIMIT query instead of derive_phase25_
+    +/-FINE_RADIUS of each of up to N_ISLANDS island centers, center detection
+    unrestricted (2026-08-23: matches derive_phase25_candidates_ground_truth's own
+    2026-08-23 redesign -- Phase1-grid-only center restriction removed so both methods
+    can see whatever any Phase2 generation actually discovered), islands below
+    PHASE25_ISLAND_CAGR_MIN marked phase4_eligible=False rather than dropped" --
+    expressed as a per-island SQL ORDER BY/LIMIT query instead of derive_phase25_
     candidates_ground_truth's pandas boolean-mask + sort_values + head(3). Runs
     unconditionally against whatever ros.DB_PATH currently points at."""
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     sl_col = ros._sl_axis_real_column(sl_axis_col)
     tpct_col_sql = 'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'
     scope_sql, scope_params = _independent_scope_sql(strategy_name, fixed_sl, entry_timing)
-    tp_ph = ','.join('?' * len(hp['take_profits']))
-    sl_ph = ','.join('?' * len(hp['stop_losses']))
 
     conn = sqlite3.connect(ros.DB_PATH, timeout=60.0)
     try:
@@ -168,8 +175,7 @@ def independent_candidates_for_scope(ticker, strategy_name, version, entry_timin
             FROM backtest_cache
             WHERE ticker=? AND strategy=? AND version=? AND trades > 0
               AND kernel_version='{pbcg.KERNEL_VERSION}' {scope_sql}
-              AND axis_tp IN ({tp_ph}) AND {sl_col} IN ({sl_ph})
-        """, (ticker, strategy_name, version, *scope_params, *hp['take_profits'], *hp['stop_losses'])).fetchall()
+        """, (ticker, strategy_name, version, *scope_params)).fetchall()
         if not centers_rows:
             return []
         df_centers = pd.DataFrame(centers_rows, columns=['take_profit', 'stop_loss', 'robust_alpha'])
@@ -224,8 +230,10 @@ def independent_candidates_for_scope(ticker, strategy_name, version, entry_timin
             if not region_rows:
                 continue
             top_cagr = region_rows[0][7]
-            if top_cagr is None or top_cagr <= ros.PHASE25_ISLAND_CAGR_MIN:
-                continue
+            # 2026-08-23 redesign: no longer drops the island's candidates outright --
+            # matches derive_phase25_candidates_ground_truth's own phase4_eligible flag,
+            # not a hard filter (see that function's docstring).
+            phase4_eligible = top_cagr is not None and top_cagr > ros.PHASE25_ISLAND_CAGR_MIN
             for tp, sl, hold, w, z, tpct, robust_alpha, cagr, trades in region_rows:
                 if cagr is None or robust_alpha is None:
                     continue  # NULL cagr/alpha on a non-top region row -- not a real,
@@ -237,6 +245,7 @@ def independent_candidates_for_scope(ticker, strategy_name, version, entry_timin
                     'max_hold_hours': int(hold), 'window': int(w),
                     'z_score_threshold': float(z), 'tpct': float(tpct),
                     'robust_alpha': float(robust_alpha), 'cagr': float(cagr),
+                    'phase4_eligible': phase4_eligible,
                 })
         candidates.sort(key=lambda c: (c['island_tp'], c['island_sl'], -c['robust_alpha'],
                                         c['take_profit'], c['stop_loss'], c['max_hold_hours'], c['tpct']))

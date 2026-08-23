@@ -61,11 +61,11 @@ START="${START:-2021-08-23}"
 END="${END:-2026-08-21}"
 DATA_SOURCE="${DATA_SOURCE:-massive}"
 WORKERS="${WORKERS:-10}"
-# Paired review, 2026-08-22: default full Phase1->2->2.5 for every combo (72 combos at
-# the 12-ticker/both-strategy/3-fixed_sl default) is expensive for a first discovery
-# pass -- MAX_PHASE=1 gives a cheap coarse-only first cut; override to 2.5 once
-# promising (ticker,strategy,fixed_sl) combos are known.
-MAX_PHASE="${MAX_PHASE:-1}"
+# Corrected 2026-08-23: default is full Phase1->2->2.5 per combo (finish one
+# ticker/strategy/fixed_sl combination all the way before moving to the next),
+# not a phase1-only breadth-first pass across every combo. Override to 1 (or 2)
+# explicitly for a deliberate cheap coarse-only first cut.
+MAX_PHASE="${MAX_PHASE:-2.5}"
 
 STATE_DIR="logs/.gt_tranche_state"
 TRANCHES_FILE="scripts/gt_tranches.txt"

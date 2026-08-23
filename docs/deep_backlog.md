@@ -1,5 +1,100 @@
 # Backlog
 
+## ✅ [backtest] Resolved 2026-08-23 (late) — GT sweep engine's Phase2/Phase2.5 unnecessarily diverged from v5, causing a cascade of real bugs; fixed by reuse instead of rebuild
+
+Direct continuation of the earlier 2026-08-23 entry (multi-generation search silently
+disabled, data-backfill/sweep race). That entry's fixes (the `exclude_centers` forcing
+mechanism, the ceiling-walk-past-30 change, `--generations` bumped to 5) were THEMSELVES
+found broken by two further review rounds this same day and reverted entirely, along with
+several more real bugs found by simply asking "does v5 already do this" at each step:
+
+1. **`exclude_centers`'s exclusion radius (6) exceeded the mesh radius (4)** — every cell a
+generation computed sat inside its own exclusion zone, so a genuine edge cell could never
+become the next generation's center. The walk could hop to unrelated regions but couldn't
+actually crawl outward. Reverted entirely rather than re-tuned, once it became clear v5's
+real generation loop (`run_phase2_island`, still fully intact and unmodified in the
+codebase) never needed any exclusion mechanism at all — it just re-derives fresh each
+pass, unrestricted, and converges naturally.
+
+2. **The ceiling-walk change** (letting tp/sl exceed the grid's nominal max of 30) let real
+production data land at tp=31-34, but `run_phase25_cliff_box_ground_truth`'s cliff-box
+generation and `prune_backtest_cache_ground_truth.py`'s keep-manifest logic both stayed
+hard-clamped to 30 — a real off-grid winner (confirmed against live AGQ data) would get a
+truncated/empty cliff box and could be deleted by a real prune run. Also: v5 never walked
+past 30 either (same shared `FINE_RADIUS`-based clamp) — this was a genuinely new
+capability, not a v5-parity gap, and not worth the risk it introduced. Reverted.
+
+3. **Root cause of both, and the real lesson**: `run_phase25_cliff_box_ground_truth` and
+`derive_phase25_candidates_ground_truth` were restricted to Phase1's coarse-grid values for
+island-center detection (added 2026-08-22 to fix a narrow, different bug in the
+completeness-check function) — meaning everything a generation-loop walk discovered beyond
+the original 3 islands was invisible to actual candidate selection, no matter how good it
+was. v5's own `run_phase25_cliff_box` has never had any such restriction — it queries the
+single global-best row from the entire current scope, unconditionally. Fixed by
+unrestricting both GT functions to match v5's real, always-correct behavior. Verified
+against real AGQ data: a genuinely-discovered off-grid candidate (tp=31, the actual best
+cell in the whole scope) is now correctly selected and reported, where before it was
+silently unreachable.
+
+4. **The Phase2-completeness gate (`_phase2_island_gt_status`) was removed entirely, not
+re-tuned.** Added 2026-08-22 as a hard block before Phase2.5, it re-derives expected
+centers from whatever's currently in `backtest_cache` — but a genuinely-progressing
+multi-generation walk's own last-generation writes always shift what a fresh re-derivation
+would want next, so the check can only pass in the degenerate case of zero progress.
+Measured directly against real production data: it falsely blocked 5 of 6 real scopes
+tested, including scopes with already-working Phase2.5 data from before this session.
+Real justification for removing it outright (not just loosening it): `dispatch_parallel_
+grid_ground_truth` is fully synchronous (blocks on its entire task batch, no early return),
+so whatever centers get picked in one call are guaranteed fully attempted by the time that
+call returns — there's no execution path where a normal run leaves an island's
+neighborhood genuinely incomplete, so the gate was solving a problem the dispatch
+mechanism already structurally prevents. v5's `run_phase25_cliff_box` has zero
+completeness check between Phase2 and Phase2.5, and never has.
+
+5. **Also fixed same day, smaller items**: `PHASE25_ISLAND_CAGR_MIN` (50→30) no longer
+drops an island's candidates outright — it only sets a `phase4_eligible` flag consumed to
+skip the expensive drought/add-on overlay compute for low-CAGR candidates specifically;
+every candidate still appears in the report with its real numbers. A new, separate,
+much-narrower `PHASE25_ISLAND_CLIFFBOX_CAGR_MIN=0` skips cliff-boxing only for islands
+whose coarse cell is already negative (real compute savings, low near-miss risk, unlike
+the old 50% gate which risked dropping real borderline candidates). `--generations`
+settled at 3 (matching v5's own historical convention) after real campaign runs showed the
+walk consistently converges by generation 3 — 4-5 were pure no-op overhead. The report
+printer and `candidate_summary_report.py`'s xlsx writer now surface `phase4_eligible`
+explicitly (a skipped candidate reads "SKIPPED", not a blank indistinguishable from a real
+compute failure). Both prune-tool files (`prune_backtest_cache_ground_truth.py`'s
+`island_centers_for_scope`, `prune_backtest_cache_ground_truth_validate.py`'s independent
+Method B) updated to match the unrestricted-center/phase4_eligible-not-drop behavior — a
+later review round found the validator's own `patch.object` call still referenced the
+deleted `_phase2_island_gt_status` symbol (would have hard-crashed the mandatory prune
+gate with an `AttributeError`); fixed same pass.
+
+**Real evidence this needed real review, not just self-checking**: four separate paired-
+review rounds ran against this body of work over the course of the day (Opus+Fable twice,
+then Opus solo twice more as the diff evolved), and each of the first three found at least
+one real, previously-unnoticed bug — including the reviewer who first suggested the
+`exclude_centers` design also being the one whose math (`min_sep` vs `FINE_RADIUS`) had the
+fatal flaw. The pattern across every single bug: it was found by asking "what does v5
+actually do here" and discovering GT had diverged with no real justification, not by
+finding a subtle logic error in original reasoning. See `docs/sweep_engine_v7_lessons.md`
+for the forward-looking framing and `feedback_reuse_over_rebuild_default`/
+`feedback_shallow_audit_passes_missed_real_gaps` (agent memory) for the process lessons.
+
+**Outstanding, deliberately not fixed this session**: real off-grid AGQ rows (tp=31-34,
+~180k rows) from the reverted ceiling-walk attempt were left in place rather than deleted
+— they're not a correctness risk (confirmed: a candidate's own cliff-box clamp is back to
+30 regardless of whether the data exists, so nothing reads these rows unsafely), just
+real, valid, already-computed data. The FULL/PARTIAL neighbor-completeness labeling this
+would ideally get (`scripts/top_safe_nodes_full_partial.py`'s existing v5 mechanism, never
+ported to the GT candidate report) remains the same deliberately-deferred, correctly-
+diagnosed low-priority gap it was called in the 2026-08-22 adversarial plan review
+(`docs/conversation_summary.md:8296`) — not new, not escalated by today's findings.
+Tranches 1-3 (the 12 real-money tickers) were resweept partway through today's various
+broken-then-fixed states and will need a genuine resweep under the final code before their
+results are trustworthy — use tranche mode (`TRANCHE=1`/`2`/`3` or `--tranches`), not a
+flat `TICKERS=` list spanning all 12, which would reintroduce the exact strategy-outermost
+delay tranching exists to bound.
+
 ## [backtest] Idea, raised 2026-08-22, not yet scoped or built — trade the inverse ticker on a gap-fill-continuation signal, instead of just eating it as a long-side risk
 Builds directly on the existing gap-fill-continuation finding (`backlog_cache.md`, "carried gap-fills... continued falling through the stop-loss level within the SAME hour," 54-71% of the time depending on ticker, real 3yr SOXL/LABU/JNUG/KORU/DPST/HIBL data) — that finding was originally framed as a risk to the existing long position, but the same directional bias is itself a signal: since we can't short SOXL directly, when a gap-fill-continuation condition is detected, buy the ticker's real inverse (SOXS for SOXL) with its own protective SL instead of/alongside eating the loss on the long side.
 

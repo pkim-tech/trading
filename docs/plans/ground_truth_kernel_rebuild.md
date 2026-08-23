@@ -492,6 +492,12 @@ worth exploring, separate from what a parameter search might suggest.
 
 ## Follow-on (separate future project, not this plan)
 
+**Sweep engine v7**: `docs/sweep_engine_v7_lessons.md` (2026-08-23) — real design issues
+found running the first full GT permutation campaign (multi-generation search silently
+disabled by a narrow completeness-check fix, hard completeness gates new to GT and why,
+data-backfill/sweep ordering, the un-precedented Phase2.5 CAGR gate). Read before designing
+any successor to the current Phase1→2→2.5 engine.
+
 Folding together two previously-separate deferred backlog items, all sharing the same
 real trigger condition ("a new strategy variant/kernel architecture is actually being
 designed"): the `backtest_cache` overloaded-columns schema definition (2026-08-07,

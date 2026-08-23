@@ -30,10 +30,19 @@ FINE_RADIUS    = 4
 N_ISLANDS      = 3
 ISLAND_MIN_SEP = 6
 CLIFF_RADIUS   = 2
-# Same threshold as idx_bc_cagr_candidates' partial index (rebuild_indexes()) -- an
-# island whose own best cell doesn't clear this isn't worth cliff-boxing regardless of
-# how it ranks against other islands (2026-08-22, run_phase25_cliff_box_ground_truth).
-PHASE25_ISLAND_CAGR_MIN = 50
+# Same threshold as idx_bc_cagr_candidates' partial index (rebuild_indexes()) -- gates
+# Phase4 (drought/add-on overlay) eligibility in derive_phase25_candidates_ground_truth,
+# NOT whether an island gets cliff-boxed at all (2026-08-23 redesign: the original
+# 2026-08-22 version of this gate blocked cliff-boxing itself, which had no v5 precedent
+# and risked dropping a real near-miss -- e.g. a coarse 33 sitting next to a genuine
+# cliff-safe 55 -- before refinement ever got a chance to find it).
+PHASE25_ISLAND_CAGR_MIN = 30
+# Separate, much more conservative gate (2026-08-23): skips cliff-boxing ONLY for an
+# island whose coarse top cell is already negative -- unlike PHASE25_ISLAND_CAGR_MIN's
+# 50% bar, a negative coarse cell is unlikely to be hiding a genuinely better neighbor
+# (it already lost to its own island's own top rank), so this is a real compute-saving
+# measure without the near-miss risk the 50% cliff-boxing gate had.
+PHASE25_ISLAND_CLIFFBOX_CAGR_MIN = 0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1979,41 +1988,31 @@ def _phase1_coarse_gt_status(ticker, strategy_name, config_version, hp, entry_ti
 
 def _phase2_island_gt_tasks(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl):
     """Task set (tp, sl, hold, w, z, tpct) that Phase2-Island-GT's own island-mesh
-    generation builds for this exact campaign scope. Factored out of
-    run_phase2_island_ground_truth so _phase2_island_gt_status can compare "what SHOULD
-    have been computed" against real backtest_cache rows using the IDENTICAL mesh-
-    generation logic (island centers off Phase1's ground_truth_v6 rows, ±FINE_RADIUS),
-    not a re-derived approximation -- Phase2's mesh size is data-dependent (unlike
-    Phase1's fixed grid), so there's no formula for `expected`, only rebuilding the
-    actual mesh. Caller must have already confirmed Phase1-Coarse-GT is complete.
+    generation builds for this exact campaign scope. Phase2's mesh size is data-dependent
+    (unlike Phase1's fixed grid), so there's no formula for `expected`, only rebuilding
+    the actual mesh.
 
-    The center-detection query is deliberately restricted to axis_tp/sl values that are
-    literally IN Phase1's own coarse-grid lists (hp['take_profits']/hp['stop_losses']) --
-    found by paired-review (2026-08-22, Opus independent-cold + Fable independent-cold,
-    both converged on this): without this filter, calling this function AFTER Phase2 has
-    already run (as _phase2_island_gt_status does, to check completeness) would pick
-    centers off a df_wz that now also includes Phase2's own fine-mesh rows, which very
-    commonly shifts the top robust-alpha cell to a refined (tp, sl) the coarse grid never
-    had -- producing a DIFFERENT, larger mesh than the one Phase2 actually dispatched, so
-    the completeness check would false-block a Phase2 run that genuinely finished.
-    Restricting to Phase1's own grid values makes center detection depend only on
-    Phase1-Coarse-GT's rows, which are identical whether this runs before or after Phase2
-    -- matching the ORIGINAL real-dispatch call site's behavior exactly (before this
-    filter existed, Phase1-Coarse-GT's rows were the only ground_truth_v6 rows in scope
-    at that call time anyway, so this filter is a no-op there and only changes behavior
-    for the new reuse-after-Phase2-completes case)."""
+    Unrestricted -- sees the full current scope, including any prior generation's own
+    fine-mesh rows, matching legacy's run_phase2_island/run_phase25_cliff_box exactly
+    (neither has ever had any grid restriction). This function used to also support a
+    restrict_to_phase1_grid=True mode for _phase2_island_gt_status's completeness check
+    (added 2026-08-22, preemptively, for a hypothetical mid-Phase2 call that never
+    actually occurs in the real call chain) -- removed 2026-08-23 after confirming
+    against real data that the restricted set is NOT reliably a subset of what
+    unrestricted dispatch actually computes (different pick_island_centers picks on
+    different underlying data), which could false-block a genuinely complete run. Both
+    real callers of the completeness check only ever run after Phase2's entire
+    generation loop finishes (data is static), so matching dispatch's own query exactly
+    is both simpler and correct, not just tolerable."""
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
-    tp_ph = ','.join('?' * len(hp['take_profits']))
-    sl_ph = ','.join('?' * len(hp['stop_losses']))
     tasks = set()
     with sqlite3.connect(DB_PATH) as conn:
         for z in hp['z_score_thresholds']:
             for w in hp['windows']:
                 for tpct in trail_pcts:
-                    params = [config_version, ticker, strategy_name, float(z), int(w),
-                              *hp['take_profits'], *hp['stop_losses'], *scope_params]
+                    params = [config_version, ticker, strategy_name, float(z), int(w), *scope_params]
                     tpct_filter = ""
                     if fourth_axis_col == 'trail_pct':
                         tpct_filter = "AND trail_sell_pct=?"
@@ -2024,7 +2023,6 @@ def _phase2_island_gt_tasks(ticker, strategy_name, config_version, hp, entry_tim
                         FROM backtest_cache
                         WHERE version=? AND ticker=? AND strategy=?
                           AND z_score_threshold=? AND window=? AND trades > 0
-                          AND axis_tp IN ({tp_ph}) AND {_sl_axis_real_column(sl_axis_col)} IN ({sl_ph})
                           AND kernel_version='ground_truth_v6' {scope_sql} {tpct_filter}
                     """, conn, params=params)
 
@@ -2038,68 +2036,6 @@ def _phase2_island_gt_tasks(ticker, strategy_name, config_version, hp, entry_tim
                                 for hold in hp['hold_time_caps']:
                                     tasks.add((tp, sl, int(hold), int(w), float(z), float(tpct)))
     return tasks
-
-
-def _phase2_island_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl):
-    """(done_count, expected_count) for Phase2-Island-GT's own mesh, for this exact
-    campaign scope. `expected` is Phase2's own island-mesh size, rebuilt via
-    _phase2_island_gt_tasks -- not a fixed-grid formula like Phase1's, since island
-    centers are data-dependent and there's no way to know the mesh size without
-    literally regenerating it the same way run_phase2_island_ground_truth does.
-
-    `done` is deliberately NOT filtered to phase='Phase2-Island-GT'. Corrected during
-    paired review (2026-08-22, Opus contextual pass): the original wording here claimed
-    dispatch_parallel_grid_ground_truth's cache-hit path relabels an existing coordinate
-    on a later rerun -- verified false, it skips any coordinate already in cached_map and
-    never rewrites it. The REAL reason not to filter on phase is the same one this whole
-    fix exists for: a coordinate can be genuinely computed and inside Phase2's own mesh
-    while still legitimately carrying an earlier phase's label (e.g. it happened to also
-    be one of Phase1's coarse-grid cells, which Phase2 cache-hits rather than
-    recomputing/relabeling). What matters is whether the exact
-    (tp, sl, hold, w, z, tpct) coordinate has ANY ground_truth_v6 row, not which
-    phase's name currently happens to be stamped on it -- this is also exactly the
-    scenario this check exists to unblock: the true best row for a scope can
-    legitimately still carry phase='Phase1-Coarse-GT' if Phase2's mesh confirmed
-    nothing nearby beats it.
-
-    Caller must have already confirmed Phase1-Coarse-GT is complete for this scope
-    (island centers are read off Phase1's own backtest_cache rows)."""
-    tasks = _phase2_island_gt_tasks(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
-    if not tasks:
-        return 0, 0
-    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
-    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
-    zs = sorted({t[4] for t in tasks})
-    ws = sorted({t[3] for t in tasks})
-    holds = sorted({t[2] for t in tasks})
-    z_ph = ','.join('?' * len(zs))
-    w_ph = ','.join('?' * len(ws))
-    hold_ph = ','.join('?' * len(holds))
-    tpct_filter, tpct_params = "", []
-    tpct_select = ""
-    if fourth_axis_col == 'trail_pct':
-        tpcts = sorted({t[5] for t in tasks})
-        tpct_filter = f" AND trail_sell_pct IN ({','.join('?' * len(tpcts))})"
-        tpct_params = [float(v) for v in tpcts]
-        tpct_select = ", trail_sell_pct"
-    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
-        rows = conn.execute(
-            f"SELECT axis_tp, {_sl_axis_real_column(sl_axis_col)}, max_hold_hours, window, z_score_threshold"
-            f"{tpct_select} FROM backtest_cache WHERE strategy=? AND version=? AND ticker=?"
-            f" AND kernel_version='ground_truth_v6'"
-            f" AND z_score_threshold IN ({z_ph}) AND window IN ({w_ph})"
-            f" AND max_hold_hours IN ({hold_ph}) {scope_sql} {tpct_filter}",
-            (strategy_name, config_version, ticker, *zs, *ws, *holds, *scope_params, *tpct_params)
-        ).fetchall()
-    done_coords = set()
-    for r in rows:
-        if fourth_axis_col == 'trail_pct':
-            tp, sl, hold, w, z, tpct = r
-        else:
-            tp, sl, hold, w, z = r
-            tpct = 0.0
-        done_coords.add((int(tp), int(sl), int(hold), int(w), float(z), float(tpct)))
-    return len(tasks & done_coords), len(tasks)
 
 
 def run_phase2_island_ground_truth(shared_pool, ticker, strategy_name, config_version, hp, spy_bh,
@@ -2121,7 +2057,19 @@ def run_phase2_island_ground_truth(shared_pool, ticker, strategy_name, config_ve
     the fix is to fail loudly, not to warn-and-continue). `hp` MUST be the full campaign
     hp dict (take_profits/stop_losses included, matching run_phase1_coarse's own shape) —
     passing a reduced hp (as an earlier smoke test did) will raise here rather than
-    silently under-checking completeness."""
+    silently under-checking completeness.
+
+    Callable multiple times with an increasing `generation` number (see
+    run_ground_truth_phase1.py's --generations loop) to mirror the legacy engine's own
+    multi-generation Phase2 -- each call re-derives centers off whatever's currently in
+    backtest_cache (including any prior generation's own fine-mesh rows), same as
+    run_phase2_island (legacy) always did. No exclusion/forcing mechanism -- a
+    generation that finds nothing new simply re-picks the same centers and cache-hits
+    its way to a fast no-op, matching legacy's real behavior exactly (2026-08-23: an
+    earlier attempt to force new territory via an exclude-prior-centers mechanism had a
+    real bug -- excluded radius exceeded the mesh radius, making genuine edge-walking
+    structurally impossible -- reverted in favor of this simpler, legacy-faithful
+    approach)."""
     _require_full_gt_hp(hp, strategy_name, "run_phase2_island_ground_truth")
     done, expected = _phase1_coarse_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
     if done < expected:
@@ -2209,31 +2157,27 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
     in a single call (same mechanism, phase_label unchanged, so downstream consumers
     filtering on "Phase2.5-CliffBox-GT" are unaffected).
 
-    Center detection is restricted to rows whose (tp, sl) are literally in Phase1's own
-    coarse-grid lists (hp['take_profits']/hp['stop_losses']) -- same rerun-safety
-    rationale as _phase2_island_gt_tasks (see its docstring): without this, a RERUN of
-    this function would pick up its own previously-dispatched Phase2.5-CliffBox-GT rows
-    (which fall inside the fine-mesh, off Phase1's coarse grid) and could shift centers
-    between calls. Once centers are fixed, each island's actual top-3 candidates are
-    still selected from the FULL scope data (Phase2's fine mesh included), since that's
-    the refined data the ranking is supposed to use.
+    Center detection is unrestricted (2026-08-23 redesign) -- sees the full current
+    scope, not just Phase1's coarse grid, matching legacy's run_phase25_cliff_box
+    exactly (no restriction, ever). Without this, a genuinely-discovered fine-mesh or
+    multi-generation island would be invisible to Phase2.5/candidate selection (found
+    2026-08-23: this was the actual behavior before this fix, silently making the whole
+    generation loop's work unreachable).
 
-    HARD-BLOCKS on two independent completeness checks, per two paired-review passes on
-    2026-08-22: (1) Phase1-Coarse-GT itself must be complete for this scope (same
-    _require_full_gt_hp/_phase1_coarse_gt_status check as run_phase2_island_ground_truth
-    -- checked first here since it's cheap and catches an early smoke-test-against-a-
-    still-growing-Phase1-grid scenario). (2) Phase2-Island-GT's own mesh must be complete
-    for this scope (_phase2_island_gt_status, mirroring (1)'s completeness-vs-fixed-label
-    pattern) -- this REPLACES an earlier version of this guard that instead required the
-    current best-robust-alpha row to literally carry phase='Phase2-Island-GT'. That
-    label-equality check was itself a false block: dispatch_parallel_grid_ground_truth's
-    cache-hit path never relabels a coordinate it skips because it's already cached, and
-    Phase2's own island centers are, by construction, Phase1's own local best points -- so
-    if Phase2's mesh search genuinely confirms nothing beats Phase1's center, the true
-    best row legitimately stays labeled 'Phase1-Coarse-GT' even though Phase2 completed
-    correctly and did its job. Checking mesh completeness instead of the winning row's
-    label fixes this: once Phase2 is confirmed complete for the scope, proceed regardless
-    of which phase label the current best row happens to carry."""
+    HARD-BLOCKS on Phase1-Coarse-GT's completeness only (same _require_full_gt_hp/
+    _phase1_coarse_gt_status check as run_phase2_island_ground_truth) -- Phase1 has a
+    real, external race to guard against (Massive data can still be mid-build) and a
+    fixed, formula-computable expected size, so this gate is sound. A second gate on
+    Phase2-Island-GT's own completeness (_phase2_island_gt_status) existed here from
+    2026-08-22 to 2026-08-23 and was REMOVED (not just re-tuned) after being measured
+    against real production data: it re-derives centers from whatever's in the cache
+    RIGHT NOW, but a genuinely-progressing multi-generation walk's own last-generation
+    writes always shift what a fresh re-derivation would want next -- the check can only
+    pass in the degenerate case where the walk made zero progress. Applied as a hard
+    gate, it blocked 5 of 6 real production scopes tested, including scopes with
+    already-working Phase2.5-CliffBox-GT data from before this redesign. No v5 analog
+    ever existed for this gate; v5's run_phase25_cliff_box has never had ANY completeness
+    check between Phase2 and Phase2.5."""
     _require_full_gt_hp(hp, strategy_name, "run_phase25_cliff_box_ground_truth")
     p1_done, p1_expected = _phase1_coarse_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
     if p1_done < p1_expected:
@@ -2243,20 +2187,9 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
             f"point, which itself depends on Phase1 having actually finished. Wait for "
             f"Phase1-Coarse-GT to finish before calling this."
         )
-    p2_done, p2_expected = _phase2_island_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
-    if p2_done < p2_expected:
-        raise RuntimeError(
-            f"[{ticker}] Phase2.5-GT blocked: Phase2-Island-GT is incomplete for this campaign "
-            f"scope ({p2_done:,}/{p2_expected:,} cells) -- Phase2.5 refines around the true best "
-            f"point, which depends on Phase2's island mesh having actually finished. Wait for "
-            f"Phase2-Island-GT to finish before calling this."
-        )
-
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
-    tp_ph = ','.join('?' * len(hp['take_profits']))
-    sl_ph = ','.join('?' * len(hp['stop_losses']))
     with sqlite3.connect(DB_PATH) as conn:
         df = pd.read_sql(f"""
             SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
@@ -2267,20 +2200,27 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
             WHERE version=? AND ticker=? AND strategy=? AND trades > 0
               AND kernel_version='ground_truth_v6' {scope_sql}
         """, conn, params=(config_version, ticker, strategy_name, *scope_params))
-        df_centers = pd.read_sql(f"""
-            SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
-                   {ROBUST_ALPHA_SQL} AS robust_alpha
-            FROM backtest_cache
-            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
-              AND axis_tp IN ({tp_ph}) AND {_sl_axis_real_column(sl_axis_col)} IN ({sl_ph})
-              AND kernel_version='ground_truth_v6' {scope_sql}
-        """, conn, params=(config_version, ticker, strategy_name, *hp['take_profits'],
-                            *hp['stop_losses'], *scope_params))
-    if df.empty or df_centers.empty:
+    if df.empty:
         logger.warning(f"[{ticker}] Phase2.5-GT: no ground_truth_v6 rows in scope -- nothing to cliff-box.")
         return
 
-    centers = pick_island_centers(df_centers)
+    # Center detection matches v5's actual behavior (2026-08-23 redesign): unrestricted
+    # over the FULL current scope, not just Phase1's original coarse-grid values. Safe
+    # here specifically because run_phase25_cliff_box_ground_truth only ever runs AFTER
+    # Phase2's entire generation loop has finished, and dispatch_parallel_grid_ground_
+    # truth is fully synchronous (blocks on its whole task batch, no early return) -- so
+    # whatever centers the last generation picked are guaranteed fully ATTEMPTED by the
+    # time this runs (a per-cell failure still just logs and skips, same as any dispatch
+    # call, not a new risk this introduces), not just "static" in the sense of no
+    # concurrent writer. The
+    # rerun-instability concern that motivated the earlier Phase1-grid-only restriction
+    # only applied to re-deriving centers WHILE Phase2 is still actively writing, which
+    # can't happen here either way. This lets Phase2.5 actually see
+    # whatever the generation loop's own walk discovered -- v5's own Phase2.5
+    # (run_phase25_cliff_box) queries its single global-best row with no
+    # tp/sl restriction at all, so this restores real v5 parity rather than the
+    # GT-only restriction that made the generation loop's discoveries unreachable.
+    centers = pick_island_centers(df)
 
     tasks = set()
     for tp_c, sl_c in centers:
@@ -2307,16 +2247,21 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
             # cagr for the whole scope before Phase2.5 runs -- flagged loud in case a
             # future standalone/resume-from-phase call skips that backfill.
             logger.error(f"[{ticker}] Phase2.5-GT: island(TP={tp_c} SL={sl_c})'s top cell has "
-                         f"NULL cagr (unknown, not sub-{PHASE25_ISLAND_CAGR_MIN}) -- skipping "
-                         f"this island rather than risk cliff-boxing an unranked cell. If this "
-                         f"fires outside the standard Phase1->2->2.5 chain, run Phase1 for this "
-                         f"scope first to backfill cagr.")
+                         f"NULL cagr (unknown, not sub-{PHASE25_ISLAND_CLIFFBOX_CAGR_MIN}) -- "
+                         f"skipping this island rather than risk cliff-boxing an unranked cell. "
+                         f"If this fires outside the standard Phase1->2->2.5 chain, run Phase1 "
+                         f"for this scope first to backfill cagr.")
             continue
-        if top_cagr <= PHASE25_ISLAND_CAGR_MIN:
+        if top_cagr <= PHASE25_ISLAND_CLIFFBOX_CAGR_MIN:
             logger.info(f"[{ticker}] Phase2.5-GT: skipping island(TP={tp_c} SL={sl_c}) -- "
-                        f"top cell cagr={top_cagr:.2f} does not clear the {PHASE25_ISLAND_CAGR_MIN}% "
-                        f"candidate-quality bar (idx_bc_cagr_candidates' threshold).")
+                        f"top cell cagr={top_cagr:.2f} is negative, not worth cliff-boxing.")
             continue
+        # No quality gate beyond the negative-CAGR skip above (2026-08-23 redesign): v5's
+        # own Phase2.5 (run_phase25_cliff_box) cliff-boxes its single best row
+        # unconditionally. PHASE25_ISLAND_CAGR_MIN still applies, but only downstream at
+        # derive_phase25_candidates_ground_truth, where it decides which candidates are
+        # eligible for Phase4 (drought/add-on overlay), not whether an island gets
+        # refined at all.
 
         for _, cand in region.head(3).iterrows():
             tp_c2, sl_c2, hold_c, w_c, z_c = (int(cand['take_profit']), int(cand['stop_loss']),
@@ -2366,10 +2311,15 @@ def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version
     """Read-only re-derivation of run_phase25_cliff_box_ground_truth's own up-to-
     (N_ISLANDS * 3) candidate list, against whatever Phase1/Phase2-GT rows already exist
     in backtest_cache -- does NOT dispatch anything (no Phase2.5-CliffBox-GT rows are
-    required or produced). Same completeness guards, same center/top-3-per-island
-    selection logic, same PHASE25_ISLAND_CAGR_MIN gate -- kept in exact lockstep with
-    that function's own candidate-selection block since a divergence here would compute
-    add-on safety for a candidate set the real Phase2.5-GT dispatch wouldn't recognize.
+    required or produced). Same Phase1-completeness guard, same center/top-3-per-island
+    selection logic as that function (no Phase2-completeness guard -- removed 2026-08-23,
+    see that function's own docstring for why) -- but the CAGR gates deliberately differ now
+    (2026-08-23 redesign), not kept in lockstep: run_phase25_cliff_box_ground_truth uses
+    the narrower PHASE25_ISLAND_CLIFFBOX_CAGR_MIN (skips cliff-boxing only a negative-
+    coarse-cell island, real compute savings with low near-miss risk); this function
+    uses PHASE25_ISLAND_CAGR_MIN to set each returned candidate's `phase4_eligible` flag
+    (whether it's worth the expensive drought/add-on overlay), never to drop a candidate
+    outright -- every island this function finds a center for returns real candidates.
 
     Returns a list of dicts: {island_tp, island_sl, take_profit, stop_loss,
     max_hold_hours, window, z_score_threshold, tpct, robust_alpha, cagr}."""
@@ -2378,16 +2328,9 @@ def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version
     if p1_done < p1_expected:
         raise RuntimeError(f"[{ticker}] derive_phase25_candidates_ground_truth blocked: "
                             f"Phase1-Coarse-GT incomplete ({p1_done:,}/{p1_expected:,}).")
-    p2_done, p2_expected = _phase2_island_gt_status(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl)
-    if p2_done < p2_expected:
-        raise RuntimeError(f"[{ticker}] derive_phase25_candidates_ground_truth blocked: "
-                            f"Phase2-Island-GT incomplete ({p2_done:,}/{p2_expected:,}).")
-
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
-    tp_ph = ','.join('?' * len(hp['take_profits']))
-    sl_ph = ','.join('?' * len(hp['stop_losses']))
     with sqlite3.connect(DB_PATH) as conn:
         df = pd.read_sql(f"""
             SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
@@ -2398,19 +2341,13 @@ def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version
             WHERE version=? AND ticker=? AND strategy=? AND trades > 0
               AND kernel_version='ground_truth_v6' {scope_sql}
         """, conn, params=(config_version, ticker, strategy_name, *scope_params))
-        df_centers = pd.read_sql(f"""
-            SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
-                   {ROBUST_ALPHA_SQL} AS robust_alpha
-            FROM backtest_cache
-            WHERE version=? AND ticker=? AND strategy=? AND trades > 0
-              AND axis_tp IN ({tp_ph}) AND {_sl_axis_real_column(sl_axis_col)} IN ({sl_ph})
-              AND kernel_version='ground_truth_v6' {scope_sql}
-        """, conn, params=(config_version, ticker, strategy_name, *hp['take_profits'],
-                            *hp['stop_losses'], *scope_params))
-    if df.empty or df_centers.empty:
+    if df.empty:
         return []
 
-    centers = pick_island_centers(df_centers)
+    # Center detection unrestricted (2026-08-23 redesign, matches run_phase25_cliff_box_
+    # ground_truth's own fix) -- sees whatever any Phase2 generation actually wrote,
+    # not just Phase1's original coarse grid.
+    centers = pick_island_centers(df)
     candidates = []
     for tp_c, sl_c in centers:
         region = df[(df['take_profit'] - tp_c).abs().le(FINE_RADIUS) &
@@ -2427,8 +2364,14 @@ def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version
         _tb_asc = [False] + [asc for _, asc in GT_CANDIDATE_TIEBREAK]
         region = region.sort_values(_tb_cols, ascending=_tb_asc)
         top_cagr = region.iloc[0]['cagr']
-        if pd.isna(top_cagr) or top_cagr <= PHASE25_ISLAND_CAGR_MIN:
-            continue
+        # PHASE25_ISLAND_CAGR_MIN (2026-08-23 redesign): no longer drops the island's
+        # candidates outright -- they're still real candidates the report should show.
+        # It only decides Phase4 (drought/add-on overlay) eligibility, since overlay
+        # compute isn't worth spending on a candidate whose own core CAGR is already
+        # sub-threshold (e.g. negative) -- that decision belongs at this reporting/
+        # selection layer, not inside Phase2.5's execution (which cliff-boxes every
+        # island unconditionally now, matching v5).
+        phase4_eligible = not pd.isna(top_cagr) and top_cagr > PHASE25_ISLAND_CAGR_MIN
         for _, cand in region.head(3).iterrows():
             candidates.append({
                 'island_tp': tp_c, 'island_sl': sl_c,
@@ -2436,6 +2379,7 @@ def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version
                 'max_hold_hours': int(cand['max_hold_hours']), 'window': int(cand['window']),
                 'z_score_threshold': float(cand['z_score_threshold']), 'tpct': float(cand['tpct']),
                 'robust_alpha': float(cand['robust_alpha']), 'cagr': float(cand['cagr']),
+                'phase4_eligible': phase4_eligible,
             })
     return candidates
 
@@ -2731,9 +2675,11 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
 # already-selected Phase2.5-GT candidates per campaign (NOT the full grid -- see
 # build_candidate_report_ground_truth's own docstring). Two robustness bars are used
 # throughout this codebase for two different purposes and are NOT interchangeable:
-# PHASE25_ISLAND_CAGR_MIN (50%) gates whether an island is even worth cliff-boxing in the
-# first place (candidate-quality bar); GT_ROBUSTNESS_CAGR_MIN (20%) is the established
-# "does this survive a perturbation" bar applied to checks 9/13 below (robustness bar).
+# PHASE25_ISLAND_CAGR_MIN (30%) gates Phase4 (drought/add-on overlay) eligibility for an
+# already-selected candidate (candidate-quality bar; does NOT block cliff-boxing itself
+# -- see PHASE25_ISLAND_CLIFFBOX_CAGR_MIN for that); GT_ROBUSTNESS_CAGR_MIN (20%) is the
+# established "does this survive a perturbation" bar applied to checks 9/13 below
+# (robustness bar).
 GT_ROBUSTNESS_CAGR_MIN = 20
 GT_FLUKE_MIN_TRADES = 10  # same "too few to trust" threshold as checklist_v65.check4_stability
 GT_WALK_FORWARD_FOLDS = 5  # same fold count as checklist_v65.FOLDS
@@ -2844,7 +2790,7 @@ def _check13_walk_forward_gt(trades, robustness_cagr_min=GT_ROBUSTNESS_CAGR_MIN)
     same equal-TIME-span 5-fold slicing. Reports each fold's own CAGR (GT trades carry
     Return directly, no alpha-vs-SPY split needed the way the hourly path's possible/
     pessimistic/certain triple required) and flags a fold 'fragile' at CAGR<=20%
-    (GT_ROBUSTNESS_CAGR_MIN, the project's established robustness bar) -- NOT the 50%
+    (GT_ROBUSTNESS_CAGR_MIN, the project's established robustness bar) -- NOT the 30%
     PHASE25_ISLAND_CAGR_MIN candidate-quality bar used elsewhere in this pipeline; the
     two are deliberately different thresholds for two different purposes."""
     if len(trades) < GT_WALK_FORWARD_FOLDS:
@@ -2934,10 +2880,25 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
 
     addon_eligible, addon_eligibility_reason = addon_margin_eligible_ticker(ticker)
 
-    addon_results = run_addon_cliff_safety_ground_truth(
-        ticker, strategy_name, config_version, hp, candidates, spy_bh, fixed_sl=fixed_sl,
-        entry_timing=entry_timing, start_date=start_date, end_date=end_date, years=years,
-        data_source=data_source, cliff_radius=cliff_radius, addon_eligible=addon_eligible)
+    # Phase4 (drought/add-on overlay) is real, possibly-slow compute (one
+    # run_backtest_ground_truth call per cell, times up to 9 candidates times the full
+    # cliff-box neighborhood -- see this function's own docstring) -- skip it for any
+    # candidate PHASE25_ISLAND_CAGR_MIN already marked ineligible (2026-08-23 redesign),
+    # rather than computing it for everyone and only using the CAGR flag informationally.
+    phase4_candidates = [c for c in candidates if c.get('phase4_eligible', True)]
+    if phase4_candidates:
+        eligible_addon_results = run_addon_cliff_safety_ground_truth(
+            ticker, strategy_name, config_version, hp, phase4_candidates, spy_bh, fixed_sl=fixed_sl,
+            entry_timing=entry_timing, start_date=start_date, end_date=end_date, years=years,
+            data_source=data_source, cliff_radius=cliff_radius, addon_eligible=addon_eligible)
+    else:
+        eligible_addon_results = []
+    _addon_by_id = dict(zip((id(c) for c in phase4_candidates), eligible_addon_results))
+    addon_results = [
+        _addon_by_id[id(c)] if id(c) in _addon_by_id
+        else {'core_cliff': None, 'addon_cliff': None, 'addon_cagr': None, 'own_cell': None}
+        for c in candidates
+    ]
 
     strategy_class = getattr(strategies, strategy_name)
     is_both = strategy_name == 'TrailingBothZScoreBreakout'
@@ -2980,8 +2941,11 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
         dd_pct, dd_peak, dd_trough = _check11_max_drawdown_gt(trades) if trades else (None, None, None)
         c13_folds = _check13_walk_forward_gt(trades) if trades else []
 
+        # Drought is Phase4 overlay work same as add-on -- skip for phase4_eligible=False
+        # candidates too (2026-08-23 fix: this was still computing unconditionally,
+        # only add-on had been wired to respect the flag).
         drought = None
-        if is_both and trades and df_hourly_windowed is not None:
+        if cand.get('phase4_eligible', True) and is_both and trades and df_hourly_windowed is not None:
             drought = simulate_drought_overlay_ground_truth(
                 trades, df_hourly_windowed, ticker, fixed_sl,
                 arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']))
@@ -2992,6 +2956,7 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
 
         rows.append({
             'candidate': cand,
+            'phase4_eligible': cand.get('phase4_eligible', True),
             'n_trades': len(trades),
             'check4_early_wr_pct': c4_early_wr, 'check4_late_wr_pct': c4_late_wr,
             'check8_fluke': c8,
@@ -3041,10 +3006,14 @@ def print_candidate_report_ground_truth(report):
               f"SL={c['stop_loss']} hold={c['max_hold_hours']}h w={c['window']} z={c['z_score_threshold']} "
               f"tpct={c['tpct']}  robust_alpha={c['robust_alpha']:.2f}  cagr={c['cagr']:.1f}%  n_trades={row['n_trades']}")
 
-        core_s = "SAFE" if row['core_safe'] else ("CLIFF" if row['core_safe'] is False else "UNKNOWN")
-        addon_s = "SAFE" if row['addon_safe'] else ("CLIFF" if row['addon_safe'] is False else "UNKNOWN")
+        phase4_eligible = row.get('phase4_eligible', True)
+        skip_note = " (skipped -- below PHASE25_ISLAND_CAGR_MIN)" if not phase4_eligible else ""
+        core_s = "SAFE" if row['core_safe'] else ("CLIFF" if row['core_safe'] is False else
+                 ("SKIPPED" if not phase4_eligible else "UNKNOWN"))
+        addon_s = "SAFE" if row['addon_safe'] else ("CLIFF" if row['addon_safe'] is False else
+                  ("SKIPPED" if not phase4_eligible else "UNKNOWN"))
         flag = "  *** CORE/ADD-ON DISAGREEMENT ***" if row['core_addon_disagreement'] else ""
-        print(f"  Verdicts: core-safe={core_s}  add-on-safe={addon_s}{flag}")
+        print(f"  Verdicts: core-safe={core_s}  add-on-safe={addon_s}{skip_note}{flag}")
 
         # Add-on CAGR (2026-08-23, GT Phase 4; corrected same day per direct user
         # instruction): ALWAYS computed and surfaced prominently here, regardless of
@@ -3069,6 +3038,8 @@ def print_candidate_report_ground_truth(report):
             delta = (addon_cagr - core_cagr_own) if core_cagr_own is not None else None
             delta_str = f", {delta:+.1f}pp vs core's own {core_cagr_own:.1f}%" if delta is not None else ""
             print(f"  Add-on CAGR if placed in a margin-capable account: {addon_cagr:+.1f}%{delta_str}  [{deploy_note}]")
+        elif not phase4_eligible:
+            print("  Add-on CAGR: skipped (below PHASE25_ISLAND_CAGR_MIN, not worth the compute)")
         elif own is None:
             print("  Add-on CAGR: unavailable (no cell data for this candidate)")
         else:

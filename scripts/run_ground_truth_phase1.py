@@ -119,6 +119,18 @@ def main():
                      help="Run phases up through this one, then stop (default: 2.5, full "
                           "Phase1-Coarse-GT -> Phase2-Island-GT -> Phase2.5-CliffBox-GT chain). "
                           "'1' stops after the coarse grid; '2' stops after the island mesh.")
+    ap.add_argument("--generations", type=int, default=3,
+                     help="Phase2-Island-GT generation count (default 3, matching legacy's "
+                          "own convention -- briefly bumped to 5 on 2026-08-23, reverted the "
+                          "same day after real campaign runs showed the walk consistently "
+                          "converges by generation 3, making 4-5 pure no-op overhead). Each "
+                          "generation re-derives island centers off the CURRENT backtest_"
+                          "cache state (including prior generations' own fine-mesh rows), so "
+                          "a later generation can pick up a real island near, but not on, an "
+                          "earlier generation's pick -- see run_optimization_sweep."
+                          "_phase2_island_gt_tasks's own docstring. No completeness gate "
+                          "between generations -- a generation that finds nothing new just "
+                          "cache-hits its way to a fast no-op.")
     ap.add_argument("--skip-cache-refresh", action="store_true",
                      help="skip rebuild_indexes() -- pass this on EVERY ticker in a "
                           "multi-ticker loop (see scripts/run_ground_truth_sweep_queue.sh), "
@@ -253,11 +265,14 @@ def main():
             return
 
         t1 = time.time()
-        run_phase2_island_ground_truth(
-            pool, TICKER, strategy_name, version, hp, spy_bh, asset_bh, run_timestamp,
-            fixed_sl=fixed_sl, entry_timing=ENTRY_TIMING, same_bar_reentry=True,
-            start_date=START, end_date=END, data_source=data_source,
-        )
+        for gen in range(args.generations):
+            print(f"Phase2-Island-GT generation {gen+1}/{args.generations}...")
+            run_phase2_island_ground_truth(
+                pool, TICKER, strategy_name, version, hp, spy_bh, asset_bh, run_timestamp,
+                fixed_sl=fixed_sl, entry_timing=ENTRY_TIMING, same_bar_reentry=True,
+                start_date=START, end_date=END, data_source=data_source,
+                generation=gen + 1,
+            )
         print(f"Phase2-Island-GT done in {(time.time()-t1)/3600:.2f}h")
 
         if max_phase == "2":

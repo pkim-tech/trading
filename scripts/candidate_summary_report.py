@@ -106,12 +106,18 @@ GT_COLUMN_DEFS = {
                   "run_addon_cliff_safety_ground_truth's docstring for its known limitations before treating "
                   "this as an absolute go/no-go signal).",
     "core_addon_disagreement": "True when core_safe and addon_safe disagree for this candidate.",
-    "addon_cagr_pct": "Add-on-adjusted CAGR at this candidate's own cell -- ALWAYS computed regardless of the "
-                       "ticker's current account (see addon_eligible/addon_eligibility_reason) since it's a real "
-                       "input to a future account-assignment decision, not just a property of today's account.",
+    "addon_cagr_pct": "Add-on-adjusted CAGR at this candidate's own cell -- computed regardless of the ticker's "
+                       "current account (see addon_eligible/addon_eligibility_reason) since it's a real input to "
+                       "a future account-assignment decision, not just a property of today's account. Blank when "
+                       "phase4_eligible is False (skipped, not worth the compute) -- check that column first "
+                       "before reading a blank here as a real compute failure.",
     "addon_eligible": "Whether this ticker is CURRENTLY on a margin-capable account (schwab_safety's real "
                        "margin_capable gate) -- annotation only, does not gate addon_cagr_pct's computation.",
     "addon_eligibility_reason": "Human-readable reason for addon_eligible's value.",
+    "phase4_eligible": "Whether this candidate's own coarse island cell cleared PHASE25_ISLAND_CAGR_MIN -- "
+                        "False means core_safe/addon_safe/addon_cagr_pct were deliberately never computed "
+                        "(skipped, not worth the overlay compute), not a failure. Every candidate still appears "
+                        "in this report and still has real robust_alpha_pct/cagr_pct/n_trades regardless.",
     "error": "Set instead of the above when this scope/candidate couldn't be evaluated (e.g. Phase1/2-GT campaign "
              "not complete yet, or a build_candidate_report_ground_truth failure) -- see the message for why.",
 }
@@ -774,6 +780,7 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
             "addon_cagr_pct": own["addon_cagr"] if own else None,
             "addon_eligible": report["addon_eligible"],
             "addon_eligibility_reason": report["addon_eligibility_reason"],
+            "phase4_eligible": row.get("phase4_eligible", True),
         })
     return rows
 
