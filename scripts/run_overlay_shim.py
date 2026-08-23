@@ -24,6 +24,15 @@ rows reference candidate_node_id instead of repeating the node's params.
 
 Usage:
   .venv/bin/python scripts/run_overlay_shim.py TICKER [TICKER ...] [--version v5] [--confirm-days 10]
+
+GT-kernel mode (2026-08-23, run_for_node_ground_truth()): --kernel gt runs an arbitrary
+hand-specified node (not a backtest_cache lookup, no resolve_version()) through the v6
+ground-truth kernel's own drought/add-on functions (backtester.run_backtest_ground_truth +
+simulate_drought_overlay_ground_truth + apply_addon_overlay_ground_truth) instead:
+  .venv/bin/python scripts/run_overlay_shim.py TICKER --kernel gt \\
+      --strategy TrailingBothZScoreBreakout --window 20 --z 1.5 --sl 2 --arm 29 \\
+      --tb 1.0 --ts 4.0 --hold 126 [--entry-timing open_check] \\
+      [--start-date 2023-07-24 --end-date 2026-08-21] [--data-source yahoo]
 """
 import argparse
 import sqlite3
@@ -127,6 +136,133 @@ def run_for_node(conn, ticker, node, confirm_days, mechanisms=("drought", "addon
     return rows
 
 
+def run_for_node_ground_truth(ticker, node, start_date, end_date, data_source="yahoo",
+                               confirm_days_grid=None, vol_gate_grid=None):
+    """GT-native equivalent of run_for_node() above, for an ARBITRARY node (not limited
+    to Phase2.5-GT shortlisted candidates) -- added 2026-08-23 alongside the GT-kernel
+    drought/add-on work (backtester.simulate_drought_overlay_ground_truth,
+    backtester.apply_addon_overlay_ground_truth, both built for run_optimization_sweep.py's
+    per-candidate Phase2.5-GT report and generic w.r.t. its shortlist pipeline). This just
+    wires the same two functions up for a hand-specified node instead.
+
+    Deliberately does NOT go through locate_best_node.resolve_version() -- that function
+    hard-errors on any ticker with real kernel_version='ground_truth_v6' backtest_cache rows
+    specifically to stop a caller from silently falling back to stale legacy v5/v5.1 data
+    (see its 2026-08-23 guard). This path never queries backtest_cache by version at all --
+    `node`'s params are supplied directly by the caller (CLI args here) and fed straight to
+    run_backtest_ground_truth, so there is no version string to resolve and nothing for that
+    guard to catch or need to route around.
+
+    Drought is scoped to TrailingBothZScoreBreakout only (simulate_drought_overlay_ground_
+    truth's own docstring: "Scope: TrailingBothZScoreBreakout candidates only ... callers
+    must gate on is_both themselves") -- this wrapper derives is_both from node['strategy']
+    and skips the drought call (printing why) for any other strategy, rather than calling it
+    incorrectly. Add-on has no such restriction (matches run_addon()'s own unconditional call
+    for both strategies above).
+
+    same_bar_reentry=True (2026-08-23, paired-review CONFIRMED HIGH finding): matches every
+    real GT reference path this wrapper claims to mirror -- run_optimization_sweep.py's own
+    per-candidate drought/add-on report (build_candidate_report_ground_truth, ~line 2974) and
+    GT Phase1 (run_ground_truth_phase1.py) both pass True. run_optimization_sweep.py:3085-3092
+    explicitly documents that the drought core list was fixed to True this month specifically
+    to stop it disagreeing with "the old post-hoc drought script's" same False choice this
+    wrapper had first drafted -- reusing False here would have silently regressed that exact
+    fix and made this tool's own core-trade count/compounded figures disagree with the
+    candidate report for the identical node.
+
+    addon_compounded_pct (2026-08-23, paired-review CONFIRMED HIGH finding): computed over
+    ALL of apply_addon_overlay_ground_truth(trades) (armed trades carry the blended return,
+    unarmed trades keep their own core Return unchanged), exactly like the canonical consumer
+    (run_optimization_sweep.py:~2567) -- NOT over the armed-only subset. Filtering to
+    addon_applied==True first (an earlier draft's bug) silently drops every SL/unarmed-TIME
+    loss from the compounding, systematically inflating the number. The armed-only subset
+    (`addon_trades` in the returned dict) is still used for the n=/mean_ret/win_rate
+    descriptive stats -- those are legitimately about the add-on leg's own trades -- just not
+    for the compounded total, which must reflect the whole strategy.
+
+    return_below_floor handling (2026-08-23, paired-review CONFIRMED HIGH finding):
+    apply_addon_overlay_ground_truth's own docstring and run_optimization_sweep.py:2576-2580
+    establish a hard convention -- if ANY trade breaches the -100% floor, addon compounded
+    stats must NOT be aggregated (a single such trade can flip prod(1+r)'s sign into a
+    meaningless number with no exception raised). addon_compounded_pct is forced to None
+    (with addon_below_floor_count still reported honestly) whenever that happens, matching
+    that convention instead of silently printing a poisoned number.
+
+    Returns None (after printing why) if the ticker has no hourly data for data_source, the
+    windowed frame is empty, or fewer than 2 real core GT trades result. Otherwise a dict:
+    {ticker, n_core_trades, addon_trades (list of dicts, addon_applied==True only -- for the
+    descriptive stats below), addon_mean_ret, addon_win_rate, addon_compounded_pct (over the
+    FULL trade list, or None if addon_below_floor_count > 0), addon_below_floor_count, drought
+    (simulate_drought_overlay_ground_truth's own result dict, or None if not is_both)}."""
+    import pandas as pd
+    import run_optimization_sweep as ros
+    import strategies as strategies_mod
+    from backtester import (
+        run_backtest_ground_truth, apply_addon_overlay_ground_truth,
+        simulate_drought_overlay_ground_truth,
+    )
+
+    strategy_class = getattr(strategies_mod, node["strategy"])
+    is_both = node["strategy"] == "TrailingBothZScoreBreakout"
+
+    inputs = ros._load_node_inputs_ground_truth(
+        ticker, strategy_class, node["strategy"], int(node["window"]), float(node["z"]),
+        start_date, end_date, data_source=data_source)
+    if inputs is None:
+        print(f"{ticker}: no hourly data available for data_source={data_source}")
+        return None
+    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+    if df_hourly_windowed.empty:
+        print(f"{ticker}: empty windowed hourly frame for {start_date}..{end_date}")
+        return None
+
+    trades = run_backtest_ground_truth(
+        df_hourly_windowed, df_daily_processed, ticker, minute_df,
+        fixed_sl=float(node["fixed_sl"]), arm_pct=float(node["arm_pct"]),
+        trail_buy_pct=float(node["trail_buy_pct"]), trail_sell_pct=float(node["trail_sell_pct"]),
+        max_hours_to_hold=int(node["max_hold_hours"]), z_score_threshold=float(node["z"]),
+        is_both=is_both, open_check_entry_timing=(node["entry_timing"] == "open_check"),
+        same_bar_reentry=True, prep=prep, mprep=mprep, need_times=True,
+    )
+    if len(trades) < 2:
+        print(f"{ticker}: too few real GT core trades ({len(trades)}) to evaluate overlays")
+        return None
+
+    result = {"ticker": ticker, "n_core_trades": len(trades)}
+
+    all_addon_trades = apply_addon_overlay_ground_truth(trades)
+    addon_trades = [t for t in all_addon_trades if t["addon_applied"]]
+    result["addon_trades"] = addon_trades
+    below_floor_count = int(sum(t["return_below_floor"] for t in all_addon_trades))
+    result["addon_below_floor_count"] = below_floor_count
+    if addon_trades:
+        armed_rets = pd.Series([t["Return"] for t in addon_trades])
+        result["addon_mean_ret"] = float(armed_rets.mean())
+        result["addon_win_rate"] = float((armed_rets > 0).mean())
+        if below_floor_count > 0:
+            # A floor breach can flip prod(1+r)'s sign into a meaningless number with no
+            # exception raised -- never aggregate through it (see docstring above).
+            result["addon_compounded_pct"] = None
+        else:
+            all_rets = pd.Series([t["Return"] for t in all_addon_trades])
+            result["addon_compounded_pct"] = float((all_rets + 1).prod() - 1) * 100
+    else:
+        result["addon_mean_ret"] = result["addon_win_rate"] = result["addon_compounded_pct"] = None
+
+    if is_both:
+        result["drought"] = simulate_drought_overlay_ground_truth(
+            trades, df_hourly_windowed, ticker, fixed_sl=float(node["fixed_sl"]),
+            arm_pct=float(node["arm_pct"]), trail_sell_pct=float(node["trail_sell_pct"]),
+            confirm_days_grid=confirm_days_grid, vol_gate_grid=vol_gate_grid)
+    else:
+        result["drought"] = None
+        print(f"{ticker}: strategy={node['strategy']} is not TrailingBothZScoreBreakout -- "
+              f"skipping drought overlay (simulate_drought_overlay_ground_truth is scoped to "
+              f"is_both only)")
+
+    return result
+
+
 def run_for_ticker(conn, ticker, version, confirm_days):
     resolved = version or resolve_version(conn, ticker)
     node = node_dict(conn, ticker, resolved)
@@ -152,7 +288,78 @@ def main():
                           "per-candidate-type node picks). Mutually exclusive with "
                           "passing tickers.")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--kernel", choices=["legacy", "gt"], default="legacy",
+                     help="legacy (default): existing backtest_cache-based path "
+                          "(drought_overlay_test/stacked_model.add_on, "
+                          "resolve_version()-scoped). gt: v6 ground-truth kernel path "
+                          "(run_backtest_ground_truth + simulate_drought_overlay_ground_"
+                          "truth + apply_addon_overlay_ground_truth) for an arbitrary "
+                          "hand-specified node -- no backtest_cache lookup, no "
+                          "resolve_version(). Requires exactly one ticker plus "
+                          "--strategy/--window/--z/--sl/--arm/--tb/--ts/--hold.")
+    ap.add_argument("--strategy", default=None, help="--kernel gt only")
+    ap.add_argument("--window", type=int, default=None, help="--kernel gt only")
+    ap.add_argument("--z", type=float, default=None, help="--kernel gt only")
+    ap.add_argument("--sl", type=float, default=None, help="fixed_sl, --kernel gt only")
+    ap.add_argument("--arm", type=float, default=None, help="arm_pct, --kernel gt only")
+    ap.add_argument("--tb", type=float, default=None, help="trail_buy_pct, --kernel gt only")
+    ap.add_argument("--ts", type=float, default=None, help="trail_sell_pct, --kernel gt only")
+    ap.add_argument("--hold", type=int, default=None, help="max_hold_hours, --kernel gt only")
+    ap.add_argument("--entry-timing", default="open_check", choices=["close", "open_check"],
+                     help="--kernel gt only")
+    ap.add_argument("--start-date", default=None, help="--kernel gt only")
+    ap.add_argument("--end-date", default=None, help="--kernel gt only")
+    ap.add_argument("--data-source", default="yahoo", choices=["yahoo", "massive"],
+                     help="--kernel gt only")
     args = ap.parse_args()
+
+    if args.kernel == "gt":
+        if len(args.tickers) != 1:
+            print("--kernel gt requires exactly one ticker positional arg")
+            return
+        required = {"strategy": args.strategy, "window": args.window, "z": args.z,
+                    "sl": args.sl, "arm": args.arm, "tb": args.tb, "ts": args.ts,
+                    "hold": args.hold}
+        missing = [k for k, v in required.items() if v is None]
+        if missing:
+            print(f"--kernel gt requires: {', '.join('--' + m for m in missing)}")
+            return
+        ticker = args.tickers[0]
+        node = {
+            "strategy": args.strategy, "window": args.window, "z": args.z,
+            "fixed_sl": args.sl, "arm_pct": args.arm, "trail_buy_pct": args.tb,
+            "trail_sell_pct": args.ts, "max_hold_hours": args.hold,
+            "entry_timing": args.entry_timing,
+        }
+        result = run_for_node_ground_truth(ticker, node, args.start_date, args.end_date,
+                                            data_source=args.data_source)
+        if result is None:
+            return
+        print(f"\n{ticker}: {result['n_core_trades']} core GT trades")
+        d = result["drought"]
+        if d is not None:
+            drought_str = "n/a" if d['drought_compounded_pct'] is None else f"{d['drought_compounded_pct']:+.1f}%"
+            combined_str = "n/a" if d['combined_compounded_pct'] is None else f"{d['combined_compounded_pct']:+.1f}%"
+            print(f"drought: confirm_days={d['best_confirm_days']} vol_gate={d['best_vol_gate']} "
+                  f"windows={d['n_drought_windows']} simulated={d['n_drought_simulated']} "
+                  f"core={d['core_compounded_pct']:+.1f}% "
+                  f"drought={drought_str} combined={combined_str}")
+        if result["addon_trades"]:
+            if result["addon_compounded_pct"] is None:
+                compounded_str = f"n/a (return_below_floor breach x{result['addon_below_floor_count']} -- not aggregated)"
+            else:
+                compounded_str = f"{result['addon_compounded_pct']:.1f}%"
+            print(f"addon: n={len(result['addon_trades'])} "
+                  f"mean_ret={result['addon_mean_ret']*100:.2f}% "
+                  f"win_rate={result['addon_win_rate']:.3f} "
+                  f"compounded={compounded_str} "
+                  f"below_floor={result['addon_below_floor_count']}")
+        else:
+            print("addon: no armed core trades -- nothing to evaluate")
+        if args.out:
+            pd.DataFrame(result["addon_trades"]).to_csv(args.out, index=False)
+            print(f"\nWrote {args.out}")
+        return
 
     conn = sqlite3.connect(DB_PATH)
     ensure_candidate_nodes_table(conn)
