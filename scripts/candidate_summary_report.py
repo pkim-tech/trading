@@ -24,6 +24,18 @@ Usage:
   .venv/bin/python scripts/candidate_summary_report.py --all-swept
   .venv/bin/python scripts/candidate_summary_report.py TNA --skip-5min  # faster, skip yfinance calls
   .venv/bin/python scripts/candidate_summary_report.py TNA --xlsx report  # output/report.xlsx, 2 sheets
+
+GT-kernel mode (2026-08-23, GT Phase 4): --kernel gt switches the ticker loop over to the
+v6 GT pipeline (run_optimization_sweep.derive_phase25_candidates_ground_truth ->
+build_candidate_report_ground_truth -> print_candidate_report_ground_truth) instead of the
+legacy candidate_nodes/run_overlay_shim machinery above -- a genuinely different candidate
+shape (up-to-9 island-derived candidates per real GT scope, not this file's fixed 3-5 named
+candidate types), so it gets its own row schema/columns (GT_COLUMN_DEFS) rather than being
+forced into COLUMN_DEFS's legacy-only column meanings. Still the same script/CLI/--csv/--xlsx
+plumbing, per the standing "canonical report, don't spin up a new script" convention above.
+  .venv/bin/python scripts/candidate_summary_report.py --kernel gt AGQ GDXU UGL WEBL
+  .venv/bin/python scripts/candidate_summary_report.py --kernel gt --tranche 1
+  .venv/bin/python scripts/candidate_summary_report.py --kernel gt --tranche 1 --xlsx gt_t1
 """
 import argparse
 import csv
@@ -37,7 +49,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from top_safe_nodes import CLIFF_RADIUS
+from top_safe_nodes import CLIFF_RADIUS, best_safe_node
 from annualized_alpha_report import calendar_days, cagr
 from locate_best_node import resolve_version
 from verify_fill_resolution_accuracy import fill_accuracy_for_node
@@ -47,9 +59,63 @@ from run_overlay_shim import (
 )
 from datetime import datetime as _datetime
 
+import campaign_config
+from run_optimization_sweep import (
+    derive_phase25_candidates_ground_truth,
+    build_candidate_report_ground_truth,
+    print_candidate_report_ground_truth,
+)
+from prune_backtest_cache_ground_truth import discover_all_gt_scopes, _hp_for_strategy
+
 DB_PATH = "cache/research/trading_universe.db"
 ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_vs_spy), "
                      "COALESCE(alpha_vs_spy_certain, alpha_vs_spy))")
+GT_TRANCHES_PATH = Path(__file__).resolve().parent / "gt_tranches.txt"
+
+# Column schema for --kernel gt output -- deliberately separate from COLUMN_DEFS (see
+# module docstring): a GT candidate row's 'robust_alpha_pct'/'cagr_pct' are NOT the same
+# thing as the legacy schema's core_alpha_pct/ann_excess_pct (different derivation,
+# different fill-resolution/reentry conventions -- see run_optimization_sweep.py's own
+# derive_phase25_candidates_ground_truth/build_candidate_report_ground_truth docstrings),
+# so reusing those column names here would misrepresent one kernel's numbers as the other's.
+GT_COLUMN_DEFS = {
+    "ticker": "The symbol.",
+    "strategy": "TrailingBothZScoreBreakout or TrailingExitZScoreBreakout -- this scope's real GT campaign strategy.",
+    "config_version": "The real backtest_cache `version` string this scope's GT rows were computed under.",
+    "entry_timing": "'open_check' or 'close' -- this scope's real GT campaign entry timing.",
+    "fixed_sl": "Fixed stop-loss %% for strategies that use one (TrailingExitZScoreBreakout); 0 otherwise.",
+    "candidate_rank": "1-based position in derive_phase25_candidates_ground_truth's own returned candidate list "
+                       "for this scope (up to 9 -- top-3-per-island across up to 3 islands).",
+    "is_winner": "True for the single candidate build_candidate_report_ground_truth picked as the scope's overall "
+                 "winner (highest robust_alpha among the shortlisted candidates).",
+    "take_profit": "Candidate's take_profit/arm_sell_pct cell value (see run_optimization_sweep.py's take_profit "
+                    "column meaning per strategy).",
+    "stop_loss": "Candidate's stop_loss/trail_buy_pct cell value.",
+    "max_hold_hours": "Candidate's max hold time cell value.",
+    "window": "Candidate's z-score lookback window.",
+    "z_score_threshold": "Candidate's entry z-score threshold.",
+    "tpct": "Candidate's 4th-axis trail_sell_pct (TrailingBoth) or 0 (TrailingExit).",
+    "robust_alpha_pct": "MIN(possible,pessimistic,certain) alpha vs SPY for this candidate's own cell, as computed "
+                         "by the real Phase1/2-GT sweep rows this scope's candidates were derived from.",
+    "cagr_pct": "Real annualized CAGR for this candidate's own cell (same source as robust_alpha_pct).",
+    "n_trades": "Real trade count from this candidate's own same_bar_reentry=True trade list (build_candidate_"
+                "report_ground_truth's own re-simulation, matching the real live dispatch convention).",
+    "core_safe": "True/False/None(unknown) -- cliff-safety verdict on the CORE (unlevered) alpha, same worst-"
+                 "neighbor<0 convention this project uses everywhere else.",
+    "addon_safe": "Same cliff-safety verdict, computed on the ADD-ON-adjusted alpha instead (see "
+                  "run_addon_cliff_safety_ground_truth's docstring for its known limitations before treating "
+                  "this as an absolute go/no-go signal).",
+    "core_addon_disagreement": "True when core_safe and addon_safe disagree for this candidate.",
+    "addon_cagr_pct": "Add-on-adjusted CAGR at this candidate's own cell -- ALWAYS computed regardless of the "
+                       "ticker's current account (see addon_eligible/addon_eligibility_reason) since it's a real "
+                       "input to a future account-assignment decision, not just a property of today's account.",
+    "addon_eligible": "Whether this ticker is CURRENTLY on a margin-capable account (schwab_safety's real "
+                       "margin_capable gate) -- annotation only, does not gate addon_cagr_pct's computation.",
+    "addon_eligibility_reason": "Human-readable reason for addon_eligible's value.",
+    "error": "Set instead of the above when this scope/candidate couldn't be evaluated (e.g. Phase1/2-GT campaign "
+             "not complete yet, or a build_candidate_report_ground_truth failure) -- see the message for why.",
+}
+GT_CSV_COLUMNS = list(GT_COLUMN_DEFS.keys())
 
 # Relabels find_candidates()'s internal keys to the user's requested wording
 # 2026-08-08 (later) -- kept as a separate map (not renamed at the source in
@@ -418,18 +484,18 @@ def _row_to_record(row):
     }
 
 
-def _write_csv(name, rows):
+def _write_csv(name, rows, col_defs=COLUMN_DEFS, to_record=_row_to_record):
     out_path = Path("output") / (name if name.endswith(".csv") else f"{name}.csv")
     out_path.parent.mkdir(exist_ok=True)
     with open(out_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(COLUMN_DEFS.keys()))
+        w = csv.DictWriter(f, fieldnames=list(col_defs.keys()))
         w.writeheader()
         for row in rows:
-            w.writerow(_row_to_record(row))
+            w.writerow(to_record(row))
     print(f"Wrote {out_path} ({len(rows)} rows)")
 
 
-def _write_xlsx(name, rows):
+def _write_xlsx(name, rows, col_defs=COLUMN_DEFS, to_record=_row_to_record):
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment
     from openpyxl.utils import get_column_letter
@@ -441,12 +507,12 @@ def _write_xlsx(name, rows):
     data_ws = wb.active
     data_ws.title = "Candidates"
 
-    cols = list(COLUMN_DEFS.keys())
+    cols = list(col_defs.keys())
     data_ws.append(cols)
     for cell in data_ws[1]:
         cell.font = Font(bold=True)
     for row in rows:
-        rec = _row_to_record(row)
+        rec = to_record(row)
         data_ws.append([rec.get(c) for c in cols])
     data_ws.freeze_panes = "A2"
     for i, col in enumerate(cols, start=1):
@@ -456,7 +522,7 @@ def _write_xlsx(name, rows):
     def_ws.append(["Column", "Definition"])
     for cell in def_ws[1]:
         cell.font = Font(bold=True)
-    for col, definition in COLUMN_DEFS.items():
+    for col, definition in col_defs.items():
         def_ws.append([col, definition])
         def_ws.cell(row=def_ws.max_row, column=2).alignment = Alignment(wrap_text=True, vertical="top")
     def_ws.column_dimensions["A"].width = 32
@@ -527,9 +593,165 @@ def build_rows_for_ticker(conn, ticker, version, min_alpha, skip_5min, skip_over
     return rows
 
 
+def load_gt_tranche(n):
+    """Parses gt_tranches.txt's own "<number> <space-separated tickers>" format,
+    skipping comment/blank lines."""
+    with open(GT_TRANCHES_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            num, *tickers = line.split()
+            if num == str(n):
+                return tickers
+    raise ValueError(f"Tranche {n} not found in {GT_TRANCHES_PATH}")
+
+
+def gt_scopes_for_tickers(conn, tickers):
+    """Real (ticker, strategy, version, entry_timing, fixed_sl) GT scopes for exactly
+    these tickers, restricted to strategies with a known campaign_config.STRATEGIES hp
+    grid (a scope with no known grid can't be passed to derive_phase25_candidates_
+    ground_truth at all) -- reuses prune_backtest_cache_ground_truth's own scope
+    discovery/hp-grid-construction rather than re-deriving either."""
+    wanted = set(tickers)
+    scopes = [s for s in discover_all_gt_scopes(conn) if s[0] in wanted]
+    return [s for s in scopes if s[1] in campaign_config.STRATEGIES]
+
+
+def gt_current_best_node(conn, ticker, strategy, version, metric):
+    """Independent second opinion via top_safe_nodes.best_safe_node, scoped to
+    kernel_version='ground_truth_v6' rows only -- mirrors top_safe_nodes.py's own
+    --kernel-version ground_truth_v6 / --metric CLI scoping (CLI-only there,
+    reproduced here for inline/structured use, same query shape as load_ticker_df
+    above but GT-scoped and with the cagr column)."""
+    df = pd.read_sql("""
+        SELECT ticker, COALESCE(take_profit, arm_sell_pct) AS take_profit,
+               stop_loss, max_hold_hours, window,
+               z_score_threshold, trail_buy_pct, trail_sell_pct, entry_timing,
+               alpha_vs_spy, alpha_vs_spy_pessimistic, alpha_vs_spy_certain,
+               strategy_return, trades, win_rate, cagr
+        FROM backtest_cache
+        WHERE version=? AND strategy=? AND ticker=? AND trades > 0
+          AND kernel_version='ground_truth_v6'
+    """, conn, params=(version, strategy, ticker))
+    if df.empty:
+        return None
+    pess = df["alpha_vs_spy_pessimistic"].fillna(df["alpha_vs_spy"])
+    cert = df["alpha_vs_spy_certain"].fillna(df["alpha_vs_spy"])
+    df["robust_alpha"] = pd.concat([df["alpha_vs_spy"], pess, cert], axis=1).min(axis=1)
+    min_alpha = 50 if metric == "cagr" else 200
+    return best_safe_node(df, min_alpha=min_alpha, metric=metric)
+
+
+def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
+    """Real per-candidate GT rows for one scope, matching GT_COLUMN_DEFS. A
+    scope whose Phase1/2-GT campaign isn't complete yet, or whose
+    build_candidate_report_ground_truth call fails (e.g. the in-progress
+    backtester.py drought-overlay dependency as of 2026-08-23), returns row(s)
+    with only 'error' populated (plus raw candidate cells when derive_phase25_
+    candidates_ground_truth itself succeeded) rather than raising -- callers
+    loop over many scopes and must not have one bad scope kill the batch."""
+    base = {"ticker": ticker, "strategy": strategy, "config_version": version,
+            "entry_timing": entry_timing, "fixed_sl": fixed_sl}
+    hp = _hp_for_strategy(strategy)
+    try:
+        candidates = derive_phase25_candidates_ground_truth(
+            ticker, strategy, version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
+    except Exception as e:
+        print(f"  [GT candidate report] SKIPPED -- derive_phase25_candidates_ground_truth raised: {e}")
+        return [{**base, "error": f"derive_phase25_candidates_ground_truth: {e}"}]
+    if not candidates:
+        print("  [GT candidate report] SKIPPED -- no Phase2.5-GT candidates for this scope.")
+        return [{**base, "error": "no Phase2.5-GT candidates for this scope"}]
+
+    try:
+        report = build_candidate_report_ground_truth(
+            ticker, strategy, version, hp, start_date=None, end_date=None,
+            fixed_sl=fixed_sl, entry_timing=entry_timing)
+    except Exception as e:
+        # Known-in-progress dependency (backtester.py drought-overlay fix, in flight
+        # in another session as of this change) -- log and return the raw candidate
+        # cells so the batch/export still records what WAS derived successfully.
+        print(f"  [GT candidate report] FAILED (expected while the kernel fix is in flight) -- "
+              f"{len(candidates)} raw candidates were derived successfully: {e}")
+        return [{**base, "candidate_rank": i + 1, "take_profit": c['take_profit'],
+                 "stop_loss": c['stop_loss'], "max_hold_hours": c['max_hold_hours'],
+                 "window": c['window'], "z_score_threshold": c['z_score_threshold'],
+                 "tpct": c['tpct'], "robust_alpha_pct": c['robust_alpha'], "cagr_pct": c['cagr'],
+                 "error": f"build_candidate_report_ground_truth failed: {e}"}
+                for i, c in enumerate(candidates)]
+    if report.get("error"):
+        print(f"  [GT candidate report] {report['error']}")
+        return [{**base, "error": report["error"]}]
+
+    print_candidate_report_ground_truth(report)
+    rows = []
+    for i, row in enumerate(report["candidates"]):
+        c = row["candidate"]
+        own = row["addon_detail"]["own_cell"] if row.get("addon_detail") else None
+        rows.append({
+            **base, "candidate_rank": i + 1, "is_winner": (i == report["winner_index"]),
+            "take_profit": c["take_profit"], "stop_loss": c["stop_loss"],
+            "max_hold_hours": c["max_hold_hours"], "window": c["window"],
+            "z_score_threshold": c["z_score_threshold"], "tpct": c["tpct"],
+            "robust_alpha_pct": c["robust_alpha"], "cagr_pct": c["cagr"],
+            "n_trades": row["n_trades"],
+            "core_safe": row["core_safe"], "addon_safe": row["addon_safe"],
+            "core_addon_disagreement": row["core_addon_disagreement"],
+            "addon_cagr_pct": own["addon_cagr"] if own else None,
+            "addon_eligible": report["addon_eligible"],
+            "addon_eligibility_reason": report["addon_eligibility_reason"],
+        })
+    return rows
+
+
+def run_gt_mode(conn, tickers, metric, csv_name, xlsx_name):
+    """--kernel gt entry point: loops every real GT scope for `tickers`, printing
+    each scope's full candidate report (print_candidate_report_ground_truth) plus
+    a top_safe_nodes cross-check to the terminal, and returns the flat GT_COLUMN_
+    DEFS row list for optional --csv/--xlsx export. A per-scope exception is caught
+    inside gt_rows_for_scope/gt_current_best_node's own SQL (no bare try/except
+    needed here) -- gt_rows_for_scope never raises."""
+    scopes = gt_scopes_for_tickers(conn, tickers)
+    found = {s[0] for s in scopes}
+    for ticker in tickers:
+        if ticker not in found:
+            print(f"\n{ticker}: no GT (kernel_version='ground_truth_v6') scope with a known "
+                  f"campaign_config.STRATEGIES hp grid found in backtest_cache -- skipping.")
+
+    all_rows = []
+    for ticker, strategy, version, entry_timing, fixed_sl in scopes:
+        print(f"\n{'#'*100}\n{ticker} / {strategy} / {version} / entry_timing={entry_timing} "
+              f"/ fixed_sl={fixed_sl}\n{'#'*100}")
+        node = gt_current_best_node(conn, ticker, strategy, version, metric)
+        if node is None:
+            print(f"  [top_safe_nodes cross-check] no cliff-safe node found for {metric} floor")
+        else:
+            print(f"  [top_safe_nodes cross-check] best {metric}: arm/tp={node['arm_pct']} sl={node['sl']} "
+                  f"hold={node['hold']}h window={node['window']} z={node['z']} "
+                  f"robust_alpha={node['alpha']:+.1f}% cagr={node['cagr']}")
+        all_rows.extend(gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl))
+
+    if csv_name:
+        _write_csv(csv_name, all_rows, col_defs=GT_COLUMN_DEFS, to_record=lambda r: r)
+    if xlsx_name:
+        _write_xlsx(xlsx_name, all_rows, col_defs=GT_COLUMN_DEFS, to_record=lambda r: r)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("tickers", nargs="*")
+    ap.add_argument("--kernel", choices=["legacy", "gt"], default="legacy",
+                     help="'legacy' (default, unchanged behavior): candidate_nodes/run_overlay_shim-based "
+                          "3-5-row-per-ticker report. 'gt': v6 GT-kernel pipeline (derive_phase25_candidates_"
+                          "ground_truth -> build_candidate_report_ground_truth), up-to-9 rows/scope -- see "
+                          "GT_COLUMN_DEFS, a separate column schema from the legacy report's COLUMN_DEFS.")
+    ap.add_argument("--tranche", type=int, default=None,
+                     help="--kernel gt only: source tickers from scripts/gt_tranches.txt's tranche N "
+                          "instead of positional args.")
+    ap.add_argument("--metric", choices=["robust_alpha", "cagr"], default="robust_alpha",
+                     help="--kernel gt only: metric for the top_safe_nodes cross-check (see that script's "
+                          "own --metric help).")
     ap.add_argument("--version", default=None,
                      help="force a single version for every ticker (old behavior). Default: auto-resolve "
                           "per ticker via resolve_version() -- v5.1 when the ticker has it, else v5.")
@@ -550,6 +772,18 @@ def main():
     args = ap.parse_args()
 
     conn = sqlite3.connect(args.db)
+
+    if args.kernel == "gt":
+        tickers = load_gt_tranche(args.tranche) if args.tranche is not None else args.tickers
+        if not tickers:
+            print("--kernel gt requires --tranche N or an explicit ticker list.")
+            conn.close()
+            return
+        print(f"Tickers: {' '.join(tickers)}")
+        run_gt_mode(conn, tickers, args.metric, args.csv, args.xlsx)
+        conn.close()
+        return
+
     ensure_candidate_nodes_table(conn)
     ensure_overlay_table(conn)
     tickers = args.tickers
