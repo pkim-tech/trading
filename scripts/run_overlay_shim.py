@@ -316,14 +316,14 @@ def main():
     if args.kernel == "gt":
         if len(args.tickers) != 1:
             print("--kernel gt requires exactly one ticker positional arg")
-            return
+            sys.exit(1)
         required = {"strategy": args.strategy, "window": args.window, "z": args.z,
                     "sl": args.sl, "arm": args.arm, "tb": args.tb, "ts": args.ts,
                     "hold": args.hold}
         missing = [k for k, v in required.items() if v is None]
         if missing:
             print(f"--kernel gt requires: {', '.join('--' + m for m in missing)}")
-            return
+            sys.exit(1)
         ticker = args.tickers[0]
         node = {
             "strategy": args.strategy, "window": args.window, "z": args.z,
@@ -369,7 +369,7 @@ def main():
         node = node_from_candidate_id(conn, args.node_id)
         if node is None:
             print(f"no candidate_nodes row with id={args.node_id}")
-            return
+            sys.exit(1)
         all_rows += run_for_node(conn, node["ticker"], node, args.confirm_days)
     else:
         for t in args.tickers:
