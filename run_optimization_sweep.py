@@ -1692,6 +1692,33 @@ def compute_bh_returns(ticker, start_date=None, end_date=None, data_source="yaho
 ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_vs_spy), "
                      "COALESCE(alpha_vs_spy_certain, alpha_vs_spy))")
 
+# Deterministic tiebreak for GT top-3-per-island candidate selection (derive_phase25_
+# candidates_ground_truth / run_phase25_cliff_box_ground_truth's `region.sort_values(
+# 'robust_alpha', ...)` step) -- found 2026-08-22 via the GT-kernel prune-validation
+# gate's first real-data run: a real SOXL campaign (v6-w2026-06-01_2026-08-01,
+# TrailingBoth) had multiple tpct values tied at the exact same robust_alpha within one
+# island, and neither this function's pandas sort nor the validator's independent SQL
+# re-implementation applied any tiebreak, so each picked an arbitrary (and different)
+# top-3 subset among the tied cells -- the same bug class already fixed once in
+# prune_backtest_cache.py's own TIEBREAK_SQL (found 2026-08-07, 5,800/11,288 groups tied
+# on max robust_alpha there). Each column here is a genuine secondary preference, not
+# merely a determinism nonce:
+#   trades DESC          -- more trades backing the same alpha is a more statistically
+#                            reliable sample, not a coincidence from a thin sample.
+#   stop_loss ASC         -- among configs tied on alpha/trades, the tighter stop achieved
+#                            the same return while risking less per trade (genuinely
+#                            better risk-adjusted).
+#   max_hold_hours ASC    -- among configs additionally tied on stop_loss, the shorter
+#                            hold achieved the same return with less capital tied up per
+#                            trade (better capital efficiency).
+# window/z_score_threshold/tpct/take_profit ASC are appended only as a final catch-all in
+# case all of the above still tie -- no risk/capital-efficiency claim is made for those,
+# they just guarantee the exact same winner every run against the same data.
+GT_CANDIDATE_TIEBREAK = [
+    ('trades', False), ('stop_loss', True), ('max_hold_hours', True),
+    ('window', True), ('z_score_threshold', True), ('tpct', True), ('take_profit', True),
+]
+
 
 def pick_island_centers(df, n=N_ISLANDS, min_sep=ISLAND_MIN_SEP):
     rank_col = 'robust_alpha' if 'robust_alpha' in df.columns else 'alpha_vs_spy'
@@ -2205,7 +2232,7 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
             SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
                    max_hold_hours, window, z_score_threshold,
                    {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct,
-                   {ROBUST_ALPHA_SQL} AS robust_alpha, cagr
+                   {ROBUST_ALPHA_SQL} AS robust_alpha, cagr, trades
             FROM backtest_cache
             WHERE version=? AND ticker=? AND strategy=? AND trades > 0
               AND kernel_version='ground_truth_v6' {scope_sql}
@@ -2231,7 +2258,15 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
                     (df['stop_loss'] - sl_c).abs().le(FINE_RADIUS)]
         if region.empty:
             continue
-        region = region.sort_values('robust_alpha', ascending=False)
+        # GT_CANDIDATE_TIEBREAK (module-level, see its own comment) resolves ties on
+        # robust_alpha deterministically. Note: pandas ignores `kind` for a multi-column
+        # sort_values (it always uses a stable lexsort internally regardless), so no
+        # `kind=` argument is needed here for stability -- residual ties past the full
+        # tiebreak column set are already impossible in practice since that column set
+        # fully identifies a cache cell within a scope.
+        _tb_cols = ['robust_alpha'] + [c for c, _ in GT_CANDIDATE_TIEBREAK]
+        _tb_asc = [False] + [asc for _, asc in GT_CANDIDATE_TIEBREAK]
+        region = region.sort_values(_tb_cols, ascending=_tb_asc)
 
         top_cagr = region.iloc[0]['cagr']
         if pd.isna(top_cagr):
@@ -2328,7 +2363,7 @@ def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version
             SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss,
                    max_hold_hours, window, z_score_threshold,
                    {'trail_sell_pct' if fourth_axis_col == 'trail_pct' else '0'} AS tpct,
-                   {ROBUST_ALPHA_SQL} AS robust_alpha, cagr
+                   {ROBUST_ALPHA_SQL} AS robust_alpha, cagr, trades
             FROM backtest_cache
             WHERE version=? AND ticker=? AND strategy=? AND trades > 0
               AND kernel_version='ground_truth_v6' {scope_sql}
@@ -2352,7 +2387,15 @@ def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version
                     (df['stop_loss'] - sl_c).abs().le(FINE_RADIUS)]
         if region.empty:
             continue
-        region = region.sort_values('robust_alpha', ascending=False)
+        # GT_CANDIDATE_TIEBREAK (module-level, see its own comment) resolves ties on
+        # robust_alpha deterministically. Note: pandas ignores `kind` for a multi-column
+        # sort_values (it always uses a stable lexsort internally regardless), so no
+        # `kind=` argument is needed here for stability -- residual ties past the full
+        # tiebreak column set are already impossible in practice since that column set
+        # fully identifies a cache cell within a scope.
+        _tb_cols = ['robust_alpha'] + [c for c, _ in GT_CANDIDATE_TIEBREAK]
+        _tb_asc = [False] + [asc for _, asc in GT_CANDIDATE_TIEBREAK]
+        region = region.sort_values(_tb_cols, ascending=_tb_asc)
         top_cagr = region.iloc[0]['cagr']
         if pd.isna(top_cagr) or top_cagr <= PHASE25_ISLAND_CAGR_MIN:
             continue

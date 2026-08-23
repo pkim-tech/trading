@@ -175,16 +175,50 @@ def independent_candidates_for_scope(ticker, strategy_name, version, entry_timin
         df_centers = pd.DataFrame(centers_rows, columns=['take_profit', 'stop_loss', 'robust_alpha'])
         centers = ros.pick_island_centers(df_centers)
 
+        # Independently-expressed version of the same GT_CANDIDATE_TIEBREAK contract
+        # Method A's pandas sort applies (see run_optimization_sweep.py's own comment on
+        # that constant for why each column is a genuine secondary preference, not a bare
+        # determinism nonce) -- written directly as a SQL ORDER BY here rather than
+        # reusing Method A's sort call, so a bug in that call site isn't guaranteed to
+        # reproduce identically in this re-implementation. Note the independence is
+        # partial by design: the MECHANISM (hand-written SQL vs. pandas) is genuinely
+        # separate, but both sides import the same GT_CANDIDATE_TIEBREAK POLICY constant
+        # (which columns, which directions) rather than each hardcoding their own copy --
+        # a wrong/incomplete entry in that shared constant would reproduce identically on
+        # both sides and this cross-check would not catch it. Accepted tradeoff: a
+        # hand-duplicated policy list risks silent drift between the two sides even more
+        # than a shared-but-wrong policy does (2026-08-22 4-way review).
+        _tiebreak_sql_col = {
+            'trades': 'trades', 'stop_loss': sl_col, 'max_hold_hours': 'max_hold_hours',
+            'window': 'window', 'z_score_threshold': 'z_score_threshold',
+            'tpct': tpct_col_sql, 'take_profit': 'axis_tp',
+        }
+        # tpct_col_sql is the bare literal '0' for any strategy without a real trail_pct
+        # axis (e.g. TrailingExitZScoreBreakout) -- harmless in a SELECT list, but SQLite
+        # reinterprets a bare integer literal appearing in ORDER BY as a 1-based
+        # output-column ordinal rather than a value, which raised "ORDER BY term out of
+        # range" for every non-TrailingBoth scope (caught by the 2026-08-22 4-way review,
+        # confirmed independently by all four reviewers, missed by this session's own
+        # repro since it only exercised a TrailingBoth scope). Sorting on a column that's
+        # constant across the region is a no-op anyway (same as it is for Method A's
+        # pandas sort on the equally-constant `tpct` column), so the term is dropped
+        # rather than special-cased into a non-ordinal SQL expression.
+        order_by = ', '.join(
+            [f"{ros.ROBUST_ALPHA_SQL} DESC"] +
+            [f"{_tiebreak_sql_col[col]} {'ASC' if asc else 'DESC'}" for col, asc in ros.GT_CANDIDATE_TIEBREAK
+             if _tiebreak_sql_col[col] != '0']
+        )
+
         candidates = []
         for tp_c, sl_c in centers:
             region_rows = conn.execute(f"""
                 SELECT axis_tp, {sl_col}, max_hold_hours, window, z_score_threshold,
-                       {tpct_col_sql}, {ros.ROBUST_ALPHA_SQL}, cagr
+                       {tpct_col_sql}, {ros.ROBUST_ALPHA_SQL}, cagr, trades
                 FROM backtest_cache
                 WHERE ticker=? AND strategy=? AND version=? AND trades > 0
                   AND kernel_version='{pbcg.KERNEL_VERSION}' {scope_sql}
                   AND ABS(axis_tp - ?) <= {ros.FINE_RADIUS} AND ABS({sl_col} - ?) <= {ros.FINE_RADIUS}
-                ORDER BY {ros.ROBUST_ALPHA_SQL} DESC
+                ORDER BY {order_by}
                 LIMIT 3
             """, (ticker, strategy_name, version, *scope_params, tp_c, sl_c)).fetchall()
             if not region_rows:
@@ -192,7 +226,7 @@ def independent_candidates_for_scope(ticker, strategy_name, version, entry_timin
             top_cagr = region_rows[0][7]
             if top_cagr is None or top_cagr <= ros.PHASE25_ISLAND_CAGR_MIN:
                 continue
-            for tp, sl, hold, w, z, tpct, robust_alpha, cagr in region_rows:
+            for tp, sl, hold, w, z, tpct, robust_alpha, cagr, trades in region_rows:
                 if cagr is None or robust_alpha is None:
                     continue  # NULL cagr/alpha on a non-top region row -- not a real,
                               # rankable candidate; Method A's pandas path tolerates NaN
