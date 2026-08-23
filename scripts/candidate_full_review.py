@@ -111,6 +111,13 @@ DEFAULT_FOLDS = 5
 # glossary sheet by default, not a bare CSV.
 COLUMN_DEFS = {
     "ticker": "The symbol.",
+    "config_version": "The real backtest_cache `version` string this row's data came from (e.g. "
+                       "'v6-massive-w2021-08-23_2026-08-21' -- the trailing 'wSTART_END' suffix is the real "
+                       "declared date window). Added 2026-08-23 for node provenance/traceability after a real "
+                       "incident: a report silently mixed in an in-progress separate windowed-sweep's rows "
+                       "alongside the primary 5yr sweep's rows with no way to tell them apart. Legacy "
+                       "(--kernel legacy) rows: always 'v5'/'v5.1', included for schema consistency, not because "
+                       "legacy has the multi-version ambiguity GT does.",
     "sector": "Real description/leverage/inverse flag straight from the tickers table.",
     "k1_status": "K-1/UBTI tax-filer status. Only reflects tickers actually confirmed via a real source "
                  "check (issuer tax-document page) -- every other ticker honestly reads 'not checked', never "
@@ -1790,6 +1797,7 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
         rec["candidate_type"] = (f"GT winner (rank {i + 1})" if i == report["winner_index"]
                                   else f"GT candidate (rank {i + 1})")
         rec["also_matches"] = [rec["candidate_type"]]
+        rec["config_version"] = version
 
         # core_alpha_pct is DIAGNOSTIC-ONLY for GT rows (2026-08-23, ground_truth_kernel_
         # rebuild.md Step 4): the GT candidate/winner selection itself
@@ -2146,6 +2154,7 @@ def main():
                 out_rows.append({"ticker": ticker, "no_data": True})
                 continue
             rec = _row_to_record(row)
+            rec["config_version"] = version
             years = rec["years"]
             strat_cagr = cagr(rec["abs_return_pct"], years * 365.25) if years else None
             rec["strategy_cagr_pct"] = strat_cagr
