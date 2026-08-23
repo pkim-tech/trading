@@ -71,6 +71,12 @@ days early for longer holds and produces fabricated "ran out of data" results. B
 scripts had this bug until fixed 2026-07-13.
 
 ## 4. Win-rate stability check (train/live split)
+**GT/v6 candidates**: a GT-native equivalent of this check now exists —
+`run_optimization_sweep.build_candidate_report_ground_truth`'s check 4 (added `ff8372e`,
+2026-08-22), run automatically for `derive_phase25_candidates_ground_truth`'s shortlisted
+candidates. Use that instead of the `run_backtest_v110` replay below for a v6 candidate;
+the manual steps below still apply as-is for v5/v5.1.
+
 Is the backtested win rate real, or an artifact of the older (training) portion of the
 history — i.e., would a strategy that stopped working recently still show a good
 full-history win rate? Replay the node's trades (same params as the live watchlist entry,
@@ -114,12 +120,22 @@ overstated, 7007%→3591%) — worth a spot-check on any candidate with an unusu
 number before trusting it at face value.
 
 ## 8. Trade-count fluke check
+**GT/v6 candidates**: GT-native equivalent exists — `build_candidate_report_ground_truth`'s
+check 8 (`ff8372e`), run automatically for shortlisted candidates. Use that for a v6
+candidate; the manual check below still applies as-is for v5/v5.1.
+
 Before trusting a "best alpha" node, check whether it's actually driven by a single
 outlier trade (`trades` column at or near 1 for the winning grid cell) rather than a
 real repeatable edge. Recurring failure mode in sweep results (e.g. UVIX had thousands of
 `trades=1` rows driving misleadingly high headline alpha).
 
 ## 9. Same-day-block sensitivity check
+**GT/v6 candidates**: confirmed genuinely out of scope for now — `run_backtest_ground_truth`/
+`_simulate_trail_ground_truth` have no `same_day_block` parameter at all (confirmed while
+building the GT candidate-report, `ff8372e`). Porting it is deferred as low priority (user's
+call, 2026-08-22 — `same_day_block` has never actually produced a useful signal
+historically). This check does not run for v6 candidates; only applies to v5/v5.1 below.
+
 How much of a node's edge depends on capital that the real cash-account same-day-re-buy
 rule (`schwab_safety.py`'s same-day-block, enforced live) would actually block — i.e. a
 fresh signal on the same calendar day as that node's own prior exit? Run
@@ -133,6 +149,10 @@ under blocking but **retained only 7.2% of robust alpha** — most of the edge l
 exactly the trades the real same-day rule would block.
 
 ## 10. Same-day-collision stability check (70/30 split)
+**GT/v6 candidates**: unresolved — depends on check 9, which doesn't run for GT (see
+above). Not scoped whether this check should be dropped for v6 or given its own GT-aware
+form; don't run this check for a v6 candidate until that's decided.
+
 A same-day-block sensitivity number (check 9) is a single aggregate ratio — this checks
 whether that vulnerability itself is stable over time or concentrated in one window.
 Chronologically split the node's trades 70/30 (same method as check 4) and compare each
@@ -142,6 +162,10 @@ from check 9 is hiding a regime-dependent effect, not a stable structural proper
 the ticker.
 
 ## 11. Max drawdown check
+**GT/v6 candidates**: GT-native equivalent exists — `build_candidate_report_ground_truth`'s
+check 11 (`ff8372e`), run automatically for shortlisted candidates. Use that for a v6
+candidate; the manual `v4_max_drawdown.py` check below still applies as-is for v5/v5.1.
+
 True peak-to-trough max drawdown across the node's full compounded equity curve
 (`scripts/v4_max_drawdown.py`) — not just the longest consecutive-loss streak, since a
 drawdown can also build from a mix of wins-that-don't-recover-the-prior-peak and losses.
@@ -167,6 +191,11 @@ worst point, at that exact moment) — the same real-world price action producin
 different strategy-level pain depending on stop width.
 
 ## 13. Walk-forward (N-fold out-of-time) consistency check
+**GT/v6 candidates**: GT-native equivalent exists — `build_candidate_report_ground_truth`'s
+check 13 (`ff8372e`), run automatically for shortlisted candidates, using
+`GT_ROBUSTNESS_CAGR_MIN` (20%) as its fragility bar rather than robust-alpha. Use that for
+a v6 candidate; `walk_forward_check.py` below still applies as-is for v5/v5.1.
+
 Generalizes check 4's single 70/30 split into N (default 5) equal chronological calendar
 windows across the ticker's full cached history (`scripts/walk_forward_check.py`), and
 reports robust-alpha (`MIN(possible,pessimistic,certain)`) independently per window, each

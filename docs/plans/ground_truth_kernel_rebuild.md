@@ -62,12 +62,16 @@ because a reviewer caught it, not deferred to Step 7's later audit.
 
 **Explicitly NOT in scope for this plan:**
 - lowvol/same_day_block as standalone overlay axes
-- Full drought/add-on resweep (confirm_days × vol_gate grid) — sample sizes are too thin at
-  2yr coverage to trust a sweep result (see research log: 1-9 trades per cell); add-on runs
-  in full (no confirm_days/vol_gate axis to sweep), drought runs ONCE at confirm_days=3 as a
-  directional indicator only, not a validated selection input
-- Core+overlay jointly-optimized kernel (drought/add-on state machines built into the sweep's
-  hot loop) — a larger, separate future architecture project
+- Full drought/add-on resweep **across the whole universe** (every core grid cell, not just
+  shortlisted candidates) — sample sizes are too thin at 2yr coverage to trust a sweep result
+  at that scale (see research log: 1-9 trades per cell), and it's computationally infeasible
+  regardless (164k-cell core grid × a drought grid, per ticker).
+- **Clarified 2026-08-23 (superseding the two bullets this replaces)**: core+overlay joint
+  optimization IS in scope for this plan, chopped down to the shortlist — see Phase 4 below.
+  A true core+overlay jointly-optimized kernel across the FULL universe (drought/add-on state
+  machines in the sweep's 164k-cell hot loop) stays out of scope, for the same cost/sample-size
+  reasons as the bullet above — the in-scope version only ever runs inline sim against the
+  ~9-per-ticker shortlist Phase 2.5-GT already produces, never the full grid.
 - 10-year historical data purchase
 - SOXS `drought_confirm_days=1` fix — real, already recommended (see research log's SOXS
   entry), deliberately not bundled into this plan
@@ -389,22 +393,37 @@ regardless of what a parameter search might otherwise suggest.
 4. **Build the GT-aware tooling**: candidate-report pipeline, `top_safe_nodes.py`
    kernel-version-aware selection, promotion checklist's 3 GT-dependent checks (9/10/13).
    **Alpha removed entirely** (not just de-prioritized) from schema/reports/ranking —
-   CAGR (or GT worst-neighbor-CAGR) is the sole metric going forward. **Core+overlay
-   joint optimization folded in here** (moved from the old Follow-on bucket, see below) —
-   `ensure_overlay_for_node`/`run_overlay_shim.run_for_node` confirmed to only compute one
-   fixed drought variant (confirm_days=10, vol_gate=off) + one addon variant, automatically
-   but only for whichever core node already won on core-only CAGR, never searched jointly.
-   Real deployability constraint: add-on needs margin-borrowed capital (`brokerage`-only,
-   Reg-T margin), not available in `ira`/`roth`/`sep` (cash accounts) — the joint sweep
-   scopes add-on to `brokerage`-bound nodes only; drought has no such constraint and
-   applies universe-wide. `kernel_version` added as a real schema column (future-proofs
-   the data model for eventual multi-strategy use) but no general pluggable-kernel
-   selector built — no second kernel needs one yet. **Review-gate applies**: alpha
-   removal touches `ROBUST_ALPHA_SQL`/`run_optimization_sweep.py`, a backtest kernel
-   module under CLAUDE.md's mandatory paired independent-cold + contextual Opus review —
-   flag explicitly here rather than relying on session-wrap to catch it after the fact,
-   per this project's own `908a6f0` incident (shipped once without review because
-   attention was on a narrower sub-problem, same risk shape as this megaproject).
+   CAGR (or GT worst-neighbor-CAGR) is the sole metric going forward.
+
+   **Core+overlay joint optimization, clarified 2026-08-23 (supersedes the original framing
+   below)**: today's pipeline (`ensure_overlay_for_node`/`run_overlay_shim.run_for_node`,
+   and the newer `gt_addon_winner_drought_eval.py::compute_drought_eval` built 2026-08-22
+   for the GT candidate report) runs core sweep first, THEN bolts on one fixed drought
+   variant + one add-on variant to whichever core node already won — a separate post-hoc
+   pass, not inline with the backtest. **Real decision**: replace this with a single inline
+   simulation (core + drought + add-on state machines running together in one backtest
+   pass, not three stitched-together passes) — but ONLY applied to the shortlisted
+   candidates Phase 2.5-GT already selects (~9 per ticker), never the full core grid
+   (too expensive/too thin-sample at universe scale, see the "Explicitly NOT in scope"
+   section above). Drought's `confirm_days`×`vol_gate` grid IS swept per shortlisted
+   candidate (not fixed to one setting) — small grid, cheap at shortlist scale, finds the
+   real best pairing per candidate instead of guessing one value. Add-on has no equivalent
+   parameter grid (on/off only) so it still just runs in full per candidate. Real
+   deployability constraint stands: add-on needs margin-borrowed capital (`brokerage`-only,
+   Reg-T margin), not available in `ira`/`roth`/`sep` (cash accounts) — scope add-on
+   evaluation to `brokerage`-bound candidates only; drought has no such constraint and
+   applies to every shortlisted candidate regardless of account. **Review-gate applies**:
+   a new inline combined-simulation function is kernel-adjacent (`backtester.py`/
+   `run_optimization_sweep.py`), under CLAUDE.md's mandatory paired independent-cold +
+   contextual Opus review — flag explicitly, don't rely on session-wrap to catch it later.
+
+   `kernel_version` added as a real schema column (future-proofs the data model for
+   eventual multi-strategy use) but no general pluggable-kernel selector built — no second
+   kernel needs one yet. **Review-gate also applies to the alpha-removal piece**: touches
+   `ROBUST_ALPHA_SQL`/`run_optimization_sweep.py` — flag explicitly here rather than
+   relying on session-wrap to catch it after the fact, per this project's own `908a6f0`
+   incident (shipped once without review because attention was on a narrower sub-problem,
+   same risk shape as this megaproject).
 5. **Pick new v6 candidates, sunset v5/v5.1** — no re-derivation of old picks, straight
    fresh selection via Phase 4's tooling against Phase 3's sweep output. **Rollback
    posture, decided 2026-08-22**: if a v6 candidate turns out wrong post-promotion,
