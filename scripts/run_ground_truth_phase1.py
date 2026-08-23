@@ -10,7 +10,7 @@ authorization (2026-08-21/22), and an explicit one-time exception to run it dire
 the standard run_sweep_queue.sh). Generic over ticker via --ticker (mirrors
 run_ground_truth_neighborhood.py's own --ticker convention). The per-strategy grid shape
 (take_profits/stop_losses/whether a real 4th trail_pct axis exists) is looked up from
-campaign_config.STRATEGIES[n["strategy"]], keyed off strategies.resolve_axis_columns --
+campaign_config.STRATEGIES[strategy_name], keyed off strategies.resolve_axis_columns --
 NOT hardcoded here, since TrailingBothZScoreBreakout and TrailingExitZScoreBreakout sweep
 physically different columns under the same "stop_losses" grid name (see
 strategies.resolve_axis_columns / campaign_config.py's own per-strategy comments:
@@ -32,6 +32,20 @@ real hourly-data overlap for a given ticker. A different window gets its own ver
 string automatically (window_version_suffix), so it writes fresh backtest_cache rows
 rather than colliding with the 2024-08-21..2026-08-20 campaign's results.
 
+--strategy/--fixed-sl (added 2026-08-22, for candidate-discovery/permutation campaigns
+-- see scripts/run_ground_truth_sweep_queue_permutation.sh): when BOTH are passed
+explicitly, they're used INSTEAD of load_live_node(TICKER)'s strategy/fixed_sl --
+load_live_node() is not even called in that case, so this works for any ticker
+regardless of what's currently live, under either strategy, at any fixed_sl value
+(exactly the STRATEGY x FIXED_SL x TICKER permutation the legacy run_sweep_queue.sh
+sweeps for the hourly kernel). This is deliberately NOT the same question the
+existing --ticker-only mode answers ("does the kernel faithfully reproduce what's
+already live") -- it's unconstrained candidate discovery. Passing only one of the two
+is an error (ambiguous: which source does the other value come from?). Passing
+neither preserves the original live-config-derived behavior unchanged, so the
+already-working run_ground_truth_sweep_queue.sh / Step 4-5 use case keeps working
+exactly as before.
+
 **Phase2/2.5-GT auto-chain (added 2026-08-22, per the plan's Step 3 "search strategy:
 unchanged" decision)**: after Phase1-coarse-GT finishes, this script automatically calls
 run_phase2_island_ground_truth (fine mesh around Phase1's own island centers) and then
@@ -52,6 +66,7 @@ separate completeness check is needed in this script.
 legacy pipeline's own --max-phase convention.
 
 Usage: .venv/bin/python scripts/run_ground_truth_phase1.py --ticker SOXL [--workers 8] [--start YYYY-MM-DD] [--end YYYY-MM-DD] [--max-phase {1,2,2.5}]
+       .venv/bin/python scripts/run_ground_truth_phase1.py --ticker SOXL --strategy TrailingExitZScoreBreakout --fixed-sl 2   # permutation mode, no live-node dependency
 Writes to cache/research/trading_universe.db, version='v6-w<start>_<end>' (yahoo) or
 'v6-massive-w<start>_<end>' (--data-source massive).
 """
@@ -84,6 +99,19 @@ ENTRY_TIMING = "open_check"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ticker", required=True)
+    ap.add_argument("--strategy", choices=sorted(campaign_config.STRATEGIES),
+                     help="explicit strategy, used INSTEAD of load_live_node(TICKER)'s "
+                          "strategy (permutation/candidate-discovery mode). Must be paired "
+                          "with --fixed-sl. Omit both to keep the original live-node-derived "
+                          "behavior.")
+    ap.add_argument("--fixed-sl", dest="fixed_sl", type=int,
+                     help="explicit fixed_sl, used INSTEAD of load_live_node(TICKER)'s "
+                          "fixed_sl. Must be paired with --strategy. Integer only (paired "
+                          "review, 2026-08-22): backtest_cache's PK stores "
+                          "int(round(fixed_sl)) while the cache-key/campaign-scope lookups "
+                          "use the raw value -- a fractional fixed_sl (e.g. 1.5) would get a "
+                          "distinct cache key but collide on PK with fixed_sl=2, so "
+                          "INSERT OR REPLACE would silently clobber another campaign's rows.")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--start", default=DEFAULT_START)
     ap.add_argument("--end", default=DEFAULT_END)
@@ -117,14 +145,27 @@ def main():
     # 5yr comparison across all 12 real live tickers -- see scripts/compare_all_live_
     # 5yr_massive.py). No remaining restriction on --max-phase for massive runs.
 
-    n = load_live_node(TICKER)
-    print(f"Live node: {n}")
-    strategy_name = n["strategy"]
+    if (args.strategy is None) != (args.fixed_sl is None):
+        raise SystemExit(
+            "--strategy and --fixed-sl must be passed together (permutation mode) or not "
+            "at all (live-node-derived mode) -- got only one of the two."
+        )
+    if args.strategy is not None:
+        strategy_name = args.strategy
+        fixed_sl = args.fixed_sl
+        print(f"Permutation mode: strategy={strategy_name}, fixed_sl={fixed_sl} (no live-node lookup)")
+    else:
+        n = load_live_node(TICKER)
+        print(f"Live node: {n}")
+        strategy_name = n["strategy"]
+        fixed_sl = n["fixed_sl"]
     if strategy_name not in campaign_config.STRATEGIES:
         raise SystemExit(
-            f"{TICKER}'s live node strategy is {strategy_name!r}, which has no grid entry in "
-            f"campaign_config.STRATEGIES ({sorted(campaign_config.STRATEGIES)}). This script "
-            f"only supports strategies with a defined grid there."
+            f"{TICKER}'s resolved strategy is {strategy_name!r} (from "
+            f"{'--strategy' if args.strategy is not None else 'load_live_node()'}), which "
+            f"has no grid entry in campaign_config.STRATEGIES "
+            f"({sorted(campaign_config.STRATEGIES)}). This script only supports strategies "
+            f"with a defined grid there."
         )
     grid = campaign_config.STRATEGIES[strategy_name]
     # Per-strategy axis remapping (paired review, 2026-08-22): campaign_config.STRATEGIES'
@@ -201,8 +242,8 @@ def main():
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         dispatch_parallel_grid_ground_truth(
-            pool, tasks, TICKER, n["strategy"], version, "Phase1-Coarse-GT",
-            spy_bh, asset_bh, run_timestamp, fixed_sl=n["fixed_sl"], entry_timing=ENTRY_TIMING,
+            pool, tasks, TICKER, strategy_name, version, "Phase1-Coarse-GT",
+            spy_bh, asset_bh, run_timestamp, fixed_sl=fixed_sl, entry_timing=ENTRY_TIMING,
             same_bar_reentry=True, start_date=START, end_date=END, data_source=data_source,
         )
         print(f"Phase1-coarse-GT done in {(time.time()-t0)/3600:.2f}h")
@@ -213,8 +254,8 @@ def main():
 
         t1 = time.time()
         run_phase2_island_ground_truth(
-            pool, TICKER, n["strategy"], version, hp, spy_bh, asset_bh, run_timestamp,
-            fixed_sl=n["fixed_sl"], entry_timing=ENTRY_TIMING, same_bar_reentry=True,
+            pool, TICKER, strategy_name, version, hp, spy_bh, asset_bh, run_timestamp,
+            fixed_sl=fixed_sl, entry_timing=ENTRY_TIMING, same_bar_reentry=True,
             start_date=START, end_date=END, data_source=data_source,
         )
         print(f"Phase2-Island-GT done in {(time.time()-t1)/3600:.2f}h")
@@ -225,8 +266,8 @@ def main():
 
         t2 = time.time()
         run_phase25_cliff_box_ground_truth(
-            pool, TICKER, n["strategy"], version, hp, spy_bh, asset_bh, run_timestamp,
-            fixed_sl=n["fixed_sl"], entry_timing=ENTRY_TIMING, same_bar_reentry=True,
+            pool, TICKER, strategy_name, version, hp, spy_bh, asset_bh, run_timestamp,
+            fixed_sl=fixed_sl, entry_timing=ENTRY_TIMING, same_bar_reentry=True,
             start_date=START, end_date=END, data_source=data_source,
         )
         print(f"Phase2.5-CliffBox-GT done in {(time.time()-t2)/3600:.2f}h")
