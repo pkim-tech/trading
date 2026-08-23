@@ -2314,7 +2314,7 @@ def simulate_drought_overlay_ground_truth(trades, df_hourly_windowed, ticker, fi
             'best_confirm_days': None, 'best_vol_gate': None,
             'n_drought_windows': 0, 'n_drought_simulated': 0,
             'drought_compounded_pct': None, 'combined_compounded_pct': None,
-            'n_grid_cells_evaluated': 0,
+            'n_grid_cells_evaluated': 0, 'best_rets': None,
         }
 
     def _combined_compounded(rets):
@@ -2332,4 +2332,106 @@ def simulate_drought_overlay_ground_truth(trades, df_hourly_windowed, ticker, fi
         'drought_compounded_pct': drought_compounded,
         'combined_compounded_pct': _combined_compounded(best_rets),
         'n_grid_cells_evaluated': len(cells),
+        # 'best_rets' (2026-08-23, GT full-review port): the raw per-window return list at
+        # the winning (confirm_days, vol_gate) cell, in the SAME chronological order
+        # `windows` (from find_drought_windows, an ascending bar-index scan) produced them
+        # -- added so a caller can compute real win-rate/early-late-stability checks off
+        # the actual windows, not just the aggregate drought_compounded_pct. None whenever
+        # the winning cell doesn't exist (the `not cells` branch above).
+        'best_rets': best_rets,
+    }
+
+
+def drought_included_excluded_ground_truth(trades, df_hourly_windowed, ticker, fixed_sl,
+                                            arm_pct, trail_sell_pct, confirm_days, vol_gate):
+    """GT-kernel port (2026-08-23, candidate_full_review.py GT full-review build-out) of
+    scripts/candidate_full_review.drought_included_excluded_check -- docs/overlay_
+    parameter_robustness_process.md step 4: confirm the entry-time intraday-vol-percentile
+    gate does real differential selection (kept windows beat thrown-out windows), not just
+    look profitable in isolation. Reuses the exact same building blocks simulate_drought_
+    overlay_ground_truth already imports (find_drought_windows/simulate_overlay/
+    get_ivol_series/_entry_vol_pctile) and the same floor-bar timestamp->bar-index mapping
+    fix that function's own docstring documents (GT trade times are real minute
+    timestamps, not always an exact hourly bar label) -- NOT re-derived, just inlined here
+    since simulate_drought_overlay_ground_truth doesn't expose its own _floor_bar closure.
+
+    `confirm_days` is the caller's choice -- pass the SAME winning confirm_days
+    simulate_drought_overlay_ground_truth's own sweep picked (its 'best_confirm_days'
+    field) so this challenge stays consistent with whatever drought_n/drought_compounded_pct
+    a report is showing elsewhere for the same candidate, matching the legacy check's own
+    "pulled from this node's own existing drought overlay run" convention.
+
+    Returns None if <2 real core trades, <2 real drought windows at this confirm_days, or
+    no real ivol data exists for `ticker`. Otherwise a dict (same shape as the legacy
+    check): {confirm_days, vol_gate, n_included, included_compounded_pct,
+    included_win_rate_pct, n_excluded, excluded_compounded_pct, excluded_win_rate_pct,
+    verdict} where verdict is one of REAL_SELECTION / DISCRIMINATES_BUT_UNPROFITABLE /
+    NO_REAL_SELECTION / 'N/A (all one side)' -- same requires-profitable-AND-discriminates
+    convention as the legacy check (a filter that merely loses less isn't a pass)."""
+    if len(trades) < 2:
+        return None
+    from scripts.drought_overlay_test import find_drought_windows, simulate_overlay
+    from scripts.drought_overlay_sweep import get_ivol_series, _entry_vol_pctile
+
+    idx = df_hourly_windowed.index
+    n_bars = len(idx)
+
+    def _floor_bar(ts):
+        pos = int(idx.searchsorted(ts, side='right')) - 1
+        return pos if 0 <= pos < n_bars else None
+
+    bar_trades = []
+    for t in trades:
+        signal_i = _floor_bar(t['Entry Time'])
+        exit_i = _floor_bar(t['Exit Time'])
+        if signal_i is None or exit_i is None:
+            continue
+        bar_trades.append({'signal_i': signal_i, 'exit_i': exit_i})
+    if len(bar_trades) < 2:
+        return None
+
+    windows = find_drought_windows(bar_trades, df_hourly_windowed, confirm_days)
+    if len(windows) < 2:
+        return None
+
+    try:
+        ivol_series = get_ivol_series(ticker)
+    except (FileNotFoundError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError):
+        return None
+    if ivol_series is None:
+        return None
+
+    included, excluded = [], []
+    for entry_i, backstop_i in windows:
+        entry_time = idx[entry_i + 1] if entry_i + 1 < len(idx) else idx[entry_i]
+        pctile = _entry_vol_pctile(entry_time, ivol_series)
+        if pctile is None:
+            continue
+        ret = simulate_overlay(df_hourly_windowed, entry_i, backstop_i,
+                                fixed_sl_pct=fixed_sl, arm_pct=arm_pct,
+                                trail_sell_pct=trail_sell_pct)['ret']
+        (included if pctile < vol_gate else excluded).append(ret)
+
+    if len(included) < 1 or len(excluded) < 1:
+        return {"confirm_days": confirm_days, "vol_gate": vol_gate,
+                "n_included": len(included), "n_excluded": len(excluded),
+                "verdict": "N/A (all one side)"}
+
+    inc_comp = float((pd.Series(included) + 1).prod() - 1) * 100
+    exc_comp = float((pd.Series(excluded) + 1).prod() - 1) * 100
+    inc_wr = sum(1 for r in included if r > 0) / len(included) * 100
+    exc_wr = sum(1 for r in excluded if r > 0) / len(excluded) * 100
+    discriminates = (inc_comp > exc_comp) and (inc_wr > exc_wr)
+    if discriminates and inc_comp > 0:
+        verdict = "REAL_SELECTION"
+    elif discriminates:
+        verdict = "DISCRIMINATES_BUT_UNPROFITABLE"
+    else:
+        verdict = "NO_REAL_SELECTION"
+
+    return {
+        "confirm_days": confirm_days, "vol_gate": vol_gate,
+        "n_included": len(included), "included_compounded_pct": inc_comp, "included_win_rate_pct": inc_wr,
+        "n_excluded": len(excluded), "excluded_compounded_pct": exc_comp, "excluded_win_rate_pct": exc_wr,
+        "verdict": verdict,
     }

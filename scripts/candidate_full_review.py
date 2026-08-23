@@ -71,7 +71,7 @@ import yfinance as yf
 from annualized_alpha_report import cagr
 from candidate_summary_report import (
     DB_PATH, build_rows_for_ticker, _row_to_record, best_node_strategy, load_ticker_df,
-    CANDIDATE_LABELS, resolve_version,
+    CANDIDATE_LABELS, resolve_version, liquidity_dollars_per_day, gt_scopes_for_tickers,
 )
 from candidate_5min_report import best_safe_node, _node_from_row, _node_key
 from run_overlay_shim import ensure_candidate_nodes_table, ensure_table as ensure_overlay_table
@@ -747,8 +747,24 @@ def overlay_robustness(conn, ticker, strategy, version, mechanism, node):
     trades = c.fetchall()
     if len(trades) < 2:
         return None
-
     rets = [t[1] for t in trades]
+    return _chrono_split_robustness(rets)
+
+
+def _chrono_split_robustness(rets):
+    """Shared chronological-split-robustness math (docs/overlay_parameter_robustness_
+    process.md steps 1/3 -- chronological half1/half2 split, single-biggest-trade
+    removal -- PLUS checklist item 4's early/late win-rate comparison on the same split),
+    factored out 2026-08-23 (GT full-review port) so both the legacy hourly-kernel path
+    (overlay_robustness above, unchanged behavior) and the new --kernel gt path can apply
+    the identical math to their own real chronologically-ordered return list, instead of
+    the GT path reimplementing this by hand. `rets` MUST already be in chronological
+    (Entry Time ascending) order -- this function does no sorting itself, matching the
+    legacy caller's own `ORDER BY cor.entry_time` SQL and the GT caller's own trade-list/
+    drought-window ordering (see their own docstrings for why each is already
+    chronological). Returns None if <2 rets."""
+    if len(rets) < 2:
+        return None
     mid = len(rets) // 2
     half1, half2 = rets[:mid], rets[mid:]
     half1_pct, half2_pct = compounded(half1), compounded(half2)
@@ -1607,6 +1623,341 @@ def _build_output_row(rec):
     return row
 
 
+# ── --kernel gt full-review port (2026-08-23) ────────────────────────────────
+# Ports this report's full v5 checklist (COLUMN_DEFS/FIELDNAMES above, unchanged) to GT
+# (kernel_version='ground_truth_v6') scopes, reusing build_candidate_report_ground_truth
+# (run_optimization_sweep.py) and the new drought_included_excluded_ground_truth
+# (backtester.py) as the real building blocks -- NOT a re-derivation of the hourly-kernel
+# checks above. bear_*/crash25_* stay legacy-hourly-only (GT has no decades-deep daily
+# history for the 2008/2020/2022/2000 crashes, and the 2025 crash check needs the same
+# real hourly bars the legacy kernel already has cached, which this port doesn't touch) --
+# same for a handful of other legacy-only mechanisms with no GT-kernel equivalent yet
+# (candidate_nodes pick/comment registry, the 5-min bounce-fill accuracy check, same_day_
+# block). GT_SKIP_COLUMNS below is applied as a final pass over every --kernel gt output
+# row so these read as an honest, labeled skip -- never a blank/NaN that could be misread
+# as a compute failure (this file's own COLUMN_DEFS/FIELDNAMES schema is reused as-is for
+# --kernel gt output, so these columns exist in the CSV/xlsx either way).
+GT_SKIP_LABEL = "not computed for GT (see legacy report)"
+GT_SKIP_COLUMNS = (
+    [c for c in COLUMN_DEFS if c.startswith("bear_")] +
+    [c for c in COLUMN_DEFS if c.startswith("crash25_")] + ["crash_2025_tranche"] +
+    ["node_id", "pick", "comment"] +
+    ["fillacc_possible_win_pct", "fillacc_possible_mean_err_pct", "fillacc_n",
+     "exit_fillacc_win_pct", "exit_fillacc_mean_err_pct", "exit_fillacc_n"] +
+    ["sdb_trade_retention_pct", "sdb_alpha_retention_pct", "sdb_alpha_unblocked_pct",
+     "sdb_alpha_blocked_pct", "sdb_compounded_unblocked_pct", "sdb_compounded_blocked_pct",
+     "sdb_retention_early_pct", "sdb_retention_late_pct", "sdb_tranche", "sdb_recommend",
+     "core_sdb_cagr_pct"] +
+    ["calendar_years_pct", "current_drawdown_pct",
+     "core_fluke_alpha_pct", "core_fluke_alpha_without_biggest_pct"]
+)
+
+
+def _gt_alpha_resolutions(conn, ticker, strategy, version, entry_timing, fixed_sl, cand):
+    """Real alpha_vs_spy / alpha_vs_spy_pessimistic / alpha_vs_spy_certain for this exact
+    swept GT cell, straight off backtest_cache (the same three resolutions ROBUST_ALPHA_SQL
+    already MINs together into core_alpha_pct/candidate['robust_alpha']) -- looked up, not
+    re-derived or approximated. Same column-mapping helpers derive_phase25_candidates_
+    ground_truth itself uses (resolve_axis_columns/_sl_axis_real_column/_campaign_scope_sql),
+    reused directly so this can't silently drift from that function's own WHERE shape."""
+    import run_optimization_sweep as ros
+    sl_axis_col, fourth_axis_col = _strategies.resolve_axis_columns(strategy)
+    sl_real_col = ros._sl_axis_real_column(sl_axis_col)
+    scope_sql, scope_params = ros._campaign_scope_sql(strategy, fixed_sl, entry_timing)
+    where_extra = " AND axis_tp=? AND {}=? AND max_hold_hours=? AND window=? AND z_score_threshold=?".format(sl_real_col)
+    params = [version, ticker, strategy, cand['take_profit'], cand['stop_loss'],
+              cand['max_hold_hours'], cand['window'], cand['z_score_threshold']]
+    if fourth_axis_col == 'trail_pct':
+        where_extra += " AND trail_sell_pct=?"
+        params.append(cand['tpct'])
+    params += list(scope_params)
+    df = pd.read_sql(f"""
+        SELECT alpha_vs_spy, alpha_vs_spy_pessimistic, alpha_vs_spy_certain
+        FROM backtest_cache
+        WHERE version=? AND ticker=? AND strategy=? AND kernel_version='ground_truth_v6'
+              {where_extra} {scope_sql}
+        LIMIT 1
+    """, conn, params=params)
+    if df.empty:
+        return None, None, None
+    r = df.iloc[0]
+    poss = float(r['alpha_vs_spy']) if pd.notna(r['alpha_vs_spy']) else None
+    pess = float(r['alpha_vs_spy_pessimistic']) if pd.notna(r['alpha_vs_spy_pessimistic']) else poss
+    cert = float(r['alpha_vs_spy_certain']) if pd.notna(r['alpha_vs_spy_certain']) else poss
+    return poss, pess, cert
+
+
+def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl, vol_gate=DEFAULT_VOL_GATE):
+    """Full-checklist rows for one GT scope, one row per Phase2.5-GT candidate --
+    GT-kernel counterpart of this file's legacy per-ticker loop in main(), producing
+    records shaped exactly like the legacy path's `rec` dicts (same nested walk_forward/
+    addon_robustness/drought_robustness/drought_included_excluded/bear_market/
+    exit_fill_acc keys) so add_tranches()/_build_output_row() -- both UNCHANGED, no GT-
+    specific branching added to either -- can be reused as-is rather than duplicated.
+
+    Real vs. skipped, by column group (see GT_SKIP_COLUMNS above for the mechanical list):
+    ticker/sector/k1/underlier/trend/split/liquidity are ticker-generic and reused
+    unmodified. core_alpha_pct/abs_return_pct/strategy_cagr_pct/ann_excess_pct/alpha_*_pct/
+    years/trades/worst_neighbor_pct/status are real GT-native numbers (build_candidate_
+    report_ground_truth's own candidate/addon_detail/check11 fields, or a direct
+    backtest_cache lookup for the 3 fill resolutions). addon_n/addon_compounded_pct/
+    addon_win_rate_pct/addon_robustness_verdict/addon_*_wr_* are computed from this
+    candidate's OWN real per-trade list (row['trades']) passed through backtester.
+    apply_addon_overlay_ground_truth and filtered to armed trades -- a real per-trade
+    blended-return list, not an aggregate proxy. drought_* mirror this off
+    simulate_drought_overlay_ground_truth's 'best_rets' (the real per-window return list
+    at the winning confirm_days/vol_gate cell). drought_ie_* are real via the new
+    backtester.drought_included_excluded_ground_truth. core_fluke_trades/compounded_*/
+    verdict are real (check8_fluke, GT's Return-based fluke check) -- core_fluke_alpha_pct/
+    _alpha_without_biggest_pct are a genuine, labeled divergence from the legacy check
+    (which tests ALPHA sign): GT's check8 only has a raw-Return-based split, no alpha
+    variant, so those two specific columns are skipped rather than mislabeled. core_wr_*
+    (win-rate stability) reuse check4_early/late_wr_pct directly. wf_* (walk-forward)
+    reuse check13_folds, with each fold's own CAGR standing in for "fold alpha" (GT's
+    check13 doesn't compute a per-fold alpha-vs-SPY split the way the legacy walk_forward_
+    check.py does) -- again a real, documented divergence, not an approximation dressed up
+    as the legacy metric. max_drawdown_pct is real (check11); current_drawdown_pct has no
+    GT building block yet and is skipped. bear_market/crash25/fillacc/exit_fillacc/sdb/
+    node_id-pick-comment/calendar_years_pct are skipped per GT_SKIP_COLUMNS.
+
+    Returns [] (not raising) if this scope's build_candidate_report_ground_truth call
+    fails or finds no candidates -- matches gt_rows_for_scope's own per-scope-must-not-
+    kill-the-batch convention in candidate_summary_report.py."""
+    import run_optimization_sweep as ros
+    from run_optimization_sweep import (
+        derive_phase25_candidates_ground_truth, build_candidate_report_ground_truth,
+        compute_bh_returns, _campaign_years_for_window,
+    )
+    from prune_backtest_cache_ground_truth import _hp_for_strategy
+
+    hp = _hp_for_strategy(strategy)
+    _orig_db_path = ros.DB_PATH
+    try:
+        ros.DB_PATH = DB_PATH
+        try:
+            report = build_candidate_report_ground_truth(
+                ticker, strategy, version, hp, start_date=None, end_date=None,
+                fixed_sl=fixed_sl, entry_timing=entry_timing)
+        except Exception as e:
+            import traceback
+            print(f"  [GT full review] {ticker}/{strategy}/{version}: build_candidate_report_ground_truth "
+                  f"RAISED: {e}\n{traceback.format_exc()}", file=sys.stderr)
+            return []
+        if report.get("error") or not report.get("candidates"):
+            print(f"  [GT full review] {ticker}/{strategy}/{version}: "
+                  f"{report.get('error', 'no Phase2.5-GT candidates for this scope')}")
+            return []
+        # spy_bh/years are scope-level (ticker/date-window), not candidate-level -- computed
+        # once here via the SAME public functions build_candidate_report_ground_truth calls
+        # internally (it doesn't return them on its own report dict).
+        _, spy_bh = compute_bh_returns(ticker, start_date=None, end_date=None)
+        years = _campaign_years_for_window(ticker, None, None)
+    finally:
+        ros.DB_PATH = _orig_db_path
+
+    days_span = years * 365.25 if years else None
+    sector = ticker_sector(conn, ticker)
+    k1 = k1_status(conn, ticker)
+    underlier_count, underlier_note = underlier_info(conn, ticker)
+    trend_30d, trend_90d = ticker_trend(ticker)
+    split_flag = ticker_split_flag(ticker)
+    liquidity = liquidity_dollars_per_day(conn, ticker)
+
+    out_rows = []
+    for i, row in enumerate(report["candidates"]):
+        c = row["candidate"]
+        trades = row.get("trades") or []
+        drought = row.get("drought")
+        drought_ie = row.get("drought_ie")
+        c8 = row.get("check8_fluke") or {}
+
+        rec = {
+            "ticker": ticker, "strategy": strategy,
+            "sector": sector, "k1_status": k1,
+            "underlier_count": underlier_count, "underlier_note": underlier_note,
+            "trend_30d_pct": trend_30d, "trend_90d_pct": trend_90d, "split_flag": split_flag,
+            "liquidity_dollars_per_day": liquidity,
+        }
+        rec["candidate_type"] = (f"GT winner (rank {i + 1})" if i == report["winner_index"]
+                                  else f"GT candidate (rank {i + 1})")
+        rec["also_matches"] = [rec["candidate_type"]]
+
+        rec["core_alpha_pct"] = c["robust_alpha"]
+        abs_return_pct = compounded([t["Return"] for t in trades]) if trades else None
+        rec["abs_return_pct"] = abs_return_pct
+        rec["strategy_cagr_pct"] = c["cagr"]
+        spy_cagr = cagr(spy_bh, days_span) if (spy_bh is not None and days_span) else None
+        rec["ann_excess_pct"] = (c["cagr"] - spy_cagr) if spy_cagr is not None else None
+        rec["years"] = years
+        rec["trades"] = row["n_trades"]
+
+        poss, pess, cert = _gt_alpha_resolutions(conn, ticker, strategy, version, entry_timing, fixed_sl, c)
+        rec["alpha_possible_pct"], rec["alpha_pessimistic_pct"], rec["alpha_certain_pct"] = poss, pess, cert
+
+        addon_detail = row.get("addon_detail") or {}
+        rec["worst_neighbor_pct"] = addon_detail.get("worst_neighbor_core_alpha")
+        core_safe = row.get("core_safe")
+        rec["status"] = None if core_safe is None else ("SAFE" if core_safe else "CLIFF")
+
+        # --- add-on leg: real per-trade OWN-LEG return (Exit Price - Arm Price)/Arm Price
+        # for armed trades only -- matches this column's own documented meaning ("compounded
+        # return of just the add-on overlay's own trades, not combined with core", COLUMN_DEFS
+        # above) and scripts/stacked_model/add_on.py's own raw_ret definition (exit_p/arm_p -
+        # 1), NOT backtester.apply_addon_overlay_ground_truth's BLENDED (2*exit-entry-arm)/
+        # entry Return.
+        #
+        # (Paired-review CRITICAL finding, 2026-08-23, both independent-cold and contextual
+        # Opus review converged on this independently: an earlier version of this function
+        # used the blended Return here, which already contains the core leg's own return for
+        # that trade -- silently double-counting core in every downstream x_addon_pct/
+        # core_addon_cagr_pct/core_both_cagr_pct multiplication (those formulas already
+        # multiply by core_factor separately) and inflating some real AGQ TrailingExit rows
+        # to 100,000%+ addon_compounded_pct -- confirmed via a worked example and cited
+        # against scripts/run_overlay_shim.py's own prior CONFIRMED-HIGH paired-review finding
+        # on this exact mistake shape. The raw per-leg return used here is also inherently
+        # floor-safe (Exit Price >= 0, Arm Price > 0 => raw_addon_ret >= -1, same guarantee
+        # core Return already has), so no return_below_floor handling is needed here -- unlike
+        # the blended Return, which run_overlay_shim.py's own GT add-on path (a DIFFERENT,
+        # deliberately whole-strategy-COMBINED computation, not this per-leg-only one) must
+        # guard against a -100% floor breach for.)
+        armed_trades = [t for t in trades if t.get("armed")]
+        addon_rets = [(t["Exit Price"] - t["Arm Price"]) / t["Arm Price"] for t in armed_trades]
+        rec["addon_n"] = len(addon_rets) if trades else None
+        rec["addon_compounded_pct"] = compounded(addon_rets) if addon_rets else None
+        rec["addon_win_rate_pct"] = win_rate(addon_rets) if addon_rets else None
+        rec["addon_robustness"] = _chrono_split_robustness(addon_rets) if len(addon_rets) >= 2 else None
+
+        # --- drought overlay: real per-window return list at the winning grid cell ---
+        drought_rets = drought.get("best_rets") if drought else None
+        rec["drought_n"] = (len(drought_rets) if drought_rets else (0 if drought else None))
+        rec["drought_compounded_pct"] = drought.get("drought_compounded_pct") if drought else None
+        rec["drought_win_rate_pct"] = win_rate(drought_rets) if drought_rets else None
+        rec["drought_robustness"] = (_chrono_split_robustness(drought_rets)
+                                      if drought_rets and len(drought_rets) >= 2 else None)
+        rec["drought_included_excluded"] = drought_ie
+
+        addon_ok = rec["addon_robustness"] is not None and rec["addon_robustness"]["verdict"] == "OK"
+        drought_ok = rec["drought_robustness"] is not None and rec["drought_robustness"]["verdict"] == "OK"
+        addon_factor_gated = (1.0 + rec["addon_compounded_pct"] / 100.0) if (
+            rec["addon_compounded_pct"] is not None and addon_ok) else 1.0
+        drought_factor_gated = (1.0 + rec["drought_compounded_pct"] / 100.0) if (
+            rec["drought_compounded_pct"] is not None and drought_ok) else 1.0
+        if drought_ie is not None and drought_ie.get("verdict") == "REAL_SELECTION":
+            drought_factor_gated = 1.0 + drought_ie["included_compounded_pct"] / 100.0
+        if abs_return_pct is not None:
+            core_factor = 1.0 + abs_return_pct / 100.0
+            rec["core_addon_cagr_pct"] = cagr((core_factor * addon_factor_gated - 1.0) * 100.0, days_span)
+            rec["core_drought_cagr_pct"] = cagr((core_factor * drought_factor_gated - 1.0) * 100.0, days_span)
+            rec["core_both_cagr_pct"] = cagr(
+                (core_factor * addon_factor_gated * drought_factor_gated - 1.0) * 100.0, days_span)
+        else:
+            rec["core_addon_cagr_pct"] = rec["core_drought_cagr_pct"] = rec["core_both_cagr_pct"] = None
+        rec["x_addon_pct"] = (((1 + abs_return_pct / 100.0) * (1 + rec["addon_compounded_pct"] / 100.0) - 1) * 100.0
+                               if (abs_return_pct is not None and rec["addon_compounded_pct"] is not None) else None)
+        rec["x_drought_pct"] = (((1 + abs_return_pct / 100.0) * (1 + rec["drought_compounded_pct"] / 100.0) - 1) * 100.0
+                                 if (abs_return_pct is not None and rec["drought_compounded_pct"] is not None) else None)
+
+        # --- core fluke (check 8) -- Return-based, see docstring on the alpha-vs-return
+        # divergence from the legacy (alpha-based) check.
+        core_fluke_verdict = None
+        if c8.get("n_trades", 0) > 0 and c8.get("compounded_pct") is not None:
+            sign_flip = (c8["compounded_pct"] > 0) != (c8["compounded_without_best_pct"] > 0)
+            core_fluke_verdict = "FLUKE" if (c8.get("too_few_trades") or sign_flip) else "OK"
+
+        # --- walk-forward (check 13) -- fold CAGR standing in for "fold alpha", see docstring.
+        folds = row.get("check13_folds") or []
+        nonempty_folds = [f for f in folds if f.get("n", 0) > 0]
+        fold_cagrs = [f["cagr"] for f in nonempty_folds if f.get("cagr") is not None]
+        positive_folds = sum(1 for v in fold_cagrs if v > 0)
+        if not folds or len(nonempty_folds) < len(folds):
+            wf_verdict = "THIN"
+        elif positive_folds == len(folds):
+            wf_verdict = "PASS"
+        elif positive_folds >= len(folds) / 2:
+            wf_verdict = "MARGINAL"
+        else:
+            wf_verdict = "FAIL"
+
+        c4_early, c4_late = row.get("check4_early_wr_pct"), row.get("check4_late_wr_pct")
+        wr_diff = (c4_late - c4_early) if (c4_early is not None and c4_late is not None) else None
+        rec["walk_forward"] = {
+            "verdict": wf_verdict, "positive_folds": positive_folds, "total_folds": len(folds),
+            "min_fold_alpha": min(fold_cagrs) if fold_cagrs else None,
+            "max_fold_alpha": max(fold_cagrs) if fold_cagrs else None,
+            "mean_fold_alpha": (sum(fold_cagrs) / len(fold_cagrs)) if fold_cagrs else None,
+            "max_drawdown_pct": row.get("check11_max_drawdown_pct"),
+            "current_drawdown_pct": None,  # no GT building block yet -- GT_SKIP_COLUMNS labels this
+            "fluke_check": {
+                "trades": c8.get("n_trades"), "alpha_pct": None, "alpha_without_biggest_pct": None,
+                "compounded_pct": c8.get("compounded_pct"),
+                "compounded_without_biggest_pct": c8.get("compounded_without_best_pct"),
+                "verdict": core_fluke_verdict,
+            },
+            "win_rate_stability": {
+                "early_win_rate_pct": c4_early, "late_win_rate_pct": c4_late, "diff_pct": wr_diff,
+                "verdict": None if wr_diff is None else ("FADING" if wr_diff < -20 else "STABLE"),
+            },
+            "same_day_block_check": None,  # no same_day_block param in the GT kernel -- GT_SKIP_COLUMNS
+            "crash_2025_check": None,  # legacy-hourly-only -- GT_SKIP_COLUMNS
+        }
+        rec["bear_market"] = None  # legacy-hourly-only -- GT_SKIP_COLUMNS
+        rec["exit_fill_acc"] = None  # GT resolves real minute-level fills directly -- GT_SKIP_COLUMNS
+        rec["node_id"] = rec["pick"] = rec["comment"] = None  # GT_SKIP_COLUMNS
+        rec["calendar_years_pct"] = None  # legacy-only opt-in feature -- GT_SKIP_COLUMNS
+
+        add_tranches(rec)
+        out_rows.append(rec)
+    return out_rows
+
+
+def run_gt_full_review(conn, tickers, csv_name, xlsx_name, vol_gate=DEFAULT_VOL_GATE):
+    """--kernel gt entry point for candidate_full_review.py -- loops every real GT scope
+    for `tickers` (candidate_summary_report.gt_scopes_for_tickers, same scope discovery
+    candidate_summary_report.py's own --kernel gt mode uses) and writes the SAME COLUMN_
+    DEFS/FIELDNAMES schema this file's legacy --csv/--xlsx path writes, with GT_SKIP_
+    COLUMNS applied to every row as a final pass so legacy-only columns read as an honest
+    labeled skip, never a blank."""
+    scopes = gt_scopes_for_tickers(conn, tickers)
+    found = {s[0] for s in scopes}
+    for ticker in tickers:
+        if ticker not in found:
+            print(f"\n{ticker}: no GT (kernel_version='ground_truth_v6') scope with a known "
+                  f"campaign_config.STRATEGIES hp grid found in backtest_cache -- skipping.")
+
+    out_rows = []
+    for ticker, strategy, version, entry_timing, fixed_sl in scopes:
+        print(f"\n{'#' * 100}\n{ticker} / {strategy} / {version} / entry_timing={entry_timing} "
+              f"/ fixed_sl={fixed_sl}\n{'#' * 100}")
+        try:
+            out_rows.extend(gt_full_review_rows(conn, ticker, strategy, version, entry_timing,
+                                                 fixed_sl, vol_gate=vol_gate))
+        except Exception as e:
+            import traceback
+            print(f"  UNEXPECTED error on this scope, skipping: {e}\n{traceback.format_exc()}")
+
+    csv_rows = []
+    for rec in out_rows:
+        row = _build_output_row(rec)
+        for col in GT_SKIP_COLUMNS:
+            row[col] = GT_SKIP_LABEL
+        csv_rows.append(row)
+
+    if csv_name:
+        out_path = Path("output") / _timestamped_name(csv_name, ".csv")
+        out_path.parent.mkdir(exist_ok=True)
+        with open(out_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDNAMES)
+            w.writeheader()
+            for row in csv_rows:
+                w.writerow(row)
+        print(f"Wrote {out_path} ({len(csv_rows)} rows)")
+    if xlsx_name:
+        xlsx_out = _timestamped_name(xlsx_name, ".xlsx")
+        _write_xlsx(xlsx_out, csv_rows)
+        print(f"Wrote output/{xlsx_out} ({len(csv_rows)} rows)")
+    return csv_rows
+
+
 def _timestamped_name(name, ext):
     """Appends a run timestamp to the given base name so successive --csv/--xlsx
     runs never overwrite each other -- every run is real evidence (which
@@ -1653,9 +2004,16 @@ def _write_xlsx(name, csv_rows):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("tickers", nargs="*")
+    ap.add_argument("--kernel", choices=["legacy", "gt"], default="legacy",
+                     help="'legacy' (default, unchanged behavior): hourly-kernel candidate_nodes-based "
+                          "report. 'gt': v6 GT-kernel full-checklist report (build_candidate_report_ground_"
+                          "truth-based) -- same COLUMN_DEFS/FIELDNAMES schema, minus bear_*/crash25_* and a "
+                          "few other legacy-only mechanisms (see GT_SKIP_COLUMNS/gt_full_review_rows' own "
+                          "docstring), which are labeled 'not computed for GT' rather than blank.")
     ap.add_argument("--version", default=None,
                      help="force a single version for every ticker (old behavior). Default: auto-resolve "
-                          "per ticker via resolve_version() -- v5.1 when the ticker has it, else v5.")
+                          "per ticker via resolve_version() -- v5.1 when the ticker has it, else v5. "
+                          "Ignored for --kernel gt (GT scope discovery reads its own version per scope).")
     ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--min-alpha", type=float, default=0,
                      help="Alpha floor for the 'best safe node' cliff-safety search (default 0 -- show "
@@ -1698,6 +2056,17 @@ def main():
         ensure_candidate_nodes_table(conn)
         set_pick_comment(conn, int(node_id), pick=pick, comment=args.comment)
         print(f"node_id={node_id}: pick={pick!r} comment={args.comment!r}")
+        conn.close()
+        return
+
+    if args.kernel == "gt":
+        if not args.tickers:
+            print("--kernel gt requires an explicit ticker list (GT scopes are discovered off "
+                  "backtest_cache, not candidate_nodes, so there is no default 'every registered "
+                  "ticker' set here).")
+            return
+        conn = sqlite3.connect(args.db)
+        run_gt_full_review(conn, args.tickers, args.csv, args.xlsx, vol_gate=args.vol_gate)
         conn.close()
         return
 

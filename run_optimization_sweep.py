@@ -17,7 +17,8 @@ from backtester import (run_backtest_dispatch,
                         prep_inputs, _simulate, _simulate_limit, _simulate_trail, _simulate_trail_buy,
                         _simulate_trail_both, _simulate_limit_trail, _simulate_close_limitexit,
                         run_backtest_ground_truth, prep_minute_inputs,
-                        apply_addon_overlay_ground_truth, simulate_drought_overlay_ground_truth)
+                        apply_addon_overlay_ground_truth, simulate_drought_overlay_ground_truth,
+                        drought_included_excluded_ground_truth)
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
@@ -2683,6 +2684,7 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
 GT_ROBUSTNESS_CAGR_MIN = 20
 GT_FLUKE_MIN_TRADES = 10  # same "too few to trust" threshold as checklist_v65.check4_stability
 GT_WALK_FORWARD_FOLDS = 5  # same fold count as checklist_v65.FOLDS
+GT_DROUGHT_IE_VOL_GATE = 0.4  # same "one real validated value" as candidate_full_review.DEFAULT_VOL_GATE
 
 
 def _check1_macro_gt(ticker, start_date, end_date, data_source="yahoo"):
@@ -2945,10 +2947,20 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
         # candidates too (2026-08-23 fix: this was still computing unconditionally,
         # only add-on had been wired to respect the flag).
         drought = None
+        drought_ie = None
         if cand.get('phase4_eligible', True) and is_both and trades and df_hourly_windowed is not None:
             drought = simulate_drought_overlay_ground_truth(
                 trades, df_hourly_windowed, ticker, fixed_sl,
                 arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']))
+            # Included-vs-excluded vol-gate challenge (2026-08-23, candidate_full_review.py
+            # GT full-review port -- docs/overlay_parameter_robustness_process.md step 4),
+            # only meaningful once a real winning confirm_days exists (drought['best_confirm_days']
+            # is None when the sweep found zero real drought windows at every grid cell).
+            if drought is not None and drought.get('best_confirm_days') is not None:
+                drought_ie = drought_included_excluded_ground_truth(
+                    trades, df_hourly_windowed, ticker, fixed_sl,
+                    arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']),
+                    confirm_days=drought['best_confirm_days'], vol_gate=GT_DROUGHT_IE_VOL_GATE)
 
         core_cliff = addon['core_cliff']
         addon_cliff = addon['addon_cliff']
@@ -2958,6 +2970,13 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             'candidate': cand,
             'phase4_eligible': cand.get('phase4_eligible', True),
             'n_trades': len(trades),
+            # Raw per-trade closed-trade list (need_times=True -- Entry/Exit Time/Price,
+            # Return, armed/Arm Time/Arm Price), added 2026-08-23 for candidate_full_
+            # review.py's --kernel gt full-review port: lets that report compute real
+            # win-rate/tranche/addon-leg numbers directly off this SAME trade list (via
+            # apply_addon_overlay_ground_truth) instead of a second run_backtest_ground_
+            # truth call. [] when this candidate had no cached hourly inputs.
+            'trades': trades,
             'check4_early_wr_pct': c4_early_wr, 'check4_late_wr_pct': c4_late_wr,
             'check8_fluke': c8,
             'check11_max_drawdown_pct': dd_pct, 'check11_dd_peak_time': dd_peak, 'check11_dd_trough_time': dd_trough,
@@ -2967,6 +2986,7 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             'core_addon_disagreement': disagreement,
             'addon_detail': addon,
             'drought': drought,
+            'drought_ie': drought_ie,
         })
 
     winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['robust_alpha'])

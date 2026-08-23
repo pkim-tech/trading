@@ -120,6 +120,49 @@ GT_COLUMN_DEFS = {
                         "in this report and still has real robust_alpha_pct/cagr_pct/n_trades regardless.",
     "error": "Set instead of the above when this scope/candidate couldn't be evaluated (e.g. Phase1/2-GT campaign "
              "not complete yet, or a build_candidate_report_ground_truth failure) -- see the message for why.",
+    "check4_early_wr_pct": "Check 4 (70/30 win-rate stability): win rate over the earlier 70% of this candidate's "
+                            "own trades by time.",
+    "check4_late_wr_pct": "Check 4: win rate over the later 30% of trades. A big early-vs-late gap flags a "
+                           "candidate whose edge may be decaying, not stable.",
+    "check8_compounded_pct": "Check 8 (trade-count fluke): full compounded return across this candidate's own "
+                              "trades (same_bar_reentry=True).",
+    "check8_compounded_without_best_pct": "Check 8: compounded return with the single best trade removed.",
+    "check8_best_trade_share_pct": "Check 8: percentage-point share of compounded return contributed by the "
+                                    "single best trade -- large values flag a one-trade fluke.",
+    "check8_too_few_trades": "Check 8: True when n_trades < GT_FLUKE_MIN_TRADES (run_optimization_sweep.py) -- "
+                              "the fluke check is unreliable below this count.",
+    "check11_max_drawdown_pct": "Check 11: max peak-to-trough compounded-equity drawdown (<=0) across this "
+                                 "candidate's own trades.",
+    "check11_dd_peak_time": "Check 11: timestamp of the equity peak the max drawdown fell from.",
+    "check11_dd_trough_time": "Check 11: timestamp of the equity trough the max drawdown bottomed at.",
+    # Real per-fold keys (paired-review CRITICAL finding, 2026-08-23, both independent-cold
+    # and contextual Opus review converged on this independently): this used to be 3 literal
+    # "{N}" template-string keys, which don't match the real check13_fold1_n..check13_fold5_
+    # fragile keys gt_rows_for_scope() actually emits below -- _write_csv's DictWriter (default
+    # extrasaction='raise') crashed outright on any real row, and _write_xlsx silently wrote 3
+    # blank template-named columns while dropping all 15 real fold values (exactly the
+    # "blank looks like a compute failure" trap this whole GT column schema exists to avoid).
+    **{k: v for n in range(1, 6) for k, v in {
+        f"check13_fold{n}_n": f"Check 13 (walk-forward 5-fold): trade count in fold {n} "
+                               f"(1-5, equal-time-span slices).",
+        f"check13_fold{n}_cagr_pct": f"Check 13: fold {n}'s own annualized CAGR.",
+        f"check13_fold{n}_fragile": f"Check 13: True when fold {n}'s CAGR <= GT_ROBUSTNESS_CAGR_MIN (20%) -- "
+                                     f"None means the fold was empty (no trades), not evaluated.",
+    }.items()},
+    "drought_n_core_trades": "Drought overlay (TrailingBoth only): core trade count fed into the drought sim.",
+    "drought_core_compounded_pct": "Drought overlay: core-only compounded return over the same window.",
+    "drought_best_confirm_days": "Drought overlay: winning confirm_days from the swept grid "
+                                  "(drought_overlay_sweep.CONFIRM_DAYS_GRID).",
+    "drought_best_vol_gate": "Drought overlay: winning vol_gate from the swept grid "
+                              "(drought_overlay_sweep.VOL_GATE_GRID), None if ungated.",
+    "drought_n_windows": "Drought overlay: number of real drought windows found (confirm_days no-signal gaps).",
+    "drought_n_simulated": "Drought overlay: number of those windows actually simulated (some may be skipped, "
+                            "e.g. missing vol data).",
+    "drought_compounded_pct": "Drought overlay: compounded return from drought-window trades alone. None (not "
+                               "NaN) when zero real drought windows existed at the winning grid cell.",
+    "drought_combined_compounded_pct": "Drought overlay: core+drought combined compounded return.",
+    "drought_skip_reason": "Set when drought was never computed for this scope at all (e.g. strategy is not "
+                            "TrailingBothZScoreBreakout) -- see run_optimization_sweep.py's drought_skip_reason.",
 }
 
 # Relabels find_candidates()'s internal keys to the user's requested wording
@@ -768,7 +811,8 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
     for i, row in enumerate(report["candidates"]):
         c = row["candidate"]
         own = row["addon_detail"]["own_cell"] if row.get("addon_detail") else None
-        rows.append({
+        d = row.get("drought")
+        out = {
             **base, "candidate_rank": i + 1, "is_winner": (i == report["winner_index"]),
             "take_profit": c["take_profit"], "stop_loss": c["stop_loss"],
             "max_hold_hours": c["max_hold_hours"], "window": c["window"],
@@ -781,7 +825,32 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
             "addon_eligible": report["addon_eligible"],
             "addon_eligibility_reason": report["addon_eligibility_reason"],
             "phase4_eligible": row.get("phase4_eligible", True),
-        })
+            "check4_early_wr_pct": row.get("check4_early_wr_pct"),
+            "check4_late_wr_pct": row.get("check4_late_wr_pct"),
+            "check8_compounded_pct": row["check8_fluke"].get("compounded_pct") if row.get("check8_fluke") else None,
+            "check8_compounded_without_best_pct": row["check8_fluke"].get("compounded_without_best_pct") if row.get("check8_fluke") else None,
+            "check8_best_trade_share_pct": row["check8_fluke"].get("best_trade_share_pct") if row.get("check8_fluke") else None,
+            "check8_too_few_trades": row["check8_fluke"].get("too_few_trades") if row.get("check8_fluke") else None,
+            "check11_max_drawdown_pct": row.get("check11_max_drawdown_pct"),
+            "check11_dd_peak_time": row.get("check11_dd_peak_time"),
+            "check11_dd_trough_time": row.get("check11_dd_trough_time"),
+            "drought_n_core_trades": d.get("n_core_trades") if d else None,
+            "drought_core_compounded_pct": d.get("core_compounded_pct") if d else None,
+            "drought_best_confirm_days": d.get("best_confirm_days") if d else None,
+            "drought_best_vol_gate": d.get("best_vol_gate") if d else None,
+            "drought_n_windows": d.get("n_drought_windows") if d else None,
+            "drought_n_simulated": d.get("n_drought_simulated") if d else None,
+            "drought_compounded_pct": d.get("drought_compounded_pct") if d else None,
+            "drought_combined_compounded_pct": d.get("combined_compounded_pct") if d else None,
+            "drought_skip_reason": report.get("drought_skip_reason"),
+        }
+        folds = row.get("check13_folds") or []
+        for f in range(1, 6):
+            fold = next((x for x in folds if x["fold"] == f), None)
+            out[f"check13_fold{f}_n"] = fold["n"] if fold else None
+            out[f"check13_fold{f}_cagr_pct"] = fold["cagr"] if fold else None
+            out[f"check13_fold{f}_fragile"] = fold["fragile"] if fold else None
+        rows.append(out)
     return rows
 
 
