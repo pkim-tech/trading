@@ -14,11 +14,18 @@ set -eo pipefail
 cd "$(dirname "$0")/.."
 
 PYTHON=".venv/bin/python"
-# Default list is the 8 real live tickers whose live node is TrailingBothZScoreBreakout
-# (verified via load_live_node, 2026-08-22) -- run_ground_truth_phase1.py asserts this
-# strategy and cannot run AGQ/NUGT/UGL/WEBL (real live TrailingExitZScoreBreakout nodes)
-# at all. Override TICKERS= explicitly for a different/narrower set.
-TICKERS="${TICKERS:-DFEN DPST GDXU HIBL JNUG KORU LABU SOXL}"
+# Default list is all 12 real live tickers (state='live', archived_at IS NULL,
+# starting_notional >= 5000; verified fresh via watch_list, 2026-08-22) -- 6
+# TrailingBothZScoreBreakout (DPST/HIBL/JNUG/KORU/LABU/SOXL) + 6
+# TrailingExitZScoreBreakout (AGQ/DFEN/GDXU/NUGT/UGL/WEBL). run_ground_truth_phase1.py
+# now looks up the correct per-strategy grid from campaign_config.STRATEGIES for both
+# strategies, so the TrailingExit six no longer need to be excluded (the prior
+# 8-ticker default's comment claiming only AGQ/NUGT/UGL/WEBL were TrailingExit was
+# itself wrong -- DFEN/GDXU are too, per paired review 2026-08-22 -- and traced back to
+# load_live_node returning a stale archived row; see the fix in
+# scripts/run_ground_truth_neighborhood.py). Override TICKERS= explicitly for a
+# different/narrower set.
+TICKERS="${TICKERS:-AGQ DFEN DPST GDXU HIBL JNUG KORU LABU NUGT SOXL UGL WEBL}"
 START="${START:-2021-08-23}"
 END="${END:-2026-08-21}"
 DATA_SOURCE="${DATA_SOURCE:-massive}"

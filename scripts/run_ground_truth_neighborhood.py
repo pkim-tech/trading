@@ -48,19 +48,38 @@ LIVE_DB = os.path.join(ROOT, "cache", "live", "trading_live.db")
 
 
 def load_live_node(ticker):
+    """Fixed 2026-08-22 (paired review on scripts/run_ground_truth_phase1.py's
+    per-strategy grid generalization): the original query had no `archived_at IS
+    NULL` filter and no ORDER BY, so `LIMIT 1` could silently return a stale
+    archived row instead of the real current live node -- confirmed live for
+    DFEN/GDXU (archived TrailingBoth row sorted before the real current
+    TrailingExit row) and JNUG/NUGT (right strategy, stale fixed_sl). That bug
+    predates this file's `--ticker` genericization but only became load-bearing
+    once run_ground_truth_phase1.py started trusting this function for
+    previously-excluded TrailingExit tickers. Now requires exactly one
+    non-archived match -- raises loudly on genuine ambiguity (e.g. YINN, which
+    real-live-carries two concurrent non-archived nodes, one per strategy) rather
+    than picking one silently."""
     con = sqlite3.connect(f"file:{LIVE_DB}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
-    row = con.execute(
+    rows = con.execute(
         "SELECT id, ticker, strategy, window, z_score_threshold, fixed_sl, trail_buy_pct, "
         "trail_sell_pct, arm_sell_pct, take_profit, max_hold_hours, entry_timing "
-        "FROM watch_list WHERE ticker=? AND state='live' AND strategy IN "
-        "('TrailingBothZScoreBreakout','TrailingExitZScoreBreakout') LIMIT 1",
+        "FROM watch_list WHERE ticker=? AND state='live' AND archived_at IS NULL AND strategy IN "
+        "('TrailingBothZScoreBreakout','TrailingExitZScoreBreakout')",
         (ticker,)
-    ).fetchone()
+    ).fetchall()
     con.close()
-    if row is None:
-        raise ValueError(f"No real state='live' TrailingBoth/TrailingExit node found for {ticker}")
-    n = dict(row)
+    if len(rows) == 0:
+        raise ValueError(f"No real state='live', non-archived TrailingBoth/TrailingExit node found for {ticker}")
+    if len(rows) > 1:
+        strategies_found = sorted({r["strategy"] for r in rows})
+        raise ValueError(
+            f"{ticker} has {len(rows)} concurrent state='live', non-archived TrailingBoth/"
+            f"TrailingExit nodes ({strategies_found}) -- ambiguous which one to sweep. "
+            f"Disambiguate explicitly (e.g. by node id) before running this ticker."
+        )
+    n = dict(rows[0])
     n["arm_pct"] = (n["arm_sell_pct"] if n["strategy"] == "TrailingBothZScoreBreakout"
                     else n["take_profit"]) or 0.0
     return n

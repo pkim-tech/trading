@@ -1,16 +1,26 @@
-"""Real Phase1-coarse v6 (ground-truth) sweep for a single ticker — 164,640 cells, full
-standard grid (windows/z/tp/sl/hold/trail_pct, entry_timing='open_check' only per
-campaign_config.py's established scope for TrailingBothZScoreBreakout). NOT a
-neighborhood check — this is the real coarse discovery pass.
+"""Real Phase1-coarse v6 (ground-truth) sweep for a single ticker — full standard grid
+(windows/z/tp/sl/hold[/trail_pct], entry_timing='open_check' only per campaign_config.py's
+established scope), generic over BOTH live strategies (TrailingBothZScoreBreakout and
+TrailingExitZScoreBreakout). NOT a neighborhood check — this is the real coarse discovery
+pass.
 
 Built for docs/plans/ground_truth_kernel_rebuild.md Step 3, under explicit user
 authorization (2026-08-21/22), and an explicit one-time exception to run it directly
 (not user-run) given this is bespoke tooling with no config.json race condition (unlike
 the standard run_sweep_queue.sh). Generic over ticker via --ticker (mirrors
-run_ground_truth_neighborhood.py's own --ticker convention) -- the campaign grid
-constants below (WINDOWS/Z_THRESHOLDS/COMBINED/TRAIL_PCTS/HOLD_TIME_CAPS) are a fixed
-standard grid, not ticker-specific; only the live node config (strategy, fixed_sl, etc.,
-via load_live_node) varies per ticker.
+run_ground_truth_neighborhood.py's own --ticker convention). The per-strategy grid shape
+(take_profits/stop_losses/whether a real 4th trail_pct axis exists) is looked up from
+campaign_config.STRATEGIES[n["strategy"]], keyed off strategies.resolve_axis_columns --
+NOT hardcoded here, since TrailingBothZScoreBreakout and TrailingExitZScoreBreakout sweep
+physically different columns under the same "stop_losses" grid name (see
+strategies.resolve_axis_columns / campaign_config.py's own per-strategy comments:
+TrailingBoth's stop_losses is the COMBINED 1-30 grid mapped to trail_buy_pct, with a real
+swept trail_sell_pct 4th axis; TrailingExit's stop_losses is actually the 1-7 TRAIL_PCTS
+grid mapped to trail_pct, with NO real 4th axis -- collapsed to a single dummy value via
+run_optimization_sweep._trail_pcts_for_strategy). WINDOWS/Z_THRESHOLDS/HOLD_TIME_CAPS are
+genuinely strategy-agnostic (confirmed against campaign_config.py, which only varies
+take_profits/stop_losses/trail_pcts/entry_timings per strategy) and stay as fixed
+module-level constants, not ticker- or strategy-specific.
 
 Default window matches the validated Step 2a parity test and the earlier neighborhood
 check (2024-08-21..2026-08-20) — kept consistent for apples-to-apples comparison, since
@@ -58,15 +68,15 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 from run_optimization_sweep import (
     init_idempotent_db, rebuild_indexes, dispatch_parallel_grid_ground_truth, compute_bh_returns,
     window_version_suffix, run_phase2_island_ground_truth, run_phase25_cliff_box_ground_truth,
+    _trail_pcts_for_strategy,
 )
 from run_ground_truth_neighborhood import load_live_node
+import campaign_config
 
 DEFAULT_START, DEFAULT_END = "2024-08-21", "2026-08-20"
 
 WINDOWS = [10, 20]
 Z_THRESHOLDS = [1.0, 1.5, 2.0]
-COMBINED = [1, 2, 3, 4, 5, 6, 9, 12, 15, 18, 21, 24, 27, 30]
-TRAIL_PCTS = [1, 2, 3, 4, 5, 6, 7]
 HOLD_TIME_CAPS = [7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105, 112, 119, 126, 133, 140]
 ENTRY_TIMING = "open_check"
 
@@ -109,16 +119,34 @@ def main():
 
     n = load_live_node(TICKER)
     print(f"Live node: {n}")
-    # Flagged by independent-cold review (2026-08-22): the grid/hp shape below (TRAIL_PCTS
-    # swept as the 4th axis) is only valid for TrailingBothZScoreBreakout. load_live_node
-    # also accepts TrailingExitZScoreBreakout (whose 4th axis collapses to [0.0]), which
-    # would silently submit 7x redundant tpct duplicates per cell and, worse, produce zero
-    # cache hits on any re-run (cache key uses the real 0.0 tpct, tasks carry 1.0-7.0).
-    # Asserted so a ticker whose live node isn't TrailingBoth can't go live wrong.
-    assert n["strategy"] == "TrailingBothZScoreBreakout", (
-        f"This script's grid (TRAIL_PCTS swept as a real axis) is only valid for "
-        f"TrailingBothZScoreBreakout, but {TICKER}'s live node is {n['strategy']!r}."
-    )
+    strategy_name = n["strategy"]
+    if strategy_name not in campaign_config.STRATEGIES:
+        raise SystemExit(
+            f"{TICKER}'s live node strategy is {strategy_name!r}, which has no grid entry in "
+            f"campaign_config.STRATEGIES ({sorted(campaign_config.STRATEGIES)}). This script "
+            f"only supports strategies with a defined grid there."
+        )
+    grid = campaign_config.STRATEGIES[strategy_name]
+    # Per-strategy axis remapping (paired review, 2026-08-22): campaign_config.STRATEGIES'
+    # "stop_losses" key holds a DIFFERENT physical grid depending on strategy --
+    # TrailingBothZScoreBreakout's is the COMBINED 1-30 grid (-> trail_buy_pct column, with
+    # a real swept 4th trail_sell_pct axis); TrailingExitZScoreBreakout's is actually the
+    # 1-7 TRAIL_PCTS grid (-> trail_pct column, no real 4th axis). Never assume COMBINED for
+    # both -- see strategies.resolve_axis_columns, the single source of truth this reads.
+    TAKE_PROFITS = grid["take_profits"]
+    STOP_LOSSES = grid["stop_losses"]
+    # TRAIL_PCTS is only a real, swept 4th axis for strategies where
+    # strategies.resolve_axis_columns(strategy_name)'s fourth_axis == 'trail_pct'
+    # (TrailingBothZScoreBreakout today) -- _trail_pcts_for_strategy below re-derives this
+    # itself. For everything else (e.g.
+    # TrailingExitZScoreBreakout, whose 4th axis collapses entirely -- its own trail_pct
+    # concept already lives in the sl_axis/STOP_LOSSES grid above), looping over the full
+    # TRAIL_PCTS list here would submit real duplicate-cell tasks that only differ in an
+    # ignored column, and produce zero cache hits on re-run (cache key uses the real 0.0
+    # tpct, tasks would carry 1.0-7.0). run_optimization_sweep._trail_pcts_for_strategy is
+    # the same helper Phase2/2.5-GT already use for this -- reused here for task generation
+    # too, not just neighbor-selection, so Phase1's own tasks/hp match that logic exactly.
+    TRAIL_PCTS = _trail_pcts_for_strategy(strategy_name, grid)
 
     init_idempotent_db()
     if args.skip_cache_refresh:
@@ -139,8 +167,8 @@ def main():
     tasks = [(int(tp), int(sl), int(hold), int(w), float(z), float(tpct))
              for z in Z_THRESHOLDS
              for w in WINDOWS
-             for tp in COMBINED
-             for sl in COMBINED
+             for tp in TAKE_PROFITS
+             for sl in STOP_LOSSES
              for hold in HOLD_TIME_CAPS
              for tpct in TRAIL_PCTS]
     print(f"{len(tasks):,} Phase1-coarse cells, version={version}, workers={args.workers}")
@@ -156,16 +184,18 @@ def main():
     # Full campaign hp dict -- MUST match the exact grid `tasks` above was built from,
     # since run_phase2_island_ground_truth/run_phase25_cliff_box_ground_truth's
     # completeness guards (_phase1_coarse_gt_status) recompute `expected` from these same
-    # lists and compare against real backtest_cache rows. COMBINED is deliberately reused
-    # for both take_profits and stop_losses -- Phase1's own task list above sweeps the
-    # same COMBINED values across both the tp and sl loops.
+    # lists (via their own _trail_pcts_for_strategy(strategy_name, hp) call) and compare
+    # against real backtest_cache rows. hp['trail_pcts'] is always the raw
+    # campaign_config.STRATEGIES[...]["trail_pcts"] value (not the possibly-collapsed
+    # [0.0] TRAIL_PCTS used for task generation above) -- callers re-derive whether it's a
+    # real axis themselves via resolve_axis_columns, same as this script does.
     hp = {
         "windows": WINDOWS,
         "z_score_thresholds": Z_THRESHOLDS,
-        "take_profits": COMBINED,
-        "stop_losses": COMBINED,
+        "take_profits": TAKE_PROFITS,
+        "stop_losses": STOP_LOSSES,
         "hold_time_caps": HOLD_TIME_CAPS,
-        "trail_pcts": TRAIL_PCTS,
+        "trail_pcts": grid["trail_pcts"],
     }
 
     t0 = time.time()
