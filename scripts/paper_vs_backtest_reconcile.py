@@ -33,7 +33,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import signals_db as db
-from backtester import prep_inputs, OPEN
+from backtester import prep_inputs, prep_minute_inputs, run_backtest_ground_truth, OPEN
 from scripts.export_trades import load_hourly, simulate_trail_both_annotated, simulate_trail_exit_chaos
 from scripts.drought_overlay_test import build_indicators, TARGET_H0, TARGET_H1
 
@@ -62,6 +62,131 @@ def get_paper_trades(wl_id, start, end):
     return pd.DataFrame(rows, columns=["ticker", "entry_time", "exit_time", "pnl_pct", "exit_reason"])
 
 
+def _is_ground_truth_node(node):
+    """v6 nodes are tagged via watch_list.version, the same column/convention
+    run_optimization_sweep.py/locate_best_node.py already use to mark a
+    backtest_cache/candidate_nodes row as ground-truth-kernel-sourced (version
+    starting with 'v6', e.g. 'v6', 'v6-massive', 'v6-w2023-07-24_2026-08-21') --
+    a promoted-to-live node's watch_list.version is copied straight from the
+    candidate row it came from (see locate_best_node.node_dict), so this is the
+    same string a v6 candidate already carries pre-promotion, not a new tag."""
+    return str(node.get("version") or "").startswith("v6")
+
+
+def get_trades_and_bars_since_ground_truth(node, sim_start):
+    """v6 (ground-truth minute kernel) counterpart to get_trades_and_bars_since below.
+    Real minute data through backtester.run_backtest_ground_truth, not the legacy
+    hourly kernel -- replaying a v6 node through the wrong (hourly) kernel would
+    silently give a misleading divergence read (the routing gap this function exists
+    to close, see docs/deep_backlog.md).
+
+    Cold-start (sim_start / flat-start-position): confirmed there IS a clean GT
+    equivalent to get_trades_and_bars_since's own p_sliced approach, already used by
+    the real GT sweep engine itself (run_optimization_sweep._load_node_inputs_ground_
+    truth's start_date/end_date windowing) -- slice the HOURLY bars fed to prep_inputs/
+    prep_minute_inputs to start at sim_start BEFORE computing them, while daily
+    indicators (`ind`, from build_indicators) stay computed off the full, unsliced
+    df_daily. That mirrors the hourly path's own sma_arr/std_arr-stay-unsliced
+    reasoning (full lookback for the indicator, flat start for the simulator) and is
+    the same windowing shape _load_node_inputs_ground_truth already relies on for
+    every real GT campaign, not a new invention for this file. minute_df itself is
+    never sliced either -- prep_minute_inputs buckets minutes onto whichever hourly
+    index it's given, so handing it the windowed hourly index is sufficient to keep
+    the simulator from ever seeing (or opening against) a pre-sim_start bar.
+
+    Known imprecision (documented, not silently swept under the rug -- corrected
+    2026-08-23 after paired Opus review caught the first draft understating this):
+    the legacy hourly path tracks a trade's `signal_i` (the bar the z-score band was
+    first breached, i.e. when a WAIT/trailing-buy STARTS) separately from its actual
+    fill bar. run_backtest_ground_truth's own trade output does not expose the
+    analogous internal wait-start bar (only entry/exit fill times), and this file is
+    deliberately not re-deriving that internal state-machine detail here (would be a
+    second, subtly-different reimplementation of _simulate_trail_ground_truth's own
+    WAIT-state tracking -- exactly the drift risk CLAUDE.md's daily-track-reconciliation
+    convention warns against). So for GT TrailingBoth trades, `signal_i` below is the
+    bar OWNING the real fill time, not the original signal bar. This is exact ONLY for
+    TrailingExitZScoreBreakout (no WAIT state exists in the kernel for that strategy,
+    fill IS the signal). For TrailingBothZScoreBreakout it is NOT exact for either
+    entry_timing -- `is_both` always goes through STATE_WAIT regardless of open_check
+    vs close_check (see backtester.py's `_simulate_trail_ground_truth`, the
+    `open_check_entry_timing and o <= band` branch under `if is_both:` sets STATE_WAIT,
+    it does not fill immediately), so the fill can land any bar up to
+    `wait_bar0 + max_hours_to_hold` later. Every real live node as of 2026-08-23 is
+    entry_timing='open_check', and the TrailingBoth ones carry max_hold_hours in the
+    11-126-bar range -- meaning this approximation applies to essentially every real
+    live TrailingBoth v6 node, not just an edge case, and can drift far past
+    evening_status.py Part 3's match_trades 4h tolerance, producing false PHANTOM/
+    MISSED flags there. It does NOT affect the win-rate/compounded-return comparisons
+    the rest of this script and Part 5's compute_divergence rely on (those only use
+    `ret`, never `signal_i`/entry_time). Recovering the true signal bar would require
+    changing run_backtest_ground_truth's return contract (out of this file's scope) --
+    flagged as a real follow-up, not fixed here.
+    """
+    if node["strategy"] not in ("TrailingBothZScoreBreakout", "TrailingExitZScoreBreakout"):
+        raise ValueError(f"unhandled strategy {node['strategy']}")
+
+    version = node.get("version") or ""
+    data_source = "massive" if "-massive" in version else "yahoo"
+    if data_source == "massive":
+        import db_cache
+        df_h = db_cache.get_massive_hourly_ohlcv(node["ticker"])
+    else:
+        df_h = load_hourly(node["ticker"])
+    df_daily = df_h.resample("D").last().dropna(subset=["Close"])
+    ind = build_indicators(node["strategy"], df_daily, node["window"])
+    open_check = node["entry_timing"] == "open_check"
+
+    df_h_sliced = df_h.loc[pd.Timestamp(sim_start):]
+    empty_ts = pd.DatetimeIndex([])
+    if df_h_sliced.empty:
+        return [], empty_ts
+
+    from run_optimization_sweep import _load_minute_df
+    minute_df = _load_minute_df(node["ticker"], data_source=data_source)
+
+    # Minute data is only refreshed manually (scripts/fetch_massive_minute_data.py /
+    # build_massive_hourly_derived.py -- no cron entry, confirmed 2026-08-23 paired
+    # review), unlike the hourly CSV's own crontab-scheduled collector. Without this
+    # guard, a stale minute snapshot silently produces a bar_min_count=0 hourly bar for
+    # every real bar past the snapshot's cutoff -- TrailingBoth then never leaves
+    # STATE_WAIT and TrailingExit can only ever time out, so the kernel quietly reports
+    # ZERO trades instead of erroring, and every real trade in that window reads as a
+    # false PHANTOM (Part 3) / false divergence (Part 5). Fail loud instead: callers
+    # (evening_status.py Parts 3/5, eod_live_node_table.window_replay) already wrap
+    # this call in try/except and report "NOT CHECKED"/"unsupported" on exception,
+    # which is the correct outcome here -- an unrefreshed snapshot must read as
+    # "couldn't check," never as "checked, found nothing."
+    if minute_df.empty or minute_df.index.max() < df_h_sliced.index.max():
+        raise RuntimeError(
+            f"get_trades_and_bars_since_ground_truth: minute data for {node['ticker']} "
+            f"(data_source={data_source!r}) is stale -- covers through "
+            f"{minute_df.index.max() if not minute_df.empty else 'no data'}, but the "
+            f"hourly replay needs bars through {df_h_sliced.index.max()}. Refresh minute "
+            f"data before trusting this v6 divergence check.")
+
+    prep = prep_inputs(df_h_sliced, ind)
+    mprep = prep_minute_inputs(minute_df, df_h_sliced)
+
+    gt_trades = run_backtest_ground_truth(
+        df_h_sliced, ind, node["ticker"], minute_df,
+        fixed_sl=node["fixed_sl"], arm_pct=node["arm_pct"],
+        trail_buy_pct=node.get("trail_buy_pct") or 0.0, trail_sell_pct=node["trail_sell_pct"],
+        max_hours_to_hold=node["max_hold_hours"], z_score_threshold=node["z"],
+        is_both=node["strategy"] == "TrailingBothZScoreBreakout",
+        target_hours=(TARGET_H0, TARGET_H1), open_check_entry_timing=open_check,
+        prep=prep, mprep=mprep, need_times=True,
+    )
+
+    timestamps = prep["timestamps"]
+    real_trades = []
+    for t in gt_trades:
+        # floor-lookup: bar H:30 owns [H:30, H+1:30) -- same bucketing convention
+        # prep_minute_inputs/run_backtest_ground_truth's own resolve_time() use.
+        signal_i = int(timestamps.searchsorted(t["Entry Time"], side="right")) - 1
+        real_trades.append({"signal_i": signal_i, "ret": t["Return"], "result": t["exit_reason"]})
+    return real_trades, timestamps
+
+
 def get_trades_and_bars_since(node, sim_start):
     """Same replay get_trades_and_bars() does, except the simulator's own bar-by-bar
     loop only sees hourly rows from sim_start onward -- so it starts flat (no position),
@@ -82,7 +207,14 @@ def get_trades_and_bars_since(node, sim_start):
     misalign every lookup. This keeps the full lookback available for computing SMA/std
     (a node's window needs real prior-day history), it just stops the simulator from
     opening/holding a position based on a signal from before sim_start.
+
+    v5/v5.1 (hourly kernel) path only -- see _is_ground_truth_node/
+    get_trades_and_bars_since_ground_truth for the v6 (minute ground-truth kernel)
+    counterpart this dispatches to below. v5/v5.1 behavior here is unchanged.
     """
+    if _is_ground_truth_node(node):
+        return get_trades_and_bars_since_ground_truth(node, sim_start)
+
     df_h = load_hourly(node["ticker"])
     df_daily = df_h.resample("D").last().dropna(subset=["Close"])
     ind = build_indicators(node["strategy"], df_daily, node["window"])
@@ -191,7 +323,7 @@ def resolve_live_track_nodes_by_activity(watchlist_id, tickers=None):
 
     cols = ["id", "ticker", "strategy", "window", "z_score_threshold", "arm_sell_pct",
             "take_profit", "fixed_sl", "trail_buy_pct", "trail_sell_pct", "max_hold_hours",
-            "entry_timing", "state", "added_at"]
+            "entry_timing", "state", "added_at", "version"]
 
     def _to_node(n):
         node = {c: n.get(c) for c in cols}

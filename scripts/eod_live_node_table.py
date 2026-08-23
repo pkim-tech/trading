@@ -46,7 +46,7 @@ def load_nodes(conn, states):
     c.execute(f"""SELECT id, ticker, account, strategy, window, z_score_threshold, fixed_sl,
                          arm_sell_pct, take_profit, trail_buy_pct, trail_sell_pct, entry_timing,
                          max_hold_hours, added_at, drought_overlay_enabled, drought_vol_gate,
-                         drought_confirm_days, addon_enabled, force_same_day_block
+                         drought_confirm_days, addon_enabled, force_same_day_block, version
                   FROM watch_list WHERE state IN ({placeholders})""", states)
     nodes = [dict(r) for r in c.fetchall()]
     for n in nodes:
@@ -107,11 +107,18 @@ def state_and_action(conn, node):
 def window_replay(node, df_h, sim_start):
     """Real replay of this node's exact live config from sim_start to the latest cached
     bar, flat-start (see get_trades_and_bars_since docstring) -- returns (window_return_pct,
-    trade_count), or None if the strategy isn't supported by the replay mirror."""
+    trade_count), or None if the strategy isn't supported by the replay mirror, OR the
+    replay itself couldn't run (v6 nodes route through get_trades_and_bars_since_ground_
+    truth, which raises RuntimeError if minute data hasn't been refreshed far enough to
+    cover this window -- a real, currently-manual-only refresh step, see
+    scripts/fetch_massive_minute_data.py -- rather than silently replaying zero trades).
+    Caught broadly (not just ValueError) so one bad/stale node degrades to 'unsupported'
+    in this row's own validation column instead of crashing the whole nightly table for
+    every other node too."""
     try:
         trades, _ = get_trades_and_bars_since(node, sim_start)
-    except ValueError:
-        return None  # unhandled strategy in the replay mirror
+    except (ValueError, RuntimeError):
+        return None  # unhandled strategy, or v6 replay blocked (e.g. stale minute data)
     compounded = 1.0
     for t in trades:
         compounded *= (1.0 + t["ret"])  # fraction, not percent (see export_trades.py trade dicts)
