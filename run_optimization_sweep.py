@@ -469,6 +469,153 @@ def rebuild_indexes():
     conn.close()
 
 
+# ── cliff_addon_cache (2026-08-23, same_bar_reentry True-flip fix) ──────────────
+# Persistence for run_addon_cliff_safety_ground_truth's per-cell (core+addon) results.
+# Deliberately its own table, not new columns on backtest_cache -- backtest_cache's PK
+# and every downstream query in this file assume "one row per grid coordinate, core
+# metrics only"; addon_alpha/addon_cagr/addon_return_floor_breached have no home there
+# without touching that shared, load-bearing schema for a small (~9 candidates x their
+# cliff-box neighborhoods per campaign) bounded write pattern that's structurally
+# different from the full-sweep grid. kernel_version is part of the PK (not a plain
+# column checked after the fact) so a stale row from an older kernel_version simply
+# never matches a lookup under the current one -- same "no backfill, old rows just go
+# unread" convention backtest_cache itself uses for its own kernel_version column.
+#
+# WHY this table exists instead of reading core numbers straight out of backtest_cache
+# (the framing this fix was originally scoped under): checked and rejected -- addon_
+# alpha/addon_cagr require the per-trade `trades` list from run_backtest_ground_truth
+# (apply_addon_overlay_ground_truth needs real per-trade Return/exit data), and
+# backtest_cache only ever stores aggregate columns (win_rate, strategy_return, cagr,
+# ...), never trades. A backtest_cache hit for a neighbor coordinate's CORE row could
+# never skip the run_backtest_ground_truth call this function needs anyway to get
+# trades for the addon overlay -- so it would buy zero simulation-avoidance, only (now
+# redundant, since same_bar_reentry=True makes the two independently-computed core
+# numbers deterministic-equal anyway) cross-checking. The only real compute-avoidance
+# lever for this workload is caching the FULL per-cell (core+addon) result across
+# separate report runs for the same candidate/scope -- this table is that cache.
+#
+# data_source/date-window ARE real PK columns here (2026-08-23, paired-review
+# independent-cold HIGH finding, fixed same day) -- unlike backtest_cache, which relies
+# entirely on config_version encoding both (the '-massive' marker / window_version_
+# suffix convention) with NO enforcement on THIS function's own call path. That gap was
+# not hypothetical: verifying this same fix found a real, already-shipped caller bug
+# (scripts/candidate_summary_report.py's gt_rows_for_scope calls this function via
+# build_candidate_report_ground_truth with no data_source and start_date=end_date=None,
+# silently evaluating a massive-tagged, windowed config_version against full-history
+# yahoo data). Before this table existed, that produced wrong output for one run, once.
+# With a config_version-only cache key, it would have done something worse: PERSISTED
+# the wrong-source/wrong-window numbers under the correctly-tagged version string,
+# where a later, correctly-invoked call would silently receive them as a "hit." Making
+# data_source/start_date/end_date real key columns closes that regardless of whether
+# every caller remembers to pass them consistently -- the guards below in
+# run_addon_cliff_safety_ground_truth catch the loud/detectable half (data_source=
+# 'massive' with no marker); this key design catches the quiet half (two calls that
+# legitimately differ in source/window never collide in the cache, full stop).
+def _ensure_cliff_addon_cache_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cliff_addon_cache (
+            ticker TEXT, strategy TEXT, version TEXT, entry_timing TEXT, fixed_sl REAL,
+            same_bar_reentry INTEGER, data_source TEXT, start_date TEXT, end_date TEXT,
+            take_profit REAL, stop_loss REAL,
+            max_hold_hours INTEGER, window INTEGER, z_score_threshold REAL, tpct REAL,
+            kernel_version TEXT,
+            n_trades INTEGER, n_armed INTEGER,
+            core_alpha REAL, core_return REAL, core_cagr REAL,
+            addon_alpha REAL, addon_return REAL, addon_cagr REAL,
+            addon_return_floor_breached INTEGER,
+            computed_at TEXT,
+            PRIMARY KEY (ticker, strategy, version, entry_timing, fixed_sl, same_bar_reentry,
+                         data_source, start_date, end_date,
+                         take_profit, stop_loss, max_hold_hours, window, z_score_threshold,
+                         tpct, kernel_version)
+        )
+    """)
+
+
+def _load_cliff_addon_cache_map(conn, ticker, strategy_name, config_version, entry_timing,
+                                 fixed_sl, data_source, start_date, end_date,
+                                 kernel_version='ground_truth_v6'):
+    """One bulk SELECT for this (ticker, strategy, version, entry_timing, fixed_sl,
+    data_source, start_date, end_date, kernel_version) scope -- covers every
+    candidate's own cell AND full cliff-box neighborhood in this campaign, not just one
+    coordinate, so a repeat report run for the same ticker/scope needs exactly one
+    query total, not one per cell. Keyed on same_bar_reentry=1 only -- this file's
+    caller always evaluates under True now (see run_addon_cliff_safety_ground_truth's
+    docstring); a row can only exist under a different value if written by code that
+    predates this fix, and won't match here.
+
+    'addon_eligible' is deliberately NOT read from the cached row into the returned map
+    (2026-08-23, paired-review independent-cold HIGH finding) -- it's a pure
+    account-status ANNOTATION with zero effect on the computed core/addon numbers, and
+    the ticker's real watch_list account can change between when a row was written and
+    when it's read back. The caller (_evaluate_cell_ground_truth_with_addon) always
+    overwrites this field with the CURRENT call's addon_eligible before returning a
+    cache-hit result, so a stale cached value is never actually the one that goes to
+    a report."""
+    start_key = pd.Timestamp(start_date).strftime('%Y-%m-%d') if start_date is not None else ''
+    end_key = pd.Timestamp(end_date).strftime('%Y-%m-%d') if end_date is not None else ''
+    rows = conn.execute("""
+        SELECT take_profit, stop_loss, max_hold_hours, window, z_score_threshold, tpct,
+               n_trades, n_armed, core_alpha, core_return, core_cagr,
+               addon_alpha, addon_return, addon_cagr, addon_return_floor_breached
+        FROM cliff_addon_cache
+        WHERE ticker=? AND strategy=? AND version=? AND entry_timing=? AND fixed_sl=?
+          AND same_bar_reentry=1 AND data_source=? AND start_date=? AND end_date=?
+          AND kernel_version=?
+    """, (ticker, strategy_name, config_version, entry_timing, round(float(fixed_sl), 4),
+          data_source, start_key, end_key, kernel_version)).fetchall()
+    cache_map = {}
+    for r in rows:
+        tp, sl, hold, w, z, tpct = r[0], r[1], r[2], r[3], r[4], r[5]
+        key = (int(tp), round(float(sl), 4), int(hold), int(w), round(float(z), 4), round(float(tpct), 4))
+        cache_map[key] = {
+            'coords': (tp, sl, hold, w, z, tpct),
+            'n_trades': r[6], 'n_armed': r[7],
+            'core_alpha': r[8], 'core_return': r[9], 'core_cagr': r[10],
+            'addon_alpha': r[11], 'addon_return': r[12], 'addon_cagr': r[13],
+            'addon_return_floor_breached': bool(r[14]),
+        }
+    return cache_map
+
+
+def _flush_cliff_addon_cache_rows(conn, ticker, strategy_name, config_version, entry_timing,
+                                   fixed_sl, data_source, start_date, end_date, new_rows,
+                                   kernel_version='ground_truth_v6'):
+    """new_rows: list of (coord_key, result_dict) pairs collected during a
+    run_addon_cliff_safety_ground_truth pass (own cell across all candidates + every
+    evaluated neighbor) -- persisted in one executemany + commit at the end of the
+    pass, not per-cell, to keep the write path cheap relative to the simulation cost
+    it's saving on the NEXT run."""
+    if not new_rows:
+        return
+    start_key = pd.Timestamp(start_date).strftime('%Y-%m-%d') if start_date is not None else ''
+    end_key = pd.Timestamp(end_date).strftime('%Y-%m-%d') if end_date is not None else ''
+    now = datetime.now().isoformat()
+    params = []
+    for key, result in new_rows:
+        tp, sl, hold, w, z, tpct = key
+        params.append((
+            ticker, strategy_name, config_version, entry_timing, round(float(fixed_sl), 4),
+            1, data_source, start_key, end_key, tp, sl, hold, w, z, tpct, kernel_version,
+            result['n_trades'], result['n_armed'],
+            result['core_alpha'], result['core_return'], result['core_cagr'],
+            result['addon_alpha'], result['addon_return'], result['addon_cagr'],
+            int(bool(result['addon_return_floor_breached'])),
+            now,
+        ))
+    conn.executemany("""
+        INSERT OR REPLACE INTO cliff_addon_cache
+            (ticker, strategy, version, entry_timing, fixed_sl, same_bar_reentry,
+             data_source, start_date, end_date,
+             take_profit, stop_loss, max_hold_hours, window, z_score_threshold, tpct,
+             kernel_version, n_trades, n_armed, core_alpha, core_return, core_cagr,
+             addon_alpha, addon_return, addon_cagr, addon_return_floor_breached,
+             computed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, params)
+    conn.commit()
+
+
 def _tickers_data_date_range(tickers):
     """Real min/max Datetime actually present across these tickers' cached hourly CSVs,
     right now, at sweep-start time -- the "what data did this run load" counterpart to
@@ -2321,8 +2468,13 @@ def run_phase25_cliff_box_ground_truth(shared_pool, ticker, strategy_name, confi
 # in-process via a direct run_backtest_ground_truth call (reusing
 # _load_node_inputs_ground_truth's per-(ticker,strategy,window) prep/mprep memo), then
 # passed through backtester.apply_addon_overlay_ground_truth for the blended number.
-# same_bar_reentry is always False here (user's explicit compute-halving direction for
-# this addon-safety pass specifically -- core candidate selection itself is unaffected).
+# same_bar_reentry=True (2026-08-23 fix -- this comment used to read "always False here,
+# user's explicit compute-halving direction," left unreconciled against
+# dispatch_parallel_grid_ground_truth's own CAUTION comment for a full day; see
+# run_addon_cliff_safety_ground_truth's docstring for the full reasoning and why leaving
+# a stale comment like this one unfixed is exactly the failure shape being fixed).
+# Core candidate selection itself is unaffected either way -- this section only covers
+# the add-on-safety cliff-box pass.
 
 def derive_phase25_candidates_ground_truth(ticker, strategy_name, config_version, hp,
                                             fixed_sl=0, entry_timing='open_check'):
@@ -2492,13 +2644,35 @@ def addon_margin_eligible_ticker(ticker):
 
 def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_hours, w, z_thresh,
                                             fixed_sl, tpct, entry_timing, start_date, end_date,
-                                            spy_bh, years, data_source="yahoo", addon_eligible=True):
+                                            spy_bh, years, data_source="yahoo", addon_eligible=True,
+                                            config_version=None, addon_cache_map=None,
+                                            new_cache_rows=None):
     """One (tp, sl, hold, w, z, tpct) cell, evaluated in-process (no ProcessPoolExecutor,
-    no backtest_cache write) with same_bar_reentry=False -- returns core AND add-on-
+    no backtest_cache write) with same_bar_reentry=True -- returns core AND add-on-
     adjusted alpha/CAGR side by side. Reuses run_single_backtest_node_ground_truth_
     isolated's exact axis-mapping convention (trail_buy_pct/trail_sell_pct/arm_pct from
     tp/sl/tpct) so a cell computed here matches what the real sweep would have computed
     for the same coordinates.
+
+    same_bar_reentry=True (2026-08-23, fixes a same-week regression -- see
+    run_addon_cliff_safety_ground_truth's own docstring for the full reasoning): this
+    function used to hardcode False as an explicit "compute-halving" choice for add-on
+    safety specifically. That directly contradicted dispatch_parallel_grid_ground_truth's
+    own CAUTION comment ("every caller today passes True") one day after that comment was
+    written, with no reconciliation on file -- confirmed via `git log -S` as a same-week
+    unreconciled reversal, not a deliberate considered exception. Fixed here: every
+    real GT campaign call uses True, and a candidate's cliff-box neighborhood must be
+    evaluated under the SAME same_bar_reentry setting that produced the island it was
+    selected from, or the neighbor check is scoring a different landscape shape than the
+    one that actually produced the candidate.
+
+    addon_cache_map/new_cache_rows (2026-08-23, same fix): optional cliff_addon_cache
+    read/write plumbing -- see run_addon_cliff_safety_ground_truth's docstring and the
+    cliff_addon_cache table comment above _ensure_cliff_addon_cache_table for the design.
+    When config_version and addon_cache_map are both given and this exact coordinate is
+    already in the map, the cached result is returned immediately with ZERO simulation.
+    On a cache miss, if new_cache_rows is given, the freshly computed result is appended
+    to it (as (coord_key, result)) for the caller to persist after the whole pass.
 
     addon_eligible (2026-08-23, GT Phase 4; corrected same day -- see below): purely an
     ANNOTATION carried through to the return dict, never a gate on whether the add-on
@@ -2513,6 +2687,21 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
     not-yet-promoted candidate. (Earlier same-day version of this function DID gate on
     addon_eligible and skipped the computation entirely for a non-eligible/unknown
     account -- corrected per direct user instruction before this shipped.)"""
+    cache_key = None
+    if config_version is not None and addon_cache_map is not None:
+        cache_key = (int(tp), round(float(sl), 4), int(hold_hours), int(w),
+                     round(float(z_thresh), 4), round(float(tpct), 4))
+        cached = addon_cache_map.get(cache_key)
+        if cached is not None:
+            # addon_eligible is a pure account-status ANNOTATION (paired-review
+            # independent-cold HIGH finding, 2026-08-23) -- it has zero effect on the
+            # cached core/addon numbers, and the ticker's real watch_list account can
+            # change between when a row was cached and when it's read back. Always
+            # stamped with the CURRENT call's value on a cache hit (never persisted/
+            # read from cliff_addon_cache itself -- see _load_cliff_addon_cache_map's
+            # docstring) so a stale cached account status can never leak into a report.
+            return {**cached, 'addon_eligible': addon_eligible}
+
     strategy_class = getattr(strategies, strategy_name)
     is_both = strategy_name == 'TrailingBothZScoreBreakout'
     inputs = _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
@@ -2533,7 +2722,7 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
         trail_sell_pct=trail_sell_pct_arg, max_hours_to_hold=hold_hours,
         z_score_threshold=z_thresh, is_both=is_both,
         open_check_entry_timing=(entry_timing == 'open_check'),
-        same_bar_reentry=False, prep=prep, mprep=mprep, need_times=False,
+        same_bar_reentry=True, prep=prep, mprep=mprep, need_times=False,
     )
     if not trades:
         return None
@@ -2555,7 +2744,7 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
         addon_alpha, addon_ret, addon_cagr = None, None, None
     else:
         addon_alpha, _, _, addon_ret, _, addon_cagr = _summarize_trades_ground_truth(addon_trades, spy_bh, years)
-    return {
+    result = {
         'coords': (tp, sl, hold_hours, w, z_thresh, tpct),
         'n_trades': n_trades, 'n_armed': n_armed,
         'core_alpha': core_alpha, 'core_return': core_ret, 'core_cagr': core_cagr,
@@ -2563,6 +2752,9 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
         'addon_return_floor_breached': floor_breached,
         'addon_eligible': addon_eligible,
     }
+    if cache_key is not None and new_cache_rows is not None:
+        new_cache_rows.append((cache_key, result))
+    return result
 
 
 def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, hp, candidates,
@@ -2587,7 +2779,46 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
     Real compute: each cell here is one direct run_backtest_ground_truth call
     (~seconds warm, per docs/plans/ground_truth_kernel_rebuild.md's own benchmark note)
     -- a full 9-candidate x full cliff-box pass is real, possibly slow work, same
-    caution as any other GT campaign call in this file.
+    caution as any other GT campaign call in this file. See cliff_addon_cache (2026-08-23
+    fix, below) for the persistence layer that avoids paying this cost again on a repeat
+    report run for the same ticker/scope.
+
+    same_bar_reentry=True (2026-08-23, fixes a same-week regression): this pass used to
+    hardcode same_bar_reentry=False for every cell, an explicit "compute-halving"
+    decision made 2026-08-22. That directly contradicted dispatch_parallel_grid_ground_
+    truth's own CAUTION comment ("Do not vary same_bar_reentry within a single version
+    string; every caller today passes True"), written ONE DAY EARLIER (2026-08-21) with
+    no reconciliation between the two on file -- confirmed via `git log -S
+    same_bar_reentry` as a same-week unreconciled reversal, not a deliberate considered
+    exception (user's own assessment, 2026-08-23). Fixed here for two reasons, not just
+    consistency: (1) every real GT campaign call (Phase1/Phase2/Phase2.5-GT,
+    dispatch_parallel_grid_ground_truth) uses True, so a candidate's own cached core row
+    was always computed under True; (2) structurally, a candidate's "island" (the local
+    good-performing region Phase2.5 selected it from) was found under True -- checking
+    its neighbors under False evaluates a DIFFERENT landscape shape than the one that
+    actually produced the candidate, not just a cheaper approximation of the same one.
+    `core_alpha`/`core_cliff` in each result now DO match the candidate's own cached
+    `candidate['robust_alpha']` (mod float determinism) -- the "NOT guaranteed to match"
+    caveat this docstring used to carry for that comparison no longer applies.
+
+    Persistence / cliff_addon_cache (2026-08-23, same fix): the flip to True means every
+    neighbor coordinate is now evaluated under the exact setting Phase1/Phase2/Phase2.5-GT
+    already swept -- so many neighbor coordinates for a Phase2.5-derived candidate were
+    already computed by the real campaign that produced it. A backtest_cache-read
+    shortcut for those coordinates' CORE numbers was considered and rejected (see the
+    cliff_addon_cache table comment above _ensure_cliff_addon_cache_table): addon_alpha/
+    addon_cagr need the per-trade `trades` list, which backtest_cache never stores, so a
+    backtest_cache hit could never skip the run_backtest_ground_truth call this function
+    needs anyway for the addon overlay -- it would buy zero simulation-avoidance. The
+    real, verifiable compute-avoidance lever is cliff_addon_cache, this function's own
+    small table: on the FIRST report run for a ticker/scope, every cell is still
+    simulated (no shortcut exists for a coordinate whose addon result has never been
+    computed before) and persisted; on a REPEAT run for the same
+    (ticker, strategy, version, entry_timing, fixed_sl, kernel_version) scope, every cell
+    is a cache hit and the pass runs with zero simulation. Loaded once per call (one bulk
+    SELECT covering every candidate's own cell and full neighborhood, not one query per
+    cell) and flushed once at the end (one executemany), not per-cell, to keep the
+    caching overhead itself cheap relative to what it's saving.
 
     KNOWN LIMITATIONS (paired-review findings, 2026-08-22, not fixed -- read before
     treating `addon_cliff`/`addon_cagr` as a real-money go/no-go signal on their own):
@@ -2603,15 +2834,12 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
     _place_stop_loss_for_addon_leg, anchored to the PARENT's entry price, not the arm
     price) that can fire first, and can also fail to open at all (non-margin account,
     ticker/node automation gates, a SafetyViolation, or an entry-timeout ABANDONED leg)
-    -- this pass assumes a 100% fill rate. (4) same_bar_reentry=False here does not
-    match the True setting every real campaign dispatch uses, so `core_alpha`/
-    `core_cliff` in each result are NOT the same numbers the real Phase2.5-GT dispatch
-    would have produced for that candidate (see the 'same_bar_reentry' field on each
-    result, and compare against `candidate['robust_alpha']` if an apples-to-apples
-    check is needed). None of these make the add-on-vs-core COMPARISON invalid (both
-    sides of that comparison share the same same_bar_reentry/fill-rate/financing
-    assumptions) -- they matter if this output is used for an absolute, not relative,
-    verdict.
+    -- this pass assumes a 100% fill rate. (4) [RESOLVED 2026-08-23, see above --
+    same_bar_reentry is now True, matching every real campaign dispatch; kept as (4) so
+    the numbering doesn't shift under any external reference to (1)-(3).] None of (1)-(3)
+    make the add-on-vs-core COMPARISON invalid (both sides of that comparison share the
+    same same_bar_reentry/fill-rate/financing assumptions) -- they matter if this output
+    is used for an absolute, not relative, verdict.
 
     CAGR-based worst-neighbor (2026-08-23, ground_truth_kernel_rebuild.md Step 4,
     paired-review HIGH finding): `worst_neighbor`/`worst_neighbor_core` are now computed
@@ -2637,7 +2865,46 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
     number that decision needs). Every result in the returned list carries the same
     'addon_eligible' value (whatever the ticker's real watch_list account status was at
     call time) purely so a caller/report can label the number's current deployability
-    without having to re-derive it."""
+    without having to re-derive it.
+
+    data_source/config_version (2026-08-23, found LIVE while verifying this fix, then
+    hardened after BOTH paired-review passes independently flagged it HIGH): real,
+    reproduced bug found verifying this fix -- scripts/candidate_summary_report.py's
+    gt_rows_for_scope (and scripts/candidate_full_review.py has the identical
+    omission) calls build_candidate_report_ground_truth without passing data_source
+    through at all, so a massive-tagged config_version (e.g.
+    'v6-massive-w2021-08-23_2026-08-21') silently gets its own_cell/neighbor cells
+    evaluated against YAHOO data instead -- confirmed via direct comparison (DPST
+    TP=17/SL=3/hold=112 massive: 394 trades/36.6% core CAGR; same coords, yahoo
+    default: 200 trades/27.9% core CAGR -- same coordinates, different data, silently
+    different numbers). Those caller bugs are out of THIS fix's scope (different
+    files, pre-existing, affect both same_bar_reentry settings equally) -- see
+    docs/backlog_cache.md.
+
+    What IS in scope: cliff_addon_cache itself must never silently serve/persist one
+    source's numbers as another's. First cut of this fix (same day) tried to handle
+    this with ONLY a ValueError guard below (mirroring dispatch_parallel_grid_ground_
+    truth's identical one-directional check) -- both the independent-cold and
+    contextual paired reviews independently flagged this as insufficient: the guard
+    only fires when data_source=='massive' with no '-massive' marker; the bug actually
+    found above is the OPPOSITE direction (data_source silently defaulting to 'yahoo'
+    under an already-massive-tagged version), which no caller-side omission can trigger
+    this check to catch. Real fix: data_source/start_date/end_date are now genuine
+    PK columns on cliff_addon_cache itself (see _ensure_cliff_addon_cache_table's own
+    comment) -- a yahoo-sourced call and a massive-sourced call for the same
+    coordinates now simply never collide in the cache, regardless of whether every
+    caller remembers to pass data_source correctly. The ValueError guard below is kept
+    for parity with dispatch_parallel_grid_ground_truth and because a loud failure is
+    still better than a silent one where it CAN fire, but it is not what makes the
+    cache safe -- the PK design is."""
+    if data_source == "massive" and "-massive" not in config_version:
+        raise ValueError(
+            f"run_addon_cliff_safety_ground_truth: data_source='massive' but "
+            f"config_version={config_version!r} carries no '-massive' marker -- append "
+            f"'-massive' to config_version so massive-sourced cliff_addon_cache rows can "
+            f"never collide with yahoo-sourced rows under the same version string "
+            f"(same guard as dispatch_parallel_grid_ground_truth's own data_source check)."
+        )
     radius = CLIFF_RADIUS if cliff_radius is None else cliff_radius
     trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
     # Same fourth-axis test run_phase25_cliff_box_ground_truth itself uses (NOT a
@@ -2647,6 +2914,14 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
     # CRITICAL elsewhere in this file (identify_full_mesh_candidates' trail_sell_pct
     # mix-up). resolve_axis_columns is the single source of truth for this.
     _, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+
+    cache_conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    _ensure_cliff_addon_cache_table(cache_conn)
+    addon_cache_map = _load_cliff_addon_cache_map(
+        cache_conn, ticker, strategy_name, config_version, entry_timing, fixed_sl,
+        data_source, start_date, end_date)
+    new_cache_rows = []
+
     results = []
     for cand in candidates:
         tp_c, sl_c, hold_c, w_c, z_c, tpct_c = (cand['take_profit'], cand['stop_loss'],
@@ -2661,7 +2936,8 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
         own = _evaluate_cell_ground_truth_with_addon(
             ticker, strategy_name, tp_c, sl_c, hold_c, w_c, z_c, fixed_sl, tpct_c,
             entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
-            addon_eligible=addon_eligible)
+            addon_eligible=addon_eligible, config_version=config_version,
+            addon_cache_map=addon_cache_map, new_cache_rows=new_cache_rows)
 
         neighbor_addon_cagrs = []
         neighbor_core_cagrs = []
@@ -2672,7 +2948,8 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
                         cell = _evaluate_cell_ground_truth_with_addon(
                             ticker, strategy_name, tp, sl, hold, w_c, z_c, fixed_sl, tpct,
                             entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
-                            addon_eligible=addon_eligible)
+                            addon_eligible=addon_eligible, config_version=config_version,
+                            addon_cache_map=addon_cache_map, new_cache_rows=new_cache_rows)
                         if cell is not None:
                             # cagr, not alpha (2026-08-23, ground_truth_kernel_rebuild.md
                             # Step 4): raw alpha differences are unbounded below -100%
@@ -2713,17 +2990,21 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
             'worst_neighbor_core_alpha': worst_neighbor_core,
             'core_cliff': core_cliff,
             'addon_cliff': addon_cliff,
-            # Paired-review finding (2026-08-22): this pass always evaluates with
-            # same_bar_reentry=False (the user's explicit compute-halving direction for
-            # add-on safety specifically), which will generally differ from whatever
-            # same_bar_reentry the candidate's own cached core row (from
-            # derive_phase25_candidates_ground_truth, i.e. real Phase1/Phase2-GT data)
-            # was computed under. `core_alpha`/`core_cliff` above are NOT guaranteed to
-            # match the cached `candidate['robust_alpha']` for this reason -- this flag
-            # travels with the result so a consumer can't mistake one for the other.
-            'same_bar_reentry': False,
+            # same_bar_reentry=True (2026-08-23 fix, see this function's own docstring):
+            # this pass now evaluates under the SAME setting every real campaign dispatch
+            # uses, so `core_alpha`/`core_cliff` above match the candidate's own cached
+            # `candidate['robust_alpha']` (mod float determinism) -- kept as an explicit
+            # field (rather than dropped now that it's a constant) so a consumer reading
+            # an older result dict (or one persisted before this fix) can still tell
+            # which convention it was computed under.
+            'same_bar_reentry': True,
             'addon_eligible': addon_eligible,
         })
+
+    _flush_cliff_addon_cache_rows(cache_conn, ticker, strategy_name, config_version,
+                                   entry_timing, fixed_sl, data_source, start_date, end_date,
+                                   new_cache_rows)
+    cache_conn.close()
     return results
 
 
@@ -2890,8 +3171,9 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     duplicating either. Adds checks 1/4/8/11/13 (see module comment above check1) computed
     against each candidate's OWN real trade list (same_bar_reentry=True, matching the real
     Phase1/2/2.5-GT dispatch convention every cached row in this campaign was computed
-    under -- unlike run_addon_cliff_safety_ground_truth's own same_bar_reentry=False cells,
-    which exist for a different, cheaper, add-on-safety-only purpose).
+    under -- run_addon_cliff_safety_ground_truth's own cells now also use same_bar_
+    reentry=True as of 2026-08-23, see that function's docstring; this comment used to
+    call out a same_bar_reentry mismatch between the two that no longer exists).
 
     Check 9 (same-day-block sensitivity) is NOT built: `run_backtest_ground_truth`/
     `_simulate_trail_ground_truth` (backtester.py) have no same_day_block parameter at
@@ -3137,10 +3419,13 @@ def print_candidate_report_ground_truth(report):
             # now reuses this SAME same_bar_reentry=True trades list (2026-08-23 GT Phase
             # 4 change), so its 'core=' figure matches this compounded_pct exactly, unlike
             # the old post-hoc drought script which recomputed core trades with
-            # same_bar_reentry=False. add-on's own same_bar_reentry=False cliff-safety
-            # pass (Verdicts line above) is still computed separately and can legitimately
-            # differ from this number -- see run_addon_cliff_safety_ground_truth's own
-            # docstring on that pass's same_bar_reentry convention.
+            # same_bar_reentry=False. add-on's own cliff-safety pass (Verdicts line above)
+            # is computed separately (its own run_backtest_ground_truth call, own trades
+            # list) and can still legitimately differ from this number in magnitude (e.g.
+            # candidate-report-scoped date window vs cliff-box campaign scope) -- but as
+            # of 2026-08-23 it uses the SAME same_bar_reentry=True setting, not a
+            # different one, so any difference is no longer a same_bar_reentry mismatch;
+            # see run_addon_cliff_safety_ground_truth's own docstring.
             print(f"  Check 8 (trade-count fluke, same_bar_reentry=True): n={c8['n_trades']}"
                   f"{' [TOO FEW]' if c8['too_few_trades'] else ''}  "
                   f"compounded={c8['compounded_pct']:+.1f}%  w/o best trade={c8['compounded_without_best_pct']:+.1f}%  "
