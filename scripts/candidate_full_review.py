@@ -1747,13 +1747,19 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
     from prune_backtest_cache_ground_truth import _hp_for_strategy
 
     hp = _hp_for_strategy(strategy)
+    # data_source resolution (fix, 2026-08-23, same convention as candidate_summary_
+    # report.py's gt_rows_for_scope -- see that function's own comment for the full
+    # rationale/citations). A version carrying '-massive' was always swept with
+    # data_source='massive' (enforced at dispatch time in run_optimization_sweep.py),
+    # so the marker reliably identifies the campaign's real data source.
+    data_source = "massive" if "-massive" in version else "yahoo"
     _orig_db_path = ros.DB_PATH
     try:
         ros.DB_PATH = DB_PATH
         try:
             report = build_candidate_report_ground_truth(
                 ticker, strategy, version, hp, start_date=None, end_date=None,
-                fixed_sl=fixed_sl, entry_timing=entry_timing)
+                fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source)
         except Exception as e:
             import traceback
             print(f"  [GT full review] {ticker}/{strategy}/{version}: build_candidate_report_ground_truth "
@@ -1766,8 +1772,8 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
         # spy_bh/years are scope-level (ticker/date-window), not candidate-level -- computed
         # once here via the SAME public functions build_candidate_report_ground_truth calls
         # internally (it doesn't return them on its own report dict).
-        _, spy_bh = compute_bh_returns(ticker, start_date=None, end_date=None)
-        years = _campaign_years_for_window(ticker, None, None)
+        _, spy_bh = compute_bh_returns(ticker, start_date=None, end_date=None, data_source=data_source)
+        years = _campaign_years_for_window(ticker, None, None, data_source=data_source)
     finally:
         ros.DB_PATH = _orig_db_path
 

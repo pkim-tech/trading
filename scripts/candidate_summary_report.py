@@ -764,6 +764,19 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
     base = {"ticker": ticker, "strategy": strategy, "config_version": version,
             "entry_timing": entry_timing, "fixed_sl": fixed_sl}
     hp = _hp_for_strategy(strategy)
+    # data_source resolution (fix, 2026-08-23, backlog item logged same day): mirrors
+    # scripts/run_ground_truth_phase1.py's own version-string convention (line ~217,
+    # `version = "v6" + ("-massive" if data_source == "massive" else "") + ...`) and
+    # scripts/paper_vs_backtest_reconcile.py's identical inline resolution -- a version
+    # carrying the '-massive' marker was always swept with data_source='massive'
+    # (dispatch_parallel_grid_ground_truth/run_addon_cliff_safety_ground_truth both
+    # hard-require the marker whenever data_source='massive', see run_optimization_
+    # sweep.py ~line 1263/2900), so the marker is a reliable, already-enforced signal,
+    # not a new heuristic. Without this, build_candidate_report_ground_truth silently
+    # defaulted to data_source='yahoo' regardless of version, evaluating a massive-
+    # tagged campaign against Yahoo's shorter cached history (confirmed materially
+    # wrong on AGQ node_id=436: 138 vs real 240 trades).
+    data_source = "massive" if "-massive" in version else "yahoo"
     _orig_db_path = ros.DB_PATH
     try:
         ros.DB_PATH = DB_PATH
@@ -780,7 +793,7 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
         try:
             report = build_candidate_report_ground_truth(
                 ticker, strategy, version, hp, start_date=None, end_date=None,
-                fixed_sl=fixed_sl, entry_timing=entry_timing)
+                fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source)
         except Exception as e:
             # Broad on purpose -- the in-progress backtester.py drought-overlay fix could
             # legitimately fail with any exception shape while it's mid-fix, not just
