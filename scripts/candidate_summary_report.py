@@ -301,21 +301,37 @@ def load_ticker_df(conn, ticker, version, strategy):
     return df
 
 
-def _window_days_from_version(version):
-    """Real calendar-day span encoded in a windowed version string (see
-    run_optimization_sweep.window_version_suffix -- `-w{start}_{end}`,
-    e.g. 'v5-w2025-07-01_2026-06-30'), or None if `version` isn't windowed.
-    Uses the LAST match so a double-suffixed version (the run_quarterly_
-    soxl_sweep.sh bug, 2026-08-15 -- --version already windowed AND
-    --start-date/--end-date passed, so run_optimization_sweep.py appends
-    its own suffix on top) still parses the correct real window, not a
-    truncated partial match."""
+def _window_dates_from_version(version):
+    """Real (start_date, end_date) strings encoded in a windowed version string (see
+    run_optimization_sweep.window_version_suffix -- `-w{start}_{end}`, e.g.
+    'v6-massive-w2022-05-20_2026-05-20'), or (None, None) if `version` isn't windowed.
+    Inverse of window_version_suffix. Uses the LAST match so a double-suffixed version
+    (the run_quarterly_soxl_sweep.sh bug, 2026-08-15 -- --version already windowed AND
+    --start-date/--end-date passed, so run_optimization_sweep.py appends its own suffix
+    on top) still parses the correct real window, not a truncated partial match. Fix,
+    2026-08-23 (sibling to the data_source fix, same night): gt_rows_for_scope/
+    gt_full_review_rows previously called build_candidate_report_ground_truth with
+    start_date=None, end_date=None unconditionally, even for a version string that
+    encodes a real narrower window -- silently re-deriving GT report legs (spy_bh,
+    years, check1 macro, addon/drought re-simulation) over the ticker's FULL history
+    instead of the campaign's real window. This is the parsing half of that fix; see
+    gt_rows_for_scope/gt_full_review_rows for where the result is actually threaded
+    through."""
     if not version:
-        return None
+        return None, None
     matches = re.findall(r"-w(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})", version)
     if not matches:
-        return None
+        return None, None
     start, end = matches[-1]
+    return start, end
+
+
+def _window_days_from_version(version):
+    """Real calendar-day span encoded in a windowed version string, or None if
+    `version` isn't windowed. See _window_dates_from_version for the underlying parse."""
+    start, end = _window_dates_from_version(version)
+    if start is None:
+        return None
     return (pd.Timestamp(end) - pd.Timestamp(start)).days
 
 
@@ -777,6 +793,12 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
     # tagged campaign against Yahoo's shorter cached history (confirmed materially
     # wrong on AGQ node_id=436: 138 vs real 240 trades).
     data_source = "massive" if "-massive" in version else "yahoo"
+    # window resolution (fix, 2026-08-23, sibling to the data_source fix above): a version
+    # carrying the '-w{start}_{end}' suffix (window_version_suffix, run_optimization_
+    # sweep.py:691) was swept over a real narrower date window -- see _window_dates_
+    # from_version's own docstring for the full incident. (None, None) for a non-windowed
+    # version, which build_candidate_report_ground_truth already treats as full-history.
+    win_start, win_end = _window_dates_from_version(version)
     _orig_db_path = ros.DB_PATH
     try:
         ros.DB_PATH = DB_PATH
@@ -792,7 +814,7 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
 
         try:
             report = build_candidate_report_ground_truth(
-                ticker, strategy, version, hp, start_date=None, end_date=None,
+                ticker, strategy, version, hp, start_date=win_start, end_date=win_end,
                 fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source)
         except Exception as e:
             # Broad on purpose -- the in-progress backtester.py drought-overlay fix could

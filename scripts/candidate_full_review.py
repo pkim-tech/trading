@@ -72,6 +72,7 @@ from annualized_alpha_report import cagr
 from candidate_summary_report import (
     DB_PATH, build_rows_for_ticker, _row_to_record, best_node_strategy, load_ticker_df,
     CANDIDATE_LABELS, resolve_version, liquidity_dollars_per_day, gt_scopes_for_tickers,
+    _window_dates_from_version,
 )
 from candidate_5min_report import best_safe_node, _node_from_row, _node_key
 from run_overlay_shim import ensure_candidate_nodes_table, ensure_table as ensure_overlay_table
@@ -1753,12 +1754,16 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
     # data_source='massive' (enforced at dispatch time in run_optimization_sweep.py),
     # so the marker reliably identifies the campaign's real data source.
     data_source = "massive" if "-massive" in version else "yahoo"
+    # window resolution (fix, 2026-08-23, sibling to the data_source fix above -- same
+    # convention as candidate_summary_report.py's gt_rows_for_scope, see that function's
+    # comment / _window_dates_from_version's docstring for the full incident).
+    win_start, win_end = _window_dates_from_version(version)
     _orig_db_path = ros.DB_PATH
     try:
         ros.DB_PATH = DB_PATH
         try:
             report = build_candidate_report_ground_truth(
-                ticker, strategy, version, hp, start_date=None, end_date=None,
+                ticker, strategy, version, hp, start_date=win_start, end_date=win_end,
                 fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source)
         except Exception as e:
             import traceback
@@ -1772,8 +1777,8 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
         # spy_bh/years are scope-level (ticker/date-window), not candidate-level -- computed
         # once here via the SAME public functions build_candidate_report_ground_truth calls
         # internally (it doesn't return them on its own report dict).
-        _, spy_bh = compute_bh_returns(ticker, start_date=None, end_date=None, data_source=data_source)
-        years = _campaign_years_for_window(ticker, None, None, data_source=data_source)
+        _, spy_bh = compute_bh_returns(ticker, start_date=win_start, end_date=win_end, data_source=data_source)
+        years = _campaign_years_for_window(ticker, win_start, win_end, data_source=data_source)
     finally:
         ros.DB_PATH = _orig_db_path
 
