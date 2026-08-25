@@ -2853,6 +2853,86 @@ def remove_node(watch_id):
         c.commit()
 
 
+def transfer_position_to_new_node(old_wl_id, new_wl_id, reason):
+    """Re-homes a real open position from a retiring node (old_wl_id) onto a
+    replacement node's (new_wl_id) full config -- built 2026-08-24 for the v6
+    promotion batch, where 3 real v5 live nodes (DFEN/SOXL/WEBL) had a genuine
+    open position blocking archive_node()'s hard safety gate, and the user's
+    explicit call was same-ticker/same-account config swap rather than sell-
+    and-rebuy (avoids a real taxable event in `brokerage`, and the position is
+    small/early enough to accept the risk of moving it onto unvalidated-in-
+    this-exact-scenario risk params).
+
+    IMPORTANT, confirmed by reading signals_compute.py's real check_exit call
+    directly (not assumed): the live SL/TP/trailing logic reads its governing
+    params from the open_positions ROW's OWN baked-in columns (fixed_sl,
+    trail_sell_pct, trail_buy_pct, arm_sell_pct/take_profit, max_hold_hours,
+    window, strategy, version) -- NOT a fresh watch_list join via wl_id. So
+    reassigning wl_id alone does nothing; this function re-bakes the new
+    node's full config onto the existing row, same field list open_position()
+    itself sets on INSERT.
+
+    Real, deliberately unvalidated risk this function accepts on the caller's
+    explicit instruction: the position's stop-loss/take-profit/trailing
+    thresholds jump to the new node's values immediately, mid-flight, with no
+    backtest coverage of "opened under config A, transferred to config B"
+    specifically -- this project's own standing rule (feedback_live_must_
+    match_validated_backtest) is knowingly not satisfied here. Caller's
+    responsibility, not this function's to second-guess.
+
+    Requires same ticker (refuses otherwise -- a cross-ticker transfer is a
+    different, unscoped operation) and same account (refuses otherwise --
+    moving accounts has its own real settlement/tax implications, out of
+    scope here). `reason` is a required free-text audit note (this is exactly
+    the kind of state change this project's incident/audit trail exists for).
+
+    After a successful transfer, old_wl_id has zero open positions, so
+    archive_node(old_wl_id) can proceed through its normal safety gate --
+    this function does NOT auto-archive the old node, the caller decides
+    when."""
+    if not reason:
+        raise ValueError("transfer_position_to_new_node: reason is required")
+    with _conn() as c:
+        old_node = c.execute("SELECT * FROM watch_list WHERE id=?", (old_wl_id,)).fetchone()
+        new_node = c.execute("SELECT * FROM watch_list WHERE id=?", (new_wl_id,)).fetchone()
+        if old_node is None:
+            raise ValueError(f"transfer_position_to_new_node: no watch_list row with id={old_wl_id}")
+        if new_node is None:
+            raise ValueError(f"transfer_position_to_new_node: no watch_list row with id={new_wl_id}")
+        if old_node['ticker'] != new_node['ticker']:
+            raise ValueError(
+                f"transfer_position_to_new_node refused: ticker mismatch "
+                f"({old_node['ticker']!r} -> {new_node['ticker']!r}) -- cross-ticker transfer "
+                f"is a different, unscoped operation")
+        if (old_node['account'] or None) != (new_node['account'] or None):
+            raise ValueError(
+                f"transfer_position_to_new_node refused: account mismatch "
+                f"({old_node['account']!r} -> {new_node['account']!r}) -- cross-account transfer "
+                f"has its own settlement/tax implications, out of scope here")
+        pos = c.execute("SELECT id FROM open_positions WHERE wl_id=?", (old_wl_id,)).fetchone()
+        if pos is None:
+            raise ValueError(
+                f"transfer_position_to_new_node: no open_positions row for wl_id={old_wl_id} "
+                f"-- nothing to transfer")
+        c.execute("""
+            UPDATE open_positions SET
+                wl_id=?, strategy=?, version=?, window=?, take_profit=?, stop_loss=?,
+                max_hold_hours=?, trail_sell_pct=?, fixed_sl=?, trail_buy_pct=?, arm_sell_pct=?
+            WHERE id=?
+        """, (
+            new_wl_id, new_node['strategy'], new_node['version'], new_node['window'],
+            new_node['take_profit'], new_node['stop_loss'], new_node['max_hold_hours'],
+            new_node['trail_sell_pct'], new_node['fixed_sl'],
+            new_node['trail_buy_pct'], new_node['arm_sell_pct'], pos['id'],
+        ))
+        _log_audit(c, 'transfer_position_to_new_node', watchlist_id=new_node['watchlist_id'],
+                   watch_id=new_wl_id, ticker=new_node['ticker'],
+                   detail=f"open_positions.id={pos['id']} old_wl_id={old_wl_id} -> new_wl_id={new_wl_id}: {reason}")
+        c.commit()
+    print(f"transfer_position_to_new_node: open_positions.id={pos['id']} "
+          f"({old_node['ticker']}) moved wl_id {old_wl_id} -> {new_wl_id}")
+
+
 def archive_node(watch_id):
     """Retires a node from active consideration (get_watchlist()'s default view,
     get_live_nodes(), evening_status.py's real_capital_nodes()) without deleting
