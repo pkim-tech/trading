@@ -13,6 +13,78 @@ from signals_helpers import (
 )
 
 
+# Slack's own hard per-field length caps (Block Kit reference) -- exceeding
+# ANY of these fails the WHOLE message (invalid_blocks), not just the
+# offending block/row. Real incident, 2026-08-25: a startup morning report
+# never posted because one per-node button's dynamically-built label
+# (ticker + a free-text blocker description with no length cap of its own)
+# exceeded the button text cap. That one call site is now fixed at the
+# source (_ticker_block), and _sanitize_blocks is a durable backstop for
+# every future dynamic label built ANYWHERE _post_message is the send path.
+# NOT a universal guarantee, though (paired-review finding, 2026-08-25):
+# several other real send paths bypass this entirely -- signals_handlers.py's
+# chat_update/views_open call sites, signals_notify.py:3503,
+# signals_config.py:126. All are currently static/section-only text (no
+# dynamic length risk today), but a future dynamic label built at one of
+# those sites would NOT be protected by this module. Not yet routed through
+# a shared sanitizer -- see docs/backlog_cache.md.
+_BUTTON_TEXT_LIMIT = 75
+_OVERFLOW_TEXT_LIMIT = 75
+_HEADER_TEXT_LIMIT = 150
+_SECTION_TEXT_LIMIT = 3000
+_CONTEXT_TEXT_LIMIT = 2000
+_CONFIRM_TITLE_LIMIT = 100
+_CONFIRM_TEXT_LIMIT = 300
+_CONFIRM_BUTTON_LIMIT = 30
+
+
+def _sanitize_blocks(blocks):
+    """Defensively clip every known length-capped text field in a Block Kit
+    payload before it's sent -- best-effort, never raises (an unexpected
+    shape is left alone rather than crashing the send path over a cosmetic
+    guard). Not a substitute for building correct blocks at the source
+    (_ticker_block's fix stays) -- this is the backstop for whatever call
+    site does it wrong next."""
+    if not blocks:
+        return blocks
+
+    def _clip_text_obj(obj, limit):
+        if isinstance(obj, dict) and isinstance(obj.get('text'), str):
+            obj['text'] = _clip(obj['text'], limit)
+
+    def _clip_confirm(confirm):
+        if not isinstance(confirm, dict):
+            return
+        _clip_text_obj(confirm.get('title'), _CONFIRM_TITLE_LIMIT)
+        _clip_text_obj(confirm.get('text'), _CONFIRM_TEXT_LIMIT)
+        _clip_text_obj(confirm.get('confirm'), _CONFIRM_BUTTON_LIMIT)
+        _clip_text_obj(confirm.get('deny'), _CONFIRM_BUTTON_LIMIT)
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get('type')
+        if btype == 'header':
+            _clip_text_obj(block.get('text'), _HEADER_TEXT_LIMIT)
+        elif btype == 'section':
+            _clip_text_obj(block.get('text'), _SECTION_TEXT_LIMIT)
+        elif btype == 'context':
+            for el in block.get('elements') or []:
+                _clip_text_obj(el, _CONTEXT_TEXT_LIMIT)
+        elif btype == 'actions':
+            for el in block.get('elements') or []:
+                if not isinstance(el, dict):
+                    continue
+                if el.get('type') == 'button':
+                    _clip_text_obj(el.get('text'), _BUTTON_TEXT_LIMIT)
+                    _clip_confirm(el.get('confirm'))
+                elif el.get('type') == 'overflow':
+                    for opt in el.get('options') or []:
+                        _clip_text_obj(opt.get('text'), _OVERFLOW_TEXT_LIMIT)
+                    _clip_confirm(el.get('confirm'))
+    return blocks
+
+
 def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node_id=None, incident=False,
                    pos=None, node=None, real_order=False):
     """Returns (channel, ts) when posted via the Socket Mode client (None, None
@@ -171,6 +243,7 @@ def _post_message(text, blocks=None, thread_ts=None, reply_broadcast=False, node
             header_marker = {"type": "context", "elements": [{"type": "mrkdwn", "text": f"🧪 *SIM MODE{scenario_str}*"}]}
             footer_marker = {"type": "context", "elements": [{"type": "mrkdwn", "text": "🧪 *SIM MODE END*"}]}
             blocks = [header_marker] + blocks + [footer_marker]
+    blocks = _sanitize_blocks(blocks)
     log_mode = 'sim' if cfg.SIM_MODE else ('live' if cfg.SOCKET_MODE else ('webhook' if cfg.SLACK_HOOK else 'console'))
     channel, ts, error = None, None, None
     if cfg.SOCKET_MODE:
@@ -590,6 +663,32 @@ def _trailing_order_blocks(pos, current_price, reminder_num=0):
     return blocks
 
 
+def _utf16_len(s):
+    """Slack's real length validator counts UTF-16 code units (matching JS
+    string.length), not Python code points -- an astral-plane character like
+    the 🛑 emoji is 1 Python len() unit but 2 UTF-16 units. Confirmed by
+    paired review, 2026-08-25: a naive len()-based clip on a real Stop-button
+    label lands at exactly 75 Python chars / 76 UTF-16 units -- reproducing
+    the ORIGINAL "must be less than 76 characters" incident verbatim, on the
+    string meant to fix it."""
+    return len(s.encode('utf-16-le')) // 2
+
+
+def _clip(s, limit):
+    """Truncate to fit within `limit` UTF-16 code units (see _utf16_len) with
+    an ellipsis rather than silently clipping -- a clause disappearing off
+    the end with no visible sign is worse than an obviously-cut string.
+    Shared by _confirm_dialog and any button `text.text` field, both of which
+    have hard Slack-enforced length caps (invalid_blocks kills the WHOLE
+    report, not just one row/button, if either is exceeded)."""
+    if _utf16_len(s) <= limit:
+        return s
+    n = len(s)
+    while n > 0 and _utf16_len(s[:n] + "…") > limit:
+        n -= 1
+    return s[:n] + "…"
+
+
 def _confirm_dialog(title, text, confirm_label, deny_label="Cancel", style=None):
     """Block Kit `confirm` object -- the native "are you sure?" dialog Slack
     renders before dispatching a button's action. First use of this in the
@@ -608,9 +707,6 @@ def _confirm_dialog(title, text, confirm_label, deny_label="Cancel", style=None)
     dialogs carry the warning text a user is being asked to act on, and a
     clause disappearing off the end with no visible sign is worse than an
     obviously-cut sentence. Callers should still stay under the caps."""
-    def _clip(s, limit):
-        return s if len(s) <= limit else s[:limit - 1] + "…"
-
     obj = {
         "title":   {"type": "plain_text", "text": _clip(title, 100)},
         "text":    {"type": "mrkdwn",     "text": _clip(text, 300)},
@@ -781,11 +877,25 @@ def _ticker_block(row):
                 })
             else:
                 # Label must not claim the node is running when another layer
-                # has already halted it.
-                suffix = f" (already halted: {other_blockers[0]})" if other_blockers else ""
+                # has already halted it -- but the reason lives in its OWN
+                # context block (below), not appended into the button label.
+                # 2026-08-25: an earlier version concatenated the free-text
+                # blocker reason directly into the label, which both risked
+                # exceeding Slack's 75-char button cap (the real incident
+                # that started this) AND meant a clip-to-fit fix could make
+                # the button unreadable ("what does this even do?") on
+                # mobile if the important part landed in the truncated tail.
+                # Splitting it out means the button label is always short and
+                # fully legible (action + ticker, nothing else, never at risk
+                # of the 75-char cap), and the reason gets its own field with
+                # a much larger real budget (2000 chars for a context block)
+                # where clipping in practice never happens.
+                if other_blockers:
+                    blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+                        "text": f"⚠️ *{ticker}* already halted: {other_blockers[0]}"}]})
                 elements.append({
                     "type": "button", "style": "danger",
-                    "text": {"type": "plain_text", "text": f"🛑 Stop {ticker}{suffix}"},
+                    "text": {"type": "plain_text", "text": f"🛑 Stop {ticker}"},
                     "action_id": "stop_node_automation", "value": auto_value,
                     # Kept comfortably under _confirm_dialog's 300-char cap so
                     # the SELL warning can't be the part that gets truncated

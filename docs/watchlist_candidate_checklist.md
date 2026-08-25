@@ -298,6 +298,20 @@ open_positions/pending_buys check above. Orders, positions, and watch_list rows 
 interrelated state that can drift out of sync specifically at a strategy-version
 transition, not just a config-param change.
 
+## 18. Automation-scope check (REQUIRED ACTION, do this at the moment of live promotion)
+Confirm the ticker is actually in `.env`'s `SCHWAB_AUTOMATION_TICKERS`
+(`schwab_safety.AUTOMATION_ENABLED_TICKERS` at runtime) — `state='live'` alone does NOT
+mean automated order placement works; a ticker missing from this list still gets real
+Slack signal alerts but every automated BUY/SELL attempt is blocked
+(`automation_blockers_other_than_node` returns `"{ticker} not in automation pilot scope
+(manual-only)"`), silently downgrading a "live, automated" promotion to "live, manual-only"
+with no error anywhere. **Real, recurring gap-shape — 3+ confirmed instances**: CURE/TMF/
+ERX (2026-08-16), the FAS-missing-from-list bug, and OILU (2026-08-25, found live the same
+day it was promoted alongside ETHU — ETHU was added to the list, OILU wasn't, same
+promotion batch). Add the ticker to `.env` and **restart the daemon** — the list is read
+from the environment once at import time, so an `.env` edit alone does not take effect on
+a running process.
+
 ## Methodology notes (not standalone checks, but keep in mind while running the above)
 - **Compare same node, not best-of-grid**, when checking whether a kernel/logic fix
   changed a ticker's numbers — re-optimizing across the whole grid after a fix confounds

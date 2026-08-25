@@ -78,6 +78,7 @@ Full build/bugfix history for every file below: `docs/deep_backlog.md` (search b
 - Mapping Accountability Grid rows to test tickers / closing a coverage gap / retiring a staged node: `docs/grid_ticker_coverage_promotion_process.md` first.
 - Writing/trusting a cliff-safety or neighbor-search query: `docs/cliff_safety_query_checklist.md` first.
 - Validating a new overlay/config parameter (not a ticker's core strategy): `docs/overlay_parameter_robustness_process.md` first.
+- Touching `backtest_cache`'s schema, the sweep's prune/bloat problem, or node identity (`node_id`/`candidate_nodes`): `docs/plans/backtest_schema_v2_phase_tables.md` first — design only, not built, but it's the current answer to the overloaded-column bug family, the prune treadmill, and per-candidate trade-sequence retention; check it before re-deriving any of those from scratch.
 
 **Core engine**:
 - `app.py` — Streamlit UI for configuring/launching optimization sweeps
