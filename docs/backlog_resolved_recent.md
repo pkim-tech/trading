@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][security] Resolved 2026-08-25 (dispatched session) — SL/pending-buy orders going CANCELED/REPLACED/REJECTED/EXPIRED at the broker (never just FILLED) now alert instead of silently polling forever; WEBL/DPST incidents both covered. Paired review found+fixed 1 CRITICAL (REPLACED must never auto-clear a pending-buy row) + 2 HIGH (alert-storm cooldown, missing Grid rows). Full detail: `deep_backlog.md`.
+
 ## [live-trading] Resolved 2026-08-25 (planner session) — full v6 promotion: 14 real tickers now live on v6 (was v5), CLAUDE.md's stale "v5/v5.1 default" gap closed. Real DB-vs-broker reconciliation gap found and fixed (DFEN/SOXL/WEBL/DPST) via new `scripts/reconcile_flat_position.py`; a real fill-optimism bug found and root-caused on OILU via new 1-sec/1-min Massive-data checklist scripts. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-08-23 (even later still) — `candidate_summary_report.py`/`candidate_full_review.py` GT paths also never windowed `build_candidate_report_ground_truth` (start_date/end_date always None)

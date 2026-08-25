@@ -501,6 +501,17 @@ _ORDER_CONFIRM_POLL_ATTEMPTS = 4
 _ORDER_CONFIRM_POLL_INTERVAL_SECS = 0.5
 _ORDER_TERMINAL_BAD_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
 
+# REPLACED is deliberately its own set, not folded into _ORDER_TERMINAL_BAD_STATUSES:
+# that set drives OrderRejected/_post_order_confirmation's "this order is dead, bad
+# outcome" alerting, but REPLACED isn't inherently bad (e.g. a resting SL order
+# legitimately superseded by a manual sell at the broker). It IS still terminal-and-
+# not-FILLED for a locally-tracked order_id, though -- get_filled_order's FILLED-only
+# match never surfaces it, so a poll keyed on that order_id goes silent forever
+# (real incidents: WEBL's resting SL order REPLACED by a manual market SELL, DPST's
+# resting pending-buy order CANCELED by the user, both 2026-08-24 -- see
+# signals_notify._check_order_terminal_not_filled).
+_ORDER_TERMINAL_UNRESOLVED_STATUSES = _ORDER_TERMINAL_BAD_STATUSES | {"REPLACED"}
+
 
 class OrderRejected(Exception):
     """Raised when the post-placement status poll confirms an order was

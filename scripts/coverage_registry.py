@@ -293,6 +293,49 @@ REGISTRY = [
                "(deliberately not auto_fill_detection_enabled -- see the function's own docstring for "
                "why). No live proof yet for any of the three result paths -- needs a real market-buy "
                "order to genuinely terminate, which hasn't happened organically."),
+    dict(id='sl_order_terminal_not_filled',
+         scenario="A locally-tracked resting SL/TRAIL order (open_positions.sl_order_id) reaches a "
+                  "terminal-but-not-FILLED broker status (REJECTED/CANCELED/EXPIRED/REPLACED) and gets "
+                  "alerted, instead of get_filled_order's FILLED-only poll silently returning None every "
+                  "cycle forever with zero alert and zero log line",
+         code_path="signals_notify.check_sl_order_fills -> _check_order_terminal_not_filled",
+         offline_coverage="tests/test_fake_broker_order_terminal_not_filled_scenario.py",
+         check_mechanism='coverage_events', scenario_key='sl_order_terminal_not_filled',
+         bad_results=['alerted'],
+         notes="Built 2026-08-25, real live incident the same night: WEBL's resting SL order was "
+               "REPLACED at the broker when the user placed a real market SELL to close the position "
+               "directly, and nothing polled sl_order_id for anything but FILLED -- confirmed via "
+               "schwab_client.get_real_orders after the fact, no alert ever fired. Alert-only, no "
+               "auto-clear (matches this function's existing qty-mismatch alert-not-auto-correct "
+               "precedent) -- REPLACED specifically must never trigger an auto-clear anywhere in this "
+               "shared helper (a paired-review CRITICAL finding caught before landing: REPLACED can "
+               "mean a live replacement order superseded this one, e.g. check_gap_resize's own replace "
+               "path, not that nothing is resting). No live proof yet -- built from the WEBL incident "
+               "after the fact, not observed firing live since."),
+    dict(id='pending_buy_order_terminal_not_filled',
+         scenario="A locally-tracked resting trailing-buy order (pending_buys.order_id) reaches a "
+                  "genuine zero-fill terminal-bad status (REJECTED/CANCELED/EXPIRED -- NOT REPLACED, see "
+                  "notes) and gets alerted + tracking cleared, instead of polling forever with zero "
+                  "termination path. Complements market_buy_order_terminated (market-buy population "
+                  "only) -- this is the trailing-buy population check_market_buy_rejected's own docstring "
+                  "assumed check_entry_abandon already covered, which it doesn't (that function is a "
+                  "hold-time timeout only, never checks real broker order status).",
+         code_path="signals_notify.check_buy_reminders / check_auto_fills -> "
+                   "_check_order_terminal_not_filled (trailing-buy branches only)",
+         offline_coverage="tests/test_fake_broker_order_terminal_not_filled_scenario.py",
+         check_mechanism='coverage_events', scenario_key='pending_buy_order_terminal_not_filled',
+         bad_results=['partial_fill_preserved'],
+         notes="Built 2026-08-25, real live incident the same night: DPST's resting pending-buy order "
+               "was manually CANCELED by the user at the broker -- confirmed via "
+               "schwab_client.get_real_orders, never surfaced by the FILLED-only poll (check_entry_abandon "
+               "only fires on max_hold_hours timeout, not a real broker-side cancel). Same partial-fill "
+               "safety as market_buy_order_terminated (a terminal-bad status doesn't mean zero shares "
+               "executed) -- a nonzero-fill terminal order is alerted and PRESERVED, never cleared. "
+               "REPLACED is deliberately excluded from clear-eligibility (see sl_order_terminal_not_filled's "
+               "notes above) -- alert-and-preserve only, since a replaced pending-buy order can have a "
+               "live successor (check_gap_resize's own replace path). check_buy_reminders and "
+               "check_auto_fills share one throttle store keyed by order_id specifically so both call "
+               "sites polling the same dead order_id don't double-alert. No live proof yet."),
     # 'kernel_fill_parity' removed 2026-08-13 -- this row asked a categorically different question
     # than everything else in the Grid: does the backtest kernel's fill-resolution math agree with
     # the live code's own version of the same math (a code-consistency check between two Python

@@ -4377,6 +4377,88 @@ def check_own_sell_fills(open_positions):
             print(f"  [warn] {ticker} — unexpected error in close_addon_leg_real_if_open: {e}")
 
 
+_SL_ORDER_TERMINAL_ALERTED = {}
+# 15min, matches _RECONCILE_COOLDOWN_SECS/_ENTRY_ABANDON_ALERT_COOLDOWN_SECS/_STALE_PRICE_COOLDOWN_SECS
+# elsewhere in this module -- NOT the module's default POLL_SECS (300s): this call site is alert-only
+# (no clear_fn, see _check_order_terminal_not_filled's docstring), so nothing ever resolves the
+# condition and a cooldown equal to the poll interval reposts the same real_order=True incident (which
+# bypasses every should_alert_live/has_capital_at_stake suppression gate, signals_blocks._post_message)
+# every single cycle, indefinitely -- the exact alert-storm shape _throttled_entry_abandon_alert's own
+# docstring describes (found by contextual paired review, 2026-08-25, before this landed).
+_SL_ORDER_TERMINAL_ALERT_COOLDOWN_SECS = 900
+
+_PENDING_BUY_ORDER_TERMINAL_ALERTED = {}
+_PENDING_BUY_ORDER_TERMINAL_ALERT_COOLDOWN_SECS = 900  # 15min, matches BUY_REMINDER_MINUTES' own cadence
+
+
+def _check_order_terminal_not_filled(account, ticker, order_id, scenario_key, mode, label,
+                                      node_id, post_anchor_kwargs, clear_fn=None):
+    """Shared by check_sl_order_fills (sl_order_id) and the trailing-buy pending-order
+    checks in check_buy_reminders/check_auto_fills (pending_buys.order_id): both poll a
+    locally-tracked order_id via get_filled_order every cycle, which only ever returns
+    non-None for status=='FILLED' -- a REJECTED/CANCELED/EXPIRED/REPLACED order_id (see
+    schwab_client._ORDER_TERMINAL_UNRESOLVED_STATUSES) silently returns None forever,
+    with zero alert and zero log line. Real incidents, both 2026-08-24: WEBL's resting
+    SL order REPLACED by a manual market SELL, DPST's resting pending-buy order CANCELED
+    by the user at the broker -- confirmed via schwab_client.get_real_orders in both
+    cases, neither ever surfaced by the FILLED-only poll.
+
+    Uses get_order_detail/_order_executed_quantity, not get_order_status alone -- same
+    partial-fill-safety pattern as check_market_buy_rejected (2026-08-17 paired review):
+    a terminal-bad status does NOT mean zero shares executed (Schwab reports a
+    partially-filled-then-killed order as CANCELED, not FILLED). A nonzero-fill terminal
+    order is alerted and never auto-cleared (clear_fn is only invoked on a genuine
+    zero-fill terminal order) -- a real partial fill needs a human to reconcile.
+
+    REPLACED is NEVER clear-eligible, regardless of executed quantity or clear_fn --
+    unlike REJECTED/CANCELED/EXPIRED (schwab_client._ORDER_TERMINAL_BAD_STATUSES, what
+    check_market_buy_rejected's own clear gate uses), REPLACED means a NEW live order
+    superseded this one, not that nothing is working at the broker. clear_fn deleting
+    the local tracking row here would orphan that real replacement order with no local
+    row to reconcile its eventual fill against -- concretely reachable via
+    check_gap_resize's own replace_equity_order_with_market call (~line 6281): its
+    generic `except Exception` branch (~line 6301) deliberately leaves order_id
+    pointing at the now-superseded order while a real new MARKET order rests, precisely
+    so a later poll can retry -- this function must not treat that surviving stale
+    order_id as safe to delete tracking over just because IT read REPLACED with zero
+    executions (found by independent-cold paired review, 2026-08-25, before this
+    landed).
+
+    Returns the confirmed terminal status string once alerted, or None (still resting,
+    genuinely FILLED, or get_order_detail itself failed -- fails toward the cautious
+    poll-again-next-cycle path like every sibling check in this module, no escalation
+    path for a permanently-unconfirmable order_id here, unlike check_market_buy_rejected's
+    _MARKET_BUY_STATUS_UNKNOWN_SINCE fallback -- not needed yet, add if this proves to be
+    a real gap)."""
+    order = schwab_client.get_order_detail(account, order_id)
+    if order is None:
+        return None
+    status = order.get("status")
+    if status not in schwab_client._ORDER_TERMINAL_UNRESOLVED_STATUSES:
+        return None
+    executed = schwab_client._order_executed_quantity(order)
+    clear_fn = clear_fn if status in schwab_client._ORDER_TERMINAL_BAD_STATUSES else None
+    if executed > 0:
+        db.log_coverage_event(scenario_key, mode, ticker=ticker, node_id=node_id,
+                               result="partial_fill_preserved", detail=f"status={status} executed={executed:g}")
+        _post_message(
+            f"🚨 *{ticker}* ({account}) — {label} order {order_id} was {status} by Schwab AFTER partially "
+            f"executing {executed:g} shares — tracking PRESERVED, no auto-clear. Verify the real "
+            f"position/order at the broker and reconcile manually.",
+            incident=True, real_order=True, **post_anchor_kwargs)
+        return status
+    db.log_coverage_event(scenario_key, mode, ticker=ticker, node_id=node_id,
+                           result="cleared" if clear_fn else "alerted", detail=f"status={status}")
+    _post_message(
+        f"⚠️ *{ticker}* ({account}) — {label} order {order_id} was {status} by Schwab, not resting/filled"
+        + (" — tracking cleared, verify at the broker if unexpected."
+           if clear_fn else " — local tracking still points at this dead order, verify at the broker."),
+        incident=True, real_order=True, **post_anchor_kwargs)
+    if clear_fn:
+        clear_fn()
+    return status
+
+
 def check_sl_order_fills(open_positions):
     """Every poll cycle, rechecks each open position's own resting protective
     stop-loss order (pos['sl_order_id'], placed at entry via
@@ -4430,6 +4512,11 @@ def check_sl_order_fills(open_positions):
         ticker = pos['ticker']
         fill = schwab_client.get_filled_order(account, ticker, 'SELL', order_id=sl_order_id)
         if fill is None:
+            if _throttled(_SL_ORDER_TERMINAL_ALERTED, sl_order_id, _SL_ORDER_TERMINAL_ALERT_COOLDOWN_SECS):
+                _check_order_terminal_not_filled(
+                    account, ticker, sl_order_id, scenario_key='sl_order_terminal_not_filled',
+                    mode=_coverage_mode(account), label='SL/TRAIL', node_id=pos.get('wl_id'),
+                    post_anchor_kwargs=dict(node_id=pos.get('wl_id'), pos=pos))
             continue
         if state.get('exit_forced_by_hold_time'):
             reason = 'TIME'
@@ -4895,6 +4982,24 @@ def check_buy_reminders():
                 print(f"  [buy_reminders] {pending['ticker']}: fill re-verification failed, "
                       f"falling back to the ordinary reminder: {e}")
                 fill = None
+            if fill is None:
+                # Trailing-buy-only population (order_placed is never set for a
+                # market-buy node, see this function's own docstring) -- market-buy's
+                # equivalent terminal-status detection is check_market_buy_rejected.
+                # Shared _PENDING_BUY_ORDER_TERMINAL_ALERTED throttle-by-order_id with
+                # check_auto_fills' identical check below: whichever runs first within
+                # the cooldown window alerts, the other is suppressed -- avoids a
+                # duplicate Slack post for the same dead order.
+                if _throttled(_PENDING_BUY_ORDER_TERMINAL_ALERTED, pending['order_id'],
+                              _PENDING_BUY_ORDER_TERMINAL_ALERT_COOLDOWN_SECS):
+                    status = _check_order_terminal_not_filled(
+                        account, pending['ticker'], pending['order_id'],
+                        scenario_key='pending_buy_order_terminal_not_filled', mode=_coverage_mode(account),
+                        label='trailing-buy', node_id=pending['node']['id'],
+                        post_anchor_kwargs=dict(node_id=pending['node']['id'], node=pending['node']),
+                        clear_fn=lambda: db.clear_pending_buy_by_wl_id(pending['node']['id']))
+                    if status is not None:
+                        continue
             if fill is not None:
                 db.log_coverage_event("confirmed_fill_dropped_at_gate", _coverage_mode(account),
                                        ticker=pending['ticker'], node_id=pending['node']['id'],
@@ -6471,6 +6576,20 @@ def check_auto_fills(open_positions):
             continue
         fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=pending.get('order_id'))
         if fill is None:
+            # Trailing-buy only -- market-buy's terminal-status detection is the known
+            # residual gap flagged just above (check_market_buy_rejected already covers
+            # it). Shared _PENDING_BUY_ORDER_TERMINAL_ALERTED throttle-by-order_id with
+            # check_buy_reminders' identical check -- avoids a duplicate alert when both
+            # run within the same cooldown window.
+            if db._is_trailing_buy(node) and pending.get('order_id') and _throttled(
+                    _PENDING_BUY_ORDER_TERMINAL_ALERTED, pending['order_id'],
+                    _PENDING_BUY_ORDER_TERMINAL_ALERT_COOLDOWN_SECS):
+                _check_order_terminal_not_filled(
+                    account, ticker, pending['order_id'],
+                    scenario_key='pending_buy_order_terminal_not_filled', mode=_coverage_mode(account),
+                    label='trailing-buy', node_id=node['id'],
+                    post_anchor_kwargs=dict(node_id=node['id'], node=node),
+                    clear_fn=lambda: db.clear_pending_buy_by_wl_id(node['id']))
             continue
         _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], wl_id=node['id'], account=account)
 
