@@ -505,20 +505,20 @@ def main():
         post_problems.append(f"Non-GT backtest_cache row count changed on copy: PRE={non_gt_pre} POST={non_gt_post} "
                               f"(this tool must never touch non-ground_truth_v6 rows).")
 
-    if post_problems:
-        print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print(f" POST validation FAILED -- {len(post_problems)} problem(s). No sentinel written, no swap possible.")
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        for p in post_problems[:40]:
-            print(f"  {p}")
-        sys.exit(1)
-    print(f"POST: Method A (gate-bypassed) and Method B both reproduce PRE exactly across "
-          f"all prunable scopes. Per-entry (candidate + anchor + passthrough-scope) content "
-          f"fingerprints match ({len(all_groups)} groups). All other tables + non-GT/"
-          f"non-prunable-GT backtest_cache rows copied with exact row-count preservation.")
-
-    # Kept-row-count regression check per scope (prunable AND passthrough, so a
-    # passthrough scope quietly shrinking is flagged too).
+    # 2026-08-25: row-count-regression check moved ahead of the post_problems exit
+    # below -- previously a candidate-selection tie-break disagreement (found live
+    # this same night, AGQ: a near-tied cluster of adjacent grid cells with no
+    # data loss involved -- see docs/plans/backtest_schema_v2_phase_tables.md's
+    # "one definition of winner" section) short-circuited main() via sys.exit(1)
+    # before this check ever ran, even though it answers a DIFFERENT question
+    # (did the prune lose/shrink real data) than the candidate check does (does
+    # the selection algorithm agree with its own earlier run). Bundling both into
+    # one pass/fail meant a harmless selection-tie-break bug blocked ever finding
+    # out whether the data-integrity check -- the one that actually matters for
+    # swap safety -- would have passed. Now both run and both get reported;
+    # either failing still refuses the swap (kept-row-count regressions per scope,
+    # prunable AND passthrough, so a passthrough scope quietly shrinking is
+    # flagged too).
     prev = {}
     if KEPT_COUNT_LOG.exists():
         prev = {tuple(json.loads(k)): v for k, v in json.loads(KEPT_COUNT_LOG.read_text()).items()}
@@ -538,6 +538,22 @@ def main():
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         for k, old, new in regressions[:20]:
             print(f"  {k}: {old} -> {new}")
+    else:
+        print("\nNo row-count regressions vs. the last recorded GT prune.")
+
+    if post_problems:
+        print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print(f" POST validation FAILED -- {len(post_problems)} problem(s). No sentinel written, no swap possible.")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        for p in post_problems[:40]:
+            print(f"  {p}")
+        sys.exit(1)
+    print(f"POST: Method A (gate-bypassed) and Method B both reproduce PRE exactly across "
+          f"all prunable scopes. Per-entry (candidate + anchor + passthrough-scope) content "
+          f"fingerprints match ({len(all_groups)} groups). All other tables + non-GT/"
+          f"non-prunable-GT backtest_cache rows copied with exact row-count preservation.")
+
+    if regressions:
         sys.exit(1)
 
     pbcg.write_validation_sentinel()

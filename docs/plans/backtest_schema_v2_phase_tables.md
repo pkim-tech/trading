@@ -181,6 +181,28 @@ change.
   actually flags it — a comparison tool that never fires on a real injected failure is worse
   than no tool at all.
 
+## Requirement: one definition of "winner", not one per script
+
+Raised 2026-08-25 (evening), after `prune_backtest_cache_ground_truth_validate.py` found a real
+PRE-vs-POST candidate-selection discrepancy for AGQ (2 scopes) with no data drift and no
+corruption -- root-caused to a near-tied cluster of adjacent grid cells (`axis_tp` 30/31/32,
+CAGRs within ~1 point of each other) where the top-N-per-island tie-break isn't guaranteed
+stable across two runs of the same selection code against identical data. Confirmed harmless
+this time (the affected scope was `TrailingBothZScoreBreakout`, never the strategy actually
+picked for AGQ's real live node), but it's the third distinct "definition of winner" bug found
+this project's history (robust_alpha-vs-CAGR ranking confusion, `top_safe_nodes.py`'s hardcoded
+`metric="robust_alpha"` with no GT-aware override, and now this tie-break instability) --
+pattern is "pick the best row" logic reimplemented slightly differently in `run_optimization_
+sweep.py`, `candidate_full_review.py`, `candidate_summary_report.py`, `prune_backtest_cache_
+ground_truth.py`, and `top_safe_nodes.py`, each a chance to drift.
+
+**Decided**: rather than auditing/fixing the current (soon-to-be-superseded) scripts one at a
+time, this schema-v2 rebuild should define "winner" (ranking metric, full deterministic
+tie-break column list, island/neighborhood grouping) exactly once, in one place, and have every
+consumer (report, prune, sweep) call that single definition -- not re-derive it. Scope/design
+of that single definition not yet started; flagged here so it's a stated requirement of the
+rebuild, not an afterthought once the phase tables exist.
+
 ## Open, deferred out of this design
 
 - **KORU "upswing-watch" as a real swept strategy** (own `sma_short_days`/`sma_long_days`/

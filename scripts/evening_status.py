@@ -1368,6 +1368,34 @@ def part4():
         for g in overlay_gaps:
             print(f"  {g}")
 
+    print("\n--- 2c. Stale unresolved pending buys (order_placed=False, signal predates today) ---")
+    # Wires in scripts/check_stale_pending_buys.py's exact detection logic --
+    # that script existed specifically to catch this class of gap (a pending
+    # buy that never resolved and never got a real broker order) but was
+    # never actually called from any nightly routine, so it only caught
+    # anything if a human remembered to run it by hand. Found 2026-08-25:
+    # CURE and TMF both sat stuck since 2026-08-17 (8+ days) with nothing
+    # flagging it -- the standalone script would have caught it immediately,
+    # it just never ran. Reuses db.get_pending_buys() directly, not a
+    # re-derived query, so this can't drift from the standalone script's logic.
+    today_date = datetime.now().date()
+    stale_pending = []
+    for pending in db.get_pending_buys():
+        if pending['order_placed']:
+            continue
+        signal_dt = datetime.strptime(pending['signal_time'], '%Y-%m-%d %H:%M:%S')
+        if signal_dt.date() >= today_date:
+            continue
+        stale_pending.append(pending)
+    if not stale_pending:
+        print("none -- no stale unresolved pending buys")
+    else:
+        for p in stale_pending:
+            node = p['node']
+            print(f"  {p['ticker']:6s} wl_id={p['wl_id']} account={node.get('account')} "
+                  f"state={node.get('state')} signal_time={p['signal_time']} "
+                  f"reminder_count={p['reminder_count']}")
+
 
 PARTS = {'1': part1, '2': part2, '3': part3, '4': part4}
 
