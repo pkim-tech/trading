@@ -2,8 +2,15 @@
 trailing-buy entry (_simulate_trail_both's 'waiting' state: track running_low, fire when High
 clears running_low * (1 + trail_buy_pct)) is a reasonable proxy for what a continuously-tracking
 broker trailing-buy order would actually do -- without needing real broker fills. Re-detects the
-same bounce using 5-min bars (yfinance, ~60 days back) for every recent live-watchlist signal and
-compares entry price/time against what the hourly kernel predicts for the same signal.
+same bounce using real 1-min bars (Massive.com, cache/research/minute_data/*_1m.csv, full real
+history -- ~2-5yr depending on ticker, see db_cache.get_massive_minute_ohlcv) for every recent
+live-watchlist signal and compares entry price/time against what the hourly kernel predicts for
+the same signal.
+
+Switched from a live yfinance 5-min pull to the cached Massive 1-min data 2026-08-24 (planner
+session) -- yfinance only retains 5-min bars for a rolling ~60 days, which both capped how far
+back this check could look AND used coarser resolution than necessary now that real 1-min data
+is cached locally with multi-year depth. Finer bars + longer real lookback, no live API call.
 
 Usage: .venv/bin/python scripts/verify_trailing_buy_resolution.py [--tickers AGQ,SOXL]
        .venv/bin/python scripts/verify_trailing_buy_resolution.py --adhoc "ZSL:20:1.0:1.0:70,NAIL:10:1.0:1.0:63"
@@ -19,15 +26,15 @@ from datetime import timedelta
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from backtester import prep_inputs
 import strategies
+from scripts.sim_minute_groundtruth_independent import load_minutes
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
 LIVE_DB = Path(__file__).resolve().parent.parent / "cache" / "live" / "trading_live.db"
-FIVE_MIN_LOOKBACK_DAYS = 58  # yfinance caps 5m history at 60d; leave margin
+ONE_MIN_LOOKBACK_DAYS = 1825  # ~5yr -- bounded by Massive minute data's own real depth per ticker, not an API limit
 
 
 def _load_hourly(ticker):
@@ -101,13 +108,13 @@ def find_hourly_signals(ticker, window, z_thresh, trail_buy_pct, max_hold_hours,
     return [s for s in signals if s['signal_time'] >= cutoff]
 
 
-def replay_five_min(ticker, df_5m, signal_time, signal_close, trail_buy_pct, cutoff_time):
-    """From the bar immediately after the signal hour's close, walk 5-min bars tracking the
+def replay_one_min(ticker, df_1m, signal_time, signal_close, trail_buy_pct, cutoff_time):
+    """From the bar immediately after the signal hour's close, walk 1-min bars tracking the
     same running_low/buy_trigger logic as the hourly kernel. Returns None if the trade
-    needs more 5-min history than yfinance's 60-day window actually has (rather than
-    silently reporting the last available bar as a fabricated result)."""
+    needs more 1-min history than the cached Massive data actually has for this ticker
+    (rather than silently reporting the last available bar as a fabricated result)."""
     start = signal_time + timedelta(hours=1)
-    window = df_5m[(df_5m.index >= start) & (df_5m.index <= cutoff_time)]
+    window = df_1m[(df_1m.index >= start) & (df_1m.index <= cutoff_time)]
     if window.empty:
         return None
     running_low = signal_close
@@ -117,7 +124,7 @@ def replay_five_min(ticker, df_5m, signal_time, signal_close, trail_buy_pct, cut
             running_low = row['Low']
             buy_trigger = running_low * (1.0 + trail_buy_pct)
         if row['High'] >= buy_trigger:
-            return {'five_min_entry_time': ts, 'five_min_entry_price': buy_trigger}
+            return {'one_min_entry_time': ts, 'one_min_entry_price': buy_trigger}
     return None
 
 
@@ -152,7 +159,7 @@ def main():
         if ticker_filter:
             nodes = [n for n in nodes if n['ticker'] in ticker_filter]
 
-    cutoff = pd.Timestamp.now().normalize() - timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
+    cutoff = pd.Timestamp.now().normalize() - timedelta(days=ONE_MIN_LOOKBACK_DAYS)
     all_rows = []
 
     vol_ratios = {}
@@ -168,40 +175,43 @@ def main():
         signals = find_hourly_signals(
             ticker, n['window'], n['z_score_threshold'], trail_buy_pct, n['max_hold_hours'], cutoff)
         if not signals:
-            print(f"{ticker}: no signals in the last {FIVE_MIN_LOOKBACK_DAYS}d")
+            print(f"{ticker}: no signals in the last {ONE_MIN_LOOKBACK_DAYS}d")
             continue
 
-        df_5m = yf.download(ticker, period="60d", interval="5m", multi_level_index=False, progress=False)
-        df_5m.index = pd.to_datetime(df_5m.index).tz_localize(None)
+        try:
+            df_1m = load_minutes(ticker, data_source="massive")
+        except FileNotFoundError:
+            print(f"{ticker}: no cached Massive 1-min data, skipping")
+            continue
 
         for s in signals:
-            r = replay_five_min(ticker, df_5m, s['signal_time'], s['signal_close'],
-                                 trail_buy_pct, s['cutoff_time'])
+            r = replay_one_min(ticker, df_1m, s['signal_time'], s['signal_close'],
+                                trail_buy_pct, s['cutoff_time'])
             row = {'ticker': ticker, **s}
             if r is None:
-                row['five_min_entry_time'] = None
-                row['five_min_entry_price'] = None
+                row['one_min_entry_time'] = None
+                row['one_min_entry_price'] = None
                 row['price_diff_pct'] = None
             else:
                 row.update(r)
-                row['price_diff_pct'] = (r['five_min_entry_price'] - s['hourly_entry_price']) / s['hourly_entry_price'] * 100
+                row['price_diff_pct'] = (r['one_min_entry_price'] - s['hourly_entry_price']) / s['hourly_entry_price'] * 100
             all_rows.append(row)
 
     if not all_rows:
-        print("No comparable signals found in the 5-min data window.")
+        print("No comparable signals found in the 1-min data window.")
         return
 
     df = pd.DataFrame(all_rows)
     pd.set_option('display.width', 160)
     print(df.to_string(index=False))
 
-    matched = df.dropna(subset=['five_min_entry_time'])
+    matched = df.dropna(subset=['one_min_entry_time'])
     if len(matched):
-        print(f"\n{len(matched)}/{len(df)} signals matched within the 5-min data window.")
-        print(f"Mean price diff (5-min fill vs hourly kernel): {matched['price_diff_pct'].mean():+.3f}%")
+        print(f"\n{len(matched)}/{len(df)} signals matched within the 1-min data window.")
+        print(f"Mean price diff (1-min fill vs hourly kernel): {matched['price_diff_pct'].mean():+.3f}%")
         print(f"Max abs price diff: {matched['price_diff_pct'].abs().max():.3f}%")
-        time_diff_hours = (matched['five_min_entry_time'] - matched['hourly_entry_time']).dt.total_seconds() / 3600
-        print(f"Mean entry-time diff (5-min earlier than hourly bar close, hours): {(-time_diff_hours).mean():+.2f}h")
+        time_diff_hours = (matched['one_min_entry_time'] - matched['hourly_entry_time']).dt.total_seconds() / 3600
+        print(f"Mean entry-time diff (1-min earlier than hourly bar close, hours): {(-time_diff_hours).mean():+.2f}h")
         summary = matched.groupby('ticker')['price_diff_pct'].agg(['mean', 'count'])
         summary['median_intrahour_range_pct_of_trigger'] = summary.index.map(vol_ratios)
         print("\nPer-ticker mean price diff (%) and median-intrahour-range / trail_buy_pct ratio")

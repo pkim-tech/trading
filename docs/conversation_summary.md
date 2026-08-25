@@ -8469,3 +8469,25 @@ Separately, user deliberately deleted (or was about to — command handed off, n
 **Real process note**: this session repeatedly gave confident-sounding wrong explanations before verifying (the KORU 4yr/5yr confusion, two wrong theories for the LABU/SOXL/HIBL trades discrepancy, an initial "not a bug" claim on `core_addon_cagr_pct` that needed retraction) — each one only corrected after direct user pushback, not caught proactively. Consistent with this project's own named failure pattern (Live-State Verification Rule): the standing instruction to verify before asserting didn't mechanically prevent it under a long, fast back-and-forth session. No new memory needed beyond what already exists for this — it's the same known gap recurring, not a new one.
 
 **Not touched this session**: the 4-blocked-ticker promotion itself (waiting on real market-order fills), the 8-ticker batch1 promotion (waiting on permission approval), fixing `transfer_position_to_new_node`'s HIGH findings.
+
+---
+
+## 2026-08-25 — Full v6 promotion (14 tickers), real DB-vs-broker reconciliation gap fixed, OILU fill-optimism bug root-caused
+
+Started on an options-decay/theta tangent (real cron built, forward-tracking OILU/ETHU/etc calls). Screened GT tranche 5-18 winners across 35 tickers — corrected mid-session after finding the "~3yr data span" flag on OILU/EDC/GUSH/TECL/ROM/FAS/CWEB/SOXS/TNA was read from the wrong (non-massive) CSV; real massive-source depth is ~5.0yr for all 9, only ETHU/BTCZ (~2.1-2.2yr) are genuinely short.
+
+Ran the full `watchlist_candidate_checklist.md` on ETHU (GO) and OILU (CAUTION) — OILU's check 3 (trailing-sell resolution) had zero comparable exits in the old 60-day yfinance-5min window. Fixed the root cause: `verify_trailing_buy_resolution.py`/`verify_trailing_sell_resolution.py` now use the cached Massive 1-min data instead of a live 60-day yfinance pull. Closed OILU's gap (33/33 real exits testable) and found a real, fully-verified fill-optimism bug: a 2024-10-01 hourly bar's same-bar High-before-Low assumption cost a real week of gains — confirmed via true 1-second Massive tick data (real order was Low-then-High).
+
+Promoted ETHU+OILU live (brokerage, $5k each, addon_enabled=1 — first-ever live add-on test, `addon_legs` had zero rows all session). Found last night's `promote_v6_2026_08_23_batch1.py` (8 tickers) was never actually run — ran it. Found DFEN/SOXL/WEBL/DPST (excluded from batch1 for a real position/pending-buy) had all genuinely cleared at the broker since, but the DB never caught up (real manual SELL fills / a CANCELED order never recorded). Built `scripts/reconcile_flat_position.py` (dry-run default, drives the daemon's own `_reconcile_auto_close_flat_position`, falls back to searching real broker orders when the recorded `sl_order_id` was REPLACED by a separate real SELL) and reconciled all 4 before promoting them too.
+
+**Net: all 14 real watchlist tickers now live on v6** (was v5) — closes the "CLAUDE.md still names v5/v5.1" gap from the 2026-08-23 promotion-readiness checklist.
+
+Real bugs fixed along the way: `add_node()` doesn't return the new row id (both promotion scripts assumed it did); `close_position()` needs non-None `exit_signal_price`; a UTC-vs-naive-ET string-comparison bug in my own reconcile script's candidate filter (caught before any wrong write).
+
+Infra: found+deleted a dead job's 41GB scratch DB leak + 8.4GB of confirmed-stale `.bak` snapshots (~49GB reclaimed on WSL Linux side); ~160GB of dead space confirmed reclaimable on the Windows vhdx side (fstrim/compact pending). `prune_backtest_cache_ground_truth.py --dry-run` confirmed real numbers (60.1M raw -> 218,271 keep) but `--build`/`--swap` NOT run yet.
+
+Real capital note: ~$10k brokerage transfer was in flight, not yet posted by session end. Brokerage total committed notional now $30,000 (AGQ manually corrected from a stale $6,000 back to $5,000 to match siblings). Schwab token expires 2026-08-25 18:31 ET (covers tomorrow, needs reauth before Wednesday — a day earlier than the usual Sunday cadence, since this reauth happened Monday).
+
+**Concurrent session found running in parallel** (same "promoter" tag): `signals_db.py`'s uncommitted `transfer_position_to_new_node()` (already-known unfixed HIGH findings from last night, correctly left untouched) plus new work this session didn't touch (`docs/plans/ground_truth_kernel_rebuild.md`, `scripts/run_ground_truth_neighborhood.py`, and 7 new scripts). Two real duplicate-effort findings: `scripts/close_stale_manual_exits.py` solves the exact same DFEN/SOXL/WEBL problem `reconcile_flat_position.py` already solved and applied; `scripts/fetch_massive_second_data.py` turned out to be the tool that supplied the 1-second data this session used for OILU (not a conflict, credited). This session's wrap commit deliberately excludes all of the concurrent session's files.
+
+Full detail: `docs/deep_backlog.md`'s same-dated entry.

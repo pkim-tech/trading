@@ -2,9 +2,16 @@
 TrailingBothZScoreBreakout (once trailing is armed: track peak, exit when Low crosses
 peak * (1 - trail_sell_pct)) is a reasonable proxy for what continuous price tracking
 would actually catch -- mirrors verify_trailing_buy_resolution.py but for the exit side.
-Re-detects every recent live-watchlist trailing-sell exit using 5-min bars (yfinance,
-~60 days back) and compares exit price/time against what the hourly kernel predicts for
-the same trade.
+Re-detects every recent live-watchlist trailing-sell exit using real 1-min bars
+(Massive.com, cache/research/minute_data/*_1m.csv, full real history -- ~2-5yr depending
+on ticker) and compares exit price/time against what the hourly kernel predicts for the
+same trade.
+
+Switched from a live yfinance 5-min pull to the cached Massive 1-min data 2026-08-24
+(planner session), same rationale as verify_trailing_buy_resolution.py's own header:
+yfinance's 5-min data only retains a rolling ~60 days, which both capped the real lookback
+AND used coarser resolution than the now-available cached 1-min data supports. Finer bars,
+years of real history instead of 60 days, no live API call.
 
 Usage: .venv/bin/python scripts/verify_trailing_sell_resolution.py [--tickers AGQ,SOXL]
        .venv/bin/python scripts/verify_trailing_sell_resolution.py --adhoc "ZSL:20:1.0:1.0:5.0:4.0:70"
@@ -21,17 +28,17 @@ from datetime import timedelta
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backtester import prep_inputs
 from export_trades import simulate_trail_both_annotated
 import strategies
+from scripts.sim_minute_groundtruth_independent import load_minutes
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
 LIVE_DB = Path(__file__).resolve().parent.parent / "cache" / "live" / "trading_live.db"
-FIVE_MIN_LOOKBACK_DAYS = 58  # yfinance caps 5m history at 60d; leave margin
+ONE_MIN_LOOKBACK_DAYS = 1825  # ~5yr -- bounded by Massive minute data's own real depth per ticker, not an API limit
 
 
 def _load_hourly(ticker):
@@ -81,13 +88,14 @@ def find_hourly_trailing_exits(ticker, window, z_thresh, trail_buy_pct, trail_se
     return events
 
 
-def replay_five_min(df_5m, arm_time, peak_at_arm, trail_sell_pct, cutoff_time):
-    """From the bar immediately after the arm hour's close, walk 5-min bars tracking the
+def replay_one_min(df_1m, arm_time, peak_at_arm, trail_sell_pct, cutoff_time):
+    """From the bar immediately after the arm hour's close, walk 1-min bars tracking the
     same peak/trail_stop logic as the hourly kernel's trailing branch. Returns None if the
-    trade needs more 5-min history than yfinance's 60-day window actually has (rather than
-    silently reporting the last available bar as if it were a real time-based exit)."""
+    trade needs more 1-min history than the cached Massive data actually has for this
+    ticker (rather than silently reporting the last available bar as if it were a real
+    time-based exit)."""
     start = arm_time + timedelta(hours=1)
-    window = df_5m[(df_5m.index >= start) & (df_5m.index <= cutoff_time)]
+    window = df_1m[(df_1m.index >= start) & (df_1m.index <= cutoff_time)]
     if window.empty:
         return None
     peak = peak_at_arm
@@ -97,11 +105,11 @@ def replay_five_min(df_5m, arm_time, peak_at_arm, trail_sell_pct, cutoff_time):
             peak = row['High']
             trail_stop = peak * (1.0 - trail_sell_pct)
         if row['Low'] <= trail_stop:
-            return {'five_min_exit_time': ts, 'five_min_exit_price': trail_stop, 'five_min_reason': 'trail'}
-    if df_5m.index.max() < cutoff_time:
-        return None  # ran out of 5-min history before the real max-hold cutoff
+            return {'one_min_exit_time': ts, 'one_min_exit_price': trail_stop, 'one_min_reason': 'trail'}
+    if df_1m.index.max() < cutoff_time:
+        return None  # ran out of 1-min history before the real max-hold cutoff
     last_row = window.iloc[-1]
-    return {'five_min_exit_time': window.index[-1], 'five_min_exit_price': last_row['Close'], 'five_min_reason': 'time'}
+    return {'one_min_exit_time': window.index[-1], 'one_min_exit_price': last_row['Close'], 'one_min_reason': 'time'}
 
 
 def main():
@@ -138,7 +146,7 @@ def main():
         if ticker_filter:
             nodes = [n for n in nodes if n['ticker'] in ticker_filter]
 
-    cutoff = pd.Timestamp.now().normalize() - timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
+    cutoff = pd.Timestamp.now().normalize() - timedelta(days=ONE_MIN_LOOKBACK_DAYS)
     all_rows = []
 
     vol_ratios = {}
@@ -157,40 +165,43 @@ def main():
             ticker, n['window'], n['z_score_threshold'], trail_buy_pct, trail_sell_pct,
             arm_pct, n['max_hold_hours'], cutoff)
         if not events:
-            print(f"{ticker}: no trailing-sell exits in the last {FIVE_MIN_LOOKBACK_DAYS}d")
+            print(f"{ticker}: no trailing-sell exits in the last {ONE_MIN_LOOKBACK_DAYS}d")
             continue
 
-        df_5m = yf.download(ticker, period="60d", interval="5m", multi_level_index=False, progress=False)
-        df_5m.index = pd.to_datetime(df_5m.index).tz_localize(None)
+        try:
+            df_1m = load_minutes(ticker, data_source="massive")
+        except FileNotFoundError:
+            print(f"{ticker}: no cached Massive 1-min data, skipping")
+            continue
 
         for ev in events:
-            r = replay_five_min(df_5m, ev['arm_time'], ev['peak_at_arm'], trail_sell_pct,
-                                 ev['cutoff_time'])
+            r = replay_one_min(df_1m, ev['arm_time'], ev['peak_at_arm'], trail_sell_pct,
+                                ev['cutoff_time'])
             row = {'ticker': ticker, **ev}
             if r is None:
-                row['five_min_exit_time'] = None
-                row['five_min_exit_price'] = None
+                row['one_min_exit_time'] = None
+                row['one_min_exit_price'] = None
                 row['price_diff_pct'] = None
             else:
                 row.update(r)
-                row['price_diff_pct'] = (r['five_min_exit_price'] - ev['hourly_exit_price']) / ev['hourly_exit_price'] * 100
+                row['price_diff_pct'] = (r['one_min_exit_price'] - ev['hourly_exit_price']) / ev['hourly_exit_price'] * 100
             all_rows.append(row)
 
     if not all_rows:
-        print("No comparable trailing-sell exits found in the 5-min data window.")
+        print("No comparable trailing-sell exits found in the 1-min data window.")
         return
 
     df = pd.DataFrame(all_rows)
     pd.set_option('display.width', 160)
     print(df.to_string(index=False))
 
-    matched = df.dropna(subset=['five_min_exit_time'])
+    matched = df.dropna(subset=['one_min_exit_time'])
     if len(matched):
-        print(f"\n{len(matched)}/{len(df)} exits matched within the 5-min data window.")
-        print(f"Mean price diff (5-min exit vs hourly kernel): {matched['price_diff_pct'].mean():+.3f}%")
+        print(f"\n{len(matched)}/{len(df)} exits matched within the 1-min data window.")
+        print(f"Mean price diff (1-min exit vs hourly kernel): {matched['price_diff_pct'].mean():+.3f}%")
         print(f"Max abs price diff: {matched['price_diff_pct'].abs().max():.3f}%")
-        time_diff_hours = (matched['five_min_exit_time'] - matched['hourly_exit_time']).dt.total_seconds() / 3600
-        print(f"Mean exit-time diff (5-min earlier than hourly bar close, hours): {(-time_diff_hours).mean():+.2f}h")
+        time_diff_hours = (matched['one_min_exit_time'] - matched['hourly_exit_time']).dt.total_seconds() / 3600
+        print(f"Mean exit-time diff (1-min earlier than hourly bar close, hours): {(-time_diff_hours).mean():+.2f}h")
         summary = matched.groupby('ticker')['price_diff_pct'].agg(['mean', 'count'])
         summary['median_intrahour_range_pct_of_trigger'] = summary.index.map(vol_ratios)
         print("\nPer-ticker mean price diff (%) and median-intrahour-range / trail_sell_pct ratio")

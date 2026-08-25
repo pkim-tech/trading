@@ -18,7 +18,14 @@ specifically, since you'd be forced to buy multi-week protection every night. Li
 also thin nearly everywhere except KORU and SOXL (real open interest, tighter spreads) --
 worth weighing before assuming any of this is actually executable at real size.
 
+Extended 2026-08-24 (planner session) with a --option-type flag (puts/calls/both, default puts
+for backward compat) for the separate "buy-signal via call option" theta-decay idea -- same
+snapshot mechanics, just the other side of the chain, no forecast model attached yet (see
+scripts/put_decay_forecast.py for the put-hedge decay model this doesn't reuse since the
+buy-signal idea isn't scoped to a specific hold-duration distribution the way drought-hedge is).
+
 Usage: .venv/bin/python scripts/collect_options_snapshot.py [--tickers ...] [--expirations N]
+                                                              [--option-type puts|calls|both]
        Meant to be run daily (cron/manual), not continuously -- each run is one snapshot.
 """
 import argparse
@@ -34,6 +41,8 @@ from scripts.drought_detection_test import load_nodes
 
 DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "research" / "trading_universe.db"
 DEFAULT_TICKERS = ["AGQ", "DPST", "GDXU", "HIBL", "KORU", "NUGT", "SOXL", "UDOW", "USD", "YANG", "USO"]
+V6_CANDIDATE_TICKERS = ["AGQ", "DFEN", "DPST", "GDXU", "HIBL", "JNUG", "KORU",
+                         "LABU", "NUGT", "SOXL", "UGL", "WEBL"]
 
 
 def ensure_table(conn):
@@ -41,6 +50,7 @@ def ensure_table(conn):
         CREATE TABLE IF NOT EXISTS options_snapshot (
             snapshot_ts TEXT NOT NULL,
             ticker TEXT NOT NULL,
+            option_type TEXT NOT NULL DEFAULT 'put',
             underlying_price REAL,
             expiration TEXT NOT NULL,
             strike REAL NOT NULL,
@@ -50,35 +60,43 @@ def ensure_table(conn):
             volume REAL,
             open_interest REAL,
             implied_volatility REAL,
-            PRIMARY KEY (snapshot_ts, ticker, expiration, strike)
+            PRIMARY KEY (snapshot_ts, ticker, option_type, expiration, strike)
         )
     """)
     conn.commit()
 
 
-def collect_ticker(ticker, n_expirations):
+def collect_ticker(ticker, n_expirations, option_type):
     """Returns (rows, underlying_price, expirations_available) for one ticker's puts
-    across its nearest n_expirations real expirations. Empty rows (not an error) if the
-    ticker has no options market at all -- GDXU is the known real case as of 2026-08-06."""
+    and/or calls (option_type: 'puts', 'calls', or 'both') across its nearest
+    n_expirations real expirations. Empty rows (not an error) if the ticker has no
+    options market at all -- GDXU is the known real case as of 2026-08-06."""
     tk = yf.Ticker(ticker)
     exps = tk.options
     if not exps:
         return [], None, 0
     px = tk.fast_info.get("lastPrice") or tk.fast_info.get("last_price")
     ts = datetime.now(timezone.utc).isoformat()
+    sides = []
+    if option_type in ("puts", "both"):
+        sides.append("put")
+    if option_type in ("calls", "both"):
+        sides.append("call")
     rows = []
     for exp in exps[:n_expirations]:
         chain = tk.option_chain(exp)
-        for _, p in chain.puts.iterrows():
-            rows.append((
-                ts, ticker, px, exp, float(p["strike"]),
-                float(p["bid"]) if p["bid"] == p["bid"] else None,
-                float(p["ask"]) if p["ask"] == p["ask"] else None,
-                float(p["lastPrice"]) if p["lastPrice"] == p["lastPrice"] else None,
-                float(p["volume"]) if p["volume"] == p["volume"] else None,
-                float(p["openInterest"]) if p["openInterest"] == p["openInterest"] else None,
-                float(p["impliedVolatility"]) if p["impliedVolatility"] == p["impliedVolatility"] else None,
-            ))
+        for side in sides:
+            df = chain.puts if side == "put" else chain.calls
+            for _, p in df.iterrows():
+                rows.append((
+                    ts, ticker, side, px, exp, float(p["strike"]),
+                    float(p["bid"]) if p["bid"] == p["bid"] else None,
+                    float(p["ask"]) if p["ask"] == p["ask"] else None,
+                    float(p["lastPrice"]) if p["lastPrice"] == p["lastPrice"] else None,
+                    float(p["volume"]) if p["volume"] == p["volume"] else None,
+                    float(p["openInterest"]) if p["openInterest"] == p["openInterest"] else None,
+                    float(p["impliedVolatility"]) if p["impliedVolatility"] == p["impliedVolatility"] else None,
+                ))
     return rows, px, len(exps)
 
 
@@ -87,6 +105,7 @@ def main():
     parser.add_argument("--tickers", nargs="*", default=None)
     parser.add_argument("--expirations", type=int, default=3,
                          help="how many nearest real expirations to snapshot per ticker")
+    parser.add_argument("--option-type", choices=["puts", "calls", "both"], default="puts")
     args = parser.parse_args()
 
     tickers = args.tickers or DEFAULT_TICKERS
@@ -96,7 +115,7 @@ def main():
     total_rows = 0
     for ticker in tickers:
         try:
-            rows, px, n_exps = collect_ticker(ticker, args.expirations)
+            rows, px, n_exps = collect_ticker(ticker, args.expirations, args.option_type)
         except Exception as e:
             print(f"{ticker}: failed ({e})")
             continue
@@ -105,13 +124,13 @@ def main():
             continue
         conn.executemany("""
             INSERT OR REPLACE INTO options_snapshot
-            (snapshot_ts, ticker, underlying_price, expiration, strike, bid, ask,
+            (snapshot_ts, ticker, option_type, underlying_price, expiration, strike, bid, ask,
              last_price, volume, open_interest, implied_volatility)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, rows)
         conn.commit()
         total_rows += len(rows)
-        print(f"{ticker}: {len(rows)} put rows across {min(n_exps, args.expirations)} expirations "
+        print(f"{ticker}: {len(rows)} {args.option_type} rows across {min(n_exps, args.expirations)} expirations "
               f"(underlying=${px:.2f})")
 
     print(f"\nWrote {total_rows} rows to options_snapshot @ {DB_PATH}")
