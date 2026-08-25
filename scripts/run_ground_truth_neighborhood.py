@@ -96,14 +96,14 @@ def main():
                           "reads db_cache.get_massive_hourly_ohlcv (back to ~2021-08-23 vs "
                           "yahoo's ~2023-07-24 floor).")
     args = ap.parse_args()
-    if args.data_source == "massive":
-        # CONFIRMED BLOCKER (paired review, 2026-08-22) -- see run_ground_truth_phase1.py's
-        # matching warning: massive_hourly_derived is dividend/split-adjusted but the minute
-        # feed used to resolve SL/TP/TRAIL intrabar isn't, causing a systematic price
-        # mismatch. Not yet trustworthy for a real go/no-go decision.
-        print("WARNING: --data-source massive uses an unadjusted minute feed against "
-              "adjusted hourly bars -- SL/TP/TRAIL exit prices will be systematically off. "
-              "Do not trust these results for a live-trading decision yet.")
+    # The minute/hourly adjustment-basis mismatch this used to warn about here was
+    # real as of the original --data-source wiring diff, but is resolved: _load_minute_df
+    # reads db_cache.get_massive_minute_ohlcv (dividend-adjusted, consistent with the
+    # hourly leg) under data_source='massive' (fixed 2026-08-22, verified via a real
+    # 24/24 byte-identical 5yr comparison across all 12 real live tickers -- see
+    # scripts/compare_all_live_5yr_massive.py). Found stale here 2026-08-24
+    # ("promoter" session) -- this file's own warning never got updated when
+    # run_ground_truth_phase1.py's matching one did in the same original fix.
 
     n = load_live_node(args.ticker)
     is_both = n["strategy"] == "TrailingBothZScoreBreakout"
