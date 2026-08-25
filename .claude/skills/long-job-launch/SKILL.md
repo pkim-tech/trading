@@ -63,3 +63,25 @@ real complaint: "i have just no idea when to come back."
    same unit list, same pattern as launching N independent jobs — this was
    also the fix that turned an 11-ticker sequential dividend-adjustment pass
    into 4 parallel ones tonight.
+
+7. **Cap parallel launches to real headroom, not just "how many independent
+   units exist."** Found 2026-08-25: 14 independent CPU-bound per-ticker jobs
+   were launched at once on a 12-core box, pushing load average to 17+ and
+   slowing the real live trading daemon (`active_signals.py run`, which shares
+   this machine and must stay responsive) — on a real trading day, not
+   off-hours. **The full US market session, 9:00 AM-4:00 PM ET, is the
+   responsiveness-critical window** (not just the two 10:25-10:40/15:25-15:40
+   ET signal-check sub-windows) — the daemon's poll loop, order placement,
+   and fill/exit monitoring all need to stay responsive across the whole
+   session, not only during signal checks. Before firing N parallel
+   single-threaded jobs during 9-4 ET on a trading day: check `nproc` and
+   `uptime` (or `ps aux --sort=-%cpu` for what's already running, including
+   the daemon), and if N exceeds cores-minus-headroom, split into tranches
+   (e.g. batches of ~half the core count) launched one after another instead
+   of all at once. This is tighter than the general
+   `feedback_scope_jobs_to_reset_window` guidance — it's about concurrent CPU
+   contention with a live process, not usage-quota pacing. Whether it's a
+   trading day/trading-hours window matters here specifically because the
+   daemon's responsiveness requirement is real then; off-hours the same batch
+   is much lower-stakes (see CLAUDE.md's Background-Agent Trading-Hours Rule
+   for the parallel concern about spawning agents, not just raw CPU jobs).
