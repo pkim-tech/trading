@@ -35,6 +35,12 @@ of the ad hoc order a fresh investigation is likely to reach for:
      production kernel (backtester.py), that rules out an implementation
      bug in one specific kernel.
 
+Scope (validated 2026-08-26): TrailingBothZScoreBreakout / TrailingExitZScoreBreakout only,
+entry_timing='open_check' only, GT/v6 kernel (get_trades_and_bars_since_ground_truth /
+run_backtest_ground_truth) only. NOT validated for close_check entry timing, the legacy
+hourly kernel, or any strategy this project's stated multi-strategy future may add later --
+main() raises rather than silently mis-tracing an out-of-scope node.
+
 Usage:
   .venv/bin/python scripts/trace_real_vs_kernel_divergence.py --ticker DPST --account ira
 """
@@ -57,6 +63,18 @@ import verify_real_trades_vs_kernel as verify
 import sim_minute_groundtruth_independent as smgi
 
 LIVE_DB = Path(__file__).resolve().parent.parent / "cache" / "live" / "trading_live.db"
+
+VALID_STRATEGIES = ("TrailingBothZScoreBreakout", "TrailingExitZScoreBreakout")
+
+# The two daily open_check signal windows this tool checks, ET hour-of-bar (hourly bars
+# are labeled by START time -- see CLAUDE.md's "Signal windows" note): 9:31 checks the
+# 09:30 bar, 14:31 checks the 14:30 bar. Borrowed from (must stay in sync with)
+# sim_minute_groundtruth_independent.TARGET_HOURS -- stated explicitly here rather than
+# relying on that import alone, since a silent divergence between the two would make this
+# tool trace the wrong bars without any error.
+OPEN_CHECK_SIGNAL_HOURS_ET = (9, 14)
+assert OPEN_CHECK_SIGNAL_HOURS_ET == smgi.TARGET_HOURS, (
+    "OPEN_CHECK_SIGNAL_HOURS_ET has drifted from sim_minute_groundtruth_independent.TARGET_HOURS")
 
 
 def step1_real_order_history(ticker, account, strategy, position_shares=None, position_entry_time=None):
@@ -175,6 +193,14 @@ def step6_instrumented_kernel_replay(node, start, end):
 
     df_h = smgi.load_hourly(n['ticker'], data_source='yahoo')
     minute_df = smgi.load_minutes(n['ticker'], data_source='yahoo')
+    # smgi.load_minutes already restricts to 09:30:00-15:59:59 ET -- assert it rather than
+    # just trusting the docstring, since a pre/post-market tick treated as a candidate
+    # signal moment was a real trap tonight (real ticks exist outside session hours, but
+    # this system never trades on them).
+    if not minute_df.empty:
+        mt = minute_df.index.time
+        assert (mt >= pd.Timestamp("09:30").time()).all() and (mt < pd.Timestamp("16:00").time()).all(), \
+            "minute_df contains extended-hours ticks -- do not treat these as candidate signal moments"
     ind = smgi.daily_indicators(df_h, int(n['window']))
     dl = smgi.daily_lookup(ind)
     sma_arr = ind['SMA'].to_numpy(); std_arr = ind['Std'].to_numpy()
@@ -194,7 +220,7 @@ def step6_instrumented_kernel_replay(node, start, end):
     sim = smgi.Sim(node=n, intrabar='kernel', backstop=False)
 
     def band_at(i):
-        if hours[i] not in smgi.TARGET_HOURS or di_arr[i] < 0 or std_arr[di_arr[i]] == 0:
+        if hours[i] not in OPEN_CHECK_SIGNAL_HOURS_ET or di_arr[i] < 0 or std_arr[di_arr[i]] == 0:
             return None
         return sma_arr[di_arr[i]] - std_arr[di_arr[i]] * z
 
@@ -261,6 +287,14 @@ def main():
         print(f"Node not kernel-checkable: {skipped}")
         return
     node = nodes[wl_id]
+    if node['strategy'] not in VALID_STRATEGIES:
+        print(f"Out of scope: strategy={node['strategy']!r} is not one of {VALID_STRATEGIES} "
+              f"-- this tool has not been validated for it, refusing to trace.")
+        return
+    if node['entry_timing'] != 'open_check':
+        print(f"Out of scope: entry_timing={node['entry_timing']!r} is not 'open_check' "
+              f"-- this tool has not been validated for close_check nodes, refusing to trace.")
+        return
 
     pos_row = conn.execute(
         "SELECT shares, entry_time FROM open_positions WHERE wl_id=? ORDER BY entry_time DESC LIMIT 1",
