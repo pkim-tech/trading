@@ -385,6 +385,88 @@ def _part2_activity(nodes):
         print(f"  {ts}  {line}")
 
 
+def _part2_daily_sweep(nodes, node_state):
+    """Sub-part, added 2026-08-26 after the real SOXL/DPST/DFEN investigation (see
+    docs/research_log.md's 2026-08-26 entries): cheap, routine, per-node/per-day check,
+    split from the full instrumented kernel trace (scripts/trace_real_vs_kernel_
+    divergence.py, reserved for when something's already flagged suspicious).
+
+    Two branches per currently-`holding` real node, by whether its open_positions
+    entry_time is TODAY or a prior day:
+      - PRIOR day, still open: only a limit check (not a full signal re-derivation) --
+        has the current price breached the real fixed_sl/take_profit trigger, or has
+        the position been open longer than max_hold_hours' worth of hourly bars, in
+        either case implying it should already have exited and something's stuck.
+      - TODAY: same-day stop-out-and-re-entry is real (confirmed on DPST 2026-08-25:
+        3 real trades in one day) -- print every real BUY/SELL leg from today's broker
+        order history (schwab_client.get_real_orders) directly, not just today's
+        trade_log rows (_part2_activity above already does the trade_log side; this
+        adds the broker-order-level view so a same-day sequence is visible even before
+        a leg closes into trade_log)."""
+    print("\n--- 2b. Per-position daily sweep (prior-day limit check / today's real branch walk) ---")
+    any_printed = False
+    for n in nodes:
+        status, real_position, cur = node_state.get(n['id'], (None, None, None))
+        if status != 'holding' or real_position is None or cur is None:
+            continue
+        any_printed = True
+        entry_time_str = real_position['entry_time']
+        entry_date = entry_time_str[:10]
+        label = f"{n['ticker']:6s} {n['account'] or '':10s}"
+
+        if entry_date == TODAY:
+            print(f"{label} entered TODAY -- real broker order history for {TODAY}:")
+            try:
+                orders = schwab_client.get_real_orders(n['account'], n['ticker'])
+            except Exception as e:
+                print(f"    order history fetch failed ({e})")
+                continue
+            todays = sorted((o for o in orders if str(o.get('enteredTime') or '')[:10] == TODAY
+                              and o.get('status') == 'FILLED'),
+                             key=lambda o: o['enteredTime'])
+            if not todays:
+                print("    no FILLED orders found today (may still be resting/pending)")
+            for o in todays:
+                print(f"    {o['enteredTime']}  {o['instruction']:4s} {o['orderType']:12s} "
+                      f"qty={o['quantity']:g}")
+            continue
+
+        # PRIOR day, still open -- limit check only.
+        entry_price = real_position['entry_price']
+        fixed_sl = real_position.get('fixed_sl')
+        take_profit = real_position.get('take_profit')
+        flags = []
+        if fixed_sl is not None:
+            sl_price = entry_price * (1 - fixed_sl / 100)
+            if cur <= sl_price:
+                flags.append(f"cur ${cur:.4f} <= SL trigger ${sl_price:.4f} ({fixed_sl}%) -- "
+                              f"should already have stopped out")
+        if take_profit is not None:
+            tp_price = entry_price * (1 + take_profit / 100)
+            if cur >= tp_price:
+                flags.append(f"cur ${cur:.4f} >= TP trigger ${tp_price:.4f} ({take_profit}%) -- "
+                              f"should already have taken profit")
+        max_hold_hours = real_position.get('max_hold_hours')
+        if max_hold_hours is not None:
+            try:
+                import pandas as pd  # local: no other evening_status.py section needs pandas
+                df_h = pd.read_csv(f"cache/research/{n['ticker']}_1h.csv", index_col=0, parse_dates=True)
+                bars_since_entry = int((df_h.index > entry_time_str).sum())
+                if bars_since_entry >= int(max_hold_hours):
+                    flags.append(f"{bars_since_entry} hourly bar(s) since entry >= max_hold_hours="
+                                 f"{max_hold_hours} -- should already have TIME-exited")
+            except Exception as e:
+                flags.append(f"could not check max_hold_hours ({e})")
+        if flags:
+            print(f"{label} entered {entry_date} (prior day), still open -- LIMIT BREACH:")
+            for f in flags:
+                print(f"    {f}")
+        else:
+            print(f"{label} entered {entry_date} (prior day), still open -- within SL/TP/max-hold limits")
+    if not any_printed:
+        print("no real open positions to sweep")
+
+
 def _brokerage_tax_forecast_section():
     """End-of-year tax reserve forecast for `brokerage` (the one taxable account) --
     docs/deep_backlog.md's 2026-08-15 tax-forecast model. ESTIMATOR ONLY, not a
@@ -552,6 +634,7 @@ def part2():
             print(f"{'':<6} !! {order_detail}")
 
     _part2_activity(nodes)
+    _part2_daily_sweep(nodes, node_state)
 
     accounts = sorted({n['account'] for n in nodes if n.get('account')}, key=lambda x: ACCOUNT_ORDER.get(x, 99))
 
