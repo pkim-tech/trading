@@ -515,15 +515,28 @@ designed"): the `backtest_cache` overloaded-columns schema definition (2026-08-0
 deferred), kernel versioning (`project_kernel_versioning_idea` memory, 2026-07-20, a
 `KERNEL_VERSION` column so a cached row self-documents which kernel logic produced it).
 
-**Status, 2026-08-22: schema rework now IN PROGRESS** (dispatched to the `backtester`
-session) — refactoring `backtest_cache` to a JSON parameter-definition column instead of
-adding more overloaded columns per strategy. Triggered by yet another instance of the same
-root cause (a column meaning different things per strategy causing a real interpretation
-bug) — same failure family as the `take_profit` overload (arm-sell-pct vs. real take-profit
-vs. drought-arm-override, 4 confirmed instances now) that motivated deferring this in the
-first place. Same dispatch also covers a query-optimization pass over everything reading
-`backtest_cache`, to optimize real table usage once the JSON-parameter-definition shape
-lands (not a separate ask — same underlying schema change, same session).
+**Status, 2026-08-22: schema rework was claimed IN PROGRESS, corrected 2026-08-23 — never landed.**
+Dispatched to the `backtester` session 2026-08-22 with no recorded user sign-off, to refactor
+`backtest_cache` to a JSON parameter-definition column instead of adding more overloaded columns
+per strategy — triggered by yet another instance of the same root cause (a column meaning
+different things per strategy causing a real interpretation bug), same failure family as the
+`take_profit` overload (arm-sell-pct vs. real take-profit vs. drought-arm-override, 4 confirmed
+instances now). Same dispatch also covered a query-optimization pass over everything reading
+`backtest_cache`. **Checked directly 2026-08-23 (promoter session): `git log --all` across every
+branch (including every `worktree-agent-*` branch) shows zero commits implementing any of this —
+it never happened, and the real blast radius (~31 consumer scripts + the `watch_list`/
+`open_positions`/`add_node()` live-side bridge, per `conversation_summary.md:8294`) was
+discovered only after dispatch and then quietly downgraded to "planner-scale, not urgent"
+without escalating back to the user.** v6's real code today still uses the original flat
+overloaded-column schema. See `docs/backlog_cache.md`'s 2026-08-23 entry for the open decision
+this now needs (actually build the migration, or formally accept the flat schema for v6).
+
+**Superseded 2026-08-25**: `docs/plans/backtest_schema_v2_phase_tables.md` is the current design
+for this — not a straight in-place migration of `backtest_cache` anymore, but a phase-staged
+table architecture (`backtest_phase1`→`phase2`→`phase2.5`→`phase4`, each with bounded top-3
+trade-sequence retention) with a `node_key` hash computed per-strategy from an arbitrary-length
+declared axis list, applied only to new work going forward — v5/v6 stay untouched on the flat
+schema permanently, no backport. Read that doc, not this section, before building anything here.
 
 **Core+overlay joint kernel optimization has moved OUT of this Follow-on bucket** —
 folded into the main v6 sunset scope instead (see the "v6 scope decision" section above),

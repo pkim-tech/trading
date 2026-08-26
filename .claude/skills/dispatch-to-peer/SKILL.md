@@ -56,6 +56,26 @@ here.
    [[feedback_default_background_long_commands]]. Don't assume a peer session
    applies this on its own; state it per dispatch.
 
+   **Recurred 2026-08-25**: stating this once in the initial dispatch prompt
+   is not sufficient — `ListAgents` showed the dispatched peer sitting `busy`
+   (foreground-blocking) on its own build/test steps minutes into the same
+   dispatch this exact instruction was sent with. The instruction as written
+   only explicitly names "the paired-review agents (and any build
+   sub-agents)" — it doesn't say anything about the peer's own direct,
+   long-running tool calls (running the full test suite itself, a build
+   script, `git` operations) that never spawn a sub-agent at all and so
+   never trigger the "background it" framing in the peer's own head. Say
+   BOTH explicitly, every dispatch: (a) any sub-agent it spawns (reviewers,
+   further build dispatches) must run backgrounded, AND (b) its own
+   long-running Bash/tool calls (test runs, builds, anything that isn't a
+   quick command) should also run with `run_in_background: true` rather than
+   blocking its own turn — don't rely on "background execution" alone to be
+   read as covering both. **Check `ListAgents` a few minutes after any
+   dispatch** — a peer showing `busy` (not `idle`) while you'd expect it to
+   be waiting on a backgrounded job is the live signal this is happening
+   again; send a direct one-line reminder (referencing this same
+   instruction) rather than assuming it'll self-correct.
+
 5. **Priority order, explicit and numbered**, whenever more than one item is
    queued. State which one to start on first, not just "here's a list."
 
