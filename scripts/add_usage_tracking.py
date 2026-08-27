@@ -46,8 +46,6 @@ def _find_main_block(tree):
 
 def process(path: Path, dry_run: bool):
     text = path.read_text()
-    if _MARKER in text:
-        return 'already-wired'
     try:
         tree = ast.parse(text)
     except SyntaxError as e:
@@ -57,9 +55,12 @@ def process(path: Path, dry_run: bool):
         return 'no-main-block'
     if not node.body:
         return 'empty-main-block'
+    lines = text.splitlines(keepends=True)
+    block_text = ''.join(lines[node.lineno - 1:node.end_lineno])
+    if _MARKER in block_text:
+        return 'already-wired'
     first = node.body[0]
     indent = ' ' * first.col_offset
-    lines = text.splitlines(keepends=True)
     insert_at = first.lineno - 1  # 0-indexed
     snippet_lines = [indent + l for l in _SNIPPET.splitlines(keepends=True)]
     new_lines = lines[:insert_at] + snippet_lines + lines[insert_at:]
@@ -79,7 +80,7 @@ def main():
     args = ap.parse_args()
 
     _SKIP = {
-        'add_usage_tracking.py', 'check_script_usage_convention.py', 'list_scripts.py',
+        'list_scripts.py',  # meta/introspection tool that reads the usage log itself
     }
     results = {}
     for path in sorted(_SCRIPTS_DIR.glob('*.py')):
@@ -102,4 +103,8 @@ def main():
 
 
 if __name__ == '__main__':
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     sys.exit(main())

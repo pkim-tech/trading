@@ -17,14 +17,14 @@ _MARKER = "script_usage.record_invocation()"
 # Files exempt from the convention (e.g. this file and its bulk-insertion
 # sibling don't need to self-track; add a real reason here if a genuine
 # exemption is ever needed for a normal script).
-_EXEMPT = {'add_usage_tracking.py', 'check_script_usage_convention.py', 'list_scripts.py'}
+_EXEMPT = {'list_scripts.py'}  # meta/introspection tool that reads the usage log itself
 
 
-def _has_main_block(text: str) -> bool:
+def _find_main_block(text: str):
     try:
         tree = ast.parse(text)
     except SyntaxError:
-        return False
+        return None
     for node in tree.body:
         if not isinstance(node, ast.If):
             continue
@@ -35,8 +35,8 @@ def _has_main_block(text: str) -> bool:
         names = [s.id for s in sides if isinstance(s, ast.Name)]
         consts = [s.value for s in sides if isinstance(s, ast.Constant)]
         if names == ['__name__'] and consts == ['__main__']:
-            return True
-    return False
+            return node
+    return None
 
 
 def main():
@@ -45,7 +45,16 @@ def main():
         if path.name in _EXEMPT:
             continue
         text = path.read_text()
-        if _has_main_block(text) and _MARKER not in text:
+        node = _find_main_block(text)
+        if node is None:
+            continue
+        # Scope the marker check to the __main__ block's own source, not the
+        # whole file -- a tool that mentions _MARKER as a string constant
+        # (like this file and add_usage_tracking.py do) would otherwise
+        # false-positive as "compliant" without actually being wired.
+        lines = text.splitlines(keepends=True)
+        block_text = ''.join(lines[node.lineno - 1:node.end_lineno])
+        if _MARKER not in block_text:
             violations.append(path.name)
 
     if violations:
@@ -60,4 +69,8 @@ def main():
 
 
 if __name__ == '__main__':
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     sys.exit(main())
