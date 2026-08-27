@@ -93,7 +93,7 @@ def _entry_group_key(entry):
             entry['entry_timing'], entry['fixed_sl'])
     if entry['kind'] == 'candidate':
         return base + (entry['candidate_idx'],)
-    if entry['kind'] == 'center_anchor':
+    if entry['kind'] in ('center_anchor', 'island_region'):
         return base + (entry['island_idx'],)
     return base  # passthrough_scope -- one group per scope, no sub-index
 
@@ -374,9 +374,12 @@ def main():
     manifest = pbcg.compute_keep_manifest(conn)
     candidate_entries = [e for e in manifest if e['kind'] == 'candidate']
     anchor_entries = [e for e in manifest if e['kind'] == 'center_anchor']
+    region_entries = [e for e in manifest if e['kind'] == 'island_region']
     passthrough_entries = [e for e in manifest if e['kind'] == 'passthrough_scope']
     prunable_scope_keys = {(e['ticker'], e['strategy'], e['version'], e['entry_timing'], e['fixed_sl'])
                             for e in candidate_entries}
+    passthrough_scope_keys = {(e['ticker'], e['strategy'], e['version'], e['entry_timing'], e['fixed_sl'])
+                               for e in passthrough_entries}
     print(f"Prunable scopes: {len(prunable_scope_keys)} ({len(candidate_entries)} candidates, "
           f"{len(anchor_entries)} island anchors). Passthrough scopes (kept whole): "
           f"{len(passthrough_entries)}.")
@@ -422,7 +425,7 @@ def main():
     print(f"PRE: Method A/B candidate agreement AND independent cliff-box re-implementation "
           f"both clean across all {len(prunable_scope_keys)} prunable scope(s).")
 
-    pre_fp = _fingerprint_entries(live, candidate_entries + anchor_entries + passthrough_entries)
+    pre_fp = _fingerprint_entries(live, candidate_entries + anchor_entries + region_entries + passthrough_entries)
     pre_table_counts = _table_row_counts(live)
     conn.close()
 
@@ -454,7 +457,7 @@ def main():
     # unrelated to its old rowid -- INSERT...SELECT reassigns rowids).
     pconn = sqlite3.connect(str(pbcg.PRUNED_PATH), timeout=60.0)
     post_entries = []
-    for entry in candidate_entries + anchor_entries + passthrough_entries:
+    for entry in candidate_entries + anchor_entries + region_entries + passthrough_entries:
         hp = pbcg._hp_for_strategy(entry['strategy'])
         if entry['kind'] == 'candidate':
             rowids = pbcg.cliff_box_rowids_for_candidate(
@@ -465,6 +468,10 @@ def main():
                 pconn, entry['ticker'], entry['strategy'], entry['version'], entry['fixed_sl'],
                 entry['entry_timing'], entry['island_tp'], entry['island_sl'])
             rowids = [r] if r is not None else []
+        elif entry['kind'] == 'island_region':
+            rowids = pbcg.island_region_rowids(
+                pconn, entry['ticker'], entry['strategy'], entry['version'], entry['fixed_sl'],
+                entry['entry_timing'], entry['island_tp'], entry['island_sl'])
         else:  # passthrough_scope -- should reproduce verbatim, same rowid COUNT (not
                # the same rowid numbers, which INSERT...SELECT reassigns)
             rowids = pbcg.rowids_for_scope(
@@ -519,17 +526,60 @@ def main():
     # either failing still refuses the swap (kept-row-count regressions per scope,
     # prunable AND passthrough, so a passthrough scope quietly shrinking is
     # flagged too).
+    # 2026-08-25 (later, live investigation of a real false-positive): a scope legitimately
+    # transitioning from PASSTHROUGH (kept whole because incomplete -- e.g. Phase1-Coarse-GT
+    # done but Phase2-Island-GT still running, so the whole scope's real rows are kept
+    # verbatim) to PRUNABLE (now complete, correctly collapsed down to just the top
+    # candidates + island anchors) will ALWAYS look like a huge row-count drop under a bare
+    # count comparison -- that's the intended, correct behavior of pruning, not data loss.
+    # Confirmed live: KORU/TrailingBothZScoreBreakout/v6-massive-w2021-08-23_2026-08-21
+    # (fixed_sl=3) dropped 164,640 -> 1,299 between two runs purely because Phase2-Island-GT
+    # crossed its completeness bar in between (40,080 -> 105,560 rows, a background sweep
+    # kept running) -- verified the underlying data is sane (270,200 real GT rows, max
+    # cagr=75.9%, Phase1 100% complete against the current campaign_config grid) and the
+    # scope was NOT in this run's passthrough list, meaning it genuinely just became
+    # prunable. The fix: only flag a regression when the scope was ALREADY prunable (not
+    # passthrough) in BOTH the previous baseline and this run -- an apples-to-apples
+    # comparison of an already-pruned scope's candidate set shrinking is the only case
+    # that's actually suspicious. KEPT_COUNT_LOG now stores {"count":N,"prunable":bool} per
+    # scope instead of a bare int; a legacy bare-int entry (prunable state unknown) is
+    # treated as "don't know, don't flag" rather than assumed either way.
+    scope_is_prunable = {}
+    for key in prunable_scope_keys:
+        scope_is_prunable[json.dumps(list(key))] = True
+    for key in passthrough_scope_keys:
+        scope_is_prunable[json.dumps(list(key))] = False
+
     prev = {}
     if KEPT_COUNT_LOG.exists():
-        prev = {tuple(json.loads(k)): v for k, v in json.loads(KEPT_COUNT_LOG.read_text()).items()}
+        for k, v in json.loads(KEPT_COUNT_LOG.read_text()).items():
+            key = tuple(json.loads(k))
+            if isinstance(v, dict):
+                prev[key] = v
+            else:
+                prev[key] = {"count": v, "prunable": None}  # legacy format, unknown state
+
     scope_counts = {}
     for entry in post_entries:
         sk = json.dumps([entry['ticker'], entry['strategy'], entry['version'],
                           entry['entry_timing'], entry['fixed_sl']])
         scope_counts[sk] = scope_counts.get(sk, 0) + len(entry['rowids'])
-    regressions = [(k, prev[tuple(json.loads(k))], v) for k, v in scope_counts.items()
-                   if tuple(json.loads(k)) in prev and v < prev[tuple(json.loads(k))]]
-    KEPT_COUNT_LOG.write_text(json.dumps(scope_counts))
+
+    regressions = []
+    for sk, v in scope_counts.items():
+        key = tuple(json.loads(sk))
+        if key not in prev or v >= prev[key]["count"]:
+            continue
+        prev_prunable = prev[key]["prunable"]
+        curr_prunable = scope_is_prunable.get(sk)
+        if prev_prunable is False or curr_prunable is False:
+            continue  # passthrough<->prunable transition -- expected, not a regression
+        if prev_prunable is None:
+            continue  # legacy log entry, unknown prior state -- can't safely judge
+        regressions.append((sk, prev[key]["count"], v))
+
+    new_log = {sk: {"count": v, "prunable": scope_is_prunable.get(sk)} for sk, v in scope_counts.items()}
+    KEPT_COUNT_LOG.write_text(json.dumps(new_log))
 
     if regressions:
         print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")

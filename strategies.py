@@ -71,6 +71,66 @@ def validate_axis_values(strategy_name, trail_buy_pct=None, trail_pct=None):
     return warnings
 
 
+def validate_row_axis_mapping(strategy_name, row_take_profit, row_stop_loss, row_trail_buy_pct,
+                               row_trail_pct, row_arm_sell_pct):
+    """Raises ValueError if a freshly-computed backtest_cache/backtest_phase1 row's
+    overloaded columns don't match what this strategy actually declares (sl_axis/
+    fourth_axis, see resolve_axis_columns() above) -- only the column(s) a strategy
+    owns may hold a non-neutral value; every other overloaded column must stay at
+    its documented neutral default (0/0.0 for trail_buy_pct/trail_pct, None for
+    take_profit XOR arm_sell_pct). Targets the recurring "column meant something
+    else" bug family (4+ confirmed real instances -- take_profit vs arm_sell_pct vs
+    drought-arm-override, trail_buy_pct/trail_pct mis-mapping -- see
+    docs/backlog_cache.md's 2026-08-07/2026-08-22 entries and
+    docs/plans/backtest_schema_v2_phase_tables.md). Call this at write time, right
+    before a row is persisted -- a violation here means the CALLER's own axis-to-
+    column mapping logic has a bug, not that the input data is questionable (contrast
+    with validate_axis_values() above, which warns rather than raises for exactly
+    that reason -- this function's inputs are internally computed, not user-supplied).
+
+    Deliberately does not check stop_loss's fixed_sl-mirror behavior (uses_fixed_sl
+    strategies store round(fixed_sl) in stop_loss, not a swept axis value) -- that's
+    a real, separate mapping rule, out of scope for this first version."""
+    sl_axis_col, fourth_axis_col = resolve_axis_columns(strategy_name)
+    owns_trail_buy_pct = 'trail_buy_pct' in (sl_axis_col, fourth_axis_col)
+    owns_trail_pct = 'trail_pct' in (sl_axis_col, fourth_axis_col)
+    violations = []
+
+    if not owns_trail_buy_pct and row_trail_buy_pct:
+        violations.append(f"trail_buy_pct={row_trail_buy_pct!r} set but {strategy_name} doesn't "
+                           f"own that column (sl_axis={sl_axis_col!r}, fourth_axis={fourth_axis_col!r})")
+    if owns_trail_buy_pct and not row_trail_buy_pct:
+        violations.append(f"{strategy_name} owns trail_buy_pct but got {row_trail_buy_pct!r}")
+
+    if not owns_trail_pct and row_trail_pct:
+        violations.append(f"trail_pct={row_trail_pct!r} set but {strategy_name} doesn't own "
+                           f"that column (sl_axis={sl_axis_col!r}, fourth_axis={fourth_axis_col!r})")
+    if owns_trail_pct and not row_trail_pct:
+        violations.append(f"{strategy_name} owns trail_pct but got {row_trail_pct!r}")
+
+    # take_profit/arm_sell_pct: TrailingBothZScoreBreakout stores its swept 'tp' grid
+    # value in arm_sell_pct (take_profit NULL, since backtest_cache's composite PK
+    # can't dedupe on a column that's sometimes NULL); every other strategy is the
+    # reverse. See init_idempotent_db()'s axis_tp/take_profit split comment.
+    if strategy_name == 'TrailingBothZScoreBreakout':
+        if row_take_profit is not None:
+            violations.append(f"take_profit={row_take_profit!r} should be None for "
+                               f"TrailingBothZScoreBreakout (value belongs in arm_sell_pct)")
+        if row_arm_sell_pct is None:
+            violations.append("arm_sell_pct is None for TrailingBothZScoreBreakout "
+                               "(should hold the swept take-profit value)")
+    else:
+        if row_arm_sell_pct is not None:
+            violations.append(f"arm_sell_pct={row_arm_sell_pct!r} should be None for "
+                               f"{strategy_name} (only TrailingBothZScoreBreakout uses it)")
+        if row_take_profit is None:
+            violations.append(f"take_profit is None for {strategy_name} "
+                               f"(should hold the swept take-profit value)")
+
+    if violations:
+        raise ValueError(f"validate_row_axis_mapping({strategy_name}): " + "; ".join(violations))
+
+
 class ZScoreBreakout(BaseStrategy):
     """v1.5/v1.6: bar-close entry, bar-close TP/SL/TIME. Mirrors backtester._simulate."""
 

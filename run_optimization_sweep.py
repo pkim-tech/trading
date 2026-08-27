@@ -303,6 +303,38 @@ def init_idempotent_db():
     except Exception:
         pass
 
+    # backtest_phase1 (2026-08-25): ephemeral scratch table for the schema-v2 experiment
+    # (docs/plans/backtest_schema_v2_phase_tables.md) -- a PARALLEL destination for
+    # Phase1-Coarse-GT data, written/read only by the new *_phase1() functions below
+    # (dispatch_parallel_grid_ground_truth_phase1, _phase1_coarse_gt_status_phase1,
+    # _phase2_island_gt_tasks_phase1). Does NOT touch backtest_cache or any existing
+    # function/call site -- the real (currently-swept) GT pipeline is byte-for-byte
+    # unchanged; this exists so the new table/read/write shape can be tested side-by-side
+    # against the real pipeline's output before anything is ever cut over. Same column
+    # set/PK shape as backtest_cache's GT-relevant columns, since the parallel functions
+    # are near-verbatim copies of their backtest_cache counterparts -- easiest to diff
+    # output when the shapes match exactly. Explicitly ephemeral/droppable per campaign
+    # (not a permanent growing table like backtest_cache) -- nothing here is precious.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_phase1 (
+            strategy TEXT, version TEXT, ticker TEXT, window INTEGER,
+            max_hold_hours INTEGER, take_profit INTEGER, stop_loss INTEGER,
+            trades INTEGER, win_rate REAL, strategy_return REAL,
+            alpha_vs_spy REAL, asset_bh REAL, spy_bh REAL, run_timestamp TEXT,
+            z_score_threshold REAL DEFAULT 2.0, fixed_sl REAL DEFAULT 0,
+            trail_buy_pct REAL DEFAULT 0, trail_sell_pct REAL DEFAULT 0,
+            win_twin_rate REAL DEFAULT 0, arm_sell_pct REAL, axis_tp REAL NOT NULL DEFAULT 0,
+            entry_timing TEXT NOT NULL DEFAULT 'open_check',
+            strategy_return_pessimistic REAL, alpha_vs_spy_pessimistic REAL,
+            strategy_return_certain REAL, alpha_vs_spy_certain REAL,
+            phase TEXT, generation INTEGER, sweep_run_id INTEGER,
+            kernel_version TEXT, cagr REAL,
+            PRIMARY KEY (strategy, version, ticker, window, max_hold_hours,
+                         axis_tp, stop_loss, z_score_threshold,
+                         trail_buy_pct, trail_sell_pct, entry_timing)
+        )
+    """)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sl_sweep_summary (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1452,6 +1484,304 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
 
     conn.close()
     return pd.DataFrame(matrix_results)
+
+
+# ── Phase1 schema-v2 experiment (parallel, backtest_phase1) ──────────────────
+# Added 2026-08-25, docs/plans/backtest_schema_v2_phase_tables.md. These 3 functions
+# are near-verbatim copies of dispatch_parallel_grid_ground_truth/_phase1_coarse_gt_status/
+# _phase2_island_gt_tasks above, retargeted at the new backtest_phase1 scratch table
+# instead of backtest_cache. NOT wired into any real call site (scripts/run_ground_truth_
+# phase1.py, run_phase2_island_ground_truth, run_phase25_cliff_box_ground_truth all still
+# call the ORIGINAL backtest_cache-based functions, completely unchanged) -- this exists
+# purely so the new table/read/write shape can be run side-by-side against the real
+# pipeline's output on a real ticker and diffed, per the plan doc's test-plan item #3/#6,
+# before anything is ever cut over. Kernel-adjacent (touches run_optimization_sweep.py) --
+# CLAUDE.md's Review-Gate Persistence Rule applies once this is wired into any real script
+# or call site, same as any other change here. Deliberately duplicated rather than
+# parameterizing the existing functions with a table-name arg -- the point is to be able to
+# run both and diff, not to change what's live; once validated, per the plan doc's own "one
+# definition of winner, not one per script" requirement, this should collapse back into a
+# single implementation rather than persist as two.
+def dispatch_parallel_grid_ground_truth_phase1(shared_pool, tasks, ticker, strategy_name, config_version,
+                                                phase_label, spy_bh, asset_bh, run_timestamp, fixed_sl=0,
+                                                entry_timing='close', same_bar_reentry=True, generation=None,
+                                                run_id=None, start_date=None, end_date=None, data_source="yahoo"):
+    """Parallel twin of dispatch_parallel_grid_ground_truth, writing/reading
+    backtest_phase1 instead of backtest_cache. Same guards, same dispatch/write shape.
+    Additionally calls strategies.validate_row_axis_mapping() on every row before
+    buffering it -- the new schema-enforcement check requested alongside this table,
+    not (yet) added to the original backtest_cache-writing function since that's live
+    production code this experiment is deliberately not touching."""
+    if start_date is not None or end_date is not None:
+        required_suffix = window_version_suffix(start_date, end_date)
+        if not config_version.endswith(required_suffix):
+            raise ValueError(
+                f"dispatch_parallel_grid_ground_truth_phase1: windowed call (start_date={start_date!r}, "
+                f"end_date={end_date!r}) but config_version={config_version!r} does not end with "
+                f"the required suffix {required_suffix!r}. Build config_version via "
+                f"window_version_suffix(start_date, end_date) before calling this."
+            )
+
+    if data_source == "massive" and "-massive" not in config_version:
+        raise ValueError(
+            f"dispatch_parallel_grid_ground_truth_phase1: data_source='massive' but "
+            f"config_version={config_version!r} carries no '-massive' marker -- append "
+            f"'-massive' to config_version so massive-sourced rows can never collide with "
+            f"yahoo-sourced rows under the same version string."
+        )
+
+    conn   = sqlite3.connect(DB_PATH, timeout=60.0)
+    cursor = conn.cursor()
+    matrix_results  = []
+    unvisited_tasks = []
+
+    uses_fixed_sl = strategies.uses_fixed_sl(strategy_name)
+    stored_fsl = float(fixed_sl) if uses_fixed_sl else 0.0
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+
+    cached_map = {}
+    _missing_cagr_rows = []
+    cursor.execute("""
+        SELECT window, max_hold_hours, axis_tp, stop_loss, z_score_threshold, fixed_sl,
+               trail_buy_pct, trail_sell_pct, trades, win_rate, strategy_return, alpha_vs_spy, win_twin_rate,
+               cagr
+        FROM backtest_phase1
+        WHERE strategy=? AND version=? AND ticker=? AND entry_timing=?
+    """, (strategy_name, config_version, ticker, entry_timing))
+    for r in cursor.fetchall():
+        if r[4] is None:
+            continue
+        row_fsl = float(r[5]) if (uses_fixed_sl and r[5] is not None) else 0.0
+        if sl_axis_col == 'trail_buy_pct':
+            row_sl_raw = float(r[6])
+        elif sl_axis_col == 'trail_pct':
+            row_sl_raw = float(r[7])
+        else:
+            row_sl_raw = float(r[3])
+        row_tpct_raw = float(r[7]) if fourth_axis_col == 'trail_pct' else 0.0
+        cached_map[(int(r[2]), row_sl_raw, int(r[1]), int(r[0]), float(r[4]), row_fsl, row_tpct_raw)] = \
+            (r[8], r[9], r[10], r[11], r[12] if r[12] is not None else 0.0)
+        if r[13] is None and r[10] is not None:
+            _missing_cagr_rows.append(r)
+
+    if _missing_cagr_rows:
+        campaign_years = _campaign_years_for_window(ticker, start_date, end_date, data_source=data_source)
+        if campaign_years is not None:
+            backfill_params = []
+            for r in _missing_cagr_rows:
+                node_cagr = _cagr_from_total_return(r[10], campaign_years)
+                if node_cagr is not None:
+                    backfill_params.append((node_cagr, strategy_name, config_version, ticker,
+                                             r[0], r[1], r[2], r[3], r[4], r[6], r[7], entry_timing))
+            if backfill_params:
+                cursor.executemany(
+                    """UPDATE backtest_phase1 SET cagr=?
+                       WHERE strategy=? AND version=? AND ticker=? AND window=? AND max_hold_hours=?
+                         AND axis_tp=? AND stop_loss=? AND z_score_threshold=?
+                         AND trail_buy_pct=? AND trail_sell_pct=? AND entry_timing=?""",
+                    backfill_params
+                )
+                conn.commit()
+                logger.info(f"[{ticker}] {phase_label} (phase1-experiment): backfilled cagr for "
+                            f"{len(backfill_params)} pre-existing rows")
+
+    for t in tasks:
+        tp, sl, hold_hours, w, z_thresh, tpct = t
+        cached_row = cached_map.get((int(tp), float(sl), int(hold_hours), int(w), float(z_thresh), stored_fsl, float(tpct)))
+        if cached_row:
+            matrix_results.append({
+                "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
+                "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
+                "Z Threshold": z_thresh,
+                "Trades": cached_row[0], "Win Rate %": cached_row[1], "Return %": cached_row[2],
+                "Alpha vs SPY %": cached_row[3], "Win+TWin Rate %": cached_row[4],
+                "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
+            })
+        else:
+            unvisited_tasks.append(t)
+
+    logger.info(f"[{ticker}] {phase_label} (phase1-experiment): {len(matrix_results):,} cached, "
+                f"{len(unvisited_tasks):,} to compute (of {len(tasks):,} total)")
+
+    if not unvisited_tasks:
+        conn.close()
+        return pd.DataFrame(matrix_results)
+
+    futures_map = {
+        shared_pool.submit(run_single_backtest_node_ground_truth_isolated,
+                           (ticker, strategy_name, config_version, int(tp), int(sl), hold, w, spy_bh, z,
+                            fixed_sl, tpct, entry_timing, same_bar_reentry, start_date, end_date,
+                            data_source)): task
+        for task in unvisited_tasks
+        for tp, sl, hold, w, z, tpct in [task]
+    }
+
+    progress_bar = tqdm(
+        as_completed(futures_map), total=len(futures_map),
+        desc=f"[{ticker}] {phase_label} (phase1-experiment)", unit="node",
+        mininterval=15.0, maxinterval=30.0
+    )
+
+    fail_counts = {}
+    buffer = []
+    batch_size = 5000
+
+    for future in progress_bar:
+        tp, sl, hold_hours, w, z_thresh, tpct = futures_map[future]
+        try:
+            res = future.result()
+            status = res.get("status")
+            if status not in ("SUCCESS", "NO_TRADES"):
+                fail_counts[status] = fail_counts.get(status, 0) + 1
+                if sum(fail_counts.values()) == 1:
+                    logger.warning(f"[{ticker}] {phase_label} first failed node TP={tp} SL={sl}: "
+                                   f"{status} {res.get('error', '')}")
+                continue
+
+            if status == "SUCCESS":
+                alpha, num_trades, wr, comp_ret, wtw, node_cagr = res["payload"]
+            else:
+                alpha, num_trades, wr, comp_ret, wtw, node_cagr = 0.0, 0, 0.0, 0.0, 0.0, None
+
+            progress_bar.set_postfix({"Alpha": f"{alpha:+.1f}%", "Trades": num_trades})
+
+            if status == "SUCCESS":
+                matrix_results.append({
+                    "Strategy": strategy_name, "Version": config_version, "Ticker": ticker, "Window": w,
+                    "Take Profit %": int(tp), "Stop Loss %": int(sl), "Max Hold Hours": hold_hours,
+                    "Z Threshold": z_thresh,
+                    "Trades": num_trades, "Win Rate %": wr, "Return %": comp_ret,
+                    "Alpha vs SPY %": alpha, "Win+TWin Rate %": wtw,
+                    "Asset B&H %": asset_bh, "SPY B&H %": spy_bh
+                })
+
+            if sl_axis_col == 'trail_buy_pct':
+                row_stop_loss, row_trail_buy_pct = int(round(stored_fsl)), float(sl)
+                row_trail_pct = float(tpct) if fourth_axis_col == 'trail_pct' else 0.0
+            elif sl_axis_col == 'trail_pct':
+                row_stop_loss, row_trail_buy_pct, row_trail_pct = int(round(stored_fsl)), 0.0, float(sl)
+            else:
+                row_stop_loss, row_trail_buy_pct, row_trail_pct = int(sl), 0.0, 0.0
+
+            if strategy_name == 'TrailingBothZScoreBreakout':
+                row_take_profit, row_arm_sell_pct = None, float(tp)
+            else:
+                row_take_profit, row_arm_sell_pct = int(tp), None
+
+            strategies.validate_row_axis_mapping(strategy_name, row_take_profit, row_stop_loss,
+                                                  row_trail_buy_pct, row_trail_pct, row_arm_sell_pct)
+
+            buffer.append((strategy_name, config_version, ticker, w, hold_hours, row_take_profit, row_stop_loss,
+                           num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
+                           stored_fsl, row_trail_buy_pct, row_trail_pct, wtw, row_arm_sell_pct, float(tp),
+                           entry_timing, None, None, None, None, phase_label, generation, run_id,
+                           'ground_truth_v6', node_cagr))
+
+            if len(buffer) >= batch_size:
+                cursor.executemany(
+                    """INSERT OR REPLACE INTO backtest_phase1
+                       (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
+                        trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
+                        run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
+                        win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
+                        strategy_return_pessimistic, alpha_vs_spy_pessimistic,
+                        strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
+                        kernel_version, cagr)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    buffer
+                )
+                buffer = []
+                conn.commit()
+
+        except Exception as e:
+            logger.error(f"Worker crashed TP={tp} SL={sl}: {e}")
+
+    if buffer:
+        cursor.executemany(
+            """INSERT OR REPLACE INTO backtest_phase1
+               (strategy, version, ticker, window, max_hold_hours, take_profit, stop_loss,
+                trades, win_rate, strategy_return, alpha_vs_spy, asset_bh, spy_bh,
+                run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
+                win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
+                strategy_return_pessimistic, alpha_vs_spy_pessimistic,
+                strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
+                kernel_version, cagr)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            buffer
+        )
+        conn.commit()
+
+    conn.close()
+    return pd.DataFrame(matrix_results)
+
+
+def _phase1_coarse_gt_status_phase1(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl):
+    """Parallel twin of _phase1_coarse_gt_status, reading backtest_phase1 instead of
+    backtest_cache. No kernel_version filter needed -- every row in backtest_phase1 is
+    GT by construction (only dispatch_parallel_grid_ground_truth_phase1 writes here).
+    See that function's module-level comment for why this duplicates rather than
+    parameterizes the original."""
+    trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    expected = (len(hp['z_score_thresholds']) * len(hp['windows']) * len(hp['take_profits'])
+                * len(hp['stop_losses']) * len(hp['hold_time_caps']) * len(trail_pcts))
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    tpct_filter, tpct_params = "", []
+    if fourth_axis_col == 'trail_pct':
+        tpct_filter = f" AND trail_sell_pct IN ({','.join('?' * len(trail_pcts))})"
+        tpct_params = [float(v) for v in trail_pcts]
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        z_ph = ','.join('?' * len(hp['z_score_thresholds']))
+        w_ph = ','.join('?' * len(hp['windows']))
+        tp_ph = ','.join('?' * len(hp['take_profits']))
+        sl_ph = ','.join('?' * len(hp['stop_losses']))
+        hold_ph = ','.join('?' * len(hp['hold_time_caps']))
+        done = conn.execute(
+            f"SELECT COUNT(*) FROM backtest_phase1 WHERE strategy=? AND version=? AND ticker=?"
+            f" AND z_score_threshold IN ({z_ph}) AND window IN ({w_ph})"
+            f" AND axis_tp IN ({tp_ph}) AND {_sl_axis_real_column(sl_axis_col)} IN ({sl_ph})"
+            f" AND max_hold_hours IN ({hold_ph}) {scope_sql} {tpct_filter}",
+            (strategy_name, config_version, ticker, *hp['z_score_thresholds'], *hp['windows'],
+             *hp['take_profits'], *hp['stop_losses'], *hp['hold_time_caps'], *scope_params, *tpct_params)
+        ).fetchone()[0]
+    return done, expected
+
+
+def _phase2_island_gt_tasks_phase1(ticker, strategy_name, config_version, hp, entry_timing, fixed_sl):
+    """Parallel twin of _phase2_island_gt_tasks, reading island-center source data from
+    backtest_phase1 instead of backtest_cache. See dispatch_parallel_grid_ground_truth_phase1's
+    module-level comment for why this duplicates rather than parameterizes the original."""
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    trail_pcts = _trail_pcts_for_strategy(strategy_name, hp)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    tasks = set()
+    with sqlite3.connect(DB_PATH) as conn:
+        for z in hp['z_score_thresholds']:
+            for w in hp['windows']:
+                for tpct in trail_pcts:
+                    params = [config_version, ticker, strategy_name, float(z), int(w), *scope_params]
+                    tpct_filter = ""
+                    if fourth_axis_col == 'trail_pct':
+                        tpct_filter = "AND trail_sell_pct=?"
+                        params.append(float(tpct))
+                    df_wz = pd.read_sql(f"""
+                        SELECT axis_tp AS take_profit, {_sl_axis_real_column(sl_axis_col)} AS stop_loss, max_hold_hours, alpha_vs_spy,
+                               {ROBUST_ALPHA_SQL} AS robust_alpha, cagr
+                        FROM backtest_phase1
+                        WHERE version=? AND ticker=? AND strategy=?
+                          AND z_score_threshold=? AND window=? AND trades > 0 {scope_sql} {tpct_filter}
+                    """, conn, params=params)
+
+                    if df_wz.empty:
+                        continue
+
+                    centers = pick_island_centers(df_wz, rank_col='cagr')
+                    for (tp_c, sl_c) in centers:
+                        for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
+                            for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
+                                for hold in hp['hold_time_caps']:
+                                    tasks.add((tp, sl, int(hold), int(w), float(z), float(tpct)))
+    return tasks
 
 
 def run_single_backtest_node_isolated(args):

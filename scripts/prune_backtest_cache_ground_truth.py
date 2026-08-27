@@ -95,6 +95,7 @@ import argparse
 import re
 import shutil
 import sqlite3
+import hashlib
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -109,7 +110,7 @@ import strategies
 import campaign_config
 from run_ground_truth_phase1 import WINDOWS, Z_THRESHOLDS, HOLD_TIME_CAPS
 from run_optimization_sweep import (
-    CLIFF_RADIUS, derive_phase25_candidates_ground_truth, _campaign_scope_sql,
+    CLIFF_RADIUS, FINE_RADIUS, derive_phase25_candidates_ground_truth, _campaign_scope_sql,
     _sl_axis_real_column, _trail_pcts_for_strategy, rebuild_indexes, pick_island_centers,
 )
 
@@ -293,27 +294,108 @@ def center_anchor_rowid(conn, ticker, strategy_name, version, fixed_sl, entry_ti
     island's candidates (take_profit/stop_loss = 25/10, 24/10, 24/10), which sit up to 4
     units away, outside CLIFF_RADIUS=2 of the center itself).
 
-    No tiebreak needed here (unlike the legacy tool's winner-selection query) -- any row
-    tied for the max cagr value at this exact coordinate reproduces the same
-    (island_tp, island_sl, cagr) triple pick_island_centers actually used; WHICH
-    physical row achieves it doesn't matter for center reproduction, only the value.
-
     ORDER BY cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md Step 4,
     paired-review CRITICAL finding): must match island_centers_for_scope's own
     rank_col='cagr' pick_island_centers call -- same reasoning as that function's own
-    comment."""
+    comment.
+
+    Content-hash tiebreak added 2026-08-25 (real live finding, not a hypothetical):
+    "no tiebreak needed... WHICH physical row achieves it doesn't matter" (the original
+    claim here) is true for the (island_tp, island_sl, cagr) VALUE triple, but false for
+    this validator's own row-content fingerprint check -- confirmed live on a real BOIL
+    scope: 7 real rows tied bit-identically at cagr=29.178089578731736 for the same
+    island coordinate, differing only in window/z_score_threshold/max_hold_hours/
+    trail_sell_pct. A bare `ORDER BY cagr DESC LIMIT 1` lets SQLite pick whichever tied
+    row happens to come first in its own internal scan order -- not guaranteed stable
+    across a file copy (INSERT...SELECT reassigns physical row placement), so PRE (live
+    DB) and POST (pruned file) can legitimately return a DIFFERENT one of the 7 tied
+    rows, each individually valid but producing a fingerprint MISMATCH. Fix: fetch every
+    row tied at the max cagr, then break the tie deterministically by a hash of the
+    row's own CONTENT (window/z/hold/tpct -- never rowid, which isn't stable across
+    files) -- same value, same file-independent pick, every time."""
     sl_axis_col, _ = strategies.resolve_axis_columns(strategy_name)
     sl_col = _sl_axis_real_column(sl_axis_col)
     scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
     c = conn.cursor()
     c.execute(f"""
-        SELECT rowid FROM backtest_cache
+        SELECT rowid, window, z_score_threshold, max_hold_hours, trail_sell_pct, cagr, trades
+        FROM backtest_cache
         WHERE ticker=? AND strategy=? AND version=? AND kernel_version='{KERNEL_VERSION}' {scope_sql}
           AND trades > 0 AND axis_tp=? AND {sl_col}=?
-        ORDER BY cagr DESC LIMIT 1
     """, [ticker, strategy_name, version, *scope_params, island_tp, island_sl])
-    row = c.fetchone()
-    return row[0] if row else None
+    rows = c.fetchall()
+    if not rows:
+        return None
+    top_cagr = max(r[5] for r in rows)
+    tied = [r for r in rows if r[5] == top_cagr]
+
+    # Tiebreak order (2026-08-25, user's call): MORE TRADES first among exact-cagr ties --
+    # a candidate backing the same return with a larger real trade count is the more
+    # statistically robust pick, a meaningful business preference rather than an arbitrary
+    # one. The content-hash only breaks a residual tie on trades too (still needed --
+    # trades can tie right alongside cagr, e.g. the BOIL group above has several rows
+    # sharing both), and remains file-independent (window/z/hold/tpct content, never
+    # rowid) for the same reproducibility reason it was added.
+    def _content_hash(r):
+        s = "|".join(str(v) for v in r[1:5])  # window, z, hold, tpct -- never rowid
+        return hashlib.md5(s.encode()).hexdigest()
+
+    tied.sort(key=lambda r: (-r[6], _content_hash(r)))
+    return tied[0][0]
+
+
+def island_region_rowids(conn, ticker, strategy_name, version, fixed_sl, entry_timing, island_tp, island_sl):
+    """Every real row within +/-FINE_RADIUS tp/sl of an island center, across ALL
+    window/z/hold/tpct combinations for this scope -- exactly the neighborhood
+    derive_phase25_candidates_ground_truth's own `region` filter draws from when ranking
+    an island's top-3 candidates (region = df[(take_profit-tp_c).abs()<=FINE_RADIUS &
+    (stop_loss-sl_c).abs()<=FINE_RADIUS], unfiltered by window/z/hold/tpct -- see that
+    function's own region-construction code in run_optimization_sweep.py).
+
+    Found missing live, 2026-08-25: without retaining this FULL neighborhood, a
+    post-prune re-derivation only sees whatever happened to survive in OTHER
+    candidates' own individual +/-CLIFF_RADIUS boxes (cliff_box_rowids_for_candidate,
+    CLIFF_RADIUS=2 vs this function's FINE_RADIUS=4 -- a much smaller, effectively
+    arbitrary subset) and can silently pick a DIFFERENT top-3 than the original run
+    found, even though `pick_island_centers`' own center-selection tiebreak (fixed
+    2026-08-23) is fully deterministic and reproduces the SAME center both times. Real,
+    confirmed divergence: AGQ/TrailingBothZScoreBreakout/v6-massive-w2021-08-23_2026-08-21
+    (fixed_sl=1 and 2) -- candidate rows at tp=31/32 were completely absent (0 rows) from
+    a pruned file built before this fix, causing derive_phase25_candidates_ground_truth to
+    re-derive a different, worse-informed top-3 (tp=30 instead) purely because the real
+    winning rows were never retained -- not a tiebreak/determinism bug at all.
+
+    trades > 0 filter matches derive_phase25_candidates_ground_truth's own `region` input
+    query exactly (that function's WHERE clause also requires trades > 0) -- a NO_TRADES
+    cell is never part of the real ranking pool and doesn't need to be retained for this
+    purpose (it's still covered separately by whichever candidate's own cliff-box or a
+    passthrough-scope entry, if it's part of one, for AGQ's other outstanding checks)."""
+    # NO [1,30] grid clamp here (found live, 2026-08-25, first version of this fix was
+    # itself wrong): derive_phase25_candidates_ground_truth's own `region` filter is a
+    # pure distance check (df['take_profit'].sub(tp_c).abs().le(FINE_RADIUS)), un-clamped
+    # to the nominal grid -- unlike cliff_box_rowids_for_candidate's tp_range/sl_range
+    # (which correctly clamps to [1,30] because IT generates dispatch-task coordinates,
+    # never dispatched outside that range). A real row at axis_tp=32 (outside the nominal
+    # 1-30 grid, from an earlier/different campaign) is genuinely included by the real
+    # ranking function's un-clamped distance filter -- clamping this retention query to
+    # [1,30] silently excluded it, reproducing the exact same under-retention bug this
+    # function exists to fix, just shifted from CLIFF_RADIUS-vs-FINE_RADIUS to an
+    # unrelated-but-analogous clamping mismatch. BETWEEN with unclamped bounds is
+    # equivalent to the pandas distance filter (island_tp/island_sl are themselves already
+    # real observed coordinates, so lo/hi can't go far outside a sane range in practice).
+    sl_axis_col, _ = strategies.resolve_axis_columns(strategy_name)
+    sl_col = _sl_axis_real_column(sl_axis_col)
+    scope_sql, scope_params = _campaign_scope_sql(strategy_name, fixed_sl, entry_timing)
+    tp_lo, tp_hi = island_tp - FINE_RADIUS, island_tp + FINE_RADIUS
+    sl_lo, sl_hi = island_sl - FINE_RADIUS, island_sl + FINE_RADIUS
+    c = conn.cursor()
+    c.execute(f"""
+        SELECT rowid FROM backtest_cache
+        WHERE ticker=? AND strategy=? AND version=? AND trades > 0
+          AND kernel_version='{KERNEL_VERSION}' {scope_sql}
+          AND axis_tp BETWEEN ? AND ? AND {sl_col} BETWEEN ? AND ?
+    """, [ticker, strategy_name, version, *scope_params, tp_lo, tp_hi, sl_lo, sl_hi])
+    return [r[0] for r in c.fetchall()]
 
 
 def rowids_for_scope(conn, ticker, strategy_name, version, entry_timing, fixed_sl):
@@ -367,6 +449,17 @@ def compute_keep_manifest(conn):
                 'entry_timing': entry_timing, 'fixed_sl': fixed_sl,
                 'island_idx': island_idx, 'island_tp': island_tp, 'island_sl': island_sl,
                 'rowids': [anchor_rowid] if anchor_rowid is not None else [],
+            })
+            # island_region (2026-08-25): the FULL +/-FINE_RADIUS neighborhood ranking
+            # actually draws from, not just the single anchor row -- see
+            # island_region_rowids' own docstring for the real AGQ divergence this fixes.
+            manifest.append({
+                'kind': 'island_region',
+                'ticker': ticker, 'strategy': strategy_name, 'version': version,
+                'entry_timing': entry_timing, 'fixed_sl': fixed_sl,
+                'island_idx': island_idx, 'island_tp': island_tp, 'island_sl': island_sl,
+                'rowids': island_region_rowids(
+                    conn, ticker, strategy_name, version, fixed_sl, entry_timing, island_tp, island_sl),
             })
 
     for ticker, strategy_name, version, entry_timing, fixed_sl in discover_all_gt_scopes(conn):
