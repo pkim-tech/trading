@@ -104,6 +104,10 @@ def run(ticker, window, z, tb, arm, sl, ts, max_hours, target_hours=(9, 14), ope
 
 
 if __name__ == '__main__':
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     parser = argparse.ArgumentParser()
     parser.add_argument('ticker')
     parser.add_argument('--window', type=int, required=True)

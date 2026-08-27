@@ -272,6 +272,10 @@ def compare(ticker, strategy_name, window, z_thresh, tp, sl, hold, trail_pct=Non
 
 
 if __name__ == '__main__':
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     results = []
     results.append(compare('SOXL', 'ZScoreBreakout', 10, 1.5, 29, 29, 119))
     results.append(compare('TQQQ', 'LimitOrderZScoreBreakout', 10, 2.0, 19, 19, 119))

@@ -120,4 +120,8 @@ if __name__ == "__main__":
     # one-off real-DB setup script as a side effect of test collection (found
     # while verifying the wl_id refactor, 2026-07-25/26). Never touched by
     # this refactor's actual runtime code -- purely a test-collection hazard.
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     main()

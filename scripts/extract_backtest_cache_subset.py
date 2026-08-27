@@ -32,4 +32,8 @@ def extract(output_path: str, where_clause: str, source_db: str = DEFAULT_SOURCE
 
 
 if __name__ == "__main__":
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     extract(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else DEFAULT_SOURCE_DB)

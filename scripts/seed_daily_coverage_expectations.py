@@ -108,6 +108,10 @@ OCCASIONAL_IDS = [
 ]
 
 if __name__ == '__main__':
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     db.ensure_tables()
     by_id = {r['id']: r for r in REGISTRY}
     for freq, ids in (('daily', DAILY_EXPECTED_IDS), ('informational', INFORMATIONAL_IDS), ('occasional', OCCASIONAL_IDS)):

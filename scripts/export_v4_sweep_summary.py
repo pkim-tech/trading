@@ -94,6 +94,10 @@ def load_v4_summary(conn):
 
 
 if __name__ == '__main__':
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     out_path = sys.argv[1] if len(sys.argv) > 1 else 'logs/v4_sweep_summary.csv'
     with sqlite3.connect(RESEARCH_DB_PATH, timeout=60) as conn:
         df = load_v4_summary(conn)

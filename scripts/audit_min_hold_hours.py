@@ -119,6 +119,10 @@ def audit(ticker, window, z, tp, sl, tb, ts, max_hours, min_hold_hours, entry_ti
 
 
 if __name__ == "__main__":
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     ap = argparse.ArgumentParser()
     ap.add_argument("ticker")
     ap.add_argument("--window", type=int, required=True)

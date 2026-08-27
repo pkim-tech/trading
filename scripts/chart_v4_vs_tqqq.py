@@ -122,6 +122,10 @@ def make_chart(curves, out_path):
 
 
 if __name__ == "__main__":
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     tickers = sys.argv[1:] or DEFAULT_TICKERS
     curves = run(tickers)
     out_path = Path(__file__).resolve().parent.parent / "output" / "v4_vs_tqqq_chart.png"

@@ -100,6 +100,10 @@ def verify_ticker(ticker):
 
 
 if __name__ == "__main__":
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     tickers = sys.argv[1:] or ["SOXL"]
     results = {t: verify_ticker(t) for t in tickers}
     print("\n=== Summary ===")

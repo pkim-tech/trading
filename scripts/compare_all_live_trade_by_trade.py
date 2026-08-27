@@ -90,6 +90,10 @@ def run_one(ticker, node_id, start, same_bar_reentry):
 
 
 if __name__ == "__main__":
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     all_results = []
     for ticker, node_id in LIVE_NODE_IDS.items():
         start = hourly_start(ticker)

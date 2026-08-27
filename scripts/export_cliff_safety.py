@@ -84,6 +84,10 @@ def load_cliff_safety(conn, version_strategy_pairs):
 
 
 if __name__ == '__main__':
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     out_path = sys.argv[1] if len(sys.argv) > 1 else 'logs/cliff_safety_v3plus.csv'
     with sqlite3.connect(DB_PATH, timeout=60) as conn:
         pairs = [(v, s) for v, s in conn.execute(

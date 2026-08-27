@@ -161,6 +161,10 @@ def run(tickers):
 
 
 if __name__ == '__main__':
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     args = sys.argv[1:]
     out_path = 'logs/candidate_checklist_report.csv'
     if args and args[-1].endswith('.csv'):

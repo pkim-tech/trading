@@ -53,6 +53,10 @@ def patch_config(strategy, fixed_sl):
 
 
 if __name__ == "__main__":
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     cmd = sys.argv[1]
     if cmd == "patch":
         patch_config(sys.argv[2], sys.argv[3])

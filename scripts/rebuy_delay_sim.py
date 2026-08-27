@@ -73,6 +73,10 @@ def simulate(ticker):
 
 
 if __name__ == "__main__":
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     tickers = sys.argv[1:] or ["AGQ", "EDC", "HIBL", "KORU", "LABU", "SOXL"]
     rows = [simulate(t) for t in tickers]
     rows = [r for r in rows if r]
