@@ -80,9 +80,6 @@ def main():
 
     _SKIP = {
         'add_usage_tracking.py', 'check_script_usage_convention.py', 'list_scripts.py',
-        # has unrelated uncommitted WIP (known CONFIRMED-HIGH bugs, user's call not to touch
-        # yet) -- don't entangle this mechanical edit with that diff
-        'prune_backtest_cache_ground_truth.py', 'prune_backtest_cache_ground_truth_validate.py',
     }
     results = {}
     for path in sorted(_SCRIPTS_DIR.glob('*.py')):
