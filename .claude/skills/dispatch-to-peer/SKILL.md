@@ -54,7 +54,11 @@ here.
    further) with background execution, not blocking its own foreground
    thread — matches [[feedback_background_review_agents]] and
    [[feedback_default_background_long_commands]]. Don't assume a peer session
-   applies this on its own; state it per dispatch.
+   applies this on its own; state it per dispatch. Include the standing
+   phrasing verbatim in every dispatch prompt: **"unless explicitly asked for
+   by the user, run in the background"** — covers both its own long-running
+   steps and anything it spawns, in one line, rather than relying on the
+   longer explanation below to be re-derived correctly each time.
 
    **Recurred 2026-08-25**: stating this once in the initial dispatch prompt
    is not sufficient — `ListAgents` showed the dispatched peer sitting `busy`
