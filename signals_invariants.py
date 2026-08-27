@@ -9,6 +9,9 @@ Each check function returns a list of human-readable violation strings (empty =
 clean) and documents, in its own docstring, exactly which downstream code relies
 on the invariant -- so a violation is actionable without a backlog lookup.
 """
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import signals_db as db
 import schwab_safety
 
@@ -353,6 +356,77 @@ def check_starting_notional_override_has_staged_config():
                 f"key) -- either stage it (set_staged_test_config) or clear it "
                 f"(clear_starting_notional_override) if it wasn't meant to be permanent."
             )
+    return violations
+
+
+def check_starting_notional_override_once_stuck():
+    """Companion to check_starting_notional_override_has_staged_config -- flags
+    a node whose starting_notional_override_once is still set even though it
+    has an open position entered AFTER the override was set. That's exactly
+    the signature of "should have auto-cleared on the fill that consumed it
+    (signals_db.open_position(), same transaction as the position record
+    write) but didn't" -- real, ongoing verification that the consume-on-fill
+    logic actually works, not just code-review confidence.
+
+    Timezone trap, checked directly rather than assumed (found while building
+    this 2026-08-26): watch_list_audit.ts is written via sqlite's
+    datetime('now'), which is UTC; open_positions.entry_time is written via
+    Python's datetime.now(), which is this host's LOCAL time -- confirmed via
+    `timedatectl` to be America/New_York (matches CLAUDE.md's ET signal-window
+    convention). Comparing the two naively would be off by 4-5 hours
+    (EDT/EST) -- converts the audit timestamp to ET before comparing.
+
+    Skips a node with no set_starting_notional_override_once audit row at all
+    (can't determine when it was set -- e.g. a value written by a future
+    direct-DB path this function doesn't know about) rather than guessing a
+    might-be-wrong "always violated" or "never violated" default.
+
+    Checks BOTH open_positions (still-open) and trade_log (already closed) --
+    paired review finding 2026-08-26: an open_positions-only check goes silent
+    the moment the consuming position closes (the row is DELETEd, not
+    archived), even though a stuck field is still stuck. Both queries exclude
+    is_dry_run_sim=1 rows -- open_position()'s clear itself is gated on real
+    fills only (not paper, not dry-run-sim), so a dry_run node's synthesized
+    fill is CORRECTLY never cleared and must not be reported as a bug (found
+    live: 9 of 12 real open_positions rows on file are dry_run today)."""
+    violations = []
+    with db._conn() as c:
+        nodes = [dict(r) for r in c.execute(
+            "SELECT * FROM watch_list WHERE archived_at IS NULL "
+            "AND starting_notional_override_once IS NOT NULL")]
+        for node in nodes:
+            pos = c.execute(
+                "SELECT entry_time FROM open_positions WHERE wl_id=? AND is_dry_run_sim=0 "
+                "ORDER BY entry_time DESC LIMIT 1",
+                (node['id'],)
+            ).fetchone()
+            if pos is None:
+                pos = c.execute(
+                    "SELECT entry_time FROM trade_log WHERE wl_id=? AND is_dry_run_sim=0 "
+                    "ORDER BY entry_time DESC LIMIT 1",
+                    (node['id'],)
+                ).fetchone()
+            if pos is None:
+                continue
+            audit_row = c.execute(
+                "SELECT ts FROM watch_list_audit WHERE watch_id=? "
+                "AND action='set_starting_notional_override_once' ORDER BY id DESC LIMIT 1",
+                (node['id'],)
+            ).fetchone()
+            if audit_row is None:
+                continue
+            set_ts_et = (datetime.strptime(audit_row[0], '%Y-%m-%d %H:%M:%S')
+                         .replace(tzinfo=ZoneInfo('UTC'))
+                         .astimezone(ZoneInfo('America/New_York'))
+                         .replace(tzinfo=None))
+            entry_time = datetime.strptime(pos[0], '%Y-%m-%d %H:%M:%S')
+            if entry_time > set_ts_et:
+                violations.append(
+                    f"{node['ticker']} (wl_id={node['id']}) has starting_notional_override_once="
+                    f"${node['starting_notional_override_once']:,.0f} set at {set_ts_et} (ET) but "
+                    f"an open position entered {entry_time} (ET, after the override was set) -- "
+                    f"should have auto-cleared on that fill (signals_db.open_position) but didn't."
+                )
     return violations
 
 
@@ -822,6 +896,7 @@ CHECKS = [
     check_margin_floor_zero_for_trading_enabled_accounts,
     check_starting_notional_within_account_notional_cap,
     check_starting_notional_override_has_staged_config,
+    check_starting_notional_override_once_stuck,
     check_open_position_config_matches_live_node,
     check_staged_config_matches_expected,
     check_addon_drought_live_nodes_have_coherent_account_type,

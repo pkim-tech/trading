@@ -721,12 +721,23 @@ def _last_sale_recovery(node, position_source='core'):
     exist; no-op today since trade_log has zero non-core rows, see
     docs/plans/real_order_execution_drought_addon.md 0.7).
 
-    starting_notional_override (2026-08-12), when set, is checked FIRST and
+    starting_notional_override_once (2026-08-26) is checked FIRST of all --
+    a one-time bump for exactly the next real buy (e.g. capital was just
+    added to this node), auto-cleared by open_position() the moment that
+    buy's real fill is recorded, so normal compounding resumes automatically
+    on the buy right after (see signals_db.set_starting_notional_override_once).
+    Checked ahead of the permanent override below since it's the more
+    specific, more recently-expressed intent when both happen to be set.
+
+    starting_notional_override (2026-08-12), when set, is checked next and
     returned directly -- bypasses both the trade_log lookup below and the
     plain starting_notional fallback. The only real lever to deliberately
-    grow (or shrink) a node's sizing once it has closed a real trade; a
-    plain starting_notional edit silently has no effect past that point
-    (see signals_db.set_starting_notional_override)."""
+    grow (or shrink) a node's sizing PERMANENTLY once it has closed a real
+    trade; a plain starting_notional edit silently has no effect past that
+    point (see signals_db.set_starting_notional_override)."""
+    once = node.get('starting_notional_override_once')
+    if once is not None:
+        return once
     override = node.get('starting_notional_override')
     if override is not None:
         return override

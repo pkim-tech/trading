@@ -507,6 +507,21 @@ def ensure_tables():
             # starting_notional fallback, until explicitly cleared again.
             c.execute("ALTER TABLE watch_list ADD COLUMN starting_notional_override REAL")
 
+        if 'starting_notional_override_once' not in wl_cols:
+            # 2026-08-26: starting_notional_override above is permanent (only ever
+            # cleared manually) -- wrong for "capital was just added to this real
+            # node, size the NEXT buy off the new amount, then resume normal
+            # _last_sale_recovery compounding" (real, recurring need as more capital
+            # gets added to live nodes over time, not just a one-off test-stage
+            # bump). This field sizes exactly the next real buy: checked FIRST in
+            # _last_sale_recovery (signals_helpers.py), ahead of the permanent
+            # override, then auto-cleared by open_position() the moment that buy's
+            # real fill is recorded (not on order placement -- survives a
+            # cancel/replace/retry cycle on the same signal, only clears on an
+            # actual fill). Nullable REAL, default NULL, no live behavior change
+            # until set explicitly.
+            c.execute("ALTER TABLE watch_list ADD COLUMN starting_notional_override_once REAL")
+
         # account wasn't part of the original UNIQUE constraint -- found 2026-07-26 while
         # adding a second real DPST node in a different account: two nodes with identical
         # strategy params but different accounts are genuinely distinct (the whole point of
@@ -3099,12 +3114,23 @@ def set_starting_notional_override(watch_id, value):
     """Pins the next real order's sizing to `value`, bypassing
     signals_helpers._last_sale_recovery's trade_log-compounding lookup
     entirely -- the only way to deliberately grow (or shrink) a node's real
-    position size once it has closed at least one real trade (see that
-    function's docstring: starting_notional alone stops taking effect the
+    position size PERMANENTLY once it has closed at least one real trade (see
+    that function's docstring: starting_notional alone stops taking effect the
     moment a real trade exists). Stays active until explicitly cleared via
     clear_starting_notional_override -- NOT a one-shot (no code path
     consumes/clears it automatically), so organic trade_log compounding
-    stays bypassed until a human decides to resume it."""
+    stays bypassed until a human decides to resume it. For a ONE-TIME bump
+    (e.g. capital was just added to this node, size the next buy off the new
+    amount, then resume normal compounding automatically) use
+    set_starting_notional_override_once instead -- that field self-clears on
+    the next real fill and is checked first by _last_sale_recovery.
+
+    signals_invariants.check_starting_notional_override_has_staged_config
+    (2026-08-26) flags any node with this set but no staged_test_config row
+    documenting it -- a permanent override is meant to always have an
+    on-file reason, whether that's a deliberately-staged test node or a
+    genuine production resize (in which case stage a row for it too, e.g.
+    scenario_role='manual_resize', to satisfy the invariant)."""
     with _conn() as c:
         row = c.execute(
             "SELECT watchlist_id, ticker, starting_notional_override FROM watch_list WHERE id = ?", (watch_id,)
@@ -3130,6 +3156,48 @@ def clear_starting_notional_override(watch_id):
         c.execute("UPDATE watch_list SET starting_notional_override = NULL WHERE id = ?", (watch_id,))
         _log_audit(c, 'clear_starting_notional_override', watchlist_id=row['watchlist_id'], watch_id=watch_id,
                    ticker=row['ticker'], detail=f"{row['starting_notional_override']} -> NULL")
+        c.commit()
+
+
+def set_starting_notional_override_once(watch_id, value):
+    """Sizes exactly the NEXT real buy at `value`, then auto-clears itself the
+    moment that buy's real fill is recorded (open_position(), not order
+    placement -- survives a cancel/replace/retry cycle on the same signal,
+    only clears on an actual fill) -- see signals_helpers._last_sale_recovery
+    (checks this FIRST, ahead of the permanent starting_notional_override) and
+    open_position()'s own consume-and-clear comment. Real, recurring need as
+    more capital gets added to an established live node over time: unlike
+    set_starting_notional_override, this does NOT permanently freeze the
+    node's sizing -- normal trade_log-proceeds compounding resumes
+    automatically on the buy right after the one this sizes."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, starting_notional_override_once FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"set_starting_notional_override_once: no watch_list row with id={watch_id}")
+        c.execute("UPDATE watch_list SET starting_notional_override_once = ? WHERE id = ?",
+                   (float(value), watch_id))
+        _log_audit(c, 'set_starting_notional_override_once', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                   ticker=row['ticker'], detail=f"{row['starting_notional_override_once']} -> {value}")
+        c.commit()
+
+
+def clear_starting_notional_override_once(watch_id):
+    """Manual escape hatch -- cancels a pending one-time bump before it's ever
+    consumed by a real fill (e.g. the intended entry never fires). Not called
+    by the normal consume-on-fill path (see open_position()), which clears
+    this column inline as part of the same transaction that records the fill,
+    not via this function."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT watchlist_id, ticker, starting_notional_override_once FROM watch_list WHERE id = ?", (watch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"clear_starting_notional_override_once: no watch_list row with id={watch_id}")
+        c.execute("UPDATE watch_list SET starting_notional_override_once = NULL WHERE id = ?", (watch_id,))
+        _log_audit(c, 'clear_starting_notional_override_once', watchlist_id=row['watchlist_id'], watch_id=watch_id,
+                   ticker=row['ticker'], detail=f"{row['starting_notional_override_once']} -> NULL")
         c.commit()
 
 
@@ -4238,8 +4306,20 @@ def get_held_tickers():
 _PENDING_BUY_NODE_KEYS = ('id', 'ticker', 'strategy', 'version', 'window', 'take_profit', 'stop_loss',
                           'max_hold_hours', 'label', 'trail_sell_pct', 'fixed_sl', 'trail_buy_pct',
                           'arm_sell_pct', 'account', 'starting_notional', 'starting_notional_override',
+                          'starting_notional_override_once',
                           'state', 'drought_sl_pct_override', 'drought_arm_pct_override',
                           'drought_trail_pct_override')
+# 2026-08-26, paired review finding (both independent-cold and contextual rounds
+# converged): starting_notional_override_once was originally left out of this tuple,
+# the exact same drift pattern this tuple's own header comment already documents for
+# starting_notional_override ("both lists independently went stale missing
+# starting_notional_override") -- the pending_buys.node_json snapshot this tuple
+# controls feeds signals_notify._reconcile_fill's post-fill top-up target and
+# check_gap_resize's overnight-gap replacement sizing, both of which call
+# _last_sale_recovery(node) off this frozen snapshot, not a fresh watch_list read.
+# Without the once-value in the snapshot, a real fill that under-spends its
+# once-sized target (the common case -- buy_order_sizing pads worst-case) gets
+# topped up back toward the OLD (pre-bump) notional, silently fighting the bump.
 
 
 def add_pending_buy(node, sig, channel, ts, order_id=None, position_source='core',
@@ -4848,7 +4928,58 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             signal_bar_time_str, position_source, drought_confirm_days, drought_vol_gate,
             drought_gap_start, drought_vol_pctile,
         ))
+        _once_consumed_args = None
+        if not paper and not is_dry_run_sim and node.get('id') is not None and position_source == 'core':
+            # Consume-and-clear starting_notional_override_once (2026-08-26) right
+            # here, in the SAME transaction as the INSERT above -- this is the one
+            # place every real position-open funnels through (open_position_from_
+            # pending/open_drought_overlay_position both delegate to this function;
+            # see open_position_from_pending's own docstring), so clearing here
+            # covers every real-fill call site (automated + all 3 manual Slack
+            # confirmation flows) without needing to duplicate this at each one.
+            # Deliberately does NOT gate on order-placement or a cancel/replace
+            # cycle: the once-value is meant to survive exactly that (a signal that
+            # gets replaced/retried several times before it finally fills should
+            # still get the bump on whichever attempt actually fills), only
+            # clearing once a real fill is durably recorded, atomically with it.
+            #
+            # Deliberately re-reads the CURRENT DB value here rather than trusting
+            # node.get('starting_notional_override_once') -- paired review finding
+            # 2026-08-26: `node` on every real call site is a FROZEN pending_buys.
+            # node_json snapshot (see _PENDING_BUY_NODE_KEYS above), not a fresh
+            # watch_list row, so trusting the passed-in dict for the clear itself
+            # (as opposed to for sizing, which _PENDING_BUY_NODE_KEYS now also
+            # covers) would silently no-op if the once-value was set after the
+            # snapshot was frozen -- the exact bug class this tuple's own header
+            # comment already warns about recurring.
+            #
+            # position_source == 'core' only -- a drought-overlay fill (position_
+            # source='drought_overlay') sizes off flat starting_notional, never
+            # _last_sale_recovery/the once-value (see notify_drought_buy_signal),
+            # so a drought entry firing before the next core entry must not
+            # silently consume a bump it never actually applied.
+            once_row = c.execute(
+                "SELECT starting_notional_override_once FROM watch_list WHERE id = ?", (node['id'],)
+            ).fetchone()
+            once_value = once_row[0] if once_row else None
+            if once_value is not None:
+                c.execute("UPDATE watch_list SET starting_notional_override_once = NULL WHERE id = ?",
+                          (node['id'],))
+                _once_consumed_args = (node, once_value, float(entry_price) * (float(shares) if shares else 0))
         c.commit()
+        if _once_consumed_args is not None:
+            # Auditable record of every real consumption (2026-08-26, user's own
+            # ask) -- lets a human later verify "was this position actually sized
+            # to what was intended" without trusting the sizing math by
+            # construction alone. Reuses coverage_events (the project's existing
+            # pattern for auditing real execution events) rather than a new
+            # table -- fire-and-forget, can't block the real fill this logs.
+            _n, _once_value, _real_notional = _once_consumed_args
+            log_coverage_event(
+                "starting_notional_override_once_consumed", "live", ticker=_n['ticker'], node_id=_n.get('id'),
+                result="consumed",
+                detail=f"once_value=${_once_value:,.2f} real_position_size=${_real_notional:,.2f} "
+                       f"(entry_price={entry_price} shares={shares})")
         if not paper and not is_dry_run_sim:
             # Real fills only -- a paper/dry-run-sim fill is synthesized against
             # cached/live price data, not a real broker execution, so its drift
