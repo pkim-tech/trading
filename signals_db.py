@@ -587,6 +587,7 @@ def ensure_tables():
                     skim_last_mark_time TEXT,
                     force_same_day_block INTEGER NOT NULL DEFAULT 0,
                     starting_notional_override REAL,
+                    starting_notional_override_once REAL,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account)
@@ -661,6 +662,7 @@ def ensure_tables():
                     skim_last_mark_time TEXT,
                     force_same_day_block INTEGER NOT NULL DEFAULT 0,
                     starting_notional_override REAL,
+                    starting_notional_override_once REAL,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
                            trail_sell_pct, account, paper_role)
@@ -745,6 +747,7 @@ def ensure_tables():
                     skim_last_mark_time TEXT,
                     force_same_day_block INTEGER NOT NULL DEFAULT 0,
                     starting_notional_override REAL,
+                    starting_notional_override_once REAL,
                     archived_at        TIMESTAMP,
                     UNIQUE(watchlist_id, ticker, strategy, version, window, take_profit,
                            stop_loss, max_hold_hours, arm_sell_pct, trail_buy_pct,
