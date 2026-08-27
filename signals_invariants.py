@@ -302,6 +302,60 @@ def check_starting_notional_within_account_notional_cap():
     return violations
 
 
+def check_starting_notional_override_has_staged_config():
+    """A node's starting_notional_override should only ever be permanent for a
+    deliberately-staged test node (tracked via staged_test_config, per
+    .claude/skills/live-test-node-setup/SKILL.md's convention) -- everything else
+    (a manual sizing nudge, a temporary bump) is expected to get cleared again.
+
+    Found 2026-08-26 while staging an ERY test node: db.clear_starting_notional_
+    override() exists but is never called anywhere in the codebase except its own
+    definition -- nothing actually clears an override once set. That makes an
+    override left on a real production node (e.g. after a one-off manual nudge
+    that was meant to be temporary) invisible forever, since nothing currently
+    checks that a non-null override has a documented reason on file. This check
+    is that documentation requirement.
+
+    Deliberately requires a staged_test_config row whose expected_config
+    literally documents 'starting_notional_override' as a key -- NOT just "any
+    staged row for this wl_id" (the first version of this check, caught by
+    paired review 2026-08-26): every mode='live' node gets an auto-seeded
+    baseline_config row from scripts/seed_baseline_config.py regardless of
+    whether it carries an override, and a node can carry other, unrelated
+    staged_test_config roles (e.g. RETL's time_exit_via_sl/drought_handoff,
+    both predating its override) -- "some row exists" passed both of the two
+    real overrides on file without either one's row actually mentioning the
+    override, which defeats the whole point.
+
+    Deliberately queries watch_list directly (all watchlists, any state,
+    archived excluded) rather than db.get_watchlist() (active-watchlist-only)
+    or db.get_live_nodes() (state='live' only) -- the thing being audited is a
+    column that a paper/dry_run/staged-test node can just as legitimately
+    carry as a state='live' one (this file's other live-money checks use
+    get_live_nodes() because THEY care about live capital specifically; this
+    one cares about the column, not liveness). Archived nodes are excluded
+    since they can no longer place a real order regardless of sizing config."""
+    violations = []
+    documented_wl_ids = {
+        row['wl_id'] for row in db.get_staged_test_configs()
+        if 'starting_notional_override' in row['expected_config']
+    }
+    with db._conn() as c:
+        nodes = [dict(r) for r in c.execute(
+            "SELECT * FROM watch_list WHERE archived_at IS NULL "
+            "AND starting_notional_override IS NOT NULL")]
+    for node in nodes:
+        if node['id'] not in documented_wl_ids:
+            violations.append(
+                f"{node['ticker']} (wl_id={node['id']}) has starting_notional_override="
+                f"${node['starting_notional_override']:,.0f} but no staged_test_config row "
+                f"documents it (expected_config must include a 'starting_notional_override' "
+                f"key) -- either stage it (set_staged_test_config) or clear it "
+                f"(clear_starting_notional_override) if it wasn't meant to be permanent."
+            )
+    return violations
+
+
 def check_open_position_config_matches_live_node():
     """An open position's snapshotted max_hold_hours/fixed_sl/account should
     match its node's current live watch_list config, unless deliberately
@@ -767,6 +821,7 @@ CHECKS = [
     check_tax_advantaged_excluded_tickers,
     check_margin_floor_zero_for_trading_enabled_accounts,
     check_starting_notional_within_account_notional_cap,
+    check_starting_notional_override_has_staged_config,
     check_open_position_config_matches_live_node,
     check_staged_config_matches_expected,
     check_addon_drought_live_nodes_have_coherent_account_type,
