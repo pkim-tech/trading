@@ -6,6 +6,7 @@ fetch failure/retry doesn't repeat the (slower) adjustment step.
 Usage: .venv/bin/python scripts/apply_dividend_adjustment_batch.py --tickers T ...
 """
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_massive_hourly_derived import fetch_dividends, apply_dividend_adjustment
 
 SECOND_DATA_DIR = Path(__file__).resolve().parent.parent / "cache" / "research" / "second_data"
+BACKUP_DIR = SECOND_DATA_DIR / "backups"
 
 
 def adjust_ticker(ticker):
@@ -33,8 +35,18 @@ def adjust_ticker(ticker):
     df["High"] = adj["High"].values
     df["Low"] = adj["Low"].values
     df["Close"] = adj["Close"].values
+
+    # Back up the pre-adjustment file before overwriting -- real precedent tonight
+    # (2026-08-26, see scripts/promote_market_data_pull.py): never overwrite a
+    # canonical market-data file without a way to recover the prior version if the
+    # transform turns out wrong.
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    import time as _time
+    backup_path = BACKUP_DIR / f"{ticker}_1s_pre_dividend_adjust_{_time.strftime('%Y%m%d_%H%M%S')}.csv"
+    shutil.copy2(path, backup_path)
+
     df.to_csv(path, index=False)
-    print(f"  {ticker}: {len(divs)} dividends applied, {len(df):,} rows saved")
+    print(f"  {ticker}: {len(divs)} dividends applied, {len(df):,} rows saved (backup: {backup_path.name})")
 
 
 def main():
