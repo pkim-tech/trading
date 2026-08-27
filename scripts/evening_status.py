@@ -1198,8 +1198,24 @@ def part3():
         if db.is_snoozed('paper_vs_kernel_mismatch', ticker=node['ticker'], node_id=node['id']):
             results.append((node, len(paper), len(bt), 'snoozed', None))
             continue
-        mismatch = abs(len(paper) - len(bt)) > 2
-        results.append((node, len(paper), len(bt), 'MISMATCH' if mismatch else 'ok', None))
+        # Occurrence/magnitude split (2026-08-26, folded in from the trace-tool dispatch):
+        # occurrence (did a trade happen at all) is a HARD bidirectional flag, no tolerance
+        # band -- replaces the old abs(len(paper)-len(bt))>2 count-diff heuristic, which
+        # could silently pass a real divergence (e.g. paper=3/kernel=3 by count, but a
+        # different 3 trades on each side) or flag a benign one-trade-later-than-expected
+        # timing wobble. Magnitude (real vs kernel return% for a trade BOTH sides agree
+        # happened) is pure reporting, never gated -- see verify.match_trades' own 4h
+        # signal-time tolerance, which is a "is this the same event" matching tolerance,
+        # not a magnitude tolerance. Paper trades have no separate signal_time column
+        # (paper_trade_log), so entry_time doubles as signal_time here -- a paper fill is
+        # simulated at/near the signal bar, unlike a real trailing-buy's bounce-fill delay.
+        real_for_match = [{"signal_time": r["entry_time"], "pnl_pct": r["pnl_pct"]}
+                           for r in paper.to_dict("records")]
+        bt_for_match = [{"entry_time": str(t["entry_time"]), "ret": t["ret"]} for t in bt]
+        pmatched, punmatched_real, punmatched_bt = verify.match_trades(real_for_match, bt_for_match, 4)
+        occurrence_mismatch = bool(punmatched_real or punmatched_bt)
+        results.append((node, len(paper), len(bt), 'MISMATCH' if occurrence_mismatch else 'ok',
+                         (pmatched, punmatched_real, punmatched_bt)))
 
     quiet = sum(1 for r in results if r[3] == 'quiet')
     not_paper = sum(1 for r in results if r[3] == 'not-paper')
@@ -1211,13 +1227,37 @@ def part3():
           f"(dry_run/canary/live -- not comparable here), {matched} matched, {flagged} issues"
           + (f", {snoozed} snoozed" if snoozed else "")
           + (f", {errored} errored" if errored else ""))
-    for node, paper_n, kernel_n, tag, err in results:
+    for node, paper_n, kernel_n, tag, detail in results:
         if tag == 'MISMATCH':
-            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  paper={paper_n} kernel={kernel_n}  MISMATCH")
+            pmatched, punmatched_real, punmatched_bt = detail
+            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  paper={paper_n} kernel={kernel_n}  MISMATCH"
+                  f" ({len(punmatched_real)} paper trade(s) with no kernel counterpart, "
+                  f"{len(punmatched_bt)} kernel trade(s) the paper track never took)")
         elif tag == 'error':
-            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  NOT CHECKED ({err})")
+            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  NOT CHECKED ({detail})")
         elif tag == 'snoozed':
             print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  paper={paper_n} kernel={kernel_n}  (snoozed)")
+        elif tag == 'ok':
+            print(f"  {node['ticker']:6s} wl_id={node['id']:4d}  paper={paper_n} kernel={kernel_n}  ok")
+        # Magnitude, pure reporting -- every matched pair's real vs kernel return%, never
+        # gated/flagged regardless of how far apart the two numbers are, and printed
+        # independent of the node's occurrence tag above (LABD-shaped case: an occurrence
+        # MISMATCH from 11 unmatched paper trades doesn't mean the OTHER 5 matched trades
+        # have nothing worth reporting -- found live testing this exact node, 2026-08-26).
+        # pnl_pct is NULL until a paper position closes -- a still-open one has no real
+        # return yet to compare.
+        if tag in ('MISMATCH', 'ok') and detail and detail[0]:
+            pmatched = detail[0]
+            # paper's pnl_pct came through a pandas DataFrame (.to_dict('records')) --
+            # a still-open row's missing value is NaN there, not None, and `is not None`
+            # silently passes NaN through (found live testing this exact code, 2026-08-26:
+            # SOXL printed "real +nan% vs kernel ...").  != self is the NaN-only-value-that-
+            # isn't-equal-to-itself check, no pandas import needed for one comparison.
+            priced = [(r, t) for r, t, _dh in pmatched
+                      if r.get('pnl_pct') is not None and r.get('pnl_pct') == r.get('pnl_pct')]
+            if priced:
+                mags = ", ".join(f"real {r['pnl_pct']:+.2f}% vs kernel {t['ret']*100:+.2f}%" for r, t in priced)
+                print(f"      matched: {mags}")
 
     print(f"\n--- 3. Live vs kernel (all real capital-at-stake nodes today, not just ones that traded) ---")
     # Previously scoped to wl_ids derived from TODAY's real trades only -- a node with ZERO
@@ -1246,11 +1286,14 @@ def part3():
         active_count += 1
         matched, unmatched_real, unmatched_bt = verify.match_trades(
             [{"signal_time": r["signal_time"], "entry_time": r["entry_time"],
-              "ticker": r["ticker"], "exit_reason": r["exit_reason"]} for r in node_real],
-            [{"entry_time": str(t["entry_time"])} for t in bt], 4)
+              "ticker": r["ticker"], "exit_reason": r["exit_reason"], "pnl_pct": r["pnl_pct"]} for r in node_real],
+            [{"entry_time": str(t["entry_time"]), "ret": t["ret"]} for t in bt], 4)
         genuine = [r for r in unmatched_real if not verify.is_staged_or_manual(r['ticker'], r['entry_time'], r['exit_reason'])]
-        # Bidirectional: a kernel trade the real daemon NEVER TOOK is exactly as much of a
-        # "trades must equal backtest" violation as a real trade the kernel never predicted.
+        # Occurrence (PHANTOM/MISSED, bidirectional -- a kernel trade the real daemon
+        # NEVER TOOK is exactly as much of a "trades must equal backtest" violation as a
+        # real trade the kernel never predicted) stays a HARD flag, no tolerance band --
+        # the existing 4h window above is match_trades' own "is this the same event"
+        # signal-time tolerance, not a magnitude tolerance, so it's unchanged.
         flags = []
         if genuine:
             flags.append(f"{len(genuine)} PHANTOM real trade(s) the kernel never predicted")
@@ -1262,6 +1305,18 @@ def part3():
             print(f"      PHANTOM: entry={r['entry_time']} exit_reason={r['exit_reason']}")
         for t in unmatched_bt:
             print(f"      MISSED : kernel entry={t['entry_time']}")
+        # Magnitude, pure reporting (2026-08-26, folded in from the trace-tool dispatch)
+        # -- once BOTH sides agree a trade happened, just show real vs kernel return% side
+        # by side. Deliberately no pass/fail line and no threshold here -- Part 3's
+        # existing compounded-return divergence section (below) already owns that
+        # aggregate, separately-calibrated alert; this is per-trade information only.
+        # pnl_pct is NULL on trade_log until a position closes -- a still-open real
+        # position matched against a kernel trade has no real return yet to compare.
+        priced_matches = [(r, t) for r, t, _dh in matched if r.get('pnl_pct') is not None]
+        if priced_matches:
+            mags = ", ".join(f"entry={r['entry_time']} real {r['pnl_pct']:+.2f}% vs kernel {t['ret']*100:+.2f}%"
+                              for r, t in priced_matches)
+            print(f"      matched: {mags}")
     for wl_id, reason in sorted(unchecked.items()):
         print(f"  wl_id={wl_id:4d}  UNCHECKED -- {reason}")
     print(f"{active_count} node(s) had activity to compare, {quiet_count} confirmed quiet on BOTH "
