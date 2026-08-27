@@ -12,16 +12,22 @@ scope is 1 year, SOXL only -- deliberately narrower than the 1-minute pull's
 5yr/6-ticker scope, since 1-second data is ~60x the row count/storage; widen
 via --years/--tickers only once the smaller pull's proven useful.
 
-Saves one CSV per ticker to cache/research/second_data/{ticker}_1s.csv.
+Saves one CSV per ticker to cache/research/second_data/pulls/{ticker}_1s_{start}_{end}.csv --
+NEVER writes to the canonical cache/research/second_data/{ticker}_1s.csv path directly (same
+never-overwrite-canonical-directly convention as fetch_massive_minute_data.py, added
+2026-08-26 after that script's no-args refresh silently narrowed SOXL/DPST/DFEN's canonical
+minute archive). Use scripts/promote_market_data_pull.py --kind second to promote a staged
+pull into the canonical location.
 
 Usage:
     .venv/bin/python scripts/fetch_massive_second_data.py [--tickers T ...] [--years N]
+    .venv/bin/python scripts/fetch_massive_second_data.py [--tickers T ...] --start-date 2021-08-27
 """
 import argparse
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -32,6 +38,7 @@ load_dotenv()
 
 API_KEY = os.environ.get("MASSIVE_API_KEY")
 OUT_DIR = Path(__file__).resolve().parent.parent / "cache" / "research" / "second_data"
+PULLS_DIR = OUT_DIR / "pulls"
 
 TICKERS = ["SOXL"]
 SLEEP_BETWEEN_CALLS = 0.15
@@ -95,15 +102,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tickers", nargs="*", default=TICKERS)
     ap.add_argument("--years", type=float, default=1)
+    ap.add_argument("--start-date", type=str, default=None,
+                     help="explicit YYYY-MM-DD start date, overrides --years")
     args = ap.parse_args()
 
     if not API_KEY:
         print("MASSIVE_API_KEY not set in .env", file=sys.stderr)
         sys.exit(1)
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    PULLS_DIR.mkdir(parents=True, exist_ok=True)
     end = date.today()
-    start = end - timedelta(days=int(365 * args.years))
+    start = datetime.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else end - timedelta(days=int(365 * args.years))
 
     total = len(args.tickers)
     job_start = time.time()
@@ -111,12 +120,13 @@ def main():
         elapsed = time.time() - job_start
         eta = (elapsed / (i - 1) * (total - i + 1)) if i > 1 else float("nan")
         print(f"=== [{i}/{total}] {ticker} ({start} to {end})  job_elapsed={elapsed:.0f}s  eta_remaining={eta:.0f}s ===")
-        out_path = OUT_DIR / f"{ticker}_1s.csv"
+        out_path = PULLS_DIR / f"{ticker}_1s_{start}_{end}.csv"
         n_rows = fetch_ticker_streaming(ticker, start, end, out_path)
         if not n_rows:
             print(f"  {ticker}: no data, skipping")
             continue
         print(f"  {ticker}: saved {n_rows:,} rows to {out_path} ({out_path.stat().st_size / 1_000_000:.1f}MB)")
+        print(f"  {ticker}: staged only -- run scripts/promote_market_data_pull.py --ticker {ticker} --kind second to make this canonical")
         if i < total:
             time.sleep(SLEEP_BETWEEN_CALLS)
 

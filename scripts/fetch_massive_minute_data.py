@@ -7,16 +7,23 @@ Handles pagination (next_url) and the free tier's 5-calls/minute rate limit. Inc
 extended hours (pre-market/after-hours) -- confirmed real via scripts/test_massive_api.py,
 04:00-19:59 ET per day, not just the regular 9:30-16:00 session.
 
-Saves one CSV per ticker to cache/research/minute_data/{ticker}_1m.csv.
+Saves one CSV per ticker to cache/research/minute_data/pulls/{ticker}_1m_{start}_{end}.csv --
+NEVER writes to the canonical cache/research/minute_data/{ticker}_1m.csv path directly (real
+incident, 2026-08-26: a no-args refresh silently overwrote SOXL/DPST/DFEN's canonical 5yr
+archive down to this script's own --years default of 2, undetected until hours later). Use
+scripts/promote_market_data_pull.py to move a staged pull into the canonical location -- that
+script backs up whatever's currently canonical first and refuses to promote a narrower range
+without --force, so nothing here can ever silently destroy archived history again.
 
 Usage:
     .venv/bin/python scripts/fetch_massive_minute_data.py [--tickers T ...] [--years N]
+    .venv/bin/python scripts/fetch_massive_minute_data.py [--tickers T ...] --start-date 2021-08-27
 """
 import argparse
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -27,6 +34,7 @@ load_dotenv()
 
 API_KEY = os.environ.get("MASSIVE_API_KEY")
 OUT_DIR = Path(__file__).resolve().parent.parent / "cache" / "research" / "minute_data"
+PULLS_DIR = OUT_DIR / "pulls"
 
 TICKERS = ["SOXL", "DPST", "KORU", "JNUG", "HIBL", "LABU"]
 
@@ -75,15 +83,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tickers", nargs="*", default=TICKERS)
     ap.add_argument("--years", type=int, default=2)
+    ap.add_argument("--start-date", type=str, default=None,
+                     help="explicit YYYY-MM-DD start date, overrides --years")
     args = ap.parse_args()
 
     if not API_KEY:
         print("MASSIVE_API_KEY not set in .env", file=sys.stderr)
         sys.exit(1)
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    PULLS_DIR.mkdir(parents=True, exist_ok=True)
     end = date.today()
-    start = end - timedelta(days=365 * args.years)
+    start = datetime.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else end - timedelta(days=365 * args.years)
 
     for i, ticker in enumerate(args.tickers):
         print(f"=== {ticker} ({start} to {end}) ===")
@@ -96,9 +106,10 @@ def main():
         df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close",
                                  "v": "Volume", "vw": "VWAP", "n": "NumTrades"})
         df = df[["timestamp", "Open", "High", "Low", "Close", "Volume", "VWAP", "NumTrades"]]
-        out_path = OUT_DIR / f"{ticker}_1m.csv"
+        out_path = PULLS_DIR / f"{ticker}_1m_{start}_{end}.csv"
         df.to_csv(out_path, index=False)
         print(f"  {ticker}: saved {len(df):,} rows to {out_path} ({out_path.stat().st_size / 1_000_000:.1f}MB)")
+        print(f"  {ticker}: staged only -- run scripts/promote_market_data_pull.py --ticker {ticker} --kind minute to make this canonical")
         if i < len(args.tickers) - 1:
             time.sleep(SLEEP_BETWEEN_CALLS)
 

@@ -259,6 +259,27 @@ the constants directly; use the full-mesh spot-check once it exists to test whet
 anything 3→1 actually misses, and let that evidence decide.** Deferred, not urgent — "we can do
 that later."
 
+## Related finding: raw-data-layer "latest" resolution has the same failure shape (2026-08-26)
+
+Real incident tonight, one layer below this doc's scope (`massive_hourly_derived_builds`/
+`massive_minute_derived`, not `backtest_cache` itself): `get_massive_hourly_ohlcv`/
+`get_massive_minute_ohlcv`'s no-`build_id` path resolves "latest" via `ORDER BY id DESC LIMIT 1`
+— pure insertion order, no completeness/freshness check. A no-args `fetch_massive_minute_data.py`
+refresh silently narrowed SOXL/DPST/DFEN's canonical minute CSVs from 5yr to 2yr, and a
+subsequent `build_massive_hourly_derived.py` run created a newer, narrower build from that
+truncated CSV — which then silently became "latest" over the prior, correct, full-5yr build.
+Same failure shape as the overloaded-column bug family this doc exists to fix: something
+silently resolves to a worse state with no check that it's actually complete/correct. Recovered
+tonight via `scripts/reinject_derived_build.py` (copies a known-good build's rows into a fresh
+build_id — see `docs/backlog_cache.md`'s 2026-08-26 entry for detail) and a new
+never-overwrite-canonical-directly fetch/stage/promote convention (`scripts/promote_market_data_pull.py`).
+Real fix specced but not built: an explicit `active_builds` promotion table (same "explicit
+promote, not implicit ordering" pattern this doc's own phase-table design already uses for
+`backtest_cache`'s winner-selection problem) — see the backlog entry for the full spec. Not
+folded into this doc's own build-order since it's a distinct layer (raw derived market data,
+not `backtest_cache`/`candidate_nodes`), but the same underlying principle applies: don't let an
+implicit ordering rule stand in for an explicit correctness check.
+
 ## Status
 
 Discussion only. Not built, not scoped into tasks, not paired-reviewed. Next step if picked up:
