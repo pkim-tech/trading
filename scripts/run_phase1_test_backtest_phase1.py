@@ -47,12 +47,24 @@ ENTRY_TIMING = "open_check"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--strategy", choices=sorted(campaign_config.STRATEGIES),
+                     help="explicit strategy, used INSTEAD of load_live_node(TICKER)'s -- "
+                          "same override pattern as run_ground_truth_phase1.py")
+    ap.add_argument("--fixed-sl", dest="fixed_sl", type=int,
+                     help="explicit fixed_sl, used INSTEAD of load_live_node(TICKER)'s")
     args = ap.parse_args()
 
-    n = load_live_node(TICKER)
-    print(f"Live node: {n}")
-    strategy_name = n["strategy"]
-    fixed_sl = n["fixed_sl"]
+    if args.strategy is not None:
+        strategy_name = args.strategy
+        fixed_sl = args.fixed_sl
+        if fixed_sl is None:
+            raise SystemExit("--strategy requires --fixed-sl too (no live-node lookup in this mode)")
+        print(f"Permutation mode: strategy={strategy_name}, fixed_sl={fixed_sl} (no live-node lookup)")
+    else:
+        n = load_live_node(TICKER)
+        print(f"Live node: {n}")
+        strategy_name = n["strategy"]
+        fixed_sl = n["fixed_sl"]
     if strategy_name not in campaign_config.STRATEGIES:
         raise SystemExit(
             f"{TICKER}'s resolved strategy is {strategy_name!r}, which has no grid entry "

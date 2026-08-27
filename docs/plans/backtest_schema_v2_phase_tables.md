@@ -60,23 +60,33 @@ ephemeral scratch table instead, since it's the actual source of the bloat (60M+
 ```
 Phase1-Coarse  → backtest_phase1 (NEW, ephemeral/droppable per campaign — NOT a permanent
                   growing table; this is what kills the prune treadmill, not a relocation of
-                  it). Exact drop timing not locked in — leaning toward "once candidate_nodes
-                  is written" (mechanical, short) rather than waiting on the human
-                  promotion-review step (manual, can take days) — playing this by ear.
-                  Nothing gets copied from Phase1 into backtest_cache directly -- checked
-                  pick_island_centers() (run_optimization_sweep.py:1880): it's a greedy
-                  multi-center picker that walks the FULL ranked grid, skipping any coordinate
-                  within min_sep of an already-picked center. A pre-filtered "winners" subset
-                  would break this (could pick 3 clustered points, never seeing the excluded
-                  rows needed to know they're near-duplicates). Real fix: Phase2-Island reads
-                  directly from backtest_phase1 (the full per-(z,window,tpct) grid slice,
-                  before it's dropped) instead of backtest_cache, same query shape as today
-                  just pointed at the new table. Phase2's own fine-mesh sweep around the
-                  detected centers naturally re-covers the peak cell when IT writes to
-                  backtest_cache -- nothing needs a separate promotion step.
-                  Also seeds → backtest_winner_trades (real trade sequences for the current
-                  top-3, min-heap eviction — the actual new capability, the thing the original
-                  `[specced]` backlog item asked for)
+                  it). **Drop timing settled 2026-08-26/27**: immediately after Phase2-Island
+                  finishes its read for that scope, not "once candidate_nodes is written" (the
+                  earlier draft's leaning) -- backtest_phase1's only real consumer anywhere in
+                  this design is Phase2-Island's own read step; nothing later (Phase2.5, the
+                  trade-regeneration pass, candidate_nodes) ever reads it again, so there's no
+                  reason to keep the full table alive past that point.
+                  **Insurance kept before the drop**: copy the top 100 rows (by whatever ranking
+                  metric, aggregate columns only -- no trade-level detail needed at this stage)
+                  into `backtest_cache` itself, tagged `phase='Phase1-Coarse-GT'`, same permanent
+                  table Phase2/2.5/3/4 already write into -- not a new table. Gives real
+                  optionality to re-debug Phase2-Island's center-detection logic later without
+                  re-running the full expensive Phase1-Coarse sweep, at negligible storage cost
+                  (100 rows/scope is nothing next to the 60M+-row bloat problem this whole
+                  redesign exists to fix).
+                  Nothing gets copied from Phase1 into backtest_cache directly for the actual
+                  island-detection input -- checked pick_island_centers() (run_optimization_
+                  sweep.py:1880): it's a greedy multi-center picker that walks the FULL ranked
+                  grid, skipping any coordinate within min_sep of an already-picked center. A
+                  pre-filtered "winners" subset would break this (could pick 3 clustered points,
+                  never seeing the excluded rows needed to know they're near-duplicates). Real
+                  fix: Phase2-Island reads directly from backtest_phase1 (the full
+                  per-(z,window,tpct) grid slice, before it's dropped) instead of backtest_cache,
+                  same query shape as today just pointed at the new table. Phase2's own
+                  fine-mesh sweep around the detected centers naturally re-covers the peak cell
+                  when IT writes to backtest_cache -- nothing needs a separate promotion step.
+                  Trade capture (below) is NOT seeded here -- Phase1-Coarse itself never
+                  needs trade-level detail, only aggregate CAGR to find island centers.
 
 Phase2-Island, Phase2.5-CliffBox, Phase3, Phase4 → unchanged from today except Phase2's read
   source (backtest_phase1 instead of backtest_cache for the island-center step, above) — all
@@ -85,11 +95,25 @@ Phase2-Island, Phase2.5-CliffBox, Phase3, Phase4 → unchanged from today except
   run_optimization_sweep.py:2258) already writes real neighborhood data this way — nothing to
   build there.
 
-backtest_winner_trades → cycled throughout Phase2/2.5 (compare each newly-computed cell's
-  trades against current worst-of-top-3, evict/replace). Phase4 gets its own sibling,
-  backtest_overlay_trades, partitioned into separate min-heaps per overlay kind
-  (none/drought/add-on/drought+add-on) — a drought winner should never evict a genuinely-better
-  no-overlay winner it isn't actually competing with.
+backtest_winner_trades → **settled 2026-08-26/27: regenerate, don't inline-capture.** Original
+  plan (struck) was a live min-heap cycled throughout Phase2/2.5, comparing each newly-computed
+  cell's trades against current worst-of-top-3 -- rejected as too much write volume against too
+  much of the grid (Phase2/2.5 still touch a very large cell count even after Phase1-Coarse is
+  scoped down; capturing full trade sequences for all of them, then evicting most, wastes real
+  writes for zero benefit over just re-deriving the few that actually survive). Settled instead:
+  once Phase2.5-CliffBox finishes and each island's real top-3 is already decided (from
+  backtest_cache, same as today), do ONE re-simulation pass -- just for those final top-3-per-
+  island cells, not the full Phase2/2.5 grid -- and persist that result into
+  backtest_winner_trades, keyed by node_key. This is a smaller, better-understood extension of
+  the exact re-simulation `candidate_full_review.py` already does today (build_candidate_report_
+  ground_truth) -- just moved to run ONCE right after Phase2.5, cached, instead of every single
+  time a report gets generated. Solves the original `[specced]` backlog item's actual complaint
+  (report-layer re-simulation is the real bottleneck) without touching Phase1/2/2.5's own
+  already-tuned sweep loops at all -- zero risk to sweep throughput, all the risk is contained
+  in a new, isolated, small re-simulation step. Phase4 gets its own sibling, backtest_overlay_
+  trades, same regenerate-once approach, partitioned into separate results per overlay kind
+  (none/drought/add-on/drought+add-on) — a drought winner's trades must never be conflated with
+  a no-overlay winner's, since they're not the same underlying simulation.
 
 candidate_nodes → promotion step, unchanged from today except: node_key already exists (minted
   at Phase1 generation time) — candidate_nodes references it, no re-keying at the promotion
@@ -141,8 +165,18 @@ change.
 - A dropped/missing `backtest_phase1` for a ticker doesn't corrupt anything downstream — Phase2
   should just regenerate from scratch (see the "no coordination logic" decision above), not
   error or silently skip.
-- Two concurrent campaigns' `backtest_phase1` rows never collide/interfere (real scenario: two
-  tickers swept in parallel, per the project's own `ProcessPoolExecutor` architecture).
+- **Multi-ticker concurrent-campaign collision: settled 2026-08-26/27 as a non-issue, no test
+  needed.** Originally flagged as a real risk to guard against; walked back after checking real
+  history didn't actually support it (the cited precedent turned out to be 8 workers on ONE
+  ticker's own grid, not multiple tickers colliding) and confirming the actual operational
+  pattern -- this system doesn't run tickers concurrently in practice, since a single ticker's
+  own grid (164,640 cells for SOXL) already saturates the whole worker pool; there's no
+  operational reason two tickers would ever sweep at the same time. Single shared
+  `backtest_phase1` table is fine as originally designed -- no run-specific-table scheme, no
+  scoped-delete mechanism, no extra design needed for a scenario rare enough not to be worth
+  insuring against. This is a "for now" call, not a permanent constraint -- if the operational
+  pattern ever changes (ticker concurrency becomes desired/needed), revisit rather than assume
+  this reasoning still holds.
 
 **3. `pick_island_centers` read-source migration** [kernel-adjacent]
 - Simplified 2026-08-25: no synthetic byte-identical harness — just run the new pipeline for
@@ -151,21 +185,26 @@ change.
   same shape as #6 below — this is a storage-location change, not a logic change, so a real
   delta here is the actual signal to investigate, not a hypothetical one to construct.
 
-**4. `backtest_winner_trades` min-heap eviction** [kernel-adjacent]
-- Insert cells in different orders, confirm convergence to the same true top-3 by whatever
-  metric regardless of arrival order (order-independence is the whole point of a min-heap here
-  — a bug that makes results order-dependent would be silent and hard to notice).
-- Tie-handling: reuse the deterministic-tiebreak lesson already learned the hard way this month
-  (`GT_CANDIDATE_TIEBREAK`, `pick_island_centers`' 2026-08-23 fix, `prune_backtest_cache.py`'s
-  `TIEBREAK_SQL` — three real instances of "sort with no secondary key" bugs already found in
-  this exact codebase). Don't let this be a fourth.
-- Eviction correctness: a genuinely better cell replaces the current worst-of-top-3, never a
-  better one.
+**4. `backtest_winner_trades` regeneration pass** [kernel-adjacent] -- revised 2026-08-26/27
+  for the settled regenerate-once design (min-heap eviction rejected, see above)
+- Re-simulating a Phase2.5 top-3-per-island cell must reproduce the EXACT same trade sequence
+  `backtest_cache`'s own row for that cell already implies (same params, same kernel version,
+  same window) — real regression check: diff the regenerated trades against an independent
+  from-scratch replay (`sim_minute_groundtruth_independent.py`-style) for a few real cells,
+  same rigor already applied to the kernel itself.
+- Tie-handling for "which cells are the real top-3" still reuses the deterministic-tiebreak
+  lesson already learned the hard way this month (`GT_CANDIDATE_TIEBREAK`, `pick_island_
+  centers`' 2026-08-23 fix, `prune_backtest_cache.py`'s `TIEBREAK_SQL`) — that selection logic
+  is unchanged by this redesign, still needs to be correct before regeneration even starts.
+- A dropped/incomplete Phase2.5 scope (regeneration never runs) must not leave
+  `backtest_winner_trades` silently stale for that scope — report-layer consumers need a clear
+  signal ("no trades captured for this node_key yet") rather than serving an old vintage.
 
 **5. `backtest_overlay_trades` partitioning** [kernel-adjacent]
-- Confirm the 4 overlay-kind heaps (none/drought/add-on/drought+add-on) never cross-evict — a
-  drought winner must never replace a better no-overlay winner it isn't actually competing
-  with. Direct regression test for the exact failure mode already named as the reason for
+- Confirm the 4 overlay-kind results (none/drought/add-on/drought+add-on) are never conflated —
+  a drought winner's regenerated trades must never be attributed to a no-overlay winner's slot
+  or vice versa, since they're different simulations, not competing entries in one heap anymore.
+  Direct regression test for the exact failure mode already named as the reason for
   partitioning them.
 
 **6. End-to-end smoke test against real production shape**
@@ -215,6 +254,14 @@ rebuild, not an afterthought once the phase tables exist.
   strategy version of it is ever wanted, that's a new, separate, bigger backlog item.
 - Whether `candidate_nodes` keeps its own autoincrement `id` alongside `node_key`, or `node_key`
   becomes the PK directly — leaning toward `node_key` as PK (one identity, not two), not decided.
+  **Settled 2026-08-26/27 for `backtest_winner_trades` specifically** (doesn't resolve the
+  broader `candidate_nodes` question above, just this one table): a nullable `node_id` column,
+  bridging old int-id consumers to the new node_key-first identity. Every regenerated Phase2.5
+  top-3-per-island row gets a `node_key` always; `node_id` stays NULL for the (large majority)
+  that never get promoted, and only gets backfilled at the moment a `node_key` actually gets
+  promoted into `candidate_nodes` (which mints the real integer id). Lets old code still
+  expecting an integer `node_id` join to trade data for a promoted candidate, without forcing
+  every unpromoted top-3 row to carry one it doesn't need.
 - Exact `axis_columns` declaration mechanism (minimal list-per-class vs. building the fuller
   `PARAMS` contract from `strategy_architecture.md` at the same time) — not decided; either
   works for `node_key`, the fuller contract just does more (sweep-grid auto-build, UI rendering)
@@ -279,6 +326,22 @@ promote, not implicit ordering" pattern this doc's own phase-table design alread
 folded into this doc's own build-order since it's a distinct layer (raw derived market data,
 not `backtest_cache`/`candidate_nodes`), but the same underlying principle applies: don't let an
 implicit ordering rule stand in for an explicit correctness check.
+
+## Build staging: independently testable pieces now, fused single-ticker pipeline later
+
+Settled 2026-08-26/27. The eventual end state is a single-ticker wrapper: feed one ticker
+through Phase1→Phase2→Phase2.5→the `backtest_winner_trades` regeneration pass→a reviewable
+output file, then move to the next ticker — same simple per-ticker queue-loop shape
+`scripts/run_ground_truth_sweep_queue.sh` already uses today, no new scheduling machinery
+needed for that part.
+
+**But not built that way first.** Each piece (node_key/params_dict, `backtest_phase1`
+lifecycle, `pick_island_centers`'s read-source migration, the trade-regeneration pass, overlay
+partitioning) gets built and validated standalone, in roughly the test-plan's numbered order,
+before anything gets wired into the fused end-to-end flow. Fusing first would make it much
+harder to tell which phase introduced a bug when something breaks — staying separated lets each
+step's output be inspected and any error caught at the specific phase it happened in, not
+discovered downstream after several phases have already run.
 
 ## Status
 
