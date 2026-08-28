@@ -146,7 +146,14 @@ def _print_staged_config(node, source):
             actual = source.get(field)
             if actual is None:
                 continue
-            if abs(float(actual) - float(expected)) > 0.01:
+            # expected={"test_value": X, "revert_to": Y} is the documented staging
+            # convention (.claude/skills/live-test-node-setup/SKILL.md) for any
+            # deliberately-detuned field -- watch_list/open_positions only ever store
+            # the flat scalar X, never this wrapper, so an unguarded float(expected)
+            # crashed here on any staged row using it (found 2026-08-28, same bug
+            # class as signals_invariants._config_field_mismatch's identical fix).
+            cmp_expected = expected["test_value"] if isinstance(expected, dict) and "test_value" in expected else expected
+            if abs(float(actual) - float(cmp_expected)) > 0.01:
                 mismatches.append(f"{field}: expected {expected}, actual {actual}")
         if mismatches:
             print(f"  \U000026A0️  STAGED CONFIG MISMATCH: {'; '.join(mismatches)}")

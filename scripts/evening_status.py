@@ -1401,6 +1401,14 @@ def part3():
     div_real_all = verify.get_real_trades(div_start, TODAY, accounts=None)
     div_wl_ids = sorted({r['wl_id'] for r in div_real_all if r['wl_id'] and r['wl_id'] > 0})
     div_nodes, _div_skipped = verify.resolve_nodes(div_wl_ids, min_notional=5000)
+    # A retired node has no forward performance to judge -- comparing its stale real
+    # trades against a backtest replay that keeps running its dead config past archival
+    # is meaningless (found 2026-08-28, SOXL wl_id=92 rotated out at v6 promotion,
+    # 8-day-old real trades still dragged into this report with no current relevance).
+    # This intentionally means a just-promoted node has thin/no comparison data for a
+    # while -- accepted as bootstrap noise, per user's call, rather than stitching
+    # predecessor/successor history together.
+    div_nodes = {wl_id: node for wl_id, node in div_nodes.items() if not node.get("archived_at")}
     div_flagged = 0
     for wl_id, node in sorted(div_nodes.items()):
         node_real = [r for r in div_real_all if r['wl_id'] == wl_id and r['pnl_pct'] is not None]

@@ -280,6 +280,15 @@ def get_backtest_trades_in_window(node, start, end):
     trades, timestamps = get_trades_and_bars_since(node, sim_start)
     out = []
     end_bound = pd.Timestamp(end) + pd.Timedelta(days=1)
+    # A retired node's config can't have generated real trades after it was archived --
+    # without this cap, a node retired mid-window keeps accruing phantom backtest-implied
+    # trades all the way to `end`, with no real counterpart possible, silently inflating
+    # any real-vs-backtest divergence comparison (found 2026-08-28, SOXL wl_id=92).
+    archived_at = node.get("archived_at")
+    if archived_at:
+        archived_bound = (pd.Timestamp(archived_at, tz="UTC")
+                           .tz_convert("America/New_York").tz_localize(None))
+        end_bound = min(end_bound, archived_bound)
     for t in trades:
         if t["signal_i"] is None:
             continue

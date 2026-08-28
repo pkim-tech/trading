@@ -650,9 +650,21 @@ def _config_field_mismatch(field, expected, actual):
     test_config.expected_config is a free-form dict -- set_staged_test_config
     accepts anything JSON-serializable) is reported as its own mismatch
     instead of raising ValueError and taking down the rest of run_all(),
-    which has no per-check try/except (found by Opus review, 2026-07-30)."""
+    which has no per-check try/except (found by Opus review, 2026-07-30).
+
+    expected={"test_value": X, "revert_to": Y} is a documented convention
+    (.claude/skills/live-test-node-setup/SKILL.md) for staging ANY
+    deliberately-detuned field, not just starting_notional_override --
+    watch_list only ever stores the flat scalar (X), never this wrapper
+    shape, so comparing the dict itself against the column's real value
+    always false-positived as "non-numeric, could not compare" (found
+    2026-08-28, RETL/ERY staged rows). Unwrap and compare against
+    test_value; a dict without that key is genuinely not this convention
+    and still falls through to the non-numeric branch below."""
     if actual is None:
         return f"{field}: expected {expected}, actual None (field missing)"
+    if isinstance(expected, dict) and "test_value" in expected:
+        expected = expected["test_value"]
     try:
         drifted = abs(float(actual) - float(expected)) > 1e-9
     except (TypeError, ValueError):
