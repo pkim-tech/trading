@@ -97,6 +97,7 @@ import shutil
 import sqlite3
 import hashlib
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -424,7 +425,14 @@ def compute_keep_manifest(conn):
     the per-entry structure directly for fingerprinting."""
     manifest = []
     prunable_keys = set()
-    for ticker, strategy_name, version, entry_timing, fixed_sl in discover_scopes(conn):
+    scopes = discover_scopes(conn)
+    n_scopes = len(scopes)
+    t0 = time.monotonic()
+    for i, (ticker, strategy_name, version, entry_timing, fixed_sl) in enumerate(scopes, start=1):
+        elapsed = time.monotonic() - t0
+        eta = (elapsed / i) * (n_scopes - i) if i else 0
+        print(f"[keep-set {i}/{n_scopes}, {elapsed:.0f}s elapsed, ETA {eta:.0f}s] "
+              f"{ticker}/{strategy_name}/{version}/{entry_timing}")
         hp = _hp_for_strategy(strategy_name)
         candidates = candidates_for_scope(ticker, strategy_name, version, entry_timing, fixed_sl)
         if not candidates:
@@ -462,10 +470,17 @@ def compute_keep_manifest(conn):
                     conn, ticker, strategy_name, version, fixed_sl, entry_timing, island_tp, island_sl),
             })
 
-    for ticker, strategy_name, version, entry_timing, fixed_sl in discover_all_gt_scopes(conn):
+    all_scopes = discover_all_gt_scopes(conn)
+    n_all_scopes = len(all_scopes)
+    t1 = time.monotonic()
+    for i, (ticker, strategy_name, version, entry_timing, fixed_sl) in enumerate(all_scopes, start=1):
+        elapsed = time.monotonic() - t1
+        eta = (elapsed / i) * (n_all_scopes - i) if i else 0
         key = (ticker, strategy_name, version, entry_timing, fixed_sl)
         if key in prunable_keys:
             continue
+        print(f"[passthrough-scan {i}/{n_all_scopes}, {elapsed:.0f}s elapsed, ETA {eta:.0f}s] "
+              f"{ticker}/{strategy_name}/{version}/{entry_timing}")
         rowids = rowids_for_scope(conn, ticker, strategy_name, version, entry_timing, fixed_sl)
         manifest.append({
             'kind': 'passthrough_scope',
@@ -531,11 +546,14 @@ def cmd_build():
                      else create_sql)
 
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-    tables = [r[0] for r in c.fetchall()]
-    for t in tables:
-        if t == 'backtest_cache':
-            continue
-        print(f"Copying full table: {t}")
+    tables = [t for t in (r[0] for r in c.fetchall()) if t != 'backtest_cache']
+    n_tables = len(tables)
+    t_tables = time.monotonic()
+    for i, t in enumerate(tables, start=1):
+        elapsed = time.monotonic() - t_tables
+        eta = (elapsed / i) * (n_tables - i) if i else 0
+        print(f"[table copy {i}/{n_tables}, {elapsed:.0f}s elapsed, ETA {eta:.0f}s] "
+              f"Copying full table: {t}")
         conn.execute(f"INSERT INTO pruned.{t} SELECT * FROM main.{t}")
 
     print("Copying non-GT backtest_cache rows verbatim (this tool only prunes "
