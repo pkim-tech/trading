@@ -597,7 +597,26 @@ def ensure_tables():
             # a hardcoded list here would silently drop any column added by the
             # ALTER ladder above within this same ensure_tables() call on a DB
             # that hasn't been rebuilt yet (found by Opus review 2026-07-26).
-            live_cols = ', '.join(r[1] for r in c.execute("PRAGMA table_info(watch_list)"))
+            live_cols_list = [r[1] for r in c.execute("PRAGMA table_info(watch_list)")]
+            new_cols_set = {r[1] for r in c.execute("PRAGMA table_info(watch_list_new)")}
+            missing = set(live_cols_list) - new_cols_set
+            if missing:
+                # Same self-check guard as the entry_timing/fixed_sl migration below
+                # (added there 2026-08-19, a paired-review finding). This block and the
+                # paper_role block didn't get it at the time -- the exact bug class it
+                # guards against then bit both of them for real on 2026-08-26, when
+                # starting_notional_override_once got missed from their hardcoded
+                # CREATE TABLE watch_list_new lists. Extending the guard here now
+                # instead of a bare "no such column" deep inside ensure_tables() at
+                # daemon startup.
+                raise RuntimeError(
+                    f"ensure_tables() account-UNIQUE migration: live watch_list has "
+                    f"column(s) {sorted(missing)} not present in the CREATE TABLE watch_list_new "
+                    f"statement above -- that hardcoded column list is stale (likely a newer "
+                    f"ALTER TABLE ADD COLUMN was added above this block without being mirrored "
+                    f"here). Add the missing column(s) to CREATE TABLE watch_list_new before "
+                    f"retrying.")
+            live_cols = ', '.join(live_cols_list)
             c.execute(f"INSERT INTO watch_list_new ({live_cols}) SELECT {live_cols} FROM watch_list")
             c.execute("DROP TABLE watch_list")
             c.execute("ALTER TABLE watch_list_new RENAME TO watch_list")
@@ -668,7 +687,26 @@ def ensure_tables():
                            trail_sell_pct, account, paper_role)
                 );
             """)
-            live_cols = ', '.join(r[1] for r in c.execute("PRAGMA table_info(watch_list)"))
+            live_cols_list = [r[1] for r in c.execute("PRAGMA table_info(watch_list)")]
+            new_cols_set = {r[1] for r in c.execute("PRAGMA table_info(watch_list_new)")}
+            missing = set(live_cols_list) - new_cols_set
+            if missing:
+                # Same self-check guard as the entry_timing/fixed_sl migration below
+                # (added there 2026-08-19, a paired-review finding). This block and the
+                # paper_role block didn't get it at the time -- the exact bug class it
+                # guards against then bit both of them for real on 2026-08-26, when
+                # starting_notional_override_once got missed from their hardcoded
+                # CREATE TABLE watch_list_new lists. Extending the guard here now
+                # instead of a bare "no such column" deep inside ensure_tables() at
+                # daemon startup.
+                raise RuntimeError(
+                    f"ensure_tables() paper_role-UNIQUE migration: live watch_list has "
+                    f"column(s) {sorted(missing)} not present in the CREATE TABLE watch_list_new "
+                    f"statement above -- that hardcoded column list is stale (likely a newer "
+                    f"ALTER TABLE ADD COLUMN was added above this block without being mirrored "
+                    f"here). Add the missing column(s) to CREATE TABLE watch_list_new before "
+                    f"retrying.")
+            live_cols = ', '.join(live_cols_list)
             c.execute(f"INSERT INTO watch_list_new ({live_cols}) SELECT {live_cols} FROM watch_list")
             c.execute("DROP TABLE watch_list")
             c.execute("ALTER TABLE watch_list_new RENAME TO watch_list")
