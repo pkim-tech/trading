@@ -16,6 +16,7 @@ import subprocess
 import sys
 import os
 import time as time_mod
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, time as dt_time
 from pathlib import Path
 
@@ -51,6 +52,7 @@ import k1_tax
 TODAY = datetime.now().strftime('%Y-%m-%d')
 ACCOUNT_ORDER = {'brokerage': 0, 'roth': 1, 'ira': 2, 'soxl_ira': 3}
 LIVE_DB = "cache/live/trading_live.db"
+DEEP_PARITY_CACHE_PATH = Path("cache/live/deep_parity_cache.json")
 TOKEN_PATH = Path("cache/live/schwab_token.json")
 # Schwab's refresh token is a hard 7-day cap from initial interactive login (schwab_auth.py's
 # docstring); schwab-py's TokenMetadata.creation_timestamp deliberately does NOT move on a
@@ -941,11 +943,59 @@ def part2():
 PARITY_UNSUPPORTED = {'TrailingBuyZScoreBreakout', 'TrailingBothZScoreBreakout'}
 
 
+def _deep_parity_worker(ticker, wl_id, strategy, window, z_score_threshold, take_profit,
+                         sl, max_hold_hours, trail_pct):
+    """ProcessPoolExecutor worker -- must stay a plain module-level function (picklable) and
+    take only primitive args, not a `node` dict closed over from the caller. Computes and
+    returns the exact print line _deep_live_parity used to build inline; the parallelized
+    version below prints them back in original node order once all workers finish, since
+    prints can't be safely interleaved across worker processes."""
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            kt = parity.kernel_trades(ticker, strategy, window, z_score_threshold, take_profit,
+                                       sl, max_hold_hours, trail_pct=trail_pct)
+            rt = parity.replay(ticker, strategy, window, z_score_threshold, take_profit,
+                                sl, max_hold_hours, trail_pct=trail_pct)
+    except Exception as e:
+        return f"  {ticker:6s} wl_id={wl_id:4d}  NOT CHECKED -- replay failed ({e})"
+    closed = ('WIN', 'LOSS', 'TWIN', 'TLOSS')
+    kt = [t for t in kt if t['Result'] in closed]
+    rt = [t for t in rt if t['Result'] in closed]
+    first = None
+    for i in range(min(len(kt), len(rt))):
+        k, r = kt[i], rt[i]
+        if (k['Entry Time'] != r['Entry Time'] or k['Exit Time'] != r['Exit Time']
+                or k['Result'] != r['Result'] or abs(k['Return'] - r['Return']) > 1e-6):
+            first = (i, k, r)
+            break
+    if first is None and len(kt) == len(rt):
+        return f"  {ticker:6s} MATCH, {len(kt)} trades identical"
+    elif first is None:
+        return (f"  {ticker:6s} count differs (kernel {len(kt)} vs replay {len(rt)}), "
+                f"first {min(len(kt), len(rt))} identical")
+    else:
+        i, k, _ = first
+        return (f"  {ticker:6s} first mismatch #{i} entry {k['Entry Time']:%Y-%m-%d}, "
+                f"kernel {len(kt)}/replay {len(rt)} trades")
+
+
 def _deep_live_parity():
     """Plan Part 3 sub-part 3 -- live CODE vs kernel, which is a different question from the
     outcome-vs-kernel check above: it replays active_signals.py's own compute_buy_signal/
     check_sell_condition bar-by-bar against the numba kernel, so it catches silent drift
-    between the two codebases even on days with no real trades at all."""
+    between the two codebases even on days with no real trades at all.
+
+    The per-node kernel_trades()/replay() pair is the dominant cost of the whole evening
+    report (timed 2026-08-28: 187.98s of ~233s total 4-part run, vs 19.13s with
+    --skip-deep-parity) -- each node's compute is fully independent (no shared state), so
+    it's parallelized via ProcessPoolExecutor (matching this project's sweep-worker-pool
+    convention, see run_optimization_sweep.py), and same-day results are cached to
+    DEEP_PARITY_CACHE_PATH so a later same-day invocation just reads and prints them instead
+    of recomputing. Only real_capital_nodes()'s cheap DB query and the unsupported-strategy
+    listing stay uncached/recomputed fresh every call. Caching same-day is safe because the
+    16:05 EOD cron run happens after the 16:00 close -- nothing about that day's trade/
+    position state changes after that (confirmed with user, 2026-08-28)."""
     print("\n--- 4. Live CODE vs kernel (scripts/verify_live_parity.py bar-by-bar replay) ---")
     if '--skip-deep-parity' in sys.argv:
         print("NOT CHECKED this run (--skip-deep-parity passed)")
@@ -972,40 +1022,48 @@ def _deep_live_parity():
     # to filter by "did the index move."
     print("(a MATCH here is the expected outcome now -- a mismatch is real, not noise; "
           "investigate it directly)")
-    for n in supported:
-        uses_fixed = strategies.uses_fixed_sl(n['strategy'])
-        sl = (n.get('fixed_sl') if uses_fixed else n.get('stop_loss')) or 0
+
+    node_keys = sorted(f"{n['ticker']}:{n['id']}" for n in supported)
+    cache = None
+    if '--refresh-parity' not in sys.argv and DEEP_PARITY_CACHE_PATH.exists():
         try:
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                kt = parity.kernel_trades(n['ticker'], n['strategy'], n['window'],
-                                          n['z_score_threshold'], n['take_profit'], sl,
-                                          n['max_hold_hours'], trail_pct=n.get('trail_sell_pct'))
-                rt = parity.replay(n['ticker'], n['strategy'], n['window'],
-                                   n['z_score_threshold'], n['take_profit'], sl,
-                                   n['max_hold_hours'], trail_pct=n.get('trail_sell_pct'))
-        except Exception as e:
-            print(f"  {n['ticker']:6s} wl_id={n['id']:4d}  NOT CHECKED -- replay failed ({e})")
-            continue
-        closed = ('WIN', 'LOSS', 'TWIN', 'TLOSS')
-        kt = [t for t in kt if t['Result'] in closed]
-        rt = [t for t in rt if t['Result'] in closed]
-        first = None
-        for i in range(min(len(kt), len(rt))):
-            k, r = kt[i], rt[i]
-            if (k['Entry Time'] != r['Entry Time'] or k['Exit Time'] != r['Exit Time']
-                    or k['Result'] != r['Result'] or abs(k['Return'] - r['Return']) > 1e-6):
-                first = (i, k, r)
-                break
-        if first is None and len(kt) == len(rt):
-            print(f"  {n['ticker']:6s} MATCH, {len(kt)} trades identical")
-        elif first is None:
-            print(f"  {n['ticker']:6s} count differs (kernel {len(kt)} vs replay {len(rt)}), "
-                  f"first {min(len(kt), len(rt))} identical")
-        else:
-            i, k, _ = first
-            print(f"  {n['ticker']:6s} first mismatch #{i} entry {k['Entry Time']:%Y-%m-%d}, "
-                  f"kernel {len(kt)}/replay {len(rt)} trades")
+            cache = json.loads(DEEP_PARITY_CACHE_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            cache = None
+        if cache and (cache.get('date') != TODAY or sorted(cache.get('node_keys', [])) != node_keys):
+            cache = None  # different day, or the live node set changed since -- recompute
+
+    if cache is not None:
+        print(f"(cached from {cache['computed_at']})")
+        for line in cache['lines']:
+            print(line)
+        return
+
+    lines_by_ticker = {}
+    max_workers = min(len(supported), os.cpu_count() or 4)
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for n in supported:
+            uses_fixed = strategies.uses_fixed_sl(n['strategy'])
+            sl = (n.get('fixed_sl') if uses_fixed else n.get('stop_loss')) or 0
+            fut = pool.submit(_deep_parity_worker, n['ticker'], n['id'], n['strategy'],
+                               n['window'], n['z_score_threshold'], n['take_profit'], sl,
+                               n['max_hold_hours'], n.get('trail_sell_pct'))
+            futures[fut] = n['ticker']
+        for fut in as_completed(futures):
+            lines_by_ticker[futures[fut]] = fut.result()
+
+    lines = [lines_by_ticker[n['ticker']] for n in supported]
+    for line in lines:
+        print(line)
+
+    DEEP_PARITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DEEP_PARITY_CACHE_PATH.write_text(json.dumps({
+        'date': TODAY,
+        'computed_at': datetime.now().strftime('%H:%M:%S'),
+        'node_keys': node_keys,
+        'lines': lines,
+    }))
 
 
 def part3():
