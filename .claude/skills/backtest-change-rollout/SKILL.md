@@ -135,22 +135,23 @@ Distinct from `verify_trailing_buy_resolution.py`/
 approximation quality against finer-grained (5-min bar) data -- not whether
 the live/paper code paths independently reimplement the changed logic.
 
-## Critical: never launch the campaign yourself
+## Launching the campaign
 
-**Preparing the queue script/config and running it are two different asks.**
-Building `run_sweep_queue.sh`, computing the storage forecast, or discussing
-scope is not authorization to execute it -- confirming scope/design in
-conversation is not authorization either. **The user runs these campaigns
-themselves, in their own shell, always** -- this mirrors the existing
-`run_backfill_queue.sh` convention ("meant to be run directly by the user in
-their own terminal ... not launched by an agent, to avoid config.json races
-with any other in-flight run"). Present the exact command plus the storage/
-time forecast, then stop. Do not run it in the background "to save the user
-a step" even after a scoping discussion looks settled -- wait for an
-explicit "run it" / "go ahead" on the actual execution, separate from
-agreeing on scope. If a campaign is already running and needs to change, say
-so and let the user decide whether to interrupt it -- don't kill or relaunch
-sweep processes unilaterally either.
+**Standing rule relaxed 2026-08-28**: the agent may now launch a sweep
+campaign itself (schema-v2 in-memory flow, or the full `run_sweep_queue.sh`/
+`run_optimization_sweep.py` queue) after confirming non-destructiveness --
+every write is `INSERT OR REPLACE` keyed on the sweep's own param-tuple PK,
+the only `DROP TABLE backtest_cache` calls are guarded one-time schema
+migrations that no longer fire against the current (already-migrated)
+schema, and `run_sweep_queue.sh` backs up/restores `config.json` via a
+`trap ... EXIT`. Originally restricted because the user was manually tailing
+sweep logs for an early preview faster than querying through the agent --
+no longer the bottleneck now that querying is fast. Still applies
+unconditionally: never touch the real destructive tools
+(`prune_backtest_cache*.py`) without the `prune-validation` skill's gate,
+and if a campaign is already running and needs to change, say so and let the
+user decide whether to interrupt it -- don't kill or relaunch sweep
+processes unilaterally.
 
 ## Gotchas already found and fixed
 
