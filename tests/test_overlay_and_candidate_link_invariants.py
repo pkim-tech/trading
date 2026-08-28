@@ -12,6 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -219,7 +220,24 @@ def test_traceability_checks_excluded_from_run_all(env):
     assert signals_invariants.check_live_overlay_missing_validation_link in signals_invariants.TRACEABILITY_CHECKS
 
     node = _add_live_node('RUNALLSCOPE')
-    assert not any(f"wl_id={node['id']}" in v for v in signals_invariants.run_all()), (
-        "an unlinked live node must not appear in run_all()'s output"
+    # check_market_data_freshness (2026-08-28, real CHECKS member as of
+    # yesterday's session) reads cache/research/{ticker}_1h.csv directly off
+    # disk, unrelated to this test's tmp-DB isolation -- a synthetic ticker
+    # with no real cache file would otherwise legitimately fail that check
+    # too, which isn't what this test is regression-testing (that's the
+    # freshness check's own job, covered by its own test elsewhere). Give it
+    # a fresh, current bar so only the traceability-link gap under test can
+    # produce a wl_id match here.
+    csv_path = Path('cache/research/RUNALLSCOPE_1h.csv')
+    csv_path.write_text(
+        "Datetime,Close,High,Low,Open,Volume\n"
+        f"{pd.Timestamp.now(tz='America/New_York').tz_localize(None).normalize() + pd.Timedelta(hours=9, minutes=30)},"
+        "10.0,10.1,9.9,10.0,1000000\n"
     )
+    try:
+        assert not any(f"wl_id={node['id']}" in v for v in signals_invariants.run_all()), (
+            "an unlinked live node must not appear in run_all()'s output"
+        )
+    finally:
+        csv_path.unlink(missing_ok=True)
     assert any(f"wl_id={node['id']}" in v for v in signals_invariants.run_traceability_checks())

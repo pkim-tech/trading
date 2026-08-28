@@ -522,9 +522,14 @@ def load_seconds(ticker, path_override=None):
     float32 downcast PER CHUNK, before it ever joins the list -- each retained
     chunk is already trimmed to ~1/3 the rows (regular session only) and the 4
     needed OHLC columns at half the per-value width, so the final concat's peak
-    is a small fraction of the original. Output is unchanged (same columns/dtype
-    values within float32 precision, same index) -- this is a memory fix only, not
-    a behavior change to what simulate() receives."""
+    is a small fraction of the original. Correction (2026-08-28, paired-review
+    LOW finding): this IS a real, small precision change, not "no behavior
+    change" as an earlier version of this docstring claimed -- float32 has
+    ~7 significant decimal digits vs float64's ~15, so a price value can shift
+    by a sub-cent amount relative to reading the same CSV at float64. Real
+    values stay well within float32 precision for OHLC price data at this
+    magnitude, but simulate() receives float32-rounded prices, not the exact
+    float64 values a naive read would produce."""
     import subprocess
     import time as _time
     path = path_override or os.path.join(SECOND_DIR, f"{ticker}_1s.csv")

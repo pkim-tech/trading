@@ -168,6 +168,35 @@ def check_live_node_missing_account():
     return violations
 
 
+def _last_completed_trading_day(today):
+    """NYSE-calendar-aware replacement for pd.bdate_range(end=today, periods=2)[0]
+    -- holiday-aware (2026-08-28 fix: pd.bdate_range only knows weekends, not
+    market holidays, so the day after any real NYSE holiday would produce a
+    guaranteed false 'stale' violation on both freshness checks below). Reuses
+    the same NYSE calendar this project already depends on for schwab_safety.
+    _is_trading_day, instead of pulling in a second holiday-calendar source
+    of truth.
+
+    NOT byte-identical semantics to the old bdate_range call on a non-trading
+    day (paired-review finding, 2026-08-28): when today itself isn't a real
+    session, this returns the MOST RECENT real session (e.g. Saturday now
+    requires data through Friday), whereas bdate_range(end=today, periods=2)[0]
+    returned the session BEFORE that (Saturday required only through Thursday).
+    Arguably the more correct behavior (a weekend check shouldn't be looser
+    than a weekday one), but a real, deliberate behavior change beyond pure
+    holiday-awareness -- noting it here since the old docstring wrongly
+    claimed no semantic change.
+
+    20-day lookback (not 10) so sessions[-2] can't IndexError even under an
+    unusually long real closure (comfortably wider than any NYSE closure on
+    record, e.g. 9/11's 4 trading days)."""
+    import pandas as pd
+    sessions = schwab_safety._NYSE_CAL.schedule(
+        start_date=today - pd.Timedelta(days=20), end_date=today
+    ).index.tz_localize(None).normalize()
+    return sessions[-2] if sessions[-1] == today else sessions[-1]
+
+
 def check_market_data_freshness():
     """Every real capital-at-stake ticker's cache/research/{ticker}_1h.csv should be
     current through the last real completed trading day -- staleness here silently
@@ -191,8 +220,7 @@ def check_market_data_freshness():
     import pandas as pd
     violations = []
     today = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
-    last_bday = pd.bdate_range(end=today, periods=2)[0]  # yesterday's business day, or
-                                                           # today if today isn't one
+    last_bday = _last_completed_trading_day(today)
     for node in db.get_watchlist():
         if not helpers.has_capital_at_stake(node):
             continue
@@ -233,7 +261,7 @@ def check_massive_hourly_derived_freshness():
     import db_cache
     violations = []
     today = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
-    last_bday = pd.bdate_range(end=today, periods=2)[0]
+    last_bday = _last_completed_trading_day(today)
     with sqlite3.connect(db_cache.DB_PATH) as conn:
         for node in db.get_watchlist():
             if not helpers.has_capital_at_stake(node):
@@ -998,6 +1026,29 @@ CHECKS = [
     check_addon_drought_live_nodes_have_coherent_account_type,
     check_all_account_values_are_known_aliases,
     check_market_data_freshness,
+]
+
+# DATA_FRESHNESS_CHECKS: deliberately NOT in CHECKS/run_all() (2026-08-28,
+# found real: massive_hourly_derived currently has no automated nightly
+# refresh -- see docs/backlog_cache.md -- so this check would surface ~14
+# already-known violations on EVERY run_all() call (daemon startup, 07:00,
+# EOD, and this module's own pre-commit sys.exit(1) gate) until that refresh
+# cron actually exists. Same shape and same fix as TRACEABILITY_CHECKS above:
+# a real, known, not-yet-fixed gap shouldn't permanently hard-block commits or
+# page Slack 3x/day. Run standalone (this module's __main__, below) so a
+# human running the documented pre-commit check still sees it, clearly
+# separated and non-blocking. Re-fold into CHECKS once the refresh cron
+# exists and it genuinely passes clean.
+#
+# check_market_data_freshness (the yahoo-sourced sibling) deliberately stays
+# in CHECKS, not here -- paired-review finding, 2026-08-28: it's currently
+# CLEAN (0 violations, confirmed live), and it's the exact independent cross-
+# check whose own docstring says it's meant to catch the next false-PHANTOM
+# incident (the 2026-08-27 DPST one this pair of checks was built for). The
+# original carve-out bundled both checks together, but only the massive-side
+# one is actually noisy right now -- carving the clean one out too would have
+# silently dropped real, non-noisy, automatic Slack coverage for no reason.
+DATA_FRESHNESS_CHECKS = [
     check_massive_hourly_derived_freshness,
 ]
 
@@ -1031,9 +1082,23 @@ TRACEABILITY_CHECKS = [
 
 
 def run_all():
+    """Per-check isolation (2026-08-28, found real: no isolation existed --
+    if a single check's own query raised (e.g. a table missing on some DB),
+    the whole run_all() call would raise uncaught, silently killing every
+    OTHER check too -- daemon startup/07:00/EOD callers all wrap this in
+    _guarded, so a raised exception here would have looked identical to "zero
+    violations found", the worst possible failure mode for a safety check).
+    A check that raises now surfaces as its own violation string (so it's
+    visible, loud, and doesn't block the other 16+ checks from still
+    running) instead of aborting the whole pass."""
     violations = []
     for check in CHECKS:
-        violations.extend(check())
+        try:
+            violations.extend(check())
+        except Exception as e:
+            violations.append(f"{check.__name__} raised {type(e).__name__}: {e} "
+                               f"-- this check itself is broken, treat as a violation "
+                               f"until fixed (other checks still ran).")
     return violations
 
 
@@ -1041,6 +1106,22 @@ def run_traceability_checks():
     violations = []
     for check in TRACEABILITY_CHECKS:
         violations.extend(check())
+    return violations
+
+
+def run_data_freshness_checks():
+    """Same per-check isolation as run_all() (2026-08-28, paired-review finding:
+    an uncaught exception here would crash __main__ with a non-zero exit before
+    reaching the 'All invariants hold.' verdict line, contradicting this carve-
+    out's own stated 'does NOT affect the sys.exit(1) exit code' guarantee)."""
+    violations = []
+    for check in DATA_FRESHNESS_CHECKS:
+        try:
+            violations.extend(check())
+        except Exception as e:
+            violations.append(f"{check.__name__} raised {type(e).__name__}: {e} "
+                               f"-- this check itself is broken, treat as a violation "
+                               f"until fixed (other checks still ran).")
     return violations
 
 
@@ -1062,6 +1143,16 @@ if __name__ == "__main__":
             print(f"  - {v}")
     else:
         print("No traceability gaps.")
+
+    print()
+    freshness_gaps = run_data_freshness_checks()
+    if freshness_gaps:
+        print(f"{len(freshness_gaps)} data freshness gap(s) (non-blocking until the "
+              f"massive_hourly_derived refresh cron exists):")
+        for v in freshness_gaps:
+            print(f"  - {v}")
+    else:
+        print("No data freshness gaps.")
 
     if found:
         sys.exit(1)
