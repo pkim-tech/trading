@@ -757,6 +757,20 @@ def run_loop(tickers: set = None):
     ensure_tables()
     schwab_safety.sync_automation_scope()
 
+    # Moved here from just before "Signal monitor started" below (found
+    # 2026-08-28: every startup diagnostic above that point -- sim_mode_check,
+    # signals_invariants.run_all(), print_all_live_node_state, the startup EOD
+    # closures -- printed only to sys.__stdout__, never reaching logs/
+    # active_signals.log at all, since the Tee redirect used to happen after
+    # all of them ran. The real invariant/sim_mode violations still reached
+    # Slack (that path doesn't depend on stdout), but anyone checking the log
+    # file itself for "what did startup find" saw nothing. buffering=1
+    # (line-buffered) -- see the comment this block used to sit under, same
+    # reasoning (console output must not block-buffer on a non-tty).
+    human_fh = open(HUMAN_LOG_PATH, "a", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, human_fh)
+    sys.stderr = _Tee(sys.__stderr__, human_fh)
+
     # SIM_MODE must be off for a genuine daemon run (see os.environ.setdefault
     # at the top of this file, and signals_config's fail-safe SIM_MODE default,
     # 2026-08-01). Not part of signals_invariants.run_all() below -- that
@@ -838,15 +852,8 @@ def run_loop(tickers: set = None):
         _run_startup_eod_report("eod_scenario_review[startup]", "startup EOD scenario review",
                                  build_eod_scenario_review)
 
-    # buffering=1 (line-buffered) -- without it this file object block-buffers
-    # since it's not a tty, so console output (including any Slack post error)
-    # can sit invisible on disk for a long time; found 2026-07-22 debugging a
-    # live missing-report incident where the file's mtime was frozen for 10+
-    # minutes while the daemon was demonstrably still looping (heartbeat proved
-    # it), making the buffered output useless for real-time diagnosis.
-    human_fh = open(HUMAN_LOG_PATH, "a", buffering=1)
-    sys.stdout = _Tee(sys.__stdout__, human_fh)
-    sys.stderr = _Tee(sys.__stderr__, human_fh)
+    # human_fh/stdout+stderr Tee setup now happens at the top of run_loop()
+    # (see the comment there) so startup diagnostics land in the log file too.
     verbose_fh = open(VERBOSE_LOG_PATH, "a")
 
     ticker_label = ",".join(sorted(tickers)) if tickers else "all"
