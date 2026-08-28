@@ -385,6 +385,64 @@ def _part2_activity(nodes):
         print(f"  {ts}  {line}")
 
 
+def _cheap_signal_cross_check(ticker, signal_or_entry_time_str, window, z_score_threshold, entry_timing):
+    """Independent, lightweight cross-check for a real PHANTOM flag -- computes the
+    real prior-day SMA/Std/band directly from cache/research/{ticker}_1h.csv (the
+    daily-collector-refreshed CSV, current through today -- NOT massive_hourly_
+    derived, which has no automated refresh and silently went 4 real trading days
+    stale, 2026-08-27) and checks whether the real bar genuinely breached it.
+
+    Caller MUST pass trade_log.signal_time when available, entry_time only as a
+    fallback (2026-08-28 fix, paired-review CONFIRMED HIGH finding): for
+    TrailingBothZScoreBreakout (broker-tracked trailing-buy bounce fill), the real
+    fill routinely lands 1+ hourly bars after the real signal bar -- passing
+    entry_time reads the WRONG bar for the majority of real live nodes (10/17 are
+    this strategy). signal_time is already a real bar-owning timestamp, no
+    bucketing ambiguity.
+
+    Built 2026-08-27 after a real false-PHANTOM incident on DPST: Part 3's kernel
+    replay silently succeeded on stale data (never erroring, so the RuntimeError
+    staleness guard never caught it) and reported a real, correct trade as a
+    PHANTOM. A conditional 'run this only when something looks wrong' design
+    wouldn't have caught that case either -- Part 3 never signaled anything was
+    wrong. So this runs unconditionally for every real PHANTOM flag, not as a
+    fallback gated on an explicit failure.
+
+    Returns (breached: bool, detail: str) or (None, reason) if it can't check
+    (e.g. CSV itself missing/stale, or entry_time isn't a real bar-owning hour)."""
+    import pandas as pd
+    try:
+        df_h = pd.read_csv(f"cache/research/{ticker}_1h.csv", index_col=0, parse_dates=True)
+    except FileNotFoundError:
+        return None, f"no cache/research/{ticker}_1h.csv on file"
+    entry_ts = pd.Timestamp(signal_or_entry_time_str)
+    bar_ts = entry_ts.floor("h") - pd.Timedelta(minutes=30) if entry_ts.minute < 30 \
+        else entry_ts.floor("h") + pd.Timedelta(minutes=30)
+    if df_h.index.max() < entry_ts.normalize():
+        return None, f"_1h.csv itself is stale (last bar {df_h.index.max()}, entry was {entry_ts})"
+    if bar_ts not in df_h.index:
+        return None, f"no {bar_ts} bar in _1h.csv (holiday/half-day/data gap?)"
+    daily = df_h.resample("D").last().dropna(subset=["Close"])
+    sma = daily["Close"].rolling(window).mean().shift(1)
+    std = daily["Close"].rolling(window).std().shift(1)
+    day = bar_ts.normalize()
+    if day not in sma.index or pd.isna(sma.loc[day]) or pd.isna(std.loc[day]):
+        return None, f"insufficient prior-day history for a real {window}-day SMA/Std as of {day}"
+    lower_band = sma.loc[day] - z_score_threshold * std.loc[day]
+    bar = df_h.loc[bar_ts]
+    if isinstance(bar, pd.DataFrame):
+        return None, f"duplicate {bar_ts} rows in _1h.csv -- can't pick one unambiguously"
+    check_price = bar["Open"] if entry_timing == "open_check" else bar["Close"]
+    if pd.isna(check_price):
+        return None, f"bar={bar_ts} has no real {'Open' if entry_timing == 'open_check' else 'Close'} " \
+                      f"(empty/no-trade bar) -- NaN can't be compared against the band, not a real no-breach"
+    breached = check_price <= lower_band
+    return breached, (f"bar={bar_ts} {'Open' if entry_timing == 'open_check' else 'Close'}="
+                       f"${check_price:.2f} vs lower_band=${lower_band:.2f} "
+                       f"(SMA={sma.loc[day]:.2f} Std={std.loc[day]:.2f} z={z_score_threshold}) "
+                       f"-> {'REAL BREACH' if breached else 'no breach'}")
+
+
 def _part2_daily_sweep(nodes, node_state):
     """Sub-part, added 2026-08-26 after the real SOXL/DPST/DFEN investigation (see
     docs/research_log.md's 2026-08-26 entries): cheap, routine, per-node/per-day check,
@@ -1303,6 +1361,20 @@ def part3():
         print(f"  {node['ticker']:6s} {node['account'] or '':10s} wl_id={wl_id:4d}  {flag}")
         for r in genuine:
             print(f"      PHANTOM: entry={r['entry_time']} exit_reason={r['exit_reason']}")
+            # Always run, not gated on Part 3's own check having errored -- see
+            # _cheap_signal_cross_check's own docstring for why (it can silently
+            # succeed on stale data instead of raising).
+            breached, detail = _cheap_signal_cross_check(
+                node['ticker'], r.get('signal_time') or r['entry_time'],
+                node['window'], node['z'], node['entry_timing'])
+            if breached is None:
+                print(f"        cross-check: UNABLE TO VERIFY ({detail})")
+            elif breached:
+                print(f"        cross-check: REAL signal confirmed independently ({detail}) "
+                      f"-- likely a stale-kernel-data false PHANTOM, not a real divergence")
+            else:
+                print(f"        cross-check: NO real breach found ({detail}) "
+                      f"-- this PHANTOM looks genuine, worth investigating")
         for t in unmatched_bt:
             print(f"      MISSED : kernel entry={t['entry_time']}")
         # Magnitude, pure reporting (2026-08-26, folded in from the trace-tool dispatch)

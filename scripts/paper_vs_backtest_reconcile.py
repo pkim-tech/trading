@@ -125,13 +125,15 @@ def get_trades_and_bars_since_ground_truth(node, sim_start):
     if node["strategy"] not in ("TrailingBothZScoreBreakout", "TrailingExitZScoreBreakout"):
         raise ValueError(f"unhandled strategy {node['strategy']}")
 
-    version = node.get("version") or ""
-    data_source = "massive" if "-massive" in version else "yahoo"
-    if data_source == "massive":
-        import db_cache
-        df_h = db_cache.get_massive_hourly_ohlcv(node["ticker"])
-    else:
-        df_h = load_hourly(node["ticker"])
+    # yahoo fully retired project-wide (2026-08-27) -- massive is the only real data
+    # source now. Previously conditioned on '-massive' being present in node['version'],
+    # but only 2 of 14 real live nodes ever carried that marker (ETHU/OILU); the other
+    # 12 have plain version='v6' and were silently falling through to the dead yahoo
+    # path, causing every real evening_status.py Part 3 "Live vs kernel" check for them
+    # to fail with a stale-data RuntimeError.
+    data_source = "massive"
+    import db_cache
+    df_h = db_cache.get_massive_hourly_ohlcv(node["ticker"])
     df_daily = df_h.resample("D").last().dropna(subset=["Close"])
     ind = build_indicators(node["strategy"], df_daily, node["window"])
     open_check = node["entry_timing"] == "open_check"

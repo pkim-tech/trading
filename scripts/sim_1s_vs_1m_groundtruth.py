@@ -511,7 +511,20 @@ def load_seconds(ticker, path_override=None):
     """Regular-session (09:30:00-15:59:59 ET) 1-second bars from the Massive.com
     second-data cache, tz-naive ET index. Chunked read + progress reporting, same
     pattern as the retired sim_1m_vs_1s_walk.py (a multi-GB single-shot pd.read_csv
-    gives zero output for minutes -- see long-job-launch skill)."""
+    gives zero output for minutes -- see long-job-launch skill).
+
+    Memory fix (2026-08-27, design discussion): the original version accumulated
+    RAW chunks (8 columns incl. Volume/VWAP/NumTrades we never use, float64, full
+    24h incl. extended hours) then did session-filter/column-select/dtype AFTER a
+    single pd.concat() -- that concat briefly needs ~2x the final size (the chunk
+    list + the new combined frame coexisting) on top of carrying ~2x the columns
+    and precision actually needed. Fixed by doing session-filter + column-select +
+    float32 downcast PER CHUNK, before it ever joins the list -- each retained
+    chunk is already trimmed to ~1/3 the rows (regular session only) and the 4
+    needed OHLC columns at half the per-value width, so the final concat's peak
+    is a small fraction of the original. Output is unchanged (same columns/dtype
+    values within float32 precision, same index) -- this is a memory fix only, not
+    a behavior change to what simulate() receives."""
     import subprocess
     import time as _time
     path = path_override or os.path.join(SECOND_DIR, f"{ticker}_1s.csv")
@@ -519,20 +532,20 @@ def load_seconds(ticker, path_override=None):
                        .stdout.split()[0]) - 1
     t0 = _time.time()
     chunks, rows_read = [], 0
-    for chunk in pd.read_csv(path, chunksize=2_000_000):
-        chunks.append(chunk)
+    for chunk in pd.read_csv(path, chunksize=2_000_000,
+                              usecols=["timestamp", "Open", "High", "Low", "Close"]):
+        ts = pd.to_datetime(chunk["timestamp"], utc=True).dt.tz_convert("US/Eastern").dt.tz_localize(None)
+        chunk = chunk.set_index(ts)[["Open", "High", "Low", "Close"]].astype("float32")
+        t = chunk.index.time
+        keep = (t >= pd.Timestamp("09:30").time()) & (t < pd.Timestamp("16:00").time())
+        chunks.append(chunk.loc[keep])
         rows_read += len(chunk)
         elapsed = _time.time() - t0
         rate = rows_read / elapsed if elapsed else 0
         eta = (total_lines - rows_read) / rate if rate > 0 else float("nan")
         print(f"  [load 1s] {rows_read:,}/{total_lines:,} ({100*rows_read/total_lines:.0f}%) "
               f"elapsed={elapsed:.1f}s eta={eta:.1f}s")
-    df = pd.concat(chunks, ignore_index=True)
-    ts = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("US/Eastern").dt.tz_localize(None)
-    df = df.set_index(ts).sort_index()[["Open", "High", "Low", "Close"]]
-    t = df.index.time
-    keep = (t >= pd.Timestamp("09:30").time()) & (t < pd.Timestamp("16:00").time())
-    return df.loc[keep]
+    return pd.concat(chunks).sort_index()
 
 
 def resample_seconds_to_minutes(df_1s):

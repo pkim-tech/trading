@@ -13,6 +13,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import signals_db as db
+import signals_helpers as helpers
 import schwab_safety
 
 
@@ -164,6 +165,101 @@ def check_live_node_missing_account():
                 f"{node['ticker']} (wl_id={node['id']}) is state={node['state']!r} with account=None -- "
                 f"check_order will fail closed as 'unknown account' for every order attempt."
             )
+    return violations
+
+
+def check_market_data_freshness():
+    """Every real capital-at-stake ticker's cache/research/{ticker}_1h.csv should be
+    current through the last real completed trading day -- staleness here silently
+    corrupts any check that reads it directly, AND (found 2026-08-27, real DPST
+    incident) a SEPARATE cache (massive_hourly_derived, no automated refresh) can go
+    stale in a way that doesn't raise -- evening_status.py Part 3's kernel replay
+    silently succeeded on 4-day-stale massive data and reported a real, correct live
+    trade as a false PHANTOM. This check can only cover _1h.csv (massive_hourly_
+    derived isn't a flat file, needs its own DB-side freshness check -- not built
+    here, flagged as a real follow-up in docs/backlog_cache.md), but it's the same
+    failure shape: don't wait to discover staleness ad hoc inside a report's error
+    path, check it as a standing invariant instead.
+
+    _1h.csv is genuinely yahoo-sourced (data_collector.py's fetch_live_data_smart,
+    confirmed directly, 2026-08-27) -- NOT stale/leftover yahoo, deliberate design
+    (build_massive_hourly_derived.py's own docstring: "Yahoo hourly stays completely
+    separate, used only as an independent audit signal, never consumed directly").
+    That's actually what makes it a genuinely independent cross-check against a
+    massive-sourced kernel replay, not a same-source self-check that couldn't catch
+    a massive-specific data bug."""
+    import pandas as pd
+    violations = []
+    today = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
+    last_bday = pd.bdate_range(end=today, periods=2)[0]  # yesterday's business day, or
+                                                           # today if today isn't one
+    for node in db.get_watchlist():
+        if not helpers.has_capital_at_stake(node):
+            continue
+        path = f"cache/research/{node['ticker']}_1h.csv"
+        try:
+            # NOT usecols=[0] -- a 1-column read (index_col=0 + usecols=[0]) leaves
+            # zero real columns, and pandas' .empty checks BOTH axes, so a real,
+            # populated index still reads as empty=True (caught live building this
+            # check, 2026-08-27 -- read the real columns, check len() not .empty).
+            df = pd.read_csv(path, index_col=0, parse_dates=True)
+        except FileNotFoundError:
+            violations.append(f"{node['ticker']} (wl_id={node['id']}): no {path} on file at all")
+            continue
+        if len(df) == 0 or df.index.max().normalize() < last_bday:
+            last = df.index.max() if len(df) else "empty file"
+            violations.append(f"{node['ticker']} (wl_id={node['id']}): {path} stale "
+                               f"(last bar {last}, need >= {last_bday.date()})")
+    return violations
+
+
+def check_massive_hourly_derived_freshness():
+    """Sibling to check_market_data_freshness (_1h.csv/yahoo) -- covers the OTHER real
+    data source, massive_hourly_derived (the DB-backed cache evening_status.py Part 3's
+    kernel replay actually reads for GT nodes). Real incident, 2026-08-27: this cache
+    went 4 real trading days stale with zero automated refresh, and because the
+    staleness guard inside get_trades_and_bars_since_ground_truth only checks MINUTE
+    data (not hourly), the kernel replay silently succeeded on stale hourly data
+    instead of raising -- producing a false PHANTOM flag on a real, correct DPST trade
+    rather than a loud error. check_market_data_freshness's yahoo-sourced cross-check
+    catches this AFTER the fact, per-PHANTOM; this check exists to catch it BEFORE
+    anything reads the stale cache at all, same as _1h.csv's own check.
+
+    Cheap: MAX(ts) per ticker's current build, not a full DataFrame load (this DB has
+    60M+ raw rows across all tickers/builds -- loading full OHLCV per ticker here would
+    be real, avoidable cost for a check that only needs one timestamp)."""
+    import sqlite3
+    import pandas as pd
+    import db_cache
+    violations = []
+    today = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
+    last_bday = pd.bdate_range(end=today, periods=2)[0]
+    with sqlite3.connect(db_cache.DB_PATH) as conn:
+        for node in db.get_watchlist():
+            if not helpers.has_capital_at_stake(node):
+                continue
+            ticker = node['ticker']
+            row = conn.execute("""
+                SELECT MAX(d.ts) FROM massive_hourly_derived_builds b
+                JOIN massive_hourly_derived d ON d.ticker=b.ticker AND d.build_id=b.id
+                WHERE b.ticker=? AND b.id = (
+                    SELECT b2.id FROM massive_hourly_derived_builds b2
+                    WHERE b2.ticker=b.ticker AND EXISTS (
+                        SELECT 1 FROM massive_hourly_derived d2
+                        WHERE d2.ticker=b2.ticker AND d2.build_id=b2.id
+                    )
+                    ORDER BY b2.id DESC LIMIT 1
+                )
+            """, (ticker,)).fetchone()
+            last_ts = row[0] if row else None
+            if last_ts is None:
+                violations.append(f"{ticker} (wl_id={node['id']}): no massive_hourly_derived "
+                                   f"build with real rows on file at all")
+                continue
+            last_dt = pd.Timestamp(last_ts).normalize()
+            if last_dt < last_bday:
+                violations.append(f"{ticker} (wl_id={node['id']}): massive_hourly_derived stale "
+                                   f"(last bar {last_ts}, need >= {last_bday.date()})")
     return violations
 
 
@@ -901,6 +997,8 @@ CHECKS = [
     check_staged_config_matches_expected,
     check_addon_drought_live_nodes_have_coherent_account_type,
     check_all_account_values_are_known_aliases,
+    check_market_data_freshness,
+    check_massive_hourly_derived_freshness,
 ]
 
 # TRACEABILITY_CHECKS: deliberately NOT in CHECKS/run_all() (2026-08-19,

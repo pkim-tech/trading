@@ -242,6 +242,37 @@ consumer (report, prune, sweep) call that single definition -- not re-derive it.
 of that single definition not yet started; flagged here so it's a stated requirement of the
 rebuild, not an afterthought once the phase tables exist.
 
+## New Phase3: second-level granularity/drift check on Phase2.5's winners (raised 2026-08-27)
+
+Real motivation: prior second-level-vs-kernel divergence work (SOXL/HIBL, `docs/research_log.md`
+2026-08-21) generalized from a single production node -- weak sample size for characterizing
+whether/how the kernel systematically diverges from real tick-level execution. This design's
+own benchmark work (`scripts/bench_phase1_phase2_inmemory.py`) now produces a much larger real
+population per campaign (Phase2.5's full cliff-box, ~800 cells/scope, not just the 9 final
+winners) at negligible cost, so the same second-level check can run against a far wider sample
+instead of n=1.
+
+**Where it sits**: after Phase2.5, before Phase4 (overlay). Not part of Phase1/Phase2's bulk
+search (infeasible at 150K-300K+ cells) -- scoped to Phase2.5's small output only, matching every
+other "compute broadly is cheap, verify narrowly" pattern this design already uses (the top-100
+insurance snapshot, `worst_neighbor_cagr`, the trade-rebuild tool).
+
+**Real efficiency available, not yet verified**: entry timing is driven purely by the
+`(window, z)` signal trigger -- independent of TP/SL/hold/trail_pct -- so across many parameter
+variations sharing the same `(window, z)`, entry fills are heavily duplicated. Deduping entry
+checks to unique `(entry_time)` values before the second-level lookup should cut real
+verification work substantially without losing node-level coverage on the exit side (which
+genuinely does vary per node). Not confirmed against real data yet.
+
+**Data**: no fresh pull needed for SOXL -- `cache/research/second_data/SOXL_1s.csv` already
+covers the full real campaign window (2021-08-25 to 2026-08-24, 29.1M rows, 2.7GB, fetched
+2026-08-24). Other tickers would need the same real per-ticker check before assuming coverage.
+
+Not built yet. See the Search Completeness Audit section above for the deliberately-unrelated
+periodic full-mesh check this must not be conflated with -- that answers "did the search miss a
+better node," this answers "does the kernel's prediction for the nodes it DID find match real
+tick-level execution."
+
 ## Open, deferred out of this design
 
 - **KORU "upswing-watch" as a real swept strategy** (own `sma_short_days`/`sma_long_days`/
@@ -267,7 +298,14 @@ rebuild, not an afterthought once the phase tables exist.
   works for `node_key`, the fuller contract just does more (sweep-grid auto-build, UI rendering)
   that isn't needed to unblock this design specifically.
 
-## Periodic validation: full-mesh spot-check (raised 2026-08-25, settled shape)
+## Search Completeness Audit: full-mesh spot-check (raised 2026-08-25, settled shape; renamed 2026-08-27)
+
+**Renamed 2026-08-27** from "Phase3-Full spot-check" to "Search Completeness Audit," deliberately
+*not* a numbered phase — every campaign goes through Phase1→2→2.5→3→4 in order (see the new
+Phase3 section below), but this audit is a periodic/occasional standing check run independently
+against whatever campaigns have already completed, not a required per-campaign step. Freed up
+the name "Phase3" for something unrelated (see below) — this audit answers a completely
+different question and was getting conflated with it.
 
 Real question this answers: **does the generational walk (Phase1-Coarse → Phase2-Island →
 Phase2.5-CliffBox) need to be adjusted to find a better base CAGR** — i.e., is the greedy/
