@@ -1214,3 +1214,30 @@ Two real, confirmed, low-stakes findings survive: (1) `get_session_open_price`'s
 ## 2026-08-28 — Phase3 second-level granularity check: real results, first full run (45 TrailingBoth winners)
 
 45 SOXL TrailingBoth winners (all fixed_sl 1-8 except 3/6) checked at 1-minute vs 1-second resolution (`scripts/phase3_second_level_check.py`, memory-safe after `load_seconds()` per-chunk fix): mean delta +0.49pp, median +0.20pp, worst +7.23pp, best -2.78pp, 36/45 show 1m optimism. Most winners agree closely (median gap small). One real outlier cluster: `TP=23/24,SL=14,hold=84-91h,tpct=6.0` at +7.23pp (1m 55.81% vs 1s 48.58%) -- see backlog for follow-up.
+
+## 2026-08-28 (later) — Phase3 +7.23pp outlier root-caused: single-trade fill-bar-SL artifact, not a broad wide-TP/SL/long-hold risk
+
+Full investigation of the 2026-08-28 (earlier) outlier cluster (`TP=23/24,SL=14,hold=84-91h,tpct=6.0`, +7.23pp 1m-vs-1s). Read-only re-run of `simulate()` at both resolutions against the real 22.2M-row SOXL 1-second series, plus 6 controls -- no sweep dispatch, no DB writes.
+
+**Labeling bug found first**: `scripts/phase3_second_level_check.py:99`'s print statement has the column labels wrong -- `TP=arm_pct SL=trail_buy_pct tpct=trail_sell_pct`. So "TP=23/24, SL=14, tpct=6.0" is really `arm_pct=23/24`, `trail_buy_pct=14`, `trail_sell_pct=6` -- the real stop is `fixed_sl=1.0`. These are the only `window=20` nodes in the 115-row SOXL v6 winner set: `candidate_nodes` ids 2140/2141/2142.
+
+**Reproduced exactly**: 2140/2141 = 55.81% vs 48.58% (+7.23pp), 2142 = 55.13% vs 47.93% (+7.21pp). Trade counts identical (110/110, 112/112) -- the entire gap traces to one differing trade (1m `TRAIL 10/SL 98` vs 1s `TRAIL 9/SL 99`).
+
+**The single trade, node 2140 index 78**: entry 2025-04-09 13:19:00 @ $9.4408 (SOXL, tariff-pause melt-up day).
+- 1m sim: rides to 2025-04-09 14:56, exits **TRAIL +26.46%**.
+- 1s sim: real tick at 13:19:29 (one second after the 13:19:28 fill) already printed Low=9.3427, through the ~9.3464 stop -- exits **SL -1.00%** immediately.
+
+Excluding just that one trade: 1m 48.65% vs 1s 48.88%, delta -0.23pp -- right at the 45-winner median (+0.20pp).
+
+**Mechanism, confirmed against raw tick data**: `Sim._minutes()` (`scripts/sim_1s_vs_1m_groundtruth.py:323`) skips the SL check entirely on the fill bar when the fill was mid-bar (`if self.fill_partial and t == self.fill_minute: continue`). At 1-minute resolution this grants up to 59 seconds of unstopped post-fill price action; at 1-second resolution, one second. For this trade, that 59-second blind spot is exactly where the real stop breach happened.
+
+**Why this config specifically** (all measured, not inferred):
+- `fixed_sl=1.0` is necessary -- `fixed_sl=4/5` controls (candidate ids 2152/2165/2166/2169) had zero differing common trades, delta +0.17 to +0.25pp.
+- Not sufficient alone -- `fixed_sl=1.0, window=10` controls (2136/2139) were -0.31/-0.34pp, same small-per-trade noise, no flip.
+- `trail_buy_pct=14` (a wide required bounce to fill) means the fill lands inside maximum-momentum price action; `arm_pct=23` (wide take-profit) means the resulting winner is large enough that one flipped trade is worth ~27 points of trade return.
+
+**Verdict**: the +7.23pp number itself is a one-off knife-edge artifact -- one trade, one day, and the three "near-duplicate" candidates share the literal same trade sequence, not independent evidence of a broader pattern. The underlying mechanism is real and systematic, but the correct generalization is **tight fixed_sl (~1%) is untrustworthy at 1-minute granularity, amplified by a wide arm_pct** -- not "wide TP/SL/long hold" as the original finding framed it (hold length showed zero effect: 84h and 91h behaved identically). Also worth noting: 1m isn't uniformly optimistic here -- 4 other trades in the same dataset book *worse* SL fills at 1m than at 1s (next-minute gap-through) -- it's noisier, not just rosier.
+
+**Relationship to the 2026-08-21 same-bar-SL divergence finding** (SOXL/LABU, live-vs-backtest kernel, not this Phase3 tool): same underlying mechanism -- a fill bar's own exit conditions aren't checked -- but a different kernel/codepath (`backtester.py`'s live-replay path there, `sim_1s_vs_1m_groundtruth.py`'s `Sim._minutes()` here). The 08-21 finding's resolved fix direction (remove the fill-bar SL check entirely, not add a width-tuned exemption) is the same class of fix that would also close this Phase3 artifact, if `sim_1s_vs_1m_groundtruth.py` is ever changed to match. Not built here -- this was root-cause investigation only, no code changed.
+
+Artifacts (not committed, scratch): `/tmp/soxl_1s_diag.py`, `/tmp/soxl_1s_diag.log`, `/tmp/n{2140,2141,2142,2136,2139,2152,2165,2166,2169}_{1m,1s}.csv`.
