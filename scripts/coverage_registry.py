@@ -1781,6 +1781,48 @@ REGISTRY = [
                "throttled trading_incidents row + Slack alert at the point it happens, in addition to "
                "counting here. No live proof yet -- fake_broker-confirmed only; will earn verified-live "
                "off the next real manual trailing-buy placement."),
+    dict(id='daily_close_retroactive_adjustment_detected',
+         scenario="A live compute_buy_signal call's fresh yfinance daily-close fetch shows an "
+                  "already-elapsed historical date's value differs from what a prior day's fetch "
+                  "recorded for that same date -- direct evidence of a retroactive dividend/split "
+                  "adjustment landing in the cached data the live SMA/z-score indicator reads",
+         code_path="signals_compute._daily_close_source (called from compute_buy_signal's live-only "
+                   "path, excludes daily_sync nodes) -> signals_helpers."
+                   "check_daily_close_retroactive_adjustment (detector) -> signals_compute."
+                   "_alert_daily_close_discontinuity (Slack alert + Pause-Automation button, never "
+                   "auto-pauses)",
+         offline_coverage="tests/test_daily_close_retroactive_adjustment.py (14 scenarios: dividend- "
+                          "sized and split-sized injected discontinuities detected and correctly "
+                          "classified, a real partial-window rebase -- minority of the overlapping "
+                          "dates affected -- still detected, ordinary new-day price movement/a single "
+                          "glitched date/scattered non-contiguous mismatches do NOT false-positive, "
+                          "state self-corrects to the freshest values, same-day repeat calls don't "
+                          "re-diff, daily_sync nodes are excluded, fetch-failure falls back to the "
+                          "existing resampled-cache path, end-to-end alert firing + once-per-day dedup)",
+         check_mechanism='coverage_events', scenario_key='daily_close_retroactive_adjustment_detected',
+         bad_results=[],
+         notes="Built 2026-08-28 (docs/design.md's '2026-08-28 (late)' entry -- full design writeup). "
+               "Fresh narrow yfinance daily fetch REPLACES (not just alerts alongside) the resampled-"
+               "from-_1h.csv daily-close series feeding generate_daily_indicators/prev_close on every "
+               "live call -- self-correcting by construction (auto_adjust=True re-adjusts the whole "
+               "returned range every call), and the day-over-day comparison doubles as the detector. "
+               "Paired review (independent-cold + contextual Opus, two rounds) found and fixed a real "
+               "HIGH bug: the first version's 'majority of the whole window must mismatch' gate silently "
+               "MISSED a real rebase whenever the comparison window straddled the actual ex-date (a real "
+               "adjustment only rescales dates BEFORE its effective date, which can be a minority of an "
+               "overlap window) -- replaced with a 'contiguous oldest-first prefix' signature that "
+               "matches the real corp-action shape regardless of what fraction of the window it covers. "
+               "Also fixed: state-file atomic write (torn-read risk from concurrent poll-loop/Bolt-"
+               "handler-thread access could silently wipe every other ticker's baseline), negative-"
+               "caching of a transient fetch failure (was disabling the fix+detector for the whole day "
+               "on one hiccup), a timeout wrapper on the yfinance call (matching _live_tick_price's "
+               "existing pattern), and a misleading Massive-cross-check false-CORROBORATES for any "
+               "ticker with no cached dividend baseline. bad_results left empty -- this scenario_key only "
+               "ever logs on a genuine detection (alert-worthy by definition), no 'ran but found nothing "
+               "wrong' result variant exists for it. No live proof yet -- no real historical ex-dividend "
+               "event has occurred against this mechanism since it shipped; the design doc's own open, "
+               "explicitly-unverified caveats (Massive dividend-endpoint lag, either source's split-"
+               "rebase timing) should get a first real data point whenever one does."),
 ]
 
 

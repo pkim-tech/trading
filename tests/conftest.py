@@ -82,6 +82,29 @@ def _isolate_schwab_safety_state_files(monkeypatch, tmp_path):
         monkeypatch.setattr(schwab_safety, name, tmp_path / f"{name.lower()}.json")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_daily_close_fetch(monkeypatch):
+    """signals_compute._daily_close_source (2026-08-28 design, see docs/
+    design.md's "2026-08-28 (late)" entry) makes a REAL yfinance network call
+    on any live (non-df_hourly_override) compute_buy_signal call -- without
+    this, the entire existing test_ZScoreBreakout.py/test_TrailingBuyZScore
+    Breakout.py/etc. family (which calls compute_buy_signal(node()) with no
+    override, relying only on make_synthetic_csv's fake _1h.csv) would each
+    make a real, slow, flaky network request for a fictional ticker
+    (TEST_ZSB etc.) on every run. Same direct-name-import pattern as
+    _no_real_slack_posts above (signals_compute does `from signals_helpers
+    import fetch_fresh_daily_closes`, so patching signals_helpers' copy alone
+    would not affect signals_compute's own bound reference) -- patched to
+    return None (a fetch failure), which signals_compute._daily_close_source
+    already falls back on gracefully to the existing resampled-cache
+    behavior, so every pre-existing test's assertions are unaffected. Tests
+    that specifically want to exercise the fresh-fetch/detector path
+    (tests/test_daily_close_retroactive_adjustment.py) re-patch this
+    themselves, same pattern as other autouse fixtures here."""
+    import signals_compute
+    monkeypatch.setattr(signals_compute, 'fetch_fresh_daily_closes', lambda ticker, window: None)
+
+
 def _synthetic_timestamps(days=90):
     """Same hourly-bar timestamp grid make_synthetic_csv() writes to disk --
     shared so fake_position() can place signal_time exactly N bars back from

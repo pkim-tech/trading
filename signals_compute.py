@@ -17,7 +17,11 @@ from signals_helpers import (
     detect_price_discontinuity, nearest_split_factor, real_split_confirmed_since,
     corporate_action_confirmed_since,
     already_alerted_corp_action, mark_corp_action_alerted, log_poll, coverage_mode,
+    fetch_fresh_daily_closes, check_daily_close_retroactive_adjustment,
+    already_alerted_daily_close_discontinuity, mark_daily_close_discontinuity_alerted,
+    massive_dividend_cross_check,
 )
+import schwab_safety
 
 # (ticker, date-str) pairs already logged as price_discontinuity_ruled_out today -- see
 # check_sell_condition's dedup comment. In-memory only (resets on daemon restart), unlike
@@ -165,6 +169,103 @@ def _hurst_adf(ticker, df_hourly):
 _indicator_cache = {}  # (ticker, strategy, window) -> (cache_key, indicators df); avoids
                        # recomputing the full rolling SMA/Std history on every 5-min poll
 
+# (ticker, window) -> (date_str, df_or_None); avoids re-hitting yfinance on every poll --
+# see _daily_close_source's docstring for the full 2026-08-28 design.
+_fresh_daily_cache = {}
+# ticker -> date_str, once-per-(ticker, day) gate on running the retroactive-adjustment
+# detector itself (distinct from _fresh_daily_cache, which is per (ticker, window) --
+# a ticker with 2+ live windows must not run the detector twice the same day).
+_daily_close_last_checked = {}
+
+
+def _daily_close_source(node, window, df_daily_fallback):
+    """Live-call-only (see compute_buy_signal's call site guard) -- returns the
+    daily-closes DataFrame to feed generate_daily_indicators/prev_close: the
+    fresh yfinance fetch (docs/design.md's 2026-08-28 entry) when available,
+    falling back to df_daily_fallback (the existing resampled-from-_1h.csv
+    dataframe) on any fetch failure or insufficient rows, so a transient
+    yfinance hiccup degrades to today's pre-existing behavior rather than
+    blocking signal computation.
+
+    Runs the day-over-day self-consistency detector as a side effect, once
+    per (ticker, calendar day) regardless of how many nodes/windows share
+    that ticker -- not once per node, which would both re-fetch redundantly
+    and could double-alert. On a genuine detection: alerts (Slack, mobile-
+    readable convention), recommends pausing the ticker via the EXISTING
+    pause_ticker_automation lever (a button, not an automatic call -- this
+    project's standing philosophy is alert-and-point-at-existing-levers, not
+    automated intervention in live trading decisions), and logs a
+    coverage_event. Deliberately does NOT build any new auto-pause/auto-block
+    logic."""
+    ticker = node['ticker']
+    today_str = date.today().isoformat()
+    cache_key = (ticker, window)
+    cached = _fresh_daily_cache.get(cache_key)
+    if cached is not None and cached[0] == today_str:
+        fresh_df = cached[1]
+    else:
+        fresh_df = fetch_fresh_daily_closes(ticker, window)
+        # Only cache a SUCCESSFUL fetch -- a None (transient yfinance
+        # hiccup) must retry on the next poll, not get negative-cached for
+        # the rest of the day. The original version cached (today_str, None)
+        # unconditionally, so one bad fetch on the day's first poll silently
+        # disabled both the fix and the detector for that ticker until
+        # tomorrow (found by paired review).
+        if fresh_df is not None:
+            _fresh_daily_cache[cache_key] = (today_str, fresh_df)
+        if fresh_df is not None and _daily_close_last_checked.get(ticker) != today_str:
+            _daily_close_last_checked[ticker] = today_str
+            detection = check_daily_close_retroactive_adjustment(ticker, fresh_df)
+            if detection is not None:
+                _alert_daily_close_discontinuity(node, detection)
+    if fresh_df is not None and len(fresh_df) >= window:
+        return fresh_df
+    return df_daily_fallback
+
+
+def _alert_daily_close_discontinuity(node, detection):
+    ticker = node['ticker']
+    if already_alerted_daily_close_discontinuity(ticker):
+        return
+    mode = coverage_mode(node.get('account'), node)
+    classification = detection['classification']
+    ratio = detection['ratio']
+    massive_note = massive_dividend_cross_check(ticker)
+
+    header = f"⚠️ {ticker} — live daily-close cache discontinuity detected ({classification})"
+    text = (
+        f"{header}\n"
+        f"A prior day's fetched daily close no longer matches today's fresh yfinance "
+        f"re-fetch for the SAME historical date(s) ({detection['dates_affected']}/"
+        f"{detection['total_compared']} overlapping dates, sample: "
+        f"{', '.join(detection['sample_dates'])}) -- direct evidence of a retroactive "
+        f"price adjustment between {detection['prior_as_of']} and today.\n"
+        f"Ratio≈{ratio:.4f}" + (f" (nearest split factor {detection['nearest_split_factor']})"
+                                 if detection['nearest_split_factor'] else "") + f"\n"
+        f"{massive_note}\n"
+        f"Live SMA/z-score indicator computation already switched to the fresh, "
+        f"self-correcting fetch as of today -- no further fix needed for signal accuracy "
+        f"going forward. Recommend reviewing recent signals/trades for this ticker against "
+        f"the OLD (pre-fix) data, and pausing the ticker below if in doubt."
+    )
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+    if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
+        blocks.append({
+            "type": "actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": f"⏸️ Pause {ticker} Automation"},
+                 "style": "danger", "action_id": "pause_ticker_automation", "value": ticker},
+            ],
+        })
+    _post_message(header, blocks=blocks)
+    mark_daily_close_discontinuity_alerted(ticker)
+    db.log_coverage_event(
+        "daily_close_retroactive_adjustment_detected", mode, ticker=ticker, node_id=node.get('id'),
+        result="alerted",
+        detail=f"classification={classification} ratio={ratio:.6f} "
+               f"dates_affected={detection['dates_affected']}/{detection['total_compared']} "
+               f"sample={detection['sample_dates']} prior_as_of={detection['prior_as_of']} "
+               f"massive_cross_check={massive_note}")
+
 
 def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override=None, df_daily_override=None):
     ticker = node['ticker']
@@ -178,7 +279,20 @@ def compute_buy_signal(node, as_of=None, price_override=None, df_hourly_override
         df_hourly, df_daily = df_hourly_override, df_daily_override
     else:
         df_hourly, df_daily = _load_cache(ticker)
-    if df_hourly is None or len(df_daily) < window:
+        # Live call only -- every replay/backtest-verification caller
+        # (scripts/verify_live_parity.py, scripts/live_sim.py, scripts/
+        # verify_pinned_entry_vs_backtest.py) always passes df_hourly_override,
+        # so this can't fire for a historical replay. Excludes daily_sync
+        # nodes deliberately: their entire purpose is isolating price-source
+        # TIMING as the only variable against a backtest replay (see the
+        # paper_role == 'daily_sync' branch below) -- feeding their indicator
+        # computation from a genuinely different data source (live yfinance
+        # daily fetch vs. the resampled _1h.csv cache the backtest kernel
+        # itself trades off of) would reintroduce exactly the confound that
+        # isolation exists to eliminate. See docs/design.md's 2026-08-28 entry.
+        if df_hourly is not None and node.get('paper_role') != 'daily_sync':
+            df_daily = _daily_close_source(node, window, df_daily)
+    if df_hourly is None or df_daily is None or len(df_daily) < window:
         return None
 
     z_thresh = float(node.get('z_score_threshold', 2.0))

@@ -2719,9 +2719,20 @@ yet (separate, already-backlogged 2026-08-26 item, now safe to build post-`activ
 whether to pursue the yahoo-side self-consistency fix above, the bigger live-source migration, or both —
 this doc entry exists so the design isn't lost before that decision gets made.
 
-Not built. `signals_compute.py` is a `signals_*.py` module — any implementation of part 1/2 above needs
-the paired independent-cold + contextual Opus review before landing, per CLAUDE.md's Review-Gate
-Persistence Rule.
+**Part 1 built 2026-08-28** (see `docs/deep_backlog.md`'s corresponding entry for full detail): fresh
+narrow yfinance daily fetch now replaces the resampled-from-`_1h.csv` daily-close series feeding
+`compute_buy_signal`'s indicator computation on every live call, with the day-over-day self-consistency
+check as the detector, a secondary Massive dividends cross-check, and a Slack alert pointing at the
+existing `pause_ticker_automation` lever (never auto-pausing). Paired independent-cold + contextual Opus
+review (two rounds) found and fixed a real HIGH bug in the first version's consistency gate (see
+`signals_helpers.check_daily_close_retroactive_adjustment`'s own docstring/comments for the fix). No live
+proof yet — no real historical ex-dividend event has occurred against this mechanism since it shipped;
+the open, explicitly-unverified caveats below (Massive dividend-endpoint lag, either source's split-rebase
+timing) should get a first real data point whenever one does.
+
+Part 2 (Massive as the eventual primary source, via `active_builds`) — still not built, not decided
+whether to pursue given part 1's yahoo-side fix already closes the immediate gap. This doc entry's
+"Separate, bigger-scope thread" paragraph above still applies unchanged.
 
 ## 2026-08-28 (later still) — Design, not built, part 2: quarterly ticker-rotation concept ("v6-q4"-style), swap-on-flat, and a real BUY-only node-pause gap found
 

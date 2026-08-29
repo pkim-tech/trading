@@ -1,7 +1,7 @@
 """Small shared helpers with no cross-dependency on blocks/charts/handlers."""
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import schwab_safety
@@ -9,6 +9,8 @@ import signals_config as cfg
 import signals_db as db
 
 _CORP_ACTION_ALERT_PATH = Path(__file__).parent / "cache" / "live" / "corporate_action_alerts.json"
+_DAILY_CLOSE_STATE_PATH = Path(__file__).parent / "cache" / "live" / "daily_close_consistency_state.json"
+_DAILY_CLOSE_ALERT_PATH = Path(__file__).parent / "cache" / "live" / "daily_close_discontinuity_alerts.json"
 
 
 def node_state(node):
@@ -380,6 +382,264 @@ def nearest_split_factor(ratio):
     happen if only ever called after a positive detect_price_discontinuity)."""
     candidates = list(_SPLIT_RATIOS) + [1 / r for r in _SPLIT_RATIOS]
     return min(candidates, key=lambda r: abs(ratio - r))
+
+
+# ---------------------------------------------------------------------------
+# Daily-close retroactive-adjustment detection (2026-08-28 design -- see
+# docs/design.md's "2026-08-28 (late)" entry for the full writeup). Distinct
+# from the entry/exit-side corp-action machinery above (detect_price_
+# discontinuity/corporate_action_confirmed_since/real_split_confirmed_since):
+# those compare a LIVE current price against one stale reference price at
+# poll time; this compares two INDEPENDENT FETCHES of the same already-
+# elapsed historical date against each other, which is what actually proves
+# a retroactive adjustment happened (a live-price ratio match is circumstantial;
+# a same-date value that silently changed between two fetches is direct proof).
+# ---------------------------------------------------------------------------
+
+_RETROACTIVE_ADJUSTMENT_NOISE_TOLERANCE = 0.0005  # 0.05% -- float/rounding noise floor;
+                                                   # every real corp action (even the smallest
+                                                   # ordinary dividend) is far larger than this.
+
+
+def _load_daily_close_state():
+    try:
+        return json.loads(_DAILY_CLOSE_STATE_PATH.read_text())
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        return {}
+
+
+def _save_daily_close_state(state):
+    # Atomic write (tmp file + os.replace) -- this file holds EVERY ticker's
+    # baseline in one JSON blob, and compute_buy_signal runs from both the
+    # poll loop thread and the Bolt listener thread (build_reference_table /
+    # a Slack button handler can call it directly) -- a torn read of a
+    # partially-written file during a real concurrent write would hit the
+    # JSONDecodeError fallback in _load_daily_close_state (returns {}), and
+    # the following save would then silently wipe every OTHER ticker's
+    # baseline for the day (found by paired review). os.replace is atomic on
+    # POSIX, so a reader never observes a partially-written file.
+    import os
+    _DAILY_CLOSE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _DAILY_CLOSE_STATE_PATH.with_suffix('.json.tmp')
+    tmp_path.write_text(json.dumps(state))
+    os.replace(tmp_path, _DAILY_CLOSE_STATE_PATH)
+
+
+def fetch_fresh_daily_closes(ticker, window):
+    """Fetches a small, fresh window of daily OHLCV directly from yfinance
+    (auto_adjust=True re-adjusts the ENTIRE returned range on every call, so
+    a fresh narrow fetch is always internally consistent by construction --
+    no incremental patching, no discontinuity possible within one fetch).
+    Returns a tz-naive-indexed DataFrame (Open/High/Low/Close/Volume) sorted
+    ascending, or None on any fetch failure/empty result -- callers must fall
+    back to their existing data source on None, never block signal
+    computation on a transient yfinance hiccup.
+
+    window's calendar-day buffer is sized generously (1.6x + 20 fixed days)
+    to comfortably cover real configured window sizes up to 99 (the largest
+    on file today, a paper test fixture) without over-fetching for the
+    common 5/10/20 case -- weekends/holidays mean trading days always need
+    more calendar days than a naive 1:1 mapping."""
+    import pandas as pd
+    import yfinance as yf
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        buffer_days = int(window * 1.6) + 20
+        start = (datetime.now() - timedelta(days=buffer_days)).strftime('%Y-%m-%d')
+        # Timeout-wrapped, matching signals_compute._live_tick_price's own
+        # yfinance call -- an un-timeout-ed yf.Ticker(...).history() call can
+        # hang, and compute_buy_signal is called serially per node from the
+        # poll loop (found by paired review: no timeout here would reintroduce
+        # the exact stall risk that pattern already exists to prevent).
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            hist = ex.submit(
+                lambda: yf.Ticker(ticker).history(start=start, interval='1d', auto_adjust=True)
+            ).result(timeout=10)
+        if hist.empty:
+            return None
+        hist.index = pd.to_datetime(hist.index).tz_localize(None).normalize()
+        return hist[['Open', 'High', 'Low', 'Close', 'Volume']].sort_index()
+    except Exception:
+        return None
+
+
+def check_daily_close_retroactive_adjustment(ticker, fresh_df, today=None):
+    """Day-over-day self-consistency check -- compares fresh_df's overlapping
+    ALREADY-ELAPSED dates against what was stored from a PRIOR day's fetch
+    for those same dates. A mismatch is direct proof a retroactive adjustment
+    happened between the two fetches -- no cross-vendor comparison needed for
+    this to fire (Massive is a secondary confirmation only, see
+    massive_dividend_cross_check below).
+
+    Always updates the stored state to today's fresh values before returning
+    (unless already updated today), regardless of whether a discontinuity was
+    found -- self-correcting by construction: the freshest fetch is always
+    what gets trusted going forward, so there's no separate 'now go fix it'
+    step; the old, now-known-wrong values are simply superseded.
+
+    Returns a detection dict, or None if no discontinuity fired (including
+    the first-ever call for a ticker, with nothing yet to compare against).
+    Firing requires a MAJORITY of the overlapping mismatched dates to share a
+    consistent ratio (within 1% of each other) -- a single noisy/glitched
+    date alone does not fire this. That shape (one date off, the rest
+    unchanged) is a data-quality blip in one fetch, not the systematic
+    whole-range rescale a real retroactive adjustment produces; requiring
+    consistency across multiple dates is what actually distinguishes the two.
+
+    today (optional, 'YYYY-MM-DD' str): overrides date.today() -- lets tests
+    simulate "the next day" deterministically without monkeypatching the
+    stdlib date class (which would leak globally across every module holding
+    a reference to it, not just this one)."""
+    today_str = today or date.today().isoformat()
+    fresh_closes = {ts.strftime('%Y-%m-%d'): float(c) for ts, c in fresh_df['Close'].items()
+                     if c is not None and c > 0}
+
+    state = _load_daily_close_state()
+    prior = state.get(ticker)
+    detection = None
+    if prior and prior.get('as_of') != today_str:
+        prior_closes = prior.get('closes', {})
+        # Real corp-action signature, oldest-date-first: dates BEFORE a real
+        # adjustment's effective date get rescaled; dates on/after it don't.
+        # So a real rebase shows up as a CONTIGUOUS PREFIX of the oldest
+        # overlapping dates sharing one consistent ratio, followed by
+        # unchanged dates for the rest of the window -- not "a majority of
+        # the whole window". An earlier version of this gate required
+        # majority-of-window and silently MISSED a real rebase whenever the
+        # comparison window straddled the actual ex-date so only the older
+        # minority of dates were affected (found by paired review, both
+        # independent-cold and contextual, converging on the same bug via
+        # different concrete repro cases). The >= 2 prefix-length floor still
+        # rules out a single lone glitched date; requiring everything AFTER
+        # the prefix to be unchanged additionally rules out scattered,
+        # non-contiguous noise across the window (a different failure shape
+        # from a real rebase).
+        overlap_dates = sorted(d for d in prior_closes if d in fresh_closes)
+        ratios = {}
+        for d in overlap_dates:
+            old_val, new_val = prior_closes[d], fresh_closes[d]
+            if old_val <= 0 or new_val <= 0:
+                continue
+            ratios[d] = old_val / new_val
+        valid_dates = [d for d in overlap_dates if d in ratios]
+        prefix = []
+        for d in valid_dates:
+            if abs(ratios[d] - 1.0) <= _RETROACTIVE_ADJUSTMENT_NOISE_TOLERANCE:
+                break
+            prefix.append(d)
+        if len(prefix) >= 2:
+            prefix_ratios = sorted(ratios[d] for d in prefix)
+            median_ratio = prefix_ratios[len(prefix_ratios) // 2]
+            consistent = [d for d in prefix if abs(ratios[d] - median_ratio) / median_ratio < 0.01]
+            rest_unchanged = all(
+                abs(ratios[d] - 1.0) <= _RETROACTIVE_ADJUSTMENT_NOISE_TOLERANCE
+                for d in valid_dates[len(prefix):]
+            )
+            if len(consistent) == len(prefix) and rest_unchanged:
+                split_ratio_hit = detect_price_discontinuity(1.0, median_ratio)
+                detection = {
+                    'ticker': ticker,
+                    'dates_affected': len(consistent),
+                    'total_compared': len(prior_closes),
+                    'ratio': median_ratio,
+                    'classification': 'split-sized' if split_ratio_hit else 'dividend-or-other-sized',
+                    'nearest_split_factor': nearest_split_factor(median_ratio) if split_ratio_hit else None,
+                    'sample_dates': consistent[:5],
+                    'prior_as_of': prior.get('as_of'),
+                    'detected_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                }
+
+    if not prior or prior.get('as_of') != today_str:
+        state[ticker] = {'as_of': today_str, 'closes': fresh_closes}
+        _save_daily_close_state(state)
+    return detection
+
+
+def already_alerted_daily_close_discontinuity(ticker, day=None) -> bool:
+    """Once-per-(ticker, day) dedup for the retroactive-adjustment alert --
+    separate state from already_alerted_corp_action (that gate is for the
+    OPEN-POSITION entry_price-vs-current-price check above, a different
+    mechanism with a different clearing condition). This one self-clears
+    naturally the next day (detection re-runs fresh every day against a new
+    'prior' baseline), so no explicit clear function is needed the way the
+    position-side alert has one."""
+    try:
+        state = json.loads(_DAILY_CLOSE_ALERT_PATH.read_text())
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        state = {}
+    return state.get(ticker) == (day or date.today().isoformat())
+
+
+def mark_daily_close_discontinuity_alerted(ticker, day=None):
+    try:
+        state = json.loads(_DAILY_CLOSE_ALERT_PATH.read_text())
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        state = {}
+    state[ticker] = day or date.today().isoformat()
+    _DAILY_CLOSE_ALERT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _DAILY_CLOSE_ALERT_PATH.write_text(json.dumps(state))
+
+
+def massive_dividend_cross_check(ticker):
+    """Best-effort SECONDARY confirmation only (docs/design.md's 2026-08-28
+    entry) -- never gates/blocks check_daily_close_retroactive_adjustment
+    above, only appends corroborating (or non-corroborating) context to the
+    resulting alert. Compares db_cache's CACHED Massive dividends (whatever
+    was on file as of the last build/backfill -- a 'prior' pull) against a
+    genuinely fresh, uncached live pull of the same endpoint right now (a
+    'today' pull); a new ex-dividend record in the fresh pull that the cache
+    doesn't have corroborates a real dividend independent of yahoo's data.
+
+    Whether Massive's dividends endpoint updates promptly after a real
+    ex-date is an OPEN, UNVERIFIED question (see design doc's "Open,
+    explicitly unresolved unknowns") -- this function does not assume any
+    particular lag in either direction; it reports what it actually observes
+    right now, nothing more. Never raises, never returns None -- always a
+    short, displayable string, including when it couldn't run at all."""
+    import os
+    import requests
+    import db_cache
+    api_key = os.environ.get("MASSIVE_API_KEY")
+    if not api_key:
+        return "Massive cross-check: skipped (MASSIVE_API_KEY not set)"
+    try:
+        cached = db_cache.get_massive_dividends(ticker) or []
+        cached_dates = {r['ex_dividend_date'] for r in cached}
+        resp = requests.get(
+            "https://api.massive.com/stocks/v1/dividends",
+            params={"ticker": ticker, "limit": 50, "apiKey": api_key},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return f"Massive cross-check: fetch failed (HTTP {resp.status_code})"
+        fresh_dates = {r['ex_dividend_date'] for r in resp.json().get("results", [])}
+        recent_cutoff = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        if not cached_dates:
+            # No baseline on file at all (this ticker was never backfilled
+            # via scripts/build_massive_hourly_derived.py) -- every fresh
+            # date would otherwise look "new" vs an empty cache and falsely
+            # read as corroborating, even for a dividend paid years ago
+            # (found by paired review). Report the absence of a baseline
+            # explicitly instead of a misleading blanket "CORROBORATES".
+            recent = sorted(d for d in fresh_dates if d >= recent_cutoff)
+            if recent:
+                return f"Massive cross-check: no cached baseline for this ticker, but a RECENT ex-div is on file: {recent}"
+            return "Massive cross-check: no cached baseline for this ticker (never backfilled) -- can't compare"
+        # RECENT new dates only -- a new_dates set built from an empty/thin
+        # cache could otherwise list every historical dividend as "new";
+        # restricting to the last 30 days keeps this signal meaningful
+        # regardless of how complete the cached baseline is.
+        new_recent_dates = sorted(d for d in (fresh_dates - cached_dates) if d >= recent_cutoff)
+        if new_recent_dates:
+            return f"Massive cross-check: CORROBORATES -- new RECENT dividend record(s) not yet in our cache: {new_recent_dates}"
+        recent = sorted(d for d in fresh_dates if d >= recent_cutoff)
+        if recent:
+            return f"Massive cross-check: no NEW record vs our cache, but a recent ex-div already on file: {recent}"
+        return ("Massive cross-check: no matching RECENT dividend record found (consistent with a split, a "
+                "yahoo-only data glitch, or Massive lagging the real ex-date -- lag timing not yet "
+                "empirically known either direction, see docs/design.md)")
+    except Exception as e:
+        return f"Massive cross-check: error ({type(e).__name__})"
 
 
 def get_real_splits(ticker):
