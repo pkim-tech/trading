@@ -123,6 +123,46 @@ _DF_1M = None
 _DF_1S = None
 
 
+def _compounded(rets):
+    """Vendored copy of scripts/candidate_full_review.py's own `compounded()` (2026-08-29,
+    Task #5) -- NOT imported from that module: importing it here drags in that file's
+    full heavy dependency chain (walk_forward_check -> candidate_checklist_report ->
+    verify_trailing_buy_resolution), which has an unrelated, pre-existing broken import
+    (`replay_five_min` missing) as of this task -- confirmed by trying the direct import
+    first. Trivial, stable math (compound a return-fraction list into a total-return pct);
+    vendoring it here is safer than pulling in that whole chain for one function."""
+    prod = 1.0
+    for r in rets:
+        prod *= (1 + r)
+    return (prod - 1) * 100
+
+
+def _chrono_split_robustness_verdict(rets):
+    """Vendored copy of scripts/candidate_full_review.py's own `_chrono_split_robustness`
+    -- verdict computation ONLY (half1/half2 chronological split + single-biggest-trade
+    removal, docs/overlay_parameter_robustness_process.md steps 1/3), not the full return
+    dict (win-rate stability isn't needed here). See `_compounded`'s own docstring for why
+    this is vendored rather than imported. `rets` MUST already be chronological (Entry
+    Time ascending) -- true for both the addon leg's armed-trade list and the drought
+    overlay's own window list, matching the original function's same precondition.
+    Returns None if <2 rets (same as the original)."""
+    if len(rets) < 2:
+        return None
+    mid = len(rets) // 2
+    half1, half2 = rets[:mid], rets[mid:]
+    half1_pct, half2_pct = _compounded(half1), _compounded(half2)
+    comp_all = _compounded(rets)
+    biggest_idx = max(range(len(rets)), key=lambda i: rets[i])
+    without_biggest = rets[:biggest_idx] + rets[biggest_idx + 1:]
+    comp_without = _compounded(without_biggest) if without_biggest else 0.0
+    flips = (comp_all > 0) != (comp_without > 0)
+    if flips:
+        return "FRAGILE (sign flip)"
+    if half1_pct < 0 or half2_pct < 0:
+        return "FRAGILE (half negative)"
+    return "OK"
+
+
 def node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, cand):
     """Same axis-column mapping run_optimization_sweep.build_candidate_report_
     ground_truth uses internally (its own is_both branch, right before its
@@ -173,9 +213,29 @@ def overlay_cagrs(gt_trades, ticker, dfh, node, years):
     (apply_addon_overlay_ground_truth / simulate_drought_overlay_ground_truth),
     unmodified -- this differs from report_overlays only in RETURNING the
     computed CAGR numbers (for a delta table) instead of only printing them.
-    `gt_trades` is already dict-shaped (see _run_gt_kernel), no conversion here."""
+    `gt_trades` is already dict-shaped (see _run_gt_kernel), no conversion here.
+
+    core_both_cagr (2026-08-29, Task #5): core+addon+drought triple-stacked CAGR,
+    same formula scripts/candidate_full_review.py's own core_both_cagr_pct uses
+    (core_factor * addon_factor_gated * drought_factor_gated) -- GATED the same way
+    that reference does: addon/drought are only stacked in if their own chronological-
+    split robustness verdict is 'OK' (docs/overlay_parameter_robustness_process.md
+    steps 1/3), else they contribute a neutral 1.0 factor. Deliberately NOT matching
+    Phase5's own addon_cagr/drought_cagr above, which stay ungated (unchanged, existing
+    behavior) -- picked gating for core_both specifically because (a) the verification
+    target for this task IS candidate_full_review.py's own gated number for node 851,
+    so an ungated version would validate against the wrong definition, and (b) an
+    ungated combined number risks a fragile single-trade addon/drought outlier
+    dominating the 1m-vs-1s delta, which would read as a granularity-sensitivity
+    finding when it's actually a robustness-fragility artifact -- exactly the
+    conflation Phase5 exists to avoid. addon's own per-trade return for the gate
+    uses the UNBLENDED (Exit-Arm)/Arm leg return, not apply_addon_overlay_ground_
+    truth's blended 'Return' (which already contains core's own return -- see that
+    function's own docstring; using the blended value here would double-count core
+    exactly like candidate_full_review.py's own documented 2026-08-23 paired-review
+    fix)."""
     if not gt_trades:
-        return None, None, None
+        return None, None, None, None
     addon_trades = apply_addon_overlay_ground_truth(gt_trades)
     core_bal = addon_bal = 1.0
     for t in addon_trades:
@@ -184,14 +244,35 @@ def overlay_cagrs(gt_trades, ticker, dfh, node, years):
     core_cagr = cagr(core_bal, years, start_bal=1.0)
     addon_cagr = cagr(addon_bal, years, start_bal=1.0)
 
+    armed_trades = [t for t in addon_trades if t.get('armed')]
+    addon_rets = [(t['Exit Price'] - t['Arm Price']) / t['Arm Price'] for t in armed_trades]
+    addon_compounded_pct = _compounded(addon_rets) if addon_rets else None
+    addon_ok = (len(addon_rets) >= 2 and
+                _chrono_split_robustness_verdict(addon_rets) == 'OK')
+
     drought_cagr = None
+    drought_compounded_pct = None
+    drought_ok = False
     if node["strategy"] == "TrailingBothZScoreBreakout":
         drought = simulate_drought_overlay_ground_truth(
             gt_trades, dfh, ticker, fixed_sl=node["fixed_sl"], arm_pct=node["arm_pct"],
             trail_sell_pct=node["trail_sell_pct"])
         if drought is not None and drought.get("combined_compounded_pct") is not None:
             drought_cagr = cagr(1.0 + drought["combined_compounded_pct"] / 100.0, years, start_bal=1.0)
-    return core_cagr, addon_cagr, drought_cagr
+        if drought is not None:
+            drought_compounded_pct = drought.get("drought_compounded_pct")
+            drought_rets = drought.get("best_rets")
+            drought_ok = (drought_rets is not None and len(drought_rets) >= 2 and
+                          _chrono_split_robustness_verdict(drought_rets) == 'OK')
+
+    addon_factor_gated = (1.0 + addon_compounded_pct / 100.0) if (
+        addon_compounded_pct is not None and addon_ok) else 1.0
+    drought_factor_gated = (1.0 + drought_compounded_pct / 100.0) if (
+        drought_compounded_pct is not None and drought_ok) else 1.0
+    core_both_bal = core_bal * addon_factor_gated * drought_factor_gated
+    core_both_cagr = cagr(core_both_bal, years, start_bal=1.0)
+
+    return core_cagr, addon_cagr, drought_cagr, core_both_cagr
 
 
 def _check_candidate_core(node, dfh, df_1m, df_1s, start, end, years):
@@ -202,16 +283,19 @@ def _check_candidate_core(node, dfh, df_1m, df_1s, start, end, years):
     t0 = time.monotonic()
     trades_1m = _run_gt_kernel(node, dfh, df_1m, start, end)
     trades_1s = _run_gt_kernel(node, dfh, df_1s, start, end)
-    core_1m, addon_1m, drought_1m = overlay_cagrs(trades_1m, node["ticker"], dfh, node, years)
-    core_1s, addon_1s, drought_1s = overlay_cagrs(trades_1s, node["ticker"], dfh, node, years)
+    core_1m, addon_1m, drought_1m, both_1m = overlay_cagrs(trades_1m, node["ticker"], dfh, node, years)
+    core_1s, addon_1s, drought_1s, both_1s = overlay_cagrs(trades_1s, node["ticker"], dfh, node, years)
     elapsed = time.monotonic() - t0
     return {
         "n_trades_1m": len(trades_1m), "n_trades_1s": len(trades_1s),
         "core_cagr_1m": core_1m, "core_cagr_1s": core_1s,
         "addon_cagr_1m": addon_1m, "addon_cagr_1s": addon_1s,
         "drought_cagr_1m": drought_1m, "drought_cagr_1s": drought_1s,
+        "core_both_cagr_1m": both_1m, "core_both_cagr_1s": both_1s,
+        "core_delta_pp": None if (core_1m is None or core_1s is None) else (core_1m - core_1s) * 100,
         "addon_delta_pp": None if (addon_1m is None or addon_1s is None) else (addon_1m - addon_1s) * 100,
         "drought_delta_pp": None if (drought_1m is None or drought_1s is None) else (drought_1m - drought_1s) * 100,
+        "core_both_delta_pp": None if (both_1m is None or both_1s is None) else (both_1m - both_1s) * 100,
         "elapsed_secs": elapsed,
     }
 
@@ -230,11 +314,14 @@ def _pool_worker(cand_idx, node, start, end, years):
 def _print_row(row, node):
     print(f"  candidate {row['candidate']}: TP={node['arm_pct']} SL={node['trail_buy_pct']} "
           f"tpct={node['trail_sell_pct']} hold={node['max_hold_hours']}h -- "
-          f"core 1m/1s={_fmt(row['core_cagr_1m'])}/{_fmt(row['core_cagr_1s'])}  "
+          f"core 1m/1s={_fmt(row['core_cagr_1m'])}/{_fmt(row['core_cagr_1s'])} "
+          f"(delta {_fmt_pp(row['core_delta_pp'])})  "
           f"addon 1m/1s={_fmt(row['addon_cagr_1m'])}/{_fmt(row['addon_cagr_1s'])} "
           f"(delta {_fmt_pp(row['addon_delta_pp'])})  "
           f"drought 1m/1s={_fmt(row['drought_cagr_1m'])}/{_fmt(row['drought_cagr_1s'])} "
-          f"(delta {_fmt_pp(row['drought_delta_pp'])})  [{row['elapsed_secs']:.1f}s]")
+          f"(delta {_fmt_pp(row['drought_delta_pp'])})  "
+          f"both 1m/1s={_fmt(row['core_both_cagr_1m'])}/{_fmt(row['core_both_cagr_1s'])} "
+          f"(delta {_fmt_pp(row['core_both_delta_pp'])})  [{row['elapsed_secs']:.1f}s]")
 
 
 def _fmt(x):
@@ -417,7 +504,7 @@ def main():
     df_out.to_csv(out_path, index=False)
 
     print(f"\n=== Phase5 summary: {len(df_out)} candidate(s) checked across {len(scopes)} scope(s) ===")
-    for label in ("addon_delta_pp", "drought_delta_pp"):
+    for label in ("core_delta_pp", "addon_delta_pp", "drought_delta_pp", "core_both_delta_pp"):
         s = df_out[label].dropna()
         if s.empty:
             print(f"  {label}: no candidates had both 1m/1s values -- N/A")
