@@ -2798,3 +2798,38 @@ rotation logic itself, not a manual control surface to maintain.
 BUY-only pause flag, the weekend-sweep-to-Monday-decision pipeline) needs real design time in a future
 session. `schwab_safety.py` is a `schwab_*.py` module -- any new pause-flag implementation needs the
 paired-review gate, same as anything else touching real order-placement safety logic.
+
+## 2026-08-29 (very late) — Design, not built, part 3: minute-builds provenance parity + a real adjustment-event log
+
+Two smaller real gaps found while manually verifying tonight's `active_builds` work (querying
+`massive_hourly_derived_builds` for SOXL directly), both agreed as worth doing, not built yet:
+
+**Minute-builds provenance parity**: `massive_hourly_derived_builds` (built_at, raw_data_pulled_at,
+raw_data_start/end, dividend_data_asof, correction_count -- one row per hourly build, real consumers:
+`signals_invariants.check_massive_hourly_derived_freshness`, `scripts/promote_derived_build.py`'s display/
+candidate-selection, `scripts/reinject_derived_build.py`'s recovery lookups) has no minute-side equivalent
+-- `massive_minute_derived` builds carry zero built_at/provenance history. Confirmed the actual promotion
+SAFETY guard doesn't depend on this table (it compares the data table's own real MIN/MAX(ts) directly, not
+builds-table metadata) so minute promotion is NOT unsafe today -- but there's no automated freshness
+invariant check for minute data the way hourly has one, and no incident-forensics trail if a minute build
+ever needs `reinject_derived_build.py`-style recovery. Fix: add `massive_minute_derived_builds`, same shape
+as the hourly table.
+
+**Real adjustment-event log**: distinct from the builds provenance table (which describes "what does build
+X look like"), a separate 1-to-many event log recording "what real corporate-action event was detected/
+applied, and when" is needed for the rolling-window/canary-triggered-rebuild mechanism (part 1/2 above) --
+this is genuinely a different table, not a builds-table column, since many adjustment events accumulate
+per ticker over the life of a continuously-maintained master dataset. Real precedent already exists for
+this exact pattern in this codebase: `db_cache.data_mutation_log` (`_ensure_mutation_log_table`) already
+does a 1-to-many append-only event log (ticker, factor, detected_at, price_before/after, notes,
+pre_mutation_snapshot) for `data_manager.py`'s legacy yahoo `_1h.csv` split-guard rescales specifically.
+Reuse the PATTERN, not the table itself -- `data_mutation_log` predates `active_builds` (no `build_id`
+column), is split-only (not dividends), and is scoped to a different pathway (yahoo `_1h.csv`, not the
+Massive-derived builds this whole design thread is about). A new table (name TBD, e.g.
+`derived_build_adjustments`) with a similar shape plus an explicit `resulting_build_id` column (linking to
+`active_builds`/`massive_hourly_derived_builds`, so a detected event is traceable to the exact rebuild it
+triggered) is the right design.
+
+Not built, not scoped further tonight -- captured so the pattern precedent and the real (small) minute-
+provenance gap aren't lost before a future session picks this up alongside the rest of the part 1/2/3
+thread.
