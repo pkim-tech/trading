@@ -102,6 +102,8 @@ Full build/bugfix history for every file below: `docs/deep_backlog.md` (search b
 
 **Data traceability**: `db_cache.log_data_mutation`/`get_data_mutations` — `data_mutation_log` table in `trading_universe.db`, one row per split-guard rescale with a pre-rescale snapshot.
 
+**Derived-data build versioning** (`active_builds`, 2026-08-28): `massive_hourly_derived`/`massive_minute_derived` (dividend-adjusted, built from raw Massive minute data) are multi-vintage — every rebuild gets a new `build_id`, nothing is ever overwritten in place. `active_builds(ticker, table_name, build_id)` is the explicit promotion pointer every real consumer (`db_cache.get_massive_hourly_ohlcv`/`get_massive_minute_ohlcv`'s no-`build_id` path) resolves through — a build only becomes active via `scripts/promote_derived_build.py` (refuse-to-narrow guard), never automatically on creation. `massive_hourly_derived_builds`/`massive_minute_derived_builds` hold per-build provenance (`built_at`, `raw_data_start/end`, `correction_count`). Backtest/sweep code should log which `build_id` it resolved (`db_cache._log_build_id_resolution`, already wired into the two `get_massive_*_ohlcv` functions) so a superseded build is traceable later. Real production data-integrity tooling, not experimental — replaces a prior pure-`ORDER BY id DESC` resolution after a real incident (SOXL/DPST/DFEN minute-archive narrowing, 2026-08-27).
+
 **Operational scripts**: `scripts/daemon_status.py` — checks daemon running + restart-staleness vs source mtimes, use instead of manual `ps`/mtime comparison. `scripts/live_sim.py` — manual-step live-sim REPL against an isolated DB, drives the real signal/notify functions bar-by-bar without touching the live daemon.
 
 ## Runtime Artifacts (not committed)
