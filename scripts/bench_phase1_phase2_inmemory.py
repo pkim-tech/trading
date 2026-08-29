@@ -555,6 +555,15 @@ def main():
                           "real production grid (module-level WINDOWS=[10,20]) -- e.g. "
                           "--window 15 to explore a midpoint value not otherwise swept. "
                           "Does not add to the standard grid, replaces it for this run.")
+    ap.add_argument("--ticker", type=str, default=None,
+                     help="override module-level TICKER (default 'SOXL') -- e.g. --ticker "
+                          "AGQ to run a different ticker's campaign. Mutually exclusive with "
+                          "--seed-watch-list-id, which derives TICKER from the real live "
+                          "watch_list row it seeds from -- reproducing that exact node, "
+                          "including its real ticker, IS seed mode's whole point, so an "
+                          "explicit --ticker there would be a silent, likely-wrong override "
+                          "rather than a deliberate choice. Default None leaves TICKER at "
+                          "its module default unchanged.")
     ap.add_argument("--seed-watch-list-id", dest="seed_watch_list_id", type=int, default=None,
                      help="Smoke-test mode (2026-08-29): seed Phase1 with exactly ONE real "
                           "live watch_list row's params (reverse-mapped via "
@@ -617,6 +626,8 @@ def main():
             _seed_conflicts.append("--resume-from-top100")
         if args.checkpoint_file:
             _seed_conflicts.append("--checkpoint-file")
+        if args.ticker is not None:
+            _seed_conflicts.append("--ticker")
         if _seed_conflicts:
             raise SystemExit(
                 f"--seed-watch-list-id is mutually exclusive with {', '.join(_seed_conflicts)} "
@@ -639,12 +650,27 @@ def main():
         END = args.end_date
         print(f"End-date override: END={END} (module default '2026-08-21')")
 
+    if args.ticker is not None:
+        # Mutually exclusive with --seed-watch-list-id (enforced above) -- seed mode
+        # derives TICKER from the real live watch_list row instead, so this branch and
+        # that one never both apply to the same run. Must run before load_live_node(TICKER)
+        # below (live-node-mode default branch) and before run_one_fixed_sl's TICKER usage.
+        global TICKER
+        TICKER = args.ticker
+        print(f"Ticker override: TICKER={TICKER} (module default 'SOXL')")
+
     seed = None
     if args.seed_watch_list_id is not None:
         seed = _load_seed_node(args.seed_watch_list_id)
         strategy_name = seed["strategy_name"]
         fixed_sl_list = [seed["fixed_sl"]]
-        global TICKER, ENTRY_TIMING, Z_THRESHOLDS, HOLD_TIME_CAPS
+        # TICKER already declared global above (--ticker override block) -- a second
+        # `global TICKER` here after that block's assignment raises SyntaxError ("assigned
+        # to before global declaration"), a real Python quirk confirmed while building this:
+        # once a name is globalled+assigned in one place in a function, a later `global`
+        # statement for the SAME name is illegal, even in a mutually-exclusive branch that
+        # can never run in the same call. TICKER stays covered by the earlier declaration.
+        global ENTRY_TIMING, Z_THRESHOLDS, HOLD_TIME_CAPS
         WINDOWS = [seed["window"]]
         # Z_THRESHOLDS/ENTRY_TIMING/HOLD_TIME_CAPS overridden the same way WINDOWS already
         # is above -- found by paired review 2026-08-29 (round 2 and round 3):
