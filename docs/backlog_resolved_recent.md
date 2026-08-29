@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][testing] Resolved 2026-08-28 (stale-entry cleanup) — 08-25's "12/14 NOT CHECKED (RuntimeError)" item was already fixed by the 08-27 yahoo->massive routing fix (`5b2f29e`), just never removed from backlog_cache.md. Confirmed via 2 fresh evening_status.py 3 reruns, zero RuntimeErrors. Full detail: `deep_backlog.md`.
+
 ## [live-trading][tooling] Resolved 2026-08-28 (coder3 dispatch) — self-check guard added to the 2 remaining hardcoded `CREATE TABLE watch_list_new` migration blocks (commit `8474e0e`), paired-reviewed, no HIGH findings. Full detail: `deep_backlog.md`.
 
 ## [tooling] Resolved 2026-08-28 (coder3 dispatch) — `prune_backtest_cache_ground_truth.py --build` now has index/total+ETA progress logging (commit `b983b89`), tested end-to-end against a scratch DB copy. Full detail: `deep_backlog.md`.
