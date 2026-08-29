@@ -22,6 +22,7 @@ numba-JIT-warmup cost twice and understating in-memory throughput on a small sam
 Usage: .venv/bin/python scripts/bench_phase1_phase2_inmemory.py [--workers 8]
 """
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -43,7 +44,7 @@ from run_optimization_sweep import (
 )
 from run_ground_truth_neighborhood import load_live_node
 from backtester import run_backtest_ground_truth
-from node_key import node_key
+from node_key import node_key, build_params_dict
 import campaign_config
 import strategies
 
@@ -158,12 +159,26 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
             trail_buy_pct, trail_sell_pct = 0.0, float(c["stop_loss"])
         else:
             trail_buy_pct, trail_sell_pct = 0.0, 0.0
+        # params_json (2026-08-29): built from the RAW pre-remap axis values (c["take_profit"]/
+        # c["stop_loss"]/c["trail_sell_pct"]) -- same raw inputs node_key() itself takes
+        # elsewhere in this file (see the node_key(...) call above in the winner-trades
+        # block), NOT the strategy-remapped trail_buy_pct/arm_pct columns just computed
+        # above for the candidate_nodes row itself. See feedback_backtest_cache_axis_
+        # column_remapping memory -- mixing these two up is a real prior bug class.
+        params_json = json.dumps(
+            build_params_dict(strategy_name, ticker, fixed_sl, c["window"], c["z_score_threshold"],
+                               c["max_hold_hours"], c["take_profit"], c["stop_loss"],
+                               c["trail_sell_pct"], entry_timing, strategies.resolve_axis_columns),
+            sort_keys=True)
         buffer.append((now_iso, ticker, strategy_name, config_version, c["window"],
                        c["z_score_threshold"], float(fixed_sl), arm_pct, trail_buy_pct,
                        trail_sell_pct, c["max_hold_hours"], entry_timing,
-                       c["alpha_vs_spy"], c["trades"], now_iso))
+                       c["alpha_vs_spy"], c["trades"], now_iso, params_json))
 
     with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
+        if 'params_json' not in existing_cols:
+            conn.execute("ALTER TABLE candidate_nodes ADD COLUMN params_json TEXT")
         before = conn.execute(
             "SELECT COUNT(*) FROM candidate_nodes WHERE version=? AND ticker=? AND strategy=?",
             (config_version, ticker, strategy_name)).fetchone()[0]
@@ -171,8 +186,8 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
             INSERT OR IGNORE INTO candidate_nodes
                 (created_at, ticker, strategy, version, window, z, fixed_sl, arm_pct,
                  trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing,
-                 robust_alpha, trades, robust_alpha_computed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 robust_alpha, trades, robust_alpha_computed_at, params_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, buffer)
         conn.commit()
         after = conn.execute(
