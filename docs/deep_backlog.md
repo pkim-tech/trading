@@ -1,5 +1,11 @@
 # Backlog
 
+## ✅ [live-trading][tooling] Resolved 2026-08-28 (coder3 dispatch) — self-check guard added to the 2 remaining hardcoded `CREATE TABLE watch_list_new` migration blocks (`ensure_tables()`)
+Commit `8474e0e`. Added the same loud-`RuntimeError`-on-stale-column-list guard (already present on the newest block since the 2026-08-26 `starting_notional_override_once` regression) to the account-UNIQUE and paper_role-UNIQUE rebuild blocks — chose duplicate-guard over a shared-source refactor for a smaller off-hours diff, root-causing the whole class left as a real follow-up. Verified via `scripts/verify_live_parity.py` (fresh-DB build + replay, all 4 sample nodes MATCH). Paired-reviewed (independent-cold + contextual Opus, rebuttal exchange): no HIGH findings; 1 disputed MEDIUM left as-is (both reviewers agree unreachable on any real path — `archived_at` isn't ALTERed in until after these blocks run in the current migration order); 1 LOW (incoherent comment dates) fixed directly.
+
+## ✅ [tooling] Resolved 2026-08-28 (coder3 dispatch) — `prune_backtest_cache_ground_truth.py --build` now has index/total+ETA progress logging
+Commit `b983b89`. Added progress logging to `compute_keep_manifest`'s two scope loops and `cmd_build`'s table-copy loop, per the `long-job-launch` skill convention. Tested end-to-end against a `/tmp` scratch copy of `trading_universe_daily.db.bak` (never the live DB or the backup itself) — ran a full `cmd_build()` to completion, all progress sections rendered correctly, build succeeded. Not a signals_*/schwab_*/kernel module, no paired-review gate needed.
+
 ## ✅ [process][backtest] Resolved 2026-08-28 (evening) — "agent never launches a sweep campaign itself" rule fully relaxed, general not narrow
 Standing rule (CLAUDE.md's Key Files section) originated 2026-07-20 after an agent launched `run_sweep_queue.sh` right after a scoping discussion the user hadn't actually authorized. Revisited after the user overrode it once this session (ran SOXL `bench_phase1_phase2_inmemory.py` fixed_sl=6 directly, a low-risk gap-fill). User's own retrospective: the original restriction existed only because manually tailing sweep logs gave a faster early preview than querying through the agent -- "we've come pretty far since the dark ages," no longer the bottleneck.
 

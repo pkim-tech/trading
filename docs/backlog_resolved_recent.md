@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [live-trading][tooling] Resolved 2026-08-28 (coder3 dispatch) — self-check guard added to the 2 remaining hardcoded `CREATE TABLE watch_list_new` migration blocks (commit `8474e0e`), paired-reviewed, no HIGH findings. Full detail: `deep_backlog.md`.
+
+## [tooling] Resolved 2026-08-28 (coder3 dispatch) — `prune_backtest_cache_ground_truth.py --build` now has index/total+ETA progress logging (commit `b983b89`), tested end-to-end against a scratch DB copy. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-08-28 (coder dispatch) — `active_builds` promotion table now gates `massive_hourly_derived`/`massive_minute_derived`'s "latest build" resolution instead of pure `ORDER BY id DESC`; new `scripts/promote_derived_build.py` (refuse-to-narrow guard, `--migrate` backfill), migration verified byte-identical on real live DB for all 17 live tickers. Full detail: `deep_backlog.md`.
 
 ## [process][backtest] Resolved 2026-08-28 (evening) — "agent never launches a sweep campaign itself" rule fully relaxed (general, not just schema-v2 gap-fills), after directly verifying the full `run_sweep_queue.sh` campaign path is non-destructive (INSERT OR REPLACE-only writes, guarded/dead migration DROP TABLEs, config.json trap-restored, real deletion tools untouched/still gated separately). CLAUDE.md, backtest-change-rollout skill, design.md, and memory all updated. Full detail: `deep_backlog.md`.
