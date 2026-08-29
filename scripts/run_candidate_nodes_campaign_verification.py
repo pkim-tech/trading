@@ -92,8 +92,21 @@ def main():
     args = ap.parse_args()
 
     t_all = time.monotonic()
-    if "phase3" not in args.skip:
-        run_phase3(args.ticker, args.version, args.window, args.data_source)
+    # Phase3 retired as an active step, 2026-08-29 (planner decision): Phase5's
+    # `_check_candidate_core` already computes core_cagr_1m/core_cagr_1s/core_delta_pp
+    # as part of its own per-candidate check -- that WAS Phase3's entire computation,
+    # done again. Phase5 used to be scoped narrower than Phase3 (island-capped top-9-
+    # per-scope subset vs Phase3's full raw candidate_nodes population) purely because
+    # of Phase5's old ~112s/candidate cost; the 2026-08-29 kernel-direct trade-generation
+    # change cut that to ~4-11s/candidate, so the narrowing no longer earns its cost.
+    # Phase5 (phase4_candidate_nodes_resolver.derive_phase25_candidates_from_candidate_
+    # nodes's new full_population=True path) now covers the full un-narrowed population
+    # Phase3 used to audit, PLUS addon/drought/core_both -- see phase5_second_level_
+    # overlay_check.py's run_scope()/_try_all_stored() call sites. run_phase3() and
+    # phase3_second_level_check.py itself are left in place (not deleted), just unwired
+    # here -- kept as a real Phase5 cross-check reference if ever needed again.
+    # if "phase3" not in args.skip:
+    #     run_phase3(args.ticker, args.version, args.window, args.data_source)
     if "phase4" not in args.skip:
         run_phase4(args.ticker, args.version, args.window, args.data_source)
     if "phase5" not in args.skip:

@@ -153,9 +153,22 @@ def discover_candidate_nodes_scopes(ticker, config_version):
 
 def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config_version,
                                                      fixed_sl=0, entry_timing='open_check',
-                                                     window=None):
+                                                     window=None, full_population=False):
     """candidate_nodes-sourced replacement for derive_phase25_candidates_ground_truth --
     see module docstring for the full design/known-deviations writeup. Read-only.
+
+    `full_population` (added 2026-08-29, Phase3-retirement/Phase5-widening task): when
+    True, SKIPS the island-clustering step below entirely and returns every raw
+    candidate_nodes row for the scope (same query, no up-to-`N_ISLANDS`-islands-of-
+    up-to-3 cap) -- this is the same un-narrowed population phase3_second_level_check.py's
+    own `main()` query has always audited. Existing callers (phase5_second_level_overlay_
+    check.py's original narrow path, candidate_summary_report.py, validate_phase4_
+    candidate_nodes_resolver.py) are UNCHANGED -- they don't pass this, so they keep
+    getting the island-capped subset exactly as before. Each returned dict still has the
+    real `id`/`take_profit`/`stop_loss`/`tpct` keys (via the same `_stop_loss_and_tpct_
+    from_row` mapping), but `island_tp`/`island_sl` are just set to the candidate's own
+    (take_profit, stop_loss) -- there is no real island grouping to report when every row
+    is returned individually.
 
     `window` (added 2026-08-29, planner review): candidate_nodes' natural scope key
     (ticker, strategy, version, fixed_sl, entry_timing) is NOT enough to identify one
@@ -200,12 +213,30 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
     df['stop_loss'] = sl_tpct[0]
     df['tpct'] = sl_tpct[1]
 
-    # Greedy fixed-capacity island assignment -- see module docstring's deviation #3
-    # for why this replaces a second pick_island_centers pass.
     _tb_cols = ['robust_alpha'] + [c for c, _ in GT_CANDIDATE_TIEBREAK]
     _tb_asc = [False] + [asc for _, asc in GT_CANDIDATE_TIEBREAK]
     df = df.sort_values(_tb_cols, ascending=_tb_asc)
 
+    if full_population:
+        # No island-clustering -- every raw row is its own "island" of one, same
+        # un-narrowed population phase3_second_level_check.py's own query has always
+        # audited. See docstring above.
+        candidates = []
+        for _, cand in df.iterrows():
+            tp, sl = int(cand['take_profit']), int(cand['stop_loss'])
+            candidates.append({
+                'id': int(cand['id']),
+                'island_tp': tp, 'island_sl': sl,
+                'take_profit': tp, 'stop_loss': sl,
+                'max_hold_hours': int(cand['max_hold_hours']), 'window': int(cand['window']),
+                'z_score_threshold': float(cand['z_score_threshold']), 'tpct': float(cand['tpct']),
+                'robust_alpha': float(cand['robust_alpha']), 'cagr': None,
+                'phase4_eligible': True,
+            })
+        return candidates
+
+    # Greedy fixed-capacity island assignment -- see module docstring's deviation #3
+    # for why this replaces a second pick_island_centers pass.
     islands = []  # list of {'seed': (tp, sl), 'members': [row dict, ...]}
     for _, row in df.iterrows():
         tp, sl = float(row['take_profit']), float(row['stop_loss'])
