@@ -238,6 +238,11 @@ def main():
                      help="explicit strategy, used INSTEAD of load_live_node(TICKER)'s")
     ap.add_argument("--fixed-sl", dest="fixed_sl", type=int,
                      help="explicit fixed_sl, used INSTEAD of load_live_node(TICKER)'s")
+    ap.add_argument("--window", type=int, default=None,
+                     help="run this single window value in ISOLATION instead of the "
+                          "real production grid (module-level WINDOWS=[10,20]) -- e.g. "
+                          "--window 15 to explore a midpoint value not otherwise swept. "
+                          "Does not add to the standard grid, replaces it for this run.")
     ap.add_argument("--resume-from-top100", action="store_true",
                      help="skip Phase1 dispatch entirely; load df1 from the persisted "
                           "top-100 Phase1-Coarse-GT snapshot in backtest_cache instead. "
@@ -261,6 +266,12 @@ def main():
                           "(one tests a narrow top-100-only dataset, the other a full "
                           "Phase1+Phase2 checkpoint) -- pick one.")
 
+    if args.window is not None:
+        global WINDOWS
+        WINDOWS = [args.window]
+        print(f"Window override: running window={args.window} in ISOLATION "
+              f"(replaces standard grid {[10, 20]})")
+
     if args.strategy is not None:
         strategy_name = args.strategy
         fixed_sl = args.fixed_sl
@@ -281,8 +292,15 @@ def main():
     version = "bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
 
     _job_tmp = os.path.join(os.environ["CLAUDE_JOB_DIR"], "tmp") if "CLAUDE_JOB_DIR" in os.environ else "/tmp"
+    # Keyed on WINDOWS too (not just strategy/fixed_sl) -- found live 2026-08-29: a
+    # --window override run silently loaded a stale checkpoint from an earlier
+    # standard-grid ([10,20]) run under the same strategy/fixed_sl, skipping Phase1+2
+    # entirely and never actually computing the overridden window at all. The checkpoint
+    # itself is explicitly documented as a "dev-iteration" convenience, not a production
+    # artifact -- this key just makes that convenience safe to use across different grids.
+    _windows_key = "-".join(str(w) for w in WINDOWS)
     checkpoint_path = args.checkpoint_file or os.path.join(
-        _job_tmp, f"bench_phase12_checkpoint_{strategy_name}_{fixed_sl}.parquet")
+        _job_tmp, f"bench_phase12_checkpoint_{strategy_name}_{fixed_sl}_w{_windows_key}.parquet")
 
     asset_bh, spy_bh = compute_bh_returns(TICKER, start_date=START, end_date=END, data_source=DATA_SOURCE)
     if spy_bh is None:
