@@ -49,8 +49,20 @@ needs a real order placed with no node_id -- a later leg, not this one.
          a real possibility, not hypothetical). B is already reconciled by
          leg 2, so this exercises drain_fill_queue's orphan-fill branch (no
          matching pending_buys row, ticker still in automation scope) --
-         proves a duplicate delivery alerts safely instead of raising or
+         proves a duplicate delivery is handled safely instead of raising or
          opening a second position.
+
+         UPDATED, 2026-08-28 (real orphaned_fill_detected false-alarm fix,
+         see fake_venue/scenarios_post_fill_topup.py's own 2026-08-28 note
+         for the full incident): this redelivery is structurally identical
+         to that fix's target case -- a fill with no matching pending_buys
+         row that's already fully accounted for by a real, recently-opened
+         open_positions row. It now correctly SUPPRESSES the alert
+         (result='suppressed_reconciled_position') instead of firing a false
+         🚨 "not reconciled, no position opened, no stop-loss placed" claim
+         for a fill that in fact WAS reconciled two lines above. Still
+         "handled safely" in exactly the sense this leg was built to prove
+         (no raise, no double position) -- just without the noise.
 
 FIXED 2026-08-16 (docs/backlog_cache.md, both items now closed): this
 scenario originally found and pinned down two real, pre-existing production
@@ -309,9 +321,13 @@ def run(price=None, verbose=True):
     # possibility, not hypothetical. B is already fully reconciled by leg 2
     # (pending row cleared, position open) -- re-emitting the identical
     # real-shaped fill must not raise, must not open a second position, and
-    # must not silently vanish. It should land in drain_fill_queue's
-    # orphan-fill branch (no matching pending_buys row, ticker still in
-    # automation scope) and alert instead.
+    # must not silently vanish. It lands in drain_fill_queue's orphan-fill
+    # branch (no matching pending_buys row, ticker still in automation
+    # scope) and, as of the 2026-08-28 false-alarm fix, is correctly
+    # SUPPRESSED there (see this module's leg 3 docstring above) rather than
+    # alerting -- the real open_positions row for node B (opened moments
+    # earlier in leg 2) is exactly the proof-of-already-reconciled signal
+    # that fix checks for.
     say(f"[leg 3] re-emitting the identical real-shaped fill for node B's already-reconciled order "
         f"{order_b} (simulated stream redelivery)")
     activity_stream.emit_fill(MARGIN_ACCOUNT_NUMBER, order_b, TICKER, 'BUY', fill_price_b, shares)
@@ -323,8 +339,13 @@ def run(price=None, verbose=True):
     checks.append(Check("redelivered fill for an already-reconciled order did not raise",
                         observations['drain_redelivery'] == 'completed without raising'))
     orphan = db.get_coverage_events(scenario_key="orphaned_fill_detected")
-    checks.append(Check("redelivery landed in the orphan-fill alert branch (no duplicate pending row)",
-                        any(e['result'] == 'alerted' and e['ticker'] == TICKER for e in orphan),
+    checks.append(Check("redelivery landed in the orphan-fill branch and was correctly SUPPRESSED "
+                        "(already reconciled, real open position on file -- no false alert)",
+                        any(e['result'] == 'suppressed_reconciled_position' and e['ticker'] == TICKER for e in orphan),
+                        f"results={[(e['result'], e['ticker']) for e in orphan]}"))
+    checks.append(Check("no ALERTED orphan-fill event fired for the redelivery -- the old (buggy) "
+                        "false-alarm behavior must not have silently regressed back",
+                        not any(e['result'] == 'alerted' and e['ticker'] == TICKER for e in orphan),
                         f"results={[(e['result'], e['ticker']) for e in orphan]}"))
     pos_b_after_redelivery = db.get_open_position_by_wl_id(node_b['id'])
     checks.append(Check("node B still has exactly one position after the redelivered fill",

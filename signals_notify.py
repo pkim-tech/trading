@@ -6349,6 +6349,23 @@ def check_gap_resize():
         _reconcile_buy_fill(ticker, fill['price'], fill['quantity'], is_gap_correction=True, wl_id=node['id'], account=account)
 
 
+# How recently a real open_positions row must have been opened (entry_time)
+# for drain_fill_queue's orphan-fill check to treat it as proof this fill was
+# already reconciled, rather than a genuine orphan (see the check itself,
+# below, for the full incident and why this reuses _reconcile_buy_fill's own
+# get_real_open_position precedent). Set to signals_config.POLL_SECS rather
+# than a tighter empirical value: the real worst-case delay between a fill
+# actually reconciling and its OWN stream event being drained is one full
+# poll cycle (a stream event that arrives just after drain_fill_queue's
+# in-flight pass won't be seen again until the next one). The real observed
+# reconcile-to-alert gaps across every occurrence of this incident (SOXL/
+# DPST/RETL/DFEN, 2026-08-20 through 2026-08-28) topped out at ~71s -- a
+# tighter window would also have been safe against everything observed SO
+# FAR, but ties the margin to what's happened to occur rather than to the
+# system's actual worst-case timing guarantee, which is POLL_SECS.
+_ORPHAN_RECONCILED_POSITION_WINDOW_SECS = cfg.POLL_SECS
+
+
 def drain_fill_queue(source='daemon'):
     """Fast-path fill detection (Part 3, branch C) -- pops all pending events off
     schwab_stream's account-activity queue and reconciles each. A no-op if
@@ -6457,15 +6474,84 @@ def drain_fill_queue(source='daemon'):
             # alongside the AccountNumber fix above since it's the same call.
             _confirmed_fill = schwab_client.get_filled_order(account, ticker, 'BUY', order_id=_order_id_int)
             if _confirmed_fill is not None:
-                _post_message(
-                    f"🚨 {ticker} ({account} · {mode_tag(account)}) — real BUY fill confirmed "
-                    f"(price=${_confirmed_fill['price']:.4f} shares={_confirmed_fill['quantity']:g}, "
-                    f"order_id={order_id}) but NO pending_buys row matches this order at all — "
-                    f"not reconciled, no position opened, no stop-loss placed. Verify and record manually."
-                )
-                db.log_coverage_event("orphaned_fill_detected", _coverage_mode(account), ticker=ticker,
-                                       result="alerted", detail=f"order_id={order_id} "
-                                       f"price={_confirmed_fill['price']:.4f} shares={_confirmed_fill['quantity']:g}", source=source)
+                # Recognize an already-reconciled fill before concluding
+                # genuine orphan (real, recurring false-alarm found 2026-08-28:
+                # SOXL/DPST/RETL/DFEN all false-fired here -- confirmed against
+                # real coverage_events that BOTH the primary fill's own stream
+                # event AND its same-day top-up's own stream event (CLAUDE.md's
+                # Position sizing section, "_reconcile_fill tops up the
+                # shortfall same-day") self-orphan: neither one's order_id is
+                # ever in pending_buys by the time drain_fill_queue sees it --
+                # the primary's row is cleared by whichever path (sync
+                # fast-confirm, slow poll, or this same drain call noticing a
+                # different queued event) reconciles it first, and the top-up
+                # order never gets a pending_buys row at all (see
+                # _reconcile_fill's docstring). In every real occurrence the
+                # position/SL were already fully, correctly reconciled before
+                # either alert fired.
+                #
+                # An initial version of this fix keyed off the fuzzy ticker+
+                # account db.get_watch_list_node lookup + a node-scoped
+                # 'top_up' coverage_event share-count match -- paired review
+                # (independent-cold + contextual Opus) found BOTH broken
+                # against real production data: get_watch_list_node returns
+                # None (ambiguous) for SOXL/DPST/DFEN's real watch_list rows
+                # (multiple archived/paper sibling rows share the same
+                # ticker+account, and that lookup applies no state/archived_at
+                # filter), so the suppression never actually fired for the
+                # tickers the incident was about; and keying on a specific
+                # 'top_up' event only ever covered the top-up leg, never the
+                # primary leg's own self-orphaning, which the real
+                # coverage_events data showed firing just as often.
+                #
+                # Fixed by reusing the exact precedent that already exists a
+                # few lines up in THIS SAME FILE for the identical bug shape:
+                # _reconcile_buy_fill's own no-pending-rows-at-all branch
+                # (search "get_real_open_position (not bare get_open_position)"
+                # above) already treats "a real, non-dry-run open position
+                # exists for this ticker/account" as proof of prior
+                # reconciliation, with no node lookup needed at all --
+                # ticker+account is already exactly what's in scope here.
+                # Bounded to a recency window (unlike that sibling check,
+                # which has none) because THIS check fires per-order-id, far
+                # more often in normal operation (every top-up, not just a
+                # rare zero-pending-rows case) -- an unbounded match here
+                # would risk masking a genuinely new, unrelated orphan fill
+                # for a ticker/account that happens to also hold an old,
+                # unrelated position. Window matches signals_config.POLL_SECS
+                # (the real worst-case delay: a stream event that misses the
+                # in-flight drain lands on the NEXT poll cycle) rather than
+                # the tighter, empirically-wrong 120s the first version used.
+                _already_reconciled = False
+                _recon_position = db.get_real_open_position(ticker, account=account)
+                _recon_age_secs = None
+                if _recon_position is not None:
+                    try:
+                        _entry_dt = datetime.strptime(_recon_position['entry_time'], '%Y-%m-%d %H:%M:%S')
+                        _recon_age_secs = (datetime.now() - _entry_dt).total_seconds()
+                    except (ValueError, TypeError):
+                        _recon_age_secs = None
+                    if _recon_age_secs is not None and 0 <= _recon_age_secs <= _ORPHAN_RECONCILED_POSITION_WINDOW_SECS:
+                        _already_reconciled = True
+                if _already_reconciled:
+                    db.log_coverage_event(
+                        "orphaned_fill_detected", _coverage_mode(account), ticker=ticker,
+                        node_id=_recon_position.get('wl_id'), result="suppressed_reconciled_position",
+                        detail=f"order_id={order_id} price={_confirmed_fill['price']:.4f} "
+                               f"shares={_confirmed_fill['quantity']:g} -- a real open position for "
+                               f"{ticker}/{account} was opened {_recon_age_secs:.0f}s ago, already "
+                               f"accounting for this fill (e.g. same-day top-up or a race with a "
+                               f"faster reconcile path), not a genuine orphan", source=source)
+                else:
+                    _post_message(
+                        f"🚨 {ticker} ({account} · {mode_tag(account)}) — real BUY fill confirmed "
+                        f"(price=${_confirmed_fill['price']:.4f} shares={_confirmed_fill['quantity']:g}, "
+                        f"order_id={order_id}) but NO pending_buys row matches this order at all — "
+                        f"not reconciled, no position opened, no stop-loss placed. Verify and record manually."
+                    )
+                    db.log_coverage_event("orphaned_fill_detected", _coverage_mode(account), ticker=ticker,
+                                           result="alerted", detail=f"order_id={order_id} "
+                                           f"price={_confirmed_fill['price']:.4f} shares={_confirmed_fill['quantity']:g}", source=source)
         # Same opt-in gate as check_auto_fills (the slow-poll fallback) --
         # without this, the fast websocket path auto-reconciled any real fill
         # regardless of auto_fill_detection_enabled/node_auto_fill_detection_enabled,

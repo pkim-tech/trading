@@ -89,9 +89,34 @@ order's own fill reconciling correctly):
          downstream, so this was a real (if usually small) live-money
          correctness gap, not cosmetic bookkeeping.
 
-         => coverage_events['orphaned_fill_detected'] = 'alerted', with
-            quantity/price matching the TOP-UP order specifically (not the
-            original fill)                                       <-- checked
+         UPDATED, 2026-08-28 (real SOXL/DPST/RETL/DFEN incident): the
+         orphan-fill alert firing here was itself a real, recurring FALSE
+         ALARM, not correct behavior -- a top-up fill's own stream event
+         structurally never has a matching pending_buys row (by design, see
+         above), so it predictably "orphan"-alerted every single time even
+         though the position/SL were already correctly reconciled by leg 1.
+         (A real production audit also found the PRIMARY fill's own stream
+         event does the same thing when re-drained after its pending_buys
+         row is cleared by a faster reconcile path -- both legs alerted in
+         every real occurrence; this scenario only exercises the top-up leg,
+         see test_fake_broker_topup_orphan_fill_suppression_scenario.py in
+         tests/ for the primary-leg proof.) Fixed in
+         signals_notify.drain_fill_queue: before alerting, it now checks
+         db.get_real_open_position(ticker, account) -- the exact precedent
+         _reconcile_buy_fill's own no-pending-rows branch already uses for
+         the identical bug shape a few lines up in the same file -- and
+         suppresses only if a real (non-dry-run) position was opened within
+         the last signals_config.POLL_SECS seconds (an earlier version of
+         this fix keyed off a fuzzy ticker+account db.get_watch_list_node
+         lookup + a node-scoped 'top_up' coverage_event match; paired review
+         found get_watch_list_node returns None -- ambiguous -- for every
+         real ticker in the actual incident, since multiple archived/paper
+         sibling watch_list rows share the same ticker+account). This
+         scenario's leg 2 is now the canonical proof of the FIX, not of the
+         old alert firing:
+         => coverage_events['orphaned_fill_detected'] = 'suppressed_reconciled_position',
+            with quantity/price matching the TOP-UP order specifically (not
+            the original fill) -- the alert itself must NOT fire   <-- checked
          => coverage_events['fast_path_fill_reconciliation'] =
             'auto_fill_detection_disabled' (node_auto_fill_detection_enabled
             (None) is a hard False -- schwab_safety.py:636 -- so no second,
@@ -366,17 +391,24 @@ def run(price=None, verbose=True):
                         observations['drain_topup_fill'] == 'completed without raising'))
 
     orphan = db.get_coverage_events(scenario_key="orphaned_fill_detected")
-    topup_orphan = [e for e in orphan if e['result'] == 'alerted' and e['ticker'] == TICKER
+    topup_orphan = [e for e in orphan if e['result'] == 'suppressed_reconciled_position' and e['ticker'] == TICKER
                     and f"order_id={topup_order_id}" in (e['detail'] or '')]
-    checks.append(Check("the top-up's own fill correctly landed in the orphan-fill alert branch "
-                        "(no pending_buys row -- by design, _reconcile_fill already recorded it "
-                        "synchronously), tagged to the TOP-UP order's id specifically",
+    checks.append(Check("the top-up's own fill is recognized as already-reconciled and its orphan "
+                        "alert is SUPPRESSED (real 2026-08-28 SOXL/DPST false-alarm fix -- a "
+                        "top-up fill structurally never has a pending_buys row, but the position/SL "
+                        "were already correctly reconciled by leg 1), tagged to the TOP-UP order's "
+                        "id specifically",
                         len(topup_orphan) == 1,
                         f"events={[(e['result'], e['detail']) for e in orphan]}"))
+    checks.append(Check("no ALERTED orphan-fill event fired for this fix -- the old (buggy) "
+                        "false-alarm behavior must not have silently regressed back",
+                        not any(e['result'] == 'alerted' and e['ticker'] == TICKER for e in orphan),
+                        f"events={[(e['result'], e['detail']) for e in orphan]}"))
     if topup_orphan:
-        checks.append(Check("orphan-fill alert reports the TOP-UP order's own price/quantity, "
-                            "not the original fill's (order_id-exact get_filled_order resolved the "
-                            "right one of two FILLED orders on file for this ticker)",
+        checks.append(Check("suppressed orphan-fill record still logs the TOP-UP order's own "
+                            "price/quantity, not the original fill's (order_id-exact "
+                            "get_filled_order resolved the right one of two FILLED orders on "
+                            "file for this ticker)",
                             f"price={topup_fill_price:.4f}" in topup_orphan[0]['detail']
                             and f"shares={top_up_shares:g}" in topup_orphan[0]['detail'],
                             f"detail={topup_orphan[0]['detail']}"))
@@ -415,6 +447,8 @@ SELECT op.wl_id, op.shares AS final_shares, op.entry_price, wl.account, wl.state
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='top_up' AND result='placed'
          AND node_id=op.wl_id) AS top_up_placed_events,
        (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='orphaned_fill_detected'
+         AND result='suppressed_reconciled_position' AND ticker=wl.ticker) AS orphan_fill_suppressed,
+       (SELECT COUNT(*) FROM coverage_events WHERE scenario_key='orphaned_fill_detected'
          AND result='alerted' AND ticker=wl.ticker) AS orphan_fill_alerts
   FROM open_positions op
   JOIN watch_list wl ON wl.id = op.wl_id
@@ -424,8 +458,11 @@ SELECT op.wl_id, op.shares AS final_shares, op.entry_price, wl.account, wl.state
 
 def verify_proof(db_path):
     """Returns (ok, rows). ok requires exactly one open position, with exactly
-    one 'placed' top_up event and exactly one 'alerted' orphaned-fill event
-    (the top-up's own fill), directly from the harness DB."""
+    one 'placed' top_up event and exactly one 'suppressed_reconciled_position'
+    orphaned-fill event (the top-up's own fill, correctly recognized as
+    already-reconciled rather than false-alarmed -- see the 2026-08-28 fix
+    note in this module's docstring) and ZERO 'alerted' orphaned-fill events,
+    directly from the harness DB."""
     import sqlite3
 
     from fake_venue.scenarios_meta import TICKER as _ticker
@@ -437,5 +474,6 @@ def verify_proof(db_path):
     finally:
         conn.close()
     ok = (len(rows) == 1 and rows[0]['top_up_placed_events'] == 1
-          and rows[0]['orphan_fill_alerts'] == 1 and rows[0]['state'] == 'live')
+          and rows[0]['orphan_fill_suppressed'] == 1 and rows[0]['orphan_fill_alerts'] == 0
+          and rows[0]['state'] == 'live')
     return ok, rows
