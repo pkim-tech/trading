@@ -2734,6 +2734,11 @@ Part 2 (Massive as the eventual primary source, via `active_builds`) — still n
 whether to pursue given part 1's yahoo-side fix already closes the immediate gap. This doc entry's
 "Separate, bigger-scope thread" paragraph above still applies unchanged.
 
+(Standalone observation tool, not this integration: `scripts/corp_action_canary.py`, built same night,
+revised to a 15-min-poll cadence — applies this entry's part-1/part-2 detection logic purely as an
+external SPY-only logger, doesn't touch `signals_compute.py`/the live cache at all. See
+`docs/deep_backlog.md`'s corresponding Task #10 entry.)
+
 ## 2026-08-28 (later still) — Design, not built, part 2: quarterly ticker-rotation concept ("v6-q4"-style), swap-on-flat, and a real BUY-only node-pause gap found
 
 **Origin**: a follow-on design thread the same night, connected to part 1 above (both stem from wanting a
