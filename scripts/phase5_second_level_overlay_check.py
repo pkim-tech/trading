@@ -103,6 +103,8 @@ from backtester import (
     simulate_drought_overlay_ground_truth,
 )
 from candidate_verification_store import get_stored, upsert, insert_trades, trades_complete
+from node_key import node_key as _compute_node_key
+import strategies
 
 # Above this measured per-candidate wall-clock cost (seconds), fall back to
 # top-few-only instead of the full finalist set, absent an explicit --limit
@@ -114,6 +116,42 @@ from candidate_verification_store import get_stored, upsert, insert_trades, trad
 # count) rather than assuming the fast case always holds.
 _CHEAP_ENOUGH_SECS_PER_CANDIDATE = 15.0
 _FALLBACK_TOP_N = 3
+
+# Column definitions for the xlsx sibling's "Column Definitions" sheet (Task,
+# 2026-08-29, xlsx-output dispatch) -- passed to candidate_summary_report._write_xlsx,
+# ordered to match df_out's real columns (ticker/scope identity, then trade counts/
+# source, then core/addon/drought/both CAGR pairs + deltas, then timing).
+_PHASE5_COLUMN_DEFS = {
+    "candidate": "1-based rank within this scope's finalist list (submission order).",
+    "ticker": "Underlying ticker for this scope.",
+    "strategy": "Strategy class name (TrailingBothZScoreBreakout / TrailingExitZScoreBreakout).",
+    "fixed_sl": "Fixed stop-loss percent for this scope.",
+    "window": "Real candidate_nodes window value, or blank for a backtest_cache-sourced "
+              "scope (which aggregates across windows).",
+    "n_trades_1m": "Number of core trades in the 1-minute-resolution trade list.",
+    "n_trades_1s": "Number of core trades in the 1-second-resolution trade list.",
+    "trades_1m_source": "'backtest_winner_trades' if the 1m trade list was read from "
+                        "Phase2.5's already-persisted winner trades (node_key/version "
+                        "match), 'kernel' if it had to be recomputed fresh, or blank if "
+                        "this row came from a stored candidate_verification_results skip "
+                        "(no fresh check ran this pass).",
+    "core_cagr_1m": "Core-only CAGR at 1-minute resolution.",
+    "core_cagr_1s": "Core-only CAGR at 1-second resolution.",
+    "core_delta_pp": "core_cagr_1m - core_cagr_1s, in percentage points.",
+    "addon_cagr_1m": "Core+add-on overlay CAGR at 1-minute resolution.",
+    "addon_cagr_1s": "Core+add-on overlay CAGR at 1-second resolution.",
+    "addon_delta_pp": "addon_cagr_1m - addon_cagr_1s, in percentage points.",
+    "drought_cagr_1m": "Core+drought overlay CAGR at 1-minute resolution (TrailingBoth only).",
+    "drought_cagr_1s": "Core+drought overlay CAGR at 1-second resolution (TrailingBoth only).",
+    "drought_delta_pp": "drought_cagr_1m - drought_cagr_1s, in percentage points.",
+    "core_both_cagr_1m": "Core+add-on+drought triple-stacked (robustness-gated) CAGR at "
+                         "1-minute resolution.",
+    "core_both_cagr_1s": "Core+add-on+drought triple-stacked (robustness-gated) CAGR at "
+                         "1-second resolution.",
+    "core_both_delta_pp": "core_both_cagr_1m - core_both_cagr_1s, in percentage points.",
+    "elapsed_secs": "Wall-clock seconds for this candidate's check (0.0 if reused from a "
+                    "stored candidate_verification_results row).",
+}
 
 # Set once in main() before the ProcessPoolExecutor is created -- fork (the
 # Linux default multiprocessing start method) gives every worker copy-on-write
@@ -190,7 +228,66 @@ def node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, cand):
         # is the signal used everywhere below to skip verification-result persistence
         # for that path (no candidate_id exists to validate/insert against).
         id=cand.get("id"),
+        # RAW (pre-strategy-remap) axis values (Task, 2026-08-29, trades-from-cache
+        # dispatch) -- kept separately from arm_pct/trail_buy_pct/trail_sell_pct above
+        # because node_key() (and bench_phase1_phase2_inmemory.py's own winner-trades
+        # write path) is keyed on the RAW take_profit/stop_loss/trail_sell_pct grid-axis
+        # values, not the strategy-remapped trail_buy_pct/trail_sell_pct pair -- these
+        # only coincide for TrailingBothZScoreBreakout (sl_axis='trail_buy_pct'), NOT for
+        # TrailingExitZScoreBreakout (sl_axis='trail_pct'), where trail_sell_pct above
+        # is the raw stop_loss value and there is no raw tpct at all. Confirmed empirically
+        # against real backtest_winner_trades rows for both strategies before relying on
+        # this -- see this task's commit message for the actual match-count check.
+        _raw_take_profit=float(cand["take_profit"]), _raw_stop_loss=float(cand["stop_loss"]),
+        _raw_tpct=float(cand["tpct"]),
     )
+
+
+def _node_key_for_candidate(node):
+    return _compute_node_key(
+        node["strategy"], node["ticker"], node["fixed_sl"], node["window"],
+        node["z_score_threshold"], node["max_hold_hours"],
+        node["_raw_take_profit"], node["_raw_stop_loss"], node["_raw_tpct"],
+        node["entry_timing"], strategies.resolve_axis_columns,
+    )
+
+
+def _trades_from_backtest_winner_trades(node, version):
+    """Read the real 1m trade list straight from backtest_winner_trades (Phase2.5's
+    already-persisted winner trades, see scripts/rebuild_winner_trades.py /
+    bench_phase1_phase2_inmemory.py) instead of recomputing it via a fresh kernel call
+    -- Task, 2026-08-29 (planner dispatch: "stop recomputing the 1m trade list").
+    Returns None (never raises) when no matching (node_key, version) rows exist --
+    a real, expected partial-coverage case (this candidate wasn't part of Phase2.5's
+    original promoted top-9-per-scope set, or came via the backtest_cache-sourced
+    legacy path with no real node_key trail), not a bug; the caller falls back to
+    `_run_gt_kernel` exactly as before in that case. Reconstructs the exact dict shape
+    `apply_addon_overlay_ground_truth`/`simulate_drought_overlay_ground_truth`/
+    `insert_trades` all expect ('Entry Time'/'Entry Price'/'Exit Time'/'Exit Price'/
+    'exit_reason'/'Return'/'armed'/'Arm Time'/'Arm Price') from backtest_winner_trades'
+    own snake_case columns -- NOT the raw DB row shape."""
+    nk = _node_key_for_candidate(node)
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT entry_time, entry_price, exit_time, exit_price, exit_reason,
+                   return_pct, armed, arm_time, arm_price
+            FROM backtest_winner_trades
+            WHERE node_key=? AND version=?
+            ORDER BY trade_idx
+        """, (nk, version)).fetchall()
+    if not rows:
+        return None
+    trades = []
+    for entry_time, entry_price, exit_time, exit_price, exit_reason, return_pct, armed, arm_time, arm_price in rows:
+        armed_bool = bool(armed)
+        trades.append({
+            'Entry Time': pd.Timestamp(entry_time), 'Entry Price': entry_price,
+            'Exit Time': pd.Timestamp(exit_time), 'Exit Price': exit_price,
+            'exit_reason': exit_reason, 'Return': return_pct, 'armed': armed_bool,
+            'Arm Time': pd.Timestamp(arm_time) if (armed_bool and arm_time) else None,
+            'Arm Price': arm_price if armed_bool else None,
+        })
+    return trades
 
 
 def _run_gt_kernel(node, dfh, minute_df, start, end):
@@ -283,28 +380,42 @@ def overlay_cagrs(gt_trades, ticker, dfh, node, years):
     return core_cagr, addon_cagr, drought_cagr, core_both_cagr
 
 
-def _check_candidate_core(node, dfh, df_1m, df_1s, start, end, years):
+def _check_candidate_core(node, dfh, df_1m, df_1s, start, end, years, version):
     """The actual compute -- shared by the standalone first-candidate timing
     call (main process) and the pool worker below (forked process, reading
     the module-level _DFH/_DF_1M/_DF_1S globals instead of taking them as
     arguments, so they're never re-pickled/re-sent per task).
 
+    1m trades (Task, 2026-08-29, "stop recomputing the 1m trade list"): tried first
+    from backtest_winner_trades (Phase2.5's own already-persisted winner trades for
+    this exact node_key/version) via _trades_from_backtest_winner_trades -- only
+    falls back to a fresh `_run_gt_kernel` call when no matching rows exist there
+    (real, expected partial coverage, not an error). The 1s leg is ALWAYS computed
+    fresh -- nothing in this codebase persists 1s-resolution trades the way
+    backtest_winner_trades does for 1m.
+
     Returns the real full 1m/1s trade lists under 'trades_1m'/'trades_1s' (Task,
     2026-08-29, planner dispatch/correction) -- these are ALWAYS included when this
-    function actually ran a fresh kernel call (never present in a stored-result skip
-    row from _stored_row_or_none, which never calls this function at all). The
-    caller (run_scope, always the main process even for a pool-worker result -- see
+    function actually ran (never present in a stored-result skip row from
+    _stored_row_or_none, which never calls this function at all), regardless of
+    whether the 1m leg came from the cache or a fresh kernel run -- phase5_trades'
+    own persistence always needs the full trade list either way. The caller
+    (run_scope, always the main process even for a pool-worker result -- see
     _pool_worker's own docstring for why persistence doesn't happen inside the
     worker) is responsible for persisting these into phase5_trades and then
     stripping the keys back out before the row is used for CSV/summary output."""
     t0 = time.monotonic()
-    trades_1m = _run_gt_kernel(node, dfh, df_1m, start, end)
+    trades_1m = _trades_from_backtest_winner_trades(node, version)
+    trades_1m_source = "backtest_winner_trades" if trades_1m is not None else "kernel"
+    if trades_1m is None:
+        trades_1m = _run_gt_kernel(node, dfh, df_1m, start, end)
     trades_1s = _run_gt_kernel(node, dfh, df_1s, start, end)
     core_1m, addon_1m, drought_1m, both_1m = overlay_cagrs(trades_1m, node["ticker"], dfh, node, years)
     core_1s, addon_1s, drought_1s, both_1s = overlay_cagrs(trades_1s, node["ticker"], dfh, node, years)
     elapsed = time.monotonic() - t0
     return {
         "n_trades_1m": len(trades_1m), "n_trades_1s": len(trades_1s),
+        "trades_1m_source": trades_1m_source,
         "core_cagr_1m": core_1m, "core_cagr_1s": core_1s,
         "addon_cagr_1m": addon_1m, "addon_cagr_1s": addon_1s,
         "drought_cagr_1m": drought_1m, "drought_cagr_1s": drought_1s,
@@ -318,7 +429,7 @@ def _check_candidate_core(node, dfh, df_1m, df_1s, start, end, years):
     }
 
 
-def _pool_worker(cand_idx, node, start, end, years):
+def _pool_worker(cand_idx, node, start, end, years, version):
     """Runs in a forked worker process -- reads _DFH/_DF_1M/_DF_1S as module-
     level globals (inherited via fork's copy-on-write at pool-creation time,
     set in main() before the ProcessPoolExecutor is created), not as function
@@ -327,12 +438,14 @@ def _pool_worker(cand_idx, node, start, end, years):
     The already-verified skip check happens in run_scope BEFORE dispatch (so an
     already-stored-AND-trades-backfilled candidate never costs a pool round-trip at
     all, see run_scope/_stored_row_or_none) -- this worker always does a genuine
-    fresh kernel run. Trade lists ride back to the main process in the returned row
-    (under 'trades_1m'/'trades_1s') and are persisted there, not here -- every other
-    DB write in this file already happens in the main process only (see run_scope's
-    existing upsert() call sites), so phase5_trades follows the same convention
-    rather than opening a writer connection from inside a forked worker."""
-    row = _check_candidate_core(node, _DFH, _DF_1M, _DF_1S, start, end, years)
+    fresh check (1m from backtest_winner_trades when available, else kernel; 1s
+    always kernel -- see _check_candidate_core). Trade lists ride back to the main
+    process in the returned row (under 'trades_1m'/'trades_1s') and are persisted
+    there, not here -- every other DB write in this file already happens in the
+    main process only (see run_scope's existing upsert() call sites), so
+    phase5_trades follows the same convention rather than opening a writer
+    connection from inside a forked worker."""
+    row = _check_candidate_core(node, _DFH, _DF_1M, _DF_1S, start, end, years, version)
     row["candidate"] = cand_idx
     return row
 
@@ -450,7 +563,7 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
     first_node = node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, candidates[0])
     first_row = _stored_row_or_none(first_node.get("id"), 1)
     if first_row is None:
-        first_row = _check_candidate_core(first_node, dfh, df_1m, df_1s, start, end, years)
+        first_row = _check_candidate_core(first_node, dfh, df_1m, df_1s, start, end, years, version)
         first_row["candidate"] = 1
         if first_node.get("id") is not None:
             with sqlite3.connect(DB_PATH) as conn:
@@ -484,7 +597,7 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
                 extra_by_idx[i] = dict(row, ticker=ticker, strategy=strategy_name,
                                         fixed_sl=fixed_sl, window=window)
                 continue
-            fut = pool.submit(_pool_worker, i, node, start, end, years)
+            fut = pool.submit(_pool_worker, i, node, start, end, years, version)
             futures[fut] = node
         for fut in as_completed(futures):
             row = fut.result()
@@ -666,14 +779,28 @@ def main():
     # scope (window=None) has no real window to key on -- its rows go to the
     # no-suffix filename, matching this script's original single-CSV-per-run shape
     # for that path (only one such group can exist per run either way).
+    # xlsx sibling (Task, 2026-08-29: Phase5 "keep the discipline the same" as Phase4's
+    # own dual-format convention) -- reuses candidate_summary_report._write_xlsx/
+    # _write_csv directly (generic enough already: takes any list-of-dicts `rows` + an
+    # ordered {col: definition} dict, `to_record=lambda r: r` since these rows are
+    # already flat dicts, same pattern that module's own GT report path already uses
+    # at its own call site) rather than duplicating xlsx-writing logic here. Imported
+    # locally (not at module level) so this file's ProcessPoolExecutor workers never
+    # pull in that module's heavier import chain (top_safe_nodes/run_overlay_shim/etc.)
+    # -- only the main process, after the pool has already exited, needs it.
+    from candidate_summary_report import _write_xlsx
+
     out_paths = []
     for window_val, group in df_out.groupby(df_out["window"], dropna=False):
         suffix = f"_w{int(window_val)}" if pd.notna(window_val) else ""
-        out_path = os.path.join(
-            ROOT, "output",
-            f"phase5_second_level_overlay_check_{args.ticker.lower()}_{args.version}{suffix}.csv")
+        base_name = f"phase5_second_level_overlay_check_{args.ticker.lower()}_{args.version}{suffix}"
+        out_path = os.path.join(ROOT, "output", f"{base_name}.csv")
         group.to_csv(out_path, index=False)
         out_paths.append(out_path)
+        xlsx_out_path = os.path.join(ROOT, "output", f"{base_name}.xlsx")
+        _write_xlsx(xlsx_out_path, group.to_dict("records"),
+                    col_defs=_PHASE5_COLUMN_DEFS, to_record=lambda r: r)
+        out_paths.append(xlsx_out_path)
 
     print(f"\n=== Phase5 summary: {len(df_out)} candidate(s) checked across {len(scopes)} scope(s) ===")
     for label in ("core_delta_pp", "addon_delta_pp", "drought_delta_pp", "core_both_delta_pp"):
