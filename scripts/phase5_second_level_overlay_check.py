@@ -102,9 +102,10 @@ from backtester import (
     run_backtest_ground_truth, apply_addon_overlay_ground_truth,
     simulate_drought_overlay_ground_truth,
 )
-from candidate_verification_store import get_stored, upsert, insert_trades, trades_complete
-from node_key import node_key as _compute_node_key
+from candidate_verification_store import get_stored, upsert, insert_trades, trades_complete, get_cached_trades
+from node_key import node_key as _compute_node_key, GT_TRADES_KERNEL_VERSION
 import strategies
+import db_cache
 
 # Above this measured per-candidate wall-clock cost (seconds), fall back to
 # top-few-only instead of the full finalist set, absent an explicit --limit
@@ -252,6 +253,25 @@ def _node_key_for_candidate(node):
     )
 
 
+# Real resolved db_cache build_ids, memoized per-ticker (2026-08-29, paired-review HIGH
+# finding, round 2, contextual Opus review NEW finding): _trades_from_backtest_winner_
+# trades below is called once per candidate, but get_active_build_id's own SQL lookup is
+# cheap enough (unlike the multi-GB hourly/1s data loads this module already memoizes
+# via module-level globals) that a plain per-ticker dict cache here is simplest -- no
+# need to thread build_ids through the ProcessPoolExecutor's pool-creation setup the way
+# the big DataFrames are.
+_BUILD_ID_CACHE = {}
+
+
+def _resolved_build_ids(ticker):
+    if ticker not in _BUILD_ID_CACHE:
+        _BUILD_ID_CACHE[ticker] = (
+            db_cache.get_active_build_id(ticker, 'hourly'),
+            db_cache.get_active_build_id(ticker, 'minute'),
+        )
+    return _BUILD_ID_CACHE[ticker]
+
+
 def _trades_from_backtest_winner_trades(node, version):
     """Read the real 1m trade list straight from backtest_winner_trades (Phase2.5's
     already-persisted winner trades, see scripts/rebuild_winner_trades.py /
@@ -261,33 +281,24 @@ def _trades_from_backtest_winner_trades(node, version):
     a real, expected partial-coverage case (this candidate wasn't part of Phase2.5's
     original promoted top-9-per-scope set, or came via the backtest_cache-sourced
     legacy path with no real node_key trail), not a bug; the caller falls back to
-    `_run_gt_kernel` exactly as before in that case. Reconstructs the exact dict shape
-    `apply_addon_overlay_ground_truth`/`simulate_drought_overlay_ground_truth`/
-    `insert_trades` all expect ('Entry Time'/'Entry Price'/'Exit Time'/'Exit Price'/
-    'exit_reason'/'Return'/'armed'/'Arm Time'/'Arm Price') from backtest_winner_trades'
-    own snake_case columns -- NOT the raw DB row shape."""
+    `_run_gt_kernel` exactly as before in that case.
+
+    Staleness-aware (fixed 2026-08-29, paired-review HIGH finding, round 2, contextual
+    Opus review): this used to duplicate run_optimization_sweep.build_candidate_report_
+    ground_truth's own read-back logic inline, with NO kernel_version/build_id staleness
+    guard at all -- the identical gap Task #1's whole trades-cache fix exists to close,
+    just unguarded in this sibling consumer. Now calls the SAME shared, hardened
+    candidate_verification_store.get_cached_trades Phase4 uses (one staleness-aware
+    implementation, not two independently-maintained copies of the same read-back+
+    reconstruction logic) -- see that function's own docstring for the full
+    kernel_version/hourly_build_id/minute_build_id contract."""
     nk = _node_key_for_candidate(node)
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("""
-            SELECT entry_time, entry_price, exit_time, exit_price, exit_reason,
-                   return_pct, armed, arm_time, arm_price
-            FROM backtest_winner_trades
-            WHERE node_key=? AND version=?
-            ORDER BY trade_idx
-        """, (nk, version)).fetchall()
-    if not rows:
-        return None
-    trades = []
-    for entry_time, entry_price, exit_time, exit_price, exit_reason, return_pct, armed, arm_time, arm_price in rows:
-        armed_bool = bool(armed)
-        trades.append({
-            'Entry Time': pd.Timestamp(entry_time), 'Entry Price': entry_price,
-            'Exit Time': pd.Timestamp(exit_time), 'Exit Price': exit_price,
-            'exit_reason': exit_reason, 'Return': return_pct, 'armed': armed_bool,
-            'Arm Time': pd.Timestamp(arm_time) if (armed_bool and arm_time) else None,
-            'Arm Price': arm_price if armed_bool else None,
-        })
-    return trades
+    hourly_build_id, minute_build_id = _resolved_build_ids(node["ticker"])
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        return get_cached_trades(
+            conn, nk, version, ticker=node["ticker"],
+            kernel_version=GT_TRADES_KERNEL_VERSION,
+            hourly_build_id=hourly_build_id, minute_build_id=minute_build_id)
 
 
 def _run_gt_kernel(node, dfh, minute_df, start, end):

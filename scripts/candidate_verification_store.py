@@ -249,11 +249,27 @@ def get_cached_trades(conn, node_key_val, version, ticker=None,
     if [r[0] for r in rows] != list(range(len(rows))):
         return None  # gapped/partial persistence -- don't trust it, fall back
     # Staleness check -- every row shares the same (kernel_version, hourly_build_id,
-    # minute_build_id) by construction (one _insert_winner_trades_rows call stamps all of
-    # a run's rows identically), so checking row 0 stands in for the whole set.
+    # minute_build_id) by construction (one _insert_winner_trades_rows call now does a
+    # real DELETE-then-INSERT per (node_key, version), see that function's own docstring
+    # for the round-2 paired-review HIGH fix this depends on -- without it, a re-run
+    # could leave a "Frankenstein" mix of old/new-vintage rows at one node_key, silently
+    # breaking this stands-in-for-the-whole-set assumption), so checking row 0 stands in
+    # for the whole set.
+    #
+    # EXPLICIT None-handling (2026-08-29, paired-review LOW finding, round 2,
+    # independent-cold): plain `!=` would let a stored None (never-stamped/legacy row)
+    # silently "match" a caller-passed None (a ticker/table with nothing ever promoted)
+    # -- unreachable today since run_optimization_sweep.py's real caller always resolves
+    # real values, but the comparison must match this function's own documented "unknown
+    # is never trusted as matches" guarantee regardless of what a future caller passes.
     if kernel_version is not None or hourly_build_id is not None or minute_build_id is not None:
         _stored_kv, _stored_hb, _stored_mb = rows[0][10], rows[0][11], rows[0][12]
-        if _stored_kv != kernel_version or _stored_hb != hourly_build_id or _stored_mb != minute_build_id:
+        _mismatch = (
+            _stored_kv is None or _stored_kv != kernel_version
+            or _stored_hb is None or _stored_hb != hourly_build_id
+            or _stored_mb is None or _stored_mb != minute_build_id
+        )
+        if _mismatch:
             return None  # stale or unresolvable -- fall back to a fresh resimulation
     import pandas as pd
     trades = []
