@@ -277,7 +277,8 @@ def main():
                 done += 1
                 elapsed = time.monotonic() - t_all
                 eta = f", ETA {(elapsed / done * (total - done)):.0f}s" if done < total else ""
-                print(f"[{done}/{total}, {elapsed:.0f}s elapsed{eta}] candidate_id={anchor['candidate_id']} done")
+                print(f"[{done}/{total}, {elapsed:.0f}s elapsed{eta}] candidate_id={anchor['candidate_id']} done",
+                      flush=True)
     else:
         for anchor in anchors:
             all_rows.extend(run_anchor(anchor, args.axes, axis_values_override, spy_bh))
