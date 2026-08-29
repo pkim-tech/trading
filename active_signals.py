@@ -1687,7 +1687,10 @@ def cmd_add():
     window         = int(input("  window: ").strip())
     take_profit    = int(input("  take_profit: ").strip())
     stop_loss      = int(input("  stop_loss: ").strip())
-    max_hold_hours    = int(input("  max_hold_hours: ").strip())
+    max_hold_hours    = int(input(
+        "  max_hold_hours (trading-HOUR BARS elapsed, not wall-clock hours -- "
+        "~7 bars/trading day, so this runs slower than calendar time across "
+        "weekends/off-hours; see signals_compute._bars_held): ").strip())
     z_score_threshold = float(input("  z_score_threshold [2.0]: ").strip() or "2.0")
     label             = input("  label (optional): ").strip()
     fixed_sl_override = None
