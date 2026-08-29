@@ -3621,14 +3621,14 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     # superseded derived-data build (real precedent: the 2026-08-27 SOXL/DPST/DFEN
     # minute-archive narrowing incident, which changed real bars with ZERO version-string
     # change) is treated as stale and falls through to a fresh resimulation, instead of
-    # silently served forever. Bump _GT_TRADES_KERNEL_VERSION (kept in lockstep with
-    # bench_phase1_phase2_inmemory.GT_TRADES_KERNEL_VERSION -- same 'ground_truth_v6'
-    # literal backtest_cache's own kernel_version column already uses, not a new naming
-    # scheme) the next time this function's real trade-generation call below changes.
-    from scripts.node_key import node_key as _node_key
+    # silently served forever. GT_TRADES_KERNEL_VERSION now lives in scripts/node_key.py
+    # (round-2 paired-review LOW finding, fixed -- was two independently-duplicated
+    # 'ground_truth_v6' literals here and in bench_phase1_phase2_inmemory.py, nothing
+    # forcing them to move together on a real kernel bump) -- every real writer/reader
+    # of backtest_winner_trades' kernel_version column imports the SAME constant now.
+    from scripts.node_key import node_key as _node_key, GT_TRADES_KERNEL_VERSION as _GT_TRADES_KERNEL_VERSION
     from scripts.candidate_verification_store import get_cached_trades as _get_cached_trades
     import db_cache as _db_cache
-    _GT_TRADES_KERNEL_VERSION = "ground_truth_v6"
     _hourly_build_id = _db_cache.get_active_build_id(ticker, 'hourly')
     _minute_build_id = _db_cache.get_active_build_id(ticker, 'minute')
     _trades_conn = sqlite3.connect(DB_PATH, timeout=60.0)
