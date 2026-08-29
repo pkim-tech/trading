@@ -47,6 +47,7 @@ from backtester import run_backtest_ground_truth
 from node_key import node_key, build_params_dict
 import campaign_config
 import strategies
+import db_cache
 
 TICKER = "SOXL"
 START, END = "2021-08-23", "2026-08-21"
@@ -200,13 +201,41 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
     return actually_inserted
 
 
+# GT_TRADES_KERNEL_VERSION (2026-08-29, staleness-invalidation fix, paired-review HIGH
+# finding against run_optimization_sweep.get_cached_trades' consumer -- both independent-
+# cold and contextual Opus review independently converged on this): reuses the SAME
+# 'ground_truth_v6' literal backtest_cache's own kernel_version column already uses
+# (run_optimization_sweep.py, e.g. discover_all_gt_scopes) -- not a new naming scheme.
+# Bump this the next time backtester.run_backtest_ground_truth's real trade-generation
+# logic changes materially (the same cadence docs/backtest-change-rollout's own skill
+# already tracks) -- a bumped value here makes every OLDER backtest_winner_trades row
+# fail get_cached_trades' comparison and fall back to a fresh resimulation, rather than
+# silently serving pre-fix trades forever.
+GT_TRADES_KERNEL_VERSION = "ground_truth_v6"
+
+
 def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_name,
-                                config_version, ticker, fixed_sl):
+                                config_version, ticker, fixed_sl,
+                                kernel_version=GT_TRADES_KERNEL_VERSION,
+                                hourly_build_id=None, minute_build_id=None):
     """New table (not yet in real production) -- one row per real trade, keyed by
     node_key (stable across re-sweeps) + version (disambiguates which data window this
     specific trade sequence came from, since node_key deliberately does NOT encode that
     -- same reasoning candidate_nodes already uses its own separate version column
-    rather than baking it into any identity)."""
+    rather than baking it into any identity).
+
+    kernel_version/hourly_build_id/minute_build_id (2026-08-29, staleness-invalidation
+    fix): stamps which GT kernel logic version and which db_cache.active_builds
+    hourly/minute build_id produced this trade list, so run_optimization_sweep.
+    get_cached_trades can detect two real stale-cache scenarios neither node_key nor
+    version alone catches: (1) a future backtester.py fix changing what
+    run_backtest_ground_truth computes without a matching data/version change, (2) a
+    scripts/promote_derived_build.py promotion changing the real underlying bars with
+    ZERO change to `version` (real precedent: the 2026-08-27 SOXL/DPST/DFEN minute-
+    archive narrowing incident). NULL when the caller passes no build_id (a ticker/
+    table with nothing ever promoted via active_builds) -- get_cached_trades treats a
+    NULL stored value as "unknown, don't trust" too, same as a value mismatch, never as
+    an automatic match."""
     with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS backtest_winner_trades (
@@ -216,6 +245,13 @@ def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_
                 arm_time TEXT, arm_price REAL, created_at TEXT,
                 UNIQUE(node_key, version, trade_idx)
             )""")
+        # sqlite has no "ADD COLUMN IF NOT EXISTS" (pre-3.35) -- probe-first pattern,
+        # same convention scripts/candidate_verification_store.py's ensure_table() uses.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_winner_trades)")}
+        for col in ("kernel_version TEXT", "hourly_build_id INTEGER", "minute_build_id INTEGER"):
+            name = col.split()[0]
+            if name not in existing_cols:
+                conn.execute(f"ALTER TABLE backtest_winner_trades ADD COLUMN {col}")
         before = conn.execute(
             "SELECT COUNT(*) FROM backtest_winner_trades WHERE version=? AND ticker=? AND strategy=?",
             (config_version, ticker, strategy_name)).fetchone()[0]
@@ -227,13 +263,14 @@ def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_
                 buffer.append((nk, config_version, ticker, strategy_name, float(fixed_sl), i,
                                str(t['Entry Time']), t['Entry Price'], str(t['Exit Time']),
                                t['Exit Price'], t['exit_reason'], t['Return'], int(t['armed']),
-                               str(t['Arm Time']) if t['armed'] else None, t['Arm Price'], now_iso))
+                               str(t['Arm Time']) if t['armed'] else None, t['Arm Price'], now_iso,
+                               kernel_version, hourly_build_id, minute_build_id))
         conn.executemany("""
             INSERT OR IGNORE INTO backtest_winner_trades
                 (node_key, version, ticker, strategy, fixed_sl, trade_idx, entry_time,
                  entry_price, exit_time, exit_price, exit_reason, return_pct, armed,
-                 arm_time, arm_price, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 arm_time, arm_price, created_at, kernel_version, hourly_build_id, minute_build_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, buffer)
         conn.commit()
         after = conn.execute(
@@ -822,8 +859,18 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
           f"{total_trade_rows:,} total trade rows, captured in {t_ins5 - t_ins4:.2f}s")
 
     t_ins6 = time.time()
+    # Real resolved build_ids (staleness-invalidation fix, 2026-08-29, paired-review HIGH
+    # finding) -- one lookup per ticker/table for this whole run, not per candidate (a
+    # promotion mid-run is not a case this pipeline defends against anywhere else either).
+    # None when nothing has ever been promoted for this ticker/table (get_active_build_id's
+    # own documented "no build at all" case) -- stored as NULL, which get_cached_trades
+    # treats as "unknown, don't trust" on read-back, same as a real mismatch.
+    _hourly_build_id = db_cache.get_active_build_id(TICKER, 'hourly')
+    _minute_build_id = db_cache.get_active_build_id(TICKER, 'minute')
     n_trade_rows_written = _insert_winner_trades_rows(
-        winner_trades, node_keys_by_key, strategy_name, version, TICKER, fixed_sl)
+        winner_trades, node_keys_by_key, strategy_name, version, TICKER, fixed_sl,
+        kernel_version=GT_TRADES_KERNEL_VERSION,
+        hourly_build_id=_hourly_build_id, minute_build_id=_minute_build_id)
     t_ins7 = time.time()
     print(f"Trade rows written to backtest_winner_trades: {n_trade_rows_written} "
           f"in {t_ins7 - t_ins6:.2f}s")

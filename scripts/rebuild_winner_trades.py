@@ -27,6 +27,7 @@ from run_optimization_sweep import DB_PATH, _load_node_inputs_ground_truth
 from backtester import run_backtest_ground_truth
 from node_key import node_key
 import strategies
+from phase4_candidate_nodes_resolver import _stop_loss_and_tpct_from_row
 
 
 def _window_dates_from_version(version):
@@ -94,8 +95,31 @@ def main():
             open_check_entry_timing=(row_entry_timing == 'open_check'),
             same_bar_reentry=True, prep=prep, mprep=mprep, need_times=True,
         )
+        # node_key() takes (take_profit, stop_loss, trail_sell_pct) in the STRATEGY-
+        # NEUTRAL axis meaning build_params_dict/resolve_axis_columns expect -- NOT the
+        # raw candidate_nodes storage columns (arm_pct, trail_buy_pct, trail_sell_pct)
+        # unpacked here. Passing the raw columns straight through is correct BY
+        # COINCIDENCE for TrailingBoth (its sl_axis mapping is an identity, trail_buy_pct
+        # IS stop_loss) but WRONG for TrailingExit (resolve_axis_columns returns
+        # ('trail_pct', None) there, so the real stop_loss lives in trail_sell_pct, not
+        # trail_buy_pct -- candidate_nodes always stores trail_buy_pct=0.0 for a
+        # TrailingExit row, see build_candidate_report_ground_truth's own is_both branch
+        # -- an unfixed call here would silently bake stop_loss=0.0 into every
+        # TrailingExit node_key, both making those rows permanently invisible to
+        # run_optimization_sweep.get_cached_trades' read-back (dead cache -- a real
+        # regression this script's dead cache would otherwise cause, found 2026-08-29
+        # paired-review MEDIUM finding against the trades-cache read-back task) AND
+        # colliding multiple distinct TrailingExit candidates onto ONE node_key under
+        # backtest_winner_trades' UNIQUE(node_key, version, trade_idx) constraint,
+        # interleaving different candidates' trades into a single stored list. Use the
+        # same inverse mapping phase4_candidate_nodes_resolver.py's own forward mapping
+        # (and build_candidate_report_ground_truth's is_both branch) already establish,
+        # not a third independent derivation.
+        sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(args.strategy)
+        real_stop_loss, real_tpct = _stop_loss_and_tpct_from_row(
+            sl_axis_col, fourth_axis_col, trail_buy_pct, trail_sell_pct)
         nk = node_key(args.strategy, args.ticker, args.fixed_sl, window, z, max_hold_hours,
-                       arm_pct, trail_buy_pct, trail_sell_pct, row_entry_timing,
+                       arm_pct, real_stop_loss, real_tpct, row_entry_timing,
                        strategies.resolve_axis_columns)
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
         for i, t in enumerate(trades):

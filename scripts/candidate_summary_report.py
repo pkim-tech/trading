@@ -126,6 +126,12 @@ GT_COLUMN_DEFS = {
     "cagr_pct": "Real annualized CAGR for this candidate's own cell (same source as robust_alpha_pct).",
     "n_trades": "Real trade count from this candidate's own same_bar_reentry=True trade list (build_candidate_"
                 "report_ground_truth's own re-simulation, matching the real live dispatch convention).",
+    "trades_from_cache": "True when this candidate's trade list came from backtest_winner_trades (Phase2.5's "
+                          "persisted cache, kernel_version/build_id-matched -- see build_candidate_report_"
+                          "ground_truth's own trades-cache docstring), False when freshly resimulated this "
+                          "call. Informational/provenance only -- a stale cache-hit should already be "
+                          "unreachable (kernel_version/build_id mismatch falls through to resim), this "
+                          "column exists so that's independently verifiable after the fact.",
     "core_safe": "True/False/None(unknown) -- cliff-safety verdict on the CORE (unlevered) CAGR (2026-08-23, "
                  "ground_truth_kernel_rebuild.md Step 4 -- alpha replaced by CAGR for GT), same worst-neighbor<0 "
                  "convention this project uses everywhere else. NOTE units: for GT this threshold means 'a "
@@ -925,6 +931,13 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
             "z_score_threshold": c["z_score_threshold"], "tpct": c["tpct"],
             "robust_alpha_pct": c["robust_alpha"], "cagr_pct": c["cagr"],
             "n_trades": row["n_trades"],
+            # Cache-hit/resim provenance (2026-08-29, paired-review HIGH finding "at
+            # minimum" ask -- see run_optimization_sweep.build_candidate_report_ground_
+            # truth's own trades-cache docstring for the staleness-invalidation design
+            # this flag makes after-the-fact-detectable): True when this candidate's
+            # trades came from backtest_winner_trades (kernel_version/build_id-matched),
+            # False when freshly resimulated this call.
+            "trades_from_cache": row.get("trades_from_cache", False),
             "core_safe": row["core_safe"], "addon_safe": row["addon_safe"],
             "core_addon_disagreement": row["core_addon_disagreement"],
             "addon_cagr_pct": own["addon_cagr"] if own else None,

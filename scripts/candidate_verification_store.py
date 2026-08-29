@@ -191,7 +191,8 @@ def insert_trades(conn, candidate_id, resolution, version, ticker, strategy, fix
 # wider than that top-9 (e.g. candidate_nodes' full_population=True path) will legitimately
 # miss cache for the non-top-9 candidates -- get_cached_trades returning None is that real,
 # expected fallback-to-resimulate signal, not a bug.
-def get_cached_trades(conn, node_key_val, version):
+def get_cached_trades(conn, node_key_val, version, ticker=None,
+                       kernel_version=None, hourly_build_id=None, minute_build_id=None):
     """Real persisted trade list for (node_key_val, version) from backtest_winner_trades,
     reconstructed into the exact dict shape build_candidate_report_ground_truth's downstream
     checks (4/8/11/13, drought) expect: 'Entry Time'/'Exit Time' as real pandas Timestamps
@@ -199,21 +200,44 @@ def get_cached_trades(conn, node_key_val, version):
     simulate_drought_overlay_ground_truth's idx.searchsorted both require real Timestamp
     objects, not strings), 'armed' as a real bool, 'Arm Time'/'Arm Price' as None when
     armed=0 (matching run_backtest_ground_truth's own None-when-unarmed convention rather
-    than echoing back whatever NULL/non-NULL happens to be stored).
+    than echoing back whatever NULL/non-NULL happens to be stored), plus 'Ticker' (added
+    2026-08-29, paired-review LOW finding -- run_backtest_ground_truth's own trade dicts
+    normally carry this; a fresh-resim trade list already has it, so a cache-hit trade
+    list omitting it was a real shape divergence that could KeyError a future consumer
+    even though nothing reads it today).
+
+    Staleness invalidation (2026-08-29, paired-review HIGH finding, both independent-cold
+    and contextual Opus review independently converged on this against the original
+    version of this function): node_key/version alone do NOT catch (1) a future
+    backtester.py fix changing what run_backtest_ground_truth computes, or (2) a
+    scripts/promote_derived_build.py promotion changing the real underlying bars with
+    ZERO change to `version` (real precedent: the 2026-08-27 SOXL/DPST/DFEN minute-
+    archive narrowing incident) -- unlike backtest_cache, which uses kernel_version as
+    real row-identity, not just an informational column. When the caller passes
+    `kernel_version`/`hourly_build_id`/`minute_build_id` (run_optimization_sweep.py's
+    real caller always does), a stored row whose own kernel_version/hourly_build_id/
+    minute_build_id doesn't EXACTLY match -- including when the caller's OR the stored
+    value is None (an unresolved/never-promoted build, or a legacy pre-this-fix row that
+    predates these columns) -- is treated as stale and skipped: 'unknown' is never
+    silently trusted as 'matches'. Passing None for all three (the default) skips this
+    check entirely -- ONLY safe for a caller that doesn't care about staleness (no real
+    caller in this codebase does that today).
 
     Returns None (not []) when the table doesn't exist yet, has zero rows for this
-    (node_key_val, version), or the stored trade_idx sequence has a gap (a prior insert
-    that never finished) -- all three are this function's real "not safely cached, caller
-    must fall back to a fresh run_backtest_ground_truth call" signal. A genuinely
-    trade-free candidate (real n_trades=0) is indistinguishable from "never cached" here
-    (no separate expected-count row exists for this table, unlike phase5_trades'
-    trades_complete check) -- an accepted, documented limitation, not a silent bug: the
-    caller always has a real re-simulation fallback available, so worst case is one wasted
-    (but still correct) recompute, never a wrong answer."""
+    (node_key_val, version) that also pass the staleness check above, or the stored
+    trade_idx sequence has a gap (a prior insert that never finished) -- all of these are
+    this function's real "not safely cached, caller must fall back to a fresh
+    run_backtest_ground_truth call" signal. A genuinely trade-free candidate (real
+    n_trades=0) is indistinguishable from "never cached" here (no separate expected-count
+    row exists for this table, unlike phase5_trades' trades_complete check) -- an
+    accepted, documented limitation, not a silent bug: the caller always has a real
+    re-simulation fallback available, so worst case is one wasted (but still correct)
+    recompute, never a wrong answer."""
     try:
         rows = conn.execute("""
             SELECT trade_idx, entry_time, entry_price, exit_time, exit_price, exit_reason,
-                   return_pct, armed, arm_time, arm_price
+                   return_pct, armed, arm_time, arm_price,
+                   kernel_version, hourly_build_id, minute_build_id
             FROM backtest_winner_trades
             WHERE node_key=? AND version=?
             ORDER BY trade_idx
@@ -224,12 +248,20 @@ def get_cached_trades(conn, node_key_val, version):
         return None
     if [r[0] for r in rows] != list(range(len(rows))):
         return None  # gapped/partial persistence -- don't trust it, fall back
+    # Staleness check -- every row shares the same (kernel_version, hourly_build_id,
+    # minute_build_id) by construction (one _insert_winner_trades_rows call stamps all of
+    # a run's rows identically), so checking row 0 stands in for the whole set.
+    if kernel_version is not None or hourly_build_id is not None or minute_build_id is not None:
+        _stored_kv, _stored_hb, _stored_mb = rows[0][10], rows[0][11], rows[0][12]
+        if _stored_kv != kernel_version or _stored_hb != hourly_build_id or _stored_mb != minute_build_id:
+            return None  # stale or unresolvable -- fall back to a fresh resimulation
     import pandas as pd
     trades = []
     for (_, entry_time, entry_price, exit_time, exit_price, exit_reason,
-         return_pct, armed, arm_time, arm_price) in rows:
+         return_pct, armed, arm_time, arm_price, _kv, _hb, _mb) in rows:
         armed = bool(armed)
         trades.append({
+            'Ticker': ticker,
             'Entry Time': pd.Timestamp(entry_time), 'Entry Price': entry_price,
             'Exit Time': pd.Timestamp(exit_time), 'Exit Price': exit_price,
             'exit_reason': exit_reason, 'Return': return_pct, 'armed': armed,
