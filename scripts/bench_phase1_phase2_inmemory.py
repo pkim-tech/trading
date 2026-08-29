@@ -294,6 +294,73 @@ def _log_sweep_run_finish(run_id, n_final_candidates, n_candidate_nodes_written,
         conn.commit()
 
 
+def _load_seed_node(watch_list_id):
+    """Smoke-test seed mode (2026-08-29): loads a real live watch_list row and
+    reverse-maps its flat strategy-specific SL/trail columns back into the generic
+    (tp, sl, tpct) axis-value triple phase1_tasks expects -- the exact INVERSE of
+    _insert_candidate_nodes_rows' forward mapping above (same sl_axis_col/
+    fourth_axis_col branches, read backwards). watch_list lives in
+    cache/live/trading_live.db, a DIFFERENT sqlite file than this script's own
+    DB_PATH (trading_universe.db) -- needs its own connection, never DB_PATH.
+
+    Forward mapping (for reference, from _insert_candidate_nodes_rows):
+        arm_pct = generic tp always (direct passthrough, no strategy-dependent case)
+        sl_axis_col == 'trail_buy_pct': trail_buy_pct = generic sl;
+            trail_sell_pct = generic tpct (4th axis) if fourth_axis_col == 'trail_pct' else 0.0
+        sl_axis_col == 'trail_pct':     trail_buy_pct = 0.0; trail_sell_pct = generic sl
+        else (sl_axis_col == 'stop_loss'): trail_buy_pct = trail_sell_pct = 0.0
+
+    So the reverse, given the row's real flat columns:
+        generic tp    = row['take_profit']  (always, mirrors arm_pct passthrough above)
+        sl_axis_col == 'trail_buy_pct': generic sl = row['trail_buy_pct'];
+            generic tpct = row['trail_sell_pct'] if fourth_axis_col == 'trail_pct' else 0.0
+        sl_axis_col == 'trail_pct':     generic sl = row['trail_sell_pct']; generic tpct = 0.0
+        else:                            generic sl = row['stop_loss']; generic tpct = 0.0
+    """
+    live_db_path = os.path.join(ROOT, "cache", "live", "trading_live.db")
+    with sqlite3.connect(live_db_path, timeout=60.0) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM watch_list WHERE id=?", (watch_list_id,)).fetchone()
+    if row is None:
+        raise SystemExit(f"--seed-watch-list-id {watch_list_id}: no such row in watch_list "
+                          f"({live_db_path}).")
+    row = dict(row)
+    strategy_name = row["strategy"]
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+
+    generic_tp = float(row["take_profit"])
+    if sl_axis_col == 'trail_buy_pct':
+        generic_sl = float(row["trail_buy_pct"])
+        generic_tpct = float(row["trail_sell_pct"]) if fourth_axis_col == 'trail_pct' else 0.0
+    elif sl_axis_col == 'trail_pct':
+        generic_sl = float(row["trail_sell_pct"])
+        generic_tpct = 0.0
+    else:
+        generic_sl = float(row["stop_loss"])
+        generic_tpct = 0.0
+
+    task = (int(round(generic_tp)), int(round(generic_sl)), int(row["max_hold_hours"]),
+            int(row["window"]), float(row["z_score_threshold"]), float(generic_tpct))
+    seed = {
+        "ticker": row["ticker"],
+        "strategy_name": strategy_name,
+        "fixed_sl": float(row["fixed_sl"]),
+        "window": int(row["window"]),
+        "z_score_threshold": float(row["z_score_threshold"]),
+        "max_hold_hours": int(row["max_hold_hours"]),
+        "entry_timing": row["entry_timing"],
+        "task": task,
+    }
+    print(f"Seed node loaded: watch_list id={watch_list_id} ticker={seed['ticker']} "
+          f"strategy={strategy_name} label={row.get('label')!r} -- raw flat columns "
+          f"take_profit={row['take_profit']} stop_loss={row['stop_loss']} "
+          f"trail_buy_pct={row['trail_buy_pct']} trail_sell_pct={row['trail_sell_pct']} "
+          f"fixed_sl={row['fixed_sl']} (sl_axis_col={sl_axis_col!r}, "
+          f"fourth_axis_col={fourth_axis_col!r}) -> reverse-mapped generic Phase1 task "
+          f"(tp,sl,hold,w,z,tpct)={task}")
+    return seed
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=8)
@@ -302,19 +369,34 @@ def main():
     ap.add_argument("--fixed-sl", dest="fixed_sl", type=int,
                      help="explicit SINGLE fixed_sl, used INSTEAD of load_live_node(TICKER)'s. "
                           "Takes precedence over --fixed-sl-values when both are given.")
-    ap.add_argument("--fixed-sl-values", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8],
+    ap.add_argument("--fixed-sl-values", type=int, nargs="+", default=None,
                      help="2026-08-29 addition (packaging only, see main()'s own docstring-"
                           "adjacent comment below): loop over each of these fixed_sl values "
                           "within ONE process/pool instead of requiring a separate CLI "
                           "invocation per value -- only used in --strategy override mode "
                           "(ignored when --fixed-sl is explicitly given, and ignored entirely "
                           "in live-node mode, which already has one canonical fixed_sl). "
-                          "Default [1..8] matches the real production fixed_sl grid.")
+                          "Default (when omitted) is [1..8], matching the real production "
+                          "fixed_sl grid -- default is None here (not [1..8] directly) purely "
+                          "so --seed-watch-list-id can detect whether this was EXPLICITLY "
+                          "passed for its own mutual-exclusivity check below.")
     ap.add_argument("--window", type=int, default=None,
                      help="run this single window value in ISOLATION instead of the "
                           "real production grid (module-level WINDOWS=[10,20]) -- e.g. "
                           "--window 15 to explore a midpoint value not otherwise swept. "
                           "Does not add to the standard grid, replaces it for this run.")
+    ap.add_argument("--seed-watch-list-id", dest="seed_watch_list_id", type=int, default=None,
+                     help="Smoke-test mode (2026-08-29): seed Phase1 with exactly ONE real "
+                          "live watch_list row's params (reverse-mapped via "
+                          "strategies.resolve_axis_columns back to the generic tp/sl/tpct "
+                          "axis-value triple phase1_tasks expects) instead of the full "
+                          "campaign_config grid -- Phase2's real fine-mesh/island logic then "
+                          "builds the neighborhood around that single seed point completely "
+                          "unchanged. Reads cache/live/trading_live.db (a DIFFERENT sqlite "
+                          "file than this script's own DB_PATH), NOT DB_PATH. Mutually "
+                          "exclusive with --strategy/--fixed-sl/--fixed-sl-values (the full "
+                          "campaign grid path) and --window (window comes from the seed node "
+                          "itself, not a separate override).")
     ap.add_argument("--resume-from-top100", action="store_true",
                      help="skip Phase1 dispatch entirely; load df1 from the persisted "
                           "top-100 Phase1-Coarse-GT snapshot in backtest_cache instead. "
@@ -347,6 +429,23 @@ def main():
                           "(one tests a narrow top-100-only dataset, the other a full "
                           "Phase1+Phase2 checkpoint) -- pick one.")
 
+    if args.seed_watch_list_id is not None:
+        _seed_conflicts = []
+        if args.strategy is not None:
+            _seed_conflicts.append("--strategy")
+        if args.fixed_sl is not None:
+            _seed_conflicts.append("--fixed-sl")
+        if args.fixed_sl_values is not None:
+            _seed_conflicts.append("--fixed-sl-values")
+        if args.window is not None:
+            _seed_conflicts.append("--window")
+        if _seed_conflicts:
+            raise SystemExit(
+                f"--seed-watch-list-id is mutually exclusive with {', '.join(_seed_conflicts)} "
+                f"-- seed mode derives strategy/fixed_sl/window directly from the real live "
+                f"watch_list row, it doesn't take a separate grid-override or window-override "
+                f"path. Pick one.")
+
     if args.window is not None:
         global WINDOWS
         WINDOWS = [args.window]
@@ -362,12 +461,27 @@ def main():
         END = args.end_date
         print(f"End-date override: END={END} (module default '2026-08-21')")
 
-    if args.strategy is not None:
+    seed = None
+    if args.seed_watch_list_id is not None:
+        seed = _load_seed_node(args.seed_watch_list_id)
+        strategy_name = seed["strategy_name"]
+        fixed_sl_list = [seed["fixed_sl"]]
+        global TICKER
+        WINDOWS = [seed["window"]]
+        print(f"Seed mode: strategy={strategy_name}, fixed_sl={fixed_sl_list[0]}, "
+              f"WINDOWS override -> {WINDOWS} (all derived from watch_list "
+              f"id={args.seed_watch_list_id}, no grid/live-node lookup)")
+        if seed["ticker"] != TICKER:
+            print(f"Seed mode: ticker override {TICKER} -> {seed['ticker']} "
+                  f"(from watch_list id={args.seed_watch_list_id})")
+            TICKER = seed["ticker"]
+    elif args.strategy is not None:
         strategy_name = args.strategy
         # --fixed-sl (single, explicit) takes precedence over --fixed-sl-values (the new
         # looping default) -- an explicit single value is an unambiguous "just this one"
         # request, not something the new default-[1..8] behavior should override.
-        fixed_sl_list = [args.fixed_sl] if args.fixed_sl is not None else args.fixed_sl_values
+        fixed_sl_list = [args.fixed_sl] if args.fixed_sl is not None else (
+            args.fixed_sl_values if args.fixed_sl_values is not None else [1, 2, 3, 4, 5, 6, 7, 8])
         print(f"Override mode: strategy={strategy_name}, fixed_sl values={fixed_sl_list} "
               f"(no live-node lookup)")
     else:
@@ -402,6 +516,11 @@ def main():
     # candidate_nodes from a prior run). Makes a killed-partway multi-value run
     # resumable: rerunning the same command only redoes the fixed_sl values that never
     # finished.
+    # Seed mode's single reverse-mapped Phase1 task, stashed on args so
+    # run_one_fixed_sl can bypass the full grid cross-product with it -- None in
+    # every non-seed mode, leaving that function's existing behavior untouched.
+    args._seed_task = seed["task"] if seed is not None else None
+
     _windows_str = ",".join(str(w) for w in WINDOWS)
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         for fixed_sl in fixed_sl_list:
@@ -465,10 +584,20 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     if spy_bh is None:
         raise SystemExit(f"compute_bh_returns returned None for {TICKER}/{DATA_SOURCE} -- no derived build.")
 
-    phase1_tasks = [(int(tp), int(sl), int(hold), int(w), float(z), float(tpct))
-                     for z in Z_THRESHOLDS for w in WINDOWS
-                     for tp in TAKE_PROFITS for sl in STOP_LOSSES
-                     for hold in HOLD_TIME_CAPS for tpct in TRAIL_PCTS]
+    _seed_task = getattr(args, "_seed_task", None)
+    if _seed_task is not None:
+        # Seed-mode smoke test (2026-08-29): Phase1 reduced to exactly the one real
+        # live node's reverse-mapped task tuple, bypassing the full grid cross-product
+        # entirely. Everything downstream (Phase2 mesh, Phase2.5-cliffbox, promotion)
+        # is untouched -- it already just consumes whatever ends up in df1.
+        phase1_tasks = [_seed_task]
+        print(f"Seed mode: Phase1 task list reduced to ONE cell: {_seed_task} "
+              f"(bypasses the {len(TAKE_PROFITS) * len(STOP_LOSSES) * len(HOLD_TIME_CAPS) * len(TRAIL_PCTS) * len(Z_THRESHOLDS) * len(WINDOWS):,}-cell full grid)")
+    else:
+        phase1_tasks = [(int(tp), int(sl), int(hold), int(w), float(z), float(tpct))
+                         for z in Z_THRESHOLDS for w in WINDOWS
+                         for tp in TAKE_PROFITS for sl in STOP_LOSSES
+                         for hold in HOLD_TIME_CAPS for tpct in TRAIL_PCTS]
 
     if not args.resume_from_top100 and os.path.exists(checkpoint_path):
       t0 = time.time()
@@ -511,7 +640,16 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
       # Sanity check: fewer than 100 successful Phase1 cells out of 164,640 means
       # something is badly wrong upstream (data load failure, wrong ticker/window,
       # near-total SIM_ERROR/EMPTY rate) -- not a legitimate sparse-grid outcome.
-      if len(df1) < 100:
+      # Seed mode is a deliberate exception: phase1_tasks is exactly 1 cell by design,
+      # so the real bar there is just "did that one cell succeed at all" (trades>0),
+      # not >=100.
+      if _seed_task is not None:
+          if len(df1) < 1:
+              raise SystemExit(f"Seed mode Phase1 sanity check FAILED: the seed cell "
+                                f"{_seed_task} produced zero successful rows (trades>0) -- "
+                                f"the real live node itself failed to backtest. Check "
+                                f"_dispatch's non-SUCCESS status counts above.")
+      elif len(df1) < 100:
           raise SystemExit(f"Phase1 sanity check FAILED: only {len(df1)} successful cells "
                             f"(need >=100) -- something is wrong upstream, not a real "
                             f"sparse-data outcome. Check _dispatch's non-SUCCESS status counts above.")
