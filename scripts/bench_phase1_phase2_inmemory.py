@@ -481,8 +481,9 @@ def main():
                           "for iterating on Phase2.5 logic without repaying the ~7min "
                           "Phase1+Phase2 cost each time. If missing, computes normally "
                           "and saves it after Phase2 finishes. Default: "
-                          "<job-tmp>/bench_phase12_checkpoint_<strategy>_<fixed_sl>.parquet "
-                          "(mutually exclusive with --resume-from-top100).")
+                          "<job-tmp>/bench_phase12_checkpoint_<ticker>_<strategy>_<fixed_sl>_"
+                          "w<windows>_<date-range-suffix>.parquet (mutually exclusive with "
+                          "--resume-from-top100 AND with --seed-watch-list-id).")
     args = ap.parse_args()
     if args.resume_from_top100 and args.checkpoint_file:
         raise SystemExit("--resume-from-top100 and --checkpoint-file are mutually exclusive "
@@ -530,21 +531,31 @@ def main():
         seed = _load_seed_node(args.seed_watch_list_id)
         strategy_name = seed["strategy_name"]
         fixed_sl_list = [seed["fixed_sl"]]
-        global TICKER, ENTRY_TIMING, Z_THRESHOLDS
+        global TICKER, ENTRY_TIMING, Z_THRESHOLDS, HOLD_TIME_CAPS
         WINDOWS = [seed["window"]]
-        # Z_THRESHOLDS/ENTRY_TIMING overridden the same way WINDOWS already is above --
-        # found by paired review 2026-08-29: without this, a seed z not in the default
-        # [1.0, 1.5, 2.0] grid (true for every real z=0.1 canary node) makes every Phase2
-        # w/z/tpct slice come up empty with no explicit warning, silently degrading to
-        # seed-alone; and leaving ENTRY_TIMING at its "open_check" default silently
-        # backtests/promotes a real close-entry_timing seed node under the WRONG
-        # entry_timing, defeating "reproduce this exact live node."
+        # Z_THRESHOLDS/ENTRY_TIMING/HOLD_TIME_CAPS overridden the same way WINDOWS already
+        # is above -- found by paired review 2026-08-29 (round 2 and round 3):
+        # - Z_THRESHOLDS: without this, a seed z not in the default [1.0, 1.5, 2.0] grid
+        #   (true for every real z=0.1 canary node) makes every Phase2 w/z/tpct slice come
+        #   up empty with no explicit warning, silently degrading to seed-alone.
+        # - ENTRY_TIMING: left at its "open_check" default, silently backtests/promotes a
+        #   real close-entry_timing seed node under the WRONG entry_timing, defeating
+        #   "reproduce this exact live node."
+        # - HOLD_TIME_CAPS: without this, Phase2's mesh only ever explores the STANDARD
+        #   grid's hold values (7,14,21,...) around the seed's tp/sl, never the seed's own
+        #   real hold (real examples: RETL live hold=11, TMF live hold=48, hold=100 paper
+        #   node) -- and since the cliff-safety neighbor check filters strictly on
+        #   max_hold_hours == candidate's own hold, a candidate at the seed's off-grid hold
+        #   would only ever match itself (n_neighbors_checked=1), producing a
+        #   "cliff-safe"-looking verdict backed by nothing.
         Z_THRESHOLDS = [seed["z_score_threshold"]]
         ENTRY_TIMING = seed["entry_timing"]
+        HOLD_TIME_CAPS = [seed["max_hold_hours"]]
         print(f"Seed mode: strategy={strategy_name}, fixed_sl={fixed_sl_list[0]}, "
               f"WINDOWS override -> {WINDOWS}, Z_THRESHOLDS override -> {Z_THRESHOLDS}, "
-              f"ENTRY_TIMING override -> {ENTRY_TIMING!r} (all derived from watch_list "
-              f"id={args.seed_watch_list_id}, no grid/live-node lookup)")
+              f"ENTRY_TIMING override -> {ENTRY_TIMING!r}, HOLD_TIME_CAPS override -> "
+              f"{HOLD_TIME_CAPS} (all derived from watch_list id={args.seed_watch_list_id}, "
+              f"no grid/live-node lookup)")
         if seed["ticker"] != TICKER:
             print(f"Seed mode: ticker override {TICKER} -> {seed['ticker']} "
                   f"(from watch_list id={args.seed_watch_list_id})")
@@ -616,7 +627,17 @@ def main():
                         n_final_candidates INTEGER, n_candidate_nodes_written INTEGER,
                         n_trade_rows_written INTEGER, elapsed_s REAL
                     )""")
-                already_done = _conn.execute("""
+                # Seed mode bypasses this dedup check entirely (2026-08-29, paired review
+                # round 3, contextual): the "-seed<id>" version suffix alone only solved
+                # cross-contamination with real full-grid campaigns, it did NOT achieve
+                # repeatability -- every invocation of the same --seed-watch-list-id
+                # produces the identical version string, so a second identical run of the
+                # exact same seed command would otherwise print "already done" and do zero
+                # work, contradicting the whole point ("fast, REPEATABLE full-pipeline
+                # smoke test"). Seed mode is explicitly a cheap, intentionally-repeatable
+                # smoke test, not a real campaign that needs resumability protection from
+                # a killed-partway run -- so it just always re-runs.
+                already_done = None if args.seed_watch_list_id is not None else _conn.execute("""
                     SELECT 1 FROM sweep_run_log
                     WHERE ticker=? AND strategy=? AND fixed_sl=? AND windows=? AND version=?
                           AND finished_at IS NOT NULL
@@ -675,6 +696,24 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         raise SystemExit(f"compute_bh_returns returned None for {TICKER}/{DATA_SOURCE} -- no derived build.")
 
     _seed_task = getattr(args, "_seed_task", None)
+    if _seed_task is not None and _seed_task[5] not in TRAIL_PCTS:
+        # Seed-mode tpct off-grid fix (2026-08-29, paired review round 3, CONFIRMED by
+        # both reviewers): tpct is exempt from the tp/sl integer-mesh guard in
+        # _load_seed_node (it's never range()-walked, unlike tp/sl), but Phase2's own
+        # w/z/tpct island-detection loop DOES match it by exact equality against
+        # TRAIL_PCTS (`df1[df1["trail_sell_pct"] == tpct]`) -- if the seed's real tpct
+        # isn't already in the strategy's standard TRAIL_PCTS grid (true for 8 real
+        # seedable TrailingBoth rows, e.g. DPST=13.0/SOXL=15.0/TQQQ=9.0), every Phase2
+        # slice comes up empty, phase2_tasks stays empty, and the run silently degrades
+        # to seed-alone with no crash and no warning. Fix: add the seed's own tpct to the
+        # iterated TRAIL_PCTS set for this run, mirroring Phase2.5's own existing
+        # `tpct_neighbors = [tpct_c]` off-grid fallback further below.
+        TRAIL_PCTS = TRAIL_PCTS + [_seed_task[5]]
+        print(f"Seed mode: seed's tpct={_seed_task[5]} not in standard TRAIL_PCTS grid "
+              f"{_trail_pcts_for_strategy(strategy_name, grid)} -- added it so Phase2's "
+              f"w/z/tpct loop doesn't silently skip the seed's own slice. "
+              f"TRAIL_PCTS now {TRAIL_PCTS}")
+
     if _seed_task is not None:
         # Seed-mode smoke test (2026-08-29): Phase1 reduced to exactly the one real
         # live node's reverse-mapped task tuple, bypassing the full grid cross-product
