@@ -231,6 +231,54 @@ def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_
     return actually_inserted
 
 
+def _log_sweep_run_start(ticker, strategy_name, fixed_sl, windows, version):
+    """Real invocation log -- new table, 2026-08-29 (Task #6 piece #1, planner dispatch).
+    Real gap found the same night: nobody could tell, after the fact, which sweep
+    invocations of THIS script actually ran (ticker/strategy/fixed_sl/windows/version,
+    when, whether they finished) -- run_optimization_sweep.py's legacy backtest_cache
+    pipeline has its own completeness-checking functions (_phase1_coarse_gt_status
+    etc.); this in-memory pipeline has no equivalent, since it writes nothing to
+    backtest_cache at all (see phase4_candidate_nodes_resolver.py's own module
+    docstring for the downstream consequence this already caused). Deliberately no
+    try/finally around the start/finish pair -- if the process crashes or is killed
+    before _log_sweep_run_finish runs, the row simply stays with finished_at=NULL
+    forever, and THAT incompleteness is the "this run never finished" signal. No
+    separate status column, no exception handling -- keep it this simple.
+    Returns the new row's id."""
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sweep_run_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL, finished_at TEXT,
+                script TEXT, pid INTEGER, ticker TEXT, strategy TEXT, fixed_sl REAL,
+                windows TEXT, version TEXT,
+                n_final_candidates INTEGER, n_candidate_nodes_written INTEGER,
+                n_trade_rows_written INTEGER, elapsed_s REAL
+            )""")
+        cur = conn.execute("""
+            INSERT INTO sweep_run_log (started_at, script, pid, ticker, strategy, fixed_sl,
+                windows, version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (time.strftime("%Y-%m-%dT%H:%M:%S"), os.path.basename(__file__), os.getpid(),
+              ticker, strategy_name, float(fixed_sl), ",".join(str(w) for w in windows), version))
+        conn.commit()
+        return cur.lastrowid
+
+
+def _log_sweep_run_finish(run_id, n_final_candidates, n_candidate_nodes_written,
+                           n_trade_rows_written, elapsed_s):
+    """Completes the row _log_sweep_run_start created. See that function's own
+    docstring for why there's deliberately no try/finally guaranteeing this runs."""
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        conn.execute("""
+            UPDATE sweep_run_log SET finished_at=?, n_final_candidates=?,
+                n_candidate_nodes_written=?, n_trade_rows_written=?, elapsed_s=?
+            WHERE id=?
+        """, (time.strftime("%Y-%m-%dT%H:%M:%S"), n_final_candidates, n_candidate_nodes_written,
+              n_trade_rows_written, elapsed_s, run_id))
+        conn.commit()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=8)
@@ -290,6 +338,9 @@ def main():
     TRAIL_PCTS = _trail_pcts_for_strategy(strategy_name, grid)
 
     version = "bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
+
+    _run_log_t0 = time.time()
+    _run_log_id = _log_sweep_run_start(TICKER, strategy_name, fixed_sl, WINDOWS, version)
 
     _job_tmp = os.path.join(os.environ["CLAUDE_JOB_DIR"], "tmp") if "CLAUDE_JOB_DIR" in os.environ else "/tmp"
     # Keyed on WINDOWS too (not just strategy/fixed_sl) -- found live 2026-08-29: a
@@ -669,6 +720,9 @@ def main():
     t_ins7 = time.time()
     print(f"Trade rows written to backtest_winner_trades: {n_trade_rows_written} "
           f"in {t_ins7 - t_ins6:.2f}s")
+
+    _log_sweep_run_finish(_run_log_id, len(final_candidates), n_written9, n_trade_rows_written,
+                           time.time() - _run_log_t0)
 
 
 if __name__ == "__main__":
