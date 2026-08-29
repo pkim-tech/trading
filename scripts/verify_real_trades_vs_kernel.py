@@ -117,7 +117,8 @@ def get_real_trades(start, end, tickers=None, accounts=None):
     con = sqlite3.connect(LIVE_DB)
     con.row_factory = sqlite3.Row
     q = """
-        SELECT wl_id, ticker, account, strategy, signal_time, entry_time, exit_time, pnl_pct, exit_reason
+        SELECT wl_id, ticker, account, strategy, signal_time, entry_time, exit_time, pnl_pct, exit_reason,
+               signal_price
         FROM trade_log
         WHERE is_dry_run_sim = 0 AND position_source = 'core' AND wl_id IS NOT NULL AND wl_id > 0
           AND entry_time >= ? AND entry_time <= ?

@@ -445,6 +445,175 @@ def _cheap_signal_cross_check(ticker, signal_or_entry_time_str, window, z_score_
                        f"-> {'REAL BREACH' if breached else 'no breach'}")
 
 
+def _pattern_open_check_pinned_price(node, r):
+    """Known non-issue: entry_timing='open_check' nodes pin signal_price to the
+    real session-open print (schwab_client.get_session_open_price's quote.openPrice,
+    active_signals.py:587), not a live tick sampled at signal_time -- root-caused
+    2026-08-28 (SOXL wl_id=249, Task #7; see docs/deep_backlog.md's 2026-08-28
+    entry). A signal_time that lands right at market open (09:31-09:40/14:31-14:40,
+    active_signals._OPEN_CHECK_WINDOWS) is itself part of this normal pattern, not
+    an anomaly -- the recorded signal_price should match the real 9:30/14:30
+    session-open bar, not a live tick near signal_time.
+
+    Returns None if this pattern doesn't apply (not an open_check node); otherwise
+    (matched: bool, detail) or (None, reason) if it applies but can't be checked."""
+    if node.get('entry_timing') != 'open_check':
+        return None
+    sig_price = r.get('signal_price')
+    if sig_price is None:
+        return None, "no signal_price on this real trade row"
+    import pandas as pd
+    sig_ts = pd.Timestamp(r.get('signal_time') or r['entry_time'])
+    open_hour = 9 if sig_ts.hour < 12 else 14
+    open_bar_ts = sig_ts.normalize() + pd.Timedelta(hours=open_hour, minutes=30)
+    try:
+        df_h = pd.read_csv(f"cache/research/{node['ticker']}_1h.csv", index_col=0, parse_dates=True)
+    except FileNotFoundError:
+        return None, f"no cache/research/{node['ticker']}_1h.csv on file"
+    if open_bar_ts not in df_h.index:
+        return None, f"no {open_bar_ts} bar in _1h.csv (holiday/half-day/data gap?)"
+    real_open = df_h.loc[open_bar_ts, 'Open']
+    if isinstance(real_open, pd.Series):
+        return None, f"duplicate {open_bar_ts} rows in _1h.csv -- can't pick one unambiguously"
+    if pd.isna(real_open):
+        return None, f"bar={open_bar_ts} has no real Open (empty/no-trade bar)"
+    real_open = float(real_open)
+    diff_pct = abs(sig_price - real_open) / real_open * 100
+    matched = diff_pct <= 0.1
+    detail = (f"signal_price=${sig_price:.4f} vs real session-open bar={open_bar_ts} "
+              f"Open=${real_open:.4f} (diff={diff_pct:.4f}%)")
+    return matched, detail
+
+
+def _pattern_topup_restamp(node, r):
+    """Known non-issue: a top-up fill can restamp trade_log's signal_time/
+    entry_time to the top-up's own (later) event while signal_price keeps the
+    ORIGINAL trigger's price -- root-caused 2026-08-26 (DFEN wl_id=247, see
+    docs/research_log.md's 2026-08-26 entry: real trigger 2026-08-25 09:31:22,
+    restamped forward to a 2026-08-26 top-up). Applies only to open_check
+    nodes: checks whether signal_price matches, tightly, that SAME pinned
+    open_check window (9:30 or 14:30) on one of the 3 PRIOR calendar days
+    instead of today's -- deliberately narrower than "any earlier bar in the
+    lookback window": a real top_up event fires on essentially every real
+    open_check fill (confirmed directly -- SOXL's clean, non-restamped
+    wl_id=249 case has one too), so top_up presence alone isn't distinctive
+    enough to gate on; the specific prior-day-pinned-window match is.
+
+    Returns None if inapplicable (not open_check); otherwise (matched: bool,
+    detail) or (None, reason)."""
+    if node.get('entry_timing') != 'open_check':
+        return None
+    sig_price = r.get('signal_price')
+    if sig_price is None:
+        return None, "no signal_price on this real trade row"
+    import pandas as pd
+    sig_ts = pd.Timestamp(r.get('signal_time') or r['entry_time'])
+    open_hour = 9 if sig_ts.hour < 12 else 14
+    try:
+        df_h = pd.read_csv(f"cache/research/{node['ticker']}_1h.csv", index_col=0, parse_dates=True)
+    except FileNotFoundError:
+        return None, f"no cache/research/{node['ticker']}_1h.csv on file"
+    for days_back in (1, 2, 3):
+        open_bar_ts = sig_ts.normalize() - pd.Timedelta(days=days_back) + pd.Timedelta(hours=open_hour, minutes=30)
+        if open_bar_ts not in df_h.index:
+            continue
+        real_open = df_h.loc[open_bar_ts, 'Open']
+        if isinstance(real_open, pd.Series) or pd.isna(real_open):
+            continue
+        real_open = float(real_open)
+        diff_pct = abs(sig_price - real_open) / real_open * 100
+        if diff_pct <= 0.1:
+            # Corroborating (not gating -- see docstring): a top_up near signal_time
+            # is consistent with the restamping fill, but present on ordinary fills too.
+            con = sqlite3.connect(LIVE_DB)
+            con.row_factory = sqlite3.Row
+            has_topup = con.execute(
+                "SELECT 1 FROM coverage_events WHERE ticker=? AND node_id=? AND scenario_key='top_up' "
+                "AND datetime(ts, 'localtime') BETWEEN ? AND ? LIMIT 1",
+                (node['ticker'], node['id'],
+                 (sig_ts - pd.Timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S'),
+                 (sig_ts + pd.Timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')),
+            ).fetchone()
+            con.close()
+            topup_note = "corroborated by a same-window top_up event" if has_topup \
+                else "(no corroborating top_up event found near signal_time)"
+            detail = (f"signal_price=${sig_price:.4f} vs {open_bar_ts} (PRIOR-day, {days_back}d earlier, "
+                      f"same {open_hour}:30 open_check window) Open=${real_open:.4f} (diff={diff_pct:.4f}%) "
+                      f"{topup_note} -- recorded signal_time={sig_ts} likely restamped forward")
+            return True, detail
+    return None, "no tight match at any prior-day (1-3d back) pinned open_check window"
+
+
+def _pattern_stale_duplicate_open_price(node, r):
+    """Known BUG, not yet code-fixed (still open in docs/backlog_cache.md):
+    schwab_client.get_session_open_price's SECOND same-day open_check pinned
+    call (the 14:30 window) has been observed returning the exact same price
+    as its FIRST (9:30) call instead of a fresh one -- root-caused 2026-08-26
+    (DPST), confirmed directly via open_price_quality_log showing identical
+    9:30/14:30 prices. This check classifies a matching flag as 'known bug,
+    not investigation-needed' -- it does NOT fix the underlying bug, which
+    stays separately tracked and open; don't conflate the two.
+
+    Returns None if inapplicable (not open_check, or not a 14:30-window
+    signal); otherwise (matched: bool, detail) or (None, reason)."""
+    if node.get('entry_timing') != 'open_check':
+        return None
+    import pandas as pd
+    sig_ts = pd.Timestamp(r.get('signal_time') or r['entry_time'])
+    if sig_ts.hour != 14:
+        return None
+    day = sig_ts.strftime('%Y-%m-%d')
+    con = sqlite3.connect(LIVE_DB)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT target_h, price FROM open_price_quality_log WHERE ticker=? AND ts LIKE ? "
+        "AND target_h IN (9, 14) AND target_m=30 ORDER BY ts",
+        (node['ticker'], f"{day}%"),
+    ).fetchall()
+    con.close()
+    by_hour = {row['target_h']: row['price'] for row in rows}
+    if 9 not in by_hour or 14 not in by_hour:
+        return None, f"missing open_price_quality_log rows for {day} (9:30 present={9 in by_hour}, 14:30 present={14 in by_hour})"
+    matched = abs(by_hour[9] - by_hour[14]) < 1e-6
+    detail = f"9:30 logged open=${by_hour[9]:.4f} vs 14:30 logged open=${by_hour[14]:.4f}"
+    return matched, detail
+
+
+# Ordered library of known-explained non-issue patterns for a real PHANTOM/
+# signal-mismatch flag, checked after the existing stale-kernel-data breach
+# check (_cheap_signal_cross_check) comes back with no real breach. Each entry
+# is (label, check_fn); check_fn returns None if inapplicable, (None, reason)
+# if applicable but unable to verify, or (matched: bool, detail) once checked.
+# Extend this list when a new root cause gets explained, rather than
+# re-deriving it by hand next time the same pattern recurs (Task #8, 2026-08-28).
+_KNOWN_SIGNAL_MISMATCH_PATTERNS = [
+    ("open_check pinned-open-price", _pattern_open_check_pinned_price),
+    # Same-day stale-duplicate checked BEFORE the cross-day restamp pattern: a
+    # same-day exact 9:30==14:30 duplicate (DPST's case) is a stronger, more
+    # direct signature than a cross-day approximate match, and the two can
+    # otherwise collide (found testing 2026-08-28: DPST's real case also
+    # happens to sit within the restamp pattern's 0.1% prior-day tolerance).
+    ("get_session_open_price stale-duplicate 2nd pinned call", _pattern_stale_duplicate_open_price),
+    ("same-day top-up restamp", _pattern_topup_restamp),
+]
+
+
+def _known_pattern_checks(node, r):
+    """Runs the known-non-issue pattern library in order; returns (label, detail)
+    for the first pattern that matches, or None if none matched (falls through
+    to 'genuinely unexplained' at the call site)."""
+    for label, fn in _KNOWN_SIGNAL_MISMATCH_PATTERNS:
+        result = fn(node, r)
+        if result is None:
+            continue
+        matched, detail = result
+        if matched is None:
+            continue  # applicable but couldn't be verified -- try the next pattern
+        if matched:
+            return label, detail
+    return None
+
+
 def _part2_daily_sweep(nodes, node_state):
     """Sub-part, added 2026-08-26 after the real SOXL/DPST/DFEN investigation (see
     docs/research_log.md's 2026-08-26 entries): cheap, routine, per-node/per-day check,
@@ -1402,7 +1571,8 @@ def part3():
         active_count += 1
         matched, unmatched_real, unmatched_bt = verify.match_trades(
             [{"signal_time": r["signal_time"], "entry_time": r["entry_time"],
-              "ticker": r["ticker"], "exit_reason": r["exit_reason"], "pnl_pct": r["pnl_pct"]} for r in node_real],
+              "ticker": r["ticker"], "exit_reason": r["exit_reason"], "pnl_pct": r["pnl_pct"],
+              "signal_price": r["signal_price"]} for r in node_real],
             [{"entry_time": str(t["entry_time"]), "ret": t["ret"]} for t in bt], 4)
         genuine = [r for r in unmatched_real if not verify.is_staged_or_manual(r['ticker'], r['entry_time'], r['exit_reason'])]
         # Occurrence (PHANTOM/MISSED, bidirectional -- a kernel trade the real daemon
@@ -1431,8 +1601,14 @@ def part3():
                 print(f"        cross-check: REAL signal confirmed independently ({detail}) "
                       f"-- likely a stale-kernel-data false PHANTOM, not a real divergence")
             else:
-                print(f"        cross-check: NO real breach found ({detail}) "
-                      f"-- this PHANTOM looks genuine, worth investigating")
+                pattern = _known_pattern_checks(node, r)
+                if pattern:
+                    plabel, pdetail = pattern
+                    print(f"        cross-check: NO real breach found ({detail}) -- but matches known "
+                          f"pattern '{plabel}': {pdetail} -- known non-issue, not investigation-needed")
+                else:
+                    print(f"        cross-check: NO real breach found ({detail}) "
+                          f"-- this PHANTOM looks genuine, worth investigating")
         for t in unmatched_bt:
             print(f"      MISSED : kernel entry={t['entry_time']}")
         # Magnitude, pure reporting (2026-08-26, folded in from the trace-tool dispatch)
