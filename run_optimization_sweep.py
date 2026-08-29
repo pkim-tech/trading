@@ -22,13 +22,6 @@ from backtester import (run_backtest_dispatch,
 import strategies
 from db_cache import refresh_dropdown_cache, refresh_pivot_cache, refresh_cliff_grid_cache
 
-# scripts/ isn't a package this file lives in, so it's not on sys.path by default --
-# add it so build_params_dict (params_json population, 2026-08-29) can be imported the
-# same way scripts/bench_phase1_phase2_inmemory.py imports node_key() in the other
-# direction (sys.path.insert(0, ROOT) + sys.path.insert(0, ROOT/scripts)).
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
-from node_key import build_params_dict
-
 CACHE_DIR    = Path("./cache/research")
 OPTO_LOG_DIR = Path("./logs")
 OPTO_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -309,16 +302,6 @@ def init_idempotent_db():
         cursor.execute("ALTER TABLE backtest_cache ADD COLUMN cagr REAL")
     except Exception:
         pass
-
-    # params_json (2026-08-29): nullable JSON mirror of the exact params dict
-    # scripts.node_key.build_params_dict()/node_key() hash -- populated on every NEW
-    # write going forward only, no backfill of existing rows. Groundwork for the
-    # schema-v2 node-identity migration (docs/plans/backtest_schema_v2_phase_tables.md)
-    # -- NOT a read-path change, every existing reader keeps working unmodified since
-    # it only reads the flat columns it always has.
-    bc_cols = {r[1] for r in cursor.execute("PRAGMA table_info(backtest_cache)").fetchall()}
-    if 'params_json' not in bc_cols:
-        cursor.execute("ALTER TABLE backtest_cache ADD COLUMN params_json TEXT")
 
     # backtest_phase1 (2026-08-25): ephemeral scratch table for the schema-v2 experiment
     # (docs/plans/backtest_schema_v2_phase_tables.md) -- a PARALLEL destination for
@@ -1459,16 +1442,11 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
             else:
                 row_take_profit, row_arm_sell_pct = int(tp), None
 
-            params_json = json.dumps(
-                build_params_dict(strategy_name, ticker, stored_fsl, w, z_thresh, hold_hours,
-                                   tp, sl, tpct, entry_timing, strategies.resolve_axis_columns),
-                sort_keys=True)
-
             buffer.append((strategy_name, config_version, ticker, w, hold_hours, row_take_profit, row_stop_loss,
                            num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
                            stored_fsl, row_trail_buy_pct, row_trail_pct, wtw, row_arm_sell_pct, float(tp),
                            entry_timing, None, None, None, None, phase_label, generation, run_id,
-                           'ground_truth_v6', node_cagr, params_json))
+                           'ground_truth_v6', node_cagr))
 
             if len(buffer) >= batch_size:
                 cursor.executemany(
@@ -1479,8 +1457,8 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
                         win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                         strategy_return_pessimistic, alpha_vs_spy_pessimistic,
                         strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
-                        kernel_version, cagr, params_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        kernel_version, cagr)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     buffer
                 )
                 buffer = []
@@ -1498,8 +1476,8 @@ def dispatch_parallel_grid_ground_truth(shared_pool, tasks, ticker, strategy_nam
                 win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                 strategy_return_pessimistic, alpha_vs_spy_pessimistic,
                 strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
-                kernel_version, cagr, params_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                kernel_version, cagr)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             buffer
         )
         conn.commit()
@@ -2074,16 +2052,11 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                 else:
                     row_take_profit, row_arm_sell_pct = int(tp), None
 
-                params_json = json.dumps(
-                    build_params_dict(strategy_name, ticker, stored_fsl, w, z_thresh, hold_hours,
-                                       tp, sl, tpct, entry_timing, strategies.resolve_axis_columns),
-                    sort_keys=True)
-
                 buffer.append((strategy_name, config_version, ticker, w, hold_hours, row_take_profit, row_stop_loss,
                                num_trades, wr, comp_ret, alpha, asset_bh, spy_bh, run_timestamp, z_thresh,
                                stored_fsl, row_trail_buy_pct, row_trail_pct, wtw, row_arm_sell_pct, float(tp),
                                entry_timing, comp_ret_pess, alpha_pess, comp_ret_cert, alpha_cert, phase_label,
-                               generation, run_id, params_json))
+                               generation, run_id))
 
                 if len(buffer) >= batch_size:
                     cursor.executemany(
@@ -2093,9 +2066,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                             run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
                             win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                             strategy_return_pessimistic, alpha_vs_spy_pessimistic,
-                            strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
-                            params_json)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         buffer
                     )
                     buffer = []
@@ -2112,9 +2084,8 @@ def dispatch_parallel_grid(shared_pool, tasks, ticker, strategy_name, config_ver
                 run_timestamp, z_score_threshold, fixed_sl, trail_buy_pct, trail_sell_pct,
                 win_twin_rate, arm_sell_pct, axis_tp, entry_timing,
                 strategy_return_pessimistic, alpha_vs_spy_pessimistic,
-                strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id,
-                params_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                strategy_return_certain, alpha_vs_spy_certain, phase, generation, sweep_run_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             buffer
         )
     conn.commit()
