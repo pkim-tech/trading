@@ -426,39 +426,77 @@ def _save_daily_close_state(state):
 
 
 def fetch_fresh_daily_closes(ticker, window):
-    """Fetches a small, fresh window of daily OHLCV directly from yfinance
-    (auto_adjust=True re-adjusts the ENTIRE returned range on every call, so
-    a fresh narrow fetch is always internally consistent by construction --
-    no incremental patching, no discontinuity possible within one fetch).
+    """Fetches a small, fresh HOURLY window directly from yfinance and
+    resamples it to daily bars using the EXACT SAME resample logic the
+    backtest kernel/every other consumer in this codebase uses
+    (`.resample('D').last().dropna()` -- see data_manager.py's own daily
+    resample calls, signals_compute._load_cache, run_optimization_sweep.py,
+    and dozens of scripts/sim_*.py files, all identical). auto_adjust
+    defaults True on yf.download() (confirmed in data_manager.py's own
+    comment) and re-adjusts the ENTIRE returned range on every call, so a
+    fresh narrow fetch is always internally consistent by construction -- no
+    incremental patching, no discontinuity possible within one fetch.
     Returns a tz-naive-indexed DataFrame (Open/High/Low/Close/Volume) sorted
     ascending, or None on any fetch failure/empty result -- callers must fall
     back to their existing data source on None, never block signal
     computation on a transient yfinance hiccup.
 
+    An earlier version of this function fetched yfinance's NATIVE daily bars
+    (interval='1d') directly instead of resampling from hourly -- paired
+    review found this created a real, if small, live-vs-backtest basis
+    mismatch (yfinance's own daily aggregation differs from the resampled-
+    hourly-close basis the validated backtest kernel actually trades off,
+    measured ~0.03-0.15%/day). Fetching hourly and resampling with the
+    kernel's own exact logic closes that gap while keeping every property
+    the original design needed (still a fresh, unpatched fetch every call,
+    still self-correcting).
+
     window's calendar-day buffer is sized generously (1.6x + 20 fixed days)
     to comfortably cover real configured window sizes up to 99 (the largest
     on file today, a paper test fixture) without over-fetching for the
     common 5/10/20 case -- weekends/holidays mean trading days always need
-    more calendar days than a naive 1:1 mapping."""
+    more calendar days than a naive 1:1 mapping. Yahoo's hourly-history hard
+    limit is 730 calendar days (see data_manager.py's own comment on this
+    exact constant) -- comfortably far above any real buffer this produces."""
     import pandas as pd
     import yfinance as yf
     from concurrent.futures import ThreadPoolExecutor
     try:
         buffer_days = int(window * 1.6) + 20
-        start = (datetime.now() - timedelta(days=buffer_days)).strftime('%Y-%m-%d')
         # Timeout-wrapped, matching signals_compute._live_tick_price's own
-        # yfinance call -- an un-timeout-ed yf.Ticker(...).history() call can
-        # hang, and compute_buy_signal is called serially per node from the
-        # poll loop (found by paired review: no timeout here would reintroduce
-        # the exact stall risk that pattern already exists to prevent).
+        # yfinance call -- an un-timeout-ed yf.download() call can hang, and
+        # compute_buy_signal is called serially per node from the poll loop
+        # (found by paired review of an earlier version of this function: no
+        # timeout here would reintroduce the exact stall risk that pattern
+        # already exists to prevent).
         with ThreadPoolExecutor(max_workers=1) as ex:
+            # yf.download(..., interval="1h") -- the EXACT call shape
+            # data_manager.py uses to build the _1h.csv cache the backtest
+            # kernel reads (see its own "Yahoo's hard limit for hourly
+            # history" comment) -- not yf.Ticker(...).history(), so this
+            # fetch is on an identical basis, not just an equivalent one.
+            # progress=False -- yf.download() otherwise prints a progress bar
+            # to stdout on every single call (found by paired review); this
+            # runs on every live compute_buy_signal call across every node's
+            # ticker, so left default that's real, constant noise in the
+            # daemon's log output for no benefit.
             hist = ex.submit(
-                lambda: yf.Ticker(ticker).history(start=start, interval='1d', auto_adjust=True)
+                lambda: yf.download(ticker, period=f"{buffer_days}d", interval="1h", progress=False)
             ).result(timeout=10)
         if hist.empty:
             return None
-        hist.index = pd.to_datetime(hist.index).tz_localize(None).normalize()
-        return hist[['Open', 'High', 'Low', 'Close', 'Volume']].sort_index()
+        # Same MultiIndex-column flattening data_manager.py applies (newer
+        # yfinance versions can return a MultiIndex even for a single
+        # ticker) -- resample('D').last() on an un-flattened MultiIndex
+        # frame silently produces the wrong column shape instead of raising.
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+        hist.index = pd.to_datetime(hist.index).tz_localize(None)
+        hist = hist.sort_index()
+        daily = hist.resample('D').last().dropna(subset=['Close'])
+        if daily.empty:
+            return None
+        return daily[['Open', 'High', 'Low', 'Close', 'Volume']]
     except Exception:
         return None
 

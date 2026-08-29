@@ -305,12 +305,74 @@ def test_daily_sync_node_is_excluded_from_fresh_fetch(isolated_state, monkeypatc
 
 
 def test_fetch_fresh_daily_closes_returns_none_on_fetch_failure(monkeypatch):
-    """Fail-open contract, proven without a real network call: yf.Ticker(...)
+    """Fail-open contract, proven without a real network call: yf.download(...)
     raising must return None, not propagate."""
-    class _Boom:
-        def __init__(self, ticker):
-            raise ConnectionError("simulated network failure")
+    def _boom(*a, **kw):
+        raise ConnectionError("simulated network failure")
     import yfinance as yf
-    monkeypatch.setattr(yf, 'Ticker', _Boom)
+    monkeypatch.setattr(yf, 'download', _boom)
     result = signals_helpers.fetch_fresh_daily_closes('ANY', 20)
     assert result is None
+
+
+def test_fetch_fresh_daily_closes_resamples_hourly_to_daily_via_kernel_logic(monkeypatch):
+    """Real regression test for the Task #15 basis-mismatch fix: the fetch
+    must go through yf.download(..., interval='1h') and resample('D').last()
+    -- NOT yfinance's native daily bars -- so live indicators are computed on
+    the identical basis the validated backtest kernel uses."""
+    import yfinance as yf
+    hourly_idx = pd.to_datetime([
+        '2026-08-25 09:30', '2026-08-25 10:30', '2026-08-25 15:30',  # day 1: last hourly close = 102.0
+        '2026-08-26 09:30', '2026-08-26 15:30',                       # day 2: last hourly close = 205.0
+    ])
+    hourly_df = pd.DataFrame(
+        {'Open': [100.0, 101.0, 101.5, 200.0, 204.0],
+         'High': [100.0, 101.0, 101.5, 200.0, 204.0],
+         'Low': [100.0, 101.0, 101.5, 200.0, 204.0],
+         'Close': [100.0, 101.0, 102.0, 200.0, 205.0],
+         'Volume': [1000] * 5},
+        index=hourly_idx,
+    )
+    captured = {}
+
+    def _fake_download(ticker, period, interval, progress=True):
+        captured['ticker'], captured['period'], captured['interval'] = ticker, period, interval
+        captured['progress'] = progress
+        return hourly_df.copy()
+
+    monkeypatch.setattr(yf, 'download', _fake_download)
+    result = signals_helpers.fetch_fresh_daily_closes('ANY', 5)
+
+    assert captured['interval'] == '1h', "must fetch hourly, not native daily bars"
+    assert captured['period'] == '28d', "window=5 -> buffer_days = int(5*1.6)+20 = 28"
+    assert captured['progress'] is False, "must suppress yfinance's stdout progress bar"
+    assert result is not None
+    # resample('D').last() -- daily Close must be each day's LAST hourly bar's
+    # Close, not yfinance's own daily aggregation (which this test's fake
+    # download() bypasses entirely, so any daily-native code path would
+    # crash or return something unrelated to hourly_df).
+    assert result.loc['2026-08-25', 'Close'] == 102.0
+    assert result.loc['2026-08-26', 'Close'] == 205.0
+
+
+def test_fetch_fresh_daily_closes_flattens_multiindex_columns(monkeypatch):
+    """A newer yfinance version can return a MultiIndex column frame even for
+    a single ticker (the same real issue data_manager.py's own bootstrap/
+    delta fetches guard against) -- must be flattened before resample, or
+    resample('D').last() silently produces the wrong column shape instead of
+    raising (per this function's own comment)."""
+    import yfinance as yf
+    idx = pd.to_datetime(['2026-08-25 09:30', '2026-08-25 15:30'])
+    hourly_df = pd.DataFrame(
+        {'Open': [100.0, 101.0], 'High': [100.0, 101.0], 'Low': [100.0, 101.0],
+         'Close': [100.0, 103.0], 'Volume': [1000, 1000]},
+        index=idx,
+    )
+    hourly_df.columns = pd.MultiIndex.from_product([hourly_df.columns, ['ANY']])
+
+    monkeypatch.setattr(yf, 'download', lambda *a, **kw: hourly_df.copy())
+    result = signals_helpers.fetch_fresh_daily_closes('ANY', 5)
+
+    assert result is not None
+    assert not isinstance(result.columns, pd.MultiIndex)
+    assert result.loc['2026-08-25', 'Close'] == 103.0
