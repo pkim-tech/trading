@@ -200,6 +200,43 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
     return actually_inserted
 
 
+def _clear_prior_seed_mode_rows(strategy_name, config_version, ticker):
+    """Seed mode only (2026-08-29, paired review round 4, CONFIRMED by both reviewers):
+    deletes this version's PRIOR candidate_nodes/backtest_winner_trades rows before a
+    new seed run writes its own output. Needed because round 3's repeatability fix
+    (seed mode always bypasses sweep_run_log's dedup skip, and skips the checkpoint
+    entirely) makes every repeat invocation of the same --seed-watch-list-id genuinely
+    re-run for real -- but the version string is still deterministic (stable
+    "-seed<id>" suffix, not timestamped), so without this, repeat runs would UNION
+    their writes under the identical version via INSERT OR IGNORE with no way to tell
+    which run produced which row, and a node promoted by an older/buggier code
+    revision would stay there indistinguishably forever.
+
+    Deliberately DELETE-and-replace rather than a timestamp-suffixed version per
+    invocation: seed mode is a disposable smoke test meant to reflect the CURRENT
+    code's behavior against one real node, not an audit trail of every historical
+    invocation -- a stable, greppable "-seed<id>" version that always reflects the
+    latest run is more useful here than an ever-growing pile of past runs a consumer
+    would have to filter by recency to find the real answer. Never called for a
+    non-seed run (full-grid campaigns keep their real accumulate-forever semantics)."""
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        cn_deleted = conn.execute(
+            "DELETE FROM candidate_nodes WHERE version=? AND ticker=? AND strategy=?",
+            (config_version, ticker, strategy_name)).rowcount
+        wt_deleted = 0
+        existing_tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='backtest_winner_trades'")}
+        if existing_tables:
+            wt_deleted = conn.execute(
+                "DELETE FROM backtest_winner_trades WHERE version=? AND ticker=? AND strategy=?",
+                (config_version, ticker, strategy_name)).rowcount
+        conn.commit()
+    if cn_deleted or wt_deleted:
+        print(f"Seed mode: cleared {cn_deleted} prior candidate_nodes row(s) and "
+              f"{wt_deleted} prior backtest_winner_trades row(s) for version={config_version} "
+              f"before writing this run's output (repeat-invocation replace, not union).")
+
+
 def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_name,
                                 config_version, ticker, fixed_sl):
     """New table (not yet in real production) -- one row per real trade, keyed by
@@ -696,23 +733,33 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         raise SystemExit(f"compute_bh_returns returned None for {TICKER}/{DATA_SOURCE} -- no derived build.")
 
     _seed_task = getattr(args, "_seed_task", None)
-    if _seed_task is not None and _seed_task[5] not in TRAIL_PCTS:
-        # Seed-mode tpct off-grid fix (2026-08-29, paired review round 3, CONFIRMED by
-        # both reviewers): tpct is exempt from the tp/sl integer-mesh guard in
-        # _load_seed_node (it's never range()-walked, unlike tp/sl), but Phase2's own
-        # w/z/tpct island-detection loop DOES match it by exact equality against
-        # TRAIL_PCTS (`df1[df1["trail_sell_pct"] == tpct]`) -- if the seed's real tpct
-        # isn't already in the strategy's standard TRAIL_PCTS grid (true for 8 real
-        # seedable TrailingBoth rows, e.g. DPST=13.0/SOXL=15.0/TQQQ=9.0), every Phase2
-        # slice comes up empty, phase2_tasks stays empty, and the run silently degrades
-        # to seed-alone with no crash and no warning. Fix: add the seed's own tpct to the
-        # iterated TRAIL_PCTS set for this run, mirroring Phase2.5's own existing
-        # `tpct_neighbors = [tpct_c]` off-grid fallback further below.
-        TRAIL_PCTS = TRAIL_PCTS + [_seed_task[5]]
-        print(f"Seed mode: seed's tpct={_seed_task[5]} not in standard TRAIL_PCTS grid "
-              f"{_trail_pcts_for_strategy(strategy_name, grid)} -- added it so Phase2's "
-              f"w/z/tpct loop doesn't silently skip the seed's own slice. "
-              f"TRAIL_PCTS now {TRAIL_PCTS}")
+    if _seed_task is not None:
+        # Seed-mode TRAIL_PCTS override (2026-08-29, paired review round 4, CONFIRMED by
+        # both reviewers -- fixes a real regression round 3 itself introduced): REPLACE
+        # TRAIL_PCTS entirely with the seed's own tpct, same pattern as WINDOWS/
+        # Z_THRESHOLDS/HOLD_TIME_CAPS, rather than appending it to the end of the
+        # standard grid. Round 3's `TRAIL_PCTS = TRAIL_PCTS + [_seed_task[5]]` fixed
+        # Phase2's island-detection empty-slice bug but broke Phase2.5's neighbor-slicing
+        # (`idx = TRAIL_PCTS.index(tpct_c); tpct_neighbors = TRAIL_PCTS[idx-1:idx+2]`),
+        # which assumes LIST-POSITION adjacency == NUMERIC adjacency -- an appended value
+        # at the end of the list has a numerically-distant list neighbor. Concrete
+        # example: DPST id=53 (tpct=13.0) made TRAIL_PCTS=[1,2,3,4,5,6,7,13], idx=7,
+        # neighbors=[7.0, 13.0] -- Phase2.5 built a whole cliffbox at tpct=7.0 (6 grid-
+        # steps away, zero real Phase1/Phase2 support), and those rows could outrank and
+        # get PROMOTED into candidate_nodes instead of the seed's own tpct=13.0 rows.
+        # Worse, this fired unconditionally for EVERY TrailingExitZScoreBreakout seed
+        # (generic_tpct is always 0.0 for that strategy, never in [1..7]) -- 31 of 39 real
+        # off-grid-tpct seedable rows are TrailingExit-at-0.0, including 5 real LIVE nodes
+        # (AGQ id=239, GDXU id=240, UGL id=246, DPST id=248, SOXL id=249): TrailingExit's
+        # kernel discards the tpct arg entirely, so the phantom tpct=7.0 cells were
+        # byte-identical backtests to the real tpct=0.0 cells but survived
+        # drop_duplicates as separate rows, splitting each node's Phase2.5 population
+        # across 2 phantom "different" tpct values and silently yielding fewer than 9
+        # distinct promoted candidates. REPLACING (not appending) makes idx always 0,
+        # tpct_neighbors always [seed_tpct], correct for both cases.
+        TRAIL_PCTS = [_seed_task[5]]
+        print(f"Seed mode: TRAIL_PCTS override -> {TRAIL_PCTS} (replaces standard grid "
+              f"{_trail_pcts_for_strategy(strategy_name, grid)}, not appended -- round-4 fix)")
 
     if _seed_task is not None:
         # Seed-mode smoke test (2026-08-29): Phase1 reduced to exactly the one real
@@ -728,7 +775,17 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
                          for tp in TAKE_PROFITS for sl in STOP_LOSSES
                          for hold in HOLD_TIME_CAPS for tpct in TRAIL_PCTS]
 
-    if not args.resume_from_top100 and os.path.exists(checkpoint_path):
+    # Seed mode never uses the checkpoint at all (2026-08-29, paired review round 4,
+    # CONFIRMED by both reviewers): the round-3 repeatability fix bypassed sweep_run_log's
+    # dedup check, but the default checkpoint path is STABLE across identical seed
+    # invocations (keyed on _seed<id>), so it still silently short-circuited a repeat run
+    # -- loading the PRIOR run's df_full and only re-running Phase2.5+promotion against
+    # stale upstream data. If the kernel/strategy changed between runs (the actual reason
+    # to rerun a smoke test), this would silently validate new code against old Phase1/
+    # Phase2 output. Seed mode's whole cost profile (Phase1=1 cell, Phase2=~81 cells) is
+    # cheap enough that there's no expensive cost to amortize -- the checkpoint's entire
+    # justification for existing -- so it's skipped (both load AND save) entirely.
+    if _seed_task is None and not args.resume_from_top100 and os.path.exists(checkpoint_path):
       t0 = time.time()
       df_full = pd.read_parquet(checkpoint_path)
       t1 = t2 = t3 = time.time()
@@ -887,9 +944,15 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
 
       # Dev-iteration checkpoint save (not a production artifact) -- lets the NEXT
       # run skip straight to Phase2.5 instead of repaying Phase1+Phase2's ~7min.
-      os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-      df_full.to_parquet(checkpoint_path)
-      print(f"Checkpoint saved: {checkpoint_path} ({len(df_full):,} rows)")
+      # Skipped entirely in seed mode (2026-08-29, round 4) -- see the load-side skip's
+      # own comment above for why: seed mode is cheap enough that there's no cost to
+      # amortize, and saving one would make repeat seed runs silently stale.
+      if _seed_task is None:
+          os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+          df_full.to_parquet(checkpoint_path)
+          print(f"Checkpoint saved: {checkpoint_path} ({len(df_full):,} rows)")
+      else:
+          print("Seed mode: checkpoint save skipped (always re-runs Phase1+Phase2 for real).")
 
     # --- Everything below runs regardless of which branch built df_full ---
 
@@ -1050,6 +1113,8 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # Top-9 write: promotion into candidate_nodes (NOT backtest_cache -- per the
     # "neither top-100 nor top-9 belongs in backtest_cache" design conclusion, the
     # winners are the campaign's real OUTPUT, not a cache row).
+    if _seed_task is not None:
+        _clear_prior_seed_mode_rows(strategy_name, version, TICKER)
     t_ins2 = time.time()
     n_written9 = _insert_candidate_nodes_rows(
         final_candidates, strategy_name, version, TICKER, fixed_sl, ENTRY_TIMING)
