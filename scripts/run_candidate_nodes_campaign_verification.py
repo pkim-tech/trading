@@ -39,12 +39,41 @@ def run_phase3(ticker, version, window, data_source):
     print(f"[Phase3 done in {time.monotonic()-t0:.1f}s]", flush=True)
 
 
+def _phase4_fields_from_row(row):
+    """Maps candidate_summary_report.gt_rows_for_scope's real `out` dict (GT_COLUMN_DEFS
+    shape) onto candidate_verification_store._PHASE4_VALUE_COLUMNS -- check13's 5 real
+    per-fold columns are summarized here to worst_fold_cagr_pct/any_fold_fragile (matching
+    phase4_results' aggregate-result scope, see that table's own module docstring)."""
+    folds = [row.get(f"check13_fold{f}_cagr_pct") for f in range(1, 6)]
+    real_folds = [c for c in folds if c is not None]
+    any_fragile = any(bool(row.get(f"check13_fold{f}_fragile")) for f in range(1, 6))
+    return {
+        "cagr_pct": row.get("cagr_pct"), "robust_alpha_pct": row.get("robust_alpha_pct"),
+        "n_trades": row.get("n_trades"),
+        "core_safe": row.get("core_safe"), "addon_safe": row.get("addon_safe"),
+        "core_addon_disagreement": row.get("core_addon_disagreement"),
+        "check4_early_wr_pct": row.get("check4_early_wr_pct"),
+        "check4_late_wr_pct": row.get("check4_late_wr_pct"),
+        "check8_compounded_pct": row.get("check8_compounded_pct"),
+        "check8_compounded_without_best_pct": row.get("check8_compounded_without_best_pct"),
+        "check8_best_trade_share_pct": row.get("check8_best_trade_share_pct"),
+        "check8_too_few_trades": row.get("check8_too_few_trades"),
+        "check11_max_drawdown_pct": row.get("check11_max_drawdown_pct"),
+        "check13_worst_fold_cagr_pct": min(real_folds) if real_folds else None,
+        "check13_any_fold_fragile": any_fragile,
+        "addon_cagr_pct": row.get("addon_cagr_pct"),
+        "drought_compounded_pct": row.get("drought_compounded_pct"),
+        "drought_combined_compounded_pct": row.get("drought_combined_compounded_pct"),
+    }
+
+
 def run_phase4(ticker, version, window, data_source):
     print(f"\n{'='*100}\nPHASE 4 -- {ticker} / {version} / window={window}\n{'='*100}", flush=True)
     t0 = time.monotonic()
     from phase4_candidate_nodes_resolver import discover_candidate_nodes_scopes
     from candidate_summary_report import gt_rows_for_scope, _write_csv, _write_xlsx, GT_COLUMN_DEFS
     from run_optimization_sweep import DB_PATH
+    from candidate_verification_store import ensure_phase4_table, get_stored_phase4, upsert_phase4
 
     with sqlite3.connect(DB_PATH) as conn:
         cn_scopes = discover_candidate_nodes_scopes(ticker, version)
@@ -56,13 +85,56 @@ def run_phase4(ticker, version, window, data_source):
     for strategy, entry_timing, fixed_sl in scopes:
         print(f"\n{'#'*80}\n{ticker} / {strategy} / {version} / entry_timing={entry_timing} "
               f"/ fixed_sl={fixed_sl} / window={window}\n{'#'*80}", flush=True)
+        # Query-first skip (Task #2, PERF): if every real candidate_nodes row this exact
+        # scope resolves to already has a phase4_results row (phase4_checked_at set),
+        # skip gt_rows_for_scope's real (if now trades-cache-accelerated, see Task #1)
+        # recompute entirely for this scope -- mirrors Phase5's own get_stored/upsert
+        # skip pattern, at scope granularity rather than per-candidate: build_candidate_
+        # report_ground_truth (run_optimization_sweep.py, hard-gated) computes a whole
+        # scope's candidate population in one call (cross-candidate addon-cliff-safety
+        # batching), so there is no cheap per-candidate short-circuit to hook into
+        # without restructuring that gated function itself, which is out of this task's
+        # scope. A skipped scope's rows are NOT reconstructed into this run's CSV/xlsx
+        # (they were already written out on the run that computed them) -- this is a
+        # real, accepted simplification, not a silent data loss (nothing here deletes a
+        # prior run's output/phase4_*.csv/.xlsx).
+        with sqlite3.connect(DB_PATH) as conn:
+            ensure_phase4_table(conn)
+            cand_ids = [r[0] for r in conn.execute(
+                "SELECT id FROM candidate_nodes WHERE ticker=? AND strategy=? AND version=? "
+                "AND fixed_sl=? AND entry_timing=? AND window=?",
+                (ticker, strategy, version, float(fixed_sl), entry_timing, window)).fetchall()]
+            already_done = bool(cand_ids) and all(
+                get_stored_phase4(conn, cid) is not None for cid in cand_ids)
+        if already_done:
+            print(f"  already checked -- every real candidate_nodes row ({len(cand_ids)}) in this "
+                  f"scope already has a phase4_results row. Skipping recompute.")
+            continue
         try:
-            all_rows.extend(gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl,
-                                               grid_window=window))
+            scope_rows = gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl,
+                                            grid_window=window)
         except Exception as e:
             print(f"  UNEXPECTED error on this scope, skipping: {e}")
+            continue
+        all_rows.extend(scope_rows)
+        with sqlite3.connect(DB_PATH) as conn:
+            for row in scope_rows:
+                cid = row.get("candidate_id")
+                if cid is None or row.get("error"):
+                    continue
+                upsert_phase4(conn, cid, _phase4_fields_from_row(row))
 
     out_name = f"phase4_{ticker.lower()}_{version}_w{window}"
+    if not all_rows and scopes:
+        # Every real scope was skipped via the query-first skip above (a pure rerun) --
+        # don't clobber the prior run's real output/phase4_*.csv/.xlsx with an empty
+        # file just because this invocation itself did no fresh work (found while
+        # verifying Task #2's skip logic, 2026-08-29: an earlier version of this always
+        # rewrote both files unconditionally).
+        print(f"[Phase4 done in {time.monotonic()-t0:.1f}s -- every scope already checked, "
+              f"nothing recomputed -- leaving prior output/{out_name}.csv / .xlsx untouched]",
+              flush=True)
+        return
     _write_csv(out_name, all_rows, col_defs=GT_COLUMN_DEFS, to_record=lambda r: r)
     _write_xlsx(out_name, all_rows, col_defs=GT_COLUMN_DEFS, to_record=lambda r: r)
     print(f"[Phase4 done in {time.monotonic()-t0:.1f}s -- {len(all_rows)} rows -- "

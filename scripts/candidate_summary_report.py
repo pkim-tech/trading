@@ -110,6 +110,10 @@ GT_COLUMN_DEFS = {
                          "writes zero backtest_cache rows -- scripts/phase4_candidate_nodes_resolver.py). A "
                          "candidate_nodes-sourced row always has cagr_pct=None and phase4_eligible=True "
                          "(no CAGR-based gate exists without a real cagr -- see phase4_eligible's own note).",
+    "candidate_id": "The real candidate_nodes.id this row came from (candidate_source='candidate_nodes' only) "
+                     "-- None for a backtest_cache-sourced row, which was never promoted into candidate_nodes. "
+                     "This is the real anchor key scripts/candidate_verification_store.py's phase4_results "
+                     "table persists against (Task #2, 2026-08-29 planner dispatch).",
     "take_profit": "Candidate's take_profit/arm_sell_pct cell value (see run_optimization_sweep.py's take_profit "
                     "column meaning per strategy).",
     "stop_loss": "Candidate's stop_loss/trail_buy_pct cell value.",
@@ -910,6 +914,12 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
             **base, "candidate_rank": i + 1, "is_winner": (i == report["winner_index"]),
             "winner_metric": report.get("winner_metric"),
             "candidate_source": "candidate_nodes" if grid_window is not None else "backtest_cache",
+            # real candidate_nodes.id when this row came from the candidate_nodes-sourced
+            # path (phase4_candidate_nodes_resolver's `id` key, see that module's own
+            # docstring) -- None for a backtest_cache-sourced row, which was never
+            # promoted into candidate_nodes and so has no real candidate_id to anchor a
+            # phase4_results row against (Task #2, 2026-08-29 planner dispatch, PERF).
+            "candidate_id": c.get("id"),
             "take_profit": c["take_profit"], "stop_loss": c["stop_loss"],
             "max_hold_hours": c["max_hold_hours"], "window": c["window"],
             "z_score_threshold": c["z_score_threshold"], "tpct": c["tpct"],

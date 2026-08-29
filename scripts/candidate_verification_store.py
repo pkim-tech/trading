@@ -9,6 +9,7 @@ duplicate a CREATE TABLE statement" convention (see bench_phase1_phase2_inmemory
 own `_log_sweep_run_start` for the sibling pattern this follows: inline
 CREATE TABLE IF NOT EXISTS, no separate migration file, no FK enforcement).
 """
+import sqlite3
 import time
 
 _VALUE_COLUMNS = [
@@ -175,3 +176,146 @@ def insert_trades(conn, candidate_id, resolution, version, ticker, strategy, fix
         "SELECT COUNT(*) FROM phase5_trades WHERE candidate_id=? AND resolution=?",
         (candidate_id, resolution)).fetchone()[0]
     return after - before, len(buffer)
+
+
+# --- backtest_winner_trades read-back (Task #1, 2026-08-29 planner dispatch, Phase4 TRADES) ---
+# Phase4 (build_candidate_report_ground_truth in run_optimization_sweep.py) used to ALWAYS
+# re-simulate every candidate's trades via run_backtest_ground_truth, even though Phase2.5
+# (bench_phase1_phase2_inmemory.py's _insert_winner_trades_rows) already persists the
+# IDENTICAL same_bar_reentry=True/need_times=True trade list for its own top-9-per-scope
+# population, under the same real inputs (same node_key params, same version -- which
+# encodes data_source + start/end date window) Phase4 re-derives from scratch. Reading it
+# back saves a full run_backtest_ground_truth call per candidate whenever it's already
+# there. Real coverage check at dispatch time (see this task's own commit message):
+# Phase2.5 only EVER persists its own top-9-per-scope population, so a Phase4 population
+# wider than that top-9 (e.g. candidate_nodes' full_population=True path) will legitimately
+# miss cache for the non-top-9 candidates -- get_cached_trades returning None is that real,
+# expected fallback-to-resimulate signal, not a bug.
+def get_cached_trades(conn, node_key_val, version):
+    """Real persisted trade list for (node_key_val, version) from backtest_winner_trades,
+    reconstructed into the exact dict shape build_candidate_report_ground_truth's downstream
+    checks (4/8/11/13, drought) expect: 'Entry Time'/'Exit Time' as real pandas Timestamps
+    (NOT the TEXT strings stored on disk -- _check13_walk_forward_gt's fold-span math and
+    simulate_drought_overlay_ground_truth's idx.searchsorted both require real Timestamp
+    objects, not strings), 'armed' as a real bool, 'Arm Time'/'Arm Price' as None when
+    armed=0 (matching run_backtest_ground_truth's own None-when-unarmed convention rather
+    than echoing back whatever NULL/non-NULL happens to be stored).
+
+    Returns None (not []) when the table doesn't exist yet, has zero rows for this
+    (node_key_val, version), or the stored trade_idx sequence has a gap (a prior insert
+    that never finished) -- all three are this function's real "not safely cached, caller
+    must fall back to a fresh run_backtest_ground_truth call" signal. A genuinely
+    trade-free candidate (real n_trades=0) is indistinguishable from "never cached" here
+    (no separate expected-count row exists for this table, unlike phase5_trades'
+    trades_complete check) -- an accepted, documented limitation, not a silent bug: the
+    caller always has a real re-simulation fallback available, so worst case is one wasted
+    (but still correct) recompute, never a wrong answer."""
+    try:
+        rows = conn.execute("""
+            SELECT trade_idx, entry_time, entry_price, exit_time, exit_price, exit_reason,
+                   return_pct, armed, arm_time, arm_price
+            FROM backtest_winner_trades
+            WHERE node_key=? AND version=?
+            ORDER BY trade_idx
+        """, (node_key_val, version)).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        return None
+    if [r[0] for r in rows] != list(range(len(rows))):
+        return None  # gapped/partial persistence -- don't trust it, fall back
+    import pandas as pd
+    trades = []
+    for (_, entry_time, entry_price, exit_time, exit_price, exit_reason,
+         return_pct, armed, arm_time, arm_price) in rows:
+        armed = bool(armed)
+        trades.append({
+            'Entry Time': pd.Timestamp(entry_time), 'Entry Price': entry_price,
+            'Exit Time': pd.Timestamp(exit_time), 'Exit Price': exit_price,
+            'exit_reason': exit_reason, 'Return': return_pct, 'armed': armed,
+            'Arm Time': pd.Timestamp(arm_time) if armed and arm_time else None,
+            'Arm Price': arm_price if armed else None,
+        })
+    return trades
+
+
+# --- phase4_results: Phase4 aggregate-result persistence (Task #2, 2026-08-29 planner
+# dispatch, PERF) -- sibling shape to candidate_verification_results above, but keyed on
+# candidate_id ALONE (no 'phase' dimension -- this table only ever holds Phase4's own
+# result, unlike candidate_verification_results which shares one table across Phase3/
+# Phase5). Persists Phase4's real per-candidate aggregate output (checks 4/8/11/13,
+# cliff-safety verdict, overlay summary, cagr) -- field names taken directly from
+# candidate_summary_report.gt_rows_for_scope's real `out` dict (build_candidate_report_
+# ground_truth's actual return shape), not invented. check13's 5 real per-fold values are
+# summarized to worst_fold_cagr_pct/any_fold_fragile (matching this table's "aggregate
+# result" scope, same granularity candidate_verification_results already uses for its own
+# check-derived columns) rather than exploding into 15 columns the way GT_COLUMN_DEFS
+# does for the full per-candidate CSV/xlsx export.
+_PHASE4_VALUE_COLUMNS = [
+    "cagr_pct", "robust_alpha_pct", "n_trades",
+    "core_safe", "addon_safe", "core_addon_disagreement",
+    "check4_early_wr_pct", "check4_late_wr_pct",
+    "check8_compounded_pct", "check8_compounded_without_best_pct",
+    "check8_best_trade_share_pct", "check8_too_few_trades",
+    "check11_max_drawdown_pct",
+    "check13_worst_fold_cagr_pct", "check13_any_fold_fragile",
+    "addon_cagr_pct", "drought_compounded_pct", "drought_combined_compounded_pct",
+]
+
+
+def ensure_phase4_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS phase4_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id INTEGER NOT NULL,
+            checked_at TEXT NOT NULL,
+            cagr_pct REAL, robust_alpha_pct REAL, n_trades INTEGER,
+            core_safe INTEGER, addon_safe INTEGER, core_addon_disagreement INTEGER,
+            check4_early_wr_pct REAL, check4_late_wr_pct REAL,
+            check8_compounded_pct REAL, check8_compounded_without_best_pct REAL,
+            check8_best_trade_share_pct REAL, check8_too_few_trades INTEGER,
+            check11_max_drawdown_pct REAL,
+            check13_worst_fold_cagr_pct REAL, check13_any_fold_fragile INTEGER,
+            addon_cagr_pct REAL, drought_compounded_pct REAL, drought_combined_compounded_pct REAL,
+            UNIQUE(candidate_id)
+        )""")
+    # Same sqlite "no ADD COLUMN IF NOT EXISTS" probe-first pattern as ensure_table()
+    # above (Task #4, 2026-08-29 planner dispatch, STATE): phase4_checked_at is a
+    # denormalized pointer into phase4_results, kept in sync by upsert_phase4() below.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
+    if "phase4_checked_at" not in existing_cols:
+        conn.execute("ALTER TABLE candidate_nodes ADD COLUMN phase4_checked_at TEXT")
+
+
+def get_stored_phase4(conn, candidate_id):
+    """Returns a dict with keys 'checked_at' + all of _PHASE4_VALUE_COLUMNS, or None if
+    no row exists yet for this candidate_id."""
+    ensure_phase4_table(conn)
+    row = conn.execute(
+        "SELECT checked_at, " + ", ".join(_PHASE4_VALUE_COLUMNS) +
+        " FROM phase4_results WHERE candidate_id=?", (candidate_id,)).fetchone()
+    if row is None:
+        return None
+    return dict(zip(["checked_at"] + _PHASE4_VALUE_COLUMNS, row))
+
+
+def upsert_phase4(conn, candidate_id, fields):
+    """`fields` may be any dict containing (a subset of) _PHASE4_VALUE_COLUMNS as keys --
+    anything not present is stored NULL. Same real-candidate_id validation and INSERT OR
+    REPLACE-via-UNIQUE-constraint convention as upsert() above. Also stamps
+    candidate_nodes.phase4_checked_at (Task #4, STATE) in the same call, same pattern
+    upsert() already uses for phase3_checked_at/phase5_checked_at. Returns the checked_at
+    timestamp written."""
+    ensure_phase4_table(conn)
+    exists = conn.execute("SELECT 1 FROM candidate_nodes WHERE id=?", (candidate_id,)).fetchone()
+    if exists is None:
+        raise ValueError(f"candidate_id={candidate_id} not found in candidate_nodes -- refusing to insert")
+    checked_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+    cols = ["candidate_id", "checked_at"] + _PHASE4_VALUE_COLUMNS
+    placeholders = ", ".join("?" for _ in cols)
+    values = [candidate_id, checked_at] + [fields.get(c) for c in _PHASE4_VALUE_COLUMNS]
+    conn.execute(
+        f"INSERT OR REPLACE INTO phase4_results ({', '.join(cols)}) VALUES ({placeholders})", values)
+    conn.execute("UPDATE candidate_nodes SET phase4_checked_at=? WHERE id=?", (checked_at, candidate_id))
+    conn.commit()
+    return checked_at
