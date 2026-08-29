@@ -2644,3 +2644,81 @@ circuit breaker twice, before manual reconciliation.
 
 Full suite 1342+ passed at each stage. Full backlog/incident writeups: `docs/deep_backlog.md`'s 2026-08-19
 entries.
+
+## 2026-08-28 (late) — Design, not built: corporate-action detection for the yahoo `_1h.csv` live-signal cache, and the "backtest range vs. rolling live window" data-tiering concept
+
+**Trigger**: investigating a real backlog item ("cached `cache/research/{ticker}_1h.csv` may carry an
+undetected retroactive-dividend-adjustment discontinuity that the live SMA/z-score reads directly," found
+2026-08-28). `signals_compute._load_cache` resolves to this same yahoo-sourced file
+`export_trades.load_hourly` uses (confirmed 2026-08-26 research log entry) — `data_manager.py`'s merge
+logic only ever *appends* freshly-adjusted rows onto the existing cache, never re-adjusts rows already
+sitting there from a prior fetch. A dividend's adjustment ratio is too small to trip the existing
+split-guard's large-ratio detector, so it could slip through as a silent, permanent discontinuity in the
+cached series the live SMA/z-score reads directly.
+
+**Where the risk actually lives, traced precisely** (this matters — it's narrower than it first sounds):
+`compute_buy_signal`'s indicator computation (`strat.generate_daily_indicators(df_daily_prior)`) reads
+`df_daily_prior`, resampled from the big incrementally-cached `_1h.csv` — that's the one place a stale-
+adjustment row could sit next to a freshly-adjusted one. `signal_price`/`current_price` itself is NOT read
+from this cache at all: for `entry_timing='open_check'` nodes it's `schwab_client.get_session_open_price`
+(broker-sourced), and for ordinary nodes it's `_live_tick_price`'s fresh live `yfinance` `.history()` call
+— both already bypass the incrementally-merged cache. So the real exposure is narrowly the SMA/Std
+indicator inputs, not the entry-trigger price itself.
+
+**Design, part 1 — self-consistency detector + fix in one motion, single source, no new data pipeline
+needed**: each day (already-cached indicator invalidation only fires once per new daily bar, per
+`_indicator_cache`'s existing keying on `(ticker, strategy, window)` — this isn't adding new fetch
+frequency), fetch a small, fresh window of daily closes directly from yfinance (just `window` days + a
+small buffer, not the whole multi-year cached history) instead of resampling from the large incrementally-
+merged file. Since `yf.download()`'s `auto_adjust=True` re-adjusts the *entire* returned range on every
+call, a fresh narrow fetch is always internally consistent by construction — no discontinuity possible,
+because nothing about it is ever incrementally patched.
+
+This doubles as the detector: compare the *overlapping* historical dates in today's fresh fetch against
+what was cached/used yesterday. If yesterday's stored close for an already-elapsed date now differs from
+today's fresh fetch for that same date, that's direct proof a retroactive adjustment happened between
+yesterday and today — no cross-vendor comparison needed for this to fire. The size of the shift also
+classifies the event (small ≈ dividend, large ≈ split, same threshold shape as the existing split-guard).
+It's self-correcting in the same motion: since today's freshly re-adjusted values are what get trusted and
+cached going forward, there's no separate "now go fix it" step — the old, now-known-wrong values are just
+superseded by the new fetch as part of normal daily operation.
+
+**Design, part 2 — Massive as a secondary confirmation, not the primary detector**: cross-check against
+Massive too, both same-day and prior-day pulls, to confirm the two sources broadly agree — catches a case
+where yahoo itself has a data-quality glitch unrelated to a real corp action. Massive's own raw minute
+data is split-adjusted only (their `adjusted=true` aggregates flag covers splits, NOT dividends — confirmed
+live against massive.com's own docs, 2026-08-22, see `build_massive_hourly_derived.py`'s docstring), so a
+yahoo-vs-massive divergence that ISN'T split-ratio-sized independently points at a dividend having
+occurred — but this is a secondary sanity signal, not depended on for detection, since the primary
+self-consistency check above already fires on yahoo's own data alone.
+
+**Open, explicitly unresolved unknowns — carry these forward, don't assume**:
+- Whether Massive's `/stocks/v1/dividends` endpoint reflects a dividend *promptly after* the real ex-date
+  (existing backlog item, revisit ~2026-09-19 against SPY's real 2026-09-18 ex-div date) — confirmed only
+  that it does NOT expose a dividend *in advance*, unverified whether/how much it lags *after*.
+- Neither Massive's nor Yahoo's split-rebase timing (how promptly either source's raw historical series
+  retroactively rebases after a real split's effective date) has ever been empirically observed in this
+  project — no existing doc/log covers it for either source. Symmetric unknown, not just a Massive gap.
+  The detector should expect a real transitional lag window in either direction, not assume simultaneous
+  updates — treat the first real corporate action observed after this ships as a genuine data point (log
+  the actual observed timing), not something to hardcode an assumed lag for upfront.
+
+**Separate, bigger-scope thread this connects to, not part of the same fix**: the `active_builds` table
+(built 2026-08-28, see `docs/deep_backlog.md`'s corresponding entry) already provides half of a "backtest
+range vs. rolling live window" data-tiering concept — a sweep/scope pins to a specific frozen `build_id`
+(the backtest range, immutable once run against), while live signal computation could read whatever
+`active_builds` currently promotes as active for that ticker (the rolling window, continuously extended
+forward). Today this only exists for `massive_hourly_derived`/`massive_minute_derived`; second-granularity
+data (`cache/research/second_data/{ticker}_1s.csv`) is still flat, unversioned CSVs with no promotion
+concept at all, and daily bars aren't persisted as their own granularity at all (cheaply resampled on
+demand from hourly, so probably doesn't need its own versioned store). The prerequisite for ever migrating
+LIVE signal computation onto this mechanism (inheriting Massive's already-correct dividend handling for
+free, no separate yahoo-side fix needed) is first building real refresh cadence for `massive_hourly_derived`
+— it's currently 7 days stale for SOXL as of tonight, confirmed directly, with no cron/refresh mechanism
+yet (separate, already-backlogged 2026-08-26 item, now safe to build post-`active_builds`). Not decided
+whether to pursue the yahoo-side self-consistency fix above, the bigger live-source migration, or both —
+this doc entry exists so the design isn't lost before that decision gets made.
+
+Not built. `signals_compute.py` is a `signals_*.py` module — any implementation of part 1/2 above needs
+the paired independent-cold + contextual Opus review before landing, per CLAUDE.md's Review-Gate
+Persistence Rule.
