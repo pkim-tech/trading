@@ -651,6 +651,33 @@ def _ensure_active_builds_table(conn):
     """)
 
 
+# (ticker, table_name) pairs already logged this process -- see
+# _log_build_id_resolution's docstring. Real gap found 2026-08-28: get_massive_
+# hourly_ohlcv/get_massive_minute_ohlcv correctly resolve through active_builds
+# (verified directly: SOXL -> build_id=174, byte-identical to an explicit
+# request), but nothing ever LOGGED which build_id got used for a given run --
+# if a build is ever superseded later, there's no record of which vintage an
+# old sweep actually saw. Logging only (no backtest_cache.build_id column --
+# that's separate, bigger scope, not part of this fix).
+_logged_build_id_resolutions = set()
+
+
+def _log_build_id_resolution(ticker, table_name, build_id):
+    """Prints once per (ticker, table_name) per PROCESS -- not once per call.
+    A sweep's ProcessPoolExecutor workers are separate OS processes (forked
+    after run_optimization_sweep.run()'s sys.stdout Tee is already installed,
+    so each worker's inherited sys.stdout still reaches the real run log
+    file), each with its own copy of this module-level set -- this correctly
+    logs the FIRST resolution per (ticker, table_name) in each worker that
+    touches it, rather than flooding output on every one of the many calls a
+    single sweep phase makes for the same ticker."""
+    key = (ticker, table_name)
+    if key in _logged_build_id_resolutions:
+        return
+    _logged_build_id_resolutions.add(key)
+    print(f"[db_cache] {ticker} massive_{table_name}_derived resolved active build_id={build_id}")
+
+
 def get_active_build_id(ticker, table_name, conn=None):
     """The explicit-promotion resolution used by get_massive_hourly_derived/
     get_massive_minute_derived's no-build_id path. Returns None if no build has ever
@@ -728,6 +755,7 @@ def get_massive_hourly_derived(ticker, build_id=None):
             build_id = get_active_build_id(ticker, 'hourly', conn=conn)
             if build_id is None:
                 return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume", "corrected"])
+            _log_build_id_resolution(ticker, 'hourly', build_id)
         df = pd.read_sql_query(
             "SELECT ts, open AS Open, high AS High, low AS Low, close AS Close, "
             "volume AS Volume, corrected FROM massive_hourly_derived WHERE ticker=? AND build_id=? ORDER BY ts",
@@ -815,6 +843,7 @@ def get_massive_minute_derived(ticker, build_id=None):
             build_id = get_active_build_id(ticker, 'minute', conn=conn)
             if build_id is None:
                 return pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+            _log_build_id_resolution(ticker, 'minute', build_id)
         df = pd.read_sql_query(
             "SELECT ts, open AS Open, high AS High, low AS Low, close AS Close "
             "FROM massive_minute_derived WHERE ticker=? AND build_id=? ORDER BY ts",

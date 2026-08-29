@@ -193,6 +193,41 @@ def test_no_active_build_returns_empty_frame_not_an_error(isolated_db):
         db_cache.get_massive_hourly_ohlcv("TEST")
 
 
+def test_build_id_resolution_is_logged_once_per_process(isolated_db, capsys, monkeypatch):
+    """Real gap found 2026-08-28: the active_builds resolution path had zero
+    logging of which build_id got used for a given run -- if a build is ever
+    superseded, there's no record of which vintage an old sweep saw. Proves
+    the log line fires on the first resolution and does NOT re-fire on a
+    second call in the same process (the sweep's own dedupe-per-process ask,
+    not a full silence -- a fresh process, e.g. a different worker, gets its
+    own first log line, unaffected by this test's isolated set)."""
+    monkeypatch.setattr(db_cache, "_logged_build_id_resolutions", set())
+    df = _hourly_df("2021-01-01", 100)
+    build_id = _make_build("TEST", "v1", df)
+    db_cache.promote_active_build("TEST", "hourly", build_id)
+
+    db_cache.get_massive_hourly_derived("TEST")
+    out = capsys.readouterr().out
+    assert f"TEST massive_hourly_derived resolved active build_id={build_id}" in out
+
+    db_cache.get_massive_hourly_derived("TEST")
+    out2 = capsys.readouterr().out
+    assert out2 == "", f"must not re-log on a second call in the same process: {out2!r}"
+
+
+def test_build_id_resolution_not_logged_for_explicit_build_id(isolated_db, capsys, monkeypatch):
+    """Passing an explicit build_id (reproducing an older vintage on purpose)
+    bypasses active_builds resolution entirely -- nothing to log, since
+    there's no ambiguity about which build got used."""
+    monkeypatch.setattr(db_cache, "_logged_build_id_resolutions", set())
+    df = _hourly_df("2021-01-01", 100)
+    build_id = _make_build("TEST", "v1", df)
+
+    db_cache.get_massive_hourly_derived("TEST", build_id=build_id)
+    out = capsys.readouterr().out
+    assert out == "", f"an explicit build_id must not trigger resolution logging: {out!r}"
+
+
 class _Args:
     def __init__(self, ticker, table, build_id, force, note):
         self.ticker = ticker
