@@ -228,6 +228,73 @@ def test_build_id_resolution_not_logged_for_explicit_build_id(isolated_db, capsy
     assert out == "", f"an explicit build_id must not trigger resolution logging: {out!r}"
 
 
+def _second_df(start, n, freq="s"):
+    idx = pd.date_range(start, periods=n, freq=freq)
+    return pd.DataFrame(
+        {"Open": 10.0, "High": 10.1, "Low": 9.9, "Close": 10.05, "Volume": 100},
+        index=idx,
+    )
+
+
+def _make_second_build(ticker, label, df):
+    """Second leg's equivalent of _make_build -- its OWN independent build_id
+    sequence (massive_second_derived_builds), not shared with hourly/minute."""
+    build_id = db_cache.record_massive_second_build(
+        ticker, label, raw_data_pulled_at="2026-08-29", raw_data_start=str(df.index.min()),
+        raw_data_end=str(df.index.max()), dividend_data_asof="2026-08-29",
+        row_count=len(df), correction_count=0)
+    db_cache.write_massive_second_derived(ticker, build_id, df)
+    return build_id
+
+
+def test_second_table_promotion_and_resolution(isolated_db):
+    """The 2026-08-29 'second' pipeline: active_builds' CHECK now admits 'second',
+    promotion works via the same path, and get_massive_second_ohlcv resolves
+    through active_builds like its hourly/minute siblings."""
+    df = _second_df("2021-08-25 09:30:00", 300)
+    build_id = _make_second_build("TEST", "v1", df)
+
+    # not promoted yet -> empty frame / loud ValueError, same as siblings
+    assert db_cache.get_massive_second_derived("TEST").empty
+    with pytest.raises(ValueError, match="no massive_second_derived rows"):
+        db_cache.get_massive_second_ohlcv("TEST")
+
+    db_cache.promote_active_build("TEST", "second", build_id)
+    assert db_cache.get_active_build_id("TEST", "second") == build_id
+    resolved = db_cache.get_massive_second_ohlcv("TEST")
+    assert len(resolved) == 300
+    assert list(resolved.columns) == ["Open", "High", "Low", "Close", "Volume"]
+
+
+def test_second_has_independent_build_id_sequence(isolated_db):
+    """massive_second_derived_builds mints its OWN ids -- an hourly build and a
+    second build for the same ticker do NOT collide or share a build_id."""
+    hourly_bid = _make_build("TEST", "h1", _hourly_df("2021-01-01", 50))
+    second_bid = _make_second_build("TEST", "s1", _second_df("2021-08-25 09:30:00", 50))
+    # both are id=1 in their OWN table -- proves the sequences are independent,
+    # not a shared counter
+    assert hourly_bid == 1
+    assert second_bid == 1
+    db_cache.promote_active_build("TEST", "hourly", hourly_bid)
+    db_cache.promote_active_build("TEST", "second", second_bid)
+    assert db_cache.get_active_build_id("TEST", "hourly") == hourly_bid
+    assert db_cache.get_active_build_id("TEST", "second") == second_bid
+
+
+def test_promote_second_via_cmd_promote_default_build_id(isolated_db):
+    """cmd_promote's default (no --build-id) lookup for 'second' must query
+    massive_second_derived_builds, NOT massive_hourly_derived_builds (which the
+    hourly/minute path uses -- 'second' has its own sequence)."""
+    b1 = _make_second_build("TEST", "s1", _second_df("2021-08-25 09:30:00", 100))
+    b2 = _make_second_build("TEST", "s2", _second_df("2021-08-25 09:30:00", 200))  # newer, wider
+    with sqlite3.connect(isolated_db) as conn:
+        rc = promote_mod.cmd_promote(conn, _Args(ticker="TEST", table="second",
+                                                 build_id=None, force=False, note=None))
+    assert rc == 0
+    assert db_cache.get_active_build_id("TEST", "second") == b2
+    assert len(db_cache.get_massive_second_ohlcv("TEST")) == 200
+
+
 class _Args:
     def __init__(self, ticker, table, build_id, force, note):
         self.ticker = ticker

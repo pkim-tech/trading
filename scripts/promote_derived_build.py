@@ -22,9 +22,18 @@ Two modes:
    nothing changes behaviorally for any ticker until a human explicitly promotes
    something different. Never touches a (ticker, table_name) that already has an
    active_builds row.
-2. Explicit promotion: --ticker --table {hourly,minute,both} [--build-id N]
-   (default: the newest build_id in massive_hourly_derived_builds for that
-   ticker) [--force]. Refuses to promote a build whose real stored date range is
+2. Explicit promotion: --ticker --table {hourly,minute,second,both} [--build-id N]
+   (default: the newest build_id in massive_hourly_derived_builds for that ticker
+   -- massive_second_derived_builds for --table second, since it has its OWN
+   independent build_id sequence, not shared with hourly/minute -- see
+   massive_second_derived's table docstring in db_cache.py) [--force]. --table both
+   means hourly+minute only (unchanged meaning) -- 'second' is deliberately NOT
+   included in 'both', since it's a wholly separate raw source (pre-fetched 1s
+   CSVs, not derived from the same Massive-minute-API pull hourly/minute share) on
+   its own build_id sequence; bundling it into 'both' would silently promote a
+   third, unrelated pipeline whenever a caller meant "the hourly/minute pair from
+   one build_massive_hourly_derived.py run". Pass --table second explicitly.
+   Refuses to promote a build whose real stored date range is
    narrower than the currently active build's on EITHER end (new start later, OR
    new end earlier) without --force -- a real, data-integrity refuse-to-narrow
    guard, not just a start-date check (this module's date range comes from the
@@ -49,6 +58,18 @@ import db_cache
 TABLE_FOR = {
     'hourly': 'massive_hourly_derived',
     'minute': 'massive_minute_derived',
+    'second': 'massive_second_derived',
+}
+
+# The builds/provenance table each table_name's "latest build_id" lookup resolves
+# against. hourly and minute share massive_hourly_derived_builds (one real build
+# event produces both legs, see db_cache.py's massive_hourly_derived_builds
+# docstring) -- second has its OWN independent id sequence, massive_second_
+# derived_builds (see db_cache.py's massive_second_derived table docstring for why).
+BUILDS_TABLE_FOR = {
+    'hourly': 'massive_hourly_derived_builds',
+    'minute': 'massive_hourly_derived_builds',
+    'second': 'massive_second_derived_builds',
 }
 
 
@@ -57,9 +78,11 @@ def _old_style_latest_with_rows(conn, ticker, table_name):
     get_massive_hourly_derived/get_massive_minute_derived used before active_builds
     existed -- reproduced here ONLY for --migrate's backfill, so migration is a
     behavioral no-op by construction. Never used by the promoted read path itself
-    anymore (see db_cache.py)."""
+    anymore (see db_cache.py). Not applicable to 'second' -- it postdates
+    active_builds entirely (no legacy pre-active_builds state to migrate), so
+    --migrate never iterates it (see cmd_migrate)."""
     row = conn.execute(f"""
-        SELECT b.id FROM massive_hourly_derived_builds b
+        SELECT b.id FROM {BUILDS_TABLE_FOR[table_name]} b
         WHERE b.ticker=? AND EXISTS (
             SELECT 1 FROM {TABLE_FOR[table_name]} d
             WHERE d.ticker=b.ticker AND d.build_id=b.id
@@ -87,6 +110,10 @@ def cmd_migrate(conn):
     db_cache._ensure_massive_hourly_derived_table(conn)
     db_cache._ensure_massive_minute_derived_table(conn)
     db_cache._ensure_active_builds_table(conn)
+    # 'second' is deliberately NOT included below -- it postdates active_builds
+    # entirely (built 2026-08-29, after active_builds already existed), so there's
+    # no pre-active_builds legacy state for it to backfill; every real second
+    # build gets an explicit --table second promotion instead.
     tickers = [r[0] for r in conn.execute("SELECT DISTINCT ticker FROM massive_hourly_derived_builds").fetchall()]
     n_backfilled = 0
     n_skipped_existing = 0
@@ -117,17 +144,19 @@ def cmd_migrate(conn):
 def cmd_promote(conn, args):
     db_cache._ensure_massive_hourly_derived_table(conn)
     db_cache._ensure_massive_minute_derived_table(conn)
+    db_cache._ensure_massive_second_derived_table(conn)
     db_cache._ensure_active_builds_table(conn)
     tables = ['hourly', 'minute'] if args.table == 'both' else [args.table]
     exit_code = 0
     for table_name in tables:
         build_id = args.build_id
         if build_id is None:
+            builds_table = BUILDS_TABLE_FOR[table_name]
             row = conn.execute(
-                "SELECT id FROM massive_hourly_derived_builds WHERE ticker=? ORDER BY id DESC LIMIT 1",
+                f"SELECT id FROM {builds_table} WHERE ticker=? ORDER BY id DESC LIMIT 1",
                 (args.ticker,)).fetchone()
             if row is None:
-                print(f"No massive_hourly_derived_builds rows at all for {args.ticker} -- nothing to promote.",
+                print(f"No {builds_table} rows at all for {args.ticker} -- nothing to promote.",
                       file=sys.stderr)
                 exit_code = 1
                 continue
@@ -169,7 +198,7 @@ def main():
     ap.add_argument("--migrate", action="store_true",
                      help="one-time idempotent backfill for a DB predating active_builds")
     ap.add_argument("--ticker")
-    ap.add_argument("--table", choices=["hourly", "minute", "both"])
+    ap.add_argument("--table", choices=["hourly", "minute", "second", "both"])
     ap.add_argument("--build-id", type=int, default=None,
                      help="default: newest build_id in massive_hourly_derived_builds for this ticker")
     ap.add_argument("--force", action="store_true", help="allow promoting a narrower (shrinking) build")
