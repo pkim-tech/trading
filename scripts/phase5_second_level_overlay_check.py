@@ -102,6 +102,7 @@ from backtester import (
     run_backtest_ground_truth, apply_addon_overlay_ground_truth,
     simulate_drought_overlay_ground_truth,
 )
+from candidate_verification_store import get_stored, upsert
 
 # Above this measured per-candidate wall-clock cost (seconds), fall back to
 # top-few-only instead of the full finalist set, absent an explicit --limit
@@ -182,6 +183,13 @@ def node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, cand):
         arm_pct=arm_pct, arm_sell_pct=arm_pct, take_profit=None,
         trail_buy_pct=trail_buy_pct, trail_sell_pct=trail_sell_pct,
         max_hold_hours=cand["max_hold_hours"], entry_timing=entry_timing,
+        # Real candidate_nodes.id (Task #4, 2026-08-29, planner dispatch) -- only
+        # present for the candidate_nodes-fallback path (phase4_candidate_nodes_
+        # resolver's own `cand` dicts carry a real `id`); the backtest_cache-sourced
+        # path's `cand` dicts have no such key, so `.get` yields None here, and None
+        # is the signal used everywhere below to skip verification-result persistence
+        # for that path (no candidate_id exists to validate/insert against).
+        id=cand.get("id"),
     )
 
 
@@ -304,10 +312,33 @@ def _pool_worker(cand_idx, node, start, end, years):
     """Runs in a forked worker process -- reads _DFH/_DF_1M/_DF_1S as module-
     level globals (inherited via fork's copy-on-write at pool-creation time,
     set in main() before the ProcessPoolExecutor is created), not as function
-    arguments, so the ~450MB+ DataFrames are never pickled/sent over IPC."""
+    arguments, so the ~450MB+ DataFrames are never pickled/sent over IPC.
+
+    The already-verified skip check happens in run_scope BEFORE dispatch (so an
+    already-stored candidate never costs a pool round-trip at all, see run_scope) --
+    this worker always does a genuine fresh kernel run."""
     row = _check_candidate_core(node, _DFH, _DF_1M, _DF_1S, start, end, years)
     row["candidate"] = cand_idx
-    row["node"] = node
+    return row
+
+
+def _stored_row_or_none(cid, cand_idx):
+    """Query-first skip (Task #4, 2026-08-29, planner correction): if `cid` (real
+    candidate_nodes.id) already has a stored phase5 result, return a row dict shaped
+    like _check_candidate_core's own return value (elapsed_secs=0.0 -- genuinely
+    near-zero real cost this run, which is also what the scope-wide cost-based
+    fallback decision in run_scope should see). Returns None if `cid` is None (the
+    backtest_cache-sourced path, no candidate_id to check) or nothing is stored yet."""
+    if cid is None:
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        stored = get_stored(conn, cid, "phase5")
+    if stored is None:
+        return None
+    print(f"  candidate {cand_idx}: already verified at {stored['checked_at']}, using stored result")
+    row = {k: v for k, v in stored.items() if k != "checked_at"}
+    row["elapsed_secs"] = 0.0
+    row["candidate"] = cand_idx
     return row
 
 
@@ -360,11 +391,20 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
     # gives a real, uncontended timing measurement to decide the rest of this
     # scope's scope, per this file's own docstring. Only meaningful when the
     # caller didn't already force --limit.
+    # Task #4, 2026-08-29 (planner correction, point 4): the "always run first
+    # candidate standalone for timing" logic goes through the same skip-check as
+    # every other candidate -- an already-verified first candidate must not bypass
+    # the stored-result reuse just because of this special case.
     first_node = node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, candidates[0])
-    first_row = _check_candidate_core(first_node, dfh, df_1m, df_1s, start, end, years)
-    first_row["candidate"] = 1
+    first_row = _stored_row_or_none(first_node.get("id"), 1)
+    if first_row is None:
+        first_row = _check_candidate_core(first_node, dfh, df_1m, df_1s, start, end, years)
+        first_row["candidate"] = 1
+        if first_node.get("id") is not None:
+            with sqlite3.connect(DB_PATH) as conn:
+                upsert(conn, first_node["id"], "phase5", first_row)
     _print_row(first_row, first_node)
-    rows = [dict(first_row, ticker=ticker, strategy=strategy_name, fixed_sl=fixed_sl)]
+    rows = [dict(first_row, ticker=ticker, strategy=strategy_name, fixed_sl=fixed_sl, window=window)]
 
     remaining = candidates[1:]
     if limit is None and len(candidates) > _FALLBACK_TOP_N:
@@ -380,24 +420,68 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
 
     if remaining:
         futures = {}
+        extra_by_idx = {}
         for i, cand in enumerate(remaining, start=2):
             node = node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, cand)
+            row = _stored_row_or_none(node.get("id"), i)
+            if row is not None:
+                _print_row(row, node)
+                extra_by_idx[i] = dict(row, ticker=ticker, strategy=strategy_name,
+                                        fixed_sl=fixed_sl, window=window)
+                continue
             fut = pool.submit(_pool_worker, i, node, start, end, years)
             futures[fut] = node
-        # Collect in submission order (not completion order) so scope output
-        # reads in the same TP/SL-descending order Phase4's own report does,
-        # even though the underlying work ran in parallel.
-        results_by_idx = {}
         for fut in as_completed(futures):
             row = fut.result()
-            results_by_idx[row["candidate"]] = (row, futures[fut])
-        for i in sorted(results_by_idx):
-            row, node = results_by_idx[i]
+            node = futures[fut]
             _print_row(row, node)
-            row.pop("node", None)
-            rows.append(dict(row, ticker=ticker, strategy=strategy_name, fixed_sl=fixed_sl))
+            if node.get("id") is not None:
+                with sqlite3.connect(DB_PATH) as conn:
+                    upsert(conn, node["id"], "phase5", row)
+            extra_by_idx[row["candidate"]] = dict(row, ticker=ticker, strategy=strategy_name,
+                                                   fixed_sl=fixed_sl, window=window)
+        # Combine in submission order (not completion order) so scope output
+        # reads in the same TP/SL-descending order Phase4's own report does,
+        # even though the underlying work ran in parallel.
+        for i in sorted(extra_by_idx):
+            rows.append(extra_by_idx[i])
 
     return rows
+
+
+def _try_all_stored(scopes, limit):
+    """Task #4 early-exit (2026-08-29, planner correction, point 1): if every scope
+    in `scopes` is candidate_nodes-sourced (window is not None -- checked by the
+    caller before this is invoked at all) AND every real candidate across all of
+    them already has a stored phase5 result, build the full summary straight from
+    candidate_verification_results and return it -- letting main() skip the
+    multi-GB 1-second data load entirely on a pure rerun. Returns None the moment
+    any candidate anywhere still needs a fresh kernel run (including a scope with
+    zero real candidates -- nothing to report, not "fully stored")."""
+    all_rows = []
+    with sqlite3.connect(DB_PATH) as conn:
+        for ticker, strategy_name, version, entry_timing, fixed_sl, window in scopes:
+            candidates = derive_phase25_candidates_from_candidate_nodes(
+                ticker, strategy_name, version, fixed_sl=fixed_sl,
+                entry_timing=entry_timing, window=window)
+            if limit is not None:
+                candidates = candidates[:limit]
+            if not candidates:
+                continue
+            for i, cand in enumerate(candidates, start=1):
+                cid = cand.get("id")
+                stored = get_stored(conn, cid, "phase5") if cid is not None else None
+                if stored is None:
+                    return None
+                node = node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, cand)
+                print(f"  candidate {i}: already verified at {stored['checked_at']}, using stored result")
+                row = {k: v for k, v in stored.items() if k != "checked_at"}
+                row["elapsed_secs"] = 0.0
+                row["candidate"] = i
+                _print_row(row, node)
+                all_rows.append(dict(row, ticker=ticker, strategy=strategy_name,
+                                      fixed_sl=fixed_sl, window=window))
+    return all_rows
 
 
 def main():
@@ -464,44 +548,72 @@ def main():
     print(f"Found {len(scopes)} real GT scope(s) to check "
           f"({sum(1 for s in scopes if s[5] is not None)} via candidate_nodes fallback).")
 
-    t_load = time.monotonic()
-    print(f"Loading {args.ticker} hourly data...")
-    _DFH = load_hourly(args.ticker, data_source=args.data_source)
-    print(f"Loading {args.ticker} 1-second data (this is the slow step)...")
-    _DF_1S = load_seconds(args.ticker)
-    print(f"  {len(_DF_1S):,} 1-second rows, {_DF_1S.index.min()} -> {_DF_1S.index.max()}")
-    _DF_1M = resample_seconds_to_minutes(_DF_1S)
-    print(f"  {len(_DF_1M):,} 1-minute rows (resampled from the 1s series above)")
-    load_secs = time.monotonic() - t_load
-    print(f"Data load: {load_secs:.1f}s")
+    # Early-exit-before-data-load (Task #4, 2026-08-29, planner correction, point 1):
+    # if EVERY scope is candidate_nodes-sourced (window is not None -- a backtest_
+    # cache-sourced scope always needs a fresh run, no candidate_id to check against)
+    # AND every real candidate in every such scope already has a stored phase5 result,
+    # skip the multi-GB 1-second data load entirely and build the summary straight
+    # from candidate_verification_results.
+    load_secs = 0.0
+    run_secs = 0.0
+    all_rows = _try_all_stored(scopes, args.limit) if all(s[5] is not None for s in scopes) else None
 
-    start = "2021-08-23"
-    end = "2026-08-21"
-    bars_for_years = _DFH.loc[start:end + " 23:59:59"]
-    years = (bars_for_years.index.max() - bars_for_years.index.min()).total_seconds() / (365.25 * 86400)
+    if all_rows is not None:
+        print("\nAll candidates in every scope already verified -- skipping data load entirely.")
+    else:
+        t_load = time.monotonic()
+        print(f"Loading {args.ticker} hourly data...")
+        _DFH = load_hourly(args.ticker, data_source=args.data_source)
+        print(f"Loading {args.ticker} 1-second data (this is the slow step)...")
+        _DF_1S = load_seconds(args.ticker)
+        print(f"  {len(_DF_1S):,} 1-second rows, {_DF_1S.index.min()} -> {_DF_1S.index.max()}")
+        _DF_1M = resample_seconds_to_minutes(_DF_1S)
+        print(f"  {len(_DF_1M):,} 1-minute rows (resampled from the 1s series above)")
+        load_secs = time.monotonic() - t_load
+        print(f"Data load: {load_secs:.1f}s")
 
-    t_run = time.monotonic()
-    all_rows = []
-    # Pool created AFTER _DFH/_DF_1M/_DF_1S are populated, so fork (Linux
-    # default) gives every worker copy-on-write access with no reload.
-    with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        for ticker, strategy_name, version, entry_timing, fixed_sl, window in scopes:
-            print(f"\n{'#' * 80}\n{ticker} / {strategy_name} / {version} / "
-                  f"entry_timing={entry_timing} / fixed_sl={fixed_sl}"
-                  f"{f' / window={window}' if window is not None else ''}\n{'#' * 80}")
-            rows = run_scope(ticker, strategy_name, version, entry_timing, fixed_sl,
-                              _DFH, _DF_1M, _DF_1S, start, end, years, pool, limit=args.limit,
-                              window=window)
-            all_rows.extend(rows)
-    run_secs = time.monotonic() - t_run
+        start = "2021-08-23"
+        end = "2026-08-21"
+        bars_for_years = _DFH.loc[start:end + " 23:59:59"]
+        years = (bars_for_years.index.max() - bars_for_years.index.min()).total_seconds() / (365.25 * 86400)
+
+        t_run = time.monotonic()
+        all_rows = []
+        # Pool created AFTER _DFH/_DF_1M/_DF_1S are populated, so fork (Linux
+        # default) gives every worker copy-on-write access with no reload.
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            for ticker, strategy_name, version, entry_timing, fixed_sl, window in scopes:
+                print(f"\n{'#' * 80}\n{ticker} / {strategy_name} / {version} / "
+                      f"entry_timing={entry_timing} / fixed_sl={fixed_sl}"
+                      f"{f' / window={window}' if window is not None else ''}\n{'#' * 80}")
+                rows = run_scope(ticker, strategy_name, version, entry_timing, fixed_sl,
+                                  _DFH, _DF_1M, _DF_1S, start, end, years, pool, limit=args.limit,
+                                  window=window)
+                all_rows.extend(rows)
+        run_secs = time.monotonic() - t_run
 
     if not all_rows:
         print("\nNo candidates checked -- nothing to summarize.")
         return
 
     df_out = pd.DataFrame(all_rows)
-    out_path = os.path.join(ROOT, "output", f"phase5_second_level_overlay_check_{args.ticker}.csv")
-    df_out.to_csv(out_path, index=False)
+    # Task #5, 2026-08-29 (planner dispatch): filename now includes version+window --
+    # the old fixed ticker-only filename let two different version/window runs for
+    # the same ticker silently overwrite each other's output. One CSV per real window
+    # value (a per-scope split, since a single run can cover multiple windows) --
+    # matches the output/phase4_<ticker>_<version>_w<window> convention used by
+    # scripts/run_candidate_nodes_campaign_verification.py. A backtest_cache-sourced
+    # scope (window=None) has no real window to key on -- its rows go to the
+    # no-suffix filename, matching this script's original single-CSV-per-run shape
+    # for that path (only one such group can exist per run either way).
+    out_paths = []
+    for window_val, group in df_out.groupby(df_out["window"], dropna=False):
+        suffix = f"_w{int(window_val)}" if pd.notna(window_val) else ""
+        out_path = os.path.join(
+            ROOT, "output",
+            f"phase5_second_level_overlay_check_{args.ticker.lower()}_{args.version}{suffix}.csv")
+        group.to_csv(out_path, index=False)
+        out_paths.append(out_path)
 
     print(f"\n=== Phase5 summary: {len(df_out)} candidate(s) checked across {len(scopes)} scope(s) ===")
     for label in ("core_delta_pp", "addon_delta_pp", "drought_delta_pp", "core_both_delta_pp"):
@@ -515,7 +627,7 @@ def main():
     print(f"\nData load: {load_secs:.1f}s | Candidate checks: {run_secs:.1f}s total ({args.workers} workers), "
           f"{run_secs / len(df_out):.1f}s/candidate average (wall-clock, not CPU-time) | "
           f"Total: {load_secs + run_secs:.1f}s")
-    print(f"Full results: {out_path}")
+    print(f"Full results: {', '.join(out_paths)}")
 
 
 if __name__ == "__main__":
