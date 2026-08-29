@@ -38,6 +38,7 @@ import os
 import sqlite3
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -213,6 +214,16 @@ def main():
     ap.add_argument("--z-values", type=float, nargs="+", default=None)
     ap.add_argument("--tpct-values", type=float, nargs="+", default=None)
     ap.add_argument("--fixed-sl-values", type=float, nargs="+", default=None)
+    ap.add_argument("--workers", type=int, default=8,
+                     help="--all-candidates only: ProcessPoolExecutor worker count (default 8, "
+                          "leaves headroom on a 12-core box, see long-job-launch skill's "
+                          "cap-to-headroom rule). One task per CANDIDATE (its full 7-axis OAT "
+                          "sweep, not per axis-point) -- _load_node_inputs_ground_truth memoizes "
+                          "per-process by (ticker,strategy,window,start,end), and most of a "
+                          "candidate's own axis points share its anchor window, so splitting at "
+                          "the point level would scatter that reuse across workers and pay a "
+                          "fresh data-load far more often. Single-candidate mode (--candidate-id) "
+                          "stays serial -- already fast, no pool needed.")
     args = ap.parse_args()
 
     if not args.candidate_id and not args.all_candidates:
@@ -250,8 +261,27 @@ def main():
 
     t_all = time.monotonic()
     all_rows = []
-    for anchor in anchors:
-        all_rows.extend(run_anchor(anchor, args.axes, axis_values_override, spy_bh))
+    if args.all_candidates and len(anchors) > 1:
+        # Candidate-level parallelism only (see --workers help above) -- each task runs
+        # one candidate's ENTIRE OAT sweep (all axes) in its own process, preserving
+        # _load_node_inputs_ground_truth's real per-process window-memoization reuse
+        # exactly as the serial path already gets it.
+        total = len(anchors)
+        done = 0
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(run_anchor, anchor, args.axes, axis_values_override, spy_bh): anchor
+                       for anchor in anchors}
+            for fut in as_completed(futures):
+                anchor = futures[fut]
+                all_rows.extend(fut.result())
+                done += 1
+                elapsed = time.monotonic() - t_all
+                eta = f", ETA {(elapsed / done * (total - done)):.0f}s" if done < total else ""
+                print(f"[{done}/{total}, {elapsed:.0f}s elapsed{eta}] candidate_id={anchor['candidate_id']} done",
+                      flush=True)
+    else:
+        for anchor in anchors:
+            all_rows.extend(run_anchor(anchor, args.axes, axis_values_override, spy_bh))
 
     df_out = pd.DataFrame(all_rows)
     out_dir = os.path.join(ROOT, "output")
