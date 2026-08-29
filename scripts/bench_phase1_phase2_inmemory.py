@@ -200,17 +200,17 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
     return actually_inserted
 
 
-def _clear_prior_seed_mode_rows(strategy_name, config_version, ticker):
-    """Seed mode only (2026-08-29, paired review round 4, CONFIRMED by both reviewers):
-    deletes this version's PRIOR candidate_nodes/backtest_winner_trades rows before a
-    new seed run writes its own output. Needed because round 3's repeatability fix
-    (seed mode always bypasses sweep_run_log's dedup skip, and skips the checkpoint
-    entirely) makes every repeat invocation of the same --seed-watch-list-id genuinely
-    re-run for real -- but the version string is still deterministic (stable
-    "-seed<id>" suffix, not timestamped), so without this, repeat runs would UNION
-    their writes under the identical version via INSERT OR IGNORE with no way to tell
-    which run produced which row, and a node promoted by an older/buggier code
-    revision would stay there indistinguishably forever.
+def _clear_prior_seed_mode_table_rows(table_name, strategy_name, config_version, ticker, fixed_sl):
+    """Seed mode only (2026-08-29, paired review rounds 4-5): deletes THIS version's
+    PRIOR rows in ONE table before a new seed run writes its own output to that same
+    table. Needed because the repeatability fix (seed mode always bypasses
+    sweep_run_log's dedup skip, and skips the checkpoint entirely) makes every repeat
+    invocation of the same --seed-watch-list-id genuinely re-run for real -- but the
+    version string is still deterministic (stable "-seed<id>" suffix, not
+    timestamped), so without this, repeat runs would UNION their writes under the
+    identical version via INSERT OR IGNORE with no way to tell which run produced
+    which row, and a row written by an older/buggier code revision would stay there
+    indistinguishably forever.
 
     Deliberately DELETE-and-replace rather than a timestamp-suffixed version per
     invocation: seed mode is a disposable smoke test meant to reflect the CURRENT
@@ -218,23 +218,41 @@ def _clear_prior_seed_mode_rows(strategy_name, config_version, ticker):
     invocation -- a stable, greppable "-seed<id>" version that always reflects the
     latest run is more useful here than an ever-growing pile of past runs a consumer
     would have to filter by recency to find the real answer. Never called for a
-    non-seed run (full-grid campaigns keep their real accumulate-forever semantics)."""
+    non-seed run (full-grid campaigns keep their real accumulate-forever semantics).
+
+    Called separately, once per table, immediately before that table's own write site
+    (round-5 fix, contextual review) -- NOT all bundled at one call site before
+    candidate_nodes' write. backtest_phase1_insurance is written ~230 lines before
+    candidate_nodes/backtest_winner_trades in run_one_fixed_sl, and clearing it that
+    early left the SAME version-union staleness this whole mechanism was built to
+    close, just on a third table (verified real: all 4 existing seed versions each
+    had exactly 1 stale backtest_phase1_insurance row from their first run only).
+    backtest_winner_trades' clear is similarly deferred to immediately before ITS OWN
+    write (rather than bundled with candidate_nodes' clear ~65 lines earlier) --
+    there's real per-candidate kernel work (real backtests, need_times=True) between
+    the two writes that can raise; clearing early would leave backtest_winner_trades
+    at zero rows for this version if that work crashed, while candidate_nodes already
+    has the new run's rows -- the "worse than stale" state this feature exists to
+    prevent, just moved to a different table/timing.
+
+    fixed_sl included in the WHERE (round-5 hardening, contextual review): harmless
+    today since seed mode always pins exactly one fixed_sl per run, but free to add
+    and would matter if the fixed_sl-looping machinery ever got relaxed for seed
+    mode."""
     with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
-        cn_deleted = conn.execute(
-            "DELETE FROM candidate_nodes WHERE version=? AND ticker=? AND strategy=?",
-            (config_version, ticker, strategy_name)).rowcount
-        wt_deleted = 0
         existing_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='backtest_winner_trades'")}
-        if existing_tables:
-            wt_deleted = conn.execute(
-                "DELETE FROM backtest_winner_trades WHERE version=? AND ticker=? AND strategy=?",
-                (config_version, ticker, strategy_name)).rowcount
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))}
+        if not existing_tables:
+            return 0
+        deleted = conn.execute(
+            f"DELETE FROM {table_name} WHERE version=? AND ticker=? AND strategy=? AND fixed_sl=?",
+            (config_version, ticker, strategy_name, float(fixed_sl))).rowcount
         conn.commit()
-    if cn_deleted or wt_deleted:
-        print(f"Seed mode: cleared {cn_deleted} prior candidate_nodes row(s) and "
-              f"{wt_deleted} prior backtest_winner_trades row(s) for version={config_version} "
-              f"before writing this run's output (repeat-invocation replace, not union).")
+    if deleted:
+        print(f"Seed mode: cleared {deleted} prior {table_name} row(s) for "
+              f"version={config_version} before writing this run's output "
+              f"(repeat-invocation replace, not union).")
+    return deleted
 
 
 def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_name,
@@ -747,16 +765,29 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         # neighbors=[7.0, 13.0] -- Phase2.5 built a whole cliffbox at tpct=7.0 (6 grid-
         # steps away, zero real Phase1/Phase2 support), and those rows could outrank and
         # get PROMOTED into candidate_nodes instead of the seed's own tpct=13.0 rows.
-        # Worse, this fired unconditionally for EVERY TrailingExitZScoreBreakout seed
-        # (generic_tpct is always 0.0 for that strategy, never in [1..7]) -- 31 of 39 real
-        # off-grid-tpct seedable rows are TrailingExit-at-0.0, including 5 real LIVE nodes
-        # (AGQ id=239, GDXU id=240, UGL id=246, DPST id=248, SOXL id=249): TrailingExit's
-        # kernel discards the tpct arg entirely, so the phantom tpct=7.0 cells were
-        # byte-identical backtests to the real tpct=0.0 cells but survived
-        # drop_duplicates as separate rows, splitting each node's Phase2.5 population
-        # across 2 phantom "different" tpct values and silently yielding fewer than 9
-        # distinct promoted candidates. REPLACING (not appending) makes idx always 0,
-        # tpct_neighbors always [seed_tpct], correct for both cases.
+        # REAL affected population (corrected 2026-08-29, round-5 relay correction --
+        # round 4 mischaracterized this): TrailingBothZScoreBreakout off-grid-tpct seeds
+        # ONLY, 32 of 105 non-archived TB rows, all state='paper'/'dry_run'/'research',
+        # ZERO live nodes -- DPST id=53 above is the real representative example.
+        # TrailingExitZScoreBreakout was NEVER actually affected by round 3's append
+        # bug despite the earlier writeup claiming otherwise: `_trail_pcts_for_strategy`
+        # short-circuits to the literal list `[0.0]` for that strategy (never reads a
+        # real multi-value grid at all, since TrailingExit has no real fourth axis), so
+        # `0.0 not in [0.0]` was always False and the append branch never fired for any
+        # TrailingExit seed, live or otherwise.
+        #
+        # REPLACING (not appending) makes idx always 0, tpct_neighbors always
+        # [seed_tpct], correct for both the off-grid case above and the always-on-grid
+        # TrailingExit case. Also note (round-5, contextual review): for the 73 TB seeds
+        # that WERE already on-grid before this fix (including 11 real live nodes --
+        # RETL, TMF, ETHU, OILU, HIBL, JNUG, KORU, LABU, NUGT, DFEN, WEBL), this override
+        # is a deliberate, real behavior change vs the ORIGINAL (pre-round-3) code: it
+        # narrows Phase2.5's explored tpct neighborhood from the two numerically-adjacent
+        # standard-grid values down to just the seed's own single value -- an intentional
+        # trade-off consistent with WINDOWS/Z_THRESHOLDS/HOLD_TIME_CAPS all being pinned
+        # to their seed's exact value too (seed mode's whole point is reproducing ONE
+        # real node's exact config, not exploring a neighborhood around it on every
+        # axis), not something needing its own separate fix.
         TRAIL_PCTS = [_seed_task[5]]
         print(f"Seed mode: TRAIL_PCTS override -> {TRAIL_PCTS} (replaces standard grid "
               f"{_trail_pcts_for_strategy(strategy_name, grid)}, not appended -- round-4 fix)")
@@ -886,6 +917,9 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
               subset=["take_profit", "stop_loss", "max_hold_hours", "window",
                       "z_score_threshold", "trail_sell_pct"])
           insurance_rows = insurance_df.to_dict("records")
+          if _seed_task is not None:
+              _clear_prior_seed_mode_table_rows(
+                  "backtest_phase1_insurance", strategy_name, version, TICKER, fixed_sl)
           n_written = _insert_phase1_insurance_rows(
               insurance_rows, strategy_name, version, TICKER, fixed_sl, ENTRY_TIMING)
           t_ins1 = time.time()
@@ -1114,7 +1148,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # "neither top-100 nor top-9 belongs in backtest_cache" design conclusion, the
     # winners are the campaign's real OUTPUT, not a cache row).
     if _seed_task is not None:
-        _clear_prior_seed_mode_rows(strategy_name, version, TICKER)
+        _clear_prior_seed_mode_table_rows("candidate_nodes", strategy_name, version, TICKER, fixed_sl)
     t_ins2 = time.time()
     n_written9 = _insert_candidate_nodes_rows(
         final_candidates, strategy_name, version, TICKER, fixed_sl, ENTRY_TIMING)
@@ -1165,6 +1199,9 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
           f"{total_trade_rows:,} total trade rows, captured in {t_ins5 - t_ins4:.2f}s")
 
     t_ins6 = time.time()
+    if _seed_task is not None:
+        _clear_prior_seed_mode_table_rows(
+            "backtest_winner_trades", strategy_name, version, TICKER, fixed_sl)
     n_trade_rows_written = _insert_winner_trades_rows(
         winner_trades, node_keys_by_key, strategy_name, version, TICKER, fixed_sl)
     t_ins7 = time.time()
