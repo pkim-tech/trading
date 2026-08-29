@@ -80,8 +80,13 @@ documented rather than silently absorbed:
      scripts/validate_phase4_candidate_nodes_resolver.py's real run, 2026-08-29),
      including the (30,7)/(23,7) near-collision case above.
 
-Returns the same list-of-dicts shape as derive_phase25_candidates_ground_truth:
-{island_tp, island_sl, take_profit, stop_loss, max_hold_hours, window,
+Returns the same list-of-dicts shape as derive_phase25_candidates_ground_truth, PLUS
+a real `id` key (added 2026-08-29, Task #3, planner dispatch -- the real
+candidate_nodes.id this row came from, so a caller like Phase5's verification-
+persistence code can recover a real candidate_id; derive_phase25_candidates_ground_
+truth's own backtest_cache-sourced output has no equivalent, since those candidates
+were never promoted into candidate_nodes at all):
+{id, island_tp, island_sl, take_profit, stop_loss, max_hold_hours, window,
  z_score_threshold, tpct, robust_alpha, cagr, phase4_eligible}.
 """
 import os
@@ -179,7 +184,7 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
         params.append(int(window))
     with sqlite3.connect(DB_PATH) as conn:
         df = pd.read_sql(f"""
-            SELECT window, z AS z_score_threshold, arm_pct, trail_buy_pct, trail_sell_pct,
+            SELECT id, window, z AS z_score_threshold, arm_pct, trail_buy_pct, trail_sell_pct,
                    max_hold_hours, robust_alpha, trades
             FROM candidate_nodes
             WHERE ticker=? AND strategy=? AND version=? AND fixed_sl=? AND entry_timing=?{window_sql}
@@ -229,6 +234,7 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
         seed_tp, seed_sl = isl['seed']
         for cand in isl['members']:
             candidates.append({
+                'id': int(cand['id']),
                 'island_tp': seed_tp, 'island_sl': seed_sl,
                 'take_profit': int(cand['take_profit']), 'stop_loss': int(cand['stop_loss']),
                 'max_hold_hours': int(cand['max_hold_hours']), 'window': int(cand['window']),

@@ -51,6 +51,7 @@ from sim_1s_vs_1m_groundtruth import (
     load_hourly, load_seconds, resample_seconds_to_minutes, daily_indicators, cagr,
 )
 from backtester import run_backtest_ground_truth
+from candidate_verification_store import get_stored, upsert
 
 
 def main():
@@ -107,8 +108,22 @@ def main():
     print(f"  {len(df_1m):,} 1-minute rows (resampled from the 1s series above)")
 
     results = []
+    vconn = sqlite3.connect(DB_PATH)
     for (nid, strategy, window, z, fixed_sl, arm_pct, trail_buy_pct, trail_sell_pct,
          max_hold_hours, entry_timing, data_start, data_end) in rows:
+        # Query-first skip (Task #6 follow-up, 2026-08-29, planner correction): a
+        # rerun over an already-checked scope reuses the stored result instead of
+        # re-running the two expensive _run() kernel calls below -- the data load
+        # above is unconditional either way (see this file's dispatch prompt: the
+        # data load, not the per-candidate kernel call, is cheap here).
+        stored = get_stored(vconn, nid, "phase3")
+        if stored is not None:
+            print(f"  node id={nid}: already verified at {stored['checked_at']}, using stored result")
+            results.append({"candidate_node_id": nid, "n_trades_1m": stored["n_trades_1m"],
+                            "cagr_1m": stored["core_cagr_1m"], "n_trades_1s": stored["n_trades_1s"],
+                            "cagr_1s": stored["core_cagr_1s"], "delta_pp": stored["core_delta_pp"]})
+            continue
+
         is_both = strategy == "TrailingBothZScoreBreakout"
         ind = daily_indicators(dfh, int(window))
         # Use the real overlap between the campaign window and the real 1s data's own
@@ -147,6 +162,11 @@ def main():
         results.append({"candidate_node_id": nid, "n_trades_1m": len(trades_1m),
                         "cagr_1m": g1m, "n_trades_1s": len(trades_1s), "cagr_1s": g1s,
                         "delta_pp": delta})
+        upsert(vconn, nid, "phase3", {
+            "n_trades_1m": len(trades_1m), "n_trades_1s": len(trades_1s),
+            "core_cagr_1m": g1m, "core_cagr_1s": g1s, "core_delta_pp": delta,
+        })
+    vconn.close()
 
     df_out = pd.DataFrame(results)
     print(f"\n=== Summary across {len(df_out)} winners ===")
