@@ -619,6 +619,81 @@ def record_massive_hourly_build(ticker, label, raw_data_pulled_at, raw_data_star
             c.close()
 
 
+def _ensure_active_builds_table(conn):
+    # active_builds: explicit promotion pointer for massive_hourly_derived_builds --
+    # get_massive_hourly_derived/get_massive_minute_derived's no-build_id path resolves
+    # from here instead of `ORDER BY b.id DESC` (real incident, 2026-08-26: a
+    # fetch_massive_minute_data.py refresh with no --years flag silently truncated
+    # SOXL/DPST/DFEN's canonical minute archive, and the resulting narrower build
+    # silently became "latest" purely by insertion order, with zero completeness/
+    # freshness check -- see docs/deep_backlog.md's 2026-08-26 "active_builds
+    # promotion table" entry for the full incident). A build only becomes active via
+    # an explicit scripts/promote_derived_build.py call, never automatically on
+    # creation or on write_massive_hourly_derived()/write_massive_minute_derived().
+    #
+    # Compound key (ticker, table_name) rather than one row per ticker -- confirmed
+    # directly against the real DB (2026-08-28, before this table existed) that
+    # hourly's and minute's own "latest build WITH ROWS" resolution CAN diverge for
+    # the same ticker (a build that died mid-write between the two legs would leave
+    # hourly on a newer build_id than minute, or vice versa -- see
+    # write_massive_hourly_derived's docstring). Zero real cases of divergence found
+    # across all 82 tickers at migration time, but the schema doesn't assume it can't
+    # happen, so hourly and minute are promoted (and can be re-promoted) independently.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS active_builds (
+            ticker      TEXT NOT NULL,
+            table_name  TEXT NOT NULL CHECK (table_name IN ('hourly', 'minute')),
+            build_id    INTEGER NOT NULL,
+            promoted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            note        TEXT,
+            PRIMARY KEY (ticker, table_name)
+        )
+    """)
+
+
+def get_active_build_id(ticker, table_name, conn=None):
+    """The explicit-promotion resolution used by get_massive_hourly_derived/
+    get_massive_minute_derived's no-build_id path. Returns None if no build has ever
+    been promoted for this ticker/table_name (a brand-new build that hasn't been
+    promoted yet, or a ticker that predates scripts/promote_derived_build.py --migrate
+    having been run) -- callers treat that the same as "no build at all" (existing
+    loud-failure convention), never silently falling back to insertion order."""
+    c, owns = _connect_or_reuse(conn)
+    try:
+        _ensure_active_builds_table(c)
+        row = c.execute(
+            "SELECT build_id FROM active_builds WHERE ticker=? AND table_name=?",
+            (ticker, table_name)).fetchone()
+        return row[0] if row else None
+    finally:
+        if owns:
+            c.close()
+
+
+def promote_active_build(ticker, table_name, build_id, note=None, conn=None):
+    """The ONLY way active_builds changes -- see scripts/promote_derived_build.py for
+    the safety-checked CLI wrapping this (refuse-to-narrow guard without --force,
+    migration backfill mode, before/after logging). Idempotent re-promotion of the
+    same (ticker, table_name) just updates build_id/promoted_at/note in place --
+    active_builds is a pointer, not an append-only history (massive_hourly_derived_
+    builds is the permanent provenance record; this table only ever tracks the
+    CURRENT pointer)."""
+    c, owns = _connect_or_reuse(conn)
+    try:
+        _ensure_active_builds_table(c)
+        c.execute("""
+            INSERT INTO active_builds (ticker, table_name, build_id, promoted_at, note)
+            VALUES (?, ?, ?, datetime('now'), ?)
+            ON CONFLICT(ticker, table_name) DO UPDATE SET
+                build_id=excluded.build_id, promoted_at=excluded.promoted_at, note=excluded.note
+        """, (ticker, table_name, build_id, note))
+        if owns:
+            c.commit()
+    finally:
+        if owns:
+            c.close()
+
+
 def get_latest_massive_hourly_build(ticker):
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_massive_hourly_derived_table(conn)
@@ -631,35 +706,28 @@ def get_latest_massive_hourly_build(ticker):
 
 
 def get_massive_hourly_derived(ticker, build_id=None):
-    """Returns the CURRENT vintage (latest build_id THAT ACTUALLY HAS PRICE ROWS)
-    by default. Pass an explicit build_id (from massive_hourly_derived_builds) to
-    reproduce what an older vintage looked like -- e.g. to exactly recreate the
-    inputs a past backtest campaign actually saw.
+    """Returns the ACTIVE (explicitly promoted) vintage by default -- see
+    get_active_build_id/active_builds table. Pass an explicit build_id (from
+    massive_hourly_derived_builds) to reproduce what an older vintage looked like
+    -- e.g. to exactly recreate the inputs a past backtest campaign actually saw.
 
-    record_massive_hourly_build()/write_massive_hourly_derived() are two separate,
-    uncoordinated writes (build_ticker() calls the former first to obtain a
-    build_id, then the latter) -- if a process dies in between (confirmed to have
-    actually happened this session, from the killed 19-ticker batch: SOXL build_id
-    1 and KORU build_id 2 both exist in massive_hourly_derived_builds with zero
-    matching rows in massive_hourly_derived), a naive "highest id" pick would
-    silently return an empty DataFrame instead of falling back to the last build
-    that actually has data (paired review 2026-08-22). The EXISTS check below
-    picks the latest build with real rows, skipping any orphan."""
+    Resolution used to be a naive `ORDER BY id DESC` (latest build_id THAT ACTUALLY
+    HAS ROWS, to skip an orphan build_id -- record_massive_hourly_build()/
+    write_massive_hourly_derived() are two separate, uncoordinated writes, and a
+    process dying in between used to leave an orphan build_id with zero matching
+    rows, see the 2026-08-22 paired review this orphan-skip was built for). That
+    insertion-order-only resolution is what silently let a narrower rebuild become
+    "latest" with no completeness/freshness check (real 2026-08-26 incident, see
+    active_builds table's own docstring) -- replaced with an explicit promotion
+    pointer instead. No orphan-skip logic needed here anymore: promotion only ever
+    points at a build scripts/promote_derived_build.py already confirmed has rows."""
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_massive_hourly_derived_table(conn)
         import pandas as pd
         if build_id is None:
-            row = conn.execute("""
-                SELECT b.id FROM massive_hourly_derived_builds b
-                WHERE b.ticker=? AND EXISTS (
-                    SELECT 1 FROM massive_hourly_derived d
-                    WHERE d.ticker=b.ticker AND d.build_id=b.id
-                )
-                ORDER BY b.id DESC LIMIT 1
-            """, (ticker,)).fetchone()
-            if row is None:
+            build_id = get_active_build_id(ticker, 'hourly', conn=conn)
+            if build_id is None:
                 return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume", "corrected"])
-            build_id = row[0]
         df = pd.read_sql_query(
             "SELECT ts, open AS Open, high AS High, low AS Low, close AS Close, "
             "volume AS Volume, corrected FROM massive_hourly_derived WHERE ticker=? AND build_id=? ORDER BY ts",
@@ -735,26 +803,18 @@ def write_massive_minute_derived(ticker, build_id, df, conn=None):
 
 
 def get_massive_minute_derived(ticker, build_id=None):
-    """Returns the CURRENT vintage (latest build_id THAT ACTUALLY HAS MINUTE ROWS)
-    by default, same orphan-build-id fallback as get_massive_hourly_derived (a
-    build_id can exist in massive_hourly_derived_builds with no matching rows here
-    if the process died between record_massive_hourly_build() and
-    write_massive_minute_derived()). Pass an explicit build_id to reproduce an
+    """Returns the ACTIVE (explicitly promoted) vintage by default -- see
+    get_massive_hourly_derived's docstring for the full rationale (same
+    active_builds-based resolution, promoted independently per table_name='minute'
+    since hourly's and minute's own "latest build with rows" CAN diverge -- see
+    active_builds table's own docstring). Pass an explicit build_id to reproduce an
     older vintage exactly."""
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_massive_minute_derived_table(conn)
         if build_id is None:
-            row = conn.execute("""
-                SELECT b.id FROM massive_hourly_derived_builds b
-                WHERE b.ticker=? AND EXISTS (
-                    SELECT 1 FROM massive_minute_derived d
-                    WHERE d.ticker=b.ticker AND d.build_id=b.id
-                )
-                ORDER BY b.id DESC LIMIT 1
-            """, (ticker,)).fetchone()
-            if row is None:
+            build_id = get_active_build_id(ticker, 'minute', conn=conn)
+            if build_id is None:
                 return pd.DataFrame(columns=["Open", "High", "Low", "Close"])
-            build_id = row[0]
         df = pd.read_sql_query(
             "SELECT ts, open AS Open, high AS High, low AS Low, close AS Close "
             "FROM massive_minute_derived WHERE ticker=? AND build_id=? ORDER BY ts",

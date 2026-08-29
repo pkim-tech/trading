@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Resolved 2026-08-28 (coder dispatch) — `active_builds` promotion table now gates `massive_hourly_derived`/`massive_minute_derived`'s "latest build" resolution instead of pure `ORDER BY id DESC`; new `scripts/promote_derived_build.py` (refuse-to-narrow guard, `--migrate` backfill), migration verified byte-identical on real live DB for all 17 live tickers. Full detail: `deep_backlog.md`.
+
 ## [process][backtest] Resolved 2026-08-28 (evening) — "agent never launches a sweep campaign itself" rule fully relaxed (general, not just schema-v2 gap-fills), after directly verifying the full `run_sweep_queue.sh` campaign path is non-destructive (INSERT OR REPLACE-only writes, guarded/dead migration DROP TABLEs, config.json trap-restored, real deletion tools untouched/still gated separately). CLAUDE.md, backtest-change-rollout skill, design.md, and memory all updated. Full detail: `deep_backlog.md`.
 
 ## [live-trading][testing][HIGH] Resolved 2026-08-28 (later) — 4 of 6 findings fixed from the paired review of the yahoo->massive/PHANTOM-cross-check fix (CHECKS carve-out narrowed after a 2nd paired-review round, holiday calendar, run_all() isolation, docstring); 1 superseded into a new backlog item (dividend-adjustment discontinuity), 1 remains open (close_check wrong-bar bug). Full detail: `deep_backlog.md`.
