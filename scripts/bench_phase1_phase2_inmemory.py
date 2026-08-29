@@ -44,9 +44,10 @@ from run_optimization_sweep import (
 )
 from run_ground_truth_neighborhood import load_live_node
 from backtester import run_backtest_ground_truth
-from node_key import node_key, build_params_dict
+from node_key import node_key, build_params_dict, GT_TRADES_KERNEL_VERSION
 import campaign_config
 import strategies
+import db_cache
 
 TICKER = "SOXL"
 START, END = "2021-08-23", "2026-08-21"
@@ -264,12 +265,46 @@ def _clear_prior_seed_mode_table_rows(table_name, strategy_name, config_version,
 
 
 def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_name,
-                                config_version, ticker, fixed_sl):
+                                config_version, ticker, fixed_sl,
+                                kernel_version=GT_TRADES_KERNEL_VERSION,
+                                hourly_build_id=None, minute_build_id=None):
     """New table (not yet in real production) -- one row per real trade, keyed by
     node_key (stable across re-sweeps) + version (disambiguates which data window this
     specific trade sequence came from, since node_key deliberately does NOT encode that
     -- same reasoning candidate_nodes already uses its own separate version column
-    rather than baking it into any identity)."""
+    rather than baking it into any identity).
+
+    kernel_version/hourly_build_id/minute_build_id (2026-08-29, staleness-invalidation
+    fix): stamps which GT kernel logic version and which db_cache.active_builds
+    hourly/minute build_id produced this trade list, so run_optimization_sweep.
+    get_cached_trades can detect two real stale-cache scenarios neither node_key nor
+    version alone catches: (1) a future backtester.py fix changing what
+    run_backtest_ground_truth computes without a matching data/version change, (2) a
+    scripts/promote_derived_build.py promotion changing the real underlying bars with
+    ZERO change to `version` (real precedent: the 2026-08-27 SOXL/DPST/DFEN minute-
+    archive narrowing incident). NULL when the caller passes no build_id (a ticker/
+    table with nothing ever promoted via active_builds) -- get_cached_trades treats a
+    NULL stored value as "unknown, don't trust" too, same as a value mismatch, never as
+    an automatic match.
+
+    DELETE-then-INSERT, not INSERT OR IGNORE (fixed 2026-08-29, paired-review HIGH
+    finding, round 2, both independent-cold and contextual Opus review independently
+    confirmed): the OLD INSERT OR IGNORE behavior meant a re-run over an already-
+    populated (node_key, version) silently kept the OLD rows (with their OLD, possibly
+    now-stale-or-NULL kernel_version/build_id stamps) and dropped every freshly-stamped
+    replacement -- so a re-run could NEVER refresh a stale cache entry, which defeats
+    this entire staleness-invalidation fix's purpose (confirmed empirically: the real
+    DB's ~73k pre-existing rows would have stayed permanently NULL-stamped forever,
+    0% real benefit on all existing data). Worse, a plain per-row INSERT OR REPLACE
+    (the other option the review considered) has its own real correctness bug if a
+    re-run's new trade list has a DIFFERENT length than what's already stored: it would
+    only overwrite the overlapping trade_idx range and leave any extra OLD trade_idx
+    rows in place, producing a "Frankenstein" trade list mixing old and new vintages at
+    ONE node_key/version -- get_cached_trades' own "trade_idx sequence is contiguous
+    0..len-1" gap check would not catch this (both halves are individually contiguous).
+    DELETE-then-INSERT avoids both failure modes: every (node_key, version) pair this
+    call is about to write gets its ENTIRE old row set removed first, so a re-run is a
+    genuine full replacement, never a partial merge."""
     with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS backtest_winner_trades (
@@ -279,10 +314,31 @@ def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_
                 arm_time TEXT, arm_price REAL, created_at TEXT,
                 UNIQUE(node_key, version, trade_idx)
             )""")
-        before = conn.execute(
-            "SELECT COUNT(*) FROM backtest_winner_trades WHERE version=? AND ticker=? AND strategy=?",
-            (config_version, ticker, strategy_name)).fetchone()[0]
+        # sqlite has no "ADD COLUMN IF NOT EXISTS" (pre-3.35) -- probe-first pattern,
+        # same convention scripts/candidate_verification_store.py's ensure_table() uses.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_winner_trades)")}
+        for col in ("kernel_version TEXT", "hourly_build_id INTEGER", "minute_build_id INTEGER"):
+            name = col.split()[0]
+            if name not in existing_cols:
+                conn.execute(f"ALTER TABLE backtest_winner_trades ADD COLUMN {col}")
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
+        # DELETE every (node_key, version) pair this call is about to (re)write -- see
+        # this function's own docstring for why this must be a full delete, not a
+        # per-row REPLACE. One DELETE per distinct node_key (there are at most 9 -- the
+        # top-9-per-scope population), not one big DELETE over the whole ticker/version,
+        # so an UNRELATED node_key's existing rows (e.g. a different fixed_sl's earlier
+        # run sharing this same version string) are never touched.
+        distinct_node_keys = sorted(set(node_keys_by_key.values()))
+        n_deleted = 0
+        for nk in distinct_node_keys:
+            cur = conn.execute(
+                "DELETE FROM backtest_winner_trades WHERE node_key=? AND version=?",
+                (nk, config_version))
+            n_deleted += cur.rowcount
+        if n_deleted:
+            print(f"  (deleted {n_deleted} pre-existing trade row(s) across "
+                  f"{len(distinct_node_keys)} node_key(s) about to be rewritten -- "
+                  f"real refresh, not a stale-stamp-preserving skip)")
         buffer = []
         for key, trades in winner_trades_by_key.items():
             nk = node_keys_by_key[key]
@@ -290,23 +346,17 @@ def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_
                 buffer.append((nk, config_version, ticker, strategy_name, float(fixed_sl), i,
                                str(t['Entry Time']), t['Entry Price'], str(t['Exit Time']),
                                t['Exit Price'], t['exit_reason'], t['Return'], int(t['armed']),
-                               str(t['Arm Time']) if t['armed'] else None, t['Arm Price'], now_iso))
+                               str(t['Arm Time']) if t['armed'] else None, t['Arm Price'], now_iso,
+                               kernel_version, hourly_build_id, minute_build_id))
         conn.executemany("""
-            INSERT OR IGNORE INTO backtest_winner_trades
+            INSERT INTO backtest_winner_trades
                 (node_key, version, ticker, strategy, fixed_sl, trade_idx, entry_time,
                  entry_price, exit_time, exit_price, exit_reason, return_pct, armed,
-                 arm_time, arm_price, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 arm_time, arm_price, created_at, kernel_version, hourly_build_id, minute_build_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, buffer)
         conn.commit()
-        after = conn.execute(
-            "SELECT COUNT(*) FROM backtest_winner_trades WHERE version=? AND ticker=? AND strategy=?",
-            (config_version, ticker, strategy_name)).fetchone()[0]
-    actually_inserted = after - before
-    if actually_inserted < len(buffer):
-        print(f"  ({len(buffer) - actually_inserted} of {len(buffer)} trade rows already existed "
-              f"-- skipped via INSERT OR IGNORE, not overwritten)")
-    return actually_inserted
+    return len(buffer)
 
 
 def _log_sweep_run_start(ticker, strategy_name, fixed_sl, windows, version):
@@ -1210,8 +1260,18 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     if _seed_task is not None:
         _clear_prior_seed_mode_table_rows(
             "backtest_winner_trades", strategy_name, version, TICKER, fixed_sl)
+    # Real resolved build_ids (staleness-invalidation fix, 2026-08-29, paired-review HIGH
+    # finding) -- one lookup per ticker/table for this whole run, not per candidate (a
+    # promotion mid-run is not a case this pipeline defends against anywhere else either).
+    # None when nothing has ever been promoted for this ticker/table (get_active_build_id's
+    # own documented "no build at all" case) -- stored as NULL, which get_cached_trades
+    # treats as "unknown, don't trust" on read-back, same as a real mismatch.
+    _hourly_build_id = db_cache.get_active_build_id(TICKER, 'hourly')
+    _minute_build_id = db_cache.get_active_build_id(TICKER, 'minute')
     n_trade_rows_written = _insert_winner_trades_rows(
-        winner_trades, node_keys_by_key, strategy_name, version, TICKER, fixed_sl)
+        winner_trades, node_keys_by_key, strategy_name, version, TICKER, fixed_sl,
+        kernel_version=GT_TRADES_KERNEL_VERSION,
+        hourly_build_id=_hourly_build_id, minute_build_id=_minute_build_id)
     t_ins7 = time.time()
     print(f"Trade rows written to backtest_winner_trades: {n_trade_rows_written} "
           f"in {t_ins7 - t_ins6:.2f}s")

@@ -25,8 +25,10 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from run_optimization_sweep import DB_PATH, _load_node_inputs_ground_truth
 from backtester import run_backtest_ground_truth
-from node_key import node_key
+from node_key import node_key, GT_TRADES_KERNEL_VERSION
 import strategies
+from phase4_candidate_nodes_resolver import _stop_loss_and_tpct_from_row
+import db_cache
 
 
 def _window_dates_from_version(version):
@@ -75,6 +77,19 @@ def main():
     strategy_class = getattr(strategies, args.strategy)
     is_both = args.strategy == 'TrailingBothZScoreBreakout'
 
+    # Real resolved build_ids + kernel_version stamp (2026-08-29, paired-review HIGH
+    # finding, round 2, both reviewers CONFIRMED: this script's own node_key fix earlier
+    # tonight made its TrailingExit rows finally COMPUTE the right node_key, but its
+    # INSERT never wrote the new kernel_version/hourly_build_id/minute_build_id columns
+    # at all -- every row this script writes got NULL stamps and was therefore STILL
+    # permanently invisible to run_optimization_sweep.get_cached_trades' now-hardened
+    # staleness check, for a different reason than before). Same db_cache.
+    # get_active_build_id calls / same shared GT_TRADES_KERNEL_VERSION constant
+    # bench_phase1_phase2_inmemory.py's own writer uses -- one lookup for this whole
+    # run, not per candidate.
+    _hourly_build_id = db_cache.get_active_build_id(args.ticker, 'hourly')
+    _minute_build_id = db_cache.get_active_build_id(args.ticker, 'minute')
+    node_keys_seen = set()
     buffer = []
     t0 = time.time()
     for window, z, arm_pct, trail_buy_pct, trail_sell_pct, max_hold_hours, row_entry_timing in rows:
@@ -94,15 +109,40 @@ def main():
             open_check_entry_timing=(row_entry_timing == 'open_check'),
             same_bar_reentry=True, prep=prep, mprep=mprep, need_times=True,
         )
+        # node_key() takes (take_profit, stop_loss, trail_sell_pct) in the STRATEGY-
+        # NEUTRAL axis meaning build_params_dict/resolve_axis_columns expect -- NOT the
+        # raw candidate_nodes storage columns (arm_pct, trail_buy_pct, trail_sell_pct)
+        # unpacked here. Passing the raw columns straight through is correct BY
+        # COINCIDENCE for TrailingBoth (its sl_axis mapping is an identity, trail_buy_pct
+        # IS stop_loss) but WRONG for TrailingExit (resolve_axis_columns returns
+        # ('trail_pct', None) there, so the real stop_loss lives in trail_sell_pct, not
+        # trail_buy_pct -- candidate_nodes always stores trail_buy_pct=0.0 for a
+        # TrailingExit row, see build_candidate_report_ground_truth's own is_both branch
+        # -- an unfixed call here would silently bake stop_loss=0.0 into every
+        # TrailingExit node_key, both making those rows permanently invisible to
+        # run_optimization_sweep.get_cached_trades' read-back (dead cache -- a real
+        # regression this script's dead cache would otherwise cause, found 2026-08-29
+        # paired-review MEDIUM finding against the trades-cache read-back task) AND
+        # colliding multiple distinct TrailingExit candidates onto ONE node_key under
+        # backtest_winner_trades' UNIQUE(node_key, version, trade_idx) constraint,
+        # interleaving different candidates' trades into a single stored list. Use the
+        # same inverse mapping phase4_candidate_nodes_resolver.py's own forward mapping
+        # (and build_candidate_report_ground_truth's is_both branch) already establish,
+        # not a third independent derivation.
+        sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(args.strategy)
+        real_stop_loss, real_tpct = _stop_loss_and_tpct_from_row(
+            sl_axis_col, fourth_axis_col, trail_buy_pct, trail_sell_pct)
         nk = node_key(args.strategy, args.ticker, args.fixed_sl, window, z, max_hold_hours,
-                       arm_pct, trail_buy_pct, trail_sell_pct, row_entry_timing,
+                       arm_pct, real_stop_loss, real_tpct, row_entry_timing,
                        strategies.resolve_axis_columns)
+        node_keys_seen.add(nk)
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
         for i, t in enumerate(trades):
             buffer.append((nk, args.version, args.ticker, args.strategy, args.fixed_sl, i,
                            str(t['Entry Time']), t['Entry Price'], str(t['Exit Time']),
                            t['Exit Price'], t['exit_reason'], t['Return'], int(t['armed']),
-                           str(t['Arm Time']) if t['armed'] else None, t['Arm Price'], now_iso))
+                           str(t['Arm Time']) if t['armed'] else None, t['Arm Price'], now_iso,
+                           GT_TRADES_KERNEL_VERSION, _hourly_build_id, _minute_build_id))
     t1 = time.time()
     print(f"Regenerated {len(buffer):,} trade rows across {len(rows)} candidates in {t1 - t0:.2f}s")
 
@@ -115,22 +155,39 @@ def main():
                 arm_time TEXT, arm_price REAL, created_at TEXT,
                 UNIQUE(node_key, version, trade_idx)
             )""")
-        before = conn.execute(
-            "SELECT COUNT(*) FROM backtest_winner_trades WHERE version=? AND ticker=? AND strategy=?",
-            (args.version, args.ticker, args.strategy)).fetchone()[0]
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_winner_trades)")}
+        for col in ("kernel_version TEXT", "hourly_build_id INTEGER", "minute_build_id INTEGER"):
+            name = col.split()[0]
+            if name not in existing_cols:
+                conn.execute(f"ALTER TABLE backtest_winner_trades ADD COLUMN {col}")
+        # DELETE-then-INSERT, not INSERT OR IGNORE (2026-08-29, paired-review HIGH
+        # finding, round 2 -- same fix/same reasoning as bench_phase1_phase2_inmemory.
+        # _insert_winner_trades_rows' own docstring: INSERT OR IGNORE would silently
+        # keep any pre-existing (now possibly NULL-stamped or stale) rows at a re-run's
+        # (node_key, version), and a per-row INSERT OR REPLACE has its own real
+        # "Frankenstein" mixed-vintage risk if the new trade count differs from the old
+        # one. Delete each distinct node_key's full row set for this version first, so a
+        # re-run of this script is a genuine full replacement.
+        n_deleted = 0
+        for nk in sorted(node_keys_seen):
+            cur = conn.execute(
+                "DELETE FROM backtest_winner_trades WHERE node_key=? AND version=?",
+                (nk, args.version))
+            n_deleted += cur.rowcount
+        if n_deleted:
+            print(f"  (deleted {n_deleted} pre-existing trade row(s) across "
+                  f"{len(node_keys_seen)} node_key(s) about to be rewritten)")
         conn.executemany("""
-            INSERT OR IGNORE INTO backtest_winner_trades
+            INSERT INTO backtest_winner_trades
                 (node_key, version, ticker, strategy, fixed_sl, trade_idx, entry_time,
                  entry_price, exit_time, exit_price, exit_reason, return_pct, armed,
-                 arm_time, arm_price, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 arm_time, arm_price, created_at, kernel_version, hourly_build_id, minute_build_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, buffer)
         conn.commit()
-        after = conn.execute(
-            "SELECT COUNT(*) FROM backtest_winner_trades WHERE version=? AND ticker=? AND strategy=?",
-            (args.version, args.ticker, args.strategy)).fetchone()[0]
-    print(f"Written to backtest_winner_trades: {after - before} new rows "
-          f"({len(buffer) - (after - before)} already existed).")
+    print(f"Written to backtest_winner_trades: {len(buffer)} rows "
+          f"(kernel_version={GT_TRADES_KERNEL_VERSION!r}, "
+          f"hourly_build_id={_hourly_build_id}, minute_build_id={_minute_build_id}).")
 
 
 if __name__ == "__main__":
