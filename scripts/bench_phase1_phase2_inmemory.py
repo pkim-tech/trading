@@ -235,18 +235,26 @@ def _clear_prior_seed_mode_table_rows(table_name, strategy_name, config_version,
     has the new run's rows -- the "worse than stale" state this feature exists to
     prevent, just moved to a different table/timing.
 
-    fixed_sl included in the WHERE (round-5 hardening, contextual review): harmless
-    today since seed mode always pins exactly one fixed_sl per run, but free to add
-    and would matter if the fixed_sl-looping machinery ever got relaxed for seed
-    mode."""
+    Deliberately WHERE version=? ALONE (round-5 REVERTED the fixed_sl/ticker/strategy
+    predicates a same-round change had added -- both independent-cold and contextual
+    Opus review, round 5, independently converged on this): the "-seed<id>" version
+    namespace is written by nothing else, so it's already sufficient to select exactly
+    this seed's rows and nothing else. Adding fixed_sl/ticker/strategy to the WHERE
+    re-opens the exact staleness class this function exists to close: those columns
+    are read from the seed's CURRENT (mutable) watch_list row, not fixed at version-
+    creation time, so if a seed node is retuned between two runs of the identical
+    --seed-watch-list-id (real, plausible -- staged/canary nodes get re-roled often),
+    the second run's DELETE would silently fail to match the first run's rows, leaving
+    two vintages coexisting under one version with no way to tell which run produced
+    which -- precisely the union-under-identical-version failure this mechanism was
+    built to prevent."""
     with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
         existing_tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))}
         if not existing_tables:
             return 0
         deleted = conn.execute(
-            f"DELETE FROM {table_name} WHERE version=? AND ticker=? AND strategy=? AND fixed_sl=?",
-            (config_version, ticker, strategy_name, float(fixed_sl))).rowcount
+            f"DELETE FROM {table_name} WHERE version=?", (config_version,)).rowcount
         conn.commit()
     if deleted:
         print(f"Seed mode: cleared {deleted} prior {table_name} row(s) for "
