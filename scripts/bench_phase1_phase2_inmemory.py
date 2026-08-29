@@ -285,7 +285,16 @@ def main():
     ap.add_argument("--strategy", choices=sorted(campaign_config.STRATEGIES),
                      help="explicit strategy, used INSTEAD of load_live_node(TICKER)'s")
     ap.add_argument("--fixed-sl", dest="fixed_sl", type=int,
-                     help="explicit fixed_sl, used INSTEAD of load_live_node(TICKER)'s")
+                     help="explicit SINGLE fixed_sl, used INSTEAD of load_live_node(TICKER)'s. "
+                          "Takes precedence over --fixed-sl-values when both are given.")
+    ap.add_argument("--fixed-sl-values", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8],
+                     help="2026-08-29 addition (packaging only, see main()'s own docstring-"
+                          "adjacent comment below): loop over each of these fixed_sl values "
+                          "within ONE process/pool instead of requiring a separate CLI "
+                          "invocation per value -- only used in --strategy override mode "
+                          "(ignored when --fixed-sl is explicitly given, and ignored entirely "
+                          "in live-node mode, which already has one canonical fixed_sl). "
+                          "Default [1..8] matches the real production fixed_sl grid.")
     ap.add_argument("--window", type=int, default=None,
                      help="run this single window value in ISOLATION instead of the "
                           "real production grid (module-level WINDOWS=[10,20]) -- e.g. "
@@ -322,25 +331,87 @@ def main():
 
     if args.strategy is not None:
         strategy_name = args.strategy
-        fixed_sl = args.fixed_sl
-        if fixed_sl is None:
-            raise SystemExit("--strategy requires --fixed-sl too (no live-node lookup in this mode)")
-        print(f"Override mode: strategy={strategy_name}, fixed_sl={fixed_sl} (no live-node lookup)")
+        # --fixed-sl (single, explicit) takes precedence over --fixed-sl-values (the new
+        # looping default) -- an explicit single value is an unambiguous "just this one"
+        # request, not something the new default-[1..8] behavior should override.
+        fixed_sl_list = [args.fixed_sl] if args.fixed_sl is not None else args.fixed_sl_values
+        print(f"Override mode: strategy={strategy_name}, fixed_sl values={fixed_sl_list} "
+              f"(no live-node lookup)")
     else:
         node = load_live_node(TICKER)
         strategy_name = node["strategy"]
-        fixed_sl = node["fixed_sl"]
-        print(f"Live node: strategy={strategy_name}, fixed_sl={fixed_sl}")
+        fixed_sl_list = [node["fixed_sl"]]
+        print(f"Live node: strategy={strategy_name}, fixed_sl={fixed_sl_list[0]}")
+
+    # version depends only on DATA_SOURCE/START/END (not fixed_sl) -- computed ONCE and
+    # reused across every fixed_sl in the loop below, matching the real established
+    # convention already confirmed against live data (scripts/candidate_nodes_status.py):
+    # one version string legitimately covers every (strategy, fixed_sl) combo from a
+    # single campaign's real invocations.
+    version = "bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
+
+    # fixed_sl packaging (2026-08-29, Task #6 follow-up, planner dispatch): loops the
+    # existing per-fixed_sl Phase1+Phase2+Phase2.5+candidate-write logic (now
+    # run_one_fixed_sl below) over multiple fixed_sl values within ONE process/pool,
+    # instead of requiring 8 separate CLI invocations. PACKAGING ONLY, NOT a selection-
+    # algorithm change: fixed_sl stays OUTSIDE the pooled/flattened window/z/tpct
+    # ranking -- each fixed_sl value still gets its own fully separate Phase1/2/2.5 run
+    # and its own separate top-9 candidate_nodes rows, exactly what a separate
+    # --fixed-sl N invocation would produce today. Deliberately NOT pooling fixed_sl in
+    # with window/z/tpct for island detection -- Task #6's OAT sensitivity work
+    # (commit 3390eeb) found fixed_sl is genuinely cliff-prone (real cliffs even at
+    # 0.25%-step sub-integer resolution), so pooling it into the existing ranking would
+    # be wrong given that finding.
+    #
+    # Resumability (real requirement): before each fixed_sl iteration, check sweep_run_log
+    # for an already-finished row at this exact (ticker, strategy, fixed_sl, windows,
+    # version) -- if found, skip it entirely (its candidates are already in
+    # candidate_nodes from a prior run). Makes a killed-partway multi-value run
+    # resumable: rerunning the same command only redoes the fixed_sl values that never
+    # finished.
+    _windows_str = ",".join(str(w) for w in WINDOWS)
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        for fixed_sl in fixed_sl_list:
+            with sqlite3.connect(DB_PATH, timeout=60.0) as _conn:
+                _conn.execute("""
+                    CREATE TABLE IF NOT EXISTS sweep_run_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        started_at TEXT NOT NULL, finished_at TEXT,
+                        script TEXT, pid INTEGER, ticker TEXT, strategy TEXT, fixed_sl REAL,
+                        windows TEXT, version TEXT,
+                        n_final_candidates INTEGER, n_candidate_nodes_written INTEGER,
+                        n_trade_rows_written INTEGER, elapsed_s REAL
+                    )""")
+                already_done = _conn.execute("""
+                    SELECT 1 FROM sweep_run_log
+                    WHERE ticker=? AND strategy=? AND fixed_sl=? AND windows=? AND version=?
+                          AND finished_at IS NOT NULL
+                    LIMIT 1
+                """, (TICKER, strategy_name, float(fixed_sl), _windows_str, version)).fetchone()
+            if already_done:
+                print(f"\nfixed_sl={fixed_sl}: already done (finished sweep_run_log row found "
+                      f"for this exact ticker/strategy/fixed_sl/windows/version) -- skipping.")
+                continue
+            run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args)
+
+
+def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
+    """Real per-fixed_sl Phase1+Phase2+Phase2.5+candidate-write body -- extracted
+    2026-08-29 (Task #6 follow-up, planner dispatch) from what used to be main()'s
+    own single-fixed_sl body, so main() can loop this over multiple fixed_sl values
+    within one shared pool. Also owns this fixed_sl's own sweep_run_log start/finish
+    logging (piece #1) -- main()'s own resumability check (already-finished row ==
+    skip) happens BEFORE this function is even called, so every real call here is a
+    genuine new unit of work."""
+    _run_log_t0 = time.time()
+    _run_log_id = _log_sweep_run_start(TICKER, strategy_name, fixed_sl, WINDOWS, version)
 
     grid = campaign_config.STRATEGIES[strategy_name]
     TAKE_PROFITS = grid["take_profits"]
     STOP_LOSSES = grid["stop_losses"]
     TRAIL_PCTS = _trail_pcts_for_strategy(strategy_name, grid)
 
-    version = "bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
 
-    _run_log_t0 = time.time()
-    _run_log_id = _log_sweep_run_start(TICKER, strategy_name, fixed_sl, WINDOWS, version)
 
     _job_tmp = os.path.join(os.environ["CLAUDE_JOB_DIR"], "tmp") if "CLAUDE_JOB_DIR" in os.environ else "/tmp"
     # Keyed on WINDOWS too (not just strategy/fixed_sl) -- found live 2026-08-29: a
@@ -362,214 +433,213 @@ def main():
                      for tp in TAKE_PROFITS for sl in STOP_LOSSES
                      for hold in HOLD_TIME_CAPS for tpct in TRAIL_PCTS]
 
-    with ProcessPoolExecutor(max_workers=args.workers) as pool:
-      if not args.resume_from_top100 and os.path.exists(checkpoint_path):
-        t0 = time.time()
-        df_full = pd.read_parquet(checkpoint_path)
-        t1 = t2 = t3 = time.time()
-        phase1_rows, phase2_rows = [], []  # total-cells-computed count below stays honest
-        print(f"CHECKPOINT: loaded df_full ({len(df_full):,} rows, deduped Phase1+Phase2) "
-              f"from {checkpoint_path} in {t1 - t0:.2f}s -- skipping Phase1 AND Phase2 "
-              f"dispatch entirely (dev-iteration checkpoint, NOT a production artifact).")
+    if not args.resume_from_top100 and os.path.exists(checkpoint_path):
+      t0 = time.time()
+      df_full = pd.read_parquet(checkpoint_path)
+      t1 = t2 = t3 = time.time()
+      phase1_rows, phase2_rows = [], []  # total-cells-computed count below stays honest
+      print(f"CHECKPOINT: loaded df_full ({len(df_full):,} rows, deduped Phase1+Phase2) "
+            f"from {checkpoint_path} in {t1 - t0:.2f}s -- skipping Phase1 AND Phase2 "
+            f"dispatch entirely (dev-iteration checkpoint, NOT a production artifact).")
+    else:
+      if args.resume_from_top100:
+          t0 = time.time()
+          with sqlite3.connect(DB_PATH) as conn:
+              df1 = pd.read_sql("""
+                  SELECT take_profit, stop_loss, max_hold_hours, window,
+                         z_score_threshold, trail_sell_pct, cagr, trades
+                  FROM backtest_phase1_insurance
+                  WHERE version=? AND ticker=? AND strategy=?
+              """, conn, params=(version, TICKER, strategy_name))
+          t1 = time.time()
+          print(f"RESUME MODE: loaded {len(df1):,} rows from persisted top-100 snapshot "
+                f"in {t1 - t0:.2f}s -- skipping Phase1 dispatch entirely "
+                f"({len(phase1_tasks):,} cells NOT recomputed). "
+                f"pick_island_centers will run against only these {len(df1):,} rows, "
+                f"not the full grid -- real correctness risk, that's the point of this test.")
+          phase1_rows = []  # for the final total-cells-computed count below
       else:
-        if args.resume_from_top100:
-            t0 = time.time()
-            with sqlite3.connect(DB_PATH) as conn:
-                df1 = pd.read_sql("""
-                    SELECT take_profit, stop_loss, max_hold_hours, window,
-                           z_score_threshold, trail_sell_pct, cagr, trades
-                    FROM backtest_phase1_insurance
-                    WHERE version=? AND ticker=? AND strategy=?
-                """, conn, params=(version, TICKER, strategy_name))
-            t1 = time.time()
-            print(f"RESUME MODE: loaded {len(df1):,} rows from persisted top-100 snapshot "
-                  f"in {t1 - t0:.2f}s -- skipping Phase1 dispatch entirely "
-                  f"({len(phase1_tasks):,} cells NOT recomputed). "
-                  f"pick_island_centers will run against only these {len(df1):,} rows, "
-                  f"not the full grid -- real correctness risk, that's the point of this test.")
-            phase1_rows = []  # for the final total-cells-computed count below
-        else:
-            print(f"Phase1-coarse (in-memory): {len(phase1_tasks):,} cells, "
-                  f"windows={WINDOWS}, z={Z_THRESHOLDS}, version={version} (not written anywhere)")
-            t0 = time.time()
-            phase1_rows = _dispatch(pool, phase1_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
-                                     desc="Phase1-coarse (in-memory)")
-            t1 = time.time()
-            print(f"Phase1-coarse (in-memory) done: {len(phase1_rows):,} rows in {t1 - t0:.1f}s "
-                  f"({len(phase1_rows) / max(t1 - t0, 0.001):.0f} nodes/sec)")
+          print(f"Phase1-coarse (in-memory): {len(phase1_tasks):,} cells, "
+                f"windows={WINDOWS}, z={Z_THRESHOLDS}, version={version} (not written anywhere)")
+          t0 = time.time()
+          phase1_rows = _dispatch(pool, phase1_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
+                                   desc="Phase1-coarse (in-memory)")
+          t1 = time.time()
+          print(f"Phase1-coarse (in-memory) done: {len(phase1_rows):,} rows in {t1 - t0:.1f}s "
+                f"({len(phase1_rows) / max(t1 - t0, 0.001):.0f} nodes/sec)")
 
-            df1 = pd.DataFrame(phase1_rows)
-            df1 = df1[df1["trades"] > 0]
+          df1 = pd.DataFrame(phase1_rows)
+          df1 = df1[df1["trades"] > 0]
 
-        # Sanity check: fewer than 100 successful Phase1 cells out of 164,640 means
-        # something is badly wrong upstream (data load failure, wrong ticker/window,
-        # near-total SIM_ERROR/EMPTY rate) -- not a legitimate sparse-grid outcome.
-        if len(df1) < 100:
-            raise SystemExit(f"Phase1 sanity check FAILED: only {len(df1)} successful cells "
-                              f"(need >=100) -- something is wrong upstream, not a real "
-                              f"sparse-data outcome. Check _dispatch's non-SUCCESS status counts above.")
+      # Sanity check: fewer than 100 successful Phase1 cells out of 164,640 means
+      # something is badly wrong upstream (data load failure, wrong ticker/window,
+      # near-total SIM_ERROR/EMPTY rate) -- not a legitimate sparse-grid outcome.
+      if len(df1) < 100:
+          raise SystemExit(f"Phase1 sanity check FAILED: only {len(df1)} successful cells "
+                            f"(need >=100) -- something is wrong upstream, not a real "
+                            f"sparse-data outcome. Check _dispatch's non-SUCCESS status counts above.")
 
-        # Insurance snapshot: written for real into backtest_phase1_insurance under the
-        # bench- version prefix. Matters more here than in the disk-based backtest_phase1
-        # design -- Phase1's raw grid is never written anywhere else in this script, so
-        # once the process exits nothing survives unless something is explicitly saved.
-        #
-        # NOT a naive global top-N (2026-08-27 fix, found in design discussion): a plain
-        # top-N-by-cagr sort can silently omit an entire real island if the global top-N
-        # happens to cluster around one strong region -- pick_island_centers (which sees
-        # the FULL grid) would still find that other island correctly for Phase2, but the
-        # insurance snapshot -- whose whole purpose is to let a future session re-debug
-        # pick_island_centers's choices -- would have zero evidence it existed. Fixed by
-        # unioning global top-1000-by-cagr with a WIDE island-detection pass (n=30, well
-        # above the real N_ISLANDS=3) so up to 30 distinct regions are represented, not
-        # just whichever one cell ranks highest overall. Still capped/lossy in principle
-        # (an unlikely 31st+ region could still be missed), but size was never the
-        # constraint here (union stays well under ~2000 rows, still negligible) -- this
-        # is about actually satisfying the snapshot's stated purpose, not about a byte
-        # budget. Skipped in resume mode -- df1 IS already the snapshot, re-snapshotting
-        # a subset of itself is a no-op (INSERT OR IGNORE would just skip every row).
-        if args.resume_from_top100:
-            print("Phase1 insurance snapshot: skipped (resume mode -- df1 already IS "
-                  "the persisted snapshot, nothing new to write)")
-        else:
-            t_ins0 = time.time()
-            global_top = df1.sort_values("cagr", ascending=False).head(1000)
-            wide_centers = pick_island_centers(df1, n=30, rank_col="cagr")
-            region_rows = []
-            for tp_c, sl_c in wide_centers:
-                region = df1[(df1["take_profit"] - tp_c).abs().le(FINE_RADIUS)
-                             & (df1["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
-                region_rows.append(region.sort_values("cagr", ascending=False).head(10))
-            insurance_df = pd.concat([global_top] + region_rows, ignore_index=True).drop_duplicates(
-                subset=["take_profit", "stop_loss", "max_hold_hours", "window",
-                        "z_score_threshold", "trail_sell_pct"])
-            insurance_rows = insurance_df.to_dict("records")
-            n_written = _insert_phase1_insurance_rows(
-                insurance_rows, strategy_name, version, TICKER, fixed_sl, ENTRY_TIMING)
-            t_ins1 = time.time()
-            print(f"Phase1 insurance snapshot: {len(insurance_rows)} rows "
-                  f"(top-1000 + {len(wide_centers)}-region coverage), {n_written} written to "
-                  f"backtest_phase1_insurance in {t_ins1 - t_ins0:.2f}s (version={version})")
+      # Insurance snapshot: written for real into backtest_phase1_insurance under the
+      # bench- version prefix. Matters more here than in the disk-based backtest_phase1
+      # design -- Phase1's raw grid is never written anywhere else in this script, so
+      # once the process exits nothing survives unless something is explicitly saved.
+      #
+      # NOT a naive global top-N (2026-08-27 fix, found in design discussion): a plain
+      # top-N-by-cagr sort can silently omit an entire real island if the global top-N
+      # happens to cluster around one strong region -- pick_island_centers (which sees
+      # the FULL grid) would still find that other island correctly for Phase2, but the
+      # insurance snapshot -- whose whole purpose is to let a future session re-debug
+      # pick_island_centers's choices -- would have zero evidence it existed. Fixed by
+      # unioning global top-1000-by-cagr with a WIDE island-detection pass (n=30, well
+      # above the real N_ISLANDS=3) so up to 30 distinct regions are represented, not
+      # just whichever one cell ranks highest overall. Still capped/lossy in principle
+      # (an unlikely 31st+ region could still be missed), but size was never the
+      # constraint here (union stays well under ~2000 rows, still negligible) -- this
+      # is about actually satisfying the snapshot's stated purpose, not about a byte
+      # budget. Skipped in resume mode -- df1 IS already the snapshot, re-snapshotting
+      # a subset of itself is a no-op (INSERT OR IGNORE would just skip every row).
+      if args.resume_from_top100:
+          print("Phase1 insurance snapshot: skipped (resume mode -- df1 already IS "
+                "the persisted snapshot, nothing new to write)")
+      else:
+          t_ins0 = time.time()
+          global_top = df1.sort_values("cagr", ascending=False).head(1000)
+          wide_centers = pick_island_centers(df1, n=30, rank_col="cagr")
+          region_rows = []
+          for tp_c, sl_c in wide_centers:
+              region = df1[(df1["take_profit"] - tp_c).abs().le(FINE_RADIUS)
+                           & (df1["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
+              region_rows.append(region.sort_values("cagr", ascending=False).head(10))
+          insurance_df = pd.concat([global_top] + region_rows, ignore_index=True).drop_duplicates(
+              subset=["take_profit", "stop_loss", "max_hold_hours", "window",
+                      "z_score_threshold", "trail_sell_pct"])
+          insurance_rows = insurance_df.to_dict("records")
+          n_written = _insert_phase1_insurance_rows(
+              insurance_rows, strategy_name, version, TICKER, fixed_sl, ENTRY_TIMING)
+          t_ins1 = time.time()
+          print(f"Phase1 insurance snapshot: {len(insurance_rows)} rows "
+                f"(top-1000 + {len(wide_centers)}-region coverage), {n_written} written to "
+                f"backtest_phase1_insurance in {t_ins1 - t_ins0:.2f}s (version={version})")
 
-        # Island-center detection, straight off the in-memory DataFrame -- same shape as
-        # _phase2_island_gt_tasks's per-(w,z,tpct) loop, minus the SQL read.
-        phase2_tasks = set()
-        for z in Z_THRESHOLDS:
-            for w in WINDOWS:
-                for tpct in TRAIL_PCTS:
-                    df_wz = df1[(df1["window"] == w) & (df1["z_score_threshold"] == z)
-                                & (df1["trail_sell_pct"] == tpct)]
-                    if df_wz.empty:
-                        continue
-                    centers = pick_island_centers(df_wz, rank_col="cagr")
-                    if len(centers) < N_ISLANDS:
-                        print(f"  WARNING: (w={w} z={z} tpct={tpct}) only found {len(centers)} "
-                              f"island(s), expected {N_ISLANDS} -- check for a data gap in "
-                              f"this slice, not necessarily fatal (a real scope can "
-                              f"legitimately have fewer distinct islands than N_ISLANDS).")
-                    for (tp_c, sl_c) in centers:
-                        for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
-                            for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
-                                for hold in HOLD_TIME_CAPS:
-                                    phase2_tasks.add((tp, sl, int(hold), int(w), float(z), float(tpct)))
-        print(f"Phase2-island mesh (in-memory): {len(phase2_tasks):,} cells "
-              f"({N_ISLANDS} islands x {len(WINDOWS)}w x {len(Z_THRESHOLDS)}z x {len(TRAIL_PCTS)} trail_pcts, +-{FINE_RADIUS} box)")
+      # Island-center detection, straight off the in-memory DataFrame -- same shape as
+      # _phase2_island_gt_tasks's per-(w,z,tpct) loop, minus the SQL read.
+      phase2_tasks = set()
+      for z in Z_THRESHOLDS:
+          for w in WINDOWS:
+              for tpct in TRAIL_PCTS:
+                  df_wz = df1[(df1["window"] == w) & (df1["z_score_threshold"] == z)
+                              & (df1["trail_sell_pct"] == tpct)]
+                  if df_wz.empty:
+                      continue
+                  centers = pick_island_centers(df_wz, rank_col="cagr")
+                  if len(centers) < N_ISLANDS:
+                      print(f"  WARNING: (w={w} z={z} tpct={tpct}) only found {len(centers)} "
+                            f"island(s), expected {N_ISLANDS} -- check for a data gap in "
+                            f"this slice, not necessarily fatal (a real scope can "
+                            f"legitimately have fewer distinct islands than N_ISLANDS).")
+                  for (tp_c, sl_c) in centers:
+                      for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
+                          for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
+                              for hold in HOLD_TIME_CAPS:
+                                  phase2_tasks.add((tp, sl, int(hold), int(w), float(z), float(tpct)))
+      print(f"Phase2-island mesh (in-memory): {len(phase2_tasks):,} cells "
+            f"({N_ISLANDS} islands x {len(WINDOWS)}w x {len(Z_THRESHOLDS)}z x {len(TRAIL_PCTS)} trail_pcts, +-{FINE_RADIUS} box)")
 
-        t2 = time.time()
-        phase2_rows = _dispatch(pool, phase2_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
-                                 desc="Phase2-island (in-memory)")
-        t3 = time.time()
-        print(f"Phase2-island (in-memory) done: {len(phase2_rows):,} rows in {t3 - t2:.1f}s "
-              f"({len(phase2_rows) / max(t3 - t2, 0.001):.0f} nodes/sec)")
+      t2 = time.time()
+      phase2_rows = _dispatch(pool, phase2_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
+                               desc="Phase2-island (in-memory)")
+      t3 = time.time()
+      print(f"Phase2-island (in-memory) done: {len(phase2_rows):,} rows in {t3 - t2:.1f}s "
+            f"({len(phase2_rows) / max(t3 - t2, 0.001):.0f} nodes/sec)")
 
-        # Phase2.5-CliffBox-GT (in-memory): center detection off the FULL scope
-        # (Phase1 + Phase2 combined), matching run_phase25_cliff_box_ground_truth's own
-        # "unrestricted, sees whatever the generation loop found" behavior -- not just
-        # Phase2's mesh. Top-3-per-island candidates (same GT_CANDIDATE_TIEBREAK order),
-        # cliff-boxed +-CLIFF_RADIUS around each.
-        df2 = pd.DataFrame(phase2_rows)
-        df_full = pd.concat([df1, df2], ignore_index=True)
-        df_full = df_full[df_full["trades"] > 0]
-        # dedupe on the real grid coordinate -- the same (tp,sl,hold,w,z,tpct) cell can
-        # legitimately get recomputed in more than one phase (e.g. a Phase1 grid point
-        # that also falls inside Phase2's mesh); real backtest_cache never double-stores
-        # a cell (cache-lookup-before-write), this in-memory concat needs the same guard
-        # or top-N/top-3-per-island ranking will double-count identical cells as if they
-        # were distinct.
-        df_full = df_full.drop_duplicates(
-            subset=["take_profit", "stop_loss", "max_hold_hours", "window",
-                    "z_score_threshold", "trail_sell_pct"])
+      # Phase2.5-CliffBox-GT (in-memory): center detection off the FULL scope
+      # (Phase1 + Phase2 combined), matching run_phase25_cliff_box_ground_truth's own
+      # "unrestricted, sees whatever the generation loop found" behavior -- not just
+      # Phase2's mesh. Top-3-per-island candidates (same GT_CANDIDATE_TIEBREAK order),
+      # cliff-boxed +-CLIFF_RADIUS around each.
+      df2 = pd.DataFrame(phase2_rows)
+      df_full = pd.concat([df1, df2], ignore_index=True)
+      df_full = df_full[df_full["trades"] > 0]
+      # dedupe on the real grid coordinate -- the same (tp,sl,hold,w,z,tpct) cell can
+      # legitimately get recomputed in more than one phase (e.g. a Phase1 grid point
+      # that also falls inside Phase2's mesh); real backtest_cache never double-stores
+      # a cell (cache-lookup-before-write), this in-memory concat needs the same guard
+      # or top-N/top-3-per-island ranking will double-count identical cells as if they
+      # were distinct.
+      df_full = df_full.drop_duplicates(
+          subset=["take_profit", "stop_loss", "max_hold_hours", "window",
+                  "z_score_threshold", "trail_sell_pct"])
 
-        # Dev-iteration checkpoint save (not a production artifact) -- lets the NEXT
-        # run skip straight to Phase2.5 instead of repaying Phase1+Phase2's ~7min.
-        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-        df_full.to_parquet(checkpoint_path)
-        print(f"Checkpoint saved: {checkpoint_path} ({len(df_full):,} rows)")
+      # Dev-iteration checkpoint save (not a production artifact) -- lets the NEXT
+      # run skip straight to Phase2.5 instead of repaying Phase1+Phase2's ~7min.
+      os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+      df_full.to_parquet(checkpoint_path)
+      print(f"Checkpoint saved: {checkpoint_path} ({len(df_full):,} rows)")
 
-      # --- Everything below runs regardless of which branch built df_full ---
+    # --- Everything below runs regardless of which branch built df_full ---
 
-      # Centers/seed cells for WHERE to cliff-box: pre-2.5 data only (Phase1+Phase2),
-      # matching run_phase25_cliff_box_ground_truth's own input at the point it runs
-      # (Phase2.5-CliffBox-GT rows don't exist yet). This part does NOT decide the
-      # final 9 candidates -- see below.
-      centers25 = pick_island_centers(df_full, rank_col="cagr")
-      if len(centers25) < N_ISLANDS:
-          print(f"  WARNING (Phase2.5 seed detection): only found {len(centers25)} island(s) "
-                f"across the full scope, expected {N_ISLANDS} -- check df_full for a real gap.")
-      tb_cols = ["cagr"] + [("trail_sell_pct" if c == "tpct" else c) for c, _ in GT_CANDIDATE_TIEBREAK]
-      tb_asc = [False] + [asc for _, asc in GT_CANDIDATE_TIEBREAK]
+    # Centers/seed cells for WHERE to cliff-box: pre-2.5 data only (Phase1+Phase2),
+    # matching run_phase25_cliff_box_ground_truth's own input at the point it runs
+    # (Phase2.5-CliffBox-GT rows don't exist yet). This part does NOT decide the
+    # final 9 candidates -- see below.
+    centers25 = pick_island_centers(df_full, rank_col="cagr")
+    if len(centers25) < N_ISLANDS:
+        print(f"  WARNING (Phase2.5 seed detection): only found {len(centers25)} island(s) "
+              f"across the full scope, expected {N_ISLANDS} -- check df_full for a real gap.")
+    tb_cols = ["cagr"] + [("trail_sell_pct" if c == "tpct" else c) for c, _ in GT_CANDIDATE_TIEBREAK]
+    tb_asc = [False] + [asc for _, asc in GT_CANDIDATE_TIEBREAK]
 
-      phase25_tasks = set()
-      seed_count = 0
-      for tp_c, sl_c in centers25:
-          region = df_full[(df_full["take_profit"] - tp_c).abs().le(FINE_RADIUS)
-                            & (df_full["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
-          if region.empty:
-              continue
-          region = region.sort_values(tb_cols, ascending=tb_asc)
-          top_cagr = region.iloc[0]["cagr"]
-          if pd.isna(top_cagr) or top_cagr <= PHASE25_ISLAND_CLIFFBOX_CAGR_MIN:
-              print(f"  island(TP={tp_c} SL={sl_c}): top cagr={top_cagr} -- skipped (<= "
-                    f"{PHASE25_ISLAND_CLIFFBOX_CAGR_MIN} or NaN)")
-              continue
-          for _, cand in region.head(3).iterrows():
-              seed_count += 1
-              tp_c2, sl_c2 = int(cand["take_profit"]), int(cand["stop_loss"])
-              hold_c, w_c, z_c = int(cand["max_hold_hours"]), int(cand["window"]), float(cand["z_score_threshold"])
-              tpct_c = float(cand["trail_sell_pct"])
-              if tpct_c in TRAIL_PCTS:
-                  idx = TRAIL_PCTS.index(tpct_c)
-                  tpct_neighbors = TRAIL_PCTS[max(0, idx - 1): idx + 2]
-              else:
-                  tpct_neighbors = [tpct_c]
-              for tp in range(max(1, tp_c2 - CLIFF_RADIUS), min(30, tp_c2 + CLIFF_RADIUS) + 1):
-                  for sl in range(max(1, sl_c2 - CLIFF_RADIUS), min(30, sl_c2 + CLIFF_RADIUS) + 1):
-                      for hold in [h for h in HOLD_TIME_CAPS if abs(h - hold_c) <= 7]:
-                          for tpct in tpct_neighbors:
-                              phase25_tasks.add((tp, sl, hold, w_c, z_c, float(tpct)))
+    phase25_tasks = set()
+    seed_count = 0
+    for tp_c, sl_c in centers25:
+        region = df_full[(df_full["take_profit"] - tp_c).abs().le(FINE_RADIUS)
+                          & (df_full["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
+        if region.empty:
+            continue
+        region = region.sort_values(tb_cols, ascending=tb_asc)
+        top_cagr = region.iloc[0]["cagr"]
+        if pd.isna(top_cagr) or top_cagr <= PHASE25_ISLAND_CLIFFBOX_CAGR_MIN:
+            print(f"  island(TP={tp_c} SL={sl_c}): top cagr={top_cagr} -- skipped (<= "
+                  f"{PHASE25_ISLAND_CLIFFBOX_CAGR_MIN} or NaN)")
+            continue
+        for _, cand in region.head(3).iterrows():
+            seed_count += 1
+            tp_c2, sl_c2 = int(cand["take_profit"]), int(cand["stop_loss"])
+            hold_c, w_c, z_c = int(cand["max_hold_hours"]), int(cand["window"]), float(cand["z_score_threshold"])
+            tpct_c = float(cand["trail_sell_pct"])
+            if tpct_c in TRAIL_PCTS:
+                idx = TRAIL_PCTS.index(tpct_c)
+                tpct_neighbors = TRAIL_PCTS[max(0, idx - 1): idx + 2]
+            else:
+                tpct_neighbors = [tpct_c]
+            for tp in range(max(1, tp_c2 - CLIFF_RADIUS), min(30, tp_c2 + CLIFF_RADIUS) + 1):
+                for sl in range(max(1, sl_c2 - CLIFF_RADIUS), min(30, sl_c2 + CLIFF_RADIUS) + 1):
+                    for hold in [h for h in HOLD_TIME_CAPS if abs(h - hold_c) <= 7]:
+                        for tpct in tpct_neighbors:
+                            phase25_tasks.add((tp, sl, hold, w_c, z_c, float(tpct)))
 
-      print(f"\nPhase2.5-cliffbox (in-memory): {seed_count} seed cells across "
-            f"{len(centers25)} island(s), {len(phase25_tasks):,} cliff-box cells to verify")
+    print(f"\nPhase2.5-cliffbox (in-memory): {seed_count} seed cells across "
+          f"{len(centers25)} island(s), {len(phase25_tasks):,} cliff-box cells to verify")
 
-      # Real overlap check: how many of Phase2.5's cells were ALREADY computed in
-      # Phase1 and/or Phase2? Real production would skip these via cache-lookup;
-      # this in-memory version has no equivalent, so it's pure redundant compute.
-      already_computed = set(
-          (int(r.take_profit), int(r.stop_loss), int(r.max_hold_hours), int(r.window),
-           float(r.z_score_threshold), float(r.trail_sell_pct))
-          for r in df_full[["take_profit", "stop_loss", "max_hold_hours", "window",
-                             "z_score_threshold", "trail_sell_pct"]].itertuples(index=False))
-      overlap = phase25_tasks & already_computed
-      print(f"Phase2.5-cliffbox overlap check: {len(overlap):,} of {len(phase25_tasks):,} "
-            f"cliff-box cells ({100 * len(overlap) / max(len(phase25_tasks), 1):.1f}%) "
-            f"were already computed in Phase1/Phase2 -- redundant recompute.")
+    # Real overlap check: how many of Phase2.5's cells were ALREADY computed in
+    # Phase1 and/or Phase2? Real production would skip these via cache-lookup;
+    # this in-memory version has no equivalent, so it's pure redundant compute.
+    already_computed = set(
+        (int(r.take_profit), int(r.stop_loss), int(r.max_hold_hours), int(r.window),
+         float(r.z_score_threshold), float(r.trail_sell_pct))
+        for r in df_full[["take_profit", "stop_loss", "max_hold_hours", "window",
+                           "z_score_threshold", "trail_sell_pct"]].itertuples(index=False))
+    overlap = phase25_tasks & already_computed
+    print(f"Phase2.5-cliffbox overlap check: {len(overlap):,} of {len(phase25_tasks):,} "
+          f"cliff-box cells ({100 * len(overlap) / max(len(phase25_tasks), 1):.1f}%) "
+          f"were already computed in Phase1/Phase2 -- redundant recompute.")
 
-      t4 = time.time()
-      phase25_rows = _dispatch(pool, phase25_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
-                                desc="Phase2.5-cliffbox (in-memory)")
-      t5 = time.time()
-      print(f"Phase2.5-cliffbox (in-memory) done: {len(phase25_rows):,} rows in {t5 - t4:.1f}s "
-            f"({len(phase25_rows) / max(t5 - t4, 0.001):.0f} nodes/sec)")
+    t4 = time.time()
+    phase25_rows = _dispatch(pool, phase25_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
+                              desc="Phase2.5-cliffbox (in-memory)")
+    t5 = time.time()
+    print(f"Phase2.5-cliffbox (in-memory) done: {len(phase25_rows):,} rows in {t5 - t4:.1f}s "
+          f"({len(phase25_rows) / max(t5 - t4, 0.001):.0f} nodes/sec)")
 
     print(f"\nTotal: Phase1={t1 - t0:.1f}s + Phase2={t3 - t2:.1f}s + Phase2.5={t5 - t4:.1f}s "
           f"= {t5 - t0:.1f}s wall-clock, zero DB writes "
