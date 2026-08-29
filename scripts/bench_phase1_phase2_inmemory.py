@@ -454,8 +454,12 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # itself is explicitly documented as a "dev-iteration" convenience, not a production
     # artifact -- this key just makes that convenience safe to use across different grids.
     _windows_key = "-".join(str(w) for w in WINDOWS)
+    # Also keyed on the date range (not just WINDOWS) -- same bug class as the WINDOWS key
+    # above: a full-range run's checkpoint must not get silently loaded by a later
+    # short-range --start-date/--end-date smoke-test run (or vice versa).
+    _range_key = window_version_suffix(START, END)
     checkpoint_path = args.checkpoint_file or os.path.join(
-        _job_tmp, f"bench_phase12_checkpoint_{strategy_name}_{fixed_sl}_w{_windows_key}.parquet")
+        _job_tmp, f"bench_phase12_checkpoint_{strategy_name}_{fixed_sl}_w{_windows_key}{_range_key}.parquet")
 
     asset_bh, spy_bh = compute_bh_returns(TICKER, start_date=START, end_date=END, data_source=DATA_SOURCE)
     if spy_bh is None:
