@@ -106,16 +106,45 @@ def run_point(anchor, axis, value, spy_bh):
     return cagr, status
 
 
-def sweep_axis(anchor, axis, values, spy_bh):
+def sweep_axis(anchor, axis, values, spy_bh, label=None):
+    """`label` (default: `axis`) is what gets written to the output rows' 'axis' column --
+    lets a caller run a real point using `axis`'s own run_point() override logic (e.g.
+    'fixed_sl') while reporting it under a different name (e.g. 'fixed_sl_fine', the
+    anchor-relative sub-integer pass -- see FIXED_SL_FINE_STEP/FIXED_SL_FINE_RADIUS'
+    own docstring) so the two passes' stats never get merged."""
+    label = label or axis
     rows = []
     for v in values:
         cagr, status = run_point(anchor, axis, v, spy_bh)
         rows.append({
             "candidate_id": anchor["candidate_id"], "ticker": anchor["ticker"],
-            "strategy": anchor["strategy"], "version": anchor["version"], "axis": axis,
+            "strategy": anchor["strategy"], "version": anchor["version"], "axis": label,
             "anchor_value": anchor[axis], "swept_value": v, "cagr_pct": cagr, "status": status,
         })
     return rows
+
+
+# fixed_sl fine-resolution pass (2026-08-29 correction, planner dispatch): fixed_sl is
+# stored as a real float (campaign_config.patch_config does float(fixed_sl)) -- the
+# CLI's integer-only default sweep has the same coarse-grid blind spot Phase1's own
+# TP/SL coarse grid has, and unlike TP/SL there's no existing fine-mesh convention to
+# fall back on for fixed_sl. Sweeps a narrow band AROUND THE ANCHOR'S OWN fixed_sl value
+# only (not the whole 1-8 range at fine resolution -- that's expensive for no benefit;
+# the question is only whether a cliff exists right next to where a real candidate
+# actually sits), reported as its own separate 'fixed_sl_fine' axis/stat, never merged
+# with the coarse integer pass's own adjacent-delta (they answer different-resolution
+# questions). take_profit/stop_loss/window/z/tpct do NOT get this treatment -- TP/SL
+# already has the real FINE_RADIUS/CLIFF_RADIUS convention establishing whole-integer-
+# percent as fine enough, and window/z/tpct are inherently discrete real-world settings
+# (a window of 12.5 bars isn't a real config anyone would set).
+FIXED_SL_FINE_STEP = 0.25
+FIXED_SL_FINE_RADIUS = 1.5
+
+
+def _fixed_sl_fine_values(anchor_fixed_sl):
+    n_steps = int(round(FIXED_SL_FINE_RADIUS / FIXED_SL_FINE_STEP))
+    return [round(anchor_fixed_sl + FIXED_SL_FINE_STEP * i, 2) for i in range(-n_steps, n_steps + 1)
+            if anchor_fixed_sl + FIXED_SL_FINE_STEP * i > 0]
 
 
 def summarize_axis(rows):
@@ -152,6 +181,19 @@ def run_anchor(anchor, axes_to_run, axis_values_override, spy_bh):
         max_adj_str = "N/A" if max_adj is None else f"{max_adj:.2f}pp"
         print(f"  {axis}: {len(values)} points in {elapsed:.1f}s -- spread={spread_str} "
               f"max_adjacent_delta={max_adj_str}")
+
+        if axis == "fixed_sl":
+            fine_values = _fixed_sl_fine_values(anchor["fixed_sl"])
+            t0 = time.monotonic()
+            fine_rows = sweep_axis(anchor, "fixed_sl", fine_values, spy_bh, label="fixed_sl_fine")
+            all_rows.extend(fine_rows)
+            fine_spread, fine_max_adj = summarize_axis(fine_rows)
+            elapsed = time.monotonic() - t0
+            fine_spread_str = "N/A" if fine_spread is None else f"{fine_spread:.2f}pp"
+            fine_max_adj_str = "N/A" if fine_max_adj is None else f"{fine_max_adj:.2f}pp"
+            print(f"  fixed_sl_fine: {len(fine_values)} points (anchor {anchor['fixed_sl']} "
+                  f"+/-{FIXED_SL_FINE_RADIUS} step {FIXED_SL_FINE_STEP}) in {elapsed:.1f}s -- "
+                  f"spread={fine_spread_str} max_adjacent_delta={fine_max_adj_str}")
     return all_rows
 
 
@@ -221,7 +263,8 @@ def main():
 
     if len(anchors) > 1:
         print(f"\n=== Aggregate summary across {len(anchors)} anchors ===")
-        for axis in args.axes:
+        agg_axes = list(args.axes) + (["fixed_sl_fine"] if "fixed_sl" in args.axes else [])
+        for axis in agg_axes:
             axis_df = df_out[df_out["axis"] == axis]
             if axis_df.empty:
                 continue
