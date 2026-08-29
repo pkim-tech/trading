@@ -60,6 +60,18 @@ here.
    steps and anything it spawns, in one line, rather than relying on the
    longer explanation below to be re-derived correctly each time.
 
+   **Recurred 2026-08-28, third recurrence, new failure shape**: the full checklist
+   (including this instruction) was correctly included in an item's FIRST dispatch
+   message, but then dropped from a short follow-up/redirect message minutes later
+   (re-routing the same task to a different/same peer after a delivery issue) —
+   the shorter message felt like "just a routing note," not a fresh dispatch, so the
+   habit of attaching the full checklist didn't fire. A follow-up that assigns real
+   work (even just "queue this behind your other task") is still a dispatch — restate
+   the background-execution instruction (and re-verify via `ListAgents` afterward)
+   every time a message hands off or re-routes work, not only on an item's first
+   appearance. When in doubt, treat "does this message cause the peer to do
+   something" as the trigger, not "is this the first time I'm mentioning this task."
+
    **Recurred 2026-08-25**: stating this once in the initial dispatch prompt
    is not sufficient — `ListAgents` showed the dispatched peer sitting `busy`
    (foreground-blocking) on its own build/test steps minutes into the same
