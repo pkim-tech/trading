@@ -100,8 +100,16 @@ GT_COLUMN_DEFS = {
     "candidate_rank": "1-based position in derive_phase25_candidates_ground_truth's own returned candidate list "
                        "for this scope (up to 9 -- top-3-per-island across up to 3 islands).",
     "is_winner": "True for the single candidate build_candidate_report_ground_truth picked as the scope's overall "
-                 "winner (highest cagr_pct among the shortlisted candidates -- 2026-08-23, "
-                 "ground_truth_kernel_rebuild.md Step 4, CAGR replaced alpha as the GT selection metric).",
+                 "winner -- ranked by cagr_pct (2026-08-23, ground_truth_kernel_rebuild.md Step 4, CAGR is the "
+                 "GT selection metric) EXCEPT for a candidate_source='candidate_nodes' scope, where cagr_pct is "
+                 "never available and the winner is ranked by robust_alpha_pct instead -- see winner_metric.",
+    "winner_metric": "Which column actually decided is_winner for this scope: 'cagr' (normal path) or "
+                      "'robust_alpha' (candidate_source='candidate_nodes' scope, no real cagr available).",
+    "candidate_source": "'backtest_cache' (normal GT path, derive_phase25_candidates_ground_truth) or "
+                         "'candidate_nodes' (fallback for a campaign the in-memory sweep pipeline ran, which "
+                         "writes zero backtest_cache rows -- scripts/phase4_candidate_nodes_resolver.py). A "
+                         "candidate_nodes-sourced row always has cagr_pct=None and phase4_eligible=True "
+                         "(no CAGR-based gate exists without a real cagr -- see phase4_eligible's own note).",
     "take_profit": "Candidate's take_profit/arm_sell_pct cell value (see run_optimization_sweep.py's take_profit "
                     "column meaning per strategy).",
     "stop_loss": "Candidate's stop_loss/trail_buy_pct cell value.",
@@ -133,7 +141,11 @@ GT_COLUMN_DEFS = {
     "phase4_eligible": "Whether this candidate's own coarse island cell cleared PHASE25_ISLAND_CAGR_MIN -- "
                         "False means core_safe/addon_safe/addon_cagr_pct were deliberately never computed "
                         "(skipped, not worth the overlay compute), not a failure. Every candidate still appears "
-                        "in this report and still has real robust_alpha_pct/cagr_pct/n_trades regardless.",
+                        "in this report and still has real robust_alpha_pct/cagr_pct/n_trades regardless. "
+                        "ALWAYS True for a candidate_source='candidate_nodes' row -- that gate is cagr-based and "
+                        "no real cagr exists there, so this column means 'gate not applicable' for those rows, "
+                        "not 'gate applied and passed' -- check candidate_source before reading this as a real "
+                        "CAGR-floor verdict.",
     "error": "Set instead of the above when this scope/candidate couldn't be evaluated (e.g. Phase1/2-GT campaign "
              "not complete yet, or a build_candidate_report_ground_truth failure) -- see the message for why.",
     "check4_early_wr_pct": "Check 4 (70/30 win-rate stability): win rate over the earlier 70% of this candidate's "
@@ -767,7 +779,7 @@ def gt_current_best_node(conn, ticker, strategy, version, entry_timing, fixed_sl
     return best_safe_node(df, min_alpha=min_alpha, metric=metric)
 
 
-def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
+def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_window=None):
     """Real per-candidate GT rows for one scope, matching GT_COLUMN_DEFS. A
     scope whose Phase1/2-GT campaign isn't complete yet, or whose
     build_candidate_report_ground_truth call fails (e.g. the in-progress
@@ -775,6 +787,21 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
     with only 'error' populated (plus raw candidate cells when derive_phase25_
     candidates_ground_truth itself succeeded) rather than raising -- callers
     loop over many scopes and must not have one bad scope kill the batch.
+
+    `grid_window` (2026-08-29, Task #3, additive -- named to avoid colliding with this
+    file's own unrelated "window" concept, the date-range pair `_window_dates_from_
+    version` resolves into `win_start`/`win_end` below): when set, skips the backtest_
+    cache-based derive_phase25_candidates_ground_truth path entirely and uses scripts/
+    phase4_candidate_nodes_resolver.derive_phase25_candidates_from_candidate_nodes
+    instead (its own `window` param is the sweep-grid window count, e.g. 10/15/20 --
+    matches candidate_nodes.window/every candidate dict's own 'window' key), via
+    build_candidate_report_ground_truth's candidates_override param -- for a campaign
+    the in-memory sweep pipeline ran (zero backtest_cache rows, invisible to the default
+    path). `grid_window=None` (default) is byte-identical to this function's behavior
+    before this param existed -- no existing caller is affected. Required (not optional)
+    whenever the caller already knows `version` aliases multiple unrelated batches (see
+    that resolver's own `window` param docstring) -- this function does not try to
+    detect that on its own.
 
     DB_PATH sync (paired-review finding, 2026-08-23): derive_phase25_candidates_
     ground_truth/build_candidate_report_ground_truth connect via run_optimization_
@@ -790,6 +817,7 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
         print_candidate_report_ground_truth,
     )
     from prune_backtest_cache_ground_truth import _hp_for_strategy
+    from phase4_candidate_nodes_resolver import derive_phase25_candidates_from_candidate_nodes
 
     base = {"ticker": ticker, "strategy": strategy, "config_version": version,
             "entry_timing": entry_timing, "fixed_sl": fixed_sl}
@@ -816,20 +844,34 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
     _orig_db_path = ros.DB_PATH
     try:
         ros.DB_PATH = DB_PATH
-        try:
-            candidates = derive_phase25_candidates_ground_truth(
-                ticker, strategy, version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
-        except RuntimeError as e:
-            print(f"  [GT candidate report] SKIPPED -- derive_phase25_candidates_ground_truth raised: {e}")
-            return [{**base, "error": f"derive_phase25_candidates_ground_truth: {e}"}]
-        if not candidates:
-            print("  [GT candidate report] SKIPPED -- no Phase2.5-GT candidates for this scope.")
-            return [{**base, "error": "no Phase2.5-GT candidates for this scope"}]
+        if grid_window is not None:
+            # candidate_nodes fallback (Task #3, 2026-08-29) -- see this function's own
+            # grid_window docstring. Bypasses derive_phase25_candidates_ground_truth
+            # entirely (it would just raise/return [] for an in-memory-only campaign).
+            print(f"  [GT candidate report] using candidate_nodes fallback "
+                  f"(grid_window={grid_window}) -- no backtest_cache rows expected for this scope.")
+            candidates = derive_phase25_candidates_from_candidate_nodes(
+                ticker, strategy, version, fixed_sl=fixed_sl, entry_timing=entry_timing,
+                window=grid_window)
+            if not candidates:
+                print("  [GT candidate report] SKIPPED -- no candidate_nodes candidates for this scope.")
+                return [{**base, "error": "no candidate_nodes candidates for this scope"}]
+        else:
+            try:
+                candidates = derive_phase25_candidates_ground_truth(
+                    ticker, strategy, version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
+            except RuntimeError as e:
+                print(f"  [GT candidate report] SKIPPED -- derive_phase25_candidates_ground_truth raised: {e}")
+                return [{**base, "error": f"derive_phase25_candidates_ground_truth: {e}"}]
+            if not candidates:
+                print("  [GT candidate report] SKIPPED -- no Phase2.5-GT candidates for this scope.")
+                return [{**base, "error": "no Phase2.5-GT candidates for this scope"}]
 
         try:
             report = build_candidate_report_ground_truth(
                 ticker, strategy, version, hp, start_date=win_start, end_date=win_end,
-                fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source)
+                fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source,
+                candidates_override=candidates if grid_window is not None else None)
         except Exception as e:
             # Broad on purpose -- the in-progress backtester.py drought-overlay fix could
             # legitimately fail with any exception shape while it's mid-fix, not just
@@ -866,6 +908,8 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
         d = row.get("drought")
         out = {
             **base, "candidate_rank": i + 1, "is_winner": (i == report["winner_index"]),
+            "winner_metric": report.get("winner_metric"),
+            "candidate_source": "candidate_nodes" if grid_window is not None else "backtest_cache",
             "take_profit": c["take_profit"], "stop_loss": c["stop_loss"],
             "max_hold_hours": c["max_hold_hours"], "window": c["window"],
             "z_score_threshold": c["z_score_threshold"], "tpct": c["tpct"],
@@ -906,7 +950,7 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl):
     return rows
 
 
-def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name):
+def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_window_filter=None):
     """--kernel gt entry point: loops every real GT scope for `tickers`, printing
     each scope's full candidate report (print_candidate_report_ground_truth) plus
     a top_safe_nodes cross-check to the terminal, and returns the flat GT_COLUMN_
@@ -915,28 +959,62 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name):
     but this loop's own per-scope work (the cross-check call, row accumulation) is
     ALSO wrapped per-scope -- a scope-level exception here logs and continues rather
     than losing every already-accumulated row before a --csv/--xlsx write (paired-
-    review finding, 2026-08-23, against an earlier version with no such guard)."""
-    scopes = gt_scopes_for_tickers(conn, tickers)
+    review finding, 2026-08-23, against an earlier version with no such guard).
+
+    candidate_nodes fallback (2026-08-29, Task #3, additive): gt_scopes_for_tickers
+    only reads backtest_cache, so a campaign the in-memory sweep pipeline ran (zero
+    backtest_cache rows) is otherwise invisible here -- without this, gt_rows_for_
+    scope's own grid_window param has no reachable caller (paired-review HIGH finding,
+    confirmed on rebuttal: 2026-08-29). Adds every real candidate_nodes scope for
+    `tickers` not already covered by a backtest_cache scope (same (strategy,
+    entry_timing, fixed_sl) match convention scripts/phase5_second_level_overlay_
+    check.py's own main() already uses), each carrying its own real window value.
+    `grid_window_filter`, when set, additionally restricts the candidate_nodes
+    fallback to that one window -- use it whenever a version is known to alias
+    multiple unrelated batches (see phase4_candidate_nodes_resolver.py's own
+    `window` param docstring); has no effect on backtest_cache-sourced scopes,
+    which don't carry this ambiguity."""
+    from phase4_candidate_nodes_resolver import discover_all_candidate_nodes_scopes
+
+    scopes = [(s[0], s[1], s[2], s[3], s[4], None) for s in gt_scopes_for_tickers(conn, tickers)]
+    covered = {(s[0], s[1], s[3], s[4]) for s in scopes}  # (ticker, strategy, entry_timing, fixed_sl)
+    for ticker in tickers:
+        for strategy, version, entry_timing, fixed_sl, window in discover_all_candidate_nodes_scopes(ticker):
+            if (ticker, strategy, entry_timing, fixed_sl) in covered:
+                continue
+            if grid_window_filter is not None and window != grid_window_filter:
+                continue
+            scopes.append((ticker, strategy, version, entry_timing, fixed_sl, window))
+
     found = {s[0] for s in scopes}
     for ticker in tickers:
         if ticker not in found:
-            print(f"\n{ticker}: no GT (kernel_version='ground_truth_v6') scope with a known "
-                  f"campaign_config.STRATEGIES hp grid found in backtest_cache -- skipping.")
+            print(f"\n{ticker}: no GT (kernel_version='ground_truth_v6') scope found in backtest_cache "
+                  f"or candidate_nodes -- skipping.")
 
     all_rows = []
-    for ticker, strategy, version, entry_timing, fixed_sl in scopes:
+    for ticker, strategy, version, entry_timing, fixed_sl, grid_window in scopes:
         print(f"\n{'#'*100}\n{ticker} / {strategy} / {version} / entry_timing={entry_timing} "
-              f"/ fixed_sl={fixed_sl}\n{'#'*100}")
+              f"/ fixed_sl={fixed_sl}"
+              f"{f' / grid_window={grid_window}' if grid_window is not None else ''}\n{'#'*100}")
         try:
-            node = gt_current_best_node(conn, ticker, strategy, version, entry_timing, fixed_sl,
-                                         metric, min_alpha_arg)
-            if node is None:
-                print(f"  [top_safe_nodes cross-check] no cliff-safe node found for {metric} floor")
+            if grid_window is None:
+                node = gt_current_best_node(conn, ticker, strategy, version, entry_timing, fixed_sl,
+                                             metric, min_alpha_arg)
+                if node is None:
+                    print(f"  [top_safe_nodes cross-check] no cliff-safe node found for {metric} floor")
+                else:
+                    print(f"  [top_safe_nodes cross-check] best {metric}: arm/tp={node['arm_pct']} sl={node['sl']} "
+                          f"hold={node['hold']}h window={node['window']} z={node['z']} "
+                          f"robust_alpha={node['alpha']:+.1f}% cagr={node['cagr']}")
             else:
-                print(f"  [top_safe_nodes cross-check] best {metric}: arm/tp={node['arm_pct']} sl={node['sl']} "
-                      f"hold={node['hold']}h window={node['window']} z={node['z']} "
-                      f"robust_alpha={node['alpha']:+.1f}% cagr={node['cagr']}")
-            all_rows.extend(gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl))
+                # top_safe_nodes cross-check is backtest_cache-only (best_row/gt_current_
+                # best_node) -- no equivalent exists for a candidate_nodes-sourced scope,
+                # skip rather than print a misleading "no cliff-safe node found".
+                print("  [top_safe_nodes cross-check] skipped -- candidate_nodes-sourced scope, "
+                      "no backtest_cache equivalent.")
+            all_rows.extend(gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl,
+                                               grid_window=grid_window))
         except Exception as e:
             print(f"  UNEXPECTED error on this scope, skipping: {e}")
 
@@ -957,6 +1035,13 @@ def main():
     ap.add_argument("--tranche", type=int, default=None,
                      help="--kernel gt only: source tickers from scripts/gt_tranches.txt's tranche N "
                           "instead of positional args.")
+    ap.add_argument("--grid-window", type=int, default=None,
+                     help="--kernel gt only: restrict the candidate_nodes fallback (a campaign the "
+                          "in-memory sweep pipeline ran, invisible to the normal backtest_cache path) "
+                          "to one real sweep-grid window value -- REQUIRED whenever a version string "
+                          "aliases multiple unrelated in-memory batches (see phase4_candidate_nodes_"
+                          "resolver.py's own `window` param docstring). Has no effect on backtest_cache-"
+                          "sourced scopes. Omit to include every candidate_nodes window found.")
     ap.add_argument("--metric", choices=["robust_alpha", "cagr"], default=None,
                      help="--kernel gt only: metric for the top_safe_nodes cross-check (see that script's "
                           "own --metric help). Default: cagr under --kernel gt (2026-08-23, "
@@ -997,7 +1082,8 @@ def main():
         print(f"Tickers: {' '.join(tickers)}")
         conn = sqlite3.connect(args.db)
         try:
-            run_gt_mode(conn, tickers, args.metric, args.min_alpha, args.csv, args.xlsx)
+            run_gt_mode(conn, tickers, args.metric, args.min_alpha, args.csv, args.xlsx,
+                        grid_window_filter=args.grid_window)
         finally:
             conn.close()
         return

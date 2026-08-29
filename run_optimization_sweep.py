@@ -3493,8 +3493,22 @@ def _check13_walk_forward_gt(trades, robustness_cagr_min=GT_ROBUSTNESS_CAGR_MIN)
 def build_candidate_report_ground_truth(ticker, strategy_name, config_version, hp,
                                          start_date, end_date, fixed_sl=0,
                                          entry_timing='open_check', data_source="yahoo",
-                                         cliff_radius=None):
-    """Full enriched candidate report for a completed GT campaign's up-to-9 Phase2.5-GT
+                                         cliff_radius=None, candidates_override=None):
+    """candidates_override (2026-08-29, Task #3, additive -- see Review-Gate Persistence
+    Rule outcome recorded in this commit's message): when provided, use this candidate
+    list directly instead of calling derive_phase25_candidates_ground_truth -- lets a
+    caller feed a candidate_nodes-sourced list (scripts/phase4_candidate_nodes_resolver.py)
+    for a campaign the in-memory sweep pipeline ran, which writes zero backtest_cache
+    rows and so derive_phase25_candidates_ground_truth can never see. Every existing
+    caller passes nothing (default None) and gets byte-identical behavior to before this
+    param existed -- pure additive override, no existing call site changes. A candidate_
+    nodes-sourced list has real robust_alpha but cagr=None for every candidate (that
+    table doesn't persist a cagr column) -- winner_index selection below falls back to
+    ranking by robust_alpha ONLY when every candidate's cagr is None (a real backtest_
+    cache-sourced list always has real cagr on every candidate, so the default path's
+    ranking is unaffected); a report can never mix the two sources within one call.
+
+    Full enriched candidate report for a completed GT campaign's up-to-9 Phase2.5-GT
     candidates (2026-08-22 candidate-report build-out). Reuses derive_phase25_candidates_
     ground_truth (candidate derivation -- NOT re-derived here) and run_addon_cliff_safety_
     ground_truth (core_cliff/addon_cliff verdicts -- NOT re-derived here) rather than
@@ -3539,8 +3553,11 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     computed ONCE for the whole campaign purely to ANNOTATE the number with its current
     real-world deployability ('addon_eligible'/'addon_eligibility_reason' at the report
     level) -- it never gates or blanks the computation itself."""
-    candidates = derive_phase25_candidates_ground_truth(
-        ticker, strategy_name, config_version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
+    if candidates_override is not None:
+        candidates = candidates_override
+    else:
+        candidates = derive_phase25_candidates_ground_truth(
+            ticker, strategy_name, config_version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
     if not candidates:
         return {'ticker': ticker, 'strategy_name': strategy_name, 'config_version': config_version,
                 'candidates': [], 'error': 'No Phase2.5-GT candidates found for this campaign scope.'}
@@ -3661,7 +3678,16 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     # cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md Step 4): CAGR is
     # the sole GT selection metric now -- this is the single most consequential ranking
     # line in the pipeline (decides which candidate gets labeled the overall winner).
-    winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['cagr'])
+    # Falls back to robust_alpha ONLY for a candidates_override list whose cagr is
+    # entirely None (candidate_nodes doesn't persist cagr, see this function's own
+    # docstring) -- never triggers for the default backtest_cache-sourced path, which
+    # always has real cagr on every candidate.
+    if all(c['cagr'] is None for c in candidates):
+        winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['robust_alpha'])
+        winner_metric = 'robust_alpha'
+    else:
+        winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['cagr'])
+        winner_metric = 'cagr'
 
     return {
         'ticker': ticker, 'strategy_name': strategy_name, 'config_version': config_version,
@@ -3671,6 +3697,7 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
         'addon_eligibility_reason': addon_eligibility_reason,
         'candidates': rows,
         'winner_index': winner_index,
+        'winner_metric': winner_metric,
         'drought_skip_reason': drought_skip_reason,
     }
 
@@ -3692,11 +3719,15 @@ def print_candidate_report_ground_truth(report):
 
     for i, row in enumerate(report['candidates']):
         c = row['candidate']
-        marker = " <-- OVERALL WINNER" if i == report['winner_index'] else ""
+        marker = f" <-- OVERALL WINNER (by {report['winner_metric']})" if i == report['winner_index'] else ""
         print(f"--- Candidate {i+1}{marker} ---")
+        # cagr can be None for a candidates_override list (candidate_nodes doesn't
+        # persist cagr, see this function's own docstring) -- never None for the
+        # default backtest_cache-sourced path.
+        cagr_str = f"{c['cagr']:.1f}%" if c['cagr'] is not None else "N/A (candidate_nodes-sourced)"
         print(f"  island(TP={c['island_tp']} SL={c['island_sl']})  cell TP={c['take_profit']} "
               f"SL={c['stop_loss']} hold={c['max_hold_hours']}h w={c['window']} z={c['z_score_threshold']} "
-              f"tpct={c['tpct']}  robust_alpha={c['robust_alpha']:.2f}  cagr={c['cagr']:.1f}%  n_trades={row['n_trades']}")
+              f"tpct={c['tpct']}  robust_alpha={c['robust_alpha']:.2f}  cagr={cagr_str}  n_trades={row['n_trades']}")
 
         phase4_eligible = row.get('phase4_eligible', True)
         skip_note = " (skipped -- below PHASE25_ISLAND_CAGR_MIN)" if not phase4_eligible else ""

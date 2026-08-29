@@ -114,6 +114,20 @@ def _stop_loss_and_tpct_from_row(sl_axis_col, fourth_axis_col, trail_buy_pct, tr
     return stop_loss, tpct
 
 
+def discover_all_candidate_nodes_scopes(ticker):
+    """Same as discover_candidate_nodes_scopes but across EVERY version for `ticker`,
+    not just one known version -- mirrors prune_backtest_cache_ground_truth.
+    discover_all_gt_scopes(conn)'s own ticker-agnostic-of-version discovery pattern,
+    for a caller (e.g. scripts/candidate_summary_report.py's --kernel gt ticker-driven
+    flow) that doesn't already know which version(s) a candidate_nodes-only campaign
+    used. Returns (strategy, version, entry_timing, fixed_sl, window) 5-tuples."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT strategy, version, entry_timing, fixed_sl, window "
+            "FROM candidate_nodes WHERE ticker=?", (ticker,)).fetchall()
+    return sorted(rows)
+
+
 def discover_candidate_nodes_scopes(ticker, config_version):
     """Real (strategy, entry_timing, fixed_sl, window) tuples present in candidate_nodes
     for (ticker, config_version) -- new, 2026-08-29 (Task #3, planner dispatch). Parallel
