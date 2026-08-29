@@ -1,6 +1,16 @@
 # Backlog
 
-## ✅ [live-trading][testing] Built 2026-08-28 (dispatched, coder4) — evening_status.py's PHANTOM/signal-mismatch cross-check generalized into a known-non-issue pattern library (Task #8)
+## ✅ [backtest][live-trading] Built 2026-08-28 (dispatched, coder4) — `scripts/corp_action_canary.py`: daily SPY yahoo-vs-massive dividend-timing observation logger (Task #10)
+
+Closes 2 real open unknowns from `docs/design.md`'s 2026-08-28 (late) "corporate-action detection..." entry: whether Massive's `/stocks/v1/dividends` endpoint reflects a dividend promptly AFTER the real ex-date (only confirmed it doesn't show one in advance), and neither Massive's nor Yahoo's split/dividend rebase timing has ever been empirically observed by this project for either source. Real test case: SPY's next real ex-div date is 2026-09-18.
+
+Pure observation/logging, read-only against external APIs, no live-trading impact, no signal-computation coupling. Each run: (1) fetches a fresh 30d window of SPY daily closes from Yahoo and diffs against yesterday's logged closes for already-elapsed dates (direct proof of a retroactive rebase, design.md's part-1 self-consistency detector used here purely as an observation); (2) fetches a small 5d window of SPY raw minute data from Massive (`scripts.fetch_massive_minute_data.fetch_ticker`, reused as-is, never promoted/staged) and records the raw Close of the first bar on/after the ex-div date once available; (3) calls `scripts.build_massive_hourly_derived.fetch_dividends('SPY')` (existing cached endpoint call, reused, not reimplemented) and records whether the 2026-09-18 entry has appeared yet.
+
+Logs one JSON line/day to `docs/corp_action_canary_log.jsonl` (committed, chosen over `docs/research_log.md`'s free-form prose since this needs ~3-4 weeks of daily, machine-diffable structured entries). Idempotent — a same-day rerun replaces, not duplicates, that day's line; verified directly (ran 3x same day, always 1 line). Verified the retroactive-change detector actually fires by injecting a synthetic altered prior-day entry (real value $763.47, faked to $758.47 for 08-24) and confirming it printed the exact diff — not just tested for silence on the happy path.
+
+First real observation (2026-08-28, 21 days out): Yahoo shows no retroactive changes yet (expected, nothing to rebase pre-ex-date); Massive's dividends endpoint does NOT yet show the 2026-09-18 entry (78 other historical dividend rows present, confirming the endpoint itself works); Massive raw minute has no ex-div-date bar yet (21 days out).
+
+Not `signals_*.py`/`schwab_*.py`/a backtest-kernel module — no paired-review gate required. **Explicit non-goals, not built here**: no alerting, no crontab wiring (planner handles that with the user directly), not extended past SPY.
 
 User's idea, tonight: instead of manually re-deriving the same explained root causes every time a real PHANTOM/signal-mismatch flag surfaces, generalize `scripts/evening_status.py`'s existing single-pattern check (`_cheap_signal_cross_check`, built 2026-08-27, the stale-kernel-data check) into an ordered library of known-explained patterns, checked automatically before anything prints as "genuinely unexplained."
 
