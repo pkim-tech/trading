@@ -323,6 +323,15 @@ def main():
                           "grid by design (a pre-filtered top-100 subset can miss a real "
                           "island entirely) -- this compares against the full-grid run's "
                           "own 9 final candidates to see how much it actually diverges.")
+    ap.add_argument("--start-date", type=str, default=None,
+                     help="override module-level START (format YYYY-MM-DD, matching "
+                          "START/END module default '2021-08-23'/'2026-08-21') -- use a "
+                          "short range for a fast full-pipeline smoke test. Optional; "
+                          "default None leaves START at its module default unchanged.")
+    ap.add_argument("--end-date", type=str, default=None,
+                     help="override module-level END (format YYYY-MM-DD) -- paired with "
+                          "--start-date for a short-range smoke test. Optional; default "
+                          "None leaves END at its module default unchanged.")
     ap.add_argument("--checkpoint-file", default=None,
                      help="local dev-iteration checkpoint (parquet, NOT a production "
                           "artifact) for Phase1+Phase2's combined df_full. If it exists, "
@@ -343,6 +352,15 @@ def main():
         WINDOWS = [args.window]
         print(f"Window override: running window={args.window} in ISOLATION "
               f"(replaces standard grid {[10, 20]})")
+
+    if args.start_date is not None:
+        global START
+        START = args.start_date
+        print(f"Start-date override: START={START} (module default '2021-08-23')")
+    if args.end_date is not None:
+        global END
+        END = args.end_date
+        print(f"End-date override: END={END} (module default '2026-08-21')")
 
     if args.strategy is not None:
         strategy_name = args.strategy
@@ -436,8 +454,12 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # itself is explicitly documented as a "dev-iteration" convenience, not a production
     # artifact -- this key just makes that convenience safe to use across different grids.
     _windows_key = "-".join(str(w) for w in WINDOWS)
+    # Also keyed on the date range (not just WINDOWS) -- same bug class as the WINDOWS key
+    # above: a full-range run's checkpoint must not get silently loaded by a later
+    # short-range --start-date/--end-date smoke-test run (or vice versa).
+    _range_key = window_version_suffix(START, END)
     checkpoint_path = args.checkpoint_file or os.path.join(
-        _job_tmp, f"bench_phase12_checkpoint_{strategy_name}_{fixed_sl}_w{_windows_key}.parquet")
+        _job_tmp, f"bench_phase12_checkpoint_{strategy_name}_{fixed_sl}_w{_windows_key}{_range_key}.parquet")
 
     asset_bh, spy_bh = compute_bh_returns(TICKER, start_date=START, end_date=END, data_source=DATA_SOURCE)
     if spy_bh is None:
