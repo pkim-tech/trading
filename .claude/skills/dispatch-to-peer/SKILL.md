@@ -141,6 +141,21 @@ here.
    process to maintain — agents do exactly what they're dispatched to do,
    so the actual fix is upstream, at dispatch time.
 
+9. **Interim progress checkpoints for open-ended/exploratory dispatches.**
+   Found 2026-08-29: asked for an ETA on a multi-step, genuinely exploratory
+   task (find an undocumented entry point, possibly rebuild a stale table,
+   build brand-new code, run it) and had nothing to answer with beyond
+   `ListAgents` showing `busy` — no real signal of which step the peer was
+   actually on. Same "progress/ETA for long jobs" standard this project
+   already requires of its own scripts (`feedback_progress_eta_for_long_jobs`
+   memory) applies to a peer dispatch too. For any task with more than ~2
+   real steps or an unknown/exploratory first step, say explicitly in the
+   dispatch prompt: post a one-line SendMessage status update after each
+   major step completes (not a full report — just "step 2 of 5 done, moving
+   to step 3"), rather than going silent until the final report. Doesn't
+   replace the final report — just fills the gap for how long a step is
+   plausibly going to take when it can't be estimated in advance.
+
 ## Clearing a peer session
 
 Two safe-to-clear states — don't conflate them:
