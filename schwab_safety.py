@@ -497,6 +497,72 @@ def resume_node_automation(node_id):
     NODE_AUTOMATION_PATH.write_text(json.dumps(state))
 
 
+NODE_BUY_PAUSE_PATH = _STATE_DIR / "schwab_node_buy_pause.json"
+
+
+def node_buy_paused(node_id) -> bool:
+    """BUY-only sibling of node_automation_enabled -- additive, separate state
+    file (not a second key namespace in NODE_AUTOMATION_PATH, to keep the two
+    mechanisms' read/write paths fully independent and avoid any risk of a
+    key-collision bug between them). Built for the not-yet-built quarterly
+    ticker-rotation concept (docs/design.md's 2026-08-28 (later still) entry):
+    node_automation_enabled/pause_node_automation block BOTH BUY and SELL for
+    a node (check_order's node_automation_enabled gate runs unconditionally,
+    before any side branching) -- unusable for "stop new entries but let an
+    already-open position's own exit orders (SL/TP/trail-sell) keep working,"
+    which is the actual rotation use case (pause once a swap decision is made,
+    wait for the position to close via its own real exit, then apply the new
+    config once flat). This flag is checked ONLY inside check_order's
+    `side == "BUY"` path -- SELL/exit orders never consult it at all.
+
+    node_id=None defaults to False (not paused) -- same "can't resolve a
+    specific node -> don't apply a node-scoped pause" semantics as
+    node_automation_enabled(None) (which defaults to True/enabled, the
+    not-paused state expressed with that function's own polarity).
+
+    Explicitly programmatic-only (user's call, 2026-08-28) -- no Slack button
+    or other human-facing UI; meant to be set/cleared by future rotation
+    logic (not built yet, not part of this), not a manual control surface."""
+    if node_id is None:
+        return False
+    if NODE_BUY_PAUSE_PATH.exists():
+        try:
+            state = json.loads(NODE_BUY_PAUSE_PATH.read_text())
+            if str(node_id) in state:
+                return bool(state[str(node_id)])
+        except (json.JSONDecodeError, OSError):
+            pass
+    return False
+
+
+def pause_node_buy(node_id, reason: str = ""):
+    """Sets the BUY-only pause for this node -- mirrors pause_node_automation's
+    real implementation exactly, just against NODE_BUY_PAUSE_PATH instead."""
+    NODE_BUY_PAUSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {}
+    if NODE_BUY_PAUSE_PATH.exists():
+        try:
+            state = json.loads(NODE_BUY_PAUSE_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    state[str(node_id)] = True
+    state[f"{node_id}_reason"] = reason
+    NODE_BUY_PAUSE_PATH.write_text(json.dumps(state))
+
+
+def resume_node_buy(node_id):
+    NODE_BUY_PAUSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = {}
+    if NODE_BUY_PAUSE_PATH.exists():
+        try:
+            state = json.loads(NODE_BUY_PAUSE_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    state[str(node_id)] = False
+    state.pop(f"{node_id}_reason", None)
+    NODE_BUY_PAUSE_PATH.write_text(json.dumps(state))
+
+
 NODE_BREAKER_PATH = _STATE_DIR / "schwab_node_breaker_state.json"
 NODE_BREAKER_THRESHOLD = 3
 
@@ -1435,6 +1501,15 @@ def check_order(
         signals_db.log_coverage_event("node_level_automation_pause", _mode, ticker=ticker, node_id=_node_id,
                                        result="blocked", source=source)
         raise SafetyViolation(f"node id={_node_id} for '{ticker}' has automation paused")
+    # BUY-only sibling of the gate immediately above -- deliberately scoped to side=="BUY"
+    # so it never touches an open position's own exit orders (SL placement, TP/trail-sell
+    # replace calls). See node_buy_paused's own docstring for the real use case this
+    # exists for (the not-yet-built quarterly ticker-rotation concept, docs/design.md's
+    # 2026-08-28 (later still) entry).
+    if side == "BUY" and node_buy_paused(_node_id):
+        signals_db.log_coverage_event("node_buy_pause_block", _mode, ticker=ticker, node_id=_node_id,
+                                       result="blocked", source=source)
+        raise SafetyViolation(f"node id={_node_id} for '{ticker}' has BUY-side automation paused")
     if ticker not in AUTOMATION_ENABLED_TICKERS:
         signals_db.log_coverage_event("ticker_not_in_automation_scope_block", _mode, ticker=ticker,
                                        node_id=_node_id, result="blocked",

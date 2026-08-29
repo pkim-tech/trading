@@ -854,6 +854,21 @@ REGISTRY = [
                "real production call site now passes node_id, so the fuzzy ticker+account lookup is only "
                "a fallback for a caller that doesn't (none remain). See docs/deep_backlog.md's 2026-08-10 "
                "entry."),
+    dict(id='node_buy_pause_block',
+         scenario="BUY-only node pause blocks new entries for that node while leaving its own SELL/exit "
+                  "orders (SL placement, TP/trail-sell replace) completely unaffected",
+         code_path="schwab_safety.pause_node_buy, node_buy_paused (check_order, side=='BUY' only)",
+         offline_coverage="tests/test_fake_broker_check_order_guards_scenario.py: "
+                           "test_node_buy_pause_blocks_buy_then_resume_unblocks, "
+                           "test_node_buy_pause_does_not_block_sell",
+         check_mechanism='coverage_events', scenario_key='node_buy_pause_block',
+         notes="Built 2026-08-28 (Task #11) as the narrower, additive sibling of "
+               "node_level_automation_pause above -- that gate runs unconditionally before any side "
+               "branching in check_order, so it blocks BOTH BUY and SELL for a node, unusable for "
+               "pausing new entries while an already-open position's own exit orders must keep working "
+               "(the not-yet-built quarterly ticker-rotation concept, docs/design.md's 2026-08-28 "
+               "(later still) entry). Programmatic-only by design -- no Slack button, never fired live "
+               "(nothing sets it yet; the rotation logic that would is a separate, not-yet-built task)."),
     dict(id='unknown_account_block',
          scenario="check_order blocks a real order attempt for an account not in the accounts allowlist",
          code_path="schwab_safety.check_order (ACCOUNTS.get(account) is None)",
@@ -2271,6 +2286,7 @@ BEST_HARNESS = {
     'kill_switch_block': 'canary',
     'live_state_reconciliation_mismatch': 'canary',    # needs a manually-seeded fake position
     'market_buy_placement': 'canary',
+    'node_buy_pause_block': 'canary',
     'node_circuit_breaker': 'canary',
     'node_level_automation_pause': 'canary',
     'open_price_quality': 'canary',

@@ -46,6 +46,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(schwab_safety, 'KILL_SWITCH_PATH', tmp_path / "schwab_kill_switch.json")
     monkeypatch.setattr(schwab_safety, 'TICKER_AUTOMATION_PATH', tmp_path / "schwab_ticker_automation.json")
     monkeypatch.setattr(schwab_safety, 'NODE_AUTOMATION_PATH', tmp_path / "schwab_node_automation.json")
+    monkeypatch.setattr(schwab_safety, 'NODE_BUY_PAUSE_PATH', tmp_path / "schwab_node_buy_pause.json")
     monkeypatch.setattr(schwab_safety, 'NODE_BREAKER_PATH', tmp_path / "schwab_node_breaker_state.json")
     monkeypatch.setattr(schwab_safety, 'AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_auto_fill_detection.json")
     monkeypatch.setattr(schwab_safety, 'NODE_AUTO_FILL_DETECTION_PATH', tmp_path / "schwab_node_auto_fill_detection.json")
@@ -174,6 +175,75 @@ def test_node_level_automation_pause_blocks_then_resume_unblocks(env, fake_broke
     r, oid = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
     assert oid is not None, "resuming automation must unblock the same node's real order"
     assert len(_real_placed_orders(fake_broker, TICKER)) == 1
+
+
+def test_node_buy_pause_blocks_buy_then_resume_unblocks(env, fake_broker):
+    """BUY-only sibling of test_node_level_automation_pause_blocks_then_resume_
+    unblocks above -- proves node_buy_paused/pause_node_buy/resume_node_buy
+    (Task #11, docs/design.md's 2026-08-28 (later still) entry) behave the
+    same way node_automation_enabled/pause_node_automation do on the BUY side."""
+    node = _add_node(TICKER, 'soxl_ira')
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+
+    # Baseline: an unpaused node's BUY behaves identically to today (no new gate firing).
+    # Quantities deliberately vary (10/40/70) across the 3 BUYs below, same as
+    # test_dup_order_does_not_false_block_a_genuinely_different_order -- otherwise the
+    # existing duplicate-order-window guard (a different, unrelated gate) would block
+    # the 2nd/3rd BUY regardless of this test's own pause/resume state.
+    assert schwab_safety.node_buy_paused(node['id']) is False
+    r0, oid0 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
+    assert oid0 is not None
+    assert len(_real_placed_orders(fake_broker, TICKER)) == 1
+
+    schwab_safety.pause_node_buy(node['id'], reason="test buy pause")
+    assert schwab_safety.node_buy_paused(node['id']) is True
+    with pytest.raises(schwab_safety.SafetyViolation, match="BUY-side automation paused"):
+        schwab_client.place_equity_buy('soxl_ira', TICKER, 40, 10.0)
+    assert len(_real_placed_orders(fake_broker, TICKER)) == 1, \
+        "the BUY-paused node's new BUY must never reach the broker"
+    events = signals_db.get_coverage_events(scenario_key='node_buy_pause_block')
+    assert any(e['ticker'] == TICKER and e['result'] == 'blocked' for e in events)
+
+    schwab_safety.resume_node_buy(node['id'])
+    assert schwab_safety.node_buy_paused(node['id']) is False
+    r1, oid1 = schwab_client.place_equity_buy('soxl_ira', TICKER, 70, 10.0)
+    assert oid1 is not None, "resuming BUY must unblock the same node's real order"
+    assert len(_real_placed_orders(fake_broker, TICKER)) == 2
+
+
+def test_node_buy_pause_does_not_block_sell(env, fake_broker):
+    """The actual point of this new gate: a BUY-paused node's own open
+    position must still be able to exit normally (SL placement, TP/trail-sell
+    replace) -- this is exactly the bug node_automation_enabled has (blocks
+    BOTH sides unconditionally, see docs/design.md's 2026-08-28 (later still)
+    entry) that node_buy_paused exists to NOT repeat."""
+    node = _add_node(TICKER, 'soxl_ira')
+    fake_broker.set_quote(TICKER, last=10.0, bid=10.0, ask=10.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+
+    # Open a real position first, same as the real rotation use case (pause
+    # BUY only once a position already exists, waiting for it to exit) --
+    # both the real broker fill AND the local open_positions row (SELL/STOP
+    # LOSS placement reads local DB state, not the broker, to size/verify).
+    r0, oid0 = schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
+    assert oid0 is not None
+    signals_db.open_position(node, signal_price=10.0, signal_time=_IN_WINDOW_TIME,
+                              entry_price=10.0, entry_time=_IN_WINDOW_TIME, shares=10)
+
+    schwab_safety.pause_node_buy(node['id'], reason="test buy pause")
+    with pytest.raises(schwab_safety.SafetyViolation, match="BUY-side automation paused"):
+        schwab_client.place_equity_buy('soxl_ira', TICKER, 10, 10.0)
+
+    # The SELL/exit side must be completely unaffected by the BUY-side pause.
+    # Protective STOP LOSS placement -- exactly the exit path docs/design.md's
+    # 2026-08-28 (later still) entry calls out by name as what must keep
+    # working while BUY is paused. (A second, separate plain SELL isn't
+    # additionally exercised here -- schwab_safety's own dup_sell_order_
+    # blocked guard would legitimately refuse two concurrent resting SELLs
+    # for the same shares, an unrelated pre-existing guard, not this one.)
+    r_sl, sl_oid = schwab_client.place_stop_loss('soxl_ira', TICKER, 10, 9.0)
+    assert sl_oid is not None, "a BUY-paused node's protective STOP LOSS placement must not be blocked"
 
 
 def test_node_id_disambiguates_same_ticker_account_siblings(env, fake_broker):
