@@ -3611,9 +3611,27 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     # population (confirmed empirically at dispatch time, see this task's own real-DB
     # coverage check) -- get_cached_trades returning None is the real, expected
     # fallback-to-resimulate signal for any candidate outside that population, not a bug.
+    #
+    # Staleness invalidation (2026-08-29, paired-review HIGH finding, independent-cold +
+    # contextual Opus review both converged on this): resolves this scope's real active
+    # db_cache build_ids ONCE here (not per candidate -- a build promotion mid-report is
+    # not a case this pipeline defends against anywhere else either) and the GT kernel
+    # version this function's own trade-generation logic is currently on, then threads
+    # both through get_cached_trades so a row written under an older kernel or a since-
+    # superseded derived-data build (real precedent: the 2026-08-27 SOXL/DPST/DFEN
+    # minute-archive narrowing incident, which changed real bars with ZERO version-string
+    # change) is treated as stale and falls through to a fresh resimulation, instead of
+    # silently served forever. Bump _GT_TRADES_KERNEL_VERSION (kept in lockstep with
+    # bench_phase1_phase2_inmemory.GT_TRADES_KERNEL_VERSION -- same 'ground_truth_v6'
+    # literal backtest_cache's own kernel_version column already uses, not a new naming
+    # scheme) the next time this function's real trade-generation call below changes.
     from scripts.node_key import node_key as _node_key
     from scripts.candidate_verification_store import get_cached_trades as _get_cached_trades
-    _trades_conn = sqlite3.connect(DB_PATH)
+    import db_cache as _db_cache
+    _GT_TRADES_KERNEL_VERSION = "ground_truth_v6"
+    _hourly_build_id = _db_cache.get_active_build_id(ticker, 'hourly')
+    _minute_build_id = _db_cache.get_active_build_id(ticker, 'minute')
+    _trades_conn = sqlite3.connect(DB_PATH, timeout=60.0)
 
     rows = []
     try:
@@ -3622,7 +3640,10 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                 strategy_name, ticker, fixed_sl, cand['window'], cand['z_score_threshold'],
                 cand['max_hold_hours'], cand['take_profit'], cand['stop_loss'], cand['tpct'],
                 entry_timing, strategies.resolve_axis_columns)
-            cached_trades = _get_cached_trades(_trades_conn, node_key_val, config_version)
+            cached_trades = _get_cached_trades(
+                _trades_conn, node_key_val, config_version, ticker=ticker,
+                kernel_version=_GT_TRADES_KERNEL_VERSION,
+                hourly_build_id=_hourly_build_id, minute_build_id=_minute_build_id)
             need_resim = cached_trades is None
             # is_both scopes still need df_hourly_windowed for the drought overlay below
             # even when trades came from cache -- non-is_both scopes with a cache hit
@@ -3684,6 +3705,12 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                 'candidate': cand,
                 'phase4_eligible': cand.get('phase4_eligible', True),
                 'n_trades': len(trades),
+                # Real cache-hit/resim provenance flag (2026-08-29, paired-review HIGH
+                # finding -- "at minimum" ask): lets a report reader tell a cache-served
+                # candidate apart from a freshly-resimulated one after the fact, even
+                # though get_cached_trades' own kernel_version/build_id check above
+                # already means a stale-cache hit shouldn't be reachable in practice.
+                'trades_from_cache': not need_resim,
                 # Raw per-trade closed-trade list (need_times=True -- Entry/Exit Time/Price,
                 # Return, armed/Arm Time/Arm Price), added 2026-08-23 for candidate_full_
                 # review.py's --kernel gt full-review port: lets that report compute real
