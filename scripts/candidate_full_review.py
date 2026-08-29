@@ -84,7 +84,8 @@ from backtester import run_backtest_dispatch, run_backtest_v110
 from check_stock_splits import check_ticker as _check_splits
 from v4_max_drawdown import max_drawdown
 from run_optimization_sweep import _summarize_trades
-from verify_trailing_sell_resolution import find_hourly_trailing_exits, replay_five_min, FIVE_MIN_LOOKBACK_DAYS
+from verify_trailing_sell_resolution import find_hourly_trailing_exits, replay_one_min, ONE_MIN_LOOKBACK_DAYS
+from scripts.sim_minute_groundtruth_independent import load_minutes
 from drought_overlay_test import find_drought_windows, get_trades_and_bars, simulate_overlay
 from calendar_year_returns import calendar_year_breakdown, format_calendar_years
 from drought_overlay_sweep import get_ivol_series, _entry_vol_pctile
@@ -432,13 +433,15 @@ def exit_fill_accuracy_summary(ticker, strategy, node):
     of item 2's entry-side fillacc columns (already reused as-is from
     candidate_summary_report.py). TrailingBothZScoreBreakout only -- exit
     logic for TrailingExitZScoreBreakout is a plain market-sell, no trailing-
-    stop resolution to check. Real yfinance 5-min replay, same
-    FIVE_MIN_LOOKBACK_DAYS window as the entry-side check, so this only ever
-    covers recently-armed trades -- can legitimately be (win%, err%, n=0) for
-    a node that hasn't armed in the last ~58 days."""
+    stop resolution to check. Cached-Massive 1-min replay (see
+    verify_trailing_sell_resolution.py's own header -- switched off a live
+    yfinance 5-min pull 2026-08-24), same ONE_MIN_LOOKBACK_DAYS window as the
+    entry-side check, so this only ever covers recently-armed trades -- can
+    legitimately be (win%, err%, n=0) for a node that hasn't armed in the
+    last ~5yr of cached history."""
     if strategy != "TrailingBothZScoreBreakout":
         return None
-    cutoff = _dt.now() - _timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
+    cutoff = _dt.now() - _timedelta(days=ONE_MIN_LOOKBACK_DAYS)
     try:
         events = find_hourly_trailing_exits(
             ticker, node["window"], node["z"], node["trail_buy_pct"] / 100.0,
@@ -448,18 +451,16 @@ def exit_fill_accuracy_summary(ticker, strategy, node):
     if not events:
         return (None, None, 0)
     try:
-        df_5m = yf.Ticker(ticker).history(period=f"{FIVE_MIN_LOOKBACK_DAYS}d", interval="5m")
-        if df_5m.index.tz is not None:
-            df_5m.index = df_5m.index.tz_localize(None)
+        df_1m = load_minutes(ticker, data_source="massive")
     except Exception:
         return None
     diffs = []
     for ev in events:
-        real = replay_five_min(df_5m, ev["arm_time"], ev["peak_at_arm"], node["trail_sell_pct"] / 100.0,
-                                ev["cutoff_time"])
+        real = replay_one_min(df_1m, ev["arm_time"], ev["peak_at_arm"], node["trail_sell_pct"] / 100.0,
+                               ev["cutoff_time"])
         if real is None:
             continue
-        diffs.append((real["five_min_exit_price"] - ev["hourly_exit_price"]) / ev["hourly_exit_price"] * 100)
+        diffs.append((real["one_min_exit_price"] - ev["hourly_exit_price"]) / ev["hourly_exit_price"] * 100)
     if not diffs:
         return (None, None, 0)
     mean_abs_err = sum(abs(d) for d in diffs) / len(diffs)

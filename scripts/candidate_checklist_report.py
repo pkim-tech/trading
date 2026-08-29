@@ -1,6 +1,6 @@
 """Consolidated watchlist-candidate-checklist report: for a list of tickers, pulls
 each one's real v4 winning node (stop_loss=1%, entry_timing=open_check) plus
-checks 1 (macro/trend), 2/3 (trailing-buy/sell fill-drift vs a 5-min replay), 6
+checks 1 (macro/trend), 2/3 (trailing-buy/sell fill-drift vs a 1-min replay), 6
 (stock splits), 7 (fill-logic optimism -- already built into v4's robust_alpha,
 no separate run needed), and 8 (trade-count fluke, read straight off `trades`).
 Reuses the existing checklist scripts' functions directly (verify_trailing_buy/
@@ -9,6 +9,19 @@ their logic -- see docs/watchlist_candidate_checklist.md for what each check
 means and why. Checks 4/9/10 (win-rate stability, same-day-block sensitivity)
 need a full trade replay per ticker and are intentionally left out of this
 summary pass -- run them separately for any ticker that clears this screen.
+
+`replay_five_min`/`FIVE_MIN_LOOKBACK_DAYS` were renamed to `replay_one_min` in
+commit 2a9f3d3 ("Full v6 promotion") when verify_trailing_buy/sell_resolution.py
+switched from a live yfinance 5-min pull (rolling ~60d retention) to the cached
+Massive 1-min data (cache/research/minute_data/*_1m.csv via
+sim_minute_groundtruth_independent.load_minutes(data_source="massive"),
+full real multi-year history per ticker). This file's own import was never
+updated to match (found 2026-08-29, broke import of every downstream consumer
+incl. candidate_full_review.py). Fixed here the same way the sibling files
+were fixed: switched to the cached-Massive-data path and picked up their
+already-decided ONE_MIN_LOOKBACK_DAYS=1825 (~5yr) constant -- see that
+constant's own comment below for why 1-min data doesn't need a yfinance-style
+retention cap here.
 
 Usage: .venv/bin/python scripts/candidate_checklist_report.py TICKER [TICKER ...] [out.csv]
 """
@@ -21,19 +34,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import sqlite3
 import pandas as pd
-import yfinance as yf
 
 from check_stock_splits import check_ticker as _check_splits
 from verify_trailing_buy_resolution import (
-    find_hourly_signals, replay_five_min as _replay_buy, _load_hourly,
+    find_hourly_signals, replay_one_min as _replay_buy, _load_hourly,
 )
 from verify_trailing_sell_resolution import (
-    find_hourly_trailing_exits, replay_five_min as _replay_sell,
+    find_hourly_trailing_exits, replay_one_min as _replay_sell,
 )
+from scripts.sim_minute_groundtruth_independent import load_minutes
 
 RESEARCH_DB = Path(__file__).resolve().parent.parent / "cache" / "research" / "trading_universe.db"
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "research"
-FIVE_MIN_LOOKBACK_DAYS = 58
+ONE_MIN_LOOKBACK_DAYS = 1825  # ~5yr -- bounded by Massive minute data's own real depth per ticker, not an API limit
 CLIFF_RADIUS = 2
 
 ROBUST_ALPHA_SQL = "MIN(alpha_vs_spy, alpha_vs_spy_pessimistic, alpha_vs_spy_certain)"
@@ -87,7 +100,7 @@ def trend_check(ticker):
 
 
 def fill_drift_buy(ticker, window, z, tb_pct, hold):
-    cutoff = pd.Timestamp.now().normalize() - timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
+    cutoff = pd.Timestamp.now().normalize() - timedelta(days=ONE_MIN_LOOKBACK_DAYS)
     tb = tb_pct / 100.0
     df_hourly, _ = _load_hourly(ticker)
     recent = df_hourly[df_hourly.index >= cutoff]
@@ -97,32 +110,36 @@ def fill_drift_buy(ticker, window, z, tb_pct, hold):
     signals = find_hourly_signals(ticker, window, z, tb, hold, cutoff)
     if not signals:
         return None, ratio, 0
-    df_5m = yf.download(ticker, period="60d", interval="5m", multi_level_index=False, progress=False)
-    df_5m.index = pd.to_datetime(df_5m.index).tz_localize(None)
+    try:
+        df_1m = load_minutes(ticker, data_source="massive")
+    except FileNotFoundError:
+        return None, ratio, 0
     diffs = []
     for s in signals:
-        r = _replay_buy(ticker, df_5m, s['signal_time'], s['signal_close'], tb, s['cutoff_time'])
+        r = _replay_buy(ticker, df_1m, s['signal_time'], s['signal_close'], tb, s['cutoff_time'])
         if r:
-            diffs.append((r['five_min_entry_price'] - s['hourly_entry_price']) / s['hourly_entry_price'] * 100)
+            diffs.append((r['one_min_entry_price'] - s['hourly_entry_price']) / s['hourly_entry_price'] * 100)
     if not diffs:
         return None, ratio, 0
     return sum(diffs) / len(diffs), ratio, len(diffs)
 
 
 def fill_drift_sell(ticker, window, z, tb_pct, ts_pct, arm_pct, hold):
-    cutoff = pd.Timestamp.now().normalize() - timedelta(days=FIVE_MIN_LOOKBACK_DAYS)
+    cutoff = pd.Timestamp.now().normalize() - timedelta(days=ONE_MIN_LOOKBACK_DAYS)
     tb, ts, arm = tb_pct / 100.0, ts_pct / 100.0, arm_pct / 100.0
 
     events = find_hourly_trailing_exits(ticker, window, z, tb, ts, arm, hold, cutoff)
     if not events:
         return None, 0
-    df_5m = yf.download(ticker, period="60d", interval="5m", multi_level_index=False, progress=False)
-    df_5m.index = pd.to_datetime(df_5m.index).tz_localize(None)
+    try:
+        df_1m = load_minutes(ticker, data_source="massive")
+    except FileNotFoundError:
+        return None, 0
     diffs = []
     for ev in events:
-        r = _replay_sell(df_5m, ev['arm_time'], ev['peak_at_arm'], ts, ev['cutoff_time'])
+        r = _replay_sell(df_1m, ev['arm_time'], ev['peak_at_arm'], ts, ev['cutoff_time'])
         if r:
-            diffs.append((r['five_min_exit_price'] - ev['hourly_exit_price']) / ev['hourly_exit_price'] * 100)
+            diffs.append((r['one_min_exit_price'] - ev['hourly_exit_price']) / ev['hourly_exit_price'] * 100)
     if not diffs:
         return None, 0
     return sum(diffs) / len(diffs), len(diffs)
