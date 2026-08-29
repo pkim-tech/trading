@@ -2758,11 +2758,13 @@ definition.
   a future, more defined policy) decides whether a given swap is worth acting on.
 - **Liquidate, not migrate**: when a ticker IS being swapped out, close the position outright via its
   normal exit path rather than trying to carry it forward onto a new node config. This deliberately avoids
-  ever needing `signals_db.transfer_position_to_new_node()` (built 2026-08-24, paired-reviewed, multiple
-  unfixed HIGH findings -- real broker SL never reconciled, no duplicate-position guard, stale
-  `trail_state` carryover -- still sitting unsafe-to-use, never landed). A newly-promoted ticker just
-  starts a fresh node with no position to inherit, so none of that function's bug surface is ever
-  exercised. Sidesteps fixing a known-broken function by design, rather than requiring it to be fixed first.
+  ever needing a migrate-in-place mechanism like `signals_db.transfer_position_to_new_node()` (built
+  2026-08-24, committed as-is in `c97b8d0` with a "NOT READY, do not use on real capital" note per
+  paired review -- real broker SL never reconciled, no duplicate-position guard, stale `trail_state`
+  carryover, among other unfixed HIGH findings; removed entirely 2026-08-28, see `docs/deep_backlog.md`,
+  since this design decision makes it permanently unnecessary). A newly-promoted ticker just starts a
+  fresh node with no position to inherit, so none of that function's former bug surface is ever
+  exercised. Sidesteps a known-broken function by design, rather than requiring it to be fixed.
 - **Swap-on-flat, not forced liquidation**: don't force-sell on a schedule -- wait for the position to
   close via its own real exit (SL/TP/TIME), then apply the new ticker/config once flat. No new
   sell-triggering logic needed, just a rotation decision sitting ready to act on whichever real exit fires

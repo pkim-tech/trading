@@ -2,6 +2,8 @@
 
 ## [live-trading][data] Resolved 2026-08-28 (dispatched, coder) — daily-close retroactive-adjustment detector + fix built for the live SMA/z-score indicator cache (Task #9); a fresh yfinance daily fetch now replaces the resampled-`_1h.csv` series feeding `compute_buy_signal`'s indicators, self-correcting by construction, with a day-over-day consistency detector, Slack alert, and Massive secondary cross-check. Paired review (2 rounds) found+fixed a real HIGH bug in the consistency gate. Full detail: `deep_backlog.md`.
 
+## [live-trading][security] Resolved 2026-08-28 (dispatched worktree agent) — removed `signals_db.transfer_position_to_new_node()` entirely (superseded by liquidate-not-migrate rotation design, `docs/design.md`'s 2026-08-28 "quarterly ticker-rotation concept" entry), zero callers confirmed, paired-reviewed. Full detail: `deep_backlog.md`.
+
 ## [live-trading][security][HIGH] Resolved 2026-08-28 (dispatched, coder4) — signal_price-vs-real-market-data mismatch fully explained for all 3 tickers (SOXL/DPST/DFEN). SOXL was the missing piece: entry_timing='open_check' pins signal_price to the real session-open print by design, confirmed exact match ($117.37) against real Massive.com 1s data. Not a bug. Full detail: `deep_backlog.md`.
 
 ## [live-trading][testing] Resolved 2026-08-28 (stale-entry cleanup) — 08-25's "12/14 NOT CHECKED (RuntimeError)" item was already fixed by the 08-27 yahoo->massive routing fix (`5b2f29e`), just never removed from backlog_cache.md. Confirmed via 2 fresh evening_status.py 3 reruns, zero RuntimeErrors. Full detail: `deep_backlog.md`.
