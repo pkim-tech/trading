@@ -255,7 +255,18 @@ def check_massive_hourly_derived_freshness():
 
     Cheap: MAX(ts) per ticker's current build, not a full DataFrame load (this DB has
     60M+ raw rows across all tickers/builds -- loading full OHLCV per ticker here would
-    be real, avoidable cost for a check that only needs one timestamp)."""
+    be real, avoidable cost for a check that only needs one timestamp).
+
+    Resolves the "current" build via db_cache.get_active_build_id -- the SAME
+    active_builds promotion pointer every real consumer (get_massive_hourly_derived's
+    own no-build_id path) resolves through, NOT insertion order. An earlier version of
+    this check used `ORDER BY id DESC` directly, which could measure a build nothing
+    actually reads: after a rollback promotion to an older build_id, a newer
+    non-promoted build with a fresher MAX(ts) would make this check pass while every
+    real consumer still reads the older, genuinely stale, active one -- the exact
+    silent-stale-pass this check exists to prevent (found by paired review, contextual
+    reviewer, 2026-08-29; verified latent at the time -- 0/82 tickers mismatched -- but
+    a real false-negative risk once any rollback promotion happens)."""
     import sqlite3
     import pandas as pd
     import db_cache
@@ -267,18 +278,14 @@ def check_massive_hourly_derived_freshness():
             if not helpers.has_capital_at_stake(node):
                 continue
             ticker = node['ticker']
-            row = conn.execute("""
-                SELECT MAX(d.ts) FROM massive_hourly_derived_builds b
-                JOIN massive_hourly_derived d ON d.ticker=b.ticker AND d.build_id=b.id
-                WHERE b.ticker=? AND b.id = (
-                    SELECT b2.id FROM massive_hourly_derived_builds b2
-                    WHERE b2.ticker=b.ticker AND EXISTS (
-                        SELECT 1 FROM massive_hourly_derived d2
-                        WHERE d2.ticker=b2.ticker AND d2.build_id=b2.id
-                    )
-                    ORDER BY b2.id DESC LIMIT 1
-                )
-            """, (ticker,)).fetchone()
+            active_build_id = db_cache.get_active_build_id(ticker, "hourly", conn=conn)
+            if active_build_id is None:
+                violations.append(f"{ticker} (wl_id={node['id']}): no active_builds row for "
+                                   f"massive_hourly_derived at all")
+                continue
+            row = conn.execute(
+                "SELECT MAX(ts) FROM massive_hourly_derived WHERE ticker=? AND build_id=?",
+                (ticker, active_build_id)).fetchone()
             last_ts = row[0] if row else None
             if last_ts is None:
                 violations.append(f"{ticker} (wl_id={node['id']}): no massive_hourly_derived "
@@ -302,7 +309,12 @@ def check_massive_minute_derived_freshness():
     DATA_FRESHNESS_CHECKS alongside its hourly sibling, NOT in CHECKS/run_all()
     -- see DATA_FRESHNESS_CHECKS' own comment for why (would surface a wall of
     already-known violations on every daemon-startup/07:00/EOD run until the
-    refresh cron actually exists)."""
+    refresh cron actually exists).
+
+    Resolves the "current" build via db_cache.get_active_build_id (active_builds'
+    promotion pointer), NOT insertion order -- see check_massive_hourly_derived_
+    freshness's docstring for the full reasoning (same fix applied to both siblings
+    together, found by the same paired-review finding, 2026-08-29)."""
     import sqlite3
     import pandas as pd
     import db_cache
@@ -314,18 +326,14 @@ def check_massive_minute_derived_freshness():
             if not helpers.has_capital_at_stake(node):
                 continue
             ticker = node['ticker']
-            row = conn.execute("""
-                SELECT MAX(d.ts) FROM massive_minute_derived_builds b
-                JOIN massive_minute_derived d ON d.ticker=b.ticker AND d.build_id=b.id
-                WHERE b.ticker=? AND b.id = (
-                    SELECT b2.id FROM massive_minute_derived_builds b2
-                    WHERE b2.ticker=b.ticker AND EXISTS (
-                        SELECT 1 FROM massive_minute_derived d2
-                        WHERE d2.ticker=b2.ticker AND d2.build_id=b2.id
-                    )
-                    ORDER BY b2.id DESC LIMIT 1
-                )
-            """, (ticker,)).fetchone()
+            active_build_id = db_cache.get_active_build_id(ticker, "minute", conn=conn)
+            if active_build_id is None:
+                violations.append(f"{ticker} (wl_id={node['id']}): no active_builds row for "
+                                   f"massive_minute_derived at all")
+                continue
+            row = conn.execute(
+                "SELECT MAX(ts) FROM massive_minute_derived WHERE ticker=? AND build_id=?",
+                (ticker, active_build_id)).fetchone()
             last_ts = row[0] if row else None
             if last_ts is None:
                 violations.append(f"{ticker} (wl_id={node['id']}): no massive_minute_derived "

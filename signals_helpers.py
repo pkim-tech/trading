@@ -529,8 +529,18 @@ def check_daily_close_retroactive_adjustment(ticker, fresh_df, today=None):
     stdlib date class (which would leak globally across every module holding
     a reference to it, not just this one)."""
     today_str = today or date.today().isoformat()
+    # Exclude today's own row -- fetch_fresh_daily_closes's hourly-resample always
+    # includes today's still-forming bar (a partial close, not a real daily close).
+    # Storing/comparing that partial value as if it were final poisons the baseline:
+    # the NEXT day's real, complete close for that same date then reads as a
+    # "retroactive adjustment" against yesterday's partial one, and since that
+    # contaminated date is always the newest in the window, it lands in the
+    # rest_unchanged suffix check below and silently suppresses real detections
+    # (found by paired-review cold reviewer, 2026-08-29, reproduced against this
+    # exact function: a baseline containing a partial today-bar missed a real
+    # 1.005 dividend rebase that an otherwise-identical clean baseline caught).
     fresh_closes = {ts.strftime('%Y-%m-%d'): float(c) for ts, c in fresh_df['Close'].items()
-                     if c is not None and c > 0}
+                     if c is not None and c > 0 and ts.strftime('%Y-%m-%d') != today_str}
 
     state = _load_daily_close_state()
     prior = state.get(ticker)

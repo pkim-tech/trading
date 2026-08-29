@@ -74,7 +74,10 @@ def test_first_ever_call_never_fires(isolated_state):
     assert detection is None
     state = json.loads(signals_helpers._DAILY_CLOSE_STATE_PATH.read_text())
     assert TICKER in state
-    assert state[TICKER]['closes'] == closes
+    # today's own row (DAY1, the last date in the 20-day range) is deliberately
+    # excluded from the stored baseline -- it's a partial/in-progress bar, not a
+    # real final close (paired-review fix, 2026-08-29).
+    assert state[TICKER]['closes'] == {d: v for d, v in closes.items() if d != DAY1}
     assert state[TICKER]['as_of'] == DAY1
 
 
@@ -105,7 +108,10 @@ def test_dividend_sized_retroactive_rescale_is_detected(isolated_state):
     assert detection is not None, "a uniform small retroactive rescale must be detected"
     assert detection['classification'] == 'dividend-or-other-sized'
     assert detection['nearest_split_factor'] is None
-    assert detection['dates_affected'] == len(closes_day1)
+    # -1: DAY1 (the last date in closes_day1's range) was excluded from the stored
+    # baseline on the first call (today's own row, a partial bar) -- see
+    # test_first_ever_call_never_fires's comment.
+    assert detection['dates_affected'] == len(closes_day1) - 1
     assert abs(detection['ratio'] - 1 / rescale) < 0.001
 
 
@@ -207,7 +213,8 @@ def test_same_day_repeat_call_does_not_re_diff(isolated_state):
     detection = signals_helpers.check_daily_close_retroactive_adjustment(TICKER, _daily_df(different), today=DAY1)
     assert detection is None
     state = json.loads(signals_helpers._DAILY_CLOSE_STATE_PATH.read_text())
-    assert state[TICKER]['closes'] == closes_day1, "same-day repeat call must not overwrite the day's baseline"
+    assert state[TICKER]['closes'] == {d: v for d, v in closes_day1.items() if d != DAY1}, (
+        "same-day repeat call must not overwrite the day's baseline")
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +258,14 @@ def test_compute_buy_signal_live_call_triggers_alert_on_detected_rescale(isolate
         signals_compute._fresh_daily_cache.clear()
         signals_compute._daily_close_last_checked.clear()
 
+        # This test specifically exercises the daemon-only alert path (paired-review
+        # fix, 2026-08-29: non-daemon SIM_MODE=1 ad hoc callers -- evening_status.py,
+        # watchlist_status.py, audit_live_test_candidates.py -- share the same
+        # process-global once-per-day gate/state file as the real daemon, and could
+        # silently consume the detection/alert-dedup before the daemon ever saw it;
+        # the alert side effect is now daemon-only, gated on not cfg.SIM_MODE).
+        monkeypatch.setattr(signals_compute.cfg, 'SIM_MODE', False)
+
         posted = []
         monkeypatch.setattr(signals_compute, '_post_message',
                              lambda *a, **kw: (posted.append(a[0] if a else kw.get('text')), (None, None))[1])
@@ -280,6 +295,58 @@ def test_compute_buy_signal_live_call_triggers_alert_on_detected_rescale(isolate
         posted.clear()
         signals_compute.compute_buy_signal(node)
         assert not posted, "must not re-alert twice the same day (dedup)"
+    finally:
+        cleanup_csv(TICKER)
+        signals_compute._fresh_daily_cache.clear()
+        signals_compute._daily_close_last_checked.clear()
+
+
+def test_compute_buy_signal_sim_mode_does_not_consume_daily_close_gate(isolated_state, monkeypatch):
+    """The real bug this locks in (paired review, 2026-08-29): compute_buy_signal's
+    live-call path (no df_hourly_override) is also hit by non-daemon SIM_MODE=1 ad
+    hoc callers (evening_status.py, watchlist_status.py, audit_live_test_candidates.py)
+    that share the SAME process-global once-per-day gate/state file as the real
+    daemon. Before the fix, whichever process touched a ticker first each day
+    consumed the detection AND the once-per-(ticker,day) alert dedup -- a real
+    rescale landing in a SIM_MODE script's run meant the daemon's real Slack alert
+    never fired that day at all. Now: under SIM_MODE (the test default, matching
+    every ad hoc script), a real detected rescale must NOT alert and must NOT
+    consume the once-per-day gate -- a later daemon-mode (SIM_MODE=False) call the
+    same day must still get to detect and alert for real."""
+    make_synthetic_csv(TICKER, last_close=95.0)
+    try:
+        closes_day1 = _base_closes(n=25, value=95.0)
+        signals_helpers._save_daily_close_state({TICKER: {'as_of': '2020-01-01', 'closes': closes_day1}})
+        signals_compute._fresh_daily_cache.clear()
+        signals_compute._daily_close_last_checked.clear()
+
+        assert signals_compute.cfg.SIM_MODE, "test assumes the real project-wide SIM_MODE=1 test default"
+
+        posted = []
+        monkeypatch.setattr(signals_compute, '_post_message',
+                             lambda *a, **kw: (posted.append(a[0] if a else kw.get('text')), (None, None))[1])
+        monkeypatch.setattr(signals_compute, 'massive_dividend_cross_check',
+                             lambda ticker: "Massive cross-check: skipped (test)")
+
+        node = fake_node(TICKER, 'ZScoreBreakout', window=20)
+        closes_day2 = {d: v * 0.97 for d, v in closes_day1.items()}  # ~3% uniform rescale
+        day2_df = _daily_df(closes_day2)
+        monkeypatch.setattr(signals_compute, 'fetch_fresh_daily_closes', lambda ticker, window: day2_df)
+
+        # SIM_MODE call: must not alert, must not consume the once-per-day gate.
+        signals_compute.compute_buy_signal(node)
+        assert not posted, "SIM_MODE call must not alert on a real detected rescale"
+        assert not signals_helpers._DAILY_CLOSE_ALERT_PATH.exists() or \
+            TICKER not in json.loads(signals_helpers._DAILY_CLOSE_ALERT_PATH.read_text()), \
+            "SIM_MODE call must not consume the alert dedup"
+
+        # Real daemon-mode call, same day: must still detect and alert for real --
+        # proves the SIM_MODE call above didn't silently burn the once-per-day check.
+        monkeypatch.setattr(signals_compute.cfg, 'SIM_MODE', False)
+        signals_compute._fresh_daily_cache.clear()
+        signals_compute.compute_buy_signal(node)
+        assert any(TICKER in m and 'discontinuity' in m for m in posted), (
+            f"daemon-mode call the same day must still detect+alert the real rescale, got: {posted}")
     finally:
         cleanup_csv(TICKER)
         signals_compute._fresh_daily_cache.clear()

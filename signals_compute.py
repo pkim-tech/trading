@@ -213,7 +213,20 @@ def _daily_close_source(node, window, df_daily_fallback):
         # tomorrow (found by paired review).
         if fresh_df is not None:
             _fresh_daily_cache[cache_key] = (today_str, fresh_df)
-        if fresh_df is not None and _daily_close_last_checked.get(ticker) != today_str:
+        # Daemon-only (not cfg.SIM_MODE) -- compute_buy_signal's live-call path is
+        # also hit by non-daemon SIM_MODE=1 ad hoc callers (evening_status.py,
+        # watchlist_status.py, audit_live_test_candidates.py). Those share this
+        # process-global _daily_close_last_checked/state-file gate with the real
+        # daemon, so whichever process happens to touch a ticker first each day
+        # consumes the once-per-day check and the once-per-(ticker,day) alert
+        # dedup -- a real detection landing in a SIM_MODE script's console output
+        # (or nowhere, in a cron env with no Slack tokens) instead of the daemon's
+        # real Slack alert, with no re-fire path that day (found by paired review,
+        # both independent-cold and contextual reviewers, 2026-08-29). The
+        # fresh-fetch data-source fix itself (fetch_fresh_daily_closes, above)
+        # stays unconditional -- it's the real correctness fix and is read-only.
+        if (not cfg.SIM_MODE and fresh_df is not None
+                and _daily_close_last_checked.get(ticker) != today_str):
             _daily_close_last_checked[ticker] = today_str
             detection = check_daily_close_retroactive_adjustment(ticker, fresh_df)
             if detection is not None:
