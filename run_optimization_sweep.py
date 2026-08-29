@@ -3599,81 +3599,111 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
         f"strategy is {strategy_name!r}, not TrailingBothZScoreBreakout -- the drought "
         f"overlay mechanism is only validated for TrailingBoth's arm-then-trail shape.")
 
+    # Trades-cache read-back (2026-08-29, Task #1, planner dispatch): Phase2.5
+    # (bench_phase1_phase2_inmemory.py's _insert_winner_trades_rows) already persists
+    # this exact same_bar_reentry=True/need_times=True trade list for its own top-9-
+    # per-scope population, under the identical real inputs (same node_key params,
+    # same version -- which encodes data_source + start/end window, see
+    # candidate_summary_report._window_dates_from_version) this loop re-derives from
+    # scratch below. Reading it back saves a full run_backtest_ground_truth call per
+    # candidate whenever it's already there. NOT every Phase4 candidate is guaranteed
+    # to have a cached row -- Phase2.5 only ever writes its own top-9-per-scope
+    # population (confirmed empirically at dispatch time, see this task's own real-DB
+    # coverage check) -- get_cached_trades returning None is the real, expected
+    # fallback-to-resimulate signal for any candidate outside that population, not a bug.
+    from scripts.node_key import node_key as _node_key
+    from scripts.candidate_verification_store import get_cached_trades as _get_cached_trades
+    _trades_conn = sqlite3.connect(DB_PATH)
+
     rows = []
-    for cand, addon in zip(candidates, addon_results):
-        inputs = _load_node_inputs_ground_truth(
-            ticker, strategy_class, strategy_name, cand['window'], cand['z_score_threshold'],
-            start_date, end_date, data_source=data_source)
-        trades = []
-        df_hourly_windowed = None
-        if inputs is not None:
-            _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
-            if not df_hourly_windowed.empty:
-                if is_both:
-                    trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = (
-                        float(cand['stop_loss']), float(cand['tpct']), float(cand['take_profit']))
-                else:
-                    trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = (
-                        0.0, float(cand['stop_loss']), float(cand['take_profit']))
-                trades = run_backtest_ground_truth(
-                    df_hourly_windowed, df_daily_processed, ticker, minute_df,
-                    fixed_sl=fixed_sl, arm_pct=arm_pct_arg, trail_buy_pct=trail_buy_pct_arg,
-                    trail_sell_pct=trail_sell_pct_arg, max_hours_to_hold=cand['max_hold_hours'],
-                    z_score_threshold=cand['z_score_threshold'], is_both=is_both,
-                    open_check_entry_timing=(entry_timing == 'open_check'), same_bar_reentry=True,
-                    prep=prep, mprep=mprep, need_times=True,
-                )
+    try:
+        for cand, addon in zip(candidates, addon_results):
+            node_key_val = _node_key(
+                strategy_name, ticker, fixed_sl, cand['window'], cand['z_score_threshold'],
+                cand['max_hold_hours'], cand['take_profit'], cand['stop_loss'], cand['tpct'],
+                entry_timing, strategies.resolve_axis_columns)
+            cached_trades = _get_cached_trades(_trades_conn, node_key_val, config_version)
+            need_resim = cached_trades is None
+            # is_both scopes still need df_hourly_windowed for the drought overlay below
+            # even when trades came from cache -- non-is_both scopes with a cache hit
+            # never need the (possibly slow) hourly/minute input load at all.
+            need_inputs = need_resim or is_both
 
-        c4_early_wr, c4_late_wr = _check4_stability_gt(trades) if trades else (None, None)
-        c8 = _check8_fluke_gt(trades)
-        dd_pct, dd_peak, dd_trough = _check11_max_drawdown_gt(trades) if trades else (None, None, None)
-        c13_folds = _check13_walk_forward_gt(trades) if trades else []
+            inputs = _load_node_inputs_ground_truth(
+                ticker, strategy_class, strategy_name, cand['window'], cand['z_score_threshold'],
+                start_date, end_date, data_source=data_source) if need_inputs else None
+            trades = cached_trades if cached_trades is not None else []
+            df_hourly_windowed = None
+            if inputs is not None:
+                _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+                if not df_hourly_windowed.empty and need_resim:
+                    if is_both:
+                        trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = (
+                            float(cand['stop_loss']), float(cand['tpct']), float(cand['take_profit']))
+                    else:
+                        trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = (
+                            0.0, float(cand['stop_loss']), float(cand['take_profit']))
+                    trades = run_backtest_ground_truth(
+                        df_hourly_windowed, df_daily_processed, ticker, minute_df,
+                        fixed_sl=fixed_sl, arm_pct=arm_pct_arg, trail_buy_pct=trail_buy_pct_arg,
+                        trail_sell_pct=trail_sell_pct_arg, max_hours_to_hold=cand['max_hold_hours'],
+                        z_score_threshold=cand['z_score_threshold'], is_both=is_both,
+                        open_check_entry_timing=(entry_timing == 'open_check'), same_bar_reentry=True,
+                        prep=prep, mprep=mprep, need_times=True,
+                    )
 
-        # Drought is Phase4 overlay work same as add-on -- skip for phase4_eligible=False
-        # candidates too (2026-08-23 fix: this was still computing unconditionally,
-        # only add-on had been wired to respect the flag).
-        drought = None
-        drought_ie = None
-        if cand.get('phase4_eligible', True) and is_both and trades and df_hourly_windowed is not None:
-            drought = simulate_drought_overlay_ground_truth(
-                trades, df_hourly_windowed, ticker, fixed_sl,
-                arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']))
-            # Included-vs-excluded vol-gate challenge (2026-08-23, candidate_full_review.py
-            # GT full-review port -- docs/overlay_parameter_robustness_process.md step 4),
-            # only meaningful once a real winning confirm_days exists (drought['best_confirm_days']
-            # is None when the sweep found zero real drought windows at every grid cell).
-            if drought is not None and drought.get('best_confirm_days') is not None:
-                drought_ie = drought_included_excluded_ground_truth(
+            c4_early_wr, c4_late_wr = _check4_stability_gt(trades) if trades else (None, None)
+            c8 = _check8_fluke_gt(trades)
+            dd_pct, dd_peak, dd_trough = _check11_max_drawdown_gt(trades) if trades else (None, None, None)
+            c13_folds = _check13_walk_forward_gt(trades) if trades else []
+
+            # Drought is Phase4 overlay work same as add-on -- skip for phase4_eligible=False
+            # candidates too (2026-08-23 fix: this was still computing unconditionally,
+            # only add-on had been wired to respect the flag).
+            drought = None
+            drought_ie = None
+            if cand.get('phase4_eligible', True) and is_both and trades and df_hourly_windowed is not None:
+                drought = simulate_drought_overlay_ground_truth(
                     trades, df_hourly_windowed, ticker, fixed_sl,
-                    arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']),
-                    confirm_days=drought['best_confirm_days'], vol_gate=GT_DROUGHT_IE_VOL_GATE)
+                    arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']))
+                # Included-vs-excluded vol-gate challenge (2026-08-23, candidate_full_review.py
+                # GT full-review port -- docs/overlay_parameter_robustness_process.md step 4),
+                # only meaningful once a real winning confirm_days exists (drought['best_confirm_days']
+                # is None when the sweep found zero real drought windows at every grid cell).
+                if drought is not None and drought.get('best_confirm_days') is not None:
+                    drought_ie = drought_included_excluded_ground_truth(
+                        trades, df_hourly_windowed, ticker, fixed_sl,
+                        arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']),
+                        confirm_days=drought['best_confirm_days'], vol_gate=GT_DROUGHT_IE_VOL_GATE)
 
-        core_cliff = addon['core_cliff']
-        addon_cliff = addon['addon_cliff']
-        disagreement = (core_cliff is not None and addon_cliff is not None and core_cliff != addon_cliff)
+            core_cliff = addon['core_cliff']
+            addon_cliff = addon['addon_cliff']
+            disagreement = (core_cliff is not None and addon_cliff is not None and core_cliff != addon_cliff)
 
-        rows.append({
-            'candidate': cand,
-            'phase4_eligible': cand.get('phase4_eligible', True),
-            'n_trades': len(trades),
-            # Raw per-trade closed-trade list (need_times=True -- Entry/Exit Time/Price,
-            # Return, armed/Arm Time/Arm Price), added 2026-08-23 for candidate_full_
-            # review.py's --kernel gt full-review port: lets that report compute real
-            # win-rate/tranche/addon-leg numbers directly off this SAME trade list (via
-            # apply_addon_overlay_ground_truth) instead of a second run_backtest_ground_
-            # truth call. [] when this candidate had no cached hourly inputs.
-            'trades': trades,
-            'check4_early_wr_pct': c4_early_wr, 'check4_late_wr_pct': c4_late_wr,
-            'check8_fluke': c8,
-            'check11_max_drawdown_pct': dd_pct, 'check11_dd_peak_time': dd_peak, 'check11_dd_trough_time': dd_trough,
-            'check13_folds': c13_folds,
-            'core_safe': None if core_cliff is None else (not core_cliff),
-            'addon_safe': None if addon_cliff is None else (not addon_cliff),
-            'core_addon_disagreement': disagreement,
-            'addon_detail': addon,
-            'drought': drought,
-            'drought_ie': drought_ie,
-        })
+            rows.append({
+                'candidate': cand,
+                'phase4_eligible': cand.get('phase4_eligible', True),
+                'n_trades': len(trades),
+                # Raw per-trade closed-trade list (need_times=True -- Entry/Exit Time/Price,
+                # Return, armed/Arm Time/Arm Price), added 2026-08-23 for candidate_full_
+                # review.py's --kernel gt full-review port: lets that report compute real
+                # win-rate/tranche/addon-leg numbers directly off this SAME trade list (via
+                # apply_addon_overlay_ground_truth) instead of a second run_backtest_ground_
+                # truth call. [] when this candidate had no cached hourly inputs.
+                'trades': trades,
+                'check4_early_wr_pct': c4_early_wr, 'check4_late_wr_pct': c4_late_wr,
+                'check8_fluke': c8,
+                'check11_max_drawdown_pct': dd_pct, 'check11_dd_peak_time': dd_peak, 'check11_dd_trough_time': dd_trough,
+                'check13_folds': c13_folds,
+                'core_safe': None if core_cliff is None else (not core_cliff),
+                'addon_safe': None if addon_cliff is None else (not addon_cliff),
+                'core_addon_disagreement': disagreement,
+                'addon_detail': addon,
+                'drought': drought,
+                'drought_ie': drought_ie,
+            })
+    finally:
+        _trades_conn.close()
 
     # cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md Step 4): CAGR is
     # the sole GT selection metric now -- this is the single most consequential ranking
