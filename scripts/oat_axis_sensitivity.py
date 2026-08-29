@@ -148,6 +148,60 @@ def _fixed_sl_fine_values(anchor_fixed_sl):
             if anchor_fixed_sl + FIXED_SL_FINE_STEP * i > 0]
 
 
+# window_fine / z_fine (2026-08-29, Task #6 follow-up, planner dispatch): a real
+# --all-candidates run found window (40.1pp median adjacent delta) and z (36.2pp) both
+# beat take_profit's 17.5pp -- but window's coarse default only tests 5-unit steps
+# (5,10,15,20,25) and z only has 3 points total (1.0/1.5/2.0), the same coarse-grid
+# blind spot already caught for fixed_sl. Mirrors _fixed_sl_fine_values' exact
+# anchor+/-radius pattern, reported under its own 'window_fine'/'z_fine' axis label,
+# never merged with the coarse pass' own adjacent-delta stats.
+#
+# window is a real integer bar-count -- step=1 is the natural fine resolution (a
+# window of 12.5 bars isn't a real config). Floor at window>=2: strategies.py's
+# rolling SMA/Std (e.g. line 141 df['Close'].rolling(window=w).std()) needs >=2 points
+# to produce a non-degenerate std; window<2 gives NaN/zero std and a broken z-score,
+# not a real edge case worth generating.
+#
+# z is a continuous statistical threshold (unlike window) -- step=0.05 matches its
+# real resolution. Floor at z>0 (a non-positive z-score threshold isn't sensible --
+# same non-positive-value convention as fixed_sl's own >0 filter above).
+#
+# Radius sizing (measured empirically, not guessed -- see commit message for the real
+# numbers): window sweep points are NOT free like z/fixed_sl -- each distinct window
+# value forces a fresh rolling-window recompute (~4s/point cold), unlike z/tpct which
+# reuse the anchor's already-prepped data for ~0s/point. Real finding, not assumed:
+# run_optimization_sweep._NODE_INPUT_CACHE_GT (the per-process memo this cost hinges
+# on) caps at 6 entries (_NODE_INPUT_CACHE_MAX). The coarse window grid alone already
+# uses 5 of those 6 slots -- so ANY window_fine radius>=1 (2+ new distinct window
+# values beyond the anchor) pushes total distinct touches past 6, wiping the whole
+# cache (clear-on-full, not LRU) and killing the coarse pass' previously-free
+# steady-state reuse across candidates too, not just adding window_fine's own cost.
+# This makes radius=1 (2 new points) the minimum *and* the best choice: cost is
+# dominated by the now-unavoidable coarse-pass cache-wipe overhead, not by the fine
+# pass' own point count, so a smaller radius only saves ~2 points' worth of compute
+# on top of a mostly-fixed overhead -- no reason to go smaller than the minimum
+# meaningful ±1-bar neighbor check. z_fine has no such interaction (z isn't part of
+# the cache key) and stays near-free regardless of radius.
+WINDOW_FINE_STEP = 1
+WINDOW_FINE_RADIUS = 1
+WINDOW_FINE_MIN = 2
+
+Z_FINE_STEP = 0.05
+Z_FINE_RADIUS = 0.3
+
+
+def _window_fine_values(anchor_window):
+    n_steps = int(round(WINDOW_FINE_RADIUS / WINDOW_FINE_STEP))
+    return [anchor_window + WINDOW_FINE_STEP * i for i in range(-n_steps, n_steps + 1)
+            if anchor_window + WINDOW_FINE_STEP * i >= WINDOW_FINE_MIN]
+
+
+def _z_fine_values(anchor_z):
+    n_steps = int(round(Z_FINE_RADIUS / Z_FINE_STEP))
+    return [round(anchor_z + Z_FINE_STEP * i, 2) for i in range(-n_steps, n_steps + 1)
+            if anchor_z + Z_FINE_STEP * i > 0]
+
+
 def summarize_axis(rows):
     """(spread, max_adjacent_delta) from a real (already ordered) sweep, both None if
     fewer than 2 real (non-None cagr) points."""
@@ -194,6 +248,32 @@ def run_anchor(anchor, axes_to_run, axis_values_override, spy_bh):
             fine_max_adj_str = "N/A" if fine_max_adj is None else f"{fine_max_adj:.2f}pp"
             print(f"  fixed_sl_fine: {len(fine_values)} points (anchor {anchor['fixed_sl']} "
                   f"+/-{FIXED_SL_FINE_RADIUS} step {FIXED_SL_FINE_STEP}) in {elapsed:.1f}s -- "
+                  f"spread={fine_spread_str} max_adjacent_delta={fine_max_adj_str}")
+
+        if axis == "window":
+            fine_values = _window_fine_values(anchor["window"])
+            t0 = time.monotonic()
+            fine_rows = sweep_axis(anchor, "window", fine_values, spy_bh, label="window_fine")
+            all_rows.extend(fine_rows)
+            fine_spread, fine_max_adj = summarize_axis(fine_rows)
+            elapsed = time.monotonic() - t0
+            fine_spread_str = "N/A" if fine_spread is None else f"{fine_spread:.2f}pp"
+            fine_max_adj_str = "N/A" if fine_max_adj is None else f"{fine_max_adj:.2f}pp"
+            print(f"  window_fine: {len(fine_values)} points (anchor {anchor['window']} "
+                  f"+/-{WINDOW_FINE_RADIUS} step {WINDOW_FINE_STEP}) in {elapsed:.1f}s -- "
+                  f"spread={fine_spread_str} max_adjacent_delta={fine_max_adj_str}")
+
+        if axis == "z":
+            fine_values = _z_fine_values(anchor["z"])
+            t0 = time.monotonic()
+            fine_rows = sweep_axis(anchor, "z", fine_values, spy_bh, label="z_fine")
+            all_rows.extend(fine_rows)
+            fine_spread, fine_max_adj = summarize_axis(fine_rows)
+            elapsed = time.monotonic() - t0
+            fine_spread_str = "N/A" if fine_spread is None else f"{fine_spread:.2f}pp"
+            fine_max_adj_str = "N/A" if fine_max_adj is None else f"{fine_max_adj:.2f}pp"
+            print(f"  z_fine: {len(fine_values)} points (anchor {anchor['z']} "
+                  f"+/-{Z_FINE_RADIUS} step {Z_FINE_STEP}) in {elapsed:.1f}s -- "
                   f"spread={fine_spread_str} max_adjacent_delta={fine_max_adj_str}")
     return all_rows
 
@@ -293,7 +373,10 @@ def main():
 
     if len(anchors) > 1:
         print(f"\n=== Aggregate summary across {len(anchors)} anchors ===")
-        agg_axes = list(args.axes) + (["fixed_sl_fine"] if "fixed_sl" in args.axes else [])
+        agg_axes = (list(args.axes)
+                    + (["fixed_sl_fine"] if "fixed_sl" in args.axes else [])
+                    + (["window_fine"] if "window" in args.axes else [])
+                    + (["z_fine"] if "z" in args.axes else []))
         for axis in agg_axes:
             axis_df = df_out[df_out["axis"] == axis]
             if axis_df.empty:
