@@ -43,7 +43,22 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
-## [tooling][data] Idea, raised 2026-08-29 (later still), no rush — unified continuous 1h/1m/1s derived reference, replacing 3 independently-adjusted pipelines
+## [tooling][security] Found 2026-08-29 (much later), high priority — ~16 stale worktrees hold real uncommitted diffs, several touching live-trading files, never merged
+Confirmed directly (`git worktree list` + per-worktree `git status --short` loop): of 44 total worktrees under `.claude/worktrees/`, 18 have real uncommitted changes. 2 are tonight's actual in-progress dispatches (`agent-a0e275fc3bb109c0a` = massive_second_derived work in progress; `agent-af015196213acba00` = AGQ ticker-generalization in progress) — leave those alone, they're live. The other ~16 are from past, unrelated sessions and were never merged to main:
+- `agent-a099e74c2380d8a79`: `signals_notify.py` + new `tests/test_report_production_incident_filter.py`
+- `agent-a0f7bee415286ba23`: `scripts/evening_status.py`, `scripts/node_candidate_trace.py`, `signals_db.py` + new `tests/test_node_archive.py`
+- `agent-a253add9f502cb9b2`: `schwab_client.py` + new `tests/test_schwab_client_retry_lock_scenario.py`
+- `agent-a2f0f827fdba1c062`: `scripts/coverage_designated_tester.py`, `scripts/coverage_registry.py`, `scripts/coverage_ticket_table.py` + new `tests/test_coverage_designated_tester.py`
+- `agent-a47aca41d08ae639d`: `pages/4_Portfolio.py`, `schwab_safety.py`, `scripts/premarket_prep.py`, `scripts/watchlist_status.py`, `signals_blocks.py`, `signals_helpers.py`, `signals_notify.py` (all staged, `M `) + new `tests/test_live_tier_display.py`
+- `agent-a54ff1791e91d0981`: `docs/backlog_resolved_recent.md`, `docs/deep_backlog.md`, `schwab_safety.py`, `signals_notify.py`, 2 test files + new `scripts/preview_intraday_risk_review.py`
+- `agent-a74e8f849f4082886`: `docs/backlog_cache.md`, `docs/backlog_resolved_recent.md`, `docs/deep_backlog.md`, `pages/14_Coverage.py`, `scripts/coverage_proof_matrix.py`, `scripts/coverage_registry.py`, `scripts/evening_status.py`, 4 test files
+- `agent-a999502f765f7de3f`: `scripts/fake_venue_harness.py`, `signals_notify.py` + new `fake_venue/scenarios_post_fill_topup.py`
+- `agent-aa4bb1f1551f5c794`: `active_signals.py`, `scripts/coverage_registry.py`, `signals_config.py`, `signals_db.py` (all staged) + new `signals_trade_control.py` (staged) + new `tests/test_trade_control_channel.py` (staged) -- looks like a genuinely complete feature (trade control channel) ready to commit
+- `agent-ab9d241ce5f769cff`: `schwab_safety.py`, `schwab_stream.py`, `signals_db.py`, `signals_notify.py`, 1 test file + 2 new files (`scripts/backfill_coverage_event_source.py`, `tests/test_coverage_event_source.py`)
+- `agent-afb9808b12febee3a`: `tests/test_coverage_check.py`
+- `agent-afbdf905edbe72f67`: `schwab_safety.py` + new `tests/test_replacing_order_id_dup_window_exemption_scenario.py`
+
+Several of these touch real live-trading files (`active_signals.py`, `schwab_client.py`, `schwab_safety.py`, `schwab_stream.py`, `signals_db.py`, `signals_notify.py`) with what look like completed features/fixes and paired new test files -- genuinely concerning that this much real work was never merged. High priority to triage next session: for each worktree, read the diff, determine if it's complete/tested work worth merging (with the paired-review gate applied if it touches a gated file) or abandoned/superseded work safe to discard. Don't touch the 2 tonight-in-progress ones without checking they've actually finished first.
 Real future direction, user's own framing (possibly "next weekend"): today's `massive_hourly_derived`/`massive_minute_derived`/(new tonight) `massive_second_derived` are each built by independently re-fetching dividends and applying adjustment at that granularity — three separate pipelines that could theoretically drift apart from each other over time (different dividend-fetch timing, different correction passes) rather than one coherent, continuously-updated source of truth. A unified design would build/adjust once at the finest available granularity and derive the coarser ones by resampling, guaranteeing all three stay consistent by construction instead of by convention. Not scoped — no schema, no build-pipeline redesign, just the direction. Checked directly, not already in backlog_cache.md/deep_backlog.md under any phrasing found tonight — first time it's on file.
 
 ## [tooling][backtest] Found 2026-08-29 (later still), confirmed independently twice — `rebuild_winner_trades.py` has a latent node_key bug for TrailingExitZScoreBreakout candidates
