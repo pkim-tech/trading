@@ -619,7 +619,57 @@ def record_massive_hourly_build(ticker, label, raw_data_pulled_at, raw_data_star
             c.close()
 
 
+def _migrate_active_builds_table_widen_check(conn):
+    """One-time migration (2026-08-29): active_builds' table_name CHECK constraint
+    was hardcoded to ('hourly', 'minute') -- adding 'second' (the new dividend-
+    adjusted 1-second derived pipeline, see massive_second_derived/
+    massive_second_derived_builds -- its OWN independent build_id sequence, not
+    shared with hourly/minute) requires a real schema migration since SQLite has
+    no ALTER TABLE ... CHECK. Idempotent: checks sqlite_master's stored CREATE TABLE
+    SQL for the widened CHECK before doing anything, so re-running this (or calling
+    it twice in the same process) is a no-op the second time. The RENAME/CREATE/
+    INSERT/verify/DROP sequence below runs inside the caller's own transaction --
+    every caller reaches this via `with sqlite3.connect(DB_PATH) as conn:` (commits
+    only if the whole block succeeds, rolls back on any exception), so a failure at
+    any point (including the explicit row-count check) leaves the original table
+    completely untouched under its original name."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='active_builds'"
+    ).fetchone()
+    if row is None:
+        return  # fresh DB -- _ensure_active_builds_table's own CREATE below already has the widened CHECK
+    existing_sql = row[0] or ""
+    if "'second'" in existing_sql:
+        return  # already migrated
+
+    old_count = conn.execute("SELECT COUNT(*) FROM active_builds").fetchone()[0]
+    conn.execute("ALTER TABLE active_builds RENAME TO active_builds_pre_second_migration")
+    conn.execute("""
+        CREATE TABLE active_builds (
+            ticker      TEXT NOT NULL,
+            table_name  TEXT NOT NULL CHECK (table_name IN ('hourly', 'minute', 'second')),
+            build_id    INTEGER NOT NULL,
+            promoted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            note        TEXT,
+            PRIMARY KEY (ticker, table_name)
+        )
+    """)
+    conn.execute("""
+        INSERT INTO active_builds (ticker, table_name, build_id, promoted_at, note)
+        SELECT ticker, table_name, build_id, promoted_at, note FROM active_builds_pre_second_migration
+    """)
+    new_count = conn.execute("SELECT COUNT(*) FROM active_builds").fetchone()[0]
+    if new_count != old_count:
+        raise RuntimeError(
+            f"active_builds migration row-count mismatch: old={old_count} new={new_count} -- "
+            f"aborting (transaction will roll back, old table preserved as "
+            f"active_builds_pre_second_migration under its original name)."
+        )
+    conn.execute("DROP TABLE active_builds_pre_second_migration")
+
+
 def _ensure_active_builds_table(conn):
+    _migrate_active_builds_table_widen_check(conn)
     # active_builds: explicit promotion pointer for massive_hourly_derived_builds --
     # get_massive_hourly_derived/get_massive_minute_derived's no-build_id path resolves
     # from here instead of `ORDER BY b.id DESC` (real incident, 2026-08-26: a
@@ -642,7 +692,7 @@ def _ensure_active_builds_table(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS active_builds (
             ticker      TEXT NOT NULL,
-            table_name  TEXT NOT NULL CHECK (table_name IN ('hourly', 'minute')),
+            table_name  TEXT NOT NULL CHECK (table_name IN ('hourly', 'minute', 'second')),
             build_id    INTEGER NOT NULL,
             promoted_at TEXT NOT NULL DEFAULT (datetime('now')),
             note        TEXT,
@@ -761,6 +811,161 @@ def get_massive_hourly_derived(ticker, build_id=None):
             "volume AS Volume, corrected FROM massive_hourly_derived WHERE ticker=? AND build_id=? ORDER BY ts",
             conn, params=(ticker, build_id), parse_dates=["ts"])
         return df.set_index("ts")
+
+
+def _ensure_massive_second_derived_table(conn):
+    # massive_second_derived: the dividend-adjusted 1-SECOND derived series, built
+    # from cache/research/second_data/{ticker}_1s.csv raw ticks (2026-08-29,
+    # scripts/build_massive_second_derived.py) -- same column shape as
+    # massive_hourly_derived (including `corrected`, kept for shape consistency
+    # with the sibling tables even though it's always 0 here: there is no spike-
+    # correction step for seconds, no Yahoo-second reference exists to cross-check
+    # against). PRIMARY KEY (ticker, build_id, ts), same never-overwritten multi-
+    # vintage convention as the hourly/minute tables.
+    #
+    # build_id is its OWN independent AUTOINCREMENT sequence (massive_second_
+    # derived_builds below), NOT shared with massive_hourly_derived_builds/
+    # massive_minute_derived_builds -- deliberate design choice: the hourly and
+    # minute legs share one build_id because build_massive_hourly_derived.py
+    # produces both from the exact same Massive-minute-API pull in one pass (so
+    # "same build" is a real, meaningful concept there). The raw 1-second data is a
+    # wholly separate source (pre-fetched CSVs on disk, not derived from that same
+    # minute-API pull), so there is no equivalent "same build" relationship to
+    # preserve -- giving it its own id sequence avoids implying a provenance link
+    # that doesn't exist.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS massive_second_derived (
+            ticker     TEXT NOT NULL,
+            build_id   INTEGER NOT NULL,
+            ts         TEXT NOT NULL,
+            open       REAL NOT NULL,
+            high       REAL NOT NULL,
+            low        REAL NOT NULL,
+            close      REAL NOT NULL,
+            volume     REAL,
+            corrected  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (ticker, build_id, ts)
+        )
+    """)
+    # massive_second_derived_builds: the vintage/provenance record for each per-
+    # ticker second-leg rebuild -- same columns as massive_hourly_derived_builds
+    # (built_at, raw_data_start/end, dividend_data_asof, row_count,
+    # correction_count -- correction_count is always 0, see table docstring above).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS massive_second_derived_builds (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker                TEXT NOT NULL,
+            label                 TEXT NOT NULL,
+            built_at              TEXT NOT NULL DEFAULT (datetime('now')),
+            raw_data_pulled_at    TEXT,
+            raw_data_start        TEXT,
+            raw_data_end          TEXT,
+            dividend_data_asof    TEXT,
+            row_count             INTEGER,
+            correction_count      INTEGER
+        )
+    """)
+
+
+def write_massive_second_derived(ticker, build_id, df, conn=None):
+    """df: DataFrame indexed by tz-naive second timestamp, columns Open/High/Low/
+    Close/Volume (dividend-adjusted), 'corrected' optional (defaults 0 -- always 0
+    in practice, no spike-correction step for seconds). Same permanent, never-
+    overwritten-in-place, multi-vintage convention as write_massive_hourly_derived
+    -- build_id must come from record_massive_second_build()'s return value. Builds
+    row tuples via zip() over numpy/pandas arrays rather than df.iterrows()
+    (mirrors write_massive_minute_derived's own reasoning -- iterrows() boxes every
+    row into a Series, too slow over the multi-million-row second-level history a
+    full ticker build has). Pass conn to participate in a caller-managed transaction
+    (see _connect_or_reuse); default (conn=None) opens/commits/closes its own
+    connection."""
+    c, owns = _connect_or_reuse(conn)
+    try:
+        _ensure_massive_second_derived_table(c)
+        ts_str = df.index.strftime("%Y-%m-%d %H:%M:%S")
+        volume = df["Volume"].fillna(0).astype(float) if "Volume" in df.columns else [0.0] * len(df)
+        corrected = df["corrected"].astype(int) if "corrected" in df.columns else [0] * len(df)
+        rows = list(zip([ticker] * len(df), [build_id] * len(df), ts_str,
+                         df["Open"].astype(float), df["High"].astype(float),
+                         df["Low"].astype(float), df["Close"].astype(float),
+                         volume, corrected))
+        c.executemany("""
+            INSERT INTO massive_second_derived (ticker, build_id, ts, open, high, low, close, volume, corrected)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        if owns:
+            c.commit()
+    finally:
+        if owns:
+            c.close()
+
+
+def record_massive_second_build(ticker, label, raw_data_pulled_at, raw_data_start,
+                                 raw_data_end, dividend_data_asof, row_count, correction_count,
+                                 conn=None):
+    """Second leg's provenance-record function -- mirrors record_massive_hourly_
+    build() exactly, except this mints its OWN independent build_id (AUTOINCREMENT
+    on massive_second_derived_builds), not shared with the hourly/minute builds
+    tables (see massive_second_derived's table docstring for why). Returns the new
+    build_id."""
+    c, owns = _connect_or_reuse(conn)
+    try:
+        _ensure_massive_second_derived_table(c)
+        cur = c.execute("""
+            INSERT INTO massive_second_derived_builds
+                (ticker, label, raw_data_pulled_at, raw_data_start, raw_data_end,
+                 dividend_data_asof, row_count, correction_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, label, raw_data_pulled_at, raw_data_start, raw_data_end,
+              dividend_data_asof, row_count, correction_count))
+        build_id = cur.lastrowid
+        if owns:
+            c.commit()
+        return build_id
+    finally:
+        if owns:
+            c.close()
+
+
+def get_massive_second_derived(ticker, build_id=None):
+    """Returns the ACTIVE (explicitly promoted) vintage by default -- see
+    get_massive_hourly_derived's docstring for the full active_builds-based
+    resolution rationale (table_name='second', promoted independently from
+    hourly/minute). Pass an explicit build_id to reproduce an older vintage."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_massive_second_derived_table(conn)
+        if build_id is None:
+            build_id = get_active_build_id(ticker, 'second', conn=conn)
+            if build_id is None:
+                return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume", "corrected"])
+            _log_build_id_resolution(ticker, 'second', build_id)
+        df = pd.read_sql_query(
+            "SELECT ts, open AS Open, high AS High, low AS Low, close AS Close, "
+            "volume AS Volume, corrected FROM massive_second_derived WHERE ticker=? AND build_id=? ORDER BY ts",
+            conn, params=(ticker, build_id), parse_dates=["ts"])
+        return df.set_index("ts")
+
+
+def get_massive_second_ohlcv(ticker, build_id=None):
+    """Drop-in-style accessor mirroring get_massive_hourly_ohlcv/get_massive_
+    minute_ohlcv exactly (same Open/High/Low/Close/Volume columns, tz-naive
+    DatetimeIndex, sorted ascending, Volume cast to int64) for the dividend-
+    adjusted 1-second derived series. No consumer is wired to use this yet
+    (2026-08-29) -- exists as the accessor, matching the sibling resolution/
+    logging conventions (_log_build_id_resolution etc.). Raises if the ticker has
+    no second build at all, matching the sibling loud-failure convention."""
+    df = get_massive_second_derived(ticker, build_id=build_id)
+    if df.empty:
+        raise ValueError(
+            f"get_massive_second_ohlcv: no massive_second_derived rows for ticker={ticker!r} "
+            f"(build_id={build_id!r}) -- run scripts/build_massive_second_derived.py first."
+        )
+    df = df.drop(columns=["corrected"])
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = df.sort_index()
+    df["Volume"] = df["Volume"].fillna(0).astype("int64")
+    df.index.name = "timestamp"
+    return df
 
 
 def _ensure_massive_minute_derived_table(conn):
