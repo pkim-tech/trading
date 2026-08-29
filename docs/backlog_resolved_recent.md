@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][security][HIGH] Resolved 2026-08-28 (dispatched, coder4) — signal_price-vs-real-market-data mismatch fully explained for all 3 tickers (SOXL/DPST/DFEN). SOXL was the missing piece: entry_timing='open_check' pins signal_price to the real session-open print by design, confirmed exact match ($117.37) against real Massive.com 1s data. Not a bug. Full detail: `deep_backlog.md`.
+
 ## [live-trading][testing] Resolved 2026-08-28 (stale-entry cleanup) — 08-25's "12/14 NOT CHECKED (RuntimeError)" item was already fixed by the 08-27 yahoo->massive routing fix (`5b2f29e`), just never removed from backlog_cache.md. Confirmed via 2 fresh evening_status.py 3 reruns, zero RuntimeErrors. Full detail: `deep_backlog.md`.
 
 ## [live-trading][tooling] Resolved 2026-08-28 (coder3 dispatch) — self-check guard added to the 2 remaining hardcoded `CREATE TABLE watch_list_new` migration blocks (commit `8474e0e`), paired-reviewed, no HIGH findings. Full detail: `deep_backlog.md`.
