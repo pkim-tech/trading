@@ -379,6 +379,15 @@ def build_ticker(ticker):
 
         db_cache.write_massive_hourly_derived(ticker, build_id, hourly_corrected, conn=conn)
         db_cache.write_massive_minute_derived(ticker, build_id, minute_session, conn=conn)
+        # Minute's own provenance row, sharing the SAME build_id as the hourly leg
+        # above (2026-08-29, docs/design.md's 2026-08-29 (very late) entry) -- row_count
+        # is the minute leg's own count (len(minute_session)), not copied from the
+        # hourly row_count, since the two legs' row counts are never the same number
+        # (different bar granularity). correction_count is always 0 -- the spike-
+        # correction step never runs against minute bars, only the hourly aggregate.
+        db_cache.record_massive_minute_build(
+            build_id, ticker, BUILD_LABEL, raw_pulled_at, raw_data_start, raw_data_end,
+            dividend_asof, len(minute_session), correction_count=0, conn=conn)
 
     # raw_value == new_value is the real structural signal for "flagged, not
     # actually changed" -- more robust than matching specific reason strings,

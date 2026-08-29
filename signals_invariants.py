@@ -291,6 +291,53 @@ def check_massive_hourly_derived_freshness():
     return violations
 
 
+def check_massive_minute_derived_freshness():
+    """Minute's freshness sibling to check_massive_hourly_derived_freshness --
+    same logic, same JOIN pattern (best-with-rows build per ticker via
+    massive_minute_derived_builds, added 2026-08-29 by Task #17 specifically to
+    make this check possible -- no automated minute freshness check existed
+    before that table did, docs/design.md's 2026-08-29 (very late) entry). Same
+    real staleness gap applies here too (no automated refresh cron exists for
+    either massive_hourly_derived or massive_minute_derived), so this lives in
+    DATA_FRESHNESS_CHECKS alongside its hourly sibling, NOT in CHECKS/run_all()
+    -- see DATA_FRESHNESS_CHECKS' own comment for why (would surface a wall of
+    already-known violations on every daemon-startup/07:00/EOD run until the
+    refresh cron actually exists)."""
+    import sqlite3
+    import pandas as pd
+    import db_cache
+    violations = []
+    today = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
+    last_bday = _last_completed_trading_day(today)
+    with sqlite3.connect(db_cache.DB_PATH) as conn:
+        for node in db.get_watchlist():
+            if not helpers.has_capital_at_stake(node):
+                continue
+            ticker = node['ticker']
+            row = conn.execute("""
+                SELECT MAX(d.ts) FROM massive_minute_derived_builds b
+                JOIN massive_minute_derived d ON d.ticker=b.ticker AND d.build_id=b.id
+                WHERE b.ticker=? AND b.id = (
+                    SELECT b2.id FROM massive_minute_derived_builds b2
+                    WHERE b2.ticker=b.ticker AND EXISTS (
+                        SELECT 1 FROM massive_minute_derived d2
+                        WHERE d2.ticker=b2.ticker AND d2.build_id=b2.id
+                    )
+                    ORDER BY b2.id DESC LIMIT 1
+                )
+            """, (ticker,)).fetchone()
+            last_ts = row[0] if row else None
+            if last_ts is None:
+                violations.append(f"{ticker} (wl_id={node['id']}): no massive_minute_derived "
+                                   f"build with real rows on file at all")
+                continue
+            last_dt = pd.Timestamp(last_ts).normalize()
+            if last_dt < last_bday:
+                violations.append(f"{ticker} (wl_id={node['id']}): massive_minute_derived stale "
+                                   f"(last bar {last_ts}, need >= {last_bday.date()})")
+    return violations
+
+
 def check_tax_advantaged_excluded_tickers():
     """No mode='live' watch_list node for a TAX_ADVANTAGED_EXCLUDED_TICKERS ticker
     (e.g. USO -- see CLAUDE.md's "Ticker exclusion, decided 2026-08-04" note,
@@ -1062,6 +1109,7 @@ CHECKS = [
 # silently dropped real, non-noisy, automatic Slack coverage for no reason.
 DATA_FRESHNESS_CHECKS = [
     check_massive_hourly_derived_freshness,
+    check_massive_minute_derived_freshness,
 ]
 
 # TRACEABILITY_CHECKS: deliberately NOT in CHECKS/run_all() (2026-08-19,

@@ -871,6 +871,170 @@ def get_massive_minute_ohlcv(ticker, build_id=None):
     return df
 
 
+def _ensure_massive_minute_derived_builds_table(conn):
+    # massive_minute_derived_builds: minute's provenance sibling to
+    # massive_hourly_derived_builds (2026-08-29 design, docs/design.md's 2026-08-29
+    # (very late) entry) -- SAME shape, same columns, deliberately not redesigned.
+    # `id` is NOT autoincrement here: build_ticker() writes both legs of a build
+    # from the exact same dividend/raw-data vintage in one pass, sharing ONE
+    # build_id (record_massive_hourly_build()'s return value) between
+    # massive_hourly_derived and massive_minute_derived -- this table's `id`
+    # mirrors that same value explicitly (record_massive_minute_build() inserts
+    # it, never lets SQLite generate its own), so massive_minute_derived_builds.id
+    # always equals massive_hourly_derived_builds.id for the same real build event
+    # and the two tables stay trivially joinable. correction_count is always 0 for
+    # every minute build (real, not unknown/placeholder): the spike-correction step
+    # only ever operates on the hourly aggregate, never the raw minute bars -- see
+    # massive_minute_derived's own table docstring for the known residual gap this
+    # implies (a bad tick the hourly leg corrects can still be present, uncorrected,
+    # in the minute leg).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS massive_minute_derived_builds (
+            id                    INTEGER PRIMARY KEY,
+            ticker                TEXT NOT NULL,
+            label                 TEXT NOT NULL,
+            built_at              TEXT NOT NULL DEFAULT (datetime('now')),
+            raw_data_pulled_at    TEXT,
+            raw_data_start        TEXT,
+            raw_data_end          TEXT,
+            dividend_data_asof    TEXT,
+            row_count             INTEGER,
+            correction_count      INTEGER
+        )
+    """)
+
+
+def record_massive_minute_build(build_id, ticker, label, raw_data_pulled_at, raw_data_start,
+                                 raw_data_end, dividend_data_asof, row_count, correction_count=0,
+                                 built_at=None, conn=None):
+    """Minute's provenance-record sibling to record_massive_hourly_build() -- but
+    takes build_id as an explicit argument rather than generating/returning one:
+    the real build_id always comes from record_massive_hourly_build()'s own return
+    value (called first, same build_ticker() pass, same transaction), never
+    independently minted here. Upserts (INSERT OR REPLACE) rather than a bare
+    INSERT so this is safe to call twice for the same build_id (e.g. a backfill
+    script re-run) without violating the PRIMARY KEY.
+
+    built_at: pass the REAL value explicitly when known (e.g. a backfill reusing
+    a sibling massive_hourly_derived_builds row's own built_at -- the true past
+    build time, not now). Omit (None, the default) for a genuine fresh build
+    happening right now -- build_ticker()'s own real-time call relies on this
+    default. Precedence, in order: explicit built_at argument > this row's own
+    already-stored built_at (so a re-run of the SAME call never clobbers a
+    previously-recorded value with 'now') > datetime('now') as the final
+    fallback for a genuinely first-ever INSERT with no built_at supplied.
+    (Fixed 2026-08-29, contextual Opus review, CONFIRMED HIGH: an earlier
+    version had no built_at parameter at all, so the backfill script's call
+    silently stamped every backfilled row with the BACKFILL's own run time
+    instead of the real historical build time it had already looked up from
+    the sibling hourly row -- contradicted that script's own docstring and
+    corrupted exactly the incident-forensics trail this table exists for.)"""
+    c, owns = _connect_or_reuse(conn)
+    try:
+        _ensure_massive_minute_derived_builds_table(c)
+        c.execute("""
+            INSERT OR REPLACE INTO massive_minute_derived_builds
+                (id, ticker, label, built_at, raw_data_pulled_at, raw_data_start, raw_data_end,
+                 dividend_data_asof, row_count, correction_count)
+            VALUES (?, ?, ?, COALESCE(?, (SELECT built_at FROM massive_minute_derived_builds WHERE id=?),
+                                       datetime('now')), ?, ?, ?, ?, ?, ?)
+        """, (build_id, ticker, label, built_at, build_id, raw_data_pulled_at, raw_data_start, raw_data_end,
+              dividend_data_asof, row_count, correction_count))
+        if owns:
+            c.commit()
+    finally:
+        if owns:
+            c.close()
+
+
+def get_massive_minute_derived_builds(ticker=None):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_massive_minute_derived_builds_table(conn)
+        conn.row_factory = sqlite3.Row
+        q = "SELECT * FROM massive_minute_derived_builds"
+        params = ()
+        if ticker:
+            q += " WHERE ticker = ?"
+            params = (ticker,)
+        q += " ORDER BY id"
+        return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+
+def _ensure_derived_build_adjustments_table(conn):
+    # derived_build_adjustments: a 1-to-many, append-only event log recording real
+    # detected/applied corporate-action events against the Massive-derived
+    # hourly/minute pipeline -- distinct from massive_hourly_derived_builds/
+    # massive_minute_derived_builds (which describe "what does build X look like",
+    # not "what real-world event happened and when"). Reuses data_mutation_log's
+    # PATTERN (ticker, detection fields, notes, append-only), not the table itself
+    # -- data_mutation_log predates active_builds (no build_id concept), is
+    # split-only, and is scoped to the legacy yahoo _1h.csv split-guard rescale
+    # path specifically, a different pathway from this one. See docs/design.md's
+    # 2026-08-29 (very late) entry for the full design rationale.
+    #
+    # Column choices, deviating slightly from the design doc's own sketch:
+    # - event_type has no CHECK constraint (unlike the doc's ['dividend'/'split'/
+    #   'other'] suggestion) -- deliberately open string, matching this project's
+    #   existing convention of not over-constraining a freeform-ish classification
+    #   column this early (e.g. coverage_events.scenario_key is also unconstrained
+    #   TEXT). A CHECK can be added later once real usage confirms the real value
+    #   set; loosening a CHECK is a schema migration, widening a convention isn't.
+    # - magnitude and cash_amount are BOTH present (not a single "magnitude/ratio"
+    #   column as sketched) -- mirrors massive_dividends_raw's own two-field split
+    #   (historical_adjustment_factor vs cash_amount), since a real dividend event
+    #   naturally carries both a ratio-style adjustment factor AND a raw cash
+    #   amount, and a split event only ever has the former. Collapsing them into
+    #   one ambiguous column would lose real information for no benefit.
+    # - resulting_build_id is nullable INTEGER with no FK enforcement (SQLite FKs
+    #   aren't enabled project-wide here) -- a detected event can predate any
+    #   rebuild it eventually triggers, exactly as the design doc specifies.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS derived_build_adjustments (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker             TEXT NOT NULL,
+            event_type         TEXT NOT NULL,
+            detected_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            event_date         TEXT,
+            magnitude          REAL,
+            cash_amount        REAL,
+            source             TEXT NOT NULL,
+            resulting_build_id INTEGER,
+            notes              TEXT
+        )
+    """)
+
+
+def log_derived_build_adjustment(ticker, event_type, event_date, magnitude, cash_amount,
+                                  source, resulting_build_id, notes):
+    """Records one detected/applied corp-action event against the Massive-derived
+    pipeline. NOT wired into anything live yet (2026-08-29) -- no code currently
+    detects-and-triggers a rebuild automatically; that's the separate, bigger,
+    not-yet-built rolling-window/canary-triggered-rebuild mechanism from
+    docs/design.md's 2026-08-29 entry. This is schema + a real insert/query helper
+    pair only, matching log_data_mutation/get_data_mutations' own shape."""
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_derived_build_adjustments_table(conn)
+        conn.execute("""
+            INSERT INTO derived_build_adjustments
+                (ticker, event_type, event_date, magnitude, cash_amount, source, resulting_build_id, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, event_type, event_date, magnitude, cash_amount, source, resulting_build_id, notes))
+
+
+def get_derived_build_adjustments(ticker=None, limit=200):
+    with sqlite3.connect(DB_PATH) as conn:
+        _ensure_derived_build_adjustments_table(conn)
+        conn.row_factory = sqlite3.Row
+        q = "SELECT * FROM derived_build_adjustments"
+        params = ()
+        if ticker:
+            q += " WHERE ticker = ?"
+            params = (ticker,)
+        q += " ORDER BY id DESC LIMIT ?"
+        params = params + (limit,)
+        return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+
 def get_massive_hourly_ohlcv(ticker, build_id=None):
     """Drop-in replacement for `pd.read_csv(f"{ticker}_1h.csv", index_col=0,
     parse_dates=True)` (the Yahoo-sourced hourly CSV every GT/hourly caller currently
