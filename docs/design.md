@@ -2722,3 +2722,61 @@ this doc entry exists so the design isn't lost before that decision gets made.
 Not built. `signals_compute.py` is a `signals_*.py` module — any implementation of part 1/2 above needs
 the paired independent-cold + contextual Opus review before landing, per CLAUDE.md's Review-Gate
 Persistence Rule.
+
+## 2026-08-28 (later still) — Design, not built, part 2: quarterly ticker-rotation concept ("v6-q4"-style), swap-on-flat, and a real BUY-only node-pause gap found
+
+**Origin**: a follow-on design thread the same night, connected to part 1 above (both stem from wanting a
+"clean, consistent dataset per ticker" — this part is about what to DO with that data on a recurring
+cadence, not the data-correctness question part 1 covers). Not decided/built, captured so it isn't lost.
+
+**Weekend sweep, Monday decision**: run the full candidate-selection sweep (schema-v2 in-memory flow, now
+dispatchable by the agent per the sweep-launch-rule relaxation earlier tonight) over a weekend against a
+new ticker cohort, so a ranked result is ready by Monday. Real data-architecture question resolved during
+discussion: **don't do a second, separate full data pull per quarter** — that duplicates datasets and
+risks quarter-to-quarter inconsistency. Instead, treat the continuously-refreshed `massive_hourly_derived`
+active build (once its refresh cron exists — separate, already-queued item) as a single master dataset,
+and have each quarterly rebalance sweep just select a date RANGE against it — exactly the same
+`window_version_suffix()`/`-w{start}_{end}` windowing convention already used by every other GT/backtest
+campaign today. No new data-pull mechanism needed, just applying an existing pattern to a new sweep
+definition.
+
+**Swap trigger and mechanism, several real simplifications found during discussion**:
+- Whether to actually swap a given ticker out is NOT a fixed rule ("new winner always replaces old") --
+  explicitly undecided, deferred to a real per-quarter judgment call (e.g. a marginal improvement might
+  not be worth the churn/tax cost of swapping). The pipeline produces a ranked candidate set; a human (or
+  a future, more defined policy) decides whether a given swap is worth acting on.
+- **Liquidate, not migrate**: when a ticker IS being swapped out, close the position outright via its
+  normal exit path rather than trying to carry it forward onto a new node config. This deliberately avoids
+  ever needing `signals_db.transfer_position_to_new_node()` (built 2026-08-24, paired-reviewed, multiple
+  unfixed HIGH findings -- real broker SL never reconciled, no duplicate-position guard, stale
+  `trail_state` carryover -- still sitting unsafe-to-use, never landed). A newly-promoted ticker just
+  starts a fresh node with no position to inherit, so none of that function's bug surface is ever
+  exercised. Sidesteps fixing a known-broken function by design, rather than requiring it to be fixed first.
+- **Swap-on-flat, not forced liquidation**: don't force-sell on a schedule -- wait for the position to
+  close via its own real exit (SL/TP/TIME), then apply the new ticker/config once flat. No new
+  sell-triggering logic needed, just a rotation decision sitting ready to act on whichever real exit fires
+  next. Same-day-rebuy-block (`force_same_day_block`) was considered as a natural race-preventer here and
+  explicitly ruled out -- confirmed via prior research that this flag doesn't produce better alpha and
+  isn't actually relied on in this system, so nothing about the swap design should assume it's active.
+
+**Real gap found, verified directly against the code (not assumed)**: the natural first idea -- pause the
+outgoing node's automation once a swap decision is made, so it can't re-buy after going flat -- does NOT
+work with the existing `schwab_safety.node_automation_enabled`/`pause_node_automation` mechanism. Checked
+`check_order`'s real control flow directly: the `node_automation_enabled` gate (line ~1433) runs
+unconditionally, BEFORE any `if side ==` branching in the function -- it blocks BOTH BUY and SELL orders
+for that node, not BUY only. So pausing a node while its position is still open (the actual use case here,
+since the whole point is to pause new entries while waiting for the existing position to exit naturally)
+would also block that position's own real exit orders (SL placement, TP/trail-sell replace calls) --
+exactly backwards from what's needed, and a real way to strand a position without its protective stop if
+built naively.
+
+**What's actually needed**: a new, narrower BUY-only pause flag (name TBD, something like
+`node_buy_paused`), additive/scoped separately from the existing all-or-nothing `node_automation_enabled`
+-- blocks new entries only, never touches the exit-order path. **Explicitly programmatic-only, no Slack
+button or other human-facing UI** (user's call) -- this is meant to be set/cleared entirely by the
+rotation logic itself, not a manual control surface to maintain.
+
+**Not built, not scoped further tonight** -- this whole part 2 thread (rotation cadence/policy, the new
+BUY-only pause flag, the weekend-sweep-to-Monday-decision pipeline) needs real design time in a future
+session. `schwab_safety.py` is a `schwab_*.py` module -- any new pause-flag implementation needs the
+paired-review gate, same as anything else touching real order-placement safety logic.
