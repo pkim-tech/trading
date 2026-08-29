@@ -114,6 +114,24 @@ def _stop_loss_and_tpct_from_row(sl_axis_col, fourth_axis_col, trail_buy_pct, tr
     return stop_loss, tpct
 
 
+def discover_candidate_nodes_scopes(ticker, config_version):
+    """Real (strategy, entry_timing, fixed_sl, window) tuples present in candidate_nodes
+    for (ticker, config_version) -- new, 2026-08-29 (Task #3, planner dispatch). Parallel
+    to prune_backtest_cache_ground_truth.discover_all_gt_scopes, but reads candidate_nodes
+    instead of backtest_cache, so it also finds a campaign the in-memory pipeline ran (no
+    backtest_cache rows to discover from at all -- see module docstring). `window` IS part
+    of the tuple here (backtest_cache's own discovery doesn't need it -- a version there
+    is one real campaign) because a candidate_nodes version string can alias multiple
+    unrelated batches distinguished only by window (see derive_phase25_candidates_from_
+    candidate_nodes's own `window` param docstring) -- the caller MUST pass each returned
+    window value through to that function's `window` param, not drop it."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT strategy, entry_timing, fixed_sl, window FROM candidate_nodes "
+            "WHERE ticker=? AND version=?", (ticker, config_version)).fetchall()
+    return sorted(rows)
+
+
 def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config_version,
                                                      fixed_sl=0, entry_timing='open_check',
                                                      window=None):

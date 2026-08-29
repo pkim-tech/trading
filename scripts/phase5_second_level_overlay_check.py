@@ -92,6 +92,9 @@ import pandas as pd
 
 from run_optimization_sweep import DB_PATH, derive_phase25_candidates_ground_truth
 from prune_backtest_cache_ground_truth import discover_all_gt_scopes, _hp_for_strategy
+from phase4_candidate_nodes_resolver import (
+    derive_phase25_candidates_from_candidate_nodes, discover_candidate_nodes_scopes,
+)
 from sim_1s_vs_1m_groundtruth_overlays import (
     load_hourly, load_seconds, resample_seconds_to_minutes, daily_indicators, cagr,
 )
@@ -243,10 +246,23 @@ def _fmt_pp(x):
 
 
 def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m, df_1s,
-              start, end, years, pool, limit=None):
-    hp = _hp_for_strategy(strategy_name)
-    candidates = derive_phase25_candidates_ground_truth(
-        ticker, strategy_name, version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
+              start, end, years, pool, limit=None, window=None):
+    """`window` (Task #3, 2026-08-29): when set, this scope was discovered via
+    candidate_nodes (not backtest_cache) -- see main()'s scope-discovery fallback and
+    phase4_candidate_nodes_resolver.py's own docstring for why the version string alone
+    isn't enough to disambiguate a real campaign in that case. `window=None` (default)
+    keeps the original backtest_cache-based derive_phase25_candidates_ground_truth path
+    exactly as before."""
+    if window is not None:
+        print(f"  (candidate_nodes fallback -- no backtest_cache rows for this version; "
+              f"window={window} disambiguates which real batch)")
+        candidates = derive_phase25_candidates_from_candidate_nodes(
+            ticker, strategy_name, version, fixed_sl=fixed_sl, entry_timing=entry_timing,
+            window=window)
+    else:
+        hp = _hp_for_strategy(strategy_name)
+        candidates = derive_phase25_candidates_ground_truth(
+            ticker, strategy_name, version, hp, fixed_sl=fixed_sl, entry_timing=entry_timing)
     if not candidates:
         print("  no Phase4 candidates for this scope -- skipping.")
         return []
@@ -305,6 +321,13 @@ def main():
     ap.add_argument("--strategy", default=None, help="omit to check every real GT strategy scope")
     ap.add_argument("--entry-timing", default=None, help="omit to check every real GT entry_timing scope")
     ap.add_argument("--fixed-sl", type=float, default=None, help="omit to check every real GT fixed_sl scope")
+    ap.add_argument("--window", type=int, default=None,
+                     help="filter to one real window value -- only meaningful for the "
+                          "candidate_nodes fallback path (a version string can alias multiple "
+                          "unrelated in-memory-pipeline batches, see phase4_candidate_nodes_"
+                          "resolver.py); ignored for backtest_cache-sourced scopes, which "
+                          "aggregate across windows exactly as derive_phase25_candidates_"
+                          "ground_truth always has.")
     ap.add_argument("--data-source", choices=["yahoo", "massive"], default="massive")
     ap.add_argument("--limit", type=int, default=None,
                      help="force top-N finalists per scope instead of the auto cost-based decision")
@@ -316,15 +339,43 @@ def main():
 
     with sqlite3.connect(DB_PATH) as conn:
         all_scopes = discover_all_gt_scopes(conn)
-    scopes = [s for s in all_scopes
+    # 6-tuples (ticker, strategy, version, entry_timing, fixed_sl, window) -- window=None
+    # for a backtest_cache-sourced scope (old path, aggregates across windows, matching
+    # derive_phase25_candidates_ground_truth's own real cross-window semantics).
+    scopes = [(s[0], s[1], s[2], s[3], s[4], None) for s in all_scopes
               if s[0] == args.ticker and s[2] == args.version
               and (args.strategy is None or s[1] == args.strategy)
               and (args.entry_timing is None or s[3] == args.entry_timing)
               and (args.fixed_sl is None or s[4] == args.fixed_sl)]
+    covered = {(s[1], s[3], s[4]) for s in scopes}
+
+    # candidate_nodes fallback (Task #3, 2026-08-29): a campaign the in-memory pipeline
+    # ran has ZERO backtest_cache rows, so discover_all_gt_scopes can never find it --
+    # only skip a (strategy, entry_timing, fixed_sl) already covered above, never a
+    # window duplicate of it (see phase4_candidate_nodes_resolver.discover_candidate_
+    # nodes_scopes' own docstring on why window is a real disambiguator here, not
+    # redundant with the backtest_cache scope shape).
+    cn_scopes = discover_candidate_nodes_scopes(args.ticker, args.version)
+    for strategy, entry_timing, fixed_sl, window in cn_scopes:
+        if (strategy, entry_timing, fixed_sl) in covered:
+            continue
+        if (args.strategy is not None and strategy != args.strategy):
+            continue
+        if (args.entry_timing is not None and entry_timing != args.entry_timing):
+            continue
+        if (args.fixed_sl is not None and fixed_sl != args.fixed_sl):
+            continue
+        if (args.window is not None and window != args.window):
+            continue
+        scopes.append((args.ticker, strategy, args.version, entry_timing, fixed_sl, window))
+
     if not scopes:
-        raise SystemExit(f"No real GT scopes found for ticker={args.ticker} version={args.version} "
-                          f"strategy={args.strategy} entry_timing={args.entry_timing} fixed_sl={args.fixed_sl}")
-    print(f"Found {len(scopes)} real GT scope(s) to check.")
+        raise SystemExit(f"No real GT scopes found (backtest_cache or candidate_nodes) for "
+                          f"ticker={args.ticker} version={args.version} strategy={args.strategy} "
+                          f"entry_timing={args.entry_timing} fixed_sl={args.fixed_sl} "
+                          f"window={args.window}")
+    print(f"Found {len(scopes)} real GT scope(s) to check "
+          f"({sum(1 for s in scopes if s[5] is not None)} via candidate_nodes fallback).")
 
     t_load = time.monotonic()
     print(f"Loading {args.ticker} hourly data...")
@@ -347,11 +398,13 @@ def main():
     # Pool created AFTER _DFH/_DF_1M/_DF_1S are populated, so fork (Linux
     # default) gives every worker copy-on-write access with no reload.
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        for ticker, strategy_name, version, entry_timing, fixed_sl in scopes:
+        for ticker, strategy_name, version, entry_timing, fixed_sl, window in scopes:
             print(f"\n{'#' * 80}\n{ticker} / {strategy_name} / {version} / "
-                  f"entry_timing={entry_timing} / fixed_sl={fixed_sl}\n{'#' * 80}")
+                  f"entry_timing={entry_timing} / fixed_sl={fixed_sl}"
+                  f"{f' / window={window}' if window is not None else ''}\n{'#' * 80}")
             rows = run_scope(ticker, strategy_name, version, entry_timing, fixed_sl,
-                              _DFH, _DF_1M, _DF_1S, start, end, years, pool, limit=args.limit)
+                              _DFH, _DF_1M, _DF_1S, start, end, years, pool, limit=args.limit,
+                              window=window)
             all_rows.extend(rows)
     run_secs = time.monotonic() - t_run
 

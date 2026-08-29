@@ -45,6 +45,16 @@ def main():
     ap.add_argument("--version", required=True)
     ap.add_argument("--fixed-sl", dest="fixed_sl", type=float, default=None,
                      help="omit to check every fixed_sl scope for this ticker/strategy/version")
+    ap.add_argument("--window", type=int, default=None,
+                     help="filter to one real window value -- REQUIRED whenever the version "
+                          "string aliases multiple unrelated sweep batches under one campaign "
+                          "'version' tag (confirmed 2026-08-29: "
+                          "'bench-inmemory-v6-massive-w2021-08-23_2026-08-21' holds a real "
+                          "window=[10,20] batch AND a separate window=15 batch under the same "
+                          "string -- without this filter, candidate_nodes rows from BOTH get "
+                          "pooled into one run's 'winners' list, which is wrong: they were never "
+                          "swept against each other. Omit only when the version is known to be "
+                          "a single real campaign.")
     ap.add_argument("--data-source", choices=["yahoo", "massive"], default="massive")
     args = ap.parse_args()
 
@@ -58,6 +68,9 @@ def main():
     if args.fixed_sl is not None:
         query += " AND fixed_sl=?"
         params.append(args.fixed_sl)
+    if args.window is not None:
+        query += " AND window=?"
+        params.append(args.window)
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(query, params).fetchall()
     if not rows:
