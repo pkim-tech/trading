@@ -5,11 +5,28 @@ granularity/drift check on Phase2.5's winners -- runs AFTER Phase2.5, BEFORE Pha
 actually promoted, since that data is now cheap to produce (this design's own benchmark
 pipeline) and the second-level source data already exists on disk (no fresh pull).
 
-Reuses scripts/sim_1s_vs_1m_groundtruth.py's validated simulate()/load_seconds()/
-load_hourly() directly (not reimplemented) -- loads 1s data + hourly data ONCE, then
-runs the independent from-scratch simulate() at both 1-minute and 1-second resolution
-for every real candidate_nodes winner in the given scope, reporting the CAGR delta per
-node instead of generalizing from a single hand-picked one.
+Reuses scripts/sim_1s_vs_1m_groundtruth.py's validated load_seconds()/load_hourly()/
+daily_indicators() directly (not reimplemented) -- loads 1s data + hourly data ONCE,
+then runs every real candidate_nodes winner in the given scope through both
+resolutions, reporting the CAGR delta per node instead of generalizing from a single
+hand-picked one.
+
+TRADE-GENERATION SOURCE, changed 2026-08-29 (Task #3 follow-up, planner dispatch --
+same deliberate tradeoff as Phase5's own 2026-08-29 Task #2 change, read that commit's
+module docstring in phase5_second_level_overlay_check.py before touching this file
+again): core trades now come DIRECTLY from the real production kernel (backtester.
+run_backtest_ground_truth), not from this module's own sim_1s_vs_1m_groundtruth.
+simulate() (an independent, hand-written reimplementation -- see that module's own
+docstring for why it was originally built that way). Real, measured motivation: a real
+144-candidate campaign (SOXL window=15) via the old simulate() path was projected at
+~4-5 hours single-threaded, not viable for a routine check. Phase3 is NO LONGER an
+independent reimplementation cross-checking the kernel's own correctness as a result --
+same accepted tradeoff Phase5 already made, for the same reason (this file's own
+stated purpose, per its docstring above, is "does the kernel's prediction match real
+tick-level execution", i.e. granularity sensitivity, not kernel-correctness
+verification -- a separate, already-backlogged item covers that).
+sim_1s_vs_1m_groundtruth.py itself is untouched and remains the real independent-
+reimplementation reference for anything that still needs one.
 
 NOT the "Search Completeness Audit" (formerly "Phase3-Full") -- that answers "did the
 generational search miss a better node"; this answers "does the kernel's prediction for
@@ -31,8 +48,9 @@ import pandas as pd
 
 from run_optimization_sweep import DB_PATH
 from sim_1s_vs_1m_groundtruth import (
-    load_hourly, load_seconds, resample_seconds_to_minutes, simulate, compound, cagr,
+    load_hourly, load_seconds, resample_seconds_to_minutes, daily_indicators, cagr,
 )
+from backtester import run_backtest_ground_truth
 
 
 def main():
@@ -91,23 +109,37 @@ def main():
     results = []
     for (nid, strategy, window, z, fixed_sl, arm_pct, trail_buy_pct, trail_sell_pct,
          max_hold_hours, entry_timing, data_start, data_end) in rows:
-        node = dict(
-            ticker=args.ticker, strategy=strategy, window=window,
-            z_score_threshold=z, fixed_sl=fixed_sl, arm_sell_pct=arm_pct, arm_pct=arm_pct,
-            take_profit=None, trail_buy_pct=trail_buy_pct, trail_sell_pct=trail_sell_pct,
-            max_hold_hours=max_hold_hours, entry_timing=entry_timing,
-        )
+        is_both = strategy == "TrailingBothZScoreBreakout"
+        ind = daily_indicators(dfh, int(window))
         # Use the real overlap between the campaign window and the real 1s data's own
         # coverage -- don't assume they match, the campaign window can exceed what
         # second-level data actually covers.
         start = max(pd.Timestamp("2021-08-23"), df_1s.index.min()).strftime("%Y-%m-%d")
         end = min(pd.Timestamp("2026-08-21"), df_1s.index.max()).strftime("%Y-%m-%d")
         years = (pd.Timestamp(end) - pd.Timestamp(start)).days / 365.25
+        bars = dfh.loc[start:end + " 23:59:59"]
 
-        trades_1m = simulate(node, dfh, df_1m, start, end, same_bar_reentry=True)
-        trades_1s = simulate(node, dfh, df_1s, start, end, same_bar_reentry=True)
-        g1m = cagr(compound(trades_1m, start_bal=1.0), years, start_bal=1.0)
-        g1s = cagr(compound(trades_1s, start_bal=1.0), years, start_bal=1.0)
+        def _run(minute_df):
+            return run_backtest_ground_truth(
+                bars, ind, args.ticker, minute_df,
+                fixed_sl=fixed_sl, arm_pct=arm_pct, trail_buy_pct=trail_buy_pct,
+                trail_sell_pct=trail_sell_pct, max_hours_to_hold=max_hold_hours,
+                z_score_threshold=z, is_both=is_both,
+                open_check_entry_timing=(entry_timing == "open_check"),
+                same_bar_reentry=True, need_times=True,
+            )
+
+        trades_1m = _run(df_1m)
+        trades_1s = _run(df_1s)
+
+        def _compound(trades):
+            bal = 1.0
+            for t in trades:
+                bal *= (1 + t["Return"])
+            return bal
+
+        g1m = cagr(_compound(trades_1m), years, start_bal=1.0)
+        g1s = cagr(_compound(trades_1s), years, start_bal=1.0)
         delta = (g1m - g1s) * 100
         print(f"  node id={nid} TP={arm_pct} SL={trail_buy_pct} tpct={trail_sell_pct} "
               f"hold={max_hold_hours}h: 1m={len(trades_1m)}trades/{g1m:.2%} "
