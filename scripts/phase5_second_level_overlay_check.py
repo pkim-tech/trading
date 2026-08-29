@@ -374,9 +374,14 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
     if window is not None:
         print(f"  (candidate_nodes fallback -- no backtest_cache rows for this version; "
               f"window={window} disambiguates which real batch)")
+        # full_population=True (Phase3-retirement widening, 2026-08-29): Phase5 now
+        # audits the SAME un-narrowed candidate_nodes population Phase3's own query
+        # covered, not just the island-capped top-9-per-scope subset -- see
+        # phase4_candidate_nodes_resolver.py's docstring and run_candidate_nodes_
+        # campaign_verification.py's now-commented-out run_phase3() call.
         candidates = derive_phase25_candidates_from_candidate_nodes(
             ticker, strategy_name, version, fixed_sl=fixed_sl, entry_timing=entry_timing,
-            window=window)
+            window=window, full_population=True)
     else:
         hp = _hp_for_strategy(strategy_name)
         candidates = derive_phase25_candidates_ground_truth(
@@ -463,7 +468,7 @@ def _try_all_stored(scopes, limit):
         for ticker, strategy_name, version, entry_timing, fixed_sl, window in scopes:
             candidates = derive_phase25_candidates_from_candidate_nodes(
                 ticker, strategy_name, version, fixed_sl=fixed_sl,
-                entry_timing=entry_timing, window=window)
+                entry_timing=entry_timing, window=window, full_population=True)
             if limit is not None:
                 candidates = candidates[:limit]
             if not candidates:
