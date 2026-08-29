@@ -34,7 +34,17 @@ import pandas as pd
 import yfinance as yf
 
 from top_safe_nodes import best_safe_node
-from verify_fill_resolution_accuracy import fill_accuracy_for_node, print_accuracy_summary
+# verify_fill_resolution_accuracy -- deliberately NOT imported at module
+# level (found 2026-08-28, same fix as scripts/candidate_summary_report.py):
+# it imports replay_five_min/FIVE_MIN_LOOKBACK_DAYS, renamed to
+# replay_one_min in commit 2a9f3d3 and never updated here -- a real,
+# pre-existing bug (filed to backlog, not fixed here). This was a hard
+# import-time crash for every caller of find_candidates() (this file's only
+# export candidate_summary_report.py actually uses), even though
+# find_candidates() itself never touches fill_accuracy_for_node/
+# print_accuracy_summary -- those are only used in this file's own main()
+# CLI, below. Moved lazy into main() so importing find_candidates() doesn't
+# require this broken chain at all.
 
 DB_PATH = Path("./cache/research/trading_universe.db")
 
@@ -124,6 +134,7 @@ def find_candidates(df_t, min_alpha):
 
 
 def main():
+    from verify_fill_resolution_accuracy import fill_accuracy_for_node, print_accuracy_summary
     parser = argparse.ArgumentParser()
     parser.add_argument("--tickers", nargs="+", required=True)
     parser.add_argument("--version", default=None)

@@ -52,7 +52,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from top_safe_nodes import CLIFF_RADIUS, best_safe_node
 from annualized_alpha_report import calendar_days, cagr
 from locate_best_node import resolve_version
-from verify_fill_resolution_accuracy import fill_accuracy_for_node
+# verify_fill_resolution_accuracy (deliberately NOT imported at module level,
+# found 2026-08-28): it imports replay_five_min/FIVE_MIN_LOOKBACK_DAYS from
+# scripts/verify_trailing_buy_resolution.py, which no longer exist there --
+# renamed to replay_one_min in commit 2a9f3d3 ("Full v6 promotion"), and this
+# file's own import was never updated to match. A real, pre-existing bug
+# (unrelated to this session's own work, filed to docs/backlog_cache.md, not
+# fixed here -- fixing it properly means deciding new FIVE_MIN_LOOKBACK_DAYS-
+# equivalent semantics for 1-min-granularity data, a real judgment call
+# beyond this file's scope). Was a hard, unconditional import-time crash for
+# EVERY invocation of this script, including --skip-5min runs that never
+# actually call fill_accuracy_for_node -- moved to a lazy import inside
+# fill_accuracy_summary (its only call site) so --skip-5min's own documented
+# purpose ("skip yfinance calls") actually works again until that deeper
+# drift gets a real fix.
 from candidate_5min_report import find_candidates
 from run_overlay_shim import (
     run_for_node as run_overlay_for_node, ensure_candidate_nodes_table, ensure_table as ensure_overlay_table,
@@ -362,6 +375,7 @@ def fill_accuracy_summary(ticker, strategy, window, z, trail_buy_pct, hold):
     or a TrailingBoth row with trail_buy_pct=0)."""
     if strategy != "TrailingBothZScoreBreakout" or not trail_buy_pct:
         return None
+    from verify_fill_resolution_accuracy import fill_accuracy_for_node
     df = fill_accuracy_for_node(ticker, window, z, trail_buy_pct, hold)
     if df.empty:
         return None

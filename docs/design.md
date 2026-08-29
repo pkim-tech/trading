@@ -2833,3 +2833,71 @@ triggered) is the right design.
 Not built, not scoped further tonight -- captured so the pattern precedent and the real (small) minute-
 provenance gap aren't lost before a future session picks this up alongside the rest of the part 1/2/3
 thread.
+
+## 2026-08-28 (very very late) — Built: Phase5, second-level overlay precision check (mirrors Phase3, but for add-on/drought overlays)
+
+**Origin**: real, user-requested work the same night, dispatched with the design already partly
+decided in conversation but never written down here before this entry -- filed retroactively so
+the design has a real record, not just this session's commit message.
+
+**The gap**: `scripts/phase3_second_level_check.py` (2026-08-27) already re-verifies Phase2.5's
+CORE-trade CAGR at second-level (tick) granularity against the hourly kernel's prediction, across
+a campaign's real winner population -- but only for the unlevered core leg. The add-on/drought
+OVERLAY CAGR that GT Phase4 (`run_optimization_sweep.run_addon_cliff_safety_ground_truth`, called
+from `build_candidate_report_ground_truth`) reports had never had the same tick-level precision
+check run against it.
+
+**Built**: `scripts/phase5_second_level_overlay_check.py`. Pure orchestration around
+`scripts/sim_1s_vs_1m_groundtruth_overlays.py`'s already-validated `simulate()` +
+`apply_addon_overlay_ground_truth`/`simulate_drought_overlay_ground_truth` reuse (no re-simulation
+of overlay logic, no new kernel code) -- for every real Phase4 finalist in a scope (from
+`run_optimization_sweep.derive_phase25_candidates_ground_truth`, the SAME function GT Phase4's own
+report calls, so the finalist set is identical, not re-derived), converts the candidate into a node
+dict using the identical axis-column mapping `build_candidate_report_ground_truth` itself uses
+(TrailingBoth: `arm_pct=cand['take_profit']`, `trail_buy_pct=cand['stop_loss']`,
+`trail_sell_pct=cand['tpct']`; TrailingExit: `trail_buy_pct=0`, `trail_sell_pct=cand['stop_loss']`),
+runs the overlay CAGR at both 1-minute and 1-second granularity, and reports the delta -- same
+mean/median/worst/best-across-population reporting shape as Phase3.
+
+**Scope decision, made with real measured numbers** (not guessed upfront, per the explicit
+instruction to time first and decide from that): a single-candidate smoke test against a real
+SOXL scope measured ~456s one-time data load (hourly + the full ~22M-row 1-second series, same
+"slow step" Phase3 already has) + ~112s per candidate (two `simulate()` passes plus add-on+drought
+overlay computation at both granularities). Extrapolated to SOXL's real 10 GT scopes × 9 candidates
+each (90 total) that would be ~2.8 hours of compute -- not "fast enough to run broadly" by the
+session's own stated bar. Fell back to the top 3 finalists per scope instead (still real evidence
+across every scope, not just one hand-picked node) -- `_CHEAP_ENOUGH_SECS_PER_CANDIDATE = 15.0`
+(seconds) is the script's own auto-decision threshold, checked against the FIRST candidate's real
+measured cost per scope (not assumed globally), falling back automatically without needing a human
+to re-run with `--limit`. `--limit N` still exists for an explicit override.
+
+**Correction, same night, before the first full run completed**: the fallback logic above was
+initially buggy -- `run_scope()` reassigned `candidates = candidates[:_FALLBACK_TOP_N]` *inside*
+the `for i, cand in enumerate(candidates, ...)` loop already iterating over it, which has no effect
+on Python's already-captured iterator. Every scope silently ran all 9 candidates regardless of the
+printed "falling back to top 3" message (~2x the intended/reported cost) before this was caught (via
+the loop's own real elapsed-time output not matching the extrapolated ETA) and fixed: the truncated
+candidate list is now built *before* the loop starts. Also added real parallelization at this point
+(`ProcessPoolExecutor(max_workers=6)`) for the per-scope fallback candidates beyond the first --
+the loaded hourly/1m/1s DataFrames are set as module-level globals before the pool is created, so
+fork-based workers get them via copy-on-write with no per-worker reload of the ~286-456s 1-second
+series. The first candidate of every scope still always runs standalone in the main process (its
+real elapsed time is what drives the cheap-vs-expensive fallback decision).
+
+**Real result, SOXL, 10 real GT scopes, first candidate + up to 2 more per scope (30 candidates
+total, every scope fell back to top-3 -- real measured per-candidate cost ranged ~73s-206s, all
+well above the 15s cheap-enough threshold)**: see `docs/research_log.md`'s matching entry for the
+full numbers -- summarized here only that this was the FIRST time GT Phase4's overlay CAGR had ever
+been checked against tick-level data at all, not just spot-checked for one node. Real total
+wall-clock: data load 286.4s + candidate checks 3572.1s (6 workers) = 3858.6s (~64.4 min) for all 30
+candidates.
+
+**Real, pre-existing bug found along the way, NOT part of this build**: legacy Phase4
+(`candidate_summary_report.py`'s default `--kernel legacy` mode) turned out to correctly REFUSE to
+run for SOXL at all (`resolve_version()`'s own guard: a ticker with real `kernel_version=
+'ground_truth_v6'` rows refuses legacy v5/v5.1 resolution) -- confirming the addendum's own
+suspicion that legacy Phase4 and GT Phase4 (`--kernel gt`) are genuinely separate mechanisms, not
+two views of the same data. Separately, `scripts/verify_fill_resolution_accuracy.py`'s import of
+`replay_five_min`/`FIVE_MIN_LOOKBACK_DAYS` (renamed to `replay_one_min` in commit `2a9f3d3`) was a
+hard crash blocking `candidate_summary_report.py`/`candidate_5min_report.py` entirely -- worked
+around with a lazy import (see `docs/backlog_cache.md`'s matching entry), not fixed at the root.

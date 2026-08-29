@@ -1241,3 +1241,55 @@ Excluding just that one trade: 1m 48.65% vs 1s 48.88%, delta -0.23pp -- right at
 **Relationship to the 2026-08-21 same-bar-SL divergence finding** (SOXL/LABU, live-vs-backtest kernel, not this Phase3 tool): same underlying mechanism -- a fill bar's own exit conditions aren't checked -- but a different kernel/codepath (`backtester.py`'s live-replay path there, `sim_1s_vs_1m_groundtruth.py`'s `Sim._minutes()` here). The 08-21 finding's resolved fix direction (remove the fill-bar SL check entirely, not add a width-tuned exemption) is the same class of fix that would also close this Phase3 artifact, if `sim_1s_vs_1m_groundtruth.py` is ever changed to match. Not built here -- this was root-cause investigation only, no code changed.
 
 Artifacts (not committed, scratch): `/tmp/soxl_1s_diag.py`, `/tmp/soxl_1s_diag.log`, `/tmp/n{2140,2141,2142,2136,2139,2152,2165,2166,2169}_{1m,1s}.csv`.
+
+## 2026-08-29 — Phase5 second-level overlay precision check: real results, first full run (SOXL, all 10 GT scopes)
+
+**Hypothesis**: GT Phase4's add-on/drought overlay CAGR, computed at 1-minute (hourly-derived)
+granularity, could diverge meaningfully from the same overlay computed at real 1-second (tick)
+granularity — the same question Phase3 already answered for core trades (2026-08-28: mean +0.49pp,
+worst +7.23pp, one real outlier root-caused to a single-trade fill-bar-SL artifact), but never
+checked for the overlay legs specifically.
+
+**Method**: `scripts/phase5_second_level_overlay_check.py` (new, this session) — for SOXL's 10 real
+GT scopes (`discover_all_gt_scopes`), derived each scope's real Phase4 finalist candidates
+(`derive_phase25_candidates_ground_truth`, the same function GT Phase4's own report calls). First
+candidate of each scope always run standalone to get a real timing measurement; measured cost
+ranged ~73s-206s per candidate (all above the 15s cheap-enough threshold), so every scope fell back
+to its top 3 finalists (30 candidates total, not the full 90). Each candidate: ran `simulate()` at
+both 1-minute and 1-second granularity, then ran the same already-validated
+`apply_addon_overlay_ground_truth`/`simulate_drought_overlay_ground_truth` GT overlay functions
+against both trade lists, and compared the resulting overlay CAGR.
+
+**Result**: addon_delta_pp across 30 candidates: mean +0.22pp, median +0.22pp, worst +0.80pp, best
+-0.33pp, 27/30 show 1m optimism (1m CAGR higher than 1s). drought_delta_pp (TrailingBoth-only
+scopes, 15 candidates): mean +0.16pp, median +0.28pp, worst +0.32pp, best -0.36pp, 12/15 show 1m
+optimism. All deltas are small — no outlier remotely near Phase3's +7.23pp core-trade case. Full
+per-candidate CSV: `output/phase5_second_level_overlay_check_SOXL.csv`.
+
+**Timing** (both phases, as explicitly requested): GT Phase4 itself (`candidate_summary_report.py
+--kernel gt`, SOXL, all 10 scopes/90 candidates, report-only, zero DB writes): 4m55.229s. Phase5
+(this check, 30 candidates across the same 10 scopes, `--workers 6`): data load 286.4s (hourly +
+full ~22.2M-row 1-second series) + candidate checks 3572.1s (6-way `ProcessPoolExecutor`, first
+candidate of each scope always run standalone/unparallelized for a clean timing read) = 3858.6s
+(~64.4 min) real wall-clock total, 119.1s/candidate average (wall-clock, not CPU-time — `user` time
+was 89m43.8s across the run, confirming real multi-core parallel utilization, not serial).
+
+**Verdict**: overlay-leg 1m-vs-1s divergence for SOXL is consistently small (sub-1pp) across every
+checked scope — no evidence of a systematic or outlier-scale overlay-specific granularity artifact
+analogous to Phase3's core-trade outlier. Real, mildly noteworthy secondary finding: the 27/30 and
+12/15 skew toward "1m optimism" (1m overstates the overlay CAGR vs 1s) is a real, consistent
+direction, not scope-specific noise — plausibly the same fill-bar-resolution mechanism Phase3's
+outlier investigation already characterized for core trades, now showing up (at much smaller
+magnitude) on the overlay legs too. Not investigated further this session — small enough (<1pp) not
+to warrant its own root-cause dig the way Phase3's +7.23pp outlier did, but worth revisiting if a
+future overlay-adjacent bug investigation needs a starting hypothesis.
+
+**Bug found and fixed during this run, not a research result but recorded for the record**: an
+early version of `phase5_second_level_overlay_check.py`'s scope-decision fallback logic reassigned
+its candidate list inside the very `for` loop it was iterating (a no-op in Python — the iterator is
+captured once at loop start), so an earlier attempt at this same run was silently checking all 9
+candidates per scope instead of the intended top-3 fallback, before being caught and killed ~53
+minutes in (4 scopes done, all needlessly full-width) via the loop's own real per-candidate timing
+not matching the extrapolated ETA. Fixed (build the truncated list before the loop) and
+parallelized (`ProcessPoolExecutor`, 6 workers, data preloaded once and shared via fork
+copy-on-write) before the real numbers above were produced.
