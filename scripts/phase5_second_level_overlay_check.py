@@ -4,16 +4,15 @@ adjusted CAGR, mirroring Phase3's own core-trades-only precision check
 Phase3 deliberately doesn't touch. Runs AFTER Phase4 (GT overlay report), against
 that scope's real finalist candidates.
 
-Real head start reused directly, not reimplemented: scripts/
-sim_1s_vs_1m_groundtruth_overlays.py already runs the existing, already-validated
-GT overlay functions (backtester.apply_addon_overlay_ground_truth,
-backtester.simulate_drought_overlay_ground_truth) against BOTH a 1-minute and a
-1-second trade list for a single node (its own --overlays flag). This module is
-an ORCHESTRATION wrapper: for every real GT Phase4 finalist in a scope (from
+Real head start reused directly, not reimplemented: backtester.
+apply_addon_overlay_ground_truth/simulate_drought_overlay_ground_truth (the
+existing, already-validated GT overlay functions) run against BOTH a
+1-minute and a 1-second trade list for a single node. This module is an
+ORCHESTRATION wrapper: for every real GT Phase4 finalist in a scope (from
 run_optimization_sweep.derive_phase25_candidates_ground_truth -- the exact same
 function GT Phase4's own report calls, so the finalist set here is identical to
 what Phase4 already reported, not re-derived independently), converts the
-candidate into the node dict simulate()/report_overlays expect (same axis-column
+candidate into the node dict the kernel call expects (same axis-column
 mapping run_optimization_sweep.build_candidate_report_ground_truth itself uses:
 for TrailingBothZScoreBreakout, arm_pct=cand['take_profit'],
 trail_buy_pct=cand['stop_loss'], trail_sell_pct=cand['tpct']; for
@@ -23,6 +22,30 @@ run_optimization_sweep.build_candidate_report_ground_truth's own is_both branch)
 runs the overlay CAGR at both granularities, and reports the delta -- same
 reporting shape/thresholds as Phase3 (mean/median/worst/best delta across the
 finalist population, not just a single hand-picked node).
+
+TRADE-GENERATION SOURCE, changed 2026-08-29 (Task #2, planner dispatch/finding
+-- deliberate tradeoff, read before touching this file again): core trades for
+both granularities now come DIRECTLY from the real production kernel
+(`backtester.run_backtest_ground_truth`, the same `@njit`-compiled function
+every other GT phase uses), not from `sim_1s_vs_1m_groundtruth_overlays.simulate()`
+(a from-scratch, hand-written independent reimplementation -- see that module's
+own docstring for why it was originally built that way: to give genuine
+independent evidence when cross-checking the kernel, not another patch on the
+same lineage). Confirmed directly (`prep_minute_inputs`/`_simulate_trail_ground_
+truth` are fully granularity-agnostic -- bucket whatever rows are in `minute_df`
+by hourly bucket, no hardcoded minute-count assumption) that feeding real
+1-second data straight into the kernel is not a hack: it reproduced candidate_
+nodes id=851's real 123-trade/83.59% CAGR byte-identically in 2.96s, vs
+`simulate()`'s ~120-270s/candidate. This makes Phase5 NO LONGER an independent
+reimplementation cross-checking the kernel's own correctness -- it is now the
+real kernel run twice at different resolutions, so a full core-trade agreement
+here no longer says anything about whether the kernel itself is right, only
+about the kernel's own sensitivity to bar granularity (which is Phase5's actual
+stated purpose -- overlay CAGR sensitivity to data granularity, not kernel-
+correctness verification; that's a separate, already-backlogged item: "no
+independent-reimplementation verification exists for GT add-on/drought/vol-gate
+overlays"). `sim_1s_vs_1m_groundtruth_overlays.py` itself is untouched and still
+the real independent-reimplementation reference for anything that needs one.
 
 Data (hourly + 1-second, resampled once to 1-minute) is loaded ONCE per ticker,
 matching Phase3's own pattern -- not once per candidate, which would repeat the
@@ -70,18 +93,21 @@ import pandas as pd
 from run_optimization_sweep import DB_PATH, derive_phase25_candidates_ground_truth
 from prune_backtest_cache_ground_truth import discover_all_gt_scopes, _hp_for_strategy
 from sim_1s_vs_1m_groundtruth_overlays import (
-    load_hourly, load_seconds, resample_seconds_to_minutes, simulate, cagr,
+    load_hourly, load_seconds, resample_seconds_to_minutes, daily_indicators, cagr,
 )
-from backtester import apply_addon_overlay_ground_truth, simulate_drought_overlay_ground_truth
+from backtester import (
+    run_backtest_ground_truth, apply_addon_overlay_ground_truth,
+    simulate_drought_overlay_ground_truth,
+)
 
 # Above this measured per-candidate wall-clock cost (seconds), fall back to
 # top-few-only instead of the full finalist set, absent an explicit --limit
-# override. Chosen as "same order of magnitude as Phase3's own per-node cost"
-# per the 2026-08-28 design discussion's own framing ("if it computes fast
-# then sure do it to all the finalists") -- Phase3's own per-node cost (one
-# 1m + one 1s simulate() call, no overlays) is the reference point; this adds
-# two more overlay passes on top of that, so some multiple of that base cost
-# is expected and acceptable, not a sign of trouble.
+# override. Kept as a safety net, not removed, even though the 2026-08-29
+# kernel-direct trade generation (see module docstring) measures ~4s/candidate
+# in practice -- far under this threshold, so it's not expected to trigger for
+# SOXL-scale data anymore, but stays in place for any future ticker/candidate
+# that's genuinely slower (e.g. a much longer history or a pathological trade
+# count) rather than assuming the fast case always holds.
 _CHEAP_ENOUGH_SECS_PER_CANDIDATE = 15.0
 _FALLBACK_TOP_N = 3
 
@@ -116,13 +142,35 @@ def node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, cand):
     )
 
 
-def overlay_cagrs(trades, ticker, dfh, node, years):
+def _run_gt_kernel(node, dfh, minute_df, start, end):
+    """Real production kernel call, replacing sim_1s_vs_1m_groundtruth_overlays.
+    simulate() as of 2026-08-29 (Task #2) -- see module docstring's trade-
+    generation-source note. `run_backtest_ground_truth`'s need_times=True output
+    is already in the exact gt_trades dict shape apply_addon_overlay_ground_truth/
+    simulate_drought_overlay_ground_truth expect ('Entry Time'/'Entry Price'/
+    'Exit Time'/'Exit Price'/'exit_reason'/'Return'/'armed'/'Arm Price'), so no
+    to_gt_dict()-style adapter is needed here -- the old simulate()+Trade path
+    needed that conversion, this one doesn't."""
+    is_both = node["strategy"] == "TrailingBothZScoreBreakout"
+    ind = daily_indicators(dfh, int(node["window"]))
+    bars = dfh.loc[start:end + " 23:59:59"]
+    return run_backtest_ground_truth(
+        bars, ind, node["ticker"], minute_df,
+        fixed_sl=node["fixed_sl"], arm_pct=node["arm_pct"], trail_buy_pct=node["trail_buy_pct"],
+        trail_sell_pct=node["trail_sell_pct"], max_hours_to_hold=node["max_hold_hours"],
+        z_score_threshold=node["z_score_threshold"], is_both=is_both,
+        open_check_entry_timing=(node["entry_timing"] == "open_check"),
+        same_bar_reentry=True, need_times=True,
+    )
+
+
+def overlay_cagrs(gt_trades, ticker, dfh, node, years):
     """Runs the SAME existing, already-validated GT overlay functions
     scripts/sim_1s_vs_1m_groundtruth_overlays.py's report_overlays() calls
     (apply_addon_overlay_ground_truth / simulate_drought_overlay_ground_truth),
     unmodified -- this differs from report_overlays only in RETURNING the
-    computed CAGR numbers (for a delta table) instead of only printing them."""
-    gt_trades = [t.to_gt_dict(ticker) for t in trades]
+    computed CAGR numbers (for a delta table) instead of only printing them.
+    `gt_trades` is already dict-shaped (see _run_gt_kernel), no conversion here."""
     if not gt_trades:
         return None, None, None
     addon_trades = apply_addon_overlay_ground_truth(gt_trades)
@@ -149,8 +197,8 @@ def _check_candidate_core(node, dfh, df_1m, df_1s, start, end, years):
     the module-level _DFH/_DF_1M/_DF_1S globals instead of taking them as
     arguments, so they're never re-pickled/re-sent per task)."""
     t0 = time.monotonic()
-    trades_1m = simulate(node, dfh, df_1m, start, end, same_bar_reentry=True)
-    trades_1s = simulate(node, dfh, df_1s, start, end, same_bar_reentry=True)
+    trades_1m = _run_gt_kernel(node, dfh, df_1m, start, end)
+    trades_1s = _run_gt_kernel(node, dfh, df_1s, start, end)
     core_1m, addon_1m, drought_1m = overlay_cagrs(trades_1m, node["ticker"], dfh, node, years)
     core_1s, addon_1s, drought_1s = overlay_cagrs(trades_1s, node["ticker"], dfh, node, years)
     elapsed = time.monotonic() - t0
