@@ -102,7 +102,7 @@ from backtester import (
     run_backtest_ground_truth, apply_addon_overlay_ground_truth,
     simulate_drought_overlay_ground_truth,
 )
-from candidate_verification_store import get_stored, upsert
+from candidate_verification_store import get_stored, upsert, insert_trades, trades_complete
 
 # Above this measured per-candidate wall-clock cost (seconds), fall back to
 # top-few-only instead of the full finalist set, absent an explicit --limit
@@ -287,7 +287,16 @@ def _check_candidate_core(node, dfh, df_1m, df_1s, start, end, years):
     """The actual compute -- shared by the standalone first-candidate timing
     call (main process) and the pool worker below (forked process, reading
     the module-level _DFH/_DF_1M/_DF_1S globals instead of taking them as
-    arguments, so they're never re-pickled/re-sent per task)."""
+    arguments, so they're never re-pickled/re-sent per task).
+
+    Returns the real full 1m/1s trade lists under 'trades_1m'/'trades_1s' (Task,
+    2026-08-29, planner dispatch/correction) -- these are ALWAYS included when this
+    function actually ran a fresh kernel call (never present in a stored-result skip
+    row from _stored_row_or_none, which never calls this function at all). The
+    caller (run_scope, always the main process even for a pool-worker result -- see
+    _pool_worker's own docstring for why persistence doesn't happen inside the
+    worker) is responsible for persisting these into phase5_trades and then
+    stripping the keys back out before the row is used for CSV/summary output."""
     t0 = time.monotonic()
     trades_1m = _run_gt_kernel(node, dfh, df_1m, start, end)
     trades_1s = _run_gt_kernel(node, dfh, df_1s, start, end)
@@ -305,6 +314,7 @@ def _check_candidate_core(node, dfh, df_1m, df_1s, start, end, years):
         "drought_delta_pp": None if (drought_1m is None or drought_1s is None) else (drought_1m - drought_1s) * 100,
         "core_both_delta_pp": None if (both_1m is None or both_1s is None) else (both_1m - both_1s) * 100,
         "elapsed_secs": elapsed,
+        "trades_1m": trades_1m, "trades_1s": trades_1s,
     }
 
 
@@ -315,26 +325,63 @@ def _pool_worker(cand_idx, node, start, end, years):
     arguments, so the ~450MB+ DataFrames are never pickled/sent over IPC.
 
     The already-verified skip check happens in run_scope BEFORE dispatch (so an
-    already-stored candidate never costs a pool round-trip at all, see run_scope) --
-    this worker always does a genuine fresh kernel run."""
+    already-stored-AND-trades-backfilled candidate never costs a pool round-trip at
+    all, see run_scope/_stored_row_or_none) -- this worker always does a genuine
+    fresh kernel run. Trade lists ride back to the main process in the returned row
+    (under 'trades_1m'/'trades_1s') and are persisted there, not here -- every other
+    DB write in this file already happens in the main process only (see run_scope's
+    existing upsert() call sites), so phase5_trades follows the same convention
+    rather than opening a writer connection from inside a forked worker."""
     row = _check_candidate_core(node, _DFH, _DF_1M, _DF_1S, start, end, years)
     row["candidate"] = cand_idx
     return row
 
 
+def _persist_trades(node, version, row):
+    """Writes both resolutions' trade lists (present on `row` only when this row came
+    from a genuine fresh _check_candidate_core call, never from a stored-result skip)
+    into phase5_trades, keyed on the real candidate_id. No-op (returns immediately)
+    when node['id'] is None -- the backtest_cache-sourced path has no candidate_id to
+    key on, same carve-out already established for candidate_verification_results."""
+    cid = node.get("id")
+    if cid is None or "trades_1m" not in row:
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        n_new_1m, n_total_1m = insert_trades(
+            conn, cid, "1m", version, node["ticker"], node["strategy"], node["fixed_sl"], row["trades_1m"])
+        n_new_1s, n_total_1s = insert_trades(
+            conn, cid, "1s", version, node["ticker"], node["strategy"], node["fixed_sl"], row["trades_1s"])
+    print(f"    phase5_trades: candidate_id={cid} 1m {n_new_1m}/{n_total_1m} new "
+          f"(rest already present), 1s {n_new_1s}/{n_total_1s} new")
+
+
 def _stored_row_or_none(cid, cand_idx):
-    """Query-first skip (Task #4, 2026-08-29, planner correction): if `cid` (real
-    candidate_nodes.id) already has a stored phase5 result, return a row dict shaped
-    like _check_candidate_core's own return value (elapsed_secs=0.0 -- genuinely
-    near-zero real cost this run, which is also what the scope-wide cost-based
-    fallback decision in run_scope should see). Returns None if `cid` is None (the
-    backtest_cache-sourced path, no candidate_id to check) or nothing is stored yet."""
+    """Query-first skip (Task #4, 2026-08-29, planner correction; extended same day
+    per a further planner correction to also require phase5_trades backfill): if
+    `cid` (real candidate_nodes.id) already has BOTH a stored phase5 aggregate result
+    AND a complete phase5_trades entry (both resolutions, full row count) for it,
+    return a row dict shaped like _check_candidate_core's own return value
+    (elapsed_secs=0.0 -- genuinely near-zero real cost this run, which is also what
+    the scope-wide cost-based fallback decision in run_scope should see; no
+    'trades_1m'/'trades_1s' keys on this row -- nothing to persist, this IS the skip
+    path). Returns None if `cid` is None (the backtest_cache-sourced path, no
+    candidate_id to check), no aggregate result is stored yet, OR the aggregate
+    result exists but phase5_trades is still missing/incomplete for it -- the second
+    case is the real backfill trigger: a candidate checked before this feature landed
+    has a candidate_verification_results row but zero phase5_trades rows, so this
+    correctly forces one more genuine kernel run whose only new effect is populating
+    phase5_trades (the CAGR/delta numbers it recomputes are already known and will
+    upsert to the same values)."""
     if cid is None:
         return None
     with sqlite3.connect(DB_PATH) as conn:
         stored = get_stored(conn, cid, "phase5")
-    if stored is None:
-        return None
+        if stored is None:
+            return None
+        if not trades_complete(conn, cid, stored["n_trades_1m"] or 0, stored["n_trades_1s"] or 0):
+            print(f"  candidate {cand_idx}: verified at {stored['checked_at']} but phase5_trades "
+                  f"missing/incomplete -- forcing a fresh run to backfill trades")
+            return None
     print(f"  candidate {cand_idx}: already verified at {stored['checked_at']}, using stored result")
     row = {k: v for k, v in stored.items() if k != "checked_at"}
     row["elapsed_secs"] = 0.0
@@ -408,6 +455,9 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
         if first_node.get("id") is not None:
             with sqlite3.connect(DB_PATH) as conn:
                 upsert(conn, first_node["id"], "phase5", first_row)
+            _persist_trades(first_node, version, first_row)
+        first_row.pop("trades_1m", None)
+        first_row.pop("trades_1s", None)
     _print_row(first_row, first_node)
     rows = [dict(first_row, ticker=ticker, strategy=strategy_name, fixed_sl=fixed_sl, window=window)]
 
@@ -443,6 +493,9 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
             if node.get("id") is not None:
                 with sqlite3.connect(DB_PATH) as conn:
                     upsert(conn, node["id"], "phase5", row)
+                _persist_trades(node, version, row)
+            row.pop("trades_1m", None)
+            row.pop("trades_1s", None)
             extra_by_idx[row["candidate"]] = dict(row, ticker=ticker, strategy=strategy_name,
                                                    fixed_sl=fixed_sl, window=window)
         # Combine in submission order (not completion order) so scope output
@@ -477,6 +530,8 @@ def _try_all_stored(scopes, limit):
                 cid = cand.get("id")
                 stored = get_stored(conn, cid, "phase5") if cid is not None else None
                 if stored is None:
+                    return None
+                if not trades_complete(conn, cid, stored["n_trades_1m"] or 0, stored["n_trades_1s"] or 0):
                     return None
                 node = node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, cand)
                 print(f"  candidate {i}: already verified at {stored['checked_at']}, using stored result")
