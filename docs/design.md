@@ -2723,6 +2723,11 @@ Not built. `signals_compute.py` is a `signals_*.py` module — any implementatio
 the paired independent-cold + contextual Opus review before landing, per CLAUDE.md's Review-Gate
 Persistence Rule.
 
+(Standalone observation tool, not this integration: `scripts/corp_action_canary.py`, built same night,
+revised to a 15-min-poll cadence — applies this entry's part-1/part-2 detection logic purely as an
+external SPY-only logger, doesn't touch `signals_compute.py`/the live cache at all. See
+`docs/deep_backlog.md`'s corresponding Task #10 entry.)
+
 ## 2026-08-28 (later still) — Design, not built, part 2: quarterly ticker-rotation concept ("v6-q4"-style), swap-on-flat, and a real BUY-only node-pause gap found
 
 **Origin**: a follow-on design thread the same night, connected to part 1 above (both stem from wanting a

@@ -1,4 +1,4 @@
-"""Daily SPY corp-action canary: observes whether/when Yahoo's and Massive's data
+"""SPY corp-action canary: observes whether/when Yahoo's and Massive's data
 each reflect SPY's real, known upcoming ex-dividend date (2026-09-18) -- pure
 observation/logging, NOT a live-trading alert, NOT wired into any live signal
 computation path.
@@ -11,14 +11,31 @@ advance, checked 2026-08-22); (2) neither Massive's nor Yahoo's split/dividend
 rebase timing has ever been empirically observed by this project for either
 source.
 
-Each run:
+Cadence, 2026-08-28 (revised -- supersedes the original once-daily design from
+commit 6114b3a): this script is meant to be invoked every 15 minutes, all day
+(not just market hours -- a vendor could push a retroactive rebase at any
+time, that's part of the unknown this exists to resolve). 15 minutes was
+picked as the midpoint of the requested 5-30 minute range: frequent enough to
+pinpoint a rebase to a fairly tight interval without generating an excessive
+number of near-identical log lines while nothing is happening (the expected
+state for weeks). Rate limiting is NOT a reason to run any of the 3 checks
+below on a slower cadence than the other two: this script issues exactly 2
+Massive calls per invocation (one minute-bar fetch, one dividends fetch) vs.
+Massive's free-tier budget of 5 calls/min (see build_massive_hourly_derived.py
+SLEEP_BETWEEN_TICKERS's 12s/call-minimum comment) -- even invoked every 5
+minutes (the fastest allowed cadence) that's nowhere close to the budget, so
+all 3 checks stay on one shared cadence rather than being decoupled.
+
+Each invocation:
   1. Fetches a fresh window of SPY daily closes from Yahoo (yf.download,
      auto_adjust=True, same convention as data_manager.py's existing hourly
-     fetch) and compares them against YESTERDAY's logged closes for the same
-     already-elapsed dates -- any change is direct proof of a retroactive
-     Yahoo rebase. This is design.md's part-1 self-consistency detector, used
-     here purely as an observation -- it is NOT wired into signals_compute.py
-     or any live code path.
+     fetch) and compares them against the LAST POLL's logged closes (not
+     specifically "yesterday" -- any prior poll works, since sub-daily
+     resolution is the whole point now) for the same already-elapsed dates --
+     any change is direct proof of a retroactive Yahoo rebase, and pinpoints
+     the exact ~15-minute interval it happened in. This is design.md's part-1
+     self-consistency detector, used here purely as an observation -- it is
+     NOT wired into signals_compute.py or any live code path.
   2. Fetches a fresh, small window of SPY raw minute data directly from
      Massive (scripts.fetch_massive_minute_data.fetch_ticker, reused as-is --
      this script never writes to or promotes the canonical minute cache) and
@@ -31,18 +48,25 @@ Each run:
      and records whether SPY's real 2026-09-18 ex-dividend entry is present
      yet.
 
-Logs one JSON line per day to docs/corp_action_canary_log.jsonl (committed,
+Logs one JSON line per POLL (not per day -- expect many lines/day at a
+15-minute cadence) to docs/corp_action_canary_log.jsonl (committed,
 append-only). Chosen over docs/research_log.md's free-form prose because this
-needs ~3-4 weeks of daily, structured, machine-diffable entries -- a human or
-a future script can read consecutive lines to see exactly which day each
-source's data changed, without parsing prose. Idempotent: a second same-day
-run replaces (not duplicates) that day's line.
+needs weeks of dense, structured, machine-diffable entries -- a human or a
+future script can read consecutive lines to see exactly which poll each
+source's data changed, without parsing prose. Each line carries its own
+`poll_timestamp` (ISO-8601, local time, second resolution) so consecutive
+same-day polls never collide; nothing is ever replaced or deduped by day
+anymore -- every invocation appends a new line. (The original once-daily
+script's per-day idempotent-replace logic is gone: it doesn't make sense once
+multiple polls/day are expected, and the whole point of this revision is
+retaining every poll as its own data point.)
 
 Non-goals (explicit, do not extend here): no alerting/paging -- this is silent
-data collection; no crontab wiring (a separate step, handled once this script
-is confirmed working); SPY only -- not a general corp-action detection system
-(see docs/design.md's 2026-08-28 (late) entry for that separate, bigger-scope,
-not-yet-built idea).
+data collection; no crontab wiring (a separate step, the user's own to set up
+once this script is confirmed working -- this script only needs to behave
+correctly when invoked, not schedule itself); SPY only -- not a general
+corp-action detection system (see docs/design.md's 2026-08-28 (late) entry for
+that separate, bigger-scope, not-yet-built idea).
 
 Usage:
     .venv/bin/python scripts/corp_action_canary.py
@@ -50,7 +74,7 @@ Usage:
 import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -67,7 +91,7 @@ TICKER = "SPY"
 EX_DIV_DATE = date(2026, 9, 18)
 LOG_PATH = ROOT / "docs" / "corp_action_canary_log.jsonl"
 YAHOO_WINDOW_DAYS = 30   # covers the ex-div date with buffer once it's elapsed
-MASSIVE_WINDOW_DAYS = 5  # small, cheap daily pull -- not a full-history fetch
+MASSIVE_WINDOW_DAYS = 5  # small, cheap pull -- not a full-history fetch
 
 
 def _load_last_entry():
@@ -122,8 +146,10 @@ def _massive_dividends_observation():
 
 
 def main():
-    today = date.today()
+    now = datetime.now()
+    today = now.date()
     today_str = today.strftime("%Y-%m-%d")
+    poll_timestamp = now.isoformat(timespec="seconds")
     prev_entry = _load_last_entry()
 
     yahoo_closes, retroactive_changes = _yahoo_observation(prev_entry, today_str)
@@ -131,28 +157,28 @@ def main():
     massive_div = _massive_dividends_observation()
 
     entry = {
+        "poll_timestamp": poll_timestamp,
         "date": today_str,
         "days_to_exdiv": (EX_DIV_DATE - today).days,
         "yahoo_closes": yahoo_closes,
-        "yahoo_retroactive_changes_vs_yesterday": retroactive_changes,
+        "yahoo_retroactive_changes_vs_last_poll": retroactive_changes,
         "massive_minute": massive_minute,
         "massive_dividends": massive_div,
     }
 
-    lines = []
-    if LOG_PATH.exists():
-        lines = [l for l in LOG_PATH.read_text().splitlines() if l.strip()]
-    lines = [l for l in lines if json.loads(l)["date"] != today_str]  # idempotent: replace today's entry, don't duplicate
-    lines.append(json.dumps(entry))
-    LOG_PATH.write_text("\n".join(lines) + "\n")
+    # Every invocation is its own poll -- append, never replace/dedupe by day
+    # (the old once-daily script deduped same-day reruns; that no longer
+    # applies now that multiple polls/day are the intended, normal case).
+    with LOG_PATH.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
 
-    print(f"{today_str}: logged (days_to_exdiv={entry['days_to_exdiv']}). "
+    print(f"{poll_timestamp}: logged (days_to_exdiv={entry['days_to_exdiv']}). "
           f"yahoo_retroactive_changes={len(retroactive_changes)}  "
           f"massive_dividends_endpoint_reflects_target={massive_div['endpoint_reflects_target_exdiv']}  "
           f"massive_minute_rows={massive_minute['rows_fetched']}")
     if retroactive_changes:
-        print(f"  *** Yahoo retroactively changed {len(retroactive_changes)} already-elapsed date(s): "
-              f"{retroactive_changes}")
+        print(f"  *** Yahoo retroactively changed {len(retroactive_changes)} already-elapsed date(s) "
+              f"since the last poll: {retroactive_changes}")
     if massive_div["endpoint_reflects_target_exdiv"]:
         print(f"  *** Massive dividends endpoint now reflects the {EX_DIV_DATE} ex-div: "
               f"{massive_div['target_exdiv_entry']}")
