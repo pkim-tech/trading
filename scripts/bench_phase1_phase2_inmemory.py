@@ -553,7 +553,7 @@ def apply_grid_overrides(args):
     override is unit-testable without a real backtest run. No-op for any axis whose flag
     was omitted (None). Seed mode sets both from the seed node's own params in main()
     instead and never calls this."""
-    global WINDOWS, Z_THRESHOLDS
+    global WINDOWS, Z_THRESHOLDS, N_ISLANDS
     if args.window is not None:
         _prev = list(WINDOWS)
         WINDOWS = list(args.window)
@@ -564,6 +564,14 @@ def apply_grid_overrides(args):
         Z_THRESHOLDS = list(args.z_thresholds)
         print(f"Z-threshold override: Z_THRESHOLDS={Z_THRESHOLDS} as ONE pooled Phase1 "
               f"axis (replaces standard grid {_prev})")
+    if args.n_islands is not None:
+        _prev = N_ISLANDS
+        N_ISLANDS = args.n_islands
+        print(f"Island-count override: N_ISLANDS={N_ISLANDS} (replaces default {_prev}) -- "
+              f"widens Phase2's fine-mesh dispatch to this many centers per scope. Only "
+              f"affects THIS module's own N_ISLANDS (imported copy) -- run_optimization_"
+              f"sweep.py's own module-level N_ISLANDS=3 default is untouched, so its legacy "
+              f"callers/pick_island_centers()'s own default parameter value are unaffected.")
 
 
 def build_arg_parser():
@@ -601,6 +609,14 @@ def build_arg_parser():
                           "standard grid for this run, does not add to it. Mutually exclusive "
                           "with --seed-watch-list-id (seed mode derives z from the seed node "
                           "itself). Default None leaves Z_THRESHOLDS unchanged.")
+    ap.add_argument("--n-islands", dest="n_islands", type=int, default=None,
+                     help="override module-level N_ISLANDS (default 3) -- widens Phase2's "
+                          "fine-mesh dispatch to this many centers per scope, e.g. --n-islands "
+                          "10 so a mid-CAGR core config with an explosive overlay isn't "
+                          "discarded before Phase4 ever sees it. Only affects THIS module's "
+                          "own copy of N_ISLANDS -- run_optimization_sweep.py's own N_ISLANDS=3 "
+                          "default and its own legacy callers are untouched. Default None "
+                          "leaves N_ISLANDS unchanged.")
     ap.add_argument("--ticker", type=str, default=None,
                      help="override module-level TICKER (default 'SOXL') -- e.g. --ticker "
                           "AGQ to run a different ticker's campaign. Mutually exclusive with "
@@ -655,6 +671,44 @@ def build_arg_parser():
     return ap
 
 
+def _build_version_string(args):
+    """Builds the sweep_run_log/candidate_nodes 'version' discriminator string, extracted
+    (2026-08-29, paired-review fixup) out of main() so it's directly unit-testable without
+    a real DB/backtest run. Depends only on module-level DATA_SOURCE/START/END plus the
+    override flags on args -- NOT on fixed_sl (one version string legitimately covers every
+    (strategy, fixed_sl) combo from a single campaign's real invocations)."""
+    version = "bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
+    if args.z_thresholds is not None:
+        # z discriminator (2026-08-29, paired review, CONFIRMED HIGH by both independent-
+        # cold and contextual): without this, version (and therefore sweep_run_log's dedup
+        # key, which includes version) can't tell a --z-thresholds widened-grid run apart
+        # from a standard-z-grid run at the same (ticker, strategy, fixed_sl, windows,
+        # date-range) -- a prior standard-grid finished row would make a --z-thresholds
+        # run hit "already done...skipping" and do ZERO work, AND (independent of dedup)
+        # the two runs' candidate_nodes/backtest_phase1_insurance rows would land under an
+        # indistinguishable version string, unioning two different grids' top-9s under one
+        # version. Exact same failure class the seed-mode `-seed<id>` suffix below already
+        # solves for seed mode -- same fix shape, applied to the other new grid axis.
+        version += f"-z{'-'.join(str(z) for z in Z_THRESHOLDS)}"
+    if args.seed_watch_list_id is not None:
+        # Seed-mode discriminator (2026-08-29, paired review): without this, sweep_run_log's
+        # dedup key (ticker/strategy/fixed_sl/windows/version) can't tell a seed-mode smoke
+        # test apart from a real full-grid campaign at the same coordinates -- a seed run
+        # could silently no-op a genuine full-grid run's "already done" check (or vice versa),
+        # and the resulting candidate_nodes rows would be indistinguishable from real
+        # full-grid campaign output under the default date range.
+        version += f"-seed{args.seed_watch_list_id}"
+    if args.n_islands is not None:
+        # N_ISLANDS discriminator (2026-08-29, paired review, CONFIRMED HIGH): same failure
+        # class as the -z suffix above -- without this, an --n-islands widened-dispatch run
+        # can't be told apart from a standard-N_ISLANDS run at the same (ticker, strategy,
+        # fixed_sl, windows, date-range) coordinates, so it would either silently skip real
+        # work via the "already done" dedup check or union two different island-count runs'
+        # candidates under one indistinguishable version string.
+        version += f"-isl{args.n_islands}"
+    return version
+
+
 def main():
     ap = build_arg_parser()
     args = ap.parse_args()
@@ -662,6 +716,13 @@ def main():
         raise SystemExit("--resume-from-top100 and --checkpoint-file are mutually exclusive "
                           "(one tests a narrow top-100-only dataset, the other a full "
                           "Phase1+Phase2 checkpoint) -- pick one.")
+
+    if args.n_islands is not None and args.n_islands < 1:
+        # (2026-08-29, paired review, CONFIRMED MEDIUM): pick_island_centers's loop-exit
+        # condition (`if len(centers) == n: break`) is unreachable for n<=0, so an
+        # unvalidated --n-islands 0 or negative would silently return an unbounded (all
+        # min-sep-separated) set of island centers instead of erroring.
+        raise SystemExit(f"--n-islands {args.n_islands}: must be >= 1.")
 
     if args.seed_watch_list_id is not None:
         _seed_conflicts = []
@@ -768,27 +829,7 @@ def main():
     # convention already confirmed against live data (scripts/candidate_nodes_status.py):
     # one version string legitimately covers every (strategy, fixed_sl) combo from a
     # single campaign's real invocations.
-    version = "bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
-    if args.z_thresholds is not None:
-        # z discriminator (2026-08-29, paired review, CONFIRMED HIGH by both independent-
-        # cold and contextual): without this, version (and therefore sweep_run_log's dedup
-        # key, which includes version) can't tell a --z-thresholds widened-grid run apart
-        # from a standard-z-grid run at the same (ticker, strategy, fixed_sl, windows,
-        # date-range) -- a prior standard-grid finished row would make a --z-thresholds
-        # run hit "already done...skipping" and do ZERO work, AND (independent of dedup)
-        # the two runs' candidate_nodes/backtest_phase1_insurance rows would land under an
-        # indistinguishable version string, unioning two different grids' top-9s under one
-        # version. Exact same failure class the seed-mode `-seed<id>` suffix below already
-        # solves for seed mode -- same fix shape, applied to the other new grid axis.
-        version += f"-z{'-'.join(str(z) for z in Z_THRESHOLDS)}"
-    if args.seed_watch_list_id is not None:
-        # Seed-mode discriminator (2026-08-29, paired review): without this, sweep_run_log's
-        # dedup key (ticker/strategy/fixed_sl/windows/version) can't tell a seed-mode smoke
-        # test apart from a real full-grid campaign at the same coordinates -- a seed run
-        # could silently no-op a genuine full-grid run's "already done" check (or vice versa),
-        # and the resulting candidate_nodes rows would be indistinguishable from real
-        # full-grid campaign output under the default date range.
-        version += f"-seed{args.seed_watch_list_id}"
+    version = _build_version_string(args)
 
     # fixed_sl packaging (2026-08-29, Task #6 follow-up, planner dispatch): loops the
     # existing per-fixed_sl Phase1+Phase2+Phase2.5+candidate-write logic (now
@@ -850,25 +891,11 @@ def main():
             run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args)
 
 
-def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
-    """Real per-fixed_sl Phase1+Phase2+Phase2.5+candidate-write body -- extracted
-    2026-08-29 (Task #6 follow-up, planner dispatch) from what used to be main()'s
-    own single-fixed_sl body, so main() can loop this over multiple fixed_sl values
-    within one shared pool. Also owns this fixed_sl's own sweep_run_log start/finish
-    logging (piece #1) -- main()'s own resumability check (already-finished row ==
-    skip) happens BEFORE this function is even called, so every real call here is a
-    genuine new unit of work."""
-    _run_log_t0 = time.time()
-    _run_log_id = _log_sweep_run_start(TICKER, strategy_name, fixed_sl, WINDOWS, version)
-
-    grid = campaign_config.STRATEGIES[strategy_name]
-    TAKE_PROFITS = grid["take_profits"]
-    STOP_LOSSES = grid["stop_losses"]
-    TRAIL_PCTS = _trail_pcts_for_strategy(strategy_name, grid)
-
-
-
-    _job_tmp = os.path.join(os.environ["CLAUDE_JOB_DIR"], "tmp") if "CLAUDE_JOB_DIR" in os.environ else "/tmp"
+def _build_checkpoint_filename(strategy_name, fixed_sl, args):
+    """Builds the dev-iteration checkpoint filename, extracted (2026-08-29, paired-review
+    fixup) out of run_one_fixed_sl so it's directly unit-testable without a real DB/backtest
+    run. Depends on module-level TICKER/WINDOWS/Z_THRESHOLDS/START/END plus the override
+    flags on args."""
     # Keyed on WINDOWS too (not just strategy/fixed_sl) -- found live 2026-08-29: a
     # --window override run silently loaded a stale checkpoint from an earlier
     # standard-grid ([10,20]) run under the same strategy/fixed_sl, skipping Phase1+2
@@ -891,9 +918,35 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # loading one ticker's df_full and promoting it under another ticker's version.
     _seed_key = f"_seed{args.seed_watch_list_id}" if getattr(args, "seed_watch_list_id", None) \
         is not None else ""
+    # Also keyed on N_ISLANDS -- same bug class as the WINDOWS/Z_THRESHOLDS keys above: an
+    # --n-islands override run must not silently load a checkpoint from an earlier run under
+    # a different island count with the same strategy/fixed_sl/windows/date-range.
+    _isl_key = f"_isl{args.n_islands}" if args.n_islands is not None else ""
+    return (f"bench_phase12_checkpoint_{TICKER}_{strategy_name}_{fixed_sl}_w{_windows_key}"
+            f"{_z_key}{_range_key}{_seed_key}{_isl_key}.parquet")
+
+
+def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
+    """Real per-fixed_sl Phase1+Phase2+Phase2.5+candidate-write body -- extracted
+    2026-08-29 (Task #6 follow-up, planner dispatch) from what used to be main()'s
+    own single-fixed_sl body, so main() can loop this over multiple fixed_sl values
+    within one shared pool. Also owns this fixed_sl's own sweep_run_log start/finish
+    logging (piece #1) -- main()'s own resumability check (already-finished row ==
+    skip) happens BEFORE this function is even called, so every real call here is a
+    genuine new unit of work."""
+    _run_log_t0 = time.time()
+    _run_log_id = _log_sweep_run_start(TICKER, strategy_name, fixed_sl, WINDOWS, version)
+
+    grid = campaign_config.STRATEGIES[strategy_name]
+    TAKE_PROFITS = grid["take_profits"]
+    STOP_LOSSES = grid["stop_losses"]
+    TRAIL_PCTS = _trail_pcts_for_strategy(strategy_name, grid)
+
+
+
+    _job_tmp = os.path.join(os.environ["CLAUDE_JOB_DIR"], "tmp") if "CLAUDE_JOB_DIR" in os.environ else "/tmp"
     checkpoint_path = args.checkpoint_file or os.path.join(
-        _job_tmp, f"bench_phase12_checkpoint_{TICKER}_{strategy_name}_{fixed_sl}_w{_windows_key}"
-                  f"{_z_key}{_range_key}{_seed_key}.parquet")
+        _job_tmp, _build_checkpoint_filename(strategy_name, fixed_sl, args))
 
     asset_bh, spy_bh = compute_bh_returns(TICKER, start_date=START, end_date=END, data_source=DATA_SOURCE)
     if spy_bh is None:
@@ -995,7 +1048,8 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
           phase1_rows = _dispatch(pool, phase1_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
                                    desc="Phase1-coarse (in-memory)")
           t1 = time.time()
-          print(f"Phase1-coarse (in-memory) done: {len(phase1_rows):,} rows in {t1 - t0:.1f}s "
+          print(f"PROGRESS: Phase1 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
+                f"{len(phase1_rows):,} rows in {t1 - t0:.1f}s "
                 f"({len(phase1_rows) / max(t1 - t0, 0.001):.0f} nodes/sec)")
 
           # Guard BEFORE building df1 (2026-08-29, paired review): if every Phase1 cell
@@ -1084,7 +1138,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
                               & (df1["trail_sell_pct"] == tpct)]
                   if df_wz.empty:
                       continue
-                  centers = pick_island_centers(df_wz, rank_col="cagr")
+                  centers = pick_island_centers(df_wz, n=N_ISLANDS, rank_col="cagr")
                   if len(centers) < N_ISLANDS:
                       print(f"  WARNING: (w={w} z={z} tpct={tpct}) only found {len(centers)} "
                             f"island(s), expected {N_ISLANDS} -- check for a data gap in "
@@ -1102,7 +1156,8 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
       phase2_rows = _dispatch(pool, phase2_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
                                desc="Phase2-island (in-memory)")
       t3 = time.time()
-      print(f"Phase2-island (in-memory) done: {len(phase2_rows):,} rows in {t3 - t2:.1f}s "
+      print(f"PROGRESS: Phase2 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
+            f"{len(phase2_rows):,} rows in {t3 - t2:.1f}s "
             f"({len(phase2_rows) / max(t3 - t2, 0.001):.0f} nodes/sec)")
 
       # Phase2.5-CliffBox-GT (in-memory): center detection off the FULL scope
@@ -1141,7 +1196,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # matching run_phase25_cliff_box_ground_truth's own input at the point it runs
     # (Phase2.5-CliffBox-GT rows don't exist yet). This part does NOT decide the
     # final 9 candidates -- see below.
-    centers25 = pick_island_centers(df_full, rank_col="cagr")
+    centers25 = pick_island_centers(df_full, n=N_ISLANDS, rank_col="cagr")
     if len(centers25) < N_ISLANDS:
         print(f"  WARNING (Phase2.5 seed detection): only found {len(centers25)} island(s) "
               f"across the full scope, expected {N_ISLANDS} -- check df_full for a real gap.")
@@ -1197,7 +1252,8 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     phase25_rows = _dispatch(pool, phase25_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
                               desc="Phase2.5-cliffbox (in-memory)")
     t5 = time.time()
-    print(f"Phase2.5-cliffbox (in-memory) done: {len(phase25_rows):,} rows in {t5 - t4:.1f}s "
+    print(f"PROGRESS: Phase2.5 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
+          f"{len(phase25_rows):,} rows in {t5 - t4:.1f}s "
           f"({len(phase25_rows) / max(t5 - t4, 0.001):.0f} nodes/sec)")
 
     print(f"\nTotal: Phase1={t1 - t0:.1f}s + Phase2={t3 - t2:.1f}s + Phase2.5={t5 - t4:.1f}s "
@@ -1225,7 +1281,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # recorded (`converged_from_islands`) as a real robustness signal (a cell two
     # independent neighborhoods both rank highly is stronger evidence than one alone),
     # not silently discarded.
-    final_centers = pick_island_centers(df_final, rank_col="cagr")
+    final_centers = pick_island_centers(df_final, n=N_ISLANDS, rank_col="cagr")
     final_candidates = []
     claimed = {}  # coordinate key -> candidate dict already added (tracks convergence)
     for tp_c, sl_c in final_centers:
@@ -1367,6 +1423,17 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
 
     _log_sweep_run_finish(_run_log_id, len(final_candidates), n_written9, n_trade_rows_written,
                            time.time() - _run_log_t0)
+
+    # PROGRESS line moved here (2026-08-29, paired review, CONFIRMED MEDIUM): the old
+    # "PROGRESS: fixed_sl DONE" print fired right after the final-candidates list was
+    # built, BEFORE the candidate_nodes write, the winner-trades ground-truth backtests,
+    # and _log_sweep_run_finish actually ran -- a crash after that point would leave a
+    # misleadingly "DONE"-looking log line while sweep_run_log.finished_at was still NULL.
+    # Now fires after the real last step, with the final candidate count on the line
+    # itself so a `grep "PROGRESS:"` log monitor gets real information.
+    print(f"PROGRESS: fixed_sl DONE ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
+          f"{len(final_candidates)} final candidates, {n_written9} candidate_nodes rows, "
+          f"{n_trade_rows_written} trade rows written")
 
 
 if __name__ == "__main__":
