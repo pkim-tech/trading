@@ -1499,6 +1499,33 @@ REGISTRY = [
                "trade_log -- a cold Opus review found that sharing those tables would break "
                "get_open_position/top_up_position/set_broker_stop_price/get_held_tickers/"
                "check_order's double-buy guard, all of which assume at most one row per ticker/wl_id."),
+    dict(id='drought_addon_stacked_lifecycle',
+         scenario="A single node with BOTH addon_enabled=1 AND drought_overlay_enabled=1 runs a real "
+                  "core-position addon-leg lifecycle (open -> arm -> addon fires -> lockstep close via a "
+                  "genuine SL order fill) followed by a real drought-overlay entry lifecycle (gap "
+                  "elapses -> drought entry fires -> fills -> opens a position_source='drought_overlay' "
+                  "position) on the SAME node/ticker, with neither mechanism's real order/DB state "
+                  "contaminating the other -- and the reverse ordering (drought cycle first, then a "
+                  "fresh core position arms and addon fires) also proven, not just a fluke of one order",
+         code_path="signals_notify.check_addon_trigger_real + signals_notify.notify_trailing_activated "
+                    "(addon leg) and signals_notify.check_drought_entry (drought entry), both against "
+                    "one node/ticker with addon_enabled=1 AND drought_overlay_enabled=1",
+         offline_coverage="tests/test_fake_broker_drought_addon_stacked_scenario.py",
+         check_mechanism='coverage_events', scenario_key='addon_entry_fill',
+         bad_results=[],
+         notes="Closes the real gap flagged 2026-08-20 (docs/deep_backlog.md's 'AGQ paper-node cleanup' "
+               "entry): the paper node v5-overlay-test-da (wl_id=186/187) was the only thing probing the "
+               "stacked drought+addon combination, and individual addon/drought Grid rows above only ever "
+               "exercised a node with ONE overlay flag enabled at a time. Deliberately reuses the "
+               "addon_entry_fill scenario_key (same pattern as addon_leg_independent_sl_fill_detection "
+               "reusing addon_exit_fill above) rather than adding a new log_coverage_event call site -- "
+               "this row's own real evidence is the COMBINATION (addon_entry_fill together with a real "
+               "drought_entry_placement event for the same node_id in the same test), not a scenario_key "
+               "of its own; see offline_coverage for the drought_entry_placement half of the same file. "
+               "evaluate_drought_entry's own gate (paper_trading.py ~253, `get_open_position_by_wl_id(wl_id) "
+               "or pending`) means a core position and a drought-overlay position can never genuinely "
+               "coexist OPEN at the same time for one node -- 'stacked' here means sequential on one node "
+               "config, not simultaneous positions."),
     dict(id='addon_exit_fill',
          scenario="An open add-on leg closes in lockstep with its parent core position's "
                   "own exit (SL/TRAIL/TIME), never independently",
@@ -2307,6 +2334,7 @@ BEST_HARNESS = {
     # it's properly instrumented. ---
     'account_disabled_block': 'canary',
     'addon_entry_fill': 'canary',
+    'drought_addon_stacked_lifecycle': 'canary',
     'addon_exit_fill': 'canary',
     'buy_blocked_position_exists': 'canary',
     'canary_bull_bear_pair': 'canary',
