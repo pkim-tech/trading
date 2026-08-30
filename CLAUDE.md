@@ -49,7 +49,7 @@ Full incident/build history for everything below: `docs/deep_backlog.md` (search
 **Signal windows**: 10:25–10:40 AM ET and 15:25–15:40 PM ET (matches backtest `target_hours=(9,14)`). Hourly bars are labeled by **start** time — the 15:25-15:40 window checks the **14:30** bar, not 15:30.
 
 **Execution workflow**:
-- `TrailingExitZScoreBreakout`: Stage limit order pre-market at absurd low price → Slack fires at bar close if confirmed below lower_band → edit order to market and submit.
+- `TrailingExitZScoreBreakout`: strategy-level entry is a direct bar-close z-score breakout buy (`check_signal`), no bounce-confirmation wait — unlike `TrailingBothZScoreBreakout` below, whose entry requires a real trailing-buy bounce before it fills. Live execution mechanic: Slack fires at bar close if confirmed below lower_band → edit an order to market and submit. The "stage a limit order pre-market at an absurd low price" step is the user's own manual-execution convenience (avoids having to place a brand-new order mid-day, just edits an existing resting one) — it is NOT part of the strategy's entry logic and shouldn't be read as one (confirmed 2026-08-30 after this exact conflation caused a wrong explanation of TrailingExit's real-vs-TrailingBoth performance gap).
 - `TrailingBothZScoreBreakout`: alert fires at bar close, place a **trailing buy order at `trail_buy_pct`%** — broker tracks the bounce-fill itself. Three-step Slack confirmation: BUY alert → "Trailing Buy Order Placed" → "Filled" (enters real fill price, opens position, starts arm/SL/trail triggers).
 - 🔶 in morning report = set phone alarm for 10:28 and 15:28.
 
