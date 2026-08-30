@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [tooling] Resolved 2026-08-29 — `isolation:worktree` root cause understood (runtime tool-call checks, not sandboxing; highest-risk vector is backgrounded/resumed agents losing binding), folded into dispatch-to-peer skill. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-08-29 — `GT_CANDIDATE_TIEBREAK` comment mis-describing `stop_loss`/tpct axis fixed (`293558a`, comment-only). Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved-as-decided-won't-fix 2026-08-29 — prune-validation gate island-CENTER selection A-vs-B cross-check gap, closed per user's call, no code change. Full detail: `deep_backlog.md`.

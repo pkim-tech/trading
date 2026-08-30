@@ -246,6 +246,24 @@ actually running. Lessons from that session:
   whenever asked "what's running" or before dispatching anything new — don't
   answer from what you remember launching.
 
+- **Don't blindly trust `isolation: "worktree"` for a BACKGROUNDED or
+  RESUMABLE dispatch specifically.** Found 2026-08-23 (Task #1 dispatch),
+  root-caused 2026-08-29: `isolation:worktree` works via runtime tool-call
+  checks (blocking `Edit`/`Write`/`NotebookEdit` targeting main, blocking
+  `Bash`/git commands whose cwd resolves to main, blocking git-redirect
+  tricks and unparseable shell constructs) — NOT filesystem-level sandboxing.
+  A backgrounded/resumed agent can lose its worktree binding silently (path
+  deleted, wrong launch dir on resume) and fall back to editing the shared
+  main tree with no error raised — this is the highest-risk failure vector of
+  the ones identified (the others: worktree creation failing silently at
+  setup, `ExitWorktree` called without re-entering, an unparseable shell
+  construct slipping past the command-shape check). Full writeup:
+  `docs/deep_backlog.md`. For any backgrounded/resumable dispatch using
+  `isolation:worktree`, verify the binding actually held once it completes —
+  `git worktree list`, or checking where the edits actually landed (main tree
+  vs. the expected worktree path) — rather than assuming isolation is
+  unconditionally reliable for that dispatch shape.
+
 - **Sequence dispatches that touch the same file; don't parallelize by
   default.** Beyond the collision check in item 8 above (checking for
   ALREADY-uncommitted changes before dispatching), two NEW dispatches that
