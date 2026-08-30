@@ -150,6 +150,12 @@ echo "Logging to $LOG (console + file via tee)"
       continue
     fi
 
+    # Rebuilds the single running cross-campaign phase5_second_level_overlay_
+    # check_ALL_<VERSION> file from every per-ticker file that exists so far
+    # (2026-08-30, planner dispatch) -- so the user never has to open per-ticker
+    # files or manually re-merge as the campaign progresses.
+    $PYTHON scripts/append_phase5_combined.py --version "$VERSION"
+
     ticker_banner "$ticker: full Phase1->5 pipeline complete"
   done
 
