@@ -1,5 +1,9 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Resolved 2026-08-29 — `GT_CANDIDATE_TIEBREAK` comment mis-describing `stop_loss`/tpct axis fixed (`293558a`, comment-only). Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved-as-decided-won't-fix 2026-08-29 — prune-validation gate island-CENTER selection A-vs-B cross-check gap, closed per user's call, no code change. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-08-29 — independent-reimplementation verification for GT overlays confirmed done via `scripts/sim_1s_vs_1m_groundtruth_overlays.py` (raised 2026-08-23). Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved-as-skip 2026-08-29 (recorded; user's 2026-08-23 call) — 2 real SOXL Phase2-GT scopes left incomplete by `pick_island_centers` tiebreak fix (`54cbd0c`), no recompute planned. Full detail: `deep_backlog.md`.
