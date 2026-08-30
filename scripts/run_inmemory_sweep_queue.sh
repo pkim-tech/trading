@@ -26,10 +26,14 @@
 # + window_version_suffix(START, END) (module defaults "2021-08-23"/"2026-08-21"
 # -- NOT overridden by this queue, so left out of the CLI calls below) + a
 # "-z<v1>-<v2>-..." suffix whenever --z-thresholds is passed (it always is,
-# here). NOTE: --window is deliberately NOT part of the version string (only
-# --z-thresholds and --seed-watch-list-id are) -- confirmed by reading main()
-# -- so the widened window grid below doesn't need (and must not get) its own
-# suffix here.
+# here), + a "-isl<N>" suffix whenever --n-islands is passed (it always is,
+# here, added 2026-08-29 fixing a paired-review CONFIRMED HIGH finding on the
+# --n-islands diff -- a run without this suffix would be indistinguishable in
+# sweep_run_log/candidate_nodes from a default-N_ISLANDS run at the same
+# scope). NOTE: --window is deliberately NOT part of the version string (only
+# --z-thresholds, --seed-watch-list-id, and now --n-islands are) -- confirmed
+# by reading main() -- so the widened window grid below doesn't need (and
+# must not get) its own suffix here.
 #
 # Phase4 (--kernel gt) intentionally does NOT take --version -- it auto-
 # discovers every real candidate_nodes scope for the given ticker across every
@@ -63,7 +67,7 @@ WORKERS="${WORKERS:-8}"
 # see the header comment above. Z_THRESHOLDS values are joined with '-' exactly
 # as that script's own f"-z{'-'.join(str(z) for z in Z_THRESHOLDS)}" does.
 Z_SUFFIX=$(echo "$Z_THRESHOLDS" | tr ' ' '-')
-VERSION="bench-inmemory-v6-massive-w2021-08-23_2026-08-21-z${Z_SUFFIX}"
+VERSION="bench-inmemory-v6-massive-w2021-08-23_2026-08-21-z${Z_SUFFIX}-isl${N_ISLANDS}"
 
 mkdir -p logs
 LOG="logs/inmemory_sweep_queue_$(date +%Y%m%d_%H%M%S).log"
