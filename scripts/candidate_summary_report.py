@@ -991,7 +991,8 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
     return rows
 
 
-def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_window_filter=None):
+def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_window_filter=None,
+                 version_filter=None):
     """--kernel gt entry point: loops every real GT scope for `tickers`, printing
     each scope's full candidate report (print_candidate_report_ground_truth) plus
     a top_safe_nodes cross-check to the terminal, and returns the flat GT_COLUMN_
@@ -1014,7 +1015,19 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
     fallback to that one window -- use it whenever a version is known to alias
     multiple unrelated batches (see phase4_candidate_nodes_resolver.py's own
     `window` param docstring); has no effect on backtest_cache-sourced scopes,
-    which don't carry this ambiguity."""
+    which don't carry this ambiguity.
+
+    `version_filter` (added 2026-08-30, planner dispatch): when set, restricts the
+    candidate_nodes fallback to that one exact version string, instead of every
+    version discover_all_candidate_nodes_scopes finds for the ticker. Real gap this
+    closes: with no filter, a ticker that has ever been swept under N historical
+    campaigns re-processes ALL N every Phase4 run, including long-stale orphan rows
+    from pre-GT sweeps (confirmed on real data 2026-08-29: SOXL alone has 20 distinct
+    candidate_nodes versions) -- wasted compute and noisy logs, not a correctness bug
+    (Phase5 was already unaffected, since it's version-scoped). Has no effect on
+    backtest_cache-sourced scopes (gt_scopes_for_tickers itself is not version-
+    filtered here -- out of scope for this fix, matches grid_window_filter's own
+    backtest_cache-scopes-unaffected precedent)."""
     from phase4_candidate_nodes_resolver import discover_all_candidate_nodes_scopes
 
     scopes = [(s[0], s[1], s[2], s[3], s[4], None) for s in gt_scopes_for_tickers(conn, tickers)]
@@ -1024,6 +1037,8 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
             if (ticker, strategy, entry_timing, fixed_sl) in covered:
                 continue
             if grid_window_filter is not None and window != grid_window_filter:
+                continue
+            if version_filter is not None and version != version_filter:
                 continue
             scopes.append((ticker, strategy, version, entry_timing, fixed_sl, window))
 
@@ -1099,8 +1114,12 @@ def main():
                           "ground_truth_kernel_rebuild.md Step 4 -- CAGR is the sole GT selection metric); "
                           "robust_alpha under --kernel legacy (unchanged).")
     ap.add_argument("--version", default=None,
-                     help="force a single version for every ticker (old behavior). Default: auto-resolve "
-                          "per ticker via resolve_version() -- v5.1 when the ticker has it, else v5.")
+                     help="--kernel legacy: force a single version for every ticker (old behavior). "
+                          "Default: auto-resolve per ticker via resolve_version() -- v5.1 when the ticker "
+                          "has it, else v5. --kernel gt: restrict the candidate_nodes fallback to this one "
+                          "exact version string instead of auto-discovering every version ever swept for "
+                          "the ticker (added 2026-08-30 -- see run_gt_mode's version_filter docstring). Has "
+                          "no effect on backtest_cache-sourced GT scopes either way.")
     ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--min-alpha", type=float, default=200,
                      help="Alpha floor for the 'best safe node' cliff-safety search (default 200%%, matching "
@@ -1134,7 +1153,7 @@ def main():
         conn = sqlite3.connect(args.db)
         try:
             run_gt_mode(conn, tickers, args.metric, args.min_alpha, args.csv, args.xlsx,
-                        grid_window_filter=args.grid_window)
+                        grid_window_filter=args.grid_window, version_filter=args.version)
         finally:
             conn.close()
         return

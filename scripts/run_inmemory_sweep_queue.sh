@@ -35,13 +35,15 @@
 # by reading main() -- so the widened window grid below doesn't need (and
 # must not get) its own suffix here.
 #
-# Phase4 (--kernel gt) intentionally does NOT take --version -- it auto-
-# discovers every real candidate_nodes scope for the given ticker across every
-# version (phase4_candidate_nodes_resolver.discover_all_candidate_nodes_scopes
-# is explicitly version-agnostic by design, matching prune_backtest_cache_
-# ground_truth's own ticker-agnostic-of-version discovery pattern) -- so a
-# bare `--kernel gt <TICKER>` already picks up this run's output with no
-# version plumbing needed.
+# Phase4 (--kernel gt) now takes --version too (added 2026-08-30, planner
+# dispatch): phase4_candidate_nodes_resolver.discover_all_candidate_nodes_scopes
+# is still version-agnostic by design (matching prune_backtest_cache_
+# ground_truth's own ticker-agnostic-of-version discovery pattern), but without
+# a filter it re-processes EVERY historical candidate_nodes version for the
+# ticker on every run -- confirmed real (SOXL alone has 20 distinct versions,
+# 472 rows) and wasteful, not just noisy. Passing --version "$VERSION" here
+# restricts run_gt_mode's candidate_nodes fallback to this run's own version
+# string, same scoping Phase5 already applies via its own --version.
 #
 # Usage:
 #   ./scripts/run_inmemory_sweep_queue.sh
@@ -123,7 +125,7 @@ echo "Logging to $LOG (console + file via tee)"
 
     echo ""
     echo "=== $ticker: Phase4 (candidate_summary_report.py --kernel gt) start — $(date) ==="
-    $PYTHON scripts/candidate_summary_report.py --kernel gt "$ticker"
+    $PYTHON scripts/candidate_summary_report.py --kernel gt "$ticker" --version "$VERSION"
     rc=$?
     if [ $rc -ne 0 ]; then
       echo "PROGRESS: Phase4 FAILED ticker=$ticker: exit code $rc -- skipping Phase5, continuing queue"
