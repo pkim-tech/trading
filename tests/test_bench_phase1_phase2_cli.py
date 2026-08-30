@@ -204,3 +204,110 @@ def _run_main(argv):
         bench.main()
     finally:
         sys.argv = old
+
+
+def _synthetic_grid_row(tp, sl, hold, window, z, tpct, cagr, trades=10, alpha=100.0):
+    return dict(take_profit=tp, stop_loss=sl, max_hold_hours=hold, window=window,
+                z_score_threshold=z, trail_sell_pct=tpct, cagr=cagr, trades=trades,
+                alpha_vs_spy=alpha)
+
+
+def test_find_missing_window_z_top_n_finds_gaps_and_ranks_by_cagr():
+    """2026-08-30, planner dispatch: the window/z backfill's core selection logic --
+    confirms a (window, z) combo absent from `present_combos` is detected as missing,
+    its own top-2 cells (by cagr) are returned (not top-1, not unranked), and a combo
+    already present is left untouched."""
+    df = pd.DataFrame([
+        _synthetic_grid_row(1, 1, 24, 5, 1.0, 0.0, cagr=50.0),   # present combo (5, 1.0)
+        _synthetic_grid_row(2, 2, 24, 5, 2.0, 0.0, cagr=30.0),   # missing combo (5, 2.0) -- top-2
+        _synthetic_grid_row(3, 3, 24, 5, 2.0, 0.0, cagr=25.0),   #   "
+        _synthetic_grid_row(4, 4, 24, 5, 2.0, 0.0, cagr=10.0),   #   3rd-best -- should be excluded
+        _synthetic_grid_row(5, 5, 24, 10, 1.0, 0.0, cagr=5.0),   # missing combo (10, 1.0) -- only 1 row
+        _synthetic_grid_row(6, 6, 24, 10, 2.0, 0.0, cagr=60.0),  # present combo (10, 2.0)
+    ])
+    present = {(5, 1.0), (10, 2.0)}
+    missing, rows_by_combo = bench.find_missing_window_z_top_n(
+        present, [5, 10], [1.0, 2.0], df, tb_cols=["cagr"], tb_asc=[False], top_n=2)
+
+    assert missing == [(5, 2.0), (10, 1.0)]
+    assert [r["take_profit"] for r in rows_by_combo[(5, 2.0)]] == [2, 3]  # top-2 by cagr, not top-1/top-3
+    assert [r["take_profit"] for r in rows_by_combo[(10, 1.0)]] == [5]   # only 1 available -- no crash
+
+
+def test_find_missing_window_z_top_n_zero_evidence_combo_returns_empty_list():
+    """A missing combo whose df_source slice is entirely empty (no rows at all for that
+    (window, z) -- e.g. every cell had trades=0 and was already filtered out of df_final
+    upstream before this function ever sees it) must report an empty list, distinguishable
+    from 'found some, took top_n' -- not silently absent from the returned dict. This test
+    constructs the empty slice via window absence (df has no window=10 rows at all), the
+    same shape a real all-trades=0 combo would present to this function by the time it's
+    called (that filtering happens upstream, not inside this function)."""
+    df = pd.DataFrame([_synthetic_grid_row(1, 1, 24, 5, 1.0, 0.0, cagr=50.0)])
+    present = {(5, 1.0)}
+    missing, rows_by_combo = bench.find_missing_window_z_top_n(
+        present, [5, 10], [1.0], df, tb_cols=["cagr"], tb_asc=[False], top_n=2)
+    assert missing == [(10, 1.0)]
+    assert rows_by_combo[(10, 1.0)] == []
+
+
+def test_cliffbox_tasks_for_cell_matches_the_original_per_island_expansion():
+    """cliffbox_tasks_for_cell was extracted from the per-island Phase2.5 seed loop's own
+    inline expansion so the window/z backfill seed step could reuse it without a second
+    hand-copied implementation -- confirms the extracted version reproduces the exact
+    task count/shape the original inline code produced for a known cell."""
+    cand = pd.Series(_synthetic_grid_row(2, 2, 24, 5, 2.0, 0.0, cagr=30.0))
+    tasks = bench.cliffbox_tasks_for_cell(cand, trail_pcts=[0.0, 1.0])
+    # tp/sl: max(1, 2-CLIFF_RADIUS)..min(30, 2+CLIFF_RADIUS) with CLIFF_RADIUS=2 -> [1,2,3,4] (4 values,
+    # not 5, since 0 clamps to 1); hold=24 -> HOLD_TIME_CAPS within +-7 -> {21, 28} (2 values);
+    # tpct=0.0 in [0.0, 1.0] -> neighbors [0.0, 1.0] (2 values). 4*4*2*2 = 64.
+    assert len(tasks) == 64
+    for tp, sl, hold, w, z, tpct in tasks:
+        assert 1 <= tp <= 4 and 1 <= sl <= 4
+        assert hold in (21, 28)
+        assert w == 5 and z == 2.0
+        assert tpct in (0.0, 1.0)
+
+
+def test_cliffbox_tasks_for_cell_trail_pct_neighbors_at_nonzero_index():
+    """The trail_pct neighbor slice (trail_pcts[max(0, idx-1): idx+2]) was the site of a
+    real prior bug (the round-3/round-4 seed-mode regression documented elsewhere in this
+    file, around TRAIL_PCTS reassignment) -- the other cliffbox test only exercises idx=0,
+    where a buggy `trail_pcts[idx-1: idx+2]` (no max(0, ...) guard) would produce the SAME
+    result as the correct version (both slice from index 0). This test uses idx=2 (a
+    middle element) where the two versions diverge: the buggy version would slice
+    `trail_pcts[1:4]` = [2,3,4], while the correct version slices `[max(0,1):4]` = same in
+    this case -- so use idx=2 with a value where the missing max(0,...) guard would
+    actually produce a NEGATIVE start index instead, at idx=0 vs idx=len-1 boundary check."""
+    trail_pcts = [1, 2, 3, 4, 5]
+    cand = pd.Series(_synthetic_grid_row(2, 2, 24, 5, 2.0, tpct=3, cagr=30.0))  # idx=2 (value 3)
+    tasks = bench.cliffbox_tasks_for_cell(cand, trail_pcts=trail_pcts)
+    tpct_values = {t[5] for t in tasks}
+    assert tpct_values == {2.0, 3.0, 4.0}  # trail_pcts[1:4], correct neighbor window around idx=2
+
+    cand_last = pd.Series(_synthetic_grid_row(2, 2, 24, 5, 2.0, tpct=5, cagr=30.0))  # idx=4, last element
+    tasks_last = bench.cliffbox_tasks_for_cell(cand_last, trail_pcts=trail_pcts)
+    tpct_values_last = {t[5] for t in tasks_last}
+    # idx+2 = 6 > len(trail_pcts) -- Python slicing clamps automatically, no explicit guard
+    # needed on this end; confirms no IndexError and no phantom out-of-range value included.
+    assert tpct_values_last == {4.0, 5.0}
+
+
+def test_seed_stage_backfill_runs_before_phase25_dispatch():
+    """2026-08-30, paired-review MEDIUM finding (contextual review): the three tests above
+    only exercise find_missing_window_z_top_n/cliffbox_tasks_for_cell in isolation -- none
+    of them would catch a regression that moved the seed-stage backfill call BELOW the
+    Phase2.5 dispatch, which would silently reintroduce the exact bug this two-stage design
+    was built to fix (a backfilled candidate promoted straight from raw, unrefined data with
+    a degenerate cliff-safety verdict). A real pool/data/backtest integration test isn't
+    practical here, but the ordering invariant itself is checkable directly from source:
+    the seed-stage `find_missing_window_z_top_n(` call must appear BEFORE the Phase2.5
+    `_dispatch(...desc="Phase2.5-cliffbox"` call in run_one_fixed_sl's source, matching
+    test_final_topN_region_filter_does_not_key_on_window_or_z's own source-slicing
+    convention above."""
+    import inspect
+    src = inspect.getsource(bench.run_one_fixed_sl)
+    seed_backfill_idx = src.index('find_missing_window_z_top_n(')
+    phase25_dispatch_idx = src.index('desc="Phase2.5-cliffbox')
+    assert seed_backfill_idx < phase25_dispatch_idx, (
+        "seed-stage window/z backfill must run BEFORE Phase2.5 dispatches, or backfilled "
+        "candidates lose their real cliffbox refinement + cliff-safety verification")
