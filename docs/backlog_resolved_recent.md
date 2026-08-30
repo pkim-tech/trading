@@ -1,7 +1,5 @@
 # Backlog — Recently Resolved
 
-## [tooling] Resolved 2026-08-29 (v6.3) — `params_json` coverage gap accepted as moot; `locate_best_node.py`'s promotion path (`get_or_create_candidate_node`) formally retired via docstring note, not deleted; read-only functions still in active use. 87/87 real rows verified round-trip-correct (`scripts/verify_params_json_roundtrip.py`). Full detail: `deep_backlog.md`.
-
 ## [live-trading][testing] Resolved 2026-08-29 — `verify_real_trades_vs_kernel.py`'s still-open-trade blind spot fixed (238504c/ebf86c2), full bipartite matching. Full detail: `deep_backlog.md`.
 
 ## [backtest][specced] Resolved 2026-08-29 — fold top-X trade-sequence retention resolved via `backtest_winner_trades`/`get_cached_trades` (different mechanism than originally proposed), not the sweep-inner-loop heap design. Full detail: `deep_backlog.md`.
