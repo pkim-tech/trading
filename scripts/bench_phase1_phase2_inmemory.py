@@ -531,7 +531,42 @@ def _load_seed_node(watch_list_id):
     return seed
 
 
-def main():
+def build_phase1_tasks_grid(z_thresholds, windows, take_profits, stop_losses, hold_time_caps,
+                             trail_pcts):
+    """The REAL Phase1 task cross-product (extracted verbatim from run_one_fixed_sl's
+    non-seed-mode branch, 2026-08-29 paired-review MEDIUM fix, so a test can assert
+    against the actual production code path instead of a re-implementation). z and
+    window are pooled into the SAME flat list -- this is what makes a multi-value
+    --window/--z-thresholds run ONE campaign (shared island centers / top-9 ranking
+    downstream) instead of N separate ones."""
+    return [(int(tp), int(sl), int(hold), int(w), float(z), float(tpct))
+            for z in z_thresholds for w in windows
+            for tp in take_profits for sl in stop_losses
+            for hold in hold_time_caps for tpct in trail_pcts]
+
+
+def apply_grid_overrides(args):
+    """Replace the module-level Phase1 grid axes WINDOWS / Z_THRESHOLDS with explicit
+    CLI values, if given. Each is a PLAIN REPLACE (not an add) and stays ONE pooled
+    Phase1 axis -- pick_island_centers / the final top-9 ranking pool across it, exactly
+    as if the module default had been that list. Extracted from main() 2026-08-29 so the
+    override is unit-testable without a real backtest run. No-op for any axis whose flag
+    was omitted (None). Seed mode sets both from the seed node's own params in main()
+    instead and never calls this."""
+    global WINDOWS, Z_THRESHOLDS
+    if args.window is not None:
+        _prev = list(WINDOWS)
+        WINDOWS = list(args.window)
+        print(f"Window override: WINDOWS={WINDOWS} as ONE pooled Phase1 axis "
+              f"(replaces standard grid {_prev})")
+    if args.z_thresholds is not None:
+        _prev = list(Z_THRESHOLDS)
+        Z_THRESHOLDS = list(args.z_thresholds)
+        print(f"Z-threshold override: Z_THRESHOLDS={Z_THRESHOLDS} as ONE pooled Phase1 "
+              f"axis (replaces standard grid {_prev})")
+
+
+def build_arg_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--strategy", choices=sorted(campaign_config.STRATEGIES),
@@ -550,11 +585,22 @@ def main():
                           "fixed_sl grid -- default is None here (not [1..8] directly) purely "
                           "so --seed-watch-list-id can detect whether this was EXPLICITLY "
                           "passed for its own mutual-exclusivity check below.")
-    ap.add_argument("--window", type=int, default=None,
-                     help="run this single window value in ISOLATION instead of the "
-                          "real production grid (module-level WINDOWS=[10,20]) -- e.g. "
-                          "--window 15 to explore a midpoint value not otherwise swept. "
-                          "Does not add to the standard grid, replaces it for this run.")
+    ap.add_argument("--window", type=int, nargs="+", default=None,
+                     help="run these window value(s) instead of the real production grid "
+                          f"(module-level WINDOWS={WINDOWS}) -- e.g. --window 15 for a single "
+                          "midpoint value, or --window 5 10 15 20 for a widened grid. "
+                          "Multi-value stays ONE pooled Phase1 axis (shared island centers / "
+                          "top-9 ranking), NOT N separate campaigns. Replaces the standard "
+                          "grid for this run, does not add to it.")
+    ap.add_argument("--z-thresholds", dest="z_thresholds", type=float, nargs="+", default=None,
+                     help="run these z-score threshold value(s) instead of the real "
+                          f"production grid (module-level Z_THRESHOLDS={Z_THRESHOLDS}) -- e.g. "
+                          "--z-thresholds 0.5 1 1.5 2 for the AGQ widened pooled grid (z=0.5 "
+                          "is otherwise unreachable from the CLI). Multi-value stays ONE "
+                          "pooled Phase1 axis, same semantics as --window. Replaces the "
+                          "standard grid for this run, does not add to it. Mutually exclusive "
+                          "with --seed-watch-list-id (seed mode derives z from the seed node "
+                          "itself). Default None leaves Z_THRESHOLDS unchanged.")
     ap.add_argument("--ticker", type=str, default=None,
                      help="override module-level TICKER (default 'SOXL') -- e.g. --ticker "
                           "AGQ to run a different ticker's campaign. Mutually exclusive with "
@@ -574,8 +620,8 @@ def main():
                           "unchanged. Reads cache/live/trading_live.db (a DIFFERENT sqlite "
                           "file than this script's own DB_PATH), NOT DB_PATH. Mutually "
                           "exclusive with --strategy/--fixed-sl/--fixed-sl-values (the full "
-                          "campaign grid path), --window (window comes from the seed node "
-                          "itself, not a separate override), and --resume-from-top100/"
+                          "campaign grid path), --window and --z-thresholds (both come from "
+                          "the seed node itself, not a separate override), and --resume-from-top100/"
                           "--checkpoint-file (both bypass phase1_tasks entirely, which would "
                           "let the relaxed seed-mode sanity check trivially pass on unrelated "
                           "rows).")
@@ -606,6 +652,11 @@ def main():
                           "<job-tmp>/bench_phase12_checkpoint_<ticker>_<strategy>_<fixed_sl>_"
                           "w<windows>_<date-range-suffix>.parquet (mutually exclusive with "
                           "--resume-from-top100 AND with --seed-watch-list-id).")
+    return ap
+
+
+def main():
+    ap = build_arg_parser()
     args = ap.parse_args()
     if args.resume_from_top100 and args.checkpoint_file:
         raise SystemExit("--resume-from-top100 and --checkpoint-file are mutually exclusive "
@@ -622,6 +673,8 @@ def main():
             _seed_conflicts.append("--fixed-sl-values")
         if args.window is not None:
             _seed_conflicts.append("--window")
+        if args.z_thresholds is not None:
+            _seed_conflicts.append("--z-thresholds")
         if args.resume_from_top100:
             _seed_conflicts.append("--resume-from-top100")
         if args.checkpoint_file:
@@ -631,15 +684,11 @@ def main():
         if _seed_conflicts:
             raise SystemExit(
                 f"--seed-watch-list-id is mutually exclusive with {', '.join(_seed_conflicts)} "
-                f"-- seed mode derives strategy/fixed_sl/window directly from the real live "
-                f"watch_list row, it doesn't take a separate grid-override or window-override "
+                f"-- seed mode derives strategy/fixed_sl/window/z directly from the real live "
+                f"watch_list row, it doesn't take a separate grid-override or axis-override "
                 f"path. Pick one.")
 
-    if args.window is not None:
-        global WINDOWS
-        WINDOWS = [args.window]
-        print(f"Window override: running window={args.window} in ISOLATION "
-              f"(replaces standard grid {[10, 20]})")
+    apply_grid_overrides(args)
 
     if args.start_date is not None:
         global START
@@ -670,7 +719,7 @@ def main():
         # once a name is globalled+assigned in one place in a function, a later `global`
         # statement for the SAME name is illegal, even in a mutually-exclusive branch that
         # can never run in the same call. TICKER stays covered by the earlier declaration.
-        global ENTRY_TIMING, Z_THRESHOLDS, HOLD_TIME_CAPS
+        global WINDOWS, ENTRY_TIMING, Z_THRESHOLDS, HOLD_TIME_CAPS
         WINDOWS = [seed["window"]]
         # Z_THRESHOLDS/ENTRY_TIMING/HOLD_TIME_CAPS overridden the same way WINDOWS already
         # is above -- found by paired review 2026-08-29 (round 2 and round 3):
@@ -720,6 +769,18 @@ def main():
     # one version string legitimately covers every (strategy, fixed_sl) combo from a
     # single campaign's real invocations.
     version = "bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
+    if args.z_thresholds is not None:
+        # z discriminator (2026-08-29, paired review, CONFIRMED HIGH by both independent-
+        # cold and contextual): without this, version (and therefore sweep_run_log's dedup
+        # key, which includes version) can't tell a --z-thresholds widened-grid run apart
+        # from a standard-z-grid run at the same (ticker, strategy, fixed_sl, windows,
+        # date-range) -- a prior standard-grid finished row would make a --z-thresholds
+        # run hit "already done...skipping" and do ZERO work, AND (independent of dedup)
+        # the two runs' candidate_nodes/backtest_phase1_insurance rows would land under an
+        # indistinguishable version string, unioning two different grids' top-9s under one
+        # version. Exact same failure class the seed-mode `-seed<id>` suffix below already
+        # solves for seed mode -- same fix shape, applied to the other new grid axis.
+        version += f"-z{'-'.join(str(z) for z in Z_THRESHOLDS)}"
     if args.seed_watch_list_id is not None:
         # Seed-mode discriminator (2026-08-29, paired review): without this, sweep_run_log's
         # dedup key (ticker/strategy/fixed_sl/windows/version) can't tell a seed-mode smoke
@@ -815,6 +876,10 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # itself is explicitly documented as a "dev-iteration" convenience, not a production
     # artifact -- this key just makes that convenience safe to use across different grids.
     _windows_key = "-".join(str(w) for w in WINDOWS)
+    # Keyed on Z_THRESHOLDS too -- same bug class as the WINDOWS key: a --z-thresholds
+    # override run must not silently load a checkpoint from an earlier run under the
+    # standard z grid (or a different z grid) with the same strategy/fixed_sl/windows.
+    _z_key = "z" + "-".join(str(z) for z in Z_THRESHOLDS) if args.z_thresholds is not None else ""
     # Also keyed on the date range (not just WINDOWS) -- same bug class as the WINDOWS key
     # above: a full-range run's checkpoint must not get silently loaded by a later
     # short-range --start-date/--end-date smoke-test run (or vice versa).
@@ -828,7 +893,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         is not None else ""
     checkpoint_path = args.checkpoint_file or os.path.join(
         _job_tmp, f"bench_phase12_checkpoint_{TICKER}_{strategy_name}_{fixed_sl}_w{_windows_key}"
-                  f"{_range_key}{_seed_key}.parquet")
+                  f"{_z_key}{_range_key}{_seed_key}.parquet")
 
     asset_bh, spy_bh = compute_bh_returns(TICKER, start_date=START, end_date=END, data_source=DATA_SOURCE)
     if spy_bh is None:
@@ -885,10 +950,8 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         print(f"Seed mode: Phase1 task list reduced to ONE cell: {_seed_task} "
               f"(bypasses the {len(TAKE_PROFITS) * len(STOP_LOSSES) * len(HOLD_TIME_CAPS) * len(TRAIL_PCTS) * len(Z_THRESHOLDS) * len(WINDOWS):,}-cell full grid)")
     else:
-        phase1_tasks = [(int(tp), int(sl), int(hold), int(w), float(z), float(tpct))
-                         for z in Z_THRESHOLDS for w in WINDOWS
-                         for tp in TAKE_PROFITS for sl in STOP_LOSSES
-                         for hold in HOLD_TIME_CAPS for tpct in TRAIL_PCTS]
+        phase1_tasks = build_phase1_tasks_grid(
+            Z_THRESHOLDS, WINDOWS, TAKE_PROFITS, STOP_LOSSES, HOLD_TIME_CAPS, TRAIL_PCTS)
 
     # Seed mode never uses the checkpoint at all (2026-08-29, paired review round 4,
     # CONFIRMED by both reviewers): the round-3 repeatability fix bypassed sweep_run_log's
