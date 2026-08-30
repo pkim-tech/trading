@@ -262,7 +262,19 @@ def get_pick_comment(conn: sqlite3.Connection, node_id: int):
 
 
 def get_or_create_candidate_node(conn: sqlite3.Connection, node: dict) -> int:
-    """Returns the candidate_nodes.id for this exact node param tuple, inserting
+    """RETIRED as a production promotion path, 2026-08-29 (v6.3) -- now that
+    bench_phase1_phase2_inmemory.py's _insert_candidate_nodes_rows is confirmed the
+    SOLE production sweep pipeline (see the "v6.2" parity check, commit 92a7a52), that
+    function is the sole real promotion path into candidate_nodes going forward. This
+    function is kept (never deleted, per repo convention) because run_overlay_shim.py,
+    run_overlay_shim_for_node.py, and candidate_full_review.py still call it for their
+    own ad hoc candidate-registration flows (constructing a one-off candidate_nodes row
+    to run an overlay/report against, not a sweep-campaign promotion) -- those call
+    sites are unaffected by this retirement. Notably, this path does NOT populate
+    params_json (see bench_phase1_phase2_inmemory.py's _insert_candidate_nodes_rows for
+    that), so any row created here still has params_json=NULL.
+
+    Returns the candidate_nodes.id for this exact node param tuple, inserting
     a fresh row (with a NEW created_at/robust_alpha/trades snapshot) only if no
     matching row exists yet -- a param-identical relocate (e.g. after a prune
     validation pass) reuses the same id.

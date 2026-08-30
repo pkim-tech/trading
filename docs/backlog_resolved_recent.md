@@ -1,5 +1,17 @@
 # Backlog — Recently Resolved
 
+## [tooling] Resolved 2026-08-29 (v6.3) — `params_json` coverage gap accepted as moot; `locate_best_node.py`'s promotion path (`get_or_create_candidate_node`) formally retired via docstring note, not deleted; read-only functions still in active use. 87/87 real rows verified round-trip-correct (`scripts/verify_params_json_roundtrip.py`). Full detail: `deep_backlog.md`.
+
+## [live-trading][testing] Resolved 2026-08-29 — `verify_real_trades_vs_kernel.py`'s still-open-trade blind spot fixed (238504c/ebf86c2), full bipartite matching. Full detail: `deep_backlog.md`.
+
+## [backtest][specced] Resolved 2026-08-29 — fold top-X trade-sequence retention resolved via `backtest_winner_trades`/`get_cached_trades` (different mechanism than originally proposed), not the sweep-inner-loop heap design. Full detail: `deep_backlog.md`.
+
+## [backtest][specced] Resolved 2026-08-29 — Phase 3/Phase 5 merge design question decided and built (`eca730f`): Phase 3 retired, Phase 5 widened to full `candidate_nodes` population, verified matching old Phase 3 to <0.02pp. Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved 2026-08-29 — Phase 4/5 candidate resolution gap closed, Campaign C (window=15) verification run completed (144 candidates/16 scopes, all outliers explained). Full detail: `deep_backlog.md`.
+
+## [tooling][backtest] Resolved 2026-08-29 — `rebuild_winner_trades.py`'s latent node_key bug for TrailingExitZScoreBreakout candidates fixed (`c3f2510`), paired-reviewed, verified 0 mismatches vs. forced resim. Full detail: `deep_backlog.md`.
+
 ## [backtest][testing] Decided 2026-08-29 — spot-check Phase 5's production-kernel numbers against the outside sim only on anomaly/new-mechanism, not routinely (cost: ~6 min/candidate, would more than double Phase 5's new runtime). Full detail: `deep_backlog.md`.
 
 ## [backtest] Resolved 2026-08-29 (root-caused, script archived) — the 2026-08-24/25 "unresolved 1m-vs-1s SOXL granularity gap" (candidate_nodes id=851, 104 vs 123 trades) was a bug in the verification script, not the GT kernel. `scripts/sim_1m_vs_1s_walk.py`'s hand-written close-check evaluated the WRONG hourly bar (a separate row labeled 1hr later) instead of the same bar's own Close field, per `backtester.py`'s actual `_simulate_trail_ground_truth` close_check logic (checks `c <= band` on the same row as the open-check). Confirmed via a concrete trade-by-trade diff (27 GT trades missing from the 1m walk, 7 extra) and one fully traced example (2021-12-06 signal: GT correctly used the 9:30 bar's own Close=$58.56 to fire; the walk used the next hour's bar Close=$57.68 instead, delaying/mis-sizing the WAIT state and missing the whole day's trade). Since the bug is in the shared `walk()` function, it affected BOTH the "1m" and "1s" outputs identically — the previously-reported "1m=23.91%/1s=15.73% CAGR, 34% relative delta" finding is not trustworthy evidence of real granularity risk. The other, later-built 1m-vs-1s tool (`sim_1s_vs_1m_groundtruth.py`, forked from the parity-gated `sim_minute_groundtruth_independent.py` reference) does not share this bug and is the one that produced the legitimate, already-resolved Phase3 SOXL outlier finding (fill-bar SL not checked). `sim_1m_vs_1s_walk.py` archived to `scripts/archive/` rather than fixed, since the parity-gated tool already supersedes it. Full detail: `deep_backlog.md`.
