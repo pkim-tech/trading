@@ -509,6 +509,48 @@ def test_check_trade_lifecycle_exit_reason_overnight_carry_not_masked_by_same_da
     assert 'still open' not in summary
 
 
+def test_check_trade_lifecycle_pending_carryover_met_by_retroactive_entry_day_recheck(isolated_db):
+    """5th recurrence of this bug shape (2026-08-21 contextual review finding,
+    fixed 2026-08-30): a RETROACTIVE re-check of check_date as an ENTRY day,
+    run (e.g. via `coverage_check.py --date <old_entry_date>`) after the trade
+    has already exited on a LATER date. pending_buys/open_positions are
+    already resolved by the time this runs, and the same-day/exited-on-date
+    lookups both require exit==check_date -- none of the pre-existing 4
+    lookups can see a trade that entered here and closed later. Before the
+    fix this fell through to no_activity=True, wrongly triggering the
+    price-action auto-explain (reasoning about an entry SIGNAL that day, when
+    a real entry already happened)."""
+    exit_day = _most_recent_trading_day()
+    entry_day = _prior_trading_day(exit_day)
+    _add_closed_trade('TRAIL', entry_day, exit_day)
+    check_date = entry_day.date().isoformat()  # retroactively re-checking the ENTRY day
+    scenario = dict(ticker=TICKER, check_params='{"expect_pending_carryover": true}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is True
+    assert no_activity is False
+    assert 'already closed on a later date' in summary
+    assert 'TRAIL' in summary
+
+
+def test_check_trade_lifecycle_exit_reason_met_by_retroactive_entry_day_recheck(isolated_db):
+    """Same gap, exit-reason branch: a scenario carrying expect_exit_reason
+    whose check_date is retroactively re-run against the trade's ENTRY day
+    after it already closed later. Not gradable against this date's expected
+    exit_reason (that belongs to the later exit date's own check), but real
+    activity occurred -- must not report no_activity=True."""
+    exit_day = _most_recent_trading_day()
+    entry_day = _prior_trading_day(exit_day)
+    _add_closed_trade('TRAIL', entry_day, exit_day)
+    check_date = entry_day.date().isoformat()  # retroactively re-checking the ENTRY day
+    scenario = dict(ticker=TICKER, check_params='{"expect_exit_reason": ["TRAIL"]}')
+    met, summary, no_activity = _check_trade_lifecycle(scenario, check_date)
+    assert met is True
+    assert no_activity is False
+    assert 'already closed on a later date' in summary
+    assert 'not gradable' in summary
+    assert 'TRAIL' in summary
+
+
 # ---------------------------------------------------------------------------
 # node_id / mode identity -- 2026-07-24 late-night migration off ticker-only
 # identity (proven ambiguous: two distinct watch_list nodes can share a

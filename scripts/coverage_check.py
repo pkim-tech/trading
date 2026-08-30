@@ -208,6 +208,21 @@ def _check_trade_lifecycle(scenario, check_date):
             # 2026-08-21) -- the carry itself is exactly what was expected.
             return True, (f"overnight carry completed and closed (exit_reason="
                           f"{exited_trades[0]['exit_reason']}, entered {exited_trades[0]['entry_time']})"), False
+        # 5th recurrence of this bug shape (2026-08-21, contextual review
+        # finding): a RETROACTIVE re-check of check_date as an ENTRY day,
+        # run after the trade has already exited on a LATER date. pending/
+        # open_pos are already resolved, and the same-day/exited-on-date
+        # lookups above both require exit==check_date -- none of them can see
+        # a trade that entered here and closed later. Checked last, since
+        # every branch above already covers a more specific/informative
+        # match. See get_closed_trades_entered_on_date's docstring for the
+        # full history.
+        entered_trades = db.get_closed_trades_entered_on_date(ticker, check_date, **disambig)
+        if entered_trades:
+            return True, (f"entered on check_date, already closed on a later date (exit_reason="
+                          f"{entered_trades[0]['exit_reason']}, exited {entered_trades[0]['exit_time']}) "
+                          f"-- real entry activity, not the designed still-pending carryover but not "
+                          f"no-activity either"), False
         return False, f"no pending_buys row, no open position, and no closed trade found for {ticker} on {check_date}", True
 
     expect_reasons = params.get('expect_exit_reason', [])
@@ -260,6 +275,19 @@ def _check_trade_lifecycle(scenario, check_date):
         open_pos = db.get_open_positions_for_ticker_on_date(ticker, check_date, **disambig)
         if open_pos:
             return True, f"position still open (shares={open_pos[0]['shares']}) -- exit not yet resolved", False
+        # 5th recurrence of this bug shape, same gap as the carryover branch
+        # above (see get_closed_trades_entered_on_date's docstring) --
+        # a retroactive re-check of check_date as an ENTRY day, after the
+        # trade has already exited on a LATER date. Not gradable against this
+        # date's expect_exit_reason (that outcome belongs to the later exit
+        # date's own check), but it IS real activity -- must not fall through
+        # to no_activity=True and the price-action auto-explain.
+        entered_trades = db.get_closed_trades_entered_on_date(ticker, check_date, **disambig)
+        if entered_trades:
+            return True, (f"entered on check_date, already closed on a later date (exit_reason="
+                          f"{entered_trades[0]['exit_reason']}, exited {entered_trades[0]['exit_time']}) "
+                          f"-- real activity occurred, not gradable against this date's expected "
+                          f"exit_reason"), False
         return False, f"no closed trade found for {ticker} on {check_date}", True
     reason = trades[0]['exit_reason']
     if reason in expect_reasons:

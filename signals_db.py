@@ -3829,6 +3829,69 @@ def get_closed_trades_exited_on_date(ticker, check_date, strategy=None, version=
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
+def get_closed_trades_entered_on_date(ticker, check_date, strategy=None, version=None,
+                                       window=None, account=None, wl_id=None):
+    """trade_log rows that ENTERED on check_date (YYYY-MM-DD), regardless of
+    which day they exited -- the entry-day-scoped sibling of
+    get_closed_trades_exited_on_date, needed for the 5th recurrence of this
+    exact bug shape (see that function's and get_open_positions_for_ticker_
+    on_date's/get_pending_buys_for_ticker_on_date's docstrings for the first
+    four): a RETROACTIVE re-check of a multi-day trade's ENTRY day, run
+    (e.g. via `coverage_check.py --date <old_entry_date>`) AFTER the trade has
+    already exited on a LATER date. By the time such a re-check runs,
+    pending_buys is already resolved (row deleted on fill), open_positions no
+    longer holds it (closed -- row moved to trade_log), the same-day lookup
+    requires entry==exit==check_date (this trade's exit is later), and the
+    exited-on-date lookup requires exit==check_date (also later, not this
+    date) -- every existing lookup comes back empty, minting a false
+    no_activity=True on a real entry that already happened. Found 2026-08-21
+    (contextual review), 5th recurrence of this exact bug shape; only affects
+    retroactive backfilling of OLD dates after a carry has since closed -- the
+    live nightly check (always run same-day or the exit day) is unaffected.
+
+    exit_time IS NOT NULL AND date(exit_time) > check_date (2026-08-30 paired
+    review, both independent-cold [HIGH] and contextual [MEDIUM] converged on
+    the same finding): trade_log is dual-written at ENTRY (a row with
+    exit_time=NULL exists the moment a position opens, updated in place on
+    close) and real production data has rows that entered and then never
+    resolved (exit_time still NULL -- e.g. ERROR_PHANTOM_FILL_NO_MARKET_OPEN,
+    DRY_RUN_RETROACTIVE_CLEANUP rows, 5 such orphans confirmed in the live DB).
+    Without this filter those rows matched here too, and both call sites in
+    _check_trade_lifecycle print a factually false "already closed on a later
+    date (exit_reason=None, exited None)" for what is actually a broken/
+    unresolved lifecycle -- masking a real anomaly as met=True instead of
+    surfacing it. The exit_time > check_date bound also rules out a same-day
+    fill this function's date(entry_time)=check_date alone wouldn't otherwise
+    exclude, matching this function's name and docstring ("closed trades")
+    exactly rather than by inference from the caller's checking order.
+
+    Same RESTAGED exclusion, disambiguation params, and wl_id fallback pattern
+    as get_closed_trades_exited_on_date -- see that function's docstring for
+    the full reasoning on each; not re-derived here."""
+    q = ("SELECT * FROM trade_log WHERE ticker = ? AND date(entry_time) = ? "
+         "AND exit_time IS NOT NULL AND date(exit_time) > ? "
+         "AND (exit_reason IS NULL OR exit_reason != 'RESTAGED')")
+    params = [ticker, check_date, check_date]
+    if strategy:
+        q += " AND strategy = ?"
+        params.append(strategy)
+    if version:
+        q += " AND version = ?"
+        params.append(version)
+    if window is not None:
+        q += " AND window = ?"
+        params.append(window)
+    if account:
+        q += " AND account = ?"
+        params.append(account)
+    if wl_id is not None:
+        q += " AND (wl_id = ? OR wl_id IS NULL)"
+        params.append(wl_id)
+    q += " ORDER BY id DESC"
+    with _conn() as c:
+        return [dict(r) for r in c.execute(q, params).fetchall()]
+
+
 def get_open_positions_for_ticker_on_date(ticker, check_date, strategy=None, version=None,
                                            window=None, account=None, wl_id=None):
     """open_positions rows entered on or before check_date and still open --
