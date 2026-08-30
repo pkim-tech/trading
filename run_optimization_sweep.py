@@ -2192,9 +2192,14 @@ ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_
 # merely a determinism nonce:
 #   trades DESC          -- more trades backing the same alpha is a more statistically
 #                            reliable sample, not a coincidence from a thin sample.
-#   stop_loss ASC         -- among configs tied on alpha/trades, the tighter stop achieved
-#                            the same return while risking less per trade (genuinely
-#                            better risk-adjusted).
+#   stop_loss ASC         -- despite the column name, this is never a real stop-loss for
+#                            either live GT strategy (both set uses_fixed_sl=True, so the
+#                            real SL comes from fixed_sl, not this swept axis) -- see
+#                            strategies.py sl_axis. It's trail_buy_pct (entry-trigger trail
+#                            %) for TrailingBoth/TrailingBuy, or trail_pct (exit trail %)
+#                            for TrailingExit. ASC prefers the tighter trail among ties,
+#                            same rationale as a tighter stop (less slippage/room given up
+#                            for the same return), just on the actual owned axis.
 #   max_hold_hours ASC    -- among configs additionally tied on stop_loss, the shorter
 #                            hold achieved the same return with less capital tied up per
 #                            trade (better capital efficiency).
