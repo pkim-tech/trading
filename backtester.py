@@ -1826,11 +1826,26 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                                   min_o, min_h, min_l, min_c, bar_min_start, bar_min_count,
                                   fixed_sl, arm_pct, trail_buy_pct, trail_sell_pct,
                                   max_hours_to_hold, z_thresh, target_h0, target_h1,
-                                  open_check_entry_timing, is_both, same_bar_reentry):
+                                  open_check_entry_timing, is_both, same_bar_reentry,
+                                  same_day_block=False):
     """Direct port of sim_minute_groundtruth_independent.py's Sim/simulate() state
     machine. See that module's docstring for WHY each choice was made; this function
     must not diverge from it behaviorally (mandatory byte-identical parity gate,
-    docs/plans/ground_truth_kernel_rebuild.md Step 2a) — see module-level comment above."""
+    docs/plans/ground_truth_kernel_rebuild.md Step 2a) — see module-level comment above.
+
+    same_day_block: TrailingBoth-only port of the legacy kernel's same-day-re-buy
+    block (backtester._simulate_trail_both, docs/backlog_cache.md checklist check 9)
+    — mirrors schwab_safety's real cash-account same-day-re-buy rule: a fresh signal
+    is ignored (not delayed) on any day that matches this run's own most recent exit
+    day. Gated on `is_both` in addition to the flag itself (`same_day_block and
+    is_both`) so passing True for a TrailingExit run (is_both=False) is a harmless
+    no-op rather than a silent behavior change — TrailingExit never had this in the
+    legacy kernel either (checklist_v65.py:15's own comment). Defaults to False, so
+    every existing GT caller (parity test, sweep/candidate paths) is unaffected
+    unless it opts in explicitly. `last_exit_day` tracks the daily_idx of the bar
+    the current run's own most recent trade exited on (-1 = no exit yet), same
+    semantics as the legacy kernel's `last_exit_day`, checked at both entry-signal
+    detection points (open_check and close_check) below."""
     entry_bar   = np.empty(MAX_TRADES, dtype=np.int64)
     entry_mj    = np.empty(MAX_TRADES, dtype=np.int64)
     entry_p     = np.empty(MAX_TRADES, dtype=np.float64)
@@ -1867,6 +1882,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
     cur_armed = 0
     cur_arm_bar = -1
     cur_arm_price = 0.0
+    last_exit_day = -1
 
     n = len(closes)
     for i in range(n):
@@ -1882,7 +1898,10 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
 
         # ── (1) open_check signal detection ──
         opened_this_bar = False
-        if state == STATE_IDLE and not np.isnan(band) and open_check_entry_timing and o <= band:
+        blocked_sdb = False
+        if same_day_block and is_both and not np.isnan(band):
+            blocked_sdb = di == last_exit_day
+        if state == STATE_IDLE and not np.isnan(band) and open_check_entry_timing and o <= band and not blocked_sdb:
             opened_this_bar = True
             if is_both:
                 state = STATE_WAIT
@@ -1939,7 +1958,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         entry_p[count] = cur_entry_price; exit_p[count] = mo
                         reason[count] = GT_SL
                         armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
-                        count += 1; state = STATE_IDLE
+                        count += 1; state = STATE_IDLE; last_exit_day = daily_idx[i]
                         continue
                     if ml <= stop_price:
                         entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
@@ -1947,7 +1966,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         entry_p[count] = cur_entry_price; exit_p[count] = stop_price
                         reason[count] = GT_SL
                         armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
-                        count += 1; state = STATE_IDLE
+                        count += 1; state = STATE_IDLE; last_exit_day = daily_idx[i]
                         continue
 
                 elif state == STATE_ARMED:
@@ -1958,7 +1977,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         entry_p[count] = cur_entry_price; exit_p[count] = mo
                         reason[count] = GT_TRAIL
                         armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
-                        count += 1; state = STATE_IDLE
+                        count += 1; state = STATE_IDLE; last_exit_day = daily_idx[i]
                         continue
                     if mh > peak:
                         peak = mh
@@ -1969,7 +1988,7 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                         entry_p[count] = cur_entry_price; exit_p[count] = stop
                         reason[count] = GT_TRAIL
                         armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
-                        count += 1; state = STATE_IDLE
+                        count += 1; state = STATE_IDLE; last_exit_day = daily_idx[i]
                         continue
 
         # ── (3) bar-close-gated events ──
@@ -1987,17 +2006,26 @@ def _simulate_trail_ground_truth(opens, highs, lows, closes, hours, daily_idx, s
                 entry_p[count] = cur_entry_price; exit_p[count] = c
                 reason[count] = GT_TIME
                 armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
-                count += 1; state = STATE_IDLE
+                count += 1; state = STATE_IDLE; last_exit_day = daily_idx[i]
         elif state == STATE_ARMED and (i - cur_entry_bar) >= max_hours_to_hold:
             entry_bar[count] = cur_entry_bar; entry_mj[count] = fill_mj if fill_bar == cur_entry_bar else GT_MJ_BAR_CLOSE
             exit_bar[count] = i; exit_mj[count] = GT_MJ_BAR_CLOSE
             entry_p[count] = cur_entry_price; exit_p[count] = c
             reason[count] = GT_TIME
             armed_out[count] = cur_armed; arm_bar_out[count] = cur_arm_bar; arm_price_out[count] = cur_arm_price
-            count += 1; state = STATE_IDLE
+            count += 1; state = STATE_IDLE; last_exit_day = daily_idx[i]
 
         # ── (4) close_check signal detection ──
-        if state == STATE_IDLE and not np.isnan(band) and c <= band and not (opened_this_bar and not same_bar_reentry):
+        # Re-derive blocked_sdb here rather than reusing the open_check-time value
+        # computed above: this same bar's own exit (minute-level SL/TRAIL in section
+        # (2), or bar-close TIME in section (3)) may have just updated last_exit_day,
+        # and the GT kernel (unlike the legacy kernel) allows a same-bar re-entry
+        # after such an exit (same_bar_reentry) -- so the open_check-time value can be
+        # stale by the time this check runs (bug found by paired review, 2026-08-30).
+        blocked_sdb_close = False
+        if same_day_block and is_both and not np.isnan(band):
+            blocked_sdb_close = di == last_exit_day
+        if state == STATE_IDLE and not np.isnan(band) and c <= band and not (opened_this_bar and not same_bar_reentry) and not blocked_sdb_close:
             if is_both:
                 state = STATE_WAIT
                 running_low = c
@@ -2023,7 +2051,8 @@ def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df,
                                fixed_sl, arm_pct, trail_buy_pct, trail_sell_pct,
                                max_hours_to_hold, z_score_threshold, is_both,
                                target_hours=(9, 14), open_check_entry_timing=True,
-                               same_bar_reentry=True, prep=None, mprep=None, need_times=True):
+                               same_bar_reentry=True, same_day_block=False,
+                               prep=None, mprep=None, need_times=True):
     """Python wrapper: prep + kernel call + trade reconstruction (real timestamps, not
     the kernel's bar/minute-offset indices) for the v6 ground-truth kernel. `minute_df`
     must already be regular-session-filtered/tz-naive (sim_minute_groundtruth_independent
@@ -2049,7 +2078,13 @@ def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df,
     here, not the raw `entry_timing` string those branches pass through. Copy-pasting the
     existing dispatch pattern for this function would silently pre-divide a second time
     (every threshold 100x too small) and pass the wrong type. Call this with raw
-    percentages and a bool, not a second /100.0."""
+    percentages and a bool, not a second /100.0.
+
+    same_day_block: TrailingBoth-only port of the legacy kernel's same-day-re-buy
+    block (see `_simulate_trail_ground_truth`'s docstring) — passed straight through,
+    defaults to False (no behavior change for existing callers). Passing True with
+    is_both=False (TrailingExit) is a harmless no-op, not an error — the legacy
+    kernel never had this for TrailingExit either."""
     prep = prep or prep_inputs(df_hourly, df_daily_indicators)
     mprep = mprep or prep_minute_inputs(minute_df, df_hourly)
 
@@ -2061,6 +2096,7 @@ def run_backtest_ground_truth(df_hourly, df_daily_indicators, ticker, minute_df,
         float(fixed_sl), float(arm_pct), float(trail_buy_pct), float(trail_sell_pct),
         int(max_hours_to_hold), float(z_score_threshold), int(target_hours[0]), int(target_hours[1]),
         bool(open_check_entry_timing), bool(is_both), bool(same_bar_reentry),
+        bool(same_day_block),
     )
 
     if not need_times:
