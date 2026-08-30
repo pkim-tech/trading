@@ -347,6 +347,13 @@ frequency (user's direct call) rules out any timing-architecture direction that 
 checking/trading more often — this bounds what v6.1 can even explore, not just what v6
 does.
 
+**Name reservation, 2026-08-29**: "v6.2" is claimed for a separate, unrelated piece of work
+-- an old-orchestration-vs-new-in-memory-pipeline PARITY CHECK (does
+`scripts/bench_phase1_phase2_inmemory.py` reproduce the same top-9 candidates as
+`run_optimization_sweep.py`/`scripts/run_ground_truth_phase1.py` for the same real scope),
+not a strategy/timing variant. See `scripts/compare_old_new_pipeline_parity_v62.py` and
+`docs/deep_backlog.md`'s 2026-08-29 entry. Do not reuse "v6.2" for anything else.
+
 ## v6.1 parking lot — timing-architecture variations (separate future backtest, not v6)
 
 Explicitly NOT part of the v6 sunset — folding the sunset (bounded, has a finish line: match
