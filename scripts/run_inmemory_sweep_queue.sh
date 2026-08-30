@@ -54,6 +54,14 @@
 
 cd "$(dirname "$0")/.."
 
+# Unbuffered stdout (2026-08-29, real bug found): without this, Python buffers
+# stdout when writing to a pipe/file (not a TTY) -- print() output including
+# tqdm's progress bar and all PROGRESS: markers can sit invisibly in an
+# internal buffer for a long time even while the process is genuinely
+# computing. Confirmed via ps/CPU that a prior run WAS working -- this was a
+# visibility bug (nothing appeared to tail -f), not a hang.
+export PYTHONUNBUFFERED=1
+
 PYTHON=".venv/bin/python"
 TICKERS="${TICKERS:-AGQ ETHU OILU GDXU UGL WEBL}"
 STRATEGIES="${STRATEGIES:-TrailingBothZScoreBreakout TrailingExitZScoreBreakout}"
