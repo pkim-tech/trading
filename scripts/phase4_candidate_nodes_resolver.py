@@ -85,9 +85,14 @@ a real `id` key (added 2026-08-29, Task #3, planner dispatch -- the real
 candidate_nodes.id this row came from, so a caller like Phase5's verification-
 persistence code can recover a real candidate_id; derive_phase25_candidates_ground_
 truth's own backtest_cache-sourced output has no equivalent, since those candidates
-were never promoted into candidate_nodes at all):
+were never promoted into candidate_nodes at all), PLUS `core_safe`/`addon_safe`
+(added 2026-08-30, planner dispatch -- Phase4's own cliff-safety verdict, persisted
+by candidate_summary_report.py's _persist_phase4_verdicts_and_checklist; True/False/None(unknown,
+Phase4 hasn't covered this candidate yet) tri-state, same semantics
+GT_COLUMN_DEFS' core_safe/addon_safe entries already document -- see
+phase5_second_level_overlay_check.py's SAFE/SAFE gate, the one real consumer):
 {id, island_tp, island_sl, take_profit, stop_loss, max_hold_hours, window,
- z_score_threshold, tpct, robust_alpha, cagr, phase4_eligible}.
+ z_score_threshold, tpct, robust_alpha, cagr, phase4_eligible, core_safe, addon_safe}.
 """
 import os
 import sqlite3
@@ -117,6 +122,16 @@ def _stop_loss_and_tpct_from_row(sl_axis_col, fourth_axis_col, trail_buy_pct, tr
         stop_loss = 0.0
         tpct = 0.0
     return stop_loss, tpct
+
+
+def _text_to_bool(v):
+    """core_safe/addon_safe are persisted as TEXT "True"/"False"/NULL (candidate_summary_
+    report._persist_phase4_verdicts_and_checklist) to preserve the real tri-state (True/False/None-
+    unknown) build_candidate_report_ground_truth's own row already carries -- this is the
+    read-side inverse. pd.isna guards both a real SQL NULL (read back as None) and any
+    pandas NaN-coercion edge case in a mixed-content object column, rather than assuming
+    which one read_sql produces here."""
+    return None if pd.isna(v) else (v == "True")
 
 
 def discover_all_candidate_nodes_scopes(ticker):
@@ -196,9 +211,18 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
     if window is not None:
         params.append(int(window))
     with sqlite3.connect(DB_PATH) as conn:
+        # core_safe/addon_safe (2026-08-30, planner dispatch): candidate_summary_report.py's
+        # _persist_phase4_verdicts_and_checklist is the only writer and ALTER-guards these columns lazily,
+        # so a DB that's never had a --kernel gt run against it yet (or a fresh/test DB)
+        # won't have them -- select literal NULLs instead of raising OperationalError, same
+        # tri-state "unknown" a real un-persisted candidate would carry anyway.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
+        safe_cols_sql = ", ".join(
+            (col if col in existing_cols else f"NULL AS {col}")
+            for col in ("core_safe", "addon_safe"))
         df = pd.read_sql(f"""
             SELECT id, window, z AS z_score_threshold, arm_pct, trail_buy_pct, trail_sell_pct,
-                   max_hold_hours, robust_alpha, trades
+                   max_hold_hours, robust_alpha, trades, {safe_cols_sql}
             FROM candidate_nodes
             WHERE ticker=? AND strategy=? AND version=? AND fixed_sl=? AND entry_timing=?{window_sql}
         """, conn, params=params)
@@ -232,6 +256,8 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
                 'z_score_threshold': float(cand['z_score_threshold']), 'tpct': float(cand['tpct']),
                 'robust_alpha': float(cand['robust_alpha']), 'cagr': None,
                 'phase4_eligible': True,
+                'core_safe': _text_to_bool(cand['core_safe']),
+                'addon_safe': _text_to_bool(cand['addon_safe']),
             })
         return candidates
 
@@ -272,5 +298,7 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
                 'z_score_threshold': float(cand['z_score_threshold']), 'tpct': float(cand['tpct']),
                 'robust_alpha': float(cand['robust_alpha']), 'cagr': None,
                 'phase4_eligible': True,
+                'core_safe': _text_to_bool(cand['core_safe']),
+                'addon_safe': _text_to_bool(cand['addon_safe']),
             })
     return candidates

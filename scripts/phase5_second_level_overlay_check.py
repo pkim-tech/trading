@@ -456,6 +456,68 @@ def _fmt_pp(x):
     return "N/A" if x is None else f"{x:+.2f}pp"
 
 
+def _filter_to_safe_candidates(candidates):
+    """Gate to Phase4-verified SAFE/SAFE only (2026-08-30, planner dispatch): a candidate
+    Phase4 already flagged core_safe=False or addon_safe=False is cliff-unsafe and
+    disqualified from promotion regardless of what its 1s numbers show -- running Phase5's
+    expensive 1s-verification on it is pure wasted compute (measured directly off the
+    2026-08-29/30 campaign log: 572 of 2,238 Phase5-checked candidates, 25.6%, were already
+    CLIFF-flagged by Phase4). Requires candidate_summary_report.py's --kernel gt Phase4 run
+    to have ALREADY persisted core_safe/addon_safe for this ticker/version (run_inmemory_
+    sweep_queue.sh already runs Phase4 before Phase5, so this ordering holds for the normal
+    campaign path -- see that script's own Phase4-then-Phase5 sequencing).
+
+    A candidate with NO persisted verdict yet (core_safe or addon_safe is None -- Phase4
+    hasn't covered this ticker/version/candidate at all) is explicitly SKIPPED, with a
+    clear log line distinguishing it from a real CLIFF disqualification -- never silently
+    INCLUDED (would defeat the whole point of gating, verifying a candidate nobody's
+    checked for cliff-safety yet) and never silently folded into the same count as a real
+    CLIFF skip (would look like Phase4 ran and disqualified it, when really Phase4 just
+    hasn't run for it yet).
+
+    Only meaningful for a candidate_nodes-sourced candidate (has 'core_safe'/'addon_safe'
+    keys at all -- see phase4_candidate_nodes_resolver.derive_phase25_candidates_from_
+    candidate_nodes's own docstring); a backtest_cache-sourced candidate (derive_phase25_
+    candidates_ground_truth's output) has no candidate_id to persist a verdict against in
+    the first place, so this function is only ever called on the candidate_nodes path."""
+    safe, unsafe, unverified = [], [], []
+    for c in candidates:
+        core_safe, addon_safe = c.get("core_safe"), c.get("addon_safe")
+        if core_safe is None or addon_safe is None:
+            unverified.append(c)
+        elif core_safe and addon_safe:
+            safe.append(c)
+        else:
+            unsafe.append(c)
+    if unsafe:
+        print(f"  Phase4 SAFE/SAFE gate: skipping {len(unsafe)} CLIFF-flagged candidate(s) "
+              f"(already disqualified by Phase4, Phase5 verification would be wasted compute).")
+    if unverified:
+        print(f"  Phase4 SAFE/SAFE gate: skipping {len(unverified)} candidate(s) with NO "
+              f"persisted Phase4 verdict yet (core_safe/addon_safe not set) -- not silently "
+              f"included, not silently counted as CLIFF, just not yet coverable until "
+              f"Phase4 (--kernel gt) has run for this ticker/version.")
+    if not safe and not unsafe and unverified:
+        # Fail-safe (2026-08-30, paired-review HIGH finding): if literally EVERY candidate
+        # in this scope is unverified, that's not "a few new candidates Phase4 hasn't
+        # caught up to yet" -- it means Phase4 never covered this exact scope at all (a
+        # real, confirmed pre-existing bug: candidate_summary_report.run_gt_mode's own
+        # `covered` scope-skip set has no version filter, while this file's does, so a
+        # scope Phase4 wrongly treats as "already covered by backtest_cache" can leave
+        # every one of its candidate_nodes rows with core_safe/addon_safe never persisted
+        # -- see docs/backlog_cache.md for the follow-up to fix that root cause). Gating
+        # 100% of a scope to zero candidates would silently produce a clean-looking empty
+        # Phase5 pass instead of the real verification this scope needs -- worse than the
+        # wasted compute this whole feature exists to save. Fall back to the pre-gate
+        # behavior (verify everyone) for this scope only, loudly, rather than the gate
+        # ever emptying a scope entirely.
+        print(f"  Phase4 SAFE/SAFE gate: ALL {len(unverified)} candidates in this scope are "
+              f"unverified -- falling back to verifying all of them (gate disabled for this "
+              f"scope only) rather than silently skipping the entire scope.")
+        return candidates
+    return safe
+
+
 def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m, df_1s,
               start, end, years, pool, limit=None, window=None):
     """`window` (Task #3, 2026-08-29): when set, this scope was discovered via
@@ -475,6 +537,7 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
         candidates = derive_phase25_candidates_from_candidate_nodes(
             ticker, strategy_name, version, fixed_sl=fixed_sl, entry_timing=entry_timing,
             window=window, full_population=True)
+        candidates = _filter_to_safe_candidates(candidates)
     else:
         hp = _hp_for_strategy(strategy_name)
         candidates = derive_phase25_candidates_ground_truth(
@@ -559,15 +622,24 @@ def _try_all_stored(scopes, limit):
     caller before this is invoked at all) AND every real candidate across all of
     them already has a stored phase5 result, build the full summary straight from
     candidate_verification_results and return it -- letting main() skip the
-    multi-GB 1-second data load entirely on a pure rerun. Returns None the moment
-    any candidate anywhere still needs a fresh kernel run (including a scope with
-    zero real candidates -- nothing to report, not "fully stored")."""
+    multi-GB 1-second data load entirely on a pure rerun. Returns (None, 0) the
+    moment any candidate anywhere still needs a fresh kernel run (including a
+    scope with zero real candidates that were NEVER gated -- nothing to report,
+    not "fully stored"). Returns (all_rows, n_gated) otherwise, where `n_gated` is
+    the total candidate count removed by the Phase4 SAFE/SAFE gate across every
+    scope (2026-08-30, paired-review HIGH finding) -- callers must use this to
+    avoid claiming "all already verified" when some/all of a scope's candidates
+    were never verified at all, just correctly disqualified pre-Phase5."""
     all_rows = []
+    n_gated = 0
     with sqlite3.connect(DB_PATH) as conn:
         for ticker, strategy_name, version, entry_timing, fixed_sl, window in scopes:
             candidates = derive_phase25_candidates_from_candidate_nodes(
                 ticker, strategy_name, version, fixed_sl=fixed_sl,
                 entry_timing=entry_timing, window=window, full_population=True)
+            n_before = len(candidates)
+            candidates = _filter_to_safe_candidates(candidates)
+            n_gated += n_before - len(candidates)
             if limit is not None:
                 candidates = candidates[:limit]
             if not candidates:
@@ -576,9 +648,9 @@ def _try_all_stored(scopes, limit):
                 cid = cand.get("id")
                 stored = get_stored(conn, cid, "phase5") if cid is not None else None
                 if stored is None:
-                    return None
+                    return None, 0
                 if not trades_complete(conn, cid, stored["n_trades_1m"] or 0, stored["n_trades_1s"] or 0):
-                    return None
+                    return None, 0
                 node = node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, cand)
                 print(f"  candidate {i}: already verified at {stored['checked_at']}, using stored result")
                 row = {k: v for k, v in stored.items() if k != "checked_at"}
@@ -587,7 +659,7 @@ def _try_all_stored(scopes, limit):
                 _print_row(row, node)
                 all_rows.append(dict(row, ticker=ticker, strategy=strategy_name,
                                       fixed_sl=fixed_sl, window=window))
-    return all_rows
+    return all_rows, n_gated
 
 
 def main():
@@ -662,10 +734,24 @@ def main():
     # from candidate_verification_results.
     load_secs = 0.0
     run_secs = 0.0
-    all_rows = _try_all_stored(scopes, args.limit) if all(s[5] is not None for s in scopes) else None
+    if all(s[5] is not None for s in scopes):
+        all_rows, n_gated = _try_all_stored(scopes, args.limit)
+    else:
+        all_rows, n_gated = None, 0
 
     if all_rows is not None:
-        print("\nAll candidates in every scope already verified -- skipping data load entirely.")
+        # Message must be accurate regardless of WHY nothing needed a fresh kernel run
+        # (2026-08-30, paired-review HIGH finding): with the Phase4 SAFE/SAFE gate now
+        # in play, "every candidate already stored" and "every candidate gated out
+        # pre-Phase5" are both real ways to reach this branch -- conflating them as one
+        # generic "already verified" would misreport a scope that was never actually
+        # verified at all, just correctly disqualified before Phase5 started.
+        if n_gated:
+            print(f"\nSkipping data load entirely: {len(all_rows)} candidate(s) already "
+                  f"verified (stored), {n_gated} candidate(s) gated out by Phase4 SAFE/SAFE "
+                  f"(never needed Phase5 at all) -- nothing left needing a fresh kernel run.")
+        else:
+            print("\nAll candidates in every scope already verified -- skipping data load entirely.")
     else:
         t_load = time.monotonic()
         print(f"Loading {args.ticker} hourly data...")

@@ -40,6 +40,7 @@ plumbing, per the standing "canonical report, don't spin up a new script" conven
 import argparse
 import csv
 import re
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -991,6 +992,122 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
     return rows
 
 
+# Every other Phase4 checklist field gt_rows_for_scope already computes and prints but
+# never persists (2026-08-30, planner dispatch, scope expansion on the same task): check4
+# win-rate stability, check8 fluke check, check11 max drawdown, check13 walk-forward
+# 5-fold, and the TrailingBoth-only drought overlay. Explicit key list (not "everything in
+# `out`") so this blob doesn't accidentally sweep in fields that already have their own
+# real columns/purpose (ticker/strategy/config_version/candidate_id/core_safe/addon_safe/
+# take_profit/etc.) or scope-level fields that aren't really per-candidate (drought_
+# skip_reason is scope-level, included anyway since it explains why every drought_* field
+# below might be None for this candidate).
+_PHASE4_CHECKLIST_KEYS = [
+    "check4_early_wr_pct", "check4_late_wr_pct",
+    "check8_compounded_pct", "check8_compounded_without_best_pct",
+    "check8_best_trade_share_pct", "check8_too_few_trades",
+    "check11_max_drawdown_pct", "check11_dd_peak_time", "check11_dd_trough_time",
+    "drought_n_core_trades", "drought_core_compounded_pct", "drought_best_confirm_days",
+    "drought_best_vol_gate", "drought_n_windows", "drought_n_simulated",
+    "drought_compounded_pct", "drought_combined_compounded_pct", "drought_skip_reason",
+] + [f"check13_fold{f}_{suffix}" for f in range(1, 6) for suffix in ("n", "cagr_pct", "fragile")]
+
+
+def _persist_phase4_verdicts_and_checklist(rows):
+    """Persist Phase4's per-candidate output onto candidate_nodes (2026-08-30, planner
+    dispatch): Phase4 already computes all of this (build_candidate_report_ground_truth,
+    in run_optimization_sweep.py -- a gated backtest-kernel module, deliberately NOT
+    touched here; this just persists what gt_rows_for_scope already reads off its output
+    and has always printed to console/CSV/xlsx) -- but never wrote any of it back onto the
+    candidate_nodes row it came from, so a later session/script had no way to look it up
+    without re-running Phase4. Additive UPDATE only -- never inserts a new candidate_nodes
+    row, and a backtest_cache-sourced row (candidate_id is None, never promoted into
+    candidate_nodes) has nothing to persist to and is silently skipped, same "no
+    candidate_id to anchor against" posture this file's own trades_from_cache/candidate_id
+    fields already document.
+
+    Two real consumers, two different storage shapes:
+    - core_safe/addon_safe: gates Phase5's expensive 1s-verification (phase5_second_
+      level_overlay_check.py's SAFE/SAFE gate) -- confirmed real waste: 572 of 2,238
+      Phase5-checked candidates (25.6%) were already CLIFF-flagged by Phase4 on the
+      2026-08-29/30 campaign log. Stored as its own TEXT "True"/"False"/NULL column each
+      (tri-state, matching build_candidate_report_ground_truth's own True/False/
+      None-unknown semantics) since SAFE-gating needs to filter ON these specific values.
+    - Every other checklist field (_PHASE4_CHECKLIST_KEYS): no real query/filter need on
+      an individual sub-field today, just "look this candidate's checklist up later
+      without re-running Phase4" -- one JSON blob column (`phase4_checklist_json`),
+      matching the existing `params_json` column's own precedent for exactly this
+      "structured, no per-field predicate" shape, rather than ~24 more individually
+      ALTER-guarded columns for data nothing filters on."""
+    try:
+        updates = []
+        for r in rows:
+            if r.get("candidate_id") is None:
+                continue
+            core_safe = None if r.get("core_safe") is None else str(bool(r["core_safe"]))
+            addon_safe = None if r.get("addon_safe") is None else str(bool(r["addon_safe"]))
+            # _json_safe (numpy scalar/pandas Timestamp -> JSON-serializable): check13_
+            # foldN_fragile/check8_too_few_trades can be numpy.bool_, check4/check8/
+            # check11/drought fields can be numpy.float64, and check11_dd_peak_time/
+            # check11_dd_trough_time are real pandas Timestamps (_check11_max_drawdown_gt,
+            # run_optimization_sweep.py, from backtester.py's resolve_time()) -- confirmed
+            # 2026-08-30, paired-review HIGH finding: _native()'s plain `.item()` fallback
+            # does NOT cover Timestamp (no .item() method), so json.dumps raised TypeError
+            # on the very first real candidate with a drawdown before this fix.
+            checklist_json = json.dumps(
+                {k: _json_safe(r.get(k)) for k in _PHASE4_CHECKLIST_KEYS}, sort_keys=True)
+            updates.append((core_safe, addon_safe, checklist_json, r["candidate_id"]))
+        if not updates:
+            return
+        # args.db (2026-08-30, paired-review MEDIUM finding): this module-level DB_PATH is
+        # the same one gt_rows_for_scope already syncs run_optimization_sweep's own
+        # DB_PATH to (see that function's own "DB_PATH sync" docstring) -- consistent with
+        # the rest of this file's pre-existing --db handling, not a new inconsistency.
+        with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
+            for col, col_type in (("core_safe", "TEXT"), ("addon_safe", "TEXT"),
+                                   ("phase4_checklist_json", "TEXT")):
+                if col not in existing_cols:
+                    conn.execute(f"ALTER TABLE candidate_nodes ADD COLUMN {col} {col_type}")
+            # COALESCE on core_safe/addon_safe only (2026-08-30, paired-review MEDIUM
+            # finding): run_addon_cliff_safety_ground_truth deliberately fails closed to
+            # None when no neighbor cell evaluated -- an unconditional overwrite would let
+            # a later degraded/partial Phase4 run clobber a previously-persisted real
+            # True/True verdict back to NULL, which the Phase5 SAFE/SAFE gate then reads
+            # as "unverified" and skips -- worse than never having persisted anything.
+            # phase4_checklist_json has no such gating consequence (never filtered on),
+            # so it always takes the freshest value.
+            conn.executemany(
+                "UPDATE candidate_nodes SET core_safe=COALESCE(?, core_safe), "
+                "addon_safe=COALESCE(?, addon_safe), phase4_checklist_json=? WHERE id=?",
+                updates)
+            conn.commit()
+        print(f"\nPersisted core_safe/addon_safe + full Phase4 checklist for {len(updates)} "
+              f"candidate_nodes row(s).")
+    except Exception as e:
+        # Never let a persistence bug destroy an already-computed, expensive Phase4
+        # report (2026-08-30, paired-review HIGH finding: an earlier version of this
+        # function let a JSON-serialization TypeError propagate uncaught, which -- called
+        # AFTER the scope loop but BEFORE the --csv/--xlsx write -- would have discarded
+        # every row of a multi-hour run and exited non-zero, making run_inmemory_sweep_
+        # queue.sh skip Phase5 entirely for that ticker). Persistence is a nice-to-have
+        # on top of the report, never allowed to be worse than not persisting at all.
+        print(f"\nWARNING: failed to persist core_safe/addon_safe/checklist to "
+              f"candidate_nodes ({e}) -- report itself is unaffected, continuing.")
+
+
+def _json_safe(v):
+    """_native() (numpy scalar -> Python native) plus pandas Timestamp/datetime -> ISO
+    string -- see _persist_phase4_verdicts_and_checklist's own comment for the real bug
+    this fixes (check11_dd_peak_time/check11_dd_trough_time are real Timestamps, and
+    _native's `.item()` fallback doesn't cover them)."""
+    import datetime
+    import pandas as pd
+    v = _native(v)
+    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date)):
+        return v.isoformat()
+    return v
+
+
 def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_window_filter=None,
                  version_filter=None):
     """--kernel gt entry point: loops every real GT scope for `tickers`, printing
@@ -1080,6 +1197,8 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
                                                grid_window=grid_window))
         except Exception as e:
             print(f"  UNEXPECTED error on this scope, skipping: {e}")
+
+    _persist_phase4_verdicts_and_checklist(all_rows)
 
     if csv_name:
         _write_csv(csv_name, all_rows, col_defs=GT_COLUMN_DEFS, to_record=lambda r: r)
