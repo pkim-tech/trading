@@ -1046,6 +1046,16 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
     if xlsx_name:
         _write_xlsx(xlsx_name, all_rows, col_defs=GT_COLUMN_DEFS, to_record=lambda r: r)
 
+    # Greppable per-ticker completion marker (2026-08-29), matching bench_phase1_
+    # phase2_inmemory.py's own "PROGRESS: <Phase> done ticker=..." print convention --
+    # so `grep "PROGRESS:" logfile` shows real progress through Phase4/5 too, not just
+    # Phase1-2.5, across a long unattended multi-ticker queue run.
+    for ticker in tickers:
+        n_rows = sum(1 for r in all_rows if r.get("ticker") == ticker)
+        n_scopes = sum(1 for s in scopes if s[0] == ticker)
+        print(f"PROGRESS: Phase4 done ticker={ticker}: {n_rows} candidate rows "
+              f"across {n_scopes} scope(s)")
+
 
 def main():
     ap = argparse.ArgumentParser()

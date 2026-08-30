@@ -748,6 +748,12 @@ def main():
           f"{run_secs / len(df_out):.1f}s/candidate average (wall-clock, not CPU-time) | "
           f"Total: {load_secs + run_secs:.1f}s")
     print(f"Full results: {', '.join(out_paths)}")
+    # Greppable per-ticker completion marker (2026-08-29), matching bench_phase1_
+    # phase2_inmemory.py's own "PROGRESS: <Phase> done ticker=..." print convention --
+    # so `grep "PROGRESS:" logfile` shows real progress through Phase4/5 too, not just
+    # Phase1-2.5, across a long unattended multi-ticker queue run.
+    print(f"PROGRESS: Phase5 done ticker={args.ticker}: {len(df_out)} candidates checked "
+          f"across {len(scopes)} scope(s), version={args.version}")
 
 
 if __name__ == "__main__":
