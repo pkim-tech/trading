@@ -28,6 +28,7 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -1048,7 +1049,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
           phase1_rows = _dispatch(pool, phase1_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
                                    desc="Phase1-coarse (in-memory)")
           t1 = time.time()
-          print(f"PROGRESS: Phase1 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
+          print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase1 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
                 f"{len(phase1_rows):,} rows in {t1 - t0:.1f}s "
                 f"({len(phase1_rows) / max(t1 - t0, 0.001):.0f} nodes/sec)")
 
@@ -1156,7 +1157,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
       phase2_rows = _dispatch(pool, phase2_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
                                desc="Phase2-island (in-memory)")
       t3 = time.time()
-      print(f"PROGRESS: Phase2 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
+      print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase2 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
             f"{len(phase2_rows):,} rows in {t3 - t2:.1f}s "
             f"({len(phase2_rows) / max(t3 - t2, 0.001):.0f} nodes/sec)")
 
@@ -1252,7 +1253,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     phase25_rows = _dispatch(pool, phase25_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
                               desc="Phase2.5-cliffbox (in-memory)")
     t5 = time.time()
-    print(f"PROGRESS: Phase2.5 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase2.5 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
           f"{len(phase25_rows):,} rows in {t5 - t4:.1f}s "
           f"({len(phase25_rows) / max(t5 - t4, 0.001):.0f} nodes/sec)")
 
@@ -1431,7 +1432,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # misleadingly "DONE"-looking log line while sweep_run_log.finished_at was still NULL.
     # Now fires after the real last step, with the final candidate count on the line
     # itself so a `grep "PROGRESS:"` log monitor gets real information.
-    print(f"PROGRESS: fixed_sl DONE ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: fixed_sl DONE ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
           f"{len(final_candidates)} final candidates, {n_written9} candidate_nodes rows, "
           f"{n_trade_rows_written} trade rows written")
 
