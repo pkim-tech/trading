@@ -79,6 +79,18 @@ WORKERS="${WORKERS:-8}"
 Z_SUFFIX=$(echo "$Z_THRESHOLDS" | tr ' ' '-')
 VERSION="bench-inmemory-v6-massive-w2021-08-23_2026-08-21-z${Z_SUFFIX}-isl${N_ISLANDS}"
 
+# Ticker-transition banner (2026-08-30, user feedback: this is the bigger unit of
+# progress -- one per ticker vs. one per fixed_sl/window scope inside it -- so it
+# must read as visually heavier than the inner per-scope '-'*80 banners
+# (candidate_summary_report.py/phase5_second_level_overlay_check.py), not lighter
+# as the old single-line "=== ... ===" was.
+ticker_banner() {
+  echo ""
+  echo "================================================================================"
+  echo "=== $1 — $(date)"
+  echo "================================================================================"
+}
+
 mkdir -p logs
 LOG="logs/inmemory_sweep_queue_$(date +%Y%m%d_%H%M%S).log"
 echo "Logging to $LOG (console + file via tee)"
@@ -96,8 +108,7 @@ echo "Logging to $LOG (console + file via tee)"
   echo "======================================================"
 
   for ticker in $TICKERS; do
-    echo ""
-    echo "=== $ticker: Phase1-2.5 start — $(date) ==="
+    ticker_banner "$ticker: Phase1-2.5 start"
     ticker_failed=0
 
     for strategy in $STRATEGIES; do
@@ -123,8 +134,7 @@ echo "Logging to $LOG (console + file via tee)"
       continue
     fi
 
-    echo ""
-    echo "=== $ticker: Phase4 (candidate_summary_report.py --kernel gt) start — $(date) ==="
+    ticker_banner "$ticker: Phase4 (candidate_summary_report.py --kernel gt) start"
     $PYTHON scripts/candidate_summary_report.py --kernel gt "$ticker" --version "$VERSION"
     rc=$?
     if [ $rc -ne 0 ]; then
@@ -132,8 +142,7 @@ echo "Logging to $LOG (console + file via tee)"
       continue
     fi
 
-    echo ""
-    echo "=== $ticker: Phase5 (phase5_second_level_overlay_check.py) start — $(date) ==="
+    ticker_banner "$ticker: Phase5 (phase5_second_level_overlay_check.py) start"
     $PYTHON scripts/phase5_second_level_overlay_check.py --ticker "$ticker" --version "$VERSION"
     rc=$?
     if [ $rc -ne 0 ]; then
@@ -141,8 +150,7 @@ echo "Logging to $LOG (console + file via tee)"
       continue
     fi
 
-    echo ""
-    echo "=== $ticker: full Phase1->5 pipeline complete — $(date) ==="
+    ticker_banner "$ticker: full Phase1->5 pipeline complete"
   done
 
   echo ""

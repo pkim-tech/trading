@@ -689,9 +689,16 @@ def main():
         # default) gives every worker copy-on-write access with no reload.
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             for ticker, strategy_name, version, entry_timing, fixed_sl, window in scopes:
-                print(f"\n{'#' * 80}\n{ticker} / {strategy_name} / {version} / "
+                # '-'*80 (not '#') -- deliberately lighter than run_inmemory_sweep_queue.sh's
+                # own ticker-transition banner (2026-08-30, user feedback: the per-scope banner
+                # was visually louder than the higher-level ticker banner, backwards from the
+                # real progress hierarchy). Timestamp line added same day so scope duration is
+                # readable straight from the log, matching bench_phase1_phase2_inmemory.py's
+                # own "[HH:MM:SS] PROGRESS: ..." format.
+                print(f"\n{'-' * 80}\n{ticker} / {strategy_name} / {version} / "
                       f"entry_timing={entry_timing} / fixed_sl={fixed_sl}"
-                      f"{f' / window={window}' if window is not None else ''}\n{'#' * 80}")
+                      f"{f' / window={window}' if window is not None else ''}\n{'-' * 80}")
+                print(f"[{time.strftime('%H:%M:%S')}]")
                 rows = run_scope(ticker, strategy_name, version, entry_timing, fixed_sl,
                                   _DFH, _DF_1M, _DF_1S, start, end, years, pool, limit=args.limit,
                                   window=window)

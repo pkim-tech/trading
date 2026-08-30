@@ -1050,9 +1050,16 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
 
     all_rows = []
     for ticker, strategy, version, entry_timing, fixed_sl, grid_window in scopes:
-        print(f"\n{'#'*100}\n{ticker} / {strategy} / {version} / entry_timing={entry_timing} "
+        # '-'*100 (not '#') -- deliberately lighter than run_inmemory_sweep_queue.sh's own
+        # ticker-transition banner (2026-08-30, user feedback: the per-scope banner was
+        # visually louder than the higher-level ticker banner, backwards from the real
+        # progress hierarchy). Timestamp line added same day so scope duration is readable
+        # straight from the log, matching bench_phase1_phase2_inmemory.py's own
+        # "[HH:MM:SS] PROGRESS: ..." format.
+        print(f"\n{'-'*100}\n{ticker} / {strategy} / {version} / entry_timing={entry_timing} "
               f"/ fixed_sl={fixed_sl}"
-              f"{f' / grid_window={grid_window}' if grid_window is not None else ''}\n{'#'*100}")
+              f"{f' / grid_window={grid_window}' if grid_window is not None else ''}\n{'-'*100}")
+        print(f"[{_datetime.now().strftime('%H:%M:%S')}]")
         try:
             if grid_window is None:
                 node = gt_current_best_node(conn, ticker, strategy, version, entry_timing, fixed_sl,
