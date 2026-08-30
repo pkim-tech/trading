@@ -710,15 +710,16 @@ def main():
         return
 
     df_out = pd.DataFrame(all_rows)
-    # Task #5, 2026-08-29 (planner dispatch): filename now includes version+window --
-    # the old fixed ticker-only filename let two different version/window runs for
-    # the same ticker silently overwrite each other's output. One CSV per real window
-    # value (a per-scope split, since a single run can cover multiple windows) --
-    # matches the output/phase4_<ticker>_<version>_w<window> convention used by
-    # scripts/run_candidate_nodes_campaign_verification.py. A backtest_cache-sourced
-    # scope (window=None) has no real window to key on -- its rows go to the
-    # no-suffix filename, matching this script's original single-CSV-per-run shape
-    # for that path (only one such group can exist per run either way).
+    # Task #5, 2026-08-29 (planner dispatch): filename now includes version --
+    # the old fixed ticker-only filename let two different version runs for the
+    # same ticker silently overwrite each other's output. That collision guard
+    # is exactly what still matters -- {args.ticker.lower()}_{args.version} is
+    # already unique per run/scope-set on its own (version alone, no window
+    # needed in the name). Per-window file splitting (2026-08-29's own original
+    # fix) was a SEPARATE, unwanted side effect ("i really didn't want separate
+    # files lol", 2026-08-30) -- `window` is already a real column in df_out, so
+    # one combined file per run with `window` as a filterable column achieves
+    # the same collision-safety without the split.
     # xlsx sibling (Task, 2026-08-29: Phase5 "keep the discipline the same" as Phase4's
     # own dual-format convention) -- reuses candidate_summary_report._write_xlsx/
     # _write_csv directly (generic enough already: takes any list-of-dicts `rows` + an
@@ -730,17 +731,13 @@ def main():
     # -- only the main process, after the pool has already exited, needs it.
     from candidate_summary_report import _write_xlsx
 
-    out_paths = []
-    for window_val, group in df_out.groupby(df_out["window"], dropna=False):
-        suffix = f"_w{int(window_val)}" if pd.notna(window_val) else ""
-        base_name = f"phase5_second_level_overlay_check_{args.ticker.lower()}_{args.version}{suffix}"
-        out_path = os.path.join(ROOT, "output", f"{base_name}.csv")
-        group.to_csv(out_path, index=False)
-        out_paths.append(out_path)
-        xlsx_out_path = os.path.join(ROOT, "output", f"{base_name}.xlsx")
-        _write_xlsx(xlsx_out_path, group.to_dict("records"),
-                    col_defs=_PHASE5_COLUMN_DEFS, to_record=lambda r: r)
-        out_paths.append(xlsx_out_path)
+    base_name = f"phase5_second_level_overlay_check_{args.ticker.lower()}_{args.version}"
+    out_path = os.path.join(ROOT, "output", f"{base_name}.csv")
+    df_out.to_csv(out_path, index=False)
+    xlsx_out_path = os.path.join(ROOT, "output", f"{base_name}.xlsx")
+    _write_xlsx(xlsx_out_path, df_out.to_dict("records"),
+                col_defs=_PHASE5_COLUMN_DEFS, to_record=lambda r: r)
+    out_paths = [out_path, xlsx_out_path]
 
     print(f"\n=== Phase5 summary: {len(df_out)} candidate(s) checked across {len(scopes)} scope(s) ===")
     for label in ("core_delta_pp", "addon_delta_pp", "drought_delta_pp", "core_both_delta_pp"):
