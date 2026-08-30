@@ -1,5 +1,11 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Resolved 2026-08-29 — independent-reimplementation verification for GT overlays confirmed done via `scripts/sim_1s_vs_1m_groundtruth_overlays.py` (raised 2026-08-23). Full detail: `deep_backlog.md`.
+
+## [backtest] Resolved-as-skip 2026-08-29 (recorded; user's 2026-08-23 call) — 2 real SOXL Phase2-GT scopes left incomplete by `pick_island_centers` tiebreak fix (`54cbd0c`), no recompute planned. Full detail: `deep_backlog.md`.
+
+## [backtest] Resolved 2026-08-29 — GT cliff-safety worst-neighbor CAGR threshold confirmed at 0% (code is source of truth), stale 20% line in `ground_truth_kernel_rebuild.md` fixed. Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved 2026-08-28 (Search Completeness Audit, first real run) — SOXL TrailingBoth fixed_sl=7's generational-search winner confirmed as the TRUE global optimum (756,000-cell brute-force mesh, byte-identical top-9). Full detail: `deep_backlog.md`.
 
 ## [live-trading][testing] Resolved 2026-08-29 — `verify_real_trades_vs_kernel.py`'s still-open-trade blind spot fixed (238504c/ebf86c2), full bipartite matching. Full detail: `deep_backlog.md`.

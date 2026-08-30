@@ -152,8 +152,19 @@ conservative than pure parameter-robustness alone (it was also hedging ambiguity
 previously-rejected "not cliff-safe" configs could newly pass, or vice versa — worth the
 reviewers' explicit attention.
 
-**New selection bar**: worst-neighbor ground-truth CAGR > 20% (replaces the earlier
-alpha-over-SPY framing — simpler, and would have caught SOXL directly).
+**New selection bar (superseded 2026-08-29, see below)**: worst-neighbor ground-truth CAGR
+> 20% (replaces the earlier alpha-over-SPY framing — simpler, and would have caught SOXL
+directly).
+
+**Actual implemented threshold, confirmed 2026-08-29**: the real code
+(`run_optimization_sweep.py`'s `run_addon_cliff_safety_ground_truth`, `core_safe`/`addon_safe`)
+uses `worst_neighbor < 0` — i.e. a 0% CAGR bar ("a neighbor loses money outright"), not the 20%
+figure stated above. This was a deliberate 2026-08-23 decision (see the code's own comment at
+`run_optimization_sweep.py` ~lines 3180-3193): switching `worst_neighbor` from alpha to CAGR
+units intentionally did not introduce a nonzero floor to compensate for the resulting looser
+bar, and the discrepancy with this doc's 20% figure was left as an open question rather than
+resolved silently. Resolved 2026-08-29: keep 0% — code is source of truth, this doc's 20% line
+above is stale and superseded.
 
 ## Order of operations
 
