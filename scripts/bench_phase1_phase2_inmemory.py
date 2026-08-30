@@ -1341,10 +1341,17 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         c["n_neighbors_checked"] = len(neighbors)
 
     print(f"\n=== Final {len(final_candidates)} candidates (post-Phase2.5, {N_ISLANDS} islands x top-3) ===")
+    # sl_axis_col: what the 'stop_loss' column actually means for THIS strategy (see
+    # strategies.resolve_axis_columns()) -- e.g. trail_buy_pct (entry-trigger trail%)
+    # for TrailingBothZScoreBreakout, trail_pct (exit trail%) for TrailingExitZScoreBreakout.
+    # fixed_sl is the REAL protective stop, held constant for this whole run, and was
+    # previously missing from this line entirely.
+    sl_axis_col, _ = strategies.resolve_axis_columns(strategy_name)
     for c in sorted(final_candidates, key=lambda r: -r["cagr"]):
-        print(f"  island{c['island']}: TP={c['take_profit']} SL={c['stop_loss']} "
-              f"hold={c['max_hold_hours']}h w={c['window']} z={c['z_score_threshold']} "
-              f"trail_pct={c['trail_sell_pct']} -> cagr={c['cagr']:.2f}% trades={c['trades']} "
+        print(f"  island{c['island']}: TP={c['take_profit']} {sl_axis_col}={c['stop_loss']} "
+              f"fixed_sl={fixed_sl} hold={c['max_hold_hours']}h w={c['window']} "
+              f"z={c['z_score_threshold']} trail_pct={c['trail_sell_pct']} -> "
+              f"cagr={c['cagr']:.2f}% trades={c['trades']} "
               f"| worst_neighbor_cagr={c['worst_neighbor_cagr']:.2f}% "
               f"(n={c['n_neighbors_checked']})")
 
