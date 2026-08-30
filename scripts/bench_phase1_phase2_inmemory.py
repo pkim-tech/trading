@@ -1197,7 +1197,43 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
               region = df1[(df1["take_profit"] - tp_c).abs().le(FINE_RADIUS)
                            & (df1["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
               region_rows.append(region.sort_values("cagr", ascending=False).head(10))
-          insurance_df = pd.concat([global_top] + region_rows, ignore_index=True).drop_duplicates(
+          insurance_df = pd.concat([global_top] + region_rows, ignore_index=True)
+
+          # Window/z backfill (2026-08-30, planner dispatch): same blind-spot class the
+          # candidate_nodes promotion pool had before find_missing_window_z_top_n was built
+          # for it (see that function's docstring) -- global_top/wide_centers above both pool
+          # every (window, z) combo together, so a combo can end up with zero representation
+          # in the insurance snapshot even though pick_island_centers itself (run separately,
+          # against the FULL grid, for the real Phase2 seeding) would still find it fine. Only
+          # the insurance snapshot's OWN stated purpose -- letting a future session re-debug
+          # island detection after the fact -- would have zero evidence such a combo ever
+          # existed. Unlike the promotion-pool fix, no cliffbox/Phase2.5 concern applies here:
+          # insurance is explicitly a raw, unrefined Phase1-only snapshot by design already
+          # (see the "NOT a naive global top-N" comment above), so a plain top-2-per-missing-
+          # combo union straight from df1 is the full fix, no seed/final two-stage split
+          # needed. `tb_cols=["cagr"]` (not the fuller GT_CANDIDATE_TIEBREAK-based `tb_cols`
+          # used elsewhere in this function) matches this block's OWN existing sort
+          # convention -- global_top/region_rows above both sort purely on cagr too.
+          present_combos_ins = {(int(w), float(z)) for w, z in insurance_df[
+              ["window", "z_score_threshold"]].drop_duplicates().itertuples(index=False)}
+          missing_combos_ins, backfill_ins_rows = find_missing_window_z_top_n(
+              present_combos_ins, WINDOWS, Z_THRESHOLDS, df1, tb_cols=["cagr"], tb_asc=[False],
+              top_n=2)
+          backfill_ins_flat = [row for rows in backfill_ins_rows.values() for row in rows]
+          if backfill_ins_flat:
+              insurance_df = pd.concat([insurance_df, pd.DataFrame(backfill_ins_flat)],
+                                        ignore_index=True)
+          if missing_combos_ins:
+              zero_evidence_ins = [c for c, rows in backfill_ins_rows.items() if not rows]
+              print(f"Phase1 insurance backfill: {len(missing_combos_ins)} window/z combo(s) "
+                    f"with zero representation in the top-1000/region union -- adding "
+                    f"{len(backfill_ins_flat)} extra row(s) (top-2 each, where evidence "
+                    f"existed): {missing_combos_ins}")
+              if zero_evidence_ins:
+                  print(f"  {len(zero_evidence_ins)} of those had NO evidence at all (every "
+                        f"cell had trades=0): {zero_evidence_ins}")
+
+          insurance_df = insurance_df.drop_duplicates(
               subset=["take_profit", "stop_loss", "max_hold_hours", "window",
                       "z_score_threshold", "trail_sell_pct"])
           insurance_rows = insurance_df.to_dict("records")

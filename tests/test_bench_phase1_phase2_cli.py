@@ -303,10 +303,18 @@ def test_seed_stage_backfill_runs_before_phase25_dispatch():
     the seed-stage `find_missing_window_z_top_n(` call must appear BEFORE the Phase2.5
     `_dispatch(...desc="Phase2.5-cliffbox"` call in run_one_fixed_sl's source, matching
     test_final_topN_region_filter_does_not_key_on_window_or_z's own source-slicing
-    convention above."""
+    convention above.
+
+    Anchored on the `missing_combos_seed, backfill_seed_rows = find_missing_window_z_top_n(`
+    ASSIGNMENT, not the bare call text (2026-08-30, contextual-review HIGH finding: a later,
+    unrelated Phase1-insurance-snapshot backfill added its OWN find_missing_window_z_top_n(
+    call earlier in this same function's source, so a plain `src.index('find_missing_window_z_
+    top_n(')` silently started matching that call instead and made this assertion vacuous --
+    it still passed, but no longer tested the thing its docstring claims)."""
     import inspect
     src = inspect.getsource(bench.run_one_fixed_sl)
-    seed_backfill_idx = src.index('find_missing_window_z_top_n(')
+    seed_backfill_idx = src.index(
+        'missing_combos_seed, backfill_seed_rows = find_missing_window_z_top_n(')
     phase25_dispatch_idx = src.index('desc="Phase2.5-cliffbox')
     assert seed_backfill_idx < phase25_dispatch_idx, (
         "seed-stage window/z backfill must run BEFORE Phase2.5 dispatches, or backfilled "
