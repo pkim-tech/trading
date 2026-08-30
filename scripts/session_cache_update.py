@@ -9,24 +9,40 @@ Usage:
 
 Entry text must start with "## <date> — <title>" and not include surrounding "---".
 
-Also touches ~/.claude/hooks/.session_wrap_active on success -- the marker the
-global enforce_ready_to_clear.py Stop hook checks for, instead of detecting a
-git commit (see docs/backlog_cache.md's "ready to clear" Stop hook item and
-docs/deep_backlog.md's matching entry for why: commit-detection false-positived
-on any ad hoc commit outside a real wrap, and false-negatived on a wrap that
-ended with nothing to commit). This script is the one mechanical step both
-`session wrap` and `session close` always run, so tying the marker here -- not
-to the assistant remembering to touch a marker "at the start" -- keeps the fix
-mechanical rather than memory-dependent, which is the whole reason this hook
-exists in the first place (manual compliance already failed 4 times).
+Also touches ~/.claude/hooks/.session_wrap_active.<session_id> on success --
+the marker the global enforce_ready_to_clear.py Stop hook checks for, instead
+of detecting a git commit (see docs/backlog_cache.md's "ready to clear" Stop
+hook item and docs/deep_backlog.md's matching entry for why: commit-detection
+false-positived on any ad hoc commit outside a real wrap, and false-negatived
+on a wrap that ended with nothing to commit). This script is the one
+mechanical step both `session wrap` and `session close` always run, so tying
+the marker here -- not to the assistant remembering to touch a marker "at the
+start" -- keeps the fix mechanical rather than memory-dependent, which is the
+whole reason this hook exists in the first place (manual compliance already
+failed 4 times).
+
+2026-08-30: the marker is scoped to CLAUDE_CODE_SESSION_ID (read from the
+env, set for any invocation running inside a real Claude Code session) so a
+concurrent unrelated session's Stop hook can't see this run's marker and
+wrongly conclude it wrapped too. If the env var is unset (e.g. a manual
+out-of-Claude-Code invocation), falls back to the original global filename --
+that invocation isn't Stop-hook-relevant anyway, so this just preserves prior
+behavior rather than needing new handling.
 """
+import os
 import sys
 from pathlib import Path
 
 DOCS = Path(__file__).resolve().parent.parent / "docs"
 SESSION_CACHE = DOCS / "session_cache.md"
 CONVERSATION_SUMMARY = DOCS / "conversation_summary.md"
-WRAP_MARKER = Path.home() / ".claude" / "hooks" / ".session_wrap_active"
+HOOKS_DIR = Path.home() / ".claude" / "hooks"
+_SESSION_ID = os.environ.get("CLAUDE_CODE_SESSION_ID")
+WRAP_MARKER = (
+    HOOKS_DIR / f".session_wrap_active.{_SESSION_ID}"
+    if _SESSION_ID
+    else HOOKS_DIR / ".session_wrap_active"
+)
 MAX_ENTRIES = 5
 SEP = "\n---\n\n"
 
