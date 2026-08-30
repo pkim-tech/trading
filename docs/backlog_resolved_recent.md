@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest] Resolved-as-decided-won't-pursue 2026-08-29 — trade the inverse ticker on gap-fill-continuation signal (raised 2026-08-22) closed; likely an hourly-granularity artifact, not a real pattern. Full detail: `deep_backlog.md`.
+
 ## [tooling] Resolved 2026-08-29 — `isolation:worktree` root cause understood (runtime tool-call checks, not sandboxing; highest-risk vector is backgrounded/resumed agents losing binding), folded into dispatch-to-peer skill. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-08-29 — `GT_CANDIDATE_TIEBREAK` comment mis-describing `stop_loss`/tpct axis fixed (`293558a`, comment-only). Full detail: `deep_backlog.md`.

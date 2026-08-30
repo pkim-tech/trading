@@ -171,15 +171,6 @@ Mechanism decided: `git mv` into `scripts/archive/`, not delete outright or leav
 ## [backtest][testing] Deferred 2026-08-22 (user's call, low priority) — port same_day_block sensitivity (checklist check 9) to the GT kernel, for TrailingBoth first
 `_simulate_trail_ground_truth` (GT/v6 kernel) has no `same_day_block` parameter at all, for either strategy — confirmed while building the GT candidate-report (checks 1/4/8/11/13, commit `ff8372e`). Not a build-from-scratch problem for `TrailingBothZScoreBreakout`: the legacy kernel's `same_day_block` logic already exists and is used by `scripts/checklist_v65.py`'s check 9 today (`backtester.py` lines ~611/851/1094/1148/1283/1335/1350/1365) — porting that same pattern into `_simulate_trail_ground_truth` is the real scope. `TrailingExitZScoreBreakout` has never had `same_day_block` support even in the legacy kernel (`checklist_v65.py:15`'s own comment), so that half would be genuinely new logic, not a port. User's read: same_day_block has never actually produced a useful signal historically, so this is low priority — deferred, revisit later rather than build now.
 
-## [backtest] Idea, raised 2026-08-22, not yet scoped or built — trade the inverse ticker on a gap-fill-continuation signal, instead of just eating it as a long-side risk
-Builds directly on the existing gap-fill-continuation finding above (this file, "carried gap-fills... continued falling through the stop-loss level within the SAME hour," 54-71% of the time depending on ticker, real 3yr SOXL/LABU/JNUG/KORU/DPST/HIBL data) — that finding was originally framed as a risk to the existing long position, but the same directional bias is itself a signal: since we can't short SOXL directly, when a gap-fill-continuation condition is detected, buy the ticker's real inverse (SOXS for SOXL) with its own protective SL instead of/alongside eating the loss on the long side.
-
-This is a genuinely different strategy SHAPE, not a new parameter combination of the existing TrailingBoth/TrailingExit strategies — the trigger condition (SOXL's gap-fill behavior) and the actual trade (entry/exit/SL on SOXS) live on two different tickers. Raised in the same conversation as the `backtest_cache` schema-flexibility design discussion (JSON `params` column, scoped to v6 onward) specifically because this is the concrete case that design was motivated by — this strategy's real params (`trigger_ticker`, `trade_ticker`, `gap_threshold`, protective SL sizing) don't fit the current flat-column schema without adding a pile of new columns that would sit NULL for every other strategy.
-
-User's own read: likely "a much easier backtest" than the current mean-reversion state machine, since the mechanism is simpler (detect gap-fill-continuation on ticker A, take a directional position on ticker B with a stop) rather than a full z-score/trailing-buy/arm/trailing-sell state machine.
-
-Not scoped: exact entry trigger (same bar as the gap-fill? confirmed continuation after N minutes?), exit condition for the SOXS leg (fixed target? trailing? time-based?), protective SL sizing, whether this needs the new `params`-JSON schema built first or can be prototyped ad hoc against a scratch table. Not validated against real data yet — only the underlying gap-fill-continuation rate has been confirmed; the inverse-ticker trade's own win rate/sizing has not been backtested.
-
 ## [backtest][tooling] (revisit ~2026-09-19) — check whether Massive's dividends endpoint exposes a distribution before or only after its ex-date
 Real test case in hand: SPY's next scheduled ex-dividend date is 2026-09-18 (real, publicly
 known — payment 2026-10-30). Checked 2026-08-22: Massive's `/stocks/v1/dividends` for SPY does
@@ -192,6 +183,10 @@ post-payment rather than post-ex-date) to see exactly when/whether the record ap
 determines whether future vintage-rebuild triggers for the massive_hourly_derived pipeline
 (see [[project_data_subscription_upgrade]]-adjacent 2026-08-22 pipeline work, not yet fully
 landed/reviewed) can ever be proactive or must always be reactive (checking after the fact).
+Status update 2026-08-29: `scripts/corp_action_canary.py` (built 2026-08-28) is now actually
+scheduled — added to crontab at `*/15 * * * *` this evening, after ~1 day built-but-idle with
+no scheduling anywhere. It's now really polling for real going forward, producing the data
+points this item is waiting on.
 
 ## [tooling] Found 2026-08-22 — Stop hook's "session wrap ran this turn" check isn't session-scoped
 The `session_cache_update.py`-ran checkpoint hook (enforces the `***** Ready to clear ****`
