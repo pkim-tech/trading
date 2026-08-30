@@ -79,7 +79,7 @@ from run_overlay_shim import ensure_candidate_nodes_table, ensure_table as ensur
 from locate_best_node import get_or_create_candidate_node, set_pick_comment, get_pick_comment
 from walk_forward_check import walk_forward, summarize as summarize_folds
 from train_test_split_check import period_spy_bh
-from run_optimization_sweep import _load_node_inputs, CACHE_DIR
+from run_optimization_sweep import _load_node_inputs, CACHE_DIR, _current_kernel_git_state, _REPORT_GEN_FILES
 from backtester import run_backtest_dispatch, run_backtest_v110
 from check_stock_splits import check_ticker as _check_splits
 from v4_max_drawdown import max_drawdown
@@ -2001,6 +2001,7 @@ def run_gt_full_review(conn, tickers, csv_name, xlsx_name, vol_gate=DEFAULT_VOL_
         out_path = Path("output") / _timestamped_name(csv_name, ".csv")
         out_path.parent.mkdir(exist_ok=True)
         with open(out_path, "w", newline="") as f:
+            f.write(f"# Generated: {_git_provenance_stamp()}\n")
             w = csv.DictWriter(f, fieldnames=FIELDNAMES)
             w.writeheader()
             for row in csv_rows:
@@ -2020,6 +2021,18 @@ def _timestamped_name(name, ext):
     versioning exists for coexistence" convention as backtest_cache."""
     stem = name[: -len(ext)] if name.endswith(ext) else name
     return f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+
+
+def _git_provenance_stamp():
+    """Best-effort commit/dirty/timestamp stamp for report provenance -- filed
+    against the real 2026-08-23 incident (docs/backlog_cache.md) where a
+    generated report was trusted as current for over an hour after two
+    commits changed the numbers in it, with nothing flagging staleness."""
+    commit, dirty = _current_kernel_git_state(_REPORT_GEN_FILES)
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    if commit is None:
+        return f"commit=unknown at {ts}"
+    return f"commit={commit[:12]}{'*dirty*' if dirty else ''} at {ts}"
 
 
 def _write_xlsx(name, csv_rows):
@@ -2050,6 +2063,7 @@ def _write_xlsx(name, csv_rows):
     for col, definition in COLUMN_DEFS.items():
         def_ws.append([col, definition])
         def_ws.cell(row=def_ws.max_row, column=2).alignment = Alignment(wrap_text=True, vertical="top")
+    def_ws.append(["Generated", _git_provenance_stamp()])
     def_ws.column_dimensions["A"].width = 32
     def_ws.column_dimensions["B"].width = 110
 
@@ -2288,6 +2302,7 @@ def main():
         out_path = Path("output") / csv_name
         out_path.parent.mkdir(exist_ok=True)
         with open(out_path, "w", newline="") as f:
+            f.write(f"# Generated: {_git_provenance_stamp()}\n")
             w = csv.DictWriter(f, fieldnames=FIELDNAMES)
             w.writeheader()
             for row in csv_rows:

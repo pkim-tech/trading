@@ -453,10 +453,16 @@ def init_idempotent_db():
     conn.close()
 
 
-def _current_kernel_git_state():
-    """Returns (git_commit, kernel_dirty) for the running process's checkout --
+_REPORT_GEN_FILES = ["scripts/candidate_summary_report.py", "scripts/candidate_full_review.py",
+                     "run_optimization_sweep.py", "backtester.py", "strategies.py"]
+
+
+def _current_kernel_git_state(files=("backtester.py", "strategies.py")):
+    """Returns (git_commit, dirty) for the running process's checkout --
     best-effort: any failure (git missing, not a repo, etc.) returns (None, None)
-    rather than blocking a real sweep run over a provenance nicety."""
+    rather than blocking a real sweep/report run over a provenance nicety.
+    `files` scopes the dirty-check; defaults to the kernel files (sweep_runs
+    provenance). Report-gen callers pass _REPORT_GEN_FILES instead."""
     import subprocess
     repo_dir = str(Path(__file__).resolve().parent)
     try:
@@ -465,7 +471,7 @@ def _current_kernel_git_state():
             text=True, timeout=5, check=True
         ).stdout.strip()
         dirty_out = subprocess.run(
-            ["git", "status", "--porcelain", "--", "backtester.py", "strategies.py"],
+            ["git", "status", "--porcelain", "--", *files],
             cwd=repo_dir, capture_output=True, text=True, timeout=5, check=True
         ).stdout
         return commit, int(bool(dirty_out.strip()))

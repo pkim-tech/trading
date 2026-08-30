@@ -587,10 +587,27 @@ def _row_to_record(row):
     }
 
 
+def _git_provenance_stamp():
+    """Best-effort commit/dirty/timestamp stamp for report provenance -- filed
+    against the real 2026-08-23 incident (docs/backlog_cache.md) where a
+    generated report was trusted as current for over an hour after two
+    commits changed the numbers in it, with nothing flagging staleness.
+    Lazy-imported per this file's existing run_optimization_sweep import
+    convention (see module docstring above -- avoids its import-time
+    logging.basicConfig side effect on every plain legacy-mode run)."""
+    from run_optimization_sweep import _current_kernel_git_state, _REPORT_GEN_FILES
+    commit, dirty = _current_kernel_git_state(_REPORT_GEN_FILES)
+    ts = _datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    if commit is None:
+        return f"commit=unknown at {ts}"
+    return f"commit={commit[:12]}{'*dirty*' if dirty else ''} at {ts}"
+
+
 def _write_csv(name, rows, col_defs=COLUMN_DEFS, to_record=_row_to_record):
     out_path = Path("output") / (name if name.endswith(".csv") else f"{name}.csv")
     out_path.parent.mkdir(exist_ok=True)
     with open(out_path, "w", newline="") as f:
+        f.write(f"# Generated: {_git_provenance_stamp()}\n")
         w = csv.DictWriter(f, fieldnames=list(col_defs.keys()))
         w.writeheader()
         for row in rows:
@@ -628,6 +645,7 @@ def _write_xlsx(name, rows, col_defs=COLUMN_DEFS, to_record=_row_to_record):
     for col, definition in col_defs.items():
         def_ws.append([col, definition])
         def_ws.cell(row=def_ws.max_row, column=2).alignment = Alignment(wrap_text=True, vertical="top")
+    def_ws.append(["Generated", _git_provenance_stamp()])
     def_ws.column_dimensions["A"].width = 32
     def_ws.column_dimensions["B"].width = 110
 
