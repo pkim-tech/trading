@@ -1,5 +1,8 @@
 # Backlog
 
+## ✅ [backtest] Resolved 2026-08-28 (Search Completeness Audit, first real run) — SOXL TrailingBoth fixed_sl=7's generational-search winner confirmed as the TRUE global optimum
+`scripts/search_completeness_audit.py` ran the full 756,000-cell brute-force mesh (every TP/SL 1-30, not just the coarse grid's sparse values) for this scope -- its top-9 (3 islands x top-3) came back byte-identical to the generational Phase1->Phase2->Phase2.5 search's own 9, in the same order, same CAGR values (top: TP=30/SL=8/hold=70/tpct=6.0, 93.94% CAGR, confirmed as the single best cell in the entire grid). Real, positive validation of the island-based design for this scope -- no action needed beyond noting the result. Full writeup: `docs/research_log.md`.
+
 ## [tooling] Open, paused 2026-08-29 (v6.3) — `params_json` proven end-to-end (write + Phase4 + Phase5), deliberately NOT wired into production call paths yet
 **Reframed 2026-08-29 (later still), per planner clarification**: this was originally logged as two separate closed items ("v6.3" round-trip verification + retirement, then "v6.4" as a follow-on). Per the user's actual stated goal, both are pieces of ONE still-open thread — params_json working correctly through the entire research/backtest stack, not just "written correctly to `candidate_nodes`." Merged back into a single entry below; nothing removed, only reframed.
 

@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest] Resolved 2026-08-28 (Search Completeness Audit, first real run) — SOXL TrailingBoth fixed_sl=7's generational-search winner confirmed as the TRUE global optimum (756,000-cell brute-force mesh, byte-identical top-9). Full detail: `deep_backlog.md`.
+
 ## [live-trading][testing] Resolved 2026-08-29 — `verify_real_trades_vs_kernel.py`'s still-open-trade blind spot fixed (238504c/ebf86c2), full bipartite matching. Full detail: `deep_backlog.md`.
 
 ## [backtest][specced] Resolved 2026-08-29 — fold top-X trade-sequence retention resolved via `backtest_winner_trades`/`get_cached_trades` (different mechanism than originally proposed), not the sweep-inner-loop heap design. Full detail: `deep_backlog.md`.
