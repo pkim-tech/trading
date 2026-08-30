@@ -48,15 +48,40 @@ def test_multi_window_is_one_pooled_axis():
     assert bench.WINDOWS == [5, 10, 15, 20]
     assert isinstance(bench.WINDOWS, list)
 
-    # Phase1 task construction pools z x window into a single flat list (mirrors the
-    # `for z in Z_THRESHOLDS for w in WINDOWS` cross-product at ~line 916). With the
-    # AGQ widened grid that is 4 z x 4 w = 16 distinct cells, all in one list.
+    # Exercise the REAL production task-construction function (build_phase1_tasks_grid,
+    # extracted verbatim from run_one_fixed_sl's non-seed-mode branch) rather than a
+    # re-implementation -- this would fail if the real pooling logic ever broke.
+    # AGQ widened grid: 4 z x 4 w x 1 tp x 1 sl x 1 hold x 1 tpct = 16 pooled cells,
+    # all in ONE flat list (not 16 separate single-cell lists).
     bench.Z_THRESHOLDS = [0.5, 1.0, 1.5, 2.0]
-    cells = [(w, z) for z in bench.Z_THRESHOLDS for w in bench.WINDOWS]
-    assert len(cells) == 16
-    assert len(set(cells)) == 16
-    assert {w for w, _ in cells} == {5, 10, 15, 20}
-    assert {z for _, z in cells} == {0.5, 1.0, 1.5, 2.0}
+    tasks = bench.build_phase1_tasks_grid(
+        bench.Z_THRESHOLDS, bench.WINDOWS,
+        take_profits=[10], stop_losses=[3], hold_time_caps=[14], trail_pcts=[2.0])
+    assert isinstance(tasks, list)
+    assert len(tasks) == 16
+    assert len(set(tasks)) == 16
+    windows_seen = {t[3] for t in tasks}
+    z_seen = {t[4] for t in tasks}
+    assert windows_seen == {5, 10, 15, 20}
+    assert z_seen == {0.5, 1.0, 1.5, 2.0}
+
+
+def test_final_topN_region_filter_does_not_key_on_window_or_z():
+    """Real top-9 selection (~line 1231-1256) filters each island's region only on
+    take_profit/stop_loss proximity to the island center -- confirms window and
+    z_score_threshold are NOT part of that filter, i.e. a pooled multi-window/multi-z
+    run's final ranking genuinely competes across all window/z values together rather
+    than silently re-slicing back to one value each."""
+    import inspect
+    src = inspect.getsource(bench)
+    region_block = src[src.index("final_centers = pick_island_centers(df_final"):
+                        src.index("n_converged = sum(")]
+    # The region-selection filter (df_final[...]) must only reference take_profit/
+    # stop_loss island-proximity, never window/z_score_threshold.
+    filter_block = region_block[region_block.index("region = df_final["):
+                                 region_block.index("region = region[region")]
+    assert "window" not in filter_block
+    assert "z_score_threshold" not in filter_block
 
 
 def test_single_window_still_works():

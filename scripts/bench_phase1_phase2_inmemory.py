@@ -531,6 +531,20 @@ def _load_seed_node(watch_list_id):
     return seed
 
 
+def build_phase1_tasks_grid(z_thresholds, windows, take_profits, stop_losses, hold_time_caps,
+                             trail_pcts):
+    """The REAL Phase1 task cross-product (extracted verbatim from run_one_fixed_sl's
+    non-seed-mode branch, 2026-08-29 paired-review MEDIUM fix, so a test can assert
+    against the actual production code path instead of a re-implementation). z and
+    window are pooled into the SAME flat list -- this is what makes a multi-value
+    --window/--z-thresholds run ONE campaign (shared island centers / top-9 ranking
+    downstream) instead of N separate ones."""
+    return [(int(tp), int(sl), int(hold), int(w), float(z), float(tpct))
+            for z in z_thresholds for w in windows
+            for tp in take_profits for sl in stop_losses
+            for hold in hold_time_caps for tpct in trail_pcts]
+
+
 def apply_grid_overrides(args):
     """Replace the module-level Phase1 grid axes WINDOWS / Z_THRESHOLDS with explicit
     CLI values, if given. Each is a PLAIN REPLACE (not an add) and stays ONE pooled
@@ -755,6 +769,18 @@ def main():
     # one version string legitimately covers every (strategy, fixed_sl) combo from a
     # single campaign's real invocations.
     version = "bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
+    if args.z_thresholds is not None:
+        # z discriminator (2026-08-29, paired review, CONFIRMED HIGH by both independent-
+        # cold and contextual): without this, version (and therefore sweep_run_log's dedup
+        # key, which includes version) can't tell a --z-thresholds widened-grid run apart
+        # from a standard-z-grid run at the same (ticker, strategy, fixed_sl, windows,
+        # date-range) -- a prior standard-grid finished row would make a --z-thresholds
+        # run hit "already done...skipping" and do ZERO work, AND (independent of dedup)
+        # the two runs' candidate_nodes/backtest_phase1_insurance rows would land under an
+        # indistinguishable version string, unioning two different grids' top-9s under one
+        # version. Exact same failure class the seed-mode `-seed<id>` suffix below already
+        # solves for seed mode -- same fix shape, applied to the other new grid axis.
+        version += f"-z{'-'.join(str(z) for z in Z_THRESHOLDS)}"
     if args.seed_watch_list_id is not None:
         # Seed-mode discriminator (2026-08-29, paired review): without this, sweep_run_log's
         # dedup key (ticker/strategy/fixed_sl/windows/version) can't tell a seed-mode smoke
@@ -924,10 +950,8 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         print(f"Seed mode: Phase1 task list reduced to ONE cell: {_seed_task} "
               f"(bypasses the {len(TAKE_PROFITS) * len(STOP_LOSSES) * len(HOLD_TIME_CAPS) * len(TRAIL_PCTS) * len(Z_THRESHOLDS) * len(WINDOWS):,}-cell full grid)")
     else:
-        phase1_tasks = [(int(tp), int(sl), int(hold), int(w), float(z), float(tpct))
-                         for z in Z_THRESHOLDS for w in WINDOWS
-                         for tp in TAKE_PROFITS for sl in STOP_LOSSES
-                         for hold in HOLD_TIME_CAPS for tpct in TRAIL_PCTS]
+        phase1_tasks = build_phase1_tasks_grid(
+            Z_THRESHOLDS, WINDOWS, TAKE_PROFITS, STOP_LOSSES, HOLD_TIME_CAPS, TRAIL_PCTS)
 
     # Seed mode never uses the checkpoint at all (2026-08-29, paired review round 4,
     # CONFIRMED by both reviewers): the round-3 repeatability fix bypassed sweep_run_log's
