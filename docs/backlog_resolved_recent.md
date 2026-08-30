@@ -1,5 +1,11 @@
 # Backlog — Recently Resolved
 
+## [backtest] Resolved-as-decided-won't-pursue 2026-08-30 — trailing-stop peak-update ordering (one-sided optimistic assumption, raised 2026-08-21) closed per user's call; not proven safe, just not being pursued further. Full detail: `deep_backlog.md`.
+
+## [live-trading][backtest] Resolved-as-moot/superseded 2026-08-30 — SOXL/LABU same-bar-SL divergence (raised 2026-08-21) closed by the GT/minute/second-level granularity upgrade, not by the originally-planned fill-bar-SL-check removal (never built). Full detail: `deep_backlog.md`.
+
+## [live-trading][monitoring] Resolved 2026-08-30 — direxion/proshares reverse-split press-release monitoring (raised 2026-08-19) folded into `daily-routine-check` skill as a periodic WebSearch-mirror checklist step. Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved-as-decided-won't-pursue 2026-08-29 — trade the inverse ticker on gap-fill-continuation signal (raised 2026-08-22) closed; likely an hourly-granularity artifact, not a real pattern. Full detail: `deep_backlog.md`.
 
 ## [tooling] Resolved 2026-08-29 — `isolation:worktree` root cause understood (runtime tool-call checks, not sandboxing; highest-risk vector is backgrounded/resumed agents losing binding), folded into dispatch-to-peer skill. Full detail: `deep_backlog.md`.

@@ -49,6 +49,19 @@ wrong answers that night.
    intra-window price noise (a genuine detection gap in hourly-bar backtest
    resolution) from a bug in the backtest replay logic itself.
 
+6. **Reverse-split press-release check (periodic, not every check-in)** --
+   every few days (not daily -- matches `scripts/corporate_actions.py`'s own
+   manual/periodic design intent), for each real live-capital ticker not
+   checked in the last ~week, WebSearch its sponsor's press-release page for
+   any new reverse-split announcement. Direct fetches to `direxion.com`/
+   `proshares.com` are 403/404-blocked -- use WebSearch and mirror/syndication
+   sources instead (Yahoo Finance, GlobeNewswire, prnewswire.com,
+   sponsor-adjacent newsroom pages like `newsroom.bmo.com`/
+   `microsectors.com` load fine directly). If a real announcement is found,
+   record it via `corporate_actions.py add`. No per-ticker last-checked-date
+   tracking exists yet -- treat "not checked in the last ~week" as a manual
+   judgment call, not a queryable state.
+
 ## Interpreting a coverage_check.py "miss" -- don't take the label at face value
 
 A `trade_lifecycle` miss ("no closed trade found for TICKER") can mean
