@@ -3829,6 +3829,25 @@ def get_closed_trades_exited_on_date(ticker, check_date, strategy=None, version=
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
 
+def get_real_taxable_losses_for_ticker(ticker, account='brokerage'):
+    """Real (is_dry_run_sim=0), closed, negative-pnl_pct trade_log rows for
+    `ticker` in the given taxable `account` -- across ALL nodes/wl_ids for that
+    ticker, since a wash-sale loss disallowance is a security-level tax event,
+    not scoped to this project's own node/wl_id bookkeeping (same reasoning as
+    docs/watchlist_candidate_checklist.md check #16's "ticker-wide, not just
+    the exact wl_id" correction, 2026-08-19). Added for
+    signals_invariants.check_no_wash_sale_risk_backstop -- see that function's
+    docstring for the trade_log-completeness caveat that applies to this
+    query's results (older history may be incomplete)."""
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM trade_log WHERE ticker = ? AND account = ? AND is_dry_run_sim = 0 "
+            "AND exit_time IS NOT NULL AND pnl_pct IS NOT NULL AND pnl_pct < 0 "
+            "ORDER BY exit_time DESC",
+            (ticker, account)
+        ).fetchall()]
+
+
 def get_closed_trades_entered_on_date(ticker, check_date, strategy=None, version=None,
                                        window=None, account=None, wl_id=None):
     """trade_log rows that ENTERED on check_date (YYYY-MM-DD), regardless of

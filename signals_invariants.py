@@ -425,6 +425,130 @@ def check_tax_advantaged_excluded_tickers():
     return violations
 
 
+def check_no_wash_sale_risk_backstop():
+    """DETECT-ONLY backstop for the IRS wash-sale-into-IRA rule (Rev. Rul.
+    2008-5): a real taxable-account (`brokerage`) loss on a ticker, followed
+    by a same-security repurchase in a tax-advantaged account (ira/roth/
+    soxl_ira/sep) within a 61-day window CENTERED on the loss sale date (30
+    days before the sale through 30 days after), permanently disallows that
+    loss. The reverse direction (a tax-advantaged loss followed by a taxable
+    repurchase) has no tax consequence and is not checked here -- an IRA/
+    Roth/SEP sale never generates a reportable capital loss in the first
+    place.
+
+    THIS IS A BACKSTOP, NOT THE PRIMARY DEFENSE. The real, working mitigation
+    is operational: each ticker is kept pinned to one account rather than
+    moved/rotated across accounts, and
+    docs/watchlist_candidate_checklist.md's check #16 covers this manually,
+    ticker-wide, whenever a promotion moves a ticker across the taxable/
+    tax-advantaged boundary. This check exists to catch an EXCEPTION to that
+    pinning habit (e.g. a future account reassignment done without running
+    check #16) -- it is not evidence the risk surface is being actively
+    exploited. Real incident this backstops: trading_incidents #2 (GDXU/
+    soxl_ira, 2026-08-23) -- a 2026-07-06 brokerage loss followed by a
+    2026-07-24/27 soxl_ira repurchase (node 108), found only after the fact.
+
+    Anchor date -- actual real BUY fill time(s) for the tax-advantaged
+    node, not the node's `added_at`/promotion timestamp: the wash-sale
+    mechanic is triggered by when replacement shares were actually
+    acquired, not by when a node was flagged live. A live node can sit for
+    weeks with no fill, during which no tax event has occurred yet -- using
+    `added_at` would both false-positive (flagging a node that never
+    actually bought anything in-window) and could false-negative (a node
+    added long before the window but whose actual fill lands inside it).
+    Pulls real (is_dry_run_sim=0) entry_time from both closed trade_log rows
+    (db.get_trade_log_for_wl_id) and any current open_positions row
+    (db.get_open_position_by_wl_id) for the node's wl_id.
+
+    Checked against db.get_real_taxable_losses_for_ticker(ticker), which is
+    scoped to the ticker across ALL brokerage-account nodes/wl_ids, not just
+    a matching wl_id -- a wash sale is a security-level tax event, not
+    bounded by this project's own node bookkeeping (same correction check
+    #16 itself documents, 2026-08-19: an earlier promotion pass wrongly
+    scoped the check to one wl_id).
+
+    KNOWN LIMITATION -- trade_log completeness for older history is
+    unverified. The real GDXU incident's own 2026-07-06 originating loss
+    does not exist in current trade_log at all (only rows from 2026-07-24
+    onward are present) -- this check can only see a violation if the
+    loss-side row survived in trade_log. A gap in older history can hide a
+    real violation silently; this is a known limitation, not a guarantee of
+    complete coverage. Does not replace check #16's manual review.
+
+    KNOWN LIMITATION -- scoped to CURRENTLY state='live' nodes only (via
+    db.get_live_nodes(), same scope as check_tax_advantaged_excluded_tickers)
+    -- this is a going-forward backstop for live tax-advantaged nodes, not a
+    retroactive historical audit. A node that already incurred this exact
+    exposure and was later archived or demoted to research/paper (the real
+    GDXU wl_id=108 is state='research' as of this writing) will NOT be
+    re-surfaced here even though the underlying fills are still in
+    trade_log. A one-off historical audit across ALL nodes (not just
+    currently-live ones) would need its own separate script.
+    """
+    violations = []
+    for node in db.get_live_nodes():
+        ticker = (node.get('ticker') or '').upper()
+        account = node.get('account') or ''
+        wl_id = node['id']
+        if not ticker or not account:
+            continue
+        try:
+            is_tax_advantaged = db._is_tax_advantaged_account(account)
+        except ValueError:
+            continue  # unrecognized account already flagged elsewhere (check_all_account_values_are_known_aliases)
+        if not is_tax_advantaged:
+            continue
+
+        # limit=100_000 (get_trade_log_for_wl_id defaults to 50, newest-first) --
+        # a real node's full fill history must be scanned here, not just its most
+        # recent 50 closes, or an older disallowed loss would silently drop out.
+        entry_times = set()
+        for t in db.get_trade_log_for_wl_id(wl_id, paper=False, limit=100_000):
+            if not t.get('is_dry_run_sim') and t.get('entry_time'):
+                entry_times.add(t['entry_time'])
+        open_pos = db.get_open_position_by_wl_id(wl_id, paper=False)
+        if open_pos and not open_pos.get('is_dry_run_sim') and open_pos.get('entry_time'):
+            entry_times.add(open_pos['entry_time'])
+        if not entry_times:
+            continue  # no real fill has ever happened on this node -- no tax event to check yet
+
+        losses = db.get_real_taxable_losses_for_ticker(ticker, account='brokerage')
+        if not losses:
+            continue
+
+        for entry_time in entry_times:
+            try:
+                entry_dt = datetime.fromisoformat(entry_time)
+            except (ValueError, TypeError):
+                continue
+            for loss in losses:
+                try:
+                    loss_dt = datetime.fromisoformat(loss['exit_time'])
+                except (ValueError, TypeError):
+                    continue
+                # Calendar-date difference, not a raw datetime delta -- the IRS window
+                # is 30 CALENDAR days each side of the sale date. A raw (entry_dt -
+                # loss_dt).days truncates toward zero, which is asymmetric around
+                # midnight (e.g. a loss at 15:30 and a repurchase at 09:30 exactly 31
+                # calendar days later evaluates to .days == 30 and would be wrongly
+                # flagged as in-window).
+                if abs((entry_dt.date() - loss_dt.date()).days) <= 30:
+                    violations.append(
+                        f"{ticker} (wl_id={wl_id}, account={account!r}): real buy fill at "
+                        f"{entry_time} is within 61 days of a real brokerage-account loss "
+                        f"(exit_time={loss['exit_time']}, pnl_pct={loss['pnl_pct']:.2f}%, "
+                        f"trade_log id={loss['id']}) -- this may have permanently disallowed "
+                        f"that loss under the wash-sale-into-IRA rule (Rev. Rul. 2008-5). "
+                        f"BACKSTOP CHECK ONLY -- verify against real brokerage records; "
+                        f"trade_log completeness for older history is unverified (see this "
+                        f"check's docstring)."
+                    )
+                    # Deliberately no break -- each distinct disallowed loss is a
+                    # separate real tax event and must surface as its own violation
+                    # line, not be collapsed into "one flag per fill."
+    return violations
+
+
 def check_margin_floor_zero_for_trading_enabled_accounts():
     """AccountLimits.margin_floor is dormant scaffolding, not active
     functionality -- it exists to let a genuine full-margin account's real
@@ -1084,6 +1208,7 @@ CHECKS = [
     check_daily_track_overlay_config_matches_live_track,
     check_live_node_missing_account,
     check_tax_advantaged_excluded_tickers,
+    check_no_wash_sale_risk_backstop,
     check_margin_floor_zero_for_trading_enabled_accounts,
     check_starting_notional_within_account_notional_cap,
     check_starting_notional_override_has_staged_config,
