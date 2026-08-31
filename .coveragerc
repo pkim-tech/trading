@@ -1,0 +1,30 @@
+[run]
+# Real line/branch coverage (Task #6, 2026-08-31) -- a separate signal from
+# scripts/coverage_registry.py's Accountability Grid: "did any test touch
+# this line" independent of whether the code logs a coverage_event at all.
+# See scripts/run_coverage.sh for the opt-in invocation.
+branch = True
+source =
+    .
+omit =
+    .venv/*
+    .claude/*
+    tests/*
+    cache/*
+    logs/*
+    output/*
+    fake_venue/*
+    __pycache__/*
+    setup.py
+    conftest.py
+
+[report]
+precision = 1
+skip_empty = True
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+
+[html]
+directory = output/htmlcov

@@ -11,3 +11,4 @@ current_test.json
 docs/session_cache.md
 config.json.bak
 docs/session_transcripts/
+.coverage
