@@ -41,6 +41,7 @@ import schwab.orders.equities as equity_orders
 from schwab.utils import Utils
 
 import schwab_auth
+import schwab_client
 import signals_db as db
 from schwab_client import get_current_price
 from signals_blocks import _post_message
@@ -118,30 +119,81 @@ def run_one(client, account_hash, ticker, test, account_label):
         r = client.place_order(account_hash, order)
         r.raise_for_status()
         order_id = Utils(client, account_hash).extract_order_id(r)
-        msg = f"  UNEXPECTED: order was ACCEPTED (order_id={order_id}) -- check Schwab's UI NOW, consider cancelling."
-        print(msg)
-        _post_message(f"⚠️ SANITY TEST {ticker} — order ACCEPTED, not rejected as expected "
-                       f"(order_id={order_id}) — check Schwab immediately")
-        db.log_coverage_event(f"sanity_{test}", "live", ticker=ticker, result="unexpectedly_accepted",
-                               detail=f"order_id={order_id} qty={quantity}")
-        # A Slack ping alone can be missed if the operator has stepped away
-        # since typing the confirmation -- this position/order has zero row
-        # in open_positions (no watch_list node backs it), so without a
-        # durable ticket it could go unnoticed the same way GDXU's untracked
-        # order did. trading_incidents survives until someone explicitly
-        # resolves it, unlike a Slack message.
-        db.log_incident(
-            f"live_sanity_check: {test} unexpectedly ACCEPTED for {ticker}",
-            f"order_id={order_id} qty={quantity} account={account_label} -- expected Schwab to "
-            f"reject this order; it was accepted instead. This position/order has NO row in "
-            f"open_positions (no watch_list node backs it) and will not be monitored or exited "
-            f"automatically. Verify real state in Schwab's UI and resolve manually.",
-            ticker=ticker, account=account_label, real_money_impact=True)
     except Exception as e:
+        # A real HTTP-level rejection (schwab-py raises on a non-2xx placement
+        # response) -- genuinely rejected before Schwab even queued the order.
         print(f"  REJECTED as expected: {e}")
         _post_message(f"✅ SANITY TEST {ticker} — order rejected as expected ({test})")
         db.log_coverage_event(f"sanity_{test}", "live", ticker=ticker, result="rejected_as_expected",
                                detail=str(e)[:500])
+        return
+
+    # r.raise_for_status() succeeding only means Schwab's placement endpoint
+    # accepted the HTTP REQUEST (HTTP 201) -- it says nothing about whether the
+    # order then survived Schwab's own risk checks. Poll the real terminal
+    # status before declaring an outcome (fixed 2026-08-31, Task #7/incident #16
+    # -- the exact false-positive pattern that already produced 2 historical
+    # manual DB corrections, 2026-07-23/24, docs/deep_backlog.md ~line 6470:
+    # both real runs originally logged 'unexpectedly_accepted' off the bare
+    # HTTP success and were only later confirmed REJECTED by hand). Modeled on
+    # schwab_client._confirm_order_status, the same poll every real order-
+    # placement call site in this project already uses for exactly this reason.
+    status = schwab_client._confirm_order_status(account_hash, order_id)
+    if status in schwab_client._ORDER_TERMINAL_BAD_STATUSES:
+        print(f"  REJECTED as expected (confirmed via status poll: {status}, order_id={order_id})")
+        _post_message(f"✅ SANITY TEST {ticker} — order rejected as expected "
+                       f"({test}, status={status}, order_id={order_id})")
+        db.log_coverage_event(f"sanity_{test}", "live", ticker=ticker, result="rejected_as_expected",
+                               detail=f"order_id={order_id} qty={quantity} status={status}")
+        return
+
+    if status is None:
+        # The poll itself failed (network error on every attempt) -- genuinely
+        # unconfirmed, not evidence of either outcome. Fail toward the
+        # cautious/manual path rather than guessing, matching every other
+        # schwab_client caller's convention for a None status (see
+        # get_order_status's own docstring).
+        msg = (f"  UNCONFIRMED: order_id={order_id} was submitted but the post-placement status "
+               f"poll failed -- verify manually in Schwab's UI NOW.")
+        print(msg)
+        _post_message(f"⚠️ SANITY TEST {ticker} — order submitted (order_id={order_id}) but status "
+                      f"poll UNCONFIRMED — verify manually in Schwab's UI NOW")
+        db.log_coverage_event(f"sanity_{test}", "live", ticker=ticker, result="status_unconfirmed",
+                               detail=f"order_id={order_id} qty={quantity}")
+        db.log_incident(
+            f"live_sanity_check: {test} status UNCONFIRMED for {ticker}",
+            f"order_id={order_id} qty={quantity} account={account_label} -- order was submitted "
+            f"but the post-placement status poll failed on every attempt, so real acceptance/"
+            f"rejection is unknown. This position/order has NO row in open_positions (no "
+            f"watch_list node backs it) and will not be monitored or exited automatically. "
+            f"Verify real state in Schwab's UI and resolve manually.",
+            ticker=ticker, account=account_label, real_money_impact=True)
+        return
+
+    # Confirmed FILLED, still WORKING, or any other non-terminal-bad status --
+    # Schwab genuinely accepted this order. This is the real-risk outcome the
+    # test exists to catch, now confirmed by a real status read instead of the
+    # bare HTTP success that produced 2 historical false positives.
+    msg = (f"  UNEXPECTED: order was ACCEPTED (order_id={order_id}, status={status}) -- check "
+           f"Schwab's UI NOW, consider cancelling.")
+    print(msg)
+    _post_message(f"⚠️ SANITY TEST {ticker} — order ACCEPTED (status={status}), not rejected as "
+                  f"expected (order_id={order_id}) — check Schwab immediately")
+    db.log_coverage_event(f"sanity_{test}", "live", ticker=ticker, result="unexpectedly_accepted",
+                           detail=f"order_id={order_id} qty={quantity} status={status}")
+    # A Slack ping alone can be missed if the operator has stepped away
+    # since typing the confirmation -- this position/order has zero row
+    # in open_positions (no watch_list node backs it), so without a
+    # durable ticket it could go unnoticed the same way GDXU's untracked
+    # order did. trading_incidents survives until someone explicitly
+    # resolves it, unlike a Slack message.
+    db.log_incident(
+        f"live_sanity_check: {test} unexpectedly ACCEPTED for {ticker}",
+        f"order_id={order_id} qty={quantity} status={status} account={account_label} -- expected "
+        f"Schwab to reject this order; it was accepted instead. This position/order has NO row in "
+        f"open_positions (no watch_list node backs it) and will not be monitored or exited "
+        f"automatically. Verify real state in Schwab's UI and resolve manually.",
+        ticker=ticker, account=account_label, real_money_impact=True)
 
 
 def main():
