@@ -2099,7 +2099,7 @@ REGISTRY = [
                   "theoretically open a real short instead)",
          code_path="scripts/live_sanity_check.run_one (test='naked_sell'; scenario_key is "
                    "f'sanity_{test}', so a --test oversized_buy run logs under the sibling "
-                   "'sanity_oversized_buy' key instead -- NOT covered by this row, see notes)",
+                   "'sanity_oversized_buy' key instead -- see that row below)",
          offline_coverage="No dedicated unit test found -- this is an operator-run manual live "
                           "sanity script by design (docs reference: scripts/live_sanity_check.py's "
                           "own module docstring)",
@@ -2109,11 +2109,40 @@ REGISTRY = [
                "the real-risk result -- Schwab accepted an order this test expects to be rejected, "
                "meaning the safety-net assumption it's checking (no naked short capability) didn't "
                "hold. 'aborted_real_position_held'/'skipped_by_operator' are self-protective/operator "
-               "declines, 'rejected_as_expected' is the successful-test outcome. SCOPE NOTE: this "
-               "script's --test oversized_buy path logs a distinct, still-unregistered "
-               "'sanity_oversized_buy' scenario_key via the same f'sanity_{test}' call sites -- out "
-               "of this dispatch's assigned 19-key scope (a literal-string scan misses it), flagged "
-               "back to the planner rather than added here silently."),
+               "declines, 'rejected_as_expected' is the successful-test outcome. HISTORICAL NOTE "
+               "(confirmed live in the DB, id=216/148, docs/deep_backlog.md ~line 6470): both real "
+               "runs (2026-07-23/24) initially logged 'unexpectedly_accepted' -- a false positive, "
+               "since r.raise_for_status() succeeding only means Schwab's HTTP 201 accepted the "
+               "*request*, not that the order cleared the broker's own risk checks. A follow-up "
+               "manual poll showed both were genuinely REJECTED; the DB rows carry a manually-added "
+               "'rejected_as_expected_corrected' result documenting the correction (not a value the "
+               "code itself can log, so excluded from bad_results). READ THE CODE, DON'T TRUST THE "
+               "PRIOR CLAIM (found 2026-08-31, Task #5): run_one (this file, ~line 118-121) still "
+               "declares 'unexpectedly_accepted' straight off r.raise_for_status()/extract_order_id, "
+               "with NO follow-up get_order_detail/get_order_status poll before logging -- the exact "
+               "same false-positive-prone pattern that produced both historical corrections is still "
+               "live in current code, unfixed. Flagged back to the planner rather than fixed here "
+               "(Task #5 is a registry sweep, not a fix task)."),
+    dict(id='sanity_oversized_buy',
+         scenario="Manual pre-live-flip sanity test: submits a real BUY for 50x more shares than "
+                  "the account can afford, expecting Schwab to reject at placement for insufficient "
+                  "buying power",
+         code_path="scripts/live_sanity_check.run_one (test='oversized_buy'; scenario_key is "
+                   "f'sanity_{test}', sibling of 'sanity_naked_sell' above)",
+         offline_coverage="No dedicated unit test found -- this is an operator-run manual live "
+                          "sanity script by design (docs reference: scripts/live_sanity_check.py's "
+                          "own module docstring)",
+         check_mechanism='coverage_events', scenario_key='sanity_oversized_buy',
+         bad_results=['unexpectedly_accepted'],
+         notes="Found 2026-08-31 (Task #5, dynamic-scenario_key sweep -- flagged from the prior "
+               "gap-fill dispatch's own sanity_naked_sell notes, missed there because a literal-"
+               "string scan can't resolve f'sanity_{test}' to this value). Unlike naked_sell, this "
+               "test kind has no 'aborted_real_position_held' branch (there's nothing to hold that "
+               "would make an oversized BUY unsafe to attempt) -- only 'skipped_by_operator' "
+               "(declined at the confirmation prompt), 'unexpectedly_accepted' (real risk -- an "
+               "unmonitored real position now exists, also logged to trading_incidents via "
+               "db.log_incident with real_money_impact=True), and 'rejected_as_expected' (the "
+               "successful-test outcome)."),
     dict(id='staged_live_test',
          scenario="Manual bypass-staged real order (scripts/stage_live_test_order.py) -- places a "
                   "real order that skips every schwab_safety guard, for testing an execution-code "
