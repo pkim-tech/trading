@@ -336,3 +336,54 @@ def test_seed_stage_backfill_runs_before_phase25_dispatch():
     assert seed_backfill_idx < phase25_dispatch_idx, (
         "seed-stage window/z backfill must run BEFORE Phase2.5 dispatches, or backfilled "
         "candidates lose their real cliffbox refinement + cliff-safety verification")
+
+
+def test_find_missing_arm_top_n_finds_gaps_and_ranks_by_cagr():
+    """2026-08-30, planner dispatch: the arm_pct (take_profit) backfill's core selection
+    logic, single-axis sibling of find_missing_window_z_top_n -- confirms a take_profit
+    value absent from `present_arms` is detected as missing, its own top-3 cells (by
+    cagr) are returned (not top-1, not top-2, not unranked), and a present arm is left
+    untouched."""
+    df = pd.DataFrame([
+        _synthetic_grid_row(1, 1, 24, 5, 1.0, 0.0, cagr=50.0),   # present arm (take_profit=1)
+        _synthetic_grid_row(2, 2, 24, 5, 1.0, 0.0, cagr=30.0),   # missing arm (take_profit=2) -- top-3
+        _synthetic_grid_row(2, 3, 24, 5, 1.0, 0.0, cagr=25.0),   #   "
+        _synthetic_grid_row(2, 4, 24, 5, 1.0, 0.0, cagr=20.0),   #   "
+        _synthetic_grid_row(2, 5, 24, 5, 1.0, 0.0, cagr=10.0),   #   4th-best -- should be excluded
+        _synthetic_grid_row(3, 5, 24, 5, 1.0, 0.0, cagr=5.0),    # missing arm (take_profit=3) -- only 1 row
+    ])
+    present = {1}
+    missing, rows_by_arm = bench.find_missing_arm_top_n(
+        present, [1, 2, 3], df, tb_cols=["cagr"], tb_asc=[False], top_n=3)
+
+    assert missing == [2, 3]
+    assert [r["stop_loss"] for r in rows_by_arm[2]] == [2, 3, 4]  # top-3 by cagr, not top-1/top-2/top-4
+    assert [r["stop_loss"] for r in rows_by_arm[3]] == [5]        # only 1 available -- no crash
+
+
+def test_find_missing_arm_top_n_zero_evidence_arm_returns_empty_list():
+    """A missing arm value whose df_source slice is entirely empty must report an empty
+    list, distinguishable from 'found some, took top_n' -- not silently absent from the
+    returned dict. Mirrors find_missing_window_z_top_n's own equivalent test."""
+    df = pd.DataFrame([_synthetic_grid_row(1, 1, 24, 5, 1.0, 0.0, cagr=50.0)])
+    present = {1}
+    missing, rows_by_arm = bench.find_missing_arm_top_n(
+        present, [1, 2], df, tb_cols=["cagr"], tb_asc=[False], top_n=3)
+    assert missing == [2]
+    assert rows_by_arm[2] == []
+
+
+def test_seed_stage_arm_backfill_runs_before_phase25_dispatch():
+    """2026-08-30, planner dispatch item 2: same ordering invariant as
+    test_seed_stage_backfill_runs_before_phase25_dispatch above, for the NEW arm_pct
+    backfill -- must run before Phase2.5 dispatches, or a backfilled-by-arm candidate
+    loses its real cliffbox refinement + cliff-safety verification, identical failure
+    mode to the one the window/z backfill's own two-stage design was built to fix."""
+    import inspect
+    src = inspect.getsource(bench.run_one_fixed_sl)
+    seed_arm_backfill_idx = src.index(
+        'missing_arms_seed, backfill_arm_seed_rows = find_missing_arm_top_n(')
+    phase25_dispatch_idx = src.index('desc="Phase2.5-cliffbox')
+    assert seed_arm_backfill_idx < phase25_dispatch_idx, (
+        "seed-stage arm_pct backfill must run BEFORE Phase2.5 dispatches, or backfilled "
+        "candidates lose their real cliffbox refinement + cliff-safety verification")

@@ -75,7 +75,14 @@ ENTRY_TIMING = "open_check"
 # queue.sh's own PROMOTION_ALGO_VERSION shell variable -- same manual-sync convention the
 # existing z/isl/seed suffixes already rely on (no shared single source of truth between
 # the shell script and this module).
-PROMOTION_ALGO_VERSION = 2
+# Bumped 2 -> 3 (2026-08-30, paired-review HIGH finding, independent-cold review of the
+# arm_pct backfill diff): the new arm_pct (take_profit-axis) backfill + the N_ISLANDS
+# 10->3 revert are both material promotion-algorithm changes per this constant's own
+# contract above -- confirmed as a REAL collision, not hypothetical: a --seed-watch-
+# list-id 19 smoke test run under the old pv2 code and a second run under the new
+# arm-backfill code both landed under the identical 'bench-inmemory-...-seed19-pv2'
+# version string in the real research DB before this bump.
+PROMOTION_ALGO_VERSION = 3
 
 
 def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, desc="dispatch"):
@@ -201,7 +208,16 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
         # reviewer's note and (b) get silently overwritten the first time anyone actually
         # comments on a backfilled node. None (-> NULL) for every normal island-selected
         # candidate.
-        selection_source = "backfill_missing_window_z" if c.get("backfilled") else None
+        # backfill_reason (2026-08-30, planner dispatch item 2): distinguishes which axis
+        # triggered the backfill -- "window_z" vs "arm_pct" -- rather than one generic
+        # tag, so a later report can tell the two evidenced gaps apart. Defaults to
+        # "unknown" (2026-08-30, paired-review LOW finding: defaulting to "window_z"
+        # would silently MISLABEL a future third backfill mechanism that forgets to set
+        # this key as window_z, rather than flagging it) for a backfilled candidate dict
+        # that somehow lacks the key -- shouldn't happen, both current backfill call
+        # sites always set it, but a missing-key case should announce itself, not guess.
+        selection_source = (f"backfill_missing_{c.get('backfill_reason', 'unknown')}"
+                             if c.get("backfilled") else None)
         buffer.append((now_iso, ticker, strategy_name, config_version, c["window"],
                        c["z_score_threshold"], float(fixed_sl), arm_pct, trail_buy_pct,
                        trail_sell_pct, c["max_hold_hours"], entry_timing,
@@ -614,6 +630,46 @@ def find_missing_window_z_top_n(present_combos, windows, z_thresholds, df_source
         pool_wz = pool_wz.sort_values(tb_cols, ascending=tb_asc)
         rows_by_combo[(w, z)] = [row for _, row in pool_wz.head(top_n).iterrows()]
     return missing_combos, rows_by_combo
+
+
+def find_missing_arm_top_n(present_arms, all_arms, df_source, tb_cols, tb_asc, top_n=3):
+    """Single-axis sibling of find_missing_window_z_top_n above (2026-08-30, planner
+    dispatch) -- same missing-key-then-top-N-backfill mechanism, but keyed on a single
+    `take_profit` value (the 'arm_pct' axis in candidate_nodes' own storage naming --
+    take_profit is ALWAYS the generic tp/arm axis regardless of strategy, see
+    _insert_candidate_nodes_rows' own forward-mapping docstring) rather than a
+    (window, z) pair.
+
+    Real gap this closes: ETHU's real true best SAFE overlay winner (candidate_nodes
+    id=3144, 514.3% overlay -- the actual maximum, once a CLIFF-rejected higher number is
+    correctly excluded) was discovered via island rank #3's own +-CLIFF_RADIUS neighbor
+    search, NOT as an independently-detected island center -- meaning a real, distinct
+    take_profit region can exist that never becomes its own TP/SL island under a
+    low-N_ISLANDS run, the identical failure mode the window/z backfill above already
+    protects against, just on a different axis.
+
+    A separate, twin function rather than generalizing find_missing_window_z_top_n's own
+    signature to a variable-arity key -- that function is already shipped, tested, and
+    paired-reviewed with 3 real call sites; risking a signature change there for a
+    marginal code-sharing gain isn't worth it given how small this logic is.
+
+    Deliberately NOT extended to trail_buy_pct/trail_sell_pct -- no concrete evidence of
+    missed structure was found on those axes, only window/z (handled above) and arm/TP
+    (here). Scope stays tight to what's actually evidenced, not applied "on principle."
+
+    Returns (missing_arms, rows_by_arm) -- same empty-list-vs-absent-key contract as
+    find_missing_window_z_top_n: `rows_by_arm[arm]` is a list of up to `top_n` pandas
+    Series, or [] if df_source has zero evidence at all for that arm value."""
+    missing_arms = sorted(set(all_arms) - set(present_arms))
+    rows_by_arm = {}
+    for arm in missing_arms:
+        pool_arm = df_source[(df_source["take_profit"] == arm) & df_source["cagr"].notna()]
+        if pool_arm.empty:
+            rows_by_arm[arm] = []
+            continue
+        pool_arm = pool_arm.sort_values(tb_cols, ascending=tb_asc)
+        rows_by_arm[arm] = [row for _, row in pool_arm.head(top_n).iterrows()]
+    return missing_arms, rows_by_arm
 
 
 def cliffbox_tasks_for_cell(cand, trail_pcts, cliff_radius=None, hold_time_caps=None):
@@ -1099,6 +1155,21 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         print(f"Seed mode: TRAIL_PCTS override -> {TRAIL_PCTS} (replaces standard grid "
               f"{_trail_pcts_for_strategy(strategy_name, grid)}, not appended -- round-4 fix)")
 
+        # TAKE_PROFITS override (2026-08-30, paired-review MEDIUM finding against the new
+        # arm_pct backfill): same "reproduce ONE real node's exact config" pin every other
+        # axis already gets above -- TAKE_PROFITS was the one axis seed mode left
+        # un-pinned, which the window/z backfill never noticed (it's naturally inert in
+        # seed mode once window/z are both pinned to one value -- there's nothing left to
+        # be "missing") but the new arm_pct backfill is NOT inert against: with the full
+        # 14-value grid still in play, a seed run would see ~11 of 14 grid arms as
+        # "missing" and backfill-promote real, non-seed candidates under the seed's own
+        # `-seed<id>` version -- silently defeating this mode's whole point. Confirmed via
+        # a real seed-mode smoke test before this fix: 6 extra arm-backfilled candidates
+        # got promoted alongside the seed's own real 6 island candidates.
+        TAKE_PROFITS = [_seed_task[0]]
+        print(f"Seed mode: TAKE_PROFITS override -> {TAKE_PROFITS} (replaces standard grid "
+              f"{grid['take_profits']}, not appended)")
+
     if _seed_task is not None:
         # Seed-mode smoke test (2026-08-29): Phase1 reduced to exactly the one real
         # live node's reverse-mapped task tuple, bypassing the full grid cross-product
@@ -1346,6 +1417,17 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
 
     phase25_tasks = set()
     seed_count = 0
+    # seed_arms_seeded (2026-08-30, paired-review MEDIUM finding, both independent-cold
+    # and contextual review of the arm_pct backfill diff): tracks the ACTUAL take_profit
+    # value of every real seed cell fed into cliffbox_tasks_for_cell -- NOT derived from
+    # phase25_tasks's own expanded contents (see the arm-axis seed-stage backfill below
+    # for why that shortcut, which the window/z backfill safely uses for window/z, is
+    # WRONG on the take_profit axis: cliffbox_tasks_for_cell varies tp over
+    # tp_c +-CLIFF_RADIUS, so one seed at tp=4 would make {t[0] for t in phase25_tasks}
+    # falsely report arms 2,3,4,5,6 as all "already seeded," suppressing real backfill
+    # seeding for a genuinely under-covered arm that happens to fall in another seed's
+    # cliffbox neighbor band).
+    seed_arms_seeded = set()
     for tp_c, sl_c in centers25:
         region = df_full[(df_full["take_profit"] - tp_c).abs().le(FINE_RADIUS)
                           & (df_full["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
@@ -1359,6 +1441,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
             continue
         for _, cand in region.head(3).iterrows():
             seed_count += 1
+            seed_arms_seeded.add(int(cand["take_profit"]))
             phase25_tasks |= cliffbox_tasks_for_cell(cand, TRAIL_PCTS)
 
     print(f"\nPhase2.5-cliffbox (in-memory): {seed_count} seed cells across "
@@ -1408,6 +1491,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
             if pd.isna(cand["cagr"]) or cand["cagr"] <= PHASE25_ISLAND_CLIFFBOX_CAGR_MIN:
                 backfill_seed_skipped_low_cagr.append(combo)
                 continue
+            seed_arms_seeded.add(int(cand["take_profit"]))
             phase25_tasks |= cliffbox_tasks_for_cell(cand, TRAIL_PCTS)
             backfill_seed_count += 1
     if missing_combos_seed:
@@ -1426,6 +1510,54 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
                   f"the normal per-island loop uses) -- still eligible for final-stage "
                   f"promotion from unrefined data, just not densified: {backfill_seed_skipped_low_cagr}")
         print(f"  Cliff-box cells to verify after backfill: {len(phase25_tasks):,} total")
+
+    # arm_pct (take_profit) backfill -- SEED stage (2026-08-30, planner dispatch): same
+    # two-stage requirement as the window/z backfill above, on a different axis -- a
+    # missing take_profit value must ALSO get real Phase2.5 cliffbox refinement before
+    # final-stage promotion, not a bypass straight from raw Phase1/Phase2 data (identical
+    # reasoning to the window/z seed-stage block above; see that block's own comment for
+    # the full "why seed stage, not just final stage" writeup -- not repeated here).
+    # Real gap this closes: see find_missing_arm_top_n's own docstring (ETHU's real true
+    # best SAFE overlay winner was only found via an island's neighbor search, never as
+    # its own independently-detected island center). Same PHASE25_ISLAND_CLIFFBOX_CAGR_MIN
+    # compute-cost floor applies here too, for the same reason (promotion itself stays
+    # floor-free; this only guards the expensive cliffbox expansion).
+    #
+    # seed_arms_seeded (NOT `{t[0] for t in phase25_tasks}`) -- 2026-08-30, paired-review
+    # MEDIUM finding (both independent-cold and contextual review, converging
+    # independently): the window/z backfill's own `seed_present_combos = {(t[3], t[4])
+    # for t in phase25_tasks}` a few lines up is safe because cliffbox_tasks_for_cell
+    # never varies window/z within one seed's expansion -- but it DOES vary take_profit
+    # over tp_c +-CLIFF_RADIUS, so the same shortcut on this axis would falsely count a
+    # neighbor-band arm as "already seeded" even though it was never its own seed,
+    # suppressing real backfill seeding for it. `seed_arms_seeded` (built directly from
+    # each seed loop's own `cand["take_profit"]`, above) has no such radius-inflation.
+    missing_arms_seed, backfill_arm_seed_rows = find_missing_arm_top_n(
+        seed_arms_seeded, TAKE_PROFITS, df_full, tb_cols, tb_asc, top_n=3)
+    backfill_arm_seed_count = 0
+    backfill_arm_seed_skipped_low_cagr = []
+    for arm, rows in backfill_arm_seed_rows.items():
+        for cand in rows:
+            if pd.isna(cand["cagr"]) or cand["cagr"] <= PHASE25_ISLAND_CLIFFBOX_CAGR_MIN:
+                backfill_arm_seed_skipped_low_cagr.append(arm)
+                continue
+            phase25_tasks |= cliffbox_tasks_for_cell(cand, TRAIL_PCTS)
+            backfill_arm_seed_count += 1
+    if missing_arms_seed:
+        zero_evidence_arm_seed = [a for a, rows in backfill_arm_seed_rows.items() if not rows]
+        print(f"arm_pct backfill (seed stage): {len(missing_arms_seed)} take_profit value(s) "
+              f"with zero representation among the normal Phase2.5 seed picks -- adding "
+              f"{backfill_arm_seed_count} extra seed cell(s) (top-3 each, from raw "
+              f"Phase1+Phase2 data) into the SAME cliffbox sweep: {missing_arms_seed}")
+        if zero_evidence_arm_seed:
+            print(f"  {len(zero_evidence_arm_seed)} of those had NO evidence at all (every "
+                  f"cell had trades=0) -- 0 seed cells added: {zero_evidence_arm_seed}")
+        if backfill_arm_seed_skipped_low_cagr:
+            print(f"  {len(backfill_arm_seed_skipped_low_cagr)} seed cell(s) skipped cliffbox "
+                  f"expansion (top cagr <= {PHASE25_ISLAND_CLIFFBOX_CAGR_MIN} or NaN) -- still "
+                  f"eligible for final-stage promotion from unrefined data, just not "
+                  f"densified: {backfill_arm_seed_skipped_low_cagr}")
+        print(f"  Cliff-box cells to verify after arm_pct backfill: {len(phase25_tasks):,} total")
 
     # Real overlap check: how many of Phase2.5's cells were ALREADY computed in
     # Phase1 and/or Phase2? Real production would skip these via cache-lookup;
@@ -1549,6 +1681,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
                 "trail_sell_pct": key[5], "cagr": float(cand["cagr"]),
                 "trades": int(cand["trades"]), "alpha_vs_spy": float(cand["alpha_vs_spy"]),
                 "converged_from_islands": [], "backfilled": True,
+                "backfill_reason": "window_z",
             }
             claimed[key] = c
             final_candidates.append(c)
@@ -1561,6 +1694,46 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         if combos_with_zero_evidence:
             print(f"  {len(combos_with_zero_evidence)} of those had NO evidence at all (every "
                   f"cell had trades=0) -- contributed 0, not 2: {combos_with_zero_evidence}")
+
+    # arm_pct (take_profit) backfill -- FINAL stage (2026-08-30, planner dispatch): same
+    # shape as the window/z final-stage block above, on the take_profit axis instead --
+    # re-detected fresh from final_candidates' own coverage (not reused from the seed
+    # stage, same reasoning as the window/z final-stage block: Phase2.5/convergence-dedup
+    # can legitimately shift which arm values actually land a final slot). df_final at
+    # this point already includes the seed-stage arm backfill's own cliffbox rows, so a
+    # backfilled-here candidate still gets a real cliff-safety verdict, not a degenerate
+    # one.
+    present_arms_final = {c["take_profit"] for c in final_candidates}
+    missing_arms, backfill_arm_final_rows = find_missing_arm_top_n(
+        present_arms_final, TAKE_PROFITS, df_final, tb_cols, tb_asc, top_n=3)
+    backfilled_arm_count = 0
+    for arm, rows in backfill_arm_final_rows.items():
+        for cand in rows:
+            key = (int(cand["take_profit"]), int(cand["stop_loss"]), int(cand["max_hold_hours"]),
+                   int(cand["window"]), float(cand["z_score_threshold"]), float(cand["trail_sell_pct"]))
+            if key in claimed:
+                continue  # already promoted via island selection or the window/z backfill
+                          # above -- shouldn't happen for an arm value we just confirmed
+                          # has zero representation, but safe either way
+            c = {
+                "island": None, "take_profit": key[0], "stop_loss": key[1],
+                "max_hold_hours": key[2], "window": key[3], "z_score_threshold": key[4],
+                "trail_sell_pct": key[5], "cagr": float(cand["cagr"]),
+                "trades": int(cand["trades"]), "alpha_vs_spy": float(cand["alpha_vs_spy"]),
+                "converged_from_islands": [], "backfilled": True,
+                "backfill_reason": "arm_pct",
+            }
+            claimed[key] = c
+            final_candidates.append(c)
+            backfilled_arm_count += 1
+    if missing_arms:
+        arms_with_zero_evidence = [a for a, rows in backfill_arm_final_rows.items() if not rows]
+        print(f"\nBackfilled {backfilled_arm_count} candidate(s) across {len(missing_arms)} "
+              f"take_profit value(s) with zero island representation (top-3 each, where "
+              f"evidence existed): {missing_arms}")
+        if arms_with_zero_evidence:
+            print(f"  {len(arms_with_zero_evidence)} of those had NO evidence at all (every "
+                  f"cell had trades=0) -- contributed 0, not 3: {arms_with_zero_evidence}")
 
     # Cliff-safety verdict per candidate: worst_neighbor_cagr, min(cagr) among cells
     # within +-CLIFF_RADIUS tp/sl of the candidate (same hold/window/z/trail_pct),
@@ -1581,7 +1754,12 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         c["worst_neighbor_cagr"] = float(neighbors["cagr"].min()) if not neighbors.empty else None
         c["n_neighbors_checked"] = len(neighbors)
 
-    _backfill_note = f" + {backfilled_count} backfilled (missing window/z coverage)" if backfilled_count else ""
+    _backfill_bits = []
+    if backfilled_count:
+        _backfill_bits.append(f"{backfilled_count} backfilled (missing window/z coverage)")
+    if backfilled_arm_count:
+        _backfill_bits.append(f"{backfilled_arm_count} backfilled (missing arm_pct coverage)")
+    _backfill_note = f" + {' + '.join(_backfill_bits)}" if _backfill_bits else ""
     print(f"\n=== Final {len(final_candidates)} candidates (post-Phase2.5, {N_ISLANDS} islands x "
           f"top-3{_backfill_note}) ===")
     # sl_axis_col: what the 'stop_loss' column actually means for THIS strategy (see
@@ -1591,7 +1769,8 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # previously missing from this line entirely.
     sl_axis_col, _ = strategies.resolve_axis_columns(strategy_name)
     for c in sorted(final_candidates, key=lambda r: -r["cagr"]):
-        tag = f"island{c['island']}" if c.get("island") is not None else "backfill(missing w/z)"
+        tag = (f"island{c['island']}" if c.get("island") is not None
+               else f"backfill({c.get('backfill_reason', 'unknown')})")
         print(f"  {tag}: TP={c['take_profit']} {sl_axis_col}={c['stop_loss']} "
               f"fixed_sl={fixed_sl} hold={c['max_hold_hours']}h w={c['window']} "
               f"z={c['z_score_threshold']} trail_pct={c['trail_sell_pct']} -> "

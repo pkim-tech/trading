@@ -76,7 +76,17 @@ STRATEGIES="${STRATEGIES:-TrailingBothZScoreBreakout TrailingExitZScoreBreakout}
 FIXED_SL_VALUES="${FIXED_SL_VALUES:-1 2 3 4 5 6 7 8}"
 Z_THRESHOLDS="${Z_THRESHOLDS:-0.5 1.0 1.5 2.0}"
 WINDOWS="${WINDOWS:-5 10 15 20}"
-N_ISLANDS="${N_ISLANDS:-10}"
+# Reverted 10 -> 3 (2026-08-30, planner dispatch, reversing the widen-to-10 decision
+# made earlier the same night): real-data checks against actual campaign output (GDXU/
+# ETHU) found the true best candidate on the metric that matters (core_both_cagr, i.e.
+# overlay CAGR) was ALREADY found at island rank #1-#3 -- evidence did not support the
+# ~2-3x Phase2 cost of N=10 (confirmed ~linear: 3.33x islands -> ~3.3x Phase2 cost,
+# measured directly). The one real gap N=10 was covering (a distinct arm_pct region that
+# never becomes its own TP/SL island) is now handled directly by the arm_pct backfill
+# below instead -- see find_missing_arm_top_n in bench_phase1_phase2_inmemory.py -- which
+# is targeted at the actual evidenced gap rather than paying for a blanket 3x-wider
+# island search.
+N_ISLANDS="${N_ISLANDS:-3}"
 WORKERS="${WORKERS:-8}"
 
 # Pipeline-version discriminator (2026-08-30, planner dispatch item 3) -- MUST match
@@ -87,7 +97,10 @@ WORKERS="${WORKERS:-8}"
 # IDENTICAL version string to a prior, algorithmically different campaign). No shared
 # single source of truth between this shell script and that Python module -- same
 # manual-sync convention the Z_THRESHOLDS/N_ISLANDS suffixes below already rely on.
-PROMOTION_ALGO_VERSION=2
+# Bumped 2 -> 3 (2026-08-30, paired-review HIGH finding): the new arm_pct backfill +
+# N_ISLANDS 10->3 revert are both material promotion-algorithm changes -- MUST match
+# bench_phase1_phase2_inmemory.py's own PROMOTION_ALGO_VERSION exactly.
+PROMOTION_ALGO_VERSION=3
 
 # Must match bench_phase1_phase2_inmemory.py's own version construction --
 # see the header comment above. Z_THRESHOLDS values are joined with '-' exactly
