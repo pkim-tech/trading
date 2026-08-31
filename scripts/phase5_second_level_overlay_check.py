@@ -457,51 +457,108 @@ def _fmt_pp(x):
 
 
 def _filter_to_safe_candidates(candidates):
-    """Gate to Phase4-verified SAFE/SAFE only (2026-08-30, planner dispatch): a candidate
-    Phase4 already flagged core_safe=False or addon_safe=False is cliff-unsafe and
-    disqualified from promotion regardless of what its 1s numbers show -- running Phase5's
-    expensive 1s-verification on it is pure wasted compute (measured directly off the
-    2026-08-29/30 campaign log: 572 of 2,238 Phase5-checked candidates, 25.6%, were already
-    CLIFF-flagged by Phase4). Requires candidate_summary_report.py's --kernel gt Phase4 run
-    to have ALREADY persisted core_safe/addon_safe for this ticker/version (run_inmemory_
-    sweep_queue.sh already runs Phase4 before Phase5, so this ordering holds for the normal
-    campaign path -- see that script's own Phase4-then-Phase5 sequencing).
+    """Gate to Phase4-verified core-SAFE only (2026-08-30, planner dispatch; corrected
+    2026-08-31 same-day follow-up: originally gated on core_safe AND addon_safe both --
+    that was wrong per the user's actual intent). A candidate Phase4 already flagged
+    core_safe=False is cliff-unsafe and disqualified from promotion regardless of what
+    its 1s numbers show -- running Phase5's expensive 1s-verification on it is pure
+    wasted compute (measured directly off the 2026-08-29/30 campaign log, under the
+    ORIGINAL combined core_safe-AND-addon_safe gate: 572 of 2,238 Phase5-checked
+    candidates, 25.6%, were CLIFF-flagged on at least one of the two -- NOT re-measured
+    for core_safe alone against that same historical population, so don't cite 25.6% as
+    a core-only figure. Real core_safe=False-alone count against the CURRENT full
+    phase4_results table, measured 2026-08-31: 589 of 774, vs. 640 of 774 under the old
+    core_safe-OR-addon_safe combined gate -- confirms the new core-only gate is
+    narrower/more permissive than the old one, as intended, on a different, larger,
+    current population than the original 2,238 figure). Requires candidate_summary_
+    report.py's --kernel gt Phase4 run to have
+    ALREADY persisted core_safe for this ticker/version (run_inmemory_sweep_queue.sh
+    already runs Phase4 before Phase5, so this ordering holds for the normal campaign
+    path -- see that script's own Phase4-then-Phase5 sequencing).
 
-    A candidate with NO persisted verdict yet (core_safe or addon_safe is None -- Phase4
-    hasn't covered this ticker/version/candidate at all) is explicitly SKIPPED, with a
-    clear log line distinguishing it from a real CLIFF disqualification -- never silently
-    INCLUDED (would defeat the whole point of gating, verifying a candidate nobody's
-    checked for cliff-safety yet) and never silently folded into the same count as a real
-    CLIFF skip (would look like Phase4 ran and disqualified it, when really Phase4 just
-    hasn't run for it yet).
+    addon_safe is deliberately NOT part of the gate (2026-08-31 correction): it's a real,
+    inseparable byproduct of computing addon_cagr/drought_cagr (same function call
+    produces both, still persisted by Phase4 exactly as before, untouched here), but its
+    own boolean verdict must not exclude a candidate from Phase5. Design principle:
+    core_safe is the real gate (protects against genuinely cliff-fragile candidates);
+    among core-safe survivors, the best overlay/combined CAGR wins the actual selection
+    downstream -- regardless of whether that winning candidate's own addon_safe/drought
+    verdict happened to come back True or False. Gating on addon_safe too would have
+    silently excluded a real winner purely because its ADD-ON overlay (not its core)
+    looked fragile, which was never the intent.
 
-    Only meaningful for a candidate_nodes-sourced candidate (has 'core_safe'/'addon_safe'
-    keys at all -- see phase4_candidate_nodes_resolver.derive_phase25_candidates_from_
+    A candidate with NO persisted core_safe verdict yet (Phase4 hasn't covered this
+    ticker/version/candidate at all) is explicitly SKIPPED, with a clear log line
+    distinguishing it from a real CLIFF disqualification -- never silently INCLUDED
+    (would defeat the whole point of gating, verifying a candidate nobody's checked for
+    cliff-safety yet) and never silently folded into the same count as a real CLIFF skip
+    (would look like Phase4 ran and disqualified it, when really Phase4 just hasn't run
+    for it yet).
+
+    Only meaningful for a candidate_nodes-sourced candidate (has a 'core_safe' key at
+    all -- see phase4_candidate_nodes_resolver.derive_phase25_candidates_from_
     candidate_nodes's own docstring); a backtest_cache-sourced candidate (derive_phase25_
     candidates_ground_truth's output) has no candidate_id to persist a verdict against in
-    the first place, so this function is only ever called on the candidate_nodes path."""
-    safe, unsafe, unverified = [], [], []
+    the first place, so this function is only ever called on the candidate_nodes path.
+
+    pre_filtered bucket (2026-08-31, paired-review HIGH finding): candidate_summary_
+    report.py's gt_rows_for_scope now pre-filters a candidate BEFORE Phase4 even runs,
+    on two conditions -- trades < MIN_TRADES_FOR_PHASE4, or worst_neighbor_cagr < 0 --
+    using data already on the candidate_nodes row itself (written at PROMOTION time by
+    bench_phase1_phase2_inmemory.py, independent of whether Phase4 has run for this
+    scope at all). A pre-filtered candidate therefore never gets a phase4_results row,
+    so without this bucket it would be misclassified as `unverified` ("Phase4 hasn't
+    covered this yet") when the real reason is "Phase4 deliberately declined to spend
+    compute on it, for a known, real reason." Kept SEPARATE from `unverified` for
+    exactly one purpose: the fail-safe below must fire ONLY when NOTHING is known about
+    a scope at all (a real "Phase4 never even saw this scope" gap) -- if pre_filtered
+    has any entries, that PROVES real candidate_nodes data was read successfully, so
+    the scope-detection-gap scenario the fail-safe exists for cannot be what's
+    happening here, and falling back to "verify everyone" would defeat both pre-Phase4
+    filters in precisely the scopes they're supposed to protect (a whole scope of
+    thin/CLIFF candidates, which is a real, plausible case -- confirmed on real data:
+    ETHU alone has 116 of 511 candidate_nodes rows below the trade-count floor)."""
+    # Lazy import (2026-08-31, matches this file's existing convention -- see main()'s
+    # own local `from candidate_summary_report import _write_xlsx` -- so this file's
+    # module-level import chain stays light for callers that never reach this function).
+    from candidate_summary_report import MIN_TRADES_FOR_PHASE4
+    safe, unsafe, unverified, pre_filtered = [], [], [], []
     for c in candidates:
-        core_safe, addon_safe = c.get("core_safe"), c.get("addon_safe")
-        if core_safe is None or addon_safe is None:
+        trades, wnc = c.get("trades"), c.get("worst_neighbor_cagr")
+        if trades is not None and trades < MIN_TRADES_FOR_PHASE4:
+            pre_filtered.append(c)
+            continue
+        if wnc is not None and wnc < 0:
+            pre_filtered.append(c)
+            continue
+        core_safe = c.get("core_safe")
+        if core_safe is None:
             unverified.append(c)
-        elif core_safe and addon_safe:
+        elif core_safe:
             safe.append(c)
         else:
             unsafe.append(c)
+    if pre_filtered:
+        print(f"  Phase4 core-safe gate: skipping {len(pre_filtered)} candidate(s) "
+              f"pre-filtered BEFORE Phase4 even ran (trades < {MIN_TRADES_FOR_PHASE4} "
+              f"or worst_neighbor_cagr < 0, same floors gt_rows_for_scope already "
+              f"applies) -- known, real reasons, not \"Phase4 hasn't run yet\".")
     if unsafe:
-        print(f"  Phase4 SAFE/SAFE gate: skipping {len(unsafe)} CLIFF-flagged candidate(s) "
-              f"(already disqualified by Phase4, Phase5 verification would be wasted compute).")
+        print(f"  Phase4 core-safe gate: skipping {len(unsafe)} CLIFF-flagged candidate(s) "
+              f"(core_safe=False, already disqualified by Phase4, Phase5 verification "
+              f"would be wasted compute) -- addon_safe is not part of this gate.")
     if unverified:
-        print(f"  Phase4 SAFE/SAFE gate: skipping {len(unverified)} candidate(s) with NO "
-              f"persisted Phase4 verdict yet (core_safe/addon_safe not set) -- not silently "
-              f"included, not silently counted as CLIFF, just not yet coverable until "
-              f"Phase4 (--kernel gt) has run for this ticker/version.")
-    if not safe and not unsafe and unverified:
+        print(f"  Phase4 core-safe gate: skipping {len(unverified)} candidate(s) with NO "
+              f"persisted Phase4 core_safe verdict yet -- not silently included, not "
+              f"silently counted as CLIFF, just not yet coverable until Phase4 (--kernel "
+              f"gt) has run for this ticker/version.")
+    if not safe and not unsafe and not pre_filtered and unverified:
         # Fail-safe (2026-08-30, paired-review HIGH finding), KEPT as defense-in-depth
         # even after the root cause below was fixed the same day (planner's explicit
         # instruction: "cheap insurance, no reason to remove it"): if literally EVERY
-        # candidate in this scope is unverified, that's not "a few new candidates Phase4
+        # candidate in this scope is unverified AND NONE were pre-filtered either (2026-
+        # 08-31 correction -- see pre_filtered's own docstring paragraph above for why
+        # this second condition was added), that's not "a few new candidates Phase4
         # hasn't caught up to yet" -- it means Phase4 never covered this exact scope at
         # all. The original trigger for this (candidate_summary_report.run_gt_mode's own
         # `covered` scope-skip set having no version filter, while this file's always has)
@@ -513,9 +570,10 @@ def _filter_to_safe_candidates(candidates):
         # needs -- worse than the wasted compute this whole feature exists to save. Fall
         # back to the pre-gate behavior (verify everyone) for this scope only, loudly,
         # rather than the gate ever emptying a scope entirely.
-        print(f"  Phase4 SAFE/SAFE gate: ALL {len(unverified)} candidates in this scope are "
-              f"unverified -- falling back to verifying all of them (gate disabled for this "
-              f"scope only) rather than silently skipping the entire scope.")
+        print(f"  Phase4 core-safe gate: ALL {len(unverified)} candidates in this scope are "
+              f"unverified (and none were pre-filtered either) -- falling back to verifying "
+              f"all of them (gate disabled for this scope only) rather than silently "
+              f"skipping the entire scope.")
         return candidates
     return safe
 
@@ -628,7 +686,7 @@ def _try_all_stored(scopes, limit):
     moment any candidate anywhere still needs a fresh kernel run (including a
     scope with zero real candidates that were NEVER gated -- nothing to report,
     not "fully stored"). Returns (all_rows, n_gated) otherwise, where `n_gated` is
-    the total candidate count removed by the Phase4 SAFE/SAFE gate across every
+    the total candidate count removed by the Phase4 core-safe gate across every
     scope (2026-08-30, paired-review HIGH finding) -- callers must use this to
     avoid claiming "all already verified" when some/all of a scope's candidates
     were never verified at all, just correctly disqualified pre-Phase5."""
@@ -743,7 +801,7 @@ def main():
 
     if all_rows is not None:
         # Message must be accurate regardless of WHY nothing needed a fresh kernel run
-        # (2026-08-30, paired-review HIGH finding): with the Phase4 SAFE/SAFE gate now
+        # (2026-08-30, paired-review HIGH finding): with the Phase4 core-safe gate now
         # in play, "every candidate already stored" and "every candidate gated out
         # pre-Phase5" are both real ways to reach this branch -- conflating them as one
         # generic "already verified" would misreport a scope that was never actually

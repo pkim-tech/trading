@@ -218,10 +218,26 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
         # sites always set it, but a missing-key case should announce itself, not guess.
         selection_source = (f"backfill_missing_{c.get('backfill_reason', 'unknown')}"
                              if c.get("backfilled") else None)
+        # worst_neighbor_cagr (2026-08-31, planner dispatch): the real scalar the
+        # "Cliff-safety verdict per candidate" block above already computes (min(cagr)
+        # among cells within +-CLIFF_RADIUS tp/sl, same hold/window/z/trail_pct, from
+        # df_final -- the full in-memory Phase1+Phase2+Phase2.5 evidence pool) -- was
+        # PRINT-ONLY before this (see that block's own now-stale "not stored... printed
+        # here only as the benchmark's proof-of-concept" comment, predating candidate_
+        # nodes promotion entirely). Persisted as the RAW REAL value (not a pre-derived
+        # boolean) so a reader applies whatever threshold it needs -- candidate_summary_
+        # report.py's own pre-Phase4 filter uses the exact same `< 0` bar Phase4's own
+        # run_addon_cliff_safety_ground_truth already uses for core_cliff (see that
+        # function's own docstring), so the two stay conceptually aligned even though
+        # they're two independent computations (real equivalence measured separately,
+        # not structurally coupled -- see the pre-filter's own docstring for why).
+        # None when no real neighbor existed (c["n_neighbors_checked"] == 0) -- fails
+        # CLOSED to "unknown," never silently treated as either safe or unsafe.
         buffer.append((now_iso, ticker, strategy_name, config_version, c["window"],
                        c["z_score_threshold"], float(fixed_sl), arm_pct, trail_buy_pct,
                        trail_sell_pct, c["max_hold_hours"], entry_timing,
-                       c["alpha_vs_spy"], c["trades"], now_iso, params_json, selection_source))
+                       c["alpha_vs_spy"], c["trades"], now_iso, params_json, selection_source,
+                       c["worst_neighbor_cagr"]))
 
     with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
@@ -229,6 +245,8 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
             conn.execute("ALTER TABLE candidate_nodes ADD COLUMN params_json TEXT")
         if 'selection_source' not in existing_cols:
             conn.execute("ALTER TABLE candidate_nodes ADD COLUMN selection_source TEXT")
+        if 'worst_neighbor_cagr' not in existing_cols:
+            conn.execute("ALTER TABLE candidate_nodes ADD COLUMN worst_neighbor_cagr REAL")
         before = conn.execute(
             "SELECT COUNT(*) FROM candidate_nodes WHERE version=? AND ticker=? AND strategy=?",
             (config_version, ticker, strategy_name)).fetchone()[0]
@@ -236,8 +254,9 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
             INSERT OR IGNORE INTO candidate_nodes
                 (created_at, ticker, strategy, version, window, z, fixed_sl, arm_pct,
                  trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing,
-                 robust_alpha, trades, robust_alpha_computed_at, params_json, selection_source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 robust_alpha, trades, robust_alpha_computed_at, params_json, selection_source,
+                 worst_neighbor_cagr)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, buffer)
         conn.commit()
         after = conn.execute(
@@ -1738,10 +1757,11 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # Cliff-safety verdict per candidate: worst_neighbor_cagr, min(cagr) among cells
     # within +-CLIFF_RADIUS tp/sl of the candidate (same hold/window/z/trail_pct),
     # sourced from df_final (Phase1+Phase2+Phase2.5 combined -- the full evidence pool
-    # already in memory). This is the scalar we actually persist, per the "compute the
-    # full box, persist only the verdict" design -- NOT stored in backtest_cache today
-    # (no such column exists there; would need a real schema addition to land for
-    # real, printed here only as the benchmark's proof-of-concept).
+    # already in memory). Persisted for real now (2026-08-31, planner dispatch) --
+    # _insert_candidate_nodes_rows writes it to a real candidate_nodes.worst_neighbor_cagr
+    # column, ALTER-guarded same as params_json/selection_source/core_safe. Previously
+    # print-only ("compute the full box, persist only the verdict" was the intent from
+    # the start, just not implemented until now).
     for c in final_candidates:
         neighbors = df_final[
             (df_final["take_profit"] - c["take_profit"]).abs().le(CLIFF_RADIUS)
@@ -1771,11 +1791,17 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     for c in sorted(final_candidates, key=lambda r: -r["cagr"]):
         tag = (f"island{c['island']}" if c.get("island") is not None
                else f"backfill({c.get('backfill_reason', 'unknown')})")
+        # wnc_str (2026-08-31, paired-review LOW finding): worst_neighbor_cagr is
+        # documented as a real None case (n_neighbors_checked == 0) -- unreachable in
+        # practice today (a candidate's own df_final row always satisfies its own
+        # neighbor predicate) but the print must not silently assume that forever.
+        wnc_str = (f"{c['worst_neighbor_cagr']:.2f}%" if c['worst_neighbor_cagr'] is not None
+                   else "N/A")
         print(f"  {tag}: TP={c['take_profit']} {sl_axis_col}={c['stop_loss']} "
               f"fixed_sl={fixed_sl} hold={c['max_hold_hours']}h w={c['window']} "
               f"z={c['z_score_threshold']} trail_pct={c['trail_sell_pct']} -> "
               f"cagr={c['cagr']:.2f}% trades={c['trades']} "
-              f"| worst_neighbor_cagr={c['worst_neighbor_cagr']:.2f}% "
+              f"| worst_neighbor_cagr={wnc_str} "
               f"(n={c['n_neighbors_checked']})")
 
     # Top-9 write: promotion into candidate_nodes (NOT backtest_cache -- per the

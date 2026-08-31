@@ -90,9 +90,19 @@ were never promoted into candidate_nodes at all), PLUS `core_safe`/`addon_safe`
 by candidate_summary_report.py's _persist_phase4_verdicts_and_checklist; True/False/None(unknown,
 Phase4 hasn't covered this candidate yet) tri-state, same semantics
 GT_COLUMN_DEFS' core_safe/addon_safe entries already document -- see
-phase5_second_level_overlay_check.py's SAFE/SAFE gate, the one real consumer):
+phase5_second_level_overlay_check.py's SAFE/SAFE gate, the one real consumer), PLUS
+`trades` (added 2026-08-31, planner dispatch -- real candidate_nodes.trades count,
+already selected by the query, just not previously carried into the dict; feeds
+candidate_summary_report.py's pre-Phase4 trade-count floor), PLUS `worst_neighbor_cagr`
+(added 2026-08-31, planner dispatch -- bench_phase1_phase2_inmemory.py's own real
+cliff-safety scalar, real-valued/None(unknown) tri-state, NULL-safe if the column
+doesn't exist yet on a given DB; feeds candidate_summary_report.py's pre-Phase4
+core-safety floor, same `< 0` bar Phase4's own independent core_cliff computation
+uses -- see that floor's own docstring for why this is validated by measurement, not
+structural coupling, against run_optimization_sweep.py):
 {id, island_tp, island_sl, take_profit, stop_loss, max_hold_hours, window,
- z_score_threshold, tpct, robust_alpha, cagr, phase4_eligible, core_safe, addon_safe}.
+ z_score_threshold, tpct, robust_alpha, cagr, phase4_eligible, core_safe, addon_safe,
+ trades, worst_neighbor_cagr}.
 """
 import os
 import sqlite3
@@ -230,10 +240,19 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
         # instead of an existence-guarded pair of candidate_nodes columns.
         from candidate_verification_store import ensure_phase4_table
         ensure_phase4_table(conn)
+        # worst_neighbor_cagr (2026-08-31, planner dispatch): candidate_nodes column,
+        # written by bench_phase1_phase2_inmemory.py's _insert_candidate_nodes_rows --
+        # same existence guard core_safe/addon_safe used before their consolidation onto
+        # phase4_results (a fresh/test DB, or one whose candidate_nodes rows all predate
+        # this column, won't have it yet) -- select a literal NULL instead of raising
+        # OperationalError.
+        existing_cn_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
+        wnc_sql = ("cn.worst_neighbor_cagr" if "worst_neighbor_cagr" in existing_cn_cols
+                   else "NULL AS worst_neighbor_cagr")
         df = pd.read_sql(f"""
             SELECT cn.id, cn.window, cn.z AS z_score_threshold, cn.arm_pct, cn.trail_buy_pct,
                    cn.trail_sell_pct, cn.max_hold_hours, cn.robust_alpha, cn.trades,
-                   p4.core_safe AS core_safe, p4.addon_safe AS addon_safe
+                   p4.core_safe AS core_safe, p4.addon_safe AS addon_safe, {wnc_sql}
             FROM candidate_nodes cn
             LEFT JOIN phase4_results p4 ON p4.candidate_id = cn.id
             WHERE cn.ticker=? AND cn.strategy=? AND cn.version=? AND cn.fixed_sl=?
@@ -271,6 +290,15 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
                 'phase4_eligible': True,
                 'core_safe': _sql_bool(cand['core_safe']),
                 'addon_safe': _sql_bool(cand['addon_safe']),
+                # trades (2026-08-31, planner dispatch): real candidate_nodes.trades count,
+                # needed by candidate_summary_report.py's pre-Phase4 trade-count floor (skip
+                # Phase4's own expensive addon/drought compute for a candidate with too few
+                # real trades to be statistically meaningful, ~10/year over the campaign's
+                # ~5yr window). Already selected into `df` by the query above -- just not
+                # previously carried into the returned dict shape.
+                'trades': int(cand['trades']),
+                'worst_neighbor_cagr': (None if pd.isna(cand['worst_neighbor_cagr'])
+                                        else float(cand['worst_neighbor_cagr'])),
             })
         return candidates
 
@@ -313,5 +341,14 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
                 'phase4_eligible': True,
                 'core_safe': _sql_bool(cand['core_safe']),
                 'addon_safe': _sql_bool(cand['addon_safe']),
+                # trades (2026-08-31, planner dispatch): real candidate_nodes.trades count,
+                # needed by candidate_summary_report.py's pre-Phase4 trade-count floor (skip
+                # Phase4's own expensive addon/drought compute for a candidate with too few
+                # real trades to be statistically meaningful, ~10/year over the campaign's
+                # ~5yr window). Already selected into `df` by the query above -- just not
+                # previously carried into the returned dict shape.
+                'trades': int(cand['trades']),
+                'worst_neighbor_cagr': (None if pd.isna(cand['worst_neighbor_cagr'])
+                                        else float(cand['worst_neighbor_cagr'])),
             })
     return candidates

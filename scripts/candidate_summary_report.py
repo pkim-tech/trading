@@ -82,6 +82,21 @@ from datetime import datetime as _datetime
 # run_gt_mode() instead (paired-review finding, 2026-08-23, against commit 7ec4663).
 
 DB_PATH = "cache/research/trading_universe.db"
+
+# Pre-Phase4 trade-count floor (2026-08-31, planner dispatch): a real hard pipeline
+# gate, not just a report-layer flag -- user's own ~10 trades/year sampling-confidence
+# reasoning over the campaign's real ~5yr window (2021-08-23 to 2026-08-21). Resolves
+# the earlier "not scoped -- hard filter vs soft/informational column, report vs
+# pipeline" open question the same night's backlog raised. Skips Phase4's own
+# expensive addon/drought computation entirely for a candidate below this floor (see
+# gt_rows_for_scope's own filter, right after the candidate_nodes fallback resolves its
+# candidate list) -- only meaningful for the candidate_nodes-sourced path, since that's
+# the only one whose candidate dicts carry a real 'trades' count (phase4_candidate_
+# nodes_resolver.py); the legacy backtest_cache path's own candidates_override is never
+# read by build_candidate_report_ground_truth for that path (candidates_override=None),
+# so filtering there would be a no-op, not a real gate -- deliberately left alone
+# rather than touching run_optimization_sweep.py (gated) just to add one.
+MIN_TRADES_FOR_PHASE4 = 50
 ROBUST_ALPHA_SQL = ("MIN(alpha_vs_spy, COALESCE(alpha_vs_spy_pessimistic, alpha_vs_spy), "
                      "COALESCE(alpha_vs_spy_certain, alpha_vs_spy))")
 GT_TRANCHES_PATH = Path(__file__).resolve().parent / "gt_tranches.txt"
@@ -885,6 +900,93 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
             if not candidates:
                 print("  [GT candidate report] SKIPPED -- no candidate_nodes candidates for this scope.")
                 return [{**base, "error": "no candidate_nodes candidates for this scope"}]
+            # Pre-Phase4 trade-count floor (2026-08-31, planner dispatch): filters BEFORE
+            # candidates_override reaches build_candidate_report_ground_truth below, so a
+            # too-few-trades candidate never gets its (expensive) addon/drought computed
+            # at all -- not just excluded from the printed report afterward. See
+            # MIN_TRADES_FOR_PHASE4's own module-level docstring for the real rationale.
+            n_before_trades_filter = len(candidates)
+            # c.get("trades") is not None (not the earlier `c.get("trades", 0)`, 2026-08-31
+            # paired-review LOW finding): a missing `trades` key must fail OPEN (don't
+            # filter), matching the sibling worst_neighbor_cagr filter's posture just below
+            # -- the earlier `, 0` default would have SILENTLY EXCLUDED every candidate from
+            # a future candidate source that omits this key, misreporting it as "below the
+            # trade-count floor" when it's really "unknown." Not live today (the resolver
+            # always sets `trades`), but the two adjacent filters must not disagree on this.
+            candidates = [c for c in candidates
+                          if c.get("trades") is None or c["trades"] >= MIN_TRADES_FOR_PHASE4]
+            n_skipped_low_trades = n_before_trades_filter - len(candidates)
+            if n_skipped_low_trades:
+                print(f"  [GT candidate report] pre-Phase4 trade-count floor: skipping "
+                      f"{n_skipped_low_trades} of {n_before_trades_filter} candidate(s) "
+                      f"with < {MIN_TRADES_FOR_PHASE4} trades (Phase4 addon/drought never "
+                      f"computed for them).")
+            if not candidates:
+                print("  [GT candidate report] SKIPPED -- every candidate_nodes candidate "
+                      "for this scope was below the trade-count floor.")
+                return [{**base, "error": "every candidate below MIN_TRADES_FOR_PHASE4"}]
+            # Pre-Phase4 core-safety floor (2026-08-31, planner dispatch): same filtering
+            # point/mechanism as the trade-count floor above -- skips Phase4's own addon/
+            # drought computation entirely for a candidate bench_phase1_phase2_inmemory.py
+            # already flagged core-CLIFF via its own worst_neighbor_cagr (persisted by
+            # _insert_candidate_nodes_rows). Uses the SAME `< 0` threshold Phase4's own
+            # independent run_addon_cliff_safety_ground_truth uses for core_cliff (see
+            # that function's own docstring) -- the two computations are NOT structurally
+            # coupled (an earlier attempt to restructure run_addon_cliff_safety_ground_
+            # truth to trust this value directly was rejected: tracing its neighbor loop
+            # showed the same per-cell simulations are needed regardless for the addon-
+            # side computation, so restructuring wouldn't even save compute). This is NOT
+            # just "matching thresholds by convention," though -- it's provably ONE-
+            # DIRECTIONAL SAFE by construction (2026-08-31, paired-review finding, both
+            # independent-cold and contextual review converged on this): bench's own
+            # neighborhood (+-CLIFF_RADIUS tp/sl, hold/window/z/trail_pct all PINNED to
+            # the candidate's own values, only cells already present in df_final) is a
+            # STRICT SUBSET of Phase4's own neighborhood for the same candidate (same
+            # +-CLIFF_RADIUS tp/sl, but ALSO sweeps hold +-7h and adjacent trail_pct
+            # values, and always evaluates every cell in that box, not just whatever
+            # happened to already exist in df_final) -- and both sides evaluate each cell
+            # through the same underlying kernel convention (same_bar_reentry=True, same
+            # massive/yahoo data_source, confirmed by reading both call sites). A strict
+            # subset of cells can never have a LOWER minimum than the full box, so
+            # worst_neighbor_cagr (bench's partial-box min) is always >= Phase4's own
+            # worst_neighbor_core (its full-box min) for the same candidate -- meaning
+            # this pre-filter can only ever exclude a candidate Phase4's OWN computation
+            # would ALSO have flagged CLIFF; it can never falsely exclude a real winner.
+            # THIS INVARIANT BREAKS if bench's own neighborhood is ever widened to vary
+            # hold/window/z/trail_pct, or to search past CLIFF_RADIUS, or to include cells
+            # NOT already in df_final -- any of those would make bench's box no longer a
+            # subset of Phase4's, and the "can only under-promote, never over-exclude"
+            # guarantee would silently stop holding. Anyone touching the "Cliff-safety
+            # verdict per candidate" neighbor-selection logic in bench_phase1_phase2_
+            # inmemory.py must re-check this invariant, not just assume it still holds.
+            # Empirical validation to date is weak (2026-08-31, contextual review): the
+            # only real sample (9 AGQ seed-mode candidates) all landed comfortably SAFE
+            # (+30% to +58%), nowhere near the 0 boundary -- confirms agreement on the
+            # SAFE side only, does NOT independently exercise the CLIFF/exclusion side.
+            # The subset argument above is what actually makes this safe, not that
+            # sample -- a real CLIFF-side sample is still worth running before fully
+            # trusting this in a live campaign. Fails OPEN (does not filter) when
+            # worst_neighbor_cagr is None (no real neighbor existed to judge from) --
+            # "unknown" is never treated as "unsafe," matching Phase4's own core_cliff
+            # None-handling convention (contrast with Phase5's OWN SAFE/SAFE gate
+            # downstream, phase5_second_level_overlay_check.py's _filter_to_safe_
+            # candidates, which does the OPPOSITE for its own core_safe=None case --
+            # EXCLUDES an unverified candidate rather than passing it through, since that
+            # gate's whole point is "don't verify anything nobody has judged yet." Two
+            # different postures for two different purposes, not a contradiction.)
+            n_before_core_safety_filter = len(candidates)
+            candidates = [c for c in candidates
+                          if c.get("worst_neighbor_cagr") is None or c["worst_neighbor_cagr"] >= 0]
+            n_skipped_core_cliff = n_before_core_safety_filter - len(candidates)
+            if n_skipped_core_cliff:
+                print(f"  [GT candidate report] pre-Phase4 core-safety floor: skipping "
+                      f"{n_skipped_core_cliff} of {n_before_core_safety_filter} candidate(s) "
+                      f"with worst_neighbor_cagr < 0 (Phase4 addon/drought never computed "
+                      f"for them).")
+            if not candidates:
+                print("  [GT candidate report] SKIPPED -- every candidate_nodes candidate "
+                      "for this scope was core-CLIFF.")
+                return [{**base, "error": "every candidate core-CLIFF (worst_neighbor_cagr < 0)"}]
         else:
             try:
                 candidates = derive_phase25_candidates_ground_truth(
