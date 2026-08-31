@@ -115,7 +115,48 @@
 # Usage:
 #   ./scripts/run_inmemory_sweep_queue.sh
 # Overrides via env: TICKERS, STRATEGIES, FIXED_SL_VALUES, Z_THRESHOLDS,
-#   WINDOWS, N_ISLANDS, WORKERS.
+#   WINDOWS, N_ISLANDS, WORKERS, WINDOW_START, WINDOW_END.
+#
+# Date-window override (2026-08-31, Task #10): WINDOW_START/WINDOW_END, both-
+# or-neither (validated below, before resolve_campaign runs, matching window_
+# version_suffix's own both-or-neither contract in run_optimization_sweep.py).
+# Unset (the default) leaves bench_phase1_phase2_inmemory.py's own module-level
+# START/END untouched, exactly today's behavior. When set, threaded through
+# BOTH resolve_campaign() (so the registered campaign row's window_start/
+# window_end -- and therefore its version string's -w<start>_<end> suffix,
+# via campaign_registry.build_version_string -> window_version_suffix -- match
+# the real window) AND every per-job bench invocation (--start-date/--end-date,
+# so bench's OWN version-string computation, done independently inside its own
+# process, resolves to the identical string). These are two genuinely separate
+# processes computing the same version string from what must be the same
+# inputs -- exactly the class of drift this project's PROMOTION_ALGO_VERSION
+# incident hit (see this file's header above) and Task #8's version-string
+# unification was built to close. No NEW naming scheme was needed for this:
+# window_version_suffix already makes each date window collision-safe via its
+# own -w<start>_<end> suffix (confirmed present today for every existing
+# campaign, since bench.START/END are always concrete, never None) -- a
+# 5-window KORU campaign gets 5 fully distinct version strings for free just
+# by setting WINDOW_START/WINDOW_END differently per script invocation, no
+# separate per-window numbering suffix required. (Investigated a possible
+# "v6.x-pN" per-window numbering scheme per the dispatching session's question
+# -- found no such scheme in the design doc or committed code; the only "-p"
+# suffix that exists is `-pv<promotion_algo_version>`, PROMOTION_ALGO_VERSION,
+# which is unrelated to windowing. Also checked the deferred params_json work
+# (docs/backlog_cache.md, paused 2026-08-29) for a connection -- found none;
+# params_json is about candidate-node identity representation, orthogonal to
+# date-window scoping, and explicitly not wired into any production call path
+# today.)
+if [ -n "${WINDOW_START:-}" ] || [ -n "${WINDOW_END:-}" ]; then
+  if [ -z "${WINDOW_START:-}" ] || [ -z "${WINDOW_END:-}" ]; then
+    echo "FATAL: WINDOW_START and WINDOW_END must both be set, or neither" \
+         "(got WINDOW_START='${WINDOW_START:-}' WINDOW_END='${WINDOW_END:-}')" \
+         "-- a partial override would silently leave bench's own version-string" \
+         "computation using its module default for the missing side, splitting" \
+         "this campaign's rows across two different -w<start>_<end> version" \
+         "strings with no error raised anywhere." >&2
+    exit 1
+  fi
+fi
 #
 # Deliberately NOT launched by this task -- building/committing this script is
 # the full scope; a peer session launches it once the paired review clears AND
@@ -182,6 +223,15 @@ print(b.END)
   data_source=$(echo "$bench_consts" | sed -n '3p')
   wstart=$(echo "$bench_consts" | sed -n '4p')
   wend=$(echo "$bench_consts" | sed -n '5p')
+  # WINDOW_START/WINDOW_END override (Task #10, both-or-neither already
+  # validated at script start) -- takes precedence over bench's module
+  # default so the registered campaign row's window matches what every
+  # per-job bench invocation below is actually told to run via --start-date/
+  # --end-date.
+  if [ -n "${WINDOW_START:-}" ]; then
+    wstart="$WINDOW_START"
+    wend="$WINDOW_END"
+  fi
 
   local create_out
   if ! create_out=$($PYTHON scripts/campaign_registry.py create \
@@ -379,6 +429,17 @@ echo " In-memory sweep queue start — $(date)"
     # job with a clearly-recognizable rc=130 (not a value a real bench crash could
     # produce) and `exit`s the WHOLE script -- an operator's Ctrl-C aborts the entire
     # campaign again, not just the current job.
+    # WINDOW_START/WINDOW_END pass-through (Task #10) -- an array, not a bare
+    # string interpolation, so the "unset" case contributes zero args instead
+    # of two empty-string args (which bench's own --start-date/--end-date
+    # argparse would treat as a real, wrong override value '' rather than
+    # "not passed"). Must match resolve_campaign()'s wstart/wend exactly --
+    # both read from the same WINDOW_START/WINDOW_END env vars, validated
+    # both-or-neither at script start above.
+    WINDOW_ARGS=()
+    if [ -n "${WINDOW_START:-}" ]; then
+      WINDOW_ARGS=(--start-date "$WINDOW_START" --end-date "$WINDOW_END")
+    fi
     set -m
     $PYTHON scripts/bench_phase1_phase2_inmemory.py \
         --ticker "$JOB_TICKER" \
@@ -387,7 +448,8 @@ echo " In-memory sweep queue start — $(date)"
         --z-thresholds $Z_THRESHOLDS \
         --window $WINDOWS \
         --n-islands "$N_ISLANDS" \
-        --workers "$WORKERS" &
+        --workers "$WORKERS" \
+        "${WINDOW_ARGS[@]}" &
     BENCH_PID=$!
     # Trap installed only AFTER $BENCH_PID is actually set (not before backgrounding) --
     # closes even the sub-millisecond race of a signal arriving before BENCH_PID holds

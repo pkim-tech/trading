@@ -238,6 +238,41 @@ def test_version_string_parity_with_bench_module(monkeypatch):
     assert bench_version == registry_version
 
 
+def test_version_string_parity_with_window_override(monkeypatch):
+    """Task #10 regression guard: run_inmemory_sweep_queue.sh's WINDOW_START/
+    WINDOW_END override is threaded into BOTH resolve_campaign()'s
+    campaign_registry.py create call AND the per-job bench --start-date/
+    --end-date flags -- two separate processes independently computing the
+    same version string from what must be the same inputs, the exact class
+    of drift the parity test above already guards for the default window.
+    This test proves the SAME parity holds once a real window override is
+    applied on both sides, matching what resolve_campaign()/the per-job
+    bench invocation actually do with WINDOW_START/WINDOW_END set."""
+    from scripts import bench_phase1_phase2_inmemory as bench
+
+    args = bench.build_arg_parser().parse_args(
+        ["--strategy", "TrailingBothZScoreBreakout",
+         "--z-thresholds", "0.5", "1.0", "1.5", "2.0", "--n-islands", "3",
+         "--start-date", "2024-01-01", "--end-date", "2024-06-01"])
+    bench.apply_grid_overrides(args)
+    # main() applies --start-date/--end-date to the module globals before
+    # calling _build_version_string; replicate that here since this test
+    # calls _build_version_string directly, bypassing main().
+    monkeypatch.setattr(bench, "START", args.start_date)
+    monkeypatch.setattr(bench, "END", args.end_date)
+    bench_version = bench._build_version_string(args)
+
+    # Same WINDOW_START/WINDOW_END a real resolve_campaign() call would use
+    # in place of bench's own module default once the env override is set.
+    registry_version = reg.build_version_string(
+        label=bench.CAMPAIGN_LABEL, promotion_algo_version=bench.PROMOTION_ALGO_VERSION,
+        data_source=bench.DATA_SOURCE, window_start="2024-01-01", window_end="2024-06-01",
+        z_thresholds=bench.Z_THRESHOLDS, n_islands=args.n_islands)
+
+    assert bench_version == registry_version
+    assert "-w2024-01-01_2024-06-01" in bench_version
+
+
 def test_claim_next_cli_exits_2_on_empty_queue_not_1(db_path, monkeypatch):
     """CLI-level regression guard (paired review, 2026-08-31, CONFIRMED HIGH):
     'queue empty' must be a DIFFERENT exit code from a real error, or the
