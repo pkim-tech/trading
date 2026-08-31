@@ -27,7 +27,7 @@ import os
 import sqlite3
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, as_completed, wait
 from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -105,38 +105,131 @@ N_GENERATIONS = 3
 # the new multi-generation code, so the new loop would never actually execute for them.
 PROMOTION_ALGO_VERSION = 4
 
+# Campaign name-reservation tag (2026-08-31, Task #8 -- was a bare "v6.5-" string literal
+# inline in _build_version_string before this). Was reserved 2026-08-31 for the
+# PROMOTION_ALGO_VERSION=3 resweep campaign in docs/plans/ground_truth_kernel_rebuild.md;
+# stays "v6.5" for now even though PROMOTION_ALGO_VERSION has since moved to 4 -- the label
+# names the CAMPAIGN (a resweep effort), not the algorithm version, which already has its
+# own `-pv{N}` suffix. Bump this (and reserve the new name in that doc first) only when
+# starting a genuinely new-named campaign, not on every PROMOTION_ALGO_VERSION change.
+CAMPAIGN_LABEL = "v6.5"
+
 
 def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, desc="dispatch"):
-    """Same worker call the real pipeline uses -- returns list of result dicts, in memory only."""
-    futures_map = {
-        pool.submit(run_single_backtest_node_ground_truth_isolated,
-                    (ticker, strategy_name, version, int(tp), int(sl), hold, w, spy_bh, z,
-                     fixed_sl, tpct, ENTRY_TIMING, True, START, END, DATA_SOURCE)): task
-        for task in tasks
-        for tp, sl, hold, w, z, tpct in [task]
-    }
+    """Same worker call the real pipeline uses -- returns list of result dicts, in memory only.
+
+    workers_budget (2026-08-31, Task #8 follow-up -- real dynamic CPU control, folded in
+    while the Task #8 commit was already on hold, per the user's own ask, superseding that
+    task's original judgment call #2 which said only inter-job budget control would be
+    built) is read ONCE per _dispatch call via campaign_registry.get_workers_budget(version)
+    -- NOT polled mid-call. `pool` is still the ONE shared ProcessPoolExecutor created at a
+    fixed size (main()'s ProcessPoolExecutor(max_workers=args.workers)); this only affects
+    how many of its workers THIS call gives work to.
+
+    If the budget is >= the pool's own max_workers (the common/default case -- the shell
+    passes --workers-budget equal to --workers), this takes the ORIGINAL submit-everything-
+    upfront path with zero throttling overhead. A real ProcessPoolExecutor benchmark (paired
+    review, 2026-08-31) measured bounding submission at exactly max_workers as a 1.2-1.5x
+    THROUGHPUT REGRESSION versus submit-all -- removing the executor's own internal call
+    queue means a worker can idle between the parent waking from wait(), deserializing a
+    result, and resubmitting. Only genuinely throttling (budget < max_workers) pays the
+    bounded-submission cost, which is the actual point of asking for it.
+
+    A single bench_phase1_phase2_inmemory.py process calls _dispatch MANY times (once per
+    Phase1-coarse, once per Phase2-island generation x N_GENERATIONS, once per Phase2.5,
+    per fixed_sl, per strategy) -- checking once per call, not mid-call, still gives real
+    responsiveness to `campaign_registry.py set-workers-budget` on the timescale of the next
+    dispatch (seconds to a few minutes typically), without the cost/complexity/DB-query-
+    reliability risk of polling from inside a single 400K-cell dispatch loop (confirmed
+    live, 2026-08-31: DFEN's own Phase1-coarse pass). A campaign with no workers_budget set
+    (None), a non-positive value, or a DB read failure (a real risk -- this same DB is
+    concurrently written by the sweep's own sweep_run_log/candidate_nodes writes plus any
+    enqueue/claim-next/mark-finished/status call; get_workers_budget itself fails toward
+    None on any exception) is all treated as unthrottled -- fails toward the ORIGINAL
+    submit-everything-upfront behavior, never toward a silent hang or a crashed process."""
+    from scripts import campaign_registry
+    tasks = list(tasks)
+    max_workers = pool._max_workers
+
+    b = campaign_registry.get_workers_budget(version)
+    budget = max_workers if not isinstance(b, int) or b <= 0 else max(1, min(b, max_workers))
+
     rows = []
     fail_counts = {}
-    progress = tqdm(as_completed(futures_map), total=len(futures_map), desc=desc,
-                     unit="node", mininterval=15.0, maxinterval=30.0)
-    for future in progress:
-        tp, sl, hold_hours, w, z_thresh, tpct = futures_map[future]
-        try:
-            res = future.result()
-        except Exception as e:
+
+    def _record(task, future_or_none, res_or_exc):
+        tp, sl, hold_hours, w, z_thresh, tpct = task
+        if isinstance(res_or_exc, Exception):
             fail_counts["CRASH"] = fail_counts.get("CRASH", 0) + 1
-            continue
-        status = res.get("status")
+            return
+        status = res_or_exc.get("status")
         if status != "SUCCESS":
             fail_counts[status] = fail_counts.get(status, 0) + 1
-            continue
-        alpha, num_trades, wr, comp_ret, wtw, node_cagr = res["payload"]
+            return
+        alpha, num_trades, wr, comp_ret, wtw, node_cagr = res_or_exc["payload"]
         rows.append({
             "take_profit": int(tp), "stop_loss": int(sl), "max_hold_hours": hold_hours,
             "window": w, "z_score_threshold": z_thresh, "trail_sell_pct": tpct,
             "trades": num_trades, "win_rate": wr, "strategy_return": comp_ret,
             "alpha_vs_spy": alpha, "cagr": node_cagr,
         })
+
+    if budget >= max_workers:
+        # Unthrottled -- original behavior, submit everything upfront and drain via
+        # as_completed()'s own internal handling (no bounded-submission overhead).
+        futures_map = {
+            pool.submit(run_single_backtest_node_ground_truth_isolated,
+                        (ticker, strategy_name, version, int(tp), int(sl), hold, w, spy_bh, z,
+                         fixed_sl, tpct, ENTRY_TIMING, True, START, END, DATA_SOURCE)): task
+            for task in tasks
+            for tp, sl, hold, w, z, tpct in [task]
+        }
+        progress = tqdm(as_completed(futures_map), total=len(futures_map), desc=desc,
+                         unit="node", mininterval=15.0, maxinterval=30.0)
+        for future in progress:
+            task = futures_map[future]
+            try:
+                res = future.result()
+            except Exception as e:
+                _record(task, future, e)
+                continue
+            _record(task, future, res)
+    else:
+        # Genuinely throttled -- bounded submission, at most `budget` tasks in flight.
+        task_iter = iter(tasks)
+        in_flight = {}  # future -> task
+
+        def _submit_next():
+            try:
+                task = next(task_iter)
+            except StopIteration:
+                return False
+            tp, sl, hold, w, z, tpct = task
+            future = pool.submit(run_single_backtest_node_ground_truth_isolated,
+                                  (ticker, strategy_name, version, int(tp), int(sl), hold, w,
+                                   spy_bh, z, fixed_sl, tpct, ENTRY_TIMING, True, START, END,
+                                   DATA_SOURCE))
+            in_flight[future] = task
+            return True
+
+        progress = tqdm(total=len(tasks), desc=desc, unit="node", mininterval=15.0, maxinterval=30.0)
+        while len(in_flight) < budget and _submit_next():
+            pass
+        while in_flight:
+            done, _pending = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+            for future in done:
+                task = in_flight.pop(future)
+                progress.update(1)
+                try:
+                    res = future.result()
+                except Exception as e:
+                    _record(task, future, e)
+                    continue
+                _record(task, future, res)
+            while len(in_flight) < budget and _submit_next():
+                pass
+
+    progress.close()
     if fail_counts:
         print(f"  non-SUCCESS statuses: {fail_counts}")
     return rows
@@ -882,45 +975,22 @@ def _build_version_string(args):
     (2026-08-29, paired-review fixup) out of main() so it's directly unit-testable without
     a real DB/backtest run. Depends only on module-level DATA_SOURCE/START/END plus the
     override flags on args -- NOT on fixed_sl (one version string legitimately covers every
-    (strategy, fixed_sl) combo from a single campaign's real invocations)."""
-    # "v6.5-" prefix (2026-08-31): the name-reservation tag for this resweep campaign
-    # (PROMOTION_ALGO_VERSION=3, see docs/plans/ground_truth_kernel_rebuild.md) -- distinct
-    # from the literal "v6" later in the string, which is an unrelated DATA_SOURCE/pipeline-
-    # generation marker that predates this naming thread.
-    version = "v6.5-bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
-    if args.z_thresholds is not None:
-        # z discriminator (2026-08-29, paired review, CONFIRMED HIGH by both independent-
-        # cold and contextual): without this, version (and therefore sweep_run_log's dedup
-        # key, which includes version) can't tell a --z-thresholds widened-grid run apart
-        # from a standard-z-grid run at the same (ticker, strategy, fixed_sl, windows,
-        # date-range) -- a prior standard-grid finished row would make a --z-thresholds
-        # run hit "already done...skipping" and do ZERO work, AND (independent of dedup)
-        # the two runs' candidate_nodes/backtest_phase1_insurance rows would land under an
-        # indistinguishable version string, unioning two different grids' top-9s under one
-        # version. Exact same failure class the seed-mode `-seed<id>` suffix below already
-        # solves for seed mode -- same fix shape, applied to the other new grid axis.
-        version += f"-z{'-'.join(str(z) for z in Z_THRESHOLDS)}"
-    if args.seed_watch_list_id is not None:
-        # Seed-mode discriminator (2026-08-29, paired review): without this, sweep_run_log's
-        # dedup key (ticker/strategy/fixed_sl/windows/version) can't tell a seed-mode smoke
-        # test apart from a real full-grid campaign at the same coordinates -- a seed run
-        # could silently no-op a genuine full-grid run's "already done" check (or vice versa),
-        # and the resulting candidate_nodes rows would be indistinguishable from real
-        # full-grid campaign output under the default date range.
-        version += f"-seed{args.seed_watch_list_id}"
-    if args.n_islands is not None:
-        # N_ISLANDS discriminator (2026-08-29, paired review, CONFIRMED HIGH): same failure
-        # class as the -z suffix above -- without this, an --n-islands widened-dispatch run
-        # can't be told apart from a standard-N_ISLANDS run at the same (ticker, strategy,
-        # fixed_sl, windows, date-range) coordinates, so it would either silently skip real
-        # work via the "already done" dedup check or union two different island-count runs'
-        # candidates under one indistinguishable version string.
-        version += f"-isl{args.n_islands}"
-    # Always appended, unlike the conditional suffixes above -- this is a static pipeline-
-    # algorithm marker, not a per-invocation sweep-parameter override (2026-08-30, planner
-    # dispatch, item 3 -- see PROMOTION_ALGO_VERSION's own module-level docstring).
-    version += f"-pv{PROMOTION_ALGO_VERSION}"
-    return version
+    (strategy, fixed_sl) combo from a single campaign's real invocations).
+
+    PURE -- delegates the actual string construction to campaign_registry.build_version_
+    string (2026-08-31, Task #8) so this module and run_inmemory_sweep_queue.sh resolve the
+    exact same version string from ONE shared function instead of independently
+    reconstructing it -- closes the 2026-08-31 pv3/pv4 split-brain incident class (see
+    docs/plans/campaign_registry_design.md). Deliberately does NOT call campaign_registry.
+    register_campaign here (that's a real DB write) -- this function must stay side-effect-
+    free since existing tests call it directly with no DB fixture. The one real call site
+    (main(), below) does the registration separately, exactly once per process."""
+    from scripts import campaign_registry
+    return campaign_registry.build_version_string(
+        label=CAMPAIGN_LABEL, promotion_algo_version=PROMOTION_ALGO_VERSION,
+        data_source=DATA_SOURCE, window_start=START, window_end=END,
+        z_thresholds=(Z_THRESHOLDS if args.z_thresholds is not None else None),
+        n_islands=args.n_islands, seed_watch_list_id=args.seed_watch_list_id)
 
 
 def main():
@@ -1044,6 +1114,16 @@ def main():
     # one version string legitimately covers every (strategy, fixed_sl) combo from a
     # single campaign's real invocations.
     version = _build_version_string(args)
+    # Real DB registration (2026-08-31, Task #8) -- the ONE place this process registers
+    # its campaign row, exactly once per invocation. _build_version_string above stays
+    # pure (no I/O) specifically so existing tests can call it directly with no DB
+    # fixture; this is the real side-effecting call, using the identical inputs.
+    from scripts import campaign_registry
+    campaign_registry.register_campaign(
+        version, CAMPAIGN_LABEL, PROMOTION_ALGO_VERSION, DATA_SOURCE, START, END,
+        z_thresholds=(Z_THRESHOLDS if args.z_thresholds is not None else None),
+        n_islands=args.n_islands, seed_watch_list_id=args.seed_watch_list_id,
+        created_by="bench_phase1_phase2_inmemory.py")
 
     # fixed_sl packaging (2026-08-29, Task #6 follow-up, planner dispatch): loops the
     # existing per-fixed_sl Phase1+Phase2+Phase2.5+candidate-write logic (now

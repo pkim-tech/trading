@@ -20,41 +20,97 @@
 # campaign_config.STRATEGIES + this script's own CLI overrides), so that
 # pattern doesn't apply to this pipeline.
 #
-# Version-string convention (must match bench_phase1_phase2_inmemory.py's own
-# construction exactly, see that file's main(), or Phase5's --version match
-# will find zero scopes): "v6.5-" (2026-08-31, name-reservation tag for this
-# PROMOTION_ALGO_VERSION=3 campaign, see docs/plans/ground_truth_kernel_rebuild.md --
-# paired-review CONFIRMED HIGH fixup: this literal was originally missed here when
-# the prefix was added to the Python side, which would have made this queue's
-# Phase4/Phase5 --version calls resolve zero scopes) + "bench-inmemory-v6" +
-# "-massive" (DATA_SOURCE default)
-# + window_version_suffix(START, END) (module defaults "2021-08-23"/"2026-08-21"
-# -- NOT overridden by this queue, so left out of the CLI calls below) + a
-# "-z<v1>-<v2>-..." suffix whenever --z-thresholds is passed (it always is,
-# here), + a "-isl<N>" suffix whenever --n-islands is passed (it always is,
-# here, added 2026-08-29 fixing a paired-review CONFIRMED HIGH finding on the
-# --n-islands diff -- a run without this suffix would be indistinguishable in
-# sweep_run_log/candidate_nodes from a default-N_ISLANDS run at the same
-# scope), + an UNCONDITIONAL "-pv<N>" pipeline-algorithm-version suffix (added
-# 2026-08-30, planner dispatch item 3 -- see PROMOTION_ALGO_VERSION's own
-# comment below and bench_phase1_phase2_inmemory.py's matching module
-# constant) -- unlike every other suffix here, this one always fires
-# regardless of CLI flags, since it marks the PROMOTION ALGORITHM itself, not
-# a sweep-parameter override. NOTE: --window is deliberately NOT part of the
-# version string (only --z-thresholds, --seed-watch-list-id, --n-islands, and
-# now the pipeline-version marker are) -- confirmed by reading main() -- so
-# the widened window grid below doesn't need (and must not get) its own
-# suffix here.
+# Version resolution + real job queue (2026-08-31, Task #8, implements
+# docs/plans/campaign_registry_design.md): this script used to hand-build its
+# own $VERSION bash string, independently of bench_phase1_phase2_inmemory.py's
+# own construction -- with zero shared source of truth. That drifted for real
+# the same night (a mid-queue PROMOTION_ALGO_VERSION 3->4 commit landed while a
+# queue process was already running: GDXU's TrailingBoth candidates landed
+# tagged -pv3, TrailingExit landed -pv4, and this script's stale -pv3 Phase4/
+# Phase5 --version calls silently resolved zero scopes for the new rows).
 #
-# Phase4 (--kernel gt) now takes --version too (added 2026-08-30, planner
-# dispatch): phase4_candidate_nodes_resolver.discover_all_candidate_nodes_scopes
-# is still version-agnostic by design (matching prune_backtest_cache_
-# ground_truth's own ticker-agnostic-of-version discovery pattern), but without
-# a filter it re-processes EVERY historical candidate_nodes version for the
-# ticker on every run -- confirmed real (SOXL alone has 20 distinct versions,
-# 472 rows) and wasteful, not just noisy. Passing --version "$VERSION" here
-# restricts run_gt_mode's candidate_nodes fallback to this run's own version
-# string, same scoping Phase5 already applies via its own --version.
+# Round 1 of this fix (same night) only deduplicated the version-STRING
+# CONSTRUCTION into scripts/campaign_registry.build_version_string -- it still
+# hardcoded its OWN bash copies of PROMOTION_ALGO_VERSION/CAMPAIGN_LABEL/
+# DATA_SOURCE/window dates and resolved $VERSION once at script start, which
+# does NOT close the incident: the actual drift was in the INPUTS, and a
+# once-per-script-start bash literal is exactly as stale as the original bug
+# for a commit landing mid-run (paired-review CONFIRMED HIGH, both independent
+# reviewers).
+#
+# Round 2 tried re-resolving `resolve_campaign()` fresh before EACH ticker's
+# Phase4/5 step, reassigning the loop's own $CAMPAIGN_ID/$VERSION each time --
+# BOTH independent reviewers proved by simulation this made the incident
+# WORSE, not better: a mid-campaign commit made `resolve_campaign()` `create`
+# a genuinely NEW campaign row and overwrite $CAMPAIGN_ID, so the drain
+# loop's next `claim-next` silently found an empty queue for the NEW
+# (unpopulated) campaign, `break`-ed, and printed "All done" while every
+# remaining ticker's real jobs sat stranded `queued` forever under the OLD
+# campaign_id -- plus Phase4/5 for the CURRENT ticker ran against a version
+# matching NONE of that ticker's own just-written rows (the original
+# incident, inverted: ahead of the rows instead of behind them). Reverted.
+#
+# Round 3 (this version, final): `resolve_campaign()` below still reads
+# bench_phase1_phase2_inmemory.py's OWN on-disk constants FRESH via a Python
+# import -- no hardcoded shell copies at all -- but is called ONLY ONCE, at
+# script start, exactly like round 1's simpler shape. $CAMPAIGN_ID/$VERSION
+# are the drain loop's stable operating identity for its entire life; nothing
+# reassigns them mid-run. What THIS actually fixes, honestly: the "two
+# independently hand-maintained copies of the same constants can silently
+# diverge from an ordinary editing mistake" class (there is now exactly ONE
+# place -- bench_phase1_phase2_inmemory.py's own module constants -- these
+# values can be edited at all). What this does NOT fix, same as it never
+# did: a commit landing WHILE this specific queue is actively draining still
+# produces the same drift the original incident hit -- a live bash process
+# holding $VERSION from start cannot track a live-changing on-disk Python
+# constant without re-reading it, and re-reading it necessarily invalidates
+# consistency with whatever's already been dispatched under the OLD value.
+# True elimination needs pinning a whole campaign to one git commit (e.g. a
+# worktree per campaign) -- a real, buildable follow-up, explicitly NOT built
+# here (see docs/plans/campaign_registry_design.md's own "What this does NOT
+# fix" section, which named this exact residual gap before it was ever hit).
+#
+# Job dispatch is now a real, persisted queue (campaign_jobs table in
+# trading_universe.db) instead of a bare bash `for ticker in $TICKERS` loop:
+# every (ticker, strategy) job is enqueued up front, then drained via
+# `claim-next` (SQLite-serialized, safe against a second concurrent claimer).
+# This is what actually answers the standing "sweep manager" backlog item
+# (docs/backlog_cache.md, raised 2026-08-29/reaffirmed 2026-08-31): while this
+# loop is draining, run
+#   .venv/bin/python scripts/campaign_registry.py enqueue --campaign-id N \
+#       --ticker TICKER --strategy STRATEGY --fixed-sl-values 1,2,3,4,5,6,7,8
+# from a SEPARATE terminal to append work -- it lands in the same FIFO queue
+# and gets picked up without restarting anything. `python scripts/
+# campaign_registry.py status --campaign-id N` gives a real-time queryable
+# summary instead of tailing this script's log.
+#
+# KNOWN LIMITATION, accepted for v1 (design doc's own open question #2 --
+# CPU control -- and a related concurrency gap found while building this):
+# this script's own Phase4/5-per-ticker-completion tracking (the REMAINING
+# bash associative array below) is per-PROCESS, not cross-process-atomic. The
+# only tested/supported usage today is ONE drain loop (this script) per
+# campaign. If a SECOND concurrent instance of this script were ever run
+# against the SAME campaign_id and a ticker's two strategy jobs happened to
+# split across the two processes, EACH process's own REMAINING counter would
+# only ever see its own completions and never reach zero -- Phase4/5 would
+# then SILENTLY NEVER RUN for that ticker (not double-run; corrected
+# 2026-08-31, paired review -- the original comment here had this backwards).
+# True cross-process ticker-completion tracking (e.g. via campaign_jobs' own
+# claim-next primitive on a synthetic per-ticker "phase45" job) is a real,
+# buildable follow-up, deferred here since nothing today actually runs two
+# concurrent drain loops against one campaign_id.
+#
+# ALSO KNOWN (contextual paired review, CONFIRMED MEDIUM, not fixed here per
+# this project's policy of acting only on CONFIRMED HIGH/CRITICAL findings):
+# appending a genuinely NEW ticker via `enqueue` while this loop drains (the
+# advertised use case) can trigger Phase4/5 prematurely -- REMAINING has no
+# entry for a ticker that wasn't in the original $TICKERS list, so it defaults
+# to 1 and hits zero after the FIRST of that ticker's appended strategy jobs
+# finishes, not after all of them. Self-healing (Phase5's per-ticker CSV and
+# the combined-file rebuild both just re-run against fresher data on the
+# SECOND strategy's completion), so the cost is a wasted/premature
+# intermediate report, not corruption -- but worth knowing before relying on
+# "append a whole new ticker" specifically.
 #
 # Usage:
 #   ./scripts/run_inmemory_sweep_queue.sh
@@ -62,8 +118,8 @@
 #   WINDOWS, N_ISLANDS, WORKERS.
 #
 # Deliberately NOT launched by this task -- building/committing this script is
-# the full scope; a peer session launches it once the separate --n-islands
-# paired review clears.
+# the full scope; a peer session launches it once the paired review clears AND
+# the currently-running queue (started under the pre-Task-#8 script) finishes.
 
 cd "$(dirname "$0")/.."
 
@@ -94,31 +150,59 @@ WINDOWS="${WINDOWS:-5 10 15 20}"
 N_ISLANDS="${N_ISLANDS:-3}"
 WORKERS="${WORKERS:-8}"
 
-# Pipeline-version discriminator (2026-08-30, planner dispatch item 3) -- MUST match
-# bench_phase1_phase2_inmemory.py's own PROMOTION_ALGO_VERSION module constant exactly
-# (see that constant's own docstring for the full reasoning: without this, a re-run of
-# the exact same tickers/parameters after a real promotion-algorithm change -- backfill/
-# gating/scope-detection logic, not a sweep-parameter change -- would silently produce an
-# IDENTICAL version string to a prior, algorithmically different campaign). No shared
-# single source of truth between this shell script and that Python module -- same
-# manual-sync convention the Z_THRESHOLDS/N_ISLANDS suffixes below already rely on.
-# Bumped 2 -> 3 (2026-08-30, paired-review HIGH finding): the new arm_pct backfill +
-# N_ISLANDS 10->3 revert are both material promotion-algorithm changes -- MUST match
-# bench_phase1_phase2_inmemory.py's own PROMOTION_ALGO_VERSION exactly.
-# Bumped 3 -> 4 (2026-08-31, planner dispatch, paired-review HIGH finding): the new
-# N_GENERATIONS multi-generation Phase2-island loop is a material promotion-algorithm
-# change (changes which cells get explored/promoted) -- MUST match
-# bench_phase1_phase2_inmemory.py's own PROMOTION_ALGO_VERSION exactly. NOTE: a queue
-# process already running under the OLD pv3 code computed its own $VERSION once at
-# startup and is unaffected by this file edit mid-run (same as Python not re-reading
-# source mid-process) -- this bump only affects a FUTURE invocation of this script.
-PROMOTION_ALGO_VERSION=4
+Z_THRESHOLDS_CSV=$(echo "$Z_THRESHOLDS" | tr ' ' ',')
 
-# Must match bench_phase1_phase2_inmemory.py's own version construction --
-# see the header comment above. Z_THRESHOLDS values are joined with '-' exactly
-# as that script's own f"-z{'-'.join(str(z) for z in Z_THRESHOLDS)}" does.
-Z_SUFFIX=$(echo "$Z_THRESHOLDS" | tr ' ' '-')
-VERSION="v6.5-bench-inmemory-v6-massive-w2021-08-23_2026-08-21-z${Z_SUFFIX}-isl${N_ISLANDS}-pv${PROMOTION_ALGO_VERSION}"
+# resolve_campaign() -- sets $CAMPAIGN_ID/$VERSION fresh from bench_phase1_phase2_
+# inmemory.py's OWN on-disk constants (2026-08-31, paired-review CONFIRMED HIGH
+# fixup -- round 2, see this file's header comment for what round 1 got wrong and
+# why this is still not a FULL fix). Deliberately no hardcoded PROMOTION_ALGO_
+# VERSION/CAMPAIGN_LABEL/DATA_SOURCE/window-date literals in this script at all --
+# every one of those is read fresh, every call, from the actual Python source.
+# Called once up front (for the enqueue banner) and again before EACH ticker's
+# Phase4/5 step below, so a mid-campaign code change is picked up between tickers
+# rather than only at script start.
+resolve_campaign() {
+  local bench_consts
+  if ! bench_consts=$($PYTHON -c "
+import sys; sys.path.insert(0, '.')
+from scripts import bench_phase1_phase2_inmemory as b
+print(b.CAMPAIGN_LABEL)
+print(b.PROMOTION_ALGO_VERSION)
+print(b.DATA_SOURCE)
+print(b.START)
+print(b.END)
+"); then
+    echo "FATAL: could not read bench_phase1_phase2_inmemory.py's own module constants -- aborting:"
+    echo "$bench_consts"
+    exit 1
+  fi
+  local label pv data_source wstart wend
+  label=$(echo "$bench_consts" | sed -n '1p')
+  pv=$(echo "$bench_consts" | sed -n '2p')
+  data_source=$(echo "$bench_consts" | sed -n '3p')
+  wstart=$(echo "$bench_consts" | sed -n '4p')
+  wend=$(echo "$bench_consts" | sed -n '5p')
+
+  local create_out
+  if ! create_out=$($PYTHON scripts/campaign_registry.py create \
+      --label "$label" --promotion-algo-version "$pv" \
+      --data-source "$data_source" --window-start "$wstart" --window-end "$wend" \
+      --z-thresholds "$Z_THRESHOLDS_CSV" --n-islands "$N_ISLANDS" \
+      --workers-budget "$WORKERS" --created-by run_inmemory_sweep_queue.sh); then
+    echo "FATAL: campaign_registry.py create failed -- aborting before any real work:"
+    echo "$create_out"
+    exit 1
+  fi
+  CAMPAIGN_ID=$(echo "$create_out" | sed -n 's/^campaign_id=\([0-9]*\) .*/\1/p')
+  VERSION=$(echo "$create_out" | sed -n 's/.*version=//p')
+  if [ -z "$CAMPAIGN_ID" ] || [ -z "$VERSION" ]; then
+    echo "FATAL: could not parse campaign_id/version from campaign_registry.py create output:"
+    echo "$create_out"
+    exit 1
+  fi
+}
+
+resolve_campaign
 
 # Ticker-transition banner (2026-08-30, user feedback: this is the bigger unit of
 # progress -- one per ticker vs. one per fixed_sl/window scope inside it -- so it
@@ -145,49 +229,158 @@ echo "Logging to $LOG (console + file via tee)"
   echo " Z-thresholds: $Z_THRESHOLDS"
   echo " Windows: $WINDOWS"
   echo " N-islands: $N_ISLANDS"
-  echo " Expected version string: $VERSION"
+  echo " campaign_id=$CAMPAIGN_ID  version=$VERSION"
+  # Effective workers_budget (2026-08-31, paired-review CONFIRMED MEDIUM fixup): surfaced
+  # explicitly here because register_campaign() is idempotent-on-version_string and never
+  # updates an EXISTING row's workers_budget -- relaunching a previously-throttled campaign
+  # (same version_string) silently keeps whatever value a prior `set-workers-budget` last
+  # left it at, even though this script always passes --workers-budget "$WORKERS" to
+  # `create`. Printing it here means a stale throttle is visible at a glance instead of
+  # only discoverable via a separate `status` call at the end of a run.
+  EFFECTIVE_BUDGET=$($PYTHON scripts/campaign_registry.py status --campaign-id "$CAMPAIGN_ID" \
+      | sed -n 's/.*workers_budget=\([^ ]*\).*/\1/p')
+  echo " Effective workers_budget=$EFFECTIVE_BUDGET (requested --workers-budget=$WORKERS -- differs if this campaign was relaunched after a live set-workers-budget change)"
+  echo " Append work while this runs:"
+  echo "   $PYTHON scripts/campaign_registry.py enqueue --campaign-id $CAMPAIGN_ID \\"
+  echo "       --ticker TICKER --strategy STRATEGY --fixed-sl-values 1,2,3,4,5,6,7,8"
+  echo " Check status from another terminal:"
+  echo "   $PYTHON scripts/campaign_registry.py status --campaign-id $CAMPAIGN_ID"
+  echo " Raise/lower in-flight worker cap live (no restart -- takes effect at each bench"
+  echo " process's next dispatch call, typically seconds to a few minutes, NOT a fixed poll):"
+  echo "   $PYTHON scripts/campaign_registry.py set-workers-budget --campaign-id $CAMPAIGN_ID --workers-budget N"
+  echo " Pause/resume (takes effect at the next job/phase boundary -- real memory reclaimed,"
+  echo " unlike workers_budget -- see campaign_registry.py's own docstring):"
+  echo "   $PYTHON scripts/campaign_registry.py pause --campaign-id $CAMPAIGN_ID"
+  echo "   $PYTHON scripts/campaign_registry.py resume --campaign-id $CAMPAIGN_ID"
   echo "======================================================"
 
+  FIXED_SL_CSV=$(echo "$FIXED_SL_VALUES" | tr ' ' ',')
+  NUM_STRATEGIES=$(echo "$STRATEGIES" | wc -w)
+  declare -A REMAINING
+  declare -A FAILED_TICKER
+  N_ENQUEUED=0
   for ticker in $TICKERS; do
-    ticker_banner "$ticker: Phase1-2.5 start"
-    ticker_failed=0
-
+    REMAINING[$ticker]=$NUM_STRATEGIES
     for strategy in $STRATEGIES; do
-      echo ""
-      echo "--- $ticker | $strategy | fixed_sl=$FIXED_SL_VALUES — $(date) ---"
-      $PYTHON scripts/bench_phase1_phase2_inmemory.py \
-          --ticker "$ticker" \
-          --strategy "$strategy" \
-          --fixed-sl-values $FIXED_SL_VALUES \
-          --z-thresholds $Z_THRESHOLDS \
-          --window $WINDOWS \
-          --n-islands "$N_ISLANDS" \
-          --workers "$WORKERS"
-      rc=$?
-      if [ $rc -ne 0 ]; then
-        echo "PROGRESS: Phase1-2.5 FAILED ticker=$ticker strategy=$strategy: exit code $rc -- skipping rest of $ticker, continuing queue"
-        ticker_failed=1
-        break
-      fi
+      $PYTHON scripts/campaign_registry.py enqueue --campaign-id "$CAMPAIGN_ID" \
+          --ticker "$ticker" --strategy "$strategy" --fixed-sl-values "$FIXED_SL_CSV" > /dev/null
+      N_ENQUEUED=$((N_ENQUEUED + 1))
     done
+  done
+  echo "Enqueued $N_ENQUEUED job(s) for campaign_id=$CAMPAIGN_ID."
 
-    if [ $ticker_failed -ne 0 ]; then
+  # Real inter-phase/inter-job pause (2026-08-31, real user ask, folded in while this
+  # commit was already on hold -- see campaign_registry.py's own module docstring for
+  # why this is deliberately SEPARATE from workers_budget, not a reused signal). Only
+  # ever called at a point where the PRIOR phase's subprocess has already fully exited
+  # (before claiming the next job, before launching Phase4, before launching Phase5) --
+  # never mid-phase, since only then has that phase's own pool already torn down and
+  # its memory already been reclaimed.
+  wait_while_paused() {
+    local announced=0
+    while $PYTHON scripts/campaign_registry.py is-paused --campaign-id "$CAMPAIGN_ID"; do
+      if [ "$announced" = "0" ]; then
+        echo "PAUSED: campaign_id=$CAMPAIGN_ID — $(date). Waiting for "
+        echo "  $PYTHON scripts/campaign_registry.py resume --campaign-id $CAMPAIGN_ID"
+        echo "Checking every 30s."
+        announced=1
+      fi
+      sleep 30
+    done
+  }
+
+  while true; do
+    wait_while_paused
+    CLAIMED=$($PYTHON scripts/campaign_registry.py claim-next --campaign-id "$CAMPAIGN_ID")
+    claim_rc=$?
+    if [ $claim_rc -eq 2 ]; then
+      break  # genuinely empty queue
+    elif [ $claim_rc -eq 3 ]; then
+      # Paused between the wait_while_paused check above and this claim-next call
+      # (a real, if narrow, race -- e.g. `pause` ran in that window) -- loop back to
+      # wait_while_paused rather than treating this as any kind of error or done.
+      continue
+    elif [ $claim_rc -ne 0 ]; then
+      # 2026-08-31, paired-review CONFIRMED HIGH fixup: exit 2 (empty) and any
+      # other nonzero (a real error -- e.g. a DB-lock timeout on this campaign's
+      # own BEGIN IMMEDIATE) used to be indistinguishable to a bare `|| break`,
+      # which would silently truncate an unattended multi-hour campaign and
+      # still print "All done" afterward. Abort loudly instead of guessing.
+      echo "FATAL: claim-next failed (exit $claim_rc), NOT an empty queue -- aborting rather than silently treating this as complete. Check DB connectivity."
+      exit 1
+    fi
+    read -r JOB_ID JOB_TICKER JOB_STRATEGY JOB_FIXED_SL <<< "$CLAIMED"
+
+    if [ "${FAILED_TICKER[$JOB_TICKER]:-0}" = "1" ]; then
+      # This ticker already failed earlier in this drain (either an already-
+      # queued sibling job, or one appended after the failure) -- honor the
+      # same "abandon the rest of a failed ticker" behavior as before.
+      $PYTHON scripts/campaign_registry.py mark-finished --job-id "$JOB_ID" --rc 1 > /dev/null
+      REMAINING[$JOB_TICKER]=$(( ${REMAINING[$JOB_TICKER]:-1} - 1 ))
       continue
     fi
 
-    ticker_banner "$ticker: Phase4 (candidate_summary_report.py --kernel gt) start"
-    $PYTHON scripts/candidate_summary_report.py --kernel gt "$ticker" --version "$VERSION"
+    ticker_banner "$JOB_TICKER | $JOB_STRATEGY: Phase1-2.5 start (job_id=$JOB_ID)"
+    # JOB_FIXED_SL/$WINDOWS/$Z_THRESHOLDS deliberately unquoted below for
+    # nargs="+" word-splitting, matching this script's pre-existing convention.
+    $PYTHON scripts/bench_phase1_phase2_inmemory.py \
+        --ticker "$JOB_TICKER" \
+        --strategy "$JOB_STRATEGY" \
+        --fixed-sl-values $(echo "$JOB_FIXED_SL" | tr ',' ' ') \
+        --z-thresholds $Z_THRESHOLDS \
+        --window $WINDOWS \
+        --n-islands "$N_ISLANDS" \
+        --workers "$WORKERS"
     rc=$?
+    $PYTHON scripts/campaign_registry.py mark-finished --job-id "$JOB_ID" --rc "$rc"
+
     if [ $rc -ne 0 ]; then
-      echo "PROGRESS: Phase4 FAILED ticker=$ticker: exit code $rc -- skipping Phase5, continuing queue"
+      echo "PROGRESS: Phase1-2.5 FAILED ticker=$JOB_TICKER strategy=$JOB_STRATEGY: exit code $rc -- skipping rest of $JOB_TICKER, continuing queue"
+      FAILED_TICKER[$JOB_TICKER]=1
+      $PYTHON scripts/campaign_registry.py skip-remaining --campaign-id "$CAMPAIGN_ID" --ticker "$JOB_TICKER" > /dev/null
       continue
     fi
 
-    ticker_banner "$ticker: Phase5 (phase5_second_level_overlay_check.py) start"
-    $PYTHON scripts/phase5_second_level_overlay_check.py --ticker "$ticker" --version "$VERSION"
-    rc=$?
-    if [ $rc -ne 0 ]; then
-      echo "PROGRESS: Phase5 FAILED ticker=$ticker: exit code $rc -- continuing queue"
+    REMAINING[$JOB_TICKER]=$(( ${REMAINING[$JOB_TICKER]:-1} - 1 ))
+    if [ "${REMAINING[$JOB_TICKER]}" -gt 0 ]; then
+      continue
+    fi
+    # Every strategy job enqueued for this ticker (at the time it was last
+    # decremented) is now terminal -- run Phase4/5 once. A job for this same
+    # ticker appended AFTER this point (REMAINING already <= 0) will decrement
+    # it further negative and re-trigger this block again on its own
+    # completion -- deliberately harmless (Phase4/5 re-run against fresh data
+    # for that ticker), not treated as a bug.
+
+    # Deliberately uses the SAME $CAMPAIGN_ID/$VERSION captured once at script start --
+    # NOT re-resolved here. A round-2 attempt at this (paired review, 2026-08-31) called
+    # resolve_campaign() again right before Phase4/5, which reassigned the loop's own
+    # $CAMPAIGN_ID/$VERSION -- both independent reviewers proved by simulation this made
+    # things WORSE, not better: a mid-campaign commit made resolve_campaign() `create` a
+    # NEW campaign row and overwrite $CAMPAIGN_ID, so the next claim-next silently found
+    # an empty queue and the script printed "All done" while every remaining ticker sat
+    # stranded `queued` forever -- AND Phase4/5 for the CURRENT ticker got invoked with a
+    # version matching NONE of that ticker's own just-written rows (the original incident,
+    # inverted). Reverted. See this file's header comment for what's honestly fixed here
+    # (no more hardcoded duplicate literals -- one on-disk source, read once) versus what
+    # is NOT (a commit landing while this queue is actively draining still isn't handled;
+    # true elimination needs commit-pinning a whole campaign to one git commit, e.g. a
+    # worktree per campaign -- not built here).
+    wait_while_paused  # Phase1-2.5's own pool for this ticker has already exited by here
+    ticker_banner "$JOB_TICKER: Phase4 (candidate_summary_report.py --kernel gt) start"
+    $PYTHON scripts/candidate_summary_report.py --kernel gt "$JOB_TICKER" --version "$VERSION"
+    rc4=$?
+    if [ $rc4 -ne 0 ]; then
+      echo "PROGRESS: Phase4 FAILED ticker=$JOB_TICKER: exit code $rc4 -- skipping Phase5, continuing queue"
+      continue
+    fi
+
+    wait_while_paused  # Phase4's own pool has already exited by here
+    ticker_banner "$JOB_TICKER: Phase5 (phase5_second_level_overlay_check.py) start"
+    $PYTHON scripts/phase5_second_level_overlay_check.py --ticker "$JOB_TICKER" --version "$VERSION"
+    rc5=$?
+    if [ $rc5 -ne 0 ]; then
+      echo "PROGRESS: Phase5 FAILED ticker=$JOB_TICKER: exit code $rc5 -- continuing queue"
       continue
     fi
 
@@ -197,9 +390,10 @@ echo "Logging to $LOG (console + file via tee)"
     # files or manually re-merge as the campaign progresses.
     $PYTHON scripts/append_phase5_combined.py --version "$VERSION"
 
-    ticker_banner "$ticker: full Phase1->5 pipeline complete"
+    ticker_banner "$JOB_TICKER: full Phase1->5 pipeline complete"
   done
 
   echo ""
   echo "All done — $(date)"
+  $PYTHON scripts/campaign_registry.py status --campaign-id "$CAMPAIGN_ID"
 } 2>&1 | tee "$LOG"

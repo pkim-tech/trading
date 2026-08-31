@@ -82,7 +82,7 @@ import os
 import sqlite3
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -643,8 +643,8 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
                   f"{len(candidates)} finalists for this scope.")
 
     if remaining:
-        futures = {}
         extra_by_idx = {}
+        to_submit = []
         for i, cand in enumerate(remaining, start=2):
             node = node_from_candidate(ticker, strategy_name, entry_timing, fixed_sl, cand)
             row = _stored_row_or_none(node.get("id"), i)
@@ -653,11 +653,25 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
                 extra_by_idx[i] = dict(row, ticker=ticker, strategy=strategy_name,
                                         fixed_sl=fixed_sl, window=window)
                 continue
-            fut = pool.submit(_pool_worker, i, node, start, end, years)
-            futures[fut] = node
-        for fut in as_completed(futures):
-            row = fut.result()
-            node = futures[fut]
+            to_submit.append((i, node))
+
+        # workers_budget throttle (2026-08-31, Task #8 further follow-up) -- this pool
+        # (created by the caller, see this function's own docstring) previously submitted
+        # every remaining candidate upfront/unthrottled; now shares the SAME already-
+        # paired-reviewed throttle logic bench_phase1_phase2_inmemory.py._dispatch and
+        # Phase4/candidate_summary_report.py's scope loop use, via campaign_registry.
+        # run_throttled, instead of hand-rolling a 3rd copy.
+        def _submit_candidate(pool_, task):
+            i, node = task
+            return pool_.submit(_pool_worker, i, node, start, end, years)
+
+        def _on_candidate_result(task, res_or_exc):
+            i, node = task
+            if isinstance(res_or_exc, Exception):
+                # Preserves the original as_completed()/fut.result() propagation
+                # behavior exactly -- this loop never caught a worker exception before.
+                raise res_or_exc
+            row = res_or_exc
             _print_row(row, node)
             if node.get("id") is not None:
                 with sqlite3.connect(DB_PATH) as conn:
@@ -667,6 +681,11 @@ def run_scope(ticker, strategy_name, version, entry_timing, fixed_sl, dfh, df_1m
             row.pop("trades_1s", None)
             extra_by_idx[row["candidate"]] = dict(row, ticker=ticker, strategy=strategy_name,
                                                    fixed_sl=fixed_sl, window=window)
+
+        if to_submit:
+            from scripts import campaign_registry
+            campaign_registry.run_throttled(pool, _submit_candidate, to_submit, version,
+                                             _on_candidate_result)
         # Combine in submission order (not completion order) so scope output
         # reads in the same TP/SL-descending order Phase4's own report does,
         # even though the underlying work ran in parallel.

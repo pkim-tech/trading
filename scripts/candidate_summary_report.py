@@ -1257,8 +1257,84 @@ def _json_safe(v):
     return v
 
 
+def _gt_scope_banner_text(ticker, strategy, version, entry_timing, fixed_sl, grid_window):
+    """The ONE place this banner+timestamp text is built (2026-08-31, proactive fixup
+    while fixing the paired-review CONFIRMED HIGH findings above) -- both
+    _run_one_gt_scope_worker's success path and run_gt_mode's own error path (a scope
+    whose worker raised, so there's no captured_output to reuse) need the IDENTICAL
+    banner text, and hand-duplicating an f-string in two places is exactly the "two
+    copies that can silently drift" shape this whole task exists to eliminate."""
+    return (f"\n{'-'*100}\n{ticker} / {strategy} / {version} / entry_timing={entry_timing} "
+            f"/ fixed_sl={fixed_sl}"
+            f"{f' / grid_window={grid_window}' if grid_window is not None else ''}\n{'-'*100}"
+            f"\n[{_datetime.now().strftime('%H:%M:%S')}]")
+
+
+def _run_one_gt_scope_worker(db_path, ticker, strategy, version, entry_timing, fixed_sl,
+                              grid_window, metric, min_alpha_arg):
+    """Picklable, top-level worker body for ONE Phase4 scope (2026-08-31, Task #8 further
+    follow-up -- real parallelism for a script that previously had ZERO, confirmed by grep
+    before this). Extracted from run_gt_mode's own per-scope loop body so it can run inside
+    a ProcessPoolExecutor worker via campaign_registry.run_throttled. Opens its own sqlite3
+    connection -- a live Connection object can't cross a process boundary, matches this
+    project's existing per-call `sqlite3.connect(...)` convention already used everywhere
+    else in this file.
+
+    Returns (captured_output, rows, error). captured_output is EVERY line this scope's
+    real work printed -- the banner AND gt_rows_for_scope's own internal prints (its
+    "[GT candidate report] ..." progress lines, and print_candidate_report_ground_truth's
+    full rendered report, called from inside gt_rows_for_scope -- paired-review CONFIRMED
+    HIGH, both independent reviewers, 2026-08-31: a first version of this function only
+    deferred the 2-line banner and let gt_rows_for_scope print everything else straight to
+    the worker's own inherited stdout fd, which under fork + a piped/tee'd parent stdout is
+    block-buffered and interleaves/reorders across concurrent workers -- the actual
+    candidate report, this script's primary human-readable output, became unattributable).
+    Captured via contextlib.redirect_stdout so `_on_scope_result` (run_gt_mode, below) can
+    print each scope's ENTIRE output as one atomic, correctly-ordered unit -- banner
+    immediately followed by that same scope's real body, exactly matching the original
+    serial loop's interleaving, just deferred to completion time instead of start time.
+
+    `error` (round-2 fixup, same day, cold-review CONFIRMED MEDIUM): the real work is
+    wrapped in its OWN try/except here, inside the redirect_stdout block, rather than
+    letting an exception propagate out and lose whatever this scope had already printed
+    before failing -- exactly the diagnostics (e.g. gt_rows_for_scope's own
+    '[GT candidate report] ...' lines right before a crash) most useful for explaining
+    the failure. `error` is the exception object (or None) for the caller to append its
+    own '  UNEXPECTED error...' line after the (still-real) captured_output; rows is []
+    when error is not None."""
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    error = None
+    rows = []
+    with contextlib.redirect_stdout(buf):
+        conn = sqlite3.connect(db_path)
+        try:
+            print(_gt_scope_banner_text(ticker, strategy, version, entry_timing, fixed_sl, grid_window))
+            if grid_window is None:
+                node = gt_current_best_node(conn, ticker, strategy, version, entry_timing, fixed_sl,
+                                             metric, min_alpha_arg)
+                if node is None:
+                    print(f"  [top_safe_nodes cross-check] no cliff-safe node found for {metric} floor")
+                else:
+                    print(f"  [top_safe_nodes cross-check] best {metric}: arm/tp={node['arm_pct']} "
+                          f"sl={node['sl']} hold={node['hold']}h window={node['window']} "
+                          f"z={node['z']} robust_alpha={node['alpha']:+.1f}% cagr={node['cagr']}")
+            else:
+                print("  [top_safe_nodes cross-check] skipped -- candidate_nodes-sourced scope, "
+                      "no backtest_cache equivalent.")
+            rows = gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl,
+                                      grid_window=grid_window)
+        except Exception as e:
+            error = e
+        finally:
+            conn.close()
+    return buf.getvalue(), rows, error
+
+
 def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_window_filter=None,
-                 version_filter=None):
+                 version_filter=None, db_path=None, workers=4):
     """--kernel gt entry point: loops every real GT scope for `tickers`, printing
     each scope's full candidate report (print_candidate_report_ground_truth) plus
     a top_safe_nodes cross-check to the terminal, and returns the flat GT_COLUMN_
@@ -1330,38 +1406,117 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
             print(f"\n{ticker}: no GT (kernel_version='ground_truth_v6') scope found in backtest_cache "
                   f"or candidate_nodes -- skipping.")
 
+    # Real parallelism (2026-08-31, Task #8 further follow-up) -- this loop previously ran
+    # every scope fully serially (confirmed by grep before this: zero ProcessPoolExecutor/
+    # ThreadPoolExecutor/multiprocessing anywhere in this file). Each scope's real work
+    # (_run_one_gt_scope_worker) is independent -- its own sqlite3 connection, its own
+    # gt_rows_for_scope call -- so scopes now run in a ProcessPoolExecutor, throttled via
+    # campaign_registry.run_throttled (the SAME already-paired-reviewed logic bench_
+    # phase1_phase2_inmemory.py._dispatch uses, factored out so this doesn't hand-roll a
+    # 3rd copy).
+    #
+    # Results are buffered by scope INDEX and printed/accumulated in original `scopes`
+    # order only after every scope has completed (2026-08-31, paired-review CONFIRMED
+    # HIGH + 2 MEDIUM fixup, both independent reviewers): a first version printed/
+    # extended in raw completion order, which (a) let two concurrent scopes' worker
+    # output interleave/reorder in the tee'd campaign log (the worker itself now captures
+    # its ENTIRE output including gt_rows_for_scope's own internal prints, not just the
+    # banner -- see _run_one_gt_scope_worker's own docstring), (b) made all_rows' order --
+    # and therefore the --csv/--xlsx deliverable's row order -- nondeterministic between
+    # runs over the identical scopes, breaking reproducibility/diffability, and (c) broke
+    # the exact convention Phase5's own code cites this file for ("Combine in submission
+    # order (not completion order) so scope output reads in the same TP/SL-descending
+    # order Phase4's own report does"). An exception still prints its OWN scope's banner
+    # first (matching the original serial loop, which always printed the banner before
+    # entering the try/except that could fail) so a failure is never an anonymous,
+    # unattributable error line.
+    #
+    # workers_budget lookup uses the FIRST scope's version as the representative campaign
+    # (2026-08-31) -- in the real shell-driven path (run_inmemory_sweep_queue.sh always
+    # passes --version) every scope here shares the same version by construction, so this
+    # is exact, not an approximation, for that path. A --tranche/--csv ad hoc run spanning
+    # multiple distinct versions (no --version filter) would use the first scope's budget
+    # for the whole batch -- an edge case, not the primary path this was built for.
+    # Streams in scopes order via a reorder buffer (2026-08-31, same-day fixup, cold-
+    # review CONFIRMED MEDIUM): an earlier version buffered EVERY scope until the whole
+    # batch finished, then printed all at once -- correct order, but nothing appeared in
+    # the tee'd campaign log for the entire Phase4 duration. run_inmemory_sweep_queue.sh's
+    # own PYTHONUNBUFFERED=1 comment already documents this exact class of bug as real
+    # ("nothing appeared to tail -f"), not cosmetic. This buffers only what's genuinely
+    # out of order: scope idx prints/accumulates as soon as it's ready AND every scope
+    # before it has already printed -- a scope that finishes early but is blocked behind
+    # a still-running earlier scope waits; a scope that finishes exactly in order streams
+    # immediately, same as the pre-parallelism serial loop always did.
     all_rows = []
-    for ticker, strategy, version, entry_timing, fixed_sl, grid_window in scopes:
-        # '-'*100 (not '#') -- deliberately lighter than run_inmemory_sweep_queue.sh's own
-        # ticker-transition banner (2026-08-30, user feedback: the per-scope banner was
-        # visually louder than the higher-level ticker banner, backwards from the real
-        # progress hierarchy). Timestamp line added same day so scope duration is readable
-        # straight from the log, matching bench_phase1_phase2_inmemory.py's own
-        # "[HH:MM:SS] PROGRESS: ..." format.
-        print(f"\n{'-'*100}\n{ticker} / {strategy} / {version} / entry_timing={entry_timing} "
-              f"/ fixed_sl={fixed_sl}"
-              f"{f' / grid_window={grid_window}' if grid_window is not None else ''}\n{'-'*100}")
-        print(f"[{_datetime.now().strftime('%H:%M:%S')}]")
-        try:
-            if grid_window is None:
-                node = gt_current_best_node(conn, ticker, strategy, version, entry_timing, fixed_sl,
-                                             metric, min_alpha_arg)
-                if node is None:
-                    print(f"  [top_safe_nodes cross-check] no cliff-safe node found for {metric} floor")
-                else:
-                    print(f"  [top_safe_nodes cross-check] best {metric}: arm/tp={node['arm_pct']} sl={node['sl']} "
-                          f"hold={node['hold']}h window={node['window']} z={node['z']} "
-                          f"robust_alpha={node['alpha']:+.1f}% cagr={node['cagr']}")
-            else:
-                # top_safe_nodes cross-check is backtest_cache-only (best_row/gt_current_
-                # best_node) -- no equivalent exists for a candidate_nodes-sourced scope,
-                # skip rather than print a misleading "no cliff-safe node found".
-                print("  [top_safe_nodes cross-check] skipped -- candidate_nodes-sourced scope, "
-                      "no backtest_cache equivalent.")
-            all_rows.extend(gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl,
-                                               grid_window=grid_window))
-        except Exception as e:
-            print(f"  UNEXPECTED error on this scope, skipping: {e}")
+    if scopes:
+        from concurrent.futures import ProcessPoolExecutor
+        from scripts import campaign_registry
+
+        budget_version = scopes[0][2]
+        _db_path = db_path or DB_PATH
+        _indexed_scopes = list(enumerate(scopes))
+        _pending = {}
+        _next_to_emit = [0]
+
+        def _scope_banner(scope):
+            # Uses the SAME _gt_scope_banner_text function _run_one_gt_scope_worker's
+            # success path calls -- not a hand-duplicated copy (see that function's own
+            # docstring for why this specifically was worth a shared helper).
+            ticker, strategy, version, entry_timing, fixed_sl, grid_window = scope
+            return _gt_scope_banner_text(ticker, strategy, version, entry_timing, fixed_sl, grid_window)
+
+        def _submit_scope(pool, indexed_scope):
+            _idx, scope = indexed_scope
+            ticker, strategy, version, entry_timing, fixed_sl, grid_window = scope
+            return pool.submit(_run_one_gt_scope_worker, _db_path, ticker, strategy, version,
+                                entry_timing, fixed_sl, grid_window, metric, min_alpha_arg)
+
+        def _emit_ready():
+            while _next_to_emit[0] in _pending:
+                captured_output, rows = _pending.pop(_next_to_emit[0])
+                print(captured_output, end="")
+                all_rows.extend(rows)
+                _next_to_emit[0] += 1
+
+        def _on_scope_result(indexed_scope, result_or_exc):
+            idx, scope = indexed_scope
+            if isinstance(result_or_exc, Exception):
+                # An exception here means something OUTSIDE _run_one_gt_scope_worker's own
+                # try/except failed (e.g. the task itself couldn't be pickled/unpickled) --
+                # that function catches its own real-work exceptions internally now (see
+                # its own docstring) specifically so a genuine scope failure still returns
+                # its captured partial output instead of losing it here.
+                _pending[idx] = (
+                    _scope_banner(scope) + f"\n  UNEXPECTED error on this scope, skipping: {result_or_exc}",
+                    [])
+                _emit_ready()
+                return
+            captured_output, rows, error = result_or_exc
+            if error is not None:
+                # Partial output (banner + whatever gt_rows_for_scope printed before
+                # failing) is real and preserved -- append the error line after it rather
+                # than discarding it, same "skip this scope, keep going" posture as before.
+                captured_output += f"\n  UNEXPECTED error on this scope, skipping: {error}"
+                rows = []
+            _pending[idx] = (captured_output, rows)
+            _emit_ready()
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            campaign_registry.run_throttled(pool, _submit_scope, _indexed_scopes, budget_version,
+                                             _on_scope_result)
+
+        # Completeness guard (2026-08-31, paired review LOW, both independent reviewers):
+        # _emit_ready only drains a CONTIGUOUS completed prefix, so a missing index would
+        # silently strand it and every later scope out of stdout AND all_rows -- a quietly
+        # short CSV/xlsx, not the loud KeyError the prior single-pass `for idx in range(...)`
+        # would have raised. Not reachable today (run_throttled calls on_result exactly once
+        # per submitted task, see its own docstring), but that guarantee lives in a different
+        # file -- this converts a future violation of it into a loud failure here instead of
+        # a silently truncated report.
+        assert _next_to_emit[0] == len(scopes) and not _pending, (
+            f"Phase4 scope-result bookkeeping incomplete: {len(scopes) - _next_to_emit[0]} "
+            f"scope(s) never reported (expected run_throttled to call on_result exactly once "
+            f"per task) -- refusing to write a silently truncated report.")
 
     _persist_phase4_verdicts_and_checklist(all_rows)
 
@@ -1412,6 +1567,15 @@ def main():
                           "the ticker (added 2026-08-30 -- see run_gt_mode's version_filter docstring). Has "
                           "no effect on backtest_cache-sourced GT scopes either way.")
     ap.add_argument("--db", default=DB_PATH)
+    ap.add_argument("--workers", type=int, default=4,
+                     help="ProcessPoolExecutor worker count for --kernel gt's per-scope loop "
+                          "(2026-08-31, Task #8 further follow-up -- this loop previously had "
+                          "zero parallelism at all). Actual in-flight concurrency is additionally "
+                          "gated by the resolved campaign's workers_budget, if any -- see "
+                          "scripts/campaign_registry.py. Default 4: this loop is DB-I/O + moderate-"
+                          "compute bound, not the numba-JIT-heavy Phase1-2.5 kernel, so a smaller "
+                          "default than bench_phase1_phase2_inmemory.py's --workers 8 convention "
+                          "is deliberate, not an oversight.")
     ap.add_argument("--min-alpha", type=float, default=200,
                      help="Alpha floor for the 'best safe node' cliff-safety search (default 200%%, matching "
                           "top_safe_nodes.py's convention). 'best unsafe node'/'5min best possible' are always "
@@ -1444,7 +1608,8 @@ def main():
         conn = sqlite3.connect(args.db)
         try:
             run_gt_mode(conn, tickers, args.metric, args.min_alpha, args.csv, args.xlsx,
-                        grid_window_filter=args.grid_window, version_filter=args.version)
+                        grid_window_filter=args.grid_window, version_filter=args.version,
+                        db_path=args.db, workers=args.workers)
         finally:
             conn.close()
         return

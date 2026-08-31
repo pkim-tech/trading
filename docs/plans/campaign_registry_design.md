@@ -1,6 +1,32 @@
-# Campaign registry — design proposal (not built)
+# Campaign registry — design proposal (implemented)
 
-Status: **design only**, dispatched 2026-08-31 (Task #2), for user review. No code yet.
+Status: **implemented 2026-08-31 (Task #8)**, `scripts/campaign_registry.py` +
+`bench_phase1_phase2_inmemory.py`/`run_inmemory_sweep_queue.sh`/
+`candidate_summary_report.py`/`phase5_second_level_overlay_check.py` changes.
+Paired-reviewed across 7 rounds (independent-cold + contextual Opus, both re-run on
+each new addition). Scope grew beyond this doc's original 4 open questions during
+implementation, per real-time user asks -- see those files' own module docstrings/
+comments for the final, as-built design (this doc is kept for the original problem
+statement/rationale, not as a living spec of every addition since). Key deltas from
+the original proposal below, decided during implementation:
+- Judgment calls #1-4 (original open questions) resolved as documented in
+  `campaign_registry.py`'s own module docstring.
+- `workers_budget` ended up genuinely dynamic/mid-job (not just inter-job as
+  originally scoped) -- `_dispatch`/Phase4/Phase5 all gate in-flight task submission
+  against it via the shared `run_throttled` helper.
+- A SEPARATE `paused` column + `pause`/`resume`/`is-paused` CLI, checked only at
+  real subprocess-exit boundaries (not mid-phase, unlike workers_budget) -- added
+  after an initial attempt to reuse `workers_budget==0` as a pause signal was
+  correctly rejected (two different things, would have re-created the exact
+  conflation-of-signals failure class this whole task exists to fix).
+- Phase4 (`candidate_summary_report.py`) gained real parallelism (previously zero)
+  and Phase5's existing pool was rewired onto the same throttle.
+- The version-string split-brain fix itself went through 3 real design iterations
+  (see `run_inmemory_sweep_queue.sh`'s own header comment for the full account) --
+  round 2's "re-resolve fresh per ticker" attempt was proven by paired review to
+  make the incident WORSE and was reverted; the final version only removes the
+  hardcoded-duplicate-literal class of drift, not the harder "commit lands while
+  the queue is actively draining" class (still open, see that file's own account).
 
 ## Problem this solves
 
