@@ -22,7 +22,12 @@
 #
 # Version-string convention (must match bench_phase1_phase2_inmemory.py's own
 # construction exactly, see that file's main(), or Phase5's --version match
-# will find zero scopes): "bench-inmemory-v6" + "-massive" (DATA_SOURCE default)
+# will find zero scopes): "v6.5-" (2026-08-31, name-reservation tag for this
+# PROMOTION_ALGO_VERSION=3 campaign, see docs/plans/ground_truth_kernel_rebuild.md --
+# paired-review CONFIRMED HIGH fixup: this literal was originally missed here when
+# the prefix was added to the Python side, which would have made this queue's
+# Phase4/Phase5 --version calls resolve zero scopes) + "bench-inmemory-v6" +
+# "-massive" (DATA_SOURCE default)
 # + window_version_suffix(START, END) (module defaults "2021-08-23"/"2026-08-21"
 # -- NOT overridden by this queue, so left out of the CLI calls below) + a
 # "-z<v1>-<v2>-..." suffix whenever --z-thresholds is passed (it always is,
@@ -106,7 +111,7 @@ PROMOTION_ALGO_VERSION=3
 # see the header comment above. Z_THRESHOLDS values are joined with '-' exactly
 # as that script's own f"-z{'-'.join(str(z) for z in Z_THRESHOLDS)}" does.
 Z_SUFFIX=$(echo "$Z_THRESHOLDS" | tr ' ' '-')
-VERSION="bench-inmemory-v6-massive-w2021-08-23_2026-08-21-z${Z_SUFFIX}-isl${N_ISLANDS}-pv${PROMOTION_ALGO_VERSION}"
+VERSION="v6.5-bench-inmemory-v6-massive-w2021-08-23_2026-08-21-z${Z_SUFFIX}-isl${N_ISLANDS}-pv${PROMOTION_ALGO_VERSION}"
 
 # Ticker-transition banner (2026-08-30, user feedback: this is the bigger unit of
 # progress -- one per ticker vs. one per fixed_sl/window scope inside it -- so it

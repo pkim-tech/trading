@@ -853,7 +853,11 @@ def _build_version_string(args):
     a real DB/backtest run. Depends only on module-level DATA_SOURCE/START/END plus the
     override flags on args -- NOT on fixed_sl (one version string legitimately covers every
     (strategy, fixed_sl) combo from a single campaign's real invocations)."""
-    version = "bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
+    # "v6.5-" prefix (2026-08-31): the name-reservation tag for this resweep campaign
+    # (PROMOTION_ALGO_VERSION=3, see docs/plans/ground_truth_kernel_rebuild.md) -- distinct
+    # from the literal "v6" later in the string, which is an unrelated DATA_SOURCE/pipeline-
+    # generation marker that predates this naming thread.
+    version = "v6.5-bench-inmemory-v6" + ("-massive" if DATA_SOURCE == "massive" else "") + window_version_suffix(START, END)
     if args.z_thresholds is not None:
         # z discriminator (2026-08-29, paired review, CONFIRMED HIGH by both independent-
         # cold and contextual): without this, version (and therefore sweep_run_log's dedup
