@@ -498,19 +498,21 @@ def _filter_to_safe_candidates(candidates):
               f"included, not silently counted as CLIFF, just not yet coverable until "
               f"Phase4 (--kernel gt) has run for this ticker/version.")
     if not safe and not unsafe and unverified:
-        # Fail-safe (2026-08-30, paired-review HIGH finding): if literally EVERY candidate
-        # in this scope is unverified, that's not "a few new candidates Phase4 hasn't
-        # caught up to yet" -- it means Phase4 never covered this exact scope at all (a
-        # real, confirmed pre-existing bug: candidate_summary_report.run_gt_mode's own
-        # `covered` scope-skip set has no version filter, while this file's does, so a
-        # scope Phase4 wrongly treats as "already covered by backtest_cache" can leave
-        # every one of its candidate_nodes rows with core_safe/addon_safe never persisted
-        # -- see docs/backlog_cache.md for the follow-up to fix that root cause). Gating
-        # 100% of a scope to zero candidates would silently produce a clean-looking empty
-        # Phase5 pass instead of the real verification this scope needs -- worse than the
-        # wasted compute this whole feature exists to save. Fall back to the pre-gate
-        # behavior (verify everyone) for this scope only, loudly, rather than the gate
-        # ever emptying a scope entirely.
+        # Fail-safe (2026-08-30, paired-review HIGH finding), KEPT as defense-in-depth
+        # even after the root cause below was fixed the same day (planner's explicit
+        # instruction: "cheap insurance, no reason to remove it"): if literally EVERY
+        # candidate in this scope is unverified, that's not "a few new candidates Phase4
+        # hasn't caught up to yet" -- it means Phase4 never covered this exact scope at
+        # all. The original trigger for this (candidate_summary_report.run_gt_mode's own
+        # `covered` scope-skip set having no version filter, while this file's always has)
+        # is now fixed at the root -- see run_gt_mode's own `version_filter` docstring --
+        # but this fail-safe stays in place for any OTHER future reason a scope might end
+        # up entirely unverified (e.g. Phase4 simply hasn't been run yet for a brand-new
+        # campaign). Gating 100% of a scope to zero candidates would silently produce a
+        # clean-looking empty Phase5 pass instead of the real verification this scope
+        # needs -- worse than the wasted compute this whole feature exists to save. Fall
+        # back to the pre-gate behavior (verify everyone) for this scope only, loudly,
+        # rather than the gate ever emptying a scope entirely.
         print(f"  Phase4 SAFE/SAFE gate: ALL {len(unverified)} candidates in this scope are "
               f"unverified -- falling back to verifying all of them (gate disabled for this "
               f"scope only) rather than silently skipping the entire scope.")

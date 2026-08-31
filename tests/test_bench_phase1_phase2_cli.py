@@ -176,13 +176,30 @@ def test_n_islands_rejects_negative():
 def test_version_string_gets_isl_suffix_when_overridden():
     args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--n-islands", "10"])
     version = bench._build_version_string(args)
-    assert version.endswith("-isl10")
+    # "-isl10" is no longer the true suffix (2026-08-30, planner dispatch item 3): the
+    # unconditional -pv{PROMOTION_ALGO_VERSION} pipeline-version marker always comes last
+    # now, so this asserts "-isl10" appears immediately before it, not that it ends the
+    # string.
+    assert f"-isl10-pv{bench.PROMOTION_ALGO_VERSION}" in version
+    assert version.endswith(f"-pv{bench.PROMOTION_ALGO_VERSION}")
 
 
 def test_version_string_no_isl_suffix_by_default():
     args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
     version = bench._build_version_string(args)
     assert "-isl" not in version
+
+
+def test_version_string_always_has_promotion_algo_version_suffix():
+    """2026-08-30, planner dispatch item 3: without this, a re-run of the exact same
+    tickers/parameters after a real promotion-algorithm change (backfill/gating/scope-
+    detection logic, not a sweep-parameter change) would silently produce an IDENTICAL
+    version string to a prior, algorithmically different campaign -- making the two
+    indistinguishable in candidate_nodes/sweep_run_log. Must be present regardless of
+    which other optional suffixes fire."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    version = bench._build_version_string(args)
+    assert version.endswith(f"-pv{bench.PROMOTION_ALGO_VERSION}")
 
 
 def test_checkpoint_filename_differs_with_n_islands_override():

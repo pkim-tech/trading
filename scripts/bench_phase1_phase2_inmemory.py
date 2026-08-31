@@ -59,6 +59,24 @@ Z_THRESHOLDS = [1.0, 1.5, 2.0]
 HOLD_TIME_CAPS = [7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105, 112, 119, 126, 133, 140]
 ENTRY_TIMING = "open_check"
 
+# Pipeline-version discriminator (2026-08-30, planner dispatch, item 3): the version
+# string was previously derived PURELY from sweep parameters (z-thresholds, n-islands,
+# date window) -- it had no component reflecting the PROMOTION ALGORITHM itself. A re-run
+# of the exact same tickers/parameters after a real promotion-logic change (e.g. tonight's
+# window/z backfill, SAFE/SAFE-gate persistence, Phase4 scope-detection fix) would
+# otherwise silently produce the IDENTICAL version string as a prior, algorithmically
+# different run -- making the two campaigns indistinguishable in candidate_nodes/
+# sweep_run_log. Bump this integer whenever the promotion/backfill/gating logic changes
+# materially (not for a sweep-parameter change -- those already get their own -z/-isl/
+# -seed suffix). Starts at 2 (not 1) since tonight's window/z backfill two-stage fix +
+# Phase1-insurance backfill + SAFE/SAFE-gate persistence + Phase4 scope-detection fix are
+# collectively the first material promotion-algorithm change since this pipeline's
+# original, undocumented-as-"v1" behavior. MUST stay in sync with run_inmemory_sweep_
+# queue.sh's own PROMOTION_ALGO_VERSION shell variable -- same manual-sync convention the
+# existing z/isl/seed suffixes already rely on (no shared single source of truth between
+# the shell script and this module).
+PROMOTION_ALGO_VERSION = 2
+
 
 def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, desc="dispatch"):
     """Same worker call the real pipeline uses -- returns list of result dicts, in memory only."""
@@ -789,6 +807,10 @@ def _build_version_string(args):
         # work via the "already done" dedup check or union two different island-count runs'
         # candidates under one indistinguishable version string.
         version += f"-isl{args.n_islands}"
+    # Always appended, unlike the conditional suffixes above -- this is a static pipeline-
+    # algorithm marker, not a per-invocation sweep-parameter override (2026-08-30, planner
+    # dispatch, item 3 -- see PROMOTION_ALGO_VERSION's own module-level docstring).
+    version += f"-pv{PROMOTION_ALGO_VERSION}"
     return version
 
 

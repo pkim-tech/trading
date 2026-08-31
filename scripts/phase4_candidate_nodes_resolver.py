@@ -124,14 +124,14 @@ def _stop_loss_and_tpct_from_row(sl_axis_col, fourth_axis_col, trail_buy_pct, tr
     return stop_loss, tpct
 
 
-def _text_to_bool(v):
-    """core_safe/addon_safe are persisted as TEXT "True"/"False"/NULL (candidate_summary_
-    report._persist_phase4_verdicts_and_checklist) to preserve the real tri-state (True/False/None-
-    unknown) build_candidate_report_ground_truth's own row already carries -- this is the
-    read-side inverse. pd.isna guards both a real SQL NULL (read back as None) and any
-    pandas NaN-coercion edge case in a mixed-content object column, rather than assuming
-    which one read_sql produces here."""
-    return None if pd.isna(v) else (v == "True")
+def _sql_bool(v):
+    """phase4_results.core_safe/addon_safe are real INTEGER columns (0/1/NULL,
+    candidate_verification_store.ensure_phase4_table) -- pandas reads a SQL NULL from a
+    LEFT JOIN with no matching row as NaN in a numeric-typed column (not None, since this
+    column is genuinely numeric unlike the old TEXT-column design), so pd.isna is the
+    right guard either way. True/False/None tri-state, same contract as before
+    consolidating onto phase4_results (2026-08-30, paired-review MEDIUM finding)."""
+    return None if pd.isna(v) else bool(v)
 
 
 def discover_all_candidate_nodes_scopes(ticker):
@@ -206,25 +206,38 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
     report" contract as the backtest_cache-based function's own empty-df early return,
     not an error."""
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
-    window_sql = " AND window=?" if window is not None else ""
+    window_sql = " AND cn.window=?" if window is not None else ""
     params = [ticker, strategy_name, config_version, float(fixed_sl), entry_timing]
     if window is not None:
         params.append(int(window))
-    with sqlite3.connect(DB_PATH) as conn:
-        # core_safe/addon_safe (2026-08-30, planner dispatch): candidate_summary_report.py's
-        # _persist_phase4_verdicts_and_checklist is the only writer and ALTER-guards these columns lazily,
-        # so a DB that's never had a --kernel gt run against it yet (or a fresh/test DB)
-        # won't have them -- select literal NULLs instead of raising OperationalError, same
-        # tri-state "unknown" a real un-persisted candidate would carry anyway.
-        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
-        safe_cols_sql = ", ".join(
-            (col if col in existing_cols else f"NULL AS {col}")
-            for col in ("core_safe", "addon_safe"))
+    # timeout=60.0 (2026-08-30, paired-review LOW finding): this was previously a pure-
+    # read function (default 5s sqlite busy timeout was fine); ensure_phase4_table below
+    # can now issue a real CREATE TABLE/ALTER TABLE, so this connection needs the same
+    # longer timeout candidate_summary_report._persist_phase4_verdicts_and_checklist
+    # already uses, in case a concurrent writer briefly holds the DB.
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        # core_safe/addon_safe (2026-08-30, planner dispatch, consolidated onto the
+        # PRE-EXISTING phase4_results table 2026-08-30 same day after paired review found
+        # the first version of this had created a second, unsynced core_safe/addon_safe
+        # representation directly on candidate_nodes -- phase4_results already exists
+        # (candidate_verification_store.py), keyed on candidate_id, with its own real
+        # INTEGER core_safe/addon_safe columns and upsert_phase4/get_stored_phase4 API,
+        # written by both run_candidate_nodes_campaign_verification.py and (as of this
+        # consolidation) candidate_summary_report._persist_phase4_verdicts_and_checklist.
+        # LEFT JOIN so a candidate with no phase4_results row at all (never processed by
+        # either writer) still returns a row here, with NULL/None core_safe/addon_safe --
+        # same tri-state "unknown" contract as before, just sourced from a real table
+        # instead of an existence-guarded pair of candidate_nodes columns.
+        from candidate_verification_store import ensure_phase4_table
+        ensure_phase4_table(conn)
         df = pd.read_sql(f"""
-            SELECT id, window, z AS z_score_threshold, arm_pct, trail_buy_pct, trail_sell_pct,
-                   max_hold_hours, robust_alpha, trades, {safe_cols_sql}
-            FROM candidate_nodes
-            WHERE ticker=? AND strategy=? AND version=? AND fixed_sl=? AND entry_timing=?{window_sql}
+            SELECT cn.id, cn.window, cn.z AS z_score_threshold, cn.arm_pct, cn.trail_buy_pct,
+                   cn.trail_sell_pct, cn.max_hold_hours, cn.robust_alpha, cn.trades,
+                   p4.core_safe AS core_safe, p4.addon_safe AS addon_safe
+            FROM candidate_nodes cn
+            LEFT JOIN phase4_results p4 ON p4.candidate_id = cn.id
+            WHERE cn.ticker=? AND cn.strategy=? AND cn.version=? AND cn.fixed_sl=?
+                  AND cn.entry_timing=?{window_sql}
         """, conn, params=params)
     if df.empty:
         return []
@@ -256,8 +269,8 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
                 'z_score_threshold': float(cand['z_score_threshold']), 'tpct': float(cand['tpct']),
                 'robust_alpha': float(cand['robust_alpha']), 'cagr': None,
                 'phase4_eligible': True,
-                'core_safe': _text_to_bool(cand['core_safe']),
-                'addon_safe': _text_to_bool(cand['addon_safe']),
+                'core_safe': _sql_bool(cand['core_safe']),
+                'addon_safe': _sql_bool(cand['addon_safe']),
             })
         return candidates
 
@@ -298,7 +311,7 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
                 'z_score_threshold': float(cand['z_score_threshold']), 'tpct': float(cand['tpct']),
                 'robust_alpha': float(cand['robust_alpha']), 'cagr': None,
                 'phase4_eligible': True,
-                'core_safe': _text_to_bool(cand['core_safe']),
-                'addon_safe': _text_to_bool(cand['addon_safe']),
+                'core_safe': _sql_bool(cand['core_safe']),
+                'addon_safe': _sql_bool(cand['addon_safe']),
             })
     return candidates

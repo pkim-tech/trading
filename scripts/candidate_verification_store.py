@@ -349,8 +349,20 @@ def get_stored_phase4(conn, candidate_id):
 
 def upsert_phase4(conn, candidate_id, fields):
     """`fields` may be any dict containing (a subset of) _PHASE4_VALUE_COLUMNS as keys --
-    anything not present is stored NULL. Same real-candidate_id validation and INSERT OR
-    REPLACE-via-UNIQUE-constraint convention as upsert() above. Also stamps
+    anything not present is stored NULL, UNLESS a prior row already had a real value for
+    that column (2026-08-30, paired-review HIGH finding, against candidate_summary_
+    report.py's own candidate_nodes.core_safe/addon_safe consolidation onto this table):
+    `core_safe`/`addon_safe` genuinely come back None from run_addon_cliff_safety_ground_
+    truth when no neighbor cell evaluated (a real, documented fail-closed-to-unknown
+    outcome, not a bug) -- a plain INSERT OR REPLACE would let that later, degraded/
+    partial Phase4 pass silently clobber a previously-persisted real True/False verdict
+    back to NULL, which the Phase5 SAFE/SAFE gate then reads as "unverified" and skips
+    (the exact waste this whole verdict-persistence feature exists to prevent). Fix:
+    merge with whatever row already exists first -- a None in `fields` keeps the prior
+    stored value instead of overwriting it; a real value always wins (freshest-real-value
+    semantics, same intent COALESCE(?, existing) would express in SQL, done in Python here
+    since this file's own established convention is plain INSERT OR REPLACE/OR IGNORE, not
+    ON CONFLICT DO UPDATE). Same real-candidate_id validation as before. Also stamps
     candidate_nodes.phase4_checked_at (Task #4, STATE) in the same call, same pattern
     upsert() already uses for phase3_checked_at/phase5_checked_at. Returns the checked_at
     timestamp written."""
@@ -358,10 +370,13 @@ def upsert_phase4(conn, candidate_id, fields):
     exists = conn.execute("SELECT 1 FROM candidate_nodes WHERE id=?", (candidate_id,)).fetchone()
     if exists is None:
         raise ValueError(f"candidate_id={candidate_id} not found in candidate_nodes -- refusing to insert")
+    prior = get_stored_phase4(conn, candidate_id)
     checked_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     cols = ["candidate_id", "checked_at"] + _PHASE4_VALUE_COLUMNS
     placeholders = ", ".join("?" for _ in cols)
-    values = [candidate_id, checked_at] + [fields.get(c) for c in _PHASE4_VALUE_COLUMNS]
+    merged = [fields.get(c) if fields.get(c) is not None else (prior.get(c) if prior else None)
+              for c in _PHASE4_VALUE_COLUMNS]
+    values = [candidate_id, checked_at] + merged
     conn.execute(
         f"INSERT OR REPLACE INTO phase4_results ({', '.join(cols)}) VALUES ({placeholders})", values)
     conn.execute("UPDATE candidate_nodes SET phase4_checked_at=? WHERE id=?", (checked_at, candidate_id))

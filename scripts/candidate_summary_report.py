@@ -1029,22 +1029,57 @@ def _persist_phase4_verdicts_and_checklist(rows):
     - core_safe/addon_safe: gates Phase5's expensive 1s-verification (phase5_second_
       level_overlay_check.py's SAFE/SAFE gate) -- confirmed real waste: 572 of 2,238
       Phase5-checked candidates (25.6%) were already CLIFF-flagged by Phase4 on the
-      2026-08-29/30 campaign log. Stored as its own TEXT "True"/"False"/NULL column each
-      (tri-state, matching build_candidate_report_ground_truth's own True/False/
-      None-unknown semantics) since SAFE-gating needs to filter ON these specific values.
+      2026-08-29/30 campaign log. Persisted via the PRE-EXISTING phase4_results table
+      (candidate_verification_store.py, real INTEGER columns, its own upsert_phase4/
+      get_stored_phase4 API, already written by run_candidate_nodes_campaign_
+      verification.py -- 9 real rows existed before this feature) rather than as new
+      columns on candidate_nodes -- see the "Consolidated onto phase4_results" paragraph
+      below for why an earlier version of this function did the latter and had to be
+      corrected.
     - Every other checklist field (_PHASE4_CHECKLIST_KEYS): no real query/filter need on
       an individual sub-field today, just "look this candidate's checklist up later
       without re-running Phase4" -- one JSON blob column (`phase4_checklist_json`),
       matching the existing `params_json` column's own precedent for exactly this
       "structured, no per-field predicate" shape, rather than ~24 more individually
-      ALTER-guarded columns for data nothing filters on."""
+      ALTER-guarded columns for data nothing filters on.
+
+    Consolidated onto phase4_results (2026-08-30, same day, paired-review MEDIUM
+    finding): core_safe/addon_safe were originally two new TEXT columns on
+    candidate_nodes -- but the PRE-EXISTING phase4_results table above already persists
+    exactly these two fields (as real INTEGER columns) plus most of the rest of the
+    checklist. Writing a second, unsynced representation directly on candidate_nodes was
+    a real design smell, not a functional bug, but worth fixing rather than carrying two
+    sources of truth forward. Now writes core_safe/addon_safe (+ the rest of
+    _PHASE4_VALUE_COLUMNS phase4_results already tracks) through upsert_phase4, reusing
+    run_candidate_nodes_campaign_verification._phase4_fields_from_row's exact field
+    mapping (not re-derived here) so both writers stay byte-identical. Only
+    phase4_checklist_json remains a candidate_nodes column -- it holds genuinely EXTRA
+    detail phase4_results doesn't track (all 5 real check13 folds vs. phase4_results' own
+    worst-fold summary, full drought detail, the two drawdown timestamps), so it isn't
+    redundant with the consolidated table. NOTE: the OLD candidate_nodes.core_safe/
+    addon_safe TEXT columns from the first version of this feature are no longer written
+    or read by anything -- any real verdict a session persisted there before this
+    consolidation landed needed a one-time migration into phase4_results (see
+    scripts/migrate_core_safe_to_phase4_results.py, run once against the real DB the same
+    day this consolidation landed, 636 real WEBL rows + others migrated) or it would have
+    silently gone invisible to the SAFE/SAFE gate -- confirmed as a real, not
+    hypothetical, paired-review HIGH finding against tonight's own already-completed
+    campaign."""
+    from candidate_verification_store import ensure_phase4_table, upsert_phase4
+    from run_candidate_nodes_campaign_verification import _phase4_fields_from_row
+
     try:
-        updates = []
+        checklist_updates = []
+        phase4_results_writes = []
         for r in rows:
-            if r.get("candidate_id") is None:
+            # error rows (candidate_id is None, built from `base` in gt_rows_for_scope)
+            # and any row carrying its own 'error' key are both skipped -- matching
+            # run_candidate_nodes_campaign_verification.py's own "skip both" convention
+            # (2026-08-30, paired-review MEDIUM finding: this file only checked
+            # candidate_id before, latent-harmless today since error rows never carry
+            # one, but worth being explicit rather than relying on that coincidence).
+            if r.get("candidate_id") is None or r.get("error"):
                 continue
-            core_safe = None if r.get("core_safe") is None else str(bool(r["core_safe"]))
-            addon_safe = None if r.get("addon_safe") is None else str(bool(r["addon_safe"]))
             # _json_safe (numpy scalar/pandas Timestamp -> JSON-serializable): check13_
             # foldN_fragile/check8_too_few_trades can be numpy.bool_, check4/check8/
             # check11/drought fields can be numpy.float64, and check11_dd_peak_time/
@@ -1055,33 +1090,45 @@ def _persist_phase4_verdicts_and_checklist(rows):
             # on the very first real candidate with a drawdown before this fix.
             checklist_json = json.dumps(
                 {k: _json_safe(r.get(k)) for k in _PHASE4_CHECKLIST_KEYS}, sort_keys=True)
-            updates.append((core_safe, addon_safe, checklist_json, r["candidate_id"]))
-        if not updates:
+            checklist_updates.append((checklist_json, r["candidate_id"]))
+            phase4_results_writes.append((r["candidate_id"], _phase4_fields_from_row(r)))
+        if not checklist_updates:
             return
         # args.db (2026-08-30, paired-review MEDIUM finding): this module-level DB_PATH is
         # the same one gt_rows_for_scope already syncs run_optimization_sweep's own
         # DB_PATH to (see that function's own "DB_PATH sync" docstring) -- consistent with
         # the rest of this file's pre-existing --db handling, not a new inconsistency.
         with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+            # phase4_checklist_json written FIRST, in one executemany (2026-08-30,
+            # paired-review MEDIUM finding): the per-candidate upsert_phase4 loop below
+            # can legitimately raise (e.g. a stale candidate_id) -- doing that loop first
+            # meant one bad candidate_id, via the outer except, silently discarded EVERY
+            # row's checklist JSON too, not just that one candidate's phase4_results
+            # write. Writing the checklist first means it survives even if the loop below
+            # fails partway through.
             existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
-            for col, col_type in (("core_safe", "TEXT"), ("addon_safe", "TEXT"),
-                                   ("phase4_checklist_json", "TEXT")):
-                if col not in existing_cols:
-                    conn.execute(f"ALTER TABLE candidate_nodes ADD COLUMN {col} {col_type}")
-            # COALESCE on core_safe/addon_safe only (2026-08-30, paired-review MEDIUM
-            # finding): run_addon_cliff_safety_ground_truth deliberately fails closed to
-            # None when no neighbor cell evaluated -- an unconditional overwrite would let
-            # a later degraded/partial Phase4 run clobber a previously-persisted real
-            # True/True verdict back to NULL, which the Phase5 SAFE/SAFE gate then reads
-            # as "unverified" and skips -- worse than never having persisted anything.
-            # phase4_checklist_json has no such gating consequence (never filtered on),
-            # so it always takes the freshest value.
+            if "phase4_checklist_json" not in existing_cols:
+                conn.execute("ALTER TABLE candidate_nodes ADD COLUMN phase4_checklist_json TEXT")
             conn.executemany(
-                "UPDATE candidate_nodes SET core_safe=COALESCE(?, core_safe), "
-                "addon_safe=COALESCE(?, addon_safe), phase4_checklist_json=? WHERE id=?",
-                updates)
+                "UPDATE candidate_nodes SET phase4_checklist_json=? WHERE id=?",
+                checklist_updates)
             conn.commit()
-        print(f"\nPersisted core_safe/addon_safe + full Phase4 checklist for {len(updates)} "
+            ensure_phase4_table(conn)
+            n_phase4_written = 0
+            for candidate_id, fields in phase4_results_writes:
+                # Isolated per-candidate (2026-08-30, paired-review MEDIUM finding): a
+                # single bad candidate_id must not abort phase4_results persistence for
+                # every other candidate in this batch -- upsert_phase4 itself commits per
+                # row, so a failure here only loses that one candidate's verdict, already
+                # logged, not the whole scope's worth of work.
+                try:
+                    upsert_phase4(conn, candidate_id, fields)
+                    n_phase4_written += 1
+                except Exception as e:
+                    print(f"  WARNING: failed to persist phase4_results for "
+                          f"candidate_id={candidate_id} ({e}) -- skipping just this one.")
+        print(f"\nPersisted core_safe/addon_safe (via phase4_results, {n_phase4_written} "
+              f"row(s)) + full Phase4 checklist for {len(checklist_updates)} "
               f"candidate_nodes row(s).")
     except Exception as e:
         # Never let a persistence bug destroy an already-computed, expensive Phase4
@@ -1141,13 +1188,29 @@ def run_gt_mode(conn, tickers, metric, min_alpha_arg, csv_name, xlsx_name, grid_
     campaigns re-processes ALL N every Phase4 run, including long-stale orphan rows
     from pre-GT sweeps (confirmed on real data 2026-08-29: SOXL alone has 20 distinct
     candidate_nodes versions) -- wasted compute and noisy logs, not a correctness bug
-    (Phase5 was already unaffected, since it's version-scoped). Has no effect on
-    backtest_cache-sourced scopes (gt_scopes_for_tickers itself is not version-
-    filtered here -- out of scope for this fix, matches grid_window_filter's own
-    backtest_cache-scopes-unaffected precedent)."""
+    (Phase5 was already unaffected, since it's version-scoped).
+
+    ALSO now filters the backtest_cache-sourced `covered` skip-set to `version_filter`
+    (2026-08-30, root-cause fix, paired-review HIGH finding against the SAFE/SAFE-gate
+    work: this used to be unconditionally version-unfiltered here, unlike Phase5's own
+    `covered` set at phase5_second_level_overlay_check.py's main(), which has always
+    filtered `all_scopes` to `s[2] == args.version` BEFORE building `covered`. Confirmed
+    on real data: SOXL has 10 backtest_cache GT scopes at version
+    'v6-massive-w2021-08-23_2026-08-21' -- with no filter here, EVERY one of SOXL's other
+    24 candidate_nodes scopes (a totally different, unrelated 'bench-inmemory-...'
+    campaign) got silently treated as "already covered by backtest_cache" and skipped
+    from Phase4 entirely, so Phase4 never persisted core_safe/addon_safe for them at
+    all -- which the Phase5 SAFE/SAFE gate then read as "unverified" for 100% of those
+    scopes' candidates. `version_filter=None` (the default, when --version isn't passed
+    -- multi-ticker/tranche ad hoc invocations) keeps the old, broader, version-agnostic
+    behavior unchanged; only a real single-version campaign run (run_inmemory_sweep_
+    queue.sh always passes --version) gets the tightened, Phase5-matching scoping."""
     from phase4_candidate_nodes_resolver import discover_all_candidate_nodes_scopes
 
-    scopes = [(s[0], s[1], s[2], s[3], s[4], None) for s in gt_scopes_for_tickers(conn, tickers)]
+    _bc_scopes = gt_scopes_for_tickers(conn, tickers)
+    if version_filter is not None:
+        _bc_scopes = [s for s in _bc_scopes if s[2] == version_filter]
+    scopes = [(s[0], s[1], s[2], s[3], s[4], None) for s in _bc_scopes]
     covered = {(s[0], s[1], s[3], s[4]) for s in scopes}  # (ticker, strategy, entry_timing, fixed_sl)
     for ticker in tickers:
         for strategy, version, entry_timing, fixed_sl, window in discover_all_candidate_nodes_scopes(ticker):

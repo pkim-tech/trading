@@ -30,10 +30,16 @@
 # here, added 2026-08-29 fixing a paired-review CONFIRMED HIGH finding on the
 # --n-islands diff -- a run without this suffix would be indistinguishable in
 # sweep_run_log/candidate_nodes from a default-N_ISLANDS run at the same
-# scope). NOTE: --window is deliberately NOT part of the version string (only
-# --z-thresholds, --seed-watch-list-id, and now --n-islands are) -- confirmed
-# by reading main() -- so the widened window grid below doesn't need (and
-# must not get) its own suffix here.
+# scope), + an UNCONDITIONAL "-pv<N>" pipeline-algorithm-version suffix (added
+# 2026-08-30, planner dispatch item 3 -- see PROMOTION_ALGO_VERSION's own
+# comment below and bench_phase1_phase2_inmemory.py's matching module
+# constant) -- unlike every other suffix here, this one always fires
+# regardless of CLI flags, since it marks the PROMOTION ALGORITHM itself, not
+# a sweep-parameter override. NOTE: --window is deliberately NOT part of the
+# version string (only --z-thresholds, --seed-watch-list-id, --n-islands, and
+# now the pipeline-version marker are) -- confirmed by reading main() -- so
+# the widened window grid below doesn't need (and must not get) its own
+# suffix here.
 #
 # Phase4 (--kernel gt) now takes --version too (added 2026-08-30, planner
 # dispatch): phase4_candidate_nodes_resolver.discover_all_candidate_nodes_scopes
@@ -73,11 +79,21 @@ WINDOWS="${WINDOWS:-5 10 15 20}"
 N_ISLANDS="${N_ISLANDS:-10}"
 WORKERS="${WORKERS:-8}"
 
+# Pipeline-version discriminator (2026-08-30, planner dispatch item 3) -- MUST match
+# bench_phase1_phase2_inmemory.py's own PROMOTION_ALGO_VERSION module constant exactly
+# (see that constant's own docstring for the full reasoning: without this, a re-run of
+# the exact same tickers/parameters after a real promotion-algorithm change -- backfill/
+# gating/scope-detection logic, not a sweep-parameter change -- would silently produce an
+# IDENTICAL version string to a prior, algorithmically different campaign). No shared
+# single source of truth between this shell script and that Python module -- same
+# manual-sync convention the Z_THRESHOLDS/N_ISLANDS suffixes below already rely on.
+PROMOTION_ALGO_VERSION=2
+
 # Must match bench_phase1_phase2_inmemory.py's own version construction --
 # see the header comment above. Z_THRESHOLDS values are joined with '-' exactly
 # as that script's own f"-z{'-'.join(str(z) for z in Z_THRESHOLDS)}" does.
 Z_SUFFIX=$(echo "$Z_THRESHOLDS" | tr ' ' '-')
-VERSION="bench-inmemory-v6-massive-w2021-08-23_2026-08-21-z${Z_SUFFIX}-isl${N_ISLANDS}"
+VERSION="bench-inmemory-v6-massive-w2021-08-23_2026-08-21-z${Z_SUFFIX}-isl${N_ISLANDS}-pv${PROMOTION_ALGO_VERSION}"
 
 # Ticker-transition banner (2026-08-30, user feedback: this is the bigger unit of
 # progress -- one per ticker vs. one per fixed_sl/window scope inside it -- so it
