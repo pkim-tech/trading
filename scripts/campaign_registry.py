@@ -138,6 +138,12 @@ CLI (see main() below for the full arg list):
                     queued work may still exist, the caller should wait and
                     retry, not treat this as done either.
   mark-finished -- record a claimed job's real outcome (rc).
+  update-job-pid -- record the REAL worker process's pid for an already-
+                    claimed job (2026-08-31, Task #9) -- claim-next itself
+                    leaves pid NULL, since the CLI process that claims a
+                    job is not the process that does the real work (see
+                    claim_next's own docstring for the incident this
+                    fixes).
   skip-remaining -- mark every still-queued job for one (campaign, ticker)
                     'skipped' -- used when a ticker's Phase1-2.5 run fails,
                     matching run_inmemory_sweep_queue.sh's existing "skip the
@@ -403,7 +409,17 @@ def claim_next(campaign_id=None, db_path=None):
     writers, the loser's BEGIN IMMEDIATE simply blocks until the winner
     commits, then sees the row already flipped to 'running' and moves on.
     Returns a dict (id, ticker, strategy, fixed_sl_values) or None if the
-    queue (scoped or global) is empty."""
+    queue (scoped or global) is empty.
+
+    pid is left NULL here, not os.getpid() (2026-08-31, Task #9, real bug found live
+    testing against DPST): claim-next is invoked as its OWN short-lived CLI subprocess
+    by run_inmemory_sweep_queue.sh (`CLAIMED=$($PYTHON campaign_registry.py claim-next
+    ...)`), which exits the instant it prints the claimed job -- os.getpid() here was
+    recording THAT ephemeral process's pid, not the real long-running bench_phase1_
+    phase2_inmemory.py worker the shell launches afterward, so `status` showed a
+    stale/already-exited pid for the entire duration of the real work. A wrong-looking-
+    real number is worse than an honest 'not yet known' -- see update_job_pid below,
+    which the shell now calls with the REAL worker pid right after backgrounding it."""
     db_path = db_path or DB_PATH
     ensure_tables(db_path)
     conn = sqlite3.connect(db_path, timeout=_CLAIM_LOCK_TIMEOUT_SECS, isolation_level=None)
@@ -420,8 +436,8 @@ def claim_next(campaign_id=None, db_path=None):
             conn.execute("COMMIT")
             return None
         job_id, ticker, strategy, fixed_sl_values = row
-        conn.execute("UPDATE campaign_jobs SET status='running', pid=?, started_at=? WHERE id=?",
-                     (os.getpid(), time.strftime("%Y-%m-%dT%H:%M:%S"), job_id))
+        conn.execute("UPDATE campaign_jobs SET status='running', pid=NULL, started_at=? WHERE id=?",
+                     (time.strftime("%Y-%m-%dT%H:%M:%S"), job_id))
         conn.execute("COMMIT")
         return dict(id=job_id, ticker=ticker, strategy=strategy, fixed_sl_values=fixed_sl_values)
     except Exception:
@@ -429,6 +445,20 @@ def claim_next(campaign_id=None, db_path=None):
         raise
     finally:
         conn.close()
+
+
+def update_job_pid(job_id, pid, db_path=None):
+    """Records the REAL worker process's pid for an already-claimed job (2026-08-31,
+    Task #9) -- called by run_inmemory_sweep_queue.sh right after backgrounding the real
+    bench_phase1_phase2_inmemory.py process and capturing its pid via `$!`, so `status`
+    shows the process that's actually doing the work instead of claim-next's own already-
+    exited CLI pid (see claim_next's own docstring for the incident this fixes). Returns
+    True if a row was actually updated, False if job_id doesn't exist."""
+    db_path = db_path or DB_PATH
+    with sqlite3.connect(db_path, timeout=60.0) as conn:
+        cur = conn.execute("UPDATE campaign_jobs SET pid = ? WHERE id = ?", (pid, job_id))
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def mark_finished(job_id, rc, db_path=None):
@@ -609,6 +639,10 @@ def main():
     p_finish.add_argument('--job-id', type=int, required=True)
     p_finish.add_argument('--rc', type=int, required=True)
 
+    p_pid = sub.add_parser('update-job-pid')
+    p_pid.add_argument('--job-id', type=int, required=True)
+    p_pid.add_argument('--pid', type=int, required=True)
+
     p_skip = sub.add_parser('skip-remaining')
     p_skip.add_argument('--campaign-id', type=int, required=True)
     p_skip.add_argument('--ticker', required=True)
@@ -664,6 +698,12 @@ def main():
         print(f"{job['id']} {job['ticker']} {job['strategy']} {job['fixed_sl_values']}")
     elif args.cmd == 'mark-finished':
         mark_finished(args.job_id, args.rc)
+    elif args.cmd == 'update-job-pid':
+        ok = update_job_pid(args.job_id, args.pid)
+        if not ok:
+            print(f"No job with id={args.job_id}", file=sys.stderr)
+            sys.exit(1)
+        print(f"job_id={args.job_id} pid={args.pid}")
     elif args.cmd == 'skip-remaining':
         n = skip_remaining(args.campaign_id, args.ticker)
         print(n)

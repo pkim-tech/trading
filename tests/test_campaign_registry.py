@@ -120,6 +120,34 @@ def test_claim_next_never_returns_same_job_twice(db_path):
     assert reg.claim_next(cid, db_path=db_path) is None
 
 
+def test_claim_next_leaves_pid_null(db_path):
+    """Regression guard for Task #9 (2026-08-31, found live testing against DPST):
+    claim-next is a short-lived CLI subprocess, never the process that does the real
+    work -- os.getpid() here used to record its OWN already-exited pid. Must leave
+    pid NULL, not a wrong-looking-real number."""
+    cid, _ = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                    db_path=db_path)
+    reg.enqueue(cid, "GDXU", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+    reg.claim_next(cid, db_path=db_path)
+    with sqlite3.connect(db_path) as conn:
+        pid = conn.execute("SELECT pid FROM campaign_jobs WHERE campaign_id=?", (cid,)).fetchone()[0]
+    assert pid is None
+
+
+def test_update_job_pid_records_real_worker_pid(db_path):
+    cid, _ = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                    db_path=db_path)
+    job_id = reg.enqueue(cid, "GDXU", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+    reg.claim_next(cid, db_path=db_path)
+
+    assert reg.update_job_pid(job_id, 99999, db_path=db_path) is True
+    with sqlite3.connect(db_path) as conn:
+        pid = conn.execute("SELECT pid FROM campaign_jobs WHERE id=?", (job_id,)).fetchone()[0]
+    assert pid == 99999
+
+    assert reg.update_job_pid(999999999, 1, db_path=db_path) is False  # unknown job_id
+
+
 def test_mark_finished_records_status_and_rc(db_path):
     cid, _ = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
                                     db_path=db_path)

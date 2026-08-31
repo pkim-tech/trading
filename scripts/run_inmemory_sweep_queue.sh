@@ -220,9 +220,24 @@ mkdir -p logs
 LOG="logs/inmemory_sweep_queue_$(date +%Y%m%d_%H%M%S).log"
 echo "Logging to $LOG (console + file via tee)"
 
-{
-  echo "======================================================"
-  echo " In-memory sweep queue start — $(date)"
+# `exec > >(tee "$LOG") 2>&1`, NOT `{ ... } | tee "$LOG"` (2026-08-31, round-4 same-day
+# fixup, paired-review CONFIRMED HIGH-equivalent x2 -- the cold reviewer reproduced both
+# empirically): a `{ ... } | tee` pipeline runs the WHOLE drain loop -- including the
+# INT/TERM/HUP trap -- inside `tee`'s pipeline SUBSHELL, a genuinely different process
+# from the pid an operator/supervisor/`timeout`/`nohup ... &`-then-`kill` sees. A plain
+# `kill -TERM <that pid>` (the natural way to stop an unattended overnight campaign, NOT
+# just an interactive Ctrl-C) never reaches the subshell at all -- the trap never fires,
+# reopening the exact orphaned-pool-plus-stuck-`running`-job bug this whole signal-
+# handling block exists to close. Separately, that pipeline shape also swallows the
+# trap's own `exit 130`: a pipeline's overall exit status is its LAST command's (`tee`'s,
+# always 0 here, no `pipefail` was set), not the subshell's -- so an interrupted campaign
+# used to report clean success (`$?`=0) to any wrapper/cron watching this script's own
+# exit code. `exec > >(tee ...) 2>&1` makes the redirection apply to THIS shell process
+# directly (no subshell at all) -- the trap is reachable by a plain `kill` on the real
+# script pid, and `exit 130` is genuinely this script's own exit status.
+exec > >(tee "$LOG") 2>&1
+echo "======================================================"
+echo " In-memory sweep queue start — $(date)"
   echo " Tickers: $TICKERS"
   echo " Strategies: $STRATEGIES"
   echo " Fixed SLs: $FIXED_SL_VALUES"
@@ -323,6 +338,48 @@ echo "Logging to $LOG (console + file via tee)"
     ticker_banner "$JOB_TICKER | $JOB_STRATEGY: Phase1-2.5 start (job_id=$JOB_ID)"
     # JOB_FIXED_SL/$WINDOWS/$Z_THRESHOLDS deliberately unquoted below for
     # nargs="+" word-splitting, matching this script's pre-existing convention.
+    #
+    # Backgrounded + `wait`-ed, not run in the foreground (2026-08-31, Task #9, real
+    # bug found live testing against DPST): claim-next's own os.getpid() used to record
+    # ITS OWN (already-exited by the time the real work starts) pid on the job row --
+    # claim-next is a short-lived CLI subprocess, never the process that does the real
+    # work. Backgrounding here and capturing the REAL bench_phase1_phase2_inmemory.py
+    # pid via `$!` lets update-job-pid record the actual running process, so `status`
+    # shows something real instead of a stale/wrong pid for the job's entire duration.
+    # `wait` still blocks this loop iteration exactly as the foreground call did, and
+    # still yields the real exit code via $? -- no change to the queue's own serial,
+    # one-job-at-a-time semantics.
+    #
+    # SIGINT/SIGTERM handling (2026-08-31, two same-day fixup rounds, paired-review
+    # CONFIRMED MEDIUM x3, all independently reproduced empirically by both reviewers):
+    # an asynchronously-launched (`&`) child in a non-interactive shell -- which this
+    # script always is, whether the USER's own launch was interactive or not -- inherits
+    # SIG_IGN for SIGINT/SIGQUIT. Before backgrounding, Ctrl-C on this script correctly
+    # killed the foreground bench_phase1_phase2_inmemory.py child (and, since job
+    # control was off, everything in the script's own process group, including the
+    # child's own forked ProcessPoolExecutor workers) too.
+    #
+    # Round 1 (INT/TERM trap forwarding SIGTERM to $BENCH_PID alone) fixed the
+    # kill-the-child-at-all problem but introduced two NEW regressions, both
+    # reproduced: (a) a bash trap handler RETURNS by default -- forwarding the signal
+    # and letting the loop continue silently turned "Ctrl-C stops the whole campaign"
+    # into "skip only this one job, keep draining the queue," which also writes a
+    # real-looking-but-fake `failed` rc indistinguishable from a genuine crash; (b)
+    # `kill -TERM $BENCH_PID` signals ONLY the bench parent process, not its forked
+    # pool -- Python's default SIGTERM handling kills the parent immediately with no
+    # atexit/pool-join, so every ProcessPoolExecutor worker survives as an orphan.
+    #
+    # Round 2 (this version) fixes both: `set -m` (job control) below gives each
+    # backgrounded job its OWN process group, so `kill -TERM -- -"$BENCH_PID"`
+    # (negative pid = whole group) reaches every forked pool worker too, restoring
+    # the original all-or-nothing kill behavior. The trap now does its own complete
+    # cleanup (kill the group, block via a kill-0-guarded wait loop until it's
+    # ACTUALLY dead -- not a bare `if`, which a second signal arriving mid-wait could
+    # interrupt again and reproduce the same orphan, also reproduced) then marks the
+    # job with a clearly-recognizable rc=130 (not a value a real bench crash could
+    # produce) and `exit`s the WHOLE script -- an operator's Ctrl-C aborts the entire
+    # campaign again, not just the current job.
+    set -m
     $PYTHON scripts/bench_phase1_phase2_inmemory.py \
         --ticker "$JOB_TICKER" \
         --strategy "$JOB_STRATEGY" \
@@ -330,8 +387,56 @@ echo "Logging to $LOG (console + file via tee)"
         --z-thresholds $Z_THRESHOLDS \
         --window $WINDOWS \
         --n-islands "$N_ISLANDS" \
-        --workers "$WORKERS"
+        --workers "$WORKERS" &
+    BENCH_PID=$!
+    # Trap installed only AFTER $BENCH_PID is actually set (not before backgrounding) --
+    # closes even the sub-millisecond race of a signal arriving before BENCH_PID holds
+    # this iteration's real pid.
+    #
+    # HUP included (2026-08-31, round-3 same-day fixup, paired-review CONFIRMED MEDIUM):
+    # `set -m` above puts $BENCH_PID in its OWN process group (needed for the group-kill
+    # below to reach the whole pool, not just the parent) -- but that ALSO means a
+    # terminal-generated SIGHUP (closing the terminal, an SSH drop, on the very real
+    # multi-hour foreground run this script's own usage doc describes) no longer reaches
+    # the child directly the way it did before `set -m`, reopening the exact orphan bug
+    # this trap exists to close, through a signal this trap didn't originally catch.
+    #
+    # mark-finished BEFORE the echo is load-bearing, not incidental (found by the same
+    # review round): under a real Ctrl-C, `tee` (same foreground process group) dies on
+    # the identical SIGINT, so anything printed to stdout from inside this trap after
+    # that point can be lost to a broken pipe / SIGPIPE before `exit 130` is ever
+    # reached -- the DB write must come first so the job's real fate is recorded even if
+    # the human-readable log message and the clean exit code aren't. `trap "" PIPE` (round
+    # 4, same-day fixup, paired-review CONFIRMED LOW, verified) + appending straight to
+    # `"$LOG"` instead of stdout closes the SIGPIPE gap itself, so on a real Ctrl-C (not
+    # just a directed `kill` on this script's own pid) the message AND `exit 130` both
+    # still land, not just the DB write.
+    #
+    # nohup NOTE (round 4, same-day fixup, paired-review CONFIRMED LOW): `nohup ... &`
+    # sets SIGHUP to SIG_IGN, and bash cannot install a trap over an inherited-ignored
+    # signal (POSIX) -- so this trap's HUP handling is INERT under nohup specifically
+    # (verified via /proc/<pid>/status SigIgn mask). Not a bug (a nohup'd campaign
+    # correctly surviving a terminal close/SSH drop is the whole point of nohup), but
+    # `kill -HUP` is NOT a reliable way to stop a nohup'd campaign -- use `kill -TERM`.
+    trap '
+        trap "" PIPE
+        kill -TERM -- -"$BENCH_PID" 2>/dev/null
+        while kill -0 "$BENCH_PID" 2>/dev/null; do wait "$BENCH_PID" 2>/dev/null; done
+        $PYTHON scripts/campaign_registry.py mark-finished --job-id "$JOB_ID" --rc 130 > /dev/null
+        echo "PROGRESS: interrupted by signal -- aborting the whole campaign (job_id=$JOB_ID marked rc=130, not a real crash)" >> "$LOG"
+        exit 130
+    ' INT TERM HUP
+    $PYTHON scripts/campaign_registry.py update-job-pid --job-id "$JOB_ID" --pid "$BENCH_PID" > /dev/null
+    # No re-wait loop needed here (round-1 fixup had one; removed in round 2): the trap
+    # above now does its OWN complete cleanup and `exit`s the whole script whenever it
+    # fires, so control only ever reaches this line via the trap NOT having fired --
+    # either $BENCH_PID exited normally, or it was killed by something outside this
+    # script's own signal handling (e.g. an external SIGKILL/OOM-kill), in which case
+    # `wait`'s reported code is already the real, final one.
+    wait "$BENCH_PID"
     rc=$?
+    trap - INT TERM HUP
+    set +m
     $PYTHON scripts/campaign_registry.py mark-finished --job-id "$JOB_ID" --rc "$rc"
 
     if [ $rc -ne 0 ]; then
@@ -396,4 +501,3 @@ echo "Logging to $LOG (console + file via tee)"
   echo ""
   echo "All done — $(date)"
   $PYTHON scripts/campaign_registry.py status --campaign-id "$CAMPAIGN_ID"
-} 2>&1 | tee "$LOG"
