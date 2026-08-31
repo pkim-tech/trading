@@ -67,6 +67,7 @@ Full incident/build history for everything below: `docs/deep_backlog.md` (search
 - `schwab_client._submit_order_with_retry` retries only the broker call (3x/2s) on transient failure — never `approve_and_record()` itself, never a deliberate `SafetyViolation`.
 - Nightly EOD review/plan cycle (`build_eod_scenario_review`/`build_tomorrow_plan`, 16:05 ET) posts readiness/canary/activity/tomorrow's-plan automatically. 7am split runs `signals_invariants.run_all()` + config-drift check only.
 - `active_signals.py` caches `schwab_safety.ACCOUNTS` once per process — any account-flag change needs a daemon restart to take effect.
+- **When discussing/reporting backtest or sweep results with the user, lead with real CAGR (`candidate_verification_results.core_cagr_1m`/`core_cagr_1s`/`addon_cagr_*`/`drought_cagr_*`, or Phase4's own printed CAGR lines), not `robust_alpha`.** `robust_alpha` is the internal Phase1/Phase2 island-selection ranking metric (exists for every `candidate_nodes` row, before real CAGR is even computed) — useful for the pipeline's own promotion logic, but confirmed 2026-08-30: the user finds it much less meaningful than CAGR for actually evaluating a candidate and wants CAGR as the default reporting metric. Fall back to `robust_alpha` only when no real CAGR exists yet for a scope (e.g. describing the raw promotion pool before Phase4/5 has run), and say so explicitly when doing so.
 
 ## Key Files
 Full build/bugfix history for every file below: `docs/deep_backlog.md` (search by filename/date).
