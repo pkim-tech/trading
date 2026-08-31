@@ -1850,6 +1850,285 @@ REGISTRY = [
                "event has occurred against this mechanism since it shipped; the design doc's own open, "
                "explicitly-unverified caveats (Massive dividend-endpoint lag, either source's split-"
                "rebase timing) should get a first real data point whenever one does."),
+
+    # --- 2026-08-31 gap-fill batch (Task #4, planner dispatch): 19 real scenario_keys
+    # found actually logged via log_coverage_event(...) with zero matching Row here --
+    # invisible to compute_status/the EOD report the whole time these code paths have
+    # existed. A 20th candidate ('second_ticker_buy_blocked', schwab_safety.py) was
+    # checked and correctly excluded -- deliberately removed 2026-08-13, see the
+    # 'second_ticker_one_account' comment above. Not review-gated (this file isn't on
+    # the Review-Gate module list) but self-reviewed: every entry below is anchored to a
+    # real call site read directly, not guessed from the scenario_key name alone.
+    dict(id='addon_non_margin_account_blocked',
+         scenario="Add-on-leg BUY refused because the account isn't margin-capable",
+         code_path="schwab_safety.check_order (is_addon_leg precondition #1, margin_capable check)",
+         offline_coverage="tests/test_fake_broker_addon_entry_scenario.py has siblings for "
+                          "addon_precondition_blocked/addon_size_mismatch_blocked/"
+                          "addon_combined_exposure_blocked but none found asserting this exact "
+                          "margin_capable branch",
+         check_mechanism='coverage_events', scenario_key='addon_non_margin_account_blocked',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch): a real precondition guard "
+               "with zero Row here since it was added. margin_capable is seeded per-account "
+               "(brokerage/roth/ira/soxl_ira=True, sep=False) -- see the check's own comment for why "
+               "the cash-aware replacement is deliberately deferred. Blocking is the designed "
+               "behavior here, not an anomaly, hence bad_results=[]."),
+    dict(id='addon_precondition_blocked',
+         scenario="Add-on-leg BUY refused on one of three preconditions: no open CORE position on "
+                  "file, parent position not yet armed (trail_state.trailing is not True), or a leg "
+                  "is already open for this parent",
+         code_path="schwab_safety.check_order (is_addon_leg preconditions #2-4)",
+         offline_coverage="tests/test_fake_broker_addon_entry_scenario.py "
+                          "(scenario_key='addon_precondition_blocked' asserted directly)",
+         check_mechanism='coverage_events', scenario_key='addon_precondition_blocked',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Same detail= value shape "
+               "across all three branches ('no_open_core_position'/'parent_not_armed'/"
+               "'leg_already_open') -- distinguishable only via the detail field, not result. "
+               "Blocking is designed behavior, bad_results=[]."),
+    dict(id='addon_size_mismatch_blocked',
+         scenario="Add-on-leg BUY refused because its quantity doesn't exactly equal the parent "
+                  "core position's share count",
+         code_path="schwab_safety.check_order (is_addon_leg precondition #5)",
+         offline_coverage="tests/test_fake_broker_addon_entry_scenario.py "
+                          "(scenario_key='addon_size_mismatch_blocked' asserted directly)",
+         check_mechanism='coverage_events', scenario_key='addon_size_mismatch_blocked',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Blocking is designed "
+               "behavior (an addon leg must exactly mirror its parent's sizing), bad_results=[]."),
+    dict(id='addon_combined_exposure_blocked',
+         scenario="Add-on-leg BUY refused because core+addon combined notional would exceed the "
+                  "account's notional_cap (D5 exposure ceiling)",
+         code_path="schwab_safety.check_order (is_addon_leg D5 combined-exposure ceiling)",
+         offline_coverage="tests/test_fake_broker_addon_entry_scenario.py "
+                          "(scenario_key='addon_combined_exposure_blocked' asserted directly)",
+         check_mechanism='coverage_events', scenario_key='addon_combined_exposure_blocked',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Deliberately conservative "
+               "cap (reuses notional_cap rather than a bespoke multiplier) -- can under-permit a "
+               "legitimate add-on, flagged in the code's own comment as an open question for the "
+               "user (D5 in docs/plans/real_order_execution_drought_addon.md). Blocking is designed "
+               "behavior, bad_results=[]."),
+    dict(id='dup_order_blocked',
+         scenario="A BUY refused because this ticker already has an open/working order in the same "
+                  "account (Schwab doesn't reserve buying power for a resting order, so nothing else "
+                  "stops these from stacking)",
+         code_path="schwab_safety.check_order (same-ticker resting-order dup guard, "
+                   "_has_open_buy_order_for_ticker for addon legs / _has_open_order otherwise)",
+         offline_coverage="No dedicated unit test found asserting this exact scenario_key",
+         check_mechanism='coverage_events', scenario_key='dup_order_blocked',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Blocking is designed "
+               "behavior, bad_results=[]. No live proof yet -- worth a real check next time this "
+               "guard should have fired."),
+    dict(id='node_id_ticker_account_mismatch',
+         scenario="A caller-supplied node_id doesn't actually belong to the (ticker, account) pair "
+                  "it was passed with -- fails safe to the old ambiguous ticker+account derivation "
+                  "rather than raising, but the mismatch itself is logged so it's visible",
+         code_path="schwab_safety.check_order (node_id verification, added Opus review 2026-08-10)",
+         offline_coverage="No dedicated unit test found asserting this exact scenario_key",
+         check_mechanism='coverage_events', scenario_key='node_id_ticker_account_mismatch',
+         bad_results=['fallback'],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). result is always 'fallback' "
+               "(the only value logged) -- marked as a bad_result even though the code path fails "
+               "safe, since any real firing means a caller passed a stale/wrong node_id, which is a "
+               "caller-side bug worth investigating even though this guard prevents it from causing "
+               "real harm."),
+    dict(id='daily_cap_protective_bypass',
+         scenario="A protective order (e.g. _reconcile_fill's top-up) is allowed through even though "
+                  "the account has already hit its daily_order_cap -- BUY-only cap must not block a "
+                  "protective completion of an already-open position",
+         code_path="schwab_safety.check_order (daily_order_cap check, is_protective exemption)",
+         offline_coverage="No dedicated unit test found asserting this exact scenario_key",
+         check_mechanism='coverage_events', scenario_key='daily_cap_protective_bypass',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). result is always 'allowed' -- "
+               "this IS the accountability record for the bypass (every firing reviewable), sibling "
+               "in shape to daily_order_cap_block's own row above. bad_results=[]."),
+    dict(id='addon_leg_merge',
+         scenario="An add-on leg's own resting protective SELL is folded into the parent core "
+                  "position's SELL replacement order (already_merged_reused/cancel_failed/"
+                  "cancel_saw_fill/cancel_unconfirmed branches)",
+         code_path="signals_notify._attempt_automated_sell (addon-leg-merge-into-core branch)",
+         offline_coverage="tests/test_fake_broker_addon_merge_scenario.py (scenario_key asserted "
+                          "directly, 3 call sites); tests/test_intraday_risk_review.py exercises the "
+                          "burst-dedup rendering path for this key's 'cancel_failed' result",
+         check_mechanism='coverage_events', scenario_key='addon_leg_merge',
+         bad_results=['cancel_failed'],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Named explicitly in "
+               "signals_notify.py's own _DEDICATED_ALERT_SCENARIO_KEYS comment as a scenario_key "
+               "whose 'cancel_failed' branch lacks a dedicated always-fires alert (falls through to "
+               "the general concerning-events render only) -- 'already_merged_reused' is a defensive "
+               "guard not expected to fire live (state['trailing'] is a monotonic one-way flag) and "
+               "'cancel_saw_fill' is a benign race handled independently by the leg's own "
+               "reconciliation path, so only 'cancel_failed' is a true bad_result."),
+    dict(id='orphaned_fill_detected',
+         scenario="A real confirmed BUY fill has no matching pending_buys row at all -- either newly "
+                  "detected (alerted), or suppressed because a just-opened real position for the same "
+                  "ticker/account already accounts for it (e.g. a same-day top-up or a race with a "
+                  "faster reconcile path)",
+         code_path="signals_notify._reconcile_buy_fill (no pending_buys row at all) and "
+                   "signals_notify.drain_fill_queue (fast-path websocket fill-queue drain, same "
+                   "no-pending-row detection with the suppressed-reconciled-position check added on "
+                   "top)",
+         offline_coverage="tests/test_fake_broker_orphaned_fill_alert_scenario.py, "
+                          "tests/test_fake_broker_confirmed_fill_dropped_at_gate_scenario.py, "
+                          "tests/test_fake_broker_topup_orphan_fill_suppression_scenario.py -- all "
+                          "assert scenario_key='orphaned_fill_detected' directly",
+         check_mechanism='coverage_events', scenario_key='orphaned_fill_detected',
+         bad_results=['no_pending_buys_row', 'alerted'],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Deliberately a DISTINCT "
+               "scenario_key from 'buy_fill_reconciled' (the success path) -- a genuine failure event "
+               "under the same key as success would render as verified-live proof of fill-"
+               "reconciliation working, per the code's own comment (found by paired Opus review). "
+               "'suppressed_reconciled_position' is the benign already-handled case, excluded from "
+               "bad_results."),
+    dict(id='reconciliation_fetch_failed',
+         scenario="A live-state reconciliation cycle's broker fetch (get_real_position + open orders) "
+                  "failed after all retries for an account",
+         code_path="signals_notify.check_live_state_reconciliation",
+         offline_coverage="tests/test_live_state_reconciliation.py "
+                          "(scenario_key='reconciliation_fetch_failed' asserted directly); "
+                          "tests/test_intraday_risk_review.py exercises this key's burst-dedup "
+                          "suppression via _DEDICATED_ALERT_SCENARIO_KEYS",
+         check_mechanism='coverage_events', scenario_key='reconciliation_fetch_failed',
+         bad_results=['failed_after_retries'],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Real live incident on file: "
+               "ERY/YINN's 2026-08-16 ~13-minute Schwab outage produced 24 rows under this key, all "
+               "result='failed_after_retries', deduped to one dedicated cooldown-throttled alert per "
+               "account (not the general concerning-events render) via _DEDICATED_ALERT_SCENARIO_KEYS."),
+    dict(id='skim_fire',
+         scenario="Paper-trading skim: a fraction of the deployed strategy value moves to the reserve "
+                  "sleeve once equity crosses the next skim_step threshold above skim_ref",
+         code_path="paper_trading.check_paper_skim",
+         offline_coverage="tests/test_overlay_paper_trading.py: "
+                          "test_skim_fires_on_new_high_and_amount_shrinks_each_time -- module "
+                          "docstring explicitly says 'Offline proof for coverage_registry's registry "
+                          "id \\'skim_fire\\''",
+         check_mechanism='coverage_events', scenario_key='skim_fire',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). result is always 'fired' -- "
+               "the expected periodic-skim mechanism working, not an anomaly. Paper-mode only "
+               "(mode is always 'paper', hardcoded at the call site) -- see "
+               "project_skim_liquidity_takeprofit in agent memory for why real-money skim isn't live "
+               "yet."),
+    dict(id='skim_redeploy_alert',
+         scenario="Paper-trading skim: equity recovers past the 80%/100% pre-decline-peak threshold "
+                  "while a non-empty reserve exists -- 'consider redeploying reserve' alert fires",
+         code_path="paper_trading.check_paper_skim (redeploy-alert branch, both thresh_80/thresh_100 "
+                   "call sites)",
+         offline_coverage="tests/test_overlay_paper_trading.py: module docstring explicitly says "
+                          "'Offline proof for coverage_registry's registry id \\'skim_redeploy_alert\\''",
+         check_mechanism='coverage_events', scenario_key='skim_redeploy_alert',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). result is always 'alerted' -- "
+               "informational, not an anomaly. The 2026-08-08 CRITICAL fix this logic embodies (only "
+               "fire on genuine recovery past a threshold that was actually crossed on the way down, "
+               "not a wiggle at the peak) is covered by the same test file. Paper-mode only, same as "
+               "skim_fire."),
+    dict(id='dup_buy_alert_suppressed',
+         scenario="A BUY signal is suppressed because the node already has a resting order/position "
+                  "at the broker or an unresolved pending_buys row (throttled to one Slack alert/day "
+                  "per node, but every occurrence is logged)",
+         code_path="active_signals._scan_buy_signals (already_pending branch)",
+         offline_coverage="tests/test_dup_buy_alert_suppressed_gate.py -- module docstring: "
+                          "'Confirmed-live noise bug, 2026-08-18: the dup_buy_alert_suppressed Slack "
+                          "[...]', asserts a message is logged for this branch",
+         check_mechanism='coverage_events', scenario_key='dup_buy_alert_suppressed',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). result is always 'suppressed' "
+               "-- expected dedup behavior (an unrelated resting order/position that never clears "
+               "would otherwise re-alert every poll indefinitely), not itself an anomaly, though a "
+               "persistently high count on one node is worth a human glance."),
+    dict(id='starting_notional_override_once_consumed',
+         scenario="A node's one-shot starting_notional_override_once value is consumed by a real core "
+                  "position fill, auditably recording the intended vs. actual real position size",
+         code_path="signals_db.open_position (position_source == 'core' only -- a drought-overlay "
+                   "fill never consumes this)",
+         offline_coverage="No dedicated unit test found asserting this exact scenario_key",
+         check_mechanism='coverage_events', scenario_key='starting_notional_override_once_consumed',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Built 2026-08-26 at the "
+               "user's own request specifically so a human could later verify a position was sized "
+               "to what was intended without trusting the sizing math by construction alone -- an "
+               "audit trail, not a failure signal. result is always 'consumed'. No live proof yet -- "
+               "needs a real node with this override set to actually fire."),
+    dict(id='stream_message_parsed',
+         scenario="Per-fill parse-success/failure of a real Schwab websocket ACCT_ACTIVITY message",
+         code_path="schwab_stream._parse_activity_message / _log_parse_health",
+         offline_coverage="tests/test_schwab_stream_parse_activity_message.py, "
+                          "tests/test_fake_venue_harness_scenario.py -- both assert "
+                          "scenario_key='stream_message_parsed' directly",
+         check_mechanism='coverage_events', scenario_key='stream_message_parsed',
+         bad_results=['exception'],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). result='parsed' is the "
+               "expected case; result='exception' means a real fill message's shape didn't parse -- "
+               "the code's own comment cites a 13-day-unnoticed shape-drift incident as the reason "
+               "raw-message logging was kept even after that fix, making a fresh 'exception' row here "
+               "worth investigating promptly, not just noise."),
+    dict(id='divergence_check_run',
+         scenario="Run-level completion marker for the nightly real-vs-backtest-implied CAGR "
+                  "divergence check -- fires every EOD run regardless of whether any node's "
+                  "divergence_check_log row was written, so 'zero rows' (no node had enough trades to "
+                  "compare) is distinguishable from 'never ran'/'crashed before reaching here'",
+         code_path="scripts/evening_status.py part3()",
+         offline_coverage="No dedicated unit test found asserting this exact scenario_key",
+         check_mechanism='coverage_events', scenario_key='divergence_check_run',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Added 2026-08-20 from paired "
+               "Opus review of the EOD-wiring diff specifically to close this ambiguity -- result is "
+               "always 'completed', detail carries the real checked/flagged counts. The actual "
+               "divergence findings live in divergence_check_log/get_deviations, not this key -- this "
+               "row exists purely to prove the run happened at all."),
+    dict(id='canary_restage',
+         scenario="A stale canary node's open position is force-closed (exit_reason=RESTAGED) so it "
+                  "can re-enter organically",
+         code_path="scripts/restage_canary_nodes.restage",
+         offline_coverage="tests/test_restage_canary_nodes.py (both 'restaged' and 'close_failed' "
+                          "asserted via a direct coverage_events query)",
+         check_mechanism='coverage_events', scenario_key='canary_restage',
+         bad_results=['close_failed'],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Operator-run script, not "
+               "daemon-driven -- 'close_failed' means the position row disappeared between listing "
+               "and closing (e.g. a real organic exit raced this script), added 2026-08-08 review "
+               "finding so a repeated/unexpected occurrence is visible instead of only a printed "
+               "line nobody sees."),
+    dict(id='sanity_naked_sell',
+         scenario="Manual pre-live-flip sanity test: submits a real SELL with 0 shares held, "
+                  "expecting Schwab to reject it (or, if the account holds a margin feature, could "
+                  "theoretically open a real short instead)",
+         code_path="scripts/live_sanity_check.run_one (test='naked_sell'; scenario_key is "
+                   "f'sanity_{test}', so a --test oversized_buy run logs under the sibling "
+                   "'sanity_oversized_buy' key instead -- NOT covered by this row, see notes)",
+         offline_coverage="No dedicated unit test found -- this is an operator-run manual live "
+                          "sanity script by design (docs reference: scripts/live_sanity_check.py's "
+                          "own module docstring)",
+         check_mechanism='coverage_events', scenario_key='sanity_naked_sell',
+         bad_results=['unexpectedly_accepted'],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). 'unexpectedly_accepted' is "
+               "the real-risk result -- Schwab accepted an order this test expects to be rejected, "
+               "meaning the safety-net assumption it's checking (no naked short capability) didn't "
+               "hold. 'aborted_real_position_held'/'skipped_by_operator' are self-protective/operator "
+               "declines, 'rejected_as_expected' is the successful-test outcome. SCOPE NOTE: this "
+               "script's --test oversized_buy path logs a distinct, still-unregistered "
+               "'sanity_oversized_buy' scenario_key via the same f'sanity_{test}' call sites -- out "
+               "of this dispatch's assigned 19-key scope (a literal-string scan misses it), flagged "
+               "back to the planner rather than added here silently."),
+    dict(id='staged_live_test',
+         scenario="Manual bypass-staged real order (scripts/stage_live_test_order.py) -- places a "
+                  "real order that skips every schwab_safety guard, for testing an execution-code "
+                  "path directly against the broker",
+         code_path="scripts/stage_live_test_order.main",
+         offline_coverage="tests/test_verify_real_trades_vs_kernel_staged_window.py uses "
+                          "scenario_key='staged_live_test' as its default test fixture value, but "
+                          "doesn't appear to assert against a real log_coverage_event call from this "
+                          "script -- effectively behavior-only proof, not event-asserted",
+         check_mechanism='coverage_events', scenario_key='staged_live_test',
+         bad_results=[],
+         notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Both 'aborted_by_operator' "
+               "and 'placed' are expected outcomes of a deliberate, operator-confirmed manual script "
+               "-- see docs/live_test_coverage.md/reference_live_test_bypass_runbook (agent memory) "
+               "for the direct-bypass procedure this staging tool implements."),
 ]
 
 
