@@ -105,7 +105,14 @@ WORKERS="${WORKERS:-8}"
 # Bumped 2 -> 3 (2026-08-30, paired-review HIGH finding): the new arm_pct backfill +
 # N_ISLANDS 10->3 revert are both material promotion-algorithm changes -- MUST match
 # bench_phase1_phase2_inmemory.py's own PROMOTION_ALGO_VERSION exactly.
-PROMOTION_ALGO_VERSION=3
+# Bumped 3 -> 4 (2026-08-31, planner dispatch, paired-review HIGH finding): the new
+# N_GENERATIONS multi-generation Phase2-island loop is a material promotion-algorithm
+# change (changes which cells get explored/promoted) -- MUST match
+# bench_phase1_phase2_inmemory.py's own PROMOTION_ALGO_VERSION exactly. NOTE: a queue
+# process already running under the OLD pv3 code computed its own $VERSION once at
+# startup and is unaffected by this file edit mid-run (same as Python not re-reading
+# source mid-process) -- this bump only affects a FUTURE invocation of this script.
+PROMOTION_ALGO_VERSION=4
 
 # Must match bench_phase1_phase2_inmemory.py's own version construction --
 # see the header comment above. Z_THRESHOLDS values are joined with '-' exactly

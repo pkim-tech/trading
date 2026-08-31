@@ -291,8 +291,19 @@ guard's first draft let it through; fixed in `aac8ae8`).
   outside the ±4 window, reachable by hopping" failure mode; does NOT help "true peak never
   sampled densely enough to seed as a candidate center at all" (structural — Phase2 never
   globally re-explores the original coarse space). Cost: ~1-3h extra per ticker on the
-  reduced grid. **Decision: add it as standard** for the reduced-density runs (not yet
-  wired into code).
+  reduced grid. **Decision: add it as standard** for the reduced-density runs. **Wired into
+  code 2026-08-31** (planner dispatch): `scripts/bench_phase1_phase2_inmemory.py` now runs
+  a real `N_GENERATIONS=3` loop around Phase2-island (matching legacy's
+  `config.json` `execution.max_generations` default) — each generation re-derives
+  `pick_island_centers` off the accumulated Phase1 + all-prior-generation Phase2 rows
+  (in-memory only, no mid-sweep DB write) and dispatches only the cells not already
+  explored; a generation that converges to already-explored territory just no-ops (the
+  real stopping signal, no separate early-exit heuristic). `candidate_nodes.generation`
+  (new column) records which generation, if any, first produced each promoted candidate.
+  Smoke-tested via seed mode (AGQ, watch_list id=19): gen1=81 new cells, gen2=72 new
+  (centers moved), gen3=9 new (converging) — confirms real hopping behavior, not just
+  theoretical. Paired-review outcome: see `docs/deep_backlog.md` (search "N_GENERATIONS"
+  or 2026-08-31).
 - **Window-shortening for the discovery pass, spec'd, not yet coded**: use a shorter window
   (6mo-1yr vs the validated 2024-08-21..2026-08-20 ~2yr) ONLY for Phase1-coarse-GT
   discovery/triage, then re-run Phase2/2.5-GT refinement on the FULL validated 2yr window
@@ -364,6 +375,14 @@ does.
 `run_optimization_sweep.py`/`scripts/run_ground_truth_phase1.py` for the same real scope),
 not a strategy/timing variant. See `scripts/compare_old_new_pipeline_parity_v62.py` and
 `docs/deep_backlog.md`'s 2026-08-29 entry. Do not reuse "v6.2" for anything else.
+
+**Name reservation, 2026-08-31**: "v6.5" is claimed for the resweep campaign launched under
+`PROMOTION_ALGO_VERSION=3` (`-pv3`) -- N_ISLANDS reverted 10->3, dual window/z + arm_pct
+backfill, trades<50 floor, and the `worst_neighbor_cagr` core_safe pre-Phase4 filter, all
+landed 2026-08-30/31 (commits `5e2eb2f`, `9b3e424`). Note: this is spelled the same as the
+pre-existing `scripts/checklist_v65.py` ("v65" as part of that script's own filename, unrelated
+to this thread-naming sequence) -- don't confuse the two when searching docs. Do not reuse
+"v6.5" for anything else.
 
 ## v6.1 parking lot — timing-architecture variations (separate future backtest, not v6)
 

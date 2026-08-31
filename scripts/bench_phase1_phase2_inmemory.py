@@ -59,6 +59,16 @@ Z_THRESHOLDS = [1.0, 1.5, 2.0]
 HOLD_TIME_CAPS = [7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105, 112, 119, 126, 133, 140]
 ENTRY_TIMING = "open_check"
 
+# N_GENERATIONS (2026-08-31, planner dispatch): legacy's multi-generation Phase2-island
+# loop (config.json execution.max_generations, default 3 -- see run_optimization_sweep.py's
+# run_phase2_island/run_phase2_island_ground_truth dispatch loop around line 4476) was
+# never wired into this in-memory pipeline -- it only ever ran ONE Phase2-island pass
+# (docs/plans/ground_truth_kernel_rebuild.md:290-295). Matches legacy's default exactly.
+# No CLI override -- N_ISLANDS/WINDOWS/Z_THRESHOLDS all have one because they change the
+# real scope being swept; this only changes how many extra island-reseeding passes run
+# over the SAME scope, and a stuck/no-op generation is already free (see the loop itself).
+N_GENERATIONS = 3
+
 # Pipeline-version discriminator (2026-08-30, planner dispatch, item 3): the version
 # string was previously derived PURELY from sweep parameters (z-thresholds, n-islands,
 # date window) -- it had no component reflecting the PROMOTION ALGORITHM itself. A re-run
@@ -82,7 +92,18 @@ ENTRY_TIMING = "open_check"
 # list-id 19 smoke test run under the old pv2 code and a second run under the new
 # arm-backfill code both landed under the identical 'bench-inmemory-...-seed19-pv2'
 # version string in the real research DB before this bump.
-PROMOTION_ALGO_VERSION = 3
+# Bumped 3 -> 4 (2026-08-31, planner dispatch, paired-review HIGH finding, both
+# independent-cold AND contextual review converged on this independently): the new
+# N_GENERATIONS multi-generation Phase2-island loop changes WHICH cells get explored
+# and therefore which nodes get promoted -- at least as material as the arm_pct backfill
+# that forced the pv2->pv3 bump. Confirmed as a REAL collision, not hypothetical: 3,231
+# candidate_nodes rows + 55 finished sweep_run_log rows already exist under
+# '...-isl3-pv3' from the single-pass code, and this session's own seed19 smoke test
+# landed under the IDENTICAL '...-seed19-pv3' string as a pre-change run -- without this
+# bump, run_one_fixed_sl's own dedup gate (keyed on ticker/strategy/fixed_sl/windows/
+# version) would silently skip re-running any of those 55 already-"done" scopes under
+# the new multi-generation code, so the new loop would never actually execute for them.
+PROMOTION_ALGO_VERSION = 4
 
 
 def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, desc="dispatch"):
@@ -233,11 +254,18 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
         # not structurally coupled -- see the pre-filter's own docstring for why).
         # None when no real neighbor existed (c["n_neighbors_checked"] == 0) -- fails
         # CLOSED to "unknown," never silently treated as either safe or unsafe.
+        # generation (2026-08-31, planner dispatch): which Phase2-island generation
+        # (1-indexed) first computed this candidate's underlying cell -- None for a
+        # Phase1-only or Phase2.5-cliffbox-only cell, same convention as legacy's own
+        # backtest_cache.generation column (see run_optimization_sweep.py's ALTER TABLE
+        # comment, 2026-07-15). `candidate_nodes` never had this column before (33 cols,
+        # confirmed via a direct schema query) -- added below via the same ALTER-guard
+        # pattern as params_json/selection_source/worst_neighbor_cagr.
         buffer.append((now_iso, ticker, strategy_name, config_version, c["window"],
                        c["z_score_threshold"], float(fixed_sl), arm_pct, trail_buy_pct,
                        trail_sell_pct, c["max_hold_hours"], entry_timing,
                        c["alpha_vs_spy"], c["trades"], now_iso, params_json, selection_source,
-                       c["worst_neighbor_cagr"]))
+                       c["worst_neighbor_cagr"], c.get("generation")))
 
     with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
@@ -247,6 +275,8 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
             conn.execute("ALTER TABLE candidate_nodes ADD COLUMN selection_source TEXT")
         if 'worst_neighbor_cagr' not in existing_cols:
             conn.execute("ALTER TABLE candidate_nodes ADD COLUMN worst_neighbor_cagr REAL")
+        if 'generation' not in existing_cols:
+            conn.execute("ALTER TABLE candidate_nodes ADD COLUMN generation INTEGER")
         before = conn.execute(
             "SELECT COUNT(*) FROM candidate_nodes WHERE version=? AND ticker=? AND strategy=?",
             (config_version, ticker, strategy_name)).fetchone()[0]
@@ -255,8 +285,8 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
                 (created_at, ticker, strategy, version, window, z, fixed_sl, arm_pct,
                  trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing,
                  robust_alpha, trades, robust_alpha_computed_at, params_json, selection_source,
-                 worst_neighbor_cagr)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 worst_neighbor_cagr, generation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, buffer)
         conn.commit()
         after = conn.execute(
@@ -1106,8 +1136,19 @@ def _build_checkpoint_filename(strategy_name, fixed_sl, args):
     # --n-islands override run must not silently load a checkpoint from an earlier run under
     # a different island count with the same strategy/fixed_sl/windows/date-range.
     _isl_key = f"_isl{args.n_islands}" if args.n_islands is not None else ""
+    # Also keyed on PROMOTION_ALGO_VERSION (2026-08-31, planner dispatch, paired-review
+    # HIGH finding): this checkpoint stores df_full -- the full Phase1+Phase2 evidence
+    # pool -- and loading it SKIPS Phase1 AND Phase2 entirely, including the whole
+    # N_GENERATIONS multi-generation loop. Without this key, a stale pre-pv4 checkpoint
+    # (single Phase2-island pass) would silently load under the new pv4 code and get
+    # promoted as if it were a real multi-generation result -- confirmed live: 153 stale
+    # checkpoints from the single-pass code were sitting in the checkpoint dir with
+    # otherwise-identical keys at the time this fix landed. Same bug class, same fix
+    # shape, as the WINDOWS/Z_THRESHOLDS/N_ISLANDS keys above -- this one auto-resolves
+    # every FUTURE PROMOTION_ALGO_VERSION bump too, not just this one.
+    _pv_key = f"_pv{PROMOTION_ALGO_VERSION}"
     return (f"bench_phase12_checkpoint_{TICKER}_{strategy_name}_{fixed_sl}_w{_windows_key}"
-            f"{_z_key}{_range_key}{_seed_key}{_isl_key}.parquet")
+            f"{_z_key}{_range_key}{_seed_key}{_isl_key}{_pv_key}.parquet")
 
 
 def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
@@ -1363,36 +1404,74 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
                 f"(top-1000 + {len(wide_centers)}-region coverage), {n_written} written to "
                 f"backtest_phase1_insurance in {t_ins1 - t_ins0:.2f}s (version={version})")
 
-      # Island-center detection, straight off the in-memory DataFrame -- same shape as
-      # _phase2_island_gt_tasks's per-(w,z,tpct) loop, minus the SQL read.
-      phase2_tasks = set()
-      for z in Z_THRESHOLDS:
-          for w in WINDOWS:
-              for tpct in TRAIL_PCTS:
-                  df_wz = df1[(df1["window"] == w) & (df1["z_score_threshold"] == z)
-                              & (df1["trail_sell_pct"] == tpct)]
-                  if df_wz.empty:
-                      continue
-                  centers = pick_island_centers(df_wz, n=N_ISLANDS, rank_col="cagr")
-                  if len(centers) < N_ISLANDS:
-                      print(f"  WARNING: (w={w} z={z} tpct={tpct}) only found {len(centers)} "
-                            f"island(s), expected {N_ISLANDS} -- check for a data gap in "
-                            f"this slice, not necessarily fatal (a real scope can "
-                            f"legitimately have fewer distinct islands than N_ISLANDS).")
-                  for (tp_c, sl_c) in centers:
-                      for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
-                          for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
-                              for hold in HOLD_TIME_CAPS:
-                                  phase2_tasks.add((tp, sl, int(hold), int(w), float(z), float(tpct)))
-      print(f"Phase2-island mesh (in-memory): {len(phase2_tasks):,} cells "
-            f"({N_ISLANDS} islands x {len(WINDOWS)}w x {len(Z_THRESHOLDS)}z x {len(TRAIL_PCTS)} trail_pcts, +-{FINE_RADIUS} box)")
-
+      # Island-center detection + fine mesh, run for N_GENERATIONS passes (2026-08-31,
+      # planner dispatch -- closes the gap docs/plans/ground_truth_kernel_rebuild.md:
+      # 290-295 flagged: this pipeline previously ran exactly ONE Phase2-island pass,
+      # missing a true peak that sits just outside the first pass's +-FINE_RADIUS window
+      # but is reachable by hopping generation to generation, the same failure mode
+      # legacy's multi-generation Phase2 (config.json execution.max_generations,
+      # run_phase2_island_ground_truth's own docstring) already mitigates on the disk-
+      # based path. Each generation re-derives pick_island_centers off df_gen_pool --
+      # df1 (raw Phase1) PLUS every prior generation's own Phase2 rows, accumulated
+      # in-memory exactly like Phase1->Phase2->Phase2.5 already accumulate today (no mid-
+      # sweep DB write, matching this module's whole in-memory design) -- so a later
+      # generation can walk toward a peak the first pass's mesh didn't reach.
+      #
+      # `explored_tasks` is this in-memory pipeline's equivalent of legacy's cache-lookup-
+      # before-write: only cells not already dispatched in an earlier generation get
+      # re-dispatched. A generation whose freshly-picked centers mesh entirely inside
+      # `explored_tasks` (island centers have converged -- same picks as before) simply
+      # dispatches zero new cells and no-ops. That IS the stopping signal by design --
+      # no separate hardcoded early-exit/break is layered on top, matching legacy's own
+      # "a generation that finds nothing new simply re-picks the same centers and cache-
+      # hits its way to a fast no-op" behavior (run_phase2_island_ground_truth docstring).
       t2 = time.time()
-      phase2_rows = _dispatch(pool, phase2_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
-                               desc="Phase2-island (in-memory)")
+      phase2_rows = []
+      explored_tasks = set()
+      df_gen_pool = df1
+      for gen in range(1, N_GENERATIONS + 1):
+          phase2_tasks = set()
+          for z in Z_THRESHOLDS:
+              for w in WINDOWS:
+                  for tpct in TRAIL_PCTS:
+                      df_wz = df_gen_pool[(df_gen_pool["window"] == w)
+                                           & (df_gen_pool["z_score_threshold"] == z)
+                                           & (df_gen_pool["trail_sell_pct"] == tpct)]
+                      if df_wz.empty:
+                          continue
+                      centers = pick_island_centers(df_wz, n=N_ISLANDS, rank_col="cagr")
+                      if len(centers) < N_ISLANDS and gen == 1:
+                          print(f"  WARNING: (w={w} z={z} tpct={tpct}) only found {len(centers)} "
+                                f"island(s), expected {N_ISLANDS} -- check for a data gap in "
+                                f"this slice, not necessarily fatal (a real scope can "
+                                f"legitimately have fewer distinct islands than N_ISLANDS).")
+                      for (tp_c, sl_c) in centers:
+                          for tp in range(max(1, tp_c - FINE_RADIUS), min(30, tp_c + FINE_RADIUS) + 1):
+                              for sl in range(max(1, sl_c - FINE_RADIUS), min(30, sl_c + FINE_RADIUS) + 1):
+                                  for hold in HOLD_TIME_CAPS:
+                                      phase2_tasks.add((tp, sl, int(hold), int(w), float(z), float(tpct)))
+          new_tasks = phase2_tasks - explored_tasks
+          print(f"Phase2-island mesh gen {gen}/{N_GENERATIONS} (in-memory): {len(phase2_tasks):,} cells "
+                f"picked, {len(new_tasks):,} new (not already explored in a prior generation) "
+                f"({N_ISLANDS} islands x {len(WINDOWS)}w x {len(Z_THRESHOLDS)}z x {len(TRAIL_PCTS)} trail_pcts, +-{FINE_RADIUS} box)")
+          if not new_tasks:
+              print(f"  gen {gen}/{N_GENERATIONS}: 0 new cells -- island centers converged to "
+                    f"already-explored territory, no-op (this is the real stopping signal, "
+                    f"not treated as an error).")
+              continue
+          gen_rows = _dispatch(pool, new_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
+                                desc=f"Phase2-island gen{gen} (in-memory)")
+          for row in gen_rows:
+              row["generation"] = gen
+          phase2_rows.extend(gen_rows)
+          explored_tasks |= new_tasks
+          if gen_rows:
+              # Feeds the NEXT generation's pick_island_centers call -- accumulated
+              # in-memory, never written to any table mid-sweep.
+              df_gen_pool = pd.concat([df_gen_pool, pd.DataFrame(gen_rows)], ignore_index=True)
       t3 = time.time()
       print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase2 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
-            f"{len(phase2_rows):,} rows in {t3 - t2:.1f}s "
+            f"{len(phase2_rows):,} rows across {N_GENERATIONS} generation(s) in {t3 - t2:.1f}s "
             f"({len(phase2_rows) / max(t3 - t2, 0.001):.0f} nodes/sec)")
 
       # Phase2.5-CliffBox-GT (in-memory): center detection off the FULL scope
@@ -1631,6 +1710,15 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     final_centers = pick_island_centers(df_final, n=N_ISLANDS, rank_col="cagr")
     final_candidates = []
     claimed = {}  # coordinate key -> candidate dict already added (tracks convergence)
+
+    def _row_generation(row):
+        """Which Phase2-island generation (1-indexed) first computed this df_final row --
+        NaN/absent for a Phase1-only or Phase2.5-cliffbox-only cell (matches legacy's own
+        generation-column convention: only Phase2-Island rows carry a real value, see
+        run_optimization_sweep.py's ALTER TABLE backtest_cache ADD COLUMN generation
+        comment) or a pre-generation-loop checkpoint that predates this column."""
+        gen = row.get("generation") if hasattr(row, "get") else None
+        return int(gen) if gen is not None and pd.notna(gen) else None
     for tp_c, sl_c in final_centers:
         region = df_final[(df_final["take_profit"] - tp_c).abs().le(FINE_RADIUS)
                            & (df_final["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
@@ -1652,7 +1740,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
                 "max_hold_hours": key[2], "window": key[3], "z_score_threshold": key[4],
                 "trail_sell_pct": key[5], "cagr": float(cand["cagr"]),
                 "trades": int(cand["trades"]), "alpha_vs_spy": float(cand["alpha_vs_spy"]),
-                "converged_from_islands": [(tp_c, sl_c)],
+                "converged_from_islands": [(tp_c, sl_c)], "generation": _row_generation(cand),
             }
             claimed[key] = c
             final_candidates.append(c)
@@ -1704,7 +1792,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
                 "trail_sell_pct": key[5], "cagr": float(cand["cagr"]),
                 "trades": int(cand["trades"]), "alpha_vs_spy": float(cand["alpha_vs_spy"]),
                 "converged_from_islands": [], "backfilled": True,
-                "backfill_reason": "window_z",
+                "backfill_reason": "window_z", "generation": _row_generation(cand),
             }
             claimed[key] = c
             final_candidates.append(c)
@@ -1744,7 +1832,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
                 "trail_sell_pct": key[5], "cagr": float(cand["cagr"]),
                 "trades": int(cand["trades"]), "alpha_vs_spy": float(cand["alpha_vs_spy"]),
                 "converged_from_islands": [], "backfilled": True,
-                "backfill_reason": "arm_pct",
+                "backfill_reason": "arm_pct", "generation": _row_generation(cand),
             }
             claimed[key] = c
             final_candidates.append(c)
