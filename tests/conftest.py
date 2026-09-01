@@ -52,6 +52,19 @@ def _no_real_slack_posts(monkeypatch):
         if hasattr(mod, 'cfg') and hasattr(mod.cfg, 'INTERACTIVE'):
             monkeypatch.setattr(mod.cfg, 'INTERACTIVE', True)
 
+    # signals_trade_control.py (2026-08-17) does NOT go through _post_message --
+    # a persistent, edited-in-place message needs chat_postMessage/chat_update
+    # directly on the Bolt client, which the patches above don't reach. Its own
+    # SIM_MODE/unset-channel guards already stop a real post, but this is the
+    # same defense-in-depth the 2026-07-22 leak incident established: no test
+    # should be one monkeypatch away from talking to the real Slack workspace.
+    import signals_trade_control
+    def _no_client():
+        raise AssertionError(
+            "signals_trade_control tried to reach the real Slack client under pytest -- "
+            "patch signals_trade_control._client in the test's own fixture")
+    monkeypatch.setattr(signals_trade_control, '_client', _no_client)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_schwab_safety_state_files(monkeypatch, tmp_path):

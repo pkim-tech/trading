@@ -2181,6 +2181,46 @@ def ensure_tables():
             )
         """)
 
+        # trade_control_messages -- one persistent, edited-in-place Slack message
+        # per real-live node in the dedicated trade-control channel
+        # (signals_trade_control.py, 2026-08-17). node_id is the PRIMARY KEY
+        # because the whole point is exactly one message per node, forever,
+        # spanning the full lifecycle (flat -> pending buy -> held -> armed ->
+        # exit pending -> flat again).
+        # Deliberately NOT reusing pending_buys.reminder_channel/reminder_ts,
+        # the existing "one tracked message per pending item" precedent: those
+        # columns die with the pending_buys row the moment the buy resolves
+        # (clear_pending_buy_by_wl_id), which is precisely when this message has
+        # to survive and keep being edited. Same reasoning rules out
+        # trail_state.exit_pending's reminder_ts pair.
+        # fingerprint is a hash of the rendered blocks -- the sync only issues a
+        # chat_update when the visible content actually changed (or the forced
+        # refresh interval elapsed), so a quiet day costs no Slack API calls.
+        # channel is the RESOLVED channel id Slack returned (what chat_update
+        # needs); configured_channel is the raw SLACK_TRADE_CONTROL_CHANNEL
+        # string the card was posted for, which may be a "#name". Comparing the
+        # configured value is what detects a genuine channel change -- comparing
+        # the resolved id against a name-configured value never matches, so
+        # every sync would think the channel changed and post a duplicate card
+        # (~288/day/node, each with live real-money buttons). Found by cold
+        # review, 2026-08-17.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS trade_control_messages (
+                node_id            INTEGER PRIMARY KEY REFERENCES watch_list(id),
+                channel            TEXT NOT NULL,
+                message_ts         TEXT NOT NULL,
+                fingerprint        TEXT,
+                configured_channel TEXT,
+                updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        # Additive migration for a DB that already got the first version of
+        # this table (created earlier the same day).
+        tcm_cols = {r[1] for r in c.execute("PRAGMA table_info(trade_control_messages)").fetchall()}
+        if 'configured_channel' not in tcm_cols:
+            c.execute("ALTER TABLE trade_control_messages ADD COLUMN configured_channel TEXT")
+            c.commit()
+
         # tax_realized_loss_baseline -- the user's real, pre-existing realized-loss
         # baseline for `brokerage` (the one taxable account), used by k1_tax.py's
         # brokerage_tax_forecast() to net against the year's realized gains before
@@ -4709,6 +4749,53 @@ def mark_pending_buy_placed_by_wl_id(wl_id):
             "UPDATE pending_buys SET order_placed=1, reminder_count=0, last_reminder_at=? WHERE wl_id = ?",
             (now_str, wl_id),
         )
+        c.commit()
+
+
+def get_trade_control_message(node_id):
+    """The tracked persistent trade-control message for one node, or None.
+    See ensure_tables' trade_control_messages block for why this is its own
+    table rather than a reuse of pending_buys.reminder_channel/reminder_ts."""
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        row = c.execute("SELECT * FROM trade_control_messages WHERE node_id=?", (node_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_trade_control_messages():
+    with _conn() as c:
+        c.row_factory = sqlite3.Row
+        return [dict(r) for r in c.execute("SELECT * FROM trade_control_messages").fetchall()]
+
+
+def set_trade_control_message(node_id, channel, message_ts, fingerprint, configured_channel=None,
+                               updated_at=None):
+    # Local time, matching every other timestamp this module writes (and what
+    # signals_trade_control._stale compares against) -- deliberately not the
+    # column's own datetime('now') UTC default, which is unreachable while
+    # every write goes through here.
+    # updated_at: the caller's own clock (the sync's `now`), so the stored
+    # timestamp is the same instant the card was rendered for -- otherwise
+    # _stale compares against a slightly different clock than the one it is
+    # handed, and a test/replay driving an explicit `now` can never go stale.
+    now_str = (updated_at.strftime('%Y-%m-%d %H:%M:%S') if isinstance(updated_at, datetime)
+               else (updated_at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO trade_control_messages "
+            "(node_id, channel, message_ts, fingerprint, configured_channel, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(node_id) DO UPDATE SET channel=excluded.channel, "
+            "message_ts=excluded.message_ts, fingerprint=excluded.fingerprint, "
+            "configured_channel=excluded.configured_channel, updated_at=excluded.updated_at",
+            (node_id, channel, message_ts, fingerprint, configured_channel, now_str),
+        )
+        c.commit()
+
+
+def clear_trade_control_message(node_id):
+    with _conn() as c:
+        c.execute("DELETE FROM trade_control_messages WHERE node_id=?", (node_id,))
         c.commit()
 
 
