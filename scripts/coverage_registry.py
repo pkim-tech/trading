@@ -1147,6 +1147,29 @@ REGISTRY = [
                "class of gap going forward. 'no_delivery_confirmation' covers both a real send failure and "
                "any non-Socket-Mode delivery path (webhook/console) that can't confirm delivery -- "
                "deliberately not counted as proof of success."),
+    dict(id='trade_control_sync',
+         scenario="The dedicated trade-control channel's per-node cards are created/retired "
+                  "successfully (one self-updating message per real-live node)",
+         code_path="signals_trade_control.sync_trade_control_channel (poll loop, every cycle)",
+         offline_coverage="tests/test_trade_control_channel.py (35 tests: derived cross-watchlist "
+                          "scope, lifecycle state machine, button-payload parity with the main "
+                          "channel's builders, routine-resting-exit not framed as urgent, real "
+                          "fixed_sl resolution, signature stability across the clock, "
+                          "inert-when-unconfigured, post-once-then-edit-in-place, channel-name and "
+                          "channel-change handling, retire (never with open exposure), per-node "
+                          "failure isolation, deleted-message self-heal)",
+         check_mechanism='coverage_events', scenario_key='trade_control_sync',
+         # Must match the real emitted value. 'failed' (not 'error') is itself
+         # deliberate on the producer side -- signals_notify's
+         # _CONCERNING_RESULT_SUBSTRINGS matches on "fail", so a broken control
+         # surface reaches check_intraday_risk_review's Slack alert for free.
+         bad_results=['failed'],
+         notes="New 2026-08-17, after a real pending SOXS confirmation button was unfindable in "
+               "main-channel scrollback during a Schwab API outage. Stays not-instrumented until "
+               "SLACK_TRADE_CONTROL_CHANNEL is set in .env (the feature is inert by default -- "
+               "creating the channel and inviting the bot needs a human in Slack). Deliberately "
+               "logged only on a card being created/retired or a real failure, never on routine "
+               "in-place edits, which happen many times a day."),
     dict(id='node_circuit_breaker',
          scenario="Node-level circuit breaker trips on 3 consecutive real order failures/blocks or "
                   "3 consecutive live-state reconciliation mismatches for the same node",
@@ -2073,6 +2096,7 @@ BEST_HARNESS = {
     'skim_redeploy_alert': 'paper',
     'oversell_guard_correct_position': 'canary',
     'morning_report_delivery': 'canary',          # harness-agnostic, scheduled
+    'trade_control_sync': 'canary',               # harness-agnostic, poll-loop scheduled (2026-08-17)
     'automated_sell_mode_skip': 'canary',         # trigger is specifically state=='paper'
 }
 

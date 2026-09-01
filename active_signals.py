@@ -124,6 +124,7 @@ from signals_notify import (
     check_intraday_risk_review, check_addon_buying_power_drift,
     check_orphaned_broker_positions,
 )
+from signals_trade_control import sync_trade_control_channel
 import signals_handlers  # noqa: F401 -- import registers Bolt handlers as a side effect
 
 
@@ -1446,6 +1447,20 @@ def run_loop(tickers: set = None):
             _guarded("real_pending_buys_running_low", update_real_pending_buys_running_low)
             _guarded("check_entry_abandon", check_entry_abandon)
             _guarded("check_market_buy_rejected", check_market_buy_rejected)
+
+            # Dedicated trade-control channel (2026-08-17). Deliberately last
+            # and deliberately unconditional: every step above may have just
+            # changed the state it renders, and it must reflect the END of the
+            # cycle, not a mid-cycle snapshot. Inert unless
+            # SLACK_TRADE_CONTROL_CHANNEL is configured, DB-only (no broker or
+            # price calls), and only talks to Slack when a card's content
+            # actually changed -- see signals_trade_control's module docstring.
+            # Deliberately NOT passed this loop's `watchlist`: that list is both
+            # scoped to the ACTIVE watchlist (real live nodes span several) and
+            # filtered by the --tickers CLI option, so a filtered debugging run
+            # would see every other real-live node as "gone". The sync resolves
+            # its own scope via db.get_live_nodes().
+            _guarded("trade_control_sync", sync_trade_control_channel)
 
             if not watchlist:
                 print(f"[{now.strftime('%H:%M:%S')}] Watch list empty — add nodes with: python active_signals.py add")

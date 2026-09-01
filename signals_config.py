@@ -89,6 +89,20 @@ SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
 SLACK_CHANNEL   = os.environ.get("SLACK_CHANNEL", "")
 SOCKET_MODE     = bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and SLACK_CHANNEL)
 
+# Dedicated trade-control channel (2026-08-17). Deliberately a SECOND channel,
+# not a redirect: SLACK_CHANNEL keeps receiving everything it does today.
+# This one holds exactly one self-updating message per real-live node
+# (signals_trade_control.py), so "what is the order-control state of my real
+# tickers, and is anything waiting on a tap from me" is answerable without
+# scrolling -- the real failure this exists to fix (2026-08-17: a pending SOXS
+# "Trailing Buy Order Placed" confirmation got lost in normal channel
+# scrollback during a Schwab API outage).
+# Unset (the default) = the whole feature is inert; nothing is posted and no
+# tracking rows are written. Set it to a real channel ID (Cxxxxxxxx) the bot
+# has been invited to. See signals_trade_control's module docstring for the
+# exact activation steps.
+SLACK_TRADE_CONTROL_CHANNEL = os.environ.get("SLACK_TRADE_CONTROL_CHANNEL", "")
+
 SLACK_CHANNEL_ID = ""
 # Fail-safe default, flipped 2026-08-01: SIM_MODE is ON unless explicitly set
 # to "0" -- previously defaulted OFF (opt-in safety), which meant any ad hoc
