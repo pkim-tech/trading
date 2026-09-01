@@ -25,6 +25,7 @@ import itertools
 from datetime import datetime, timezone
 
 import pytest
+import requests.exceptions
 
 import schwab_client
 
@@ -85,6 +86,8 @@ class FakeBroker:
                                      # defaults to 200.0/50% margin req, matching a real 2x fund)
         self._reject_next_order = None  # None, or a terminal-bad status string -- see
                                          # force_reject_next_order() below
+        self._network_error_next = None  # None, or an Exception instance -- see
+                                          # force_network_error_next_order() below
 
     # ------------------------------------------------------------------
     # Test-side setup helpers
@@ -113,6 +116,29 @@ class FakeBroker:
         but any other value just leaves the order looking like it's still
         resting, silently defeating the point."""
         self._reject_next_order = status
+
+    def force_network_error_next_order(self, exc=None):
+        """One-shot: the NEXT place_order()/get_order() call raises `exc`
+        instead of returning a response at all -- models a real transport-
+        level failure (timeout, connection drop) BEFORE any order id exists,
+        distinct from force_reject_next_order (HTTP succeeds, a real order id
+        comes back, only the async status poll later sees REJECTED).
+
+        Default exc reproduces the real 2026-08-17 Schwab outage's observed
+        shape exactly (trading_incidents #10/#11, schwab-py's underlying
+        requests session): `requests.exceptions.ReadTimeout("The read
+        operation timed out.")`, the exception schwab_client._submit_order_
+        with_retry's bare `except Exception` (and place_order's own callers)
+        actually caught that day -- str(e) rendered verbatim in the real
+        Slack alert/incident log entry.
+
+        Fires exactly once, on whichever of place_order/get_order is called
+        next (both are real client-boundary calls a mid-outage retry loop can
+        hit), then clears itself so later calls in the same test (e.g. a
+        retry attempt's own place_order, or a later poll cycle's get_order)
+        see normal fixture behavior again -- this only simulates the single
+        dropped call, not a sustained outage."""
+        self._network_error_next = exc or requests.exceptions.ReadTimeout("The read operation timed out.")
 
     def set_buying_power(self, account, buying_power):
         """D2 (docs/plans/real_order_execution_drought_addon.md) -- the raw
@@ -283,12 +309,20 @@ class FakeBroker:
         fake status -- correctness-neutral for callers that already treat
         None as fail-closed, but meant no fake_broker test could actually
         prove a real cancel/placement confirmation succeeded."""
+        if self._network_error_next is not None:
+            exc = self._network_error_next
+            self._network_error_next = None
+            raise exc
         o = self.orders.get(order_id)
         if o is None:
             return FakeResponse({}, order_id=None)
         return FakeResponse(dict(o))
 
     def place_order(self, account_hash, order):
+        if self._network_error_next is not None:
+            exc = self._network_error_next
+            self._network_error_next = None
+            raise exc
         account = self._account_for_hash(account_hash)
         order_id = next(self._id_counter)
         spec = self._parse_order_builder(order)
