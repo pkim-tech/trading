@@ -10,6 +10,7 @@ from plotly.subplots import make_subplots
 from pathlib import Path
 import numpy as np
 import strategies
+import signals_helpers as helpers
 from backtester import run_backtest_dispatch
 
 DB_PATH   = "./cache/research/trading_universe.db"
@@ -297,10 +298,19 @@ if watchlist:
     m_df = pd.DataFrame(metrics)
     wl_base = pd.concat([wl_raw[['id', 'state', 'ticker', 'strategy', 'version', 'window', 'z_score_threshold',
                                    'take_profit', 'stop_loss', 'max_hold_hours', 'label']].reset_index(drop=True), m_df], axis=1)
+    # Read-only tier column (2026-08-17): 'State' is an editable dropdown
+    # writing straight back to watch_list.state, so it must keep showing the
+    # raw stored value -- but 'live' alone doesn't distinguish a real
+    # capital-at-stake node from a deliberately tiny staged-test node that
+    # also places real orders. This derives that split (display only, same
+    # has_capital_at_stake fact the Slack gating uses) alongside it, blank
+    # for anything not state='live'.
+    wl_base.insert(2, 'tier', [helpers.state_label(n) if n.get('state') == 'live' else ''
+                               for n in watchlist])
     wl_base['watch'] = True
 
     wl_display = wl_base.rename(columns={
-        'id': 'ID', 'state': 'State', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
+        'id': 'ID', 'state': 'State', 'tier': 'Tier', 'ticker': 'Ticker', 'strategy': 'Strategy', 'version': 'Version',
         'window': 'Window', 'z_score_threshold': 'Z', 'take_profit': 'TP%', 'stop_loss': 'SL%',
         'max_hold_hours': 'Hold h', 'label': 'Label',
         'alpha': 'Alpha%', 'ret': 'Return%', 'trades': 'Trades', 'win_rate': 'Win%',

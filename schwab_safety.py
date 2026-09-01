@@ -568,6 +568,11 @@ def record_node_streak(ticker: str, account: str, kind: str, hit: bool, node_id=
             from signals_helpers import mode_tag  # local import: signals_helpers imports this module at load time
             _node = signals_db.get_watch_list_node_by_id(node_id)
             schwab_client._post_message(
+                # granular deliberately NOT used here (paired-review finding, 2026-09-01) --
+                # mode_tag's own docstring says granular is OFF by default specifically
+                # inside real order-placement paths; record_node_streak is called from
+                # _place_equity_order on every order, so this alert site is exactly that
+                # path even though it's the rare circuit-breaker-tripped branch.
                 f"\U0001F6A8 *{ticker}* ({account} · {mode_tag(account, _node)}) node id={node_id} circuit breaker "
                 f"TRIPPED: {node_state[count_key]} consecutive {kind.replace('_', ' ')} — "
                 f"monitor-only, automation NOT paused. Worth a look before it repeats."

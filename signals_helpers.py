@@ -66,8 +66,9 @@ def coverage_mode(account, node=None):
     return "dry_run" if effectively_dry_run(account, node) else "live"
 
 
-def mode_tag(account, node=None):
-    """'LIVE' / 'DRY-RUN' / 'UNKNOWN' display tag for an alert header -- shared
+def mode_tag(account, node=None, granular=False):
+    """'LIVE' / 'TEST-LIVE' (granular only) / 'DRY-RUN' / 'UNKNOWN' display
+    tag for an alert header -- shared
     by signals_notify.py and signals_blocks.py so every alert can show real
     vs. simulated status next to the account name, not the account name alone
     (found 2026-07-26: an account-only tag like '(ira)' reads identically
@@ -80,13 +81,133 @@ def mode_tag(account, node=None):
     2026-07-26). UNKNOWN is deliberately alarming instead.
     node: pass whenever available (2026-08-1x) -- without it, a node-forced-
     dry-run override on an otherwise-real account mislabels as LIVE, since
-    this function only sees the account's own flag."""
+    this function only sees the account's own flag.
+
+    granular (2026-08-17, display-only): opt in to the finer LIVE split --
+    'TEST-LIVE' for a node that really does place orders at the broker but
+    is deliberately sized below CAPITAL_AT_STAKE_THRESHOLD (soxl_ira's
+    $50-$800 staged-test tier as of 2026-08-17: TMF 50, CURE 200, RETL 400,
+    ERY/YINN 500, ERX 800), vs. plain 'LIVE' for a real capital-at-
+    stake node. Deliberately OFF by default rather than changing every
+    existing header at once: has_capital_at_stake does a real DB query
+    (_last_sale_recovery), and mode_tag is called from inside real order-
+    placement paths (schwab_client._mode_tag_for) where a per-alert DB hit
+    buys nothing -- an order-rejection alert's job is "is this real money",
+    which plain LIVE/DRY-RUN already answers. Opted into only where a human
+    is scanning a LIST of nodes and the real-vs-test distinction is the
+    thing being scanned for. Nothing parses this return value as data
+    (verified across every call site, 2026-08-17); the one non-cosmetic
+    consumer is build_reference_table's account/mode grouping key, which
+    just gains a third group."""
     if account is None:
         return "UNKNOWN"
     limits = schwab_safety.ACCOUNTS.get(account)
     if limits is None:
         return "UNKNOWN"
-    return "DRY-RUN" if effectively_dry_run(account, node) else "LIVE"
+    if effectively_dry_run(account, node):
+        return "DRY-RUN"
+    return "TEST-LIVE" if (granular and is_test_live(node, account)) else "LIVE"
+
+
+def node_size_is_known(node):
+    """Whether this node's intended size is actually configured at all --
+    i.e. whether 'below the capital-at-stake bar' is a real fact about it
+    or just the absence of one.
+
+    has_capital_at_stake falls back to `starting_notional or 0` whenever
+    _last_sale_recovery can't resolve (missing ticker, no trade history and
+    no configured notional), and 0 >= threshold is False -- indistinguishable
+    from a genuinely small node. Without this check a size-less live node
+    would render as the reassuring 'it's only a test' label, the exact
+    failure direction is_test_live's docstring forbids (paired Opus review,
+    2026-08-17: independent-cold found it, contextual confirmed). Kept as a
+    separate predicate rather than a third is_test_live return value so
+    mode_tag's granular path stays a strict LIVE/TEST-LIVE split."""
+    if node is None:
+        return False
+    if node.get('starting_notional_override'):
+        return True
+    # Falsy, not just None: a 0 notional is the same non-fact as a NULL one
+    # (has_capital_at_stake's own `starting_notional or 0` treats them
+    # identically, and a 0-sized node can't place an order anyway).
+    return bool(node.get('starting_notional'))
+
+
+def is_test_live(node, account=None):
+    """True for a node that places REAL orders at the real broker but is
+    deliberately sized below the capital-at-stake bar -- the 'test live'
+    proving-ground tier (soxl_ira's $50-$800 staged-test nodes), as
+    opposed to a real capital-at-stake live node (ira/roth/brokerage's
+    $6k-$10k ones) or anything simulated (dry_run/paper/research).
+
+    Display-only, derived entirely from facts that already exist
+    (state/effectively_dry_run/has_capital_at_stake) -- deliberately NOT a
+    new state value or DB column (2026-08-17 user call): watch_list.state
+    == 'live' is real gating logic threaded through schwab_safety.py/
+    signals_notify.py (_attempt_automated_sell requires it, among others),
+    and splitting it to formalize this label would risk silently changing
+    real order-placement behavior for exactly the nodes least able to
+    absorb it. Nothing here may ever be used to gate an order.
+
+    An unrecognized/None account returns False rather than True: that case
+    is mode_tag's alarming UNKNOWN, not a reassuring 'it's only a test'
+    (same failure-direction reasoning as mode_tag's own docstring). So does
+    a node whose size isn't configured at all -- see node_size_is_known.
+
+    account (2026-08-17, paired review): callers that already resolved an
+    account should pass the SAME one they're labelling. mode_tag decides
+    DRY-RUN from its own `account` argument, so re-deriving the account
+    from node['account'] here could split one label across two accounts
+    whenever a caller pairs an account with a separately-looked-up node
+    (schwab_client._mode_tag_for, signals_handlers.py's position-node
+    lookup, both of which do exactly that). Defaults to the node's own
+    account, preserving the single-argument behavior."""
+    if node is None:
+        return False
+    if account is None:
+        account = node.get('account')
+    if account is None or schwab_safety.ACCOUNTS.get(account) is None:
+        return False
+    if effectively_dry_run(account, node):
+        return False
+    if not node_size_is_known(node):
+        return False
+    try:
+        return not has_capital_at_stake(node)
+    except Exception:
+        # has_capital_at_stake already swallows _last_sale_recovery's own
+        # failures, but this is a purely cosmetic label -- it must never be
+        # the thing that raises inside an alert/report render path.
+        return False
+
+
+def state_label(node):
+    """One shared human-facing label for a node's real tier, for every
+    place that lists nodes side by side (CLI status tables, the Morning
+    Report's console print, the Streamlit watchlist grid) -- 'live-real'
+    vs 'live-test' where the raw watch_list.state column says only 'live'
+    for both, and the raw state otherwise ('dry_run'/'paper'/...).
+
+    Same display-only contract as is_test_live above: never gate on this."""
+    if node is None:
+        return ''
+    state = node.get('state')
+    if state != 'live':
+        return state or ''
+    account = node.get('account')
+    if account is None or schwab_safety.ACCOUNTS.get(account) is None:
+        return 'live-unknown'
+    if effectively_dry_run(account, node):
+        # state='live' but the ACCOUNT ceiling makes it simulated -- neither
+        # real-live nor the deliberate small-notional test tier.
+        return 'live-dryrun'
+    if not node_size_is_known(node):
+        # Reuses the same label as the unrecognized-account case above: both
+        # are "we don't know," and a size-less live node must not read as the
+        # reassuring live-test (paired Opus review, 2026-08-17). is_test_live
+        # returns False here, so mode_tag's granular path says plain LIVE.
+        return 'live-unknown'
+    return 'live-test' if is_test_live(node, account) else 'live-real'
 
 
 def automation_blockers_other_than_node(ticker, account=None):
