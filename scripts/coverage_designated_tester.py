@@ -27,12 +27,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import signals_db as db
-from scripts.coverage_registry import REGISTRY
+from scripts.coverage_registry import REGISTRY, SCRIPT_BASED_TESTERS
 from scripts.coverage_check import SCENARIO_ROLE_TO_GRID_IDS
 
 
 def compute_designations():
-    """Returns {grid_id: [(ticker, node_id), ...]} -- empty list means none designated."""
+    """Returns {grid_id: [(ticker, node_id), ...]} -- empty list means none designated.
+    A script-based plan (no node to track) is represented in the same shape via the
+    sentinel pair ('SCRIPT', script_path) -- see SCRIPT_BASED_TESTERS."""
     role_assign = {}
     for r in db.get_staged_test_configs():
         for gid in SCENARIO_ROLE_TO_GRID_IDS.get(r['scenario_role'], []):
@@ -48,6 +50,8 @@ def compute_designations():
         designated = role_assign.get(row['id'])
         if not designated and row['check_mechanism'] == 'scenario_expectations':
             designated = se_assign.get(row['scenario_key'])
+        if not designated and row['id'] in SCRIPT_BASED_TESTERS:
+            designated = [('SCRIPT', SCRIPT_BASED_TESTERS[row['id']])]
         result[row['id']] = designated or []
     return result
 
@@ -65,7 +69,10 @@ def main():
         who = designations[row['id']]
         if args.undesignated_only and who:
             continue
-        who_str = '; '.join(f'{t}(node {n})' for t, n in who) if who else '-- none designated --'
+        if who and who[0][0] == 'SCRIPT':
+            who_str = f'script: {who[0][1]}'
+        else:
+            who_str = '; '.join(f'{t}(node {n})' for t, n in who) if who else '-- none designated --'
         print(f"  {row['id']:42s} {who_str}")
 
 

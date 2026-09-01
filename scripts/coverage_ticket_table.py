@@ -59,6 +59,8 @@ def check_ticker_alignment():
     with db._conn() as c:
         for grid_id, pairs in designations.items():
             for ticker, node_id in pairs:
+                if ticker == 'SCRIPT':
+                    continue  # script-based plan, no watch_list node to check
                 row = c.execute("SELECT ticker FROM watch_list WHERE id=?", (node_id,)).fetchone()
                 if row is None:
                     mismatches.append((grid_id, ticker, node_id, 'NODE DELETED'))
@@ -80,6 +82,8 @@ def check_tester_activity():
     with db._conn() as c:
         for grid_id, pairs in designations.items():
             for ticker, node_id in pairs:
+                if ticker == 'SCRIPT':
+                    continue  # script-based plan, no watch_list node to check
                 row = c.execute("SELECT state FROM watch_list WHERE id=?", (node_id,)).fetchone()
                 if row and row['state'] not in ('live', 'dry_run'):
                     inactive.append((grid_id, ticker, node_id, row['state']))

@@ -1906,6 +1906,23 @@ def best_harness_for(row_id):
     return BEST_HARNESS.get(row_id)
 
 
+# A script-based test plan (scripts/stage_check_order_guard_scenarios.py) proves these 8 rows
+# directly against check_order -- there's no node/ticker to track (a script IS the plan), so
+# unlike BEST_HARNESS this can't be sourced from staged_test_config/scenario_expectations.
+# See docs/design.md's 2026-08-15 "Script-based test-plan design" entry for the full trace of
+# why these 8 (and not others) are the ones a script can force safely.
+SCRIPT_BASED_TESTERS = {
+    'ticker_not_live_mode_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'ticker_not_in_automation_scope_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'ticker_account_assignment_mismatch': 'scripts/stage_check_order_guard_scenarios.py',
+    'ticker_level_automation_pause': 'scripts/stage_check_order_guard_scenarios.py',
+    'buy_trading_day_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'buy_signal_window_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'hard_order_ceiling_block': 'scripts/stage_check_order_guard_scenarios.py',
+    'notional_cap_block': 'scripts/stage_check_order_guard_scenarios.py',
+}
+
+
 STATUS_ORDER = {
     'deviation-unexplained': 0, 'not-instrumented': 1, 'wired-never-fired': 1,
     'live-attempt-failed': 1, 'dry_run-attempt-failed': 1, 'paper-attempt-failed': 1,
