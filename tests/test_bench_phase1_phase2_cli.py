@@ -229,6 +229,26 @@ def test_checkpoint_filename_differs_with_n_islands_override():
     assert "_isl" not in name_default
 
 
+def test_checkpoint_filename_differs_with_entry_timing_override(monkeypatch):
+    """Real live incident, 2026-09-01: a fresh --entry-timing close run for
+    SOXL/TrailingBoth/fixed_sl=1 silently loaded an open_check checkpoint left over
+    from the prior evening's real v6.5 campaign run (same ticker/strategy/fixed_sl/
+    windows/z/date-range/isl/pv) and skipped Phase1+Phase2 entirely -- caught before
+    any candidate_nodes rows were written (its orphaned ProcessPoolExecutor workers
+    kept running pre-fix code for several more minutes after, killed live by pid).
+    Mirrors test_checkpoint_filename_differs_with_n_islands_override's pattern
+    exactly."""
+    args_default = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    args_close = _parse(["--strategy", "TrailingBothZScoreBreakout", "--entry-timing", "close"])
+    monkeypatch.setattr(bench, "ENTRY_TIMING", "open_check")
+    name_default = bench._build_checkpoint_filename("TrailingBothZScoreBreakout", 3.0, args_default)
+    monkeypatch.setattr(bench, "ENTRY_TIMING", "close")
+    name_close = bench._build_checkpoint_filename("TrailingBothZScoreBreakout", 3.0, args_close)
+    assert name_default != name_close
+    assert "_close" in name_close
+    assert "_close" not in name_default
+
+
 def _run_main(argv):
     """Drive main() far enough to hit the seed-mode mutual-exclusion check, which
     raises SystemExit before any DB/backtest work."""

@@ -1281,8 +1281,26 @@ def _build_checkpoint_filename(strategy_name, fixed_sl, args):
     # shape, as the WINDOWS/Z_THRESHOLDS/N_ISLANDS keys above -- this one auto-resolves
     # every FUTURE PROMOTION_ALGO_VERSION bump too, not just this one.
     _pv_key = f"_pv{PROMOTION_ALGO_VERSION}"
+    # Also keyed on ENTRY_TIMING -- same bug class as every key above: Phase1/Phase2's
+    # own dispatch passes ENTRY_TIMING into the real signal/fill computation (see
+    # _dispatch's task tuple), so a checkpoint computed under one entry_timing is NOT
+    # valid for another. Found live 2026-09-01: a fresh --entry-timing close run for
+    # SOXL/TrailingBoth/fixed_sl=1 silently loaded an open_check checkpoint left over
+    # from the prior evening's real v6.5 campaign run (same ticker/strategy/fixed_sl/
+    # windows/z/date-range/isl/pv) and skipped Phase1+Phase2 entirely. The run's
+    # ORPHANED ProcessPoolExecutor workers (parent killed, workers not -- same "SIGTERM
+    # doesn't propagate to a pool" class as a documented 2026-08-22/2026-08-31 incident)
+    # kept executing pre-fix code for several more minutes after this fix was written
+    # and committed, until caught live and killed directly by pid. Real candidate_nodes/
+    # backtest_phase1_insurance rows were confirmed NEVER written under the v6.6 version
+    # throughout -- caught before any DB contamination, not after. ENTRY_TIMING defaults
+    # to 'open_check' (module default, matches every pre-existing checkpoint on disk
+    # with no key needed for that case) so this only adds a suffix for a genuine
+    # close-entry run, keeping every existing open_check checkpoint's filename
+    # byte-identical.
+    _entry_timing_key = f"_{ENTRY_TIMING}" if ENTRY_TIMING != "open_check" else ""
     return (f"bench_phase12_checkpoint_{TICKER}_{strategy_name}_{fixed_sl}_w{_windows_key}"
-            f"{_z_key}{_range_key}{_seed_key}{_isl_key}{_pv_key}.parquet")
+            f"{_z_key}{_range_key}{_seed_key}{_isl_key}{_pv_key}{_entry_timing_key}.parquet")
 
 
 def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
