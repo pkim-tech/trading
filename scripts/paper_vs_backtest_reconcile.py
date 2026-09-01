@@ -134,6 +134,43 @@ def get_trades_and_bars_since_ground_truth(node, sim_start):
     data_source = "massive"
     import db_cache
     df_h = db_cache.get_massive_hourly_ohlcv(node["ticker"])
+
+    from run_optimization_sweep import _load_minute_df
+    minute_df = _load_minute_df(node["ticker"], data_source=data_source)
+
+    # Recent-cache tail extension (Task #11, 2026-09-01): massive_hourly_derived/
+    # massive_minute_derived are only refreshed manually (no automated nightly
+    # promotion -- confirmed a real reproducibility risk for the sweep pipeline if that
+    # were ever cron-automated, see scripts/refresh_recent_minute_cache.py's own
+    # docstring for the full finding). scripts/refresh_recent_minute_cache.py instead
+    # maintains a genuinely separate, disposable same-day/recent-days cache that never
+    # touches the canonical archive. Splice its rows in here, strictly beyond each
+    # frame's own current max (never overriding/duplicating anything the canonical
+    # snapshot already covers -- canonical always wins where both exist), BEFORE
+    # df_daily/ind are derived from df_h below -- splicing any later (e.g. only into
+    # df_h_sliced) would extend the bar-by-bar replay's DATA but leave the z-score
+    # band's own indicator computation (ind, from df_daily) still blind to the fresh
+    # days, silently mis-signaling near the tail. Also before the staleness guard
+    # further down, so a same-day trade the canonical snapshot hasn't caught up to yet
+    # still gets checked instead of silently reading as a false PHANTOM (tonight's
+    # real UGL incident). KNOWN LIMITATION, accepted (see that script's docstring):
+    # the recent cache is only split-adjusted, not dividend-adjusted like the
+    # canonical series -- negligible over a few days for these tickers, but a real,
+    # uncorrected discrepancy versus canonical is possible in principle.
+    from scripts.refresh_recent_minute_cache import load_recent_cache
+    recent_minute = load_recent_cache(node["ticker"])
+    if not recent_minute.empty:
+        new_minute_tail = recent_minute.loc[recent_minute.index > minute_df.index.max()] \
+            if not minute_df.empty else recent_minute
+        if not new_minute_tail.empty:
+            minute_df = pd.concat([minute_df, new_minute_tail]).sort_index()
+            from scripts.build_massive_hourly_derived import resample_to_hourly
+            new_hourly_tail = resample_to_hourly(new_minute_tail)
+            new_hourly_tail = new_hourly_tail.loc[new_hourly_tail.index > df_h.index.max()] \
+                if not df_h.empty else new_hourly_tail
+            if not new_hourly_tail.empty:
+                df_h = pd.concat([df_h, new_hourly_tail]).sort_index()
+
     df_daily = df_h.resample("D").last().dropna(subset=["Close"])
     ind = build_indicators(node["strategy"], df_daily, node["window"])
     open_check = node["entry_timing"] == "open_check"
@@ -142,9 +179,6 @@ def get_trades_and_bars_since_ground_truth(node, sim_start):
     empty_ts = pd.DatetimeIndex([])
     if df_h_sliced.empty:
         return [], empty_ts
-
-    from run_optimization_sweep import _load_minute_df
-    minute_df = _load_minute_df(node["ticker"], data_source=data_source)
 
     # Minute data is only refreshed manually (scripts/fetch_massive_minute_data.py /
     # build_massive_hourly_derived.py -- no cron entry, confirmed 2026-08-23 paired
@@ -157,7 +191,9 @@ def get_trades_and_bars_since_ground_truth(node, sim_start):
     # (evening_status.py Parts 3/5, eod_live_node_table.window_replay) already wrap
     # this call in try/except and report "NOT CHECKED"/"unsupported" on exception,
     # which is the correct outcome here -- an unrefreshed snapshot must read as
-    # "couldn't check," never as "checked, found nothing."
+    # "couldn't check," never as "checked, found nothing." (Still fires normally if
+    # even the recent-cache splice above doesn't reach far enough -- e.g. the recent
+    # cache itself hasn't been refreshed recently either.)
     if minute_df.empty or minute_df.index.max() < df_h_sliced.index.max():
         raise RuntimeError(
             f"get_trades_and_bars_since_ground_truth: minute data for {node['ticker']} "

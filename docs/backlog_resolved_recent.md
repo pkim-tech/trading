@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][tooling] Resolved 2026-09-01 — minute/second market data automated refresh (Task #11); real trigger: UGL 10 days stale, false PHANTOM. Full detail: `deep_backlog.md`.
+
 ## [live-trading] Resolved 2026-09-01 — incident #15: drought-overlay sizing bypassed starting_notional_override; final design is a shared core+drought capital pool, addon excluded. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-08-31 (confirmed, was already done) — Phase4/5 candidate_nodes resolver fully wired in. Full detail: `deep_backlog.md`.
