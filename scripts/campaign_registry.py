@@ -511,8 +511,32 @@ def status(campaign_id=None, label=None, db_path=None):
                 SELECT ticker, strategy, pid, started_at FROM campaign_jobs
                 WHERE campaign_id=? AND status='running' ORDER BY started_at
             """, (c['id'],)).fetchall()]
-            out.append(dict(campaign=c, job_counts=counts, running=running))
+            for j in running:
+                j['orphaned'] = _pid_is_dead(j['pid'])
+            failed = [dict(r) for r in conn.execute("""
+                SELECT ticker, strategy, rc, finished_at FROM campaign_jobs
+                WHERE campaign_id=? AND status='failed' ORDER BY finished_at
+            """, (c['id'],)).fetchall()]
+            out.append(dict(campaign=c, job_counts=counts, running=running, failed=failed))
         return out
+
+
+def _pid_is_dead(pid):
+    """True if pid is known (non-NULL) and no longer alive -- a 'running' job whose
+    worker process died (crash, kill -9, wsl --shutdown) without ever calling
+    mark_finished would otherwise sit 'running' forever with no automatic detection.
+    None (pid not yet recorded, e.g. claim_next just fired and update_job_pid hasn't
+    landed) is NOT treated as dead -- can't tell orphaned-vs-still-starting-up from a
+    NULL pid alone, so only a real, confirmed-dead pid counts."""
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False  # alive, just owned by another user -- can't be ours anyway
 
 
 def _print_status(rows):
@@ -528,8 +552,12 @@ def _print_status(rows):
               f"paused={bool(c['paused'])}")
         print(f"  jobs: {r['job_counts'] or '(none enqueued)'}")
         for j in r['running']:
-            print(f"    RUNNING {j['ticker']:6s} {j['strategy']:28s} pid={j['pid']} "
+            tag = "ORPHANED (pid dead)" if j['orphaned'] else "RUNNING"
+            print(f"    {tag:20s} {j['ticker']:6s} {j['strategy']:28s} pid={j['pid']} "
                   f"since {j['started_at']}")
+        for j in r['failed']:
+            print(f"    {'FAILED':20s} {j['ticker']:6s} {j['strategy']:28s} rc={j['rc']} "
+                  f"at {j['finished_at']}")
         print()
 
 
@@ -727,4 +755,8 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import script_usage
+    script_usage.record_invocation()
     main()

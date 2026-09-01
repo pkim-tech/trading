@@ -85,3 +85,15 @@ real complaint: "i have just no idea when to come back."
    daemon's responsiveness requirement is real then; off-hours the same batch
    is much lower-stakes (see CLAUDE.md's Background-Agent Trading-Hours Rule
    for the parallel concern about spawning agents, not just raw CPU jobs).
+
+8. **For a sweep/campaign queue covering a known ticker/strategy list, verify
+   the queued jobs actually match intent before walking away** -- don't just
+   trust that the launch command's ticker list was complete. Found 2026-09-01:
+   a real campaign (`campaign_jobs`, "v6.5") was assembled from several
+   separate `TICKERS=...` launches and silently ended up missing a ticker
+   entirely (DFEN) plus one ticker's real live strategy (DPST's TrailingExit)
+   -- nobody checked until asked directly, a full session+ into the run.
+   `scripts/check_campaign_coverage.py --campaign-id N` diffs a campaign's
+   real queued (ticker, strategy) pairs against the real capital-at-stake live
+   ticker set (both strategies each, by default) and reports gaps -- run it
+   right after queuing, not after the run finishes.
