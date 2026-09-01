@@ -3,6 +3,7 @@ and scripts/coverage_check.py's checker logic -- the 2026-07-24 coverage-
 system "compass": structured expected-vs-actual tracking with mandatory
 reason-on-deviation, replacing prose in deep_backlog.md/live_test_coverage.md."""
 import os
+import shutil
 import sys
 import tempfile
 from datetime import datetime, timedelta
@@ -19,15 +20,71 @@ from scripts.coverage_registry import compute_status, compute_mode_statuses, STA
 
 TICKER = 'TEST_CANARY'
 
+# /dev/shm is tmpfs (RAM-backed, no real fsync) -- safe here since these DBs
+# are throwaway test fixtures, never the real trading_live.db, and never
+# outlive the pytest session. Falls back to the OS temp dir (still correct,
+# just without the tmpfs win) if /dev/shm isn't present, e.g. non-Linux.
+_TMP_DIR = '/dev/shm' if os.path.isdir('/dev/shm') else None
+
+
+@pytest.fixture(scope='session')
+def _schema_template_db():
+    """Pays ensure_tables()'s fsync-heavy schema-creation cost exactly once
+    per test session instead of once per test (65x in this file) -- each
+    test's isolated_db still gets its own independent file copy below, so
+    per-test isolation is unaffected; only the schema-creation cost is
+    shared."""
+    tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False, dir=_TMP_DIR)
+    tmp_db.close()
+    orig_db_path = signals_config.DB_PATH
+    signals_config.DB_PATH = Path(tmp_db.name)
+    try:
+        db.ensure_tables()
+    finally:
+        signals_config.DB_PATH = orig_db_path
+    yield tmp_db.name
+    os.unlink(tmp_db.name)
+
 
 @pytest.fixture
-def isolated_db(monkeypatch):
-    tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+def isolated_db(monkeypatch, _schema_template_db):
+    tmp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False, dir=_TMP_DIR)
     tmp_db.close()
+    shutil.copy2(_schema_template_db, tmp_db.name)
     monkeypatch.setattr(signals_config, 'DB_PATH', Path(tmp_db.name))
-    db.ensure_tables()
     yield db
     os.unlink(tmp_db.name)
+
+
+def _insert_row_with_explicit_pk(isolated_db):
+    """Explicit (non-autoincrement) PK insert into scenario_expectations --
+    if the template-copy isolated_db fixture ever leaked state across tests
+    (e.g. reused the template file directly instead of a fresh copy), the
+    second test to run this would hit a real sqlite3.IntegrityError on the
+    duplicate PK, a hard failure rather than a silently-wrong count."""
+    with isolated_db._conn() as c:
+        c.execute(
+            "INSERT INTO scenario_expectations "
+            "(id, scenario_key, expected_outcome, expected_frequency, check_method) "
+            "VALUES (777, 'sk_isolation_pk', 'x', 'daily', 'trade_lifecycle')"
+        )
+        c.commit()
+
+
+def test_isolated_db_fixture_does_not_leak_state_test_a(isolated_db):
+    """Paired with test_isolated_db_fixture_does_not_leak_state_test_b below
+    -- both insert a row under the identical explicit PK. Passes only if
+    each test really gets its own independent DB file (see docstring on
+    _insert_row_with_explicit_pk)."""
+    _insert_row_with_explicit_pk(isolated_db)
+    rows = db.get_scenario_expectations(expected_frequency='daily')
+    assert len(rows) == 1
+
+
+def test_isolated_db_fixture_does_not_leak_state_test_b(isolated_db):
+    _insert_row_with_explicit_pk(isolated_db)
+    rows = db.get_scenario_expectations(expected_frequency='daily')
+    assert len(rows) == 1
 
 
 def test_add_scenario_expectation_roundtrip(isolated_db):
