@@ -1,5 +1,21 @@
 # Backlog — Recently Resolved
 
+## [live-trading] Resolved 2026-09-01 — incident #15: drought-overlay sizing bypassed starting_notional_override; final design is a shared core+drought capital pool, addon excluded. Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved 2026-08-31 (confirmed, was already done) — Phase4/5 candidate_nodes resolver fully wired in. Full detail: `deep_backlog.md`.
+
+## [backtest][live-trading] Resolved 2026-08-31 (confirmed, was already done) — gap-through-trigger fill optimism, kernel + live Part 3 infra both built. Full detail: `deep_backlog.md`.
+
+## [live-trading] Resolved 2026-08-31 (confirmed, was already done) — trailing-buy re-sizing/top-up, same Part 3 build. Full detail: `deep_backlog.md`.
+
+## [backtest] Resolved 2026-08-31 — same-bar arm/TP entry check, GT kernel's minute-level rebuild resolves the original hourly-OHLC ambiguity. Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved 2026-08-31 — sweep manager: real job queue + CPU control built (Task #8, campaign registry, commit `856c881`). Full detail: `deep_backlog.md`.
+
+## [backtest] Resolved 2026-08-31 — real cost of N_ISLANDS=3+backfill measured via two real full campaigns (6-ticker + 8-ticker), not a synthetic single-scope test. Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved-as-moot 2026-08-31 — GDXU/UGL/WEBL pv3/pv4 Phase4/5 backfill superseded by full-rerun decision. Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved-as-decided-won't-pursue 2026-08-30 — trailing-stop peak-update ordering (one-sided optimistic assumption, raised 2026-08-21) closed per user's call; not proven safe, just not being pursued further. Full detail: `deep_backlog.md`.
 
 ## [live-trading][backtest] Resolved-as-moot/superseded 2026-08-30 — SOXL/LABU same-bar-SL divergence (raised 2026-08-21) closed by the GT/minute/second-level granularity upgrade, not by the originally-planned fill-bar-SL-check removal (never built). Full detail: `deep_backlog.md`.

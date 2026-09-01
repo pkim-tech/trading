@@ -2041,11 +2041,15 @@ REGISTRY = [
                "would otherwise re-alert every poll indefinitely), not itself an anomaly, though a "
                "persistently high count on one node is worth a human glance."),
     dict(id='starting_notional_override_once_consumed',
-         scenario="A node's one-shot starting_notional_override_once value is consumed by a real core "
-                  "position fill, auditably recording the intended vs. actual real position size",
-         code_path="signals_db.open_position (position_source == 'core' only -- a drought-overlay "
-                   "fill never consumes this)",
-         offline_coverage="No dedicated unit test found asserting this exact scenario_key",
+         scenario="A node's one-shot starting_notional_override_once value is consumed by a real "
+                  "core OR drought-overlay position fill, auditably recording the intended vs. "
+                  "actual real position size",
+         code_path="signals_db.open_position (position_source in ('core', 'drought_overlay') -- "
+                   "widened 2026-08-31, incident #15: drought sizing now mimics core's basis "
+                   "exactly, including override/_once, so a drought fill can now apply and must "
+                   "also consume-and-clear this value)",
+         offline_coverage="tests/test_fake_broker_drought_entry_scenario.py::"
+                          "test_drought_entry_fill_consumes_and_clears_starting_notional_override_once",
          check_mechanism='coverage_events', scenario_key='starting_notional_override_once_consumed',
          bad_results=[],
          notes="Found 2026-08-31 (coverage-registry gap-fill dispatch). Built 2026-08-26 at the "

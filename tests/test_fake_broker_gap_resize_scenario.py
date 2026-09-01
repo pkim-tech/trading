@@ -219,3 +219,62 @@ def test_gap_resize_places_a_fresh_market_buy_when_no_order_id_on_file(env, fake
     assert signals_db.get_pending_buys() == []
     events = signals_db.get_coverage_events(scenario_key='gap_resize')
     assert any(e['result'] == 'replaced' for e in events)
+
+
+def _log_closed_drought_trade(exit_price, shares):
+    entry_price = exit_price * 0.98
+    entry_time = datetime(2026, 7, 28, 10, 30).isoformat()
+    exit_time = datetime(2026, 7, 28, 15, 30).isoformat()
+    with signals_db._conn() as c:
+        c.execute("""
+            INSERT INTO trade_log
+                (ticker, strategy, version, window, stop_loss, max_hold_hours, account,
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct,
+                 exit_price, exit_time, exit_reason, shares, is_dry_run_sim, position_source)
+            VALUES (?, 'TrailingBothZScoreBreakout', 'test', 10, 1, 105, 'soxl_ira',
+                    ?, ?, ?, ?, 0.0, ?, ?, 'SL', ?, 0, 'drought_overlay')
+        """, (TICKER, entry_price, entry_time, entry_price, entry_time, exit_price, exit_time, shares))
+        c.commit()
+
+
+def test_gap_resize_sizes_drought_pending_via_real_trade_log_history_not_flat(env, fake_broker):
+    """Real incident #15 fix (2026-08-31/09-01, final shared-capital-pool
+    design, user's explicit decision -- see signals_helpers._last_sale_recovery's
+    own docstring for the full history): check_gap_resize sizes a resting
+    order's replacement via the plain _last_sale_recovery(node) call, same as
+    every other real sizing site -- no leg-scoping parameter exists anymore
+    (an intermediate design threaded position_source through this call
+    specifically, but that was reversed: core and drought share ONE capital
+    pool per node, not separate ones). This test proves gap_resize actually
+    finds real trade_log history instead of silently falling back to the
+    flat starting_notional column: env's starting_notional is $800, this
+    test seeds a real drought_overlay trade_log row with clearly distinct
+    proceeds ($1,600), so a regression back to ignoring trade_log entirely
+    is caught by share count."""
+    node = _node()
+    _log_closed_drought_trade(exit_price=20.0, shares=80)  # drought proceeds = 1600
+    signal_price = 10.15
+    sig = {'current_price': signal_price, 'last_bar': datetime(2026, 7, 29, 0, 4, 58)}
+    signals_db.add_pending_buy(node, sig, channel='C0TEST', ts='1234.5', order_id=None,
+                                position_source='drought_overlay', drought_confirm_days=3,
+                                drought_vol_gate=None, drought_gap_start='2026-07-20 09:30:00',
+                                drought_vol_pctile=None)
+    signals_db.mark_pending_buy_placed_by_wl_id(node['id'])
+
+    current_price = 10.50  # clears the 1% trigger
+    fake_broker.set_quote(TICKER, last=current_price, bid=current_price, ask=current_price + 0.01)
+
+    signals_notify.check_gap_resize()
+
+    market_buys = [o for o in fake_broker.orders.values()
+                    if o['orderLegCollection'][0]['instrument']['symbol'] == TICKER
+                    and o['orderType'] == 'MARKET'
+                    and o['orderLegCollection'][0]['instruction'] == 'BUY']
+    assert len(market_buys) >= 1
+    padded_price = current_price * (1 + signals_notify._GAP_RESIZE_PAD_PCT / 100)
+    expected_shares = int(1600 // padded_price)
+    assert market_buys[0]['orderLegCollection'][0]['quantity'] == expected_shares, (
+        f"gap_resize did not size the drought pending off real trade_log history (target=1600) -- "
+        f"got {market_buys[0]['orderLegCollection'][0]['quantity']} shares, expected {expected_shares}. "
+        f"A regression to ignoring trade_log entirely would target $800 (env's flat starting_notional) instead."
+    )

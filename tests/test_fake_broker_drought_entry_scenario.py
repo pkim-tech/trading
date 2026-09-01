@@ -289,3 +289,143 @@ def test_drought_entry_places_real_market_buy_for_trailingexit_node(env, fake_br
     assert stop_orders[0]['status'] == 'WORKING'
     assert pos['sl_order_id'] == stop_orders[0]['orderId']
     assert signals_db.get_drought_pending_buy(node['id']) is None
+
+
+def test_drought_entry_sizing_respects_starting_notional_override(env, fake_broker, monkeypatch):
+    """Real incident #15, 2026-08-31: notify_drought_buy_signal sized off the
+    plain starting_notional column, never signals_helpers._last_sale_recovery
+    -- the only function that checks starting_notional_override/_once. This
+    test's node keeps its default starting_notional=2000 (would size 39 shares
+    at price=50.0/trail_buy_pct=1.0/pad_pct=1.0 -- see buy_order_sizing) but
+    sets a PERMANENT override to a distinct value (2500, -> 49 shares -- staying under soxl_ira's real $3,000 notional_cap so this test isn't accidentally exercising an unrelated safety gate) so a
+    silent fall-through to the flat column is caught by share count, not just
+    by a boolean."""
+    monkeypatch.setattr(paper_trading, 'evaluate_drought_entry', lambda node, paper=False: dict(_DECISION))
+    node = _node()
+    signals_db.set_starting_notional_override(node['id'], 2500)
+    fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    node = _node()
+
+    signals_notify.check_drought_entry(node)
+
+    orders = _real_orders(fake_broker, TICKER, side='BUY')
+    assert len(orders) == 1
+    assert orders[0]['orderLegCollection'][0]['quantity'] == 49, (
+        "drought entry did not size off starting_notional_override -- fell back to the flat "
+        "starting_notional column (would size 39 shares) instead of _last_sale_recovery"
+    )
+
+
+def test_drought_entry_sizing_respects_starting_notional_override_once(env, fake_broker, monkeypatch):
+    """Same real gap as the permanent-override test above, for the one-time
+    bump variant (starting_notional_override_once, checked FIRST by
+    _last_sale_recovery)."""
+    monkeypatch.setattr(paper_trading, 'evaluate_drought_entry', lambda node, paper=False: dict(_DECISION))
+    node = _node()
+    signals_db.set_starting_notional_override_once(node['id'], 2500)
+    fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    node = _node()
+
+    signals_notify.check_drought_entry(node)
+
+    orders = _real_orders(fake_broker, TICKER, side='BUY')
+    assert len(orders) == 1
+    assert orders[0]['orderLegCollection'][0]['quantity'] == 49, (
+        "drought entry did not size off starting_notional_override_once -- fell back to the "
+        "flat starting_notional column instead of _last_sale_recovery"
+    )
+
+
+def test_drought_entry_fill_consumes_and_clears_starting_notional_override_once(env, fake_broker, monkeypatch):
+    """Sequencing fix, signals_db.open_position's consume-and-clear gate
+    (paired with the sizing fix above): once a drought entry's real fill is
+    recorded, the once-value must be BOTH applied (sizing test above) AND
+    cleared -- the gate used to be hardcoded position_source=='core' only,
+    which (after the sizing fix alone, without this gate change) would let a
+    drought fill apply the once-value but never clear it, silently
+    re-applying it to whatever real fill comes next."""
+    monkeypatch.setattr(paper_trading, 'evaluate_drought_entry', lambda node, paper=False: dict(_DECISION))
+    node = _node()
+    signals_db.set_starting_notional_override_once(node['id'], 2500)
+    fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    node = _node()
+
+    signals_notify.check_drought_entry(node)
+    orders = _real_orders(fake_broker, TICKER, side='BUY')
+    order_id = orders[0]['orderId']
+    fake_broker.force_fill(order_id, price=50.5)
+    signals_notify._reconcile_buy_fill(TICKER, 50.5, 49, wl_id=node['id'])
+
+    pos = signals_db.get_open_position(TICKER)
+    assert pos is not None
+    assert pos['position_source'] == 'drought_overlay'
+    refreshed = _node()
+    assert refreshed['starting_notional_override_once'] is None, (
+        "starting_notional_override_once was applied but never cleared by a drought fill -- "
+        "would silently re-apply to the next real fill (another drought entry or a core entry)"
+    )
+
+
+def test_drought_buy_blocks_display_matches_the_real_order_sizing(env, fake_broker, monkeypatch):
+    """Real incident #15 round-2 review finding, 2026-08-31: _build_buy_blocks
+    (the Slack alert renderer, shared by notify_buy_signal and
+    notify_drought_buy_signal) used to call buy_order_sizing with no
+    target_notional at all, computing its own DISPLAYED share count/
+    target_notional independently of the REAL order's separately-computed
+    sizing -- so a bug/divergence in either path could silently show a human
+    a number that disagreed with what the broker actually did. Both paths
+    now resolve through the exact same bare buy_order_sizing(node, sig) /
+    _last_sale_recovery(node) calls (final design, 2026-09-01: core and
+    drought share one capital pool, no per-leg parameter exists anymore --
+    see signals_helpers._last_sale_recovery's own docstring), so they agree
+    by construction today; this test is a regression guard against a future
+    change reintroducing a separate/special-cased sizing path in either
+    function. Uses real drought trade_log history (NOT an override --
+    overrides are checked first inside _last_sale_recovery, found reviewing
+    this exact test) with proceeds
+    clearly distinct from the flat starting_notional column, so a regression
+    back to core's/flat's basis is caught by a different share count in the
+    rendered text, not just a boolean."""
+    monkeypatch.setattr(paper_trading, 'evaluate_drought_entry', lambda node, paper=False: dict(_DECISION))
+    node = _node()
+    with signals_db._conn() as c:
+        # Crosses the capital-at-stake alert-gate bar (see
+        # test_drought_entry_alerts_for_a_capital_at_stake_node above) so a
+        # real-time Slack post actually fires.
+        c.execute("UPDATE watch_list SET starting_notional=50000 WHERE ticker=?", (TICKER,))
+        c.execute("""
+            INSERT INTO trade_log
+                (ticker, strategy, version, window, stop_loss, max_hold_hours, account,
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct,
+                 exit_price, exit_time, exit_reason, shares, is_dry_run_sim, position_source)
+            VALUES (?, 'TrailingBothZScoreBreakout', 'test', 10, 1, 105, 'soxl_ira',
+                    27.5, ?, 27.5, ?, 0.0, 28.0, ?, 'SL', 100, 0, 'drought_overlay')
+        """, (TICKER, datetime(2026, 7, 28, 10, 30).isoformat(), datetime(2026, 7, 28, 10, 30).isoformat(),
+              datetime(2026, 7, 28, 15, 30).isoformat()))
+        c.commit()
+    fake_broker.set_quote(TICKER, last=50.0, bid=49.99, ask=50.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+    node = _node()
+
+    posted_blocks = []
+    monkeypatch.setattr(signals_notify, '_post_message',
+                         lambda text, blocks, **kw: (posted_blocks.append(blocks), (None, None))[1])
+
+    signals_notify.check_drought_entry(node)
+
+    orders = _real_orders(fake_broker, TICKER, side='BUY')
+    assert len(orders) == 1
+    real_shares = orders[0]['orderLegCollection'][0]['quantity']
+    assert real_shares == 54  # int(2800 // 51.0) -- drought proceeds = 28.0 * 100
+
+    assert len(posted_blocks) == 1
+    entry_line = next(b['text']['text'] for b in posted_blocks[0] if b.get('type') == 'section'
+                       and '`shares`' not in b.get('text', {}).get('text', '') and 'BUY' in b.get('text', {}).get('text', ''))
+    assert f"`{real_shares} shares`" in entry_line, (
+        f"drought BUY alert's displayed share count did not match the real order (real={real_shares}) -- "
+        f"alert text: {entry_line!r}. A regression to core's default sizing in _build_buy_blocks would "
+        f"display 980 (int(50000 // 51.0), the flat-starting_notional-based figure) instead."
+    )

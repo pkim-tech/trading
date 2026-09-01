@@ -102,17 +102,17 @@ if cfg.SOCKET_MODE:
         ts                = body['message']['ts']
         ticker            = data['node']['ticker']
         signal_price      = data['signal_price']
-        # D4 (docs/plans/real_order_execution_drought_addon.md): a drought
-        # pending buy's suggested share prefill must use flat starting_notional,
-        # not core's compounding _last_sale_recovery basis -- found by
-        # contextual Opus review before this shipped (inconsistent with the
-        # dispatch fix already applied to handle_entry_price's own prefill).
-        _pending_for_prefill = db.get_pending_buy_by_wl_id(data['node']['id'])
-        if _pending_for_prefill and _pending_for_prefill.get('position_source') == 'drought_overlay':
-            suggested_shares = int((data['node'].get('starting_notional') or 50000) // signal_price) \
-                if signal_price else None
-        else:
-            suggested_shares = int(_last_sale_recovery(data['node']) // signal_price) if signal_price else None
+        # D4 (docs/plans/real_order_execution_drought_addon.md) resolved,
+        # incident #15 fix, 2026-08-31/09-01 (user's explicit decision, in
+        # two steps): drought sizing now mimics core's capital usage exactly,
+        # AND core/drought share one capital pool per node (not separate
+        # ones) -- so the suggested prefill for a drought pending uses the
+        # SAME _last_sale_recovery(node) call as core, no leg-scoping, no
+        # flat starting_notional special case (that was the incident: a
+        # manual confirmation sizing flat while the entry-order path had
+        # already moved to override-aware sizing, silently ignoring a real
+        # capital override for this node).
+        suggested_shares = int(_last_sale_recovery(data['node']) // signal_price) if signal_price else None
         client.views_open(
             trigger_id=body['trigger_id'],
             view={
@@ -294,18 +294,20 @@ if cfg.SOCKET_MODE:
         exec_price = float(body['view']['state']['values']['price_block']['price_input']['value'])
         drift_pct  = (exec_price - signal_price) / signal_price * 100
         now        = datetime.now()
-        # Fetch the pending row fresh for its position_source discriminator --
-        # `node` here is the Slack-metadata snapshot, not a fresh pending_buys
-        # row (docs/plans/real_order_execution_drought_addon.md 4.3). A real
-        # drought manual-Executed confirmation sizes off starting_notional
-        # (D4, flat -- generate_drought_trades is sizing-agnostic), never off
-        # _last_sale_recovery's core-only compounding basis, which could be a
-        # very different (and unrelated) number.
+        # Fetch the pending row fresh -- `node` here is the Slack-metadata
+        # snapshot, not a fresh pending_buys row (docs/plans/
+        # real_order_execution_drought_addon.md 4.3). Used below for
+        # open_position_from_pending's leg attribution, not for sizing --
+        # D4 resolved, incident #15 fix, 2026-08-31/09-01 (user's explicit
+        # decision, in two steps): a real drought manual-Executed
+        # confirmation now sizes via the SAME bare _last_sale_recovery(node)
+        # call as core (no leg-scoping -- core and drought share one capital
+        # pool per node). Previously sized off the flat starting_notional
+        # column, which (once the entry-order path moved to override-aware
+        # sizing) would silently consume-and-clear a real capital override it
+        # never actually applied.
         pending = db.get_pending_buy_by_wl_id(node['id'])
-        if pending and pending.get('position_source') == 'drought_overlay':
-            shares = int((node.get('starting_notional') or 50000) // exec_price)
-        else:
-            shares = int(_last_sale_recovery(node) // exec_price)
+        shares = int(_last_sale_recovery(node) // exec_price)
 
         if not any(p['node']['id'] == node['id'] for p in db.get_pending_buys()):
             # The pending_buys row this button was built from is already gone

@@ -169,3 +169,78 @@ def test_start_node_automation_button_logs_coverage_event(env):
     assert events[0]['result'] == "resumed_by_user"
     assert events[0]['node_id'] == node['id']
     assert events[0]['detail'] == "Slack per-row button by bob"
+
+
+def _drought_pending(node, price=50.0):
+    sig = {'current_price': price, 'last_bar': datetime(2026, 7, 15, 10, 30)}
+    signals_db.add_pending_buy(node, sig, channel='C123', ts='111.222', position_source='drought_overlay',
+                                drought_confirm_days=3, drought_vol_gate=None,
+                                drought_gap_start='2026-07-10 09:30:00', drought_vol_pctile=None)
+
+
+def _log_closed_drought_trade(ticker, version, exit_price, shares, account):
+    entry_price = exit_price * 0.98
+    entry_time = datetime(2026, 7, 10, 10, 30).isoformat()
+    exit_time = datetime(2026, 7, 10, 15, 30).isoformat()
+    with signals_db._conn() as c:
+        c.execute("""
+            INSERT INTO trade_log
+                (ticker, strategy, version, window, stop_loss, max_hold_hours, account,
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct,
+                 exit_price, exit_time, exit_reason, shares, is_dry_run_sim, position_source)
+            VALUES (?, 'ZScoreBreakout', ?, 20, 5, 56, ?,
+                    ?, ?, ?, ?, 0.0, ?, ?, 'SL', ?, 0, 'drought_overlay')
+        """, (ticker, version, account, entry_price, entry_time, entry_price, entry_time,
+              exit_price, exit_time, shares))
+        c.commit()
+
+
+def test_handle_entry_price_sizes_drought_via_last_sale_recovery_not_flat_column(env):
+    """Real incident #15 fix, 2026-08-31: handle_entry_price's manual
+    'Executed' confirmation used to size a drought pending off the flat
+    starting_notional column (node's default here is 50000 via _add_node),
+    ignoring both overrides and real trade_log history (final design, 2026-09-01: core and drought share one capital pool -- see signals_helpers._last_sale_recovery's own docstring). Seeds a real
+    drought_overlay trade_log row with proceeds clearly distinct from the
+    flat column (2000 vs 50000) so a regression back to the flat read is
+    caught by share count, not just a boolean."""
+    node = _add_node()
+    _log_closed_drought_trade(TICKER, 'test', exit_price=20.0, shares=100, account='ira')  # proceeds=2000
+    _drought_pending(node, price=50.0)
+
+    body = _entry_price_body(node, exec_price=50.0)
+    signals_handlers.handle_entry_price(_ack, body, _FakeClient())
+
+    pos = signals_db.get_open_position(TICKER)
+    assert pos is not None
+    assert pos['position_source'] == 'drought_overlay'
+    assert pos['shares'] == 40, (  # int(2000 // 50.0)
+        f"drought manual Executed confirmation did not size off real trade_log history -- "
+        f"got {pos['shares']} shares, expected 40 (2000/50.0). A regression to the flat "
+        f"starting_notional column would size 1000 shares instead (50000/50.0)."
+    )
+
+
+def test_handle_trail_buy_filled_prefill_uses_last_sale_recovery_for_drought(env):
+    """Same real gap as above, for the modal PREFILL suggestion (still
+    user-editable, but a wrong suggestion is exactly the kind of silent
+    drift a human confirming quickly would rubber-stamp)."""
+    node = _add_node()
+    _log_closed_drought_trade(TICKER, 'test', exit_price=20.0, shares=100, account='ira')  # proceeds=2000
+    _drought_pending(node, price=50.0)
+
+    data = {'node': node, 'signal_price': 50.0}
+    body = {'actions': [{'value': json.dumps(data)}], 'channel': {'id': 'C123'},
+            'message': {'ts': '111.222'}, 'trigger_id': 'T1'}
+    client = _FakeClient()
+    client.views_open = lambda **kw: client.updates.append(('views_open', kw))
+    signals_handlers.handle_trail_buy_filled(_ack, body, client)
+
+    assert len(client.updates) == 1
+    view = client.updates[0][1]['view']
+    shares_block = [b for b in view['blocks'] if b.get('block_id') == 'shares_block'][0]
+    prefilled = int(shares_block['element']['initial_value'])
+    assert prefilled == 40, (  # int(2000 // 50.0)
+        f"drought trail-buy-filled prefill did not size off real trade_log history -- "
+        f"got {prefilled} shares, expected 40 (2000/50.0). A regression to the flat "
+        f"starting_notional column would suggest 1000 shares instead (50000/50.0)."
+    )

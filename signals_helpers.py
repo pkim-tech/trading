@@ -1008,7 +1008,7 @@ def _existing_position_note(ticker, wl_id=None):
             f"entered `{pos['entry_time']}` ({pos['account']}).")
 
 
-def _last_sale_recovery(node, position_source='core'):
+def _last_sale_recovery(node):
     """Estimated next-buy notional: proceeds (exit_price * shares) from this node's
     most recent closed trade, so sizing roughly compounds off the last recycle. Falls
     back to `starting_notional` (the node's own watch_list.starting_notional column)
@@ -1023,11 +1023,21 @@ def _last_sale_recovery(node, position_source='core'):
     feed -- doesn't know about other trades competing for the same account's cash
     in between. Excludes is_dry_run_sim rows -- a synthesized dry-run fill's
     proceeds must never size a real order, including in the same account if its
-    dry_run flag is later flipped to live (Opus review 2026-07-26). Filters
-    position_source (default 'core') -- a drought exit's proceeds must never
-    size the next core entry and vice versa (real once drought/addon trades
-    exist; no-op today since trade_log has zero non-core rows, see
-    docs/plans/real_order_execution_drought_addon.md 0.7).
+    dry_run flag is later flipped to live (Opus review 2026-07-26).
+
+    Deliberately does NOT filter by position_source (removed 2026-09-01, real
+    incident #15 follow-up, user's explicit decision): core and drought-overlay
+    share ONE capital pool per node, not separate ones -- "if I just sold SPY
+    for $5000 then that's available capital for drought or core" (user's exact
+    words). Sizing compounds off whichever leg most recently closed, regardless
+    of which one. This reverses the ORIGINAL design assumption (a position_source
+    filter existed here from 2026-08-12 through 2026-08-31/09-01, on the
+    now-overridden premise that "a drought exit's proceeds must never size the
+    next core entry and vice versa") -- that filter was a no-op until real
+    drought trade_log rows existed (RETL id=75, SOXS id=310, ERY id=425,
+    confirmed 2026-08-31), at which point it became live-reachable and was
+    immediately reversed once the user weighed in on the actual intended
+    capital model. See docs/plans/real_order_execution_drought_addon.md's D4.
 
     starting_notional_override_once (2026-08-26) is checked FIRST of all --
     a one-time bump for exactly the next real buy (e.g. capital was just
@@ -1055,10 +1065,9 @@ def _last_sale_recovery(node, position_source='core'):
         row = c.execute(
             "SELECT exit_price, shares FROM trade_log WHERE ticker=? AND strategy=? AND version=? "
             "AND window=? AND COALESCE(account,'')=COALESCE(?,'') AND exit_price IS NOT NULL "
-            "AND shares IS NOT NULL AND is_dry_run_sim=0 AND position_source=? "
+            "AND shares IS NOT NULL AND is_dry_run_sim=0 "
             "ORDER BY exit_time DESC LIMIT 1",
-            (ticker, node.get('strategy'), node.get('version'), node.get('window'), node.get('account'),
-             position_source),
+            (ticker, node.get('strategy'), node.get('version'), node.get('window'), node.get('account')),
         ).fetchone()
     if row and row['exit_price'] and row['shares']:
         return row['exit_price'] * row['shares']

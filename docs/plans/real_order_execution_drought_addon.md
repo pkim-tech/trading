@@ -62,7 +62,7 @@ Schema at `signals_db.py:655-690`. `add_pending_buy` persists only `_PENDING_BUY
 
 ### 0.7 `_last_sale_recovery` does not filter `position_source`
 
-`signals_helpers.py:217-247` — queries `trade_log` by `(ticker, strategy, version, window, account)` ORDER BY exit_time DESC LIMIT 1, ignoring `position_source`. Once real drought trades exist, a drought exit's proceeds would silently size the next core entry and vice versa. No-op today; fix now while free.
+`signals_helpers.py:217-247` — queries `trade_log` by `(ticker, strategy, version, window, account)` ORDER BY exit_time DESC LIMIT 1, ignoring `position_source`. Once real drought trades exist, a drought exit's proceeds would silently size the next core entry and vice versa. No-op today; fix now while free. **Update, 2026-08-31 (incident #15 review): the "no-op today" premise is now false — real non-sim drought_overlay trade_log rows already exist (RETL id=75, SOXS id=310, ERY id=425). The filter described here shipped and is live-reachable, not latent — see D4's resolution above.** **Further update, 2026-09-01: the filter was removed again the same window it shipped — see D4's step-2 resolution, core/drought share one capital pool, no position_source filter at all.**
 
 ### 0.8 `closed_today` / same-day re-buy interacts with HANDOFF
 
@@ -92,7 +92,7 @@ Both `check_paper_drought_entry`/`check_paper_drought_handoff` hard-return for `
 
 **D3. Does the real add-on leg get its own broker-side protective stop?** (a) no stop, lockstep-only (matches the validated model exactly, but is the only real position in this system with zero broker-side protection); (b) stop at the parent's stop price, accepting an occasional early exit the model didn't validate. Recommend (b) — an unstopped margin position is a bigger error than an early leg exit. Needs a real decision.
 
-**D4. Real drought sizing basis.** Paper uses `starting_notional // price`. Confirm against `scripts/stacked_model/drought.py::generate_drought_trades` what compounding basis the validated research actually used before picking live's formula — filter `_last_sale_recovery` to `position_source='core'` either way (0.7).
+**D4. Real drought sizing basis. RESOLVED 2026-08-31/09-01 (incident #15, user's explicit decision, in two steps).** Step 1 (08-31): real live sizing mimics core's capital usage exactly — `_last_sale_recovery(node)` at every real drought sizing call site (entry, top-up, gap-resize, both manual Slack sizing sites) — full trade_log-proceeds compounding plus `starting_notional_override`/`_once`, not a permanently-flat `starting_notional`. Superseded the original flat-sizing default (a real bug: it bypassed the override columns entirely, silently ignoring a real capital-bump override on a live node). Step 2 (09-01, follow-up correction): core and drought-overlay are NOT separate capital pools — "if I just sold SPY for $5000 then that's available capital for drought or core" (user's exact words). `_last_sale_recovery`'s trade_log lookup dropped its `position_source` filter entirely (removed, not just changed) — sizing now picks up whichever leg (core or drought) most recently closed, full stop. `buy_order_sizing` and every real call site's `position_source` parameter was removed as dead weight once the filter came out. Addon (`close_addon_leg`/`addon_legs`) is explicitly EXCLUDED from this shared pool (confirmed 09-01, user's call, reversing an initial "wire it in too" suggestion the same day) — addon is a margin-leveraged overlay against the existing core position, its exit proceeds settle the margin position rather than becoming "available cash" for the next core/drought entry the way a core or drought sale does; `addon_legs` stays a completely separate table, untouched by `_last_sale_recovery`. Paper's own `starting_notional // price` (`generate_drought_trades`) is unchanged — this resolution is about live's formula only, paper was never re-validated against the compounding basis and stays as-is.
 
 **D5. `soxl_ira`'s `notional_cap` is $3,000.** Add-on doubles exposure on a node already at 2,500 (HIBL/YANG) — individually under cap, combined position is 5,000, unchecked by any existing guard. Decide whether add-on needs a new combined-exposure ceiling.
 
@@ -124,7 +124,7 @@ Add to `addon_legs` only (not `paper_addon_legs` — asymmetry documents the rea
 
 ### 2.3 `_last_sale_recovery` position_source filter
 
-`signals_helpers.py:236-241` — add `AND position_source='core'` + a `position_source` param defaulting to `'core'`. No-op against today's real data (zero non-core rows in `trade_log`) — verify with a row count before/after.
+`signals_helpers.py:236-241` — add `AND position_source='core'` + a `position_source` param defaulting to `'core'`. No-op against today's real data (zero non-core rows in `trade_log`) — verify with a row count before/after. **Update, 2026-08-31: real non-sim drought_overlay rows now exist (RETL id=75, SOXS id=310, ERY id=425) — this is no longer a no-op, see D4's resolution above.** **Further update, 2026-09-01: removed again, see D4's step-2 resolution.**
 
 ### 2.4 Migration verification
 

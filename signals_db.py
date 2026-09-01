@@ -4972,7 +4972,8 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             drought_gap_start, drought_vol_pctile,
         ))
         _once_consumed_args = None
-        if not paper and not is_dry_run_sim and node.get('id') is not None and position_source == 'core':
+        if (not paper and not is_dry_run_sim and node.get('id') is not None
+                and position_source in ('core', 'drought_overlay')):
             # Consume-and-clear starting_notional_override_once (2026-08-26) right
             # here, in the SAME transaction as the INSERT above -- this is the one
             # place every real position-open funnels through (open_position_from_
@@ -4996,11 +4997,17 @@ def open_position(node, signal_price, signal_time, entry_price, entry_time, shar
             # snapshot was frozen -- the exact bug class this tuple's own header
             # comment already warns about recurring.
             #
-            # position_source == 'core' only -- a drought-overlay fill (position_
-            # source='drought_overlay') sizes off flat starting_notional, never
-            # _last_sale_recovery/the once-value (see notify_drought_buy_signal),
-            # so a drought entry firing before the next core entry must not
-            # silently consume a bump it never actually applied.
+            # position_source in ('core', 'drought_overlay') -- a drought-overlay
+            # fill now sizes via _last_sale_recovery too (fixed 2026-08-31, real
+            # incident #15: notify_drought_buy_signal previously read the flat
+            # starting_notional column directly, bypassing the once-value
+            # entirely, so it could never reach this consume-and-clear gate and
+            # this gate correctly stayed 'core'-only). Now that a drought entry
+            # CAN apply the once-value (via _last_sale_recovery's own
+            # starting_notional_override_once check), this gate must also clear
+            # it for a drought fill, or an applied-but-uncleared once-value would
+            # silently stick around and re-apply to whatever real fill comes
+            # next (another drought entry, or the following core entry).
             once_row = c.execute(
                 "SELECT starting_notional_override_once FROM watch_list WHERE id = ?", (node['id'],)
             ).fetchone()

@@ -2936,9 +2936,20 @@ def notify_drought_buy_signal(node, decision):
     trailing_buy = db._is_trailing_buy(node)
     auto_placed = False
     order_id = None
-    # D4: flat starting_notional, matching evaluate_drought_entry's own
-    # sizing basis (generate_drought_trades is sizing-agnostic).
-    target_notional = node.get('starting_notional') or 50000
+    # D4 (docs/plans/real_order_execution_drought_addon.md:95) resolved,
+    # real incident #15, 2026-08-31/09-01 (user's explicit decision, in two
+    # steps): (1) drought sizing mimics core's capital usage exactly --
+    # _last_sale_recovery's full trade_log-proceeds compounding +
+    # starting_notional_override/_once, NOT a permanently-flat
+    # starting_notional (the old flat-column read bypassed the override
+    # columns entirely, so a real capital-bump override for ERY silently had
+    # no effect on a drought entry); (2) core and drought share ONE capital
+    # pool per node, not separate ones ("if I just sold SPY for $5000 then
+    # that's available capital for drought or core," user's exact words) --
+    # so _last_sale_recovery's trade_log lookup is NOT scoped to this leg's
+    # own closed trades, it picks up whichever leg (core or drought) most
+    # recently closed, same as every other real sizing site now.
+    target_notional = _last_sale_recovery(node)
     sizing = buy_order_sizing(node, sig_like, target_notional=target_notional)
     if trailing_buy:
         auto_placed, order_id = _attempt_automated_buy(node, sizing)
@@ -4800,7 +4811,7 @@ def _order_id_backfill_fingerprint_ok(order, pending):
     node = pending['node']
     sig_like = {'ticker': pending['ticker'], 'current_price': pending['signal_price']}
     try:
-        target_notional = _last_sale_recovery(node, position_source=pending.get('position_source') or 'core')
+        target_notional = _last_sale_recovery(node)
         expected_shares = buy_order_sizing(node, sig_like, target_notional=target_notional)['shares']
     except Exception:
         return False
@@ -5889,14 +5900,18 @@ def _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=False, ta
     when the fill itself came from check_gap_resize's MARKET replacement,
     which runs at _GAP_CHECK_WINDOW, outside _SIGNAL_WINDOWS/_OPEN_CHECK_WINDOWS)
     so the top-up buy isn't wrongly blocked by the signal-window time gate.
-    target_notional: explicit override -- a real drought-overlay fill's
-    caller (_reconcile_buy_fill) passes node['starting_notional'] here
-    instead of letting this default to _last_sale_recovery(node), since D4
-    (docs/plans/real_order_execution_drought_addon.md) established drought
-    sizing is flat starting_notional, not core's compounding recovery basis
-    -- _last_sale_recovery(node, position_source='core') would otherwise
-    target an unrelated (and possibly very different) core-compounded
-    notional for a drought top-up.
+    target_notional: explicit override, rarely used -- when None (the normal
+    case, including for a real drought-overlay fill), defaults to
+    _last_sale_recovery(node). D4's open question (docs/plans/
+    real_order_execution_drought_addon.md:95, "confirm what compounding
+    basis the validated research actually used") is resolved as of the
+    incident #15 fix (2026-08-31/09-01, user's explicit decision, in two
+    steps): drought sizing mimics core's capital usage exactly -- and core
+    and drought share ONE capital pool per node, not separate ones (a fill
+    on either leg compounds off whichever leg most recently closed) -- not a
+    permanently flat starting_notional, and not scoped to "this leg's own"
+    history either (that was an intermediate, since-reversed design -- see
+    _last_sale_recovery's own docstring for the full history).
     position_source: which of this node's legs the fill belongs to, passed
     straight through to db.top_up_position so the top-up names its target leg
     explicitly instead of relying on there only ever being one open row per
@@ -6200,9 +6215,15 @@ def _reconcile_buy_fill(ticker, fill_price, filled_shares, is_gap_correction=Fal
                   f"(drift: {drift_pct:+.2f}%)  {filled_shares:g} shares",
                   node_id=node['id'])
     _position_source = pending.get('position_source') or 'core'
-    _drought_target_notional = node.get('starting_notional') if _position_source == 'drought_overlay' else None
+    # target_notional left None -- _reconcile_fill's own default now sizes via
+    # _last_sale_recovery(node), matching core's capital-usage basis exactly
+    # (incident #15 fix, 2026-08-31/09-01; was previously hardcoded to the
+    # flat starting_notional column for drought, which silently defeated the
+    # entry-order override fix at fill time). position_source is still passed
+    # through here -- unrelated to sizing, it's the fill's own leg identity
+    # for db.top_up_position's bookkeeping.
     _reconcile_fill(node, fill_price, filled_shares, is_gap_correction=is_gap_correction,
-                     target_notional=_drought_target_notional, position_source=_position_source)
+                     position_source=_position_source)
     if ticker in schwab_safety.AUTOMATION_ENABLED_TICKERS:
         _place_stop_loss_for_position(node, ticker)
 

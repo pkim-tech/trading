@@ -135,3 +135,96 @@ def test_topup_places_real_order_and_updates_position_when_unblocked(env, fake_b
         f"trade_log.shares should reflect the topped-up total ({expected_total_shares}), "
         f"got {row[0]} -- the exact staleness bug this test now guards against"
     )
+
+
+def test_drought_overlay_topup_compounds_off_the_shared_pools_most_recent_exit(env, fake_broker, monkeypatch):
+    """Real incident #15 CRITICAL finding (round 2, 2026-08-31) + follow-up
+    design correction (2026-09-01, user's explicit decision): _reconcile_fill's
+    top-up used to size a drought-overlay fill off the flat starting_notional
+    column directly, defeating the entry-order override fix at fill time.
+    Fixed by letting _reconcile_fill's own target_notional default
+    (_last_sale_recovery(node)) apply for a drought fill same as core,
+    instead of passing an explicit flat override.
+
+    Design correction: _last_sale_recovery does NOT scope by leg -- core and
+    drought share ONE capital pool per node ("if I just sold SPY for $5000
+    then that's available capital for drought or core," user's exact words).
+    So this test seeds a CORE trade_log row (smaller proceeds, older) and a
+    DROUGHT_OVERLAY row (larger proceeds, exiting LATER) on the same node,
+    and proves the top-up's target_notional flows through the real
+    _last_sale_recovery(node) default (drought's $2800, the most recent
+    exit) rather than the old flat-column special case. NOTE this specific
+    setup does NOT by itself distinguish "shared pool, most-recent-wins"
+    from "still scoped to position_source='drought_overlay'" -- both would
+    return $2800 here, since drought is both the newer AND the
+    would-be-scoped leg. That distinction (shared pool vs. per-leg scoping)
+    is covered separately by tests/test_starting_notional_override.py's
+    test_core_fill_compounds_off_a_more_recent_drought_exit_shared_pool. This
+    test's own job is narrower and still real: proving the top-up no longer
+    bypasses _last_sale_recovery entirely (round 2's CRITICAL finding). A
+    regression back to the old flat-column read would see the fill
+    ($2,020) as already exceeding a much smaller target and skip the top-up
+    (or worse, fire a false overspend alert) instead of correctly topping up
+    toward $2,800."""
+    node = _node()
+    with signals_db._conn() as c:
+        # core proceeds = 300, exits FIRST (older) -- deliberately SMALLER
+        # than the fill notional below, so a regression to reading this
+        # stale/wrong row would see the fill as already an OVERSPEND, not a
+        # valid top-up candidate -- a much stronger regression signal than a
+        # merely-smaller topup.
+        c.execute("""
+            INSERT INTO trade_log
+                (ticker, strategy, version, window, stop_loss, max_hold_hours, account,
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct,
+                 exit_price, exit_time, exit_reason, shares, is_dry_run_sim, position_source)
+            VALUES (?, 'TrailingBothZScoreBreakout', 'test', 10, 1, 105, 'soxl_ira',
+                    9.8, ?, 9.8, ?, 0.0, 10.0, ?, 'SL', 30, 0, 'core')
+        """, (TICKER, datetime(2026, 7, 27, 10, 30).isoformat(), datetime(2026, 7, 27, 10, 30).isoformat(),
+              datetime(2026, 7, 27, 15, 30).isoformat()))
+        # drought_overlay proceeds = 2800, exits SECOND (more recent) -- the
+        # real shared-pool target this top-up must use.
+        c.execute("""
+            INSERT INTO trade_log
+                (ticker, strategy, version, window, stop_loss, max_hold_hours, account,
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct,
+                 exit_price, exit_time, exit_reason, shares, is_dry_run_sim, position_source)
+            VALUES (?, 'TrailingBothZScoreBreakout', 'test', 10, 1, 105, 'soxl_ira',
+                    27.8, ?, 27.8, ?, 0.0, 28.0, ?, 'SL', 100, 0, 'drought_overlay')
+        """, (TICKER, datetime(2026, 7, 28, 10, 30).isoformat(), datetime(2026, 7, 28, 10, 30).isoformat(),
+              datetime(2026, 7, 28, 15, 30).isoformat()))
+        c.commit()
+
+    fill_price = 50.5
+    initial_shares = 40.0  # 40 * $50.5 = $2,020 -- exceeds core's $300 target, under the shared pool's $2,800
+
+    sig = {'current_price': 50.0, 'last_bar': datetime(2026, 7, 29, 10, 25)}
+    signals_db.add_pending_buy(node, sig, channel='C0TEST', ts='1234.5', order_id=7777777777,
+                                position_source='drought_overlay', drought_confirm_days=3,
+                                drought_vol_gate=None, drought_gap_start='2026-07-20 09:30:00',
+                                drought_vol_pctile=None)
+    signals_db.mark_pending_buy_placed_by_wl_id(node['id'])
+
+    fake_broker.set_quote(TICKER, last=fill_price, bid=fill_price, ask=fill_price + 0.01)
+    fake_broker.set_cash_balance('soxl_ira', 1_000_000.0)
+
+    signals_notify._reconcile_buy_fill(TICKER, fill_price=fill_price, filled_shares=initial_shares,
+                                        wl_id=node['id'])
+
+    pos = signals_db.get_open_position(TICKER)
+    assert pos is not None
+    assert pos['position_source'] == 'drought_overlay'
+
+    shared_pool_target_notional = 2800.0
+    delta = shared_pool_target_notional - (fill_price * initial_shares)
+    expected_topup_shares = int(delta // fill_price)
+    assert expected_topup_shares > 0, "test setup should genuinely need a top-up against the shared-pool target"
+    expected_total_shares = initial_shares + expected_topup_shares
+
+    assert pos['shares'] == expected_total_shares, (
+        f"drought top-up did not compound off the shared pool's most recent exit "
+        f"(target={shared_pool_target_notional}) -- got {pos['shares']} shares, expected "
+        f"{expected_total_shares}. A regression back to the flat starting_notional column, or to "
+        f"the stale/older core row, would produce a different (likely smaller, or "
+        f"zero/overspend-flagged) result here."
+    )

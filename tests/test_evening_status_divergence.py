@@ -55,3 +55,32 @@ def test_threshold_boundary_exact_not_flagged():
     real_comp, bt_comp, delta_pp = es.compute_divergence(real_rets, bt_rets)
     assert delta_pp == pytest.approx(-es.DIVERGENCE_THRESHOLD_PP, abs=0.01)
     assert not (delta_pp < -es.DIVERGENCE_THRESHOLD_PP)
+
+
+def test_broker_order_check_sizes_via_the_shared_last_sale_recovery_basis(monkeypatch):
+    """Real incident #15 round-2 review finding, 2026-08-31 (later corrected
+    2026-09-01 -- core/drought share ONE capital pool, not per-leg ones, see
+    signals_helpers._last_sale_recovery's own docstring): _broker_order_check's
+    local_qty estimate used to call buy_order_sizing with no target_notional
+    at all, so a wrong/hardcoded value there wouldn't be caught by any test.
+    Proves the reconciliation check genuinely flows through the shared
+    buy_order_sizing/_last_sale_recovery helper (not a separately reimplemented
+    formula) for a drought-overlay pending, same as any other pending."""
+    node = {'id': 1, 'ticker': 'TEST_ES_DIVERGENCE', 'account': 'soxl_ira', 'strategy': 'TrailingBothZScoreBreakout',
+            'trail_buy_pct': 1.0, 'starting_notional': 2000}
+    pending = {'order_id': 12345, 'signal_price': 50.0, 'position_source': 'drought_overlay'}
+
+    monkeypatch.setattr(es.helpers, 'effectively_dry_run', lambda acct, node: False)
+    monkeypatch.setattr(es.schwab_client, 'get_real_orders', lambda acct, ticker: [])
+    monkeypatch.setattr(es.schwab_client, 'filter_resting_orders', lambda orders: [])
+    monkeypatch.setattr(es.helpers, '_last_sale_recovery', lambda n: 2800.0)
+
+    _ratio, _detail = es._broker_order_check(node, 'pending_entry', pending)
+
+    # target_notional=2800 (from the shared _last_sale_recovery basis), price=50.0,
+    # trail_buy_pct=1.0, pad_pct=1.0 (default) -> int(2800 // (50.0 * 1.02)) = 54
+    expected_local_qty = int(2800 // (50.0 * 1.02))
+    assert _ratio.startswith(f"{expected_local_qty:g}/"), (
+        f"local_qty did not flow through the shared _last_sale_recovery basis -- got ratio={_ratio!r}, "
+        f"expected local_qty={expected_local_qty}"
+    )

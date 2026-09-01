@@ -263,7 +263,8 @@ def _broker_order_check(node, state, pending):
         # fixed once it fills) -- approximate what local expected using the same sizing
         # formula the real order was placed with, at the signal-time price.
         try:
-            local_qty = helpers.buy_order_sizing(node, {'ticker': node['ticker'], 'current_price': pending['signal_price']})['shares']
+            local_qty = helpers.buy_order_sizing(
+                node, {'ticker': node['ticker'], 'current_price': pending['signal_price']})['shares']
         except Exception:
             local_qty = float('nan')
         broker_qty = broker_order['quantity'] if broker_order else 0
