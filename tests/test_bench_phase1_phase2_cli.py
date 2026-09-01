@@ -190,6 +190,23 @@ def test_version_string_no_isl_suffix_by_default():
     assert "-isl" not in version
 
 
+def test_version_string_not_yet_wired_to_window_override():
+    """Item 4, 2026-09-01: campaign_registry.build_version_string/register_campaign/
+    resolve_or_create gained a windows= param (mirroring z_thresholds), covered by
+    tests/test_campaign_registry.py. NOT wired into bench_phase1_phase2_inmemory.py's
+    _build_version_string/register_campaign call sites here -- reverted mid-session
+    after paired review found scripts/run_inmemory_sweep_queue.sh always passes
+    --window unconditionally (WINDOWS defaults non-empty) but its own resolve_campaign()
+    doesn't pass --windows, so wiring bench's call sites alone would have split the
+    version string bench computes from the one the shell script registers for two
+    live-running drain loops (campaign_id=1, pids 1613975/1614043). Re-wire together
+    with the run_inmemory_sweep_queue.sh fix once those loops finish/restart."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout",
+                   "--window", "5", "10", "15", "20"])
+    version = bench._build_version_string(args)
+    assert "-w5-10-15-20" not in version
+
+
 def test_version_string_always_has_promotion_algo_version_suffix():
     """2026-08-30, planner dispatch item 3: without this, a re-run of the exact same
     tickers/parameters after a real promotion-algorithm change (backfill/gating/scope-

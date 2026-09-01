@@ -35,6 +35,32 @@ def test_build_version_string_z_and_seed_suffixes():
     assert "-z0.5-1.0-1.5-2.0-seed19-pv4" in v
 
 
+def test_build_version_string_windows_suffix():
+    """Mirrors the -z suffix exactly (Item 4, 2026-09-01): a multi-value
+    --window grid gets an equivalent -w suffix, gated the same way (None
+    omits it, not the same as an empty list)."""
+    v = reg.build_version_string("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                  windows=[5, 10, 15, 20])
+    assert "-w5-10-15-20-pv4" in v
+
+    # windows=None must produce the IDENTICAL string to omitting the kwarg entirely --
+    # window_version_suffix() already emits its own unrelated "-w<dates>" date-range
+    # suffix unconditionally, so this can't be checked via a bare "-w" substring test.
+    v_omitted = reg.build_version_string("v6.5", 4, "massive", "2021-08-23", "2026-08-21")
+    v_none = reg.build_version_string("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                       windows=None)
+    assert v_none == v_omitted
+
+
+def test_build_version_string_z_and_windows_suffix_order():
+    """z comes before w, both before entry_timing/seed/isl -- matches the
+    order build_version_string constructs them in."""
+    v = reg.build_version_string("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                  z_thresholds=[0.5, 1.0], windows=[5, 10],
+                                  entry_timing="close", seed_watch_list_id=19, n_islands=3)
+    assert "-z0.5-1.0-w5-10-close-seed19-isl3-pv4" in v
+
+
 def test_build_version_string_no_label_omits_prefix():
     v = reg.build_version_string(None, 4, "yahoo", "2021-08-23", "2026-08-21")
     assert v.startswith("bench-inmemory-v6-")
@@ -79,6 +105,28 @@ def test_resolve_or_create_different_params_get_different_versions(db_path):
     assert v_pv3 != v_pv4
     assert v_pv3.endswith("-pv3")
     assert v_pv4.endswith("-pv4")
+
+
+def test_resolve_or_create_different_windows_get_different_versions(db_path):
+    id_w1, v_w1 = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                         windows=[5, 10], db_path=db_path)
+    id_w2, v_w2 = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                         windows=[5, 10, 15, 20], db_path=db_path)
+    assert id_w1 != id_w2
+    assert v_w1 != v_w2
+    assert "-w5-10-pv4" in v_w1
+    assert "-w5-10-15-20-pv4" in v_w2
+
+
+def test_register_campaign_stores_windows_column(db_path):
+    v = reg.build_version_string("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                  windows=[5, 10, 15, 20])
+    reg.register_campaign(v, "v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                           windows=[5, 10, 15, 20], db_path=db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT windows FROM campaigns WHERE version_string = ?",
+                            (v,)).fetchone()
+    assert row[0] == "5,10,15,20"
 
 
 def test_enqueue_and_claim_next_fifo(db_path):

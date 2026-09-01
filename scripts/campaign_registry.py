@@ -197,6 +197,7 @@ def ensure_tables(db_path=None):
                 window_start TEXT NOT NULL,
                 window_end TEXT NOT NULL,
                 z_thresholds TEXT,
+                windows TEXT,
                 n_islands INTEGER,
                 entry_timing TEXT,
                 seed_watch_list_id INTEGER,
@@ -240,6 +241,8 @@ def ensure_tables(db_path=None):
             conn.execute("ALTER TABLE campaigns ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
         if "entry_timing" not in existing_cols:
             conn.execute("ALTER TABLE campaigns ADD COLUMN entry_timing TEXT")
+        if "windows" not in existing_cols:
+            conn.execute("ALTER TABLE campaigns ADD COLUMN windows TEXT")
 
         # sort_order (2026-09-01, docs/backlog_cache.md "campaign_jobs queue has no way
         # to inject a job at an arbitrary queue position") -- a separate MUTABLE queue-
@@ -264,25 +267,36 @@ def ensure_tables(db_path=None):
 
 def build_version_string(label, promotion_algo_version, data_source, window_start, window_end,
                           z_thresholds=None, n_islands=None, seed_watch_list_id=None,
-                          entry_timing=None):
+                          entry_timing=None, windows=None):
     """Pure -- no I/O. Same construction bench_phase1_phase2_inmemory.py's
     _build_version_string used to do inline; moved here so it's the ONE place
     this logic lives (see this module's own docstring for the incident this
     closes). z_thresholds: pass None to omit the -z suffix (matches the
     original's `args.z_thresholds is not None` gate -- NOT the same as
-    passing an empty list). entry_timing: pass None or 'open_check' (the
-    real production default) to omit the -close suffix; only a genuine
-    'close' campaign gets tagged, so every existing open_check version
-    string is unaffected. Without this, a close-entry campaign sharing the
-    same label/z/window/n_islands as an open_check one would collide on the
-    identical version string -- the exact split-brain bug class this module
-    exists to prevent (see this file's own docstring)."""
+    passing an empty list). windows: same gating, mirrors z_thresholds exactly
+    -- pass None to omit the -w suffix. Not a functional necessity (window-
+    aliasing under one version string is a pre-existing, already-handled
+    condition -- phase4_candidate_nodes_resolver.py filters on the real
+    per-row `window` column, sweep_run_log has its own separate `windows`
+    column for dedup, backtest_winner_trades is keyed by node_key not
+    version), purely a misleading-signal fix: without this, a widened-z
+    run's version string visibly encodes z but not window, which could
+    wrongly suggest version alone fully discriminates the grid. entry_timing:
+    pass None or 'open_check' (the real production default) to omit the
+    -close suffix; only a genuine 'close' campaign gets tagged, so every
+    existing open_check version string is unaffected. Without this, a
+    close-entry campaign sharing the same label/z/window/n_islands as an
+    open_check one would collide on the identical version string -- the
+    exact split-brain bug class this module exists to prevent (see this
+    file's own docstring)."""
     prefix = f"{label}-" if label else ""
     version = (prefix + "bench-inmemory-v6"
                + ("-massive" if data_source == "massive" else "")
                + window_version_suffix(window_start, window_end))
     if z_thresholds is not None:
         version += f"-z{'-'.join(str(z) for z in z_thresholds)}"
+    if windows is not None:
+        version += f"-w{'-'.join(str(w) for w in windows)}"
     if entry_timing is not None and entry_timing != "open_check":
         version += f"-{entry_timing}"
     if seed_watch_list_id is not None:
@@ -375,13 +389,14 @@ def set_paused(campaign_id, paused, db_path=None):
 def register_campaign(version_string, label, promotion_algo_version, data_source,
                        window_start, window_end, z_thresholds=None, n_islands=None,
                        seed_watch_list_id=None, workers_budget=None, created_by=None,
-                       notes=None, entry_timing=None, db_path=None):
+                       notes=None, entry_timing=None, windows=None, db_path=None):
     """Idempotent on version_string (the real UNIQUE constraint) -- a second
     call with the SAME version_string returns the existing row's id, never
     inserts a duplicate. Returns campaign_id."""
     db_path = db_path or DB_PATH
     ensure_tables(db_path)
     z_str = ",".join(str(z) for z in z_thresholds) if z_thresholds is not None else None
+    windows_str = ",".join(str(w) for w in windows) if windows is not None else None
     with sqlite3.connect(db_path, timeout=60.0) as conn:
         row = conn.execute("SELECT id FROM campaigns WHERE version_string = ?",
                             (version_string,)).fetchone()
@@ -389,12 +404,12 @@ def register_campaign(version_string, label, promotion_algo_version, data_source
             return row[0]
         cur = conn.execute("""
             INSERT INTO campaigns (label, promotion_algo_version, data_source, window_start,
-                window_end, z_thresholds, n_islands, entry_timing, seed_watch_list_id,
+                window_end, z_thresholds, windows, n_islands, entry_timing, seed_watch_list_id,
                 workers_budget, version_string, created_at, created_by, notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (label, promotion_algo_version, data_source, window_start, window_end, z_str,
-              n_islands, entry_timing, seed_watch_list_id, workers_budget, version_string,
-              time.strftime("%Y-%m-%dT%H:%M:%S"), created_by, notes))
+              windows_str, n_islands, entry_timing, seed_watch_list_id, workers_budget,
+              version_string, time.strftime("%Y-%m-%dT%H:%M:%S"), created_by, notes))
         conn.commit()
         return cur.lastrowid
 
@@ -402,7 +417,7 @@ def register_campaign(version_string, label, promotion_algo_version, data_source
 def resolve_or_create(label, promotion_algo_version, data_source, window_start, window_end,
                        z_thresholds=None, n_islands=None, seed_watch_list_id=None,
                        workers_budget=None, created_by=None, notes=None, entry_timing=None,
-                       db_path=None):
+                       windows=None, db_path=None):
     """build_version_string + register_campaign in one call -- what the CLI
     `resolve` subcommand and bench_phase1_phase2_inmemory.py's main() both
     use. Returns (campaign_id, version_string). All downstream calls use
@@ -412,12 +427,13 @@ def resolve_or_create(label, promotion_algo_version, data_source, window_start, 
     version_string = build_version_string(
         label=label, promotion_algo_version=promotion_algo_version, data_source=data_source,
         window_start=window_start, window_end=window_end, z_thresholds=z_thresholds,
-        n_islands=n_islands, seed_watch_list_id=seed_watch_list_id, entry_timing=entry_timing)
+        n_islands=n_islands, seed_watch_list_id=seed_watch_list_id, entry_timing=entry_timing,
+        windows=windows)
     campaign_id = register_campaign(
         version_string, label, promotion_algo_version, data_source, window_start, window_end,
         z_thresholds=z_thresholds, n_islands=n_islands, seed_watch_list_id=seed_watch_list_id,
         workers_budget=workers_budget, created_by=created_by, notes=notes,
-        entry_timing=entry_timing, db_path=db_path)
+        entry_timing=entry_timing, windows=windows, db_path=db_path)
     return campaign_id, version_string
 
 
@@ -676,6 +692,7 @@ def _print_status(rows):
         print(f"campaign id={c['id']} label={c['label']!r} version={c['version_string']}")
         print(f"  pv={c['promotion_algo_version']} data_source={c['data_source']} "
               f"window={c['window_start']}..{c['window_end']} z={c['z_thresholds']} "
+              f"windows={c['windows']} "
               f"n_islands={c['n_islands']} entry_timing={c['entry_timing'] or 'open_check'} "
               f"workers_budget={c['workers_budget']} paused={bool(c['paused'])}")
         print(f"  jobs: {r['job_counts'] or '(none enqueued)'}")
@@ -770,6 +787,8 @@ def main():
         p.add_argument('--window-end', required=required)
         p.add_argument('--z-thresholds', default=None,
                         help="comma-joined, e.g. '0.5,1.0,1.5,2.0'; omit for no -z suffix")
+        p.add_argument('--windows', default=None,
+                        help="comma-joined, e.g. '5,10,15,20'; omit for no -w suffix")
         p.add_argument('--n-islands', type=int, default=None)
         p.add_argument('--entry-timing', choices=['open_check', 'close'], default=None,
                         help="omit or 'open_check' for no version-string suffix (the real "
@@ -843,6 +862,9 @@ def main():
     def _z(argstr):
         return [float(x) for x in argstr.split(',')] if argstr else None
 
+    def _w(argstr):
+        return [int(x) for x in argstr.split(',')] if argstr else None
+
     if args.cmd in ('create', 'resolve'):
         campaign_id, version_string = resolve_or_create(
             label=args.label, promotion_algo_version=args.promotion_algo_version,
@@ -850,7 +872,7 @@ def main():
             window_end=args.window_end, z_thresholds=_z(args.z_thresholds),
             n_islands=args.n_islands, seed_watch_list_id=args.seed_watch_list_id,
             workers_budget=args.workers_budget, created_by=args.created_by, notes=args.notes,
-            entry_timing=args.entry_timing)
+            entry_timing=args.entry_timing, windows=_w(args.windows))
         if args.cmd == 'resolve':
             print(version_string)
         else:
