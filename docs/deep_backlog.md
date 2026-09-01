@@ -1,5 +1,12 @@
 # Backlog
 
+## ✅ [tooling] Resolved 2026-09-01 — archived `scripts/live_sim.py` (dormant, superseded by fake_broker/fake_venue)
+Full detail of the original finding: `docs/backlog_cache.md` (removed), raised 2026-08-26. `git mv scripts/live_sim.py scripts/archive/live_sim.py` (keeps history, matches the existing deep-archive pattern). `scripts/list_scripts.py` has no hardcoded reference to it (nothing to remove there). Removed the stale `scripts/live_sim.py` bullet from CLAUDE.md's "Operational scripts" list; updated `scripts/live_sim_harness.py`'s own docstring/comment path references (it extends the archived script) to point at the new path — left every reference inside permanent narrative docs (`docs/research_log.md`, `docs/conversation_summary.md`, `docs/design.md`, `docs/automation_principles.md`, other `deep_backlog.md` entries) untouched, since those describe what was true at the time and aren't current-state pointers.
+
+`cache/live/trading_sim.db`'s stale leftover state (11 `watch_list` rows, 1 open position, 1 trade, 1 pending buy, last touched 2026-08-07) was left alone rather than deleted — it's gitignored, not committed, and low risk either way; deleting it isn't necessary just because the script that wrote it moved.
+
+Not review-gated: neither changed file is in CLAUDE.md's gated list (`active_signals.py`/`signals_*.py`/`schwab_*.py`/`backtester.py`/`strategies.py`/`run_optimization_sweep.py`/`bench_phase1_phase2_inmemory.py`).
+
 ## ✅ [backtest][tooling] Resolved 2026-09-01 — campaign_jobs gained a mutable `sort_order` queue-position column
 Full detail of the original finding: `docs/backlog_cache.md` (removed), raised 2026-09-01. `campaign_registry.claim_next()` was a strict FIFO on the job's autoincrement `id`, no way to reposition a queued job without hacking real row ids.
 

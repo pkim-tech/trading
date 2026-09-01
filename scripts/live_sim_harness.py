@@ -2,7 +2,7 @@
 """
 Non-interactive coverage harness for active_signals.py / signals_*.py.
 
-Extends scripts/live_sim.py's interactive REPL (manual, one bar at a time)
+Extends scripts/archive/live_sim.py's interactive REPL (manual, one bar at a time)
 with a scriptable pass that calls the real orchestration functions directly
 -- _scan_pinned_entry, _scan_pinned_exit_arm, check_sell_condition (TIME
 exit), signals_notify._reconcile_fill (forced top-up shortfall),
@@ -294,7 +294,7 @@ def scenario_dry_run_sim_cycle(posted):
     into the real open_positions/trade_log tables (tagged is_dry_run_sim=1) --
     the fix for the canary/dry_run "no closed trade found" false-positive
     coverage_deviations. Exercises the full bounce-fill BUY followed by an
-    SL-triggered close, since neither scripts/live_sim.py's manual REPL nor
+    SL-triggered close, since neither scripts/archive/live_sim.py's manual REPL nor
     tests/test_dry_run_sim.py's unit tests drive this path end-to-end through
     the real active_signals.py/signals_notify.py wiring."""
     ticker = 'ZHARN7'
