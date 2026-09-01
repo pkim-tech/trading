@@ -402,8 +402,11 @@ def _build_buy_blocks(node, sig, auto_placed=False):
     # should_alert_live/has_capital_at_stake suppresses this Slack post
     # entirely as of the 2026-08-08 capital-at-stake redesign) but cheap to
     # close now rather than leave a landmine for whenever that gating logic
-    # changes -- mode_tag() itself only ever returns LIVE/DRY-RUN/UNKNOWN,
-    # deliberately not overloaded here since it's shared with other alerts.
+    # changes -- mode_tag() returns LIVE/DRY-RUN/UNKNOWN here, deliberately
+    # not overloaded since it's shared with other alerts. (It can also
+    # return TEST-LIVE as of 2026-08-17, but only when a caller opts in
+    # via granular=True; this call site deliberately does not -- the
+    # per-row tier_tag above covers that distinction here.)
     # Substring, not exact-equality (paired review finding): canary-family
     # variant nodes (e.g. 'v5-canary-drought', 'v5-canary-drought-addon')
     # exist alongside the original bare 'canary' version and are otherwise
@@ -725,6 +728,17 @@ def _ticker_block(row):
     ticker, version = row['Ticker'], row.get('Version') or ''
     account = 'bro' if (row.get('Account') or '').lower() == 'brokerage' else (row.get('Account') or '')
     account_str = f" — `{account}`" if account else ''
+    # 'live-test' tier marker (2026-08-17, paired Opus review -- both
+    # reviewers independently): this block renders the SIGNAL-WINDOW alert
+    # too (signals_notify._send_window_alert), which is fed the UNFILTERED
+    # watchlist -- unlike the Morning Report, which pre-filters to
+    # has_capital_at_stake nodes. Every live node sits in the same active
+    # watchlist, so a $50 staged-test node and a $10k real one really do
+    # render side by side there with only account/version to tell them
+    # apart. Reads the Tier field build_reference_table already stamped on
+    # the row -- no re-derivation, no extra query. Same shape as the
+    # 🧪DRY-RUN-SIM/📄PAPER markers below.
+    tier_tag = ' 🧪TEST-LIVE' if row.get('Tier') == 'live-test' else ''
     proximity = row.get('Proximity')
 
     if row['Next Action'] == 'NO_DATA':
@@ -766,7 +780,7 @@ def _ticker_block(row):
         # build_reference_table share, rather than each re-deriving it.
         paper_tag = ' 📄PAPER' if pos and pos.get('origin') == 'paper' else ''
         text = (
-            f"{phase_str}*{ticker}* `{version}`{sim_tag}{paper_tag} — {row['Hold']}{account_str}{entry_str}\n"
+            f"{phase_str}*{ticker}* `{version}`{tier_tag}{sim_tag}{paper_tag} — {row['Hold']}{account_str}{entry_str}\n"
             f"now `${now:.2f}` {pnl:+.1f}%  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_{sl_str}{arm_ts_line}"
         )
@@ -795,7 +809,7 @@ def _ticker_block(row):
         version_mode_tag = ' 🧪CANARY' if 'canary' in ((row.get('_node') or {}).get('version') or '') \
             else (' (research)' if row.get('State') == 'paper' else '')
         text = (
-            f"{phase_str}*{ticker}* `{version}`{version_mode_tag}{account_str}{last_sale_str}\n"
+            f"{phase_str}*{ticker}* `{version}`{version_mode_tag}{tier_tag}{account_str}{last_sale_str}\n"
             f"now `${now:.2f}` ({overnight:+.1f}% O/N)  z `{row['Z']:+.2f}`  {trig_label} `${trigger:.2f}` ({proximity:+.1f}%)\n"
             f"→ _{row['Next Action']}_\n"
             f"{z_trig_str}tb `{pct_str(tb)}`  arm `{pct_str(arm)}`  ts `{pct_str(ts)}`"

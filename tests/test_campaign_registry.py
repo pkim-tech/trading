@@ -134,6 +134,140 @@ def test_claim_next_leaves_pid_null(db_path):
     assert pid is None
 
 
+def test_sort_order_defaults_to_fifo_insertion_order(db_path):
+    """New jobs are still claimed in the order they were enqueued by default (no
+    reordering ever requested) -- sort_order's gapped-append scheme must not change
+    default behavior for the common case."""
+    cid, _ = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                    db_path=db_path)
+    reg.enqueue(cid, "GDXU", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+    reg.enqueue(cid, "SOXL", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+    reg.enqueue(cid, "DPST", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+
+    assert reg.claim_next(cid, db_path=db_path)['ticker'] == "GDXU"
+    assert reg.claim_next(cid, db_path=db_path)['ticker'] == "SOXL"
+    assert reg.claim_next(cid, db_path=db_path)['ticker'] == "DPST"
+
+
+def test_reorder_job_moves_it_ahead_via_direct_sort_order(db_path):
+    """The direct low-level lever (CLI: reorder-job --job-id --sort-order): setting
+    a later-enqueued job's sort_order below an earlier one's must flip claim order,
+    without touching `id` (the immutable identity column) at all."""
+    cid, _ = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                    db_path=db_path)
+    first_id = reg.enqueue(cid, "GDXU", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+    second_id = reg.enqueue(cid, "SOXL", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        first_sort_order = conn.execute("SELECT sort_order FROM campaign_jobs WHERE id=?",
+                                         (first_id,)).fetchone()[0]
+
+    assert reg.set_job_sort_order(second_id, first_sort_order - 1, db_path=db_path) is True
+
+    job = reg.claim_next(cid, db_path=db_path)
+    assert job['ticker'] == "SOXL", "SOXL was repositioned ahead of GDXU via sort_order alone"
+    with sqlite3.connect(db_path) as conn:
+        ids_still_match = conn.execute("SELECT id FROM campaign_jobs WHERE ticker='SOXL'").fetchone()[0]
+    assert ids_still_match == second_id, "id (identity/PK) must never change on a reorder"
+
+
+def test_set_job_sort_order_unknown_job_returns_false(db_path):
+    reg.ensure_tables(db_path)
+    assert reg.set_job_sort_order(999999, 5, db_path=db_path) is False
+
+
+def test_run_job_next_moves_job_before_every_other_queued_job_in_its_campaign(db_path):
+    cid, _ = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                    db_path=db_path)
+    reg.enqueue(cid, "GDXU", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+    reg.enqueue(cid, "SOXL", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+    third_id = reg.enqueue(cid, "DPST", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+
+    assert reg.run_job_next(third_id, db_path=db_path) is True
+    assert reg.claim_next(cid, db_path=db_path)['ticker'] == "DPST"
+    assert reg.claim_next(cid, db_path=db_path)['ticker'] == "GDXU"
+    assert reg.claim_next(cid, db_path=db_path)['ticker'] == "SOXL"
+
+
+def test_run_job_next_is_scoped_to_its_own_campaign(db_path):
+    """run_job_next must never let a job jump ahead of a DIFFERENT campaign's queue --
+    claim_next's own campaign_id scoping already prevents cross-campaign claims, but
+    run_job_next's internal MIN(sort_order) query must scope to the same campaign too,
+    or a job in campaign B could compute a sort_order far more negative than anything
+    in campaign A without that being meaningful (harmless here, but worth pinning)."""
+    cid_a, _ = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                      db_path=db_path)
+    cid_b, _ = reg.resolve_or_create("v6.5", 5, "massive", "2021-08-23", "2026-08-21",
+                                      db_path=db_path)
+    reg.enqueue(cid_a, "GDXU", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+    b_job_id = reg.enqueue(cid_b, "SOXL", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+
+    assert reg.run_job_next(b_job_id, db_path=db_path) is True
+    # campaign A's own queue is completely unaffected
+    job_a = reg.claim_next(cid_a, db_path=db_path)
+    assert job_a['ticker'] == "GDXU"
+
+
+def test_run_job_next_refuses_non_queued_job(db_path):
+    """Repositioning an already-claimed/finished job has no meaning -- it will never
+    be claimed again regardless of sort_order."""
+    cid, _ = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
+                                    db_path=db_path)
+    job_id = reg.enqueue(cid, "GDXU", "TrailingBothZScoreBreakout", "1", db_path=db_path)
+    reg.claim_next(cid, db_path=db_path)  # flips it to 'running'
+
+    assert reg.run_job_next(job_id, db_path=db_path) is False
+
+
+def test_run_job_next_unknown_job_returns_false(db_path):
+    reg.ensure_tables(db_path)
+    assert reg.run_job_next(999999, db_path=db_path) is False
+
+
+def test_sort_order_migration_backfills_existing_rows_preserving_fifo_order(db_path):
+    """Simulates a pre-sort_order DB (a real campaign_jobs table created before this
+    column existed): ensure_tables' ALTER+backfill must give every existing row a
+    sort_order that preserves its original id-based FIFO order, without needing any
+    caller to have set one explicitly."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE campaigns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT,
+                promotion_algo_version INTEGER NOT NULL, data_source TEXT NOT NULL,
+                window_start TEXT NOT NULL, window_end TEXT NOT NULL, z_thresholds TEXT,
+                n_islands INTEGER, seed_watch_list_id INTEGER, workers_budget INTEGER,
+                version_string TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+                created_by TEXT, notes TEXT
+            )""")
+        # Pre-sort_order (and pre-paused/entry_timing) shape -- the real "old DB" case
+        # ensure_tables' probe-first migrations exist to handle.
+        conn.execute("""
+            CREATE TABLE campaign_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER NOT NULL,
+                ticker TEXT NOT NULL, strategy TEXT NOT NULL, fixed_sl_values TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued', pid INTEGER, queued_at TEXT NOT NULL,
+                started_at TEXT, finished_at TEXT, rc INTEGER
+            )""")
+        conn.execute("INSERT INTO campaigns (id, label, promotion_algo_version, data_source, "
+                      "window_start, window_end, version_string, created_at) VALUES "
+                      "(1, 'v6.5', 4, 'massive', '2021-08-23', '2026-08-21', 'v-legacy', 'x')")
+        for ticker in ("GDXU", "SOXL", "DPST"):
+            conn.execute("INSERT INTO campaign_jobs (campaign_id, ticker, strategy, "
+                          "fixed_sl_values, status, queued_at) VALUES (1, ?, 'TrailingBothZScoreBreakout', "
+                          "'1', 'queued', 'x')", (ticker,))
+        conn.commit()
+
+    reg.ensure_tables(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT id, ticker, sort_order FROM campaign_jobs ORDER BY id").fetchall()
+    assert [r[2] for r in rows] == [r[0] * 10 for r in rows], "backfill must be id*10 for every legacy row"
+    assert reg.claim_next(1, db_path=db_path)['ticker'] == "GDXU", \
+        "post-migration claim order must still match the original FIFO (id) order"
+    assert reg.claim_next(1, db_path=db_path)['ticker'] == "SOXL"
+    assert reg.claim_next(1, db_path=db_path)['ticker'] == "DPST"
+
+
 def test_update_job_pid_records_real_worker_pid(db_path):
     cid, _ = reg.resolve_or_create("v6.5", 4, "massive", "2021-08-23", "2026-08-21",
                                     db_path=db_path)

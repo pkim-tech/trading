@@ -35,7 +35,7 @@ from signals_blocks import (
 from signals_helpers import (
     _proximity_emoji, _existing_position_note, _last_sale_recovery, _phase_emoji,
     automation_blockers_other_than_node, buy_order_sizing, effectively_dry_run,
-    has_capital_at_stake, log_poll, mode_tag,
+    has_capital_at_stake, log_poll, mode_tag, state_label,
     resolve_at_bar_close, should_alert_live, stop_status,
     MAX_RUNNING_LOW_DROP_PCT,
 )
@@ -5025,8 +5025,15 @@ def check_buy_reminders():
                 _supersede_message(pending['reminder_channel'], pending['reminder_ts'], pending['ticker'])
                 reminder_num = pending['reminder_count'] + 1
                 blocks = _pending_buy_blocks(pending, reminder_num)
+                # granular=True (2026-08-17, paired Opus review -- both reviewers
+                # independently): this alert deliberately fires ABOVE the
+                # has_capital_at_stake gate below (see that gate's own comment),
+                # so it is one of the few real-time alerts a $50-$800 staged-test
+                # node actually emits -- and plain 'LIVE' made the system's most
+                # urgent alert read identically for a test node and a real $10k
+                # one. Label only; the suppression behavior is untouched.
                 channel, ts = _post_message(
-                    f"🚨 {pending['ticker']} ({account} · {mode_tag(account, pending['node'])}) — CONFIRMED FILLED "
+                    f"🚨 {pending['ticker']} ({account} · {mode_tag(account, pending['node'], granular=True)}) — CONFIRMED FILLED "
                     f"at ${fill['price']:.4f} ({fill['quantity']:g} shares, order {pending['order_id']}) but NOT "
                     f"reconciled — tap Filled below now",
                     blocks=blocks)
@@ -6791,7 +6798,14 @@ def _send_window_alert(label, watchlist):
 
 
 _REF_TABLE_COLS = [
-    'Phase', 'Ticker', 'Hold', 'Next Trigger $', 'Now', 'Proximity', 'Next Action',
+    # 'Tier' (2026-08-17): the CLI rendering (scripts/reference_table.py ->
+    # format_reference_table) is the one view of this table that shows EVERY
+    # node, unfiltered -- unlike send_reference_report, which pre-filters to
+    # has_capital_at_stake nodes. Without a tier column a real $10k ira node
+    # and a $500 soxl_ira staged-test node print as visually identical rows
+    # (Account alone doesn't say it: soxl_ira holds both real and test nodes
+    # historically, and both really do place orders at the broker).
+    'Phase', 'Ticker', 'Tier', 'Hold', 'Next Trigger $', 'Now', 'Proximity', 'Next Action',
     'Version', 'Alpha', 'Z', 'Z Trigger', 'TrailBuy%', 'Arm%', 'TrailSell%', 'Account', 'Last Sale $',
 ]
 
@@ -6840,7 +6854,7 @@ def build_reference_table(watchlist):
                 'Z': None, 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': node.get('trail_buy_pct'), 'Arm%': db._tp_or_arm_pct(node),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
-                'Strategy': node['strategy'], 'Held': False, 'Phase': phase, 'State': node.get('state'),
+                'Strategy': node['strategy'], 'Held': False, 'Phase': phase, 'State': node.get('state'), 'Tier': state_label(node),
                 '_node': node, '_pos': None, '_sig': None,
             })
             continue
@@ -6872,7 +6886,7 @@ def build_reference_table(watchlist):
                 'Z Trigger': node.get('z_score_threshold'),
                 'TrailBuy%': trail_buy_pct, 'Arm%': db._tp_or_arm_pct(node),
                 'TrailSell%': node.get('trail_sell_pct'), 'Account': account, 'Last Sale $': last_sale,
-                'Strategy': node['strategy'], 'Held': False, 'Phase': phase, 'State': node.get('state'),
+                'Strategy': node['strategy'], 'Held': False, 'Phase': phase, 'State': node.get('state'), 'Tier': state_label(node),
                 'SL $': trigger * (1 - schwab_sl_pct / 100), 'Arm $': trigger * (1 + db._tp_or_arm_pct(node) / 100),
                 'Overnight %': (now_price - sig['prev_close']) / sig['prev_close'] * 100,
                 'Prev Close': sig['prev_close'], 'Data Date': sig['last_daily_bar'],
@@ -6928,7 +6942,7 @@ def build_reference_table(watchlist):
                 'TrailBuy%': pos.get('trail_buy_pct'), 'Arm%': arm_pct,
                 'TrailSell%': trail_sell_pct, 'Account': account, 'Last Sale $': last_sale,
                 'Strategy': pos.get('strategy', node['strategy']), 'Held': True, 'Phase': phase,
-                'State': node.get('state'),
+                'State': node.get('state'), 'Tier': state_label(node),
                 'SL $': sl_price, 'PnL %': (now_price - pos['entry_price']) / pos['entry_price'] * 100,
                 '_node': node, '_pos': pos, '_sig': sig,
             })
@@ -7423,7 +7437,13 @@ def send_reference_report(watchlist):
     groups: dict = {}
     for node in watchlist:
         account = node.get('account') or 'unmapped'
-        category = 'RESEARCH' if node.get('state') == 'paper' else mode_tag(account, node)
+        # granular=True (2026-08-17): this summary is exactly the "which
+        # accounts have real money on the line" glance, so a sub-threshold
+        # staged-test node must not group under the same LIVE heading as a
+        # real capital-at-stake one. No-op today (send_reference_report
+        # pre-filters this list to has_capital_at_stake nodes) -- kept
+        # correct for whenever that filter changes.
+        category = 'RESEARCH' if node.get('state') == 'paper' else mode_tag(account, node, granular=True)
         groups.setdefault((account, category), []).append(node['ticker'])
     summary_lines = [
         f"*{account}* — {category}: {', '.join(sorted(set(tickers)))}"
@@ -7473,7 +7493,11 @@ def send_reference_report(watchlist):
         # previously showed Version only -- found live 2026-07-30 (user
         # expected 4 identifiable live nodes, only 3 were visually
         # distinguishable from their research siblings).
-        extra = [x for x in (r.get('State'), r.get('Account')) if x]
+        # 'Tier' rather than the raw 'State' (2026-08-17): 'live' alone still
+        # collapsed a real $10k capital-at-stake node and a deliberately tiny
+        # staged-test node -- both place real orders -- into one identical
+        # label. state_label splits those into live-real/live-test.
+        extra = [x for x in (r.get('Tier') or r.get('State'), r.get('Account')) if x]
         return f"{r['Version']} ({'/'.join(extra)})" if extra else (r['Version'] or '')
 
     print(f"Morning Report — {now_str}")

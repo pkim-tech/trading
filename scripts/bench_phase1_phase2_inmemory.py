@@ -916,6 +916,24 @@ def build_arg_parser():
                           "own copy of N_ISLANDS -- run_optimization_sweep.py's own N_ISLANDS=3 "
                           "default and its own legacy callers are untouched. Default None "
                           "leaves N_ISLANDS unchanged.")
+    ap.add_argument("--entry-timing", dest="entry_timing", choices=["open_check", "close"],
+                     default=None,
+                     help="override module-level ENTRY_TIMING (default 'open_check', matching "
+                          "every real live watch_list node today -- 0 live nodes use 'close'). "
+                          "The GT kernel (_simulate_trail_ground_truth) already supports "
+                          "close_check; this flag is the CLI path to actually sweep it for a "
+                          "ticker with no live close-entry node to seed from. Mutually "
+                          "exclusive with --seed-watch-list-id (seed mode derives entry_timing "
+                          "from the seed node itself). A non-default value gets a -close "
+                          "version-string suffix (campaign_registry.build_version_string) so "
+                          "it can never collide with an open_check campaign sharing the same "
+                          "label/z/window/n_islands. Default None leaves ENTRY_TIMING "
+                          "unchanged.")
+    ap.add_argument("--campaign-label", dest="campaign_label", default=None,
+                     help="override module-level CAMPAIGN_LABEL (default 'v6.5') -- e.g. "
+                          "--campaign-label v6.6 for a new campaign generation distinct from "
+                          "the standing v6.5 one. Default None leaves CAMPAIGN_LABEL "
+                          "unchanged.")
     ap.add_argument("--ticker", type=str, default=None,
                      help="override module-level TICKER (default 'SOXL') -- e.g. --ticker "
                           "AGQ to run a different ticker's campaign. Mutually exclusive with "
@@ -990,7 +1008,8 @@ def _build_version_string(args):
         label=CAMPAIGN_LABEL, promotion_algo_version=PROMOTION_ALGO_VERSION,
         data_source=DATA_SOURCE, window_start=START, window_end=END,
         z_thresholds=(Z_THRESHOLDS if args.z_thresholds is not None else None),
-        n_islands=args.n_islands, seed_watch_list_id=args.seed_watch_list_id)
+        n_islands=args.n_islands, seed_watch_list_id=args.seed_watch_list_id,
+        entry_timing=ENTRY_TIMING)
 
 
 def main():
@@ -1026,6 +1045,8 @@ def main():
             _seed_conflicts.append("--checkpoint-file")
         if args.ticker is not None:
             _seed_conflicts.append("--ticker")
+        if args.entry_timing is not None:
+            _seed_conflicts.append("--entry-timing")
         if _seed_conflicts:
             raise SystemExit(
                 f"--seed-watch-list-id is mutually exclusive with {', '.join(_seed_conflicts)} "
@@ -1053,18 +1074,38 @@ def main():
         TICKER = args.ticker
         print(f"Ticker override: TICKER={TICKER} (module default 'SOXL')")
 
+    if args.entry_timing is not None:
+        # Mutually exclusive with --seed-watch-list-id (enforced above) -- seed mode
+        # derives ENTRY_TIMING from the real live watch_list row instead (see that
+        # block's own comment for why silently leaving it at 'open_check' there would
+        # be wrong). Must run before the live-node-mode default branch below, which
+        # would otherwise silently overwrite this with whatever the live node's own
+        # entry_timing is.
+        global ENTRY_TIMING
+        ENTRY_TIMING = args.entry_timing
+        print(f"Entry-timing override: ENTRY_TIMING={ENTRY_TIMING!r} (module default "
+              f"'open_check')")
+
+    if args.campaign_label is not None:
+        global CAMPAIGN_LABEL
+        CAMPAIGN_LABEL = args.campaign_label
+        print(f"Campaign-label override: CAMPAIGN_LABEL={CAMPAIGN_LABEL!r} (module default "
+              f"'v6.5')")
+
     seed = None
     if args.seed_watch_list_id is not None:
         seed = _load_seed_node(args.seed_watch_list_id)
         strategy_name = seed["strategy_name"]
         fixed_sl_list = [seed["fixed_sl"]]
-        # TICKER already declared global above (--ticker override block) -- a second
-        # `global TICKER` here after that block's assignment raises SyntaxError ("assigned
-        # to before global declaration"), a real Python quirk confirmed while building this:
-        # once a name is globalled+assigned in one place in a function, a later `global`
-        # statement for the SAME name is illegal, even in a mutually-exclusive branch that
-        # can never run in the same call. TICKER stays covered by the earlier declaration.
-        global WINDOWS, ENTRY_TIMING, Z_THRESHOLDS, HOLD_TIME_CAPS
+        # TICKER and ENTRY_TIMING are already declared global above (--ticker and
+        # --entry-timing override blocks) -- a second `global` here after either
+        # block's assignment raises SyntaxError ("assigned to before global
+        # declaration"), a real Python quirk confirmed while building this: once a
+        # name is globalled+assigned in one place in a function, a later `global`
+        # statement for the SAME name is illegal, even in a mutually-exclusive
+        # branch that can never run in the same call. TICKER/ENTRY_TIMING stay
+        # covered by their earlier declarations.
+        global WINDOWS, Z_THRESHOLDS, HOLD_TIME_CAPS
         WINDOWS = [seed["window"]]
         # Z_THRESHOLDS/ENTRY_TIMING/HOLD_TIME_CAPS overridden the same way WINDOWS already
         # is above -- found by paired review 2026-08-29 (round 2 and round 3):
@@ -1123,7 +1164,7 @@ def main():
         version, CAMPAIGN_LABEL, PROMOTION_ALGO_VERSION, DATA_SOURCE, START, END,
         z_thresholds=(Z_THRESHOLDS if args.z_thresholds is not None else None),
         n_islands=args.n_islands, seed_watch_list_id=args.seed_watch_list_id,
-        created_by="bench_phase1_phase2_inmemory.py")
+        entry_timing=ENTRY_TIMING, created_by="bench_phase1_phase2_inmemory.py")
 
     # fixed_sl packaging (2026-08-29, Task #6 follow-up, planner dispatch): loops the
     # existing per-fixed_sl Phase1+Phase2+Phase2.5+candidate-write logic (now

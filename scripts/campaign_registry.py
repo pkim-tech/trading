@@ -198,6 +198,7 @@ def ensure_tables(db_path=None):
                 window_end TEXT NOT NULL,
                 z_thresholds TEXT,
                 n_islands INTEGER,
+                entry_timing TEXT,
                 seed_watch_list_id INTEGER,
                 workers_budget INTEGER,
                 paused INTEGER NOT NULL DEFAULT 0,
@@ -218,7 +219,8 @@ def ensure_tables(db_path=None):
                 queued_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT,
-                rc INTEGER
+                rc INTEGER,
+                sort_order INTEGER
             )""")
         # ADD COLUMN guard (2026-08-31, paired-review CONFIRMED HIGH fixup, both
         # independent reviewers): `paused` was added to the CREATE TABLE above AFTER
@@ -236,23 +238,53 @@ def ensure_tables(db_path=None):
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaigns)")}
         if "paused" not in existing_cols:
             conn.execute("ALTER TABLE campaigns ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+        if "entry_timing" not in existing_cols:
+            conn.execute("ALTER TABLE campaigns ADD COLUMN entry_timing TEXT")
+
+        # sort_order (2026-09-01, docs/backlog_cache.md "campaign_jobs queue has no way
+        # to inject a job at an arbitrary queue position") -- a separate MUTABLE queue-
+        # position column, deliberately never `id` itself: `id` stays the immutable
+        # identity/PK every other function already keys off (mark_finished/update_job_pid/
+        # skip_remaining), and reordering the queue is now a plain UPDATE to this column
+        # rather than a fragile rewrite of real row ids. Same probe-first migration
+        # pattern as `paused`/`entry_timing` above -- safe against any pre-existing
+        # campaign_jobs table, not just ones created by this exact version of the file.
+        # Backfilled as `id * 10` (not a bare 1/2/3... sequence): preserves the existing
+        # FIFO order for every already-queued/already-run job while leaving a 10-wide gap
+        # between every pair, so a job can be inserted between two existing ones (a
+        # midpoint value) many times before ever needing a bulk renumber -- the same
+        # gapped-integer scheme enqueue()/run_job_next() use for every NEW job going
+        # forward, just retroactively applied to what's already in the table.
+        job_cols = {row[1] for row in conn.execute("PRAGMA table_info(campaign_jobs)")}
+        if "sort_order" not in job_cols:
+            conn.execute("ALTER TABLE campaign_jobs ADD COLUMN sort_order INTEGER")
+            conn.execute("UPDATE campaign_jobs SET sort_order = id * 10 WHERE sort_order IS NULL")
         conn.commit()
 
 
 def build_version_string(label, promotion_algo_version, data_source, window_start, window_end,
-                          z_thresholds=None, n_islands=None, seed_watch_list_id=None):
+                          z_thresholds=None, n_islands=None, seed_watch_list_id=None,
+                          entry_timing=None):
     """Pure -- no I/O. Same construction bench_phase1_phase2_inmemory.py's
     _build_version_string used to do inline; moved here so it's the ONE place
     this logic lives (see this module's own docstring for the incident this
     closes). z_thresholds: pass None to omit the -z suffix (matches the
     original's `args.z_thresholds is not None` gate -- NOT the same as
-    passing an empty list)."""
+    passing an empty list). entry_timing: pass None or 'open_check' (the
+    real production default) to omit the -close suffix; only a genuine
+    'close' campaign gets tagged, so every existing open_check version
+    string is unaffected. Without this, a close-entry campaign sharing the
+    same label/z/window/n_islands as an open_check one would collide on the
+    identical version string -- the exact split-brain bug class this module
+    exists to prevent (see this file's own docstring)."""
     prefix = f"{label}-" if label else ""
     version = (prefix + "bench-inmemory-v6"
                + ("-massive" if data_source == "massive" else "")
                + window_version_suffix(window_start, window_end))
     if z_thresholds is not None:
         version += f"-z{'-'.join(str(z) for z in z_thresholds)}"
+    if entry_timing is not None and entry_timing != "open_check":
+        version += f"-{entry_timing}"
     if seed_watch_list_id is not None:
         version += f"-seed{seed_watch_list_id}"
     if n_islands is not None:
@@ -343,7 +375,7 @@ def set_paused(campaign_id, paused, db_path=None):
 def register_campaign(version_string, label, promotion_algo_version, data_source,
                        window_start, window_end, z_thresholds=None, n_islands=None,
                        seed_watch_list_id=None, workers_budget=None, created_by=None,
-                       notes=None, db_path=None):
+                       notes=None, entry_timing=None, db_path=None):
     """Idempotent on version_string (the real UNIQUE constraint) -- a second
     call with the SAME version_string returns the existing row's id, never
     inserts a duplicate. Returns campaign_id."""
@@ -357,11 +389,11 @@ def register_campaign(version_string, label, promotion_algo_version, data_source
             return row[0]
         cur = conn.execute("""
             INSERT INTO campaigns (label, promotion_algo_version, data_source, window_start,
-                window_end, z_thresholds, n_islands, seed_watch_list_id, workers_budget,
-                version_string, created_at, created_by, notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                window_end, z_thresholds, n_islands, entry_timing, seed_watch_list_id,
+                workers_budget, version_string, created_at, created_by, notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (label, promotion_algo_version, data_source, window_start, window_end, z_str,
-              n_islands, seed_watch_list_id, workers_budget, version_string,
+              n_islands, entry_timing, seed_watch_list_id, workers_budget, version_string,
               time.strftime("%Y-%m-%dT%H:%M:%S"), created_by, notes))
         conn.commit()
         return cur.lastrowid
@@ -369,17 +401,23 @@ def register_campaign(version_string, label, promotion_algo_version, data_source
 
 def resolve_or_create(label, promotion_algo_version, data_source, window_start, window_end,
                        z_thresholds=None, n_islands=None, seed_watch_list_id=None,
-                       workers_budget=None, created_by=None, notes=None, db_path=None):
+                       workers_budget=None, created_by=None, notes=None, entry_timing=None,
+                       db_path=None):
     """build_version_string + register_campaign in one call -- what the CLI
     `resolve` subcommand and bench_phase1_phase2_inmemory.py's main() both
-    use. Returns (campaign_id, version_string)."""
-    version_string = build_version_string(label, promotion_algo_version, data_source,
-                                           window_start, window_end, z_thresholds, n_islands,
-                                           seed_watch_list_id)
-    campaign_id = register_campaign(version_string, label, promotion_algo_version, data_source,
-                                     window_start, window_end, z_thresholds, n_islands,
-                                     seed_watch_list_id, workers_budget, created_by, notes,
-                                     db_path)
+    use. Returns (campaign_id, version_string). All downstream calls use
+    keyword args deliberately -- register_campaign/build_version_string's
+    param order doesn't match this function's own, and a positional call here
+    would silently misroute an argument into the wrong slot."""
+    version_string = build_version_string(
+        label=label, promotion_algo_version=promotion_algo_version, data_source=data_source,
+        window_start=window_start, window_end=window_end, z_thresholds=z_thresholds,
+        n_islands=n_islands, seed_watch_list_id=seed_watch_list_id, entry_timing=entry_timing)
+    campaign_id = register_campaign(
+        version_string, label, promotion_algo_version, data_source, window_start, window_end,
+        z_thresholds=z_thresholds, n_islands=n_islands, seed_watch_list_id=seed_watch_list_id,
+        workers_budget=workers_budget, created_by=created_by, notes=notes,
+        entry_timing=entry_timing, db_path=db_path)
     return campaign_id, version_string
 
 
@@ -388,15 +426,28 @@ def enqueue(campaign_id, ticker, strategy, fixed_sl_values, db_path=None):
     the shell script's own Z_SUFFIX join convention -- kept as a single opaque
     field here since this module never needs to parse it, only pass it
     through to the real bench_phase1_phase2_inmemory.py invocation. Returns
-    the new job's id."""
+    the new job's id.
+
+    sort_order (2026-09-01): every new job is appended at the END of the GLOBAL
+    queue-position ordering (max existing sort_order + 10, gapped scheme -- see
+    ensure_tables' migration comment), matching this function's pre-sort_order
+    behavior (new jobs got the highest `id`, which claim_next's old `ORDER BY id`
+    always ran last). Not locked with BEGIN IMMEDIATE (unlike claim_next/
+    set_job_sort_order/run_job_next below): a race between two concurrent enqueue
+    calls can at worst produce a duplicate sort_order value, which just ties on
+    `id` as the tiebreak claim_next's ORDER BY already provides -- never a lost
+    or misordered job, so the extra lock isn't worth paying for on every enqueue."""
     db_path = db_path or DB_PATH
     ensure_tables(db_path)
     with sqlite3.connect(db_path, timeout=60.0) as conn:
+        max_row = conn.execute("SELECT MAX(sort_order) FROM campaign_jobs").fetchone()
+        next_sort_order = (max_row[0] if max_row and max_row[0] is not None else 0) + 10
         cur = conn.execute("""
             INSERT INTO campaign_jobs (campaign_id, ticker, strategy, fixed_sl_values,
-                status, queued_at)
-            VALUES (?, ?, ?, ?, 'queued', ?)
-        """, (campaign_id, ticker, strategy, fixed_sl_values, time.strftime("%Y-%m-%dT%H:%M:%S")))
+                status, queued_at, sort_order)
+            VALUES (?, ?, ?, ?, 'queued', ?, ?)
+        """, (campaign_id, ticker, strategy, fixed_sl_values, time.strftime("%Y-%m-%dT%H:%M:%S"),
+              next_sort_order))
         conn.commit()
         return cur.lastrowid
 
@@ -430,7 +481,11 @@ def claim_next(campaign_id=None, db_path=None):
         if campaign_id is not None:
             q += " AND campaign_id=?"
             params.append(campaign_id)
-        q += " ORDER BY id LIMIT 1"
+        # sort_order is the real queue-position column (2026-09-01) -- `id` is now only a
+        # tiebreak for two jobs that happen to share a sort_order (e.g. a benign enqueue
+        # race, see enqueue's docstring), preserving pre-sort_order FIFO behavior for
+        # everything that's never been explicitly reordered.
+        q += " ORDER BY sort_order, id LIMIT 1"
         row = conn.execute(q, params).fetchone()
         if row is None:
             conn.execute("COMMIT")
@@ -440,6 +495,79 @@ def claim_next(campaign_id=None, db_path=None):
                      (time.strftime("%Y-%m-%dT%H:%M:%S"), job_id))
         conn.execute("COMMIT")
         return dict(id=job_id, ticker=ticker, strategy=strategy, fixed_sl_values=fixed_sl_values)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def set_job_sort_order(job_id, sort_order, db_path=None):
+    """Repositions a job by directly setting its sort_order -- the mutable queue-position
+    column (2026-09-01, see ensure_tables' migration comment for the full design). `id`
+    itself is never touched, matching the user's explicit call to keep it as the
+    immutable identity/PK every other function keys off.
+
+    BEGIN IMMEDIATE guarded, the same lock claim_next uses (same _CLAIM_LOCK_TIMEOUT_SECS)
+    -- so this can never race a concurrent claim_next's read-then-update of the same row.
+    Whichever call's BEGIN IMMEDIATE wins the RESERVED lock first commits first; the other
+    blocks until it releases, then proceeds against post-commit state. The only two
+    orderings are both safe: if this commits first, claim_next's very next read already
+    sees the new position; if claim_next commits first (claiming this exact job before the
+    reposition lands), this still applies harmlessly to a now-'running' row -- claim_next
+    only ever selects 'queued' rows, so repositioning an already-claimed job just has no
+    further effect, it doesn't un-claim or misroute anything.
+
+    Returns True if a row was actually updated, False if job_id doesn't exist."""
+    db_path = db_path or DB_PATH
+    ensure_tables(db_path)
+    conn = sqlite3.connect(db_path, timeout=_CLAIM_LOCK_TIMEOUT_SECS, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute("UPDATE campaign_jobs SET sort_order=? WHERE id=?", (sort_order, job_id))
+        conn.execute("COMMIT")
+        return cur.rowcount > 0
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def run_job_next(job_id, db_path=None):
+    """Convenience over set_job_sort_order: repositions `job_id` to claim before every
+    OTHER currently-queued job in the SAME campaign -- scoped to campaign_id, matching how
+    claim_next is actually invoked in production (run_inmemory_sweep_queue.sh always passes
+    --campaign-id). Computed as (min queued sort_order in that campaign) - 10, landing in
+    the same 10-wide gapped scheme enqueue()/the migration backfill use -- repeated calls
+    just keep walking further negative, which plain SQLite INTEGER handles natively with no
+    realistic ceiling, so no renumbering is ever forced by this alone.
+
+    Same BEGIN IMMEDIATE claim_next-lock guarantee as set_job_sort_order (see its
+    docstring) -- the read (current campaign_id/status/min sort_order) and the write happen
+    inside one held lock, so a concurrent claim_next can't observe a stale MIN between this
+    function's read and its write.
+
+    Returns True if job_id exists and was genuinely 'queued' (repositioning a job that's
+    already running/done/failed/skipped has no meaning -- it isn't going to be claimed
+    again), False otherwise."""
+    db_path = db_path or DB_PATH
+    ensure_tables(db_path)
+    conn = sqlite3.connect(db_path, timeout=_CLAIM_LOCK_TIMEOUT_SECS, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT campaign_id, status FROM campaign_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None or row[1] != 'queued':
+            conn.execute("COMMIT")
+            return False
+        campaign_id = row[0]
+        min_row = conn.execute(
+            "SELECT MIN(sort_order) FROM campaign_jobs WHERE campaign_id=? AND status='queued'",
+            (campaign_id,)).fetchone()
+        new_sort_order = (min_row[0] if min_row and min_row[0] is not None else 0) - 10
+        conn.execute("UPDATE campaign_jobs SET sort_order=? WHERE id=?", (new_sort_order, job_id))
+        conn.execute("COMMIT")
+        return True
     except Exception:
         conn.execute("ROLLBACK")
         raise
@@ -548,8 +676,8 @@ def _print_status(rows):
         print(f"campaign id={c['id']} label={c['label']!r} version={c['version_string']}")
         print(f"  pv={c['promotion_algo_version']} data_source={c['data_source']} "
               f"window={c['window_start']}..{c['window_end']} z={c['z_thresholds']} "
-              f"n_islands={c['n_islands']} workers_budget={c['workers_budget']} "
-              f"paused={bool(c['paused'])}")
+              f"n_islands={c['n_islands']} entry_timing={c['entry_timing'] or 'open_check'} "
+              f"workers_budget={c['workers_budget']} paused={bool(c['paused'])}")
         print(f"  jobs: {r['job_counts'] or '(none enqueued)'}")
         for j in r['running']:
             tag = "ORPHANED (pid dead)" if j['orphaned'] else "RUNNING"
@@ -643,6 +771,11 @@ def main():
         p.add_argument('--z-thresholds', default=None,
                         help="comma-joined, e.g. '0.5,1.0,1.5,2.0'; omit for no -z suffix")
         p.add_argument('--n-islands', type=int, default=None)
+        p.add_argument('--entry-timing', choices=['open_check', 'close'], default=None,
+                        help="omit or 'open_check' for no version-string suffix (the real "
+                             "production default); 'close' tags the version with a -close "
+                             "suffix so it can't collide with an open_check campaign sharing "
+                             "the same label/z/window/n_islands")
         p.add_argument('--seed-watch-list-id', type=int, default=None)
         p.add_argument('--workers-budget', type=int, default=None)
         p.add_argument('--created-by', default=None)
@@ -692,6 +825,19 @@ def main():
     p_ispaused = sub.add_parser('is-paused')
     p_ispaused.add_argument('--campaign-id', type=int, required=True)
 
+    p_reorder = sub.add_parser('reorder-job')
+    p_reorder.add_argument('--job-id', type=int, required=True)
+    p_reorder.add_argument('--sort-order', type=int, required=True,
+                            help="direct sort_order value -- lower claims sooner. Existing jobs "
+                                 "are spaced 10 apart (enqueue()/migration backfill), so a value "
+                                 "midway between two neighbors' sort_order inserts between them "
+                                 "without needing to renumber anything else.")
+
+    p_runnext = sub.add_parser('run-next')
+    p_runnext.add_argument('--job-id', type=int, required=True,
+                            help="repositions this queued job before every other queued job in "
+                                 "its own campaign")
+
     args = ap.parse_args()
 
     def _z(argstr):
@@ -703,7 +849,8 @@ def main():
             data_source=args.data_source, window_start=args.window_start,
             window_end=args.window_end, z_thresholds=_z(args.z_thresholds),
             n_islands=args.n_islands, seed_watch_list_id=args.seed_watch_list_id,
-            workers_budget=args.workers_budget, created_by=args.created_by, notes=args.notes)
+            workers_budget=args.workers_budget, created_by=args.created_by, notes=args.notes,
+            entry_timing=args.entry_timing)
         if args.cmd == 'resolve':
             print(version_string)
         else:
@@ -752,6 +899,19 @@ def main():
     elif args.cmd == 'is-paused':
         # Plain exit-code interface for shell `if` checks -- 0=paused, 1=not paused.
         sys.exit(0 if is_paused(args.campaign_id) else 1)
+    elif args.cmd == 'reorder-job':
+        ok = set_job_sort_order(args.job_id, args.sort_order)
+        if not ok:
+            print(f"No job with id={args.job_id}", file=sys.stderr)
+            sys.exit(1)
+        print(f"job_id={args.job_id} sort_order={args.sort_order}")
+    elif args.cmd == 'run-next':
+        ok = run_job_next(args.job_id)
+        if not ok:
+            print(f"No QUEUED job with id={args.job_id} (already running/finished, or doesn't exist)",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"job_id={args.job_id} moved to the front of its campaign's queue")
 
 
 if __name__ == "__main__":

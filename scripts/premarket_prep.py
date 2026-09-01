@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import active_signals as a
 import signals_db as db
+import signals_helpers as helpers
 import schwab_client
 from scripts.daemon_status import _find_daemon_pid
 
@@ -80,7 +81,13 @@ def main(watchlist_id=None):
     print(f"LIVE NODES ({len(live_nodes)}):")
     for n in sorted(live_nodes, key=lambda n: n['ticker']):
         tag = " [CANARY]" if n.get('version') == 'canary' else ""
-        label = f"{n['ticker']:<6} {n['strategy']:<28} {n.get('account'):<10}{tag}"
+        # Tier, not just account (2026-08-17, paired Opus review -- both
+        # reviewers flagged this as the worst CLI instance): the ACTION line
+        # below is byte-identical for a $50 staged-test node and a $10k real
+        # one, and the row carried no state/tier/notional at all to tell them
+        # apart. Display only -- same derivation as every other tier surface.
+        label = (f"{n['ticker']:<6} {n['strategy']:<28} {n.get('account'):<10} "
+                 f"{helpers.state_label(n):<12}{tag}")
 
         pos = open_by_wl_id.get(n['id'])
         if pos is not None:

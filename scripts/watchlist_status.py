@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import active_signals as a
 import signals_db as db
+import signals_helpers as helpers
 from scripts.export_trades import load_hourly
 from scripts.drought_overlay_sweep import get_ivol_series, _entry_vol_pctile
 
@@ -136,19 +137,25 @@ def print_status(watchlist_id=None):
             if aleg is not None:
                 phase = f"{phase}+addon"
 
+        # Mode is state_label(n), not the raw state column (2026-08-17): a
+        # real $10k capital-at-stake node and a deliberately tiny soxl_ira
+        # staged-test node both read 'live' otherwise, with nothing on the
+        # row to tell them apart. Display-only -- derived from the same
+        # has_capital_at_stake fact the Slack gating already uses, never a
+        # new stored value.
         rows.append((n['id'], n['ticker'], role, phase, trigger, cur, pct,
-                     n.get('trail_buy_pct'), n.get('account'), n.get('state'), sma50, above_sma, vol_pctile, ovl))
+                     n.get('trail_buy_pct'), n.get('account'), helpers.state_label(n), sma50, above_sma, vol_pctile, ovl))
     rows.sort(key=lambda r: r[6])
 
     print(f"watchlist_id={watchlist_id}\n")
     print(f"{'Id':>5} {'Ticker':<6} {'Role':<11} {'Phase':>20} {'Trigger':>10} {'Current':>10} {'%':>8} "
-          f"{'TrailBuy%':>10} {'Account':>10} {'Mode':>10} {'SMA50':>10} {'>SMA50':>7} {'VolPctl':>8} {'Ovl':>4}")
+          f"{'TrailBuy%':>10} {'Account':>10} {'Mode':>12} {'SMA50':>10} {'>SMA50':>7} {'VolPctl':>8} {'Ovl':>4}")
     for wl_id, t, role, phase, trig, cur, pct, tb, acc, mode, sma50, above_sma, vol_pctile, ovl in rows:
         sma50_s = f"{sma50:.2f}" if sma50 is not None else "n/a"
         above_s = "" if above_sma is None else ("yes" if above_sma else "no")
         vol_s = f"{vol_pctile:.2f}" if vol_pctile is not None else "n/a"
         print(f"{wl_id:>5} {t:<6} {role:<11} {phase:>20} {trig:>10.2f} {cur:>10.2f} {pct:>7.2f}% "
-              f"{str(tb):>10} {str(acc):>10} {str(mode):>10} {sma50_s:>10} {above_s:>7} {vol_s:>8} {ovl:>4}")
+              f"{str(tb):>10} {str(acc):>10} {str(mode):>12} {sma50_s:>10} {above_s:>7} {vol_s:>8} {ovl:>4}")
 
 
 def print_history(ticker, num_bars=7, watchlist_id=None):
