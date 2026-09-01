@@ -15,7 +15,7 @@ Update this file in the same commit as any `crontab -e` change (add/remove/edit 
 0 10 * * 1-5 /home/pkim/git/trading/.venv/bin/python3 /home/pkim/git/trading/scripts/collect_options_snapshot.py --tickers AGQ DFEN DPST HIBL JNUG KORU LABU NUGT SOXL UGL WEBL --option-type calls --expirations 2 >> /home/pkim/git/trading/logs/options_snapshot_daily.log 2>&1
 45 3 * * * /home/pkim/git/trading/.venv/bin/python3 /home/pkim/git/trading/scripts/add_usage_tracking.py >> /home/pkim/git/trading/logs/script_usage_tracking_nightly.log 2>&1 && /home/pkim/git/trading/.venv/bin/python3 /home/pkim/git/trading/scripts/check_script_usage_convention.py >> /home/pkim/git/trading/logs/script_usage_tracking_nightly.log 2>&1
 */15 * * * * /home/pkim/git/trading/.venv/bin/python3 /home/pkim/git/trading/scripts/corp_action_canary.py >> /home/pkim/git/trading/logs/corp_action_canary.log 2>&1
-3 16 * * 1-5 /home/pkim/git/trading/.venv/bin/python3 /home/pkim/git/trading/scripts/refresh_recent_minute_cache.py >> /home/pkim/git/trading/logs/refresh_recent_minute_cache.log 2>&1
+3 16 * * 1-5 cd /home/pkim/git/trading && .venv/bin/python3 scripts/refresh_recent_minute_cache.py >> /home/pkim/git/trading/logs/refresh_recent_minute_cache.log 2>&1
 ```
 
 Captured 2026-09-01 from the real `crontab -l` output, after the `refresh_recent_minute_cache.py`
