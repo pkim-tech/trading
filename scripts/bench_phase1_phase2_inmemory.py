@@ -1009,7 +1009,16 @@ def _build_version_string(args):
         data_source=DATA_SOURCE, window_start=START, window_end=END,
         z_thresholds=(Z_THRESHOLDS if args.z_thresholds is not None else None),
         n_islands=args.n_islands, seed_watch_list_id=args.seed_watch_list_id,
-        entry_timing=ENTRY_TIMING)
+        # Gated on args.entry_timing (the explicit CLI override), NOT the module-
+        # global ENTRY_TIMING -- same reasoning as the z_thresholds gate above.
+        # In seed mode, ENTRY_TIMING is set from the seed node's own real value
+        # (main()'s seed block), and the pre-existing -seed<id> suffix already
+        # makes that campaign collision-safe; args.entry_timing stays None there
+        # (mutually exclusive with --seed-watch-list-id), so this must NOT read
+        # the global or every close-entry seed campaign's version string would
+        # silently change, breaking sweep_run_log's finished-run dedup and
+        # orphaning existing candidate_nodes rows under the old string.
+        entry_timing=args.entry_timing)
 
 
 def main():
@@ -1164,7 +1173,11 @@ def main():
         version, CAMPAIGN_LABEL, PROMOTION_ALGO_VERSION, DATA_SOURCE, START, END,
         z_thresholds=(Z_THRESHOLDS if args.z_thresholds is not None else None),
         n_islands=args.n_islands, seed_watch_list_id=args.seed_watch_list_id,
-        entry_timing=ENTRY_TIMING, created_by="bench_phase1_phase2_inmemory.py")
+        # args.entry_timing (not the module-global ENTRY_TIMING) -- must match
+        # _build_version_string's own gating exactly, or this call's stored
+        # `entry_timing` column and `version` string (computed above, already
+        # gated correctly) would disagree for a seed-mode close campaign.
+        entry_timing=args.entry_timing, created_by="bench_phase1_phase2_inmemory.py")
 
     # fixed_sl packaging (2026-08-29, Task #6 follow-up, planner dispatch): loops the
     # existing per-fixed_sl Phase1+Phase2+Phase2.5+candidate-write logic (now
