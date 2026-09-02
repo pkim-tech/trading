@@ -99,67 +99,129 @@ RAW_COLUMNS = cri.COLUMNS[:14] + [
     "core_both_cagr_1m", "core_both_cagr_1s", "core_safe",
 ]
 
-# CURATED_HEADERS-aligned column sets for the Candidates/raw tabs -- v4 (2026-09-01,
-# same-day dispatch: "one consistent column vocabulary across the whole workbook").
-# Only the CURATED_HEADERS columns with a real lightweight-data equivalent are included
-# (Cagr/Cagr Add on/CAGR Drought/CAGR Both map onto the *_cagr_1s verification numbers,
-# NOT the full-checklist strategy_cagr_pct/core_addon_cagr_pct -- a genuinely different,
-# smaller-precision metric, same distinction candidate_report_inmemory.py's own docstring
-# already draws). Columns with no lightweight equivalent (Add on %/Drought % as raw
-# non-annualized per-leg returns, Add on/Drought trades/tranche, Drought WR Verdict,
-# Years, Target-Manual) are left out entirely rather than rendered as fabricated/always-
-# blank noise -- the real per-row full-checklist versions of those already exist on the
-# Full Review/Combined tabs. Real sweep-parameter columns (Window/Z/...) are appended
-# after the CURATED_HEADERS-aligned block since they're this tab's own real identity,
-# not part of CURATED_HEADERS at all.
-_CURATED_ALIGNED_PREFIX = ["ticker", "#", "Node ID", "Matches Promotion", "K1", "Strategy",
-                           "Cagr", "Worst Neighbor", "Cliff Safe", "Trades",
-                           "Cagr Add on", "CAGR Drought", "CAGR Both"]
-_SWEEP_PARAM_SUFFIX = ["Window", "Z", "Fixed SL", "Arm %", "Trail Buy %", "Trail Sell %",
-                       "Max Hold Hrs", "Entry Timing"]
-CANDIDATES_TAB_HEADERS = _CURATED_ALIGNED_PREFIX[:6] + ["Winner"] + _CURATED_ALIGNED_PREFIX[6:] + _SWEEP_PARAM_SUFFIX
-RAW_TAB_HEADERS = _CURATED_ALIGNED_PREFIX + ["promoted_pick"] + _SWEEP_PARAM_SUFFIX
+def _watch_list_semantic_axes(strategy, take_profit, stop_loss, trail_buy_pct, trail_sell_pct, arm_sell_pct):
+    """The real (take_profit, stop_loss, trail_sell_pct) SEMANTIC triple build_params_dict/
+    get_or_create_candidate_node expect -- i.e. the backtester's own axis meanings, NOT a
+    literal column-name copy of watch_list's raw columns. v5 fix (2026-09-02, real bug
+    found + confirmed against live data -- a prior version of this function used watch_
+    list.take_profit unconditionally as the semantic take_profit/arm_pct input, which is
+    WRONG for TrailingBothZScoreBreakout: that column is always NULL for Both (confirmed:
+    every real live TrailingBoth watch_list row has take_profit=None), and an initial
+    proposed fix (watch_list.stop_loss) was ALSO checked directly and found wrong -- a real
+    query showed watch_list.stop_loss does NOT reliably equal anything meaningful for Both
+    (one sample coincidentally equaled trail_buy_pct, a second real sample, ETHU id=237,
+    did not: stop_loss=1 vs trail_buy_pct=2.0).
+
+    Ground-truthed instead via `arm_sell_pct` (a real, distinct watch_list column) --
+    confirmed by an actual end-to-end match: ETHU watch_list id=237 (TrailingBoth,
+    arm_sell_pct=1.0, trail_buy_pct=2.0, trail_sell_pct=7.0) fed through build_params_dict
+    produces a canonical params_json BYTE-IDENTICAL to real candidate_nodes.id=19460's own
+    params_json (a genuine v6.5 TrailingBoth ETHU row with arm_pct=1.0/trail_buy_pct=2.0/
+    trail_sell_pct=7.0) -- proof, not inference.
+
+    TrailingBothZScoreBreakout: semantic take_profit = arm_sell_pct (-> candidate_nodes.
+    arm_pct, ALWAYS a direct copy of the semantic take_profit field regardless of strategy
+    -- see gt_full_review_rows' own node_id-assignment comment), semantic stop_loss =
+    trail_buy_pct directly (-> params[sl_axis_col], sl_axis_col='trail_buy_pct' for Both),
+    semantic trail_sell_pct = trail_sell_pct directly (-> params[fourth_axis_col],
+    fourth_axis_col='trail_pct' for Both). watch_list.stop_loss is NOT used at all for Both
+    -- confirmed unused/irrelevant for this strategy's real semantic mapping.
+
+    Any other strategy (TrailingExitZScoreBreakout, the only other real strategy in this
+    codebase): watch_list's own take_profit/stop_loss/trail_sell_pct columns are already
+    the direct semantic values (confirmed: watch_list.stop_loss == watch_list.trail_sell_
+    pct in every real sample, both feed the same sl_axis_col='trail_pct' slot)."""
+    if strategy == "TrailingBothZScoreBreakout":
+        return arm_sell_pct, trail_buy_pct, trail_sell_pct
+    return take_profit, stop_loss, trail_sell_pct
 
 
 def _promoted_node_ids(conn, version, tickers, live_db_path=LIVE_DB_PATH):
-    """Real 'currently promoted' node_id per ticker for this exact version, resolved
-    against watch_list (cache/live/trading_live.db) -- v4 (2026-09-01 dispatch),
-    deliberately NOT a hardcoded dict like the legacy build_v6_promotion_combined_
-    report.py's PROMOTED_NODE_IDS (confirmed by reading that file directly: it's a
-    one-time manual snapshot of the 2026-08-23 promotion batch, no query at all).
-    A watch_list row's real (window/z_score_threshold/fixed_sl/take_profit/trail_buy_pct/
-    trail_sell_pct/max_hold_hours/entry_timing) already matches candidate_nodes' own
-    storage encoding column-for-column (both are the strategy's real live param names,
-    no is_both-style inversion needed) -- looked up via the exact same key_cols get_or_
-    create_candidate_node uses, so a promoted node_id here always agrees with a Full
-    Review row's own node_id for the identical param tuple. Returns {} if watch_list has
-    no non-archived row under this version for any of `tickers` (e.g. a campaign that
-    hasn't been promoted yet -- confirmed the real, current state for v6.5 as of
-    2026-09-01)."""
-    from locate_best_node import get_or_create_candidate_node
+    """Real 'currently promoted' node_id per ticker, resolved against watch_list (cache/
+    live/trading_live.db) -- v4 (2026-09-01), rebuilt v5 (2026-09-02, real bugs found +
+    fixed, see deep_backlog.md). Deliberately NOT a hardcoded dict like the legacy
+    build_v6_promotion_combined_report.py's PROMOTED_NODE_IDS (confirmed by reading that
+    file directly: a one-time manual snapshot, no query at all).
+
+    Two real fixes from v4:
+    1. Correct per-strategy watch_list column resolution -- see _watch_list_semantic_axes'
+       own docstring for the full incident (v4 used take_profit unconditionally, which is
+       always NULL for TrailingBoth).
+    2. NO version filter on the watch_list query -- a live node's watch_list.version can be
+       an older/differently-labeled sweep generation string than the exact `version` this
+       report targets, while still representing the IDENTICAL real trading parameter
+       configuration (confirmed real case: ETHU watch_list id=237 is tagged version=
+       'v6-massive-...', not this campaign's 'v6.5-...-pv4' string, yet its real param
+       tuple matches v6.5 candidate_nodes.id=19460 exactly). 'Matches Promotion' answers
+       'is this SPECIFIC real config currently live', not 'is this exact version string
+       live' -- the candidate_nodes side of the match IS still scoped to `version` (only
+       tickers actually being reported on).
+
+    Cross-validates TWO independent resolution methods per live row and returns the
+    params_json-based result (built via the SAME build_params_dict/resolve_axis_columns
+    call the real production pipeline uses to write every candidate_nodes.params_json --
+    proven correct via a real end-to-end match, see _watch_list_semantic_axes) -- the
+    flat-column method (a pure read-only SELECT against candidate_nodes' own key_cols,
+    mirroring get_or_create_candidate_node's lookup WITHOUT its insert-on-miss side effect,
+    deliberately avoided here to keep this a read-only audit) is computed alongside purely
+    as a disagreement check. Any disagreement between the two is printed explicitly, not
+    silently resolved -- per 2026-09-02 dispatch: 'don't silently pick one if they differ,
+    that itself would be a new finding worth surfacing'.
+
+    Returns {} for any ticker with no non-archived watch_list row at all."""
+    import json
+    import strategies
+    from node_key import build_params_dict
+
     if not tickers:
         return {}
     placeholders = ",".join("?" * len(tickers))
     live_conn = sqlite3.connect(live_db_path)
     try:
         rows = live_conn.execute(f"""
-            SELECT ticker, strategy, version, window, z_score_threshold, fixed_sl,
-                   take_profit, trail_buy_pct, trail_sell_pct, max_hold_hours, entry_timing
+            SELECT ticker, strategy, window, z_score_threshold, fixed_sl,
+                   take_profit, stop_loss, trail_buy_pct, trail_sell_pct, arm_sell_pct,
+                   max_hold_hours, entry_timing
             FROM watch_list
-            WHERE version=? AND archived_at IS NULL AND ticker IN ({placeholders})
-        """, (version, *tickers)).fetchall()
+            WHERE archived_at IS NULL AND ticker IN ({placeholders})
+        """, tickers).fetchall()
     finally:
         live_conn.close()
+
     out = {}
-    for (ticker, strategy, ver, window, z, fixed_sl, tp, tbp, tsp, hold, entry_timing) in rows:
-        node_id = get_or_create_candidate_node(conn, {
-            "ticker": ticker, "strategy": strategy, "version": ver, "window": window,
-            "z": z, "fixed_sl": fixed_sl or 0.0, "arm_pct": float(tp or 0),
-            "trail_buy_pct": float(tbp or 0), "trail_sell_pct": float(tsp or 0),
-            "max_hold_hours": hold, "entry_timing": entry_timing,
-            "robust_alpha": None, "trades": None, "sweep_run_id": None,
-        })
-        out[ticker] = node_id
+    for (ticker, strategy, window, z, fixed_sl, tp, sl, tbp, tsp, asp, hold, entry_timing) in rows:
+        sem_tp, sem_sl, sem_tsp = _watch_list_semantic_axes(strategy, tp, sl, tbp, tsp, asp)
+        if sem_tp is None or sem_sl is None:
+            continue  # a real row missing its own strategy's required axis -- skip, don't guess
+
+        params = build_params_dict(strategy, ticker, fixed_sl or 0.0, window, z, hold,
+                                    sem_tp, sem_sl, sem_tsp or 0.0, entry_timing,
+                                    strategies.resolve_axis_columns)
+        canonical = json.dumps(params, sort_keys=True)
+        params_row = conn.execute(
+            "SELECT id FROM candidate_nodes WHERE version=? AND ticker=? AND strategy=? AND params_json=?",
+            (version, ticker, strategy, canonical)).fetchone()
+        params_node_id = params_row[0] if params_row else None
+
+        is_both = strategy == "TrailingBothZScoreBreakout"
+        flat_trail_buy = sem_sl if is_both else 0.0
+        flat_trail_sell = sem_tsp if is_both else sem_sl
+        flat_row = conn.execute("""
+            SELECT id FROM candidate_nodes
+            WHERE ticker=? AND strategy=? AND version=? AND window=? AND z=? AND fixed_sl=?
+                  AND arm_pct=? AND trail_buy_pct=? AND trail_sell_pct=? AND max_hold_hours=?
+                  AND entry_timing=?
+        """, (ticker, strategy, version, int(window), float(z), float(fixed_sl or 0.0),
+              float(sem_tp), float(flat_trail_buy), float(flat_trail_sell), int(hold),
+              entry_timing)).fetchone()
+        flat_node_id = flat_row[0] if flat_row else None
+
+        if params_node_id != flat_node_id:
+            print(f"  DISAGREEMENT resolving promoted node for {ticker}/{strategy}: "
+                  f"params_json method -> {params_node_id}, flat-column method -> {flat_node_id} "
+                  f"(using params_json result).")
+        if params_node_id is not None:
+            out[ticker] = params_node_id
     return out
 
 
@@ -183,26 +245,86 @@ def _matches_promotion(ticker, node_id, promoted_ids):
     return "YES" if node_id == promoted_id else "no"
 
 
-def _enrich_curated_rows(conn, curated_rows):
-    """Adds core_safe (-> Cliff Safe label) + core_both_cagr_1m/1s to already-curated
-    (small, ~top-N-per-category) candidate dicts for the CURATED_HEADERS-aligned
-    Candidates tab -- a small batched lookup against phase4_results/candidate_
-    verification_results, NOT a change to candidate_report_inmemory.fetch_rows' own
-    stable query (other callers of that function must not see new columns/behavior)."""
-    ids = [r["id"] for r in curated_rows]
-    if not ids:
-        return curated_rows
-    placeholders = ",".join("?" * len(ids))
-    safe_map = {cid: (None if v is None else bool(v)) for cid, v in conn.execute(
-        f"SELECT candidate_id, core_safe FROM phase4_results WHERE candidate_id IN ({placeholders})", ids)}
-    both_map = {cid: (m, s) for cid, m, s in conn.execute(
-        f"SELECT candidate_id, core_both_cagr_1m, core_both_cagr_1s FROM candidate_verification_results "
-        f"WHERE candidate_id IN ({placeholders})", ids)}
-    for r in curated_rows:
-        core_safe = safe_map.get(r["id"])
-        r["cliff_safe_label"] = None if core_safe is None else ("SAFE" if core_safe else "CLIFF")
-        r["core_both_cagr_1m"], r["core_both_cagr_1s"] = both_map.get(r["id"], (None, None))
-    return curated_rows
+def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
+                                  full_review_by_id, lightweight_row, winner):
+    """Builds ONE row's (curated-front-24-cols, checklist-144-cols) pair -- v6 (2026-09-02,
+    'every tab gets the exact same 174-column layout' user dispatch). Single source of
+    truth for the CURATED_HEADERS-ordered front block across all 4 tabs (Full Review,
+    Combined, Candidates, All Candidates (raw)) -- was 3 separately-hand-written, already-
+    inconsistent field lists (a real cause of the format-drift complaint this rework
+    responds to).
+
+    If `node_id` has a real Full Review row (this candidate went through the full
+    checklist), ALL 24 curated-front columns + the full 144-column checklist block are
+    populated from that row's real data -- including Years/Cliff Safe/Add on and Drought
+    detail columns/Cagr Add on/CAGR Drought/CAGR Both, which a lightweight-only row can
+    never have. Cagr Add on/CAGR Drought/CAGR Both use core_addon_cagr_pct/core_drought_
+    cagr_pct/core_both_cagr_pct (the same real annualized CAGR _curate_combined_rows now
+    ranks on, v5 fix) -- NOT the lightweight candidate_verification_results numbers, even
+    on a tab (Candidates) whose own native data source is lightweight, since a real,
+    better number already exists for these particular ids (all 155 Candidates rows have a
+    matching Full Review row -- confirmed 1:1 by v2/v5's own verification).
+
+    Otherwise (no Full Review match -- the common case for All Candidates (raw)'s 13,434
+    rows, only ~155 of which were ever run through the full checklist): falls back to
+    `lightweight_row`'s own real fields (ticker/strategy/core_cagr_1s/worst_neighbor_cagr/
+    trades/core_safe/addon_cagr_1s/drought_cagr_1s/core_both_cagr_1s, whichever the row's
+    native source provides) for whatever IS real, and leaves every full-checklist-only
+    column (Years, Add on/Drought detail columns, and the entire 144-col checklist block)
+    genuinely blank -- never fabricated, never expensively backfilled (that's the whole
+    reason the raw tab stays lightweight-only, see module docstring)."""
+    fr = full_review_by_id.get(node_id)
+    if fr is not None:
+        front = [
+            fr["ticker"], counter_formula, node_id,
+            _matches_promotion(fr["ticker"], node_id, promoted_ids), k1_fn(fr["ticker"]),
+            fr["strategy"], winner, fr.get("core_cagr_1s"), fr["worst_neighbor_pct"], None,
+            fr["trades"], fr["years"], fr["status"],
+            fr["addon_compounded_pct"], fr["addon_n"], fr["addon_tranche"], fr["addon_wr_tranche"],
+            fr["drought_compounded_pct"], fr["drought_n"], fr["drought_tranche"], fr["drought_wr_verdict"],
+            fr["core_addon_cagr_pct"], fr["core_drought_cagr_pct"], fr["core_both_cagr_pct"],
+        ]
+        checklist = [fr.get(h) for h in FIELDNAMES]
+        return front, checklist
+
+    r = lightweight_row or {}
+    core_safe = r.get("core_safe")
+    cliff_safe = None if core_safe is None else ("SAFE" if core_safe else "CLIFF")
+    front = [
+        r.get("ticker"), counter_formula, node_id,
+        _matches_promotion(r.get("ticker"), node_id, promoted_ids), k1_fn(r.get("ticker")),
+        r.get("strategy"), winner, _pct100(r.get("core_cagr_1s")), r.get("worst_neighbor_cagr"), None,
+        r.get("trades"), None, cliff_safe,
+        None, None, None, None,
+        None, None, None, None,
+        _pct100(r.get("addon_cagr_1s")), _pct100(r.get("drought_cagr_1s")), _pct100(r.get("core_both_cagr_1s")),
+    ]
+    checklist = [None] * len(FIELDNAMES)
+    return front, checklist
+
+
+def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
+                        lightweight_by_id, winner_by_id):
+    """Writes one CURATED_HEADERS(24) + MANUAL_BLANK_COLS(6) + FIELDNAMES(144) = 174-column
+    tab for the given `node_ids` in order -- shared by all 4 tabs, see
+    _curated_front_and_checklist's own docstring for the per-row data-sourcing rule."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    headers = CURATED_HEADERS + [None] * MANUAL_BLANK_COLS + list(FIELDNAMES)
+    ws.append(headers)
+    for cell in ws[1]:
+        if cell.value:
+            cell.font = Font(bold=True)
+    for i, node_id in enumerate(node_ids, start=2):
+        counter = f"=COUNTIF($A$2:A{i},A{i})"
+        front, checklist = _curated_front_and_checklist(
+            node_id, promoted_ids, k1_fn, counter, full_review_by_id,
+            lightweight_by_id.get(node_id), winner_by_id.get(node_id))
+        ws.append(front + [None] * MANUAL_BLANK_COLS + checklist)
+    for i, h in enumerate(CURATED_HEADERS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = max(10, min(len(h) + 2, 30))
+    ws.freeze_panes = "B2"
 
 
 def _enrich_full_review_core_cagr(conn, csv_rows):
@@ -226,30 +348,45 @@ def _enrich_full_review_core_cagr(conn, csv_rows):
     return csv_rows
 
 
+def _cagr_sort_key(field):
+    return lambda r: r.get(field) if r.get(field) is not None else float("-inf")
+
+
 def _curate_combined_rows(csv_rows):
     """Local adaptation of build_v6_promotion_combined_report.curate_rows() for the
-    Combined tab -- v4 fix (2026-09-01, real bug found + user-confirmed fix, see
+    Combined tab -- v4 fix (2026-09-01, real bug found + user-confirmed fix), extended v5
+    (2026-09-02, ranking-metric unification + new category, both user-confirmed, see
     deep_backlog.md). Deliberately NOT calling that function directly (its own file isn't
-    edited either) -- two changes from the original, everything else (top-2-per-category
-    Add On/Drought/Best-Both + Core-fallback convention, category definitions, output
-    shape/`_winner` labeling) is identical:
+    edited either).
 
-    1. Dedup key is `node_id` instead of `(ticker, strategy, fixed_sl)`. The original key
-       assumed one campaign = one window (never needed window to disambiguate a real
-       candidate); candidate_nodes rows (this data source) have no `fixed_sl` field at all
-       in their csv_row shape (not in FIELDNAMES), so `r.get('fixed_sl')` silently returned
-       None for every row, collapsing ALL rows for a (ticker, strategy) pair onto one
-       dedup key -- confirmed on real ETHU data: 7 distinct node_ids collapsed into 1
-       Combined row, with accumulated category labels misattributed to one arbitrary
-       node_id. `node_id` is already a real, unique per-candidate identity for this data
-       source (it isn't for the original backtest_cache-sourced use, which is why the
-       original function doesn't use it) -- see _enrich_full_review_core_cagr's docstring
-       for the sibling CAGR fix this pairs with.
-    2. Best-Both sort key is `core_cagr_1s` instead of `strategy_cagr_pct` -- the latter is
-       always None for this data source (see _enrich_full_review_core_cagr), which made
-       every row's original sort key collapse to -inf (effectively unordered, first-seen-
-       wins). core_cagr_1s (attached by _enrich_full_review_core_cagr, called before this)
-       is the real per-candidate CAGR that does exist here."""
+    Changes from the original build_v6_promotion_combined_report.curate_rows():
+    1. (v4) Dedup key is `node_id` instead of `(ticker, strategy, fixed_sl)` -- the
+       original key assumed one campaign = one window; candidate_nodes rows here have no
+       `fixed_sl` field in their csv_row shape at all (not in FIELDNAMES), so `r.get(
+       'fixed_sl')` silently returned None for every row, collapsing ALL rows for a
+       (ticker, strategy) pair onto one dedup key (confirmed on real ETHU data). node_id
+       is a real, unique per-candidate identity for this data source.
+    2. (v5) Add On/Drought sort keys are `core_addon_cagr_pct`/`core_drought_cagr_pct`
+       (real annualized CAGR, computed by gt_full_review_rows against this candidate's OWN
+       trades) instead of `addon_compounded_pct`/`drought_compounded_pct` (a raw, non-
+       annualized per-leg return) -- found as a real Combined-vs-Candidates ranking-metric
+       mismatch (Candidates tab's own cri.curate() always ranked on an annualized CAGR;
+       Combined ranked the same categories on a non-annualized return, a genuinely
+       different number that could disagree on which candidate wins). core_addon_cagr_pct/
+       core_drought_cagr_pct is also now what gets DISPLAYED in the unified Cagr Add on/
+       CAGR Drought columns for any row with real Full Review data (see _curated_front),
+       so the ranking metric and the displayed metric are the same number everywhere.
+    3. (v4) Best-Both sort key is `core_cagr_1s` instead of `strategy_cagr_pct` (always
+       None for this data source, candidate_nodes doesn't persist cagr).
+    4. (v5) New 'Best Core' category (any strategy, top-2 by core_cagr_1s) -- the existing
+       'Best-Both' category is restricted to TrailingBothZScoreBreakout by design (it's
+       specifically evaluating the live-default combined-strategy's own core performance),
+       which meant a TrailingExitZScoreBreakout candidate (AGQ/ETHU/UGL/DPST/SOXL, etc.)
+       could only ever appear via Add On/Drought/the last-resort fallback, never on pure
+       core performance. 'Best Core' is strategy-unrestricted, same core_cagr_1s metric as
+       Best-Both. Both categories are kept (not merged) -- Best-Both's own
+       TrailingBoth-specific meaning is unchanged, this only ADDS visibility for the
+       strategy it excludes."""
     by_ticker = {}
     for r in csv_rows:
         by_ticker.setdefault(r["ticker"], []).append(r)
@@ -262,19 +399,22 @@ def _curate_combined_rows(csv_rows):
         safe = [r for r in rows if r.get("status") == "SAFE"]
 
         addon = [r for r in safe if r.get("addon_tranche") != "FRAGILE"
-                 and r.get("addon_compounded_pct") is not None]
-        addon.sort(key=lambda r: r["addon_compounded_pct"], reverse=True)
+                 and r.get("core_addon_cagr_pct") is not None]
+        addon.sort(key=_cagr_sort_key("core_addon_cagr_pct"), reverse=True)
 
         drought = [r for r in safe if r.get("drought_tranche") != "FRAGILE"
-                   and r.get("drought_compounded_pct") is not None]
-        drought.sort(key=lambda r: r["drought_compounded_pct"], reverse=True)
+                   and r.get("core_drought_cagr_pct") is not None]
+        drought.sort(key=_cagr_sort_key("core_drought_cagr_pct"), reverse=True)
 
         best_both = [r for r in safe if r.get("strategy") == "TrailingBothZScoreBreakout"]
-        best_both.sort(key=lambda r: r.get("core_cagr_1s") if r.get("core_cagr_1s") is not None else float("-inf"),
-                        reverse=True)
+        best_both.sort(key=_cagr_sort_key("core_cagr_1s"), reverse=True)
+
+        best_core = list(safe)
+        best_core.sort(key=_cagr_sort_key("core_cagr_1s"), reverse=True)
 
         winners = {}
-        for label, group in (("Add On", addon[:2]), ("Drought", drought[:2]), ("Best-Both", best_both[:2])):
+        for label, group in (("Add On", addon[:2]), ("Drought", drought[:2]),
+                              ("Best-Both", best_both[:2]), ("Best Core", best_core[:2])):
             for r in group:
                 k = key(r)
                 if k not in winners:
@@ -286,7 +426,7 @@ def _curate_combined_rows(csv_rows):
                 r["_winner"] = ", ".join(cats)
                 out.append(r)
         elif safe:
-            best = max(safe, key=lambda r: r.get("core_cagr_1s") if r.get("core_cagr_1s") is not None else float("-inf"))
+            best = max(safe, key=_cagr_sort_key("core_cagr_1s"))
             best["_winner"] = "Core (no category winner)"
             out.append(best)
     return out
@@ -481,6 +621,14 @@ def _full_review_rows_for_curated(curated_rows, version, vol_gate, db_path, max_
 
 
 def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn, version, tickers):
+    """v6 (2026-09-02, 'every tab gets the exact same 174-column layout' user dispatch):
+    all 4 tabs (Full Review, Combined, Candidates, All Candidates (raw)) now share the
+    IDENTICAL CURATED_HEADERS(24) + MANUAL_BLANK_COLS(6) + FIELDNAMES(144) = 174-column
+    structure, via the single shared _write_curated_tab/_curated_front_and_checklist path
+    -- was 3 separately hand-written, already-inconsistent header/field lists per tab
+    (the real complaint this rework responds to: 'every one of the 4 tabs... should have
+    the same format... i just want it to be consistent'). Row POPULATION (which node_ids
+    appear on which tab) is unchanged from v5 -- only the column structure is unified."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment
     from openpyxl.utils import get_column_letter
@@ -493,102 +641,34 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
             k1_cache[ticker] = k1_status(conn, ticker)
         return k1_cache[ticker]
 
+    full_review_rows = _enrich_full_review_core_cagr(conn, full_review_rows)
+    full_review_by_id = {r["node_id"]: r for r in full_review_rows}
+    combined_rows = _curate_combined_rows(full_review_rows)
+    combined_rows.sort(key=lambda r: (r["ticker"], r["strategy"]))
+    curated_rows = sorted(curated_rows, key=lambda r: (r["ticker"], -(r["core_cagr_1s"] or -1e9)))
+    candidates_by_id = {r["id"]: r for r in curated_rows}
+    raw_by_id = {r["id"]: r for r in raw_rows}
+    winner_by_id = {r["id"]: r.get("_winner") for r in curated_rows}  # from cri.curate(), used on the raw tab
+
     wb = Workbook()
 
     review_ws = wb.active
     review_ws.title = "Full Review"
-    review_ws.append(FIELDNAMES)
-    for cell in review_ws[1]:
-        cell.font = Font(bold=True)
-    for row in full_review_rows:
-        review_ws.append([row.get(c) for c in FIELDNAMES])
-    review_ws.freeze_panes = "B2"
-    for i, col in enumerate(FIELDNAMES, start=1):
-        review_ws.column_dimensions[get_column_letter(i)].width = max(12, min(len(col) + 2, 28))
+    _write_curated_tab(review_ws, [r["node_id"] for r in full_review_rows], promoted_ids, _k1,
+                        full_review_by_id, {}, {})  # no lightweight fallback needed -- every id has a FR row
 
-    # Combined tab (v4, 2026-09-01 dispatch): exact CURATED_HEADERS + MANUAL_BLANK_COLS +
-    # FIELDNAMES layout of the real precedent, build_v6_promotion_combined_report.py's
-    # write_combined_xlsx -- reuses that file's own CURATED_HEADERS/MANUAL_BLANK_COLS
-    # directly. Curation itself uses _curate_combined_rows (a local adaptation of that
-    # file's curate_rows(), NOT called directly -- see that function's own docstring for
-    # the two real, user-confirmed fixes: node_id dedup key instead of (ticker, strategy,
-    # fixed_sl), core_cagr_1s instead of strategy_cagr_pct for Best-Both ranking/display).
-    # curate_rows()-equivalent selection (top-2-per-category Add On/Drought/Best-Both +
-    # Core-fallback) is what actually produces a real 'Winner' label per row -- an
-    # uncurated full_review_rows row has no _winner at all, so the Combined tab is
-    # deliberately the CURATED subset of full_review_rows, not every row in it.
     combined_ws = wb.create_sheet("Combined")
-    full_review_rows = _enrich_full_review_core_cagr(conn, full_review_rows)
-    combined_rows = _curate_combined_rows(full_review_rows)
-    combined_rows.sort(key=lambda r: (r["ticker"], r["strategy"]))
-    combined_headers = CURATED_HEADERS + [None] * MANUAL_BLANK_COLS + list(FIELDNAMES)
-    combined_ws.append(combined_headers)
-    for cell in combined_ws[1]:
-        if cell.value:
-            cell.font = Font(bold=True)
-    for i, r in enumerate(combined_rows, start=2):
-        matches_promotion = _matches_promotion(r["ticker"], r["node_id"], promoted_ids)
-        curated = [
-            r["ticker"], f"=COUNTIF($A$2:A{i},A{i})", r["node_id"], matches_promotion, r.get("k1_tranche"),
-            r.get("strategy"), r.get("_winner"), _pct100(r["core_cagr_1s"]),
-            r["worst_neighbor_pct"], None, r["trades"], r["years"], r["status"],
-            r["addon_compounded_pct"], r["addon_n"], r["addon_tranche"], r["addon_wr_tranche"],
-            r["drought_compounded_pct"], r["drought_n"], r["drought_tranche"], r["drought_wr_verdict"],
-            r["core_addon_cagr_pct"], r["core_drought_cagr_pct"], r["core_both_cagr_pct"],
-        ]
-        raw = [r.get(h) for h in FIELDNAMES]
-        combined_ws.append(curated + [None] * MANUAL_BLANK_COLS + raw)
-    for i, h in enumerate(CURATED_HEADERS, start=1):
-        combined_ws.column_dimensions[get_column_letter(i)].width = max(10, min(len(h) + 2, 30))
-    combined_ws.freeze_panes = "B2"
+    combined_winner_by_id = {r["node_id"]: r.get("_winner") for r in combined_rows}
+    _write_curated_tab(combined_ws, [r["node_id"] for r in combined_rows], promoted_ids, _k1,
+                        full_review_by_id, {}, combined_winner_by_id)
 
-    # Candidates tab -- v4: CURATED_HEADERS-aligned naming/order (see CANDIDATES_TAB_
-    # HEADERS' own comment for which columns map and why some are left out).
     cand_ws = wb.create_sheet("Candidates")
-    curated_rows = _enrich_curated_rows(conn, curated_rows)
-    curated_rows = sorted(curated_rows, key=lambda r: (r["ticker"], -(r["core_cagr_1s"] or -1e9)))
-    cand_ws.append(CANDIDATES_TAB_HEADERS)
-    for cell in cand_ws[1]:
-        cell.font = Font(bold=True)
-    for i, r in enumerate(curated_rows, start=2):
-        cand_ws.append([
-            r["ticker"], f"=COUNTIF($A$2:A{i},A{i})", r["id"],
-            _matches_promotion(r["ticker"], r["id"], promoted_ids), _k1(r["ticker"]), r["strategy"],
-            r["_winner"], _pct100(r["core_cagr_1s"]), r["worst_neighbor_cagr"], r["cliff_safe_label"],
-            r["trades"], _pct100(r["addon_cagr_1s"]), _pct100(r["drought_cagr_1s"]),
-            _pct100(r["core_both_cagr_1s"]),
-            r["window"], r["z"], r["fixed_sl"], r["arm_pct"], r["trail_buy_pct"],
-            r["trail_sell_pct"], r["max_hold_hours"], r["entry_timing"],
-        ])
-    cand_ws.freeze_panes = "B2"
-    for i, col in enumerate(CANDIDATES_TAB_HEADERS, start=1):
-        cand_ws.column_dimensions[get_column_letter(i)].width = max(10, min(len(col) + 2, 22))
+    _write_curated_tab(cand_ws, [r["id"] for r in curated_rows], promoted_ids, _k1,
+                        full_review_by_id, candidates_by_id, winner_by_id)
 
-    # All Candidates (raw) tab -- v4: same CURATED_HEADERS-aligned naming/order, no
-    # 'Winner' (curate()/curate_rows() were never run against the raw population, so no
-    # real winner label exists per row -- keeping `promoted_pick` (curated top-N-set
-    # membership, v2 semantics, unchanged) alongside the new 'Matches Promotion' (real
-    # live-promotion match, v4) since the two are genuinely different concepts.
-    curated_ids = {r["id"] for r in curated_rows}
     raw_ws = wb.create_sheet("All Candidates (raw)")
-    raw_ws.append(RAW_TAB_HEADERS)
-    for cell in raw_ws[1]:
-        cell.font = Font(bold=True)
-    for i, r in enumerate(raw_rows, start=2):
-        core_safe = r.get("core_safe")
-        cliff_safe_label = None if core_safe is None else ("SAFE" if core_safe else "CLIFF")
-        raw_ws.append([
-            r["ticker"], f"=COUNTIF($A$2:A{i},A{i})", r["id"],
-            _matches_promotion(r["ticker"], r["id"], promoted_ids), _k1(r["ticker"]), r["strategy"],
-            _pct100(r["core_cagr_1s"]), r["worst_neighbor_cagr"], cliff_safe_label, r["trades"],
-            _pct100(r["addon_cagr_1s"]), _pct100(r["drought_cagr_1s"]), _pct100(r["core_both_cagr_1s"]),
-            r["id"] in curated_ids,
-            r["window"], r["z"], r["fixed_sl"], r["arm_pct"], r["trail_buy_pct"],
-            r["trail_sell_pct"], r["max_hold_hours"], r["entry_timing"],
-        ])
-    raw_ws.freeze_panes = "B2"
-    for i, col in enumerate(RAW_TAB_HEADERS, start=1):
-        raw_ws.column_dimensions[get_column_letter(i)].width = max(10, min(len(col) + 2, 20))
+    _write_curated_tab(raw_ws, [r["id"] for r in raw_rows], promoted_ids, _k1,
+                        full_review_by_id, raw_by_id, winner_by_id)
 
     def_ws = wb.create_sheet("Column Definitions")
     def_ws.append(["Column", "Definition"])
@@ -597,23 +677,29 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
     for col, definition in COLUMN_DEFS.items():
         def_ws.append([col, definition])
         def_ws.cell(row=def_ws.max_row, column=2).alignment = Alignment(wrap_text=True, vertical="top")
-    def_ws.append(["node_id join key", "Full Review's 'node_id' column == Candidates'/All Candidates "
-                                        "(raw)'s 'Node ID' column == Combined's 'Node ID' column == "
-                                        "candidate_nodes.id -- use it to cross-reference a row on any "
-                                        "tab back to the others."])
-    def_ws.append(["promoted_pick", "All Candidates (raw) only: True if this node_id is in the "
-                                     "Candidates tab's curated top-N-per-category set (v2 semantics -- "
-                                     "distinct from 'Matches Promotion' below)."])
-    def_ws.append(["Matches Promotion", "All tabs except Full Review: YES/no if this node_id matches "
-                                         "the real currently-promoted node for this ticker (resolved "
-                                         "against watch_list, not hardcoded), or 'N/A (not yet promoted)' "
-                                         "if no watch_list row exists for this ticker under this version."])
-    def_ws.append(["Combined tab", "Exact layout of the real precedent, build_v6_promotion_combined_"
-                                    "report.py's write_combined_xlsx (CURATED_HEADERS + 6 blank manual "
-                                    "columns + the full FIELDNAMES checklist), ported onto candidate_"
-                                    "nodes-sourced data. Rows are the CURATED subset (curate_rows()'s "
-                                    "top-2-per-category Add On/Drought/Best-Both + Core-fallback), not "
-                                    "every Full Review row -- only a curated row has a real 'Winner'."])
+    def_ws.append(["node_id join key", "'Node ID' (or Full Review's 'node_id') == candidate_nodes.id on "
+                                        "every one of the 4 data tabs -- all 4 share the identical column "
+                                        "layout (CURATED_HEADERS + 6 blank manual + full checklist), so "
+                                        "any row can be cross-referenced to the others directly."])
+    def_ws.append(["Winner", "Full Review: always blank (this tab isn't curated -- it's the full scoped "
+                              "population). Combined: real category label(s) from this report's own "
+                              "curation (Add On/Drought/Best-Both/Best Core/Core fallback). Candidates/"
+                              "All Candidates (raw): the Candidates tab's OWN curation label (candidate_"
+                              "report_inmemory.curate(), a different real selection scheme than Combined's "
+                              "-- Core/Add On/Drought top-N by candidate_verification_results CAGR) when "
+                              "this node_id is in that curated set, else blank."])
+    def_ws.append(["Matches Promotion", "YES/no if this node_id matches the real currently-promoted node "
+                                         "for this ticker (resolved against watch_list, not hardcoded, "
+                                         "matched on the real param tuple regardless of watch_list's own "
+                                         "version label), or 'N/A (not yet promoted)' if no watch_list row "
+                                         "matches this ticker at all."])
+    def_ws.append(["Full-checklist-only columns (Years, Add on/Drought detail columns, Cagr Add on/CAGR "
+                    "Drought/CAGR Both, and the entire checklist block starting after the 6 blank manual "
+                    "columns)", "Real data only for a row that actually went through the full checklist "
+                                 "compute (every Full Review/Combined row; Candidates rows too, since all "
+                                 "155 happen to have a matching Full Review row this campaign) -- blank, "
+                                 "never fabricated or expensively backfilled, for a raw-only row (~13,279 "
+                                 "of All Candidates (raw)'s 13,434 rows) that was never run through it."])
     def_ws.append(["Generated", _git_provenance_stamp()])
     def_ws.column_dimensions["A"].width = 32
     def_ws.column_dimensions["B"].width = 110
