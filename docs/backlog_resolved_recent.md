@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Resolved 2026-09-01 (Phase 10 v2) — top-5/category curated set, raw 13,434-row population tab w/ `promoted_pick` flag, parallel checklist compute (throttled via `campaign_registry.get_workers_budget`). Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-09-01 (Phase 10) — full 135-col checklist report ported to candidate_nodes/v6.5, 2-tab xlsx (`candidate_full_review_two_tab.py`), scoped to Tab 2's curated set for tractability. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-09-01 — campaign_jobs gained a mutable `sort_order` column (`reorder-job`/`run-next` CLI subcommands), `id` stays immutable. Full detail: `deep_backlog.md`.

@@ -1,5 +1,24 @@
 # Backlog
 
+## ✅ [backtest][tooling] Resolved 2026-09-01 (Phase 10 v2) — top-5/category curated set, raw population tab, promoted_pick flag, parallel checklist compute
+Full detail of the original finding: `docs/backlog_cache.md` (removed), raised 2026-09-01, dispatched to coder4 by the research session as a same-day follow-up to Phase 10 v1 (see the entry directly below this one) after the user reviewed v1's output. Four changes:
+
+1. **Top-N widened 2→5**: `candidate_report_inmemory.curate()` gained a `top_n` param (default 2, byte-identical for every existing caller); the v2 run passes `--top-n 5`. Both the "Candidates" tab and Tab 1's ("Full Review") scoping grow together (Tab 1 = whatever Tab 2's curated set is, same relationship as v1) -- 72 rows → 155 rows across the same 14 tickers.
+
+2. **New "All Candidates (raw)" tab**: every real `candidate_nodes` row for the version, LEFT JOINed to `candidate_verification_results` for whatever lightweight metrics (core/addon/drought/core_both CAGR) already exist. Deliberately NOT run through the full checklist (200x+ larger population than the curated set, infeasible per Phase 10 v1's own scale finding). Real measured count: **13,434 total, 9,212 with verification data** -- the research session's initial dispatch cited 16,823/11,541, which turned out to be a loose `LIKE 'v6.5-bench-inmemory%'` query that also swept in the pv3 campaign (3,371 rows) and two seed19 test runs (9+9 rows); flagged directly (exact-match query against real DB, output shown) before proceeding, research root-caused and confirmed the exact-match numbers were correct.
+
+3. **`promoted_pick` flag**: boolean column on the raw tab, True when a `node_id` is in Tab 2's curated set. Verified exact match (155 promoted rows on the raw tab == the 155 curated ids) on the real run.
+
+4. **Parallelized checklist compute**: `--workers N` (ProcessPoolExecutor), throttled via `campaign_registry.get_workers_budget(version)` -- same read-once/bounded-submission/fail-toward-unthrottled contract `bench_phase1_phase2_inmemory.py`'s own `_dispatch` documents, reimplemented standalone against just `campaign_registry` (not gated) rather than importing `bench_phase1_phase2_inmemory.py` itself (which IS gated). New top-level `_full_review_worker` opens its own sqlite connection per task (a live `Connection` object can't cross a process boundary). Default stays 1 (serial) -- the caller decides when parallelizing is safe.
+
+Per the dispatch, the real `--workers 8` run was explicitly held until the concurrently-active v6.6 (AGQ close-entry) sweep finished -- polled via `pgrep -f "bench_phase1_phase2_inmemory.py --ticker AGQ"` in a background wait-then-launch script (not blind-waited), which fired automatically once v6.6's processes exited (confirmed ~21:0x ET, within the user's expected ~21:15 window).
+
+Also made `build_report()` (the two-tab script's core logic) a plain callable, with `main()` now a thin CLI wrapper -- noted future ask (not built): wiring Phase 10 report generation into the sweep pipeline itself, auto-run after Phase5. Kept as a fresh open backlog item (see `docs/backlog_cache.md`) rather than built now, per explicit "don't build this yet" instruction -- this callable-not-CLI-only design is so that future integration doesn't require a rewrite.
+
+**Verified**: parallel-path smoke test (ETHU, `--workers 2`) produced byte-identical `node_id`/`core_alpha_pct`/`trades` values vs. the serial path, run before touching real CPU budget. Real 14-ticker run: 155/155 Full Review↔Candidates `node_id` join match, 13,434 raw rows, `promoted_pick` set exactly matches the 155 curated ids, 14/14 tickers, zero errors/warnings across all 63 real scope-groups. Spot-checked 4 random Full Review rows' `core_alpha_pct`/`trades` directly against `candidate_nodes.robust_alpha`/`trades` -- exact match on all 4. Not review-gated: same reasoning as Phase 10 v1 (neither changed file is in CLAUDE.md's gated list, and no edit landed inside any gated file, including `bench_phase1_phase2_inmemory.py`, which was deliberately NOT imported for the throttle logic).
+
+Output: `output/candidate_full_review_v6_5_14ticker_top5_20260901.xlsx` (not committed, runtime artifact). Code: commit `932b194`.
+
 ## ✅ [backtest][tooling] Resolved 2026-09-01 (Phase 10) — full 135-col checklist report ported to candidate_nodes/v6.5, 2-tab xlsx
 Full detail of the original finding: `docs/backlog_cache.md` (removed), raised 2026-09-01, dispatched to coder4 by the research session. `candidate_full_review.py`'s `--kernel gt` full checklist discovered scopes off `backtest_cache` only -- v6.5 (the in-memory pipeline's real campaign, `candidate_nodes`/`candidate_verification_results`) has zero `backtest_cache` rows, so it found nothing.
 
