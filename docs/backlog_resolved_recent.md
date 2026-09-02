@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest][tooling] Resolved 2026-09-01 (Phase 10) — full 135-col checklist report ported to candidate_nodes/v6.5, 2-tab xlsx (`candidate_full_review_two_tab.py`), scoped to Tab 2's curated set for tractability. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-09-01 — campaign_jobs gained a mutable `sort_order` column (`reorder-job`/`run-next` CLI subcommands), `id` stays immutable. Full detail: `deep_backlog.md`.
 
 ## [tooling][security] Resolved 2026-09-01 — stale-worktree triage: 3 worktrees merged (trade-control channel, coverage SCRIPT_BASED_TESTERS, TEST-LIVE display tier, test_coverage_check.py speedup), 9 discarded (superseded/incomplete), 2 real gaps re-backlogged fresh. Full detail: `deep_backlog.md`.
