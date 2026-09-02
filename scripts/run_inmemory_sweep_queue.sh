@@ -190,6 +190,31 @@ WINDOWS="${WINDOWS:-5 10 15 20}"
 # island search.
 N_ISLANDS="${N_ISLANDS:-3}"
 WORKERS="${WORKERS:-8}"
+# ENTRY_TIMING/CAMPAIGN_LABEL (2026-09-02): pass-through to bench's own --entry-timing/
+# --campaign-label CLI overrides (added same night for the v6.6 close-entry campaign).
+# Empty by default -- an unset ENTRY_TIMING omits --entry-timing entirely, matching
+# bench's own module default 'open_check'; an unset CAMPAIGN_LABEL omits --campaign-
+# label, matching bench's own module default 'v6.5'. Must match whatever config the
+# target campaign was actually registered under (see ATTACH_CAMPAIGN_ID below) -- a
+# mismatch here would make this script's per-job bench invocations compute a DIFFERENT
+# version string than the one Phase4/5 below queries, the exact split-brain class
+# ATTACH_CAMPAIGN_ID's own docstring warns about.
+ENTRY_TIMING="${ENTRY_TIMING:-}"
+CAMPAIGN_LABEL="${CAMPAIGN_LABEL:-}"
+# ATTACH_CAMPAIGN_ID (2026-09-02, real gap found live): resolve_campaign() below always
+# self-CREATEs a campaign from bench's own on-disk module constants -- there was no way
+# to point this script at an ALREADY-EXISTING campaign_id (e.g. one created ad hoc via
+# `campaign_registry.py create` for a non-default config like v6.6's close-entry sweep)
+# without it either creating a stray duplicate campaign or silently resolving back to
+# a DIFFERENT, wrong one. When set, resolve_campaign() skips the create/module-const-
+# reading path entirely and just looks up the existing campaign's real version_string
+# via `campaign_registry.py status`. The CALLER is responsible for ensuring TICKERS/
+# STRATEGIES/FIXED_SL_VALUES/Z_THRESHOLDS/WINDOWS/N_ISLANDS/ENTRY_TIMING/CAMPAIGN_LABEL
+# above match what that campaign was actually registered with (this script has no way
+# to verify that automatically) -- get this wrong and Phase4/5's --version query
+# resolves zero scopes for whatever this drain loop just computed under a silently
+# different version string.
+ATTACH_CAMPAIGN_ID="${ATTACH_CAMPAIGN_ID:-}"
 
 Z_THRESHOLDS_CSV=$(echo "$Z_THRESHOLDS" | tr ' ' ',')
 
@@ -203,6 +228,23 @@ Z_THRESHOLDS_CSV=$(echo "$Z_THRESHOLDS" | tr ' ' ',')
 # Phase4/5 step below, so a mid-campaign code change is picked up between tickers
 # rather than only at script start.
 resolve_campaign() {
+  if [ -n "$ATTACH_CAMPAIGN_ID" ]; then
+    local status_out
+    if ! status_out=$($PYTHON scripts/campaign_registry.py status --campaign-id "$ATTACH_CAMPAIGN_ID"); then
+      echo "FATAL: campaign_registry.py status --campaign-id $ATTACH_CAMPAIGN_ID failed -- aborting:"
+      echo "$status_out"
+      exit 1
+    fi
+    VERSION=$(echo "$status_out" | sed -n 's/^campaign id=.* version=//p')
+    if [ -z "$VERSION" ]; then
+      echo "FATAL: no campaign found for ATTACH_CAMPAIGN_ID=$ATTACH_CAMPAIGN_ID -- aborting:"
+      echo "$status_out"
+      exit 1
+    fi
+    CAMPAIGN_ID="$ATTACH_CAMPAIGN_ID"
+    echo "Attached to existing campaign_id=$CAMPAIGN_ID, version=$VERSION (not creating a new campaign row)"
+    return
+  fi
   local bench_consts
   if ! bench_consts=$($PYTHON -c "
 import sys; sys.path.insert(0, '.')
@@ -325,14 +367,36 @@ echo " In-memory sweep queue start — $(date)"
   declare -A FAILED_TICKER
   N_ENQUEUED=0
   for ticker in $TICKERS; do
+    # REMAINING[$ticker] tracking (used below to trigger Phase4/5 once both this
+    # ticker's strategy jobs are terminal) must ALWAYS populate from this script's
+    # own TICKERS/STRATEGIES, independent of ATTACH_CAMPAIGN_ID -- the caller in
+    # attach mode is responsible for making TICKERS/STRATEGIES describe exactly
+    # what it already enqueued via `campaign_registry.py enqueue` itself, so this
+    # count still matches reality even though the actual enqueue call below is
+    # skipped.
     REMAINING[$ticker]=$NUM_STRATEGIES
     for strategy in $STRATEGIES; do
-      $PYTHON scripts/campaign_registry.py enqueue --campaign-id "$CAMPAIGN_ID" \
-          --ticker "$ticker" --strategy "$strategy" --fixed-sl-values "$FIXED_SL_CSV" > /dev/null
+      # ATTACH_CAMPAIGN_ID mode (2026-09-02): the target campaign's queue was
+      # already populated by the caller before this script ran (e.g. `campaign_
+      # registry.py enqueue` calls made directly) -- re-enqueueing here would
+      # silently duplicate every job (real incident, found live: a first attach-
+      # mode run enqueued its own default 6-ticker TICKERS list on top of an
+      # already-enqueued 12-ticker real queue, including 5 tickers appearing
+      # twice and one -- AGQ -- that had ALREADY fully completed, which would
+      # have silently redone real finished work). Skip enqueue, not the
+      # REMAINING/N_ENQUEUED bookkeeping.
+      if [ -z "$ATTACH_CAMPAIGN_ID" ]; then
+        $PYTHON scripts/campaign_registry.py enqueue --campaign-id "$CAMPAIGN_ID" \
+            --ticker "$ticker" --strategy "$strategy" --fixed-sl-values "$FIXED_SL_CSV" > /dev/null
+      fi
       N_ENQUEUED=$((N_ENQUEUED + 1))
     done
   done
-  echo "Enqueued $N_ENQUEUED job(s) for campaign_id=$CAMPAIGN_ID."
+  if [ -n "$ATTACH_CAMPAIGN_ID" ]; then
+    echo "Attach mode: skipped enqueueing $N_ENQUEUED job(s) for campaign_id=$CAMPAIGN_ID (caller's own responsibility)."
+  else
+    echo "Enqueued $N_ENQUEUED job(s) for campaign_id=$CAMPAIGN_ID."
+  fi
 
   # Real inter-phase/inter-job pause (2026-08-31, real user ask, folded in while this
   # commit was already on hold -- see campaign_registry.py's own module docstring for
@@ -440,6 +504,18 @@ echo " In-memory sweep queue start — $(date)"
     if [ -n "${WINDOW_START:-}" ]; then
       WINDOW_ARGS=(--start-date "$WINDOW_START" --end-date "$WINDOW_END")
     fi
+    # ENTRY_TIMING/CAMPAIGN_LABEL pass-through (2026-09-02, see their own env-var
+    # docstrings above) -- same conditional-array pattern as WINDOW_ARGS, omitted
+    # entirely when unset so this script's behavior is byte-identical to before
+    # for every caller that doesn't set them.
+    ENTRY_TIMING_ARGS=()
+    if [ -n "$ENTRY_TIMING" ]; then
+      ENTRY_TIMING_ARGS=(--entry-timing "$ENTRY_TIMING")
+    fi
+    CAMPAIGN_LABEL_ARGS=()
+    if [ -n "$CAMPAIGN_LABEL" ]; then
+      CAMPAIGN_LABEL_ARGS=(--campaign-label "$CAMPAIGN_LABEL")
+    fi
     set -m
     $PYTHON scripts/bench_phase1_phase2_inmemory.py \
         --ticker "$JOB_TICKER" \
@@ -449,7 +525,9 @@ echo " In-memory sweep queue start — $(date)"
         --window $WINDOWS \
         --n-islands "$N_ISLANDS" \
         --workers "$WORKERS" \
-        "${WINDOW_ARGS[@]}" &
+        "${WINDOW_ARGS[@]}" \
+        "${ENTRY_TIMING_ARGS[@]}" \
+        "${CAMPAIGN_LABEL_ARGS[@]}" &
     BENCH_PID=$!
     # Trap installed only AFTER $BENCH_PID is actually set (not before backgrounding) --
     # closes even the sub-millisecond race of a signal arriving before BENCH_PID holds
