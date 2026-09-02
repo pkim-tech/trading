@@ -99,6 +99,56 @@ RAW_COLUMNS = cri.COLUMNS[:14] + [
     "core_both_cagr_1m", "core_both_cagr_1s", "core_safe",
 ]
 
+# phase4_results columns already real/computed for every core_safe=1 node (9,212/9,212 for
+# v6.5-pv4) but never wired into any tab before -- item #2, 2026-09-02 research dispatch.
+# All _pct-suffixed columns here follow this codebase's legacy convention (already stored
+# x100, unlike candidate_verification_results' unsuffixed core_cagr_1m/1s etc -- see
+# _pct100's own docstring on that distinct convention): confirmed directly against real
+# phase4_results rows (e.g. addon_cagr_pct=49.6, not 0.496) before wiring in, precisely
+# because _pct100's whole reason for existing was an identical scale mistake elsewhere.
+PHASE4_EXTRA_COLUMNS = [
+    "addon_cagr_pct", "drought_compounded_pct", "drought_combined_compounded_pct",
+    "check8_compounded_pct", "check8_compounded_without_best_pct", "check8_best_trade_share_pct",
+    "check11_max_drawdown_pct", "check13_worst_fold_cagr_pct", "check13_any_fold_fragile",
+    "core_addon_disagreement",
+]
+PHASE4_EXTRA_HEADERS = [
+    "Phase4 Addon Cagr %", "Phase4 Drought Compounded %", "Phase4 Drought Combined Compounded %",
+    "Phase4 Check8 Compounded %", "Phase4 Check8 Compounded (no best) %", "Phase4 Check8 Best Trade Share %",
+    "Phase4 Check11 Max Drawdown %", "Phase4 Check13 Worst Fold Cagr %", "Phase4 Check13 Any Fold Fragile",
+    "Phase4 Core/Addon Disagreement",
+]
+
+
+def _phase4_extra_by_id(conn, node_ids):
+    """Real phase4_results data for `node_ids`, appended as new columns (item #2) rather
+    than overloaded onto any existing CURATED_HEADERS/FIELDNAMES slot: checked each
+    existing front-block slot's own semantics against these phase4_results columns first
+    (e.g. 'Add on %'/addon_compounded_pct is a raw compounded return of addon-only trades,
+    computed by the full checklist -- NOT the same metric as phase4_results.addon_cagr_pct,
+    an annualized CAGR; 'Drought %'/drought_compounded_pct DOES match phase4_results.
+    drought_compounded_pct by name+semantics and is filled directly in the lightweight-
+    fallback branch below). check8/check11/check13/core_addon_disagreement have no
+    existing-column counterpart at all (full checklist tracks different, non-comparable
+    per-check fields) -- inventing a plausible-sounding overlay here would repeat exactly
+    the kind of silent-scale/semantic mismatch item #1 just fixed, so these get their own
+    clearly-labeled block instead. Applied uniformly across ALL 4 tabs (independent of
+    whether a row's front/checklist came from a Full Review match or the lightweight
+    fallback) since phase4_results exists for the full core_safe population, not just raw-
+    only rows."""
+    ids = [i for i in node_ids if i is not None]
+    out = {}
+    if not ids:
+        return out
+    placeholders = ",".join("?" * len(ids))
+    cols = ", ".join(PHASE4_EXTRA_COLUMNS)
+    rows = conn.execute(
+        f"SELECT candidate_id, {cols} FROM phase4_results WHERE candidate_id IN ({placeholders})",
+        ids).fetchall()
+    for r in rows:
+        out[r[0]] = list(r[1:])
+    return out
+
 def _watch_list_semantic_axes(strategy, take_profit, stop_loss, trail_buy_pct, trail_sell_pct, arm_sell_pct):
     """The real (take_profit, stop_loss, trail_sell_pct) SEMANTIC triple build_params_dict/
     get_or_create_candidate_node expect -- i.e. the backtester's own axis meanings, NOT a
@@ -246,7 +296,7 @@ def _matches_promotion(ticker, node_id, promoted_ids):
 
 
 def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
-                                  full_review_by_id, lightweight_row, winner):
+                                  full_review_by_id, lightweight_row, winner, phase4_extra_by_id):
     """Builds ONE row's (curated-front-24-cols, checklist-144-cols) pair -- v6 (2026-09-02,
     'every tab gets the exact same 174-column layout' user dispatch). Single source of
     truth for the CURATED_HEADERS-ordered front block across all 4 tabs (Full Review,
@@ -273,6 +323,8 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
     column (Years, Add on/Drought detail columns, and the entire 144-col checklist block)
     genuinely blank -- never fabricated, never expensively backfilled (that's the whole
     reason the raw tab stays lightweight-only, see module docstring)."""
+    p4 = phase4_extra_by_id.get(node_id) or [None] * len(PHASE4_EXTRA_COLUMNS)
+
     fr = full_review_by_id.get(node_id)
     if fr is not None:
         front = [
@@ -285,43 +337,52 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
             fr["core_addon_cagr_pct"], fr["core_drought_cagr_pct"], fr["core_both_cagr_pct"],
         ]
         checklist = [fr.get(h) for h in FIELDNAMES]
-        return front, checklist
+        return front, checklist, p4
 
     r = lightweight_row or {}
     core_safe = r.get("core_safe")
     cliff_safe = None if core_safe is None else ("SAFE" if core_safe else "CLIFF")
+    # "Drought %" (index 17) is the one existing slot with a real phase4_results
+    # counterpart of matching name+semantics (drought_compounded_pct) -- filled here per
+    # item #2. "Add on %" has no equivalent (phase4_results only has addon_cagr_pct, an
+    # annualized CAGR, not the raw compounded return this column expects) -- stays blank.
     front = [
         r.get("ticker"), counter_formula, node_id,
         _matches_promotion(r.get("ticker"), node_id, promoted_ids), k1_fn(r.get("ticker")),
         r.get("strategy"), winner, _pct100(r.get("core_cagr_1s")), r.get("worst_neighbor_cagr"), None,
         r.get("trades"), None, cliff_safe,
         None, None, None, None,
-        None, None, None, None,
+        p4[1], None, None, None,
         _pct100(r.get("addon_cagr_1s")), _pct100(r.get("drought_cagr_1s")), _pct100(r.get("core_both_cagr_1s")),
     ]
     checklist = [None] * len(FIELDNAMES)
-    return front, checklist
+    return front, checklist, p4
 
 
 def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
-                        lightweight_by_id, winner_by_id):
-    """Writes one CURATED_HEADERS(24) + MANUAL_BLANK_COLS(6) + FIELDNAMES(144) = 174-column
-    tab for the given `node_ids` in order -- shared by all 4 tabs, see
-    _curated_front_and_checklist's own docstring for the per-row data-sourcing rule."""
+                        lightweight_by_id, winner_by_id, phase4_extra_by_id):
+    """Writes one CURATED_HEADERS(24) + MANUAL_BLANK_COLS(6) + FIELDNAMES(144) +
+    PHASE4_EXTRA_HEADERS(10) = 184-column tab for the given `node_ids` in order -- shared
+    by all 4 tabs, see _curated_front_and_checklist's own docstring for the per-row data-
+    sourcing rule. The phase4 block (item #2, 2026-09-02) is appended after the existing
+    174 columns rather than overloaded onto any of them, and is populated uniformly
+    (whichever branch -- Full Review match or lightweight fallback -- supplied the rest of
+    the row) since phase4_results covers the whole core_safe population, not just raw-only
+    rows."""
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
-    headers = CURATED_HEADERS + [None] * MANUAL_BLANK_COLS + list(FIELDNAMES)
+    headers = CURATED_HEADERS + [None] * MANUAL_BLANK_COLS + list(FIELDNAMES) + PHASE4_EXTRA_HEADERS
     ws.append(headers)
     for cell in ws[1]:
         if cell.value:
             cell.font = Font(bold=True)
     for i, node_id in enumerate(node_ids, start=2):
         counter = f"=COUNTIF($A$2:A{i},A{i})"
-        front, checklist = _curated_front_and_checklist(
+        front, checklist, phase4_extra = _curated_front_and_checklist(
             node_id, promoted_ids, k1_fn, counter, full_review_by_id,
-            lightweight_by_id.get(node_id), winner_by_id.get(node_id))
-        ws.append(front + [None] * MANUAL_BLANK_COLS + checklist)
+            lightweight_by_id.get(node_id), winner_by_id.get(node_id), phase4_extra_by_id)
+        ws.append(front + [None] * MANUAL_BLANK_COLS + checklist + phase4_extra)
     for i, h in enumerate(CURATED_HEADERS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = max(10, min(len(h) + 2, 30))
     ws.freeze_panes = "B2"
@@ -628,7 +689,11 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
     -- was 3 separately hand-written, already-inconsistent header/field lists per tab
     (the real complaint this rework responds to: 'every one of the 4 tabs... should have
     the same format... i just want it to be consistent'). Row POPULATION (which node_ids
-    appear on which tab) is unchanged from v5 -- only the column structure is unified."""
+    appear on which tab) is unchanged from v5 -- only the column structure is unified.
+
+    Item #2 (2026-09-02, same-day follow-up): +10 columns (PHASE4_EXTRA_HEADERS) appended
+    after the 174, real phase4_results data joined by node_id -- see _phase4_extra_by_id's
+    own docstring. Total is now 184 columns, still identical across all 4 tabs."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment
     from openpyxl.utils import get_column_letter
@@ -650,25 +715,29 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
     raw_by_id = {r["id"]: r for r in raw_rows}
     winner_by_id = {r["id"]: r.get("_winner") for r in curated_rows}  # from cri.curate(), used on the raw tab
 
+    all_node_ids = ({r["node_id"] for r in full_review_rows} | {r["node_id"] for r in combined_rows}
+                    | {r["id"] for r in curated_rows} | {r["id"] for r in raw_rows})
+    phase4_extra_by_id = _phase4_extra_by_id(conn, all_node_ids)
+
     wb = Workbook()
 
     review_ws = wb.active
     review_ws.title = "Full Review"
     _write_curated_tab(review_ws, [r["node_id"] for r in full_review_rows], promoted_ids, _k1,
-                        full_review_by_id, {}, {})  # no lightweight fallback needed -- every id has a FR row
+                        full_review_by_id, {}, {}, phase4_extra_by_id)  # no lightweight fallback needed -- every id has a FR row
 
     combined_ws = wb.create_sheet("Combined")
     combined_winner_by_id = {r["node_id"]: r.get("_winner") for r in combined_rows}
     _write_curated_tab(combined_ws, [r["node_id"] for r in combined_rows], promoted_ids, _k1,
-                        full_review_by_id, {}, combined_winner_by_id)
+                        full_review_by_id, {}, combined_winner_by_id, phase4_extra_by_id)
 
     cand_ws = wb.create_sheet("Candidates")
     _write_curated_tab(cand_ws, [r["id"] for r in curated_rows], promoted_ids, _k1,
-                        full_review_by_id, candidates_by_id, winner_by_id)
+                        full_review_by_id, candidates_by_id, winner_by_id, phase4_extra_by_id)
 
     raw_ws = wb.create_sheet("All Candidates (raw)")
     _write_curated_tab(raw_ws, [r["id"] for r in raw_rows], promoted_ids, _k1,
-                        full_review_by_id, raw_by_id, winner_by_id)
+                        full_review_by_id, raw_by_id, winner_by_id, phase4_extra_by_id)
 
     def_ws = wb.create_sheet("Column Definitions")
     def_ws.append(["Column", "Definition"])
@@ -700,6 +769,23 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
                                  "155 happen to have a matching Full Review row this campaign) -- blank, "
                                  "never fabricated or expensively backfilled, for a raw-only row (~13,279 "
                                  "of All Candidates (raw)'s 13,434 rows) that was never run through it."])
+    def_ws.append(["Phase4 Addon Cagr % / Phase4 Drought Compounded % / Phase4 Drought Combined Compounded % / "
+                    "Phase4 Check8 Compounded % / Phase4 Check8 Compounded (no best) % / Phase4 Check8 Best "
+                    "Trade Share % / Phase4 Check11 Max Drawdown % / Phase4 Check13 Worst Fold Cagr % / "
+                    "Phase4 Check13 Any Fold Fragile / Phase4 Core/Addon Disagreement (appended after the "
+                    "144-column checklist block, item #2 2026-09-02)",
+                    "Real phase4_results data (candidate_verification_store's Phase4 table), joined by "
+                    "node_id, populated for every row whose node_id has a phase4_results row (the full real "
+                    "core_safe population, 9,212/9,212 for v6.5-pv4) regardless of which branch (Full Review "
+                    "match or lightweight fallback) built the rest of that row -- cheap existing data, no new "
+                    "compute. Deliberately NOT merged into any existing CURATED_HEADERS/checklist column: "
+                    "checked each existing slot's own semantics first ('Add on %'/addon_compounded_pct is a "
+                    "raw compounded return of addon-only trades computed by the full checklist, NOT the same "
+                    "metric as phase4_results.addon_cagr_pct, an annualized CAGR -- overloading them would "
+                    "repeat the exact silent scale/semantic mismatch this report's own Cagr-column fix just "
+                    "caught) -- 'Drought %' is the one exception, filled directly since phase4_results."
+                    "drought_compounded_pct matches its name+semantics exactly. check8/check11/check13/"
+                    "core_addon_disagreement have no existing-column counterpart at all."])
     def_ws.append(["Generated", _git_provenance_stamp()])
     def_ws.column_dimensions["A"].width = 32
     def_ws.column_dimensions["B"].width = 110
