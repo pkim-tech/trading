@@ -44,7 +44,10 @@ def fetch_rows(conn, version):
     return [dict(zip(COLUMNS, r)) for r in cur.fetchall()]
 
 
-def curate(rows):
+def curate(rows, top_n=2):
+    """top_n (2026-09-01, user request via research-session dispatch, Phase 10 v2):
+    top-N-per-category instead of the original hardcoded top-2. Default stays 2 --
+    byte-identical behavior for every existing caller that doesn't pass this."""
     safety_known = any(r["worst_neighbor_cagr"] is not None for r in rows)
     if safety_known:
         rows = [r for r in rows if (r["worst_neighbor_cagr"] or 0) > 0]
@@ -66,7 +69,8 @@ def curate(rows):
                           key=lambda r: r["drought_cagr_1s"], reverse=True)
 
         winners = {}
-        for label, group in (("Core", core[:2]), ("Add On", addon[:2]), ("Drought", drought[:2])):
+        for label, group in (("Core", core[:top_n]), ("Add On", addon[:top_n]),
+                              ("Drought", drought[:top_n])):
             for r in group:
                 k = key(r)
                 if k not in winners:
@@ -118,13 +122,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True)
     ap.add_argument("--xlsx", default="candidate_review.xlsx")
+    ap.add_argument("--top-n", type=int, default=2, help="top-N per category (Core/Add On/Drought)")
     args = ap.parse_args()
 
     conn = sqlite3.connect(DB_PATH)
     rows = fetch_rows(conn, args.version)
     if not rows:
         raise SystemExit(f"No verified candidate_nodes rows for version={args.version!r}")
-    curated, safety_known = curate(rows)
+    curated, safety_known = curate(rows, top_n=args.top_n)
     out = write_xlsx(curated, args.xlsx)
     print(f"Wrote {out} ({len(curated)} rows, {len(set(r['ticker'] for r in rows))} tickers)")
     if not safety_known:
