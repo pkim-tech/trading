@@ -1703,8 +1703,20 @@ def _gt_alpha_resolutions(conn, ticker, strategy, version, entry_timing, fixed_s
     return poss, pess, cert
 
 
-def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl, vol_gate=DEFAULT_VOL_GATE):
-    """Full-checklist rows for one GT scope, one row per Phase2.5-GT candidate --
+def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl, vol_gate=DEFAULT_VOL_GATE,
+                         candidates_override=None):
+    """candidates_override (2026-09-01, research-session dispatch): passed straight through
+    to build_candidate_report_ground_truth's own candidates_override param -- lets a caller
+    feed a candidate_nodes-sourced candidate list (scripts/phase4_candidate_nodes_resolver.py's
+    derive_phase25_candidates_from_candidate_nodes) for a campaign the in-memory sweep
+    pipeline ran, which writes zero backtest_cache rows (so this scope would otherwise be
+    invisible to this report). None (default) is byte-identical to prior behavior. When set,
+    _gt_alpha_resolutions' own backtest_cache lookup below will find nothing for this scope
+    (also zero rows there) and correctly return (None, None, None) -- alpha_possible_pct/
+    alpha_pessimistic_pct/alpha_certain_pct read as real skips, not a new GT_SKIP_COLUMNS entry
+    (those three ARE computable in principle, just not for a candidate_nodes-only campaign).
+
+    Full-checklist rows for one GT scope, one row per Phase2.5-GT candidate --
     GT-kernel counterpart of this file's legacy per-ticker loop in main(), producing
     records shaped exactly like the legacy path's `rec` dicts (same nested walk_forward/
     addon_robustness/drought_robustness/drought_included_excluded/bear_market/
@@ -1765,7 +1777,8 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
         try:
             report = build_candidate_report_ground_truth(
                 ticker, strategy, version, hp, start_date=win_start, end_date=win_end,
-                fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source)
+                fixed_sl=fixed_sl, entry_timing=entry_timing, data_source=data_source,
+                candidates_override=candidates_override)
         except Exception as e:
             import traceback
             print(f"  [GT full review] {ticker}/{strategy}/{version}: build_candidate_report_ground_truth "
@@ -1822,7 +1835,13 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
         rec["abs_return_pct"] = abs_return_pct
         rec["strategy_cagr_pct"] = c["cagr"]
         spy_cagr = cagr(spy_bh, days_span) if (spy_bh is not None and days_span) else None
-        rec["ann_excess_pct"] = (c["cagr"] - spy_cagr) if spy_cagr is not None else None
+        # c["cagr"] is None for a candidates_override list sourced from candidate_nodes
+        # (that table doesn't persist a cagr column -- see phase4_candidate_nodes_
+        # resolver.py's module docstring, known deviation #1). Guard rather than crash;
+        # ann_excess_pct reads as a real, honest None for these rows (not a GT_SKIP_
+        # COLUMNS case -- it IS computable in principle for a backtest_cache-sourced row).
+        rec["ann_excess_pct"] = ((c["cagr"] - spy_cagr) if (spy_cagr is not None and c["cagr"] is not None)
+                                  else None)
         rec["years"] = years
         rec["trades"] = row["n_trades"]
 
@@ -2014,6 +2033,111 @@ def run_gt_full_review(conn, tickers, csv_name, xlsx_name, vol_gate=DEFAULT_VOL_
     return csv_rows
 
 
+def gt_scopes_from_candidate_nodes(tickers, version=None):
+    """candidate_nodes-sourced sibling of gt_scopes_for_tickers (2026-09-01, research-session
+    dispatch) -- for a campaign the in-memory pipeline ran (bench_phase1_phase2_inmemory.py),
+    which writes zero backtest_cache rows, so gt_scopes_for_tickers/discover_all_gt_scopes
+    can never find it. Reads scripts/phase4_candidate_nodes_resolver.py's own scope
+    discovery instead: discover_candidate_nodes_scopes(ticker, version) when `version` is
+    given (the common case -- one known real campaign version string), else
+    discover_all_candidate_nodes_scopes(ticker) across every version present for that
+    ticker. Returns (ticker, strategy, version, entry_timing, fixed_sl, window) 6-tuples --
+    `window` included (unlike gt_scopes_for_tickers' 5-tuple) because a candidate_nodes
+    version string can alias multiple window batches (see discover_candidate_nodes_scopes'
+    own docstring) -- callers MUST pass window through to derive_phase25_candidates_from_
+    candidate_nodes, not drop it."""
+    from phase4_candidate_nodes_resolver import (
+        discover_all_candidate_nodes_scopes, discover_candidate_nodes_scopes,
+    )
+    scopes = []
+    for ticker in tickers:
+        if version is not None:
+            rows = [(strategy, version, entry_timing, fixed_sl, window)
+                    for strategy, entry_timing, fixed_sl, window in
+                    discover_candidate_nodes_scopes(ticker, version)]
+        else:
+            rows = [(strategy, ver, entry_timing, fixed_sl, window)
+                    for strategy, ver, entry_timing, fixed_sl, window in
+                    discover_all_candidate_nodes_scopes(ticker)]
+        if not rows:
+            print(f"\n{ticker}: no candidate_nodes scope found"
+                  f"{f' for version={version!r}' if version else ''} -- skipping.")
+        for strategy, ver, entry_timing, fixed_sl, window in rows:
+            scopes.append((ticker, strategy, ver, entry_timing, fixed_sl, window))
+    return scopes
+
+
+def run_phase10_full_review_candidate_nodes(conn, tickers, version, csv_name, xlsx_name,
+                                        vol_gate=DEFAULT_VOL_GATE):
+    """Phase 10 of the pipeline's phase numbering (2026-09-01, research-session dispatch,
+    number chosen deliberately non-sequential after Phase5 -- room reserved for future
+    phases 6-9): candidate_nodes-sourced sibling of run_gt_full_review (--kernel gt
+    --source candidate_nodes) -- same full COLUMN_DEFS/FIELDNAMES checklist output and
+    same GT_SKIP_COLUMNS honest-skip pass, but scoped/candidate-derived off candidate_nodes
+    (via phase4_candidate_nodes_resolver.py) instead of backtest_cache, for a campaign the
+    in-memory sweep pipeline ran (zero backtest_cache rows -- see gt_scopes_from_candidate_
+    nodes' own docstring). `version`: real campaign_nodes.version string to scope discovery
+    to (None discovers across every version present per ticker -- only safe when a ticker's
+    candidate_nodes rows are known to belong to one real campaign).
+
+    WARNING (measured 2026-09-01 against the real v6.5 campaign): a real candidate_nodes
+    campaign version can legitimately sweep MANY (fixed_sl, window) scopes per ticker (64
+    for v6.5 -- 8 fixed_sl x 4 window x 2 strategies), each with its own up-to-dozens-of-
+    candidates island population (soft-capped, real overflow observed past N_ISLANDS*3).
+    Full-checklist compute measured ~11-13s/candidate -- running this UNSCOPED (this
+    function's own default behavior, every scope x every candidate) over a real multi-
+    scope campaign can run tens of hours. For a report meant to explain a curated finalist
+    set (not audit the raw population), scope to just those node_ids instead -- see
+    scripts/candidate_full_review_two_tab.py's own targeted-override pattern (filters
+    derive_phase25_candidates_from_candidate_nodes(..., full_population=True)'s output to
+    exactly the wanted ids, one gt_full_review_rows call per distinct real scope) rather
+    than calling this function directly against a wide campaign."""
+    from phase4_candidate_nodes_resolver import derive_phase25_candidates_from_candidate_nodes
+
+    scopes = gt_scopes_from_candidate_nodes(tickers, version=version)
+
+    out_rows = []
+    for ticker, strategy, ver, entry_timing, fixed_sl, window in scopes:
+        print(f"\n{'#' * 100}\n{ticker} / {strategy} / {ver} / entry_timing={entry_timing} "
+              f"/ fixed_sl={fixed_sl} / window={window}\n{'#' * 100}")
+        override = derive_phase25_candidates_from_candidate_nodes(
+            ticker, strategy, ver, fixed_sl=fixed_sl, entry_timing=entry_timing, window=window)
+        if not override:
+            print(f"  [GT full review, candidate_nodes] {ticker}/{strategy}/{ver}: "
+                  f"no candidates from resolver for this scope -- skipping.")
+            continue
+        try:
+            out_rows.extend(gt_full_review_rows(conn, ticker, strategy, ver, entry_timing,
+                                                  fixed_sl, vol_gate=vol_gate,
+                                                  candidates_override=override))
+        except Exception as e:
+            import traceback
+            print(f"  UNEXPECTED error on this scope, skipping: {e}\n{traceback.format_exc()}")
+
+    csv_rows = []
+    for rec in out_rows:
+        row = _build_output_row(rec)
+        for col in GT_SKIP_COLUMNS:
+            row[col] = GT_SKIP_LABEL
+        csv_rows.append(row)
+
+    if csv_name:
+        out_path = Path("output") / _timestamped_name(csv_name, ".csv")
+        out_path.parent.mkdir(exist_ok=True)
+        with open(out_path, "w", newline="") as f:
+            f.write(f"# Generated: {_git_provenance_stamp()}\n")
+            w = csv.DictWriter(f, fieldnames=FIELDNAMES)
+            w.writeheader()
+            for row in csv_rows:
+                w.writerow(row)
+        print(f"Wrote {out_path} ({len(csv_rows)} rows)")
+    if xlsx_name:
+        xlsx_out = _timestamped_name(xlsx_name, ".xlsx")
+        _write_xlsx(xlsx_out, csv_rows)
+        print(f"Wrote output/{xlsx_out} ({len(csv_rows)} rows)")
+    return csv_rows
+
+
 def _timestamped_name(name, ext):
     """Appends a run timestamp to the given base name so successive --csv/--xlsx
     runs never overwrite each other -- every run is real evidence (which
@@ -2082,7 +2206,18 @@ def main():
     ap.add_argument("--version", default=None,
                      help="force a single version for every ticker (old behavior). Default: auto-resolve "
                           "per ticker via resolve_version() -- v5.1 when the ticker has it, else v5. "
-                          "Ignored for --kernel gt (GT scope discovery reads its own version per scope).")
+                          "Ignored for --kernel gt --source backtest_cache (GT scope discovery reads its "
+                          "own version per scope). For --kernel gt --source candidate_nodes: scopes "
+                          "discovery to this exact campaign version (recommended); omit to discover "
+                          "across every version present per ticker.")
+    ap.add_argument("--source", choices=["backtest_cache", "candidate_nodes"], default="backtest_cache",
+                     help="only meaningful with --kernel gt. 'backtest_cache' (default): unchanged "
+                          "behavior, scopes/candidates discovered off backtest_cache. 'candidate_nodes': "
+                          "for a campaign the in-memory sweep pipeline ran (bench_phase1_phase2_inmemory.py "
+                          "-- zero backtest_cache rows), scopes/candidates discovered off candidate_nodes "
+                          "via scripts/phase4_candidate_nodes_resolver.py instead (Phase 10 of the "
+                          "pipeline's phase numbering -- see run_phase10_full_review_candidate_nodes' own "
+                          "docstring, incl. a real-measured runtime warning against unscoped use).")
     ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--min-alpha", type=float, default=0,
                      help="Alpha floor for the 'best safe node' cliff-safety search (default 0 -- show "
@@ -2131,12 +2266,15 @@ def main():
     if args.kernel == "gt":
         if not args.tickers:
             print("--kernel gt requires an explicit ticker list (GT scopes are discovered off "
-                  "backtest_cache, not candidate_nodes, so there is no default 'every registered "
-                  "ticker' set here).")
+                  f"{args.source}, not the default per-ticker set here).")
             return
         conn = sqlite3.connect(args.db)
         ensure_candidate_nodes_table(conn)
-        run_gt_full_review(conn, args.tickers, args.csv, args.xlsx, vol_gate=args.vol_gate)
+        if args.source == "candidate_nodes":
+            run_phase10_full_review_candidate_nodes(conn, args.tickers, args.version, args.csv, args.xlsx,
+                                                vol_gate=args.vol_gate)
+        else:
+            run_gt_full_review(conn, args.tickers, args.csv, args.xlsx, vol_gate=args.vol_gate)
         conn.close()
         return
 
