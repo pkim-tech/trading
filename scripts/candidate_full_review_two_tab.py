@@ -163,6 +163,19 @@ def _promoted_node_ids(conn, version, tickers, live_db_path=LIVE_DB_PATH):
     return out
 
 
+def _pct100(v):
+    """candidate_verification_results' core_cagr_1m/1s, addon_cagr_1m/1s, drought_cagr_
+    1m/1s, core_both_cagr_1m/1s are stored as raw fractions (0-1+ scale) -- every legacy
+    _pct-suffixed column this report also renders (strategy_cagr_pct, addon_compounded_
+    pct, etc.) is already stored x100 by the legacy pipeline's own convention. Found as a
+    real regression, 2026-09-02 (research session, confirmed on real AGQ node_id=19026):
+    substituting a candidate_verification_results value into a 'Cagr'/'%'-labeled column
+    without this conversion renders e.g. 0.6978 instead of 69.78. Applied ONLY at render
+    time -- the DB storage itself is untouched (still fractional, consistent with whatever
+    convention wrote it)."""
+    return None if v is None else v * 100
+
+
 def _matches_promotion(ticker, node_id, promoted_ids):
     promoted_id = promoted_ids.get(ticker)
     if promoted_id is None:
@@ -517,7 +530,7 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
         matches_promotion = _matches_promotion(r["ticker"], r["node_id"], promoted_ids)
         curated = [
             r["ticker"], f"=COUNTIF($A$2:A{i},A{i})", r["node_id"], matches_promotion, r.get("k1_tranche"),
-            r.get("strategy"), r.get("_winner"), r["core_cagr_1s"],
+            r.get("strategy"), r.get("_winner"), _pct100(r["core_cagr_1s"]),
             r["worst_neighbor_pct"], None, r["trades"], r["years"], r["status"],
             r["addon_compounded_pct"], r["addon_n"], r["addon_tranche"], r["addon_wr_tranche"],
             r["drought_compounded_pct"], r["drought_n"], r["drought_tranche"], r["drought_wr_verdict"],
@@ -541,8 +554,9 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
         cand_ws.append([
             r["ticker"], f"=COUNTIF($A$2:A{i},A{i})", r["id"],
             _matches_promotion(r["ticker"], r["id"], promoted_ids), _k1(r["ticker"]), r["strategy"],
-            r["_winner"], r["core_cagr_1s"], r["worst_neighbor_cagr"], r["cliff_safe_label"], r["trades"],
-            r["addon_cagr_1s"], r["drought_cagr_1s"], r["core_both_cagr_1s"],
+            r["_winner"], _pct100(r["core_cagr_1s"]), r["worst_neighbor_cagr"], r["cliff_safe_label"],
+            r["trades"], _pct100(r["addon_cagr_1s"]), _pct100(r["drought_cagr_1s"]),
+            _pct100(r["core_both_cagr_1s"]),
             r["window"], r["z"], r["fixed_sl"], r["arm_pct"], r["trail_buy_pct"],
             r["trail_sell_pct"], r["max_hold_hours"], r["entry_timing"],
         ])
@@ -566,8 +580,9 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
         raw_ws.append([
             r["ticker"], f"=COUNTIF($A$2:A{i},A{i})", r["id"],
             _matches_promotion(r["ticker"], r["id"], promoted_ids), _k1(r["ticker"]), r["strategy"],
-            r["core_cagr_1s"], r["worst_neighbor_cagr"], cliff_safe_label, r["trades"],
-            r["addon_cagr_1s"], r["drought_cagr_1s"], r["core_both_cagr_1s"], r["id"] in curated_ids,
+            _pct100(r["core_cagr_1s"]), r["worst_neighbor_cagr"], cliff_safe_label, r["trades"],
+            _pct100(r["addon_cagr_1s"]), _pct100(r["drought_cagr_1s"]), _pct100(r["core_both_cagr_1s"]),
+            r["id"] in curated_ids,
             r["window"], r["z"], r["fixed_sl"], r["arm_pct"], r["trail_buy_pct"],
             r["trail_sell_pct"], r["max_hold_hours"], r["entry_timing"],
         ])
