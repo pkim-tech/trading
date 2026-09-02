@@ -11,7 +11,7 @@ v2 (2026-09-01, same-day follow-up dispatch, user review of v1):
   - top_n widened from a hardcoded 2 to a --top-n CLI arg (default 5) -- both Tab 2 and
     Tab 1's scoping (Tab 1 = whatever Tab 2's curated set is) grow together.
   - New Tab 3 "All Candidates (raw)": every real candidate_nodes row for the version
-    (thousands, e.g. 16,823 for v6.5), LEFT JOINed to candidate_verification_results for
+    (thousands, e.g. 13,434 for v6.5), LEFT JOINed to candidate_verification_results for
     whatever lightweight metrics (core/addon/drought/core_both CAGR) already exist --
     deliberately NOT run through the full checklist (200x+ larger population than the
     curated set makes that infeasible, see Tab 1 scoping note below). Carries a
@@ -24,6 +24,23 @@ v2 (2026-09-01, same-day follow-up dispatch, user review of v1):
     gated). Default 1 (serial, original behavior) -- the caller decides when it's safe to
     ask for more (e.g. after confirming no other campaign is actively consuming CPU
     budget); this script does not check that itself.
+
+v3 (2026-09-01, same-day follow-up after the v2 timing recalculation): --full-review-
+population {curated, core_safe} -- 'core_safe' widens Tab 1 to the real full core_safe=
+True population (phase4_results.core_safe=1 AND trades>=--min-trades, 9,212 rows for
+v6.5) instead of the curated top-N set. Tab 2/Tab 3 are unchanged either way -- this only
+widens Tab 1's population. See _core_safe_population_rows and build_report's
+full_review_population param docstring.
+
+NOTE on the v2 dispatch's real process gap (found 2026-09-01, see deep_backlog.md): the
+poll used to gate the v2 real --workers>1 run checked only one ticker's pgrep
+(bench_phase1_phase2_inmemory.py --ticker AGQ), which fired as soon as THAT ticker
+finished, not when the whole (multi-ticker) v6.6 campaign did -- v6.6 moved on to another
+ticker immediately after, causing ~2m21s of real, confirmed CPU contention between this
+script's workers and v6.6's. Any caller reusing the poll-then-launch pattern against a
+multi-ticker campaign MUST check the whole campaign (campaign_registry.status(campaign_id)
+-- job_counts.get('running', 0) == 0 and job_counts.get('queued', 0) == 0), not a single
+ticker's pgrep.
 
 Tab 1 SCOPE (deliberate, measured 2026-09-01 -- see run_phase10_full_review_candidate_
 nodes' own docstring warning): a real candidate_nodes campaign version can sweep MANY
@@ -83,6 +100,25 @@ def _tickers_for_version(conn, version):
     rows = conn.execute(
         "SELECT DISTINCT ticker FROM candidate_nodes WHERE version=?", (version,)).fetchall()
     return sorted(r[0] for r in rows)
+
+
+def _core_safe_population_rows(conn, version, min_trades=50):
+    """Real core_safe=True population (v3, 2026-09-01 overnight full-checklist dispatch,
+    user-confirmed via research session after the v2 timing recalculation) -- every
+    candidate_nodes row with a real phase4_results.core_safe=1 verdict AND trades>=
+    min_trades. Returns rows carrying exactly the scope-key fields (id/ticker/strategy/
+    entry_timing/fixed_sl/window) _full_review_rows_for_curated needs -- same shape a
+    curated row already has (that function only ever reads those 6 keys), so this is a
+    drop-in alternate population for Tab 1 with no new grouping/dispatch logic required."""
+    q = """
+    SELECT n.id, n.ticker, n.strategy, n.window, n.entry_timing, n.fixed_sl
+    FROM candidate_nodes n
+    JOIN phase4_results p4 ON p4.candidate_id = n.id
+    WHERE n.version=? AND p4.core_safe=1 AND n.trades>=?
+    """
+    cur = conn.execute(q, (version, min_trades))
+    cols = ["id", "ticker", "strategy", "window", "entry_timing", "fixed_sl"]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 def _raw_population_rows(conn, version):
@@ -320,12 +356,19 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows):
 
 
 def build_report(conn, version, tickers=None, top_n=5, vol_gate=DEFAULT_VOL_GATE,
-                  workers=1, db_path=DB_PATH):
+                  workers=1, db_path=DB_PATH, full_review_population="curated",
+                  min_trades=50):
     """Callable core of this script -- a future pipeline caller (e.g. auto-run after
     Phase5, noted as a planned-but-not-built follow-up in the 2026-09-01 v2 dispatch) can
     import and call this directly instead of shelling out to main(). Returns
     (full_review_rows, curated_rows, raw_rows) -- the same three row-sets _write_report_
-    xlsx consumes, so a caller that wants the data without an xlsx can use this alone."""
+    xlsx consumes, so a caller that wants the data without an xlsx can use this alone.
+
+    full_review_population (v3, 2026-09-01 overnight dispatch): 'curated' (default,
+    unchanged v1/v2 behavior) scopes Tab 1 to the curated top-N set. 'core_safe' scopes
+    Tab 1 to the full real core_safe=True population instead (see
+    _core_safe_population_rows) -- Tab 2 (Candidates) and Tab 3 (All Candidates raw) are
+    UNCHANGED either way, this only widens Tab 1's population."""
     ensure_candidate_nodes_table(conn)
     all_tickers = tickers or _tickers_for_version(conn, version)
     if not all_tickers:
@@ -346,9 +389,20 @@ def build_report(conn, version, tickers=None, top_n=5, vol_gate=DEFAULT_VOL_GATE
         curated_rows = [r for r in curated_rows if r["ticker"] in wanted]
     print(f"Curated: {len(curated_rows)} rows across {len(set(r['ticker'] for r in curated_rows))} tickers")
 
-    print("\n--- Building Tab 1: Full Review (scoped to Tab 2's curated node_ids -- see "
-          "module docstring for why) ---")
-    full_review_rows = _full_review_rows_for_curated(curated_rows, version, vol_gate, db_path,
+    if full_review_population == "core_safe":
+        print(f"\n--- Building Tab 1: Full Review (scoped to the real core_safe=True "
+              f"population, trades>={min_trades} -- see build_report's full_review_population "
+              f"docstring) ---")
+        tab1_population = _core_safe_population_rows(conn, version, min_trades=min_trades)
+        if tickers:
+            wanted = set(all_tickers)
+            tab1_population = [r for r in tab1_population if r["ticker"] in wanted]
+        print(f"core_safe population: {len(tab1_population)} rows")
+    else:
+        print("\n--- Building Tab 1: Full Review (scoped to Tab 2's curated node_ids -- see "
+              "module docstring for why) ---")
+        tab1_population = curated_rows
+    full_review_rows = _full_review_rows_for_curated(tab1_population, version, vol_gate, db_path,
                                                        max_workers=workers)
 
     print("\n--- Building Tab 3: All Candidates (raw) ---")
@@ -379,6 +433,13 @@ def main():
                           "(throttled via campaign_registry.get_workers_budget(--version)). "
                           "Default 1 (serial). Caller's responsibility to confirm no other "
                           "campaign is actively consuming CPU budget before raising this.")
+    ap.add_argument("--full-review-population", choices=["curated", "core_safe"], default="curated",
+                     help="'curated' (default): Tab 1 scoped to Tab 2's curated top-N set. "
+                          "'core_safe': Tab 1 scoped to the full real core_safe=True population "
+                          "instead (phase4_results.core_safe=1 AND trades>=--min-trades) -- "
+                          "Tab 2/Tab 3 unchanged either way, this only widens Tab 1.")
+    ap.add_argument("--min-trades", type=int, default=50,
+                     help="trades floor for --full-review-population core_safe. Default 50.")
     ap.add_argument("--xlsx", default=None,
                      help="output/<name>.xlsx. Default: output/candidate_full_review_<version-slug>.xlsx")
     args = ap.parse_args()
@@ -387,7 +448,8 @@ def main():
     tickers = args.tickers.split(",") if args.tickers else None
     full_review_rows, curated_rows, raw_rows = build_report(
         conn, args.version, tickers=tickers, top_n=args.top_n, vol_gate=args.vol_gate,
-        workers=args.workers, db_path=args.db)
+        workers=args.workers, db_path=args.db, full_review_population=args.full_review_population,
+        min_trades=args.min_trades)
 
     xlsx_name = args.xlsx or f"candidate_full_review_{args.version[:60]}"
     out_path = Path("output") / (xlsx_name if xlsx_name.endswith(".xlsx") else f"{xlsx_name}.xlsx")
