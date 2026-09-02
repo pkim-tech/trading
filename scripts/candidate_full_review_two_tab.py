@@ -278,7 +278,7 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
         front = [
             fr["ticker"], counter_formula, node_id,
             _matches_promotion(fr["ticker"], node_id, promoted_ids), k1_fn(fr["ticker"]),
-            fr["strategy"], winner, fr.get("core_cagr_1s"), fr["worst_neighbor_pct"], None,
+            fr["strategy"], winner, _pct100(fr.get("core_cagr_1s")), fr["worst_neighbor_pct"], None,
             fr["trades"], fr["years"], fr["status"],
             fr["addon_compounded_pct"], fr["addon_n"], fr["addon_tranche"], fr["addon_wr_tranche"],
             fr["drought_compounded_pct"], fr["drought_n"], fr["drought_tranche"], fr["drought_wr_verdict"],
