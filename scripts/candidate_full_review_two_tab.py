@@ -88,7 +88,7 @@ from candidate_full_review import (
     k1_status,
 )
 from phase4_candidate_nodes_resolver import derive_phase25_candidates_from_candidate_nodes
-from build_v6_promotion_combined_report import CURATED_HEADERS, MANUAL_BLANK_COLS
+from build_v6_promotion_combined_report import CURATED_HEADERS
 import candidate_report_inmemory as cri
 
 LIVE_DB_PATH = "cache/live/trading_live.db"
@@ -118,6 +118,20 @@ PHASE4_EXTRA_HEADERS = [
     "Phase4 Check11 Max Drawdown %", "Phase4 Check13 Worst Fold Cagr %", "Phase4 Check13 Any Fold Fragile",
     "Phase4 Core/Addon Disagreement",
 ]
+
+# item #3 (2026-09-02): 1-minute-resolution CAGR siblings of Cagr/Cagr Add on/CAGR
+# Drought/CAGR Both, for direct comparison against the primary 1s-resolution numbers
+# (the two can diverge hugely -- confirmed real case, ETHU node 19460: core_both_cagr_1m
+# =531.9% vs. core_both_cagr_1s=114.8%). Placed right after CURATED_HEADERS' 24 columns,
+# LOCAL to this file rather than added to the shared build_v6_promotion_combined_report.
+# CURATED_HEADERS/MANUAL_BLANK_COLS constants -- that module's own write_combined_xlsx
+# independently builds a 24-element `curated` row list keyed to CURATED_HEADERS' current
+# length; growing the shared constant would silently misalign ITS output columns (the
+# 144-col checklist block would land 4 columns early) without touching its own code.
+# TWO_TAB_MANUAL_BLANK_COLS (2, down from the shared MANUAL_BLANK_COLS' 6) keeps this
+# file's own total column count unchanged by the reshuffle (24 + 4 + 2 = 24 + 6 = 30).
+TWO_TAB_1M_HEADERS = ["Cagr (1m)", "Cagr Add on (1m)", "CAGR Drought (1m)", "CAGR Both (1m)"]
+TWO_TAB_MANUAL_BLANK_COLS = 2  # was "U-Z"/6 (shared MANUAL_BLANK_COLS) before item #3; now Y-Z/2
 
 
 def _phase4_extra_by_id(conn, node_ids):
@@ -322,7 +336,15 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
     native source provides) for whatever IS real, and leaves every full-checklist-only
     column (Years, Add on/Drought detail columns, and the entire 144-col checklist block)
     genuinely blank -- never fabricated, never expensively backfilled (that's the whole
-    reason the raw tab stays lightweight-only, see module docstring)."""
+    reason the raw tab stays lightweight-only, see module docstring).
+
+    Returns (front, front_1m, checklist, phase4_extra) -- front_1m (item #3, 2026-09-02)
+    is the 1-minute-resolution sibling of Cagr/Cagr Add on/CAGR Drought/CAGR Both, shown
+    for direct comparison against the primary (1s-resolution, more fill-realistic)
+    columns -- confirmed real case, ETHU node 19460: core_both_cagr_1m=531.9% vs.
+    core_both_cagr_1s=114.8%, a 417pp gap. Always _pct100()'d: both branches source these
+    straight from candidate_verification_results' raw fractions, same convention as
+    core_cagr_1s (unlike the legacy _pct-suffixed FIELDNAMES columns, already x100)."""
     p4 = phase4_extra_by_id.get(node_id) or [None] * len(PHASE4_EXTRA_COLUMNS)
 
     fr = full_review_by_id.get(node_id)
@@ -336,8 +358,10 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
             fr["drought_compounded_pct"], fr["drought_n"], fr["drought_tranche"], fr["drought_wr_verdict"],
             fr["core_addon_cagr_pct"], fr["core_drought_cagr_pct"], fr["core_both_cagr_pct"],
         ]
+        front_1m = [_pct100(fr.get("core_cagr_1m")), _pct100(fr.get("addon_cagr_1m")),
+                    _pct100(fr.get("drought_cagr_1m")), _pct100(fr.get("core_both_cagr_1m"))]
         checklist = [fr.get(h) for h in FIELDNAMES]
-        return front, checklist, p4
+        return front, front_1m, checklist, p4
 
     r = lightweight_row or {}
     core_safe = r.get("core_safe")
@@ -355,34 +379,39 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
         p4[1], None, None, None,
         _pct100(r.get("addon_cagr_1s")), _pct100(r.get("drought_cagr_1s")), _pct100(r.get("core_both_cagr_1s")),
     ]
+    front_1m = [_pct100(r.get("core_cagr_1m")), _pct100(r.get("addon_cagr_1m")),
+                _pct100(r.get("drought_cagr_1m")), _pct100(r.get("core_both_cagr_1m"))]
     checklist = [None] * len(FIELDNAMES)
-    return front, checklist, p4
+    return front, front_1m, checklist, p4
 
 
 def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
                         lightweight_by_id, winner_by_id, phase4_extra_by_id):
-    """Writes one CURATED_HEADERS(24) + MANUAL_BLANK_COLS(6) + FIELDNAMES(144) +
-    PHASE4_EXTRA_HEADERS(10) = 184-column tab for the given `node_ids` in order -- shared
-    by all 4 tabs, see _curated_front_and_checklist's own docstring for the per-row data-
-    sourcing rule. The phase4 block (item #2, 2026-09-02) is appended after the existing
-    174 columns rather than overloaded onto any of them, and is populated uniformly
-    (whichever branch -- Full Review match or lightweight fallback -- supplied the rest of
-    the row) since phase4_results covers the whole core_safe population, not just raw-only
-    rows."""
+    """Writes one CURATED_HEADERS(24) + TWO_TAB_1M_HEADERS(4) + TWO_TAB_MANUAL_BLANK_COLS(2)
+    + FIELDNAMES(144) + PHASE4_EXTRA_HEADERS(10) = 184-column tab for the given `node_ids`
+    in order -- shared by all 4 tabs, see _curated_front_and_checklist's own docstring for
+    the per-row data-sourcing rule. The phase4 block (item #2, 2026-09-02) is appended
+    after the existing 174 columns rather than overloaded onto any of them, and is
+    populated uniformly (whichever branch -- Full Review match or lightweight fallback --
+    supplied the rest of the row) since phase4_results covers the whole core_safe
+    population, not just raw-only rows. The 1m block (item #3, same day) sits right after
+    CURATED_HEADERS, consuming 4 of the original 6 manual-blank columns -- see
+    TWO_TAB_1M_HEADERS' own module-level comment for why it's local to this file."""
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
-    headers = CURATED_HEADERS + [None] * MANUAL_BLANK_COLS + list(FIELDNAMES) + PHASE4_EXTRA_HEADERS
+    headers = (CURATED_HEADERS + TWO_TAB_1M_HEADERS + [None] * TWO_TAB_MANUAL_BLANK_COLS
+               + list(FIELDNAMES) + PHASE4_EXTRA_HEADERS)
     ws.append(headers)
     for cell in ws[1]:
         if cell.value:
             cell.font = Font(bold=True)
     for i, node_id in enumerate(node_ids, start=2):
         counter = f"=COUNTIF($A$2:A{i},A{i})"
-        front, checklist, phase4_extra = _curated_front_and_checklist(
+        front, front_1m, checklist, phase4_extra = _curated_front_and_checklist(
             node_id, promoted_ids, k1_fn, counter, full_review_by_id,
             lightweight_by_id.get(node_id), winner_by_id.get(node_id), phase4_extra_by_id)
-        ws.append(front + [None] * MANUAL_BLANK_COLS + checklist + phase4_extra)
+        ws.append(front + front_1m + [None] * TWO_TAB_MANUAL_BLANK_COLS + checklist + phase4_extra)
     for i, h in enumerate(CURATED_HEADERS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = max(10, min(len(h) + 2, 30))
     ws.freeze_panes = "B2"
@@ -399,13 +428,23 @@ def _enrich_full_review_core_cagr(conn, csv_rows):
     of CAGR over robust_alpha for reporting/ranking (feedback_cagr_over_robust_alpha)."""
     ids = [r["node_id"] for r in csv_rows if r.get("node_id") is not None]
     cagr_map = {}
+    cagr_1m_map = {}
     if ids:
         placeholders = ",".join("?" * len(ids))
         cagr_map = dict(conn.execute(
             f"SELECT candidate_id, core_cagr_1s FROM candidate_verification_results "
             f"WHERE candidate_id IN ({placeholders})", ids))
+        # item #3 (2026-09-02): the 1-minute-resolution siblings, never previously carried
+        # onto the Full-Review-match branch (only core_cagr_1s was pulled here) -- these
+        # ARE raw fractions straight from candidate_verification_results, same as
+        # core_cagr_1s, so the front-row build below still needs _pct100() on them.
+        cagr_1m_map = {row[0]: row[1:] for row in conn.execute(
+            f"SELECT candidate_id, core_cagr_1m, addon_cagr_1m, drought_cagr_1m, core_both_cagr_1m "
+            f"FROM candidate_verification_results WHERE candidate_id IN ({placeholders})", ids)}
     for r in csv_rows:
         r["core_cagr_1s"] = cagr_map.get(r.get("node_id"))
+        m1 = cagr_1m_map.get(r.get("node_id")) or (None, None, None, None)
+        r["core_cagr_1m"], r["addon_cagr_1m"], r["drought_cagr_1m"], r["core_both_cagr_1m"] = m1
     return csv_rows
 
 
@@ -748,8 +787,9 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
         def_ws.cell(row=def_ws.max_row, column=2).alignment = Alignment(wrap_text=True, vertical="top")
     def_ws.append(["node_id join key", "'Node ID' (or Full Review's 'node_id') == candidate_nodes.id on "
                                         "every one of the 4 data tabs -- all 4 share the identical column "
-                                        "layout (CURATED_HEADERS + 6 blank manual + full checklist), so "
-                                        "any row can be cross-referenced to the others directly."])
+                                        "layout (CURATED_HEADERS + 1m-CAGR block + 2 blank manual + full "
+                                        "checklist + phase4 block), so any row can be cross-referenced to "
+                                        "the others directly."])
     def_ws.append(["Winner", "Full Review: always blank (this tab isn't curated -- it's the full scoped "
                               "population). Combined: real category label(s) from this report's own "
                               "curation (Add On/Drought/Best-Both/Best Core/Core fallback). Candidates/"
@@ -786,6 +826,17 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
                     "caught) -- 'Drought %' is the one exception, filled directly since phase4_results."
                     "drought_compounded_pct matches its name+semantics exactly. check8/check11/check13/"
                     "core_addon_disagreement have no existing-column counterpart at all."])
+    def_ws.append(["Cagr (1m) / Cagr Add on (1m) / CAGR Drought (1m) / CAGR Both (1m) (item #3, 2026-09-02)",
+                    "The 1-minute-resolution sibling of the primary Cagr/Cagr Add on/CAGR Drought/CAGR Both "
+                    "columns -- same core_cagr_1m/addon_cagr_1m/drought_cagr_1m/core_both_cagr_1m fields "
+                    "phase5_second_level_overlay_check.py computes and candidate_verification_results "
+                    "stores, at 1-minute bar resolution instead of the primary 1s (1-second) resolution. "
+                    "1-minute is the COARSER, more fill-optimistic of the two (a whole extra minute of "
+                    "intra-bar price movement to pick the most favorable fill inside) -- shown here for "
+                    "direct comparison only; the existing 1s-resolution columns remain the primary/trusted "
+                    "numbers for reporting/ranking, per feedback_cagr_over_robust_alpha's own convention. "
+                    "The two can diverge hugely: confirmed real case, ETHU node 19460, core_both_cagr_1m="
+                    "531.9% vs. core_both_cagr_1s=114.8%, a 417pp gap."])
     def_ws.append(["Generated", _git_provenance_stamp()])
     def_ws.column_dimensions["A"].width = 32
     def_ws.column_dimensions["B"].width = 110
