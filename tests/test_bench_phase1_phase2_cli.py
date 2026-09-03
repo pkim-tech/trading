@@ -269,22 +269,32 @@ def _synthetic_grid_row(tp, sl, hold, window, z, tpct, cagr, trades=10, alpha=10
 def test_find_missing_window_z_top_n_finds_gaps_and_ranks_by_cagr():
     """2026-08-30, planner dispatch: the window/z backfill's core selection logic --
     confirms a (window, z) combo absent from `present_combos` is detected as missing,
-    its own top-2 cells (by cagr) are returned (not top-1, not unranked), and a combo
-    already present is left untouched."""
+    its own top-2 cells are returned (not top-1, not unranked), and a combo already
+    present is left untouched.
+
+    Updated 2026-09-03 (real gap found via paired review, docs/research_log.md's 2026-09-03
+    HIBL entry): find_missing_window_z_top_n now picks up to `top_n` DISTINCT ISLANDS (via
+    pick_island_centers, min_sep=ISLAND_MIN_SEP=6) within a missing combo, not a flat
+    top_n-by-cagr sort -- the old flat sort let ONE strong island consume every backfill
+    slot for a combo, silently starving a second real, distinct island of any
+    representation. Test data updated accordingly: the (5, 2.0) combo's two picks are now
+    well-separated coordinates (2,2) and (20,20), both real distinct islands; a THIRD cell
+    (21,21) sits within min_sep of (20,20) -- same island, not a separate 3rd pick, so it's
+    naturally excluded by pick_island_centers itself, not by a top_n cutoff on a flat sort."""
     df = pd.DataFrame([
-        _synthetic_grid_row(1, 1, 24, 5, 1.0, 0.0, cagr=50.0),   # present combo (5, 1.0)
-        _synthetic_grid_row(2, 2, 24, 5, 2.0, 0.0, cagr=30.0),   # missing combo (5, 2.0) -- top-2
-        _synthetic_grid_row(3, 3, 24, 5, 2.0, 0.0, cagr=25.0),   #   "
-        _synthetic_grid_row(4, 4, 24, 5, 2.0, 0.0, cagr=10.0),   #   3rd-best -- should be excluded
-        _synthetic_grid_row(5, 5, 24, 10, 1.0, 0.0, cagr=5.0),   # missing combo (10, 1.0) -- only 1 row
-        _synthetic_grid_row(6, 6, 24, 10, 2.0, 0.0, cagr=60.0),  # present combo (10, 2.0)
+        _synthetic_grid_row(1, 1, 24, 5, 1.0, 0.0, cagr=50.0),     # present combo (5, 1.0)
+        _synthetic_grid_row(2, 2, 24, 5, 2.0, 0.0, cagr=30.0),     # missing combo (5, 2.0) -- island A
+        _synthetic_grid_row(20, 20, 24, 5, 2.0, 0.0, cagr=25.0),   # missing combo (5, 2.0) -- island B
+        _synthetic_grid_row(21, 21, 24, 5, 2.0, 0.0, cagr=10.0),   #   within min_sep of island B -- same island
+        _synthetic_grid_row(5, 5, 24, 10, 1.0, 0.0, cagr=5.0),     # missing combo (10, 1.0) -- only 1 row
+        _synthetic_grid_row(6, 6, 24, 10, 2.0, 0.0, cagr=60.0),    # present combo (10, 2.0)
     ])
     present = {(5, 1.0), (10, 2.0)}
     missing, rows_by_combo = bench.find_missing_window_z_top_n(
         present, [5, 10], [1.0, 2.0], df, tb_cols=["cagr"], tb_asc=[False], top_n=2)
 
     assert missing == [(5, 2.0), (10, 1.0)]
-    assert [r["take_profit"] for r in rows_by_combo[(5, 2.0)]] == [2, 3]  # top-2 by cagr, not top-1/top-3
+    assert [r["take_profit"] for r in rows_by_combo[(5, 2.0)]] == [2, 20]  # 2 DISTINCT islands, not top-2 flat cagr
     assert [r["take_profit"] for r in rows_by_combo[(10, 1.0)]] == [5]   # only 1 available -- no crash
 
 
@@ -359,20 +369,93 @@ def test_seed_stage_backfill_runs_before_phase25_dispatch():
     test_final_topN_region_filter_does_not_key_on_window_or_z's own source-slicing
     convention above.
 
-    Anchored on the `missing_combos_seed, backfill_seed_rows = find_missing_window_z_top_n(`
-    ASSIGNMENT, not the bare call text (2026-08-30, contextual-review HIGH finding: a later,
-    unrelated Phase1-insurance-snapshot backfill added its OWN find_missing_window_z_top_n(
-    call earlier in this same function's source, so a plain `src.index('find_missing_window_z_
-    top_n(')` silently started matching that call instead and made this assertion vacuous --
-    it still passed, but no longer tested the thing its docstring claims)."""
+    Anchored on the `combos_topped_up_seed, backfill_seed_rows, combos_zero_evidence_seed =
+    top_up_window_z_island_quota(` ASSIGNMENT, not the bare call text (2026-08-30,
+    contextual-review HIGH finding: a later, unrelated Phase1-insurance-snapshot backfill
+    added its OWN find_missing_window_z_top_n( call earlier in this same function's
+    source, so a plain `src.index('find_missing_window_z_top_n(')` silently started
+    matching that call instead and made this assertion vacuous -- it still passed, but no
+    longer tested the thing its docstring claims. Re-anchored again 2026-09-03 (paired-
+    review HIGH finding) when the seed-stage call site itself switched from
+    find_missing_window_z_top_n to top_up_window_z_island_quota -- same class of stale-
+    anchor bug, caught this time before landing instead of after)."""
     import inspect
     src = inspect.getsource(bench.run_one_fixed_sl)
     seed_backfill_idx = src.index(
-        'missing_combos_seed, backfill_seed_rows = find_missing_window_z_top_n(')
+        'combos_topped_up_seed, backfill_seed_rows, combos_zero_evidence_seed = '
+        'top_up_window_z_island_quota(')
     phase25_dispatch_idx = src.index('desc="Phase2.5-cliffbox')
     assert seed_backfill_idx < phase25_dispatch_idx, (
-        "seed-stage window/z backfill must run BEFORE Phase2.5 dispatches, or backfilled "
-        "candidates lose their real cliffbox refinement + cliff-safety verification")
+        "seed-stage window/z island-quota top-up must run BEFORE Phase2.5 dispatches, or "
+        "backfilled candidates lose their real cliffbox refinement + cliff-safety verification")
+
+
+def test_top_up_window_z_island_quota_tops_up_a_partially_present_combo():
+    """2026-09-03: top_up_window_z_island_quota's whole reason for existing over
+    find_missing_window_z_top_n -- a combo with ONE candidate already present (not
+    entirely missing) can still be missing a SECOND real, distinct island in that same
+    combo. Real motivating case: HIBL window=10/z=1.0 had two real islands (TP=2 cagr~60%,
+    TP=28 cagr~52%) -- if TP=2 alone had already won a slot via normal selection (so the
+    combo is NOT "missing" by find_missing_window_z_top_n's presence-only gate), TP=28
+    would never get backfilled at all under the old function. This test reproduces that
+    shape directly: present_df already has ONE row for (5, 1.0) (island A only) -- the
+    unconditional quota must still add island B."""
+    df = pd.DataFrame([
+        _synthetic_grid_row(2, 2, 24, 5, 1.0, 0.0, cagr=60.0),     # island A (already present)
+        _synthetic_grid_row(28, 28, 24, 5, 1.0, 0.0, cagr=52.0),   # island B (should get topped up)
+        _synthetic_grid_row(1, 1, 24, 10, 2.0, 0.0, cagr=10.0),    # a fully-covered combo -- no top-up needed
+    ])
+    present_df = pd.DataFrame([
+        {"take_profit": 2, "stop_loss": 2, "window": 5, "z_score_threshold": 1.0},
+        {"take_profit": 1, "stop_loss": 1, "window": 10, "z_score_threshold": 2.0},
+    ])
+    combos_topped_up, rows_by_combo, zero_evidence = bench.top_up_window_z_island_quota(
+        present_df, [5, 10], [1.0, 2.0], df, tb_cols=["cagr"], tb_asc=[False], top_n=2)
+
+    assert combos_topped_up == [(5, 1.0)]
+    assert [r["take_profit"] for r in rows_by_combo[(5, 1.0)]] == [28]
+    # (5, 2.0) and (10, 1.0) are real gaps in this test's own grid (never given any rows,
+    # not this test's focus) -- correctly reported as zero-evidence, not silently dropped.
+    assert zero_evidence == [(5, 2.0), (10, 1.0)]
+
+
+def test_top_up_window_z_island_quota_overlapping_boxes_dont_double_cover():
+    """2026-09-03, real bug found independently by both independent-cold and contextual
+    paired review: pick_island_centers' separation test is an OR across axes (>=min_sep on
+    EITHER tp or sl), so two genuinely distinct centers can have overlapping +-FINE_RADIUS
+    coverage boxes. A present row inside BOTH boxes must only satisfy its OWN nearest
+    center, not silently cover both -- otherwise one present row can starve a second real
+    island exactly like the original bug this whole fix targets. Centers here: (2,3) and
+    (2,11) are 8 apart in stop_loss (>= ISLAND_MIN_SEP=6, so genuinely distinct islands),
+    but a present row at (2,7) sits within FINE_RADIUS=4 of BOTH (|7-3|=4, |11-7|=4)."""
+    df = pd.DataFrame([
+        _synthetic_grid_row(2, 3, 24, 5, 1.0, 0.0, cagr=60.0),    # island A
+        _synthetic_grid_row(2, 11, 24, 5, 1.0, 0.0, cagr=55.0),   # island B
+    ])
+    present_df = pd.DataFrame([
+        {"take_profit": 2, "stop_loss": 7, "window": 5, "z_score_threshold": 1.0},  # equidistant-ish, nearer to A
+    ])
+    combos_topped_up, rows_by_combo, _ = bench.top_up_window_z_island_quota(
+        present_df, [5], [1.0], df, tb_cols=["cagr"], tb_asc=[False], top_n=2)
+
+    # The present row can cover at most ONE of the two islands -- the other must still be
+    # topped up. (Exact nearest-center tie-break for the (2,7) row isn't the point here;
+    # what matters is that the OTHER island is never silently left uncovered.)
+    assert combos_topped_up == [(5, 1.0)]
+    assert len(rows_by_combo[(5, 1.0)]) == 1
+
+
+def test_top_up_window_z_island_quota_reports_zero_evidence_combos():
+    """2026-09-03: a combo with literally zero computed cells can't be topped up at all --
+    must be reported via the dedicated combos_zero_evidence return value (restored after
+    both independent-cold and contextual review found the original diff silently dropped
+    this diagnostic, contrary to the module's own 'flag loudly, don't silently drop'
+    convention)."""
+    df = pd.DataFrame([_synthetic_grid_row(1, 1, 24, 5, 1.0, 0.0, cagr=50.0)])
+    combos_topped_up, rows_by_combo, zero_evidence = bench.top_up_window_z_island_quota(
+        pd.DataFrame(), [5, 10], [1.0], df, tb_cols=["cagr"], tb_asc=[False], top_n=2)
+    assert zero_evidence == [(10, 1.0)]
+    assert (10, 1.0) not in rows_by_combo
 
 
 def test_find_missing_arm_top_n_finds_gaps_and_ranks_by_cagr():

@@ -441,6 +441,128 @@ def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, tick
     return actually_inserted
 
 
+def _check_live_node_regression(df_final, final_candidates, ticker, strategy_name, fixed_sl,
+                                  entry_timing):
+    """Live-node regression guard (2026-09-03, added per Opus paired-review challenge on
+    the window/z island-quota-diversity fix above -- this is "the actual guarantee
+    mechanism, not the search-method fix itself"). The diversity fix reduces the RISK of a
+    real live node's own config getting silently dropped from final_candidates, but
+    doesn't GUARANTEE it -- there could always be more than top_n distinct islands in a
+    combo, or an entirely different bug. Real motivating case this whole investigation
+    started from: HIBL's arm=28/trail_buy=3 live-promoted node (candidate_nodes id=907)
+    had real evidence (cagr=52.40%) but silently never appeared in v6.5's final_candidates
+    for that ticker -- nothing printed, nothing flagged, discovered only via a separate
+    manual investigation days later.
+
+    Before promotion, checks every CURRENTLY-LIVE watch_list node matching this exact
+    (ticker, strategy, fixed_sl, entry_timing) scope against df_final (the full
+    Phase1+Phase2+Phase2.5 evidence pool this run computed) and final_candidates (what's
+    about to be promoted). Reuses _reverse_map_generic_task -- the SAME mapping seed mode
+    uses -- rather than a second, possibly-diverging implementation. Three outcomes per
+    live node: (1) its exact coordinate IS in final_candidates -- silent, nothing to flag;
+    (2) it has real evidence in df_final but ISN'T in final_candidates -- loud WARNING with
+    its real cagr + full config, since that's a live node whose backtest performance this
+    campaign run silently disagrees should be a candidate at all; (3) no evidence in
+    df_final at all (off-grid, or genuinely never computed this run) -- a quieter notice,
+    since this function can't verify a coordinate with zero evidence either way.
+
+    Read-only: never blocks promotion, never mutates final_candidates -- flags a real gap
+    for a human to notice and investigate, matching this module's existing "flag loudly,
+    don't silently drop" convention (see the WARNING prints throughout this file for
+    island-count shortfalls).
+
+    Hardened (2026-09-03, cold-review HIGH finding): this runs right before the ONLY
+    candidate_nodes write, after potentially hours of Phase1/2/2.5 compute -- a diagnostic
+    guard must never be able to discard a run's real promotion. Wrapped in a blanket
+    try/except (a bug in the guard itself must degrade to a loud skip notice, not an
+    unhandled exception that loses the whole run's output) and opens the live DB read-only
+    via a `file:...?mode=ro` URI (default sqlite3.connect silently CREATES an empty DB file
+    if trading_live.db is somehow missing, then fails with a confusing "no such table"
+    instead of a clear "file not found or no read access") with the connection explicitly
+    closed in a finally block (`with sqlite3.connect(...)` commits on exit but does NOT
+    close the connection -- a real, easy-to-miss quirk of that context manager -- this
+    function runs once per fixed_sl scope in a campaign, so a real per-scope fd leak on the
+    live trading DB otherwise).
+
+    Scope accounting (2026-09-03, contextual-review HIGH finding): a live node whose
+    strategy/fixed_sl/entry_timing doesn't match THIS run's scope literally can't be
+    checked against this run's own df_final (nonsensical to compare across scopes), but
+    silently saying nothing about it is the same silent-absence failure this guard exists
+    to prevent -- prints an explicit "N live node(s) for this ticker are outside this run's
+    scope, not checked here" notice instead, so "guard ran and found nothing" and "guard
+    silently skipped everything" are never confused for one another."""
+    try:
+        live_db_path = os.path.join(ROOT, "cache", "live", "trading_live.db")
+        conn = sqlite3.connect(f"file:{live_db_path}?mode=ro", uri=True, timeout=60.0)
+        try:
+            conn.row_factory = sqlite3.Row
+            all_ticker_rows = conn.execute(
+                "SELECT * FROM watch_list WHERE ticker=? AND state='live' AND archived_at IS NULL",
+                (ticker,)).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"  LIVE-NODE GUARD: skipped for ticker={ticker} -- could not read "
+              f"trading_live.db ({type(e).__name__}: {e}).")
+        return
+    if not all_ticker_rows:
+        return
+
+    in_scope_ids = set()
+    in_scope_rows = []
+    for r in all_ticker_rows:
+        if (r["strategy"] == strategy_name and float(r["fixed_sl"]) == float(fixed_sl)
+                and r["entry_timing"] == entry_timing):
+            in_scope_ids.add(r["id"])
+            in_scope_rows.append(r)
+    out_of_scope_ids = [r["id"] for r in all_ticker_rows if r["id"] not in in_scope_ids]
+    if out_of_scope_ids:
+        print(f"  LIVE-NODE GUARD: {len(out_of_scope_ids)} live node(s) for {ticker} "
+              f"(watch_list id(s) {out_of_scope_ids}) are outside this run's scope "
+              f"(strategy={strategy_name!r} fixed_sl={fixed_sl} entry_timing={entry_timing!r}) "
+              f"-- not checked here, only checkable by a run covering their own scope.")
+    if not in_scope_rows:
+        return
+
+    try:
+        claimed_keys = {
+            (int(c["take_profit"]), int(c["stop_loss"]), int(c["max_hold_hours"]), int(c["window"]),
+             float(c["z_score_threshold"]), float(c["trail_sell_pct"]))
+            for c in final_candidates
+        }
+        for row in in_scope_rows:
+            row = dict(row)
+            try:
+                task = _reverse_map_generic_task(row, strategy_name)
+            except (ValueError, TypeError) as e:
+                print(f"  LIVE-NODE GUARD: watch_list id={row['id']} ticker={ticker} -- could not "
+                      f"reverse-map for regression check ({e}), skipped.")
+                continue
+            tp, sl, hold, w, z, tpct = task
+            if (tp, sl, hold, w, z, tpct) in claimed_keys:
+                continue
+            evidence = df_final[
+                (df_final["take_profit"] == tp) & (df_final["stop_loss"] == sl)
+                & (df_final["max_hold_hours"] == hold) & (df_final["window"] == w)
+                & (df_final["z_score_threshold"] == z) & (df_final["trail_sell_pct"] == tpct)
+                & df_final["cagr"].notna()
+            ]
+            if evidence.empty:
+                print(f"  LIVE-NODE GUARD: watch_list id={row['id']} ticker={ticker} config "
+                      f"(TP={tp} SL={sl} hold={hold}h w={w} z={z} tpct={tpct}) has NO evidence in "
+                      f"this run's df_final -- off-grid or never computed, can't verify.")
+                continue
+            cagr = float(evidence.iloc[0]["cagr"])
+            print(f"  LIVE-NODE GUARD WARNING: watch_list id={row['id']} ticker={ticker} live node "
+                  f"config (TP={tp} SL={sl} hold={hold}h w={w} z={z} tpct={tpct}, cagr={cagr:.2f}%) "
+                  f"has real evidence in df_final but is NOT in final_candidates -- dropped by "
+                  f"selection. Investigate before treating this campaign's output as "
+                  f"authoritative for this ticker.")
+    except Exception as e:
+        print(f"  LIVE-NODE GUARD: aborted mid-check for ticker={ticker} "
+              f"({type(e).__name__}: {e}) -- not all live nodes for this scope were verified.")
+
+
 def _clear_prior_seed_mode_table_rows(table_name, strategy_name, config_version, ticker, fixed_sl):
     """Seed mode only (2026-08-29, paired review rounds 4-5): deletes THIS version's
     PRIOR rows in ONE table before a new seed run writes its own output to that same
@@ -647,6 +769,60 @@ def _log_sweep_run_finish(run_id, n_final_candidates, n_candidate_nodes_written,
         conn.commit()
 
 
+def _reverse_map_generic_task(row, strategy_name):
+    """Reverse-maps a watch_list row's flat strategy-specific SL/trail columns back into
+    the generic (tp, sl, hold, w, z, tpct) axis-value tuple phase1_tasks/df_final's own
+    take_profit/stop_loss/trail_sell_pct columns expect -- the exact INVERSE of
+    _insert_candidate_nodes_rows' forward mapping (same sl_axis_col/fourth_axis_col
+    branches, read backwards). Extracted (2026-09-03) out of _load_seed_node so
+    _check_live_node_regression (the new live-node-dropped-from-final-selection guard)
+    reuses the IDENTICAL mapping instead of a second, hand-copied implementation --
+    see feedback_backtest_cache_axis_column_remapping in agent memory for why that's a
+    real, previously-hit bug class in this codebase, not a hypothetical risk.
+
+    Forward mapping (for reference, from _insert_candidate_nodes_rows):
+        arm_pct = generic tp always (direct passthrough, no strategy-dependent case)
+        sl_axis_col == 'trail_buy_pct': trail_buy_pct = generic sl;
+            trail_sell_pct = generic tpct (4th axis) if fourth_axis_col == 'trail_pct' else 0.0
+        sl_axis_col == 'trail_pct':     trail_buy_pct = 0.0; trail_sell_pct = generic sl
+        else (sl_axis_col == 'stop_loss'): trail_buy_pct = trail_sell_pct = 0.0
+
+    Raises ValueError (not SystemExit -- callers decide whether a bad row is fatal or
+    just skippable) on a NULL tp-axis value or a non-integer tp/sl axis value (Phase1/
+    Phase2/Phase2.5's tp/sl mesh is integer-only by design -- range()-walked boxes,
+    integer-only campaign_config grids; a fractional value would silently round to a
+    DIFFERENT node, e.g. a canary node's arm_sell_pct=0.1 silently becoming node 0)."""
+    sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
+    raw_generic_tp = row["arm_sell_pct"] if strategy_name == 'TrailingBothZScoreBreakout' \
+        else row["take_profit"]
+    if raw_generic_tp is None:
+        raise ValueError(
+            f"tp-axis value is NULL (strategy={strategy_name!r}, looked in "
+            f"{'arm_sell_pct' if strategy_name == 'TrailingBothZScoreBreakout' else 'take_profit'})")
+    generic_tp = float(raw_generic_tp)
+    if sl_axis_col == 'trail_buy_pct':
+        generic_sl = float(row["trail_buy_pct"])
+        generic_tpct = float(row["trail_sell_pct"]) if fourth_axis_col == 'trail_pct' else 0.0
+    elif sl_axis_col == 'trail_pct':
+        generic_sl = float(row["trail_sell_pct"])
+        generic_tpct = 0.0
+    else:
+        generic_sl = float(row["stop_loss"])
+        generic_tpct = 0.0
+
+    def _require_integer(value, axis_name):
+        rounded = int(round(value))
+        if abs(rounded - value) > 1e-9:
+            raise ValueError(
+                f"{axis_name} axis value {value} is fractional -- Phase1/Phase2/Phase2.5's "
+                f"tp/sl mesh is integer-only by design; not supported.")
+        return rounded
+
+    return (_require_integer(generic_tp, "tp"), _require_integer(generic_sl, "sl"),
+            int(row["max_hold_hours"]), int(row["window"]), float(row["z_score_threshold"]),
+            float(generic_tpct))
+
+
 def _load_seed_node(watch_list_id):
     """Smoke-test seed mode (2026-08-29): loads a real live watch_list row and
     reverse-maps its flat strategy-specific SL/trail columns back into the generic
@@ -718,39 +894,10 @@ def _load_seed_node(watch_list_id):
         raise SystemExit(f"--seed-watch-list-id {watch_list_id}: fixed_sl is NULL on this row.")
 
     sl_axis_col, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
-
-    raw_generic_tp = row["arm_sell_pct"] if strategy_name == 'TrailingBothZScoreBreakout' \
-        else row["take_profit"]
-    if raw_generic_tp is None:
-        raise SystemExit(
-            f"--seed-watch-list-id {watch_list_id}: tp-axis value is NULL (strategy="
-            f"{strategy_name!r}, looked in "
-            f"{'arm_sell_pct' if strategy_name == 'TrailingBothZScoreBreakout' else 'take_profit'}"
-            f") -- can't seed from this row.")
-    generic_tp = float(raw_generic_tp)
-    if sl_axis_col == 'trail_buy_pct':
-        generic_sl = float(row["trail_buy_pct"])
-        generic_tpct = float(row["trail_sell_pct"]) if fourth_axis_col == 'trail_pct' else 0.0
-    elif sl_axis_col == 'trail_pct':
-        generic_sl = float(row["trail_sell_pct"])
-        generic_tpct = 0.0
-    else:
-        generic_sl = float(row["stop_loss"])
-        generic_tpct = 0.0
-
-    def _require_integer(value, axis_name):
-        rounded = int(round(value))
-        if abs(rounded - value) > 1e-9:
-            raise SystemExit(
-                f"--seed-watch-list-id {watch_list_id}: {axis_name} axis value {value} is "
-                f"fractional -- Phase1/Phase2/Phase2.5's tp/sl mesh is integer-only by design "
-                f"(range()-walked boxes, integer-only campaign_config grids); seeding from "
-                f"this value would silently round it to a DIFFERENT node. Not supported.")
-        return rounded
-
-    task = (_require_integer(generic_tp, "tp"), _require_integer(generic_sl, "sl"),
-            int(row["max_hold_hours"]), int(row["window"]), float(row["z_score_threshold"]),
-            float(generic_tpct))
+    try:
+        task = _reverse_map_generic_task(row, strategy_name)
+    except ValueError as e:
+        raise SystemExit(f"--seed-watch-list-id {watch_list_id}: {e}")
     seed = {
         "ticker": row["ticker"],
         "strategy_name": strategy_name,
@@ -789,8 +936,12 @@ def find_missing_window_z_top_n(present_combos, windows, z_thresholds, df_source
                                   top_n=2):
     """Extracted (2026-08-30, planner dispatch, paired-review fix -- same "so a test can
     assert against the actual production code path instead of a re-implementation" reasoning
-    as build_phase1_tasks_grid above), and used at TWO call sites in run_one_fixed_sl -- see
-    each call site's own comment for why one function serves both.
+    as build_phase1_tasks_grid above). Used only at the Phase1-insurance-snapshot call site
+    in run_one_fixed_sl as of 2026-09-03 -- the Phase2.5-seed and final-stage backfill call
+    sites were switched to top_up_window_z_island_quota (see that function's own docstring),
+    a stricter unconditional-per-combo-quota generalization of this one; kept here
+    unchanged for the insurance snapshot, which doesn't need that generalization (it's a
+    debug-only raw union, not a promotion decision).
 
     Real gap this closes: a pooled top-N_ISLANDS x top-3 selection over ALL (window, z) combos
     at once -- confirmed empirically (2026-08-30) that this leaves an average 11.0 of 16
@@ -800,15 +951,29 @@ def find_missing_window_z_top_n(present_combos, windows, z_thresholds, df_source
 
     Pure/read-only: does NOT mutate `df_source` or append anywhere -- callers decide what to
     do with the returned rows (seed a cliffbox sweep, or promote directly to candidate_nodes).
-    For every (window, z) combo not in `present_combos`, returns its own top-`top_n` rows (by
-    cagr, `tb_cols`/`tb_asc` tiebreak, `cagr` not null) from `df_source`, regardless of how
-    weak they look -- no CAGR floor, deliberately: filtering risks hiding a real region the
-    same way the pooled cut already does.
+    For every (window, z) combo not in `present_combos`, returns up to `top_n` rows from
+    `df_source` (cagr not null), regardless of how weak they look -- no CAGR floor,
+    deliberately: filtering risks hiding a real region the same way the pooled cut already does.
+
+    Diversified by distinct island, not a flat cagr sort (2026-09-03, real research finding --
+    see docs/research_log.md's 2026-09-03 HIBL entry): HIBL window=10/z=1.0 has TWO real,
+    distinct islands in this combo's own pool -- TP=2 (cagr ~60%) and TP=28 (cagr ~52%, the
+    real live-promoted node's own region) -- but the ORIGINAL flat `pool_wz.sort_values(...)
+    .head(top_n)` let TP=2's stronger cells consume BOTH of this combo's 2 backfill slots,
+    leaving TP=28's real island with ZERO representation even though its own (window, z) combo
+    WAS correctly identified as missing and in scope for backfill. Fixed by picking up to
+    `top_n` DISTINCT island centers within the missing combo's own pool via pick_island_centers
+    (same function/min_sep every other island-picking call site in this codebase already uses)
+    and taking each island's own single best cell (`tb_cols`/`tb_asc` tiebreak) -- not top_n
+    rows off one flat sort. A combo with only one real island still returns just one row
+    (pick_island_centers naturally returns fewer than n if fewer islands exist), same as
+    before.
 
     Returns (missing_combos, rows_by_combo) -- `rows_by_combo[(w, z)]` is a list of up to
-    `top_n` pandas Series (empty list if `df_source` has zero evidence at all for that combo,
-    e.g. every cell had trades=0 -- distinguishable from "found some, took top_n" so a caller
-    can report the two cases differently instead of treating them the same)."""
+    `top_n` pandas Series, one per distinct island found (empty list if `df_source` has zero
+    evidence at all for that combo, e.g. every cell had trades=0 -- distinguishable from
+    "found some, took up to top_n" so a caller can report the two cases differently instead of
+    treating them the same)."""
     all_combos = {(w, z) for w in windows for z in z_thresholds}
     missing_combos = sorted(all_combos - present_combos)
     rows_by_combo = {}
@@ -818,9 +983,115 @@ def find_missing_window_z_top_n(present_combos, windows, z_thresholds, df_source
         if pool_wz.empty:
             rows_by_combo[(w, z)] = []
             continue
-        pool_wz = pool_wz.sort_values(tb_cols, ascending=tb_asc)
-        rows_by_combo[(w, z)] = [row for _, row in pool_wz.head(top_n).iterrows()]
+        centers_wz = pick_island_centers(pool_wz, n=top_n, rank_col="cagr")
+        picked = []
+        for tp_c, sl_c in centers_wz:
+            region = pool_wz[(pool_wz["take_profit"] - tp_c).abs().le(FINE_RADIUS)
+                              & (pool_wz["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
+            if region.empty:
+                continue
+            region = region.sort_values(tb_cols, ascending=tb_asc)
+            picked.append(region.iloc[0])
+        rows_by_combo[(w, z)] = picked
     return missing_combos, rows_by_combo
+
+
+def top_up_window_z_island_quota(present_df, windows, z_thresholds, df_source, tb_cols, tb_asc,
+                                   top_n=2):
+    """Unconditional generalization of find_missing_window_z_top_n above (2026-09-03, real
+    gap found via Opus paired-review challenge on the diversify-by-island fix above): that
+    function only backfills a (window, z) combo that is ENTIRELY absent from the caller's
+    current selection -- a combo with even ONE candidate already present (e.g. one of its
+    own real islands happened to win a global N_ISLANDS=3 slot via normal pooled selection)
+    is treated as "covered" and never checked again, so a SECOND real, distinct island in
+    that same combo can still be silently lost with no backfill mechanism to catch it. This
+    function instead checks EVERY (window, z) combo in the full grid, unconditionally,
+    against a real per-combo quota: up to `top_n` distinct islands guaranteed represented,
+    topping up whichever of a combo's own real islands aren't already covered by an
+    existing `present_df` row -- regardless of whether that combo already had some other
+    presence. Estimated cost is roughly an ADDITIONAL ~1.2x multiplier ON TOP OF (not
+    instead of, and not "well under") the ~1.73x downstream Phase2.5/Phase4/5 cost already
+    accepted 2026-08-30 for the original window/z backfill -- worst case (every combo
+    needs a full extra island) is bounded by 16 combos x top_n=2 = 32 rows vs the original
+    mechanism's ~22, and in practice most combos need at most one additional row (this
+    only tops up the shortfall, never re-adds an already-covered island) -- corrected
+    2026-09-03, contextual-review MEDIUM finding: the ORIGINAL version of this comment
+    justified the 1.2x by claiming "most combos are already fully covered," which
+    contradicts this codebase's own empirical finding (an average 11.0 of 16 combos have
+    ZERO representation pre-backfill) -- the 1.2x estimate itself was never wrong, just
+    its stated reason, which risked a future session re-deriving a wrong cost model from it.
+
+    `present_df` -- a DataFrame of whatever candidates the caller currently has (any
+    source: island selection, an earlier backfill pass, etc), with at least take_profit/
+    stop_loss/window/z_score_threshold columns. May be empty (pd.DataFrame()) -- every
+    combo is then treated as fully uncovered, equivalent to find_missing_window_z_top_n's
+    original all-combos-missing case.
+
+    Coverage assigned by NEAREST center, not "within FINE_RADIUS of ANY center" (2026-09-03,
+    fixed a real bug both independent-cold and contextual review converged on
+    independently): pick_island_centers' own separation test is an OR across axes --
+    `abs(tp-c0) >= min_sep OR abs(sl-c1) >= min_sep` -- so two genuinely distinct centers
+    CAN have overlapping +-FINE_RADIUS boxes (e.g. centers 6 apart in stop_loss but only 2
+    apart in take_profit). The original "is any present row within FINE_RADIUS of this
+    center" check would then let ONE present row satisfy TWO centers' coverage
+    simultaneously, silently starving the second real island of any top-up -- reproduced
+    concretely by the cold reviewer with an overlapping-centers pool. Fixed by assigning
+    each present row to its OWN single nearest center (Chebyshev distance, matching the
+    box-radius shape) BEFORE checking coverage -- a present row can satisfy at most one
+    center's quota slot, exactly like the per-island top-3 selection elsewhere in this
+    file already does per-island, not per-arbitrary-box.
+
+    Returns (combos_topped_up, rows_by_combo, combos_zero_evidence) -- combos_topped_up is
+    the sorted list of (w, z) combos that needed at least one new row; a combo needing zero
+    top-up (already fully covered) is absent from both, not present with an empty list --
+    this is a coverage-repair pass, not a presence report, so "needed nothing" and "found
+    nothing to add despite a gap" are NOT the same case here (unlike find_missing_window_z_
+    top_n's own empty-list-vs-absent-key contract, which answers a different question).
+    combos_zero_evidence (2026-09-03, restored a real diagnostic both reviews found
+    silently dropped -- see find_missing_window_z_top_n's own "zero evidence" distinction)
+    is the sorted list of (w, z) combos with literally zero computed cells (every cell had
+    trades=0, or no cell was ever computed) -- these can't be topped up at all, and were
+    previously invisible in the run log, contrary to this module's "flag loudly, don't
+    silently drop" convention."""
+    all_combos = {(w, z) for w in windows for z in z_thresholds}
+    rows_by_combo = {}
+    combos_topped_up = []
+    combos_zero_evidence = []
+    for w, z in sorted(all_combos):
+        pool_wz = df_source[(df_source["window"] == w) & (df_source["z_score_threshold"] == z)
+                             & df_source["cagr"].notna()]
+        if pool_wz.empty:
+            combos_zero_evidence.append((w, z))
+            continue
+        centers_wz = pick_island_centers(pool_wz, n=top_n, rank_col="cagr")
+        if present_df.empty:
+            present_wz = present_df
+        else:
+            present_wz = present_df[(present_df["window"] == w)
+                                     & (present_df["z_score_threshold"] == z)]
+        covered_centers = set()
+        if not present_wz.empty and centers_wz:
+            for _, prow in present_wz.iterrows():
+                nearest = min(
+                    centers_wz,
+                    key=lambda c: max(abs(prow["take_profit"] - c[0]), abs(prow["stop_loss"] - c[1])))
+                if max(abs(prow["take_profit"] - nearest[0]),
+                       abs(prow["stop_loss"] - nearest[1])) <= FINE_RADIUS:
+                    covered_centers.add(nearest)
+        new_rows = []
+        for tp_c, sl_c in centers_wz:
+            if (tp_c, sl_c) in covered_centers:
+                continue
+            region = pool_wz[(pool_wz["take_profit"] - tp_c).abs().le(FINE_RADIUS)
+                              & (pool_wz["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
+            if region.empty:
+                continue
+            region = region.sort_values(tb_cols, ascending=tb_asc)
+            new_rows.append(region.iloc[0])
+        if new_rows:
+            rows_by_combo[(w, z)] = new_rows
+            combos_topped_up.append((w, z))
+    return combos_topped_up, rows_by_combo, combos_zero_evidence
 
 
 def find_missing_arm_top_n(present_arms, all_arms, df_source, tb_cols, tb_asc, top_n=3):
@@ -1934,6 +2205,11 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
 
     phase25_tasks = set()
     seed_count = 0
+    # seed_candidate_rows (2026-09-03): the actual seed candidate rows themselves (not
+    # phase25_tasks' own expanded cliffbox contents -- same "expansion inflates coverage"
+    # trap seed_arms_seeded below already avoids on the take_profit axis) -- feeds
+    # top_up_window_z_island_quota's per-(window,z) coverage check below.
+    seed_candidate_rows = []
     # seed_arms_seeded (2026-08-30, paired-review MEDIUM finding, both independent-cold
     # and contextual review of the arm_pct backfill diff): tracks the ACTUAL take_profit
     # value of every real seed cell fed into cliffbox_tasks_for_cell -- NOT derived from
@@ -1959,6 +2235,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
         for _, cand in region.head(3).iterrows():
             seed_count += 1
             seed_arms_seeded.add(int(cand["take_profit"]))
+            seed_candidate_rows.append(cand)
             phase25_tasks |= cliffbox_tasks_for_cell(cand, TRAIL_PCTS)
 
     print(f"\nPhase2.5-cliffbox (in-memory): {seed_count} seed cells across "
@@ -1998,9 +2275,19 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # filter). A combo skipped here still gets promoted at final stage from whatever
     # (possibly coarser, unrefined) data df_final already has for it -- same posture the
     # ORIGINAL per-island path already accepts for a below-floor island region.
-    seed_present_combos = {(t[3], t[4]) for t in phase25_tasks}
-    missing_combos_seed, backfill_seed_rows = find_missing_window_z_top_n(
-        seed_present_combos, WINDOWS, Z_THRESHOLDS, df_full, tb_cols, tb_asc, top_n=2)
+    # top_up_window_z_island_quota (2026-09-03, real gap found via Opus paired-review
+    # challenge on the original diversify-by-island fix -- see that function's own
+    # docstring): UNCONDITIONAL per-(window,z) quota, not gated on "this combo has zero
+    # representation" -- a combo with ONE seed already present (via normal N_ISLANDS=3
+    # pooled selection) can still be missing a SECOND real, distinct island in that same
+    # combo, which find_missing_window_z_top_n's presence-only gate would never catch.
+    # present_df built from the actual seed candidate rows themselves (seed_candidate_
+    # rows), not phase25_tasks' own expanded cliffbox contents -- same "expansion
+    # inflates coverage" trap seed_arms_seeded already avoids on the take_profit axis
+    # (see that variable's own comment above).
+    seed_present_df = pd.DataFrame(seed_candidate_rows) if seed_candidate_rows else pd.DataFrame()
+    combos_topped_up_seed, backfill_seed_rows, combos_zero_evidence_seed = top_up_window_z_island_quota(
+        seed_present_df, WINDOWS, Z_THRESHOLDS, df_full, tb_cols, tb_asc, top_n=2)
     backfill_seed_count = 0
     backfill_seed_skipped_low_cagr = []
     for combo, rows in backfill_seed_rows.items():
@@ -2011,22 +2298,23 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
             seed_arms_seeded.add(int(cand["take_profit"]))
             phase25_tasks |= cliffbox_tasks_for_cell(cand, TRAIL_PCTS)
             backfill_seed_count += 1
-    if missing_combos_seed:
-        zero_evidence_seed = [c for c, rows in backfill_seed_rows.items() if not rows]
-        print(f"Window/z backfill (seed stage): {len(missing_combos_seed)} combo(s) with zero "
-              f"representation among the normal Phase2.5 seed picks -- adding "
-              f"{backfill_seed_count} extra seed cell(s) (top-2 each, from raw Phase1+Phase2 "
-              f"data) into the SAME cliffbox sweep so they get real refinement + cliff-safety "
-              f"verification, not a bypass: {missing_combos_seed}")
-        if zero_evidence_seed:
-            print(f"  {len(zero_evidence_seed)} of those had NO evidence at all (every cell "
-                  f"had trades=0) -- 0 seed cells added: {zero_evidence_seed}")
+    if combos_topped_up_seed:
+        print(f"Window/z island-quota top-up (seed stage): {len(combos_topped_up_seed)} combo(s) "
+              f"had at least one of their own real islands under-represented (unconditional "
+              f"per-combo quota check, not just zero-representation combos) -- adding "
+              f"{backfill_seed_count} extra seed cell(s) (from raw Phase1+Phase2 data) into "
+              f"the SAME cliffbox sweep so they get real refinement + cliff-safety "
+              f"verification, not a bypass: {combos_topped_up_seed}")
         if backfill_seed_skipped_low_cagr:
             print(f"  {len(backfill_seed_skipped_low_cagr)} seed cell(s) skipped cliffbox "
                   f"expansion (top cagr <= {PHASE25_ISLAND_CLIFFBOX_CAGR_MIN} or NaN, same floor "
                   f"the normal per-island loop uses) -- still eligible for final-stage "
                   f"promotion from unrefined data, just not densified: {backfill_seed_skipped_low_cagr}")
         print(f"  Cliff-box cells to verify after backfill: {len(phase25_tasks):,} total")
+    if combos_zero_evidence_seed:
+        print(f"  {len(combos_zero_evidence_seed)} window/z combo(s) have NO evidence at all "
+              f"(every cell had trades=0, or none computed) -- can't be topped up: "
+              f"{combos_zero_evidence_seed}")
 
     # arm_pct (take_profit) backfill -- SEED stage (2026-08-30, planner dispatch): same
     # two-stage requirement as the window/z backfill above, on a different axis -- a
@@ -2190,17 +2478,26 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # candidate_nodes column, NOT `comment` -- see _insert_candidate_nodes_rows for why the
     # original `comment`-reuse plan was dropped after paired review) so a later report can
     # separate "won via island selection" from "backfilled for window/z coverage".
-    present_combos_final = {(c["window"], c["z_score_threshold"]) for c in final_candidates}
-    missing_combos, backfill_final_rows = find_missing_window_z_top_n(
-        present_combos_final, WINDOWS, Z_THRESHOLDS, df_final, tb_cols, tb_asc, top_n=2)
+    # top_up_window_z_island_quota, not find_missing_window_z_top_n (2026-09-03, real gap
+    # found via Opus paired-review challenge -- see that function's own docstring and the
+    # seed-stage call site's matching comment above): UNCONDITIONAL per-(window,z) quota,
+    # not gated on "this combo has zero representation" -- final_candidates may already
+    # contain ONE real candidate for a combo (via island selection or the seed-stage
+    # top-up above) while a SECOND real, distinct island in that same combo is still
+    # missing. present_df built straight from final_candidates itself (a list of dicts ->
+    # DataFrame, already carries take_profit/stop_loss/window/z_score_threshold).
+    final_present_df = pd.DataFrame(final_candidates) if final_candidates else pd.DataFrame()
+    combos_topped_up, backfill_final_rows, combos_zero_evidence_final = top_up_window_z_island_quota(
+        final_present_df, WINDOWS, Z_THRESHOLDS, df_final, tb_cols, tb_asc, top_n=2)
     backfilled_count = 0
     for combo, rows in backfill_final_rows.items():
         for cand in rows:
             key = (int(cand["take_profit"]), int(cand["stop_loss"]), int(cand["max_hold_hours"]),
                    int(cand["window"]), float(cand["z_score_threshold"]), float(cand["trail_sell_pct"]))
             if key in claimed:
-                continue  # already promoted via island selection -- shouldn't happen for a
-                          # combo we just confirmed has zero representation, but safe either way
+                continue  # already promoted via island selection or an earlier top-up --
+                          # shouldn't happen for a coordinate we just confirmed was
+                          # under-represented, but safe either way
             c = {
                 "island": None, "take_profit": key[0], "stop_loss": key[1],
                 "max_hold_hours": key[2], "window": key[3], "z_score_threshold": key[4],
@@ -2212,14 +2509,14 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
             claimed[key] = c
             final_candidates.append(c)
             backfilled_count += 1
-    if missing_combos:
-        combos_with_zero_evidence = [c for c, rows in backfill_final_rows.items() if not rows]
-        print(f"\nBackfilled {backfilled_count} candidate(s) across {len(missing_combos)} "
-              f"window/z combo(s) with zero island representation (top-2 each, where evidence "
-              f"existed): {missing_combos}")
-        if combos_with_zero_evidence:
-            print(f"  {len(combos_with_zero_evidence)} of those had NO evidence at all (every "
-                  f"cell had trades=0) -- contributed 0, not 2: {combos_with_zero_evidence}")
+    if combos_topped_up:
+        print(f"\nBackfilled {backfilled_count} candidate(s) across {len(combos_topped_up)} "
+              f"window/z combo(s) with at least one under-represented island (unconditional "
+              f"per-combo quota check, not just zero-representation combos): {combos_topped_up}")
+    if combos_zero_evidence_final:
+        print(f"  {len(combos_zero_evidence_final)} window/z combo(s) have NO evidence at all "
+              f"(every cell had trades=0, or none computed) -- can't be topped up: "
+              f"{combos_zero_evidence_final}")
 
     # arm_pct (take_profit) backfill -- FINAL stage (2026-08-30, planner dispatch): same
     # shape as the window/z final-stage block above, on the take_profit axis instead --
@@ -2310,6 +2607,11 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
               f"cagr={c['cagr']:.2f}% trades={c['trades']} "
               f"| worst_neighbor_cagr={wnc_str} "
               f"(n={c['n_neighbors_checked']})")
+
+    # Live-node regression guard (2026-09-03) -- runs BEFORE promotion, read-only, never
+    # blocks the write below. See _check_live_node_regression's own docstring.
+    _check_live_node_regression(df_final, final_candidates, TICKER, strategy_name, fixed_sl,
+                                 ENTRY_TIMING)
 
     # Top-9 write: promotion into candidate_nodes (NOT backtest_cache -- per the
     # "neither top-100 nor top-9 belongs in backtest_cache" design conclusion, the
