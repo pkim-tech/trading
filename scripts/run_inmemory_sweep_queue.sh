@@ -699,3 +699,24 @@ echo " In-memory sweep queue start — $(date)"
   echo ""
   echo "All done — $(date)"
   $PYTHON scripts/campaign_registry.py status --campaign-id "$CAMPAIGN_ID"
+
+  # Phase 10 report (2026-09-03, docs/backlog_cache.md's "wire Phase 10 report generation
+  # into the sweep pipeline" entry) -- run ONCE here, after the drain loop exits cleanly
+  # (every ticker's Phase1-5 done, not on an early-exit/FATAL abort above), never per-
+  # ticker: the report is a cross-ticker comparison table (Best Core/Add On/Drought/
+  # Best-Both category winners), it only makes sense once the whole campaign's real
+  # candidates exist. --version "$VERSION" with no --tickers discovers every real ticker
+  # this campaign actually produced candidate_nodes rows for -- correct scope for "the
+  # whole campaign," not just the $TICKERS this particular invocation's env started with
+  # (a later `enqueue`-appended ticker, per this script's own documented use case above,
+  # would otherwise be silently missing from the report). Best-effort: a report-generation
+  # failure here must not read as "the campaign itself failed" -- the real sweep/Phase4/5
+  # work is already done and persisted by this point regardless of this call's outcome.
+  ticker_banner "Phase 10 report (candidate_full_review_two_tab.py) start"
+  $PYTHON scripts/candidate_full_review_two_tab.py --version "$VERSION"
+  rc10=$?
+  if [ $rc10 -ne 0 ]; then
+    echo "WARNING: Phase 10 report generation failed (exit code $rc10) -- campaign's real "
+    echo "Phase1-5 work above is unaffected; re-run scripts/candidate_full_review_two_tab.py "
+    echo "--version \"$VERSION\" manually once the underlying issue is fixed."
+  fi
