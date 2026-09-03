@@ -43,20 +43,32 @@ Logic:
      reused as a subprocess -- not reimplemented)? If yes: quiet Slack confirmation,
      done. Nothing else in this script runs.
   2. If NOT running: read scripts/schwab_auth_canary.py's persisted state file
-     directly (cache/live/schwab_auth_canary_state.json) -- does NOT re-probe Schwab
-     itself (the canary already ran within the last hour; a second probe here would
-     be redundant real-API-call load for no new information).
-     - State missing, unreadable, or stale (last_checked_at more than
-       STALE_STATE_MAX_HOURS old): CANNOT CONFIRM healthy -- never starts the daemon
-       regardless of --live, alerts distinctly from "confirmed broken" so a human
-       knows this is a "no information" case, not a known-bad one.
-     - status == "healthy": WOULD start the daemon. Only actually does so if --live
-       was passed (explicit env, see safety layer 2 above); otherwise reports the
-       decision and takes no action. When it does start for real, verifies it's
-       actually alive a few seconds later (not an immediate crash) before declaring
-       success.
-     - status == "broken": never starts, regardless of --live -- posts "daemon down
-       AND Schwab needs reauth, cron can't fix this, log in manually."
+     directly (cache/live/schwab_auth_canary_state.json) first -- if it's fresh
+     (last_checked_at within STALE_STATE_MAX_HOURS), trust it as-is, no re-probe (the
+     canary already ran within the last hour; a second probe here would be redundant
+     real-API-call load for no new information).
+
+     REVISED 2026-09-03 (real bug found in testing): a stale/missing/unreadable
+     canary state used to mean "give up, never start, alert as unconfirmed" -- even
+     under --live. That's wrong: staleness means the canary hasn't told us anything
+     RECENTLY, not that Schwab is actually broken. When the state is stale/missing/
+     unreadable, this script now falls back to running the exact same direct probe
+     the canary itself uses (schwab_auth_canary.probe() -- imported and called
+     in-process, not reimplemented; same subprocess + PROBE_TIMEOUT_SECS wall-clock
+     cap as the canary's own safety design) to verify Schwab health itself, right
+     now, before deciding. Every Slack message this script posts says explicitly
+     whether the healthy/broken verdict came from the canary's own recent state or
+     from this script's own fallback probe, so a human reading the alert always
+     knows which one produced it.
+     - Status resolved (canary-fresh OR fallback-probe), healthy: WOULD start the
+       daemon. Only actually does so if --live was passed (explicit env, see safety
+       layer 2 above); otherwise reports the decision and takes no action. When it
+       does start for real, verifies it's actually alive a few seconds later (not an
+       immediate crash) before declaring success.
+     - Status resolved (canary-fresh OR fallback-probe), broken: never starts,
+       regardless of --live -- posts "daemon down AND Schwab needs reauth, cron
+       can't fix this, log in manually," including the fallback probe's real error
+       when that's the source.
 
 Usage:
   .venv/bin/python scripts/daemon_morning_check.py            # dry-run, never acts
@@ -124,8 +136,11 @@ def _daemon_running():
 
 
 def _read_canary_state():
-    """Returns (status_or_None, reason_if_none) -- None status means "cannot confirm,"
-    with a human-readable reason (missing/unreadable/stale), never fabricated."""
+    """Returns (status_or_None, staleness_reason_or_None) -- status is the canary's
+    last-known status if the state file is fresh; staleness_reason is set (and status
+    is None) when the state can't be trusted as-is (missing/unreadable/stale), which
+    triggers the direct-probe fallback in _resolve_schwab_status() below. Never
+    fabricates a status."""
     if not CANARY_STATE_PATH.exists():
         return None, "canary state file doesn't exist (canary may not be wired up yet)"
     try:
@@ -141,6 +156,28 @@ def _read_canary_state():
         return None, f"canary state is {age_hours:.1f}h stale (last checked {last_checked})"
 
     return state.get("status"), None
+
+
+def _resolve_schwab_status():
+    """Returns (status, source, detail). status is "healthy"/"broken"/None (None only
+    if the fallback probe itself couldn't run -- doesn't happen in practice since
+    probe() always returns healthy/broken, but kept honest rather than assumed).
+    source is "canary_state" or "direct_probe", so every caller/Slack message can say
+    which one produced the verdict. detail is the staleness reason when source is
+    direct_probe, or the probe's own error string when the probe found it broken."""
+    status, staleness_reason = _read_canary_state()
+    if staleness_reason is None:
+        return status, "canary_state", None
+
+    # Canary state stale/missing/unreadable -- staleness means "verify it yourself
+    # right now," not "give up." Reuse the canary's own probe (same subprocess +
+    # wall-clock-timeout safety design) rather than reimplementing it.
+    import schwab_auth_canary
+    probe_status, probe_error = schwab_auth_canary.probe()
+    detail = f"canary state unusable ({staleness_reason}); ran direct probe instead"
+    if probe_error:
+        detail += f": {probe_error}"
+    return probe_status, "direct_probe", detail
 
 
 def _start_daemon():
@@ -180,26 +217,32 @@ def main(argv=None):
         _slack("✅ Daemon morning check: active_signals.py already running, all good.")
         return
 
-    status, reason = _read_canary_state()
+    status, source, detail = _resolve_schwab_status()
+    source_note = ("Schwab canary's own recent state" if source == "canary_state"
+                    else f"this script's own direct probe ({detail})")
 
     if status is None:
+        # Only possible if the direct probe itself couldn't produce a verdict --
+        # kept as an explicit branch rather than assumed unreachable.
         _slack(f"⚠️ Daemon morning check: active_signals.py NOT running, and Schwab "
-                f"auth status can't be confirmed ({reason}) -- NOT starting the "
-                f"daemon automatically. Check manually.")
+                f"auth status can't be confirmed via {source_note} -- NOT starting "
+                f"the daemon automatically. Check manually.")
         return
 
     if status == "broken":
-        _slack("🔴 Daemon morning check: active_signals.py NOT running AND Schwab "
-               "needs reauth -- cron can't fix this, log in manually.")
+        _slack(f"🔴 Daemon morning check: active_signals.py NOT running AND Schwab "
+               f"needs reauth (per {source_note}) -- cron can't fix this, log in "
+               f"manually.")
         return
 
     # status == "healthy" -- safe to start, but only actually acts under --live.
     if not args.live:
-        print("[dry-run, no --live] would start active_signals.py now "
-              "(daemon down, Schwab healthy) -- pass --live to actually do it.")
-        _slack("ℹ️ Daemon morning check (dry-run): active_signals.py is down, Schwab "
-               "is healthy -- would auto-start, but --live wasn't passed, so nothing "
-               "was started.")
+        print(f"[dry-run, no --live] would start active_signals.py now "
+              f"(daemon down, Schwab healthy per {source_note}) -- pass --live to "
+              f"actually do it.")
+        _slack(f"ℹ️ Daemon morning check (dry-run): active_signals.py is down, Schwab "
+               f"is healthy (per {source_note}) -- would auto-start, but --live "
+               f"wasn't passed, so nothing was started.")
         return
 
     pid = _start_daemon()
