@@ -104,6 +104,7 @@ structural coupling, against run_optimization_sweep.py):
  z_score_threshold, tpct, robust_alpha, cagr, phase4_eligible, core_safe, addon_safe,
  trades, worst_neighbor_cagr}.
 """
+import json
 import os
 import sqlite3
 import sys
@@ -121,7 +122,16 @@ def _stop_loss_and_tpct_from_row(sl_axis_col, fourth_axis_col, trail_buy_pct, tr
     """Inverse of bench_phase1_phase2_inmemory._insert_candidate_nodes_rows' own
     forward mapping (and run_optimization_sweep.build_candidate_report_ground_truth's
     is_both branch, the same mapping node_from_candidate reuses) -- must stay in exact
-    lockstep with both, never re-derived independently."""
+    lockstep with both, never re-derived independently.
+
+    Kept as the FALLBACK path only as of 2026-09-03 (params_json conversion, research
+    session dispatch) -- see _take_profit_stop_loss_tpct_from_row's own docstring for why
+    params_json is now the preferred source. This function itself was never actually
+    buggy (already correctly strategy-dispatched via sl_axis_col/fourth_axis_col from
+    strategies.resolve_axis_columns(), confirmed 2026-09-03 before converting anything --
+    the real historical bug instances (candidate_full_review_two_tab.py's
+    _promoted_node_ids, an ad hoc investigation query) were both independent hand-rolled
+    reads that bypassed this function entirely, not a bug IN it)."""
     if sl_axis_col == 'trail_buy_pct':
         stop_loss = trail_buy_pct
         tpct = trail_sell_pct if fourth_axis_col == 'trail_pct' else 0.0
@@ -132,6 +142,52 @@ def _stop_loss_and_tpct_from_row(sl_axis_col, fourth_axis_col, trail_buy_pct, tr
         stop_loss = 0.0
         tpct = 0.0
     return stop_loss, tpct
+
+
+def _take_profit_stop_loss_tpct_from_row(strategy_name, sl_axis_col, fourth_axis_col,
+                                          params_json, arm_pct, trail_buy_pct, trail_sell_pct):
+    """(take_profit, stop_loss, tpct, source) for one candidate_nodes row -- params_json
+    (2026-09-03, real production wiring, research session dispatch, see docs/backlog_
+    cache.md's 'Runlist, decided 2026-09-03' + 'convert the whole sweep pipeline... to
+    params_json' entries) is now the PREFERRED source: unambiguous, already-resolved-per-
+    strategy JSON (node_key.build_params_dict's own field set), proven byte-identical to
+    the flat-column path against 2 real scopes (candidate_summary_report/gt_full_review_
+    rows) and 9 real candidates (Phase5) in the 2026-08-29 (v6.3) proof -- see
+    scripts/verify_params_json_drives_report_v64.py, same decode logic reused here, not
+    re-derived. Falls back to the flat-column method (_stop_loss_and_tpct_from_row) ONLY
+    when params_json is NULL (2,433/35,180 real candidate_nodes rows as of 2026-09-03 --
+    older rows written before params_json existed) -- that path is itself correct
+    (confirmed, see its own docstring), just not the unambiguous representation.
+
+    When BOTH are available, cross-validates them (never silently trust one without
+    checking, per this session's own standing convention) -- a real mismatch is raised
+    loudly (not printed-and-ignored), since it would mean the two 'should always agree'
+    encodings of the same node have actually diverged, a genuine data-integrity finding
+    worth stopping on, not something to paper over with a default. source is 'params_json'
+    or 'flat_fallback', carried back so a caller can report how many rows of a real query
+    took which path (visibility into the fallback's real, shrinking usage over time)."""
+    flat_sl, flat_tpct = _stop_loss_and_tpct_from_row(
+        sl_axis_col, fourth_axis_col, trail_buy_pct, trail_sell_pct)
+    flat_tp = arm_pct
+
+    if params_json is None:
+        return flat_tp, flat_sl, flat_tpct, 'flat_fallback'
+
+    p = json.loads(params_json)
+    json_tp = p['arm_pct'] if strategy_name == 'TrailingBothZScoreBreakout' else p['take_profit']
+    json_sl = p[sl_axis_col]
+    json_tpct = p[fourth_axis_col] if fourth_axis_col else 0.0
+
+    if (abs(float(json_tp) - float(flat_tp)) > 1e-9 or abs(float(json_sl) - float(flat_sl)) > 1e-9
+            or abs(float(json_tpct) - float(flat_tpct)) > 1e-9):
+        raise ValueError(
+            f"params_json vs flat-column mismatch for strategy={strategy_name!r} "
+            f"(sl_axis_col={sl_axis_col!r}, fourth_axis_col={fourth_axis_col!r}): "
+            f"json=(take_profit={json_tp}, stop_loss={json_sl}, tpct={json_tpct}) vs "
+            f"flat=(take_profit={flat_tp}, stop_loss={flat_sl}, tpct={flat_tpct}) -- "
+            f"real disagreement, not resolving silently.")
+
+    return json_tp, json_sl, json_tpct, 'params_json'
 
 
 def _sql_bool(v):
@@ -252,7 +308,7 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
         df = pd.read_sql(f"""
             SELECT cn.id, cn.window, cn.z AS z_score_threshold, cn.arm_pct, cn.trail_buy_pct,
                    cn.trail_sell_pct, cn.max_hold_hours, cn.robust_alpha, cn.trades,
-                   p4.core_safe AS core_safe, p4.addon_safe AS addon_safe, {wnc_sql}
+                   cn.params_json, p4.core_safe AS core_safe, p4.addon_safe AS addon_safe, {wnc_sql}
             FROM candidate_nodes cn
             LEFT JOIN phase4_results p4 ON p4.candidate_id = cn.id
             WHERE cn.ticker=? AND cn.strategy=? AND cn.version=? AND cn.fixed_sl=?
@@ -261,13 +317,24 @@ def derive_phase25_candidates_from_candidate_nodes(ticker, strategy_name, config
     if df.empty:
         return []
 
-    df['take_profit'] = df['arm_pct'].astype(float)
-    sl_tpct = df.apply(
-        lambda r: _stop_loss_and_tpct_from_row(sl_axis_col, fourth_axis_col,
-                                                float(r['trail_buy_pct']), float(r['trail_sell_pct'])),
+    # params_json-preferred, flat-column-fallback resolution (2026-09-03, real production
+    # wiring) -- see _take_profit_stop_loss_tpct_from_row's own docstring for the full
+    # rationale/proof this reuses. Raises loudly on a real params_json-vs-flat mismatch
+    # (never silently resolved); prints a one-line source breakdown so the fallback's real,
+    # shrinking usage stays visible rather than invisible.
+    tp_sl_tpct_source = df.apply(
+        lambda r: _take_profit_stop_loss_tpct_from_row(
+            strategy_name, sl_axis_col, fourth_axis_col, r['params_json'],
+            float(r['arm_pct']), float(r['trail_buy_pct']), float(r['trail_sell_pct'])),
         axis=1, result_type='expand')
-    df['stop_loss'] = sl_tpct[0]
-    df['tpct'] = sl_tpct[1]
+    df['take_profit'] = tp_sl_tpct_source[0].astype(float)
+    df['stop_loss'] = tp_sl_tpct_source[1].astype(float)
+    df['tpct'] = tp_sl_tpct_source[2].astype(float)
+    n_json = int((tp_sl_tpct_source[3] == 'params_json').sum())
+    n_fallback = int((tp_sl_tpct_source[3] == 'flat_fallback').sum())
+    if n_fallback:
+        print(f"  [phase4_candidate_nodes_resolver] {n_json} row(s) resolved via params_json, "
+              f"{n_fallback} via flat-column fallback (no params_json -- older row)")
 
     _tb_cols = ['robust_alpha'] + [c for c, _ in GT_CANDIDATE_TIEBREAK]
     _tb_asc = [False] + [asc for _, asc in GT_CANDIDATE_TIEBREAK]
