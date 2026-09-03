@@ -1,5 +1,17 @@
 # Backlog — Recently Resolved
 
+## [live-trading][testing] Resolved 2026-09-03 — new `scripts/concurrent_positions_check.py`: real peak=8 concurrent positions found (2026-09-02 09:32:27), real timestamp-comparison bug caught+fixed before shipping. Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved 2026-09-03 — Phase 10 report generation wired into `run_inmemory_sweep_queue.sh`, runs once after a campaign's full drain (`5425f06`). Full detail: `deep_backlog.md`.
+
+## [tooling] Resolved 2026-09-03 — first conservative `scripts/` archival tranche (4 orphaned scripts to `scripts/archive/`, `9d305c1`); broader periodic-cleanup process still open. Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved 2026-09-03 — documented the `v6` vs `v6-massive-w...` version-label split in `docs/versions.md` (`4f0ddae`). Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved 2026-09-03 — full Phase 10 report trouble-spot list (10 items) closed; items 5/6/7/8/9 were already fixed in `0b2834e`, just untracked. Full detail: `deep_backlog.md`.
+
+## [backtest][tooling] Resolved 2026-09-03 — pre-v6.5.1-rerun runlist Steps 1/2/3 done: params_json conversion (`e5cf7fe`), checkpoint provenance opt-in + resume-from-top100 save guard (`249f178`, paired-reviewed), run_inmemory_sweep_queue.sh checkpoint pass-through (`9c13cc1`). Only Step 4 (N_ISLANDS fix) remains before v6.5.1 launches. Full detail: `deep_backlog.md`.
+
 ## [live-trading][backtest] Resolved 2026-09-02 — GT kernel "zero trades today" PHANTOM read for AGQ/HIBL/NUGT/UGL: real recent-cache data-gap bug fixed (commit `f16f569`), separate kernel-SL-not-firing question resolved as normal tick-vs-1-minute-bar granularity noise, not a defect. Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-09-01 (Phase 10 v2) — top-5/category curated set, raw 13,434-row population tab w/ `promoted_pick` flag, parallel checklist compute (throttled via `campaign_registry.get_workers_budget`). Full detail: `deep_backlog.md`.
