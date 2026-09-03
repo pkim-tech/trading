@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [live-trading][backtest] Resolved 2026-09-02 — GT kernel "zero trades today" PHANTOM read for AGQ/HIBL/NUGT/UGL: real recent-cache data-gap bug fixed (commit `f16f569`), separate kernel-SL-not-firing question resolved as normal tick-vs-1-minute-bar granularity noise, not a defect. Full detail: `deep_backlog.md`.
+
 ## [backtest][tooling] Resolved 2026-09-01 (Phase 10 v2) — top-5/category curated set, raw 13,434-row population tab w/ `promoted_pick` flag, parallel checklist compute (throttled via `campaign_registry.get_workers_budget`). Full detail: `deep_backlog.md`.
 
 ## [backtest][tooling] Resolved 2026-09-01 (Phase 10) — full 135-col checklist report ported to candidate_nodes/v6.5, 2-tab xlsx (`candidate_full_review_two_tab.py`), scoped to Tab 2's curated set for tractability. Full detail: `deep_backlog.md`.
