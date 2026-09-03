@@ -277,6 +277,55 @@ def _insert_phase1_insurance_rows(rows, strategy_name, config_version, ticker, f
     return actually_inserted
 
 
+def _insert_phase2_insurance_rows(rows, strategy_name, config_version, ticker, fixed_sl, entry_timing):
+    """Same purpose/shape as _insert_phase1_insurance_rows above, one phase later:
+    Phase2's mesh-generation output (phase2_rows) is already correctly scoped per
+    (window, z, trail_pct) -- confirmed, not the pooling bug (see docs/backlog_cache.md's
+    "Root cause, corrected/completed same night" entry) -- but it gets discarded the
+    moment centers25/final_centers pool the combined result set down to N_ISLANDS global
+    regions. backtest_phase1_insurance alone isn't enough to re-debug a lost region after
+    the fact (confirmed 2026-09-02/03: only 3 rows existed for HIBL's whole window=10/
+    z=1.0/fixed_sl=3 scope) -- this table exists to persist the richer, correctly-scoped
+    Phase2 data BEFORE that pooling happens, same "write-once debug aid, not a
+    backtest_cache-compatible production table" posture as Phase1's insurance table.
+    One extra `generation` column vs Phase1's schema -- Phase2 rows genuinely carry this
+    (which Phase2-island generation first computed the cell, 1-indexed), Phase1 rows
+    don't have an equivalent concept."""
+    with sqlite3.connect(DB_PATH, timeout=60.0) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS backtest_phase2_insurance (
+                strategy TEXT, version TEXT, ticker TEXT, fixed_sl REAL, entry_timing TEXT,
+                window INTEGER, z_score_threshold REAL, max_hold_hours INTEGER,
+                take_profit REAL, stop_loss REAL, trail_sell_pct REAL, generation INTEGER,
+                trades INTEGER, cagr REAL, created_at TEXT,
+                UNIQUE(strategy, version, ticker, fixed_sl, entry_timing, window,
+                       z_score_threshold, max_hold_hours, take_profit, stop_loss, trail_sell_pct)
+            )""")
+        before = conn.execute(
+            "SELECT COUNT(*) FROM backtest_phase2_insurance WHERE version=? AND ticker=? AND strategy=?",
+            (config_version, ticker, strategy_name)).fetchone()[0]
+        conn.executemany(
+            """INSERT OR IGNORE INTO backtest_phase2_insurance
+               (strategy, version, ticker, fixed_sl, entry_timing, window, z_score_threshold,
+                max_hold_hours, take_profit, stop_loss, trail_sell_pct, generation, trades,
+                cagr, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(strategy_name, config_version, ticker, fixed_sl, entry_timing, r["window"],
+              r["z_score_threshold"], r["max_hold_hours"], r["take_profit"], r["stop_loss"],
+              r["trail_sell_pct"], r.get("generation"), r["trades"], r["cagr"],
+              time.strftime("%Y-%m-%d %H:%M:%S"))
+             for r in rows])
+        conn.commit()
+        after = conn.execute(
+            "SELECT COUNT(*) FROM backtest_phase2_insurance WHERE version=? AND ticker=? AND strategy=?",
+            (config_version, ticker, strategy_name)).fetchone()[0]
+    actually_inserted = after - before
+    if actually_inserted < len(rows):
+        print(f"  ({len(rows) - actually_inserted} of {len(rows)} rows already existed "
+              f"at this coordinate -- skipped via INSERT OR IGNORE, not overwritten)")
+    return actually_inserted
+
+
 def _insert_candidate_nodes_rows(candidates, strategy_name, config_version, ticker, fixed_sl, entry_timing):
     """Promotion step -- mirrors scripts/locate_best_node.py's real INSERT INTO
     candidate_nodes exactly (same key_cols, same UNIQUE constraint, same column
@@ -812,6 +861,48 @@ def find_missing_arm_top_n(present_arms, all_arms, df_source, tb_cols, tb_asc, t
         pool_arm = pool_arm.sort_values(tb_cols, ascending=tb_asc)
         rows_by_arm[arm] = [row for _, row in pool_arm.head(top_n).iterrows()]
     return missing_arms, rows_by_arm
+
+
+def find_missing_window_z_tpct_top_n(present_combos, windows, z_thresholds, trail_pcts,
+                                       df_source, tb_cols, tb_asc, top_n=2):
+    """Insurance-snapshot-ONLY sibling of find_missing_window_z_top_n above -- keyed on
+    the full (window, z, trail_sell_pct) triple instead of just (window, z). NOT a
+    replacement for find_missing_window_z_top_n and NOT wired into either of the
+    Phase2.5/final-stage production backfill call sites -- those stay exactly as they
+    are, per find_missing_arm_top_n's own docstring note above ("Deliberately NOT
+    extended to trail_buy_pct/trail_sell_pct -- no concrete evidence of missed
+    structure was found on those axes"), which was true for the PROMOTION pipeline at
+    the time it was written.
+
+    Real gap THIS function closes (2026-09-03, paired-review HIGH finding against the
+    backtest_phase2_insurance snapshot diff, confirmed by both independent-cold and
+    contextual review): the insurance snapshot's own top-1000-by-cagr + n=30-wide-
+    island union pools across ALL (window, z, trail_sell_pct) scopes combined, same as
+    the promotion pipeline's pre-backfill pooling did -- for a real TrailingBoth
+    campaign (7 trail_pcts x 2 windows x 3 z = 42 scopes, phase2_rows routinely in the
+    hundreds of thousands of cells) a whole trail_pct scope can legitimately end up
+    with zero rows in the ~1300-row retained union, even though find_missing_window_z_
+    top_n's own (window, z)-only key would call that scope's (w, z) pair "present"
+    (some OTHER trail_pct at that same (w, z) survived) and never backfill it. This
+    table's whole purpose is re-debugging a lost region after the fact, so leaving a
+    trail_pct-scope gap in the snapshot itself defeats that purpose the same way the
+    production pooling bug does -- unlike the production pipeline, there's no
+    downstream promotion-cost concern here (this is a raw top-N union, not a cliffbox
+    seed), so extending the key to all three axes is cheap and directly closes the gap.
+
+    Same empty-list-vs-absent-key contract as its siblings above."""
+    all_combos = {(w, z, tp) for w in windows for z in z_thresholds for tp in trail_pcts}
+    missing_combos = sorted(all_combos - present_combos)
+    rows_by_combo = {}
+    for w, z, tp in missing_combos:
+        pool_wztp = df_source[(df_source["window"] == w) & (df_source["z_score_threshold"] == z)
+                               & (df_source["trail_sell_pct"] == tp) & df_source["cagr"].notna()]
+        if pool_wztp.empty:
+            rows_by_combo[(w, z, tp)] = []
+            continue
+        pool_wztp = pool_wztp.sort_values(tb_cols, ascending=tb_asc)
+        rows_by_combo[(w, z, tp)] = [row for _, row in pool_wztp.head(top_n).iterrows()]
+    return missing_combos, rows_by_combo
 
 
 def cliffbox_tasks_for_cell(cand, trail_pcts, cliff_radius=None, hold_time_caps=None):
@@ -1625,6 +1716,83 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
       print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase2 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
             f"{len(phase2_rows):,} rows across {N_GENERATIONS} generation(s) in {t3 - t2:.1f}s "
             f"({len(phase2_rows) / max(t3 - t2, 0.001):.0f} nodes/sec)")
+
+      # Phase2 insurance snapshot (2026-09-03): same "write-once debug aid" posture as
+      # the Phase1 insurance snapshot above, applied one phase later -- persists
+      # phase2_rows (Phase2's own mesh-generation output, already correctly scoped per
+      # (window, z, trail_pct)) BEFORE centers25/final_centers pool it down to N_ISLANDS
+      # global regions below. Same top-1000-by-cagr + wide-island-union (n=30, well
+      # above the real N_ISLANDS=3) + backfill pattern as Phase1's snapshot -- see
+      # _insert_phase2_insurance_rows' docstring for why this table exists at all.
+      #
+      # _clear_prior_seed_mode_table_rows runs UNCONDITIONALLY here (2026-09-03,
+      # paired-review MEDIUM finding), not just inside the "phase2_rows non-empty"
+      # branch below -- a repeat --seed-watch-list-id run that produces zero Phase2
+      # rows (all generations converge to already-explored territory) would otherwise
+      # leave the PRIOR run's rows in place under the identical deterministic
+      # "-seed<id>" version, the exact staleness this helper exists to prevent.
+      if _seed_task is not None:
+          _clear_prior_seed_mode_table_rows(
+              "backtest_phase2_insurance", strategy_name, version, TICKER, fixed_sl)
+      if not phase2_rows:
+          print("Phase2 insurance snapshot: skipped (zero Phase2 rows this run -- "
+                "every generation converged to already-explored territory with no new "
+                "cells, or every dispatched cell returned non-SUCCESS -- check "
+                "_dispatch's status counts above to tell which)")
+      else:
+          t_ins2_0 = time.time()
+          df2_ins = pd.DataFrame(phase2_rows)
+          df2_ins = df2_ins[df2_ins["trades"] > 0]
+          global_top2 = df2_ins.sort_values("cagr", ascending=False).head(1000)
+          wide_centers2 = pick_island_centers(df2_ins, n=30, rank_col="cagr")
+          region_rows2 = []
+          for tp_c, sl_c in wide_centers2:
+              region = df2_ins[(df2_ins["take_profit"] - tp_c).abs().le(FINE_RADIUS)
+                                & (df2_ins["stop_loss"] - sl_c).abs().le(FINE_RADIUS)]
+              region_rows2.append(region.sort_values("cagr", ascending=False).head(10))
+          insurance_df2 = pd.concat([global_top2] + region_rows2, ignore_index=True)
+
+          # (window, z, trail_sell_pct)-keyed backfill (2026-09-03, paired-review HIGH
+          # finding, confirmed by both independent-cold and contextual review +
+          # rebuttal): find_missing_window_z_top_n's own (window, z)-only key would
+          # mark a whole (w, z) pair "present" as soon as ANY one of its trail_pct
+          # values survived the top-1000/wide-island union, silently missing the other
+          # trail_pct scopes at that same (w, z) -- see find_missing_window_z_tpct_
+          # top_n's own docstring for the full real-scale numbers (TrailingBoth: 42
+          # (w,z,tpct) scopes, phase2_rows in the hundreds of thousands, union capped
+          # at ~1300 rows). Insurance-snapshot-only -- does NOT touch the production
+          # Phase2.5/final-stage backfill call sites below, which stay on the
+          # (window, z)-only key exactly as before.
+          present_combos_ins2 = {(int(w), float(z), float(tp)) for w, z, tp in insurance_df2[
+              ["window", "z_score_threshold", "trail_sell_pct"]
+          ].drop_duplicates().itertuples(index=False)}
+          missing_combos_ins2, backfill_ins2_rows = find_missing_window_z_tpct_top_n(
+              present_combos_ins2, WINDOWS, Z_THRESHOLDS, TRAIL_PCTS, df2_ins,
+              tb_cols=["cagr"], tb_asc=[False], top_n=2)
+          backfill_ins2_flat = [row for rows in backfill_ins2_rows.values() for row in rows]
+          if backfill_ins2_flat:
+              insurance_df2 = pd.concat([insurance_df2, pd.DataFrame(backfill_ins2_flat)],
+                                         ignore_index=True)
+          if missing_combos_ins2:
+              zero_evidence_ins2 = [c for c, rows in backfill_ins2_rows.items() if not rows]
+              print(f"Phase2 insurance backfill: {len(missing_combos_ins2)} window/z/tpct "
+                    f"combo(s) with zero representation in the top-1000/region union -- "
+                    f"adding {len(backfill_ins2_flat)} extra row(s) (top-2 each, where "
+                    f"evidence existed): {missing_combos_ins2}")
+              if zero_evidence_ins2:
+                  print(f"  {len(zero_evidence_ins2)} of those had NO evidence at all (every "
+                        f"cell had trades=0): {zero_evidence_ins2}")
+
+          insurance_df2 = insurance_df2.drop_duplicates(
+              subset=["take_profit", "stop_loss", "max_hold_hours", "window",
+                      "z_score_threshold", "trail_sell_pct"])
+          insurance_rows2 = insurance_df2.to_dict("records")
+          n_written2 = _insert_phase2_insurance_rows(
+              insurance_rows2, strategy_name, version, TICKER, fixed_sl, ENTRY_TIMING)
+          t_ins2_1 = time.time()
+          print(f"Phase2 insurance snapshot: {len(insurance_rows2)} rows "
+                f"(top-1000 + {len(wide_centers2)}-region coverage), {n_written2} written to "
+                f"backtest_phase2_insurance in {t_ins2_1 - t_ins2_0:.2f}s (version={version})")
 
       # Phase2.5-CliffBox-GT (in-memory): center detection off the FULL scope
       # (Phase1 + Phase2 combined), matching run_phase25_cliff_box_ground_truth's own
