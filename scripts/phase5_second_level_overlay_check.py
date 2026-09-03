@@ -90,6 +90,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import pandas as pd
 
+import strategies
 from run_optimization_sweep import DB_PATH, derive_phase25_candidates_ground_truth
 from prune_backtest_cache_ground_truth import discover_all_gt_scopes, _hp_for_strategy
 from phase4_candidate_nodes_resolver import (
@@ -292,12 +293,29 @@ def overlay_cagrs(gt_trades, ticker, dfh, node, years):
     drought_cagr = None
     drought_compounded_pct = None
     drought_ok = False
-    if node["strategy"] == "TrailingBothZScoreBreakout":
+    # Generalized 2026-09-02 (real gap closed, see backtester.simulate_drought_overlay_
+    # ground_truth's own docstring) -- was previously gated to TrailingBothZScoreBreakout
+    # only via a hardcoded strategy-name check. node["arm_pct"]/node["trail_sell_pct"] are
+    # already resolved to the correct real values for whichever strategy this node actually
+    # is (node_from_candidate's is_both branch above), so no new per-strategy mapping is
+    # needed here. Gated instead on strategies.uses_arm_trail_exit -- a capability flag,
+    # not a strategy-name allowlist (paired-review finding: a future strategy paradigm
+    # with a genuinely different exit shape would otherwise silently get a plausible-
+    # looking but meaningless drought number; True today for exactly TrailingBoth/
+    # TrailingExit, confirmed byte-identical check_exit via ast.dump).
+    if strategies.uses_arm_trail_exit(node["strategy"]):
         drought = simulate_drought_overlay_ground_truth(
             gt_trades, dfh, ticker, fixed_sl=node["fixed_sl"], arm_pct=node["arm_pct"],
             trail_sell_pct=node["trail_sell_pct"])
         if drought is not None and drought.get("combined_compounded_pct") is not None:
             drought_cagr = cagr(1.0 + drought["combined_compounded_pct"] / 100.0, years, start_bal=1.0)
+    else:
+        # Fail LOUD, not a silent None -- paired-review finding: a None here must be
+        # distinguishable from "no real drought windows found for this candidate" (which
+        # also leaves drought_cagr=None, just for a completely different reason). Matches
+        # run_overlay_shim.py's own print for the same gate.
+        print(f"  {ticker} (candidate {node.get('id')}): strategy={node['strategy']} does not "
+              f"support the drought overlay's arm-then-trail exit shape -- skipping")
         if drought is not None:
             drought_compounded_pct = drought.get("drought_compounded_pct")
             drought_rets = drought.get("best_rets")

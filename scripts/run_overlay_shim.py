@@ -153,12 +153,14 @@ def run_for_node_ground_truth(ticker, node, start_date, end_date, data_source="y
     run_backtest_ground_truth, so there is no version string to resolve and nothing for that
     guard to catch or need to route around.
 
-    Drought is scoped to TrailingBothZScoreBreakout only (simulate_drought_overlay_ground_
-    truth's own docstring: "Scope: TrailingBothZScoreBreakout candidates only ... callers
-    must gate on is_both themselves") -- this wrapper derives is_both from node['strategy']
-    and skips the drought call (printing why) for any other strategy, rather than calling it
-    incorrectly. Add-on has no such restriction (matches run_addon()'s own unconditional call
-    for both strategies above).
+    Drought is gated on strategies.uses_arm_trail_exit(node['strategy']) (generalized
+    2026-09-02 -- simulate_drought_overlay_ground_truth's own docstring no longer claims a
+    TrailingBoth-only restriction; the real gate is a capability flag on whichever strategy
+    actually implements the fixed-SL-then-arm-then-trail check_exit the overlay's own
+    position-management reuses, currently True for TrailingBoth/TrailingExit) -- this
+    wrapper skips the drought call (printing why) for any strategy that flag is False for,
+    rather than calling it incorrectly. Add-on has no such restriction (matches run_addon()'s
+    own unconditional call for both strategies above).
 
     same_bar_reentry=True (2026-08-23, paired-review CONFIRMED HIGH finding): matches every
     real GT reference path this wrapper claims to mirror -- run_optimization_sweep.py's own
@@ -193,7 +195,8 @@ def run_for_node_ground_truth(ticker, node, start_date, end_date, data_source="y
     {ticker, n_core_trades, addon_trades (list of dicts, addon_applied==True only -- for the
     descriptive stats below), addon_mean_ret, addon_win_rate, addon_compounded_pct (over the
     FULL trade list, or None if addon_below_floor_count > 0), addon_below_floor_count, drought
-    (simulate_drought_overlay_ground_truth's own result dict, or None if not is_both)}."""
+    (simulate_drought_overlay_ground_truth's own result dict, or None if strategies.
+    uses_arm_trail_exit(node['strategy']) is False)}."""
     import pandas as pd
     import run_optimization_sweep as ros
     import strategies as strategies_mod
@@ -204,6 +207,7 @@ def run_for_node_ground_truth(ticker, node, start_date, end_date, data_source="y
 
     strategy_class = getattr(strategies_mod, node["strategy"])
     is_both = node["strategy"] == "TrailingBothZScoreBreakout"
+    supports_drought = strategies_mod.uses_arm_trail_exit(node["strategy"])
 
     inputs = ros._load_node_inputs_ground_truth(
         ticker, strategy_class, node["strategy"], int(node["window"]), float(node["z"]),
@@ -249,16 +253,15 @@ def run_for_node_ground_truth(ticker, node, start_date, end_date, data_source="y
     else:
         result["addon_mean_ret"] = result["addon_win_rate"] = result["addon_compounded_pct"] = None
 
-    if is_both:
+    if supports_drought:
         result["drought"] = simulate_drought_overlay_ground_truth(
             trades, df_hourly_windowed, ticker, fixed_sl=float(node["fixed_sl"]),
             arm_pct=float(node["arm_pct"]), trail_sell_pct=float(node["trail_sell_pct"]),
             confirm_days_grid=confirm_days_grid, vol_gate_grid=vol_gate_grid)
     else:
         result["drought"] = None
-        print(f"{ticker}: strategy={node['strategy']} is not TrailingBothZScoreBreakout -- "
-              f"skipping drought overlay (simulate_drought_overlay_ground_truth is scoped to "
-              f"is_both only)")
+        print(f"{ticker}: strategy={node['strategy']} does not support the drought overlay's "
+              f"arm-then-trail exit shape (strategies.uses_arm_trail_exit=False) -- skipping")
 
     return result
 

@@ -695,9 +695,14 @@ def report_overlays(label, trades, ticker, dfh, node):
               f"(blended return < -100%) -- compounding above may be poisoned (see "
               f"apply_addon_overlay_ground_truth's own docstring)")
 
+    # Still hardcoded to TrailingBoth only (unlike phase5_second_level_overlay_check.py's
+    # overlay_cagrs, generalized 2026-09-02 via strategies.uses_arm_trail_exit -- see
+    # backtester.simulate_drought_overlay_ground_truth's own docstring) -- this caller's own
+    # generalization is a separate, explicitly-queued follow-up item, not done here.
     if node["strategy"] != "TrailingBothZScoreBreakout":
-        print(f"\n--- {label}: drought overlay -- SKIPPED (TrailingExit not supported, "
-              f"see simulate_drought_overlay_ground_truth's own docstring) ---")
+        print(f"\n--- {label}: drought overlay -- SKIPPED ({node['strategy']} not yet wired "
+              f"up here -- this specific caller still hardcodes TrailingBoth-only, unlike "
+              f"phase5_second_level_overlay_check.py) ---")
         return
 
     print(f"\n--- {label}: drought overlay ---")

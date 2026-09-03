@@ -9,6 +9,22 @@ class BaseStrategy:
     sl_axis = 'stop_loss'   # real backtest_cache column the swept 'sl' grid value populates
     fourth_axis = None      # extra swept axis name, or None if the strategy doesn't have one
     uses_fixed_sl = False   # real SL comes from config.execution.fixed_stop_loss, not a grid axis
+    # uses_arm_trail_exit (2026-09-02, drought-overlay generalization, see backtester.
+    # simulate_drought_overlay_ground_truth's own docstring): True only for a strategy that
+    # is BOTH (a) shaped like the fixed-SL-then-arm-then-trail state machine the drought
+    # overlay reuses to manage its own position (scripts/drought_overlay_test.py's
+    # simulate_overlay) AND (b) an actually GT-kernel-supported strategy (backtester.py's
+    # own is_both-scoped GT kernel only knows TrailingBoth/TrailingExit -- see its GT scope
+    # note). Do NOT flip this to True off shape alone: LimitOrderTrailingExit's check_exit
+    # is ALSO byte-identical (confirmed via ast.dump) but stays False here because the GT
+    # kernel doesn't support it at all -- shape match without kernel support would still be
+    # meaningless (there's no real GT trade list to run the overlay against in the first
+    # place). A capability flag here (same pattern as sl_axis/fourth_axis above) instead of
+    # a hardcoded strategy-name set at each call site -- paired-review finding: a future
+    # strategy paradigm (plain TP, time-based, vol-target exit) would otherwise silently
+    # get a plausible-looking but meaningless drought number computed under an exit model
+    # its own core never uses, with no error to catch it.
+    uses_arm_trail_exit = False
 
     def __init__(self, **kwargs):
         self.params = kwargs
@@ -46,6 +62,18 @@ def uses_fixed_sl(strategy_name):
     config default."""
     cls = globals().get(strategy_name)
     return cls is not None and issubclass(cls, BaseStrategy) and cls.uses_fixed_sl
+
+
+def uses_arm_trail_exit(strategy_name):
+    """Whether this strategy's check_exit is the fixed-SL-then-arm-then-trail state
+    machine the drought overlay reuses to manage its own position (scripts.
+    drought_overlay_test.simulate_overlay) -- see BaseStrategy.uses_arm_trail_exit's own
+    comment. A caller computing a drought overlay CAGR should gate on this, not a
+    hardcoded strategy-name check, so a future strategy paradigm with a genuinely
+    different exit shape doesn't silently get a plausible-looking but meaningless
+    drought number computed under an exit model its own core never uses."""
+    cls = globals().get(strategy_name)
+    return cls is not None and issubclass(cls, BaseStrategy) and cls.uses_arm_trail_exit
 
 
 def validate_axis_values(strategy_name, trail_buy_pct=None, trail_pct=None):
@@ -168,6 +196,7 @@ class TrailingExitZScoreBreakout(BaseStrategy):
     TP-activation and TIME (pre-activation) are bar-close. Mirrors backtester._simulate_trail."""
     sl_axis = 'trail_pct'
     uses_fixed_sl = True
+    uses_arm_trail_exit = True  # confirmed byte-identical to TrailingBoth's own check_exit (ast.dump)
 
     def generate_daily_indicators(self, df_daily):
         w = self.params.get('window', 10)
@@ -429,6 +458,7 @@ class TrailingBothZScoreBreakout(TrailingBuyZScoreBreakout):
     """v1.10: trailing entry (bounce above running low) + trailing exit once TP% cleared.
     Mirrors backtester._simulate_trail_both."""
     fourth_axis = 'trail_pct'
+    uses_arm_trail_exit = True  # the original strategy this exit machine was designed for
 
     def check_exit(self, ctx):
         ep = ctx['entry_price']

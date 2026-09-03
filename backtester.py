@@ -2233,10 +2233,39 @@ def simulate_drought_overlay_ground_truth(trades, df_hourly_windowed, ticker, fi
     label in that same frame, so a lookup miss here would indicate a real bug upstream,
     not an expected case -- silently skipped per-trade like the original, not raised,
     since one skipped trade shouldn't block the other N-1 from finding real drought
-    windows). Scope: TrailingBothZScoreBreakout candidates only, matching the legacy
-    script's own "is_both assumed True" restriction and simulate_overlay's own
-    proven-only-for-that-shape SL/arm/trail semantics -- callers must gate on is_both
-    themselves (this function doesn't re-derive it) before calling.
+    windows).
+
+    Generalized 2026-09-02 (real gap closed -- see docs/deep_backlog.md, paired-review
+    findings applied): this function and simulate_overlay/find_drought_windows take no
+    strategy parameter at all and never did -- the ONLY strategy-scoping was a caller-side
+    `if strategy == "TrailingBothZScoreBreakout"` gate around each call site (originally
+    documented here as "matching the legacy script's own 'is_both assumed True'
+    restriction", carried forward without re-verifying it was still needed once callers
+    started resolving arm_pct/trail_sell_pct per-strategy). Confirmed both real strategies'
+    check_exit (strategies.py) run the IDENTICAL fixed-SL-then-arm-then-trail state machine
+    off the same 3 semantic values (fixed_sl/arm_pct/trail_sell_pct) -- byte-identical via
+    ast.dump, not just similar. Callers (e.g. phase5_second_level_overlay_check.py's
+    overlay_cagrs) just need the correct real (fixed_sl, arm_pct, trail_sell_pct) triple for
+    the candidate's actual strategy -- already how every existing caller resolves these
+    (phase4_candidate_nodes_resolver.py's take_profit/stop_loss/tpct columns,
+    node_from_candidate's arm_pct/trail_sell_pct), not a new mapping this change had to
+    invent. NOT unconditionally safe for an arbitrary future strategy, though -- gate a
+    caller on strategies.uses_arm_trail_exit(strategy_name), not just "call it", since a
+    strategy whose check_exit isn't this exact state machine would get a plausible-looking
+    but meaningless number with no error to catch it (paired-review MEDIUM finding).
+
+    One real asymmetry remains between the two strategies this IS validated for, worth
+    knowing rather than assuming they're equivalent in every respect: find_drought_windows
+    defines a drought window as the gap between consecutive real FILLED trades (a signal
+    whose trailing-buy entry never actually filled, e.g. TrailingBoth's `STATE_WAIT`
+    abandonment after max_hours_to_hold, leaves no trade and that period silently reads as
+    "drought" even though a real signal fired). TrailingExit has no such wait state --
+    every signal it generates becomes a trade, so its drought windows are the more
+    literal/correct definition of the two. This makes the window-finding step itself
+    subtly entry-side-dependent (confirmed via paired review) -- not a bug, and not
+    something this function can fix (it only ever receives an already-resolved trade list,
+    it doesn't generate one), just don't assume "same exit mechanic" implies "identical
+    windows" across strategies.
 
     vol_gate reuses drought_overlay_sweep.py's real intraday-realized-vol entry gate
     (get_ivol_series/_entry_vol_pctile), which reads a fixed cache/research/{ticker}_1h.csv
