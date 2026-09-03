@@ -502,8 +502,17 @@ def _curate_combined_rows(csv_rows):
                  and r.get("core_addon_cagr_pct") is not None]
         addon.sort(key=_cagr_sort_key("core_addon_cagr_pct"), reverse=True)
 
-        drought = [r for r in safe if r.get("drought_tranche") != "FRAGILE"
-                   and r.get("core_drought_cagr_pct") is not None]
+        # core_drought_cagr_pct is None unless drought was BOTH genuinely computed (this
+        # candidate's strategy supports it, see strategies.uses_arm_trail_exit) AND
+        # verified robust (drought_ok, OR the IE vol-gate's own separately-validated
+        # REAL_SELECTION override) -- candidate_full_review.py's own real fix, 2026-09-02.
+        # `is not None` alone is now the correct full gate; a separate `drought_tranche !=
+        # "FRAGILE"` check would be WRONG here (and was, before this fix) -- a
+        # REAL_SELECTION-verified row can have a real core_drought_cagr_pct while its base
+        # drought_tranche is still "FRAGILE" (the IE challenge validates a DIFFERENT number
+        # than the raw chrono-split check), so gating on tranche in addition would exclude
+        # a genuinely verified row for the wrong reason.
+        drought = [r for r in safe if r.get("core_drought_cagr_pct") is not None]
         drought.sort(key=_cagr_sort_key("core_drought_cagr_pct"), reverse=True)
 
         best_both = [r for r in safe if r.get("strategy") == "TrailingBothZScoreBreakout"]

@@ -1892,16 +1892,41 @@ def gt_full_review_rows(conn, ticker, strategy, version, entry_timing, fixed_sl,
 
         addon_ok = rec["addon_robustness"] is not None and rec["addon_robustness"]["verdict"] == "OK"
         drought_ok = rec["drought_robustness"] is not None and rec["drought_robustness"]["verdict"] == "OK"
+        drought_real_selection = drought_ie is not None and drought_ie.get("verdict") == "REAL_SELECTION"
+        # drought_verified (2026-09-02, real bug found + fixed -- research session dispatch):
+        # a genuinely computed-AND-robust drought result, matching drought_tranche's own
+        # OK/FRAGILE/NONE semantics (drought_ok is derived from drought_tranche=="OK";
+        # drought_real_selection is the IE vol-gate's own separately-validated override).
+        # Distinct from `drought is not None` (only means "was attempted at all", still
+        # ambiguous re: whether the result was good -- see drought_n's own None/0/N
+        # convention for that narrower distinction).
+        drought_verified = drought_ok or drought_real_selection
         addon_factor_gated = (1.0 + rec["addon_compounded_pct"] / 100.0) if (
             rec["addon_compounded_pct"] is not None and addon_ok) else 1.0
         drought_factor_gated = (1.0 + rec["drought_compounded_pct"] / 100.0) if (
             rec["drought_compounded_pct"] is not None and drought_ok) else 1.0
-        if drought_ie is not None and drought_ie.get("verdict") == "REAL_SELECTION":
+        if drought_real_selection:
             drought_factor_gated = 1.0 + drought_ie["included_compounded_pct"] / 100.0
         if abs_return_pct is not None:
             core_factor = 1.0 + abs_return_pct / 100.0
             rec["core_addon_cagr_pct"] = cagr((core_factor * addon_factor_gated - 1.0) * 100.0, days_span)
-            rec["core_drought_cagr_pct"] = cagr((core_factor * drought_factor_gated - 1.0) * 100.0, days_span)
+            # core_drought_cagr_pct: real number ONLY when drought was genuinely computed
+            # AND verified robust -- None otherwise (never computed, computed-but-FRAGILE,
+            # and computed-but-NONE/too-few-windows all collapse to None here, NOT to a
+            # silent core-CAGR-equivalent). Paired-review-adjacent finding, 2026-09-02:
+            # the prior unconditional cagr() call here defaulted drought_factor_gated=1.0
+            # (neutral) for all three of those cases, making an untested/unverified node
+            # indistinguishable from "drought tested and found genuinely neutral" --
+            # confirmed real consequence: a core-only TrailingExit node (drought never even
+            # attempted, is_both-gated out upstream) won the report's Drought category
+            # purely on its own core CAGR. core_both_cagr_pct's arithmetic is UNCHANGED
+            # (still uses drought_factor_gated's neutral-1.0 fallback) -- confirmed it isn't
+            # a sort key for any category winner-selection (Best-Both/Best Core both sort on
+            # core_cagr_1s), so no winner-selection consequence; left as a separate, smaller,
+            # display-only item rather than folded in unrequested.
+            rec["core_drought_cagr_pct"] = (
+                cagr((core_factor * drought_factor_gated - 1.0) * 100.0, days_span)
+                if drought_verified else None)
             rec["core_both_cagr_pct"] = cagr(
                 (core_factor * addon_factor_gated * drought_factor_gated - 1.0) * 100.0, days_span)
         else:
