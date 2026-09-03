@@ -291,12 +291,38 @@ print(b.END)
     wstart="$WINDOW_START"
     wend="$WINDOW_END"
   fi
+  # CAMPAIGN_LABEL/ENTRY_TIMING override (2026-09-03, real incident: launching
+  # with CAMPAIGN_LABEL=v6.5.1 silently registered/enqueued against the
+  # EXISTING v6.5 campaign, because `label` above was read from bench's own
+  # HARDCODED module constant via the fresh python -c subprocess two lines up
+  # -- that subprocess never sees this shell's $CAMPAIGN_LABEL env var at all.
+  # The per-job bench.py invocations below DO correctly receive --campaign-
+  # label/--entry-timing (see CAMPAIGN_LABEL_ARGS/ENTRY_TIMING_ARGS further
+  # down), so bench itself would compute a genuinely different version string
+  # per job -- but this function's own $CAMPAIGN_ID/$VERSION (used for
+  # campaign_jobs bookkeeping AND Phase4/5's --version query below) stayed
+  # pinned to whatever campaign bench's stale module default resolved to --
+  # the exact split-brain class this file's own header comments already
+  # document for other axes, just never closed on THIS one because nobody
+  # had exercised CAMPAIGN_LABEL through the auto-create path before (v6.6
+  # was created via a separate manual campaign_registry.py create + attach,
+  # not this env-var path). Same override pattern as WINDOW_START/WINDOW_END
+  # immediately above -- shell env takes precedence over bench's module
+  # default, applied BEFORE the `create` call, not after.
+  if [ -n "${CAMPAIGN_LABEL:-}" ]; then
+    label="$CAMPAIGN_LABEL"
+  fi
+  local entry_timing_create_args=()
+  if [ -n "${ENTRY_TIMING:-}" ]; then
+    entry_timing_create_args=(--entry-timing "$ENTRY_TIMING")
+  fi
 
   local create_out
   if ! create_out=$($PYTHON scripts/campaign_registry.py create \
       --label "$label" --promotion-algo-version "$pv" \
       --data-source "$data_source" --window-start "$wstart" --window-end "$wend" \
       --z-thresholds "$Z_THRESHOLDS_CSV" --n-islands "$N_ISLANDS" \
+      "${entry_timing_create_args[@]}" \
       --workers-budget "$WORKERS" --created-by run_inmemory_sweep_queue.sh); then
     echo "FATAL: campaign_registry.py create failed -- aborting before any real work:"
     echo "$create_out"
