@@ -14,6 +14,29 @@ campaign_registry_design.md`) — that infrastructure just needs to reconcile co
 it doesn't need its own version identity. This file tracks what a *label* means
 strategically, so a label stays meaningful across many campaign_ids/runs over time.
 
+## v6
+
+Full 14-ticker promotion batch, 2026-08-25 ~03:33-03:55 ET (see `docs/deep_backlog.md`'s
+"full v6 promotion" entry). All 14 tickers were genuinely promoted together in the same
+session -- but `watch_list.version` carries TWO different label strings for the batch,
+confirmed live (2026-09-03) still the current state:
+
+- **`v6`** (plain label): AGQ, DFEN, DPST, GDXU, HIBL, JNUG, KORU, LABU, NUGT, SOXL, UGL,
+  WEBL (12 tickers) -- promoted via `promote_v6_2026_08_23_batch1.py`, a batch script
+  written the prior night and finally run this session, which stamps the shorter label.
+- **`v6-massive-w2021-08-23_2026-08-21`** (fully-qualified): ETHU, OILU (2 tickers) --
+  promoted via a manual checklist pass that named the exact GT campaign scope instead.
+
+Both labels represent the SAME real campaign generation and the SAME promotion event --
+this is a labeling inconsistency in how each was promoted, not two different vintages or
+two different levels of vetting. Documented here explicitly (2026-09-03) precisely so a
+future read of two different version strings across this one batch reads as "known,
+intentional-by-omission naming split," not as a signal that ETHU/OILU are less-vetted or
+were promoted separately -- this exact false read already cost real investigation time
+once (see the backlog entry this note resolves). `watch_list.version` itself is left
+as-is (not backfilled to a single label) -- that's a separate, not-yet-decided question
+(touches live rows) from documenting the split.
+
 ## v6.5
 
 Multi-axis top-N candidate selection (window/z-threshold/arm_pct backfill, generalized
