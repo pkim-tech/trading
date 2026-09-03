@@ -201,6 +201,23 @@ WORKERS="${WORKERS:-8}"
 # ATTACH_CAMPAIGN_ID's own docstring warns about.
 ENTRY_TIMING="${ENTRY_TIMING:-}"
 CAMPAIGN_LABEL="${CAMPAIGN_LABEL:-}"
+# USE_CHECKPOINT/CHECKPOINT_FILE (2026-09-03): pass-through to bench's own --use-checkpoint/
+# --checkpoint-file opt-in flags (added same day, commit 249f178, closing a real live
+# incident -- checkpoint load defaulted on whenever the auto-computed default path
+# happened to have a stale file from an earlier, differently-configured run). Empty/unset
+# by default -- this drain loop's crash-restart path (a job killed mid-fixed_sl, then this
+# script re-run) previously recovered Phase1+Phase2's cost for free off that default path;
+# since bench's own opt-in fix, that recovery is gone unless explicitly requested here.
+# Set USE_CHECKPOINT=1 to opt back into the SAME default-path convenience bench's own
+# --use-checkpoint provides (auto-computed filename, no path management needed) -- the
+# common case for "just let a restart resume where it left off." CHECKPOINT_FILE is the
+# rarer explicit-path form (mirrors bench's own --checkpoint-file), for a caller managing
+# its own checkpoint location outside the default convention. Harmless to set both (bench
+# ORs them, `args.checkpoint_file or args.use_checkpoint`) -- neither conflicts with the
+# other, only with --resume-from-top100/--seed-watch-list-id (bench's own real mutual-
+# exclusion validators, unrelated to this script's own job-queue axes).
+USE_CHECKPOINT="${USE_CHECKPOINT:-}"
+CHECKPOINT_FILE="${CHECKPOINT_FILE:-}"
 # ATTACH_CAMPAIGN_ID (2026-09-02, real gap found live): resolve_campaign() below always
 # self-CREATEs a campaign from bench's own on-disk module constants -- there was no way
 # to point this script at an ALREADY-EXISTING campaign_id (e.g. one created ad hoc via
@@ -516,6 +533,19 @@ echo " In-memory sweep queue start — $(date)"
     if [ -n "$CAMPAIGN_LABEL" ]; then
       CAMPAIGN_LABEL_ARGS=(--campaign-label "$CAMPAIGN_LABEL")
     fi
+    # USE_CHECKPOINT/CHECKPOINT_FILE pass-through (2026-09-03, see their own env-var
+    # docstrings above) -- same conditional-array pattern as WINDOW_ARGS/ENTRY_TIMING_ARGS/
+    # CAMPAIGN_LABEL_ARGS, omitted entirely when unset so this script's behavior is
+    # byte-identical to before (i.e. still never loads a checkpoint by default, matching
+    # bench's own opt-in-required default) for every caller that doesn't set them.
+    USE_CHECKPOINT_ARGS=()
+    if [ -n "$USE_CHECKPOINT" ]; then
+      USE_CHECKPOINT_ARGS=(--use-checkpoint)
+    fi
+    CHECKPOINT_FILE_ARGS=()
+    if [ -n "$CHECKPOINT_FILE" ]; then
+      CHECKPOINT_FILE_ARGS=(--checkpoint-file "$CHECKPOINT_FILE")
+    fi
     set -m
     $PYTHON scripts/bench_phase1_phase2_inmemory.py \
         --ticker "$JOB_TICKER" \
@@ -527,7 +557,9 @@ echo " In-memory sweep queue start — $(date)"
         --workers "$WORKERS" \
         "${WINDOW_ARGS[@]}" \
         "${ENTRY_TIMING_ARGS[@]}" \
-        "${CAMPAIGN_LABEL_ARGS[@]}" &
+        "${CAMPAIGN_LABEL_ARGS[@]}" \
+        "${USE_CHECKPOINT_ARGS[@]}" \
+        "${CHECKPOINT_FILE_ARGS[@]}" &
     BENCH_PID=$!
     # Trap installed only AFTER $BENCH_PID is actually set (not before backgrounding) --
     # closes even the sub-millisecond race of a signal arriving before BENCH_PID holds
