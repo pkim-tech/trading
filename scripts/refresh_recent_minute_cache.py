@@ -87,10 +87,42 @@ def ensure_table(db_path=None):
         """)
 
 
+def _canonical_hourly_max_date(ticker):
+    """Real cutoff of massive_hourly_derived's active build for this ticker, or None if
+    no build exists yet. Same source (db_cache.get_massive_hourly_ohlcv) the real splice
+    consumer (paper_vs_backtest_reconcile.get_trades_and_bars_since_ground_truth) reads,
+    so 'does this ticker's start reach canonical' is answered with the exact same data
+    the splice will actually see -- not a separately-derived approximation that could
+    itself drift out of sync with the real canonical cutoff."""
+    import db_cache
+    try:
+        df_h = db_cache.get_massive_hourly_ohlcv(ticker)
+    except ValueError:
+        # get_massive_hourly_ohlcv raises (not an empty frame) when no build exists yet
+        # for this ticker -- a real "no canonical data at all" case, same as empty here.
+        return None
+    return None if df_h.empty else df_h.index.max().date()
+
+
 def refresh_ticker(ticker, recent_days=RECENT_DAYS, db_path=None):
+    """start reaches back far enough to directly abut canonical massive_hourly_derived's
+    own cutoff (whatever that is for THIS ticker), not just a fixed recent_days window
+    from today -- found 2026-09-02: canonical only refreshes manually (no cron), so once
+    a ticker's build drifts more than recent_days behind, the fixed window leaves a real
+    gap of missing trading days between canonical's end and this cache's start that
+    neither source covers. That gap silently corrupts every rolling SMA/Std computed
+    across it (a whole missing window of daily closes), which can shift a GT kernel
+    replay's z-score band enough to miss a real, independently-confirmed signal breach
+    (traced live on AGQ/HIBL/NUGT/UGL, all missing real trading days 08-24/08-25 between
+    canonical's 08-21 cutoff and this cache's then-7-day-window 08-26 start). Still capped
+    at recent_days as the default/minimum -- this only ever widens the window to close a
+    real gap, never narrows the ordinary case below the existing default."""
     db_path = db_path or DB_PATH
     end = date.today()
     start = end - timedelta(days=recent_days)
+    canonical_max = _canonical_hourly_max_date(ticker)
+    if canonical_max is not None and canonical_max + timedelta(days=1) < start:
+        start = canonical_max + timedelta(days=1)
     rows = fetch_ticker(ticker, start, end)
     if not rows:
         print(f"  {ticker}: no data returned, leaving prior cache (if any) untouched")
