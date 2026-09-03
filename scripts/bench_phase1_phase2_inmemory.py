@@ -1075,7 +1075,25 @@ def build_arg_parser():
                           "and saves it after Phase2 finishes. Default: "
                           "<job-tmp>/bench_phase12_checkpoint_<ticker>_<strategy>_<fixed_sl>_"
                           "w<windows>_<date-range-suffix>.parquet (mutually exclusive with "
-                          "--resume-from-top100 AND with --seed-watch-list-id).")
+                          "--resume-from-top100 AND with --seed-watch-list-id). Explicitly "
+                          "passing this flag is itself the opt-in this run needs to load a "
+                          "checkpoint at all -- see --use-checkpoint below for the "
+                          "auto-computed-default-path equivalent.")
+    ap.add_argument("--use-checkpoint", action="store_true",
+                     help="opt-in (2026-09-03, real live incident fix -- checkpoint entry_"
+                          "timing incident, docs/backlog_cache.md): without this flag (and "
+                          "without an explicit --checkpoint-file), the auto-computed default "
+                          "checkpoint path is NEVER loaded, even if a stale file happens to "
+                          "exist there -- only explicitly saved to, for a LATER run that "
+                          "passes this flag to opt back in. Closes a real live incident: "
+                          "every invocation of this script registers a real campaign row "
+                          "(main()'s unconditional campaign_registry.register_campaign call) "
+                          "-- there is no separate 'just a dev test' mode this script can "
+                          "detect on its own, so 'opt-in for any run registering a real "
+                          "campaign' means opt-in for every default-path load, full stop. "
+                          "A genuine local dev-iteration session (the ONLY real reason this "
+                          "mechanism exists) passes this explicitly; a real campaign run "
+                          "never should.")
     return ap
 
 
@@ -1119,6 +1137,15 @@ def main():
         raise SystemExit("--resume-from-top100 and --checkpoint-file are mutually exclusive "
                           "(one tests a narrow top-100-only dataset, the other a full "
                           "Phase1+Phase2 checkpoint) -- pick one.")
+    if args.resume_from_top100 and args.use_checkpoint:
+        # paired-review LOW finding (2026-09-03, Runlist Step 2): --use-checkpoint has the
+        # identical conflict --checkpoint-file already hard-errors on above -- both
+        # predicates (_should_load_checkpoint/_should_save_checkpoint) already correctly
+        # exclude --resume-from-top100 regardless of the opt-in flags, so this combination
+        # was never UNSAFE, just silently ignored instead of rejected like its sibling flag.
+        raise SystemExit("--resume-from-top100 and --use-checkpoint are mutually exclusive "
+                          "(resume-from-top100 never loads/saves a checkpoint regardless of "
+                          "this flag) -- pick one.")
 
     if args.n_islands is not None and args.n_islands < 1:
         # (2026-08-29, paired review, CONFIRMED MEDIUM): pick_island_centers's loop-exit
@@ -1143,6 +1170,8 @@ def main():
             _seed_conflicts.append("--resume-from-top100")
         if args.checkpoint_file:
             _seed_conflicts.append("--checkpoint-file")
+        if args.use_checkpoint:
+            _seed_conflicts.append("--use-checkpoint")
         if args.ticker is not None:
             _seed_conflicts.append("--ticker")
         if args.entry_timing is not None:
@@ -1394,6 +1423,39 @@ def _build_checkpoint_filename(strategy_name, fixed_sl, args):
             f"{_z_key}{_range_key}{_seed_key}{_isl_key}{_pv_key}{_entry_timing_key}.parquet")
 
 
+def _should_load_checkpoint(args, seed_task, checkpoint_path):
+    """Extracted 2026-09-03 (Runlist Step 2, real live incident fix -- checkpoint
+    entry_timing incident, docs/backlog_cache.md) so the load gate is a small, directly
+    testable predicate instead of inline logic buried in run_one_fixed_sl's own large
+    body. Opt-in: an explicit --checkpoint-file or --use-checkpoint is now REQUIRED before
+    the auto-computed default path's mere on-disk existence can trigger a load -- every
+    real invocation of this script registers a real campaign row (main()'s unconditional
+    register_campaign call), so there is no separate 'just testing' mode to detect other
+    than an explicit flag. Seed mode and --resume-from-top100 never load a checkpoint
+    regardless of the opt-in flags (see their own callers' docstrings for why).
+
+    `bool(args.checkpoint_file)` (truthy, not `is not None`) -- paired-review LOW finding:
+    an `is not None` check would let `--checkpoint-file ""` fall through to the SAME
+    default-path load this opt-in exists to gate (checkpoint_path's own resolution,
+    `args.checkpoint_file or os.path.join(...)`, already falls back to the default path
+    for an empty string) -- matching that same truthy convention closes the gap instead of
+    reopening it via a deliberately-odd empty-string invocation."""
+    return (bool(args.checkpoint_file or args.use_checkpoint)
+            and seed_task is None and not args.resume_from_top100
+            and os.path.exists(checkpoint_path))
+
+
+def _should_save_checkpoint(args, seed_task):
+    """Extracted alongside _should_load_checkpoint for the same testability reason.
+    Real fix, 2026-09-03 (Runlist Step 3): previously only checked `seed_task is None` --
+    a --resume-from-top100 run's own deliberately-narrowed df_full (built from a pre-
+    filtered top-100 snapshot, documented as able to miss a real island entirely) could
+    overwrite the SHARED default checkpoint path a later real full-campaign run would
+    load, silently promoting candidates derived from the crippled pool. Mirrors the load
+    gate's own --resume-from-top100 exclusion (must never diverge from it)."""
+    return seed_task is None and not args.resume_from_top100
+
+
 def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     """Real per-fixed_sl Phase1+Phase2+Phase2.5+candidate-write body -- extracted
     2026-08-29 (Task #6 follow-up, planner dispatch) from what used to be main()'s
@@ -1499,7 +1561,20 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # Phase2 output. Seed mode's whole cost profile (Phase1=1 cell, Phase2=~81 cells) is
     # cheap enough that there's no expensive cost to amortize -- the checkpoint's entire
     # justification for existing -- so it's skipped (both load AND save) entirely.
-    if _seed_task is None and not args.resume_from_top100 and os.path.exists(checkpoint_path):
+    #
+    # Opt-in load gate (2026-09-03, real live incident fix -- checkpoint entry_timing
+    # incident, docs/backlog_cache.md's Runlist Step 2): `args.checkpoint_file is not None
+    # or args.use_checkpoint` added -- previously this branch fired on the auto-computed
+    # DEFAULT path's mere existence, with no signal the caller actually wanted checkpoint
+    # behavior at all. Real incident: the first v6.6 (close-entry) job silently loaded an
+    # `open_check` checkpoint left over from the prior evening's real v6.5 run, skipping
+    # Phase1+Phase2 entirely for what was meant to be a genuine close-entry sweep --
+    # caught live, before any candidate_nodes/backtest_phase1_insurance rows were written,
+    # but only because a human was reading stdout in real time. Every real invocation of
+    # this script registers a real campaign row (main()'s unconditional register_campaign
+    # call, no separate 'just testing' mode exists) -- so 'opt-in for any run registering a
+    # real campaign' means every default-path load now requires an explicit ask.
+    if _should_load_checkpoint(args, _seed_task, checkpoint_path):
       t0 = time.time()
       df_full = pd.read_parquet(checkpoint_path)
       t1 = t2 = t3 = time.time()
@@ -1817,12 +1892,32 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
       # Skipped entirely in seed mode (2026-08-29, round 4) -- see the load-side skip's
       # own comment above for why: seed mode is cheap enough that there's no cost to
       # amortize, and saving one would make repeat seed runs silently stale.
-      if _seed_task is None:
+      #
+      # `not args.resume_from_top100` added (2026-09-03, Runlist Step 3, paired-review
+      # finding from the checkpoint entry_timing incident review): the LOAD guard above
+      # already excludes --resume-from-top100 (`_seed_task is None and not args.
+      # resume_from_top100 and os.path.exists(...)`), but this SAVE guard previously only
+      # checked `_seed_task is None` -- nothing kept a --resume-from-top100 run's own
+      # deliberately-narrowed df_full (built from a pre-filtered top-100 snapshot,
+      # documented as able to miss a real island entirely) from overwriting the SHARED
+      # default checkpoint path. Real failure scenario this closes: run --resume-from-
+      # top100 once as a divergence experiment for some (ticker, strategy, fixed_sl,
+      # windows, z, ...) tuple, then run the real full campaign for the identical tuple
+      # the same day -- the full run would find the file, load it (this file's own load
+      # guard already correctly prevented THAT specific load, matching the file's real
+      # narrowed provenance), print "skipping Phase1 AND Phase2," and promote candidates
+      # derived from the deliberately-crippled top-100-only pool into candidate_nodes.
+      # resume-from-top100's own df_full has no legitimate reason to ever be cached.
+      if _should_save_checkpoint(args, _seed_task):
           os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
           df_full.to_parquet(checkpoint_path)
           print(f"Checkpoint saved: {checkpoint_path} ({len(df_full):,} rows)")
-      else:
+      elif _seed_task is not None:
           print("Seed mode: checkpoint save skipped (always re-runs Phase1+Phase2 for real).")
+      else:
+          print("--resume-from-top100: checkpoint save skipped (df_full built from a "
+                "pre-filtered top-100 snapshot, not the full grid -- must never overwrite "
+                "the shared default checkpoint path a real full-campaign run would load).")
 
     # --- Everything below runs regardless of which branch built df_full ---
 

@@ -424,3 +424,80 @@ def test_seed_stage_arm_backfill_runs_before_phase25_dispatch():
     assert seed_arm_backfill_idx < phase25_dispatch_idx, (
         "seed-stage arm_pct backfill must run BEFORE Phase2.5 dispatches, or backfilled "
         "candidates lose their real cliffbox refinement + cliff-safety verification")
+
+
+# --- 2026-09-03, Runlist Steps 2/3 (checkpoint entry_timing incident real fix) ---
+# _should_load_checkpoint/_should_save_checkpoint extracted from run_one_fixed_sl's own
+# inline logic specifically so this gate is a small, directly testable predicate instead
+# of buried in a large function only exercisable via a real multi-minute backtest run.
+
+def test_use_checkpoint_flag_defaults_false():
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    assert args.use_checkpoint is False
+    assert args.checkpoint_file is None
+
+
+def test_use_checkpoint_flag_settable():
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--use-checkpoint"])
+    assert args.use_checkpoint is True
+
+
+def test_should_load_checkpoint_false_by_default_even_if_file_exists(tmp_path):
+    """The real incident this closes: a stale default-path checkpoint sitting on disk
+    from an earlier run must NOT be silently loaded just because it exists -- neither
+    --checkpoint-file nor --use-checkpoint was passed, so this is a genuine real-campaign
+    invocation, not an explicit dev-iteration request."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    ckpt = tmp_path / "bench_phase12_checkpoint_fake.parquet"
+    ckpt.write_bytes(b"not a real parquet file, existence is all this test needs")
+    assert bench._should_load_checkpoint(args, seed_task=None, checkpoint_path=str(ckpt)) is False
+
+
+def test_should_load_checkpoint_true_with_use_checkpoint_flag(tmp_path):
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--use-checkpoint"])
+    ckpt = tmp_path / "bench_phase12_checkpoint_fake.parquet"
+    ckpt.write_bytes(b"exists")
+    assert bench._should_load_checkpoint(args, seed_task=None, checkpoint_path=str(ckpt)) is True
+
+
+def test_should_load_checkpoint_true_with_explicit_checkpoint_file(tmp_path):
+    ckpt = tmp_path / "explicit.parquet"
+    ckpt.write_bytes(b"exists")
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--checkpoint-file", str(ckpt)])
+    assert bench._should_load_checkpoint(args, seed_task=None, checkpoint_path=str(ckpt)) is True
+
+
+def test_should_load_checkpoint_false_for_seed_mode_even_with_opt_in(tmp_path):
+    """Seed mode never loads a checkpoint regardless of the opt-in flags -- see the
+    caller's own 2026-08-29 round-4 rationale (stable default path across identical seed
+    invocations would silently short-circuit a genuine repeat smoke test)."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--use-checkpoint"])
+    ckpt = tmp_path / "bench_phase12_checkpoint_fake.parquet"
+    ckpt.write_bytes(b"exists")
+    assert bench._should_load_checkpoint(args, seed_task=("fake", "task"), checkpoint_path=str(ckpt)) is False
+
+
+def test_should_load_checkpoint_false_for_resume_from_top100_even_with_opt_in(tmp_path):
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--use-checkpoint",
+                    "--resume-from-top100"])
+    ckpt = tmp_path / "bench_phase12_checkpoint_fake.parquet"
+    ckpt.write_bytes(b"exists")
+    assert bench._should_load_checkpoint(args, seed_task=None, checkpoint_path=str(ckpt)) is False
+
+
+def test_should_save_checkpoint_true_for_normal_run():
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    assert bench._should_save_checkpoint(args, seed_task=None) is True
+
+
+def test_should_save_checkpoint_false_for_seed_mode():
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout"])
+    assert bench._should_save_checkpoint(args, seed_task=("fake", "task")) is False
+
+
+def test_should_save_checkpoint_false_for_resume_from_top100():
+    """Real Step 3 fix: a --resume-from-top100 run's own deliberately-narrowed df_full
+    (pre-filtered top-100 snapshot, can miss a real island) must never overwrite the
+    shared default checkpoint path a later real full-campaign run would load."""
+    args = _parse(["--strategy", "TrailingBothZScoreBreakout", "--resume-from-top100"])
+    assert bench._should_save_checkpoint(args, seed_task=None) is False
