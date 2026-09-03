@@ -85,7 +85,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from candidate_full_review import (
     DB_PATH, DEFAULT_VOL_GATE, FIELDNAMES, COLUMN_DEFS, ensure_candidate_nodes_table,
     gt_full_review_rows, _build_output_row, GT_SKIP_COLUMNS, GT_SKIP_LABEL, _git_provenance_stamp,
-    k1_status,
+    k1_status, _persist_snapshot,
 )
 from phase4_candidate_nodes_resolver import derive_phase25_candidates_from_candidate_nodes
 from build_v6_promotion_combined_report import CURATED_HEADERS
@@ -851,6 +851,7 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
     def_ws.column_dimensions["B"].width = 110
 
     wb.save(out_path)
+    _persist_snapshot(out_path)
 
 
 def build_report(conn, version, tickers=None, top_n=5, vol_gate=DEFAULT_VOL_GATE,

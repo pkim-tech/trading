@@ -243,6 +243,13 @@ def write_combined_xlsx(out_rows, out_path, curated_only=False):
     out.parent.mkdir(exist_ok=True)
     wb.save(out)
     print(f"Wrote {out} ({len(csv_rows)} rows, {len(full_headers)} columns, AA={FIELDNAMES[0]!r})")
+    try:
+        from candidate_full_review_snapshots import persist_snapshot_for_file
+        stats = persist_snapshot_for_file(str(out))
+        print(f"  snapshot persisted: {stats['rows_inserted']} new row(s), "
+              f"{stats['rows_already_present']} already present")
+    except Exception as e:
+        print(f"  WARNING: snapshot persistence failed (report itself is unaffected): {e}")
 
 
 def main():

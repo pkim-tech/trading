@@ -2184,6 +2184,21 @@ def _git_provenance_stamp():
     return f"commit={commit[:12]}{'*dirty*' if dirty else ''} at {ts}"
 
 
+def _persist_snapshot(out_path):
+    """Best-effort call into candidate_full_review_snapshots.persist_snapshot_for_file
+    (Part 2, 2026-09-03, docs/backlog_cache.md's 'persist full-review-report Excel data
+    into a queryable DB table' entry) -- the report file is already safely on disk by the
+    time this runs, so a snapshot-persistence failure (e.g. a transient DB lock) must
+    never fail the whole report-generation call; caught and printed, not raised."""
+    try:
+        from candidate_full_review_snapshots import persist_snapshot_for_file
+        stats = persist_snapshot_for_file(str(out_path))
+        print(f"  snapshot persisted: {stats['rows_inserted']} new row(s), "
+              f"{stats['rows_already_present']} already present")
+    except Exception as e:
+        print(f"  WARNING: snapshot persistence failed (report itself is unaffected): {e}")
+
+
 def _write_xlsx(name, csv_rows):
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment
@@ -2217,6 +2232,7 @@ def _write_xlsx(name, csv_rows):
     def_ws.column_dimensions["B"].width = 110
 
     wb.save(out_path)
+    _persist_snapshot(out_path)
 
 
 def main():
