@@ -63,8 +63,13 @@ Logic:
      - Status resolved (canary-fresh OR fallback-probe), healthy: WOULD start the
        daemon. Only actually does so if --live was passed (explicit env, see safety
        layer 2 above); otherwise reports the decision and takes no action. When it
-       does start for real, verifies it's actually alive a few seconds later (not an
-       immediate crash) before declaring success.
+       does start for real, verifies the REAL observed outcome a few seconds later
+       (added 2026-09-03) -- not just "is the process still alive," but whether its
+       own heartbeat file (cache/live/active_signals_heartbeat.txt, written on every
+       poll-loop iteration) actually updated since the start attempt, and whether a
+       traceback appeared in its stdout log since then. Reports which of these
+       failed (or "heartbeat confirmed fresh, no traceback") in the Slack message,
+       rather than a bare pid.
      - Status resolved (canary-fresh OR fallback-probe), broken: never starts,
        regardless of --live -- posts "daemon down AND Schwab needs reauth, cron
        can't fix this, log in manually," including the fallback probe's real error
@@ -97,6 +102,7 @@ load_dotenv(ROOT / ".env")
 
 CANARY_STATE_PATH = ROOT / "cache" / "live" / "schwab_auth_canary_state.json"
 DAEMON_STDOUT_LOG = ROOT / "logs" / "active_signals_stdout.log"
+HEARTBEAT_PATH = ROOT / "cache" / "live" / "active_signals_heartbeat.txt"  # signals_config.HEARTBEAT_PATH
 
 STALE_STATE_MAX_HOURS = 2.0   # canary runs hourly -- >2h old means it's not keeping up
 DAEMON_START_VERIFY_DELAY_SECS = 5  # brief pause before re-checking it's actually alive
@@ -203,6 +209,45 @@ def _start_daemon():
     return proc.pid
 
 
+def _verify_daemon_started(start_time, pre_start_log_size):
+    """Real observed outcome, not a prediction from old logs: checks the process is
+    actually alive, then whether its own heartbeat file was written to since
+    start_time (proves the main loop reached its first iteration, not just that the
+    process spawned -- active_signals.py writes HEARTBEAT_PATH on entry to every
+    poll iteration, active_signals.py:955) and whether any traceback appeared in its
+    stdout log since the start attempt (DAEMON_STDOUT_LOG carries whatever an
+    uncaught exception prints, since Popen redirected stderr there). Returns
+    (ok, detail) where detail is a human-readable reason either way, so the Slack
+    message reports what was actually observed."""
+    if not _daemon_running():
+        return False, (f"it's not running {DAEMON_START_VERIFY_DELAY_SECS}s later -- "
+                        f"may have crashed immediately, check {DAEMON_STDOUT_LOG} manually.")
+
+    new_log_text = ""
+    if DAEMON_STDOUT_LOG.exists():
+        with DAEMON_STDOUT_LOG.open() as f:
+            f.seek(pre_start_log_size)
+            new_log_text = f.read()
+    if "Traceback (most recent call last)" in new_log_text:
+        tail = "\n".join(new_log_text.strip().splitlines()[-15:])
+        return False, ("process is running but its own log shows a traceback since "
+                        f"the start attempt -- check manually:\n{tail}")
+
+    if not HEARTBEAT_PATH.exists():
+        return False, "process is running but no heartbeat file exists yet -- check manually."
+    try:
+        hb_mtime = HEARTBEAT_PATH.stat().st_mtime
+    except OSError:
+        return False, "process is running but heartbeat file couldn't be read -- check manually."
+    if hb_mtime < start_time.timestamp() - 1:  # 1s tolerance for filesystem mtime granularity
+        hb_text = HEARTBEAT_PATH.read_text().strip()
+        return False, (f"process is running but heartbeat hasn't updated since the "
+                        f"start attempt (last: {hb_text}) -- may be hung during init, "
+                        f"check manually.")
+
+    return True, "heartbeat confirmed fresh, no traceback in its log."
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--live", action="store_true",
@@ -245,17 +290,18 @@ def main(argv=None):
                f"wasn't passed, so nothing was started.")
         return
 
+    start_time = datetime.now()
+    pre_start_log_size = DAEMON_STDOUT_LOG.stat().st_size if DAEMON_STDOUT_LOG.exists() else 0
     pid = _start_daemon()
     time.sleep(DAEMON_START_VERIFY_DELAY_SECS)
-    if _daemon_running():
+    ok, detail = _verify_daemon_started(start_time, pre_start_log_size)
+    if ok:
         _slack(f"🟡 Daemon morning check: you forgot but the cron saved you -- "
                 f"active_signals.py was down, Schwab was healthy, started it "
-                f"automatically (pid {pid}). All clean.")
+                f"automatically (pid {pid}), {detail}")
     else:
         _slack(f"🔴 Daemon morning check: attempted to start active_signals.py "
-                f"(pid {pid}) but it's not running {DAEMON_START_VERIFY_DELAY_SECS}s "
-                f"later -- may have crashed immediately, check "
-                f"{DAEMON_STDOUT_LOG} manually.")
+                f"(pid {pid}) but {detail}")
 
 
 if __name__ == "__main__":
