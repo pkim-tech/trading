@@ -63,11 +63,17 @@ Logic:
      - Status resolved (canary-fresh OR fallback-probe), healthy: WOULD start the
        daemon. Only actually does so if --live was passed (explicit env, see safety
        layer 2 above); otherwise reports the decision and takes no action. When it
-       does start for real, verifies the REAL observed outcome a few seconds later
-       (added 2026-09-03) -- not just "is the process still alive," but whether its
-       own heartbeat file (cache/live/active_signals_heartbeat.txt, written on every
-       poll-loop iteration) actually updated since the start attempt, and whether a
-       traceback appeared in its stdout log since then. Reports which of these
+       does start for real, verifies the REAL observed outcome (added 2026-09-03) --
+       not just "is the process still alive," but whether its own heartbeat file
+       (cache/live/active_signals_heartbeat.txt, written on every poll-loop
+       iteration) actually updated since the start attempt, and whether a traceback
+       appeared in its stdout log since then. Polls up to
+       DAEMON_START_VERIFY_MAX_WAIT_SECS (not a single early snapshot) -- confirmed
+       live the same day that a real, healthy start can take ~17s of startup work
+       (invariants checks, EOD reports) before its first heartbeat write, so a
+       single 5s check produced a false "hung during init" on a daemon that was
+       actually fine. A dead process or an actual traceback still fail fast, no
+       need to wait out the rest of the window for those. Reports which of these
        failed (or "heartbeat confirmed fresh, no traceback") in the Slack message,
        rather than a bare pid.
      - Status resolved (canary-fresh OR fallback-probe), broken: never starts,
@@ -105,7 +111,14 @@ DAEMON_STDOUT_LOG = ROOT / "logs" / "active_signals_stdout.log"
 HEARTBEAT_PATH = ROOT / "cache" / "live" / "active_signals_heartbeat.txt"  # signals_config.HEARTBEAT_PATH
 
 STALE_STATE_MAX_HOURS = 2.0   # canary runs hourly -- >2h old means it's not keeping up
-DAEMON_START_VERIFY_DELAY_SECS = 5  # brief pause before re-checking it's actually alive
+DAEMON_START_VERIFY_DELAY_SECS = 5   # brief initial pause before the first check
+# Confirmed live 2026-09-03: active_signals.py does real startup work (invariants
+# checks, EOD scenario review, morning report) BEFORE reaching its main loop's first
+# heartbeat write -- took ~17s in one real run. A single early check flagged this as
+# "hung during init" when it was actually a normal, healthy start still in progress.
+# Poll up to this ceiling instead of one early snapshot.
+DAEMON_START_VERIFY_MAX_WAIT_SECS = 90
+DAEMON_START_VERIFY_POLL_SECS = 5
 
 SIM_MODE = os.environ.get("SIM_MODE", "1") != "0"
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
@@ -209,19 +222,21 @@ def _start_daemon():
     return proc.pid
 
 
-def _verify_daemon_started(start_time, pre_start_log_size):
-    """Real observed outcome, not a prediction from old logs: checks the process is
-    actually alive, then whether its own heartbeat file was written to since
-    start_time (proves the main loop reached its first iteration, not just that the
-    process spawned -- active_signals.py writes HEARTBEAT_PATH on entry to every
-    poll iteration, active_signals.py:955) and whether any traceback appeared in its
-    stdout log since the start attempt (DAEMON_STDOUT_LOG carries whatever an
-    uncaught exception prints, since Popen redirected stderr there). Returns
-    (ok, detail) where detail is a human-readable reason either way, so the Slack
-    message reports what was actually observed."""
+def _verify_daemon_started_once(start_time, pre_start_log_size):
+    """One snapshot check of the real observed outcome, not a prediction from old
+    logs: checks the process is actually alive, then whether its own heartbeat file
+    was written to since start_time (proves the main loop reached its first
+    iteration, not just that the process spawned -- active_signals.py writes
+    HEARTBEAT_PATH on entry to every poll iteration, active_signals.py:955) and
+    whether any traceback appeared in its stdout log since the start attempt
+    (DAEMON_STDOUT_LOG carries whatever an uncaught exception prints, since Popen
+    redirected stderr there). Returns (ok, detail, retryable) -- retryable is True
+    only for "still waiting on the first heartbeat, nothing wrong seen yet" so the
+    caller can keep polling; a dead process or a real traceback are fail-fast
+    (retryable=False), no point waiting out the rest of the window for those."""
     if not _daemon_running():
         return False, (f"it's not running {DAEMON_START_VERIFY_DELAY_SECS}s later -- "
-                        f"may have crashed immediately, check {DAEMON_STDOUT_LOG} manually.")
+                        f"may have crashed immediately, check {DAEMON_STDOUT_LOG} manually."), False
 
     new_log_text = ""
     if DAEMON_STDOUT_LOG.exists():
@@ -231,21 +246,38 @@ def _verify_daemon_started(start_time, pre_start_log_size):
     if "Traceback (most recent call last)" in new_log_text:
         tail = "\n".join(new_log_text.strip().splitlines()[-15:])
         return False, ("process is running but its own log shows a traceback since "
-                        f"the start attempt -- check manually:\n{tail}")
+                        f"the start attempt -- check manually:\n{tail}"), False
 
     if not HEARTBEAT_PATH.exists():
-        return False, "process is running but no heartbeat file exists yet -- check manually."
+        return False, "process is running, no heartbeat file yet, still waiting.", True
     try:
         hb_mtime = HEARTBEAT_PATH.stat().st_mtime
     except OSError:
-        return False, "process is running but heartbeat file couldn't be read -- check manually."
+        return False, "process is running but heartbeat file couldn't be read -- check manually.", False
     if hb_mtime < start_time.timestamp() - 1:  # 1s tolerance for filesystem mtime granularity
-        hb_text = HEARTBEAT_PATH.read_text().strip()
-        return False, (f"process is running but heartbeat hasn't updated since the "
-                        f"start attempt (last: {hb_text}) -- may be hung during init, "
-                        f"check manually.")
+        return False, "process is running, heartbeat hasn't updated yet, still waiting.", True
 
-    return True, "heartbeat confirmed fresh, no traceback in its log."
+    return True, "heartbeat confirmed fresh, no traceback in its log.", False
+
+
+def _verify_daemon_started(start_time, pre_start_log_size):
+    """Polls _verify_daemon_started_once up to DAEMON_START_VERIFY_MAX_WAIT_SECS --
+    startup does real work (invariants, EOD reports) before its first heartbeat
+    write, so a single early snapshot isn't enough (confirmed live 2026-09-03).
+    Stops immediately on a fail-fast result (dead process, real traceback) or once
+    the process reports healthy; only the "still waiting, nothing wrong seen"
+    result keeps polling until the deadline."""
+    deadline = time.time() + DAEMON_START_VERIFY_MAX_WAIT_SECS
+    time.sleep(DAEMON_START_VERIFY_DELAY_SECS)
+    while True:
+        ok, detail, retryable = _verify_daemon_started_once(start_time, pre_start_log_size)
+        if ok or not retryable or time.time() >= deadline:
+            if not ok and retryable:
+                detail = (f"heartbeat still hasn't updated after "
+                           f"{DAEMON_START_VERIFY_MAX_WAIT_SECS}s -- may be hung during "
+                           f"init, check manually.")
+            return ok, detail
+        time.sleep(DAEMON_START_VERIFY_POLL_SECS)
 
 
 def main(argv=None):
