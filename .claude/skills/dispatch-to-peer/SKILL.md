@@ -156,6 +156,21 @@ here.
    replace the final report — just fills the gap for how long a step is
    plausibly going to take when it can't be estimated in advance.
 
+10. **Batch related work up front; don't broker every sub-step.** Confirmed
+    2026-09-03 (v6.5.1/N_ISLANDS overnight session): caught inserting a
+    round-trip checkpoint between steps that didn't need one — e.g. asking a
+    peer to check one backlog item, waiting for its idle notice, THEN asking
+    it to check the next related item, instead of bundling both into the
+    original dispatch; pausing after part 1 of a two-part build when part 2
+    was clearly always going to be approved. The async mechanics
+    (`SendMessage`/`notify_when_idle`) weren't the problem — the problem was
+    treating "the peer finished a sub-step" as a reason to wait for
+    instructions rather than continue. When dispatching, state up front which
+    sub-steps the peer should just do and report at the end vs. which ones
+    are real judgment calls needing your input (a design tradeoff, anything
+    touching a gated file, anything genuinely ambiguous) — don't make every
+    step a checkpoint by default.
+
 ## Clearing a peer session
 
 Two safe-to-clear states — don't conflate them:
