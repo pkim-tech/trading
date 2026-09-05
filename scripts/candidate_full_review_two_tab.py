@@ -163,6 +163,51 @@ def _is_pct_header(header):
 USER_PCT_NUMBER_FORMAT = "0.0"
 USER_PCT_COLUMN_WIDTH = 6.43  # user's own convention (2026-09-04): ~50px in Excel's column-width units
 
+# User's global category-color convention (2026-09-04): applied spreadsheet-wide, to
+# every matching column regardless of whether it's also in USER_HIGHLIGHTED_FIELDNAMES
+# -- separate layer from the pct number-format/width treatment above (same columns
+# can carry both). Priority when a header could plausibly match more than one:
+# CAGR > win-rate > number (checked in that order, first match wins) -- in practice
+# these three patterns are mutually exclusive in this codebase's real column set.
+USER_CAGR_FILL = "C6EFCE"    # light green
+USER_WINRATE_FILL = "FFC7CE"  # light red
+USER_NUMBER_FILL = "BDD7EE"   # light blue
+
+
+def _is_cagr_header(header):
+    if not header or "tranche" in header.lower():
+        return False
+    return "cagr" in header.lower()
+
+
+def _is_winrate_header(header):
+    if not header:
+        return False
+    h = header.lower()
+    if "tranche" in h or "verdict" in h:
+        return False
+    return "win_rate" in h or "wr_pct" in h or "win_pct" in h or "wr %" in h
+
+
+# Plain count/tally columns -- NOT IDs (Node ID excluded explicitly) or dates. Real
+# names from this report's own column set: addon_n/drought_n, n_trades_1m/1s, trades/
+# Trades, years/Years, wf_positive_folds/wf_total_folds, core_fluke_trades, bear_*_
+# trades, crash25_*_trades, drought_ie_n_included/excluded, exit_fillacc_n, fillacc_n,
+# underlier_count.
+_NUMBER_HEADER_EXACT = {"trades", "years", "node id"}  # lowercased human-readable CURATED_HEADERS names
+
+
+def _is_number_header(header):
+    if not header:
+        return False
+    h = header.lower()
+    if h == "node id" or "tranche" in h or "verdict" in h or "%" in h or h.endswith("_pct"):
+        return False
+    if h in _NUMBER_HEADER_EXACT - {"node id"}:
+        return True
+    return (h.endswith("_n") or h.endswith("_trades") or h.endswith("_folds")
+            or h.endswith("_count") or h.startswith("n_trades"))
+
 # User's front-block visibility convention (2026-09-04, confirmed against real column
 # letters A-AD): 1-indexed positions within CURATED_HEADERS+TWO_TAB_1M_HEADERS+
 # TWO_TAB_MANUAL_BLANK_COLS (30 columns, A:AD) to group/hide -- everything else in
@@ -534,8 +579,35 @@ def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
     for pos in FRONT_BLOCK_HIDDEN_POSITIONS:
         ws.column_dimensions[get_column_letter(pos)].outlineLevel = 1
         ws.column_dimensions[get_column_letter(pos)].hidden = True
+    # User's global category-color convention (2026-09-04): every CAGR/win-rate/
+    # plain-count column, spreadsheet-wide, gets a fixed fill by category -- separate
+    # layer from the pct number-format/width treatment above (a column can carry
+    # both). Checked in priority order (CAGR > win-rate > number, first match wins)
+    # since these three patterns are mutually exclusive in this report's real column
+    # set. Columns in USER_HIGHLIGHTED_FIELDNAMES that match one of these categories
+    # get the category color instead of the fallback yellow below -- only a
+    # highlighted column matching NONE of the three (resolution_spread_tranche, the
+    # one case today) keeps yellow.
+    category_colored_cols = set()
+    for col_idx, h in enumerate(headers, start=1):
+        if _is_cagr_header(h):
+            fill_color = USER_CAGR_FILL
+        elif _is_winrate_header(h):
+            fill_color = USER_WINRATE_FILL
+        elif _is_number_header(h):
+            fill_color = USER_NUMBER_FILL
+        else:
+            continue
+        category_colored_cols.add(col_idx)
+        letter = get_column_letter(col_idx)
+        fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
+        for row in range(1, ws.max_row + 1):
+            ws[f"{letter}{row}"].fill = fill
+
     highlight_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
     for col in highlighted_cols:
+        if col in category_colored_cols:
+            continue
         letter = get_column_letter(col)
         for row in range(1, ws.max_row + 1):
             ws[f"{letter}{row}"].fill = highlight_fill
