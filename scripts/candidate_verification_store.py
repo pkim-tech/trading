@@ -287,6 +287,112 @@ def get_cached_trades(conn, node_key_val, version, ticker=None,
     return trades
 
 
+def get_phase5_1s_trades(conn, candidate_id, ticker=None, strategy=None, fixed_sl=None,
+                          start_date=None, end_date=None):
+    """Real persisted 1-second-resolution core trade list from `phase5_trades`
+    (scripts/phase5_second_level_overlay_check.py's own persistence, `_persist_trades`),
+    reconstructed into the EXACT dict shape get_cached_trades above produces -- same
+    downstream consumers (build_candidate_report_ground_truth's checks 4/8/11/13,
+    apply_addon_overlay_ground_truth, simulate_drought_overlay_ground_truth), same shape
+    requirement (real pandas Timestamps, not strings; 'armed' a real bool; 'Arm Time'/
+    'Arm Price' None when unarmed).
+
+    Real gap found 2026-09-04 (docs/research_log.md / this session's conversation): that
+    report's own core_addon_cagr_pct/core_drought_cagr_pct/core_both_cagr_pct always
+    multiplied a core_factor from a FRESH re-simulation of `run_backtest_ground_truth`
+    against MINUTE-resolution data (every call site in run_optimization_sweep.py passes
+    minute_df, confirmed directly) -- a third, independent re-derivation of the same
+    core trade list Phase5 already computed and stored at 1-second resolution
+    (candidate_verification_results.core_cagr_1s, the number this project's own
+    convention already treats as the trusted one). Feeding the SAME stored 1s trades
+    into the checklist compute instead of re-simulating removes this divergence at the
+    source, for any candidate Phase5 already verified.
+
+    WINDOW VALIDATION (added after paired review, 2026-09-04 -- both independent-cold
+    and contextual Opus review independently converged on this as a real, DB-confirmed
+    CRITICAL/HIGH bug in the first version of this function): `phase5_second_level_
+    overlay_check.py`'s own main() hardcodes ONE fixed simulation window
+    ("2021-08-23"/"2026-08-21") for EVERY campaign version it ever processes, regardless
+    of that version's own real (narrower, or differently-dated) window -- confirmed
+    against the real DB: version 'v6.5-...-w2021-08-23_2026-05-23-...-pv4' has 823
+    candidates whose persisted 1s trades run past 2026-05-23 into 2026-08-21, ~3 months
+    outside that version's own real window. A plain version-string match does NOT catch
+    this (the rows carry the correct version label; they were simply simulated over a
+    wider window than that version represents). So: when `start_date`/`end_date` are
+    given (the caller's own real campaign window), any stored row falling outside
+    [start_date, end_date] makes the WHOLE trade list untrustworthy for this call --
+    return None (fall back to resimulation) rather than silently feeding a years/fold-
+    span mismatch into check8/11/13 and the core_factor math.
+
+    PARAM CROSS-CHECK (same review round, contextual MEDIUM finding): candidate_id alone
+    is trusted as the join key with no verification against the row's own stored ticker/
+    strategy/fixed_sl -- cheap to check, done here now. Ticker is validated, not
+    silently overridden by the caller's value as the pre-review version of this function
+    did.
+
+    Returns None (never []) when: candidate_id is None, `phase5_trades` doesn't exist
+    yet, there is no resolution='1s' row for this candidate_id, the stored trade_idx
+    sequence has a gap, a provided ticker/strategy/fixed_sl doesn't match the stored
+    row, or (when start_date/end_date are given) any trade falls outside that window --
+    all of these are the caller's real "no stored 1s trades safely usable here, fall
+    back to a fresh run_backtest_ground_truth call" signal, same contract get_cached_
+    trades already establishes for backtest_winner_trades. A genuinely trade-free
+    candidate (real n_trades=0) is indistinguishable from "never persisted" here, same
+    accepted limitation get_cached_trades documents -- the caller always has a real
+    re-simulation fallback, so worst case is one wasted (but still correct) recompute,
+    never a wrong answer.
+
+    KNOWN RESIDUAL GAP, not fixed here (flagged, not silently skipped): unlike
+    get_cached_trades/backtest_winner_trades, `phase5_trades` has no kernel_version/
+    hourly_build_id/minute_build_id columns, so a Phase5 re-run after a real kernel fix
+    or a derived-build promotion (the 2026-08-27 SOXL/DPST/DFEN incident class) cannot
+    be detected as stale here, and `insert_trades`'s INSERT OR IGNORE (no DELETE-first)
+    means such a re-run can't even overwrite old rows. Real fix (schema parity with
+    backtest_winner_trades) intentionally out of scope for this pass -- flagged to
+    docs/backlog_cache.md, not silently left undocumented."""
+    if candidate_id is None:
+        return None
+    try:
+        rows = conn.execute("""
+            SELECT trade_idx, entry_time, entry_price, exit_time, exit_price, exit_reason,
+                   return_pct, armed, arm_time, arm_price, ticker, strategy, fixed_sl
+            FROM phase5_trades
+            WHERE candidate_id=? AND resolution='1s'
+            ORDER BY trade_idx
+        """, (candidate_id,)).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        return None
+    if [r[0] for r in rows] != list(range(len(rows))):
+        return None  # gapped/partial persistence -- don't trust it, fall back
+    _, _, _, _, _, _, _, _, _, _, row_ticker, row_strategy, row_fixed_sl = rows[0]
+    if ticker is not None and row_ticker != ticker:
+        return None
+    if strategy is not None and row_strategy != strategy:
+        return None
+    if fixed_sl is not None and float(row_fixed_sl) != float(fixed_sl):
+        return None
+    import pandas as pd
+    if start_date is not None and pd.Timestamp(rows[0][1]) < pd.Timestamp(start_date):
+        return None  # first trade's entry predates the caller's real window
+    if end_date is not None and pd.Timestamp(rows[-1][3]) > pd.Timestamp(end_date) + pd.Timedelta(days=1):
+        return None  # last trade's exit runs past the caller's real window
+    trades = []
+    for (_, entry_time, entry_price, exit_time, exit_price, exit_reason,
+         return_pct, armed, arm_time, arm_price, _rt, _rs, _rf) in rows:
+        armed = bool(armed)
+        trades.append({
+            'Ticker': row_ticker,
+            'Entry Time': pd.Timestamp(entry_time), 'Entry Price': entry_price,
+            'Exit Time': pd.Timestamp(exit_time), 'Exit Price': exit_price,
+            'exit_reason': exit_reason, 'Return': return_pct, 'armed': armed,
+            'Arm Time': pd.Timestamp(arm_time) if armed and arm_time else None,
+            'Arm Price': arm_price if armed else None,
+        })
+    return trades
+
+
 # --- phase4_results: Phase4 aggregate-result persistence (Task #2, 2026-08-29 planner
 # dispatch, PERF) -- sibling shape to candidate_verification_results above, but keyed on
 # candidate_id ALONE (no 'phase' dimension -- this table only ever holds Phase4's own

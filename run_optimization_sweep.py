@@ -3638,7 +3638,8 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     # forcing them to move together on a real kernel bump) -- every real writer/reader
     # of backtest_winner_trades' kernel_version column imports the SAME constant now.
     from scripts.node_key import node_key as _node_key, GT_TRADES_KERNEL_VERSION as _GT_TRADES_KERNEL_VERSION
-    from scripts.candidate_verification_store import get_cached_trades as _get_cached_trades
+    from scripts.candidate_verification_store import (
+        get_cached_trades as _get_cached_trades, get_phase5_1s_trades as _get_phase5_1s_trades)
     import db_cache as _db_cache
     _hourly_build_id = _db_cache.get_active_build_id(ticker, 'hourly')
     _minute_build_id = _db_cache.get_active_build_id(ticker, 'minute')
@@ -3651,10 +3652,23 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                 strategy_name, ticker, fixed_sl, cand['window'], cand['z_score_threshold'],
                 cand['max_hold_hours'], cand['take_profit'], cand['stop_loss'], cand['tpct'],
                 entry_timing, strategies.resolve_axis_columns)
-            cached_trades = _get_cached_trades(
-                _trades_conn, node_key_val, config_version, ticker=ticker,
-                kernel_version=_GT_TRADES_KERNEL_VERSION,
-                hourly_build_id=_hourly_build_id, minute_build_id=_minute_build_id)
+            # Real 1-second-resolution trades take priority over both the minute-only
+            # backtest_winner_trades cache and a fresh (also minute-only) resim -- see
+            # get_phase5_1s_trades' own docstring for the divergence this removes at the
+            # source, for any candidate Phase5 already verified (candidate_nodes-sourced
+            # candidates only, via cand['id']; a legacy backtest_cache-sourced candidate
+            # has no 'id' key and this is a no-op None for it, same as today).
+            cached_trades = _get_phase5_1s_trades(
+                _trades_conn, cand.get('id'), ticker=ticker, strategy=strategy_name,
+                fixed_sl=fixed_sl, start_date=start_date, end_date=end_date)
+            trades_resolution = '1s' if cached_trades is not None else None
+            if cached_trades is None:
+                cached_trades = _get_cached_trades(
+                    _trades_conn, node_key_val, config_version, ticker=ticker,
+                    kernel_version=_GT_TRADES_KERNEL_VERSION,
+                    hourly_build_id=_hourly_build_id, minute_build_id=_minute_build_id)
+                if cached_trades is not None:
+                    trades_resolution = 'minute_cache'
             need_resim = cached_trades is None
             # is_both scopes still need df_hourly_windowed for the drought overlay below
             # even when trades came from cache -- non-is_both scopes with a cache hit
@@ -3683,6 +3697,7 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                         open_check_entry_timing=(entry_timing == 'open_check'), same_bar_reentry=True,
                         prep=prep, mprep=mprep, need_times=True,
                     )
+                    trades_resolution = 'minute_resim'
 
             c4_early_wr, c4_late_wr = _check4_stability_gt(trades) if trades else (None, None)
             c8 = _check8_fluke_gt(trades)
@@ -3722,6 +3737,16 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                 # though get_cached_trades' own kernel_version/build_id check above
                 # already means a stale-cache hit shouldn't be reachable in practice.
                 'trades_from_cache': not need_resim,
+                # Which of the 3 real trade sources actually supplied this row's `trades`
+                # -- '1s' (phase5_trades, the trusted resolution), 'minute_cache'
+                # (backtest_winner_trades, minute-resolution), 'minute_resim' (fresh
+                # run_backtest_ground_truth, also minute-resolution), or None (never set
+                # -- shouldn't happen, trades is always one of the three above). Added
+                # 2026-09-04 paired-review MEDIUM finding: 'trades_from_cache' alone
+                # collapsed 1s-served and minute-cache-served into one flag, with no way
+                # for a downstream reader to tell which resolution actually produced a
+                # given row's numbers.
+                'trades_resolution': trades_resolution,
                 # Raw per-trade closed-trade list (need_times=True -- Entry/Exit Time/Price,
                 # Return, armed/Arm Time/Arm Price), added 2026-08-23 for candidate_full_
                 # review.py's --kernel gt full-review port: lets that report compute real
