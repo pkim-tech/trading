@@ -163,6 +163,14 @@ def _is_pct_header(header):
 USER_PCT_NUMBER_FORMAT = "0.0"
 USER_PCT_COLUMN_WIDTH = 6.43  # user's own convention (2026-09-04): ~50px in Excel's column-width units
 
+# User's front-block visibility convention (2026-09-04, confirmed against real column
+# letters A-AD): 1-indexed positions within CURATED_HEADERS+TWO_TAB_1M_HEADERS+
+# TWO_TAB_MANUAL_BLANK_COLS (30 columns, A:AD) to group/hide -- everything else in
+# that range stays visible. Positional (not name-keyed) since 2 of the 30 are blank
+# manual columns with no header text to key on -- relies on the user's own stated
+# "assuming it doesn't change order" caveat, same as the rest of this block.
+FRONT_BLOCK_HIDDEN_POSITIONS = [4, 5, 6, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21]
+
 
 def _phase4_extra_by_id(conn, node_ids):
     """Real phase4_results data for `node_ids`, appended as new columns (item #2) rather
@@ -507,19 +515,25 @@ def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
                 ws.cell(row=row, column=col_idx).number_format = USER_PCT_NUMBER_FORMAT
 
     # User's own standing manual-review convention (2026-09-04): a fixed set of
-    # FIELDNAMES columns get highlighted (the ones actually scanned), every OTHER
-    # FIELDNAMES column strictly between the first and last highlighted one gets
-    # grouped/collapsed (the "gaps"). Columns after the last highlighted one are left
-    # alone (untouched, not grouped) -- not yet asked to collapse those. Keyed off
-    # USER_HIGHLIGHTED_FIELDNAMES (names, not letters) so this stays correct if
-    # FIELDNAMES' own order/length ever shifts -- only breaks if one of these exact
-    # names is renamed or removed from COLUMN_DEFS entirely.
+    # FIELDNAMES columns get highlighted (the ones actually scanned); every OTHER
+    # FIELDNAMES column from the very start of the block (AE) through the last
+    # highlighted one gets grouped/collapsed (confirmed 2026-09-04: "AE through BN
+    # needs to be hidden" -- the front of the block, before the first highlighted
+    # column, collapses too, not just the internal gaps). Columns after the last
+    # highlighted one are left alone (untouched, not grouped) -- not yet asked to
+    # collapse those. Keyed off USER_HIGHLIGHTED_FIELDNAMES (names, not letters) so
+    # this stays correct if FIELDNAMES' own order/length ever shifts -- only breaks
+    # if one of these exact names is renamed or removed from COLUMN_DEFS entirely.
     fieldnames_start_col = len(CURATED_HEADERS) + len(TWO_TAB_1M_HEADERS) + TWO_TAB_MANUAL_BLANK_COLS + 1
     highlighted_cols = sorted(fieldnames_start_col + FIELDNAMES.index(name) for name in USER_HIGHLIGHTED_FIELDNAMES)
-    for col in range(highlighted_cols[0], highlighted_cols[-1] + 1):
+    for col in range(fieldnames_start_col, highlighted_cols[-1] + 1):
         if col not in highlighted_cols:
             ws.column_dimensions[get_column_letter(col)].outlineLevel = 1
             ws.column_dimensions[get_column_letter(col)].hidden = True
+    # Front-block visibility (A:AD -- see FRONT_BLOCK_HIDDEN_POSITIONS' own comment).
+    for pos in FRONT_BLOCK_HIDDEN_POSITIONS:
+        ws.column_dimensions[get_column_letter(pos)].outlineLevel = 1
+        ws.column_dimensions[get_column_letter(pos)].hidden = True
     highlight_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
     for col in highlighted_cols:
         letter = get_column_letter(col)
