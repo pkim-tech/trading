@@ -133,6 +133,36 @@ PHASE4_EXTRA_HEADERS = [
 TWO_TAB_1M_HEADERS = ["Cagr (1m)", "Cagr Add on (1m)", "CAGR Drought (1m)", "CAGR Both (1m)"]
 TWO_TAB_MANUAL_BLANK_COLS = 2  # was "U-Z"/6 (shared MANUAL_BLANK_COLS) before item #3; now Y-Z/2
 
+# User's own standing manual-review highlight set (2026-09-04, confirmed against real
+# column letters BD/BE/BO/BT/BU/BZ/CC/CD/DI in a live report) -- see _write_curated_tab's
+# grouping/highlight block for how this drives both the highlight fill and the collapsed
+# "gap" columns between them.
+USER_HIGHLIGHTED_FIELDNAMES = [
+    "resolution_spread_tranche", "years", "addon_n", "addon_early_wr_pct",
+    "addon_late_wr_pct", "drought_n", "drought_win_rate_pct", "drought_early_wr_pct",
+    "drought_late_wr_pct", "wf_positive_folds",
+]
+
+# wf_*_fold_alpha are real percentage-return values without a "_pct" suffix (legacy
+# naming) -- everything else percentage-shaped is caught by the "_pct" suffix (raw
+# FIELDNAMES/PHASE4_EXTRA_COLUMNS style), a literal "%" in a human-readable header
+# (CURATED_HEADERS/TWO_TAB_1M_HEADERS/PHASE4_EXTRA_HEADERS style), or "cagr" in the
+# header (this codebase's own CAGR columns are always percentages, never fractions,
+# per _pct100's own docstring convention) -- excluding "tranche" columns, which use
+# "cagr"/"%" only inside a bucket LABEL (e.g. "0-50%"), not as a real numeric value.
+_ALPHA_PCT_FIELDNAMES = {"wf_min_fold_alpha", "wf_max_fold_alpha", "wf_mean_fold_alpha"}
+
+
+def _is_pct_header(header):
+    if not header or "tranche" in header.lower():
+        return False
+    h = header.lower()
+    return h.endswith("_pct") or header in _ALPHA_PCT_FIELDNAMES or "%" in header or "cagr" in h
+
+
+USER_PCT_NUMBER_FORMAT = "0.0"
+USER_PCT_COLUMN_WIDTH = 6.43  # user's own convention (2026-09-04): ~50px in Excel's column-width units
+
 
 def _phase4_extra_by_id(conn, node_ids):
     """Real phase4_results data for `node_ids`, appended as new columns (item #2) rather
@@ -441,7 +471,7 @@ def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
     population, not just raw-only rows. The 1m block (item #3, same day) sits right after
     CURATED_HEADERS, consuming 4 of the original 6 manual-blank columns -- see
     TWO_TAB_1M_HEADERS' own module-level comment for why it's local to this file."""
-    from openpyxl.styles import Font
+    from openpyxl.styles import Font, PatternFill
     from openpyxl.utils import get_column_letter
 
     headers = (CURATED_HEADERS + TWO_TAB_1M_HEADERS + [None] * TWO_TAB_MANUAL_BLANK_COLS
@@ -460,6 +490,41 @@ def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
     for i, h in enumerate(CURATED_HEADERS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = max(10, min(len(h) + 2, 30))
     ws.freeze_panes = "B2"
+
+    # User's own standing display convention (2026-09-04): every percentage-shaped
+    # column, spreadsheet-wide (CURATED_HEADERS/1m/FIELDNAMES/PHASE4_EXTRA_HEADERS
+    # alike -- see _is_pct_header), gets a fixed one-decimal DISPLAY format (never
+    # rounds the underlying stored value, just how Excel renders it) and a narrow
+    # fixed column width, since these are the columns actually scanned across many
+    # rows at once and don't need CURATED_HEADERS' name-length-based width. Applied
+    # AFTER the CURATED_HEADERS width loop above so it overrides those columns too.
+    max_row = ws.max_row
+    for col_idx, h in enumerate(headers, start=1):
+        if _is_pct_header(h):
+            letter = get_column_letter(col_idx)
+            ws.column_dimensions[letter].width = USER_PCT_COLUMN_WIDTH
+            for row in range(2, max_row + 1):
+                ws.cell(row=row, column=col_idx).number_format = USER_PCT_NUMBER_FORMAT
+
+    # User's own standing manual-review convention (2026-09-04): a fixed set of
+    # FIELDNAMES columns get highlighted (the ones actually scanned), every OTHER
+    # FIELDNAMES column strictly between the first and last highlighted one gets
+    # grouped/collapsed (the "gaps"). Columns after the last highlighted one are left
+    # alone (untouched, not grouped) -- not yet asked to collapse those. Keyed off
+    # USER_HIGHLIGHTED_FIELDNAMES (names, not letters) so this stays correct if
+    # FIELDNAMES' own order/length ever shifts -- only breaks if one of these exact
+    # names is renamed or removed from COLUMN_DEFS entirely.
+    fieldnames_start_col = len(CURATED_HEADERS) + len(TWO_TAB_1M_HEADERS) + TWO_TAB_MANUAL_BLANK_COLS + 1
+    highlighted_cols = sorted(fieldnames_start_col + FIELDNAMES.index(name) for name in USER_HIGHLIGHTED_FIELDNAMES)
+    for col in range(highlighted_cols[0], highlighted_cols[-1] + 1):
+        if col not in highlighted_cols:
+            ws.column_dimensions[get_column_letter(col)].outlineLevel = 1
+            ws.column_dimensions[get_column_letter(col)].hidden = True
+    highlight_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    for col in highlighted_cols:
+        letter = get_column_letter(col)
+        for row in range(1, ws.max_row + 1):
+            ws[f"{letter}{row}"].fill = highlight_fill
 
 
 def _enrich_full_review_core_cagr(conn, csv_rows):
