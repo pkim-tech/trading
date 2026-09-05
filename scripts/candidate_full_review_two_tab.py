@@ -1057,6 +1057,26 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
     def_ws.append(["Column", "Definition"])
     for cell in def_ws[1]:
         cell.font = Font(bold=True)
+    def_ws.append(["RESOLUTION CAVEAT (2026-09-04, read before trusting any single number "
+                    "in the 144-col checklist block)",
+                    "'Cagr' and the 3 stacked columns ('Cagr Add on'/'CAGR Drought'/'CAGR Both') are "
+                    "the ONLY headline numbers corrected to Phase5's trusted 1-second (core_cagr_1s) "
+                    "resolution. Every OTHER number in the 144-col checklist block (addon/drought "
+                    "compounded %/win-rate/robustness-verdict columns, drought_ie_* the vol-gate "
+                    "challenge, check8/check11/check13, wf_* walk-forward folds, core_fluke_*, "
+                    "resolution_spread_tranche, alpha_possible/pessimistic/certain_pct) is computed by "
+                    "THIS report's own re-simulation, which always runs at MINUTE-bar resolution "
+                    "(confirmed: every run_backtest_ground_truth call site in run_optimization_sweep.py "
+                    "passes minute_df, never 1-second data) -- there is no 1-second version of these "
+                    "diagnostic columns anywhere in the pipeline. A column carrying an explicit '(1m)' "
+                    "or '_1m'/'_1s' suffix (e.g. 'Cagr (1m)', core_cagr_1m/1s in the raw DB) is the one "
+                    "explicit exception -- read its suffix literally. Minute-resolution fill timing can "
+                    "move a single trade's arm price/entry by several percentage points on a fast-moving "
+                    "leveraged ETF (confirmed concretely on ETHU node 38604, 2026-09-04), which can drive "
+                    "the annualized number many percentage points off what real second-level fills would "
+                    "show -- treat any of these minute-resolution diagnostic numbers as directionally "
+                    "useful, not literally trustworthy to a percentage point, especially for a node whose "
+                    "trades are addon/drought-leg-heavy (that's where this sensitivity concentrates)."])
     for col, definition in COLUMN_DEFS.items():
         def_ws.append([col, definition])
         def_ws.cell(row=def_ws.max_row, column=2).alignment = Alignment(wrap_text=True, vertical="top")
