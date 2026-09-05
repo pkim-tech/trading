@@ -85,7 +85,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from candidate_full_review import (
     DB_PATH, DEFAULT_VOL_GATE, FIELDNAMES, COLUMN_DEFS, ensure_candidate_nodes_table,
     gt_full_review_rows, _build_output_row, GT_SKIP_COLUMNS, GT_SKIP_LABEL, _git_provenance_stamp,
-    k1_status, _persist_snapshot,
+    k1_status, _persist_snapshot, ticker_sector, underlier_info,
 )
 from phase4_candidate_nodes_resolver import derive_phase25_candidates_from_candidate_nodes
 from build_v6_promotion_combined_report import CURATED_HEADERS
@@ -110,13 +110,13 @@ PHASE4_EXTRA_COLUMNS = [
     "addon_cagr_pct", "drought_compounded_pct", "drought_combined_compounded_pct",
     "check8_compounded_pct", "check8_compounded_without_best_pct", "check8_best_trade_share_pct",
     "check11_max_drawdown_pct", "check13_worst_fold_cagr_pct", "check13_any_fold_fragile",
-    "core_addon_disagreement",
+    "core_addon_disagreement", "check4_early_wr_pct", "check4_late_wr_pct",
 ]
 PHASE4_EXTRA_HEADERS = [
     "Phase4 Addon Cagr %", "Phase4 Drought Compounded %", "Phase4 Drought Combined Compounded %",
     "Phase4 Check8 Compounded %", "Phase4 Check8 Compounded (no best) %", "Phase4 Check8 Best Trade Share %",
     "Phase4 Check11 Max Drawdown %", "Phase4 Check13 Worst Fold Cagr %", "Phase4 Check13 Any Fold Fragile",
-    "Phase4 Core/Addon Disagreement",
+    "Phase4 Core/Addon Disagreement", "Phase4 Check4 Early WR %", "Phase4 Check4 Late WR %",
 ]
 
 # item #3 (2026-09-02): 1-minute-resolution CAGR siblings of Cagr/Cagr Add on/CAGR
@@ -309,8 +309,26 @@ def _matches_promotion(ticker, node_id, promoted_ids):
     return "YES" if node_id == promoted_id else "no"
 
 
+def _k1_tranche(k1_str):
+    """Mirrors candidate_full_review.py's inline k1_tranche/brokerage_only derivation
+    (build_candidate_report_ground_truth, right after ticker_sector/k1_status are read) --
+    kept as a small standalone copy here rather than importing, since the original isn't
+    factored out as its own function. Returns (k1_tranche, brokerage_only)."""
+    k1_str = k1_str or "not checked"
+    if k1_str.startswith("CONFIRMED K-1"):
+        tranche = "K1_CONFIRMED"
+    elif k1_str.startswith("confirmed clean"):
+        tranche = "CLEAN_CONFIRMED"
+    elif "ETN" in k1_str:
+        tranche = "ETN_NOT_K1"
+    else:
+        tranche = "NOT_CHECKED"
+    return tranche, tranche == "K1_CONFIRMED"
+
+
 def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
-                                  full_review_by_id, lightweight_row, winner, phase4_extra_by_id):
+                                  full_review_by_id, lightweight_row, winner, phase4_extra_by_id,
+                                  version=None, sector_fn=None, underlier_fn=None):
     """Builds ONE row's (curated-front-24-cols, checklist-144-cols) pair -- v6 (2026-09-02,
     'every tab gets the exact same 174-column layout' user dispatch). Single source of
     truth for the CURATED_HEADERS-ordered front block across all 4 tabs (Full Review,
@@ -381,12 +399,38 @@ def _curated_front_and_checklist(node_id, promoted_ids, k1_fn, counter_formula,
     ]
     front_1m = [_pct100(r.get("core_cagr_1m")), _pct100(r.get("addon_cagr_1m")),
                 _pct100(r.get("drought_cagr_1m")), _pct100(r.get("core_both_cagr_1m"))]
-    checklist = [None] * len(FIELDNAMES)
+    # Identity/classification fields (v7, 2026-09-04): cheap ticker/version-level lookups
+    # that don't require the expensive full-checklist compute -- were previously zeroed
+    # out unconditionally along with the genuinely-expensive trade-resimulation columns
+    # (walk-forward per-fold detail, addon/drought robustness verdicts, bear-market tests)
+    # this block also carries. Filled here for every raw/lightweight row, not just rows
+    # with a Full Review match -- real gap found 2026-09-04 (a raw-only row's sector/K1/
+    # liquidity classification costs nothing, unlike the trade-stat checks it was
+    # incorrectly gated alongside). candidate_type/also_matches/pick/comment/liquidity_*
+    # genuinely don't apply to a non-curated row (no selection category, no cached avg-
+    # volume lookup wired here) -- left blank rather than guessed.
+    checklist_map = {h: None for h in FIELDNAMES}
+    ticker_val = r.get("ticker")
+    checklist_map["ticker"] = ticker_val
+    checklist_map["node_id"] = node_id
+    checklist_map["strategy"] = r.get("strategy")
+    if version is not None:
+        checklist_map["config_version"] = version
+    if ticker_val is not None:
+        if sector_fn is not None:
+            checklist_map["sector"] = sector_fn(ticker_val)
+        k1_str = k1_fn(ticker_val)
+        checklist_map["k1_status"] = k1_str
+        checklist_map["k1_tranche"], checklist_map["brokerage_only"] = _k1_tranche(k1_str)
+        if underlier_fn is not None:
+            checklist_map["underlier_count"], checklist_map["underlier_note"] = underlier_fn(ticker_val)
+    checklist = [checklist_map[h] for h in FIELDNAMES]
     return front, front_1m, checklist, p4
 
 
 def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
-                        lightweight_by_id, winner_by_id, phase4_extra_by_id):
+                        lightweight_by_id, winner_by_id, phase4_extra_by_id,
+                        version=None, sector_fn=None, underlier_fn=None):
     """Writes one CURATED_HEADERS(24) + TWO_TAB_1M_HEADERS(4) + TWO_TAB_MANUAL_BLANK_COLS(2)
     + FIELDNAMES(144) + PHASE4_EXTRA_HEADERS(10) = 184-column tab for the given `node_ids`
     in order -- shared by all 4 tabs, see _curated_front_and_checklist's own docstring for
@@ -410,7 +454,8 @@ def _write_curated_tab(ws, node_ids, promoted_ids, k1_fn, full_review_by_id,
         counter = f"=COUNTIF($A$2:A{i},A{i})"
         front, front_1m, checklist, phase4_extra = _curated_front_and_checklist(
             node_id, promoted_ids, k1_fn, counter, full_review_by_id,
-            lightweight_by_id.get(node_id), winner_by_id.get(node_id), phase4_extra_by_id)
+            lightweight_by_id.get(node_id), winner_by_id.get(node_id), phase4_extra_by_id,
+            version=version, sector_fn=sector_fn, underlier_fn=underlier_fn)
         ws.append(front + front_1m + [None] * TWO_TAB_MANUAL_BLANK_COLS + checklist + phase4_extra)
     for i, h in enumerate(CURATED_HEADERS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = max(10, min(len(h) + 2, 30))
@@ -754,6 +799,18 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
             k1_cache[ticker] = k1_status(conn, ticker)
         return k1_cache[ticker]
 
+    sector_cache, underlier_cache = {}, {}
+
+    def _sector(ticker):
+        if ticker not in sector_cache:
+            sector_cache[ticker] = ticker_sector(conn, ticker)
+        return sector_cache[ticker]
+
+    def _underlier(ticker):
+        if ticker not in underlier_cache:
+            underlier_cache[ticker] = underlier_info(conn, ticker)
+        return underlier_cache[ticker]
+
     full_review_rows = _enrich_full_review_core_cagr(conn, full_review_rows)
     full_review_by_id = {r["node_id"]: r for r in full_review_rows}
     combined_rows = _curate_combined_rows(full_review_rows)
@@ -772,20 +829,24 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
     review_ws = wb.active
     review_ws.title = "Full Review"
     _write_curated_tab(review_ws, [r["node_id"] for r in full_review_rows], promoted_ids, _k1,
-                        full_review_by_id, {}, {}, phase4_extra_by_id)  # no lightweight fallback needed -- every id has a FR row
+                        full_review_by_id, {}, {}, phase4_extra_by_id,  # no lightweight fallback needed -- every id has a FR row
+                        version=version, sector_fn=_sector, underlier_fn=_underlier)
 
     combined_ws = wb.create_sheet("Combined")
     combined_winner_by_id = {r["node_id"]: r.get("_winner") for r in combined_rows}
     _write_curated_tab(combined_ws, [r["node_id"] for r in combined_rows], promoted_ids, _k1,
-                        full_review_by_id, {}, combined_winner_by_id, phase4_extra_by_id)
+                        full_review_by_id, {}, combined_winner_by_id, phase4_extra_by_id,
+                        version=version, sector_fn=_sector, underlier_fn=_underlier)
 
     cand_ws = wb.create_sheet("Candidates")
     _write_curated_tab(cand_ws, [r["id"] for r in curated_rows], promoted_ids, _k1,
-                        full_review_by_id, candidates_by_id, winner_by_id, phase4_extra_by_id)
+                        full_review_by_id, candidates_by_id, winner_by_id, phase4_extra_by_id,
+                        version=version, sector_fn=_sector, underlier_fn=_underlier)
 
     raw_ws = wb.create_sheet("All Candidates (raw)")
     _write_curated_tab(raw_ws, [r["id"] for r in raw_rows], promoted_ids, _k1,
-                        full_review_by_id, raw_by_id, winner_by_id, phase4_extra_by_id)
+                        full_review_by_id, raw_by_id, winner_by_id, phase4_extra_by_id,
+                        version=version, sector_fn=_sector, underlier_fn=_underlier)
 
     def_ws = wb.create_sheet("Column Definitions")
     def_ws.append(["Column", "Definition"])
