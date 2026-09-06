@@ -816,7 +816,14 @@ def get_massive_hourly_derived(ticker, build_id=None):
 def _ensure_massive_second_derived_table(conn):
     # massive_second_derived: the dividend-adjusted 1-SECOND derived series, built
     # from cache/research/second_data/{ticker}_1s.csv raw ticks (2026-08-29,
-    # scripts/build_massive_second_derived.py) -- same column shape as
+    # scripts/build_massive_second_derived.py). Dividend adjustment for this leg
+    # happens mostly at MASSIVE'S OWN source (their seconds-aggregates endpoint's
+    # adjusted=true bakes in dividends, unlike the minute/hourly aggregates
+    # endpoint's split-only adjusted=true) -- the builder script applies its own
+    # apply_dividend_adjustment only as a residual top-up for any real dividend
+    # after the raw pull date, NOT a full independent adjustment pass the way the
+    # hourly/minute legs do (2026-09-06 fix, see that script's own docstring for
+    # the double-adjustment bug this closed). Same column shape as
     # massive_hourly_derived (including `corrected`, kept for shape consistency
     # with the sibling tables even though it's always 0 here: there is no spike-
     # correction step for seconds, no Yahoo-second reference exists to cross-check
@@ -869,8 +876,10 @@ def _ensure_massive_second_derived_table(conn):
 
 def write_massive_second_derived(ticker, build_id, df, conn=None):
     """df: DataFrame indexed by tz-naive second timestamp, columns Open/High/Low/
-    Close/Volume (dividend-adjusted), 'corrected' optional (defaults 0 -- always 0
-    in practice, no spike-correction step for seconds). Same permanent, never-
+    Close/Volume (dividend-adjusted -- mostly at Massive's own source, plus a
+    residual top-up for any post-pull dividend; see build_massive_second_derived.py's
+    docstring), 'corrected' optional (defaults 0 -- always 0 in practice, no
+    spike-correction step for seconds). Same permanent, never-
     overwritten-in-place, multi-vintage convention as write_massive_hourly_derived
     -- build_id must come from record_massive_second_build()'s return value. Builds
     row tuples via zip() over numpy/pandas arrays rather than df.iterrows()

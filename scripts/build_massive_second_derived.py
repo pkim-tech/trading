@@ -13,10 +13,35 @@ Differences from build_massive_hourly_derived.py's build_ticker():
      Open/High/Low/Close/Volume/VWAP/NumTrades; timestamp column carries an
      explicit UTC offset per row, e.g. "2026-08-24 19:31:07-04:00" -- confirmed by
      reading real rows across BTCZ/TNA/GUSH/TECL directly before writing this).
-  2. Reuses fetch_dividends()/apply_dividend_adjustment() from
-     build_massive_hourly_derived.py DIRECTLY (imported, not reimplemented) --
-     dividend-history-level functions, apply identically regardless of bar
-     granularity.
+  2. Does NOT call apply_dividend_adjustment on the price data (2026-09-06 fix --
+     first version of this script did, a real bug found by paired review of a
+     downstream 1s-fill-resolution kernel wiring attempt: confirmed directly,
+     comparing raw pre-any-adjustment second/minute prices at matching
+     timestamps against the real cached historical_adjustment_factor for that
+     date, e.g. SOXL 2022-03-01 raw ratio 0.97046 vs real factor 0.970479, DFEN
+     2024-09-03 raw ratio 0.8089 vs real factor 0.804713 -- scripts/
+     fetch_massive_second_data.py's raw pull already requests Massive's seconds-
+     aggregates endpoint with adjusted=true, and THAT endpoint's adjusted=true
+     bakes in dividend adjustment too (unlike the minute/hourly aggregates
+     endpoint, confirmed split-only/not-dividend per build_massive_hourly_
+     derived.py's own docstring -- that confirmation was never re-verified for
+     the seconds endpoint specifically, and turned out not to hold there).
+     Re-applying apply_dividend_adjustment on top of already-adjusted raw data
+     was double-applying the same factor -- silently corrupted every dividend-
+     paying ticker's second-level series (near-zero-dividend tickers like GDXU/
+     AGQ happened to look fine, since double-applying a ~1.0 factor is still
+     ~1.0). fetch_dividends() still runs (not skippable, fails loud) -- and its
+     result IS still fed into apply_dividend_adjustment, but restricted to only
+     ex-dividend dates AFTER the raw pull (see build_ticker's own "Residual
+     top-up" comment) -- Massive's own source-side adjustment only reflects
+     dividends known to them as of that pull, so any later real dividend still
+     needs our own incremental correction, or this table would silently drift
+     stale relative to massive_hourly_derived/massive_minute_derived (which get
+     freshly re-adjusted from massive_dividends_raw on every rebuild) the next
+     time a new dividend lands -- the exact bug just fixed, recurring through a
+     different door. dividend_asof below is genuinely meaningful again once this
+     residual top-up is applied (this table's data really is fully adjusted
+     through that date, not just Massive's own pull-time snapshot).
   3. NO spike-correction step -- that's specific to the hourly build's cross-check
      against Yahoo hourly data; there's no Yahoo-second reference to correct
      against, and it's out of this task's scope. The `corrected` column is still
@@ -34,10 +59,6 @@ Differences from build_massive_hourly_derived.py's build_ticker():
      the raw 1s data here is a wholly separate source (pre-fetched CSVs, not
      derived from that same pull), so there's no equivalent "same build" concept
      to preserve.
-
-fetch_dividends() still runs for real here (not skippable) -- it raises on failure
-per its own "fail loud, don't silently write unadjusted data" convention, since
-dividend adjustment is the entire point of this build.
 
 Usage:
     .venv/bin/python scripts/build_massive_second_derived.py --tickers BTCZ
@@ -74,25 +95,66 @@ def build_ticker(ticker):
 
     raw_pulled_at = pd.Timestamp(os.path.getmtime(raw_path), unit="s").strftime("%Y-%m-%d %H:%M:%S")
 
-    dfs = pd.read_csv(raw_path)
-    # timestamp column already carries an explicit per-row UTC offset (e.g.
-    # "...-04:00" / "...-05:00" across DST) -- utc=True correctly interprets each
-    # row's own offset before converting to a uniform US/Eastern, tz-naive index,
-    # same convention as build_massive_hourly_derived.py's minute-CSV read.
-    dfs["timestamp"] = pd.to_datetime(dfs["timestamp"], utc=True).dt.tz_convert("US/Eastern").dt.tz_localize(None)
-    dfs = dfs.set_index("timestamp").sort_index()
-    raw_data_start = dfs.index.min().strftime("%Y-%m-%d")
-    raw_data_end = dfs.index.max().strftime("%Y-%m-%d")
+    # Chunked, per-chunk-session-pre-filtered read (2026-09-06, memory-safety fix
+    # -- a single-shot pd.read_csv on SOXL's real 2.6GB raw file repeatedly OOM-
+    # killed this build on this project's 15GB box; same fix shape as scripts/
+    # poc_1s_cliffbox_check.py's own load_seconds_lean()). Filters to regular
+    # session PER CHUNK before concatenation, so peak memory is bounded by one
+    # chunk's raw size plus the already-filtered running total, not the full raw
+    # file. raw_data_start/end still reflect the FULL raw range (including
+    # extended-hours rows, matching this script's original semantics), tracked
+    # via a running min/max across every chunk, not just the session-filtered
+    # rows.
+    parts = []
+    raw_min, raw_max = None, None
+    for chunk in pd.read_csv(raw_path, chunksize=250_000):
+        # timestamp column already carries an explicit per-row UTC offset (e.g.
+        # "...-04:00" / "...-05:00" across DST) -- utc=True correctly interprets
+        # each row's own offset before converting to a uniform US/Eastern,
+        # tz-naive index, same convention as build_massive_hourly_derived.py's
+        # minute-CSV read.
+        ts = pd.to_datetime(chunk["timestamp"], utc=True).dt.tz_convert("US/Eastern").dt.tz_localize(None)
+        chunk = chunk.set_index(ts).sort_index()
+        chunk_min, chunk_max = chunk.index.min(), chunk.index.max()
+        raw_min = chunk_min if raw_min is None else min(raw_min, chunk_min)
+        raw_max = chunk_max if raw_max is None else max(raw_max, chunk_max)
+        t = chunk.index.time
+        parts.append(chunk.loc[(t >= pd.Timestamp("09:30").time()) & (t < pd.Timestamp("16:00").time())])
+    session = pd.concat(parts).sort_index()
+    raw_data_start = raw_min.strftime("%Y-%m-%d")
+    raw_data_end = raw_max.strftime("%Y-%m-%d")
 
-    divs = fetch_dividends(ticker)  # raises on failure -- fail loud, don't silently write unadjusted data
+    # fetch_dividends() still runs (not skippable, raises on failure) purely for
+    # dividend_asof provenance below -- 2026-09-06 fix: NOT applied to the price
+    # data (see module docstring point 2's replacement) -- Massive's own seconds-
+    # aggregates pull (scripts/fetch_massive_second_data.py's adjusted=true param)
+    # already bakes in dividend adjustment at the source, unlike the minute/hourly
+    # aggregates endpoint (confirmed split-only, not dividend, per build_massive_
+    # hourly_derived.py's own docstring) -- applying apply_dividend_adjustment on
+    # top of already-adjusted second data was double-applying the same factor.
+    divs = fetch_dividends(ticker)
     print(f"{ticker}: {len(divs)} dividend records")
+
+    # Residual top-up (2026-09-06, single-Opus-review HIGH finding, added same
+    # session as the double-adjustment fix above): Massive's own seconds-endpoint
+    # adjustment only reflects real ex-dividend events known to THEM as of this
+    # raw pull -- any ex-dividend date AFTER raw_pulled_at needs its own
+    # incremental correction here, or this table's basis would silently drift
+    # stale relative to massive_hourly_derived/massive_minute_derived (which get
+    # freshly re-adjusted from massive_dividends_raw on every rebuild) the next
+    # time either leg is rebuilt after a new real dividend -- the exact bug shape
+    # just fixed above, recurring through a different door. Restricting the
+    # dividend list fed to apply_dividend_adjustment to ONLY post-pull ex-div
+    # dates means every pre-pull price's nearest-future-dividend lookup finds
+    # nothing (factor defaults to 1.0, no-op) -- only prices affected by a
+    # genuinely-new post-pull dividend get a real correction.
+    raw_pulled_at_ts = pd.Timestamp(raw_pulled_at)
+    residual_divs = [d for d in divs if pd.Timestamp(d["ex_dividend_date"]) > raw_pulled_at_ts]
+    if residual_divs:
+        print(f"{ticker}: {len(residual_divs)} dividend(s) after raw pull ({raw_pulled_at}) "
+              f"-- applying residual top-up adjustment")
+        session = apply_dividend_adjustment(session, residual_divs)
     dividend_asof = max((d["ex_dividend_date"] for d in divs), default=None)
-
-    dfs_adj = apply_dividend_adjustment(dfs, divs)
-
-    # Regular-session-only (09:30-16:00 ET) -- see module docstring point 4.
-    t = dfs_adj.index.time
-    session = dfs_adj.loc[(t >= pd.Timestamp("09:30").time()) & (t < pd.Timestamp("16:00").time())]
 
     with sqlite3.connect(db_cache.DB_PATH) as conn:
         build_id = db_cache.record_massive_second_build(

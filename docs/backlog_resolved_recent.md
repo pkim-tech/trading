@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest] Resolved 2026-09-06 — `massive_second_derived` double-dividend-adjustment bug root-caused+fixed; all 22 tickers rebuilt+verified clean (0.0000% ratio vs minute leg, was up to ~21% wrong for dividend-paying tickers). Kernel wiring that surfaced this stays paused separately. Full detail: `deep_backlog.md`.
+
 ## [live-trading] Resolved 2026-09-06 — add-on leg P&L now compounds into next-trade sizing (`_last_sale_recovery`); paired review caught+fixed a real proceeds-dropping bug in the first build. Full detail: `deep_backlog.md`.
 
 ## [live-trading][testing] Resolved 2026-09-03 — new `scripts/concurrent_positions_check.py`: real peak=8 concurrent positions found (2026-09-02 09:32:27), real timestamp-comparison bug caught+fixed before shipping. Full detail: `deep_backlog.md`.

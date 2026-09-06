@@ -1,5 +1,126 @@
 # Backlog
 
+## ✅ [backtest] Data-fix resolved 2026-09-06 (kernel wiring above still paused) — `massive_second_derived`'s double-dividend-adjustment bug root-caused and fixed; all 22 tickers rebuilt+verified clean
+
+Follow-on from the 2026-09-06 3-ticker PoC (docs/research_log.md's GDXU/SOXL/ETHU entries):
+user decided to wire real 1s fill resolution into Phase2.5's cliffbox dispatch
+(`bench_phase1_phase2_inmemory.py::_dispatch`, one call site) and Phase4's checklist
+resim (`run_optimization_sweep.build_candidate_report_ground_truth`), using
+`db_cache.get_massive_second_ohlcv` (the real dividend-adjusted `massive_second_derived`
+table, not the raw/unadjusted CSV Phase3/Phase5 use for their own diagnostic purpose) with
+a graceful per-ticker minute-resolution fallback for any ticker lacking an active
+second-level build. Backfilled 6 missing tickers (AGQ/DPST/HIBL/KORU/LABU/SOXL) via
+`scripts/build_massive_second_derived.py` + `scripts/promote_derived_build.py`
+(14/17 real live tickers now covered; ERY/RETL/TMF have no raw 1s data at all, unaffected
+either way). Code written, existing test suites (50/50 bench tests, 7/7
+`live_sim_harness.py`) unaffected. **Held uncommitted** on the working tree
+(`run_optimization_sweep.py`, `scripts/bench_phase1_phase2_inmemory.py`,
+`scripts/poc_1s_cliffbox_check.py`, `scripts/verify_1s_kernel_wiring.py`) pending the
+real fix below.
+
+**Paired review (independent-cold + contextual Opus, both run against the real diff)
+converged independently on the same CRITICAL/HIGH finding, no rebuttal round-trip
+needed given full agreement**: the active `massive_second_derived` builds are on a
+DIFFERENT dividend-adjustment vintage than the active hourly/minute builds for any
+ticker with real dividends. Contextual reviewer's direct measurement (resampled active
+second build vs active minute build, same day): SOXL −2.95% (2022-03) shrinking to
+0.0000% (2026-08), ETHU −2.49% (2024-09) shrinking to −0.07% (2026-08), GDXU exactly
+0.0000% every date checked — uniform-within-day, stepping toward zero at the present,
+the exact signature of a stale/different dividend snapshot, not a granularity effect.
+Independent-cold reviewer's concrete repro (DFEN, TrailingExit, 2022, fixed_sl=7/arm=5/
+trail=3/w=5/z=1.0): minute=67 trades (43 TIME/12 SL/12 TRAIL, avg return +0.30%) vs
+second=133 trades (ALL 133 stop out, avg return **-21.56%**) — every trade instantly
+stops out because the kernel anchors stop/arm/trail prices to the hourly leg
+(`backtester.py:1908-1912`) and then resolves fills against a second-level price series
+sitting ~21% below it for that ticker/period. This is the SAME bug class the 2026-08-22
+minute-leg adjustment fix (db_cache.py's own docstring) was built to close — just
+relocated to the second leg. GDXU (near-zero dividends) is the one PoC ticker where the
+mismatch cancels out, which is exactly why my own verification pass looked clean there
+and looked like a merely-larger-than-expected divergence on SOXL/ETHU rather than a
+real bug — my own `scripts/verify_1s_kernel_wiring.py` docstring had pre-excused that
+exact signal as "expected from real dividends," which is why it didn't catch this.
+
+**4 more real findings from the same paired review, held pending the fix above** (not
+yet acted on): (1) HIGH, both reviewers — `df_final` now mixes 1s and minute CAGRs in
+one ranking pool (`pick_island_centers`/top-3/backfill/`worst_neighbor_cagr` all
+compare across scales directly) — the concat-order fix only handles exact-coordinate
+duplicates, not a candidate's ±CLIFF_RADIUS neighborhood landing partly outside df25;
+(2) HIGH, contextual reviewer — `trades_resolution='second_resim'` can lie when
+`data_source != 'massive'` (Phase4's own default) or a build silently vanishes between
+the scope-level check and the per-candidate load; (3) HIGH, contextual reviewer — the
+top-9 winner-trades capture (`bench_phase1_phase2_inmemory.py:2668`) was never switched
+to `fill_resolution='second'`, so Phase4's actual candidate population (served via
+`_get_cached_trades`/`minute_cache`) mostly never reaches the new 1s path at all — a
+NEW minute-vs-second disagreement between a node's promoted `cagr` (can be 1s) and its
+own Phase4 checklist (stays minute), the exact class of cross-phase inconsistency this
+whole effort was meant to eliminate; (4) HIGH, contextual reviewer — real OOM risk at
+SOXL's real scale (22.2M second rows × up to 8 pool workers × `_NODE_INPUT_CACHE_MAX=6`
+retained mprep sets, measured ~1.06GB df + ~0.89GB mprep steady per worker just for
+GDXU's much smaller 1.26M rows) on this project's 15GB box — the reverification run
+that looked clean was single-process on the 2 smallest PoC tickers, never exercised the
+real pool-contention case.
+
+**Root cause, confirmed 2026-09-06 (later same day) — NOT a dividend-snapshot/vintage
+mismatch as hypothesized above.** Checked directly first, per "confirm before assuming":
+SOXL's active hourly build (id=174) and second build both showed identical
+`dividend_data_asof='2025-09-23'` — same 31 cached rows from the shared, ticker-keyed
+`massive_dividends_raw` table. Real root cause: `scripts/fetch_massive_second_data.py`'s
+raw pull requests Massive's SECONDS-aggregates endpoint with `adjusted=true` -- and
+unlike the minute/hourly aggregates endpoint (confirmed split-only, not dividend, per
+`build_massive_hourly_derived.py`'s own docstring -- that confirmation was never
+re-verified for the seconds endpoint specifically), THAT endpoint's `adjusted=true`
+already bakes in dividend adjustment at the source. `build_massive_second_derived.py`
+was then applying `apply_dividend_adjustment()` a SECOND time on top of already-adjusted
+data -- double-counting the same factor. Proven directly: raw (pre-any-adjustment)
+second/minute price ratio at SOXL 2022-03-01 (0.97046) and DFEN 2024-09-03 (0.8089)
+matched the real cached `historical_adjustment_factor` for those exact dates (0.970479,
+0.804713) almost exactly -- confirming Massive's raw seconds pull already carries that
+factor baked in. A single Opus review pass (per this ticket's judgment-call scoping,
+not the full independent-cold+contextual pairing since this file isn't on CLAUDE.md's
+gated list) independently reconfirmed the premise against a THIRD source (Yahoo daily
+bars, `auto_adjust=False`): raw seconds track Yahoo's adjusted Close, raw minutes track
+Yahoo's unadjusted Close, at both SOXL/DFEN test dates -- closes the "both derived
+series could be equally wrong" gap.
+
+**Fix** (`scripts/build_massive_second_derived.py`): removed the `apply_dividend_
+adjustment()` call on the full price series (Massive's raw second-level pull is already
+fully adjusted); `fetch_dividends()` result is now applied only as a **residual top-up**
+restricted to ex-dividend dates strictly AFTER the raw CSV's own pull timestamp (per the
+same review's 2nd HIGH finding: without this, the second leg's basis would freeze at
+raw-pull-time while hourly/minute keep getting re-adjusted from `massive_dividends_raw`
+on every rebuild, silently reintroducing the identical bug the next time a real dividend
+lands). `dividend_asof` is genuinely meaningful again as a result (data is fully
+adjusted through that date: Massive's own baked-in adjustment for the bulk of history,
+plus this script's own top-up for anything after the raw pull). `db_cache.py`'s
+`massive_second_derived`/`write_massive_second_derived` docstrings updated to note the
+adjustment now happens mostly at Massive's source.
+
+**Real, separate memory-safety bug found+fixed along the way**: SOXL's rebuild (2.6GB
+raw CSV, single-shot `pd.read_csv`) repeatedly OOM-killed on this project's 15GB box (3
+consecutive kills on retry, after two earlier successful-but-heavily-swapping runs
+earlier in the session) -- fixed by switching to the same chunked, per-chunk-session-
+pre-filtered read pattern already used in `scripts/poc_1s_cliffbox_check.py`'s own
+`load_seconds_lean()` (bounds peak memory to one chunk's raw size plus the
+already-filtered running total, not the full raw file). Succeeded cleanly after (206s,
+no memory pressure) -- confirms the bug was reproducible and real, not a fluke.
+
+**Verified**: rebuilt and promoted all 22 tickers with cached raw 1s data (not just the
+8 the original dispatch scoped -- the single review pass found 13 were still on the old
+double-adjusted vintage, including real live tickers JNUG/NUGT/OILU/UGL/WEBL the
+original backfill had missed). Ratio check (resample second build to 1-minute, join to
+minute build's own Close, same method the contextual reviewer used) across all 22
+tickers × 5 real historical dates (2022-03-01 through 2026-08-03): **every ticker/date
+pair now shows ~0.0000% ratio** (`BAD TICKERS: []` on the automated check), vs the
+pre-fix ~1-21% divergence for dividend-paying tickers. `tests/test_active_builds_
+promotion.py`: 13/13 passing throughout.
+
+**Kernel wiring above (Phase2.5 cliffbox/Phase4 checklist, `run_optimization_sweep.py`/
+`scripts/bench_phase1_phase2_inmemory.py`) intentionally left untouched/uncommitted** --
+this ticket only closes the underlying data bug; resuming that wiring (plus its own 4
+still-open findings: mixed-resolution ranking pool, `trades_resolution` mislabeling risk,
+top-9 winner-trades not wired to 1s, per-worker memory risk at SOXL's real scale) is a
+separate follow-on, not done here.
+
 ## [backtest] Gap, raised 2026-09-04 — `phase5_trades` has no kernel_version/build_id staleness columns, unlike its sibling `backtest_winner_trades`
 
 `candidate_verification_store.get_phase5_1s_trades` (new, this session, commit `47616b1`) reads
