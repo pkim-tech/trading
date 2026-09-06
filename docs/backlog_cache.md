@@ -46,9 +46,6 @@
 ## [backtest] Gap, raised 2026-09-04 — `phase5_trades` has no kernel_version/build_id staleness columns (unlike `backtest_winner_trades`)
 Both paired reviewers rated HIGH on commit `47616b1`, explicitly deferred out of scope. Full detail in `deep_backlog.md`.
 
-## [live-trading] Bug, raised 2026-09-04 — add-on leg P&L doesn't compound into next-trade sizing (live/backtest mismatch)
-Dispatched to coder3 (in progress). Full derivation in `deep_backlog.md`.
-
 ## [backtest][design] Idea, raised 2026-09-03 — annotate Check13's per-fold fragility with broad-market (SPY) context, not just the fold's own CAGR
 Real finding while reviewing AGQ's live node (candidate_id=36009) tonight: fold 1 (roughly 2021-08-23 to ~2022-08-21 given the campaign's own window boundaries, not directly confirmed via real trade dates) showed a real -28.56% CAGR, flagged fragile — but 2022 was a genuine broad-market downturn year (SPY ~-19%, Nasdaq ~-33%), so a fragile fold there likely reflects the strategy correctly tracking a real bad market period, not a strategy-specific defect. The other 4 folds (71.0%/66.8%/185.0%/132.4%) are all strongly positive, and the user's explicit stance is that 1 bad fold like this is an acceptable, expected risk (see `project_check13_fragility_judgment` memory) — but that judgment call currently has to be made by manually recalling "was that period bad for the market generally," not from anything the check itself surfaces.
 

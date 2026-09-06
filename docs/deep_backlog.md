@@ -17,19 +17,41 @@ them in `get_phase5_1s_trades` the same way `get_cached_trades` already does. Fl
 reviewers (independent-cold + contextual Opus) in the paired review for commit `47616b1` as HIGH,
 explicitly deferred out of that commit's scope rather than silently left undocumented.
 
-## [live-trading] Bug, raised 2026-09-04 — add-on leg P&L doesn't compound into next-trade sizing (live/backtest mismatch)
+## ✅ [live-trading] Resolved 2026-09-06 — add-on leg P&L now compounds into next-trade sizing (live/backtest mismatch)
 
 `_last_sale_recovery` (signals_helpers.py:1132) sizes the next trade off the most-recently-closed
-`trade_log` row (core/drought share one pool, by design) but never checks `addon_legs` — an
-add-on-at-arm leg's real gain/loss just sits there, invisible to sizing. The validated backtest's
+`trade_log` row (core/drought share one pool, by design) but never checked `addon_legs` — an
+add-on-at-arm leg's real gain/loss just sat there, invisible to sizing. The validated backtest's
 `addon_cagr_pct` (`apply_addon_overlay_ground_truth`, backtester.py:2154) assumes add-on P&L
 DOES reinvest (one continuous compounded blended-return stream) — so any live node with
-addon_enabled=1 isn't actually running what its own backtested CAGR promises. Dispatched to
-coder3 2026-09-04 (paired-review gate flagged explicitly, signals_helpers.py is gated) — real
-mechanism (blended-return math, arm-price-vs-entry-price asymmetry on the downside, resolution
-sensitivity found the same session) derived across a long conversation with the user; see
-`docs/conversation_summary.md`'s 2026-09-04/05 entry for the full derivation chain (add-on
-mechanics walkthrough, live-vs-backtest gap, downside-doubling clarification).
+addon_enabled=1 wasn't actually running what its own backtested CAGR promises. Raised 2026-09-04
+(coder3, real mechanism derived across a long conversation with the user; see
+`docs/conversation_summary.md`'s 2026-09-04/05 entry for the full derivation chain).
+
+**First build (2026-09-04/05) had a real bug, caught by the mandated paired review (independent-cold
++ contextual Opus, both run 2026-09-06 against the real diff, converged independently on the same
+findings — no contradiction, so no rebuttal round-trip was needed):** it raced an unmerged
+(`merged_into_core=0`) leg against its own parent `trade_log` row for "most recent close," returning
+only whichever side won and silently discarding the other's proceeds — both reviewers noted this is
+actively wrong on the common real path, since a leg's close (`close_addon_leg_real_if_open`) and its
+parent's close (`close_position`) both stamp `datetime.now()` at the same second-resolution format,
+so the leg's proceeds were dropped on essentially every real lockstep close, and on the timing-skew
+path the CORE's (larger) proceeds got dropped instead. Also found: an `exit_reason='ABANDONED'` leg
+(entry order never filled, zero real proceeds) qualified as a sizing candidate — a phantom fill could
+size a real buy; and the merged-leg lookup used `fetchone()` with no aggregation, so a second closed
+leg on the same parent would silently vanish.
+
+**Fix**: merged vs. unmerged is broker-order mechanics, not an economic distinction — every real
+closed leg (either kind) is now additive to its own parent `trade_log` row via `parent_trade_log_id`
+(`SUM`, not `fetchone`), with the episode's recency taken as the later of the parent's close or any
+of its legs' closes; ABANDONED legs excluded. A leg whose parent doesn't itself qualify (e.g.
+dry-run-sim) still sizes on its own as an "orphan." `tests/test_addon_legs_sizing_recovery.py`
+expanded 9→11 tests (added ABANDONED-exclusion and multi-leg-SUM regression tests; two existing
+tests' expected values corrected to match the additive model; timestamp fixtures switched from
+`isoformat()` to the real `'%Y-%m-%d %H:%M:%S'` format so string-comparison logic is actually
+exercised against what production writes). Full addon/topup/drought/dry-run-sim test subset (52
+tests) + `scripts/live_sim_harness.py` (7/7) reconfirmed clean after the fix. Commit follows this
+entry.
 
 ## ✅ [live-trading][testing] Resolved 2026-09-03 — new `scripts/concurrent_positions_check.py`: how many real positions are open simultaneously, over a lookback window
 Real gap (raised 2026-08-27, evening monitor session): no existing check surfaced how many real capital-at-stake nodes have simultaneous open positions at a given time -- just a real count, distinct from the separate open design question of positions INTERACTING (margin/correlation, see the "pooled/shared capital" backlog entry). Checked `scripts/list_scripts.py` first (per standing convention) -- confirmed no existing script answers this; the two closest (`sim_v6_inverse_overlap_check.py`/`sim_constrained_inverse_pair.py`) are backtest-simulation overlap checks for one primary/inverse ticker PAIR, not a real live cross-portfolio query.

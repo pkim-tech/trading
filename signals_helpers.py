@@ -1173,7 +1173,36 @@ def _last_sale_recovery(node):
     plain starting_notional fallback. The only real lever to deliberately
     grow (or shrink) a node's sizing PERMANENTLY once it has closed a real
     trade; a plain starting_notional edit silently has no effect past that
-    point (see signals_db.set_starting_notional_override)."""
+    point (see signals_db.set_starting_notional_override).
+
+    addon_legs (2026-09-04 fix, revised 2026-09-06 after paired review): a
+    real add-on-at-arm leg is its own margin buy/sell with its own P&L,
+    stored in addon_legs, never in trade_log -- close_position() writes
+    trade_log.shares from open_positions.shares (the CORE's own share
+    count), so a leg's real filled shares have zero trade_log
+    representation on their own. Whether a leg was merged_into_core (filled
+    in the same broker SELL order as its parent's close) or closed
+    independently (its own later exit_price/exit_time, e.g. an
+    already-armed leg outliving a TIME/SL core exit, or a reconciliation
+    catch-up) is pure broker-order mechanics, not an economic distinction --
+    either way its real proceeds belong to the SAME closing episode as its
+    parent (tied via parent_trade_log_id) and must be ADDED to that
+    episode's total, never treated as a separate recency-competing
+    candidate (an earlier version of this fix raced an independent leg
+    against its own parent for "most recent," which silently discarded
+    whichever side lost -- wrong, since both sides are proceeds from the
+    same trade). A leg's own exit_time still matters for RECENCY -- an
+    episode's recency is the later of its trade_log row's close and any of
+    its legs' closes, so a leg that closes after its parent (e.g. days later
+    via reconciliation) can make an otherwise-stale episode the most recent
+    one. A leg whose parent trade_log row doesn't itself qualify (e.g. a
+    dry-run-sim parent) is an "orphan" -- still real, sized on its own via
+    the leg's own exit_time. ABANDONED legs (entry order never filled, no
+    real proceeds) are excluded like dry-run rows.
+
+    This only augments the "most-recent-close-wins" step above -- every
+    precedence rule above it (override_once, override) is unchanged and
+    checked first."""
     once = node.get('starting_notional_override_once')
     if once is not None:
         return once
@@ -1181,17 +1210,47 @@ def _last_sale_recovery(node):
     if override is not None:
         return override
     ticker = node['ticker']
+    strategy, version, window, account = (
+        node.get('strategy'), node.get('version'), node.get('window'), node.get('account'))
     with db._conn() as c:
         c.row_factory = sqlite3.Row
-        row = c.execute(
-            "SELECT exit_price, shares FROM trade_log WHERE ticker=? AND strategy=? AND version=? "
-            "AND window=? AND COALESCE(account,'')=COALESCE(?,'') AND exit_price IS NOT NULL "
-            "AND shares IS NOT NULL AND is_dry_run_sim=0 "
-            "ORDER BY exit_time DESC LIMIT 1",
-            (ticker, node.get('strategy'), node.get('version'), node.get('window'), node.get('account')),
+        episode_row = c.execute(
+            "SELECT tl.id, "
+            "tl.exit_price*tl.shares + COALESCE(SUM(al.exit_price*al.shares), 0) AS total, "
+            "MAX(tl.exit_time, COALESCE(MAX(al.exit_time), tl.exit_time)) AS recency "
+            "FROM trade_log tl "
+            "LEFT JOIN addon_legs al ON al.parent_trade_log_id = tl.id AND al.status='closed' "
+            "AND al.exit_price IS NOT NULL AND al.shares IS NOT NULL AND al.is_dry_run_sim=0 "
+            "AND al.exit_reason != 'ABANDONED' AND COALESCE(al.account,'')=COALESCE(?,'') "
+            "WHERE tl.ticker=? AND tl.strategy=? AND tl.version=? AND tl.window=? "
+            "AND COALESCE(tl.account,'')=COALESCE(?,'') AND tl.exit_price IS NOT NULL "
+            "AND tl.shares IS NOT NULL AND tl.is_dry_run_sim=0 "
+            "GROUP BY tl.id ORDER BY recency DESC LIMIT 1",
+            (account, ticker, strategy, version, window, account),
         ).fetchone()
-    if row and row['exit_price'] and row['shares']:
-        return row['exit_price'] * row['shares']
+        orphan_row = c.execute(
+            "SELECT SUM(al.exit_price*al.shares) AS total, MAX(al.exit_time) AS recency "
+            "FROM addon_legs al JOIN trade_log tl ON tl.id = al.parent_trade_log_id "
+            "WHERE al.ticker=? AND tl.strategy=? AND tl.version=? AND tl.window=? "
+            "AND COALESCE(al.account,'')=COALESCE(?,'') AND al.status='closed' "
+            "AND al.exit_price IS NOT NULL AND al.shares IS NOT NULL AND al.is_dry_run_sim=0 "
+            "AND al.exit_reason != 'ABANDONED' "
+            "AND al.parent_trade_log_id NOT IN ("
+            "  SELECT id FROM trade_log WHERE ticker=? AND strategy=? AND version=? AND window=? "
+            "  AND COALESCE(account,'')=COALESCE(?,'') AND is_dry_run_sim=0)",
+            (ticker, strategy, version, window, account, ticker, strategy, version, window, account),
+        ).fetchone()
+
+    episode_total = episode_row['total'] if episode_row else None
+    episode_recency = episode_row['recency'] if episode_row else None
+    orphan_total = orphan_row['total'] if orphan_row else None
+    orphan_recency = orphan_row['recency'] if orphan_row else None
+
+    if episode_total is not None and (orphan_recency is None or episode_recency >= orphan_recency):
+        return episode_total
+    if orphan_total is not None:
+        return orphan_total
+
     starting_notional = node.get('starting_notional')
     if starting_notional is None:
         raise ValueError(f"_last_sale_recovery({ticker}): no trade history and no starting_notional configured")
