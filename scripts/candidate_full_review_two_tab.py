@@ -644,59 +644,6 @@ def _enrich_full_review_core_cagr(conn, csv_rows):
     return csv_rows
 
 
-def _recompute_stacked_cagr_with_1s_core(csv_rows):
-    """Fixes a real inconsistency found 2026-09-04: core_addon_cagr_pct/core_drought_
-    cagr_pct/core_both_cagr_pct (this checklist's own stacking math, run_optimization_
-    sweep.py's build_candidate_report_ground_truth) multiply a core_factor derived from
-    THIS function's own fresh GT-kernel re-simulation -- which, unlike Phase5's dedicated
-    1s/1m comparison, always runs on MINUTE-resolution data (minute_df, confirmed at
-    every run_backtest_ground_truth call site in run_optimization_sweep.py). Meanwhile
-    the adjacent 'Cagr' column already got corrected to the trusted core_cagr_1s (v4 fix,
-    _enrich_full_review_core_cagr, above) -- but that fix was never propagated into the
-    3 stacking formulas, so they silently kept multiplying the OLD, less-trusted minute-
-    resolution core factor. Not a resolution difference you should expect (a genuine
-    'the same number computed twice can differ' case) -- it's one already-applied fix
-    that didn't reach 3 downstream formulas sharing the same input.
-
-    Re-derives the exact same gating logic build_candidate_report_ground_truth used
-    (addon_robustness_verdict=='OK' gate, drought_robustness_verdict=='OK' gate,
-    drought_ie_verdict=='REAL_SELECTION' override) from this row's own already-flattened
-    checklist columns -- verified byte-for-byte against a real row (LABU node 43258,
-    2026-09-04: reconstructed core_drought_cagr_pct=92.94676625259022 vs the real stored
-    92.94676625259018, floating-point-only difference) before substituting the corrected
-    core_cagr_1s-derived factor in place of the original re-simulated one.
-
-    Only touches rows with a real core_cagr_1s (Phase5-verified -- every curated row
-    qualifies) and a real 'years' (needed to convert an annualized CAGR back to a total-
-    return factor and re-annualize) -- leaves everything else (raw-only/Phase4-only rows,
-    which have no corrected core_cagr_1s to substitute) exactly as build_candidate_
-    report_ground_truth originally computed it, same limitation the 'Cagr' display fix
-    already has."""
-    for r in csv_rows:
-        core_cagr_1s = r.get("core_cagr_1s")
-        years = r.get("years")
-        if core_cagr_1s is None or not years:
-            continue
-        addon_ok = r.get("addon_robustness_verdict") == "OK"
-        addon_compounded = r.get("addon_compounded_pct")
-        addon_factor_gated = (1.0 + addon_compounded / 100.0) if (addon_ok and addon_compounded is not None) else 1.0
-
-        drought_ie_real_selection = r.get("drought_ie_verdict") == "REAL_SELECTION"
-        if drought_ie_real_selection and r.get("drought_ie_included_compounded_pct") is not None:
-            drought_factor_gated = 1.0 + r["drought_ie_included_compounded_pct"] / 100.0
-        else:
-            drought_ok = r.get("drought_robustness_verdict") == "OK"
-            drought_compounded = r.get("drought_compounded_pct")
-            drought_factor_gated = (1.0 + drought_compounded / 100.0) if (drought_ok and drought_compounded is not None) else 1.0
-
-        core_factor_corrected = (1.0 + core_cagr_1s) ** years
-        r["core_addon_cagr_pct"] = ((core_factor_corrected * addon_factor_gated) ** (1.0 / years) - 1.0) * 100.0
-        r["core_drought_cagr_pct"] = ((core_factor_corrected * drought_factor_gated) ** (1.0 / years) - 1.0) * 100.0
-        r["core_both_cagr_pct"] = (
-            (core_factor_corrected * addon_factor_gated * drought_factor_gated) ** (1.0 / years) - 1.0) * 100.0
-    return csv_rows
-
-
 def _cagr_sort_key(field):
     return lambda r: r.get(field) if r.get(field) is not None else float("-inf")
 
@@ -1016,7 +963,6 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
         return underlier_cache[ticker]
 
     full_review_rows = _enrich_full_review_core_cagr(conn, full_review_rows)
-    full_review_rows = _recompute_stacked_cagr_with_1s_core(full_review_rows)
     full_review_by_id = {r["node_id"]: r for r in full_review_rows}
     combined_rows = _curate_combined_rows(full_review_rows)
     combined_rows.sort(key=lambda r: (r["ticker"], r["strategy"]))
@@ -1059,24 +1005,25 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
         cell.font = Font(bold=True)
     def_ws.append(["RESOLUTION CAVEAT (2026-09-04, read before trusting any single number "
                     "in the 144-col checklist block)",
-                    "'Cagr' and the 3 stacked columns ('Cagr Add on'/'CAGR Drought'/'CAGR Both') are "
-                    "the ONLY headline numbers corrected to Phase5's trusted 1-second (core_cagr_1s) "
-                    "resolution. Every OTHER number in the 144-col checklist block (addon/drought "
-                    "compounded %/win-rate/robustness-verdict columns, drought_ie_* the vol-gate "
-                    "challenge, check8/check11/check13, wf_* walk-forward folds, core_fluke_*, "
-                    "resolution_spread_tranche, alpha_possible/pessimistic/certain_pct) is computed by "
-                    "THIS report's own re-simulation, which always runs at MINUTE-bar resolution "
-                    "(confirmed: every run_backtest_ground_truth call site in run_optimization_sweep.py "
-                    "passes minute_df, never 1-second data) -- there is no 1-second version of these "
-                    "diagnostic columns anywhere in the pipeline. A column carrying an explicit '(1m)' "
-                    "or '_1m'/'_1s' suffix (e.g. 'Cagr (1m)', core_cagr_1m/1s in the raw DB) is the one "
-                    "explicit exception -- read its suffix literally. Minute-resolution fill timing can "
-                    "move a single trade's arm price/entry by several percentage points on a fast-moving "
-                    "leveraged ETF (confirmed concretely on ETHU node 38604, 2026-09-04), which can drive "
-                    "the annualized number many percentage points off what real second-level fills would "
-                    "show -- treat any of these minute-resolution diagnostic numbers as directionally "
-                    "useful, not literally trustworthy to a percentage point, especially for a node whose "
-                    "trades are addon/drought-leg-heavy (that's where this sensitivity concentrates)."])
+                    "As of 2026-09-04, build_candidate_report_ground_truth (run_optimization_sweep.py) "
+                    "prefers a candidate's real, already-persisted 1-SECOND trade list "
+                    "(candidate_verification_store.get_phase5_1s_trades, reading phase5_trades) over a "
+                    "fresh re-simulation whenever one exists -- which it does for every candidate Phase5 "
+                    "already verified (every row in this report's curated set qualifies). For those rows, "
+                    "the ENTIRE checklist (Cagr, Cagr Add on/CAGR Drought/CAGR Both, check4/8/11/13, "
+                    "wf_* walk-forward folds, drought_ie_* the vol-gate challenge, core_fluke_*) is now "
+                    "genuinely built on the same trusted 1-second data 'Cagr'/core_cagr_1s always used -- "
+                    "no more silent mixing of resolutions within one row. Only a candidate that never "
+                    "cleared Phase5 (no phase5_trades row -- Phase4-only, or a legacy backtest_cache-"
+                    "sourced candidate that predates the bench pipeline entirely) still falls back to a "
+                    "fresh MINUTE-resolution resimulation, same as before this fix -- if you see 'Cagr' "
+                    "with no matching core_cagr_1s in the raw DB for a row, that row is the fallback case "
+                    "and the same minute-resolution-drift caveat applies as always (confirmed concretely "
+                    "on ETHU node 38604, 2026-09-04: minute-bar fill timing moved one trade's arm price "
+                    "by ~8%, swinging that node's annualized CAGR by ~130pp before this fix). A column "
+                    "carrying an explicit '(1m)' or '_1m' suffix (e.g. 'Cagr (1m)') is Phase5's own "
+                    "dedicated minute-resolution sibling, computed separately for direct 1m-vs-1s "
+                    "comparison -- not affected by or related to this fix."])
     for col, definition in COLUMN_DEFS.items():
         def_ws.append([col, definition])
         def_ws.cell(row=def_ws.max_row, column=2).alignment = Alignment(wrap_text=True, vertical="top")
