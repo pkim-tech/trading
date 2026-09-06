@@ -1,5 +1,36 @@
 # Backlog
 
+## [backtest] Gap, raised 2026-09-04 — `phase5_trades` has no kernel_version/build_id staleness columns, unlike its sibling `backtest_winner_trades`
+
+`candidate_verification_store.get_phase5_1s_trades` (new, this session, commit `47616b1`) reads
+`phase5_trades` to feed `build_candidate_report_ground_truth`'s checklist compute a candidate's
+real 1-second trade list instead of re-simulating at minute resolution. Its sibling function
+`get_cached_trades` (same file, reads `backtest_winner_trades`) was hardened 2026-08-29 to reject
+a stale row via `kernel_version`/`hourly_build_id`/`minute_build_id` mismatch, after the real
+2026-08-27 SOXL/DPST/DFEN minute-archive-narrowing incident. `phase5_trades` has none of those
+columns, so a Phase5 re-run after a real `backtester.py` kernel fix or a `promote_derived_build.py`
+promotion can't be detected as stale here — and `insert_trades`' `INSERT OR IGNORE` (no DELETE-
+first) means a re-run can't even overwrite old rows, so a stale row would persist indefinitely.
+Real fix needs schema parity with `backtest_winner_trades`: add the 3 columns to `phase5_trades`,
+stamp them at write time (`phase5_second_level_overlay_check.py`'s `_persist_trades`), and check
+them in `get_phase5_1s_trades` the same way `get_cached_trades` already does. Flagged by both
+reviewers (independent-cold + contextual Opus) in the paired review for commit `47616b1` as HIGH,
+explicitly deferred out of that commit's scope rather than silently left undocumented.
+
+## [live-trading] Bug, raised 2026-09-04 — add-on leg P&L doesn't compound into next-trade sizing (live/backtest mismatch)
+
+`_last_sale_recovery` (signals_helpers.py:1132) sizes the next trade off the most-recently-closed
+`trade_log` row (core/drought share one pool, by design) but never checks `addon_legs` — an
+add-on-at-arm leg's real gain/loss just sits there, invisible to sizing. The validated backtest's
+`addon_cagr_pct` (`apply_addon_overlay_ground_truth`, backtester.py:2154) assumes add-on P&L
+DOES reinvest (one continuous compounded blended-return stream) — so any live node with
+addon_enabled=1 isn't actually running what its own backtested CAGR promises. Dispatched to
+coder3 2026-09-04 (paired-review gate flagged explicitly, signals_helpers.py is gated) — real
+mechanism (blended-return math, arm-price-vs-entry-price asymmetry on the downside, resolution
+sensitivity found the same session) derived across a long conversation with the user; see
+`docs/conversation_summary.md`'s 2026-09-04/05 entry for the full derivation chain (add-on
+mechanics walkthrough, live-vs-backtest gap, downside-doubling clarification).
+
 ## ✅ [live-trading][testing] Resolved 2026-09-03 — new `scripts/concurrent_positions_check.py`: how many real positions are open simultaneously, over a lookback window
 Real gap (raised 2026-08-27, evening monitor session): no existing check surfaced how many real capital-at-stake nodes have simultaneous open positions at a given time -- just a real count, distinct from the separate open design question of positions INTERACTING (margin/correlation, see the "pooled/shared capital" backlog entry). Checked `scripts/list_scripts.py` first (per standing convention) -- confirmed no existing script answers this; the two closest (`sim_v6_inverse_overlap_check.py`/`sim_constrained_inverse_pair.py`) are backtest-simulation overlap checks for one primary/inverse ticker PAIR, not a real live cross-portfolio query.
 

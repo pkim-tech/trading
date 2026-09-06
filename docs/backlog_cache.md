@@ -43,33 +43,11 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
-## [backtest] Gap, raised 2026-09-04 — `phase5_trades` has no kernel_version/build_id staleness columns, unlike its sibling `backtest_winner_trades`
-
-`candidate_verification_store.get_phase5_1s_trades` (new, this session, commit `47616b1`) reads
-`phase5_trades` to feed `build_candidate_report_ground_truth`'s checklist compute a candidate's
-real 1-second trade list instead of re-simulating at minute resolution. Its sibling function
-`get_cached_trades` (same file, reads `backtest_winner_trades`) was hardened 2026-08-29 to reject
-a stale row via `kernel_version`/`hourly_build_id`/`minute_build_id` mismatch, after the real
-2026-08-27 SOXL/DPST/DFEN minute-archive-narrowing incident. `phase5_trades` has none of those
-columns, so a Phase5 re-run after a real `backtester.py` kernel fix or a `promote_derived_build.py`
-promotion can't be detected as stale here — and `insert_trades`' `INSERT OR IGNORE` (no DELETE-
-first) means a re-run can't even overwrite old rows, so a stale row would persist indefinitely.
-Real fix needs schema parity with `backtest_winner_trades`: add the 3 columns to `phase5_trades`,
-stamp them at write time (`phase5_second_level_overlay_check.py`'s `_persist_trades`), and check
-them in `get_phase5_1s_trades` the same way `get_cached_trades` already does. Flagged by both
-reviewers (independent-cold + contextual Opus) in the paired review for commit `47616b1` as HIGH,
-explicitly deferred out of that commit's scope rather than silently left undocumented.
+## [backtest] Gap, raised 2026-09-04 — `phase5_trades` has no kernel_version/build_id staleness columns (unlike `backtest_winner_trades`)
+Both paired reviewers rated HIGH on commit `47616b1`, explicitly deferred out of scope. Full detail in `deep_backlog.md`.
 
 ## [live-trading] Bug, raised 2026-09-04 — add-on leg P&L doesn't compound into next-trade sizing (live/backtest mismatch)
-
-`_last_sale_recovery` (signals_helpers.py:1132) sizes the next trade off the most-recently-closed
-`trade_log` row (core/drought share one pool, by design) but never checks `addon_legs` — an
-add-on-at-arm leg's real gain/loss just sits there, invisible to sizing. The validated backtest's
-`addon_cagr_pct` (`apply_addon_overlay_ground_truth`, backtester.py:2154) assumes add-on P&L
-DOES reinvest (one continuous compounded blended-return stream) — so any live node with
-addon_enabled=1 isn't actually running what its own backtested CAGR promises. Dispatched to
-coder3 2026-09-04 (paired-review gate flagged explicitly, signals_helpers.py is gated). See
-research session's 2026-09-04 conversation for the full derivation.
+Dispatched to coder3 (in progress). Full derivation in `deep_backlog.md`.
 
 ## [backtest][design] Idea, raised 2026-09-03 — annotate Check13's per-fold fragility with broad-market (SPY) context, not just the fold's own CAGR
 Real finding while reviewing AGQ's live node (candidate_id=36009) tonight: fold 1 (roughly 2021-08-23 to ~2022-08-21 given the campaign's own window boundaries, not directly confirmed via real trade dates) showed a real -28.56% CAGR, flagged fragile — but 2022 was a genuine broad-market downturn year (SPY ~-19%, Nasdaq ~-33%), so a fragile fold there likely reflects the strategy correctly tracking a real bad market period, not a strategy-specific defect. The other 4 folds (71.0%/66.8%/185.0%/132.4%) are all strongly positive, and the user's explicit stance is that 1 bad fold like this is an acceptable, expected risk (see `project_check13_fragility_judgment` memory) — but that judgment call currently has to be made by manually recalling "was that period bad for the market generally," not from anything the check itself surfaces.
