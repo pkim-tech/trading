@@ -234,10 +234,21 @@ def get_cached_trades(conn, node_key_val, version, ticker=None,
     re-simulation fallback available, so worst case is one wasted (but still correct)
     recompute, never a wrong answer."""
     try:
+        # fill_resolution (2026-09-06, paired-review HIGH finding -- confirmed by both
+        # independent-cold and contextual review): _insert_winner_trades_rows can now
+        # write real second-resolution trade sequences, but this function previously had
+        # no way to tell the caller that -- run_optimization_sweep.py's caller was
+        # unconditionally hard-labeling every cache hit 'minute_cache', which was true
+        # when this function was written but became a real, silent mislabel the moment
+        # bench started writing 1s trades here. Stamped onto each returned trade dict
+        # (matching the existing 'Ticker' convention) rather than changing this
+        # function's return shape, since scripts/persist_addon_overlay_trades.py -- a
+        # REAL existing consumer, not a hypothetical one -- already destructures this
+        # exact dict shape.
         rows = conn.execute("""
             SELECT trade_idx, entry_time, entry_price, exit_time, exit_price, exit_reason,
                    return_pct, armed, arm_time, arm_price,
-                   kernel_version, hourly_build_id, minute_build_id
+                   kernel_version, hourly_build_id, minute_build_id, fill_resolution
             FROM backtest_winner_trades
             WHERE node_key=? AND version=?
             ORDER BY trade_idx
@@ -274,10 +285,13 @@ def get_cached_trades(conn, node_key_val, version, ticker=None,
     import pandas as pd
     trades = []
     for (_, entry_time, entry_price, exit_time, exit_price, exit_reason,
-         return_pct, armed, arm_time, arm_price, _kv, _hb, _mb) in rows:
+         return_pct, armed, arm_time, arm_price, _kv, _hb, _mb, _fill_res) in rows:
         armed = bool(armed)
         trades.append({
             'Ticker': ticker,
+            # NULL (a legacy row from before this column existed) means minute --
+            # every row ever written before 2026-09-06 was minute-only.
+            'fill_resolution': _fill_res if _fill_res is not None else 'minute',
             'Entry Time': pd.Timestamp(entry_time), 'Entry Price': entry_price,
             'Exit Time': pd.Timestamp(exit_time), 'Exit Price': exit_price,
             'exit_reason': exit_reason, 'Return': return_pct, 'armed': armed,

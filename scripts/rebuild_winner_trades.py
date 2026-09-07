@@ -96,7 +96,7 @@ def main():
         inputs = _load_node_inputs_ground_truth(args.ticker, strategy_class, args.strategy,
                                                   window, z, start_date, end_date,
                                                   data_source=data_source)
-        _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+        _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep, _actual_fill_res = inputs
         if is_both:
             trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = trail_buy_pct, trail_sell_pct, arm_pct
         else:

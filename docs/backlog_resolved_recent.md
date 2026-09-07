@@ -1,5 +1,7 @@
 # Backlog — Recently Resolved
 
+## [backtest] Resolved 2026-09-06 — Phase2.5/Phase4 1s-fill-resolution kernel wiring committed: reverified on corrected data, 4 held findings + 2 round-2 paired-review findings (selection-bias, insufficient memory mitigation) fixed, real memory near-miss caught+fixed under a full end-to-end run. Full detail: `deep_backlog.md`.
+
 ## [backtest] Resolved 2026-09-06 — `massive_second_derived` double-dividend-adjustment bug root-caused+fixed; all 22 tickers rebuilt+verified clean (0.0000% ratio vs minute leg, was up to ~21% wrong for dividend-paying tickers). Kernel wiring that surfaced this stays paused separately. Full detail: `deep_backlog.md`.
 
 ## [live-trading] Resolved 2026-09-06 — add-on leg P&L now compounds into next-trade sizing (`_last_sale_recovery`); paired review caught+fixed a real proceeds-dropping bug in the first build. Full detail: `deep_backlog.md`.

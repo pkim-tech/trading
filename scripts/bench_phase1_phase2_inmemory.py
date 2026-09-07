@@ -114,9 +114,75 @@ PROMOTION_ALGO_VERSION = 4
 # starting a genuinely new-named campaign, not on every PROMOTION_ALGO_VERSION change.
 CAMPAIGN_LABEL = "v6.5"
 
+# SECOND_RESOLUTION_MAX_CONCURRENT / _SECOND_RES_POOL (2026-09-06, paired-review MEDIUM
+# finding, real empirical test): a naive in-flight-task throttle on the SHARED 8-worker
+# pool bounds concurrent LOADS but not the total number of DISTINCT worker processes that
+# ever end up holding a ticker's full second-resolution df in their per-process
+# _SECOND_DF_CACHE over the life of a dispatch call -- confirmed empirically (2026-09-06):
+# throttling in-flight submissions to 3 on the shared 8-worker pool still let 5+ distinct
+# worker processes accumulate ~2.3GB each (the executor round-robins submissions across
+# whichever of the 8 workers is idle, not a fixed subset), pushing this box's used memory
+# to 11-12GB out of 15GB. Real fix: route ALL fill_resolution='second' work through a
+# SEPARATE, small, persistent ProcessPoolExecutor -- at most SECOND_RESOLUTION_MAX_CONCURRENT
+# processes EVER exist in it, for the whole run, so at most that many processes can ever
+# load the data, not just be submitted-to-concurrently. Lazily created once and reused
+# across every fill_resolution='second' _dispatch call in this process's lifetime
+# (Phase2.5 + its completion pass) so a ticker's second-df, once loaded into one of these
+# 3 workers' caches, stays warm for the rest of the run -- shut down implicitly at
+# interpreter exit (concurrent.futures' own atexit hook), same as the main pool.
+#
+# Round-2 validation (2026-09-06, contextual-review-confirmed gap in the original test):
+# the first empirical test used a SINGLE (window, z) throughout, so it never exercised
+# _NODE_INPUT_CACHE_GT's per-process retention across MULTIPLE distinct (window, z)
+# combos (a real ~0.9GB mprep per entry at SOXL scale, cap 6 at the time -- up to ~5.4GB/
+# process) or the top-9 winner-trades loop's own in-MAIN-PROCESS second-resolution load
+# running concurrently with this pool's 3 workers sitting resident (a 4th large-df
+# holder never accounted for in the original 2.7GB x 3 = 8.1GB estimate). Fixed
+# run_optimization_sweep.py's _load_node_inputs_ground_truth to cap second-resolution
+# _NODE_INPUT_CACHE_GT retention at 2 entries/process (not the shared minute-resolution
+# cap of 6), then re-ran a more realistic combined test: warmed this pool across 3
+# distinct (window, z) cliffboxes, THEN ran 3 more distinct (window, z) loads in the
+# MAIN process while the pool stayed resident -- system-wide used memory peaked at
+# ~12Gi/15Gi (never below ~460MB free, no swap thrashing) -- safe with real margin, not
+# just the single-(w,z) case.
+#
+# Round-3 correction (2026-09-06): a real end-to-end seed-mode smoke test (--workers 4,
+# SOXL, the FULL pipeline -- Phase1+Phase2+Phase2.5+completion+winner-trades together,
+# not an isolated component) was killed by a real low-memory intervention. The isolated
+# tests above never combined the MAIN pool (4 workers, alive for the whole run) with this
+# second-res pool (3 more) plus this session's own real overhead (~1.5GB across two
+# concurrent Claude Code processes on this same box) -- 4+3=7 real OS processes at once
+# is the actual worst case, not the second-res pool alone. Lowered to 2 as a direct
+# result of this negative finding, not a guess -- re-validate under the SAME full
+# end-to-end seed-mode invocation (not just an isolated _dispatch test) before trusting
+# any value here again.
+SECOND_RESOLUTION_MAX_CONCURRENT = 2
+_SECOND_RES_POOL = None
 
-def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, desc="dispatch"):
+
+def _get_second_resolution_pool(max_workers):
+    global _SECOND_RES_POOL
+    if _SECOND_RES_POOL is None:
+        _SECOND_RES_POOL = ProcessPoolExecutor(
+            max_workers=min(SECOND_RESOLUTION_MAX_CONCURRENT, max_workers))
+    return _SECOND_RES_POOL
+
+
+def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, desc="dispatch",
+              fill_resolution="minute"):
     """Same worker call the real pipeline uses -- returns list of result dicts, in memory only.
+
+    fill_resolution='minute' (default, unchanged): every call site except Phase2.5's
+    cliffbox dispatch. fill_resolution='second' (2026-09-06, one-shot-per-ticker design
+    doc item 1): appends a 17th element to the worker's args tuple, requesting real
+    1-second fill simulation (run_single_backtest_node_ground_truth_isolated falls back
+    to minute resolution with a printed warning per-ticker if no massive_second_derived
+    build is active) -- see run_optimization_sweep._load_node_inputs_ground_truth's own
+    docstring for the full rationale. Deliberately NOT threaded through Phase1-coarse/
+    Phase2-island's own _dispatch calls (a full coarse grid can be 100k+ cells --
+    1s-resolution there would multiply real compute cost for no established benefit;
+    the resolution-sensitivity PoC only tested a candidate's own cliffbox neighborhood,
+    see docs/research_log.md's 2026-09-06 entries).
 
     workers_budget (2026-08-31, Task #8 follow-up -- real dynamic CPU control, folded in
     while the Task #8 commit was already on hold, per the user's own ask, superseding that
@@ -149,7 +215,16 @@ def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, des
     submit-everything-upfront behavior, never toward a silent hang or a crashed process."""
     from scripts import campaign_registry
     tasks = list(tasks)
-    max_workers = pool._max_workers
+    # dispatch_pool (2026-09-06, paired-review MEDIUM finding -- see _SECOND_RES_POOL's
+    # module-level docstring for the real empirical measurement that ruled out an
+    # in-flight-submission throttle on the SHARED pool as insufficient): fill_resolution=
+    # 'second' work is routed to a dedicated, small, persistent pool instead of `pool` --
+    # every other reference in this function to "the pool" below means dispatch_pool, not
+    # the caller's shared one, so the throttle math (budget vs. max_workers) is scoped to
+    # whichever pool is actually doing the work.
+    dispatch_pool = (_get_second_resolution_pool(pool._max_workers)
+                      if fill_resolution == "second" else pool)
+    max_workers = dispatch_pool._max_workers
 
     b = campaign_registry.get_workers_budget(version)
     budget = max_workers if not isinstance(b, int) or b <= 0 else max(1, min(b, max_workers))
@@ -172,15 +247,22 @@ def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, des
             "window": w, "z_score_threshold": z_thresh, "trail_sell_pct": tpct,
             "trades": num_trades, "win_rate": wr, "strategy_return": comp_ret,
             "alpha_vs_spy": alpha, "cagr": node_cagr,
+            # Real per-cell ground truth (2026-09-06, paired-review HIGH finding), not
+            # this call's fill_resolution request -- see run_single_backtest_node_
+            # ground_truth_isolated's own comment on why the two can legitimately
+            # differ. Falls back to the requested value only for a worker built before
+            # this key existed (defensive, not expected to ever trigger in this process).
+            "resolution": res_or_exc.get("fill_resolution", fill_resolution),
         })
 
     if budget >= max_workers:
         # Unthrottled -- original behavior, submit everything upfront and drain via
         # as_completed()'s own internal handling (no bounded-submission overhead).
         futures_map = {
-            pool.submit(run_single_backtest_node_ground_truth_isolated,
+            dispatch_pool.submit(run_single_backtest_node_ground_truth_isolated,
                         (ticker, strategy_name, version, int(tp), int(sl), hold, w, spy_bh, z,
-                         fixed_sl, tpct, ENTRY_TIMING, True, START, END, DATA_SOURCE)): task
+                         fixed_sl, tpct, ENTRY_TIMING, True, START, END, DATA_SOURCE,
+                         fill_resolution)): task
             for task in tasks
             for tp, sl, hold, w, z, tpct in [task]
         }
@@ -205,10 +287,10 @@ def _dispatch(pool, tasks, ticker, strategy_name, version, fixed_sl, spy_bh, des
             except StopIteration:
                 return False
             tp, sl, hold, w, z, tpct = task
-            future = pool.submit(run_single_backtest_node_ground_truth_isolated,
+            future = dispatch_pool.submit(run_single_backtest_node_ground_truth_isolated,
                                   (ticker, strategy_name, version, int(tp), int(sl), hold, w,
                                    spy_bh, z, fixed_sl, tpct, ENTRY_TIMING, True, START, END,
-                                   DATA_SOURCE))
+                                   DATA_SOURCE, fill_resolution))
             in_flight[future] = task
             return True
 
@@ -629,7 +711,8 @@ def _clear_prior_seed_mode_table_rows(table_name, strategy_name, config_version,
 def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_name,
                                 config_version, ticker, fixed_sl,
                                 kernel_version=GT_TRADES_KERNEL_VERSION,
-                                hourly_build_id=None, minute_build_id=None):
+                                hourly_build_id=None, minute_build_id=None,
+                                fill_resolution_by_key=None):
     """New table (not yet in real production) -- one row per real trade, keyed by
     node_key (stable across re-sweeps) + version (disambiguates which data window this
     specific trade sequence came from, since node_key deliberately does NOT encode that
@@ -679,7 +762,29 @@ def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_
         # sqlite has no "ADD COLUMN IF NOT EXISTS" (pre-3.35) -- probe-first pattern,
         # same convention scripts/candidate_verification_store.py's ensure_table() uses.
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(backtest_winner_trades)")}
-        for col in ("kernel_version TEXT", "hourly_build_id INTEGER", "minute_build_id INTEGER"):
+        # fill_resolution (2026-09-06, paired-review HIGH finding, round 2 -- corrected
+        # after both independent-cold and contextual review flagged the original comment
+        # here as factually wrong): records whether THIS row's trade sequence came from a
+        # minute- or second-resolution resim. get_cached_trades (candidate_verification_
+        # store.py) now READS this column and stamps it onto every returned trade dict,
+        # so run_optimization_sweep.py's build_candidate_report_ground_truth can label
+        # trades_resolution correctly ('second_cache' vs 'minute_cache') instead of
+        # unconditionally claiming 'minute_cache' -- that mislabeling was a real,
+        # confirmed bug, not a hypothetical one, since scripts/persist_addon_overlay_
+        # trades.py is a REAL existing consumer of this table (the original comment's
+        # "no live consumer relying on it yet" was wrong -- checked directly, that
+        # script has queried backtest_winner_trades since 2026-08-29).
+        #
+        # STILL a real, deliberately-deferred gap: no second_build_id column exists here
+        # (unlike hourly_build_id/minute_build_id), so get_cached_trades' staleness check
+        # cannot detect a superseded massive_second_derived build promoting mid-campaign
+        # the way the 2026-08-27 minute-archive incident is caught on the minute leg --
+        # a stale second-resolution row could still be served as fresh. Not fixed here:
+        # closing it needs a new column on this table, plumbing get_active_build_id(...,
+        # 'second') through both writer and reader, and a real test -- deferred as a
+        # separate, scoped follow-up rather than expanding this fix further.
+        for col in ("kernel_version TEXT", "hourly_build_id INTEGER", "minute_build_id INTEGER",
+                    "fill_resolution TEXT"):
             name = col.split()[0]
             if name not in existing_cols:
                 conn.execute(f"ALTER TABLE backtest_winner_trades ADD COLUMN {col}")
@@ -704,18 +809,26 @@ def _insert_winner_trades_rows(winner_trades_by_key, node_keys_by_key, strategy_
         buffer = []
         for key, trades in winner_trades_by_key.items():
             nk = node_keys_by_key[key]
+            # Per-key resolution (2026-09-06, round 2 fix -- contextual-review-confirmed
+            # gap): a single scalar applied to every row was itself a mislabel risk --
+            # one candidate in the batch can fall back to minute while its siblings get
+            # real 1s. Defaults to "minute" for a caller that doesn't pass the map
+            # (defensive; every real call site in this file now does).
+            row_fill_resolution = (fill_resolution_by_key or {}).get(key, "minute")
             for i, t in enumerate(trades):
                 buffer.append((nk, config_version, ticker, strategy_name, float(fixed_sl), i,
                                str(t['Entry Time']), t['Entry Price'], str(t['Exit Time']),
                                t['Exit Price'], t['exit_reason'], t['Return'], int(t['armed']),
                                str(t['Arm Time']) if t['armed'] else None, t['Arm Price'], now_iso,
-                               kernel_version, hourly_build_id, minute_build_id))
+                               kernel_version, hourly_build_id, minute_build_id,
+                               row_fill_resolution))
         conn.executemany("""
             INSERT INTO backtest_winner_trades
                 (node_key, version, ticker, strategy, fixed_sl, trade_idx, entry_time,
                  entry_price, exit_time, exit_price, exit_reason, return_pct, armed,
-                 arm_time, arm_price, created_at, kernel_version, hourly_build_id, minute_build_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 arm_time, arm_price, created_at, kernel_version, hourly_build_id, minute_build_id,
+                 fill_resolution)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, buffer)
         conn.commit()
     return len(buffer)
@@ -2379,7 +2492,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
 
     t4 = time.time()
     phase25_rows = _dispatch(pool, phase25_tasks, TICKER, strategy_name, version, fixed_sl, spy_bh,
-                              desc="Phase2.5-cliffbox (in-memory)")
+                              desc="Phase2.5-cliffbox (in-memory)", fill_resolution="second")
     t5 = time.time()
     print(f"[{datetime.now().strftime('%H:%M:%S')}] PROGRESS: Phase2.5 done ticker={TICKER} strategy={strategy_name} fixed_sl={fixed_sl}: "
           f"{len(phase25_rows):,} rows in {t5 - t4:.1f}s "
@@ -2393,10 +2506,53 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     # derive_phase25_candidates_ground_truth's real query (no phase filter -- it reads
     # whatever's in backtest_cache for the scope, which after a real Phase2.5 run
     # includes its own denser cliff-box rows too, not just the pre-2.5 seed data).
+    # _second_build_active: used below to decide whether to even ATTEMPT second-
+    # resolution work (completion pass, top-9 winner-trades capture) -- NOT to tag
+    # resolution, since 2026-09-06 round 2 (paired-review HIGH finding): each row's real
+    # `resolution` now comes straight from the worker itself (run_single_backtest_node_
+    # ground_truth_isolated's own `fill_resolution` return key, threaded through
+    # _dispatch's `_record`), so df25/phase25_rows already carry the TRUE per-cell value
+    # -- including the per-cell-fallback case (a build vanishing mid-run, a transient
+    # read error) this per-run boolean cannot see. Overwriting it with this coarse
+    # per-run assumption would have silently undone that fix.
+    _second_build_active = db_cache.get_active_build_id(TICKER, 'second') is not None
     df25 = pd.DataFrame(phase25_rows)
+    if not df_full.empty and "resolution" not in df_full.columns:
+        # Only a resumed run reading an OLD checkpoint parquet (predates this column)
+        # can land here -- Phase1/Phase2 are always minute-resolution by construction
+        # (see _dispatch's own docstring: deliberately not threaded through their
+        # dispatch calls), so backfilling "minute" here is always correct, never a guess.
+        df_full["resolution"] = "minute"
+    # df_full FIRST (2026-09-06, paired-review HIGH finding, round 2 -- REVERSED from
+    # this fix's original df25-first version after both independent-cold and contextual
+    # review independently confirmed a real selection-bias bug): `df_final` is what
+    # pick_island_centers/region.sort_values below rank candidates on, and what a
+    # selected candidate's own persisted cagr/trades/alpha_vs_spy come from. Phase2.5 now
+    # runs some cells at 1s while Phase1/Phase2 stay minute -- a df25-first dedup would
+    # make WHICH CELL WINS the ranking depend on whether it happened to fall in a seed's
+    # cliffbox, purely a resolution artifact (1s vs minute CAGR diverges by a real,
+    # ticker-dependent, sometimes-large amount -- confirmed empirically: SOXL +2.7pp,
+    # ETHU +41.6pp). That changes the SELECTION itself, not just a diagnostic about it.
+    # Fix: keep `df_final`'s own ranking/selection basis minute-only-consistent (matching
+    # every campaign before Phase2.5 started requesting 1s fill), by preferring df_full's
+    # minute value on any coordinate overlap. The 1s data isn't discarded -- see
+    # `df_cliffsafety` below, a SEPARATE pool built second-first, used only for the
+    # worst_neighbor_cagr robustness verdict (which is genuinely supposed to answer "is
+    # this candidate's neighborhood safe," a real use for 1s data) and the top-9
+    # winner-trades capture (a direct resim, not a df_final lookup) -- never for deciding
+    # which cell IS a final candidate.
     df_final = pd.concat([df_full, df25], ignore_index=True)
     df_final = df_final[df_final["trades"] > 0]
     df_final = df_final.drop_duplicates(
+        subset=["take_profit", "stop_loss", "max_hold_hours", "window",
+                "z_score_threshold", "trail_sell_pct"])
+    # df_cliffsafety: df25 (1s) FIRST -- the ORIGINAL df25-first fix, now scoped to ONLY
+    # this separate pool so it can't bias df_final's own selection. Used exclusively by
+    # the "Final-candidate cliffbox completion pass" and the worst_neighbor_cagr loop
+    # below.
+    df_cliffsafety = pd.concat([df25, df_full], ignore_index=True)
+    df_cliffsafety = df_cliffsafety[df_cliffsafety["trades"] > 0]
+    df_cliffsafety = df_cliffsafety.drop_duplicates(
         subset=["take_profit", "stop_loss", "max_hold_hours", "window",
                 "z_score_threshold", "trail_sell_pct"])
 
@@ -2558,25 +2714,83 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
             print(f"  {len(arms_with_zero_evidence)} of those had NO evidence at all (every "
                   f"cell had trades=0) -- contributed 0, not 3: {arms_with_zero_evidence}")
 
+    # Final-candidate cliffbox completion pass (2026-09-06, paired-review HIGH finding):
+    # final_centers/final_candidates above are re-derived from df_final AFTER Phase2.5,
+    # so a final candidate's own (tp, sl) is not guaranteed to be one of the seed
+    # candidates cliffbox_tasks_for_cell was originally called on (those seeds came from
+    # PRE-Phase2.5 island selection, minute-resolution only) -- e.g. a final island center
+    # can shift to a cell whose neighborhood was never dispatched at 1s at all. Without
+    # this pass, worst_neighbor_cagr's min() below silently mixes 1s cells (wherever a
+    # final candidate happens to fall inside an earlier seed's cliffbox) with leftover
+    # minute-only cells for the rest of its neighborhood -- only exact-coordinate overlaps
+    # were fixed by df_cliffsafety's df25-first concat order, not the full box. Fixed by
+    # dispatching cliffbox_tasks_for_cell for EVERY final candidate (backfilled ones
+    # included) at the same fill_resolution Phase2.5 used, same as the seed-stage pattern,
+    # then merging any genuinely new cells into df_cliffsafety ONLY (df25-first, matching
+    # its own concat order) -- NEVER into df_final, which stays the minute-priority
+    # selection/ranking pool untouched by this pass (see df_final/df_cliffsafety's own
+    # comment above for why the two must not be conflated).
+    if _second_build_active:
+        final_cliffbox_needed = set()
+        for c in final_candidates:
+            final_cliffbox_needed |= cliffbox_tasks_for_cell(c, TRAIL_PCTS)
+        already_second = set(
+            (int(r.take_profit), int(r.stop_loss), int(r.max_hold_hours), int(r.window),
+             float(r.z_score_threshold), float(r.trail_sell_pct))
+            for r in df25[["take_profit", "stop_loss", "max_hold_hours", "window",
+                           "z_score_threshold", "trail_sell_pct"]].itertuples(index=False)) if not df25.empty else set()
+        missing_for_final = final_cliffbox_needed - already_second
+        if missing_for_final:
+            print(f"\nFinal-candidate cliffbox completion: {len(missing_for_final):,} cell(s) in "
+                  f"final candidates' own +-{CLIFF_RADIUS} neighborhoods were never computed at "
+                  f"1s resolution during Phase2.5 -- dispatching now so worst_neighbor_cagr never "
+                  f"mixes resolutions.")
+            completion_rows = _dispatch(pool, missing_for_final, TICKER, strategy_name, version,
+                                         fixed_sl, spy_bh, desc="Phase2.5-cliffbox-completion "
+                                         "(in-memory)", fill_resolution="second")
+            # No manual "resolution" stamp here (2026-09-06, round 2 fix) -- completion_rows
+            # already carries each cell's REAL resolution via _record (see _second_build_
+            # active's own comment above), including the per-cell-fallback case this
+            # completion pass is specifically meant to protect against.
+            df_completion = pd.DataFrame(completion_rows)
+            if not df_completion.empty:
+                df_cliffsafety = pd.concat([df_completion, df_cliffsafety], ignore_index=True)
+                df_cliffsafety = df_cliffsafety[df_cliffsafety["trades"] > 0]
+                df_cliffsafety = df_cliffsafety.drop_duplicates(
+                    subset=["take_profit", "stop_loss", "max_hold_hours", "window",
+                            "z_score_threshold", "trail_sell_pct"])
+
     # Cliff-safety verdict per candidate: worst_neighbor_cagr, min(cagr) among cells
     # within +-CLIFF_RADIUS tp/sl of the candidate (same hold/window/z/trail_pct),
-    # sourced from df_final (Phase1+Phase2+Phase2.5 combined -- the full evidence pool
-    # already in memory). Persisted for real now (2026-08-31, planner dispatch) --
+    # sourced from df_cliffsafety (Phase1+Phase2+Phase2.5+completion combined, 1s-
+    # preferring -- the full evidence pool already in memory, deliberately SEPARATE from
+    # df_final so this robustness check can use 1s data without biasing which cell won
+    # selection). Persisted for real now (2026-08-31, planner dispatch) --
     # _insert_candidate_nodes_rows writes it to a real candidate_nodes.worst_neighbor_cagr
     # column, ALTER-guarded same as params_json/selection_source/core_safe. Previously
     # print-only ("compute the full box, persist only the verdict" was the intent from
     # the start, just not implemented until now).
     for c in final_candidates:
-        neighbors = df_final[
-            (df_final["take_profit"] - c["take_profit"]).abs().le(CLIFF_RADIUS)
-            & (df_final["stop_loss"] - c["stop_loss"]).abs().le(CLIFF_RADIUS)
-            & (df_final["max_hold_hours"] == c["max_hold_hours"])
-            & (df_final["window"] == c["window"])
-            & (df_final["z_score_threshold"] == c["z_score_threshold"])
-            & (df_final["trail_sell_pct"] == c["trail_sell_pct"])
+        neighbors = df_cliffsafety[
+            (df_cliffsafety["take_profit"] - c["take_profit"]).abs().le(CLIFF_RADIUS)
+            & (df_cliffsafety["stop_loss"] - c["stop_loss"]).abs().le(CLIFF_RADIUS)
+            & (df_cliffsafety["max_hold_hours"] == c["max_hold_hours"])
+            & (df_cliffsafety["window"] == c["window"])
+            & (df_cliffsafety["z_score_threshold"] == c["z_score_threshold"])
+            & (df_cliffsafety["trail_sell_pct"] == c["trail_sell_pct"])
         ]
         c["worst_neighbor_cagr"] = float(neighbors["cagr"].min()) if not neighbors.empty else None
         c["n_neighbors_checked"] = len(neighbors)
+        # Defense-in-depth resolution check (paired-review HIGH finding): the completion
+        # pass above should make every neighbor 'second' whenever _second_build_active,
+        # but flag loudly rather than silently trust it -- e.g. a completion dispatch that
+        # itself fell back per-cell for a reason unrelated to the build (a transient read
+        # error) would otherwise mix resolutions with no visible trace.
+        if _second_build_active and not neighbors.empty and (neighbors["resolution"] != "second").any():
+            n_minute = int((neighbors["resolution"] != "second").sum())
+            print(f"  [worst_neighbor_cagr WARNING] TP={c['take_profit']} SL={c['stop_loss']}: "
+                  f"{n_minute} of {len(neighbors)} neighbor cell(s) are minute-resolution despite "
+                  f"an active second build -- cliff-safety verdict may mix resolutions.")
 
     _backfill_bits = []
     if backfilled_count:
@@ -2634,6 +2848,7 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     is_both = strategy_name == 'TrailingBothZScoreBreakout'
     winner_trades = {}
     node_keys_by_key = {}
+    fill_resolution_by_key = {}
     for c in final_candidates:
         key = (c["take_profit"], c["stop_loss"], c["max_hold_hours"], c["window"],
                c["z_score_threshold"], c["trail_sell_pct"])
@@ -2643,10 +2858,22 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
             ENTRY_TIMING, strategies.resolve_axis_columns)
         if key in winner_trades:
             continue  # duplicate candidate (shared across islands) -- don't re-simulate
-        inputs = _load_node_inputs_ground_truth(TICKER, strategy_class, strategy_name,
-                                                 c["window"], c["z_score_threshold"],
-                                                 START, END, data_source=DATA_SOURCE)
-        _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+        # fill_resolution='second' when available (2026-09-06, paired-review MEDIUM
+        # finding): this loop captures the REAL final-9 candidate population's own trade
+        # sequences -- the actual thing Phase4/backtest_winner_trades/downstream reports
+        # consume -- not just the cliffbox neighbor check above. Leaving this at the
+        # default 'minute' meant Phase2.5's whole 1s-resolution effort never reached the
+        # candidate population that matters; only the cliff-safety verdict (a robustness
+        # check ABOUT the population) ever saw 1s data.
+        inputs = _load_node_inputs_ground_truth(
+            TICKER, strategy_class, strategy_name, c["window"], c["z_score_threshold"],
+            START, END, data_source=DATA_SOURCE,
+            fill_resolution="second" if _second_build_active else "minute")
+        _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep, _actual_fill_res = inputs
+        if _second_build_active and _actual_fill_res != "second":
+            print(f"  [winner-trades WARNING] TP={c['take_profit']} SL={c['stop_loss']}: "
+                  f"requested second-resolution fill but got {_actual_fill_res!r} -- top-9 "
+                  f"trade sequence for this candidate is minute-resolution.")
         if is_both:
             trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = (
                 float(c["stop_loss"]), float(c["trail_sell_pct"]), float(c["take_profit"]))
@@ -2662,6 +2889,11 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
             same_bar_reentry=True, prep=prep, mprep=mprep, need_times=True,
         )
         winner_trades[key] = trades
+        # Per-key, not per-run (2026-09-06, round 2 fix -- same class of bug as the
+        # resolution-column fixes above): _actual_fill_res is THIS candidate's real
+        # outcome, which can legitimately differ from _second_build_active's per-run
+        # assumption (the exact case the WARNING two lines up detects and prints).
+        fill_resolution_by_key[key] = _actual_fill_res
     t_ins5 = time.time()
     total_trade_rows = sum(len(t) for t in winner_trades.values())
     print(f"Top-9 real trade sequences: {len(winner_trades)} distinct candidates, "
@@ -2682,7 +2914,8 @@ def run_one_fixed_sl(pool, strategy_name, fixed_sl, version, args):
     n_trade_rows_written = _insert_winner_trades_rows(
         winner_trades, node_keys_by_key, strategy_name, version, TICKER, fixed_sl,
         kernel_version=GT_TRADES_KERNEL_VERSION,
-        hourly_build_id=_hourly_build_id, minute_build_id=_minute_build_id)
+        hourly_build_id=_hourly_build_id, minute_build_id=_minute_build_id,
+        fill_resolution_by_key=fill_resolution_by_key)
     t_ins7 = time.time()
     print(f"Trade rows written to backtest_winner_trades: {n_trade_rows_written} "
           f"in {t_ins7 - t_ins6:.2f}s")

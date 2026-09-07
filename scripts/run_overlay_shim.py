@@ -215,7 +215,7 @@ def run_for_node_ground_truth(ticker, node, start_date, end_date, data_source="y
     if inputs is None:
         print(f"{ticker}: no hourly data available for data_source={data_source}")
         return None
-    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep, _actual_fill_res = inputs
     if df_hourly_windowed.empty:
         print(f"{ticker}: empty windowed hourly frame for {start_date}..{end_date}")
         return None

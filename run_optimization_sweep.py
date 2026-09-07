@@ -1014,8 +1014,46 @@ def _load_minute_df(ticker, data_source="yahoo"):
     return df
 
 
+_SECOND_DF_CACHE = {}
+_SECOND_DF_CACHE_MAX = 2  # second-resolution frames are much larger than minute
+                          # (~1-25M rows/ticker) -- capped tighter than _MINUTE_DF_CACHE_MAX.
+
+
+def _load_second_df(ticker, data_source="massive"):
+    """1-second counterpart to _load_minute_df, for Phase2.5's cliffbox neighbor check
+    and Phase4's checklist stats (2026-09-06, one-shot-per-ticker design doc item 1).
+    Reads db_cache.get_massive_second_ohlcv -- the real, dividend-adjusted, build-
+    versioned massive_second_derived table (built by scripts/build_massive_second_
+    derived.py) -- NOT a raw/unadjusted CSV read (unlike scripts/sim_1s_vs_1m_
+    groundtruth_overlays.py's load_seconds(), which Phase3/Phase5 use for their own
+    standalone granularity-comparison purpose; those don't feed a real promotion
+    decision, this does, so the adjustment-consistency requirement that already
+    applies to the minute leg -- see _load_minute_df's own docstring on the 2026-08-22
+    fix -- applies here too). Raises ValueError (propagated from get_massive_second_
+    ohlcv) if the ticker has no active second-level build; callers are responsible
+    for catching this and falling back to minute resolution (see _load_node_inputs_
+    ground_truth below) -- this function itself does not silently substitute minute
+    data, so a caller that forgets to handle the fallback fails loud, not quiet.
+    data_source='massive' is the only supported value -- no raw-CSV/yahoo second-
+    resolution equivalent exists in production."""
+    key = (ticker, data_source)
+    hit = _SECOND_DF_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if data_source != "massive":
+        raise ValueError(f"_load_second_df({ticker}): only data_source='massive' is "
+                          f"supported (got {data_source!r})")
+    import db_cache
+    df = db_cache.get_massive_second_ohlcv(ticker)
+    if len(_SECOND_DF_CACHE) >= _SECOND_DF_CACHE_MAX:
+        _SECOND_DF_CACHE.clear()
+    _SECOND_DF_CACHE[key] = df
+    return df
+
+
 def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
-                                    start_date=None, end_date=None, data_source="yahoo"):
+                                    start_date=None, end_date=None, data_source="yahoo",
+                                    fill_resolution="minute"):
     """Same per-worker-process memo pattern as _load_node_inputs. Indicators depend only
     on (ticker, strategy, window) — z_thresh is a kernel arg, not baked into df_daily_
     processed, so it's not part of the cache key (matches _load_node_inputs's own key,
@@ -1046,8 +1084,20 @@ def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_t
     never fired in production. Slicing df_hourly to the window BEFORE computing prep/
     mprep (below) — rather than nulling them out — restores the cache hit for the actual
     workload: every cell in a windowed campaign shares the same (ticker, strategy, w,
-    start_date, end_date) key and reuses one sliced prep/mprep pair."""
-    key = (ticker, strategy_name, int(w), start_date, end_date, data_source)
+    start_date, end_date) key and reuses one sliced prep/mprep pair.
+
+    fill_resolution='minute' (default, unchanged): the `minute_df`/mprep passed to the
+    kernel are 1-minute bars, same as before this param existed. fill_resolution=
+    'second' (2026-09-06, one-shot-per-ticker design doc item 1): loads real 1-second
+    bars via _load_second_df instead -- for Phase2.5's cliffbox neighbor check and
+    Phase4's checklist stats, where minute-resolution fill simulation was found to
+    diverge from tick-level execution by a real, ticker-dependent amount (see
+    docs/research_log.md's 2026-09-06 PoC entries). Falls back to minute resolution
+    with a printed warning if the ticker has no active massive_second_derived build
+    (_load_second_df raises ValueError) -- NOT a silent substitution; every fallback
+    is visible in the run's own output. Folded into the memo key so a mixed-resolution
+    campaign never reuses the other resolution's cached prep/mprep."""
+    key = (ticker, strategy_name, int(w), start_date, end_date, data_source, fill_resolution)
     hit = _NODE_INPUT_CACHE_GT.get(key)
     if hit is not None:
         return hit
@@ -1067,7 +1117,17 @@ def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_t
         df_daily = df_hourly_raw.resample('D').last().dropna(subset=[close_col])
         strat_instance = strategy_class(window=w, z_score_threshold=z_thresh)
         df_daily_processed = strat_instance.generate_daily_indicators(df_daily)
-        minute_df = _load_minute_df(ticker, data_source=data_source)
+        actual_fill_resolution = "minute"
+        if fill_resolution == "second":
+            try:
+                minute_df = _load_second_df(ticker, data_source=data_source)
+                actual_fill_resolution = "second"
+            except ValueError as e:
+                print(f"  [fill_resolution=second] {ticker}: {e} -- falling back to minute "
+                      f"resolution for this ticker.")
+                minute_df = _load_minute_df(ticker, data_source=data_source)
+        else:
+            minute_df = _load_minute_df(ticker, data_source=data_source)
 
         df_hourly_windowed = df_hourly_raw
         if start_date is not None or end_date is not None:
@@ -1079,13 +1139,33 @@ def _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_t
             df_hourly_windowed = df_hourly_raw.loc[lo:hi]
 
         if df_hourly_windowed.empty:
-            entry = (df_hourly_raw, df_daily_processed, minute_df, df_hourly_windowed, None, None)
+            entry = (df_hourly_raw, df_daily_processed, minute_df, df_hourly_windowed, None, None,
+                      actual_fill_resolution)
         else:
             prep = prep_inputs(df_hourly_windowed, df_daily_processed)
             mprep = prep_minute_inputs(minute_df, df_hourly_windowed)
-            entry = (df_hourly_raw, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep)
+            entry = (df_hourly_raw, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep,
+                      actual_fill_resolution)
 
-    if len(_NODE_INPUT_CACHE_GT) >= _NODE_INPUT_CACHE_MAX:
+    # Tighter cap for second-resolution entries (2026-09-06, paired-review HIGH finding):
+    # mprep for a SOXL-scale (~22M-row) second-resolution frame measured ~0.9GB (4 float64
+    # arrays + a datetime64 array over 22M rows) -- at _NODE_INPUT_CACHE_MAX=6 (sized for
+    # minute-resolution entries, ~60x smaller at the same row count) a single process
+    # juggling second-resolution work across 6 distinct (window, z) combos could retain
+    # ~5.4GB in this cache alone, on top of _SECOND_DF_CACHE's own ~1.1GB/entry (cap 2)
+    # for the underlying raw frame -- never exercised by the SECOND_RESOLUTION_MAX_
+    # CONCURRENT=3 memory test in bench_phase1_phase2_inmemory.py, which used a single
+    # (window, z) throughout. Counts only second-resolution entries already in the cache
+    # (a minute entry's small memory footprint doesn't need this protection), clearing
+    # just those rather than the whole cache so minute-resolution work sharing this same
+    # dict isn't penalized.
+    if fill_resolution == "second":
+        _SECOND_RES_NODE_INPUT_CACHE_MAX = 2
+        n_second_cached = sum(1 for k in _NODE_INPUT_CACHE_GT if k[-1] == "second")
+        if n_second_cached >= _SECOND_RES_NODE_INPUT_CACHE_MAX:
+            for k in [k for k in _NODE_INPUT_CACHE_GT if k[-1] == "second"]:
+                del _NODE_INPUT_CACHE_GT[k]
+    elif len(_NODE_INPUT_CACHE_GT) >= _NODE_INPUT_CACHE_MAX:
         _NODE_INPUT_CACHE_GT.clear()
     _NODE_INPUT_CACHE_GT[key] = entry
     return entry
@@ -1184,8 +1264,20 @@ def _campaign_years_for_window(ticker, start_date, end_date, data_source="yahoo"
 
 
 def run_single_backtest_node_ground_truth_isolated(args):
-    (ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl,
-     trail_pct_pct, entry_timing, same_bar_reentry, start_date, end_date, data_source) = args
+    # fill_resolution (2026-09-06): appended as an OPTIONAL 17th tuple element rather
+    # than inserted positionally, so every existing caller building the 16-element
+    # tuple (run_optimization_sweep.py's own dispatch_parallel_grid_ground_truth,
+    # scripts/oat_axis_sensitivity.py, scripts/search_completeness_audit.py) keeps
+    # working unchanged, defaulting to 'minute' -- only bench_phase1_phase2_inmemory.
+    # py's Phase2.5 cliffbox dispatch passes the 17-element form, requesting 'second'.
+    if len(args) >= 17:
+        (ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl,
+         trail_pct_pct, entry_timing, same_bar_reentry, start_date, end_date, data_source,
+         fill_resolution) = args
+    else:
+        (ticker, strategy_name, config_version, tp, sl, hold_hours, w, spy_bh, z_thresh, fixed_sl,
+         trail_pct_pct, entry_timing, same_bar_reentry, start_date, end_date, data_source) = args
+        fill_resolution = "minute"
 
     strategy_class = getattr(strategies, strategy_name, None)
     if strategy_name not in ('TrailingBothZScoreBreakout', 'TrailingExitZScoreBreakout') or not strategy_class:
@@ -1193,13 +1285,14 @@ def run_single_backtest_node_ground_truth_isolated(args):
 
     try:
         inputs = _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
-                                                 start_date, end_date, data_source=data_source)
+                                                 start_date, end_date, data_source=data_source,
+                                                 fill_resolution=fill_resolution)
     except Exception as e:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "ERROR", "error": repr(e)}
 
     if inputs is None:
         return {"coords": (tp, sl, hold_hours), "payload": (0.0, 0, 0.0), "window": w, "z_thresh": z_thresh, "status": "EMPTY"}
-    df_hourly_raw, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+    df_hourly_raw, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep, _actual_fill_res = inputs
     # df_daily_processed (indicators) ALWAYS stays full-history, even when windowed --
     # matches _load_node_inputs/_window_prep's convention (never truncate pre-indicator).
     # Only the hourly bars actually fed to the kernel (df_hourly_windowed) get sliced,
@@ -1247,7 +1340,16 @@ def run_single_backtest_node_ground_truth_isolated(args):
     return {
         "coords":  (tp, sl, hold_hours),
         "payload": (alpha_calc, n_trades, win_rate, compounded, win_twin_rate, node_cagr),
-        "window":  w, "z_thresh": z_thresh, "status": "SUCCESS"
+        "window":  w, "z_thresh": z_thresh, "status": "SUCCESS",
+        # fill_resolution (2026-09-06, paired-review HIGH finding -- confirmed by both
+        # independent-cold and contextual review): reports what THIS worker actually
+        # used (_actual_fill_res, from _load_node_inputs_ground_truth's real return),
+        # not the caller's request -- a per-cell silent fallback (e.g. a build vanishing
+        # mid-run, or a transient read error inside _load_second_df) is otherwise
+        # invisible to bench_phase1_phase2_inmemory.py's own resolution tagging, which
+        # previously assumed every phase25_rows cell matched the once-per-run
+        # _second_build_active check.
+        "fill_resolution": _actual_fill_res,
     }
 
 
@@ -3049,7 +3151,7 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
                                              start_date, end_date, data_source=data_source)
     if inputs is None:
         return None
-    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep, _actual_fill_res = inputs
     if df_hourly_windowed.empty:
         return None
     if is_both:
@@ -3643,6 +3745,29 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     import db_cache as _db_cache
     _hourly_build_id = _db_cache.get_active_build_id(ticker, 'hourly')
     _minute_build_id = _db_cache.get_active_build_id(ticker, 'minute')
+    # 1s fill resolution for any candidate needing a fresh resim (2026-09-06, one-shot-
+    # per-ticker design doc item 1) -- resolved ONCE per scope (matches the hourly/minute
+    # build_id pattern above, same "not a per-candidate check" reasoning), not per
+    # candidate. Checked explicitly here (rather than relying solely on
+    # _load_node_inputs_ground_truth's own internal fallback) so trades_resolution below
+    # is labeled correctly up front instead of unconditionally claiming 'second_resim'
+    # even when a ticker with no active massive_second_derived build silently fell back.
+    # data_source == 'massive' gate (2026-09-06, paired-review HIGH finding): Phase4's own
+    # default (see this function's signature) is data_source='yahoo' -- _load_second_df
+    # raises ValueError for any non-'massive' data_source, so requesting fill_resolution=
+    # 'second' against a yahoo-sourced scope would always silently fall back inside
+    # _load_node_inputs_ground_truth while this variable stayed 'second', making the
+    # trades_resolution label below claim 'second_resim' for a resim that actually ran at
+    # minute resolution. Checked here too (not just left to the per-call fallback) so the
+    # print below fires once per scope with the real reason, not per-candidate.
+    _second_build_id = (_db_cache.get_active_build_id(ticker, 'second')
+                         if data_source == "massive" else None)
+    _resim_fill_resolution = 'second' if _second_build_id is not None else 'minute'
+    if _second_build_id is None:
+        _reason = ("data_source != 'massive'" if data_source != "massive"
+                   else "no active massive_second_derived build")
+        print(f"  [Phase4] {ticker}: {_reason} -- checklist resim stays at minute "
+              f"resolution for this ticker.")
     _trades_conn = sqlite3.connect(DB_PATH, timeout=60.0)
 
     rows = []
@@ -3668,7 +3793,15 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                     kernel_version=_GT_TRADES_KERNEL_VERSION,
                     hourly_build_id=_hourly_build_id, minute_build_id=_minute_build_id)
                 if cached_trades is not None:
-                    trades_resolution = 'minute_cache'
+                    # Real per-row provenance, not an assumed 'minute_cache' (2026-09-06,
+                    # paired-review HIGH finding -- confirmed by both independent-cold
+                    # and contextual review): bench_phase1_phase2_inmemory.py can now
+                    # write real second-resolution trade sequences into
+                    # backtest_winner_trades, so a cache hit here is only 'minute_cache'
+                    # if it actually is -- get_cached_trades stamps the real value (or
+                    # 'minute' for a legacy pre-column row) onto every returned trade.
+                    trades_resolution = ('second_cache' if cached_trades[0].get('fill_resolution') == 'second'
+                                         else 'minute_cache')
             need_resim = cached_trades is None
             # is_both scopes still need df_hourly_windowed for the drought overlay below
             # even when trades came from cache -- non-is_both scopes with a cache hit
@@ -3677,11 +3810,12 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
 
             inputs = _load_node_inputs_ground_truth(
                 ticker, strategy_class, strategy_name, cand['window'], cand['z_score_threshold'],
-                start_date, end_date, data_source=data_source) if need_inputs else None
+                start_date, end_date, data_source=data_source,
+                fill_resolution=_resim_fill_resolution if need_resim else 'minute') if need_inputs else None
             trades = cached_trades if cached_trades is not None else []
             df_hourly_windowed = None
             if inputs is not None:
-                _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+                _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep, _actual_fill_res = inputs
                 if not df_hourly_windowed.empty and need_resim:
                     if is_both:
                         trail_buy_pct_arg, trail_sell_pct_arg, arm_pct_arg = (
@@ -3697,7 +3831,12 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                         open_check_entry_timing=(entry_timing == 'open_check'), same_bar_reentry=True,
                         prep=prep, mprep=mprep, need_times=True,
                     )
-                    trades_resolution = 'minute_resim'
+                    # _actual_fill_res (not _resim_fill_resolution -- the requested value,
+                    # which can lie: see the data_source gate above, and a build that
+                    # vanishes between the once-per-scope check and this per-candidate
+                    # call would also be caught here since _load_node_inputs_ground_truth
+                    # reports what it actually loaded, not what was requested).
+                    trades_resolution = 'second_resim' if _actual_fill_res == 'second' else 'minute_resim'
 
             c4_early_wr, c4_late_wr = _check4_stability_gt(trades) if trades else (None, None)
             c8 = _check8_fluke_gt(trades)

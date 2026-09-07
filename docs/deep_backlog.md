@@ -1,5 +1,25 @@
 # Backlog
 
+## ✅ [backtest] Resolved 2026-09-06 — Phase2.5/Phase4 1s-fill-resolution kernel wiring: reverified on corrected data, 4 held paired-review findings fixed, round-2 paired review (independent-cold + contextual Opus) found 2 more real bugs (fixed), real memory near-miss caught+fixed under a full end-to-end run
+
+Resumes the item below (data blocker fixed first). Full writeup: `docs/research_log.md`'s
+2026-09-06 "1s-kernel-wiring resume" entry. Summary: reverification showed the SOXL/ETHU
+trade-count divergence from the pre-fix data is gone (counts now match exactly across
+minute/second resolution); remaining CAGR deltas are real resolution sensitivity. Fixed
+all 4 originally-held findings (mixed-resolution `worst_neighbor_cagr`, a `trades_resolution`
+label that could lie, top-9 winner-trades never getting 1s treatment, untested OOM risk).
+A full paired re-review (independent-cold + contextual Opus, against the complete diff)
+found the initial memory mitigation was insufficient (executor round-robin defeated an
+in-flight throttle) AND a more fundamental selection-bias bug: candidate ranking pooled 1s
+and minute CAGR values directly, so resolution — not just a diagnostic about it — could
+decide which cell won. Both fixed (dedicated persistent worker pool for second-resolution
+work; split `df_final`/`df_cliffsafety` pools so ranking stays minute-only-consistent while
+the cliff-safety verdict still uses 1s data). A real end-to-end seed-mode smoke test
+(`--workers 4`, full pipeline, real SOXL data) was killed by the harness's own low-memory
+safeguard on the first attempt — isolated-component memory tests had understated the real
+risk. Fixed by lowering the dedicated pool's concurrency cap; re-ran the identical smoke
+test successfully. 98 existing tests pass. Committed.
+
 ## ✅ [backtest] Data-fix resolved 2026-09-06 (kernel wiring above still paused) — `massive_second_derived`'s double-dividend-adjustment bug root-caused and fixed; all 22 tickers rebuilt+verified clean
 
 Follow-on from the 2026-09-06 3-ticker PoC (docs/research_log.md's GDXU/SOXL/ETHU entries):

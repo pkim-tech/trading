@@ -940,7 +940,18 @@ def get_massive_second_derived(ticker, build_id=None):
     """Returns the ACTIVE (explicitly promoted) vintage by default -- see
     get_massive_hourly_derived's docstring for the full active_builds-based
     resolution rationale (table_name='second', promoted independently from
-    hourly/minute). Pass an explicit build_id to reproduce an older vintage."""
+    hourly/minute). Pass an explicit build_id to reproduce an older vintage.
+
+    Chunked read (2026-09-06, paired-review MEDIUM/HIGH finding -- real OOM risk under
+    worker-pool contention): a single non-chunked pd.read_sql_query() over a SOXL-scale
+    table (~22M rows) measured ~10.8GB peak RSS for one process -- sqlite3's DBAPI
+    materializes the whole result set as Python row tuples before pandas ever builds
+    columnar arrays, several times the ~1GB the resulting DataFrame itself occupies.
+    Under a real 8-worker ProcessPoolExecutor (each worker a separate process, no shared
+    memory), even 2 concurrent large-ticker loads would exceed this box's 15GB RAM.
+    Reads via chunksize instead (same pattern as scripts/build_massive_second_derived.py's
+    2026-09-06 CSV-chunking fix) so peak memory is bounded by one chunk's raw row-tuple
+    overhead plus the running concatenated total, not the full raw result set at once."""
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_massive_second_derived_table(conn)
         if build_id is None:
@@ -948,11 +959,16 @@ def get_massive_second_derived(ticker, build_id=None):
             if build_id is None:
                 return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume", "corrected"])
             _log_build_id_resolution(ticker, 'second', build_id)
-        df = pd.read_sql_query(
+        parts = []
+        for chunk in pd.read_sql_query(
             "SELECT ts, open AS Open, high AS High, low AS Low, close AS Close, "
             "volume AS Volume, corrected FROM massive_second_derived WHERE ticker=? AND build_id=? ORDER BY ts",
-            conn, params=(ticker, build_id), parse_dates=["ts"])
-        return df.set_index("ts")
+            conn, params=(ticker, build_id), parse_dates=["ts"], chunksize=500_000,
+        ):
+            parts.append(chunk.set_index("ts"))
+        if not parts:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume", "corrected"])
+        return pd.concat(parts, copy=False)
 
 
 def get_massive_second_ohlcv(ticker, build_id=None):

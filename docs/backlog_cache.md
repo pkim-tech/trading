@@ -43,9 +43,6 @@
 > in the header/body when tagging it, so the spec isn't just the tag alone. Remove the tag (or
 > just close the item) once it's built.
 
-## [backtest] Resume needed — Phase2.5/Phase4 1s-fill-resolution kernel wiring (paused, uncommitted on `run_optimization_sweep.py`/`scripts/bench_phase1_phase2_inmemory.py`), now that the `massive_second_derived` double-dividend-adjustment data blocker is fixed
-Data bug that blocked this is resolved (all 22 tickers rebuilt+verified, see `backlog_resolved_recent.md`). Wiring itself still has 4 open review findings (mixed-resolution ranking pool, `trades_resolution` mislabeling risk, top-9 winner-trades not wired to 1s, per-worker memory risk at SOXL's real scale) to resolve before it can be paired-reviewed for real and committed. Full detail in `deep_backlog.md`.
-
 ## [backtest] Gap, raised 2026-09-04 — `phase5_trades` has no kernel_version/build_id staleness columns (unlike `backtest_winner_trades`)
 Both paired reviewers rated HIGH on commit `47616b1`, explicitly deferred out of scope. Full detail in `deep_backlog.md`.
 

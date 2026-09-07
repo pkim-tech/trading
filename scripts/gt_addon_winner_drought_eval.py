@@ -83,7 +83,7 @@ def compute_drought_eval(ticker, strategy_name, start_date, end_date,
         start_date, end_date, data_source=data_source)
     if inputs is None:
         return None
-    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep = inputs
+    _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep, _actual_fill_res = inputs
     if df_hourly_windowed.empty:
         return None
 
