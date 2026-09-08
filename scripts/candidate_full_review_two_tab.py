@@ -650,7 +650,7 @@ def _enrich_full_review_core_cagr(conn, csv_rows):
     own strategy_cagr_pct is always None for candidate_nodes-sourced rows (candidate_nodes
     doesn't persist a cagr column, see phase4_candidate_nodes_resolver.py's documented
     deviation #1) -- core_cagr_1s is the real per-candidate CAGR that DOES exist for this
-    data source, and is what _curate_combined_rows below uses for its Best-Both ranking
+    data source, and is what _curate_combined_rows below uses for its Best TrailingBoth ranking
     and what the Combined tab's 'Cagr' column shows, per the standing project convention
     of CAGR over robust_alpha for reporting/ranking (feedback_cagr_over_robust_alpha).
 
@@ -716,17 +716,25 @@ def _curate_combined_rows(csv_rows):
        core_drought_cagr_pct is also now what gets DISPLAYED in the unified Cagr Add on/
        CAGR Drought columns for any row with real Full Review data (see _curated_front),
        so the ranking metric and the displayed metric are the same number everywhere.
-    3. (v4) Best-Both sort key is `core_cagr_1s` instead of `strategy_cagr_pct` (always
+    3. (v4) Best TrailingBoth sort key is `core_cagr_1s` instead of `strategy_cagr_pct` (always
        None for this data source, candidate_nodes doesn't persist cagr).
     4. (v5) New 'Best Core' category (any strategy, top-2 by core_cagr_1s) -- the existing
-       'Best-Both' category is restricted to TrailingBothZScoreBreakout by design (it's
-       specifically evaluating the live-default combined-strategy's own core performance),
-       which meant a TrailingExitZScoreBreakout candidate (AGQ/ETHU/UGL/DPST/SOXL, etc.)
-       could only ever appear via Add On/Drought/the last-resort fallback, never on pure
-       core performance. 'Best Core' is strategy-unrestricted, same core_cagr_1s metric as
-       Best-Both. Both categories are kept (not merged) -- Best-Both's own
-       TrailingBoth-specific meaning is unchanged, this only ADDS visibility for the
-       strategy it excludes."""
+       'Best TrailingBoth' category (see point 5) is restricted to TrailingBothZScoreBreakout
+       by design (it's specifically evaluating the live-default combined-strategy's own core
+       performance), which meant a TrailingExitZScoreBreakout candidate (AGQ/ETHU/UGL/DPST/
+       SOXL, etc.) could only ever appear via Add On/Drought/the last-resort fallback, never
+       on pure core performance. 'Best Core' is strategy-unrestricted, same core_cagr_1s
+       metric as 'Best TrailingBoth'. Both categories are kept (not merged) -- 'Best
+       TrailingBoth's own TrailingBoth-specific meaning is unchanged, this only ADDS
+       visibility for the strategy it excludes.
+    5. (2026-09-08, real report-gap fix) Renamed the 'Best-Both' tag to 'Best TrailingBoth'
+       -- it was never a triple-stack (core+addon+drought) category, just TrailingBoth
+       ranked on core_cagr_1s alone, and the old name was routinely misread as "core+addon
+       both winning" by anyone skimming the Winner column. Added a genuinely new 'Overlay'
+       category: any SAFE row with a real core_both_cagr_1s (the actual core+addon+drought
+       triple-stacked, robustness-gated CAGR field, already computed elsewhere in this
+       pipeline -- see FIELDNAMES/gt_full_review_rows), top-2 by that field. This is the
+       category 'Best-Both' should have been read as but never was."""
     by_ticker = {}
     for r in csv_rows:
         by_ticker.setdefault(r["ticker"], []).append(r)
@@ -769,9 +777,13 @@ def _curate_combined_rows(csv_rows):
         best_core = list(safe)
         best_core.sort(key=_cagr_sort_key("core_cagr_1s"), reverse=True)
 
+        overlay = [r for r in safe if r.get("core_both_cagr_1s") is not None]
+        overlay.sort(key=_cagr_sort_key("core_both_cagr_1s"), reverse=True)
+
         winners = {}
         for label, group in (("Add On", addon[:2]), ("Drought", drought[:2]),
-                              ("Best-Both", best_both[:2]), ("Best Core", best_core[:2])):
+                              ("Overlay", overlay[:2]),
+                              ("Best TrailingBoth", best_both[:2]), ("Best Core", best_core[:2])):
             for r in group:
                 k = key(r)
                 if k not in winners:
@@ -1086,7 +1098,7 @@ def _write_report_xlsx(out_path, full_review_rows, curated_rows, raw_rows, conn,
                                         "the others directly."])
     def_ws.append(["Winner", "Full Review: always blank (this tab isn't curated -- it's the full scoped "
                               "population). Combined: real category label(s) from this report's own "
-                              "curation (Add On/Drought/Best-Both/Best Core/Core fallback). Candidates/"
+                              "curation (Add On/Drought/Overlay/Best TrailingBoth/Best Core/Core fallback). Candidates/"
                               "All Candidates (raw): the Candidates tab's OWN curation label (candidate_"
                               "report_inmemory.curate(), a different real selection scheme than Combined's "
                               "-- Core/Add On/Drought top-N by candidate_verification_results CAGR) when "
