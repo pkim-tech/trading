@@ -13,11 +13,21 @@ Whether a leg was merged_into_core (filled in the same broker SELL order as
 its parent's close) or closed independently is broker-order mechanics, not an
 economic distinction -- an earlier version of this fix raced an independent
 leg against its own parent for "most recent," which silently discarded
-whichever side lost. Correct model: every real closed leg's proceeds are
-ADDITIVE to its own parent trade_log row (via parent_trade_log_id), and an
-episode's recency is the later of its trade_log row's close or any of its
-legs' closes. A leg whose parent doesn't itself qualify (e.g. dry-run-sim) is
-an "orphan," sized on the leg's own exit_time.
+whichever side lost. Correct model: every real closed leg's PROFIT --
+(exit_price - entry_price) * shares, never raw exit proceeds -- is ADDITIVE
+to its own parent trade_log row (via parent_trade_log_id), and an episode's
+recency is the later of its trade_log row's close or any of its legs' closes.
+A leg whose parent doesn't itself qualify (e.g. dry-run-sim) is an "orphan,"
+sized on the leg's own exit_time using the same profit-only formula.
+
+Economics corrected 2026-09-08 (real live-money bug): the original
+implementation summed each leg's raw exit_price*shares proceeds, which
+double-counts the leg's own margin-financed capital -- backtester.py's
+apply_addon_overlay_ground_truth only ever compounds the addon leg's PROFIT
+((exit_price - arm_price) * shares) into the next trade's capital base, never
+its full exit proceeds. All fixture entry_prices below are deliberately not
+exit_price*0.98 where the test cares about the leg's own profit -- see each
+assertion's inline math.
 """
 import sys
 import tempfile
@@ -83,8 +93,10 @@ def _log_closed_trade(exit_price, shares, exit_time, position_source='core'):
 
 
 def _log_addon_leg(parent_trade_log_id, exit_price, shares, exit_time, merged_into_core,
-                    is_dry_run_sim=0, status='closed', account='brokerage', exit_reason='SL'):
-    entry_price = exit_price * 0.98
+                    is_dry_run_sim=0, status='closed', account='brokerage', exit_reason='SL',
+                    entry_price=None):
+    if entry_price is None:
+        entry_price = exit_price * 0.98
     entry_time = _fmt(exit_time - timedelta(hours=5))
     with signals_db._conn() as c:
         c.execute("""
@@ -99,12 +111,14 @@ def _log_addon_leg(parent_trade_log_id, exit_price, shares, exit_time, merged_in
 
 def test_merged_leg_proceeds_add_onto_its_parent_trade_log_row(env):
     """Merged leg's shares are real filled shares absent from trade_log.shares
-    -- must be added to its own parent's proceeds, not ignored."""
+    -- its PROFIT must be added to its own parent's proceeds, not ignored
+    (and not its raw exit proceeds -- entry_price=24.5 here via the default
+    exit_price*0.98, so profit = (25.0-24.5)*20 = 10.0)."""
     now = datetime.now()
     tl_id = _log_closed_trade(exit_price=25.0, shares=100, exit_time=now)  # core proceeds = 2500
-    _log_addon_leg(tl_id, exit_price=25.0, shares=20, exit_time=now, merged_into_core=1)  # +500
+    _log_addon_leg(tl_id, exit_price=25.0, shares=20, exit_time=now, merged_into_core=1)  # +10 (profit only)
     node = _node()
-    assert _last_sale_recovery(node) == 3000.0
+    assert _last_sale_recovery(node) == 2510.0
 
 
 def test_merged_leg_on_older_trade_log_row_does_not_leak_into_newer_one(env):
@@ -128,9 +142,10 @@ def test_unmerged_leg_adds_onto_its_own_parent_and_that_episode_wins_on_recency(
     now = datetime.now()
     _log_closed_trade(exit_price=25.0, shares=100, exit_time=now - timedelta(hours=2))  # unrelated, proceeds = 2500
     tl_id = _log_closed_trade(exit_price=10.0, shares=10, exit_time=now - timedelta(hours=2))  # this leg's real parent
-    _log_addon_leg(tl_id, exit_price=30.0, shares=15, exit_time=now, merged_into_core=0)  # +450, closes later
+    # entry_price = 30.0*0.98 = 29.4, profit = (30.0-29.4)*15 = 9.0
+    _log_addon_leg(tl_id, exit_price=30.0, shares=15, exit_time=now, merged_into_core=0)  # +9 (profit only), closes later
     node = _node()
-    assert _last_sale_recovery(node) == 550.0  # 100 (parent) + 450 (leg), not 450 alone
+    assert _last_sale_recovery(node) == pytest.approx(109.0)  # 100 (parent) + 9 (leg profit), not 9 alone
 
 
 def test_unmerged_leg_still_adds_onto_core_even_when_closed_earlier(env):
@@ -140,9 +155,10 @@ def test_unmerged_leg_still_adds_onto_core_even_when_closed_earlier(env):
     recent activity."""
     now = datetime.now()
     tl_id = _log_closed_trade(exit_price=25.0, shares=100, exit_time=now)  # core proceeds = 2500
-    _log_addon_leg(tl_id, exit_price=30.0, shares=15, exit_time=now - timedelta(days=1), merged_into_core=0)  # +450
+    # entry_price = 30.0*0.98 = 29.4, profit = (30.0-29.4)*15 = 9.0
+    _log_addon_leg(tl_id, exit_price=30.0, shares=15, exit_time=now - timedelta(days=1), merged_into_core=0)  # +9
     node = _node()
-    assert _last_sale_recovery(node) == 2950.0
+    assert _last_sale_recovery(node) == 2509.0
 
 
 def test_unmerged_leg_wins_when_no_real_core_row_qualifies(env):
@@ -150,7 +166,10 @@ def test_unmerged_leg_wins_when_no_real_core_row_qualifies(env):
     on strategy/version/window (for scoping), not to itself qualify as a real
     trade_log_row candidate -- a dry-run-sim parent (is_dry_run_sim=1, excluded
     from the trade_log_row race the same as always) must still let its real,
-    non-dry-run addon leg win outright when it's the only real candidate."""
+    non-dry-run addon leg win outright when it's the only real candidate. The
+    orphan branch has no real core proceeds to add profit onto, so it falls
+    back to the node's starting_notional (2000, per the fixture) as the base
+    -- bare leg profit alone would catastrophically under-size the next buy."""
     now = datetime.now()
     with signals_db._conn() as c:
         cur = c.execute("""
@@ -164,9 +183,10 @@ def test_unmerged_leg_wins_when_no_real_core_row_qualifies(env):
               _fmt(now - timedelta(days=365))))
         c.commit()
         tl_id = cur.lastrowid
-    _log_addon_leg(tl_id, exit_price=30.0, shares=15, exit_time=now, merged_into_core=0)  # 450
+    # entry_price = 30.0*0.98 = 29.4, profit = (30.0-29.4)*15 = 9.0
+    _log_addon_leg(tl_id, exit_price=30.0, shares=15, exit_time=now, merged_into_core=0)  # 9 (profit only)
     node = _node()
-    assert _last_sale_recovery(node) == 450.0
+    assert _last_sale_recovery(node) == pytest.approx(2009.0)  # starting_notional(2000) + profit(9)
 
 
 def test_dry_run_sim_addon_leg_excluded(env):
@@ -218,13 +238,70 @@ def test_abandoned_addon_leg_excluded(env):
     assert _last_sale_recovery(node) == 2500.0
 
 
+def test_addon_leg_compounds_profit_not_raw_proceeds(env):
+    """Exact worked example from the 2026-09-08 fix: core 10sh entry=$5 exit=$10
+    (proceeds=100), addon 10sh arm(entry)=$6 exit=$10 (profit=(10-6)*10=40).
+    Matches backtester.py's apply_addon_overlay_ground_truth blended_return =
+    (2*exit - entry - arm) / entry -- addon capital (financed via margin at
+    the arm price) is excluded from the compounding base, only its profit
+    compounds in. Correct total is 140.0, NOT 200.0 (100 core proceeds + 100
+    raw addon proceeds -- the pre-fix bug)."""
+    now = datetime.now()
+    tl_id = _log_closed_trade(exit_price=10.0, shares=10, exit_time=now)
+    with signals_db._conn() as c:
+        c.execute("UPDATE trade_log SET entry_price=5.0 WHERE id=?", (tl_id,))
+        c.commit()
+    _log_addon_leg(tl_id, exit_price=10.0, shares=10, exit_time=now, merged_into_core=0,
+                    entry_price=6.0)
+    node = _node()
+    assert _last_sale_recovery(node) == 140.0
+
+
+def test_episode_losing_addon_leg_reduces_total_but_floors_at_zero(env):
+    """A losing addon leg (exit < entry, e.g. armed then reversed against a
+    leveraged ETF) subtracts from the episode total -- and if its loss
+    exceeds the core's own proceeds, the total must floor at 0, never go
+    negative (a negative next-buy notional must never reach share-count
+    math)."""
+    now = datetime.now()
+    tl_id = _log_closed_trade(exit_price=5.0, shares=10, exit_time=now)  # core proceeds = 50
+    # entry=10.0 (arm price), exit=4.0 -> loss = (4-10)*10 = -60
+    _log_addon_leg(tl_id, exit_price=4.0, shares=10, exit_time=now, merged_into_core=0, entry_price=10.0)
+    node = _node()
+    assert _last_sale_recovery(node) == 0.0  # 50 - 60 = -10, floored to 0
+
+
+def test_orphan_losing_addon_leg_falls_back_to_starting_notional_plus_loss(env):
+    """An orphan leg (no qualifying core row) that loses money still uses
+    starting_notional as its base -- never bare (negative) profit alone."""
+    now = datetime.now()
+    with signals_db._conn() as c:
+        cur = c.execute("""
+            INSERT INTO trade_log
+                (ticker, strategy, version, window, stop_loss, max_hold_hours, account,
+                 signal_price, signal_time, entry_price, entry_time, entry_drift_pct,
+                 exit_price, exit_time, exit_reason, shares, is_dry_run_sim, position_source)
+            VALUES (?, 'TrailingBothZScoreBreakout', 'test', 10, 1, 100, 'brokerage',
+                    1.0, ?, 1.0, ?, 0.0, 1.0, ?, 'SL', 1, 1, 'core')
+        """, (TICKER, _fmt(now - timedelta(days=365)), _fmt(now - timedelta(days=365)),
+              _fmt(now - timedelta(days=365))))
+        c.commit()
+        tl_id = cur.lastrowid
+    # entry=10.0 (arm price), exit=4.0 -> loss = (4-10)*10 = -60
+    _log_addon_leg(tl_id, exit_price=4.0, shares=10, exit_time=now, merged_into_core=0, entry_price=10.0)
+    node = _node()
+    assert _last_sale_recovery(node) == pytest.approx(1940.0)  # starting_notional(2000) - 60
+
+
 def test_multiple_real_legs_on_same_parent_all_sum(env):
     """Two real closed legs tied to the same parent (e.g. one abandoned leg
     freed the arm guard for a second, later real leg) must both be added, not
     just the first one a non-aggregating lookup happens to fetch."""
     now = datetime.now()
     tl_id = _log_closed_trade(exit_price=25.0, shares=100, exit_time=now - timedelta(hours=3))  # 2500
-    _log_addon_leg(tl_id, exit_price=30.0, shares=10, exit_time=now - timedelta(hours=2), merged_into_core=0)  # +300
-    _log_addon_leg(tl_id, exit_price=20.0, shares=10, exit_time=now, merged_into_core=0)  # +200
+    # entry=30*0.98=29.4, profit=(30-29.4)*10=6.0
+    _log_addon_leg(tl_id, exit_price=30.0, shares=10, exit_time=now - timedelta(hours=2), merged_into_core=0)  # +6
+    # entry=20*0.98=19.6, profit=(20-19.6)*10=4.0
+    _log_addon_leg(tl_id, exit_price=20.0, shares=10, exit_time=now, merged_into_core=0)  # +4
     node = _node()
-    assert _last_sale_recovery(node) == 3000.0
+    assert _last_sale_recovery(node) == 2510.0

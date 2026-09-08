@@ -1175,30 +1175,52 @@ def _last_sale_recovery(node):
     trade; a plain starting_notional edit silently has no effect past that
     point (see signals_db.set_starting_notional_override).
 
-    addon_legs (2026-09-04 fix, revised 2026-09-06 after paired review): a
-    real add-on-at-arm leg is its own margin buy/sell with its own P&L,
-    stored in addon_legs, never in trade_log -- close_position() writes
-    trade_log.shares from open_positions.shares (the CORE's own share
-    count), so a leg's real filled shares have zero trade_log
-    representation on their own. Whether a leg was merged_into_core (filled
-    in the same broker SELL order as its parent's close) or closed
-    independently (its own later exit_price/exit_time, e.g. an
-    already-armed leg outliving a TIME/SL core exit, or a reconciliation
-    catch-up) is pure broker-order mechanics, not an economic distinction --
-    either way its real proceeds belong to the SAME closing episode as its
-    parent (tied via parent_trade_log_id) and must be ADDED to that
-    episode's total, never treated as a separate recency-competing
-    candidate (an earlier version of this fix raced an independent leg
-    against its own parent for "most recent," which silently discarded
-    whichever side lost -- wrong, since both sides are proceeds from the
-    same trade). A leg's own exit_time still matters for RECENCY -- an
-    episode's recency is the later of its trade_log row's close and any of
-    its legs' closes, so a leg that closes after its parent (e.g. days later
-    via reconciliation) can make an otherwise-stale episode the most recent
-    one. A leg whose parent trade_log row doesn't itself qualify (e.g. a
+    addon_legs (2026-09-04 fix, revised 2026-09-06 after paired review;
+    economics corrected 2026-09-08): a real add-on-at-arm leg is its own
+    margin buy/sell with its own P&L, stored in addon_legs, never in
+    trade_log -- close_position() writes trade_log.shares from
+    open_positions.shares (the CORE's own share count), so a leg's real
+    filled shares have zero trade_log representation on their own. Whether a
+    leg was merged_into_core (filled in the same broker SELL order as its
+    parent's close) or closed independently (its own later
+    exit_price/exit_time, e.g. an already-armed leg outliving a TIME/SL core
+    exit, or a reconciliation catch-up) is pure broker-order mechanics, not
+    an economic distinction -- either way its real PROFIT belongs to the
+    SAME closing episode as its parent (tied via parent_trade_log_id) and
+    must be ADDED to that episode's total, never treated as a separate
+    recency-competing candidate (an earlier version of this fix raced an
+    independent leg against its own parent for "most recent," which
+    silently discarded whichever side lost -- wrong, since both sides
+    contribute to the same trade's compounding base).
+
+    Critically, what gets added is each leg's PROFIT -- (exit_price -
+    entry_price) * shares -- never its raw exit proceeds (exit_price *
+    shares). A leg is financed via margin at its own arm price, and that
+    borrowed capital base is explicitly NOT part of the compounding base;
+    only the profit compounds in, matching backtester.py's
+    apply_addon_overlay_ground_truth (blended_return = (2*exit_price -
+    entry_price - arm_price) / entry_price, i.e. core proceeds + addon
+    PROFIT, never addon proceeds). Using raw proceeds here double-counted
+    the leg's own capital and over-sized every subsequent buy for any node
+    with a closed addon leg (real bug, fixed 2026-09-08).
+
+    A leg's own exit_time still matters for RECENCY -- an episode's recency
+    is the later of its trade_log row's close and any of its legs' closes,
+    so a leg that closes after its parent (e.g. days later via
+    reconciliation) can make an otherwise-stale episode the most recent one.
+    A leg whose parent trade_log row doesn't itself qualify (e.g. a
     dry-run-sim parent) is an "orphan" -- still real, sized on its own via
-    the leg's own exit_time. ABANDONED legs (entry order never filled, no
-    real proceeds) are excluded like dry-run rows.
+    the leg's own exit_time, but with starting_notional/override standing in
+    for the missing core-proceeds term (there is no real core trade to add
+    the leg's profit onto in this case) -- bare leg profit alone would go
+    negative for a losing leg or catastrophically under-size a winning one,
+    since the leg's own margin-financed capital was never part of the
+    compounding base (real bug, fixed 2026-09-08, paired-review round 2).
+    Both the episode and orphan totals are floored at 0 -- a losing addon
+    leg can, in principle, erase more than the episode's own core proceeds,
+    and a negative next-buy notional must never reach share-count math.
+    ABANDONED legs (entry order never filled, no real proceeds) are excluded
+    like dry-run rows.
 
     This only augments the "most-recent-close-wins" step above -- every
     precedence rule above it (override_once, override) is unchanged and
@@ -1216,7 +1238,7 @@ def _last_sale_recovery(node):
         c.row_factory = sqlite3.Row
         episode_row = c.execute(
             "SELECT tl.id, "
-            "tl.exit_price*tl.shares + COALESCE(SUM(al.exit_price*al.shares), 0) AS total, "
+            "tl.exit_price*tl.shares + COALESCE(SUM((al.exit_price - al.entry_price)*al.shares), 0) AS total, "
             "MAX(tl.exit_time, COALESCE(MAX(al.exit_time), tl.exit_time)) AS recency "
             "FROM trade_log tl "
             "LEFT JOIN addon_legs al ON al.parent_trade_log_id = tl.id AND al.status='closed' "
@@ -1229,7 +1251,7 @@ def _last_sale_recovery(node):
             (account, ticker, strategy, version, window, account),
         ).fetchone()
         orphan_row = c.execute(
-            "SELECT SUM(al.exit_price*al.shares) AS total, MAX(al.exit_time) AS recency "
+            "SELECT SUM((al.exit_price - al.entry_price)*al.shares) AS total, MAX(al.exit_time) AS recency "
             "FROM addon_legs al JOIN trade_log tl ON tl.id = al.parent_trade_log_id "
             "WHERE al.ticker=? AND tl.strategy=? AND tl.version=? AND tl.window=? "
             "AND COALESCE(al.account,'')=COALESCE(?,'') AND al.status='closed' "
@@ -1243,13 +1265,22 @@ def _last_sale_recovery(node):
 
     episode_total = episode_row['total'] if episode_row else None
     episode_recency = episode_row['recency'] if episode_row else None
-    orphan_total = orphan_row['total'] if orphan_row else None
+    orphan_leg_profit = orphan_row['total'] if orphan_row else None
     orphan_recency = orphan_row['recency'] if orphan_row else None
 
     if episode_total is not None and (orphan_recency is None or episode_recency >= orphan_recency):
-        return episode_total
-    if orphan_total is not None:
-        return orphan_total
+        return max(episode_total, 0)
+    if orphan_leg_profit is not None:
+        # An orphan leg's parent trade_log row doesn't qualify (e.g. dry-run-sim),
+        # so there is no real core-proceeds term to add the leg's profit onto --
+        # unlike the episode branch, starting_notional/override stands in for it
+        # here (2026-09-08 fix, paired review: a bare-profit total went negative
+        # for a losing leg, or catastrophically under-sized a winning one, since
+        # a leg's own margin-financed capital was never part of the base).
+        starting_notional = node.get('starting_notional')
+        if starting_notional is None:
+            raise ValueError(f"_last_sale_recovery({ticker}): no trade history and no starting_notional configured")
+        return max(starting_notional + orphan_leg_profit, 0)
 
     starting_notional = node.get('starting_notional')
     if starting_notional is None:
