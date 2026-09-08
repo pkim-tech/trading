@@ -235,8 +235,8 @@ GT_COLUMN_DEFS = {
     "drought_compounded_pct": "Drought overlay: compounded return from drought-window trades alone. None (not "
                                "NaN) when zero real drought windows existed at the winning grid cell.",
     "drought_combined_compounded_pct": "Drought overlay: core+drought combined compounded return.",
-    "drought_skip_reason": "Set when drought was never computed for this scope at all (e.g. strategy is not "
-                            "TrailingBothZScoreBreakout) -- see run_optimization_sweep.py's drought_skip_reason.",
+    "drought_skip_reason": "Set when drought was never computed for this scope at all (strategy fails "
+                            "strategies.uses_arm_trail_exit()) -- see run_optimization_sweep.py's drought_skip_reason.",
 }
 
 # Relabels find_candidates()'s internal keys to the user's requested wording

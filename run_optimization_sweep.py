@@ -3752,14 +3752,21 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
 
     strategy_class = getattr(strategies, strategy_name)
     is_both = strategy_name == 'TrailingBothZScoreBreakout'
-    # Drought's SL/arm/trail overlay mechanism was only ever validated against
-    # TrailingBoth's own arm-then-trail risk parameters (scripts/drought_overlay_test.py
-    # -- the legacy script this replaces made the identical "is_both assumed True"
-    # restriction, carried forward unchanged rather than newly generalizing an
-    # unvalidated TrailingExit drought overlay in this same change).
-    drought_skip_reason = None if is_both else (
-        f"strategy is {strategy_name!r}, not TrailingBothZScoreBreakout -- the drought "
-        f"overlay mechanism is only validated for TrailingBoth's arm-then-trail shape.")
+    # Drought eligibility (2026-09-08 fix, lifted a stale TrailingExit restriction):
+    # backtester.simulate_drought_overlay_ground_truth's own docstring (2026-09-02,
+    # AFTER the old is_both-only restriction here was written) confirms both real GT-
+    # kernel strategies' check_exit run the byte-identical (ast.dump-verified) fixed-SL-
+    # then-arm-then-trail state machine the drought overlay reuses -- the function no
+    # longer even takes a strategy parameter. strategies.uses_arm_trail_exit() is the
+    # real capability gate (paired-review MEDIUM finding, 2026-09-02) -- NOT is_both,
+    # which only distinguishes trade-GENERATION shape (run_backtest_ground_truth still
+    # needs the real strategy identity for that, unchanged below) from drought
+    # ELIGIBILITY, a separate question this variable now answers correctly for
+    # TrailingExit too.
+    drought_eligible = strategies.uses_arm_trail_exit(strategy_name)
+    drought_skip_reason = None if drought_eligible else (
+        f"strategy is {strategy_name!r} -- the drought overlay mechanism requires "
+        f"strategies.uses_arm_trail_exit(), the fixed-SL-then-arm-then-trail exit shape.")
 
     # Trades-cache read-back (2026-08-29, Task #1, planner dispatch): Phase2.5
     # (bench_phase1_phase2_inmemory.py's _insert_winner_trades_rows) already persists
@@ -3844,10 +3851,10 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                         cached_trades = None
                         trades_resolution = None
             need_resim = cached_trades is None
-            # is_both scopes still need df_hourly_windowed for the drought overlay below
-            # even when trades came from cache -- non-is_both scopes with a cache hit
-            # never need the (possibly slow) hourly/minute input load at all.
-            need_inputs = need_resim or is_both
+            # drought_eligible scopes still need df_hourly_windowed for the drought
+            # overlay below even when trades came from cache -- non-eligible scopes with
+            # a cache hit never need the (possibly slow) hourly/minute input load at all.
+            need_inputs = need_resim or drought_eligible
 
             inputs = _load_node_inputs_ground_truth(
                 ticker, strategy_class, strategy_name, cand['window'], cand['z_score_threshold'],
@@ -3902,10 +3909,22 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             # only add-on had been wired to respect the flag).
             drought = None
             drought_ie = None
-            if cand.get('phase4_eligible', True) and is_both and trades and df_hourly_windowed is not None:
+            if cand.get('phase4_eligible', True) and drought_eligible and trades and df_hourly_windowed is not None:
+                # arm_pct is always the take_profit-axis threshold that arms the trail,
+                # for both real GT-supported arm-trail strategies. trail_sell_pct's real
+                # source column differs by strategy though (same axis-remapping bug class
+                # this project has hit repeatedly -- see feedback_backtest_cache_axis_
+                # column_remapping): TrailingBoth's real trail_pct lives in the fourth
+                # axis (cand['tpct']), while TrailingExit's sl_axis IS 'trail_pct' directly
+                # (cand['stop_loss']) -- it has no fourth axis at all, so cand['tpct'] is
+                # meaningless/unused for it. Same is_both-keyed mapping already proven
+                # correct by node_from_candidate/phase5_second_level_overlay_check.py's
+                # own docstring (verbatim reuse convention) and by the non-is_both branch
+                # above (trail_buy_pct_arg/trail_sell_pct_arg) for trade generation.
+                _drought_trail_sell_pct = float(cand['tpct']) if is_both else float(cand['stop_loss'])
                 drought = simulate_drought_overlay_ground_truth(
                     trades, df_hourly_windowed, ticker, fixed_sl,
-                    arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']))
+                    arm_pct=float(cand['take_profit']), trail_sell_pct=_drought_trail_sell_pct)
                 # Included-vs-excluded vol-gate challenge (2026-08-23, candidate_full_review.py
                 # GT full-review port -- docs/overlay_parameter_robustness_process.md step 4),
                 # only meaningful once a real winning confirm_days exists (drought['best_confirm_days']
@@ -3913,7 +3932,7 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                 if drought is not None and drought.get('best_confirm_days') is not None:
                     drought_ie = drought_included_excluded_ground_truth(
                         trades, df_hourly_windowed, ticker, fixed_sl,
-                        arm_pct=float(cand['take_profit']), trail_sell_pct=float(cand['tpct']),
+                        arm_pct=float(cand['take_profit']), trail_sell_pct=_drought_trail_sell_pct,
                         confirm_days=drought['best_confirm_days'], vol_gate=GT_DROUGHT_IE_VOL_GATE)
 
             core_cliff = addon['core_cliff']
