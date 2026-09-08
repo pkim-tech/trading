@@ -309,18 +309,35 @@ def overlay_cagrs(gt_trades, ticker, dfh, node, years):
             trail_sell_pct=node["trail_sell_pct"])
         if drought is not None and drought.get("combined_compounded_pct") is not None:
             drought_cagr = cagr(1.0 + drought["combined_compounded_pct"] / 100.0, years, start_bal=1.0)
-    else:
-        # Fail LOUD, not a silent None -- paired-review finding: a None here must be
-        # distinguishable from "no real drought windows found for this candidate" (which
-        # also leaves drought_cagr=None, just for a completely different reason). Matches
-        # run_overlay_shim.py's own print for the same gate.
-        print(f"  {ticker} (candidate {node.get('id')}): strategy={node['strategy']} does not "
-              f"support the drought overlay's arm-then-trail exit shape -- skipping")
+        # drought_compounded_pct/drought_ok (real bug, fixed 2026-09-08, confirmed by
+        # runtime trace against candidate_id=35463): these MUST be assigned in this
+        # (eligible) branch, off the SAME `drought` dict already computed two lines
+        # above -- commit 184a426 (2026-09-02) inserted the fail-loud `else:` branch
+        # below ABOVE this pre-existing assignment, silently trapping it inside the
+        # NOT-eligible branch instead, where `drought` is never even defined. Every
+        # Phase5 core_both_cagr_1m/1s written since then was drought-free
+        # (drought_factor_gated stuck at 1.0) for any TrailingBoth/TrailingExit
+        # candidate whose drought gate would otherwise have passed -- confirmed on
+        # 35463: stored core_both_cagr_1s=0.9845 exactly reproduces the bug, real
+        # value with drought applied is 1.1483 (drought_ok=True, factor=1.4862).
         if drought is not None:
             drought_compounded_pct = drought.get("drought_compounded_pct")
             drought_rets = drought.get("best_rets")
             drought_ok = (drought_rets is not None and len(drought_rets) >= 2 and
                           _chrono_split_robustness_verdict(drought_rets) == 'OK')
+    else:
+        # Fail LOUD, not a silent None -- paired-review finding: a None here must be
+        # distinguishable from "no real drought windows found for this candidate" (which
+        # also leaves drought_cagr=None, just for a completely different reason). Matches
+        # run_overlay_shim.py's own print for the same gate. `drought` is never computed
+        # in this branch (the strategy doesn't support the overlay at all) -- referencing
+        # it here was the second real bug (184a426): an UnboundLocalError latent for any
+        # non-arm-trail-exit strategy that ever reaches this function (none do today,
+        # since only TrailingBoth/TrailingExit are dispatched to Phase5, but the crash
+        # was reachable in principle -- removed rather than guarded, since there is
+        # nothing real to compute here).
+        print(f"  {ticker} (candidate {node.get('id')}): strategy={node['strategy']} does not "
+              f"support the drought overlay's arm-then-trail exit shape -- skipping")
 
     addon_factor_gated = (1.0 + addon_compounded_pct / 100.0) if (
         addon_compounded_pct is not None and addon_ok) else 1.0
