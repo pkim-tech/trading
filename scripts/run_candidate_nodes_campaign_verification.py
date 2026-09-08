@@ -64,6 +64,11 @@ def _phase4_fields_from_row(row):
         "addon_cagr_pct": row.get("addon_cagr_pct"),
         "drought_compounded_pct": row.get("drought_compounded_pct"),
         "drought_combined_compounded_pct": row.get("drought_combined_compounded_pct"),
+        # trades_resolution (2026-09-07, Review-Gate Persistence Rule item -- paired-
+        # review HIGH finding #3): threaded straight through from candidate_summary_
+        # report.gt_rows_for_scope's own `out` dict.
+        "trades_resolution": row.get("trades_resolution"),
+        "second_build_id": row.get("second_build_id"),
     }
 
 
@@ -104,8 +109,57 @@ def run_phase4(ticker, version, window, data_source):
                 "SELECT id FROM candidate_nodes WHERE ticker=? AND strategy=? AND version=? "
                 "AND fixed_sl=? AND entry_timing=? AND window=?",
                 (ticker, strategy, version, float(fixed_sl), entry_timing, window)).fetchall()]
-            already_done = bool(cand_ids) and all(
-                get_stored_phase4(conn, cid) is not None for cid in cand_ids)
+            stored = [get_stored_phase4(conn, cid) for cid in cand_ids] if cand_ids else []
+            # Real re-verification trigger (2026-09-07, Review-Gate Persistence Rule item
+            # -- paired-review HIGH finding #4, revised after a second paired-review round
+            # against the first version of this fix found it incomplete): the original
+            # "has a phase4_results row at all" check has no way to ever notice a scope
+            # was verified under a worse resolution than what's available NOW -- a scope
+            # Phase4'd back when this ticker had no active massive_second_derived build
+            # would keep stale minute-resolution numbers forever, with zero trigger to
+            # redo it once a real 1s build appears. Decided trigger, using judgment since
+            # there's no single obviously-right answer: versioning by REAL DATA
+            # AVAILABILITY (is a 1s build active for this ticker right now, AND is it the
+            # SAME specific build_id every stored row was verified under), not by a
+            # code/kernel-version stamp -- a kernel_version bump would force every scope
+            # project-wide to redo Phase4 on every future kernel fix, which is
+            # disproportionate. If a second build IS active for this ticker (gated the
+            # same "-massive" in version way gt_rows_for_scope itself decides data_source,
+            # see below), a scope only counts as already_done when EVERY stored row's
+            # trades_resolution already reflects 1s data ('1s'/'second_cache'/
+            # 'second_resim') AND that row's second_build_id matches the CURRENTLY active
+            # build (not just some earlier, possibly-superseded one) -- any row failing
+            # either check forces a real re-verification. If no second build is active,
+            # minute resolution is already the best available and the original "has a
+            # row" check is sufficient (nothing to gain from rerunning).
+            # data_source gate (2026-09-07, independent-cold paired-review HIGH finding
+            # against the first version of this fix): must match the SAME condition
+            # candidate_summary_report.gt_rows_for_scope uses internally to decide
+            # data_source ("massive" iff "-massive" in version -- gt_rows_for_scope has
+            # no data_source parameter at all, it derives this itself; the --data-source
+            # CLI flag threaded into this function is a pre-existing, out-of-scope-for-
+            # this-fix gap, NOT wired into gt_rows_for_scope, so it must not be trusted
+            # here either). Without this gate, a ticker with an active second build but
+            # a non-'-massive' version string would have `_resim_fill_resolution` stay
+            # 'minute' forever (gated the same way downstream) while this check kept
+            # expecting 1s data that can never arrive -- already_done permanently False,
+            # the full scope recomputing on every single invocation with no progress.
+            import db_cache as _db_cache
+            _has_second_build = ("-massive" in version
+                                  and _db_cache.get_active_build_id(ticker, 'second') is not None)
+            _active_second_build_id = (_db_cache.get_active_build_id(ticker, 'second')
+                                        if _has_second_build else None)
+            # second_build_id check (2026-09-07, contextual paired-review HIGH finding):
+            # trades_resolution=='1s' alone can't distinguish 1s data produced under the
+            # CURRENTLY active second build from 1s data produced under a since-
+            # superseded one (real precedent: the 2026-08-27 SOXL/DPST/DFEN minute-
+            # archive narrowing incident) -- a scope must also match the real active
+            # build_id, not just the resolution class, to count as already_done.
+            already_done = bool(cand_ids) and all(s is not None for s in stored) and (
+                not _has_second_build or all(
+                    s.get('trades_resolution') in ('1s', 'second_cache', 'second_resim')
+                    and s.get('second_build_id') == _active_second_build_id
+                    for s in stored))
         if already_done:
             print(f"  already checked -- every real candidate_nodes row ({len(cand_ids)}) in this "
                   f"scope already has a phase4_results row. Skipping recompute.")

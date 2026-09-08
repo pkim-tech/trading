@@ -428,6 +428,13 @@ _PHASE4_VALUE_COLUMNS = [
     "check11_max_drawdown_pct",
     "check13_worst_fold_cagr_pct", "check13_any_fold_fragile",
     "addon_cagr_pct", "drought_compounded_pct", "drought_combined_compounded_pct",
+    # trades_resolution (2026-09-07, Review-Gate Persistence Rule item -- paired-review
+    # HIGH finding #3): which real trade source produced this row's cagr_pct/checks --
+    # see candidate_summary_report.GT_COLUMN_DEFS' own entry for the real value set.
+    # Persisted so a post-1s-fix phase4_results row is distinguishable from a pre-fix
+    # one after the fact (previously computed and threaded all the way to the report's
+    # `out` dict, but discarded before ever reaching this table).
+    "trades_resolution", "second_build_id",
 ]
 
 
@@ -445,6 +452,7 @@ def ensure_phase4_table(conn):
             check11_max_drawdown_pct REAL,
             check13_worst_fold_cagr_pct REAL, check13_any_fold_fragile INTEGER,
             addon_cagr_pct REAL, drought_compounded_pct REAL, drought_combined_compounded_pct REAL,
+            trades_resolution TEXT, second_build_id INTEGER,
             UNIQUE(candidate_id)
         )""")
     # Same sqlite "no ADD COLUMN IF NOT EXISTS" probe-first pattern as ensure_table()
@@ -453,6 +461,15 @@ def ensure_phase4_table(conn):
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(candidate_nodes)")}
     if "phase4_checked_at" not in existing_cols:
         conn.execute("ALTER TABLE candidate_nodes ADD COLUMN phase4_checked_at TEXT")
+    # trades_resolution (2026-09-07, added to _PHASE4_VALUE_COLUMNS above -- same
+    # probe-first ALTER pattern, existing phase4_results rows get NULL, same "old rows
+    # just go unread as a resolution marker" convention this project already uses for
+    # backtest_winner_trades' own fill_resolution column).
+    existing_p4_cols = {row[1] for row in conn.execute("PRAGMA table_info(phase4_results)")}
+    if "trades_resolution" not in existing_p4_cols:
+        conn.execute("ALTER TABLE phase4_results ADD COLUMN trades_resolution TEXT")
+    if "second_build_id" not in existing_p4_cols:
+        conn.execute("ALTER TABLE phase4_results ADD COLUMN second_build_id INTEGER")
 
 
 def get_stored_phase4(conn, candidate_id):

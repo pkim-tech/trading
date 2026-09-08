@@ -3089,7 +3089,7 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
                                             fixed_sl, tpct, entry_timing, start_date, end_date,
                                             spy_bh, years, data_source="yahoo", addon_eligible=True,
                                             config_version=None, addon_cache_map=None,
-                                            new_cache_rows=None):
+                                            new_cache_rows=None, fill_resolution='minute'):
     """One (tp, sl, hold, w, z, tpct) cell, evaluated in-process (no ProcessPoolExecutor,
     no backtest_cache write) with same_bar_reentry=True -- returns core AND add-on-
     adjusted alpha/CAGR side by side. Reuses run_single_backtest_node_ground_truth_
@@ -3147,8 +3147,15 @@ def _evaluate_cell_ground_truth_with_addon(ticker, strategy_name, tp, sl, hold_h
 
     strategy_class = getattr(strategies, strategy_name)
     is_both = strategy_name == 'TrailingBothZScoreBreakout'
+    # fill_resolution (2026-09-07, Review-Gate Persistence Rule item -- paired-review
+    # HIGH finding #2): this call used to omit fill_resolution entirely, always
+    # defaulting to minute inside _load_node_inputs_ground_truth regardless of whether
+    # the caller had a real 1s build available -- so core_safe/addon_safe/addon_cagr_pct
+    # never benefited from 1s data even when the rest of Phase4 already had. Threaded
+    # through from run_addon_cliff_safety_ground_truth's own once-per-scope resolution.
     inputs = _load_node_inputs_ground_truth(ticker, strategy_class, strategy_name, w, z_thresh,
-                                             start_date, end_date, data_source=data_source)
+                                             start_date, end_date, data_source=data_source,
+                                             fill_resolution=fill_resolution)
     if inputs is None:
         return None
     _, df_daily_processed, minute_df, df_hourly_windowed, prep, mprep, _actual_fill_res = inputs
@@ -3204,7 +3211,7 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
                                          spy_bh, fixed_sl=0, entry_timing='open_check',
                                          start_date=None, end_date=None, years=None,
                                          data_source="yahoo", cliff_radius=None,
-                                         addon_eligible=True):
+                                         addon_eligible=True, fill_resolution='minute'):
     """For each candidate from derive_phase25_candidates_ground_truth, computes the
     add-on-adjusted alpha/CAGR at the candidate's own cell AND across the same cliff-box
     neighborhood shape Phase2.5-GT's own dispatch would generate (±cliff_radius in
@@ -3358,12 +3365,31 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
     # mix-up). resolve_axis_columns is the single source of truth for this.
     _, fourth_axis_col = strategies.resolve_axis_columns(strategy_name)
 
-    cache_conn = sqlite3.connect(DB_PATH, timeout=60.0)
-    _ensure_cliff_addon_cache_table(cache_conn)
-    addon_cache_map = _load_cliff_addon_cache_map(
-        cache_conn, ticker, strategy_name, config_version, entry_timing, fixed_sl,
-        data_source, start_date, end_date)
-    new_cache_rows = []
+    # fill_resolution / cliff_addon_cache bypass (2026-09-07, Review-Gate Persistence
+    # Rule item -- paired-review HIGH finding #2): cliff_addon_cache's real PRIMARY KEY
+    # (_ensure_cliff_addon_cache_table) has no fill_resolution column -- it predates 1s
+    # support entirely. Rather than migrate that table's PK under an unattended overnight
+    # pass (real risk: a wrong migration could silently collide 1s and minute rows under
+    # the same key, exactly the class of bug this table's own data_source/start_date/
+    # end_date PK columns were added in 2026-08-23 to prevent), fill_resolution='second'
+    # bypasses the cache entirely for this call -- same precedent scripts/verify_v651_
+    # cliffsafety_1s_timing.py already established (calls bench._dispatch(fill_resolution=
+    # 'second') directly, no cliff_addon_cache involvement at all for 1s work). Real cost:
+    # a 1s addon/cliff-safety pass gets zero cache reuse across repeat report runs for the
+    # same ticker/scope -- accepted, since correctness (never silently serving a minute-
+    # computed cell as a 1s one, or vice versa) matters more here than the compute-
+    # avoidance this cache exists for. A future pass extending cliff_addon_cache's own PK
+    # to include fill_resolution properly would remove this restriction.
+    use_cache = fill_resolution == 'minute'
+    cache_conn = sqlite3.connect(DB_PATH, timeout=60.0) if use_cache else None
+    addon_cache_map = None
+    new_cache_rows = None
+    if use_cache:
+        _ensure_cliff_addon_cache_table(cache_conn)
+        addon_cache_map = _load_cliff_addon_cache_map(
+            cache_conn, ticker, strategy_name, config_version, entry_timing, fixed_sl,
+            data_source, start_date, end_date)
+        new_cache_rows = []
 
     results = []
     for cand in candidates:
@@ -3380,7 +3406,8 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
             ticker, strategy_name, tp_c, sl_c, hold_c, w_c, z_c, fixed_sl, tpct_c,
             entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
             addon_eligible=addon_eligible, config_version=config_version,
-            addon_cache_map=addon_cache_map, new_cache_rows=new_cache_rows)
+            addon_cache_map=addon_cache_map, new_cache_rows=new_cache_rows,
+            fill_resolution=fill_resolution)
 
         neighbor_addon_cagrs = []
         neighbor_core_cagrs = []
@@ -3392,7 +3419,8 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
                             ticker, strategy_name, tp, sl, hold, w_c, z_c, fixed_sl, tpct,
                             entry_timing, start_date, end_date, spy_bh, years, data_source=data_source,
                             addon_eligible=addon_eligible, config_version=config_version,
-                            addon_cache_map=addon_cache_map, new_cache_rows=new_cache_rows)
+                            addon_cache_map=addon_cache_map, new_cache_rows=new_cache_rows,
+                            fill_resolution=fill_resolution)
                         if cell is not None:
                             # cagr, not alpha (2026-08-23, ground_truth_kernel_rebuild.md
                             # Step 4): raw alpha differences are unbounded below -100%
@@ -3444,10 +3472,11 @@ def run_addon_cliff_safety_ground_truth(ticker, strategy_name, config_version, h
             'addon_eligible': addon_eligible,
         })
 
-    _flush_cliff_addon_cache_rows(cache_conn, ticker, strategy_name, config_version,
-                                   entry_timing, fixed_sl, data_source, start_date, end_date,
-                                   new_cache_rows)
-    cache_conn.close()
+    if use_cache:
+        _flush_cliff_addon_cache_rows(cache_conn, ticker, strategy_name, config_version,
+                                       entry_timing, fixed_sl, data_source, start_date, end_date,
+                                       new_cache_rows)
+        cache_conn.close()
     return results
 
 
@@ -3681,6 +3710,25 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
 
     addon_eligible, addon_eligibility_reason = addon_margin_eligible_ticker(ticker)
 
+    # 1s fill resolution (2026-09-07, Review-Gate Persistence Rule item -- paired-review
+    # HIGH finding #2): resolved HERE (moved up from its original later spot in this
+    # function, before this function's own per-candidate resim loop, so the SAME
+    # resolution decision can also be threaded into the addon/cliff-safety pass below --
+    # previously that pass called _load_node_inputs_ground_truth with no fill_resolution
+    # arg at all, silently defaulting to minute regardless of whether a real 1s build
+    # was active, so core_safe/addon_safe/addon_cagr_pct never benefited from 1s data.
+    # Same data_source=='massive' gate as the per-candidate loop below (data_source's
+    # default here is 'yahoo' -- _load_second_df raises for anything else).
+    import db_cache as _db_cache
+    _second_build_id = (_db_cache.get_active_build_id(ticker, 'second')
+                         if data_source == "massive" else None)
+    _resim_fill_resolution = 'second' if _second_build_id is not None else 'minute'
+    if _second_build_id is None:
+        _reason = ("data_source != 'massive'" if data_source != "massive"
+                   else "no active massive_second_derived build")
+        print(f"  [Phase4] {ticker}: {_reason} -- checklist resim stays at minute "
+              f"resolution for this ticker.")
+
     # Phase4 (drought/add-on overlay) is real, possibly-slow compute (one
     # run_backtest_ground_truth call per cell, times up to 9 candidates times the full
     # cliff-box neighborhood -- see this function's own docstring) -- skip it for any
@@ -3691,7 +3739,8 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
         eligible_addon_results = run_addon_cliff_safety_ground_truth(
             ticker, strategy_name, config_version, hp, phase4_candidates, spy_bh, fixed_sl=fixed_sl,
             entry_timing=entry_timing, start_date=start_date, end_date=end_date, years=years,
-            data_source=data_source, cliff_radius=cliff_radius, addon_eligible=addon_eligible)
+            data_source=data_source, cliff_radius=cliff_radius, addon_eligible=addon_eligible,
+            fill_resolution=_resim_fill_resolution)
     else:
         eligible_addon_results = []
     _addon_by_id = dict(zip((id(c) for c in phase4_candidates), eligible_addon_results))
@@ -3742,32 +3791,11 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     from scripts.node_key import node_key as _node_key, GT_TRADES_KERNEL_VERSION as _GT_TRADES_KERNEL_VERSION
     from scripts.candidate_verification_store import (
         get_cached_trades as _get_cached_trades, get_phase5_1s_trades as _get_phase5_1s_trades)
-    import db_cache as _db_cache
     _hourly_build_id = _db_cache.get_active_build_id(ticker, 'hourly')
     _minute_build_id = _db_cache.get_active_build_id(ticker, 'minute')
-    # 1s fill resolution for any candidate needing a fresh resim (2026-09-06, one-shot-
-    # per-ticker design doc item 1) -- resolved ONCE per scope (matches the hourly/minute
-    # build_id pattern above, same "not a per-candidate check" reasoning), not per
-    # candidate. Checked explicitly here (rather than relying solely on
-    # _load_node_inputs_ground_truth's own internal fallback) so trades_resolution below
-    # is labeled correctly up front instead of unconditionally claiming 'second_resim'
-    # even when a ticker with no active massive_second_derived build silently fell back.
-    # data_source == 'massive' gate (2026-09-06, paired-review HIGH finding): Phase4's own
-    # default (see this function's signature) is data_source='yahoo' -- _load_second_df
-    # raises ValueError for any non-'massive' data_source, so requesting fill_resolution=
-    # 'second' against a yahoo-sourced scope would always silently fall back inside
-    # _load_node_inputs_ground_truth while this variable stayed 'second', making the
-    # trades_resolution label below claim 'second_resim' for a resim that actually ran at
-    # minute resolution. Checked here too (not just left to the per-call fallback) so the
-    # print below fires once per scope with the real reason, not per-candidate.
-    _second_build_id = (_db_cache.get_active_build_id(ticker, 'second')
-                         if data_source == "massive" else None)
-    _resim_fill_resolution = 'second' if _second_build_id is not None else 'minute'
-    if _second_build_id is None:
-        _reason = ("data_source != 'massive'" if data_source != "massive"
-                   else "no active massive_second_derived build")
-        print(f"  [Phase4] {ticker}: {_reason} -- checklist resim stays at minute "
-              f"resolution for this ticker.")
+    # _second_build_id/_resim_fill_resolution: resolved earlier in this function now
+    # (moved 2026-09-07 so the addon/cliff-safety pass above can reuse the same
+    # decision -- see that call site's own comment), reused here unchanged.
     _trades_conn = sqlite3.connect(DB_PATH, timeout=60.0)
 
     rows = []
@@ -3802,6 +3830,19 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                     # 'minute' for a legacy pre-column row) onto every returned trade.
                     trades_resolution = ('second_cache' if cached_trades[0].get('fill_resolution') == 'second'
                                          else 'minute_cache')
+                    # 1s-canonical-going-forward (2026-09-07, Review-Gate Persistence Rule
+                    # item): a plain minute-resolution cache hit is no longer "good enough"
+                    # once a real second build is active for this ticker -- without this,
+                    # a FRESH Phase4 run for a scope with a pre-existing minute-only
+                    # backtest_winner_trades row (written before this ticker's second build
+                    # existed, or by an older campaign) would silently keep serving stale
+                    # minute-resolution numbers forever, never re-deriving 1s, defeating
+                    # the whole point of "1s is canonical for fresh runs." Discard the hit
+                    # and fall through to a fresh resim (which the fill_resolution logic
+                    # below already prefers 'second' for) instead of trusting it.
+                    if trades_resolution == 'minute_cache' and _resim_fill_resolution == 'second':
+                        cached_trades = None
+                        trades_resolution = None
             need_resim = cached_trades is None
             # is_both scopes still need df_hourly_windowed for the drought overlay below
             # even when trades came from cache -- non-is_both scopes with a cache hit
@@ -3842,6 +3883,19 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
             c8 = _check8_fluke_gt(trades)
             dd_pct, dd_peak, dd_trough = _check11_max_drawdown_gt(trades) if trades else (None, None, None)
             c13_folds = _check13_walk_forward_gt(trades) if trades else []
+
+            # Real headline CAGR recomputed from the SAME `trades` list checks 4/8/11/13
+            # just ran against (2026-09-07, Review-Gate Persistence Rule item -- paired-
+            # review HIGH finding #1). Before this, the row's only CAGR was `cand['cagr']`
+            # (the original Phase1/2 sweep-time value, always minute-resolution and None
+            # for every candidate_nodes-sourced row -- see this function's own docstring
+            # on candidates_override) -- completely disconnected from `trades_resolution`
+            # above, so a candidate whose trades were served at '1s'/'second_resim' still
+            # reported a stale or missing CAGR downstream. `_summarize_trades_ground_
+            # truth` is the same call the add-on path (`_evaluate_cell_ground_truth_with_
+            # addon`) already uses for its own `core_cagr` -- this just applies it here too.
+            core_cagr = (_summarize_trades_ground_truth(trades, spy_bh, years)[5]
+                         if trades else None)
 
             # Drought is Phase4 overlay work same as add-on -- skip for phase4_eligible=False
             # candidates too (2026-08-23 fix: this was still computing unconditionally,
@@ -3886,6 +3940,22 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
                 # for a downstream reader to tell which resolution actually produced a
                 # given row's numbers.
                 'trades_resolution': trades_resolution,
+                # Real CAGR recomputed from `trades` (see the comment above this loop's
+                # `core_cagr` assignment) -- the resolution-aware headline number a
+                # downstream reader/persister should prefer over `candidate['cagr']`.
+                'core_cagr': core_cagr,
+                # second_build_id (2026-09-07, Review-Gate Persistence Rule item --
+                # contextual paired-review HIGH finding): the SPECIFIC massive_second_
+                # derived build_id active when this row's trades_resolution was decided
+                # (same `_second_build_id` resolved once per scope above), not just
+                # whether *some* second build existed. `trades_resolution=='1s'` alone
+                # can't distinguish "1s data from the currently-active build" from "1s
+                # data from a build since superseded" (real precedent: the 2026-08-27
+                # SOXL/DPST/DFEN minute-archive narrowing incident this project's own
+                # active_builds/promote_derived_build.py exists to guard against) -- a
+                # scope re-verified after a NEWER second build is promoted must not be
+                # treated as already covered just because SOME earlier 1s pass ran.
+                'second_build_id': _second_build_id,
                 # Raw per-trade closed-trade list (need_times=True -- Entry/Exit Time/Price,
                 # Return, armed/Arm Time/Arm Price), added 2026-08-23 for candidate_full_
                 # review.py's --kernel gt full-review port: lets that report compute real
@@ -3910,15 +3980,33 @@ def build_candidate_report_ground_truth(ticker, strategy_name, config_version, h
     # cagr, not robust_alpha (2026-08-23, ground_truth_kernel_rebuild.md Step 4): CAGR is
     # the sole GT selection metric now -- this is the single most consequential ranking
     # line in the pipeline (decides which candidate gets labeled the overall winner).
-    # Falls back to robust_alpha ONLY for a candidates_override list whose cagr is
-    # entirely None (candidate_nodes doesn't persist cagr, see this function's own
-    # docstring) -- never triggers for the default backtest_cache-sourced path, which
-    # always has real cagr on every candidate.
-    if all(c['cagr'] is None for c in candidates):
+    # Falls back to robust_alpha ONLY when a candidate's effective cagr is entirely None.
+    #
+    # effective_cagr (2026-09-07, Review-Gate Persistence Rule item -- paired-review
+    # HIGH finding, both independent-cold and contextual review independently converged
+    # on this): this used to rank purely on `candidates[i]['cagr']`, the stale Phase1/2
+    # sweep-time value -- always None for a candidate_nodes-sourced scope (see this
+    # function's own docstring), so EVERY such scope fell back to robust_alpha for
+    # winner selection regardless of the real, resolution-aware `core_cagr` computed a
+    # few lines above for the report's own cagr_pct column. That left is_winner/
+    # winner_metric silently out of sync with the same row's own displayed cagr_pct
+    # (confirmed live: a real GDXU run showed core_cagr=59.58 computed while
+    # winner_metric still read 'robust_alpha'). `rows` is 1:1 index-aligned with
+    # `candidates` (built via `for cand, addon in zip(candidates, addon_results)` above,
+    # `addon_results` itself built 1:1 with `candidates`, no skip/continue in that loop)
+    # so indexing both by the same `i` is safe.
+    effective_cagr = [rows[i].get('core_cagr') if rows[i].get('core_cagr') is not None
+                       else candidates[i]['cagr'] for i in range(len(candidates))]
+    if all(v is None for v in effective_cagr):
         winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['robust_alpha'])
         winner_metric = 'robust_alpha'
     else:
-        winner_index = max(range(len(candidates)), key=lambda i: candidates[i]['cagr'])
+        # -inf (not a bare None-skip) so a candidate with no effective cagr at all never
+        # wins over one that has a real, even deeply negative, cagr -- and two None
+        # entries stay safely comparable (a raw (bool, value) tuple key would raise
+        # TypeError comparing None to None whenever more than one candidate lacks a cagr).
+        winner_index = max(range(len(candidates)),
+                            key=lambda i: effective_cagr[i] if effective_cagr[i] is not None else float('-inf'))
         winner_metric = 'cagr'
 
     return {
@@ -3953,10 +4041,13 @@ def print_candidate_report_ground_truth(report):
         c = row['candidate']
         marker = f" <-- OVERALL WINNER (by {report['winner_metric']})" if i == report['winner_index'] else ""
         print(f"--- Candidate {i+1}{marker} ---")
-        # cagr can be None for a candidates_override list (candidate_nodes doesn't
-        # persist cagr, see this function's own docstring) -- never None for the
-        # default backtest_cache-sourced path.
-        cagr_str = f"{c['cagr']:.1f}%" if c['cagr'] is not None else "N/A (candidate_nodes-sourced)"
+        # Prefer row['core_cagr'] (2026-09-07, same effective_cagr precedence as the
+        # winner-selection fix above) -- c['cagr'] alone is always None for a
+        # candidates_override list (candidate_nodes doesn't persist cagr, see this
+        # function's own docstring), which used to print a misleading "N/A" here even
+        # when a real, resolution-aware core_cagr had just been computed for this row.
+        _display_cagr = row.get('core_cagr') if row.get('core_cagr') is not None else c['cagr']
+        cagr_str = f"{_display_cagr:.1f}%" if _display_cagr is not None else "N/A (no trades)"
         print(f"  island(TP={c['island_tp']} SL={c['island_sl']})  cell TP={c['take_profit']} "
               f"SL={c['stop_loss']} hold={c['max_hold_hours']}h w={c['window']} z={c['z_score_threshold']} "
               f"tpct={c['tpct']}  robust_alpha={c['robust_alpha']:.2f}  cagr={cagr_str}  n_trades={row['n_trades']}")

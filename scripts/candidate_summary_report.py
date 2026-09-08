@@ -116,16 +116,23 @@ GT_COLUMN_DEFS = {
     "candidate_rank": "1-based position in derive_phase25_candidates_ground_truth's own returned candidate list "
                        "for this scope (up to 9 -- top-3-per-island across up to 3 islands).",
     "is_winner": "True for the single candidate build_candidate_report_ground_truth picked as the scope's overall "
-                 "winner -- ranked by cagr_pct (2026-08-23, ground_truth_kernel_rebuild.md Step 4, CAGR is the "
-                 "GT selection metric) EXCEPT for a candidate_source='candidate_nodes' scope, where cagr_pct is "
-                 "never available and the winner is ranked by robust_alpha_pct instead -- see winner_metric.",
-    "winner_metric": "Which column actually decided is_winner for this scope: 'cagr' (normal path) or "
-                      "'robust_alpha' (candidate_source='candidate_nodes' scope, no real cagr available).",
+                 "winner -- ranked by the SAME effective cagr this report's own cagr_pct column shows (row's "
+                 "recomputed core_cagr when available, else the candidate's stale sweep-time cagr; 2026-09-07 fix "
+                 "-- previously ranked on the stale sweep-time value alone, which silently disagreed with a "
+                 "candidate_source='candidate_nodes' scope's own displayed cagr_pct). Falls back to "
+                 "robust_alpha_pct only when EVERY candidate in the scope has no effective cagr at all.",
+    "winner_metric": "Which column actually decided is_winner for this scope: 'cagr' (normal path, now includes "
+                      "a candidate_nodes scope with a real recomputed core_cagr) or 'robust_alpha' (only when no "
+                      "candidate in the scope has any effective cagr).",
     "candidate_source": "'backtest_cache' (normal GT path, derive_phase25_candidates_ground_truth) or "
                          "'candidate_nodes' (fallback for a campaign the in-memory sweep pipeline ran, which "
                          "writes zero backtest_cache rows -- scripts/phase4_candidate_nodes_resolver.py). A "
-                         "candidate_nodes-sourced row always has cagr_pct=None and phase4_eligible=True "
-                         "(no CAGR-based gate exists without a real cagr -- see phase4_eligible's own note).",
+                         "candidate_nodes-sourced row's own candidate['cagr'] is always None (no sweep-time "
+                         "CAGR is ever persisted there), but cagr_pct itself is NOT None here as of 2026-09-07 "
+                         "(paired-review HIGH finding #1) -- it's recomputed from this row's real `trades` "
+                         "(see trades_resolution), the same way every other row's cagr_pct is. "
+                         "phase4_eligible always True (no CAGR-based gate exists without a real sweep-time "
+                         "cagr -- see phase4_eligible's own note).",
     "candidate_id": "The real candidate_nodes.id this row came from (candidate_source='candidate_nodes' only) "
                      "-- None for a backtest_cache-sourced row, which was never promoted into candidate_nodes. "
                      "This is the real anchor key scripts/candidate_verification_store.py's phase4_results "
@@ -139,7 +146,20 @@ GT_COLUMN_DEFS = {
     "tpct": "Candidate's 4th-axis trail_sell_pct (TrailingBoth) or 0 (TrailingExit).",
     "robust_alpha_pct": "MIN(possible,pessimistic,certain) alpha vs SPY for this candidate's own cell, as computed "
                          "by the real Phase1/2-GT sweep rows this scope's candidates were derived from.",
-    "cagr_pct": "Real annualized CAGR for this candidate's own cell (same source as robust_alpha_pct).",
+    "cagr_pct": "Real annualized CAGR for this candidate's own cell -- as of 2026-09-07 (paired-review HIGH "
+                "finding #1), recomputed from this row's own `trades` list (whatever resolution actually "
+                "produced it -- see trades_resolution), NOT robust_alpha_pct's sweep-time source; falls back "
+                "to the sweep-time value only when trades produced no computable CAGR.",
+    "trades_resolution": "Which real trade source produced this row's `trades`/cagr_pct/checks 4-13: '1s' "
+                          "(phase5_trades, trusted), 'second_cache'/'second_resim' (backtest_winner_trades or "
+                          "a fresh resim, both true 1-second resolution), 'minute_cache'/'minute_resim' (minute "
+                          "resolution), or None (legacy row/no trades). Added 2026-09-07 (paired-review HIGH "
+                          "finding #3) so a post-1s-fix row is distinguishable from a pre-fix one.",
+    "second_build_id": "The real db_cache.get_active_build_id(ticker, 'second') value active when "
+                       "trades_resolution was decided for this row -- None when data_source != 'massive' or no "
+                       "second build was active. Added 2026-09-07 so a scope re-verified after a NEWER second "
+                       "build is promoted (see docs/deep_backlog.md's 2026-08-27 SOXL/DPST/DFEN incident) isn't "
+                       "mistaken for already covered just because trades_resolution=='1s' from an OLDER build.",
     "n_trades": "Real trade count from this candidate's own same_bar_reentry=True trade list (build_candidate_"
                 "report_ground_truth's own re-simulation, matching the real live dispatch convention).",
     "trades_from_cache": "True when this candidate's trade list came from backtest_winner_trades (Phase2.5's "
@@ -1050,7 +1070,17 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
             "take_profit": c["take_profit"], "stop_loss": c["stop_loss"],
             "max_hold_hours": c["max_hold_hours"], "window": c["window"],
             "z_score_threshold": c["z_score_threshold"], "tpct": c["tpct"],
-            "robust_alpha_pct": c["robust_alpha"], "cagr_pct": c["cagr"],
+            "robust_alpha_pct": c["robust_alpha"],
+            # cagr_pct (2026-09-07, Review-Gate Persistence Rule item -- paired-review
+            # HIGH finding #1): prefer row['core_cagr'], recomputed from the actual
+            # `trades` list this row's checks 4/8/11/13 ran against (resolution-aware --
+            # '1s'/'second_resim' when available, see trades_resolution below) -- over
+            # c['cagr'], the stale Phase1/2 sweep-time value (always minute-resolution,
+            # and always None for a candidate_nodes-sourced row, which is why this used
+            # to print "cagr=N/A" for every such candidate regardless of real trades).
+            # Falls back to c['cagr'] only if core_cagr itself is None (e.g. trades
+            # empty) so a real, if stale, number is still better than a hard None.
+            "cagr_pct": row.get("core_cagr") if row.get("core_cagr") is not None else c["cagr"],
             "n_trades": row["n_trades"],
             # Cache-hit/resim provenance (2026-08-29, paired-review HIGH finding "at
             # minimum" ask -- see run_optimization_sweep.build_candidate_report_ground_
@@ -1059,6 +1089,17 @@ def gt_rows_for_scope(ticker, strategy, version, entry_timing, fixed_sl, grid_wi
             # trades came from backtest_winner_trades (kernel_version/build_id-matched),
             # False when freshly resimulated this call.
             "trades_from_cache": row.get("trades_from_cache", False),
+            # Real per-row resolution marker (2026-09-07, Review-Gate Persistence Rule
+            # item -- paired-review HIGH finding #3): '1s'/'minute_cache'/'minute_resim'/
+            # 'second_resim' (see build_candidate_report_ground_truth's own trades_
+            # resolution comment) -- persisted (phase4_results.trades_resolution below)
+            # so a post-fix row is distinguishable from a pre-fix one after the fact.
+            "trades_resolution": row.get("trades_resolution"),
+            # second_build_id (2026-09-07, Review-Gate Persistence Rule item --
+            # contextual paired-review HIGH finding): the specific massive_second_
+            # derived build_id active when trades_resolution was decided -- see
+            # run_optimization_sweep.build_candidate_report_ground_truth's own comment.
+            "second_build_id": row.get("second_build_id"),
             "core_safe": row["core_safe"], "addon_safe": row["addon_safe"],
             "core_addon_disagreement": row["core_addon_disagreement"],
             "addon_cagr_pct": own["addon_cagr"] if own else None,
